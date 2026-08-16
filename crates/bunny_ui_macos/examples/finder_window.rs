@@ -17,6 +17,17 @@ const PANEL_W: f64 = 640.0;
 const PANEL_H: f64 = 480.0;
 const PANEL_TOP: f64 = 120.0;
 
+// as ações do finder — tecla vira intenção no keymap do main()
+const SELECT_NEXT: ActionId = ActionId("finder.select_next");
+const SELECT_PREV: ActionId = ActionId("finder.select_prev");
+const PAGE_FORWARD: ActionId = ActionId("finder.page_forward");
+const PAGE_BACK: ActionId = ActionId("finder.page_back");
+const OPEN: ActionId = ActionId("finder.open");
+const OPEN_SPLIT: ActionId = ActionId("finder.open_split");
+const DISMISS: ActionId = ActionId("finder.dismiss");
+
+const CLEAR: Color = Color::rgba(0, 0, 0, 0);
+
 /// (nome, diretório, recente?) — o mock de um projeto plausível.
 const FILES: &[(&str, &str, bool)] = &[
     ("main.rs", "src/", true),
@@ -99,6 +110,8 @@ struct Finder {
     query: State<String>,
     opened: State<String>,
     dark: State<bool>,
+    /// Índice selecionado na lista FILTRADA (clamp na exibição).
+    selected: State<usize>,
 }
 
 impl Component for Finder {
@@ -134,6 +147,9 @@ impl Component for Finder {
             .collect();
         let count = items.len();
         let opened = self.opened;
+        let selected = self.selected;
+        // a leitura registra a dependência: mover a seleção repinta a row
+        let selected_index = selected.get().min(count.saturating_sub(1));
 
         let header = hstack!(
             text("›").font(Font::Headline).foreground_color(theme::accent()),
@@ -143,12 +159,16 @@ impl Component for Finder {
         .alignment(VerticalAlignment::Center)
         .padding_length(10.0);
 
+        let labels: Vec<String> =
+            items.iter().map(|row| format!("{}{}", row.dir, row.name)).collect();
+        let indexed: Vec<(usize, Row)> = items.into_iter().enumerate().collect();
         let results = list(
-            items,
-            |row| format!("{}{}", row.dir, row.name),
-            move |row| {
+            indexed,
+            |(_, row)| format!("{}{}", row.dir, row.name),
+            move |(index, row)| {
                 let row = row.clone();
                 let label = format!("{}{}", row.dir, row.name);
+                let is_selected = *index == selected_index;
                 hstack!(
                     // nome: elipse no MEIO, teto de 240 como manda a anatomia
                     text(row.name)
@@ -175,6 +195,9 @@ impl Component for Finder {
                 .padding_edge(Edge::Trailing, 12.0)
                 .padding_edge(Edge::Top, 7.0)
                 .padding_edge(Edge::Bottom, 7.0)
+                // seleção por teclado pinta o fundo base; hover refina por
+                // cima (o mesmo contrato do Styled)
+                .background_color(if is_selected { theme::row_pressed() } else { CLEAR })
                 .background_hovered(theme::row_hover())
                 .background_pressed(theme::row_pressed())
                 .on_click(move || opened.set(label.clone()))
@@ -223,12 +246,48 @@ impl Component for Finder {
         .padding_edge(Edge::Top, 8.0)
         .padding_edge(Edge::Bottom, 8.0);
 
+        // abre o selecionado; os handlers capturam a lista FILTRADA do
+        // body corrente — filtro novo = body re-roda = capturas frescas
+        let open_at = move |prefix: &'static str| {
+            if let Some(label) = labels.get(selected.get().min(count.saturating_sub(1))) {
+                opened.set(format!("{prefix}{label}"));
+            }
+        };
+        let query_state = self.query;
         let panel = vstack!(header, divider(), body, divider(), footer)
             .alignment(HorizontalAlignment::Leading)
             .frame(PANEL_W, PANEL_H)
             .background_color(theme::panel())
             .corner_radius(9.0)
-            .border(theme::border(), 1.0);
+            .border(theme::border(), 1.0)
+            // ↓/↑ com wrap — funcionam ENQUANTO digita (o gate consome)
+            .on_action(SELECT_NEXT, move || {
+                if count > 0 {
+                    selected.set((selected.get().min(count - 1) + 1) % count)
+                }
+            })
+            .on_action(SELECT_PREV, move || {
+                if count > 0 {
+                    selected.set((selected.get().min(count - 1) + count - 1) % count)
+                }
+            })
+            .on_action(PAGE_FORWARD, move || {
+                if count > 0 {
+                    selected.set((selected.get() + 10).min(count - 1))
+                }
+            })
+            .on_action(PAGE_BACK, move || selected.set(selected.get().saturating_sub(10)))
+            .on_action(OPEN, {
+                let open_at = open_at.clone();
+                move || open_at("")
+            })
+            .on_action(OPEN_SPLIT, move || open_at("split: "))
+            .on_action(DISMISS, move || {
+                query_state.set(String::new());
+                selected.set(0);
+            })
+            // filtro novo = seleção volta ao topo
+            .on_change(move || query_state.get(), false, move |_, _| selected.set(0));
 
         zstack!(
             spacer().background_color(theme::backdrop()),
@@ -238,13 +297,26 @@ impl Component for Finder {
 }
 
 fn main() {
-    bunny_ui_macos::run_window(
+    let runtime =
+        Runtime::new().text_engine(Rc::new(bunny_ui_macos::CoreTextEngine::new()));
+    // o keymap do app: tecla → intenção (os handlers moram na tela)
+    runtime.bind(KeyPattern::key(Key::Down), SELECT_NEXT);
+    runtime.bind(KeyPattern::key(Key::Up), SELECT_PREV);
+    runtime.bind(KeyPattern::key(Key::PageDown), PAGE_FORWARD);
+    runtime.bind(KeyPattern::key(Key::PageUp), PAGE_BACK);
+    runtime.bind(KeyPattern::key(Key::Enter), OPEN);
+    runtime.bind(KeyPattern::command(Key::Enter), OPEN_SPLIT);
+    runtime.bind(KeyPattern::key(Key::Escape), DISMISS);
+
+    bunny_ui_macos::run_window_with(
         "Finder",
         Size { width: 760.0, height: 640.0 },
+        runtime,
         Finder {
             query: State::new(String::new()),
             opened: State::new(String::new()),
             dark: State::new(false),
+            selected: State::new(0),
         },
     );
 }

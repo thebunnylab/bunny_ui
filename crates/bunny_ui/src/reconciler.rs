@@ -42,6 +42,11 @@ pub(crate) type ActionEntry = (String, Rc<dyn Fn()>);
 pub(crate) type EditorFn = Rc<dyn Fn(EditCommand, &mut CaretState) -> Option<String>>;
 pub(crate) type EditorEntry = (String, EditorFn);
 
+/// Handler de ação NOMEADA registrado no render: (caminho do registro,
+/// id, o que roda). Retido como as ações — handler de view pulada vive.
+pub(crate) type HandlerFn = Rc<dyn Fn()>;
+pub(crate) type HandlerEntry = (String, crate::action::ActionId, HandlerFn);
+
 pub(crate) struct Entry {
     pub value: Erased,
     pub ctx: Context,
@@ -55,6 +60,8 @@ pub(crate) struct Entry {
     pub actions: Vec<ActionEntry>,
     /// Os editores de campo do body — mesma retenção.
     pub editors: Vec<EditorEntry>,
+    /// Os handlers de ação nomeada do body — mesma retenção.
+    pub handlers: Vec<HandlerEntry>,
     /// Segmentos do caminho do PAI — a semente do cursor num re-run isolado.
     pub parent_segments: Vec<String>,
 }
@@ -65,6 +72,7 @@ struct BuildingFrame {
     effects: Vec<EffectFn>,
     actions: Vec<ActionEntry>,
     editors: Vec<EditorEntry>,
+    handlers: Vec<HandlerEntry>,
 }
 
 #[derive(Default)]
@@ -79,8 +87,12 @@ struct PassState {
     root_effects: Vec<EffectFn>,
     root_actions: Vec<ActionEntry>,
     root_editors: Vec<EditorEntry>,
+    root_handlers: Vec<HandlerEntry>,
     /// Instrumentação: bodies que rodaram neste pass.
     body_runs: Vec<String>,
+    /// Fronteiras PULADAS neste pass — a subtree de uma pulada sobrevive
+    /// à varredura de entries (o walk não entrou nela de propósito).
+    skipped: Vec<String>,
 }
 
 thread_local! {
@@ -111,13 +123,14 @@ pub(crate) enum Decision {
 /// a config pode ter mudado sem passar por `State`).
 pub(crate) fn decide(path: &str) -> Decision {
     PASS.with(|pass| {
-        let pass = pass.borrow();
+        let mut pass = pass.borrow_mut();
         if !pass.active {
             return Decision::Render;
         }
         let inside_rerun = !pass.building.is_empty();
         let retained = RETAINED.with(|retained| retained.borrow().contains_key(path));
         if !inside_rerun && retained && !pass.dirty.contains(path) {
+            pass.skipped.push(path.to_string());
             Decision::Skip
         } else {
             Decision::Render
@@ -140,14 +153,14 @@ pub(crate) fn finish_entry(
     node: RenderNode,
     layout: LayoutNode,
 ) {
-    let (effects, actions, editors) = PASS.with(|pass| {
+    let (effects, actions, editors, handlers) = PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         match pass.building.pop() {
             Some(frame) => {
                 debug_assert_eq!(frame.path, path, "entries fecham na ordem que abrem");
-                (frame.effects, frame.actions, frame.editors)
+                (frame.effects, frame.actions, frame.editors, frame.handlers)
             }
-            None => (Vec::new(), Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         }
     });
     let parent_segments = motor::identity::current_path_segments()
@@ -157,7 +170,17 @@ pub(crate) fn finish_entry(
     RETAINED.with(|retained| {
         retained.borrow_mut().insert(
             path.to_string(),
-            Entry { value, ctx, node, layout, effects, actions, editors, parent_segments },
+            Entry {
+                value,
+                ctx,
+                node,
+                layout,
+                effects,
+                actions,
+                editors,
+                handlers,
+                parent_segments,
+            },
         );
     });
 }
@@ -197,6 +220,78 @@ pub(crate) fn attribute_editor(path: String, editor: EditorFn) {
             pass.root_editors.push((path, editor));
         }
     });
+}
+
+/// Um handler de ação nomeada registrado durante o render — mesma
+/// atribuição das ações: entry em construção, ou região do root.
+pub(crate) fn attribute_handler(path: String, id: crate::action::ActionId, handler: HandlerFn) {
+    PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        if let Some(frame) = pass.building.last_mut() {
+            frame.handlers.push((path, id, handler));
+        } else {
+            pass.root_handlers.push((path, id, handler));
+        }
+    });
+}
+
+thread_local! {
+    /// O mapa de handlers vigente: id → (profundidade do registro,
+    /// handler). Remontado por pass, como ações e editores — o mapa é
+    /// estampa do pass, nunca estado retido de interação.
+    static HANDLERS: RefCell<HashMap<crate::action::ActionId, (usize, HandlerFn)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Remonta o mapa de handlers da retenção sob o root + região do root.
+/// Precedência: o caminho mais FUNDO vence (mais interno na árvore);
+/// empate de profundidade → o montado por último (determinístico pela
+/// ordem da retenção, documentado como NÃO-contratual — o desempate
+/// semântico chega com key contexts).
+pub(crate) fn assemble_handlers(root: &str) {
+    let mut map: HashMap<crate::action::ActionId, (usize, HandlerFn)> = HashMap::new();
+    let place = |map: &mut HashMap<crate::action::ActionId, (usize, HandlerFn)>,
+                     path: &str,
+                     id: crate::action::ActionId,
+                     handler: HandlerFn| {
+        let depth = path.split('/').count();
+        match map.get(&id) {
+            Some((existing, _)) if *existing > depth => {}
+            _ => {
+                map.insert(id, (depth, handler));
+            }
+        }
+    };
+    RETAINED.with(|retained| {
+        for (path, entry) in retained.borrow().iter() {
+            if covers(root, path) {
+                for (key, id, handler) in &entry.handlers {
+                    place(&mut map, key, *id, handler.clone());
+                }
+            }
+        }
+    });
+    PASS.with(|pass| {
+        for (key, id, handler) in std::mem::take(&mut pass.borrow_mut().root_handlers) {
+            place(&mut map, &key, id, handler);
+        }
+    });
+    HANDLERS.with(|handlers| *handlers.borrow_mut() = map);
+}
+
+/// Roda o handler mais interno do id. `false` = ninguém registrou — a
+/// tecla NÃO é consumida (segue para o campo/sistema de input).
+pub(crate) fn run_handler(id: crate::action::ActionId) -> bool {
+    let handler = HANDLERS
+        .with(|handlers| handlers.borrow().get(&id).map(|(_, handler)| handler.clone()));
+    match handler {
+        Some(handler) => {
+            // fora do borrow: o handler pode escrever estado à vontade
+            handler();
+            true
+        }
+        None => false,
+    }
 }
 
 /// Views sujas que o walk não alcançou (pai pulado): re-roda cada uma a
@@ -346,6 +441,32 @@ pub(crate) fn forget(dead: &[String]) {
         for path in dead {
             retained.remove(path);
         }
+    });
+}
+
+/// A varredura-GÊMEA da de identidade, para views SEM estado próprio: a
+/// varredura do motor só conhece fronteiras com slots/âncoras (owners);
+/// uma view apátrida que desmonta deixaria a entry retida — e com ela
+/// handlers/ações/editores ZUMBIS respondendo depois do desmonte. Regra:
+/// sob o root, sobrevive quem re-rodou, quem foi pulado, ou quem vive sob
+/// uma fronteira PULADA (o walk não entrou nela de propósito). Descendente
+/// não-visitado de um pai que RE-RODOU está morto — o pai revisitou os
+/// filhos vivos um a um.
+pub(crate) fn sweep_stale(root: &str) {
+    let (runs, skipped) = PASS.with(|pass| {
+        let pass = pass.borrow();
+        (
+            pass.body_runs.iter().cloned().collect::<HashSet<String>>(),
+            pass.skipped.clone(),
+        )
+    });
+    RETAINED.with(|retained| {
+        retained.borrow_mut().retain(|path, _| {
+            if !covers(root, path) {
+                return true; // outra árvore montada na mesma thread
+            }
+            runs.contains(path) || skipped.iter().any(|skip| covers(skip, path))
+        });
     });
 }
 

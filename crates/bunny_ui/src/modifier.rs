@@ -67,6 +67,7 @@ pub enum Modifier {
     // MARK: - Interação real (alvo de ponteiro sem chrome — o Button sem
     // a roupa; a ação dispara no up-inside como a dele)
     OnClick(Rc<dyn Fn()>),
+    OnAction(crate::action::ActionId, Rc<dyn Fn()>),
 
     // MARK: - Interação (a ação dispara no render, como no motor headless)
     OnAppear(Rc<dyn Fn()>),
@@ -145,6 +146,7 @@ impl Modifier {
             }
             Modifier::TruncationMode(mode) => format!(" [.truncationMode(.{mode:?})]"),
             Modifier::OnClick(_) => " [.onClick()]".into(),
+            Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
             Modifier::OnTapGesture(_) => " [.onTapGesture()]".into(),
             Modifier::Effect { name, detail, .. } => format!(" [.{name}{detail}]"),
@@ -397,6 +399,13 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                         pressed: false,
                         child: Box::new(node),
                     });
+                }
+            }
+            Modifier::OnAction(id, handler) => {
+                // registro puro: nada de alvo de ponteiro nem nó de layout
+                // — a ação chega por dispatch (teclado), não por hit-test
+                if let Some(path) = motor::identity::cursor_scope() {
+                    crate::reconciler::attribute_handler(path, *id, handler.clone());
                 }
             }
             _ => {}

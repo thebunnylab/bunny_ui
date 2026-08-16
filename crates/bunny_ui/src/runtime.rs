@@ -17,6 +17,7 @@ use std::rc::Rc;
 
 use motor::state::{Context, EnvironmentValues};
 
+use crate::action::{ActionId, KeyPattern};
 use crate::effects;
 use crate::layout::{FieldPlacement, Interaction, LayoutEnv, Point, Px, Rect, ScrollRegion};
 use crate::reconciler;
@@ -82,6 +83,9 @@ pub struct Runtime {
     /// A versão do tema vista pelo último pass — trocar tema reconstrói a
     /// retenção UMA vez (tokens lidos em body ficam gravados na cena).
     theme_version: Cell<u64>,
+    /// O keymap do app: padrão de tecla → ação. Config do Runtime (como o
+    /// engine de texto), não retenção — bind é declaração de intenção.
+    keymap: RefCell<HashMap<KeyPattern, ActionId>>,
 }
 
 impl Default for Runtime {
@@ -123,6 +127,7 @@ impl Runtime {
             caret_visible: Cell::new(true),
             last_fields: RefCell::new(Vec::new()),
             theme_version: Cell::new(crate::theme::version()),
+            keymap: RefCell::new(HashMap::new()),
         }
     }
 
@@ -156,11 +161,16 @@ impl Runtime {
 
         let dead = motor::identity::end_pass();
         reconciler::forget(&dead);
+        if let Some(pass_root) = &pass_root {
+            // a gêmea da varredura acima, para views sem estado próprio
+            reconciler::sweep_stale(pass_root);
+        }
 
         if let Some(pass_root) = &pass_root {
             effects::set_queue(reconciler::assemble_effects(pass_root));
             reconciler::assemble_actions(pass_root);
             reconciler::assemble_editors(pass_root);
+            reconciler::assemble_handlers(pass_root);
             motor::identity::consume_dirty(pass_root, &snapshot);
             *self.last_root.borrow_mut() = Some(pass_root.clone());
         }
@@ -302,6 +312,27 @@ impl Runtime {
 
     pub fn scroll_offset(&self, path: &str) -> Point {
         self.scroll_offsets.borrow().get(path).copied().unwrap_or_default()
+    }
+
+    // MARK: - Ações nomeadas + keymap
+
+    /// Liga um padrão de tecla a uma ação — rebind sobrescreve. Nenhum
+    /// default: o app declara o mapa (os atalhos de edição do campo
+    /// continuam sendo do shell). Casamento de modificadores é EXATO.
+    pub fn bind(&self, pattern: KeyPattern, action: ActionId) {
+        self.keymap.borrow_mut().insert(pattern, action);
+    }
+
+    /// O binding do padrão, se houver.
+    pub fn match_key(&self, pattern: &KeyPattern) -> Option<ActionId> {
+        self.keymap.borrow().get(pattern).copied()
+    }
+
+    /// Dispara o handler mais interno vigente. `false` = nenhum handler
+    /// montado — quem chamou decide o fallback (o gate deixa a tecla
+    /// seguir para o campo).
+    pub fn dispatch_action(&self, id: ActionId) -> bool {
+        reconciler::run_handler(id)
     }
 
     // MARK: - Foco e teclado (o campo focado é o dono do teclado)

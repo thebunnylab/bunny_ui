@@ -37,6 +37,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod action;
 pub mod effects;
 pub mod erased;
 pub mod ext;
@@ -87,6 +88,7 @@ macro_rules! zstack {
 }
 
 pub mod prelude {
+    pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::erased::{CustomModifier, Erased, erased};
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
@@ -993,6 +995,166 @@ mod tests {
         assert_eq!(runtime.focused(), None);
         assert!(!runtime.key(EditCommand::Insert("x".into())).applied);
         assert!(runtime.render_stable(&form).contains("hello Dec"));
+    }
+
+    #[test]
+    fn actions_register_dispatch_and_the_innermost_wins() {
+        const PING: ActionId = ActionId("test.ping");
+
+        #[derive(Clone, Copy)]
+        struct Inner {
+            hits: State<i32>,
+        }
+
+        impl Component for Inner {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("inner").on_action(PING, move || self.hits.add(10))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Outer {
+            hits: State<i32>,
+        }
+
+        impl Component for Outer {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(Inner { hits: self.hits })
+                    .on_action(PING, move || self.hits.add(1))
+            }
+        }
+
+        let outer = Outer { hits: State::new(0) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&outer);
+
+        // o handler mais FUNDO (Inner) vence o do Outer
+        assert!(runtime.dispatch_action(PING));
+        assert_eq!(outer.hits.get(), 10);
+        assert!(!runtime.dispatch_action(ActionId("test.nope")), "id sem handler");
+
+        // bind + match compõem; modificador é exato
+        const NEXT: ActionId = ActionId("test.next");
+        runtime.bind(KeyPattern::key(Key::Down), NEXT);
+        assert_eq!(runtime.match_key(&KeyPattern::key(Key::Down)), Some(NEXT));
+        assert_eq!(runtime.match_key(&KeyPattern::command(Key::Down)), None);
+        // binding sem handler montado NÃO consome — a propriedade que
+        // deixa a tecla seguir para o campo
+        assert!(!runtime.dispatch_action(NEXT));
+    }
+
+    #[test]
+    fn a_skipped_views_handler_stays_alive_and_dies_with_it() {
+        const POKE: ActionId = ActionId("test.poke");
+
+        #[derive(Clone, Copy)]
+        struct Holder {
+            mounted: State<bool>,
+            other: State<i32>,
+            hits: State<i32>,
+        }
+
+        #[derive(Clone, Copy)]
+        struct Palette {
+            hits: State<i32>,
+        }
+
+        impl Component for Palette {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("palette").on_action(POKE, move || self.hits.add(1))
+            }
+        }
+
+        impl Component for Holder {
+            fn body(self, _ctx: &Context) -> impl View {
+                let _ = self.other.get();
+                if self.mounted.get() {
+                    Either::First(Palette { hits: self.hits })
+                } else {
+                    Either::Second(text("closed"))
+                }
+            }
+        }
+
+        let holder = Holder {
+            mounted: State::new(true),
+            other: State::new(0),
+            hits: State::new(0),
+        };
+        let runtime = Runtime::new();
+        runtime.render_stable(&holder);
+
+        // pass estável (Palette PULADA): o handler retido continua vivo
+        runtime.render(&holder);
+        assert!(runtime.dispatch_action(POKE));
+        assert_eq!(holder.hits.get(), 1);
+
+        // desmontar a Palette varre a entry — o handler morre junto
+        holder.mounted.set(false);
+        runtime.render_stable(&holder);
+        eprintln!("PRINT POS-DESMONTE: {}", runtime.render(&holder));
+        assert!(!runtime.dispatch_action(POKE), "handler desmontado não responde");
+    }
+
+    #[test]
+    fn handlers_reregister_with_fresh_captures() {
+        use crate::layout::{Proposal, Size};
+        const NEXT: ActionId = ActionId("test.select_next");
+        const DISMISS: ActionId = ActionId("test.dismiss");
+
+        // o finder-shape inteiro: campo + lista filtrada + seleção com
+        // wrap capturando o COUNT do body corrente
+        #[derive(Clone, Copy)]
+        struct MiniPalette {
+            query: State<String>,
+            selected: State<usize>,
+        }
+
+        impl Component for MiniPalette {
+            fn body(self, _ctx: &Context) -> impl View {
+                let query = self.query.get();
+                let all = ["alpha", "beta", "gamma"];
+                let count = all.iter().filter(|name| name.contains(&query)).count();
+                let selected = self.selected;
+                vstack!(
+                    text_field("filter", self.query.binding()),
+                    text!("{count} items"),
+                )
+                .on_action(NEXT, move || {
+                    if count > 0 {
+                        selected.set((selected.get() + 1) % count)
+                    }
+                })
+                .on_action(DISMISS, move || self.query.set(String::new()))
+            }
+        }
+
+        let palette = MiniPalette { query: State::new(String::new()), selected: State::new(0) };
+        let runtime = Runtime::new();
+        runtime.bind(KeyPattern::key(Key::Down), NEXT);
+        runtime.bind(KeyPattern::key(Key::Escape), DISMISS);
+        runtime.render_stable(&palette);
+
+        // foca o campo e digita — o filtro encolhe para 1 ("beta")
+        let result =
+            runtime.layout(&palette, Proposal::exact(Size { width: 200.0, height: 80.0 }));
+        let (_, rect) = result.hits.first().unwrap().clone();
+        runtime.pointer_pressed(rect.origin.x + 4.0, rect.origin.y + 4.0);
+        runtime.pointer_released(rect.origin.x + 4.0, rect.origin.y + 4.0);
+        runtime.key(EditCommand::Insert("bet".into()));
+        runtime.render_stable(&palette);
+
+        // o handler re-registrado capturou o count NOVO: wrap em 1
+        let action = runtime.match_key(&KeyPattern::key(Key::Down)).unwrap();
+        assert!(runtime.dispatch_action(action));
+        assert_eq!(palette.selected.get(), 0, "wrap com count=1 volta para 0");
+
+        // Esc despacha a ação e o FOCO fica (blur é fallback do shell)
+        let action = runtime.match_key(&KeyPattern::key(Key::Escape)).unwrap();
+        assert!(runtime.dispatch_action(action));
+        runtime.render_stable(&palette);
+        assert_eq!(palette.query.get(), "");
+        assert!(runtime.focused().is_some(), "dismiss não rouba o foco");
     }
 
     #[test]

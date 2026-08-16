@@ -21,6 +21,7 @@ use motor::runtime::Site;
 use motor::state::{Binding, Context, ProvidesQueries};
 use motor::views::Query;
 
+use crate::action::ActionId;
 use crate::effects;
 use crate::erased::Erased;
 use crate::layout::Color;
@@ -244,6 +245,17 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified {
             base: self,
             modifier: Modifier::OnClick(Rc::new(action)),
+        }
+    }
+
+    /// `.on_action(SELECT_NEXT, move || …)` — registra o handler da ação
+    /// nomeada nesta subárvore. Dois handlers do mesmo id: o mais interno
+    /// vence. Retido como as ações de clique: view pulada responde. A
+    /// tecla chega pelo keymap do `Runtime` (`bind` + o gate do shell).
+    fn on_action(self, id: ActionId, handler: impl Fn() + 'static) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::OnAction(id, Rc::new(handler)),
         }
     }
 

@@ -270,6 +270,35 @@ extern "C" fn bunny_accepts_first_responder(_this: Id, _sel: Sel) -> i8 {
     1
 }
 
+/// A tecla crua do AppKit já extraída — o vocabulário do gate de keymap.
+pub struct KeyStroke {
+    pub code: u16,
+    pub shift: bool,
+    pub control: bool,
+    pub option: bool,
+    pub command: bool,
+    pub chars: String,
+    /// `charactersIgnoringModifiers` — o char BASE: padrões `Char` casam
+    /// por aqui (shift/option não mudam a identidade da tecla).
+    pub chars_ignoring: String,
+}
+
+thread_local! {
+    /// O gate de teclado do shell: vê o keyDown ANTES do sistema de input.
+    /// `true` = o keymap despachou — o evento morre aqui.
+    static KEY_GATE: RefCell<Option<Box<dyn FnMut(&KeyStroke) -> bool>>> =
+        const { RefCell::new(None) };
+}
+
+/// Registra o gate (o shell instala junto do handler de eventos).
+pub fn set_key_gate(gate: Box<dyn FnMut(&KeyStroke) -> bool>) {
+    KEY_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+fn gate_consumed(stroke: &KeyStroke) -> bool {
+    KEY_GATE.with(|slot| slot.borrow_mut().as_mut().is_some_and(|gate| gate(stroke)))
+}
+
 // MARK: - Sincronização de IME (as perguntas SÍNCRONAS do input system)
 
 /// O espelho do campo focado que o `NSTextInputClient` responde na hora —
@@ -408,29 +437,38 @@ extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
     unsafe {
         let code = msg_u16(event, sel("keyCode"));
         let flags = msg_u64(event, sel("modifierFlags"));
-        let shift = flags & (1 << 17) != 0;
-        let command = flags & (1 << 20) != 0;
+        let stroke = KeyStroke {
+            code,
+            shift: flags & (1 << 17) != 0,
+            control: flags & (1 << 18) != 0,
+            option: flags & (1 << 19) != 0,
+            command: flags & (1 << 20) != 0,
+            chars: text_argument_to_string(msg_id(event, sel("characters"))),
+            chars_ignoring: text_argument_to_string(
+                msg_id(event, sel("charactersIgnoringModifiers")),
+            ),
+        };
+
+        // composição de IME viva: as teclas pertencem ao IME (Esc fecha
+        // candidatos, setas andam na composição) — o keymap não rouba
+        let composing = ime_mirror().is_some_and(|ime| ime.marked.location != NS_NOT_FOUND);
+        if !composing && gate_consumed(&stroke) {
+            return; // o keymap despachou — o evento morre aqui
+        }
 
         // campo focado sem cmd: o evento entra no sistema de input — a
         // composição de IME volta por insertText/setMarkedText/doCommand
-        if INTERPRET.with(|flag| flag.get()) && !command {
+        if INTERPRET.with(|flag| flag.get()) && !stroke.command {
             let array = msg_id_arg(class("NSArray"), sel("arrayWithObject:"), event);
             msg_void_id(this, sel("interpretKeyEvents:"), array);
             return;
         }
-
-        let ns_chars = msg_id(event, sel("characters"));
-        let chars = if ns_chars.is_null() {
-            String::new()
-        } else {
-            let utf8 = msg_id(ns_chars, sel("UTF8String")) as *const c_char;
-            if utf8.is_null() {
-                String::new()
-            } else {
-                std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
-            }
-        };
-        dispatch(AppEvent::Key { code, shift, command, chars });
+        dispatch(AppEvent::Key {
+            code,
+            shift: stroke.shift,
+            command: stroke.command,
+            chars: stroke.chars,
+        });
     }
 }
 
