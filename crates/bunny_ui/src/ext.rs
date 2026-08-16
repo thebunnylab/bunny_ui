@@ -23,6 +23,7 @@ use motor::views::Query;
 
 use crate::effects;
 use crate::erased::Erased;
+use crate::layout::Color;
 use crate::modifier::{Modified, Modifier};
 use crate::view::{Single, View, render_line, short_type_name};
 use crate::views::Alignment;
@@ -52,6 +53,14 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified {
             base: self,
             modifier: Modifier::Padding,
+        }
+    }
+
+    /// `.padding(12)` — uniforme com medida explícita.
+    fn padding_length(self, length: f64) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::PaddingLength(length),
         }
     }
 
@@ -164,6 +173,41 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified {
             base: self,
             modifier: Modifier::Hidden,
+        }
+    }
+
+    // MARK: - Visuais (propriedades semânticas do nó — `Styled` na cena)
+
+    /// `.background(Color.red)` — cor sólida como propriedade do nó (o
+    /// `.background { view }` de conteúdo é o outro método).
+    fn background_color(self, color: Color) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::BackgroundColor(color),
+        }
+    }
+
+    /// `.foregroundColor(.secondary)` — herdado pelo texto abaixo.
+    fn foreground_color(self, color: Color) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::ForegroundColor(color),
+        }
+    }
+
+    /// `.border(Color.gray, width: 1)` — moldura para dentro da aresta.
+    fn border(self, color: Color, width: f64) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Border(color, width),
+        }
+    }
+
+    /// `.cornerRadius(8)` — arredonda o fundo DESTE nó.
+    fn corner_radius(self, radius: f64) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::CornerRadius(radius),
         }
     }
 

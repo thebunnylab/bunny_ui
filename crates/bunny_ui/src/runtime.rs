@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use motor::state::{Context, EnvironmentValues};
 
 use crate::effects;
+use crate::layout::{Interaction, Point, Px, Rect};
 use crate::reconciler;
 use crate::view::{NodeList, View};
 
@@ -24,6 +25,12 @@ pub struct Runtime {
     /// O root do último pass — escopa `take_dirty` para não drenar sujeira
     /// de outra árvore montada na mesma thread.
     last_root: RefCell<Option<String>>,
+    /// Os alvos do último layout, na ordem de pintura — o mapa do
+    /// hit-test dos eventos de ponteiro.
+    last_hits: RefCell<Vec<(String, Rect)>>,
+    /// Estado de ponteiro do frame — resolvido ANTES do layout (a LEI:
+    /// hover troca pintura, nunca medida) e estampado na expansão.
+    interaction: RefCell<Interaction>,
 }
 
 impl Default for Runtime {
@@ -37,6 +44,8 @@ impl Runtime {
         Runtime {
             ctx: Context::default(),
             last_root: RefCell::new(None),
+            last_hits: RefCell::new(Vec::new()),
+            interaction: RefCell::new(Interaction::default()),
         }
     }
 
@@ -46,6 +55,8 @@ impl Runtime {
         Runtime {
             ctx,
             last_root: RefCell::new(None),
+            last_hits: RefCell::new(Vec::new()),
+            interaction: RefCell::new(Interaction::default()),
         }
     }
 
@@ -89,6 +100,106 @@ impl Runtime {
         reconciler::run_action(path)
     }
 
+    // MARK: - Ponteiro (resolvido ANTES do layout — a LEI)
+
+    /// O alvo sob o ponto, contra os hits do último layout.
+    fn hover_target(&self, x: Px, y: Px) -> Option<String> {
+        crate::layout::hit_test(&self.last_hits.borrow(), x, y).map(str::to_string)
+    }
+
+    /// Ponteiro moveu. `true` = o estado visível mudou (o shell repinta).
+    /// Durante um press, o hover só re-resolve contra o alvo pressionado:
+    /// arrastar para fora solta o visual, voltar re-arma (AppKit).
+    pub fn pointer_moved(&self, x: Px, y: Px) -> bool {
+        let target = self.hover_target(x, y);
+        let mut interaction = self.interaction.borrow_mut();
+        let hovered = match &interaction.pressed {
+            Some(pressed) => target.filter(|candidate| candidate == pressed),
+            None => target,
+        };
+        let changed = interaction.hovered != hovered;
+        interaction.pointer = Some(Point { x, y });
+        interaction.hovered = hovered;
+        changed
+    }
+
+    /// Botão desceu: ARMA o pressed no alvo sob o ponto — a ação não
+    /// dispara aqui (up-inside é a semântica de botão). `true` = repaint.
+    pub fn pointer_pressed(&self, x: Px, y: Px) -> bool {
+        let target = self.hover_target(x, y);
+        let mut interaction = self.interaction.borrow_mut();
+        interaction.pointer = Some(Point { x, y });
+        let changed = interaction.pressed != target || interaction.hovered != target;
+        interaction.hovered = target.clone();
+        interaction.pressed = target;
+        changed
+    }
+
+    /// Botão subiu: dispara a ação SE soltou dentro do alvo pressionado.
+    /// Devolve o caminho disparado; o visual de pressed limpa sempre.
+    pub fn pointer_released(&self, x: Px, y: Px) -> Option<String> {
+        let target = self.hover_target(x, y);
+        let fired = {
+            let mut interaction = self.interaction.borrow_mut();
+            let pressed = interaction.pressed.take();
+            interaction.pointer = Some(Point { x, y });
+            interaction.hovered = target.clone();
+            match (pressed, target) {
+                (Some(pressed), Some(target)) if pressed == target => Some(pressed),
+                _ => None,
+            }
+        };
+        // fora do borrow: a ação pode escrever estado e re-entrar aqui
+        match fired {
+            Some(path) if self.activate(&path) => Some(path),
+            _ => None,
+        }
+    }
+
+    /// O ponteiro saiu da janela: limpa o hover (um press em andamento já
+    /// teve o visual solto pelo `pointer_moved` do drag).
+    pub fn pointer_exited(&self) -> bool {
+        let mut interaction = self.interaction.borrow_mut();
+        let changed = interaction.hovered.is_some();
+        interaction.hovered = None;
+        interaction.pointer = None;
+        changed
+    }
+
+    /// Snapshot do estado de ponteiro — o cursor do shell e os asserts.
+    pub fn interaction(&self) -> Interaction {
+        self.interaction.borrow().clone()
+    }
+
+    /// Um frame completo para o shell: estabiliza, layout no viewport,
+    /// raster no scale — os hits ficam retidos para os eventos. Se o
+    /// conteúdo andou sob o ponteiro parado (uma ação inseriu/removeu), o
+    /// hover re-resolve contra os hits novos e roda UMA passada extra —
+    /// interação sempre resolvida ANTES da passada que a pinta.
+    pub fn frame(
+        &self,
+        root: &impl View,
+        size: crate::layout::Size,
+        scale: usize,
+        background: crate::layout::Color,
+    ) -> crate::raster::Bitmap {
+        self.render_stable(root);
+        let mut result = self.layout(root, crate::layout::Proposal::exact(size));
+        let pointer = self.interaction.borrow().pointer;
+        if let Some(point) = pointer
+            && self.pointer_moved(point.x, point.y)
+        {
+            result = self.layout(root, crate::layout::Proposal::exact(size));
+        }
+        crate::raster::rasterize_scaled(
+            &result.display,
+            (size.width.round() as usize) * scale,
+            (size.height.round() as usize) * scale,
+            scale,
+            background,
+        )
+    }
+
     pub fn render(&self, root: &impl View) -> String {
         self.render_pass(root)
             .into_nodes()
@@ -106,10 +217,13 @@ impl Runtime {
         proposal: crate::layout::Proposal,
     ) -> crate::layout::LayoutResult {
         let mut nodes = self.render_pass(root);
+        // a interação é estampada na CÓPIA expandida — a retenção nunca
+        // guarda estado de ponteiro
+        let interaction = self.interaction.borrow().clone();
         let mut roots: Vec<crate::layout::LayoutNode> = nodes
             .take_layout()
             .iter()
-            .map(reconciler::expand_layout)
+            .map(|node| reconciler::expand_layout(node, &interaction))
             .collect();
         let tree = if roots.len() == 1 {
             roots.remove(0)
@@ -121,7 +235,9 @@ impl Runtime {
                 children: roots,
             }
         };
-        crate::layout::layout(&tree, proposal)
+        let result = crate::layout::layout(&tree, proposal);
+        *self.last_hits.borrow_mut() = result.hits.clone();
+        result
     }
 
     /// Força todos os bodies (descarta a retenção antes do pass) — o

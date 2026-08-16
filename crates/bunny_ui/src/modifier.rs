@@ -21,7 +21,7 @@ use motor::state::{Binding, Context, EffectFn, EnvironmentValues};
 use motor::view::RenderNode;
 
 use crate::erased::CustomModifier;
-use crate::layout::{CrossAlign, Edges, LayoutNode};
+use crate::layout::{Color, CrossAlign, Edges, LayoutNode, VisualProps};
 use crate::state_ext::BindingExt;
 use crate::view::{NodeList, Single, View};
 use crate::views::{Alignment, wrap_layout};
@@ -51,6 +51,12 @@ pub enum Modifier {
     Background(String),
     Hidden,
     Equatable,
+
+    // MARK: - Visuais (dados puros → `Styled` na cena)
+    BackgroundColor(Color),
+    ForegroundColor(Color),
+    Border(Color, f64),
+    CornerRadius(f64),
 
     // MARK: - Interação (a ação dispara no render, como no motor headless)
     OnAppear(Rc<dyn Fn()>),
@@ -117,6 +123,10 @@ impl Modifier {
             Modifier::Background(line) => format!(" [.background {{ {line} }}]"),
             Modifier::Hidden => " [.hidden()]".into(),
             Modifier::Equatable => " [.equatable()]".into(),
+            Modifier::BackgroundColor(color) => format!(" [.background({color})]"),
+            Modifier::ForegroundColor(color) => format!(" [.foregroundColor({color})]"),
+            Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
+            Modifier::CornerRadius(radius) => format!(" [.cornerRadius({radius})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
             Modifier::OnTapGesture(_) => " [.onTapGesture()]".into(),
             Modifier::Effect { name, detail, .. } => format!(" [.{name}{detail}]"),
@@ -136,6 +146,23 @@ impl Modifier {
             Modifier::NavigationDestination => " [.navigationDestination(for: …)]".into(),
         }
     }
+}
+
+/// Regra de merge dos modifiers visuais: estilos empilhados na MESMA view
+/// fundem num único `Styled` — campo em conflito, o modifier mais PRÓXIMO
+/// da view vence; campos distintos se acumulam
+/// (`.background_color(a).corner_radius(r)` = UM nó, e o raio arredonda
+/// ESTE fundo). Véu sobre véu na mesma view não compõe — camadas são do
+/// `zstack`. O merge só acontece com `Styled` literal no topo:
+/// `.background_color(a).padding().background_color(b)` aninha de verdade
+/// (geometrias diferentes, os dois pintam).
+fn wrap_styled(out: &mut NodeList, delta: VisualProps) {
+    out.wrap_last_layout(|node| match node {
+        LayoutNode::Styled { props, child } => {
+            LayoutNode::Styled { props: props.or(delta), child }
+        }
+        other => LayoutNode::Styled { props: delta, child: Box::new(other) },
+    });
 }
 
 /// A view modificada — `ModifiedContent` do Swift com o modifier inline.
@@ -253,6 +280,22 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     child: Box::new(node),
                 });
             }
+            Modifier::BackgroundColor(color) => wrap_styled(
+                out,
+                VisualProps { background: Some(*color), ..VisualProps::default() },
+            ),
+            Modifier::ForegroundColor(color) => wrap_styled(
+                out,
+                VisualProps { foreground: Some(*color), ..VisualProps::default() },
+            ),
+            Modifier::Border(color, width) => wrap_styled(
+                out,
+                VisualProps { border: Some((*color, *width)), ..VisualProps::default() },
+            ),
+            Modifier::CornerRadius(radius) => wrap_styled(
+                out,
+                VisualProps { corner_radius: Some(*radius), ..VisualProps::default() },
+            ),
             _ => {}
         }
 

@@ -29,7 +29,7 @@ use motor::state::{Context, EffectFn};
 use motor::view::RenderNode;
 
 use crate::erased::Erased;
-use crate::layout::LayoutNode;
+use crate::layout::{Interaction, LayoutNode};
 
 /// Uma ação interativa registrada durante o render: (caminho do alvo, o
 /// que o clique dispara).
@@ -317,8 +317,11 @@ fn parse_ref(line: &str) -> Option<(&str, &str)> {
 }
 
 /// Resolve referências da árvore de LAYOUT contra a retenção — o gêmeo do
-/// [`expand`] para a outra saída do render.
-pub(crate) fn expand_layout(node: &LayoutNode) -> LayoutNode {
+/// [`expand`] para a outra saída do render — e ESTAMPA o estado de
+/// interação do frame nos nós `Interactive`. A retenção nunca guarda
+/// estado de ponteiro: a estampa vive só nesta cópia expandida, então
+/// hover re-expande e re-pinta sem re-rodar body nenhum.
+pub(crate) fn expand_layout(node: &LayoutNode, interaction: &Interaction) -> LayoutNode {
     match node {
         LayoutNode::BoundaryRef { path } => {
             let retained = RETAINED.with(|retained| {
@@ -328,44 +331,53 @@ pub(crate) fn expand_layout(node: &LayoutNode) -> LayoutNode {
                 debug_assert!(false, "referência de layout sem retenção: {path}");
                 return LayoutNode::Leaf { size: crate::layout::Size::default() };
             };
-            expand_layout(&inner)
+            expand_layout(&inner, interaction)
         }
         LayoutNode::Stack { axis, spacing, align, children } => LayoutNode::Stack {
             axis: *axis,
             spacing: *spacing,
             align: *align,
-            children: children.iter().map(expand_layout).collect(),
+            children: children.iter().map(|child| expand_layout(child, interaction)).collect(),
         },
         LayoutNode::Layered { children } => LayoutNode::Layered {
-            children: children.iter().map(expand_layout).collect(),
+            children: children.iter().map(|child| expand_layout(child, interaction)).collect(),
         },
         LayoutNode::Boundary { path, children } => LayoutNode::Boundary {
             path: path.clone(),
-            children: children.iter().map(expand_layout).collect(),
+            children: children.iter().map(|child| expand_layout(child, interaction)).collect(),
         },
         LayoutNode::Padding { edges, child } => LayoutNode::Padding {
             edges: *edges,
-            child: Box::new(expand_layout(child)),
+            child: Box::new(expand_layout(child, interaction)),
         },
         LayoutNode::Frame { width, height, child } => LayoutNode::Frame {
             width: *width,
             height: *height,
-            child: Box::new(expand_layout(child)),
+            child: Box::new(expand_layout(child, interaction)),
         },
         LayoutNode::MaxFrame { max_width, max_height, align, child } => {
             LayoutNode::MaxFrame {
                 max_width: *max_width,
                 max_height: *max_height,
                 align: *align,
-                child: Box::new(expand_layout(child)),
+                child: Box::new(expand_layout(child, interaction)),
             }
         }
         LayoutNode::Scroll { child } => LayoutNode::Scroll {
-            child: Box::new(expand_layout(child)),
+            child: Box::new(expand_layout(child, interaction)),
         },
-        LayoutNode::Interactive { path, child } => LayoutNode::Interactive {
+        LayoutNode::Styled { props, child } => LayoutNode::Styled {
+            props: *props,
+            child: Box::new(expand_layout(child, interaction)),
+        },
+        LayoutNode::Interactive { path, child, .. } => LayoutNode::Interactive {
             path: path.clone(),
-            child: Box::new(expand_layout(child)),
+            hovered: interaction.hovered.as_deref() == Some(path.as_str()),
+            // pressed VISUAL só com o ponteiro dentro do alvo (semântica
+            // AppKit: arrastar para fora solta, voltar re-arma)
+            pressed: interaction.pressed.as_deref() == Some(path.as_str())
+                && interaction.hovered.as_deref() == Some(path.as_str()),
+            child: Box::new(expand_layout(child, interaction)),
         },
         leaf => leaf.clone(),
     }

@@ -29,6 +29,34 @@ fn pack(color: Color) -> u32 {
     ((color.r as u32) << 24) | ((color.g as u32) << 16) | ((color.b as u32) << 8) | color.a as u32
 }
 
+/// Divisão exata por 255 com arredondamento — o clássico de compositing
+/// inteiro: `round(x / 255)` sem float.
+fn div255(x: u32) -> u32 {
+    let x = x + 128;
+    (x + (x >> 8)) >> 8
+}
+
+/// Source-over de `src` sobre `dst` (ambos `0xRRGGBBAA`, alfa reto):
+/// `out = src·sa + dst·(1−sa)` por canal. Fast paths: opaco sobrescreve,
+/// invisível não toca.
+fn blend_px(src: u32, dst: u32) -> u32 {
+    let sa = src & 0xFF;
+    if sa == 255 {
+        return src;
+    }
+    if sa == 0 {
+        return dst;
+    }
+    let inv = 255 - sa;
+    let channel = |shift: u32| {
+        let s = (src >> shift) & 0xFF;
+        let d = (dst >> shift) & 0xFF;
+        div255(s * sa + d * inv)
+    };
+    let a = sa + div255((dst & 0xFF) * inv);
+    (channel(24) << 24) | (channel(16) << 16) | (channel(8) << 8) | a
+}
+
 impl Bitmap {
     pub fn new(width: usize, height: usize, background: Color) -> Self {
         Bitmap { width, height, pixels: vec![pack(background); width * height] }
@@ -66,7 +94,8 @@ impl Bitmap {
 
     fn set(&mut self, x: i64, y: i64, color: u32) {
         if x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height {
-            self.pixels[y as usize * self.width + x as usize] = color;
+            let index = y as usize * self.width + x as usize;
+            self.pixels[index] = blend_px(color, self.pixels[index]);
         }
     }
 
@@ -79,26 +108,71 @@ impl Bitmap {
         (x0, y0, x1, y1)
     }
 
-    fn fill_rect(&mut self, rect: Rect, color: Color) {
+    /// Preenchimento com cantos opcionais: inset por linha de varredura,
+    /// círculo por canto, UMA raiz quadrada por linha — nunca por pixel.
+    /// `corner_radius: 0.0` reproduz o retângulo reto byte a byte.
+    fn fill_rect(&mut self, rect: Rect, color: Color, corner_radius: f64) {
         let (x0, y0, x1, y1) = Self::snap(rect);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
         let packed = pack(color);
+        let height = (y1 - y0) as f64;
+        let radius = corner_radius
+            .max(0.0)
+            .min((x1 - x0) as f64 / 2.0)
+            .min(height / 2.0);
         for y in y0..y1 {
-            for x in x0..x1 {
+            // distância do centro da linha à banda reta entre os cantos
+            let center = (y - y0) as f64 + 0.5;
+            let dy = if center < radius {
+                radius - center
+            } else if center > height - radius {
+                center - (height - radius)
+            } else {
+                0.0
+            };
+            let inset = if dy > 0.0 {
+                (radius - (radius * radius - dy * dy).sqrt()).round() as i64
+            } else {
+                0
+            };
+            for x in (x0 + inset)..(x1 - inset) {
                 self.set(x, y, packed);
             }
         }
     }
 
-    fn stroke_rect(&mut self, rect: Rect, color: Color) {
+    /// Moldura para dentro da aresta, em 4 barras SEM sobreposição — uma
+    /// borda translúcida não pode blendar o canto duas vezes.
+    fn stroke_rect(&mut self, rect: Rect, color: Color, width: f64) {
         let (x0, y0, x1, y1) = Self::snap(rect);
-        let packed = pack(color);
-        for x in x0..x1 {
-            self.set(x, y0, packed);
-            self.set(x, y1 - 1, packed);
+        if x1 <= x0 || y1 <= y0 {
+            return;
         }
-        for y in y0..y1 {
-            self.set(x0, y, packed);
-            self.set(x1 - 1, y, packed);
+        let packed = pack(color);
+        let thickness = width.max(1.0).round() as i64;
+        let top_end = (y0 + thickness).min(y1);
+        let bottom_start = (y1 - thickness).max(top_end);
+        let left_end = (x0 + thickness).min(x1);
+        let right_start = (x1 - thickness).max(left_end);
+        for y in y0..top_end {
+            for x in x0..x1 {
+                self.set(x, y, packed);
+            }
+        }
+        for y in bottom_start..y1 {
+            for x in x0..x1 {
+                self.set(x, y, packed);
+            }
+        }
+        for y in top_end..bottom_start {
+            for x in x0..left_end {
+                self.set(x, y, packed);
+            }
+            for x in right_start..x1 {
+                self.set(x, y, packed);
+            }
         }
     }
 
@@ -170,11 +244,11 @@ pub fn rasterize_scaled(
     let factor = scale as f64;
     for command in display.iter() {
         match command {
-            DrawCommand::FillRect { rect, color } => {
-                bitmap.fill_rect(scale_rect(*rect, factor), *color)
+            DrawCommand::FillRect { rect, color, corner_radius } => {
+                bitmap.fill_rect(scale_rect(*rect, factor), *color, corner_radius * factor)
             }
-            DrawCommand::StrokeRect { rect, color } => {
-                bitmap.stroke_rect(scale_rect(*rect, factor), *color)
+            DrawCommand::StrokeRect { rect, color, width } => {
+                bitmap.stroke_rect(scale_rect(*rect, factor), *color, width * factor)
             }
             DrawCommand::TextLine { origin, content, color } => {
                 bitmap.draw_text_line(origin.x, origin.y, scale as i64, content, *color)
@@ -282,6 +356,7 @@ mod tests {
                 size: crate::layout::Size { width: 4.0, height: 4.0 },
             },
             color: Color::FILL,
+            corner_radius: 0.0,
         });
         let bitmap = rasterize(&display, 8, 8, Color::WHITE);
 
@@ -291,5 +366,88 @@ mod tests {
         assert_eq!(bitmap.pixel(5, 5), Some(fill), "aresta [2,6): o 5 é o último dentro");
         assert_eq!(bitmap.pixel(6, 6), Some(white), "o 6 já é fora");
         assert_eq!(bitmap.pixel(1, 1), Some(white));
+    }
+
+    #[test]
+    fn source_over_blends_the_veil_exactly() {
+        // véu de azul a 128/255 sobre branco: cada canal sai do div255,
+        // valor inteiro exato — nada de "quase"
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::FillRect {
+            rect: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: crate::layout::Size { width: 1.0, height: 1.0 },
+            },
+            color: Color { r: 0, g: 0, b: 255, a: 128 },
+            corner_radius: 0.0,
+        });
+        let bitmap = rasterize(&display, 1, 1, Color::WHITE);
+
+        // r = g = round(255·127/255) = 127; b = 255; a = 128 + 127 = 255
+        assert_eq!(bitmap.pixel(0, 0), Some(0x7F7F_FFFF));
+    }
+
+    #[test]
+    fn zero_alpha_is_a_no_op_and_full_alpha_overwrites() {
+        let rect = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: crate::layout::Size { width: 1.0, height: 1.0 },
+        };
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::FillRect {
+            rect,
+            color: Color { r: 9, g: 9, b: 9, a: 0 },
+            corner_radius: 0.0,
+        });
+        display.push(DrawCommand::FillRect {
+            rect,
+            color: Color { r: 1, g: 2, b: 3, a: 255 },
+            corner_radius: 0.0,
+        });
+        let bitmap = rasterize(&display, 1, 1, Color::WHITE);
+
+        assert_eq!(bitmap.pixel(0, 0), Some(super::pack(Color { r: 1, g: 2, b: 3, a: 255 })));
+    }
+
+    #[test]
+    fn corner_radius_insets_the_scanlines() {
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::FillRect {
+            rect: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: crate::layout::Size { width: 8.0, height: 8.0 },
+            },
+            color: Color::BLACK,
+            corner_radius: 3.0,
+        });
+        let bitmap = rasterize(&display, 8, 8, Color::WHITE);
+
+        let ink = super::pack(Color::BLACK);
+        let white = super::pack(Color::WHITE);
+        assert_eq!(bitmap.pixel(0, 0), Some(white), "canto recuado");
+        assert_eq!(bitmap.pixel(7, 7), Some(white), "canto oposto recuado");
+        assert_eq!(bitmap.pixel(4, 0), Some(ink), "meio da aresta superior pintado");
+        assert_eq!(bitmap.pixel(0, 4), Some(ink), "meio da aresta esquerda pintado");
+        assert_eq!(bitmap.pixel(4, 4), Some(ink), "centro pintado");
+    }
+
+    #[test]
+    fn stroke_width_never_double_blends_the_corners() {
+        // moldura translúcida: canto e aresta têm o MESMO valor — cada
+        // pixel da borda blendou exatamente uma vez
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::StrokeRect {
+            rect: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: crate::layout::Size { width: 6.0, height: 6.0 },
+            },
+            color: Color { r: 0, g: 0, b: 0, a: 128 },
+            width: 2.0,
+        });
+        let bitmap = rasterize(&display, 6, 6, Color::WHITE);
+
+        assert_eq!(bitmap.pixel(0, 0), bitmap.pixel(3, 0), "canto == topo");
+        assert_eq!(bitmap.pixel(0, 3), bitmap.pixel(3, 0), "lateral == topo");
+        assert_eq!(bitmap.pixel(3, 3), Some(super::pack(Color::WHITE)), "interior intocado");
     }
 }

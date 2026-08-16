@@ -138,12 +138,17 @@ pub enum LayoutNode {
     /// Região de rolagem vertical: responde o oferecido, mede o conteúdo
     /// sem restrição e guarda o excedente para si (o contrato de shrink).
     Scroll { child: Box<LayoutNode> },
+    /// Propriedade visual semântica: background atrás do filho, border por
+    /// cima, foreground herdado. Transparente para a medida — por tipo.
+    Styled { props: VisualProps, child: Box<LayoutNode> },
     /// Fronteira de view (`Component`): grava o frame no caminho de
     /// identidade — o endereço dos testes e, adiante, do hit-testing.
     Boundary { path: String, children: Vec<LayoutNode> },
     /// Alvo de interação (Button): o frame entra na lista de hit-test com
-    /// o caminho que indexa a ação registrada no reconciler.
-    Interactive { path: String, child: Box<LayoutNode> },
+    /// o caminho que indexa a ação registrada no reconciler. `hovered`/
+    /// `pressed` são estampados POR FRAME na expansão — a retenção guarda
+    /// sempre `false` (estado de ponteiro nunca gruda no cache).
+    Interactive { path: String, hovered: bool, pressed: bool, child: Box<LayoutNode> },
     /// Referência a uma fronteira retida (pulada pelo reconciler); a
     /// expansão resolve antes do measure — nunca chega ao algoritmo.
     BoundaryRef { path: String },
@@ -176,6 +181,82 @@ impl Color {
     pub const WHITE: Color = Color { r: 255, g: 255, b: 255, a: 255 };
     pub const FILL: Color = Color { r: 200, g: 205, b: 215, a: 255 };
     pub const OUTLINE: Color = Color { r: 150, g: 155, b: 165, a: 255 };
+    /// Fundo padrão de janela — off-white frio, o chão do tema-de-um-lápis.
+    pub const CANVAS: Color = Color::hex(0xF2F3F7);
+
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
+        Color { r, g, b, a: 255 }
+    }
+
+    pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
+        Color { r, g, b, a }
+    }
+
+    /// `0xRRGGBB`, alfa 255 — cor escrita do jeito que se lê.
+    pub const fn hex(rgb: u32) -> Color {
+        Color { r: (rgb >> 16) as u8, g: (rgb >> 8) as u8, b: rgb as u8, a: 255 }
+    }
+
+    /// `0xRRGGBBAA` — os véus do mundo real carregam alfa a sério.
+    pub const fn hex_a(rgba: u32) -> Color {
+        Color { r: (rgba >> 24) as u8, g: (rgba >> 16) as u8, b: (rgba >> 8) as u8, a: rgba as u8 }
+    }
+}
+
+impl std::fmt::Display for Color {
+    /// `#RRGGBB` (alfa só quando não é 255) — sufixos de print e mensagens
+    /// de teste legíveis.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.a == 255 {
+            write!(f, "#{:02X}{:02X}{:02X}", self.r, self.g, self.b)
+        } else {
+            write!(f, "#{:02X}{:02X}{:02X}{:02X}", self.r, self.g, self.b, self.a)
+        }
+    }
+}
+
+/// Propriedades VISUAIS de um nó da cena — só pintura, por construção:
+/// nenhum campo aqui altera medida (a LEI "hover não mexe em layout"
+/// garantida pelo tipo). No modo Dom isto vira CSS do elemento; no Gpu,
+/// comandos de desenho — a semântica nunca morre antes de o backend
+/// escolher.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct VisualProps {
+    pub background: Option<Color>,
+    /// Herdado para baixo: o texto abaixo pinta com o foreground corrente.
+    pub foreground: Option<Color>,
+    pub border: Option<(Color, Px)>,
+    pub corner_radius: Option<Px>,
+    /// Fundo alternativo sob hover/pressed do `Interactive` ancestral —
+    /// no Dom, `:hover`/`:active`. (Generalizar o estado para o
+    /// `VisualProps` inteiro fica para o port do tema.)
+    pub background_hovered: Option<Color>,
+    pub background_pressed: Option<Color>,
+}
+
+impl VisualProps {
+    /// Merge de modifiers empilhados na mesma view: o já definido (mais
+    /// PRÓXIMO da view) vence; o de fora só preenche o que falta.
+    pub fn or(self, outer: VisualProps) -> VisualProps {
+        VisualProps {
+            background: self.background.or(outer.background),
+            foreground: self.foreground.or(outer.foreground),
+            border: self.border.or(outer.border),
+            corner_radius: self.corner_radius.or(outer.corner_radius),
+            background_hovered: self.background_hovered.or(outer.background_hovered),
+            background_pressed: self.background_pressed.or(outer.background_pressed),
+        }
+    }
+}
+
+/// Estado de interação de um frame — resolvido ANTES do layout e estampado
+/// na expansão (a LEI: hover troca pintura, nunca medida). O dono é o
+/// `Runtime`; mora aqui por ser vocabulário da cena (caminhos + ponto).
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct Interaction {
+    pub pointer: Option<Point>,
+    pub hovered: Option<String>,
+    pub pressed: Option<String>,
 }
 
 /// Um comando de desenho — a saída do passe de colocação, na ordem de
@@ -183,8 +264,10 @@ impl Color {
 /// É a interface do rasterizador e, adiante, de qualquer backend.
 #[derive(Clone, Debug)]
 pub enum DrawCommand {
-    FillRect { rect: Rect, color: Color },
-    StrokeRect { rect: Rect, color: Color },
+    /// `corner_radius: 0.0` = retângulo puro (o caminho reto de sempre).
+    FillRect { rect: Rect, color: Color, corner_radius: Px },
+    /// Moldura pintada PARA DENTRO da aresta, `width` px lógicos.
+    StrokeRect { rect: Rect, color: Color, width: Px },
     /// Uma linha de texto já quebrada, na célula de origem (avanço de 8px
     /// por caractere, célula de 16px — as métricas do layout).
     TextLine { origin: Point, content: String, color: Color },
@@ -223,6 +306,11 @@ pub struct Placement {
     pub frames: Frames,
     pub display: DisplayList,
     pub hits: Vec<(String, Rect)>,
+    /// Pilha do foreground herdado — o topo colore o texto.
+    foreground: Vec<Color>,
+    /// Pilha do `(hovered, pressed)` do `Interactive` mais próximo — o
+    /// `Styled` escolhe o fundo por ela.
+    pointer: Vec<(bool, bool)>,
 }
 
 impl Rect {
@@ -310,9 +398,9 @@ impl LayoutNode {
                 Axis::Horizontal => width.is_none() && child.is_flexible(axis),
                 Axis::Vertical => height.is_none() && child.is_flexible(axis),
             },
-            LayoutNode::Padding { child, .. } | LayoutNode::Interactive { child, .. } => {
-                child.is_flexible(axis)
-            }
+            LayoutNode::Padding { child, .. }
+            | LayoutNode::Interactive { child, .. }
+            | LayoutNode::Styled { child, .. } => child.is_flexible(axis),
             LayoutNode::Boundary { children, .. } => {
                 children.len() == 1 && children[0].is_flexible(axis)
             }
@@ -422,7 +510,7 @@ impl LayoutNode {
                 (size, Fit::ScrollContent(content, Box::new(fit)))
             }
 
-            LayoutNode::Interactive { child, .. } => {
+            LayoutNode::Interactive { child, .. } | LayoutNode::Styled { child, .. } => {
                 let (size, fit) = child.measure(proposal);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -451,6 +539,7 @@ impl LayoutNode {
         match (self, fit) {
             // folhas visuais: aqui nasce a lista de desenho
             (LayoutNode::Text { content }, Fit::Leaf) => {
+                let color = out.foreground.last().copied().unwrap_or(Color::BLACK);
                 let per_line = ((frame.size.width / 8.0).floor() as usize).max(1);
                 let chars: Vec<char> = content.chars().collect();
                 for (line_index, line) in chars.chunks(per_line).enumerate() {
@@ -460,18 +549,25 @@ impl LayoutNode {
                             y: frame.origin.y + line_index as Px * LINE_H,
                         },
                         content: line.iter().collect(),
-                        color: Color::BLACK,
+                        color,
                     });
                 }
             }
 
             (LayoutNode::Fill, Fit::Leaf) => {
-                out.display.push(DrawCommand::FillRect { rect: frame, color: Color::FILL });
+                out.display.push(DrawCommand::FillRect {
+                    rect: frame,
+                    color: Color::FILL,
+                    corner_radius: 0.0,
+                });
             }
 
             (LayoutNode::Leaf { .. }, Fit::Leaf) => {
-                out.display
-                    .push(DrawCommand::StrokeRect { rect: frame, color: Color::OUTLINE });
+                out.display.push(DrawCommand::StrokeRect {
+                    rect: frame,
+                    color: Color::OUTLINE,
+                    width: 1.0,
+                });
             }
 
             (LayoutNode::Stack { axis, spacing, align, children }, Fit::Children(fits)) => {
@@ -521,10 +617,42 @@ impl LayoutNode {
                 child.place(Rect { origin: frame.origin, size: content }, *fit, out);
             }
 
-            (LayoutNode::Interactive { path, child }, Fit::Wrapped(size, fit)) => {
+            (LayoutNode::Styled { props, child }, Fit::Wrapped(_, fit)) => {
+                let (hovered, pressed) = out.pointer.last().copied().unwrap_or((false, false));
+                // pressed > hovered > normal; estado sem fundo próprio cai
+                // no fundo base — um botão sem hover definido não pisca
+                let background = if pressed {
+                    props.background_pressed.or(props.background)
+                } else if hovered {
+                    props.background_hovered.or(props.background)
+                } else {
+                    props.background
+                };
+                if let Some(color) = background {
+                    out.display.push(DrawCommand::FillRect {
+                        rect: frame,
+                        color,
+                        corner_radius: props.corner_radius.unwrap_or(0.0),
+                    });
+                }
+                if let Some(color) = props.foreground {
+                    out.foreground.push(color);
+                }
+                child.place(frame, *fit, out);
+                if props.foreground.is_some() {
+                    out.foreground.pop();
+                }
+                if let Some((color, width)) = props.border {
+                    out.display.push(DrawCommand::StrokeRect { rect: frame, color, width });
+                }
+            }
+
+            (LayoutNode::Interactive { path, hovered, pressed, child }, Fit::Wrapped(size, fit)) => {
                 let _ = size;
                 out.hits.push((path.clone(), frame));
+                out.pointer.push((*hovered, *pressed));
                 child.place(frame, *fit, out);
+                out.pointer.pop();
             }
 
             (LayoutNode::Boundary { path, children }, Fit::Children(fits)) => {
@@ -770,5 +898,155 @@ mod tests {
         let (size, _) = text(100).measure(Proposal { width: Some(100.0), height: None });
         // natural 800 → 8 linhas de 16
         assert_eq!(size, Size { width: 100.0, height: 128.0 });
+    }
+
+    fn styled(props: VisualProps, child: LayoutNode) -> LayoutNode {
+        LayoutNode::Styled { props, child: Box::new(child) }
+    }
+
+    #[test]
+    fn styled_paints_background_behind_and_border_on_top() {
+        let root = styled(
+            VisualProps {
+                background: Some(Color::hex(0x112233)),
+                border: Some((Color::hex(0x445566), 2.0)),
+                corner_radius: Some(4.0),
+                ..VisualProps::default()
+            },
+            text(3),
+        );
+        let result = layout(&root, Proposal::unspecified());
+
+        let commands: Vec<_> = result.display.iter().collect();
+        assert_eq!(commands.len(), 3, "fundo, texto, borda — nesta ordem");
+        assert!(matches!(
+            commands[0],
+            DrawCommand::FillRect { color, corner_radius, .. }
+                if *color == Color::hex(0x112233) && *corner_radius == 4.0
+        ));
+        assert!(matches!(commands[1], DrawCommand::TextLine { .. }));
+        assert!(matches!(
+            commands[2],
+            DrawCommand::StrokeRect { color, width, .. }
+                if *color == Color::hex(0x445566) && *width == 2.0
+        ));
+    }
+
+    #[test]
+    fn styled_never_changes_measurement() {
+        // a LEI no nível do nó: VisualProps é pintura pura
+        let plain = layout(&text(7), Proposal::unspecified());
+        let dressed = layout(
+            &styled(
+                VisualProps {
+                    background: Some(Color::BLACK),
+                    border: Some((Color::WHITE, 3.0)),
+                    corner_radius: Some(8.0),
+                    ..VisualProps::default()
+                },
+                text(7),
+            ),
+            Proposal::unspecified(),
+        );
+        assert_eq!(plain.size, dressed.size);
+    }
+
+    #[test]
+    fn foreground_inherits_and_the_nearest_wins() {
+        let outer = Color::hex(0x00AA00);
+        let inner = Color::hex(0xAA0000);
+        let root = styled(
+            VisualProps { foreground: Some(outer), ..VisualProps::default() },
+            LayoutNode::Stack {
+                axis: Axis::Vertical,
+                spacing: 0.0,
+                align: CrossAlign::Start,
+                children: vec![
+                    text(3),
+                    styled(
+                        VisualProps { foreground: Some(inner), ..VisualProps::default() },
+                        text(3),
+                    ),
+                ],
+            },
+        );
+        let result = layout(&root, Proposal::unspecified());
+
+        let colors: Vec<Color> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::TextLine { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(colors, vec![outer, inner]);
+    }
+
+    #[test]
+    fn hovered_swaps_paint_but_never_frames() {
+        let node = |hovered: bool| LayoutNode::Interactive {
+            path: "botao".to_string(),
+            hovered,
+            pressed: false,
+            child: Box::new(styled(
+                VisualProps {
+                    background: Some(Color::hex(0x111111)),
+                    background_hovered: Some(Color::hex(0x222222)),
+                    ..VisualProps::default()
+                },
+                boundary("label", text(4)),
+            )),
+        };
+        let cold = layout(&node(false), Proposal::unspecified());
+        let hot = layout(&node(true), Proposal::unspecified());
+
+        assert_eq!(cold.size, hot.size);
+        assert_eq!(
+            cold.frames.get("label"),
+            hot.frames.get("label"),
+            "a LEI: hover nunca mexe em frame"
+        );
+        let background = |result: &LayoutResult| {
+            result
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::FillRect { color, .. } => Some(*color),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(background(&cold), Color::hex(0x111111));
+        assert_eq!(background(&hot), Color::hex(0x222222));
+    }
+
+    #[test]
+    fn pressed_beats_hovered() {
+        let root = LayoutNode::Interactive {
+            path: "botao".to_string(),
+            hovered: true,
+            pressed: true,
+            child: Box::new(styled(
+                VisualProps {
+                    background: Some(Color::hex(0x111111)),
+                    background_hovered: Some(Color::hex(0x222222)),
+                    background_pressed: Some(Color::hex(0x333333)),
+                    ..VisualProps::default()
+                },
+                text(2),
+            )),
+        };
+        let result = layout(&root, Proposal::unspecified());
+
+        let background = result
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::FillRect { color, .. } => Some(*color),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(background, Color::hex(0x333333));
     }
 }

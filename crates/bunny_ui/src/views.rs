@@ -28,7 +28,7 @@ use motor::state::{Binding, Context};
 use motor::view::RenderNode;
 use motor::views::NavigationPath;
 
-use crate::layout::{Axis, CrossAlign, LayoutNode, Size as LayoutSize};
+use crate::layout::{Axis, Color, CrossAlign, Edges, LayoutNode, Size as LayoutSize, VisualProps};
 use crate::state_ext::BindingExt;
 use crate::view::{NodeList, Single, View, render_line};
 
@@ -67,6 +67,15 @@ pub fn text(string: impl Into<String>) -> Text {
     Text(Rc::from(string.into()))
 }
 
+// O tema-de-um-lápis do chrome de botão (Role/Size chegam com o port do
+// tema; a referência futura é altura 26/34/44 com texto 11/13/15).
+const BUTTON_BG: Color = Color::hex(0xDDE1E9);
+const BUTTON_BG_HOVERED: Color = Color::hex(0xE7EAF1);
+const BUTTON_BG_PRESSED: Color = Color::hex(0xC7CCD8);
+const BUTTON_RADIUS: f64 = 6.0;
+const BUTTON_PAD_H: f64 = 14.0;
+const BUTTON_PAD_V: f64 = 6.0;
+
 /// `Button(action:) { label }` — a ação mora num campo `F: Fn()`, chamada
 /// estaticamente (não há `Rc<dyn Fn()>` aqui).
 #[derive(Clone)]
@@ -88,6 +97,28 @@ where
         let (prints, layouts) = label.into_parts();
         out.push(RenderNode::branch("Button", prints));
 
+        // o chrome default vive na CENA (o print fica como era): fundo com
+        // cantos + padding embutido, estados de hover/pressed inclusos —
+        // o hit-rect passa a ser o chrome inteiro, não só o label
+        let chrome = LayoutNode::Styled {
+            props: VisualProps {
+                background: Some(BUTTON_BG),
+                background_hovered: Some(BUTTON_BG_HOVERED),
+                background_pressed: Some(BUTTON_BG_PRESSED),
+                corner_radius: Some(BUTTON_RADIUS),
+                ..VisualProps::default()
+            },
+            child: Box::new(LayoutNode::Padding {
+                edges: Edges {
+                    top: BUTTON_PAD_V,
+                    bottom: BUTTON_PAD_V,
+                    leading: BUTTON_PAD_H,
+                    trailing: BUTTON_PAD_H,
+                },
+                child: Box::new(wrap_layout(layouts)),
+            }),
+        };
+
         // dentro de um pass, o botão é um alvo de interação: o frame entra
         // no hit-test com o caminho de identidade, e a ação fica registrada
         // no reconciler (retida como os efeitos — view pulada, botão vivo)
@@ -97,10 +128,12 @@ where
                 crate::reconciler::attribute_action(path.clone(), Rc::new(move || action()));
                 out.push_layout(LayoutNode::Interactive {
                     path,
-                    child: Box::new(wrap_layout(layouts)),
+                    hovered: false,
+                    pressed: false,
+                    child: Box::new(chrome),
                 });
             }
-            None => out.push_layout(wrap_layout(layouts)),
+            None => out.push_layout(chrome),
         }
     }
 }

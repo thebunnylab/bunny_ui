@@ -54,6 +54,7 @@ pub mod views;
 pub mod prelude {
     pub use crate::erased::{CustomModifier, Erased, erased};
     pub use crate::ext::ViewExt;
+    pub use crate::layout::{Color, VisualProps};
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
     pub use crate::runtime::Runtime;
     pub use crate::state_ext::{BindingExt, StateExt};
@@ -534,9 +535,10 @@ mod tests {
         let result = runtime.layout(&tapper, viewport);
         assert_eq!(runtime.body_runs(), vec!["Tapper".to_string()]);
         let title = result.frames.get("Tapper").unwrap();
-        // sem flexível no body, o root responde o natural (2 linhas), não
-        // o viewport — proposta é oferta, não imposição
-        assert_eq!(title.size.height, 32.0);
+        // sem flexível no body, o root responde o natural, não o viewport —
+        // proposta é oferta, não imposição. Natural = linha do título (16)
+        // + botão com chrome (16 do label + 2×6 de padding embutido = 28)
+        assert_eq!(title.size.height, 44.0);
         assert!(runtime.render(&tapper).contains("count: 1"));
 
         // e um clique num frame de view PULADA continua funcionando (a
@@ -546,6 +548,258 @@ mod tests {
         let (path, _) = result.hits.last().unwrap().clone();
         assert!(runtime.activate(&path));
         assert!(runtime.render(&tapper).contains("count: 2"));
+    }
+
+    /// O par (runtime estabilizado, centro do botão) que os testes de
+    /// ponteiro compartilham.
+    fn pressable() -> (Runtime, TapperFixture, f64, f64) {
+        use crate::layout::{Proposal, Size};
+
+        let tapper = TapperFixture { count: State::new(0) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&tapper);
+        let result =
+            runtime.layout(&tapper, Proposal::exact(Size { width: 200.0, height: 100.0 }));
+        let (_, rect) = result.hits.last().expect("o botão registra um alvo").clone();
+        let cx = rect.origin.x + rect.size.width / 2.0;
+        let cy = rect.origin.y + rect.size.height / 2.0;
+        (runtime, tapper, cx, cy)
+    }
+
+    #[derive(Clone, Copy)]
+    struct TapperFixture {
+        count: State<i32>,
+    }
+
+    impl Component for TapperFixture {
+        fn body(&self, _ctx: &Context) -> impl View {
+            let this = *self;
+            vstack((
+                text(format!("count: {}", self.count.get())),
+                button(text("tap!"), move || this.count.update(|n| *n += 1)),
+            ))
+        }
+    }
+
+    #[test]
+    fn hover_repaints_without_running_a_single_body() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+
+        let (runtime, tapper, cx, cy) = pressable();
+        let viewport = Proposal::exact(Size { width: 200.0, height: 100.0 });
+        let cold = runtime.layout(&tapper, viewport);
+
+        assert!(runtime.pointer_moved(cx, cy), "entrar no alvo muda o estado");
+        let hot = runtime.layout(&tapper, viewport);
+        assert!(runtime.body_runs().is_empty(), "hover repinta com ZERO bodies");
+
+        // a LEI: frames byte-idênticos sob qualquer interação
+        for (path, frame) in cold.frames.iter() {
+            assert_eq!(Some(frame), hot.frames.get(path));
+        }
+        let backgrounds = |result: &crate::layout::LayoutResult| -> Vec<Color> {
+            result
+                .display
+                .iter()
+                .filter_map(|command| match command {
+                    DrawCommand::FillRect { color, .. } => Some(*color),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_ne!(backgrounds(&cold), backgrounds(&hot), "a pintura muda");
+
+        // 1px dentro do mesmo alvo: nada a repintar
+        assert!(!runtime.pointer_moved(cx + 1.0, cy));
+    }
+
+    #[test]
+    fn up_inside_fires_and_down_alone_does_not() {
+        let (runtime, tapper, cx, cy) = pressable();
+
+        assert!(runtime.pointer_pressed(cx, cy));
+        assert!(
+            runtime.render_stable(&tapper).contains("count: 0"),
+            "down sozinho não dispara"
+        );
+        assert!(runtime.pointer_released(cx, cy).is_some(), "up-inside dispara");
+        assert!(runtime.render_stable(&tapper).contains("count: 1"));
+    }
+
+    #[test]
+    fn release_outside_never_fires() {
+        let (runtime, tapper, cx, cy) = pressable();
+
+        runtime.pointer_pressed(cx, cy);
+        assert_eq!(runtime.pointer_released(199.0, 99.0), None, "soltou fora");
+        runtime.pointer_pressed(199.0, 99.0);
+        assert_eq!(runtime.pointer_released(cx, cy), None, "press fora, up dentro");
+        assert!(runtime.render_stable(&tapper).contains("count: 0"));
+    }
+
+    #[test]
+    fn drag_out_and_back_rearms_the_press() {
+        let (runtime, tapper, cx, cy) = pressable();
+
+        runtime.pointer_pressed(cx, cy);
+        runtime.pointer_moved(199.0, 99.0);
+        assert!(
+            runtime.interaction().hovered.is_none(),
+            "arrastar para fora solta o visual"
+        );
+        runtime.pointer_moved(cx, cy);
+        assert_eq!(
+            runtime.interaction().hovered,
+            runtime.interaction().pressed,
+            "voltar re-arma"
+        );
+        assert!(runtime.pointer_released(cx, cy).is_some());
+        assert!(runtime.render_stable(&tapper).contains("count: 1"));
+    }
+
+    #[test]
+    fn pointer_exited_clears_the_hover() {
+        let (runtime, _tapper, cx, cy) = pressable();
+
+        runtime.pointer_moved(cx, cy);
+        assert!(runtime.pointer_exited());
+        assert!(runtime.interaction().hovered.is_none());
+        assert!(!runtime.pointer_exited(), "já limpo — nada a repintar");
+    }
+
+    #[test]
+    fn style_modifiers_merge_into_one_styled() {
+        use crate::layout::{DrawCommand, Proposal};
+
+        let runtime = Runtime::new();
+        let view = text("ab").corner_radius(5.0).background_color(Color::hex(0x123456));
+        let result = runtime.layout(&view, Proposal::unspecified());
+
+        let fills: Vec<(Color, f64)> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::FillRect { color, corner_radius, .. } => {
+                    Some((*color, *corner_radius))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fills,
+            vec![(Color::hex(0x123456), 5.0)],
+            "um Styled só — o raio arredonda ESTE fundo"
+        );
+    }
+
+    #[test]
+    fn the_nearest_background_wins_within_one_view() {
+        use crate::layout::{DrawCommand, Proposal};
+
+        let runtime = Runtime::new();
+        let view = text("ab")
+            .background_color(Color::hex(0x111111))
+            .background_color(Color::hex(0x222222));
+        let result = runtime.layout(&view, Proposal::unspecified());
+
+        let fills: Vec<Color> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::FillRect { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fills,
+            vec![Color::hex(0x111111)],
+            "o mais próximo da view vence; um comando só"
+        );
+    }
+
+    #[test]
+    fn padding_and_background_order_mirror_the_api() {
+        use crate::layout::{DrawCommand, Proposal, Rect};
+
+        let runtime = Runtime::new();
+        let outer = runtime.layout(
+            &text("ab").padding_length(10.0).background_color(Color::BLACK),
+            Proposal::unspecified(),
+        );
+        let inner = runtime.layout(
+            &text("ab").background_color(Color::BLACK).padding_length(10.0),
+            Proposal::unspecified(),
+        );
+
+        let fill_rect = |result: &crate::layout::LayoutResult| -> Rect {
+            result
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::FillRect { rect, .. } => Some(*rect),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        // fundo por fora do padding cobre a área acolchoada; por dentro,
+        // só o conteúdo — o tamanho total não muda, muda quem pinta o quê
+        assert_eq!(fill_rect(&outer).size.width, 36.0);
+        assert_eq!(fill_rect(&inner).size.width, 16.0);
+        assert_eq!(outer.size, inner.size);
+    }
+
+    #[test]
+    fn visual_modifiers_print_their_suffixes() {
+        let runtime = Runtime::new();
+        let printed = runtime.render(
+            &text("x")
+                .background_color(Color::hex(0xAA69FB))
+                .foreground_color(Color::hex(0x070510))
+                .border(Color::hex(0x2A1B3F), 1.0)
+                .corner_radius(6.0),
+        );
+        assert!(printed.contains("[.background(#AA69FB)]"), "{printed}");
+        assert!(printed.contains("[.foregroundColor(#070510)]"), "{printed}");
+        assert!(printed.contains("[.border(#2A1B3F, width: 1)]"), "{printed}");
+        assert!(printed.contains("[.cornerRadius(6)]"), "{printed}");
+    }
+
+    #[test]
+    fn button_chrome_shows_up_in_the_display_list() {
+        use crate::layout::{DrawCommand, Proposal};
+
+        #[derive(Clone, Copy)]
+        struct One;
+
+        impl Component for One {
+            fn body(&self, _ctx: &Context) -> impl View {
+                button(text("go"), || {})
+            }
+        }
+
+        let runtime = Runtime::new();
+        runtime.render_stable(&One);
+        let result = runtime.layout(&One, Proposal::unspecified());
+
+        // o fundo do chrome vem antes do texto do label, com os cantos
+        let mut fill_before_text = false;
+        let mut saw_text = false;
+        for command in result.display.iter() {
+            match command {
+                DrawCommand::FillRect { corner_radius, .. } if !saw_text => {
+                    assert_eq!(*corner_radius, 6.0);
+                    fill_before_text = true;
+                }
+                DrawCommand::TextLine { .. } => saw_text = true,
+                _ => {}
+            }
+        }
+        assert!(fill_before_text && saw_text);
+
+        // o hit-rect é o chrome inteiro: label + padding embutido
+        let (_, rect) = result.hits.last().unwrap().clone();
+        assert_eq!(rect.size.height, 28.0, "16 do label + 2×6");
+        assert_eq!(rect.size.width, 44.0, "2 chars × 8 + 2×14");
     }
 
     #[test]

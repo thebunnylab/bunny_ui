@@ -7,9 +7,11 @@
 //! variante `_stret`), e duas classes nascem em runtime via
 //! `objc_allocateClassPair`/`class_addMethod`:
 //!
-//! - `BunnyView` (NSView) — recebe `mouseDown:` e converte o clique para
-//!   as coordenadas do layout (AppKit conta de baixo para cima; o flip
-//!   acontece aqui, uma vez);
+//! - `BunnyView` (NSView) — recebe o ciclo completo de ponteiro
+//!   (`mouseDown:`/`mouseUp:`/`mouseMoved:`/`mouseDragged:`/entrada e
+//!   saída via NSTrackingArea) e converte cada posição para as coordenadas
+//!   do layout (AppKit conta de baixo para cima; o flip acontece aqui,
+//!   uma vez);
 //! - `BunnyDelegate` (NSObject) — `windowDidResize:` re-pinta e
 //!   `windowWillClose:` encerra o app (fechar a janela fecha o processo).
 //!
@@ -83,6 +85,9 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_init_window(obj: Id, sel: Sel, rect: CGRect, style: u64, backing: u64, defer: i8)
     -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_init_tracking(obj: Id, sel: Sel, rect: CGRect, options: u64, owner: Id, info: Id)
+    -> Id;
 }
 
 // AppKit/QuartzCore entram pelo runtime ObjC; o link garante as classes.
@@ -132,11 +137,16 @@ unsafe fn sel(name: &str) -> Sel {
 
 // MARK: - Eventos
 
-/// O que a plataforma entrega ao mundo Rust.
+/// O que a plataforma entrega ao mundo Rust. Posições em coordenadas do
+/// LAYOUT (origem no topo-esquerda, pontos lógicos) — o flip do AppKit já
+/// aconteceu.
 pub enum AppEvent {
-    /// Clique em coordenadas do LAYOUT (origem no topo-esquerda, pontos
-    /// lógicos) — o flip do AppKit já aconteceu.
-    Click { x: f64, y: f64 },
+    MouseDown { x: f64, y: f64 },
+    MouseUp { x: f64, y: f64 },
+    MouseMoved { x: f64, y: f64 },
+    /// O ponteiro saiu da janela — sem este evento o hover ficaria preso
+    /// na borda (a razão de usar NSTrackingArea).
+    MouseExited,
     /// A janela mudou de tamanho (ou precisa do primeiro frame).
     Redraw,
 }
@@ -160,13 +170,36 @@ pub fn dispatch(event: AppEvent) {
     });
 }
 
-extern "C" fn bunny_mouse_down(this: Id, _sel: Sel, event: Id) {
+/// A posição do evento em coordenadas do layout — AppKit conta de baixo,
+/// o layout conta de cima; o flip mora aqui, uma vez.
+unsafe fn event_layout_point(this: Id, event: Id) -> (f64, f64) {
     unsafe {
         let point = msg_point(event, sel("locationInWindow"));
         let bounds = msg_rect(this, sel("bounds"));
-        // AppKit conta de baixo; o layout conta de cima
-        dispatch(AppEvent::Click { x: point.x, y: bounds.size.height - point.y });
+        (point.x, bounds.size.height - point.y)
     }
+}
+
+extern "C" fn bunny_mouse_down(this: Id, _sel: Sel, event: Id) {
+    let (x, y) = unsafe { event_layout_point(this, event) };
+    dispatch(AppEvent::MouseDown { x, y });
+}
+
+extern "C" fn bunny_mouse_up(this: Id, _sel: Sel, event: Id) {
+    let (x, y) = unsafe { event_layout_point(this, event) };
+    dispatch(AppEvent::MouseUp { x, y });
+}
+
+/// `mouseMoved:`, `mouseDragged:` e `mouseEntered:` caem todos aqui —
+/// dragged é OBRIGATÓRIO: com o botão pressionado o AppKit manda dragged,
+/// nunca moved (sem ele o visual de pressed não solta ao arrastar fora).
+extern "C" fn bunny_mouse_moved(this: Id, _sel: Sel, event: Id) {
+    let (x, y) = unsafe { event_layout_point(this, event) };
+    dispatch(AppEvent::MouseMoved { x, y });
+}
+
+extern "C" fn bunny_mouse_exited(_this: Id, _sel: Sel, _event: Id) {
+    dispatch(AppEvent::MouseExited);
 }
 
 extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, _note: Id) {
@@ -195,6 +228,31 @@ unsafe fn register_classes() {
             view,
             sel("mouseDown:"),
             bunny_mouse_down as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(view, sel("mouseUp:"), bunny_mouse_up as *const c_void, types.as_ptr());
+        class_addMethod(
+            view,
+            sel("mouseMoved:"),
+            bunny_mouse_moved as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            view,
+            sel("mouseDragged:"),
+            bunny_mouse_moved as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            view,
+            sel("mouseEntered:"),
+            bunny_mouse_moved as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            view,
+            sel("mouseExited:"),
+            bunny_mouse_exited as *const c_void,
             types.as_ptr(),
         );
         objc_registerClassPair(view);
@@ -252,6 +310,20 @@ impl WindowHandle {
             msg_void_f64(self.layer, sel("setContentsScale:"), self.scale() as f64);
             msg_void_id(self.layer, sel("setContents:"), image);
             CGImageRelease(image); // a layer retém
+        }
+    }
+
+    /// Mão sobre alvo interativo; seta fora. `set` direto — sem cursor
+    /// rects por ora (o AppKit pode restaurar nas bordas de resize; glitch
+    /// cosmético aceito).
+    pub fn set_cursor_pointing(&self, pointing: bool) {
+        unsafe {
+            let cursor = if pointing {
+                msg_id(class("NSCursor"), sel("pointingHandCursor"))
+            } else {
+                msg_id(class("NSCursor"), sel("arrowCursor"))
+            };
+            msg_void(cursor, sel("set"));
         }
     }
 }
@@ -325,6 +397,24 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
         msg_void_bool(view, sel("setWantsLayer:"), 1);
         msg_void_id(window, sel("setContentView:"), view);
         let layer = msg_id(view, sel("layer"));
+
+        // moved/entered/exited chegam pelo tracking area — sem dança de
+        // first responder, e InVisibleRect acompanha o resize sozinho
+        // (o rect passado é ignorado). 0x223 = MouseEnteredAndExited |
+        // MouseMoved | ActiveInKeyWindow | InVisibleRect.
+        let area = msg_id(class("NSTrackingArea"), sel("alloc"));
+        let area = msg_init_tracking(
+            area,
+            sel("initWithRect:options:owner:userInfo:"),
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize { width: 0.0, height: 0.0 },
+            },
+            0x223,
+            view,
+            std::ptr::null_mut(),
+        );
+        msg_void_id(view, sel("addTrackingArea:"), area);
 
         // delegate: resize re-pinta, fechar encerra
         let delegate = msg_id(msg_id(class("BunnyDelegate"), sel("alloc")), sel("init"));

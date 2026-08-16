@@ -1,6 +1,6 @@
-//! Shell macOS do bunny-ui: janela nativa, eventos e o ciclo vivo —
-//! clique → hit-test → ação → estado → render incremental → repaint →
-//! blit. Sem uma dependência sequer.
+//! Shell macOS do bunny-ui: janela nativa, eventos de ponteiro e o ciclo
+//! vivo — hover/press → repaint por evento; ação no up-inside → estado →
+//! render incremental → blit. Sem uma dependência sequer.
 //!
 //! O `unsafe` do projeto mora SÓ aqui (a FFI de [`ffi`]), embrulhado nesta
 //! API segura. O core e a fachada seguem `#![forbid(unsafe_code)]`.
@@ -9,12 +9,8 @@
 
 mod ffi;
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
-use bunny_ui::layout::{Proposal, Rect, Size, hit_test};
+use bunny_ui::layout::{Color, Size};
 use bunny_ui::prelude::Runtime;
-use bunny_ui::raster::rasterize_scaled;
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
@@ -24,44 +20,37 @@ use ffi::AppEvent;
 pub fn run_window(title: &str, size: Size, root: impl View) {
     let window = ffi::create_window(title, size.width, size.height);
     let runtime = Runtime::new();
-    runtime.render_stable(&root);
 
-    // os alvos de interação do último frame — o mapa do hit-test
-    let hits: Rc<RefCell<Vec<(String, Rect)>>> = Rc::default();
-
-    let repaint = {
-        let hits = Rc::clone(&hits);
-        move |runtime: &Runtime, root: &_| {
-            let (width, height) = window.content_size();
-            let scale = window.scale();
-            let result = runtime.layout(
-                root,
-                Proposal::exact(Size { width, height }),
-            );
-            let bitmap = rasterize_scaled(
-                &result.display,
-                (width.round() as usize) * scale,
-                (height.round() as usize) * scale,
-                scale,
-                bunny_ui::layout::Color::WHITE,
-            );
-            window.set_image(bitmap.width(), bitmap.height(), &bitmap.to_rgba_bytes());
-            *hits.borrow_mut() = result.hits;
-        }
+    // um frame completo: o Runtime estabiliza, faz layout, retém os hits
+    // para os eventos de ponteiro e rasteriza — o shell só blita e alinha
+    // o cursor
+    let blit = move |runtime: &Runtime, root: &_| {
+        let (width, height) = window.content_size();
+        let bitmap = runtime.frame(root, Size { width, height }, window.scale(), Color::CANVAS);
+        window.set_image(bitmap.width(), bitmap.height(), &bitmap.to_rgba_bytes());
+        window.set_cursor_pointing(runtime.interaction().hovered.is_some());
     };
 
     ffi::set_handler(Box::new(move |event| match event {
-        AppEvent::Redraw => {
-            runtime.render_stable(&root);
-            repaint(&runtime, &root);
+        AppEvent::Redraw => blit(&runtime, &root),
+        AppEvent::MouseMoved { x, y } => {
+            if runtime.pointer_moved(x, y) {
+                blit(&runtime, &root);
+            }
         }
-        AppEvent::Click { x, y } => {
-            let target = hit_test(&hits.borrow(), x, y).map(str::to_string);
-            if let Some(target) = target {
-                // ação → estado sujo → o próximo pass re-roda SÓ quem leu
-                runtime.activate(&target);
-                runtime.render_stable(&root);
-                repaint(&runtime, &root);
+        AppEvent::MouseDown { x, y } => {
+            if runtime.pointer_pressed(x, y) {
+                blit(&runtime, &root);
+            }
+        }
+        AppEvent::MouseUp { x, y } => {
+            // dispara no up-inside; o visual de pressed limpa sempre
+            let _ = runtime.pointer_released(x, y);
+            blit(&runtime, &root);
+        }
+        AppEvent::MouseExited => {
+            if runtime.pointer_exited() {
+                blit(&runtime, &root);
             }
         }
     }));
