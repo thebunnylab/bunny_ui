@@ -557,13 +557,13 @@ impl LayoutNode {
                 let metrics = env.cache.get_or_measure(content, &env.font, env.text);
                 let natural = metrics.width;
                 let line_h = metrics.height();
-                // quebra por avanço médio — herdeira honesta das métricas
-                // fake (exata no PixelFont); shape/wrap reais são a
-                // próxima fase do sistema de texto
+                // quebra REAL por palavra, com as medições do engine — a
+                // largura entra na chave do cache (modo da sondagem)
                 let size = match proposal.width {
                     Some(width) if width > 0.0 && width < natural => {
-                        let lines = (natural / width).ceil();
-                        Size { width, height: lines * line_h }
+                        let lines =
+                            env.cache.get_or_break(content, &env.font, width, env.text);
+                        Size { width, height: lines.len() as Px * line_h }
                     }
                     _ => Size { width: natural, height: line_h },
                 };
@@ -719,22 +719,35 @@ impl LayoutNode {
             // folhas visuais: aqui nasce a lista de desenho
             (LayoutNode::Text { content }, Fit::Leaf) => {
                 let color = out.foreground.last().copied().unwrap_or(Color::BLACK);
-                let chars: Vec<char> = content.chars().collect();
-                if !chars.is_empty() {
+                if !content.is_empty() {
                     let metrics = env.cache.get_or_measure(content, &env.font, env.text);
-                    let advance = (metrics.width / chars.len() as Px).max(1.0);
                     let line_h = metrics.height();
-                    let per_line = ((frame.size.width / advance).floor() as usize).max(1);
-                    for (line_index, line) in chars.chunks(per_line).enumerate() {
+                    if metrics.width <= frame.size.width {
                         out.display.push(DrawCommand::TextLine {
-                            origin: Point {
-                                x: frame.origin.x,
-                                y: frame.origin.y + line_index as Px * line_h,
-                            },
-                            content: line.iter().collect(),
+                            origin: frame.origin,
+                            content: content.to_string(),
                             color,
                             font: env.font,
                         });
+                    } else {
+                        // as MESMAS quebras da medição (mesma chave, hit)
+                        let lines = env.cache.get_or_break(
+                            content,
+                            &env.font,
+                            frame.size.width,
+                            env.text,
+                        );
+                        for (line_index, (start, end)) in lines.iter().enumerate() {
+                            out.display.push(DrawCommand::TextLine {
+                                origin: Point {
+                                    x: frame.origin.x,
+                                    y: frame.origin.y + line_index as Px * line_h,
+                                },
+                                content: content[*start..*end].to_string(),
+                                color,
+                                font: env.font,
+                            });
+                        }
                     }
                 }
             }
@@ -1285,8 +1298,46 @@ mod tests {
     fn text_wraps_against_the_proposed_width() {
         let size =
             measure_with_defaults(&text(100), Proposal { width: Some(100.0), height: None });
-        // natural 800 → 8 linhas de 16
-        assert_eq!(size, Size { width: 100.0, height: 128.0 });
+        // 100 chars sem espaço em 100px: hard-break por CHAR inteiro —
+        // 12 por linha (96px ≤ 100) → 9 linhas (a quebra real não
+        // fraciona caracteres como a média antiga fazia)
+        assert_eq!(size, Size { width: 100.0, height: 144.0 });
+    }
+
+    #[test]
+    fn words_wrap_at_spaces_never_mid_word() {
+        let node = LayoutNode::Text { content: Rc::from("aa bb cc") };
+        let result = layout(&node, Proposal { width: Some(40.0), height: None });
+
+        // "aa bb" (40px) cabe; "cc" desce inteiro — nunca "c" órfão
+        assert_eq!(result.size.height, 2.0 * LINE_H);
+        let lines: Vec<String> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::TextLine { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, vec!["aa bb ".to_string(), "cc".to_string()]);
+    }
+
+    #[test]
+    fn a_word_longer_than_the_line_hard_breaks() {
+        let node = LayoutNode::Text { content: Rc::from("aaaaaaaaaa") };
+        let result = layout(&node, Proposal { width: Some(40.0), height: None });
+
+        // 10 chars de 8px em 40px: 5 por linha
+        assert_eq!(result.size.height, 2.0 * LINE_H);
+        let lines: Vec<String> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::TextLine { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, vec!["aaaaa".to_string(), "aaaaa".to_string()]);
     }
 
     fn styled(props: VisualProps, child: LayoutNode) -> LayoutNode {

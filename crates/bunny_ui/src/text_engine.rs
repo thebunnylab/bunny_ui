@@ -316,15 +316,86 @@ pub fn caret_from_x(
     best
 }
 
+// MARK: - Quebra de linha (shape emprestado do engine, quebra nossa)
+
+/// Quebra GREEDY por palavra com as medições reais do engine: ranges de
+/// byte contíguos, um por linha. Palavra maior que a linha quebra por
+/// char (nunca menos de um). Espaços penduram no fim da linha (não forçam
+/// quebra — o comportamento clássico).
+pub fn break_lines(
+    text: &str,
+    font: &FontSpec,
+    max_width: Px,
+    engine: &dyn TextEngine,
+    cache: &MeasureCache,
+) -> Vec<(usize, usize)> {
+    let mut lines = Vec::new();
+    let mut line_start = 0usize;
+    let mut cursor = 0usize;
+
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        let is_space = rest.starts_with(' ');
+        let token_len = if is_space {
+            rest.find(|c| c != ' ').unwrap_or(rest.len())
+        } else {
+            rest.find(' ').unwrap_or(rest.len())
+        };
+        let token_end = cursor + token_len;
+
+        if !is_space {
+            let width = cache.get_or_measure(&text[line_start..token_end], font, engine).width;
+            if width > max_width && cursor > line_start {
+                // a palavra não coube: quebra ANTES dela (os espaços já
+                // percorridos penduram no fim da linha anterior)
+                lines.push((line_start, cursor));
+                line_start = cursor;
+                continue;
+            }
+            if width > max_width {
+                // palavra sozinha maior que a linha: quebra por char no
+                // maior prefixo que couber — no mínimo um
+                let mut end = cursor + rest.chars().next().map(char::len_utf8).unwrap_or(1);
+                for (offset, _) in rest[..token_len].char_indices().skip(1) {
+                    if cache
+                        .get_or_measure(&text[line_start..cursor + offset], font, engine)
+                        .width
+                        > max_width
+                    {
+                        break;
+                    }
+                    end = cursor + offset;
+                }
+                lines.push((line_start, end));
+                line_start = end;
+                cursor = end;
+                continue;
+            }
+        }
+        cursor = token_end;
+    }
+    lines.push((line_start, text.len()));
+    lines
+}
+
 // MARK: - Cache de medição
+
+type BreakKey = (String, FontKey, u32);
+type BreakLines = std::rc::Rc<Vec<(usize, usize)>>;
 
 /// Double-buffer prev/current trocado por passada de layout: hit promove
 /// para o current, a troca descarta o que ninguém pediu no frame — LRU de
 /// frame exato, sem timer.
+///
+/// A quebra tem mapa PRÓPRIO com a LARGURA na chave — o modo da sondagem
+/// nunca compartilha entrada com a medição irrestrita (cache de linha
+/// envenenado por proposta é bug clássico; aqui é irrepresentável).
 #[derive(Default)]
 pub struct MeasureCache {
     prev: RefCell<HashMap<(String, FontKey), LineMetrics>>,
     current: RefCell<HashMap<(String, FontKey), LineMetrics>>,
+    breaks_prev: RefCell<HashMap<BreakKey, BreakLines>>,
+    breaks_current: RefCell<HashMap<BreakKey, BreakLines>>,
 }
 
 impl MeasureCache {
@@ -332,6 +403,8 @@ impl MeasureCache {
     pub fn begin_frame(&self) {
         let current = std::mem::take(&mut *self.current.borrow_mut());
         *self.prev.borrow_mut() = current;
+        let breaks = std::mem::take(&mut *self.breaks_current.borrow_mut());
+        *self.breaks_prev.borrow_mut() = breaks;
     }
 
     pub fn get_or_measure(
@@ -354,6 +427,28 @@ impl MeasureCache {
         self.current.borrow_mut().insert(key, measured);
         measured
     }
+
+    /// As quebras do texto para ESTA largura (quantizada em milésimos).
+    pub fn get_or_break(
+        &self,
+        text: &str,
+        font: &FontSpec,
+        max_width: Px,
+        engine: &dyn TextEngine,
+    ) -> BreakLines {
+        let key = (text.to_string(), font.key(), (max_width * 1000.0).round() as u32);
+        if let Some(hit) = self.breaks_current.borrow().get(&key) {
+            return hit.clone();
+        }
+        if let Some(hit) = self.breaks_prev.borrow_mut().remove(&key) {
+            self.breaks_current.borrow_mut().insert(key, hit.clone());
+            return hit;
+        }
+        let broken =
+            std::rc::Rc::new(break_lines(text, font, max_width, engine, self));
+        self.breaks_current.borrow_mut().insert(key, broken.clone());
+        broken
+    }
 }
 
 #[cfg(test)]
@@ -372,6 +467,22 @@ mod tests {
     #[test]
     fn empty_text_rasters_to_nothing() {
         assert!(PixelFont.raster_line("", &FontSpec::DEFAULT, Color::BLACK, 1).is_none());
+    }
+
+    #[test]
+    fn break_cache_keys_by_width_and_survives_a_frame() {
+        let cache = MeasureCache::default();
+        cache.begin_frame();
+
+        let wide = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 100.0, &PixelFont);
+        assert_eq!(wide.len(), 1, "cabe inteiro");
+        let narrow = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 40.0, &PixelFont);
+        assert_eq!(narrow.len(), 2, "larguras NUNCA compartilham entrada");
+
+        // double-buffer: o frame seguinte promove a MESMA alocação
+        cache.begin_frame();
+        let promoted = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 40.0, &PixelFont);
+        assert!(std::rc::Rc::ptr_eq(&narrow, &promoted));
     }
 
     #[test]

@@ -344,6 +344,27 @@ mod tests {
     }
 
     #[test]
+    fn core_text_wraps_words_with_real_measures() {
+        use bunny_ui::text_engine::{MeasureCache, break_lines};
+
+        let engine = CoreTextEngine::new();
+        let cache = MeasureCache::default();
+        let text = "hello world hello world";
+        let lines = break_lines(text, &FontSpec::DEFAULT, 60.0, &engine, &cache);
+
+        assert!(lines.len() > 1, "60px não segura a frase: {lines:?}");
+        // cobertura contígua do texto inteiro, quebras em fronteira limpa
+        assert_eq!(lines.first().unwrap().0, 0);
+        assert_eq!(lines.last().unwrap().1, text.len());
+        for window in lines.windows(2) {
+            assert_eq!(window[0].1, window[1].0);
+        }
+        for (start, end) in lines.iter() {
+            assert!(text.is_char_boundary(*start) && text.is_char_boundary(*end));
+        }
+    }
+
+    #[test]
     fn mono_design_resolves_to_a_wider_grid_or_degrades() {
         let engine = CoreTextEngine::new();
         let mono = FontSpec { design: FontDesign::Mono, ..FontSpec::DEFAULT };
