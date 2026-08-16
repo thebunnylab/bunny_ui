@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/motor",
+    "crates/bunny_ui",
+    "crates/bunny_ui_macos",
+    "crates/countries_core",
+    "apps/countries_pure",
+]
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bunny-ui = { path = "crates/bunny_ui" }
+countries-core = { path = "crates/countries_core" }
+motor = { path = "crates/motor" }

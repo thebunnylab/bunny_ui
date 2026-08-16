@@ -1,0 +1,13 @@
+[package]
+name = "countries-pure"
+version = "0.1.0"
+edition.workspace = true
+description = "CountriesSwiftUI com a camada de UI em Rust idiomático sobre o bunny-ui — mesmo espírito, sem macro"
+
+[dependencies]
+bunny-ui.workspace = true
+countries-core.workspace = true
+
+[[bin]]
+name = "countries-pure"
+path = "src/main.rs"

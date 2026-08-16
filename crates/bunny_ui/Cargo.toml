@@ -1,0 +1,8 @@
+[package]
+name = "bunny-ui"
+version = "0.1.0"
+edition.workspace = true
+description = "UI declarativa em Rust com espírito SwiftUI — árvore tipada monomórfica, estado com identidade estrutural, reconciliação incremental"
+
+[dependencies]
+motor.workspace = true

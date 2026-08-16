@@ -1,0 +1,347 @@
+//! FFI Objective-C / CoreGraphics escrita à mão — zero dependências.
+//!
+//! Este módulo é a borda sancionada de `unsafe` do projeto: o runtime
+//! Objective-C é chamado por `objc_msgSend` re-declarado com a assinatura
+//! concreta de cada mensagem (em arm64 há UM único entry point para todas
+//! as mensagens — structs pequenos vão e voltam em registrador, sem
+//! variante `_stret`), e duas classes nascem em runtime via
+//! `objc_allocateClassPair`/`class_addMethod`:
+//!
+//! - `BunnyView` (NSView) — recebe `mouseDown:` e converte o clique para
+//!   as coordenadas do layout (AppKit conta de baixo para cima; o flip
+//!   acontece aqui, uma vez);
+//! - `BunnyDelegate` (NSObject) — `windowDidResize:` re-pinta e
+//!   `windowWillClose:` encerra o app (fechar a janela fecha o processo).
+//!
+//! Os callbacks alcançam o mundo Rust por um handler thread-local (o run
+//! loop do AppKit é single-thread, como o resto do motor).
+
+use std::cell::RefCell;
+use std::ffi::{CString, c_char, c_void};
+use std::sync::Once;
+
+pub type Id = *mut c_void;
+pub type Sel = *const c_void;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CGPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CGSize {
+    pub width: f64,
+    pub height: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CGRect {
+    pub origin: CGPoint,
+    pub size: CGSize,
+}
+
+// Redeclarar `objc_msgSend` com a assinatura concreta de cada mensagem é o
+// modo de uso desenhado do runtime (o símbolo é um trampolim que preserva a
+// ABI da chamada) — o lint de declarações conflitantes não se aplica.
+#[allow(clashing_extern_declarations)]
+#[link(name = "objc", kind = "dylib")]
+unsafe extern "C" {
+    fn objc_getClass(name: *const c_char) -> Id;
+    fn sel_registerName(name: *const c_char) -> Sel;
+    fn objc_autoreleasePoolPush() -> *mut c_void;
+    fn objc_autoreleasePoolPop(pool: *mut c_void);
+    fn objc_allocateClassPair(superclass: Id, name: *const c_char, extra: usize) -> Id;
+    fn objc_registerClassPair(class: Id);
+    fn class_addMethod(class: Id, sel: Sel, imp: *const c_void, types: *const c_char) -> i8;
+
+    #[link_name = "objc_msgSend"]
+    fn msg_id(obj: Id, sel: Sel) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_void(obj: Id, sel: Sel);
+    #[link_name = "objc_msgSend"]
+    fn msg_void_id(obj: Id, sel: Sel, a: Id);
+    #[link_name = "objc_msgSend"]
+    fn msg_void_bool(obj: Id, sel: Sel, a: i8);
+    #[link_name = "objc_msgSend"]
+    fn msg_void_f64(obj: Id, sel: Sel, a: f64);
+    #[link_name = "objc_msgSend"]
+    fn msg_f64(obj: Id, sel: Sel) -> f64;
+    #[link_name = "objc_msgSend"]
+    fn msg_bool_i64(obj: Id, sel: Sel, a: i64) -> i8;
+    #[link_name = "objc_msgSend"]
+    fn msg_id_cstr(obj: Id, sel: Sel, a: *const c_char) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_point(obj: Id, sel: Sel) -> CGPoint;
+    #[link_name = "objc_msgSend"]
+    fn msg_rect(obj: Id, sel: Sel) -> CGRect;
+    #[link_name = "objc_msgSend"]
+    fn msg_init_rect(obj: Id, sel: Sel, rect: CGRect) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_init_window(obj: Id, sel: Sel, rect: CGRect, style: u64, backing: u64, defer: i8)
+    -> Id;
+}
+
+// AppKit/QuartzCore entram pelo runtime ObjC; o link garante as classes.
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {}
+#[link(name = "QuartzCore", kind = "framework")]
+unsafe extern "C" {}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+    fn CGColorSpaceRelease(space: *mut c_void);
+    fn CGDataProviderCreateWithCFData(data: *const c_void) -> *mut c_void;
+    fn CGDataProviderRelease(provider: *mut c_void);
+    #[allow(clippy::too_many_arguments)]
+    fn CGImageCreate(
+        width: usize,
+        height: usize,
+        bits_per_component: usize,
+        bits_per_pixel: usize,
+        bytes_per_row: usize,
+        space: *mut c_void,
+        bitmap_info: u32,
+        provider: *mut c_void,
+        decode: *const f64,
+        should_interpolate: bool,
+        intent: i32,
+    ) -> Id;
+    fn CGImageRelease(image: Id);
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
+    fn CFRelease(cf: *const c_void);
+}
+
+unsafe fn class(name: &str) -> Id {
+    let name = CString::new(name).expect("nome de classe sem NUL");
+    unsafe { objc_getClass(name.as_ptr()) }
+}
+
+unsafe fn sel(name: &str) -> Sel {
+    let name = CString::new(name).expect("seletor sem NUL");
+    unsafe { sel_registerName(name.as_ptr()) }
+}
+
+// MARK: - Eventos
+
+/// O que a plataforma entrega ao mundo Rust.
+pub enum AppEvent {
+    /// Clique em coordenadas do LAYOUT (origem no topo-esquerda, pontos
+    /// lógicos) — o flip do AppKit já aconteceu.
+    Click { x: f64, y: f64 },
+    /// A janela mudou de tamanho (ou precisa do primeiro frame).
+    Redraw,
+}
+
+thread_local! {
+    static HANDLER: RefCell<Option<Box<dyn FnMut(AppEvent)>>> = const { RefCell::new(None) };
+}
+
+/// Registra quem recebe os eventos (o loop do shell).
+pub fn set_handler(handler: Box<dyn FnMut(AppEvent)>) {
+    HANDLER.with(|slot| *slot.borrow_mut() = Some(handler));
+}
+
+/// Entrega um evento ao handler — usado pelos callbacks e pelo primeiro
+/// frame.
+pub fn dispatch(event: AppEvent) {
+    HANDLER.with(|slot| {
+        if let Some(handler) = slot.borrow_mut().as_mut() {
+            handler(event);
+        }
+    });
+}
+
+extern "C" fn bunny_mouse_down(this: Id, _sel: Sel, event: Id) {
+    unsafe {
+        let point = msg_point(event, sel("locationInWindow"));
+        let bounds = msg_rect(this, sel("bounds"));
+        // AppKit conta de baixo; o layout conta de cima
+        dispatch(AppEvent::Click { x: point.x, y: bounds.size.height - point.y });
+    }
+}
+
+extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, _note: Id) {
+    dispatch(AppEvent::Redraw);
+}
+
+extern "C" fn bunny_window_will_close(_this: Id, _sel: Sel, _note: Id) {
+    unsafe {
+        let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+        msg_void_id(app, sel("terminate:"), std::ptr::null_mut());
+    }
+}
+
+static REGISTER_CLASSES: Once = Once::new();
+
+unsafe fn register_classes() {
+    REGISTER_CLASSES.call_once(|| unsafe {
+        let types = CString::new("v@:@").expect("type encoding");
+
+        let view = objc_allocateClassPair(
+            class("NSView"),
+            CString::new("BunnyView").expect("nome").as_ptr(),
+            0,
+        );
+        class_addMethod(
+            view,
+            sel("mouseDown:"),
+            bunny_mouse_down as *const c_void,
+            types.as_ptr(),
+        );
+        objc_registerClassPair(view);
+
+        let delegate = objc_allocateClassPair(
+            class("NSObject"),
+            CString::new("BunnyDelegate").expect("nome").as_ptr(),
+            0,
+        );
+        class_addMethod(
+            delegate,
+            sel("windowDidResize:"),
+            bunny_window_did_resize as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            delegate,
+            sel("windowWillClose:"),
+            bunny_window_will_close as *const c_void,
+            types.as_ptr(),
+        );
+        objc_registerClassPair(delegate);
+    });
+}
+
+// MARK: - Janela
+
+/// Handles crus da janela — `Copy`, mesma thread, embrulhados pelas
+/// operações seguras abaixo.
+#[derive(Clone, Copy)]
+pub struct WindowHandle {
+    window: Id,
+    view: Id,
+    layer: Id,
+}
+
+impl WindowHandle {
+    /// Tamanho lógico da área de conteúdo (o viewport do layout).
+    pub fn content_size(&self) -> (f64, f64) {
+        unsafe {
+            let bounds = msg_rect(self.view, sel("bounds"));
+            (bounds.size.width, bounds.size.height)
+        }
+    }
+
+    /// O scale factor da tela (retina = 2).
+    pub fn scale(&self) -> usize {
+        unsafe { msg_f64(self.window, sel("backingScaleFactor")).round().max(1.0) as usize }
+    }
+
+    /// Blita um frame RGBA na layer.
+    pub fn set_image(&self, width: usize, height: usize, rgba: &[u8]) {
+        unsafe {
+            let image = cg_image(width, height, rgba);
+            msg_void_f64(self.layer, sel("setContentsScale:"), self.scale() as f64);
+            msg_void_id(self.layer, sel("setContents:"), image);
+            CGImageRelease(image); // a layer retém
+        }
+    }
+}
+
+/// `kCGImageAlphaPremultipliedLast` — bytes R,G,B,A, alfa por último.
+const ALPHA_PREMULTIPLIED_LAST: u32 = 1;
+
+unsafe fn cg_image(width: usize, height: usize, rgba: &[u8]) -> Id {
+    unsafe {
+        let data = CFDataCreate(std::ptr::null(), rgba.as_ptr(), rgba.len() as isize);
+        let provider = CGDataProviderCreateWithCFData(data);
+        let space = CGColorSpaceCreateDeviceRGB();
+        let image = CGImageCreate(
+            width,
+            height,
+            8,
+            32,
+            width * 4,
+            space,
+            ALPHA_PREMULTIPLIED_LAST,
+            provider,
+            std::ptr::null(),
+            false,
+            0,
+        );
+        CGColorSpaceRelease(space);
+        CGDataProviderRelease(provider);
+        CFRelease(data);
+        image
+    }
+}
+
+/// Cria o app + a janela com a view de eventos, pronta para blit.
+pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
+    unsafe {
+        let pool = objc_autoreleasePoolPush();
+        register_classes();
+
+        let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+        // Regular: app de terminal ganha janela, dock e foco
+        let _ = msg_bool_i64(app, sel("setActivationPolicy:"), 0);
+
+        let rect = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize { width, height },
+        };
+        // titled | closable | miniaturizable | resizable
+        let style: u64 = 1 | 2 | 4 | 8;
+        let window = msg_id(class("NSWindow"), sel("alloc"));
+        let window = msg_init_window(
+            window,
+            sel("initWithContentRect:styleMask:backing:defer:"),
+            rect,
+            style,
+            2, // buffered
+            0,
+        );
+
+        let title = CString::new(title).expect("título sem NUL");
+        let ns_title = msg_id_cstr(
+            class("NSString"),
+            sel("stringWithUTF8String:"),
+            title.as_ptr(),
+        );
+        msg_void_id(window, sel("setTitle:"), ns_title);
+        msg_void(window, sel("center"));
+
+        // a view de eventos vira o content view, com layer própria
+        let view = msg_id(class("BunnyView"), sel("alloc"));
+        let view = msg_init_rect(view, sel("initWithFrame:"), rect);
+        msg_void_bool(view, sel("setWantsLayer:"), 1);
+        msg_void_id(window, sel("setContentView:"), view);
+        let layer = msg_id(view, sel("layer"));
+
+        // delegate: resize re-pinta, fechar encerra
+        let delegate = msg_id(msg_id(class("BunnyDelegate"), sel("alloc")), sel("init"));
+        msg_void_id(window, sel("setDelegate:"), delegate);
+
+        msg_void_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
+        msg_void_bool(app, sel("activateIgnoringOtherApps:"), 1);
+        objc_autoreleasePoolPop(pool);
+
+        WindowHandle { window, view, layer }
+    }
+}
+
+/// Entra no run loop do AppKit — retorna quando o app termina.
+pub fn run() {
+    unsafe {
+        let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+        msg_void(app, sel("run"));
+    }
+}

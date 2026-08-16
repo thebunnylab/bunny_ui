@@ -1,0 +1,8 @@
+[package]
+name = "bunny-ui-macos"
+version = "0.1.0"
+edition.workspace = true
+description = "Shell macOS do bunny-ui — janela nativa e blit do bitmap, FFI Objective-C sem dependências"
+
+[dependencies]
+bunny-ui.workspace = true
