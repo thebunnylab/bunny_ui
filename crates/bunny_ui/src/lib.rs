@@ -60,7 +60,7 @@ pub mod prelude {
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
     pub use crate::text_input::{CaretState, EditCommand};
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
-    pub use crate::runtime::{Edited, Runtime};
+    pub use crate::runtime::{Edited, ImeSnapshot, Runtime};
     pub use crate::state_ext::{BindingExt, StateExt};
     pub use crate::view::{Component, Either, Many, Single, UnaryView, View};
     pub use crate::views::*;
@@ -963,6 +963,65 @@ mod tests {
         assert_eq!(runtime.focused(), None);
         assert!(!runtime.key(EditCommand::Insert("x".into())).applied);
         assert!(runtime.render_stable(&form).contains("hello Dec"));
+    }
+
+    #[test]
+    fn ime_composition_flows_through_the_runtime() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+        use crate::text_input::EditCommand;
+
+        #[derive(Clone, Copy)]
+        struct Form {
+            name: State<String>,
+        }
+
+        impl Component for Form {
+            fn body(&self, _ctx: &Context) -> impl View {
+                text_field("name", self.name.binding())
+            }
+        }
+
+        let form = Form { name: State::new(String::new()) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&form);
+        let viewport = Proposal::exact(Size { width: 240.0, height: 40.0 });
+        let result = runtime.layout(&form, viewport);
+        let (path, rect) = result.hits.last().unwrap().clone();
+        let _ = path;
+        runtime.pointer_pressed(rect.origin.x + 4.0, rect.origin.y + 4.0);
+        runtime.pointer_released(rect.origin.x + 4.0, rect.origin.y + 4.0);
+
+        // composição viva: o texto entra MARCADO (sublinhado, no binding)
+        let mark = EditCommand::SetMarked { text: "にほん".into(), caret_utf16: (3, 0) };
+        assert!(runtime.key(mark).applied);
+        assert!(runtime.render_stable(&form).contains("にほん"));
+        let composing = runtime.layout(&form, viewport);
+        let underline = |result: &crate::layout::LayoutResult| {
+            result
+                .display
+                .iter()
+                .filter(|command| matches!(
+                    command,
+                    DrawCommand::FillRect { rect, color, .. }
+                        if *color == Color::BLACK && rect.size.height == 1.0
+                ))
+                .count()
+        };
+        assert_eq!(underline(&composing), 1, "a composição pinta sublinhada");
+
+        // o snapshot fala UTF-16 com a plataforma
+        let snapshot = runtime.ime_snapshot().expect("campo focado");
+        assert_eq!(snapshot.marked, Some((0, 3)));
+        assert_eq!(snapshot.selected, (3, 0), "caret colapsado no fim da composição");
+
+        // o commit troca o marcado pelo texto final e o sublinhado some
+        assert!(runtime.key(EditCommand::Insert("日本".into())).applied);
+        let committed = runtime.render_stable(&form);
+        assert!(committed.contains("日本"), "{committed}");
+        assert!(!committed.contains("にほん"));
+        let after = runtime.layout(&form, viewport);
+        assert_eq!(underline(&after), 0);
+        assert_eq!(runtime.ime_snapshot().unwrap().marked, None);
     }
 
     #[test]

@@ -32,6 +32,19 @@ pub struct Edited {
     pub output: Option<String>,
 }
 
+/// O que a plataforma pergunta ao campo focado (NSTextInputClient e
+/// afins): texto, seleção e composição em UTF-16 — o vocabulário dela —
+/// e o rect do caret em coordenadas de LAYOUT (o shell converte para
+/// tela; é onde a janela de candidatos do IME aterrissa).
+pub struct ImeSnapshot {
+    pub text: String,
+    /// (location, length) em UTF-16.
+    pub selected: (usize, usize),
+    /// Range marcado em UTF-16, se houver composição viva.
+    pub marked: Option<(usize, usize)>,
+    pub caret_rect: Rect,
+}
+
 pub struct Runtime {
     ctx: Context,
     /// O root do último pass — escopa `take_dirty` para não drenar sujeira
@@ -294,7 +307,7 @@ impl Runtime {
         self.carets
             .borrow_mut()
             .entry(path.to_string())
-            .or_insert(CaretState { caret: usize::MAX, anchor: None });
+            .or_insert(CaretState { caret: usize::MAX, anchor: None, marked: None });
     }
 
     /// Foca posicionando o caret pelo X do clique — medição de prefixos
@@ -309,7 +322,7 @@ impl Runtime {
                 self.carets
                     .borrow_mut()
                     .entry(path.to_string())
-                    .or_insert(CaretState { caret: usize::MAX, anchor: None });
+                    .or_insert(CaretState { caret: usize::MAX, anchor: None, marked: None });
                 return;
             }
         };
@@ -327,7 +340,7 @@ impl Runtime {
         };
         self.carets
             .borrow_mut()
-            .insert(path.to_string(), CaretState { caret, anchor: None });
+            .insert(path.to_string(), CaretState { caret, anchor: None, marked: None });
     }
 
     pub fn blur(&self) -> bool {
@@ -343,6 +356,42 @@ impl Runtime {
         }
         self.caret_visible.set(!self.caret_visible.get());
         true
+    }
+
+    /// O snapshot de IME do campo focado — `None` sem foco. Índices já em
+    /// UTF-16 pela borda do framework; o caret rect sai da geometria
+    /// retida do último layout.
+    pub fn ime_snapshot(&self) -> Option<ImeSnapshot> {
+        use crate::text_input::byte_to_utf16;
+
+        let path = self.focus.borrow().clone()?;
+        let mut probe = CaretState::default();
+        let text = reconciler::run_editor(&path, EditCommand::Read, &mut probe)??;
+        let state = self.carets.borrow().get(&path).copied().unwrap_or_default();
+
+        let caret = crate::text_input::clamp_index(&text, state.caret);
+        let (start, end) = state.selection().unwrap_or((caret, caret));
+        let start_utf16 = byte_to_utf16(&text, start);
+        let selected = (start_utf16, byte_to_utf16(&text, end) - start_utf16);
+        let marked = state.marked.map(|(start, end)| {
+            let start_utf16 = byte_to_utf16(&text, start);
+            (start_utf16, byte_to_utf16(&text, end) - start_utf16)
+        });
+
+        let field = self
+            .last_fields
+            .borrow()
+            .iter()
+            .find(|field| field.path == path)
+            .cloned()?;
+        let metrics = self.cache.get_or_measure(&text, &field.font, &*self.text);
+        let prefix = self.cache.get_or_measure(&text[..caret], &field.font, &*self.text).width;
+        let caret_rect = Rect {
+            origin: Point { x: field.text_origin.x + prefix, y: field.text_origin.y },
+            size: crate::layout::Size { width: 1.5, height: metrics.height() },
+        };
+
+        Some(ImeSnapshot { text, selected, marked, caret_rect })
     }
 
     /// Aplica um comando de edição ao campo focado. A escrita no binding

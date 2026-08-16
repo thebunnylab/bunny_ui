@@ -473,6 +473,11 @@ pub(crate) fn expand_layout(node: &LayoutNode, interaction: &Stamp) -> LayoutNod
                     .flatten()
                     .map(|(start, end)| (clamp(start), clamp(end)))
                     .filter(|(start, end)| start < end),
+                marked: focused
+                    .then_some(state.marked)
+                    .flatten()
+                    .map(|(start, end)| (clamp(start), clamp(end)))
+                    .filter(|(start, end)| start < end),
             }
         }
         leaf => leaf.clone(),

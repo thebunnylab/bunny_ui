@@ -34,13 +34,33 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
     let window = ffi::create_window(title, size.width, size.height);
 
     // um frame completo: o Runtime estabiliza, faz layout, retém os hits
-    // para os eventos de ponteiro e rasteriza — o shell só blita e alinha
-    // o cursor
+    // para os eventos de ponteiro e rasteriza — o shell blita, alinha o
+    // cursor e espelha o campo focado para o sistema de input (as
+    // perguntas síncronas do IME respondem deste espelho)
     let blit = move |runtime: &Runtime, root: &_| {
         let (width, height) = window.content_size();
         let bitmap = runtime.frame(root, Size { width, height }, window.scale(), Color::CANVAS);
         window.set_image(bitmap.width(), bitmap.height(), &bitmap.to_rgba_bytes());
         window.set_cursor_pointing(runtime.interaction().hovered.is_some());
+        ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
+            let rect = snapshot.caret_rect;
+            (
+                ffi::NSRange {
+                    location: snapshot.selected.0 as u64,
+                    length: snapshot.selected.1 as u64,
+                },
+                snapshot.marked.map(|(location, length)| ffi::NSRange {
+                    location: location as u64,
+                    length: length as u64,
+                }),
+                window.layout_rect_to_screen(
+                    rect.origin.x,
+                    rect.origin.y,
+                    rect.size.width,
+                    rect.size.height,
+                ),
+            )
+        }));
     };
 
     ffi::set_handler(Box::new(move |event| match event {
@@ -123,6 +143,62 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
         AppEvent::Blink => {
             // caret parado pisca; sem foco o tick é silêncio
             if runtime.blink() {
+                blit(&runtime, &root);
+            }
+        }
+        AppEvent::ImeInsert { text } => {
+            // o commit do IME (ou digitação simples pelo input system)
+            if runtime.key(EditCommand::Insert(text)).applied {
+                blit(&runtime, &root);
+            }
+        }
+        AppEvent::ImeMark { text, location, length } => {
+            let command = EditCommand::SetMarked {
+                text,
+                caret_utf16: (location as usize, length as usize),
+            };
+            if runtime.key(command).applied {
+                blit(&runtime, &root);
+            }
+        }
+        AppEvent::ImeUnmark => {
+            if runtime.key(EditCommand::Unmark).applied {
+                blit(&runtime, &root);
+            }
+        }
+        AppEvent::Command { selector } => {
+            let edit = match selector.as_str() {
+                "deleteBackward:" => Some(EditCommand::Backspace),
+                "deleteForward:" => Some(EditCommand::Delete),
+                "moveLeft:" => Some(EditCommand::Left(false)),
+                "moveRight:" => Some(EditCommand::Right(false)),
+                "moveLeftAndModifySelection:" => Some(EditCommand::Left(true)),
+                "moveRightAndModifySelection:" => Some(EditCommand::Right(true)),
+                "moveToBeginningOfLine:" | "moveToLeftEndOfLine:" | "moveUp:" => {
+                    Some(EditCommand::Home(false))
+                }
+                "moveToBeginningOfLineAndModifySelection:"
+                | "moveToLeftEndOfLineAndModifySelection:" => Some(EditCommand::Home(true)),
+                "moveToEndOfLine:" | "moveToRightEndOfLine:" | "moveDown:" => {
+                    Some(EditCommand::End(false))
+                }
+                "moveToEndOfLineAndModifySelection:"
+                | "moveToRightEndOfLineAndModifySelection:" => Some(EditCommand::End(true)),
+                "selectAll:" => Some(EditCommand::SelectAll),
+                "cancelOperation:" => {
+                    // esc solta o foco
+                    if runtime.blur() {
+                        blit(&runtime, &root);
+                    }
+                    None
+                }
+                // insertNewline:/insertTab: — submit/troca de foco são a
+                // próxima fase de eventos tipados do campo
+                _ => None,
+            };
+            if let Some(edit) = edit
+                && runtime.key(edit).applied
+            {
                 blit(&runtime, &root);
             }
         }

@@ -7,11 +7,14 @@
 
 /// Caret + âncora de seleção de um campo, por identidade. `caret` é o
 /// ponto ativo; `anchor` marca o outro lado da seleção (None = sem
-/// seleção). Offsets de byte; valores fora do texto clampam na aplicação.
+/// seleção); `marked` é a composição de IME viva (sublinhada, ainda não
+/// committed). Offsets de byte; valores fora do texto clampam na
+/// aplicação.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct CaretState {
     pub caret: usize,
     pub anchor: Option<usize>,
+    pub marked: Option<(usize, usize)>,
 }
 
 impl CaretState {
@@ -44,6 +47,13 @@ pub enum EditCommand {
     Copy,
     /// Devolve a seleção e a remove.
     Cut,
+    /// Composição de IME: substitui o range marcado (ou a seleção) pelo
+    /// texto em composição e o mantém MARCADO (sublinhado, não
+    /// committed). `caret_utf16` = (location, length) DENTRO do texto
+    /// marcado — o vocabulário da plataforma.
+    SetMarked { text: String, caret_utf16: (usize, usize) },
+    /// Encerra a composição committando o texto marcado como está.
+    Unmark,
 }
 
 /// Fronteira de char anterior (ou 0).
@@ -96,6 +106,26 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
     if let Some(anchor) = state.anchor {
         state.anchor = Some(clamp_to_boundary(text, anchor));
     }
+    if let Some((start, end)) = state.marked {
+        let start = clamp_to_boundary(text, start);
+        let end = clamp_to_boundary(text, end);
+        state.marked = (start < end).then_some((start, end));
+    }
+
+    // qualquer comando que não seja de composição nem de leitura encerra
+    // a composição viva (committa como está) antes de agir — exceto
+    // Insert, que é o COMMIT da composição
+    if state.marked.is_some()
+        && !matches!(
+            command,
+            EditCommand::Read
+                | EditCommand::Copy
+                | EditCommand::Insert(_)
+                | EditCommand::SetMarked { .. }
+        )
+    {
+        state.marked = None;
+    }
 
     // edição sobre seleção remove a seleção primeiro
     let remove_selection = |text: &mut String, state: &mut CaretState| {
@@ -129,9 +159,36 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
 
     match command {
         EditCommand::Insert(insertion) => {
-            remove_selection(text, state);
-            text.insert_str(state.caret, &insertion);
-            state.caret += insertion.len();
+            // o commit da composição: o texto final substitui o marcado
+            if let Some((start, end)) = state.marked.take() {
+                text.replace_range(start..end, &insertion);
+                state.caret = start + insertion.len();
+                state.anchor = None;
+            } else {
+                remove_selection(text, state);
+                text.insert_str(state.caret, &insertion);
+                state.caret += insertion.len();
+            }
+        }
+        EditCommand::SetMarked { text: composition, caret_utf16 } => {
+            let (start, end) = state
+                .marked
+                .or(state.selection())
+                .unwrap_or((state.caret, state.caret));
+            text.replace_range(start..end, &composition);
+            state.anchor = None;
+            if composition.is_empty() {
+                // composição esvaziada = cancelada
+                state.marked = None;
+                state.caret = start;
+            } else {
+                state.marked = Some((start, start + composition.len()));
+                let (location, length) = caret_utf16;
+                state.caret = start + utf16_to_byte(&composition, location + length);
+            }
+        }
+        EditCommand::Unmark => {
+            // o clamp/commit lá em cima já limpou; nada mais a fazer
         }
         EditCommand::Read => return Some(text.clone()),
         EditCommand::Copy => {
@@ -202,7 +259,7 @@ mod tests {
     use super::*;
 
     fn state(caret: usize) -> CaretState {
-        CaretState { caret, anchor: None }
+        CaretState { caret, anchor: None, marked: None }
     }
 
     #[test]
@@ -259,6 +316,58 @@ mod tests {
         apply(&mut text, &mut caret, EditCommand::Insert("c".into()));
         assert_eq!(text, "abc");
         assert_eq!(caret.caret, 3);
+    }
+
+    #[test]
+    fn ime_composition_marks_replaces_and_commits() {
+        let mut text = String::from("ab");
+        let mut state = state(1); // entre a e b
+
+        // composição incremental: cada SetMarked substitui o marcado
+        apply(
+            &mut text,
+            &mut state,
+            EditCommand::SetMarked { text: "ｎ".into(), caret_utf16: (1, 0) },
+        );
+        assert_eq!(text, "aｎb");
+        assert_eq!(state.marked, Some((1, 1 + "ｎ".len())));
+        apply(
+            &mut text,
+            &mut state,
+            EditCommand::SetMarked { text: "に".into(), caret_utf16: (1, 0) },
+        );
+        assert_eq!(text, "aにb");
+        assert_eq!(state.marked, Some((1, 1 + "に".len())));
+
+        // o commit: Insert troca o marcado pelo texto final
+        apply(&mut text, &mut state, EditCommand::Insert("日本".into()));
+        assert_eq!(text, "a日本b");
+        assert_eq!(state.marked, None);
+        assert_eq!(state.caret, 1 + "日本".len());
+
+        // composição esvaziada = cancelada
+        apply(
+            &mut text,
+            &mut state,
+            EditCommand::SetMarked { text: "x".into(), caret_utf16: (1, 0) },
+        );
+        apply(
+            &mut text,
+            &mut state,
+            EditCommand::SetMarked { text: String::new(), caret_utf16: (0, 0) },
+        );
+        assert_eq!(text, "a日本b");
+        assert_eq!(state.marked, None);
+
+        // movimento no meio da composição committa como está
+        apply(
+            &mut text,
+            &mut state,
+            EditCommand::SetMarked { text: "y".into(), caret_utf16: (1, 0) },
+        );
+        apply(&mut text, &mut state, EditCommand::Left(false));
+        assert_eq!(state.marked, None);
+        assert!(text.contains('y'), "committado como estava: {text}");
     }
 
     #[test]

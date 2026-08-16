@@ -172,6 +172,8 @@ pub enum LayoutNode {
         focused: bool,
         caret: Option<usize>,
         selection: Option<(usize, usize)>,
+        /// Composição de IME viva — pinta sublinhada.
+        marked: Option<(usize, usize)>,
     },
     /// Fronteira de view (`Component`): grava o frame no caminho de
     /// identidade — o endereço dos testes e, adiante, do hit-testing.
@@ -746,7 +748,7 @@ impl LayoutNode {
             }
 
             (
-                LayoutNode::Field { path, content, placeholder, focused, caret, selection },
+                LayoutNode::Field { path, content, placeholder, focused, caret, selection, marked },
                 Fit::Leaf,
             ) => {
                 // chrome: poço branco com borda (a borda acende no foco)
@@ -800,7 +802,20 @@ impl LayoutNode {
                         font: env.font,
                     });
                 }
-                // caret por cima (estático nesta fase; blink com timers)
+                // a composição viva ganha o sublinhado do IME
+                if let Some((start, end)) = marked {
+                    let x0 = text_origin.x + prefix_width(*start);
+                    let x1 = text_origin.x + prefix_width(*end);
+                    out.display.push(DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point { x: x0, y: text_origin.y + metrics.height() - 1.0 },
+                            size: Size { width: x1 - x0, height: 1.0 },
+                        },
+                        color: Color::BLACK,
+                        corner_radius: 0.0,
+                    });
+                }
+                // caret por cima (o blink alterna via estampa)
                 if *focused && let Some(caret) = caret {
                     let x = text_origin.x + prefix_width(*caret);
                     out.display.push(DrawCommand::FillRect {

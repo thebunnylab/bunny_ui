@@ -18,12 +18,24 @@
 //! Os callbacks alcançam o mundo Rust por um handler thread-local (o run
 //! loop do AppKit é single-thread, como o resto do motor).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{CString, c_char, c_void};
 use std::sync::Once;
 
 pub type Id = *mut c_void;
 pub type Sel = *const c_void;
+
+/// `NSRange` — (location, length) em unidades UTF-16, o vocabulário do
+/// sistema de input.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NSRange {
+    pub location: u64,
+    pub length: u64,
+}
+
+/// `NSNotFound` (NSIntegerMax) — o "range nenhum" do AppKit.
+pub const NS_NOT_FOUND: u64 = i64::MAX as u64;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -59,6 +71,9 @@ unsafe extern "C" {
     fn objc_allocateClassPair(superclass: Id, name: *const c_char, extra: usize) -> Id;
     fn objc_registerClassPair(class: Id);
     fn class_addMethod(class: Id, sel: Sel, imp: *const c_void, types: *const c_char) -> i8;
+    fn objc_getProtocol(name: *const c_char) -> Id;
+    fn class_addProtocol(class: Id, protocol: Id) -> i8;
+    fn sel_getName(sel: Sel) -> *const c_char;
 
     #[link_name = "objc_msgSend"]
     fn msg_id(obj: Id, sel: Sel) -> Id;
@@ -110,6 +125,10 @@ unsafe extern "C" {
         info: Id,
         repeats: i8,
     ) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_bool_sel(obj: Id, sel: Sel, a: Sel) -> i8;
+    #[link_name = "objc_msgSend"]
+    fn msg_rect_rect(obj: Id, sel: Sel, rect: CGRect) -> CGRect;
 }
 
 // AppKit/QuartzCore entram pelo runtime ObjC; o link garante as classes.
@@ -175,11 +194,20 @@ pub enum AppEvent {
     /// Rolagem: deltas em pontos (trackpad já vem preciso e com momentum;
     /// roda legada é convertida de linhas para pontos na chegada).
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
-    /// Tecla: keyCode de hardware + modificadores + o texto que o AppKit
-    /// traduziu. NOTA de dívida: composição por `characters` commita
-    /// direto — IME de verdade (marked text CJK) chega com o
-    /// NSTextInputClient.
+    /// Tecla CRUA — só chega aqui quando o campo focado NÃO está no
+    /// caminho (sem foco, ou com cmd pressionado): atalhos e teclas de
+    /// função. Com foco, o evento entra no sistema de input
+    /// (`interpretKeyEvents:`) e volta pelos eventos de IME abaixo.
     Key { code: u16, shift: bool, command: bool, chars: String },
+    /// O IME committou texto final (ou digitação simples via input system).
+    ImeInsert { text: String },
+    /// Composição viva: o texto marcado + a seleção DENTRO dele (UTF-16).
+    ImeMark { text: String, location: u64, length: u64 },
+    /// A composição encerrou committando o que estava marcado.
+    ImeUnmark,
+    /// `doCommandBySelector:` — movimento/edição pelo nome do seletor
+    /// ("moveLeft:", "deleteBackward:", …); a política mora no shell.
+    Command { selector: String },
     /// Meio-período do blink do caret (o NSTimer do shell).
     Blink,
     /// A janela mudou de tamanho (ou precisa do primeiro frame).
@@ -242,12 +270,155 @@ extern "C" fn bunny_accepts_first_responder(_this: Id, _sel: Sel) -> i8 {
     1
 }
 
-extern "C" fn bunny_key_down(_this: Id, _sel: Sel, event: Id) {
+// MARK: - Sincronização de IME (as perguntas SÍNCRONAS do input system)
+
+/// O espelho do campo focado que o `NSTextInputClient` responde na hora —
+/// o shell re-sincroniza a cada frame (a mutação anda por eventos; a
+/// leitura anda por aqui).
+#[derive(Clone, Copy)]
+struct ImeMirror {
+    selected: NSRange,
+    marked: NSRange,
+    caret_screen: CGRect,
+}
+
+thread_local! {
+    static IME: Cell<Option<ImeMirror>> = const { Cell::new(None) };
+    /// keyDown entra no input system (composição) só quando o shell
+    /// diz que há campo focado.
+    static INTERPRET: Cell<bool> = const { Cell::new(false) };
+}
+
+/// O shell sincroniza o espelho do campo focado (`None` = sem foco).
+pub fn sync_ime(state: Option<(NSRange, Option<NSRange>, CGRect)>) {
+    INTERPRET.with(|flag| flag.set(state.is_some()));
+    IME.with(|ime| {
+        ime.set(state.map(|(selected, marked, caret_screen)| ImeMirror {
+            selected,
+            marked: marked.unwrap_or(NSRange { location: NS_NOT_FOUND, length: 0 }),
+            caret_screen,
+        }));
+    });
+}
+
+fn ime_mirror() -> Option<ImeMirror> {
+    IME.with(|ime| ime.get())
+}
+
+/// NSString OU NSAttributedString → Rust (o input system manda os dois).
+unsafe fn text_argument_to_string(object: Id) -> String {
+    unsafe {
+        if object.is_null() {
+            return String::new();
+        }
+        let plain = if msg_bool_sel(object, sel("respondsToSelector:"), sel("string")) != 0 {
+            msg_id(object, sel("string"))
+        } else {
+            object
+        };
+        let utf8 = msg_id(plain, sel("UTF8String")) as *const c_char;
+        if utf8.is_null() {
+            return String::new();
+        }
+        std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+    }
+}
+
+extern "C" fn bunny_insert_text(_this: Id, _sel: Sel, string: Id, _replacement: NSRange) {
+    let text = unsafe { text_argument_to_string(string) };
+    dispatch(AppEvent::ImeInsert { text });
+}
+
+extern "C" fn bunny_set_marked_text(
+    _this: Id,
+    _sel: Sel,
+    string: Id,
+    selected: NSRange,
+    _replacement: NSRange,
+) {
+    let text = unsafe { text_argument_to_string(string) };
+    dispatch(AppEvent::ImeMark { text, location: selected.location, length: selected.length });
+}
+
+extern "C" fn bunny_unmark_text(_this: Id, _sel: Sel) {
+    dispatch(AppEvent::ImeUnmark);
+}
+
+extern "C" fn bunny_has_marked_text(_this: Id, _sel: Sel) -> i8 {
+    i8::from(ime_mirror().is_some_and(|ime| ime.marked.location != NS_NOT_FOUND))
+}
+
+extern "C" fn bunny_marked_range(_this: Id, _sel: Sel) -> NSRange {
+    ime_mirror()
+        .map(|ime| ime.marked)
+        .unwrap_or(NSRange { location: NS_NOT_FOUND, length: 0 })
+}
+
+extern "C" fn bunny_selected_range(_this: Id, _sel: Sel) -> NSRange {
+    ime_mirror()
+        .map(|ime| ime.selected)
+        .unwrap_or(NSRange { location: 0, length: 0 })
+}
+
+extern "C" fn bunny_attributed_substring(
+    _this: Id,
+    _sel: Sel,
+    _range: NSRange,
+    _actual: *mut NSRange,
+) -> Id {
+    // piso honesto: alguns IMEs consultam para reconversão — sem isto a
+    // composição normal segue funcionando
+    std::ptr::null_mut()
+}
+
+extern "C" fn bunny_valid_attributes(_this: Id, _sel: Sel) -> Id {
+    unsafe { msg_id(class("NSArray"), sel("array")) }
+}
+
+/// Onde a janela de candidatos aterrissa: o rect do caret, em tela.
+extern "C" fn bunny_first_rect(
+    _this: Id,
+    _sel: Sel,
+    _range: NSRange,
+    _actual: *mut NSRange,
+) -> CGRect {
+    ime_mirror().map(|ime| ime.caret_screen).unwrap_or(CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize { width: 0.0, height: 0.0 },
+    })
+}
+
+extern "C" fn bunny_character_index(_this: Id, _sel: Sel, _point: CGPoint) -> u64 {
+    // piso honesto (lookup de dicionário por mouse fica para depois)
+    0
+}
+
+extern "C" fn bunny_do_command(_this: Id, _sel: Sel, command: Sel) {
+    let selector = unsafe {
+        let name = sel_getName(command);
+        if name.is_null() {
+            return;
+        }
+        std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
+    };
+    dispatch(AppEvent::Command { selector });
+}
+
+extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
     unsafe {
         let code = msg_u16(event, sel("keyCode"));
         let flags = msg_u64(event, sel("modifierFlags"));
         let shift = flags & (1 << 17) != 0;
         let command = flags & (1 << 20) != 0;
+
+        // campo focado sem cmd: o evento entra no sistema de input — a
+        // composição de IME volta por insertText/setMarkedText/doCommand
+        if INTERPRET.with(|flag| flag.get()) && !command {
+            let array = msg_id_arg(class("NSArray"), sel("arrayWithObject:"), event);
+            msg_void_id(this, sel("interpretKeyEvents:"), array);
+            return;
+        }
+
         let ns_chars = msg_id(event, sel("characters"));
         let chars = if ns_chars.is_null() {
             String::new()
@@ -354,6 +525,91 @@ unsafe fn register_classes() {
             bunny_accepts_first_responder as *const c_void,
             bool_getter.as_ptr(),
         );
+
+        // NSTextInputClient — a porta do sistema de input (IME de verdade)
+        let encode = |types: &str| CString::new(types).expect("type encoding");
+        let insert_types = encode("v@:@{_NSRange=QQ}");
+        class_addMethod(
+            view,
+            sel("insertText:replacementRange:"),
+            bunny_insert_text as *const c_void,
+            insert_types.as_ptr(),
+        );
+        let mark_types = encode("v@:@{_NSRange=QQ}{_NSRange=QQ}");
+        class_addMethod(
+            view,
+            sel("setMarkedText:selectedRange:replacementRange:"),
+            bunny_set_marked_text as *const c_void,
+            mark_types.as_ptr(),
+        );
+        let void_types = encode("v@:");
+        class_addMethod(
+            view,
+            sel("unmarkText"),
+            bunny_unmark_text as *const c_void,
+            void_types.as_ptr(),
+        );
+        class_addMethod(
+            view,
+            sel("hasMarkedText"),
+            bunny_has_marked_text as *const c_void,
+            bool_getter.as_ptr(),
+        );
+        let range_types = encode("{_NSRange=QQ}@:");
+        class_addMethod(
+            view,
+            sel("markedRange"),
+            bunny_marked_range as *const c_void,
+            range_types.as_ptr(),
+        );
+        class_addMethod(
+            view,
+            sel("selectedRange"),
+            bunny_selected_range as *const c_void,
+            range_types.as_ptr(),
+        );
+        let substring_types = encode("@@:{_NSRange=QQ}^{_NSRange=QQ}");
+        class_addMethod(
+            view,
+            sel("attributedSubstringForProposedRange:actualRange:"),
+            bunny_attributed_substring as *const c_void,
+            substring_types.as_ptr(),
+        );
+        let attrs_types = encode("@@:");
+        class_addMethod(
+            view,
+            sel("validAttributesForMarkedText"),
+            bunny_valid_attributes as *const c_void,
+            attrs_types.as_ptr(),
+        );
+        let rect_types = encode("{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}");
+        class_addMethod(
+            view,
+            sel("firstRectForCharacterRange:actualRange:"),
+            bunny_first_rect as *const c_void,
+            rect_types.as_ptr(),
+        );
+        let index_types = encode("Q@:{CGPoint=dd}");
+        class_addMethod(
+            view,
+            sel("characterIndexForPoint:"),
+            bunny_character_index as *const c_void,
+            index_types.as_ptr(),
+        );
+        let command_types = encode("v@::");
+        class_addMethod(
+            view,
+            sel("doCommandBySelector:"),
+            bunny_do_command as *const c_void,
+            command_types.as_ptr(),
+        );
+        let protocol = objc_getProtocol(
+            CString::new("NSTextInputClient").expect("nome").as_ptr(),
+        );
+        if !protocol.is_null() {
+            class_addProtocol(view, protocol);
+        }
+
         objc_registerClassPair(view);
 
         let delegate = objc_allocateClassPair(
@@ -415,6 +671,20 @@ impl WindowHandle {
             msg_void_f64(self.layer, sel("setContentsScale:"), self.scale() as f64);
             msg_void_id(self.layer, sel("setContents:"), image);
             CGImageRelease(image); // a layer retém
+        }
+    }
+
+    /// Um rect em coordenadas de LAYOUT (topo-esquerda) convertido para a
+    /// TELA do AppKit — onde a janela de candidatos do IME aterrissa.
+    pub fn layout_rect_to_screen(&self, x: f64, y: f64, width: f64, height: f64) -> CGRect {
+        unsafe {
+            let bounds = msg_rect(self.view, sel("bounds"));
+            // flip do AppKit + view == contentView (origem da janela)
+            let window_rect = CGRect {
+                origin: CGPoint { x, y: bounds.size.height - y - height },
+                size: CGSize { width, height },
+            };
+            msg_rect_rect(self.window, sel("convertRectToScreen:"), window_rect)
         }
     }
 

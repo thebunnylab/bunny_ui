@@ -202,6 +202,7 @@ impl View for TextField {
                     focused: false,
                     caret: None,
                     selection: None,
+                    marked: None,
                 });
             }
             // fora de um pass (uso decorativo): o valor vira texto puro
