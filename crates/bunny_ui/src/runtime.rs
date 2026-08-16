@@ -12,12 +12,15 @@
 //! [`Runtime::body_runs`].
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use motor::state::{Context, EnvironmentValues};
 
 use crate::effects;
-use crate::layout::{Interaction, Point, Px, Rect};
+use crate::layout::{Interaction, LayoutEnv, Point, Px, Rect};
 use crate::reconciler;
+use crate::text_engine::{FontSpec, MeasureCache, PixelFont, TextEngine};
 use crate::view::{NodeList, View};
 
 pub struct Runtime {
@@ -31,6 +34,14 @@ pub struct Runtime {
     /// Estado de ponteiro do frame — resolvido ANTES do layout (a LEI:
     /// hover troca pintura, nunca medida) e estampado na expansão.
     interaction: RefCell<Interaction>,
+    /// A borda de texto do frame — PixelFont por default (headless
+    /// byte-estável); o shell instala o engine da plataforma.
+    text: Rc<dyn TextEngine>,
+    /// Cache de medição double-buffer, trocado a cada passada de layout.
+    cache: MeasureCache,
+    /// Offsets de rolagem por identidade — engine-owned (a posse dupla da
+    /// premissa: no Dom o backend será o dono e observaremos).
+    scroll_offsets: RefCell<HashMap<String, Point>>,
 }
 
 impl Default for Runtime {
@@ -41,22 +52,31 @@ impl Default for Runtime {
 
 impl Runtime {
     pub fn new() -> Self {
-        Runtime {
-            ctx: Context::default(),
-            last_root: RefCell::new(None),
-            last_hits: RefCell::new(Vec::new()),
-            interaction: RefCell::new(Interaction::default()),
-        }
+        Self::with_parts(Context::default(), Rc::new(PixelFont))
     }
 
     pub fn with_environment(values: EnvironmentValues) -> Self {
         let mut ctx = Context::default();
         ctx.values = values;
+        Self::with_parts(ctx, Rc::new(PixelFont))
+    }
+
+    /// Troca o engine de texto (builder — compõe com `with_environment`):
+    /// `Runtime::new().text_engine(Rc::new(CoreTextEngine::new()))`.
+    pub fn text_engine(mut self, engine: Rc<dyn TextEngine>) -> Self {
+        self.text = engine;
+        self
+    }
+
+    fn with_parts(ctx: Context, text: Rc<dyn TextEngine>) -> Self {
         Runtime {
             ctx,
             last_root: RefCell::new(None),
             last_hits: RefCell::new(Vec::new()),
             interaction: RefCell::new(Interaction::default()),
+            text,
+            cache: MeasureCache::default(),
+            scroll_offsets: RefCell::new(HashMap::new()),
         }
     }
 
@@ -191,12 +211,13 @@ impl Runtime {
         {
             result = self.layout(root, crate::layout::Proposal::exact(size));
         }
-        crate::raster::rasterize_scaled(
+        crate::raster::rasterize_with(
             &result.display,
             (size.width.round() as usize) * scale,
             (size.height.round() as usize) * scale,
             scale,
             background,
+            &*self.text,
         )
     }
 
@@ -235,7 +256,19 @@ impl Runtime {
                 children: roots,
             }
         };
-        let result = crate::layout::layout(&tree, proposal);
+        self.cache.begin_frame();
+        let offsets = self.scroll_offsets.borrow();
+        let result = crate::layout::layout_with(
+            &tree,
+            proposal,
+            LayoutEnv {
+                text: &*self.text,
+                cache: &self.cache,
+                scroll_offsets: &offsets,
+                font: FontSpec::DEFAULT,
+            },
+        );
+        drop(offsets);
         *self.last_hits.borrow_mut() = result.hits.clone();
         result
     }
@@ -264,12 +297,13 @@ impl Runtime {
         scale: usize,
     ) -> crate::raster::Bitmap {
         let result = self.layout(root, crate::layout::Proposal::exact(size));
-        crate::raster::rasterize_scaled(
+        crate::raster::rasterize_with(
             &result.display,
             (size.width.round() as usize) * scale,
             (size.height.round() as usize) * scale,
             scale,
             crate::layout::Color::WHITE,
+            &*self.text,
         )
     }
 

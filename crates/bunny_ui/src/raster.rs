@@ -10,12 +10,13 @@
 //! convergem para a mesma coluna fecham sem fresta), decisão documentada e
 //! localizada — nunca espalhada pelo layout.
 //!
-//! A fonte é nossa: 3×5 pixels por glifo, desenhada à mão, desenhada ×2
-//! dentro da célula de 8×16 das métricas do layout. Legível o suficiente
-//! para o counter provar o pipeline; o sistema de texto real a substitui
-//! sem tocar na display list.
+//! Texto entra pelo [`TextEngine`] do frame: o engine rasteriza a linha
+//! num retângulo RGBA de alfa reto e o compositor daqui blenda no bitmap
+//! — um único caminho de composição para a fonte pixel da casa e para o
+//! CoreText do Mac (e para o canvas da web, um dia).
 
 use crate::layout::{Color, DisplayList, DrawCommand, Rect};
+use crate::text_engine::{PixelFont, TextEngine, TextRaster};
 
 /// Um buffer RGBA (um `u32` `0xRRGGBBAA` por pixel, linhas de cima para
 /// baixo) — o que o backend de plataforma blita na janela.
@@ -176,40 +177,23 @@ impl Bitmap {
         }
     }
 
-    /// Uma linha de texto na célula das métricas do layout: avanço de 8px
-    /// lógicos, glifo 3×5 desenhado ×(2·scale) com folga de (1, 3) lógicos
-    /// na célula 8×16.
-    fn draw_text_line(
-        &mut self,
-        origin_x: f64,
-        origin_y: f64,
-        scale: i64,
-        content: &str,
-        color: Color,
-    ) {
-        let packed = pack(color);
+    /// Compõe uma linha rasterizada pelo engine no origin lógico, snapado
+    /// UMA vez (o raster já vem em pixels físicos).
+    fn composite_text(&mut self, origin_x: f64, origin_y: f64, scale: usize, raster: &TextRaster) {
         let base_x = (origin_x * scale as f64).round() as i64;
         let base_y = (origin_y * scale as f64).round() as i64;
-        let block = 2 * scale;
-        for (index, ch) in content.chars().enumerate() {
-            let Some(rows) = glyph(ch) else { continue };
-            let cell_x = base_x + (index as i64 * 8 + 1) * scale;
-            let cell_y = base_y + 3 * scale;
-            for row in 0..5i64 {
-                for col in 0..3i64 {
-                    let bit = 14 - (row * 3 + col);
-                    if rows >> bit & 1 == 1 {
-                        for dy in 0..block {
-                            for dx in 0..block {
-                                self.set(
-                                    cell_x + col * block + dx,
-                                    cell_y + row * block + dy,
-                                    packed,
-                                );
-                            }
-                        }
-                    }
+        for row in 0..raster.height {
+            for col in 0..raster.width {
+                let index = (row * raster.width + col) * 4;
+                let alpha = raster.rgba[index + 3];
+                if alpha == 0 {
+                    continue;
                 }
+                let packed = ((raster.rgba[index] as u32) << 24)
+                    | ((raster.rgba[index + 1] as u32) << 16)
+                    | ((raster.rgba[index + 2] as u32) << 8)
+                    | alpha as u32;
+                self.set(base_x + col as i64, base_y + row as i64, packed);
             }
         }
     }
@@ -225,7 +209,8 @@ fn scale_rect(rect: Rect, scale: f64) -> Rect {
     }
 }
 
-/// Pinta a lista na ordem — quem vem depois pinta por cima.
+/// Pinta a lista na ordem — quem vem depois pinta por cima. Texto sai da
+/// fonte pixel da casa (o engine default).
 pub fn rasterize(display: &DisplayList, width: usize, height: usize, background: Color) -> Bitmap {
     rasterize_scaled(display, width, height, 1, background)
 }
@@ -240,6 +225,19 @@ pub fn rasterize_scaled(
     scale: usize,
     background: Color,
 ) -> Bitmap {
+    rasterize_with(display, width, height, scale, background, &PixelFont)
+}
+
+/// O caminho completo: pinta a lista com o [`TextEngine`] do frame — é o
+/// que o `Runtime` chama (PixelFont no headless, CoreText no Mac).
+pub fn rasterize_with(
+    display: &DisplayList,
+    width: usize,
+    height: usize,
+    scale: usize,
+    background: Color,
+    text: &dyn TextEngine,
+) -> Bitmap {
     let mut bitmap = Bitmap::new(width, height, background);
     let factor = scale as f64;
     for command in display.iter() {
@@ -250,66 +248,14 @@ pub fn rasterize_scaled(
             DrawCommand::StrokeRect { rect, color, width } => {
                 bitmap.stroke_rect(scale_rect(*rect, factor), *color, width * factor)
             }
-            DrawCommand::TextLine { origin, content, color } => {
-                bitmap.draw_text_line(origin.x, origin.y, scale as i64, content, *color)
+            DrawCommand::TextLine { origin, content, color, font } => {
+                if let Some(raster) = text.raster_line(content, font, *color, scale) {
+                    bitmap.composite_text(origin.x, origin.y, scale, &raster);
+                }
             }
         }
     }
     bitmap
-}
-
-/// A fonte da casa: 15 bits por glifo (3 colunas × 5 linhas, MSB = canto
-/// superior esquerdo). Maiúsculas caem nas minúsculas; o que não existe
-/// não pinta (a caixa vazia é honesta).
-fn glyph(ch: char) -> Option<u16> {
-    let rows = match ch.to_ascii_lowercase() {
-        '0' => 0b111_101_101_101_111,
-        '1' => 0b010_110_010_010_111,
-        '2' => 0b111_001_111_100_111,
-        '3' => 0b111_001_111_001_111,
-        '4' => 0b101_101_111_001_001,
-        '5' => 0b111_100_111_001_111,
-        '6' => 0b111_100_111_101_111,
-        '7' => 0b111_001_001_010_010,
-        '8' => 0b111_101_111_101_111,
-        '9' => 0b111_101_111_001_111,
-        'a' => 0b010_101_111_101_101,
-        'b' => 0b110_101_110_101_110,
-        'c' => 0b011_100_100_100_011,
-        'd' => 0b110_101_101_101_110,
-        'e' => 0b111_100_110_100_111,
-        'f' => 0b111_100_110_100_100,
-        'g' => 0b011_100_101_101_011,
-        'h' => 0b101_101_111_101_101,
-        'i' => 0b111_010_010_010_111,
-        'j' => 0b001_001_001_101_010,
-        'k' => 0b101_110_100_110_101,
-        'l' => 0b100_100_100_100_111,
-        'm' => 0b101_111_111_101_101,
-        'n' => 0b110_101_101_101_101,
-        'o' => 0b010_101_101_101_010,
-        'p' => 0b110_101_110_100_100,
-        'q' => 0b011_101_101_011_001,
-        'r' => 0b110_101_110_110_101,
-        's' => 0b011_100_010_001_110,
-        't' => 0b111_010_010_010_010,
-        'u' => 0b101_101_101_101_111,
-        'v' => 0b101_101_101_101_010,
-        'w' => 0b101_101_111_111_101,
-        'x' => 0b101_101_010_101_101,
-        'y' => 0b101_101_010_010_010,
-        'z' => 0b111_001_010_100_111,
-        ':' => 0b000_010_000_010_000,
-        '.' => 0b000_000_000_000_010,
-        ',' => 0b000_000_000_010_100,
-        '!' => 0b010_010_010_000_010,
-        '-' => 0b000_000_111_000_000,
-        '(' => 0b010_100_100_100_010,
-        ')' => 0b010_001_001_001_010,
-        ' ' => 0b000_000_000_000_000,
-        _ => return None,
-    };
-    Some(rows)
 }
 
 #[cfg(test)]
@@ -336,6 +282,7 @@ mod tests {
             origin: Point { x: 0.0, y: 0.0 },
             content: "1".to_string(),
             color: Color::BLACK,
+            font: crate::text_engine::FontSpec::DEFAULT,
         });
         let bitmap = rasterize(&display, 8, 16, Color::WHITE);
 

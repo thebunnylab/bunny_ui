@@ -48,6 +48,7 @@ pub mod raster;
 mod reconciler;
 pub mod runtime;
 pub mod state_ext;
+pub mod text_engine;
 pub mod view;
 pub mod views;
 
@@ -55,6 +56,7 @@ pub mod prelude {
     pub use crate::erased::{CustomModifier, Erased, erased};
     pub use crate::ext::ViewExt;
     pub use crate::layout::{Color, VisualProps};
+    pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
     pub use crate::runtime::Runtime;
     pub use crate::state_ext::{BindingExt, StateExt};
@@ -800,6 +802,57 @@ mod tests {
         let (_, rect) = result.hits.last().unwrap().clone();
         assert_eq!(rect.size.height, 28.0, "16 do label + 2×6");
         assert_eq!(rect.size.width, 44.0, "2 chars × 8 + 2×14");
+    }
+
+    #[test]
+    fn text_measures_through_the_engine() {
+        use crate::layout::{Proposal, Size};
+        use crate::text_engine::{LineMetrics, TextRaster};
+
+        // um engine de 10px/char prova a borda plugável: o frame muda sem
+        // NENHUM componente saber qual engine está ativo
+        struct Wide;
+        impl TextEngine for Wide {
+            fn measure_line(&self, text: &str, _font: &FontSpec) -> LineMetrics {
+                LineMetrics {
+                    width: text.chars().count() as f64 * 10.0,
+                    ascent: 15.0,
+                    descent: 5.0,
+                }
+            }
+            fn raster_line(
+                &self,
+                _text: &str,
+                _font: &FontSpec,
+                _color: Color,
+                _scale: usize,
+            ) -> Option<TextRaster> {
+                None
+            }
+        }
+
+        let runtime = Runtime::new().text_engine(Rc::new(Wide));
+        let result = runtime.layout(&text("abcd"), Proposal::unspecified());
+        assert_eq!(result.size, Size { width: 40.0, height: 20.0 });
+    }
+
+    #[test]
+    fn font_style_inherits_and_overrides() {
+        use crate::layout::{DrawCommand, Proposal};
+
+        let runtime = Runtime::new();
+        let view = vstack((text("big"), text("small").font(Font::Caption))).font(Font::Title);
+        let result = runtime.layout(&view, Proposal::unspecified());
+
+        let sizes: Vec<f64> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::TextLine { font, .. } => Some(font.size),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes, vec![22.0, 10.0], "Title herdado; Caption vence no filho");
     }
 
     #[test]

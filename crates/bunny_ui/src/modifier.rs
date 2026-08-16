@@ -22,6 +22,7 @@ use motor::view::RenderNode;
 
 use crate::erased::CustomModifier;
 use crate::layout::{Color, CrossAlign, Edges, LayoutNode, VisualProps};
+use crate::text_engine::{FontDesign, FontPatch, FontSpec, Weight};
 use crate::state_ext::BindingExt;
 use crate::view::{NodeList, Single, View};
 use crate::views::{Alignment, wrap_layout};
@@ -57,6 +58,7 @@ pub enum Modifier {
     ForegroundColor(Color),
     Border(Color, f64),
     CornerRadius(f64),
+    Monospaced,
 
     // MARK: - Interação (a ação dispara no render, como no motor headless)
     OnAppear(Rc<dyn Fn()>),
@@ -127,6 +129,7 @@ impl Modifier {
             Modifier::ForegroundColor(color) => format!(" [.foregroundColor({color})]"),
             Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
             Modifier::CornerRadius(radius) => format!(" [.cornerRadius({radius})]"),
+            Modifier::Monospaced => " [.monospaced()]".into(),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
             Modifier::OnTapGesture(_) => " [.onTapGesture()]".into(),
             Modifier::Effect { name, detail, .. } => format!(" [.{name}{detail}]"),
@@ -295,6 +298,29 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             Modifier::CornerRadius(radius) => wrap_styled(
                 out,
                 VisualProps { corner_radius: Some(*radius), ..VisualProps::default() },
+            ),
+            // fonte é propriedade herdada da cena — o mesmo Styled dos
+            // visuais carrega o patch (o measure aplica por cima do env)
+            Modifier::Font(font) => wrap_styled(
+                out,
+                VisualProps {
+                    font: FontPatch::full(FontSpec::resolve(*font)),
+                    ..VisualProps::default()
+                },
+            ),
+            Modifier::Bold => wrap_styled(
+                out,
+                VisualProps {
+                    font: FontPatch { weight: Some(Weight::Bold), ..FontPatch::default() },
+                    ..VisualProps::default()
+                },
+            ),
+            Modifier::Monospaced => wrap_styled(
+                out,
+                VisualProps {
+                    font: FontPatch { design: Some(FontDesign::Mono), ..FontPatch::default() },
+                    ..VisualProps::default()
+                },
             ),
             _ => {}
         }

@@ -211,6 +211,14 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.monospaced()` — troca o design da fonte herdada (grades).
+    fn monospaced(self) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Monospaced,
+        }
+    }
+
     // MARK: - Interação
 
     /// `.onTapGesture { … }` — no runtime headless dispara no render.

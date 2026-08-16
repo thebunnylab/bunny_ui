@@ -98,8 +98,8 @@ unsafe extern "C" {}
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
-    fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
-    fn CGColorSpaceRelease(space: *mut c_void);
+    pub(crate) fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+    pub(crate) fn CGColorSpaceRelease(space: *mut c_void);
     fn CGDataProviderCreateWithCFData(data: *const c_void) -> *mut c_void;
     fn CGDataProviderRelease(provider: *mut c_void);
     #[allow(clippy::too_many_arguments)]
@@ -122,7 +122,7 @@ unsafe extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
-    fn CFRelease(cf: *const c_void);
+    pub(crate) fn CFRelease(cf: *const c_void);
 }
 
 unsafe fn class(name: &str) -> Id {

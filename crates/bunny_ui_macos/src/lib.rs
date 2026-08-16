@@ -8,18 +8,23 @@
 #![cfg(target_os = "macos")]
 
 mod ffi;
+mod text;
+
+use std::rc::Rc;
 
 use bunny_ui::layout::{Color, Size};
 use bunny_ui::prelude::Runtime;
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
+pub use text::CoreTextEngine;
 
 /// Abre a janela e entra no ciclo vivo. Retorna quando o app encerra
 /// (fechar a janela encerra).
 pub fn run_window(title: &str, size: Size, root: impl View) {
     let window = ffi::create_window(title, size.width, size.height);
-    let runtime = Runtime::new();
+    // texto de verdade: o engine da plataforma entra no lugar do PixelFont
+    let runtime = Runtime::new().text_engine(Rc::new(CoreTextEngine::new()));
 
     // um frame completo: o Runtime estabiliza, faz layout, retém os hits
     // para os eventos de ponteiro e rasteriza — o shell só blita e alinha

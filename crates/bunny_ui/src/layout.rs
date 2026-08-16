@@ -20,11 +20,16 @@
 //! UMA vez por pass e emite print e layout juntos (avaliar duas vezes
 //! duplicaria âncoras de identidade). Depois da avaliação dos bodies, tudo
 //! se reduz aos built-ins — um conjunto fechado, então enum. As métricas de
-//! texto são determinísticas (8px por caractere, 16px por linha) até o
-//! sistema de fontes real chegar; os frames saem endereçados pelo caminho
-//! de identidade das fronteiras de view.
+//! texto vêm do [`TextEngine`] do frame (o [`PixelFont`] determinístico da
+//! casa por default — 8px por caractere, 16px por linha; CoreText no Mac);
+//! os frames saem endereçados pelo caminho de identidade das fronteiras.
+//!
+//! [`PixelFont`]: crate::text_engine::PixelFont
 
+use std::collections::HashMap;
 use std::rc::Rc;
+
+use crate::text_engine::{FontPatch, FontSpec, MeasureCache, PixelFont, TextEngine};
 
 /// Pixels lógicos. O snapping para pixels de dispositivo é decisão do
 /// backend real, num ponto único do pipeline — nunca espalhado.
@@ -110,9 +115,21 @@ impl Edges {
     }
 }
 
-const CHAR_W: Px = 8.0;
-/// Altura de linha das métricas fake — pública para os testes de frames.
+/// Altura de linha do [`PixelFont`] — pública para os testes de frames.
+///
+/// [`PixelFont`]: crate::text_engine::PixelFont
 pub const LINE_H: Px = 16.0;
+
+/// O contexto que desce pelas duas fases: o engine de texto do frame, o
+/// cache de medição, os offsets de rolagem (dono é o `Runtime`) e a fonte
+/// HERDADA corrente — [`LayoutNode::Styled`] troca ao descer.
+#[derive(Clone, Copy)]
+pub struct LayoutEnv<'a> {
+    pub text: &'a dyn TextEngine,
+    pub cache: &'a MeasureCache,
+    pub scroll_offsets: &'a HashMap<String, Point>,
+    pub font: FontSpec,
+}
 
 /// A árvore de layout que um pass de render emite. Conjunto fechado (tudo
 /// se reduz aos built-ins depois dos bodies), filhos em `Vec` — o dispatch
@@ -232,6 +249,10 @@ pub struct VisualProps {
     /// `VisualProps` inteiro fica para o port do tema.)
     pub background_hovered: Option<Color>,
     pub background_pressed: Option<Color>,
+    /// Patch de fonte herdado — a EXCEÇÃO da regra "props é só pintura":
+    /// fonte muda medida, então desce pelo `LayoutEnv` já na medição (o
+    /// estado de hover continua proibido de tocá-la).
+    pub font: FontPatch,
 }
 
 impl VisualProps {
@@ -245,6 +266,7 @@ impl VisualProps {
             corner_radius: self.corner_radius.or(outer.corner_radius),
             background_hovered: self.background_hovered.or(outer.background_hovered),
             background_pressed: self.background_pressed.or(outer.background_pressed),
+            font: self.font.or(outer.font),
         }
     }
 }
@@ -268,9 +290,10 @@ pub enum DrawCommand {
     FillRect { rect: Rect, color: Color, corner_radius: Px },
     /// Moldura pintada PARA DENTRO da aresta, `width` px lógicos.
     StrokeRect { rect: Rect, color: Color, width: Px },
-    /// Uma linha de texto já quebrada, na célula de origem (avanço de 8px
-    /// por caractere, célula de 16px — as métricas do layout).
-    TextLine { origin: Point, content: String, color: Color },
+    /// Uma linha de texto já quebrada. `origin` é o TOPO-esquerda da caixa
+    /// de linha (o engine converte para baseline internamente); `font` é a
+    /// fonte efetiva herdada no ponto da cena.
+    TextLine { origin: Point, content: String, color: Color, font: FontSpec },
 }
 
 /// A lista de desenho de um frame.
@@ -374,11 +397,33 @@ pub struct LayoutResult {
     pub hits: Vec<(String, Rect)>,
 }
 
-/// Roda as duas fases a partir do root.
+/// Roda as duas fases a partir do root com o ambiente default — o
+/// [`PixelFont`] determinístico, cache fresco, sem offsets de rolagem
+/// (testes e uso direto; o `Runtime` monta o env real em
+/// [`layout_with`]).
+///
+/// [`PixelFont`]: crate::text_engine::PixelFont
 pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
-    let (size, fit) = root.measure(proposal);
+    let engine = PixelFont;
+    let cache = MeasureCache::default();
+    let offsets = HashMap::new();
+    layout_with(
+        root,
+        proposal,
+        LayoutEnv {
+            text: &engine,
+            cache: &cache,
+            scroll_offsets: &offsets,
+            font: FontSpec::DEFAULT,
+        },
+    )
+}
+
+/// Roda as duas fases com o ambiente do frame.
+pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> LayoutResult {
+    let (size, fit) = root.measure(proposal, env);
     let mut out = Placement::default();
-    root.place(Rect { origin: Point::default(), size }, fit, &mut out);
+    root.place(Rect { origin: Point::default(), size }, fit, env, &mut out);
     LayoutResult { size, frames: out.frames, display: out.display, hits: out.hits }
 }
 
@@ -408,16 +453,21 @@ impl LayoutNode {
         }
     }
 
-    pub(crate) fn measure(&self, proposal: Proposal) -> (Size, Fit) {
+    pub(crate) fn measure(&self, proposal: Proposal, env: LayoutEnv) -> (Size, Fit) {
         match self {
             LayoutNode::Text { content } => {
-                let natural = content.chars().count() as Px * CHAR_W;
+                let metrics = env.cache.get_or_measure(content, &env.font, env.text);
+                let natural = metrics.width;
+                let line_h = metrics.height();
+                // quebra por avanço médio — herdeira honesta das métricas
+                // fake (exata no PixelFont); shape/wrap reais são a
+                // próxima fase do sistema de texto
                 let size = match proposal.width {
                     Some(width) if width > 0.0 && width < natural => {
                         let lines = (natural / width).ceil();
-                        Size { width, height: lines * LINE_H }
+                        Size { width, height: lines * line_h }
                     }
-                    _ => Size { width: natural, height: LINE_H },
+                    _ => Size { width: natural, height: line_h },
                 };
                 (size, Fit::Leaf)
             }
@@ -433,12 +483,12 @@ impl LayoutNode {
             LayoutNode::Leaf { size } => (*size, Fit::Leaf),
 
             LayoutNode::Stack { axis, spacing, children, .. } => {
-                measure_stack(*axis, *spacing, children, proposal)
+                measure_stack(*axis, *spacing, children, proposal, env)
             }
 
             LayoutNode::Layered { children } => {
                 let measured: Vec<(Size, Fit)> =
-                    children.iter().map(|child| child.measure(proposal)).collect();
+                    children.iter().map(|child| child.measure(proposal, env)).collect();
                 let size = measured.iter().fold(Size::default(), |acc, (size, _)| Size {
                     width: acc.width.max(size.width),
                     height: acc.height.max(size.height),
@@ -450,10 +500,13 @@ impl LayoutNode {
                 let inset = |length: Option<Px>, total: Px| {
                     length.map(|length| (length - total).max(0.0))
                 };
-                let (child_size, fit) = child.measure(Proposal {
-                    width: inset(proposal.width, edges.horizontal()),
-                    height: inset(proposal.height, edges.vertical()),
-                });
+                let (child_size, fit) = child.measure(
+                    Proposal {
+                        width: inset(proposal.width, edges.horizontal()),
+                        height: inset(proposal.height, edges.vertical()),
+                    },
+                    env,
+                );
                 let size = Size {
                     width: child_size.width + edges.horizontal(),
                     height: child_size.height + edges.vertical(),
@@ -462,10 +515,13 @@ impl LayoutNode {
             }
 
             LayoutNode::Frame { width, height, child } => {
-                let (child_size, fit) = child.measure(Proposal {
-                    width: width.or(proposal.width),
-                    height: height.or(proposal.height),
-                });
+                let (child_size, fit) = child.measure(
+                    Proposal {
+                        width: width.or(proposal.width),
+                        height: height.or(proposal.height),
+                    },
+                    env,
+                );
                 let size = Size {
                     width: width.unwrap_or(child_size.width),
                     height: height.unwrap_or(child_size.height),
@@ -479,10 +535,13 @@ impl LayoutNode {
                     None if max.is_finite() => Some(max),
                     None => None,
                 };
-                let (child_size, fit) = child.measure(Proposal {
-                    width: cap(proposal.width, *max_width),
-                    height: cap(proposal.height, *max_height),
-                });
+                let (child_size, fit) = child.measure(
+                    Proposal {
+                        width: cap(proposal.width, *max_width),
+                        height: cap(proposal.height, *max_height),
+                    },
+                    env,
+                );
                 // ∞ = preencha o proposto; finito = teto sobre o filho
                 let resolve = |proposed: Option<Px>, max: Px, child_len: Px| {
                     if max.is_infinite() {
@@ -499,10 +558,13 @@ impl LayoutNode {
             }
 
             LayoutNode::Scroll { child } => {
-                let (content, fit) = child.measure(Proposal {
-                    width: proposal.width,
-                    height: None,
-                });
+                let (content, fit) = child.measure(
+                    Proposal {
+                        width: proposal.width,
+                        height: None,
+                    },
+                    env,
+                );
                 let size = Size {
                     width: proposal.width.unwrap_or(content.width),
                     height: proposal.height.unwrap_or(content.height),
@@ -510,8 +572,16 @@ impl LayoutNode {
                 (size, Fit::ScrollContent(content, Box::new(fit)))
             }
 
-            LayoutNode::Interactive { child, .. } | LayoutNode::Styled { child, .. } => {
-                let (size, fit) = child.measure(proposal);
+            LayoutNode::Interactive { child, .. } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            LayoutNode::Styled { props, child } => {
+                // a fonte herdada troca AQUI, já na medição — é a exceção
+                // sancionada do VisualProps (fonte muda medida)
+                let env = LayoutEnv { font: props.font.apply_over(env.font), ..env };
+                let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
@@ -519,11 +589,11 @@ impl LayoutNode {
                 // fronteira com um filho é transparente; com vários, os
                 // filhos empilham na vertical (o TupleView implícito)
                 if children.len() == 1 {
-                    let (size, fit) = children[0].measure(proposal);
+                    let (size, fit) = children[0].measure(proposal, env);
                     (size, Fit::Children(vec![(size, fit)]))
                 } else {
                     let (size, fit) =
-                        measure_stack(Axis::Vertical, 0.0, children, proposal);
+                        measure_stack(Axis::Vertical, 0.0, children, proposal, env);
                     (size, fit)
                 }
             }
@@ -535,22 +605,28 @@ impl LayoutNode {
         }
     }
 
-    pub(crate) fn place(&self, frame: Rect, fit: Fit, out: &mut Placement) {
+    pub(crate) fn place(&self, frame: Rect, fit: Fit, env: LayoutEnv, out: &mut Placement) {
         match (self, fit) {
             // folhas visuais: aqui nasce a lista de desenho
             (LayoutNode::Text { content }, Fit::Leaf) => {
                 let color = out.foreground.last().copied().unwrap_or(Color::BLACK);
-                let per_line = ((frame.size.width / 8.0).floor() as usize).max(1);
                 let chars: Vec<char> = content.chars().collect();
-                for (line_index, line) in chars.chunks(per_line).enumerate() {
-                    out.display.push(DrawCommand::TextLine {
-                        origin: Point {
-                            x: frame.origin.x,
-                            y: frame.origin.y + line_index as Px * LINE_H,
-                        },
-                        content: line.iter().collect(),
-                        color,
-                    });
+                if !chars.is_empty() {
+                    let metrics = env.cache.get_or_measure(content, &env.font, env.text);
+                    let advance = (metrics.width / chars.len() as Px).max(1.0);
+                    let line_h = metrics.height();
+                    let per_line = ((frame.size.width / advance).floor() as usize).max(1);
+                    for (line_index, line) in chars.chunks(per_line).enumerate() {
+                        out.display.push(DrawCommand::TextLine {
+                            origin: Point {
+                                x: frame.origin.x,
+                                y: frame.origin.y + line_index as Px * line_h,
+                            },
+                            content: line.iter().collect(),
+                            color,
+                            font: env.font,
+                        });
+                    }
                 }
             }
 
@@ -571,7 +647,7 @@ impl LayoutNode {
             }
 
             (LayoutNode::Stack { axis, spacing, align, children }, Fit::Children(fits)) => {
-                place_stack(*axis, *spacing, *align, children, frame, fits, out);
+                place_stack(*axis, *spacing, *align, children, frame, fits, env, out);
             }
 
             (LayoutNode::Layered { children }, Fit::Children(fits)) => {
@@ -580,7 +656,7 @@ impl LayoutNode {
                         x: frame.origin.x + (frame.size.width - size.width) / 2.0,
                         y: frame.origin.y + (frame.size.height - size.height) / 2.0,
                     };
-                    child.place(Rect { origin, size }, fit, out);
+                    child.place(Rect { origin, size }, fit, env, out);
                 }
             }
 
@@ -589,7 +665,7 @@ impl LayoutNode {
                     x: frame.origin.x + edges.leading,
                     y: frame.origin.y + edges.top,
                 };
-                child.place(Rect { origin, size: child_size }, *fit, out);
+                child.place(Rect { origin, size: child_size }, *fit, env, out);
             }
 
             (LayoutNode::Frame { child, .. }, Fit::Wrapped(child_size, fit)) => {
@@ -597,7 +673,7 @@ impl LayoutNode {
                     x: frame.origin.x + (frame.size.width - child_size.width) / 2.0,
                     y: frame.origin.y + (frame.size.height - child_size.height) / 2.0,
                 };
-                child.place(Rect { origin, size: child_size }, *fit, out);
+                child.place(Rect { origin, size: child_size }, *fit, env, out);
             }
 
             (LayoutNode::MaxFrame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
@@ -608,16 +684,17 @@ impl LayoutNode {
                         CrossAlign::End => frame.size.width - child_size.width,
                     };
                 let y = frame.origin.y + (frame.size.height - child_size.height) / 2.0;
-                child.place(Rect { origin: Point { x, y }, size: child_size }, *fit, out);
+                child.place(Rect { origin: Point { x, y }, size: child_size }, *fit, env, out);
             }
 
             (LayoutNode::Scroll { child }, Fit::ScrollContent(content, fit)) => {
                 // o conteúdo vive no tamanho REAL a partir da origem da
                 // região (offset de rolagem e clip entram aqui no motor real)
-                child.place(Rect { origin: frame.origin, size: content }, *fit, out);
+                child.place(Rect { origin: frame.origin, size: content }, *fit, env, out);
             }
 
             (LayoutNode::Styled { props, child }, Fit::Wrapped(_, fit)) => {
+                let env = LayoutEnv { font: props.font.apply_over(env.font), ..env };
                 let (hovered, pressed) = out.pointer.last().copied().unwrap_or((false, false));
                 // pressed > hovered > normal; estado sem fundo próprio cai
                 // no fundo base — um botão sem hover definido não pisca
@@ -638,7 +715,7 @@ impl LayoutNode {
                 if let Some(color) = props.foreground {
                     out.foreground.push(color);
                 }
-                child.place(frame, *fit, out);
+                child.place(frame, *fit, env, out);
                 if props.foreground.is_some() {
                     out.foreground.pop();
                 }
@@ -651,7 +728,7 @@ impl LayoutNode {
                 let _ = size;
                 out.hits.push((path.clone(), frame));
                 out.pointer.push((*hovered, *pressed));
-                child.place(frame, *fit, out);
+                child.place(frame, *fit, env, out);
                 out.pointer.pop();
             }
 
@@ -661,7 +738,7 @@ impl LayoutNode {
                     let mut fits = fits;
                     let (size, fit) = fits.remove(0);
                     let _ = size;
-                    children[0].place(frame, fit, out);
+                    children[0].place(frame, fit, env, out);
                 } else {
                     place_stack(
                         Axis::Vertical,
@@ -670,6 +747,7 @@ impl LayoutNode {
                         children,
                         frame,
                         fits,
+                        env,
                         out,
                     );
                 }
@@ -693,6 +771,7 @@ fn measure_stack(
     spacing: Px,
     children: &[LayoutNode],
     proposal: Proposal,
+    env: LayoutEnv,
 ) -> (Size, Fit) {
     let cross_proposal = |main: Option<Px>| match axis {
         Axis::Vertical => Proposal { width: proposal.width, height: main },
@@ -714,7 +793,7 @@ fn measure_stack(
     // fase 1: naturais (proposta irrestrita no eixo principal)
     let mut measured: Vec<(Size, Fit)> = children
         .iter()
-        .map(|child| child.measure(cross_proposal(None)))
+        .map(|child| child.measure(cross_proposal(None), env))
         .collect();
 
     let spacing_total = spacing * children.len().saturating_sub(1) as Px;
@@ -737,7 +816,7 @@ fn measure_stack(
             .sum();
         let share = ((total - rigid - spacing_total) / flexible.len() as Px).max(0.0);
         for &index in &flexible {
-            measured[index] = children[index].measure(cross_proposal(Some(share)));
+            measured[index] = children[index].measure(cross_proposal(Some(share)), env);
         }
     }
 
@@ -754,6 +833,7 @@ fn measure_stack(
     (size, Fit::Children(measured))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn place_stack(
     axis: Axis,
     spacing: Px,
@@ -761,6 +841,7 @@ fn place_stack(
     children: &[LayoutNode],
     frame: Rect,
     fits: Vec<(Size, Fit)>,
+    env: LayoutEnv,
     out: &mut Placement,
 ) {
     let mut cursor = match axis {
@@ -783,7 +864,7 @@ fn place_stack(
                 y: frame.origin.y + cross_offset(frame.size.height, size.height),
             },
         };
-        child.place(Rect { origin, size }, fit, out);
+        child.place(Rect { origin, size }, fit, env, out);
         cursor += match axis {
             Axis::Vertical => size.height,
             Axis::Horizontal => size.width,
@@ -881,6 +962,20 @@ mod tests {
         assert_eq!(result.size, Size { width: 100.0, height: LINE_H });
     }
 
+    /// Mede um nó com o ambiente default dos testes (PixelFont).
+    fn measure_with_defaults(node: &LayoutNode, proposal: Proposal) -> Size {
+        let engine = PixelFont;
+        let cache = MeasureCache::default();
+        let offsets = HashMap::new();
+        let env = LayoutEnv {
+            text: &engine,
+            cache: &cache,
+            scroll_offsets: &offsets,
+            font: FontSpec::DEFAULT,
+        };
+        node.measure(proposal, env).0
+    }
+
     #[test]
     fn max_frame_fills_when_infinite_and_caps_when_finite() {
         let fill = LayoutNode::MaxFrame {
@@ -889,13 +984,15 @@ mod tests {
             align: CrossAlign::Start,
             child: Box::new(text(5)),
         };
-        let (size, _) = fill.measure(Proposal { width: Some(300.0), height: Some(500.0) });
+        let size =
+            measure_with_defaults(&fill, Proposal { width: Some(300.0), height: Some(500.0) });
         assert_eq!(size, Size { width: 300.0, height: LINE_H });
     }
 
     #[test]
     fn text_wraps_against_the_proposed_width() {
-        let (size, _) = text(100).measure(Proposal { width: Some(100.0), height: None });
+        let size =
+            measure_with_defaults(&text(100), Proposal { width: Some(100.0), height: None });
         // natural 800 → 8 linhas de 16
         assert_eq!(size, Size { width: 100.0, height: 128.0 });
     }
