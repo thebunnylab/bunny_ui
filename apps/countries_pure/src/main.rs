@@ -7,17 +7,14 @@
 //  deep link → destino.
 //
 
-mod root;
-mod ui;
-
 use countries_core::Core::DeepLinksHandler::{DeepLink, DeepLinksHandler, RealDeepLinksHandler};
 use countries_core::DependencyInjection::AppEnvironment::AppEnvironment;
 use countries_core::Repositories::Database::CountriesDBRepository::CountryDBModel;
 use countries_core::Repositories::Models::ApiModel;
 use bunny_ui::prelude::*;
 
-use crate::root::root_view;
-use crate::ui::country_details::CountryDetails;
+use countries_pure::root::root_view;
+use countries_pure::ui::country_details::CountryDetails;
 
 fn main() {
     // `AppEnvironment.bootstrap()` — mesma ordem de montagem do Swift

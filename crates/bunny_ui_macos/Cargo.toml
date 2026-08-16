@@ -6,3 +6,8 @@ description = "Shell macOS do bunny-ui — janela nativa e blit do bitmap, FFI O
 
 [dependencies]
 bunny-ui.workspace = true
+
+[dev-dependencies]
+# só para os examples (o countries de verdade numa janela nativa)
+countries-core.workspace = true
+countries-pure.workspace = true
