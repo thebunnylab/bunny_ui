@@ -805,6 +805,86 @@ mod tests {
     }
 
     #[test]
+    fn wheel_scrolls_clamps_and_persists_by_identity() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Rows {
+            flip: State<bool>,
+        }
+
+        impl Component for Rows {
+            fn body(&self, _ctx: &Context) -> impl View {
+                let _ = self.flip.get(); // lida: o set() invalida este body
+                list(
+                    (0..10).map(|index| index.to_string()).collect(),
+                    |item: &String| item.clone(),
+                    |item: &String| text(format!("row {item}")),
+                )
+            }
+        }
+
+        let rows = Rows { flip: State::new(false) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&rows);
+        let viewport = Proposal::exact(Size { width: 120.0, height: 100.0 });
+        let result = runtime.layout(&rows, viewport);
+
+        assert_eq!(result.scrolls.len(), 1, "a List é uma região com identidade");
+        let path = result.scrolls[0].path.clone();
+
+        // delta negativo (conteúdo para cima) → offset cresce
+        assert!(runtime.wheel(10.0, 10.0, 0.0, -30.0));
+        assert_eq!(runtime.scroll_offset(&path).y, 30.0);
+        // clamp snapado no fim do curso: 10×16 − 100 = 60
+        assert!(runtime.wheel(10.0, 10.0, 0.0, -500.0));
+        assert_eq!(runtime.scroll_offset(&path).y, 60.0);
+        assert!(!runtime.wheel(10.0, 10.0, 0.0, -1.0), "no fim do curso não há repaint");
+        assert!(!runtime.wheel(500.0, 500.0, 0.0, -10.0), "fora de qualquer região");
+
+        // o offset aplica no layout: a primeira linha de texto sobe 60
+        let scrolled = runtime.layout(&rows, viewport);
+        let first_line_y = scrolled
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::TextLine { origin, .. } => Some(origin.y),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(first_line_y, -60.0);
+
+        // invalidação e re-render NÃO perdem a posição — restauração por
+        // identidade estrutural
+        rows.flip.set(true);
+        runtime.render_stable(&rows);
+        let after = runtime.layout(&rows, viewport);
+        assert_eq!(runtime.scroll_offset(&path).y, 60.0);
+        let line_y = after
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::TextLine { origin, .. } => Some(origin.y),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(line_y, -60.0);
+
+        // rolagem programática vale no MESMO frame
+        runtime.set_scroll_offset(&path, crate::layout::Point { x: 0.0, y: 8.0 });
+        let programmatic = runtime.layout(&rows, viewport);
+        let line_y = programmatic
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::TextLine { origin, .. } => Some(origin.y),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(line_y, -8.0);
+    }
+
+    #[test]
     fn text_measures_through_the_engine() {
         use crate::layout::{Proposal, Size};
         use crate::text_engine::{LineMetrics, TextRaster};

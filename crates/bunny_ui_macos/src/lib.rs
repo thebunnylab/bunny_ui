@@ -22,9 +22,16 @@ pub use text::CoreTextEngine;
 /// Abre a janela e entra no ciclo vivo. Retorna quando o app encerra
 /// (fechar a janela encerra).
 pub fn run_window(title: &str, size: Size, root: impl View) {
-    let window = ffi::create_window(title, size.width, size.height);
     // texto de verdade: o engine da plataforma entra no lugar do PixelFont
     let runtime = Runtime::new().text_engine(Rc::new(CoreTextEngine::new()));
+    run_window_with(title, size, runtime, root)
+}
+
+/// Como [`run_window`], mas com o `Runtime` montado pelo caller — o
+/// caminho de apps com environment próprio (o engine de texto ainda é
+/// responsabilidade de quem monta).
+pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl View) {
+    let window = ffi::create_window(title, size.width, size.height);
 
     // um frame completo: o Runtime estabiliza, faz layout, retém os hits
     // para os eventos de ponteiro e rasteriza — o shell só blita e alinha
@@ -55,6 +62,12 @@ pub fn run_window(title: &str, size: Size, root: impl View) {
         }
         AppEvent::MouseExited => {
             if runtime.pointer_exited() {
+                blit(&runtime, &root);
+            }
+        }
+        AppEvent::Wheel { x, y, dx, dy } => {
+            // offset é estado do engine: repaint sem render (zero bodies)
+            if runtime.wheel(x, y, dx, dy) {
                 blit(&runtime, &root);
             }
         }

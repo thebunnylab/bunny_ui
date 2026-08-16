@@ -18,7 +18,7 @@ use std::rc::Rc;
 use motor::state::{Context, EnvironmentValues};
 
 use crate::effects;
-use crate::layout::{Interaction, LayoutEnv, Point, Px, Rect};
+use crate::layout::{Interaction, LayoutEnv, Point, Px, Rect, ScrollRegion};
 use crate::reconciler;
 use crate::text_engine::{FontSpec, MeasureCache, PixelFont, TextEngine};
 use crate::view::{NodeList, View};
@@ -40,8 +40,12 @@ pub struct Runtime {
     /// Cache de medição double-buffer, trocado a cada passada de layout.
     cache: MeasureCache,
     /// Offsets de rolagem por identidade — engine-owned (a posse dupla da
-    /// premissa: no Dom o backend será o dono e observaremos).
+    /// premissa: no Dom o backend será o dono e observaremos). Não são
+    /// podados quando a identidade some: a lista remontada RESTAURA a
+    /// posição (GC atado à varredura fica anotado como futuro).
     scroll_offsets: RefCell<HashMap<String, Point>>,
+    /// As regiões de rolagem do último layout — o mapa do wheel.
+    last_scrolls: RefCell<Vec<ScrollRegion>>,
 }
 
 impl Default for Runtime {
@@ -77,6 +81,7 @@ impl Runtime {
             text,
             cache: MeasureCache::default(),
             scroll_offsets: RefCell::new(HashMap::new()),
+            last_scrolls: RefCell::new(Vec::new()),
         }
     }
 
@@ -191,6 +196,53 @@ impl Runtime {
         self.interaction.borrow().clone()
     }
 
+    // MARK: - Rolagem (offset é estado do ENGINE: nenhuma view invalida)
+
+    /// Roteia o wheel para a região mais interna sob o ponto COM curso no
+    /// eixo do delta. Convenção AppKit: delta positivo revela conteúdo
+    /// acima — o offset diminui. `true` = moveu (o shell repinta; sem
+    /// render: zero bodies).
+    pub fn wheel(&self, x: Px, y: Px, dx: Px, dy: Px) -> bool {
+        let scrolls = self.last_scrolls.borrow();
+        let travel = |region: &ScrollRegion| {
+            let max_x =
+                (region.content.width.round() - region.frame.size.width.round()).max(0.0);
+            let max_y =
+                (region.content.height.round() - region.frame.size.height.round()).max(0.0);
+            (max_x, max_y)
+        };
+        let Some(region) = scrolls.iter().find(|region| {
+            region.frame.contains(x, y) && {
+                let (max_x, max_y) = travel(region);
+                (dx != 0.0 && max_x > 0.0) || (dy != 0.0 && max_y > 0.0)
+            }
+        }) else {
+            return false;
+        };
+        let (max_x, max_y) = travel(region);
+        let mut offsets = self.scroll_offsets.borrow_mut();
+        let current = offsets.get(&region.path).copied().unwrap_or_default();
+        let next = Point {
+            x: (current.x - dx).clamp(0.0, max_x),
+            y: (current.y - dy).clamp(0.0, max_y),
+        };
+        let moved = next != current;
+        if moved {
+            offsets.insert(region.path.clone(), next);
+        }
+        moved
+    }
+
+    /// Rolagem programática — o PRÓXIMO layout (mesmo frame) já aplica,
+    /// com clamp no place.
+    pub fn set_scroll_offset(&self, path: &str, offset: Point) {
+        self.scroll_offsets.borrow_mut().insert(path.to_string(), offset);
+    }
+
+    pub fn scroll_offset(&self, path: &str) -> Point {
+        self.scroll_offsets.borrow().get(path).copied().unwrap_or_default()
+    }
+
     /// Um frame completo para o shell: estabiliza, layout no viewport,
     /// raster no scale — os hits ficam retidos para os eventos. Se o
     /// conteúdo andou sob o ponteiro parado (uma ação inseriu/removeu), o
@@ -270,6 +322,7 @@ impl Runtime {
         );
         drop(offsets);
         *self.last_hits.borrow_mut() = result.hits.clone();
+        *self.last_scrolls.borrow_mut() = result.scrolls.clone();
         result
     }
 

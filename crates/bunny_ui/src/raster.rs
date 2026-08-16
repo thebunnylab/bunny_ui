@@ -24,6 +24,9 @@ pub struct Bitmap {
     width: usize,
     height: usize,
     pixels: Vec<u32>,
+    /// Pilha de clip em px físicos (interseções já resolvidas) — `set`
+    /// consulta o topo; fill, stroke e texto respeitam de graça.
+    clip: Vec<(i64, i64, i64, i64)>,
 }
 
 fn pack(color: Color) -> u32 {
@@ -60,7 +63,7 @@ fn blend_px(src: u32, dst: u32) -> u32 {
 
 impl Bitmap {
     pub fn new(width: usize, height: usize, background: Color) -> Self {
-        Bitmap { width, height, pixels: vec![pack(background); width * height] }
+        Bitmap { width, height, pixels: vec![pack(background); width * height], clip: Vec::new() }
     }
 
     pub fn width(&self) -> usize {
@@ -94,10 +97,30 @@ impl Bitmap {
     }
 
     fn set(&mut self, x: i64, y: i64, color: u32) {
-        if x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height {
-            let index = y as usize * self.width + x as usize;
-            self.pixels[index] = blend_px(color, self.pixels[index]);
+        if x < 0 || y < 0 || (x as usize) >= self.width || (y as usize) >= self.height {
+            return;
         }
+        if let Some((cx0, cy0, cx1, cy1)) = self.clip.last().copied()
+            && (x < cx0 || y < cy0 || x >= cx1 || y >= cy1)
+        {
+            return;
+        }
+        let index = y as usize * self.width + x as usize;
+        self.pixels[index] = blend_px(color, self.pixels[index]);
+    }
+
+    /// Empilha o clip snapado, já intersectado com o topo corrente.
+    fn push_clip(&mut self, rect: Rect) {
+        let (x0, y0, x1, y1) = Self::snap(rect);
+        let clipped = match self.clip.last().copied() {
+            Some((cx0, cy0, cx1, cy1)) => (x0.max(cx0), y0.max(cy0), x1.min(cx1), y1.min(cy1)),
+            None => (x0, y0, x1, y1),
+        };
+        self.clip.push(clipped);
+    }
+
+    fn pop_clip(&mut self) {
+        self.clip.pop();
     }
 
     /// Arestas arredondadas em device px — o ponto único de snapping.
@@ -253,6 +276,8 @@ pub fn rasterize_with(
                     bitmap.composite_text(origin.x, origin.y, scale, &raster);
                 }
             }
+            DrawCommand::PushClip { rect } => bitmap.push_clip(scale_rect(*rect, factor)),
+            DrawCommand::PopClip => bitmap.pop_clip(),
         }
     }
     bitmap

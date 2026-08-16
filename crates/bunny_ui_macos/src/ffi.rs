@@ -88,6 +88,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_init_tracking(obj: Id, sel: Sel, rect: CGRect, options: u64, owner: Id, info: Id)
     -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_bool(obj: Id, sel: Sel) -> i8;
 }
 
 // AppKit/QuartzCore entram pelo runtime ObjC; o link garante as classes.
@@ -147,6 +149,9 @@ pub enum AppEvent {
     /// O ponteiro saiu da janela — sem este evento o hover ficaria preso
     /// na borda (a razão de usar NSTrackingArea).
     MouseExited,
+    /// Rolagem: deltas em pontos (trackpad já vem preciso e com momentum;
+    /// roda legada é convertida de linhas para pontos na chegada).
+    Wheel { x: f64, y: f64, dx: f64, dy: f64 },
     /// A janela mudou de tamanho (ou precisa do primeiro frame).
     Redraw,
 }
@@ -202,6 +207,21 @@ extern "C" fn bunny_mouse_exited(_this: Id, _sel: Sel, _event: Id) {
     dispatch(AppEvent::MouseExited);
 }
 
+extern "C" fn bunny_scroll_wheel(this: Id, _sel: Sel, event: Id) {
+    unsafe {
+        let (x, y) = event_layout_point(this, event);
+        let mut dx = msg_f64(event, sel("scrollingDeltaX"));
+        let mut dy = msg_f64(event, sel("scrollingDeltaY"));
+        // trackpad entrega pontos precisos; roda legada entrega TIQUES de
+        // linha — converte para pontos aqui, uma vez
+        if msg_bool(event, sel("hasPreciseScrollingDeltas")) == 0 {
+            dx *= 16.0;
+            dy *= 16.0;
+        }
+        dispatch(AppEvent::Wheel { x, y, dx, dy });
+    }
+}
+
 extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, _note: Id) {
     dispatch(AppEvent::Redraw);
 }
@@ -253,6 +273,12 @@ unsafe fn register_classes() {
             view,
             sel("mouseExited:"),
             bunny_mouse_exited as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            view,
+            sel("scrollWheel:"),
+            bunny_scroll_wheel as *const c_void,
             types.as_ptr(),
         );
         objc_registerClassPair(view);

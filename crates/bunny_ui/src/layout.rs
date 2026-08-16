@@ -154,7 +154,9 @@ pub enum LayoutNode {
     MaxFrame { max_width: Px, max_height: Px, align: CrossAlign, child: Box<LayoutNode> },
     /// Região de rolagem vertical: responde o oferecido, mede o conteúdo
     /// sem restrição e guarda o excedente para si (o contrato de shrink).
-    Scroll { child: Box<LayoutNode> },
+    /// `path` é a identidade estrutural da região — o endereço do offset
+    /// retido (rolagem restaura quando a lista remonta).
+    Scroll { path: Option<String>, child: Box<LayoutNode> },
     /// Propriedade visual semântica: background atrás do filho, border por
     /// cima, foreground herdado. Transparente para a medida — por tipo.
     Styled { props: VisualProps, child: Box<LayoutNode> },
@@ -200,6 +202,8 @@ impl Color {
     pub const OUTLINE: Color = Color { r: 150, g: 155, b: 165, a: 255 };
     /// Fundo padrão de janela — off-white frio, o chão do tema-de-um-lápis.
     pub const CANVAS: Color = Color::hex(0xF2F3F7);
+    /// A thumb da scrollbar — véu translúcido (o blending é real).
+    pub const SCROLLBAR: Color = Color { r: 0, g: 0, b: 0, a: 90 };
 
     pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
         Color { r, g, b, a: 255 }
@@ -294,6 +298,10 @@ pub enum DrawCommand {
     /// de linha (o engine converte para baseline internamente); `font` é a
     /// fonte efetiva herdada no ponto da cena.
     TextLine { origin: Point, content: String, color: Color, font: FontSpec },
+    /// Daqui até o [`DrawCommand::PopClip`] par, todo desenho intersecta
+    /// este rect (o rect já chega intersectado com o clip de fora).
+    PushClip { rect: Rect },
+    PopClip,
 }
 
 /// A lista de desenho de um frame.
@@ -324,16 +332,51 @@ impl DisplayList {
 /// lista de desenho (rasterizador/backends) e os alvos de interação (na
 /// ordem de pintura — o hit-test varre de trás para frente, o de cima
 /// ganha).
+/// Uma região de rolagem colocada — o mapa do wheel. As regiões entram
+/// filho-antes-do-pai: a mais interna sob o ponto decide primeiro.
+#[derive(Clone, Debug)]
+pub struct ScrollRegion {
+    pub path: String,
+    pub frame: Rect,
+    pub content: Size,
+}
+
 #[derive(Default, Debug)]
 pub struct Placement {
     pub frames: Frames,
     pub display: DisplayList,
     pub hits: Vec<(String, Rect)>,
+    pub scrolls: Vec<ScrollRegion>,
     /// Pilha do foreground herdado — o topo colore o texto.
     foreground: Vec<Color>,
     /// Pilha do `(hovered, pressed)` do `Interactive` mais próximo — o
     /// `Styled` escolhe o fundo por ela.
     pointer: Vec<(bool, bool)>,
+    /// Pilha do clip corrente (interseções em coordenadas lógicas) — quem
+    /// registra hit consulta; o raster refaz o corte em px físicos.
+    clip: Vec<Rect>,
+}
+
+impl Placement {
+    fn push_clip(&mut self, rect: Rect) {
+        let clipped = match self.clip.last() {
+            Some(top) => rect
+                .intersection(*top)
+                .unwrap_or(Rect { origin: rect.origin, size: Size::default() }),
+            None => rect,
+        };
+        self.display.push(DrawCommand::PushClip { rect: clipped });
+        self.clip.push(clipped);
+    }
+
+    fn pop_clip(&mut self) {
+        self.display.push(DrawCommand::PopClip);
+        self.clip.pop();
+    }
+
+    fn current_clip(&self) -> Option<Rect> {
+        self.clip.last().copied()
+    }
 }
 
 impl Rect {
@@ -342,6 +385,18 @@ impl Rect {
             && y >= self.origin.y
             && x < self.origin.x + self.size.width
             && y < self.origin.y + self.size.height
+    }
+
+    /// `None` = interseção vazia.
+    pub fn intersection(&self, other: Rect) -> Option<Rect> {
+        let x0 = self.origin.x.max(other.origin.x);
+        let y0 = self.origin.y.max(other.origin.y);
+        let x1 = (self.origin.x + self.size.width).min(other.origin.x + other.size.width);
+        let y1 = (self.origin.y + self.size.height).min(other.origin.y + other.size.height);
+        (x1 > x0 && y1 > y0).then(|| Rect {
+            origin: Point { x: x0, y: y0 },
+            size: Size { width: x1 - x0, height: y1 - y0 },
+        })
     }
 }
 
@@ -395,6 +450,7 @@ pub struct LayoutResult {
     pub frames: Frames,
     pub display: DisplayList,
     pub hits: Vec<(String, Rect)>,
+    pub scrolls: Vec<ScrollRegion>,
 }
 
 /// Roda as duas fases a partir do root com o ambiente default — o
@@ -424,7 +480,13 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
     let (size, fit) = root.measure(proposal, env);
     let mut out = Placement::default();
     root.place(Rect { origin: Point::default(), size }, fit, env, &mut out);
-    LayoutResult { size, frames: out.frames, display: out.display, hits: out.hits }
+    LayoutResult {
+        size,
+        frames: out.frames,
+        display: out.display,
+        hits: out.hits,
+        scrolls: out.scrolls,
+    }
 }
 
 impl LayoutNode {
@@ -557,7 +619,7 @@ impl LayoutNode {
                 (size, Fit::Wrapped(child_size, Box::new(fit)))
             }
 
-            LayoutNode::Scroll { child } => {
+            LayoutNode::Scroll { child, .. } => {
                 let (content, fit) = child.measure(
                     Proposal {
                         width: proposal.width,
@@ -687,10 +749,45 @@ impl LayoutNode {
                 child.place(Rect { origin: Point { x, y }, size: child_size }, *fit, env, out);
             }
 
-            (LayoutNode::Scroll { child }, Fit::ScrollContent(content, fit)) => {
-                // o conteúdo vive no tamanho REAL a partir da origem da
-                // região (offset de rolagem e clip entram aqui no motor real)
-                child.place(Rect { origin: frame.origin, size: content }, *fit, env, out);
+            (LayoutNode::Scroll { path, child }, Fit::ScrollContent(content, fit)) => {
+                // curso por eixo sobre valores SNAPADOS: "rolável por
+                // 0.000001px" não existe aqui por construção
+                let max_x = (content.width.round() - frame.size.width.round()).max(0.0);
+                let max_y = (content.height.round() - frame.size.height.round()).max(0.0);
+                let raw = path
+                    .as_deref()
+                    .and_then(|path| env.scroll_offsets.get(path))
+                    .copied()
+                    .unwrap_or_default();
+                // conteúdo que encolheu re-clampa aqui — o offset retido
+                // nunca deixa a região em terra de ninguém
+                let offset =
+                    Point { x: raw.x.clamp(0.0, max_x), y: raw.y.clamp(0.0, max_y) };
+                out.push_clip(frame);
+                child.place(
+                    Rect {
+                        origin: Point {
+                            x: frame.origin.x - offset.x,
+                            y: frame.origin.y - offset.y,
+                        },
+                        size: content,
+                    },
+                    *fit,
+                    env,
+                    out,
+                );
+                if max_y > 0.0 {
+                    draw_scrollbar(frame, content.height, offset.y, max_y, out);
+                }
+                out.pop_clip();
+                if let Some(path) = path {
+                    // depois do filho: regiões internas ficam ANTES no vec
+                    out.scrolls.push(ScrollRegion {
+                        path: path.clone(),
+                        frame,
+                        content,
+                    });
+                }
             }
 
             (LayoutNode::Styled { props, child }, Fit::Wrapped(_, fit)) => {
@@ -726,7 +823,16 @@ impl LayoutNode {
 
             (LayoutNode::Interactive { path, hovered, pressed, child }, Fit::Wrapped(size, fit)) => {
                 let _ = size;
-                out.hits.push((path.clone(), frame));
+                // fora do viewport o hit NÃO existe; row meio-visível
+                // clica só na parte visível (o rect registrado é a
+                // interseção com o clip corrente)
+                let visible = match out.current_clip() {
+                    Some(clip) => frame.intersection(clip),
+                    None => Some(frame),
+                };
+                if let Some(visible) = visible {
+                    out.hits.push((path.clone(), visible));
+                }
                 out.pointer.push((*hovered, *pressed));
                 child.place(frame, *fit, env, out);
                 out.pointer.pop();
@@ -833,6 +939,35 @@ fn measure_stack(
     (size, Fit::Children(measured))
 }
 
+const SCROLLBAR_W: Px = 4.0;
+const SCROLLBAR_INSET: Px = 6.0;
+const SCROLLBAR_MIN: Px = 24.0;
+
+/// A thumb da região — draw-only nesta fase (drag chega com pointer
+/// capture): 4px de largura a 6px da borda direita, trilho com inset 6,
+/// piso de 24, proporcional ao viewport — e só existe quando há overflow
+/// (conteúdo curto nunca ganha barra).
+fn draw_scrollbar(frame: Rect, content_h: Px, offset_y: Px, max_y: Px, out: &mut Placement) {
+    let track = frame.size.height - 2.0 * SCROLLBAR_INSET;
+    if track <= 0.0 {
+        return;
+    }
+    let thumb_h = ((frame.size.height / content_h) * track).max(SCROLLBAR_MIN).min(track);
+    let travel = track - thumb_h;
+    let thumb_y = frame.origin.y + SCROLLBAR_INSET + travel * (offset_y / max_y);
+    out.display.push(DrawCommand::FillRect {
+        rect: Rect {
+            origin: Point {
+                x: frame.origin.x + frame.size.width - SCROLLBAR_INSET - SCROLLBAR_W,
+                y: thumb_y,
+            },
+            size: Size { width: SCROLLBAR_W, height: thumb_h },
+        },
+        color: Color::SCROLLBAR,
+        corner_radius: SCROLLBAR_W / 2.0,
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn place_stack(
     axis: Axis,
@@ -918,7 +1053,10 @@ mod tests {
                 boundary("header", text(10)),
                 boundary(
                     "region",
-                    LayoutNode::Scroll { child: Box::new(boundary("content", text(1000))) },
+                    LayoutNode::Scroll {
+                        path: None,
+                        child: Box::new(boundary("content", text(1000))),
+                    },
                 ),
             ],
         };
@@ -999,6 +1137,120 @@ mod tests {
 
     fn styled(props: VisualProps, child: LayoutNode) -> LayoutNode {
         LayoutNode::Styled { props, child: Box::new(child) }
+    }
+
+    fn rows(count: usize) -> LayoutNode {
+        LayoutNode::Stack {
+            axis: Axis::Vertical,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children: (0..count)
+                .map(|index| boundary(&format!("row{index}"), text(4)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn scroll_offset_moves_content_under_the_clip() {
+        let engine = PixelFont;
+        let cache = MeasureCache::default();
+        let mut offsets = HashMap::new();
+        offsets.insert("lista".to_string(), Point { x: 0.0, y: 40.0 });
+        let env = LayoutEnv {
+            text: &engine,
+            cache: &cache,
+            scroll_offsets: &offsets,
+            font: FontSpec::DEFAULT,
+        };
+
+        let root = LayoutNode::Scroll {
+            path: Some("lista".to_string()),
+            child: Box::new(rows(10)),
+        };
+        let result = layout_with(
+            &root,
+            Proposal::exact(Size { width: 100.0, height: 100.0 }),
+            env,
+        );
+
+        assert_eq!(result.scrolls.len(), 1);
+        assert_eq!(result.scrolls[0].content.height, 160.0, "o content real fica na região");
+        assert_eq!(
+            result.frames.get("row0").unwrap().origin.y,
+            -40.0,
+            "offset 40 empurra a row 0 para cima do viewport"
+        );
+        assert!(
+            result.display.iter().any(|command| matches!(
+                command,
+                DrawCommand::PushClip { rect } if rect.size.height == 100.0
+            )),
+            "a região clipa no frame dela"
+        );
+    }
+
+    #[test]
+    fn hits_outside_the_viewport_do_not_exist() {
+        let interactive = |path: &str| LayoutNode::Interactive {
+            path: path.to_string(),
+            hovered: false,
+            pressed: false,
+            child: Box::new(text(4)),
+        };
+        let root = LayoutNode::Scroll {
+            path: Some("lista".to_string()),
+            child: Box::new(LayoutNode::Stack {
+                axis: Axis::Vertical,
+                spacing: 0.0,
+                align: CrossAlign::Start,
+                children: vec![
+                    interactive("dentro"), // y [0, 16)
+                    interactive("metade"), // y [16, 32) — o viewport corta em 24
+                    interactive("fora"),   // y [32, 48) — invisível
+                ],
+            }),
+        };
+        let result = layout(&root, Proposal::exact(Size { width: 100.0, height: 24.0 }));
+
+        assert!(result.hits.iter().any(|(path, _)| path == "dentro"));
+        let metade = result
+            .hits
+            .iter()
+            .find(|(path, _)| path == "metade")
+            .map(|(_, rect)| *rect)
+            .expect("meio-visível existe");
+        assert_eq!(metade.size.height, 8.0, "o hit é só a parte visível");
+        assert!(
+            !result.hits.iter().any(|(path, _)| path == "fora"),
+            "fora do viewport o hit NÃO existe"
+        );
+    }
+
+    #[test]
+    fn scrollbar_appears_only_with_overflow() {
+        let scroll = |count: usize| LayoutNode::Scroll {
+            path: Some("lista".to_string()),
+            child: Box::new(rows(count)),
+        };
+        let viewport = Proposal::exact(Size { width: 100.0, height: 100.0 });
+        let thumb_of = |result: &LayoutResult| {
+            result.display.iter().find_map(|command| match command {
+                DrawCommand::FillRect { rect, color, .. } if *color == Color::SCROLLBAR => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+        };
+
+        let fits = layout(&scroll(2), viewport);
+        assert!(thumb_of(&fits).is_none(), "conteúdo curto nunca ganha barra");
+
+        let over = layout(&scroll(10), viewport);
+        let thumb = thumb_of(&over).expect("overflow ganha thumb");
+        // trilho 88 (inset 6 dos dois lados), proporcional 100/160
+        assert_eq!(thumb.size.height, (100.0 / 160.0_f64 * 88.0).max(24.0));
+        assert_eq!(thumb.size.width, 4.0);
+        assert_eq!(thumb.origin.x, 100.0 - 6.0 - 4.0);
     }
 
     #[test]

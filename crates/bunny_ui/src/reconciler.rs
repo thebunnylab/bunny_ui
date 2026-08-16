@@ -363,7 +363,8 @@ pub(crate) fn expand_layout(node: &LayoutNode, interaction: &Interaction) -> Lay
                 child: Box::new(expand_layout(child, interaction)),
             }
         }
-        LayoutNode::Scroll { child } => LayoutNode::Scroll {
+        LayoutNode::Scroll { path, child } => LayoutNode::Scroll {
+            path: path.clone(),
             child: Box::new(expand_layout(child, interaction)),
         },
         LayoutNode::Styled { props, child } => LayoutNode::Styled {

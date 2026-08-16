@@ -554,8 +554,10 @@ where
             rows,
         ));
         // List é uma região de rolagem por natureza: as rows empilham e o
-        // excedente fica por dentro
+        // excedente fica por dentro; a identidade estrutural endereça o
+        // offset retido (a lista remontada restaura a posição)
         out.push_layout(LayoutNode::Scroll {
+            path: motor::identity::cursor_scope(),
             child: Box::new(LayoutNode::Stack {
                 axis: Axis::Vertical,
                 spacing: 0.0,
@@ -672,7 +674,10 @@ impl<H: View, C: View> View for Section<H, C> {
         // a List de sections (list_content) é região de rolagem; a Section
         // comum é só o empilhamento
         out.push_layout(if self.kind == "List" {
-            LayoutNode::Scroll { child: Box::new(stacked) }
+            LayoutNode::Scroll {
+                path: motor::identity::cursor_scope(),
+                child: Box::new(stacked),
+            }
         } else {
             stacked
         });
