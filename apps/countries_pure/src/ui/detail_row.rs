@@ -24,7 +24,7 @@ impl<L: View<Arity = Single>, R: View<Arity = Single>> DetailRow<L, R> {
 }
 
 impl<L: View<Arity = Single>, R: View<Arity = Single>> Component for DetailRow<L, R> {
-    fn body(&self, _ctx: &Context) -> impl View {
+    fn body(self, _ctx: &Context) -> impl View {
         hstack((
             self.left_label.clone().font(Font::Headline),
             spacer(),

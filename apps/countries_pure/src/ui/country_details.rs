@@ -58,15 +58,17 @@ impl CountryDetails {
 }
 
 impl Component for CountryDetails {
-    fn body(&self, ctx: &Context) -> impl View {
+    fn body(self, ctx: &Context) -> impl View {
         let injected = ctx.environment::<DIContainer>();
         let locale = ctx.environment::<Locale>();
-        let this = self.clone();
+        // State é Copy: sai da struct antes de `self` entrar no content
+        let routing_state = self.routing_state;
+        let title = self.country.name_locale(locale);
 
         self.content(ctx)
-            .nav_bar_title(self.country.name_locale(locale))
+            .nav_bar_title(title)
             .on_receive(Self::routing_update(&injected), move |routing| {
-                this.routing_state.set(Routing {
+                routing_state.set(Routing {
                     details_sheet: routing.detailsSheet,
                 });
             })
@@ -76,7 +78,7 @@ impl Component for CountryDetails {
 // MARK: - Content
 
 impl CountryDetails {
-    fn content(&self, ctx: &Context) -> impl UnaryView {
+    fn content(self, ctx: &Context) -> impl UnaryView {
         match self.details.get() {
             Loadable::NotRequested => OneOf4::A(self.default_view(ctx)),
             Loadable::IsLoading(..) => OneOf4::B(self.loading_view()),
@@ -85,32 +87,29 @@ impl CountryDetails {
         }
     }
 
-    fn default_view(&self, ctx: &Context) -> impl UnaryView {
+    fn default_view(self, ctx: &Context) -> impl UnaryView {
         let injected = ctx.environment::<DIContainer>();
-        let this = self.clone();
-        text("").on_appear(move || this.load_country_details(&injected, false))
+        text("").on_appear(move || self.load_country_details(&injected, false))
     }
 
-    fn loading_view(&self) -> impl UnaryView {
-        let this = self.clone();
+    fn loading_view(self) -> impl UnaryView {
         vstack((
             progress_view().progress_style(ProgressViewStyle::Circular),
             button(text("Cancel loading"), move || {
-                this.details.update(|details| details.cancelLoading())
+                self.details.update(|details| details.cancelLoading())
             }),
         ))
     }
 
-    fn failed_view(&self, ctx: &Context, error: LoadError) -> impl UnaryView {
+    fn failed_view(self, ctx: &Context, error: LoadError) -> impl UnaryView {
         let injected = ctx.environment::<DIContainer>();
-        let this = self.clone();
         ErrorView::new(
             error,
-            Rc::new(move || this.load_country_details(&injected, true)),
+            Rc::new(move || self.load_country_details(&injected, true)),
         )
     }
 
-    fn loaded_view(&self, ctx: &Context, country_details: DBModel::CountryDetails) -> impl UnaryView {
+    fn loaded_view(self, ctx: &Context, country_details: DBModel::CountryDetails) -> impl UnaryView {
         let injected = ctx.environment::<DIContainer>();
 
         let currencies = (!country_details.currencies.is_empty())
@@ -119,15 +118,17 @@ impl CountryDetails {
             .neighbors
             .clone()
             .filter(|neighbors| !neighbors.is_empty())
-            .map(|neighbors| self.neighbors_section_view(ctx, neighbors));
+            .map(|neighbors| self.clone().neighbors_section_view(ctx, neighbors));
+        // a view carrega DADOS (Clone, não Copy): cada sub-view leva a sua
+        // cópia — explícito, e barato no tamanho que isso tem
+        let sheet_view = self.clone();
 
-        let this = self.clone();
         list_content((
             self.country
                 .flag
                 .clone()
-                .map(|url| self.flag_view(ctx, url)),
-            self.basic_info_section_view(country_details.clone()),
+                .map(|url| self.clone().flag_view(ctx, url)),
+            self.clone().basic_info_section_view(country_details.clone()),
             currencies,
             neighbors,
         ))
@@ -135,7 +136,7 @@ impl CountryDetails {
         .sheet(
             self.routing_binding(&injected)
                 .member(|r| r.details_sheet, |r, value| r.details_sheet = value),
-            move |sheet_ctx| erased(this.modal_details_view(sheet_ctx)),
+            move |sheet_ctx| erased(sheet_view.clone().modal_details_view(sheet_ctx)),
         )
     }
 }
@@ -145,14 +146,13 @@ impl CountryDetails {
 impl CountryDetails {
     /// `flagView(url:)` — o `onTapGesture` do runtime headless dispara no
     /// render (não há dedo), então a sheet abre igual à demo.
-    fn flag_view(&self, ctx: &Context, url: URL) -> impl UnaryView {
+    fn flag_view(self, ctx: &Context, url: URL) -> impl UnaryView {
         let injected = ctx.environment::<DIContainer>();
-        let this = self.clone();
         hstack((
             spacer(),
             ImageView::new(url)
                 .frame(120.0, 80.0)
-                .on_tap(move || this.show_country_details_sheet(&injected)),
+                .on_tap(move || self.show_country_details_sheet(&injected)),
             spacer(),
         ))
     }
@@ -160,7 +160,7 @@ impl CountryDetails {
     /// `basicInfoSectionView(countryDetails:)` — recebe os dados owned: em
     /// edition 2021 um `impl View` de retorno capturaria o lifetime do
     /// `&CountryDetails` e não provaria `'static`.
-    fn basic_info_section_view(&self, country_details: DBModel::CountryDetails) -> impl UnaryView {
+    fn basic_info_section_view(self, country_details: DBModel::CountryDetails) -> impl UnaryView {
         section(
             text("Basic Info"),
             (
@@ -187,7 +187,7 @@ impl CountryDetails {
     }
 
     /// `neighborsSectionView(neighbors:)`
-    fn neighbors_section_view(&self, ctx: &Context, neighbors: Vec<DBModel::Country>) -> impl UnaryView {
+    fn neighbors_section_view(self, ctx: &Context, neighbors: Vec<DBModel::Country>) -> impl UnaryView {
         let locale = ctx.environment::<Locale>();
         section(
             text("Neighboring countries"),
@@ -211,7 +211,7 @@ impl CountryDetails {
     }
 
     /// `modalDetailsView()` — o conteúdo da sheet (borda apagada).
-    fn modal_details_view(&self, ctx: &Context) -> impl UnaryView {
+    fn modal_details_view(self, ctx: &Context) -> impl UnaryView {
         let injected = ctx.environment::<DIContainer>();
         let details_sheet = self
             .routing_binding(&injected)

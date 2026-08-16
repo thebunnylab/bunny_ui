@@ -25,7 +25,7 @@ impl ErrorView {
 }
 
 impl Component for ErrorView {
-    fn body(&self, _ctx: &Context) -> impl View {
+    fn body(self, _ctx: &Context) -> impl View {
         let retry_action = self.retry_action.clone();
         vstack((
             text("An Error Occured").font(Font::Title),

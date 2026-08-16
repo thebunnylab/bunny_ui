@@ -36,10 +36,10 @@ pub struct Many;
 /// Não implemente `View` à mão: o contrato de render é interno e vai
 /// trocar junto com o motor. Views próprias implementam [`Component`].
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` não é uma View",
-    label = "esperava uma view aqui",
-    note = "views próprias implementam `Component` (o `fn body`), nunca `View` direto",
-    note = "vários filhos vão em tupla: `vstack((a, b, c))` — até 12 por tupla; para mais, aninhe"
+    message = "`{Self}` is not a View",
+    label = "a view is expected here",
+    note = "implement `Component` (the `fn body`) for your own views — never `View` directly",
+    note = "put many children in one tuple: `vstack((a, b, c))` — a tuple holds up to 12; nest tuples for more"
 )]
 pub trait View: Clone + 'static {
     /// [`Single`] quando a view appende exatamente um nó; [`Many`] quando
@@ -57,8 +57,8 @@ pub trait View: Clone + 'static {
 /// revelam o que a assinatura promete) e o callsite não conseguiria nem
 /// aplicar modifier nem entrar num braço de `OneOf`.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` pode render vários nós — aqui precisa ser exatamente um",
-    note = "para decorar um grupo, embrulhe com `tuple(…)`, que tem nó próprio"
+    message = "`{Self}` can render many nodes — exactly one is required here",
+    note = "to decorate a group, wrap it with `tuple(…)` — the wrapper has its own node"
 )]
 pub trait UnaryView: View<Arity = Single> {}
 
@@ -141,11 +141,17 @@ impl NodeList {
 
 /// The conformance every `struct X: View` writes by hand.
 ///
-/// (`var body: some View` → `fn body(&self, ctx: &Context) -> impl View` —
+/// (`var body: some View` → `fn body(self, ctx: &Context) -> impl View` —
 /// return-position `impl Trait` in trait, estável desde o Rust 1.75. O tipo
 /// concreto da árvore inteira fica conhecido em compile time.)
+///
+/// O body recebe `self` POR VALOR de propósito: closures capturam os
+/// campos que usam (captura disjunta do Rust 2021) — `move ||
+/// self.count.add(1)` funciona direto, sem o `let this = *self` que a
+/// forma `&self` obrigava. Views são valores baratos (`State` é Copy); o
+/// runtime clona antes de chamar.
 pub trait Component: Clone + 'static {
-    fn body(&self, ctx: &Context) -> impl View;
+    fn body(self, ctx: &Context) -> impl View;
 }
 
 impl<T: Component> View for T {
@@ -160,7 +166,7 @@ impl<T: Component> View for T {
         // retenção — o comportamento pré-reconciler.
         let Some(path) = motor::identity::current_view_path() else {
             let mut body = NodeList::new();
-            self.body(ctx).render_into(ctx, &mut body);
+            self.clone().body(ctx).render_into(ctx, &mut body);
             let (print_children, layout_children) = body.into_parts();
             out.push(RenderNode::branch(short_type_name::<T>(), print_children));
             out.push_layout(crate::layout::LayoutNode::Boundary {
@@ -185,7 +191,7 @@ impl<T: Component> View for T {
         motor::identity::begin_view_reads(&path);
         crate::reconciler::begin_entry(&path);
         let mut body = NodeList::new();
-        self.body(ctx).render_into(ctx, &mut body);
+        self.clone().body(ctx).render_into(ctx, &mut body);
         let (print_children, layout_children) = body.into_parts();
         let node = RenderNode::branch(short_type_name::<T>(), print_children);
         let boundary = crate::layout::LayoutNode::Boundary {

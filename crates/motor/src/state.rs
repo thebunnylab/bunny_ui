@@ -291,6 +291,14 @@ impl<T: Clone + 'static> State<T> {
     }
 }
 
+/// Exibir um `State` LÊ o valor — a dependência registra sozinha. É o que
+/// faz `text!("count: {}", self.count)` reagir sem `.get()` nenhum.
+impl<T: Clone + std::fmt::Display + 'static> std::fmt::Display for State<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.wrappedValue().fmt(f)
+    }
+}
+
 /// `Binding<T>` — a get/set pair (`$x`, `@Binding`, `Binding.dispatched`).
 pub struct Binding<T> {
     get: Rc<dyn Fn() -> T>,

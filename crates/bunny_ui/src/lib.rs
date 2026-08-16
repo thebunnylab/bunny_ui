@@ -13,12 +13,11 @@
 //! }
 //!
 //! impl Component for Counter {
-//!     fn body(&self, _ctx: &Context) -> impl View {
-//!         let this = *self;
-//!         vstack((
-//!             text(format!("count: {}", self.count.get())),
-//!             button(text("increment"), move || this.count.update(|c| *c += 1)),
-//!         ))
+//!     fn body(self, _ctx: &Context) -> impl View {
+//!         vstack!(
+//!             text!("count: {}", self.count),
+//!             button(text("increment"), move || self.count.add(1)),
+//!         )
 //!     }
 //! }
 //! ```
@@ -53,8 +52,42 @@ pub mod text_input;
 pub mod view;
 pub mod views;
 
+/// `text!("Count: {}", self.count)` — o `format!` embutido do texto.
+/// Exibir um `State` LÊ o valor: a dependência registra sozinha.
+#[macro_export]
+macro_rules! text {
+    ($($arg:tt)*) => {
+        $crate::views::text(::std::format!($($arg)*))
+    };
+}
+
+/// `vstack!(a, b, c)` — os filhos sem os parênteses dobrados da tupla.
+#[macro_export]
+macro_rules! vstack {
+    ($($child:expr),+ $(,)?) => {
+        $crate::views::vstack(($($child,)+))
+    };
+}
+
+/// `hstack!(a, b, c)` — ver [`vstack!`].
+#[macro_export]
+macro_rules! hstack {
+    ($($child:expr),+ $(,)?) => {
+        $crate::views::hstack(($($child,)+))
+    };
+}
+
+/// `zstack!(a, b, c)` — ver [`vstack!`].
+#[macro_export]
+macro_rules! zstack {
+    ($($child:expr),+ $(,)?) => {
+        $crate::views::zstack(($($child,)+))
+    };
+}
+
 pub mod prelude {
     pub use crate::erased::{CustomModifier, Erased, erased};
+    pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
     pub use crate::layout::{Color, VisualProps};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
@@ -91,7 +124,7 @@ mod tests {
         struct Cell;
 
         impl Component for Cell {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 vstack((
                     text("United States").font(Font::Title),
                     text("Population 125000000").font(Font::Caption),
@@ -134,12 +167,11 @@ mod tests {
         }
 
         impl Component for Probe {
-            fn body(&self, _ctx: &Context) -> impl View {
-                let this = *self;
+            fn body(self, _ctx: &Context) -> impl View {
                 text("probe").on_change(
-                    move || this.flag.get(),
+                    move || self.flag.get(),
                     false,
-                    move |_, new| this.seen.update(|seen| seen.push(*new)),
+                    move |_, new| self.seen.update(|seen| seen.push(*new)),
                 )
             }
         }
@@ -172,18 +204,17 @@ mod tests {
         }
 
         impl Component for Pair {
-            fn body(&self, _ctx: &Context) -> impl View {
-                let this = *self;
+            fn body(self, _ctx: &Context) -> impl View {
                 (
                     text("a").on_change(
-                        move || this.value.get(),
+                        move || self.value.get(),
                         false,
-                        move |_, new| this.first.set(*new),
+                        move |_, new| self.first.set(*new),
                     ),
                     text("b").on_change(
-                        move || this.value.get(),
+                        move || self.value.get(),
                         false,
-                        move |_, new| this.second.set(*new),
+                        move |_, new| self.second.set(*new),
                     ),
                 )
             }
@@ -216,7 +247,7 @@ mod tests {
         }
 
         impl Component for LoadRow {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 if self.loaded.get() {
                     Either::First(text(format!("{} ready", self.name)))
                 } else {
@@ -238,7 +269,7 @@ mod tests {
         }
 
         impl Component for Board {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 let appeared = self.appeared.clone();
                 list(
                     self.items.get(),
@@ -286,7 +317,7 @@ mod tests {
         }
 
         impl Component for Digit {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 text(format!("{}", self.n.get()))
             }
         }
@@ -298,7 +329,7 @@ mod tests {
         }
 
         impl Component for Duo {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 vstack((self.a, self.b))
             }
         }
@@ -328,7 +359,7 @@ mod tests {
         }
 
         impl Component for Digit {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 text(format!("{}", self.n.get()))
             }
         }
@@ -340,7 +371,7 @@ mod tests {
         }
 
         impl Component for Duo {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 vstack((self.a, self.b))
             }
         }
@@ -382,7 +413,7 @@ mod tests {
         }
 
         impl Component for Badge {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 text(format!("badge {}", self.store.value()))
             }
         }
@@ -408,11 +439,10 @@ mod tests {
         }
 
         impl Component for Watcher {
-            fn body(&self, _ctx: &Context) -> impl View {
-                let this = self.clone();
+            fn body(self, _ctx: &Context) -> impl View {
                 // o publisher é recomputado a cada body — como no app real
                 text("w").on_receive(self.store.updates(|value| *value), move |value| {
-                    this.seen.borrow_mut().push(value)
+                    self.seen.borrow_mut().push(value)
                 })
             }
         }
@@ -448,7 +478,7 @@ mod tests {
         }
 
         impl Component for Title {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 text(format!("count: {}", self.count.get()))
             }
         }
@@ -459,7 +489,7 @@ mod tests {
         }
 
         impl Component for Screen {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 let count = self.title.count;
                 vstack((
                     self.title,
@@ -503,11 +533,10 @@ mod tests {
         }
 
         impl Component for Tapper {
-            fn body(&self, _ctx: &Context) -> impl View {
-                let this = *self;
+            fn body(self, _ctx: &Context) -> impl View {
                 vstack((
                     text(format!("count: {}", self.count.get())),
-                    button(text("tap!"), move || this.count.update(|n| *n += 1)),
+                    button(text("tap!"), move || self.count.update(|n| *n += 1)),
                 ))
             }
         }
@@ -576,11 +605,10 @@ mod tests {
     }
 
     impl Component for TapperFixture {
-        fn body(&self, _ctx: &Context) -> impl View {
-            let this = *self;
+        fn body(self, _ctx: &Context) -> impl View {
             vstack((
                 text(format!("count: {}", self.count.get())),
-                button(text("tap!"), move || this.count.update(|n| *n += 1)),
+                button(text("tap!"), move || self.count.update(|n| *n += 1)),
             ))
         }
     }
@@ -776,7 +804,7 @@ mod tests {
         struct One;
 
         impl Component for One {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 button(text("go"), || {})
             }
         }
@@ -816,7 +844,7 @@ mod tests {
         }
 
         impl Component for Rows {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 let _ = self.flip.get(); // lida: o set() invalida este body
                 list(
                     (0..10).map(|index| index.to_string()).collect(),
@@ -897,7 +925,7 @@ mod tests {
         }
 
         impl Component for Form {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 vstack((
                     text(format!("hello {}", self.name.get())),
                     text_field("Your name", self.name.binding()),
@@ -966,6 +994,45 @@ mod tests {
     }
 
     #[test]
+    fn the_dream_snippet_compiles_and_reacts() {
+        use crate::layout::{Proposal, Size};
+
+        // O código que a LEI de ergonomia pede: sem `let this`, sem
+        // `.get()`, sem `format!`, sem parênteses dobrados — e por baixo,
+        // o MESMO pipeline incremental de sempre.
+        #[derive(Clone, Copy)]
+        struct Counter {
+            count: State<i32>,
+        }
+
+        impl Component for Counter {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text!("Count: {}", self.count),
+                    button(text("Tap"), move || self.count.add(1)),
+                )
+            }
+        }
+
+        let counter = Counter { count: State::new(0) };
+        let runtime = Runtime::new();
+        assert!(runtime.render_stable(&counter).contains("Count: 0"));
+
+        let result =
+            runtime.layout(&counter, Proposal::exact(Size { width: 200.0, height: 100.0 }));
+        let (_, rect) = result.hits.last().unwrap().clone();
+        let cx = rect.origin.x + rect.size.width / 2.0;
+        let cy = rect.origin.y + rect.size.height / 2.0;
+        runtime.pointer_pressed(cx, cy);
+        runtime.pointer_released(cx, cy);
+
+        // o Display do State LÊ — o clique invalida SÓ o Counter
+        runtime.render(&counter);
+        assert_eq!(runtime.body_runs(), vec!["Counter".to_string()]);
+        assert!(runtime.render_stable(&counter).contains("Count: 1"));
+    }
+
+    #[test]
     fn ime_composition_flows_through_the_runtime() {
         use crate::layout::{DrawCommand, Proposal, Size};
         use crate::text_input::EditCommand;
@@ -976,7 +1043,7 @@ mod tests {
         }
 
         impl Component for Form {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 text_field("name", self.name.binding())
             }
         }
@@ -1035,7 +1102,7 @@ mod tests {
         }
 
         impl Component for Form {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 text_field("name", self.name.binding())
             }
         }
@@ -1148,7 +1215,7 @@ mod tests {
         }
 
         impl Component for Badge {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 text(format!("n: {}", self.n.get()))
             }
         }
@@ -1193,7 +1260,7 @@ mod tests {
         struct Row;
 
         impl Component for Row {
-            fn body(&self, _ctx: &Context) -> impl View {
+            fn body(self, _ctx: &Context) -> impl View {
                 // Option None não imprime; Either/OneOf escolhem o braço em
                 // compile time — o tipo é a soma, o discriminante é runtime
                 vstack((

@@ -4,6 +4,26 @@ A declarative UI framework for Rust, inspired by SwiftUI.
 
 Write views as value types. The framework finds the views that read changed state and runs only those.
 
+## Quick look
+
+```rust
+#[derive(Clone, Copy)]
+struct Counter {
+    count: State<i32>,
+}
+
+impl Component for Counter {
+    fn body(self, _ctx: &Context) -> impl View {
+        vstack!(
+            text!("Count: {}", self.count),
+            button(text("Tap"), move || self.count.add(1)),
+        )
+    }
+}
+```
+
+The display of `count` records a read. A tap changes the state, and the framework runs only this view again.
+
 ## Status
 
 Early development. The API is not stable.

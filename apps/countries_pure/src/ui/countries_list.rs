@@ -8,9 +8,9 @@
 //  - Os `site`s de `on_change`/`on_receive` saem de `#[track_caller]` —
 //    cada callsite é seu próprio slot, nada a nomear.
 //
-//  A view é toda `State<_>`, então deriva `Copy`: `let this = *self` e cada
-//  closure captura a própria cópia — o espelho do que o Swift faz com
-//  structs, sem um `self.clone()` nomeado por papel.
+//  A view é toda `State<_>`, então deriva `Copy` e o body recebe `self`
+//  POR VALOR: cada closure captura os campos que usa (captura disjunta) —
+//  o espelho do que o Swift faz com structs, sem cerimônia nenhuma.
 //
 //  O `match` do `content` é um `OneOf4` — os quatro braços do `Loadable`
 //  com nome próprio, no lugar do `_ConditionalContent` binário aninhado.
@@ -67,9 +67,8 @@ impl Default for CountriesList {
 }
 
 impl Component for CountriesList {
-    fn body(&self, ctx: &Context) -> impl View {
+    fn body(self, ctx: &Context) -> impl View {
         let injected = ctx.environment::<DIContainer>();
-        let this = *self;
 
         navigation_stack(
             self.navigation_path.binding(),
@@ -83,13 +82,13 @@ impl Component for CountriesList {
                 .navigation_title("Countries"),),
         )
         .on_receive(Self::routing_update(&injected), move |routing| {
-            this.routing_state.set(Routing {
+            self.routing_state.set(Routing {
                 country_code: routing.countryCode,
             });
         })
         .on_receive(
             Self::can_request_push_permission_update(&injected),
-            move |can_request| this.can_request_push_permission.set(can_request),
+            move |can_request| self.can_request_push_permission.set(can_request),
         )
         .flips_for_right_to_left_layout_direction(true)
     }
@@ -99,7 +98,7 @@ impl Component for CountriesList {
 
 impl CountriesList {
     /// `@ViewBuilder private var content`
-    fn content(&self, ctx: &Context) -> impl UnaryView {
+    fn content(self, ctx: &Context) -> impl UnaryView {
         match self.countries_state.get() {
             Loadable::NotRequested => OneOf4::A(self.default_view(ctx)),
             Loadable::IsLoading(..) => OneOf4::B(Self::loading_view()),
@@ -109,14 +108,13 @@ impl CountriesList {
     }
 
     /// `defaultView()`
-    fn default_view(&self, ctx: &Context) -> impl UnaryView {
+    fn default_view(self, ctx: &Context) -> impl UnaryView {
         let injected = ctx.environment::<DIContainer>();
-        let this = *self;
         text("").on_appear(move || {
-            if !this.countries.get().is_empty() {
-                this.countries_state.set(Loadable::Loaded(()));
+            if !self.countries.get().is_empty() {
+                self.countries_state.set(Loadable::Loaded(()));
             }
-            this.load_countries_list(&injected, false);
+            self.load_countries_list(&injected, false);
         })
     }
 
@@ -126,12 +124,11 @@ impl CountriesList {
     }
 
     /// `failedView(_:)`
-    fn failed_view(&self, ctx: &Context, error: LoadError) -> impl UnaryView {
+    fn failed_view(self, ctx: &Context, error: LoadError) -> impl UnaryView {
         let injected = ctx.environment::<DIContainer>();
-        let this = *self;
         ErrorView::new(
             error,
-            Rc::new(move || this.load_countries_list(&injected, true)),
+            Rc::new(move || self.load_countries_list(&injected, true)),
         )
     }
 }
@@ -142,9 +139,8 @@ impl CountriesList {
     /// `loadedView()` — o `@ViewBuilder` com `if` + `List` vira uma tupla
     /// com `Option` (o `if let` do codegen) e o `TupleView` explícito que
     /// imprime o próprio nó.
-    fn loaded_view(&self, ctx: &Context) -> impl UnaryView {
+    fn loaded_view(self, ctx: &Context) -> impl UnaryView {
         let injected = ctx.environment::<DIContainer>();
-        let this = *self;
 
         let no_matches = (self.countries.get().is_empty() && !self.search_text.get().is_empty())
             .then(|| text("No matches found").font(Font::Footnote));
@@ -161,14 +157,14 @@ impl CountriesList {
             )
             .navigation_destination()
             .searchable(self.search_text.binding())
-            .refreshable(move || this.load_countries_list(&refresh_injected, true))
+            .refreshable(move || self.load_countries_list(&refresh_injected, true))
             .toolbar(toolbar_item(self.permissions_button(ctx)))
             .on_change(
-                move || this.routing_state.get().country_code.clone(),
+                move || self.routing_state.get().country_code.clone(),
                 true,
                 move |_, code| {
                     let Some(code) = code else { return };
-                    let Some(country) = this
+                    let Some(country) = self
                         .countries
                         .get()
                         .into_iter()
@@ -176,15 +172,15 @@ impl CountriesList {
                     else {
                         return;
                     };
-                    this.navigation_path.update(|path| path.append(country));
+                    self.navigation_path.update(|path| path.append(country));
                 },
             )
             .on_change(
-                move || this.navigation_path.get(),
+                move || self.navigation_path.get(),
                 false,
                 move |_, path| {
                     if !path.is_empty() {
-                        this.routing_binding(&clear_injected)
+                        self.routing_binding(&clear_injected)
                             .update(|r| r.country_code = None);
                     }
                 },
@@ -193,12 +189,11 @@ impl CountriesList {
     }
 
     /// `permissionsButton` — `@ViewBuilder if canRequestPushPermission { … }`
-    fn permissions_button(&self, ctx: &Context) -> Option<impl UnaryView> {
+    fn permissions_button(self, ctx: &Context) -> Option<impl UnaryView> {
         let injected = ctx.environment::<DIContainer>();
-        let this = *self;
         self.can_request_push_permission.get().then(|| {
             button(text("Allow Push"), move || {
-                this.request_push_permission(&injected)
+                self.request_push_permission(&injected)
             })
         })
     }

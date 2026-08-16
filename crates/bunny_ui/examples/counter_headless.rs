@@ -16,13 +16,12 @@ struct Counter {
 }
 
 impl Component for Counter {
-    fn body(&self, _ctx: &Context) -> impl View {
-        let this = *self;
-        vstack((
-            text(format!("count: {}", self.count.get())),
+    fn body(self, _ctx: &Context) -> impl View {
+        vstack!(
+            text!("count: {}", self.count),
             spacer(),
-            button(text("tap!"), move || this.count.update(|n| *n += 1)),
-        ))
+            button(text("tap!"), move || self.count.add(1)),
+        )
         .alignment(HorizontalAlignment::Leading)
         .padding()
     }

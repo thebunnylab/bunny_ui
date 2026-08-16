@@ -23,7 +23,7 @@ impl CountryCell {
 }
 
 impl Component for CountryCell {
-    fn body(&self, ctx: &Context) -> impl View {
+    fn body(self, ctx: &Context) -> impl View {
         let locale = ctx.environment::<Locale>();
         vstack((
             text(self.country.name_locale(locale)).font(Font::Title),
