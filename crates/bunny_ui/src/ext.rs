@@ -219,6 +219,34 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// Fundo alternativo sob o hover do alvo interativo mais próximo
+    /// (rows de lista, chips) — pintura pura, layout intocado (a LEI).
+    fn background_hovered(self, color: Color) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::BackgroundHovered(color),
+        }
+    }
+
+    /// Fundo alternativo sob o pressed — par do
+    /// [`ViewExt::background_hovered`].
+    fn background_pressed(self, color: Color) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::BackgroundPressed(color),
+        }
+    }
+
+    /// `.onClick { … }` — a view vira alvo de ponteiro SEM o chrome do
+    /// `Button`: mesma retenção de ação, mesmo up-inside. É a row de
+    /// lista clicável.
+    fn on_click(self, action: impl Fn() + 'static) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::OnClick(Rc::new(action)),
+        }
+    }
+
     // MARK: - Interação
 
     /// `.onTapGesture { … }` — no runtime headless dispara no render.

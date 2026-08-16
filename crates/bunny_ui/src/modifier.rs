@@ -59,6 +59,12 @@ pub enum Modifier {
     Border(Color, f64),
     CornerRadius(f64),
     Monospaced,
+    BackgroundHovered(Color),
+    BackgroundPressed(Color),
+
+    // MARK: - Interação real (alvo de ponteiro sem chrome — o Button sem
+    // a roupa; a ação dispara no up-inside como a dele)
+    OnClick(Rc<dyn Fn()>),
 
     // MARK: - Interação (a ação dispara no render, como no motor headless)
     OnAppear(Rc<dyn Fn()>),
@@ -130,6 +136,9 @@ impl Modifier {
             Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
             Modifier::CornerRadius(radius) => format!(" [.cornerRadius({radius})]"),
             Modifier::Monospaced => " [.monospaced()]".into(),
+            Modifier::BackgroundHovered(color) => format!(" [.backgroundHovered({color})]"),
+            Modifier::BackgroundPressed(color) => format!(" [.backgroundPressed({color})]"),
+            Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
             Modifier::OnTapGesture(_) => " [.onTapGesture()]".into(),
             Modifier::Effect { name, detail, .. } => format!(" [.{name}{detail}]"),
@@ -322,6 +331,27 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     ..VisualProps::default()
                 },
             ),
+            Modifier::BackgroundHovered(color) => wrap_styled(
+                out,
+                VisualProps { background_hovered: Some(*color), ..VisualProps::default() },
+            ),
+            Modifier::BackgroundPressed(color) => wrap_styled(
+                out,
+                VisualProps { background_pressed: Some(*color), ..VisualProps::default() },
+            ),
+            Modifier::OnClick(action) => {
+                // o mesmo registro do Button: ação retida no reconciler,
+                // frame no hit-test pela identidade do cursor
+                if let Some(path) = motor::identity::cursor_scope() {
+                    crate::reconciler::attribute_action(path.clone(), action.clone());
+                    out.wrap_last_layout(|node| LayoutNode::Interactive {
+                        path,
+                        hovered: false,
+                        pressed: false,
+                        child: Box::new(node),
+                    });
+                }
+            }
             _ => {}
         }
 
