@@ -247,6 +247,24 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// Pinta trechos do TEXTO em outra cor (ranges de byte no conteúdo) —
+    /// o highlight de match de um finder. Só faz efeito em `text(…)`.
+    fn highlight(self, ranges: Vec<(usize, usize)>, color: Color) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Highlight(Rc::new(ranges), color),
+        }
+    }
+
+    /// `.truncationMode(.middle)` — desliga a quebra: o texto vira UMA
+    /// linha com elipse no lugar escolhido quando não cabe.
+    fn truncation_mode(self, mode: crate::layout::Truncation) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::TruncationMode(mode),
+        }
+    }
+
     // MARK: - Interação
 
     /// `.onTapGesture { … }` — no runtime headless dispara no render.

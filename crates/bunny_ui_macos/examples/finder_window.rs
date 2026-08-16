@@ -61,15 +61,45 @@ const FILES: &[(&str, &str, bool)] = &[
     ("benchmark.rs", "tools/src/", false),
     ("glyphs.rs", "tools/src/", false),
     ("palette.rs", "tools/src/", false),
+    (
+        "deep_file.rs",
+        "a/very/long/nested/path/that/keeps/going/and/going/until/it/cannot/possibly/fit/",
+        false,
+    ),
 ];
 
-/// Subsequência case-insensitive — o piso honesto de um fuzzy.
-fn matches(haystack: &str, needle: &str) -> bool {
-    let mut haystack = haystack.chars().map(|c| c.to_ascii_lowercase());
-    needle
-        .chars()
-        .map(|c| c.to_ascii_lowercase())
-        .all(|wanted| haystack.any(|c| c == wanted))
+/// Subsequência case-insensitive com as posições casadas (ranges de byte
+/// coalescidos) — o piso honesto de um fuzzy, com highlight de verdade.
+fn match_ranges(haystack: &str, needle: &str) -> Option<Vec<(usize, usize)>> {
+    if needle.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut haystack = haystack.char_indices();
+    'wanted: for wanted in needle.chars() {
+        let wanted = wanted.to_ascii_lowercase();
+        for (index, candidate) in haystack.by_ref() {
+            if candidate.to_ascii_lowercase() == wanted {
+                let end = index + candidate.len_utf8();
+                match ranges.last_mut() {
+                    Some((_, last_end)) if *last_end == index => *last_end = end,
+                    _ => ranges.push((index, end)),
+                }
+                continue 'wanted;
+            }
+        }
+        return None;
+    }
+    Some(ranges)
+}
+
+#[derive(Clone)]
+struct Row {
+    name: String,
+    dir: String,
+    recent: bool,
+    name_ranges: Vec<(usize, usize)>,
+    dir_ranges: Vec<(usize, usize)>,
 }
 
 fn divider() -> impl UnaryView {
@@ -85,12 +115,33 @@ struct Finder {
 impl Component for Finder {
     fn body(self, _ctx: &Context) -> impl View {
         let query = self.query.get();
-        let items: Vec<(String, String, bool)> = FILES
+        let items: Vec<Row> = FILES
             .iter()
-            .filter(|(name, dir, _)| {
-                query.is_empty() || matches(&format!("{dir}{name}"), &query)
+            .filter_map(|(name, dir, recent)| {
+                let full = format!("{dir}{name}");
+                let ranges = match_ranges(&full, &query)?;
+                // reparte os ranges do caminho completo entre dir e nome
+                let split = dir.len();
+                let mut dir_ranges = Vec::new();
+                let mut name_ranges = Vec::new();
+                for (start, end) in ranges {
+                    if end <= split {
+                        dir_ranges.push((start, end));
+                    } else if start >= split {
+                        name_ranges.push((start - split, end - split));
+                    } else {
+                        dir_ranges.push((start, split));
+                        name_ranges.push((0, end - split));
+                    }
+                }
+                Some(Row {
+                    name: name.to_string(),
+                    dir: dir.to_string(),
+                    recent: *recent,
+                    name_ranges,
+                    dir_ranges,
+                })
             })
-            .map(|(name, dir, recent)| (name.to_string(), dir.to_string(), *recent))
             .collect();
         let count = items.len();
         let opened = self.opened;
@@ -105,15 +156,27 @@ impl Component for Finder {
 
         let results = list(
             items,
-            |item| format!("{}{}", item.1, item.0),
-            move |item| {
-                let (name, dir, recent) = item.clone();
-                let label = format!("{dir}{name}");
+            |row| format!("{}{}", row.dir, row.name),
+            move |row| {
+                let row = row.clone();
+                let label = format!("{}{}", row.dir, row.name);
                 hstack!(
-                    text(name).font(Font::Body).foreground_color(NAME),
-                    text(dir).font(Font::Subheadline).monospaced().foreground_color(DIR),
-                    spacer(),
-                    recent.then(|| {
+                    // nome: elipse no MEIO, teto de 240 como manda a anatomia
+                    text(row.name)
+                        .foreground_color(NAME)
+                        .highlight(row.name_ranges, ACCENT)
+                        .truncation_mode(Truncation::Middle)
+                        .frame_max(240.0, f64::INFINITY, Alignment::Leading),
+                    // caminho: preenche o resto, elipse no COMEÇO (o fim
+                    // do path é o que importa)
+                    text(row.dir)
+                        .font(Font::Subheadline)
+                        .monospaced()
+                        .foreground_color(DIR)
+                        .highlight(row.dir_ranges, ACCENT)
+                        .truncation_mode(Truncation::Start)
+                        .frame_max(f64::INFINITY, f64::INFINITY, Alignment::Leading),
+                    row.recent.then(|| {
                         text("recent").font(Font::Footnote).foreground_color(FAINT)
                     }),
                 )

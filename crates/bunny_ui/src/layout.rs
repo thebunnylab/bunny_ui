@@ -131,13 +131,38 @@ pub struct LayoutEnv<'a> {
     pub font: FontSpec,
 }
 
+/// Trechos coloridos POR CIMA do texto (o highlight de match de um
+/// finder): ranges de BYTE no conteúdo + a cor. A fonte não muda — só a
+/// tinta; a medida fica intacta por construção.
+#[derive(Clone, Debug)]
+pub struct TextHighlight {
+    pub ranges: Rc<Vec<(usize, usize)>>,
+    pub color: Color,
+}
+
+/// Onde a elipse mora quando o texto não cabe e a quebra está desligada.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Truncation {
+    /// `…fim/do/caminho` — preserva o fim (paths).
+    Start,
+    /// `começo…fim` — preserva as pontas (nomes de arquivo).
+    Middle,
+    /// `começo…` — o clássico.
+    End,
+}
+
 /// A árvore de layout que um pass de render emite. Conjunto fechado (tudo
 /// se reduz aos built-ins depois dos bodies), filhos em `Vec` — o dispatch
 /// estático mora na árvore de VIEWS; esta é a estrutura de runtime.
 #[derive(Clone, Debug)]
 pub enum LayoutNode {
-    /// Texto com métricas fake: `chars × 8px`, quebra pela proposta.
-    Text { content: Rc<str> },
+    /// Texto: quebra por palavra contra a proposta, ou elipse quando a
+    /// truncation está ligada; highlight pinta trechos sem tocar a medida.
+    Text {
+        content: Rc<str>,
+        highlights: Option<TextHighlight>,
+        truncation: Option<Truncation>,
+    },
     /// Flexível no eixo principal do stack que o contém.
     Spacer,
     /// Caixa rígida (ProgressView, Image e afins, até existir de verdade).
@@ -553,17 +578,22 @@ impl LayoutNode {
 
     pub(crate) fn measure(&self, proposal: Proposal, env: LayoutEnv) -> (Size, Fit) {
         match self {
-            LayoutNode::Text { content } => {
+            LayoutNode::Text { content, truncation, .. } => {
                 let metrics = env.cache.get_or_measure(content, &env.font, env.text);
                 let natural = metrics.width;
                 let line_h = metrics.height();
                 // quebra REAL por palavra, com as medições do engine — a
-                // largura entra na chave do cache (modo da sondagem)
+                // largura entra na chave do cache (modo da sondagem);
+                // truncation desliga a quebra: uma linha, sempre
                 let size = match proposal.width {
                     Some(width) if width > 0.0 && width < natural => {
-                        let lines =
-                            env.cache.get_or_break(content, &env.font, width, env.text);
-                        Size { width, height: lines.len() as Px * line_h }
+                        if truncation.is_some() {
+                            Size { width, height: line_h }
+                        } else {
+                            let lines =
+                                env.cache.get_or_break(content, &env.font, width, env.text);
+                            Size { width, height: lines.len() as Px * line_h }
+                        }
                     }
                     _ => Size { width: natural, height: line_h },
                 };
@@ -717,39 +747,17 @@ impl LayoutNode {
     pub(crate) fn place(&self, frame: Rect, fit: Fit, env: LayoutEnv, out: &mut Placement) {
         match (self, fit) {
             // folhas visuais: aqui nasce a lista de desenho
-            (LayoutNode::Text { content }, Fit::Leaf) => {
+            (LayoutNode::Text { content, highlights, truncation }, Fit::Leaf) => {
                 let color = out.foreground.last().copied().unwrap_or(Color::BLACK);
-                if !content.is_empty() {
-                    let metrics = env.cache.get_or_measure(content, &env.font, env.text);
-                    let line_h = metrics.height();
-                    if metrics.width <= frame.size.width {
-                        out.display.push(DrawCommand::TextLine {
-                            origin: frame.origin,
-                            content: content.to_string(),
-                            color,
-                            font: env.font,
-                        });
-                    } else {
-                        // as MESMAS quebras da medição (mesma chave, hit)
-                        let lines = env.cache.get_or_break(
-                            content,
-                            &env.font,
-                            frame.size.width,
-                            env.text,
-                        );
-                        for (line_index, (start, end)) in lines.iter().enumerate() {
-                            out.display.push(DrawCommand::TextLine {
-                                origin: Point {
-                                    x: frame.origin.x,
-                                    y: frame.origin.y + line_index as Px * line_h,
-                                },
-                                content: content[*start..*end].to_string(),
-                                color,
-                                font: env.font,
-                            });
-                        }
-                    }
-                }
+                place_text(
+                    content,
+                    highlights.as_ref(),
+                    *truncation,
+                    frame,
+                    color,
+                    env,
+                    out,
+                );
             }
 
             (LayoutNode::Fill, Fit::Leaf) => {
@@ -1101,6 +1109,188 @@ fn measure_stack(
     (size, Fit::Children(measured))
 }
 
+/// Pinta um texto colocado: linha única, quebrado por palavra, ou
+/// truncado com elipse — sempre pelos MESMOS caches da medição.
+fn place_text(
+    content: &Rc<str>,
+    highlights: Option<&TextHighlight>,
+    truncation: Option<Truncation>,
+    frame: Rect,
+    base_color: Color,
+    env: LayoutEnv,
+    out: &mut Placement,
+) {
+    if content.is_empty() {
+        return;
+    }
+    let metrics = env.cache.get_or_measure(content, &env.font, env.text);
+    let line_h = metrics.height();
+
+    if metrics.width <= frame.size.width {
+        emit_text_runs(content, (0, content.len()), highlights, frame.origin, base_color, env, out);
+        return;
+    }
+    if let Some(mode) = truncation {
+        // highlight não sobrevive à elipse (os ranges do original não
+        // mapeiam no texto composto) — v1 honesto, anotado
+        let composed = truncate_to_width(content, mode, frame.size.width, env);
+        out.display.push(DrawCommand::TextLine {
+            origin: frame.origin,
+            content: composed,
+            color: base_color,
+            font: env.font,
+        });
+        return;
+    }
+    let lines = env.cache.get_or_break(content, &env.font, frame.size.width, env.text);
+    for (line_index, (start, end)) in lines.iter().enumerate() {
+        emit_text_runs(
+            content,
+            (*start, *end),
+            highlights,
+            Point { x: frame.origin.x, y: frame.origin.y + line_index as Px * line_h },
+            base_color,
+            env,
+            out,
+        );
+    }
+}
+
+/// Emite os `TextLine`s de UMA linha: inteira na cor base, ou fatiada em
+/// segmentos quando há highlight — cada segmento na posição do prefixo
+/// medido (kerning entre segmentos é aproximado; o shape por runs de
+/// verdade chega com o sistema de texto atribuído).
+fn emit_text_runs(
+    content: &Rc<str>,
+    line: (usize, usize),
+    highlights: Option<&TextHighlight>,
+    origin: Point,
+    base_color: Color,
+    env: LayoutEnv,
+    out: &mut Placement,
+) {
+    let (line_start, line_end) = line;
+    let whole = || DrawCommand::TextLine {
+        origin,
+        content: content[line_start..line_end].to_string(),
+        color: base_color,
+        font: env.font,
+    };
+    let Some(highlight) = highlights else {
+        out.display.push(whole());
+        return;
+    };
+
+    // segmentos cobrindo a linha inteira, alternando base/destacado
+    let clamp = |index: usize| crate::text_input::clamp_index(content, index);
+    let mut segments: Vec<(usize, usize, bool)> = Vec::new();
+    let mut cursor = line_start;
+    for &(start, end) in highlight.ranges.iter() {
+        let start = clamp(start).clamp(cursor, line_end);
+        let end = clamp(end).min(line_end);
+        if end <= start {
+            continue;
+        }
+        if start > cursor {
+            segments.push((cursor, start, false));
+        }
+        segments.push((start, end, true));
+        cursor = end;
+    }
+    if cursor < line_end {
+        segments.push((cursor, line_end, false));
+    }
+    if segments.len() == 1 && !segments[0].2 {
+        out.display.push(whole());
+        return;
+    }
+
+    for (start, end, hot) in segments {
+        let offset = if start == line_start {
+            0.0
+        } else {
+            env.cache.get_or_measure(&content[line_start..start], &env.font, env.text).width
+        };
+        out.display.push(DrawCommand::TextLine {
+            origin: Point { x: origin.x + offset, y: origin.y },
+            content: content[start..end].to_string(),
+            color: if hot { highlight.color } else { base_color },
+            font: env.font,
+        });
+    }
+}
+
+const ELLIPSIS: &str = "…";
+
+/// Compõe a versão com elipse que cabe na largura — maior conteúdo
+/// possível, medido de verdade (cada candidato passa pelo cache).
+fn truncate_to_width(content: &str, mode: Truncation, width: Px, env: LayoutEnv) -> String {
+    let fits = |candidate: &str| {
+        env.cache.get_or_measure(candidate, &env.font, env.text).width <= width
+    };
+    match mode {
+        Truncation::End => {
+            let mut best = ELLIPSIS.to_string();
+            for (boundary, _) in content.char_indices().skip(1) {
+                let candidate = format!("{}{ELLIPSIS}", &content[..boundary]);
+                if fits(&candidate) {
+                    best = candidate;
+                } else {
+                    break;
+                }
+            }
+            best
+        }
+        Truncation::Start => {
+            let mut best = ELLIPSIS.to_string();
+            let starts: Vec<usize> = content.char_indices().map(|(index, _)| index).collect();
+            for &start in starts.iter().rev() {
+                if start == 0 {
+                    break; // o conteúdo inteiro não coube lá atrás
+                }
+                let candidate = format!("{ELLIPSIS}{}", &content[start..]);
+                if fits(&candidate) {
+                    best = candidate;
+                } else {
+                    break;
+                }
+            }
+            best
+        }
+        Truncation::Middle => {
+            let next = |index: usize| crate::text_input::boundary_after(content, index);
+            let previous = |index: usize| crate::text_input::boundary_before(content, index);
+            let mut head = 0usize;
+            let mut tail = content.len();
+            loop {
+                let mut grew = false;
+                let head_next = next(head);
+                if head_next <= tail
+                    && fits(&format!("{}{ELLIPSIS}{}", &content[..head_next], &content[tail..]))
+                {
+                    head = head_next;
+                    grew = true;
+                }
+                let tail_previous = previous(tail);
+                if tail_previous >= head
+                    && fits(&format!(
+                        "{}{ELLIPSIS}{}",
+                        &content[..head],
+                        &content[tail_previous..]
+                    ))
+                {
+                    tail = tail_previous;
+                    grew = true;
+                }
+                if !grew {
+                    break;
+                }
+            }
+            format!("{}{ELLIPSIS}{}", &content[..head], &content[tail..])
+        }
+    }
+}
+
 const SCROLLBAR_W: Px = 4.0;
 const SCROLLBAR_INSET: Px = 6.0;
 const SCROLLBAR_MIN: Px = 24.0;
@@ -1179,7 +1369,7 @@ mod tests {
     use super::*;
 
     fn text(chars: usize) -> LayoutNode {
-        LayoutNode::Text { content: Rc::from("x".repeat(chars)) }
+        LayoutNode::Text { content: Rc::from("x".repeat(chars)), highlights: None, truncation: None }
     }
 
     fn boundary(path: &str, child: LayoutNode) -> LayoutNode {
@@ -1306,7 +1496,7 @@ mod tests {
 
     #[test]
     fn words_wrap_at_spaces_never_mid_word() {
-        let node = LayoutNode::Text { content: Rc::from("aa bb cc") };
+        let node = LayoutNode::Text { content: Rc::from("aa bb cc"), highlights: None, truncation: None };
         let result = layout(&node, Proposal { width: Some(40.0), height: None });
 
         // "aa bb" (40px) cabe; "cc" desce inteiro — nunca "c" órfão
@@ -1323,8 +1513,99 @@ mod tests {
     }
 
     #[test]
+    fn highlight_splits_the_line_into_colored_runs() {
+        let hot = Color::hex(0xFF0000);
+        let node = LayoutNode::Text {
+            content: Rc::from("abcdef"),
+            highlights: Some(TextHighlight { ranges: Rc::new(vec![(2, 4)]), color: hot }),
+            truncation: None,
+        };
+        let result = layout(&node, Proposal::unspecified());
+
+        let runs: Vec<(String, Color, Px)> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::TextLine { content, color, origin, .. } => {
+                    Some((content.clone(), *color, origin.x))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            runs,
+            vec![
+                ("ab".to_string(), Color::BLACK, 0.0),
+                ("cd".to_string(), hot, 16.0),
+                ("ef".to_string(), Color::BLACK, 32.0),
+            ],
+            "segmentos nas posições dos prefixos medidos"
+        );
+    }
+
+    #[test]
+    fn highlight_survives_the_word_wrap() {
+        let hot = Color::hex(0xFF0000);
+        // "aa bb cc" em 40px quebra em "aa bb " + "cc"; os ranges cobrem
+        // o "bb" (linha 1) e o "cc" (linha 2)
+        let node = LayoutNode::Text {
+            content: Rc::from("aa bb cc"),
+            highlights: Some(TextHighlight {
+                ranges: Rc::new(vec![(3, 5), (6, 8)]),
+                color: hot,
+            }),
+            truncation: None,
+        };
+        let result = layout(&node, Proposal::exact(Size { width: 40.0, height: 100.0 }));
+
+        let hot_runs: Vec<(String, Px, Px)> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::TextLine { content, color, origin, .. } if *color == hot => {
+                    Some((content.clone(), origin.x, origin.y))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            hot_runs,
+            vec![
+                ("bb".to_string(), 24.0, 0.0),
+                ("cc".to_string(), 0.0, LINE_H),
+            ],
+            "cada linha recorta os ranges que a intersectam"
+        );
+    }
+
+    #[test]
+    fn truncation_places_the_ellipsis_where_asked() {
+        let truncated = |mode: Truncation| {
+            let node = LayoutNode::Text {
+                content: Rc::from("abcdefgh"),
+                highlights: None,
+                truncation: Some(mode),
+            };
+            let result = layout(&node, Proposal { width: Some(40.0), height: None });
+            assert_eq!(result.size.height, LINE_H, "truncation nunca quebra linha");
+            result
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::TextLine { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        // PixelFont: 8px por char, "…" também
+        assert_eq!(truncated(Truncation::End), "abcd…");
+        assert_eq!(truncated(Truncation::Start), "…efgh");
+        assert_eq!(truncated(Truncation::Middle), "ab…gh");
+    }
+
+    #[test]
     fn a_word_longer_than_the_line_hard_breaks() {
-        let node = LayoutNode::Text { content: Rc::from("aaaaaaaaaa") };
+        let node = LayoutNode::Text { content: Rc::from("aaaaaaaaaa"), highlights: None, truncation: None };
         let result = layout(&node, Proposal { width: Some(40.0), height: None });
 
         // 10 chars de 8px em 40px: 5 por linha

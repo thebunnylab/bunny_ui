@@ -59,7 +59,11 @@ impl View for Text {
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
         out.push(RenderNode::leaf(format!("Text({:?})", self.0)));
-        out.push_layout(LayoutNode::Text { content: self.0.clone() });
+        out.push_layout(LayoutNode::Text {
+            content: self.0.clone(),
+            highlights: None,
+            truncation: None,
+        });
     }
 }
 
@@ -212,6 +216,8 @@ impl View for TextField {
                 } else {
                     Rc::from(value)
                 },
+                highlights: None,
+                truncation: None,
             }),
         }
     }

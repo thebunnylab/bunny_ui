@@ -21,7 +21,7 @@ use motor::state::{Binding, Context, EffectFn, EnvironmentValues};
 use motor::view::RenderNode;
 
 use crate::erased::CustomModifier;
-use crate::layout::{Color, CrossAlign, Edges, LayoutNode, VisualProps};
+use crate::layout::{Color, CrossAlign, Edges, LayoutNode, TextHighlight, Truncation, VisualProps};
 use crate::text_engine::{FontDesign, FontPatch, FontSpec, Weight};
 use crate::state_ext::BindingExt;
 use crate::view::{NodeList, Single, View};
@@ -61,6 +61,8 @@ pub enum Modifier {
     Monospaced,
     BackgroundHovered(Color),
     BackgroundPressed(Color),
+    Highlight(Rc<Vec<(usize, usize)>>, Color),
+    TruncationMode(Truncation),
 
     // MARK: - Interação real (alvo de ponteiro sem chrome — o Button sem
     // a roupa; a ação dispara no up-inside como a dele)
@@ -138,6 +140,10 @@ impl Modifier {
             Modifier::Monospaced => " [.monospaced()]".into(),
             Modifier::BackgroundHovered(color) => format!(" [.backgroundHovered({color})]"),
             Modifier::BackgroundPressed(color) => format!(" [.backgroundPressed({color})]"),
+            Modifier::Highlight(ranges, color) => {
+                format!(" [.highlight({} ranges, {color})]", ranges.len())
+            }
+            Modifier::TruncationMode(mode) => format!(" [.truncationMode(.{mode:?})]"),
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
             Modifier::OnTapGesture(_) => " [.onTapGesture()]".into(),
@@ -168,6 +174,29 @@ impl Modifier {
 /// `zstack`. O merge só acontece com `Styled` literal no topo:
 /// `.background_color(a).padding().background_color(b)` aninha de verdade
 /// (geometrias diferentes, os dois pintam).
+/// Reescreve o nó de TEXTO sob a cadeia de `Styled` (se houver) — o
+/// caminho de `.highlight()`/`.truncationMode()`, imunes à ordem dos
+/// modifiers visuais na cadeia.
+fn rewrite_text_node(
+    node: LayoutNode,
+    rewrite: &impl Fn(
+        std::rc::Rc<str>,
+        Option<TextHighlight>,
+        Option<Truncation>,
+    ) -> LayoutNode,
+) -> LayoutNode {
+    match node {
+        LayoutNode::Text { content, highlights, truncation } => {
+            rewrite(content, highlights, truncation)
+        }
+        LayoutNode::Styled { props, child } => LayoutNode::Styled {
+            props,
+            child: Box::new(rewrite_text_node(*child, rewrite)),
+        },
+        other => other,
+    }
+}
+
 fn wrap_styled(out: &mut NodeList, delta: VisualProps) {
     out.wrap_last_layout(|node| match node {
         LayoutNode::Styled { props, child } => {
@@ -339,6 +368,24 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 out,
                 VisualProps { background_pressed: Some(*color), ..VisualProps::default() },
             ),
+            // os dois abaixo reescrevem o NÓ DE TEXTO, descendo através de
+            // `Styled` (`.font()`/`.foreground_color()` antes ou depois, a
+            // ordem não importa) — em não-texto são no-op de propósito
+            // (paridade SwiftUI: truncationMode fora de texto não faz nada)
+            Modifier::Highlight(ranges, color) => out.wrap_last_layout(|node| {
+                rewrite_text_node(node, &|content, _, truncation| LayoutNode::Text {
+                    content,
+                    highlights: Some(TextHighlight { ranges: ranges.clone(), color: *color }),
+                    truncation,
+                })
+            }),
+            Modifier::TruncationMode(mode) => out.wrap_last_layout(|node| {
+                rewrite_text_node(node, &|content, highlights, _| LayoutNode::Text {
+                    content,
+                    highlights,
+                    truncation: Some(*mode),
+                })
+            }),
             Modifier::OnClick(action) => {
                 // o mesmo registro do Button: ação retida no reconciler,
                 // frame no hit-test pela identidade do cursor

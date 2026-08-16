@@ -98,6 +98,15 @@ pub(crate) fn clamp_index(text: &str, index: usize) -> usize {
     clamp_to_boundary(text, index)
 }
 
+/// Fronteiras expostas ao crate (a elipse do layout caminha por elas).
+pub(crate) fn boundary_after(text: &str, index: usize) -> usize {
+    next_boundary(text, index)
+}
+
+pub(crate) fn boundary_before(text: &str, index: usize) -> usize {
+    previous_boundary(text, index)
+}
+
 /// Aplica um comando ao par (texto, caret) — a ÚNICA porta de mutação.
 /// Estado fora do texto (o app trocou a string por fora) clampa aqui.
 /// A saída é o texto que `Read`/`Copy`/`Cut` extraem.
