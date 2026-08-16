@@ -11,18 +11,26 @@
 //! na condição de estabilidade e fica visível em [`Runtime::take_dirty`] e
 //! [`Runtime::body_runs`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use motor::state::{Context, EnvironmentValues};
 
 use crate::effects;
-use crate::layout::{Interaction, LayoutEnv, Point, Px, Rect, ScrollRegion};
+use crate::layout::{FieldPlacement, Interaction, LayoutEnv, Point, Px, Rect, ScrollRegion};
 use crate::reconciler;
-use crate::text_engine::{FontSpec, MeasureCache, PixelFont, TextEngine};
+use crate::text_engine::{FontSpec, MeasureCache, PixelFont, TextEngine, caret_from_x};
 use crate::text_input::{CaretState, EditCommand};
 use crate::view::{NodeList, View};
+
+/// O resultado de um comando de edição: `applied` = houve campo focado
+/// para receber (o shell repinta); `output` = o texto que `Read`/`Copy`/
+/// `Cut` extraem (a ponte do clipboard e da sincronização de IME).
+pub struct Edited {
+    pub applied: bool,
+    pub output: Option<String>,
+}
 
 pub struct Runtime {
     ctx: Context,
@@ -52,6 +60,12 @@ pub struct Runtime {
     /// Caret + seleção por campo — sobrevivem a blur/refoco e a
     /// remontagem (restauração por identidade, como o scroll).
     carets: RefCell<HashMap<String, CaretState>>,
+    /// Fase do blink: o caret some e volta no tick do shell; digitar ou
+    /// focar volta para sólido (caret parado pisca, caret ativo não).
+    caret_visible: Cell<bool>,
+    /// Os campos do último layout (geometria + fonte efetiva) — o
+    /// clique-posiciona e a sincronização de IME medem por aqui.
+    last_fields: RefCell<Vec<FieldPlacement>>,
 }
 
 impl Default for Runtime {
@@ -90,6 +104,8 @@ impl Runtime {
             last_scrolls: RefCell::new(Vec::new()),
             focus: RefCell::new(None),
             carets: RefCell::new(HashMap::new()),
+            caret_visible: Cell::new(true),
+            last_fields: RefCell::new(Vec::new()),
         }
     }
 
@@ -188,7 +204,7 @@ impl Runtime {
         // fora do borrow: a ação pode escrever estado e re-entrar aqui
         match fired {
             Some(path) if reconciler::has_editor(&path) => {
-                self.focus(&path);
+                self.focus_at(&path, x);
                 Some(path)
             }
             Some(path) if self.activate(&path) => {
@@ -273,6 +289,7 @@ impl Runtime {
     /// Foca um campo. O caret vai para o FIM na primeira vez (o clamp da
     /// estampa resolve o `usize::MAX`); refocar restaura a posição retida.
     pub fn focus(&self, path: &str) {
+        self.caret_visible.set(true);
         *self.focus.borrow_mut() = Some(path.to_string());
         self.carets
             .borrow_mut()
@@ -280,25 +297,71 @@ impl Runtime {
             .or_insert(CaretState { caret: usize::MAX, anchor: None });
     }
 
+    /// Foca posicionando o caret pelo X do clique — medição de prefixos
+    /// com a FONTE efetiva do campo (retida do último layout).
+    fn focus_at(&self, path: &str, x: Px) {
+        self.caret_visible.set(true);
+        *self.focus.borrow_mut() = Some(path.to_string());
+        let mut probe = CaretState::default();
+        let text = match reconciler::run_editor(path, EditCommand::Read, &mut probe) {
+            Some(Some(text)) => text,
+            _ => {
+                self.carets
+                    .borrow_mut()
+                    .entry(path.to_string())
+                    .or_insert(CaretState { caret: usize::MAX, anchor: None });
+                return;
+            }
+        };
+        let placement = self
+            .last_fields
+            .borrow()
+            .iter()
+            .find(|field| field.path == path)
+            .cloned();
+        let caret = match placement {
+            Some(field) => {
+                caret_from_x(&text, x - field.text_origin.x, &field.font, &*self.text, &self.cache)
+            }
+            None => text.len(),
+        };
+        self.carets
+            .borrow_mut()
+            .insert(path.to_string(), CaretState { caret, anchor: None });
+    }
+
     pub fn blur(&self) -> bool {
         self.focus.borrow_mut().take().is_some()
     }
 
-    /// Aplica um comando de edição ao campo focado. `true` = houve campo
-    /// para receber (o shell repinta; a escrita no binding já sujou quem
-    /// lê).
-    pub fn key(&self, command: EditCommand) -> bool {
-        let Some(path) = self.focus.borrow().clone() else {
+    /// Meio-período do blink (o shell chama num timer): alterna a
+    /// visibilidade do caret. `true` = há campo focado — repaint.
+    pub fn blink(&self) -> bool {
+        if self.focus.borrow().is_none() {
+            self.caret_visible.set(true);
             return false;
+        }
+        self.caret_visible.set(!self.caret_visible.get());
+        true
+    }
+
+    /// Aplica um comando de edição ao campo focado. A escrita no binding
+    /// já sujou quem lê; digitar volta o caret para sólido.
+    pub fn key(&self, command: EditCommand) -> Edited {
+        let Some(path) = self.focus.borrow().clone() else {
+            return Edited { applied: false, output: None };
         };
         let mut state = self.carets.borrow().get(&path).copied().unwrap_or_default();
         // fora do borrow do mapa: o editor escreve no binding e pode
         // re-entrar no runtime
-        let applied = reconciler::run_editor(&path, command, &mut state);
-        if applied {
-            self.carets.borrow_mut().insert(path, state);
+        match reconciler::run_editor(&path, command, &mut state) {
+            Some(output) => {
+                self.carets.borrow_mut().insert(path, state);
+                self.caret_visible.set(true);
+                Edited { applied: true, output }
+            }
+            None => Edited { applied: false, output: None },
         }
-        applied
     }
 
     /// Um frame completo para o shell: estabiliza, layout no viewport,
@@ -357,6 +420,7 @@ impl Runtime {
             interaction: &interaction,
             focus: focus.as_deref(),
             carets: &carets,
+            caret_visible: self.caret_visible.get(),
         };
         let mut roots: Vec<crate::layout::LayoutNode> = nodes
             .take_layout()
@@ -389,6 +453,7 @@ impl Runtime {
         drop(offsets);
         *self.last_hits.borrow_mut() = result.hits.clone();
         *self.last_scrolls.borrow_mut() = result.scrolls.clone();
+        *self.last_fields.borrow_mut() = result.fields.clone();
         result
     }
 

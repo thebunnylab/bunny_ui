@@ -26,7 +26,8 @@ impl CaretState {
 }
 
 /// O que teclado e IME pedem a um campo. `bool` = estender a seleção
-/// (shift pressionado).
+/// (shift pressionado). `Read`/`Copy`/`Cut` devolvem texto pela saída de
+/// [`apply`] — a ponte de clipboard e de sincronização com a plataforma.
 #[derive(Clone, PartialEq, Debug)]
 pub enum EditCommand {
     Insert(String),
@@ -37,6 +38,12 @@ pub enum EditCommand {
     Home(bool),
     End(bool),
     SelectAll,
+    /// Lê o texto inteiro sem mutar (a sincronização de IME usa).
+    Read,
+    /// Devolve a seleção sem mutar (`None` = colapsada).
+    Copy,
+    /// Devolve a seleção e a remove.
+    Cut,
 }
 
 /// Fronteira de char anterior (ou 0).
@@ -83,7 +90,8 @@ pub(crate) fn clamp_index(text: &str, index: usize) -> usize {
 
 /// Aplica um comando ao par (texto, caret) — a ÚNICA porta de mutação.
 /// Estado fora do texto (o app trocou a string por fora) clampa aqui.
-pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) {
+/// A saída é o texto que `Read`/`Copy`/`Cut` extraem.
+pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) -> Option<String> {
     state.caret = clamp_to_boundary(text, state.caret);
     if let Some(anchor) = state.anchor {
         state.anchor = Some(clamp_to_boundary(text, anchor));
@@ -125,6 +133,17 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) {
             text.insert_str(state.caret, &insertion);
             state.caret += insertion.len();
         }
+        EditCommand::Read => return Some(text.clone()),
+        EditCommand::Copy => {
+            return state.selection().map(|(start, end)| text[start..end].to_string());
+        }
+        EditCommand::Cut => {
+            let cut = state.selection().map(|(start, end)| text[start..end].to_string());
+            if cut.is_some() {
+                remove_selection(text, state);
+            }
+            return cut;
+        }
         EditCommand::Backspace => {
             if !remove_selection(text, state) && state.caret > 0 {
                 let start = previous_boundary(text, state.caret);
@@ -158,6 +177,7 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) {
             state.caret = text.len();
         }
     }
+    None
 }
 
 // MARK: - A borda UTF-16 (IME e plataformas falam UTF-16; nós, bytes)

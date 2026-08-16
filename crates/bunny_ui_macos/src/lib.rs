@@ -90,14 +90,39 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
                     None
                 }
                 0 if command => Some(EditCommand::SelectAll),
+                8 if command => {
+                    // cmd+C — a saída do campo vai para o sistema
+                    if let Some(text) = runtime.key(EditCommand::Copy).output {
+                        ffi::clipboard_write(&text);
+                    }
+                    None
+                }
+                7 if command => {
+                    // cmd+X
+                    let cut = runtime.key(EditCommand::Cut);
+                    if let Some(text) = &cut.output {
+                        ffi::clipboard_write(text);
+                    }
+                    if cut.output.is_some() {
+                        blit(&runtime, &root);
+                    }
+                    None
+                }
+                9 if command => ffi::clipboard_read().map(EditCommand::Insert),
                 _ if !command && !chars.is_empty() && chars.chars().all(printable) => {
                     Some(EditCommand::Insert(chars))
                 }
                 _ => None,
             };
             if let Some(edit) = edit
-                && runtime.key(edit)
+                && runtime.key(edit).applied
             {
+                blit(&runtime, &root);
+            }
+        }
+        AppEvent::Blink => {
+            // caret parado pisca; sem foco o tick é silêncio
+            if runtime.blink() {
                 blit(&runtime, &root);
             }
         }

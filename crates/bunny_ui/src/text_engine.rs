@@ -282,6 +282,40 @@ fn glyph(ch: char) -> Option<u16> {
     Some(rows)
 }
 
+/// O índice de caret mais próximo do X (px lógicos a partir do início do
+/// texto) — o caminho do clique-posiciona: mede prefixos por fronteira de
+/// char e fica com o mais perto (o cache segura o custo).
+pub fn caret_from_x(
+    text: &str,
+    x: Px,
+    font: &FontSpec,
+    engine: &dyn TextEngine,
+    cache: &MeasureCache,
+) -> usize {
+    if x <= 0.0 || text.is_empty() {
+        return 0;
+    }
+    let mut best = 0;
+    let mut best_distance = x;
+    let boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .skip(1)
+        .chain(std::iter::once(text.len()));
+    for boundary in boundaries {
+        let width = cache.get_or_measure(&text[..boundary], font, engine).width;
+        let distance = (width - x).abs();
+        if distance < best_distance {
+            best = boundary;
+            best_distance = distance;
+        }
+        if width > x {
+            break; // já passou do clique — o mais próximo ficou para trás
+        }
+    }
+    best
+}
+
 // MARK: - Cache de medição
 
 /// Double-buffer prev/current trocado por passada de layout: hit promove

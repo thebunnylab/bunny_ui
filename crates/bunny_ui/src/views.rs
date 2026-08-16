@@ -185,10 +185,14 @@ impl View for TextField {
                     path.clone(),
                     Rc::new(move |command, state| {
                         let mut value = binding.wrappedValue();
-                        crate::text_input::apply(&mut value, state, command);
-                        // o set suja quem LÊ — o campo repinta pelo caminho
-                        // incremental normal
-                        binding.set(value);
+                        let original = value.clone();
+                        let output = crate::text_input::apply(&mut value, state, command);
+                        // o set suja quem LÊ — só quando o texto mudou de
+                        // fato (Read/Copy não podem invalidar o mundo)
+                        if value != original {
+                            binding.set(value);
+                        }
+                        output
                     }),
                 );
                 out.push_layout(LayoutNode::Field {

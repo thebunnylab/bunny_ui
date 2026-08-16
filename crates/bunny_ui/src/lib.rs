@@ -60,7 +60,7 @@ pub mod prelude {
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
     pub use crate::text_input::{CaretState, EditCommand};
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
-    pub use crate::runtime::Runtime;
+    pub use crate::runtime::{Edited, Runtime};
     pub use crate::state_ext::{BindingExt, StateExt};
     pub use crate::view::{Component, Either, Many, Single, UnaryView, View};
     pub use crate::views::*;
@@ -930,7 +930,7 @@ mod tests {
         assert_eq!(runtime.focused(), Some(field_path.clone()));
 
         // digitar flui pelo binding: o TÍTULO (outra view) vê a mudança
-        assert!(runtime.key(EditCommand::Insert("Deco".into())));
+        assert!(runtime.key(EditCommand::Insert("Deco".into())).applied);
         let printed = runtime.render_stable(&form);
         assert!(printed.contains("hello Deco"), "{printed}");
 
@@ -947,15 +947,85 @@ mod tests {
         )));
 
         // edição continua: backspace come o "o"
-        assert!(runtime.key(EditCommand::Backspace));
+        assert!(runtime.key(EditCommand::Backspace).applied);
         assert!(runtime.render_stable(&form).contains("hello Dec"));
+
+        // copy/cut extraem pela saída (a ponte do clipboard)
+        assert!(runtime.key(EditCommand::SelectAll).applied);
+        assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some("Dec"));
+        assert_eq!(runtime.key(EditCommand::Cut).output.as_deref(), Some("Dec"));
+        assert!(!runtime.render_stable(&form).contains("hello Dec"), "o cut removeu");
+        assert!(runtime.key(EditCommand::Insert("Dec".into())).applied);
 
         // clique fora tira o foco; teclar sem foco não faz nada
         runtime.pointer_pressed(239.0, 99.0);
         runtime.pointer_released(239.0, 99.0);
         assert_eq!(runtime.focused(), None);
-        assert!(!runtime.key(EditCommand::Insert("x".into())));
+        assert!(!runtime.key(EditCommand::Insert("x".into())).applied);
         assert!(runtime.render_stable(&form).contains("hello Dec"));
+    }
+
+    #[test]
+    fn click_positions_the_caret_and_blink_toggles_it() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+        use crate::text_input::EditCommand;
+
+        #[derive(Clone, Copy)]
+        struct Form {
+            name: State<String>,
+        }
+
+        impl Component for Form {
+            fn body(&self, _ctx: &Context) -> impl View {
+                text_field("name", self.name.binding())
+            }
+        }
+
+        let form = Form { name: State::new("abcdef".to_string()) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&form);
+        let viewport = Proposal::exact(Size { width: 240.0, height: 40.0 });
+        let result = runtime.layout(&form, viewport);
+        let field = result.fields.first().expect("campo colocado").clone();
+
+        // clique no meio do "abcdef" (PixelFont: 8px/char): entre c e d
+        let x = field.text_origin.x + 3.0 * 8.0 + 2.0;
+        let y = field.frame.origin.y + field.frame.size.height / 2.0;
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        assert_eq!(runtime.focused(), Some(field.path.clone()));
+        // digitar no ponto clicado prova a posição sem expor o índice
+        runtime.key(EditCommand::Insert("X".into()));
+        assert!(runtime.render_stable(&form).contains("abcXdef"));
+
+        // blink: o tick alterna a pintura do caret sem tocar em nada mais
+        let caret_count = |result: &crate::layout::LayoutResult| {
+            result
+                .display
+                .iter()
+                .filter(|command| matches!(
+                    command,
+                    DrawCommand::FillRect { rect, color, .. }
+                        if *color == Color::BLACK && rect.size.width < 2.0
+                ))
+                .count()
+        };
+        let visible = runtime.layout(&form, viewport);
+        assert_eq!(caret_count(&visible), 1);
+        assert!(runtime.blink(), "focado: o tick pede repaint");
+        let hidden = runtime.layout(&form, viewport);
+        assert_eq!(caret_count(&hidden), 0, "meio-período apagado");
+        assert!(runtime.blink());
+        let back = runtime.layout(&form, viewport);
+        assert_eq!(caret_count(&back), 1);
+        // digitar volta para sólido mesmo no meio-período apagado
+        runtime.blink();
+        runtime.key(EditCommand::Insert("!".into()));
+        let typing = runtime.layout(&form, viewport);
+        assert_eq!(caret_count(&typing), 1, "caret ativo não pisca");
+        // sem foco, o tick não pede repaint
+        runtime.blur();
+        assert!(!runtime.blink());
     }
 
     #[test]

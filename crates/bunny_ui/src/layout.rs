@@ -360,12 +360,23 @@ pub struct ScrollRegion {
     pub content: Size,
 }
 
+/// Um campo de texto colocado: geometria + fonte EFETIVA no ponto da cena
+/// — o clique-posiciona e a sincronização de IME medem por aqui.
+#[derive(Clone, Debug)]
+pub struct FieldPlacement {
+    pub path: String,
+    pub frame: Rect,
+    pub text_origin: Point,
+    pub font: FontSpec,
+}
+
 #[derive(Default, Debug)]
 pub struct Placement {
     pub frames: Frames,
     pub display: DisplayList,
     pub hits: Vec<(String, Rect)>,
     pub scrolls: Vec<ScrollRegion>,
+    pub fields: Vec<FieldPlacement>,
     /// Pilha do foreground herdado — o topo colore o texto.
     foreground: Vec<Color>,
     /// Pilha do `(hovered, pressed)` do `Interactive` mais próximo — o
@@ -470,6 +481,7 @@ pub struct LayoutResult {
     pub display: DisplayList,
     pub hits: Vec<(String, Rect)>,
     pub scrolls: Vec<ScrollRegion>,
+    pub fields: Vec<FieldPlacement>,
 }
 
 /// Roda as duas fases a partir do root com o ambiente default — o
@@ -505,6 +517,7 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         display: out.display,
         hits: out.hits,
         scrolls: out.scrolls,
+        fields: out.fields,
     }
 }
 
@@ -813,6 +826,12 @@ impl LayoutNode {
                 if let Some(visible) = visible {
                     out.hits.push((path.clone(), visible));
                 }
+                out.fields.push(FieldPlacement {
+                    path: path.clone(),
+                    frame,
+                    text_origin,
+                    font: env.font,
+                });
             }
 
             (LayoutNode::Leaf { .. }, Fit::Leaf) => {

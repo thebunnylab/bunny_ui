@@ -37,8 +37,9 @@ use crate::text_input::{CaretState, EditCommand};
 pub(crate) type ActionEntry = (String, Rc<dyn Fn()>);
 
 /// O editor de um campo de texto: aplica um comando ao par
-/// (binding, caret). Retido como as ações — campo de view pulada edita.
-pub(crate) type EditorFn = Rc<dyn Fn(EditCommand, &mut CaretState)>;
+/// (binding, caret) e devolve a saída de `Read`/`Copy`/`Cut`. Retido como
+/// as ações — campo de view pulada edita.
+pub(crate) type EditorFn = Rc<dyn Fn(EditCommand, &mut CaretState) -> Option<String>>;
 pub(crate) type EditorEntry = (String, EditorFn);
 
 pub(crate) struct Entry {
@@ -326,16 +327,16 @@ pub(crate) fn has_editor(path: &str) -> bool {
     EDITORS.with(|editors| editors.borrow().contains_key(path))
 }
 
-/// Aplica um comando ao campo — o closure retido é quem alcança o binding.
-pub(crate) fn run_editor(path: &str, command: EditCommand, state: &mut CaretState) -> bool {
+/// Aplica um comando ao campo — o closure retido é quem alcança o
+/// binding. `None` externo = campo não registrado; o `Option` interno é a
+/// saída do comando.
+pub(crate) fn run_editor(
+    path: &str,
+    command: EditCommand,
+    state: &mut CaretState,
+) -> Option<Option<String>> {
     let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
-    match editor {
-        Some(editor) => {
-            editor(command, state);
-            true
-        }
-        None => false,
-    }
+    editor.map(|editor| editor(command, state))
 }
 
 /// Identidades varridas pelo `end_pass`: as entries delas caem juntas.
@@ -388,6 +389,8 @@ pub(crate) struct Stamp<'a> {
     pub interaction: &'a Interaction,
     pub focus: Option<&'a str>,
     pub carets: &'a HashMap<String, CaretState>,
+    /// Fase do blink — o caret só pinta quando visível.
+    pub caret_visible: bool,
 }
 
 /// Resolve referências da árvore de LAYOUT contra a retenção — o gêmeo do
@@ -464,7 +467,7 @@ pub(crate) fn expand_layout(node: &LayoutNode, interaction: &Stamp) -> LayoutNod
                 content: content.clone(),
                 placeholder: placeholder.clone(),
                 focused,
-                caret: focused.then(|| clamp(state.caret)),
+                caret: (focused && interaction.caret_visible).then(|| clamp(state.caret)),
                 selection: focused
                     .then(|| state.selection())
                     .flatten()

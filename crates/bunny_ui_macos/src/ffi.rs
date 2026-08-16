@@ -94,11 +94,30 @@ unsafe extern "C" {
     fn msg_u16(obj: Id, sel: Sel) -> u16;
     #[link_name = "objc_msgSend"]
     fn msg_u64(obj: Id, sel: Sel) -> u64;
+    #[link_name = "objc_msgSend"]
+    fn msg_i64(obj: Id, sel: Sel) -> i64;
+    #[link_name = "objc_msgSend"]
+    fn msg_id_arg(obj: Id, sel: Sel, a: Id) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_bool_id_id(obj: Id, sel: Sel, a: Id, b: Id) -> i8;
+    #[link_name = "objc_msgSend"]
+    fn msg_timer(
+        obj: Id,
+        sel: Sel,
+        interval: f64,
+        target: Id,
+        selector: Sel,
+        info: Id,
+        repeats: i8,
+    ) -> Id;
 }
 
 // AppKit/QuartzCore entram pelo runtime ObjC; o link garante as classes.
 #[link(name = "AppKit", kind = "framework")]
-unsafe extern "C" {}
+unsafe extern "C" {
+    /// O tipo de string do pasteboard (`public.utf8-plain-text`).
+    static NSPasteboardTypeString: Id;
+}
 #[link(name = "QuartzCore", kind = "framework")]
 unsafe extern "C" {}
 
@@ -161,6 +180,8 @@ pub enum AppEvent {
     /// direto — IME de verdade (marked text CJK) chega com o
     /// NSTextInputClient.
     Key { code: u16, shift: bool, command: bool, chars: String },
+    /// Meio-período do blink do caret (o NSTimer do shell).
+    Blink,
     /// A janela mudou de tamanho (ou precisa do primeiro frame).
     Redraw,
 }
@@ -261,6 +282,10 @@ extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, _note: Id) {
     dispatch(AppEvent::Redraw);
 }
 
+extern "C" fn bunny_blink(_this: Id, _sel: Sel, _timer: Id) {
+    dispatch(AppEvent::Blink);
+}
+
 extern "C" fn bunny_window_will_close(_this: Id, _sel: Sel, _note: Id) {
     unsafe {
         let app = msg_id(class("NSApplication"), sel("sharedApplication"));
@@ -340,6 +365,12 @@ unsafe fn register_classes() {
             delegate,
             sel("windowDidResize:"),
             bunny_window_did_resize as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            delegate,
+            sel("bunnyBlink:"),
+            bunny_blink as *const c_void,
             types.as_ptr(),
         );
         class_addMethod(
@@ -494,6 +525,17 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
         let delegate = msg_id(msg_id(class("BunnyDelegate"), sel("alloc")), sel("init"));
         msg_void_id(window, sel("setDelegate:"), delegate);
 
+        // o meio-período do blink do caret — o run loop retém o timer
+        let _ = msg_timer(
+            class("NSTimer"),
+            sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+            0.5,
+            delegate,
+            sel("bunnyBlink:"),
+            std::ptr::null_mut(),
+            1,
+        );
+
         msg_void_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
         // o teclado nasce apontando para a view de eventos
         msg_void_id(window, sel("makeFirstResponder:"), view);
@@ -509,5 +551,39 @@ pub fn run() {
     unsafe {
         let app = msg_id(class("NSApplication"), sel("sharedApplication"));
         msg_void(app, sel("run"));
+    }
+}
+
+// MARK: - Clipboard
+
+/// Escreve texto no pasteboard geral do sistema.
+pub fn clipboard_write(text: &str) {
+    unsafe {
+        let pasteboard = msg_id(class("NSPasteboard"), sel("generalPasteboard"));
+        let _ = msg_i64(pasteboard, sel("clearContents"));
+        let Ok(text) = CString::new(text) else { return };
+        let string = msg_id_cstr(class("NSString"), sel("stringWithUTF8String:"), text.as_ptr());
+        let _ = msg_bool_id_id(
+            pasteboard,
+            sel("setString:forType:"),
+            string,
+            NSPasteboardTypeString,
+        );
+    }
+}
+
+/// Lê o texto do pasteboard geral (`None` = vazio ou não-texto).
+pub fn clipboard_read() -> Option<String> {
+    unsafe {
+        let pasteboard = msg_id(class("NSPasteboard"), sel("generalPasteboard"));
+        let string = msg_id_arg(pasteboard, sel("stringForType:"), NSPasteboardTypeString);
+        if string.is_null() {
+            return None;
+        }
+        let utf8 = msg_id(string, sel("UTF8String")) as *const c_char;
+        if utf8.is_null() {
+            return None;
+        }
+        Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned())
     }
 }
