@@ -28,7 +28,7 @@ use motor::state::{Binding, Context};
 use motor::view::RenderNode;
 use motor::views::NavigationPath;
 
-use crate::layout::{Axis, Color, CrossAlign, Edges, LayoutNode, Size as LayoutSize, VisualProps};
+use crate::layout::{Axis, CrossAlign, Edges, LayoutNode, Size as LayoutSize, VisualProps};
 use crate::state_ext::BindingExt;
 use crate::view::{NodeList, Single, View, render_line};
 
@@ -71,11 +71,9 @@ pub fn text(string: impl Into<String>) -> Text {
     Text(Rc::from(string.into()))
 }
 
-// O tema-de-um-lápis do chrome de botão (Role/Size chegam com o port do
-// tema; a referência futura é altura 26/34/44 com texto 11/13/15).
-const BUTTON_BG: Color = Color::hex(0xDDE1E9);
-const BUTTON_BG_HOVERED: Color = Color::hex(0xE7EAF1);
-const BUTTON_BG_PRESSED: Color = Color::hex(0xC7CCD8);
+// A geometria do chrome de botão (Role/Size ficam para depois; a
+// referência futura é altura 26/34/44 com texto 11/13/15). As CORES vêm
+// do tema, lidas no render — retheme reconstrói a cena.
 const BUTTON_RADIUS: f64 = 6.0;
 const BUTTON_PAD_H: f64 = 14.0;
 const BUTTON_PAD_V: f64 = 6.0;
@@ -104,11 +102,12 @@ where
         // o chrome default vive na CENA (o print fica como era): fundo com
         // cantos + padding embutido, estados de hover/pressed inclusos —
         // o hit-rect passa a ser o chrome inteiro, não só o label
+        let theme = crate::theme::current();
         let chrome = LayoutNode::Styled {
             props: VisualProps {
-                background: Some(BUTTON_BG),
-                background_hovered: Some(BUTTON_BG_HOVERED),
-                background_pressed: Some(BUTTON_BG_PRESSED),
+                background: Some(theme.control),
+                background_hovered: Some(theme.control_hovered),
+                background_pressed: Some(theme.control_pressed),
                 corner_radius: Some(BUTTON_RADIUS),
                 ..VisualProps::default()
             },

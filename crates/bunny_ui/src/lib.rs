@@ -49,6 +49,7 @@ pub mod runtime;
 pub mod state_ext;
 pub mod text_engine;
 pub mod text_input;
+pub mod theme;
 pub mod view;
 pub mod views;
 
@@ -90,6 +91,7 @@ pub mod prelude {
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
     pub use crate::layout::{Color, Truncation, VisualProps};
+    pub use crate::theme::{self, Theme};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
     pub use crate::text_input::{CaretState, EditCommand};
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
@@ -991,6 +993,58 @@ mod tests {
         assert_eq!(runtime.focused(), None);
         assert!(!runtime.key(EditCommand::Insert("x".into())).applied);
         assert!(runtime.render_stable(&form).contains("hello Dec"));
+    }
+
+    #[test]
+    fn installing_a_theme_reskins_retained_views() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Chip;
+
+        impl Component for Chip {
+            fn body(self, _ctx: &Context) -> impl View {
+                // token lido no BODY fica gravado na cena retida — o
+                // install tem que reconstruir sem nenhum estado sujo
+                button(text("go").foreground_color(theme::accent()), || {})
+            }
+        }
+
+        let runtime = Runtime::new();
+        runtime.render_stable(&Chip);
+        let viewport = Proposal::exact(Size { width: 200.0, height: 60.0 });
+
+        let control_of = |result: &crate::layout::LayoutResult| {
+            result
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::FillRect { color, .. } => Some(*color),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let text_of = |result: &crate::layout::LayoutResult| {
+            result
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::TextLine { color, .. } => Some(*color),
+                    _ => None,
+                })
+                .unwrap()
+        };
+
+        let light = runtime.layout(&Chip, viewport);
+        assert_eq!(control_of(&light), Theme::light().control);
+        assert_eq!(text_of(&light), Theme::light().accent);
+
+        theme::install(Theme::dark());
+        let dark = runtime.layout(&Chip, viewport);
+        assert_eq!(control_of(&dark), Theme::dark().control, "chrome re-lido");
+        assert_eq!(text_of(&dark), Theme::dark().accent, "token de body re-lido");
+
+        theme::install(Theme::light());
     }
 
     #[test]

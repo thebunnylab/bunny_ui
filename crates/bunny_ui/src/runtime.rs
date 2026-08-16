@@ -79,6 +79,9 @@ pub struct Runtime {
     /// Os campos do último layout (geometria + fonte efetiva) — o
     /// clique-posiciona e a sincronização de IME medem por aqui.
     last_fields: RefCell<Vec<FieldPlacement>>,
+    /// A versão do tema vista pelo último pass — trocar tema reconstrói a
+    /// retenção UMA vez (tokens lidos em body ficam gravados na cena).
+    theme_version: Cell<u64>,
 }
 
 impl Default for Runtime {
@@ -119,6 +122,7 @@ impl Runtime {
             carets: RefCell::new(HashMap::new()),
             caret_visible: Cell::new(true),
             last_fields: RefCell::new(Vec::new()),
+            theme_version: Cell::new(crate::theme::version()),
         }
     }
 
@@ -130,6 +134,13 @@ impl Runtime {
     /// o walk não alcançou, remontagem da fila de efeitos e varredura.
     /// Devolve as duas saídas (print e layout) ainda com referências.
     fn render_pass(&self, root: &impl View) -> NodeList {
+        // tema novo = retenção velha (bodies gravaram tokens antigos na
+        // cena): reconstrói uma vez e segue incremental
+        let theme_version = crate::theme::version();
+        if self.theme_version.get() != theme_version {
+            self.theme_version.set(theme_version);
+            reconciler::clear();
+        }
         effects::reset();
         let snapshot = motor::identity::dirty_snapshot();
         reconciler::begin_pass(snapshot.clone());

@@ -13,18 +13,6 @@
 use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
 
-// o tema-de-um-lápis do finder (tokens de verdade chegam com o port do tema)
-const BACKDROP: Color = Color::hex_a(0x0F172A55);
-const PANEL: Color = Color::WHITE;
-const PANEL_BORDER: Color = Color::hex_a(0x64748B55);
-const DIVIDER: Color = Color::hex_a(0x64748B2E);
-const NAME: Color = Color::hex(0x111827);
-const DIR: Color = Color::hex(0x8A94A6);
-const FAINT: Color = Color::hex(0xB3BAC7);
-const ACCENT: Color = Color::hex(0x3B82F6);
-const ROW_HOVER: Color = Color::hex_a(0x3B82F617);
-const ROW_PRESSED: Color = Color::hex_a(0x3B82F62E);
-
 const PANEL_W: f64 = 640.0;
 const PANEL_H: f64 = 480.0;
 const PANEL_TOP: f64 = 120.0;
@@ -103,13 +91,14 @@ struct Row {
 }
 
 fn divider() -> impl UnaryView {
-    spacer().frame(PANEL_W, 1.0).background_color(DIVIDER)
+    spacer().frame(PANEL_W, 1.0).background_color(theme::divider())
 }
 
 #[derive(Clone, Copy)]
 struct Finder {
     query: State<String>,
     opened: State<String>,
+    dark: State<bool>,
 }
 
 impl Component for Finder {
@@ -147,7 +136,7 @@ impl Component for Finder {
         let opened = self.opened;
 
         let header = hstack!(
-            text("›").font(Font::Headline).foreground_color(ACCENT),
+            text("›").font(Font::Headline).foreground_color(theme::accent()),
             text_field("Search files by name…", self.query.binding()).monospaced(),
         )
         .spacing(10.0)
@@ -163,8 +152,8 @@ impl Component for Finder {
                 hstack!(
                     // nome: elipse no MEIO, teto de 240 como manda a anatomia
                     text(row.name)
-                        .foreground_color(NAME)
-                        .highlight(row.name_ranges, ACCENT)
+                        .foreground_color(theme::fg())
+                        .highlight(row.name_ranges, theme::accent())
                         .truncation_mode(Truncation::Middle)
                         .frame_max(240.0, f64::INFINITY, Alignment::Leading),
                     // caminho: preenche o resto, elipse no COMEÇO (o fim
@@ -172,12 +161,12 @@ impl Component for Finder {
                     text(row.dir)
                         .font(Font::Subheadline)
                         .monospaced()
-                        .foreground_color(DIR)
-                        .highlight(row.dir_ranges, ACCENT)
+                        .foreground_color(theme::fg_secondary())
+                        .highlight(row.dir_ranges, theme::accent())
                         .truncation_mode(Truncation::Start)
                         .frame_max(f64::INFINITY, f64::INFINITY, Alignment::Leading),
                     row.recent.then(|| {
-                        text("recent").font(Font::Footnote).foreground_color(FAINT)
+                        text("recent").font(Font::Footnote).foreground_color(theme::fg_faint())
                     }),
                 )
                 .spacing(8.0)
@@ -186,8 +175,8 @@ impl Component for Finder {
                 .padding_edge(Edge::Trailing, 12.0)
                 .padding_edge(Edge::Top, 7.0)
                 .padding_edge(Edge::Bottom, 7.0)
-                .background_hovered(ROW_HOVER)
-                .background_pressed(ROW_PRESSED)
+                .background_hovered(theme::row_hover())
+                .background_pressed(theme::row_pressed())
                 .on_click(move || opened.set(label.clone()))
             },
         );
@@ -196,7 +185,7 @@ impl Component for Finder {
             Either::Second(
                 text("No matches")
                     .font(Font::Callout)
-                    .foreground_color(FAINT)
+                    .foreground_color(theme::fg_faint())
                     .frame_max(f64::INFINITY, f64::INFINITY, Alignment::Center),
             )
         } else {
@@ -209,14 +198,25 @@ impl Component for Finder {
         } else {
             format!("opened: {opened_name}")
         };
+        let dark_on = self.dark.get();
         let footer = hstack!(
             text!("{count} files")
                 .font(Font::Subheadline)
                 .monospaced()
-                .foreground_color(DIR),
+                .foreground_color(theme::fg_secondary()),
+            // retheme AO VIVO: o install reconstrói a cena no próximo pass
+            button(
+                text(if dark_on { "light" } else { "dark" }).font(Font::Footnote),
+                move || {
+                    let next = !self.dark.get();
+                    self.dark.set(next);
+                    theme::install(if next { Theme::dark() } else { Theme::light() });
+                },
+            ),
             spacer(),
-            text(status).font(Font::Subheadline).monospaced().foreground_color(DIR),
+            text(status).font(Font::Subheadline).monospaced().foreground_color(theme::fg_secondary()),
         )
+        .spacing(12.0)
         .alignment(VerticalAlignment::Center)
         .padding_edge(Edge::Leading, 12.0)
         .padding_edge(Edge::Trailing, 12.0)
@@ -226,12 +226,12 @@ impl Component for Finder {
         let panel = vstack!(header, divider(), body, divider(), footer)
             .alignment(HorizontalAlignment::Leading)
             .frame(PANEL_W, PANEL_H)
-            .background_color(PANEL)
+            .background_color(theme::panel())
             .corner_radius(9.0)
-            .border(PANEL_BORDER, 1.0);
+            .border(theme::border(), 1.0);
 
         zstack!(
-            spacer().background_color(BACKDROP),
+            spacer().background_color(theme::backdrop()),
             vstack!(spacer().frame(1.0, PANEL_TOP), panel, spacer()),
         )
     }
@@ -241,6 +241,10 @@ fn main() {
     bunny_ui_macos::run_window(
         "Finder",
         Size { width: 760.0, height: 640.0 },
-        Finder { query: State::new(String::new()), opened: State::new(String::new()) },
+        Finder {
+            query: State::new(String::new()),
+            opened: State::new(String::new()),
+            dark: State::new(false),
+        },
     );
 }

@@ -748,7 +748,7 @@ impl LayoutNode {
         match (self, fit) {
             // folhas visuais: aqui nasce a lista de desenho
             (LayoutNode::Text { content, highlights, truncation }, Fit::Leaf) => {
-                let color = out.foreground.last().copied().unwrap_or(Color::BLACK);
+                let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
                 place_text(
                     content,
                     highlights.as_ref(),
@@ -772,10 +772,12 @@ impl LayoutNode {
                 LayoutNode::Field { path, content, placeholder, focused, caret, selection, marked },
                 Fit::Leaf,
             ) => {
-                // chrome: poço branco com borda (a borda acende no foco)
+                // chrome do campo: tokens lidos na COLOCAÇÃO — retheme
+                // repinta sem re-rodar body nenhum
+                let theme = crate::theme::current();
                 out.display.push(DrawCommand::FillRect {
                     rect: frame,
-                    color: Color::WHITE,
+                    color: theme.field,
                     corner_radius: FIELD_RADIUS,
                 });
                 let text_origin = Point {
@@ -799,7 +801,7 @@ impl LayoutNode {
                             origin: Point { x: x0, y: text_origin.y },
                             size: Size { width: x1 - x0, height: metrics.height() },
                         },
-                        color: Color::SELECTION,
+                        color: theme.selection,
                         corner_radius: 0.0,
                     });
                 }
@@ -810,12 +812,12 @@ impl LayoutNode {
                         out.display.push(DrawCommand::TextLine {
                             origin: text_origin,
                             content: placeholder.to_string(),
-                            color: Color::PLACEHOLDER,
+                            color: theme.placeholder,
                             font: env.font,
                         });
                     }
                 } else {
-                    let color = out.foreground.last().copied().unwrap_or(Color::BLACK);
+                    let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
                     out.display.push(DrawCommand::TextLine {
                         origin: text_origin,
                         content: content.to_string(),
@@ -823,7 +825,8 @@ impl LayoutNode {
                         font: env.font,
                     });
                 }
-                // a composição viva ganha o sublinhado do IME
+                // a composição viva ganha o sublinhado do IME (a tinta do
+                // caret — o par visual da composição)
                 if let Some((start, end)) = marked {
                     let x0 = text_origin.x + prefix_width(*start);
                     let x1 = text_origin.x + prefix_width(*end);
@@ -832,7 +835,7 @@ impl LayoutNode {
                             origin: Point { x: x0, y: text_origin.y + metrics.height() - 1.0 },
                             size: Size { width: x1 - x0, height: 1.0 },
                         },
-                        color: Color::BLACK,
+                        color: theme.caret,
                         corner_radius: 0.0,
                     });
                 }
@@ -844,13 +847,13 @@ impl LayoutNode {
                             origin: Point { x, y: text_origin.y },
                             size: Size { width: FIELD_CARET_W, height: metrics.height() },
                         },
-                        color: Color::BLACK,
+                        color: theme.caret,
                         corner_radius: FIELD_CARET_W / 2.0,
                     });
                 }
                 out.display.push(DrawCommand::StrokeRect {
                     rect: frame,
-                    color: if *focused { Color::FOCUS } else { Color::OUTLINE },
+                    color: if *focused { theme.focus } else { theme.field_border },
                     width: 1.0,
                 });
                 // o campo é alvo de ponteiro (clicar foca) — clipado como
@@ -1320,7 +1323,7 @@ fn draw_scrollbar(frame: Rect, content_h: Px, offset_y: Px, max_y: Px, out: &mut
             },
             size: Size { width: SCROLLBAR_W, height: thumb_h },
         },
-        color: Color::SCROLLBAR,
+        color: crate::theme::current().scrollbar,
         corner_radius: SCROLLBAR_W / 2.0,
     });
 }

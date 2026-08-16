@@ -12,7 +12,7 @@ mod text;
 
 use std::rc::Rc;
 
-use bunny_ui::layout::{Color, Size};
+use bunny_ui::layout::Size;
 use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::View;
 
@@ -39,7 +39,8 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
     // perguntas síncronas do IME respondem deste espelho)
     let blit = move |runtime: &Runtime, root: &_| {
         let (width, height) = window.content_size();
-        let bitmap = runtime.frame(root, Size { width, height }, window.scale(), Color::CANVAS);
+        let canvas = bunny_ui::theme::canvas();
+        let bitmap = runtime.frame(root, Size { width, height }, window.scale(), canvas);
         window.set_image(bitmap.width(), bitmap.height(), &bitmap.to_rgba_bytes());
         window.set_cursor_pointing(runtime.interaction().hovered.is_some());
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
