@@ -13,7 +13,7 @@ mod text;
 use std::rc::Rc;
 
 use bunny_ui::layout::{Color, Size};
-use bunny_ui::prelude::Runtime;
+use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
@@ -68,6 +68,36 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
         AppEvent::Wheel { x, y, dx, dy } => {
             // offset é estado do engine: repaint sem render (zero bodies)
             if runtime.wheel(x, y, dx, dy) {
+                blit(&runtime, &root);
+            }
+        }
+        AppEvent::Key { code, shift, command, chars } => {
+            // teclas imprimíveis viram Insert; PUA F700–F8FF são as teclas
+            // de função do AppKit — nunca texto
+            let printable = |c: char| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(&c);
+            let edit = match code {
+                51 => Some(EditCommand::Backspace),
+                117 => Some(EditCommand::Delete),
+                123 => Some(EditCommand::Left(shift)),
+                124 => Some(EditCommand::Right(shift)),
+                115 => Some(EditCommand::Home(shift)),
+                119 => Some(EditCommand::End(shift)),
+                53 => {
+                    // esc solta o foco
+                    if runtime.blur() {
+                        blit(&runtime, &root);
+                    }
+                    None
+                }
+                0 if command => Some(EditCommand::SelectAll),
+                _ if !command && !chars.is_empty() && chars.chars().all(printable) => {
+                    Some(EditCommand::Insert(chars))
+                }
+                _ => None,
+            };
+            if let Some(edit) = edit
+                && runtime.key(edit)
+            {
                 blit(&runtime, &root);
             }
         }

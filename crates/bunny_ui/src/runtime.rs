@@ -21,6 +21,7 @@ use crate::effects;
 use crate::layout::{Interaction, LayoutEnv, Point, Px, Rect, ScrollRegion};
 use crate::reconciler;
 use crate::text_engine::{FontSpec, MeasureCache, PixelFont, TextEngine};
+use crate::text_input::{CaretState, EditCommand};
 use crate::view::{NodeList, View};
 
 pub struct Runtime {
@@ -46,6 +47,11 @@ pub struct Runtime {
     scroll_offsets: RefCell<HashMap<String, Point>>,
     /// As regiões de rolagem do último layout — o mapa do wheel.
     last_scrolls: RefCell<Vec<ScrollRegion>>,
+    /// O campo focado (caminho de identidade) — dono do teclado.
+    focus: RefCell<Option<String>>,
+    /// Caret + seleção por campo — sobrevivem a blur/refoco e a
+    /// remontagem (restauração por identidade, como o scroll).
+    carets: RefCell<HashMap<String, CaretState>>,
 }
 
 impl Default for Runtime {
@@ -82,6 +88,8 @@ impl Runtime {
             cache: MeasureCache::default(),
             scroll_offsets: RefCell::new(HashMap::new()),
             last_scrolls: RefCell::new(Vec::new()),
+            focus: RefCell::new(None),
+            carets: RefCell::new(HashMap::new()),
         }
     }
 
@@ -112,6 +120,7 @@ impl Runtime {
         if let Some(pass_root) = &pass_root {
             effects::set_queue(reconciler::assemble_effects(pass_root));
             reconciler::assemble_actions(pass_root);
+            reconciler::assemble_editors(pass_root);
             motor::identity::consume_dirty(pass_root, &snapshot);
             *self.last_root.borrow_mut() = Some(pass_root.clone());
         }
@@ -160,8 +169,10 @@ impl Runtime {
         changed
     }
 
-    /// Botão subiu: dispara a ação SE soltou dentro do alvo pressionado.
-    /// Devolve o caminho disparado; o visual de pressed limpa sempre.
+    /// Botão subiu: dispara a ação SE soltou dentro do alvo pressionado —
+    /// ou FOCA, se o alvo é um campo de texto. Soltar fora de qualquer
+    /// campo tira o foco (first responder segue o clique). Devolve o
+    /// caminho disparado/focado; o visual de pressed limpa sempre.
     pub fn pointer_released(&self, x: Px, y: Px) -> Option<String> {
         let target = self.hover_target(x, y);
         let fired = {
@@ -176,8 +187,18 @@ impl Runtime {
         };
         // fora do borrow: a ação pode escrever estado e re-entrar aqui
         match fired {
-            Some(path) if self.activate(&path) => Some(path),
-            _ => None,
+            Some(path) if reconciler::has_editor(&path) => {
+                self.focus(&path);
+                Some(path)
+            }
+            Some(path) if self.activate(&path) => {
+                self.blur();
+                Some(path)
+            }
+            _ => {
+                self.blur();
+                None
+            }
         }
     }
 
@@ -243,6 +264,43 @@ impl Runtime {
         self.scroll_offsets.borrow().get(path).copied().unwrap_or_default()
     }
 
+    // MARK: - Foco e teclado (o campo focado é o dono do teclado)
+
+    pub fn focused(&self) -> Option<String> {
+        self.focus.borrow().clone()
+    }
+
+    /// Foca um campo. O caret vai para o FIM na primeira vez (o clamp da
+    /// estampa resolve o `usize::MAX`); refocar restaura a posição retida.
+    pub fn focus(&self, path: &str) {
+        *self.focus.borrow_mut() = Some(path.to_string());
+        self.carets
+            .borrow_mut()
+            .entry(path.to_string())
+            .or_insert(CaretState { caret: usize::MAX, anchor: None });
+    }
+
+    pub fn blur(&self) -> bool {
+        self.focus.borrow_mut().take().is_some()
+    }
+
+    /// Aplica um comando de edição ao campo focado. `true` = houve campo
+    /// para receber (o shell repinta; a escrita no binding já sujou quem
+    /// lê).
+    pub fn key(&self, command: EditCommand) -> bool {
+        let Some(path) = self.focus.borrow().clone() else {
+            return false;
+        };
+        let mut state = self.carets.borrow().get(&path).copied().unwrap_or_default();
+        // fora do borrow do mapa: o editor escreve no binding e pode
+        // re-entrar no runtime
+        let applied = reconciler::run_editor(&path, command, &mut state);
+        if applied {
+            self.carets.borrow_mut().insert(path, state);
+        }
+        applied
+    }
+
     /// Um frame completo para o shell: estabiliza, layout no viewport,
     /// raster no scale — os hits ficam retidos para os eventos. Se o
     /// conteúdo andou sob o ponteiro parado (uma ação inseriu/removeu), o
@@ -290,14 +348,22 @@ impl Runtime {
         proposal: crate::layout::Proposal,
     ) -> crate::layout::LayoutResult {
         let mut nodes = self.render_pass(root);
-        // a interação é estampada na CÓPIA expandida — a retenção nunca
-        // guarda estado de ponteiro
+        // o estado de frame é estampado na CÓPIA expandida — a retenção
+        // nunca guarda ponteiro nem caret
         let interaction = self.interaction.borrow().clone();
+        let focus = self.focus.borrow().clone();
+        let carets = self.carets.borrow();
+        let stamp = reconciler::Stamp {
+            interaction: &interaction,
+            focus: focus.as_deref(),
+            carets: &carets,
+        };
         let mut roots: Vec<crate::layout::LayoutNode> = nodes
             .take_layout()
             .iter()
-            .map(|node| reconciler::expand_layout(node, &interaction))
+            .map(|node| reconciler::expand_layout(node, &stamp))
             .collect();
+        drop(carets);
         let tree = if roots.len() == 1 {
             roots.remove(0)
         } else {

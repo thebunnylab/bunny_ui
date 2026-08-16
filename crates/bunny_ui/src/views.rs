@@ -159,6 +159,63 @@ where
     Button { label, action }
 }
 
+/// `TextField("Placeholder", text: $binding)` — campo de UMA linha. O app
+/// é dono da STRING (o binding); o framework é dono de caret, seleção e
+/// foco (por identidade estrutural, como o scroll). A edição chega por um
+/// closure retido no reconciler — campo de view pulada continua editável.
+#[derive(Clone)]
+pub struct TextField {
+    placeholder: Rc<str>,
+    text: Binding<String>,
+}
+
+impl View for TextField {
+    type Arity = Single;
+
+    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
+        let value = self.text.wrappedValue();
+        out.push(RenderNode::leaf(format!(
+            "TextField({:?}, text: {:?})",
+            self.placeholder, value
+        )));
+        match motor::identity::cursor_scope() {
+            Some(path) => {
+                let binding = self.text.clone();
+                crate::reconciler::attribute_editor(
+                    path.clone(),
+                    Rc::new(move |command, state| {
+                        let mut value = binding.wrappedValue();
+                        crate::text_input::apply(&mut value, state, command);
+                        // o set suja quem LÊ — o campo repinta pelo caminho
+                        // incremental normal
+                        binding.set(value);
+                    }),
+                );
+                out.push_layout(LayoutNode::Field {
+                    path,
+                    content: Rc::from(value),
+                    placeholder: self.placeholder.clone(),
+                    focused: false,
+                    caret: None,
+                    selection: None,
+                });
+            }
+            // fora de um pass (uso decorativo): o valor vira texto puro
+            None => out.push_layout(LayoutNode::Text {
+                content: if value.is_empty() {
+                    self.placeholder.clone()
+                } else {
+                    Rc::from(value)
+                },
+            }),
+        }
+    }
+}
+
+pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> TextField {
+    TextField { placeholder: Rc::from(placeholder.into()), text }
+}
+
 /// `ProgressView()`
 #[derive(Clone, Copy, Default)]
 pub struct ProgressView;

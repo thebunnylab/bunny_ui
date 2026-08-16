@@ -30,10 +30,16 @@ use motor::view::RenderNode;
 
 use crate::erased::Erased;
 use crate::layout::{Interaction, LayoutNode};
+use crate::text_input::{CaretState, EditCommand};
 
 /// Uma ação interativa registrada durante o render: (caminho do alvo, o
 /// que o clique dispara).
 pub(crate) type ActionEntry = (String, Rc<dyn Fn()>);
+
+/// O editor de um campo de texto: aplica um comando ao par
+/// (binding, caret). Retido como as ações — campo de view pulada edita.
+pub(crate) type EditorFn = Rc<dyn Fn(EditCommand, &mut CaretState)>;
+pub(crate) type EditorEntry = (String, EditorFn);
 
 pub(crate) struct Entry {
     pub value: Erased,
@@ -46,6 +52,8 @@ pub(crate) struct Entry {
     /// As ações interativas do body — retidas como os efeitos: botão de
     /// view pulada continua clicável.
     pub actions: Vec<ActionEntry>,
+    /// Os editores de campo do body — mesma retenção.
+    pub editors: Vec<EditorEntry>,
     /// Segmentos do caminho do PAI — a semente do cursor num re-run isolado.
     pub parent_segments: Vec<String>,
 }
@@ -55,6 +63,7 @@ struct BuildingFrame {
     path: String,
     effects: Vec<EffectFn>,
     actions: Vec<ActionEntry>,
+    editors: Vec<EditorEntry>,
 }
 
 #[derive(Default)]
@@ -68,6 +77,7 @@ struct PassState {
     /// a cada walk.
     root_effects: Vec<EffectFn>,
     root_actions: Vec<ActionEntry>,
+    root_editors: Vec<EditorEntry>,
     /// Instrumentação: bodies que rodaram neste pass.
     body_runs: Vec<String>,
 }
@@ -129,14 +139,14 @@ pub(crate) fn finish_entry(
     node: RenderNode,
     layout: LayoutNode,
 ) {
-    let (effects, actions) = PASS.with(|pass| {
+    let (effects, actions, editors) = PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         match pass.building.pop() {
             Some(frame) => {
                 debug_assert_eq!(frame.path, path, "entries fecham na ordem que abrem");
-                (frame.effects, frame.actions)
+                (frame.effects, frame.actions, frame.editors)
             }
-            None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new()),
         }
     });
     let parent_segments = motor::identity::current_path_segments()
@@ -146,7 +156,7 @@ pub(crate) fn finish_entry(
     RETAINED.with(|retained| {
         retained.borrow_mut().insert(
             path.to_string(),
-            Entry { value, ctx, node, layout, effects, actions, parent_segments },
+            Entry { value, ctx, node, layout, effects, actions, editors, parent_segments },
         );
     });
 }
@@ -172,6 +182,18 @@ pub(crate) fn attribute_action(path: String, action: Rc<dyn Fn()>) {
             frame.actions.push((path, action));
         } else {
             pass.root_actions.push((path, action));
+        }
+    });
+}
+
+/// Um editor de campo registrado durante o render — mesma atribuição.
+pub(crate) fn attribute_editor(path: String, editor: EditorFn) {
+    PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        if let Some(frame) = pass.building.last_mut() {
+            frame.editors.push((path, editor));
+        } else {
+            pass.root_editors.push((path, editor));
         }
     });
 }
@@ -273,6 +295,49 @@ pub(crate) fn run_action(path: &str) -> bool {
     }
 }
 
+thread_local! {
+    /// O mapa de editores de campo vigente — remontado por pass, como as
+    /// ações.
+    static EDITORS: RefCell<HashMap<String, EditorFn>> = RefCell::new(HashMap::new());
+}
+
+/// Remonta o mapa de editores da retenção sob o root + região do root.
+pub(crate) fn assemble_editors(root: &str) {
+    let mut map: HashMap<String, EditorFn> = HashMap::new();
+    RETAINED.with(|retained| {
+        for (path, entry) in retained.borrow().iter() {
+            if covers(root, path) {
+                for (key, editor) in &entry.editors {
+                    map.insert(key.clone(), editor.clone());
+                }
+            }
+        }
+    });
+    PASS.with(|pass| {
+        for (key, editor) in std::mem::take(&mut pass.borrow_mut().root_editors) {
+            map.insert(key, editor);
+        }
+    });
+    EDITORS.with(|editors| *editors.borrow_mut() = map);
+}
+
+/// O alvo é um campo de texto? (decide se um clique FOCA em vez de agir)
+pub(crate) fn has_editor(path: &str) -> bool {
+    EDITORS.with(|editors| editors.borrow().contains_key(path))
+}
+
+/// Aplica um comando ao campo — o closure retido é quem alcança o binding.
+pub(crate) fn run_editor(path: &str, command: EditCommand, state: &mut CaretState) -> bool {
+    let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
+    match editor {
+        Some(editor) => {
+            editor(command, state);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Identidades varridas pelo `end_pass`: as entries delas caem juntas.
 pub(crate) fn forget(dead: &[String]) {
     RETAINED.with(|retained| {
@@ -316,12 +381,20 @@ fn parse_ref(line: &str) -> Option<(&str, &str)> {
     Some((&rest[..end], &rest[end + REF_MARK.len_utf8()..]))
 }
 
+/// O estado de frame que a expansão estampa na cópia expandida: ponteiro
+/// (hover/pressed nos `Interactive`) e edição (foco/caret/seleção nos
+/// `Field`). A retenção nunca guarda nada disso.
+pub(crate) struct Stamp<'a> {
+    pub interaction: &'a Interaction,
+    pub focus: Option<&'a str>,
+    pub carets: &'a HashMap<String, CaretState>,
+}
+
 /// Resolve referências da árvore de LAYOUT contra a retenção — o gêmeo do
-/// [`expand`] para a outra saída do render — e ESTAMPA o estado de
-/// interação do frame nos nós `Interactive`. A retenção nunca guarda
-/// estado de ponteiro: a estampa vive só nesta cópia expandida, então
-/// hover re-expande e re-pinta sem re-rodar body nenhum.
-pub(crate) fn expand_layout(node: &LayoutNode, interaction: &Interaction) -> LayoutNode {
+/// [`expand`] para a outra saída do render — e ESTAMPA o estado de frame
+/// (ver [`Stamp`]). Hover/caret re-expandem e re-pintam sem re-rodar body
+/// nenhum.
+pub(crate) fn expand_layout(node: &LayoutNode, interaction: &Stamp) -> LayoutNode {
     match node {
         LayoutNode::BoundaryRef { path } => {
             let retained = RETAINED.with(|retained| {
@@ -373,13 +446,32 @@ pub(crate) fn expand_layout(node: &LayoutNode, interaction: &Interaction) -> Lay
         },
         LayoutNode::Interactive { path, child, .. } => LayoutNode::Interactive {
             path: path.clone(),
-            hovered: interaction.hovered.as_deref() == Some(path.as_str()),
+            hovered: interaction.interaction.hovered.as_deref() == Some(path.as_str()),
             // pressed VISUAL só com o ponteiro dentro do alvo (semântica
             // AppKit: arrastar para fora solta, voltar re-arma)
-            pressed: interaction.pressed.as_deref() == Some(path.as_str())
-                && interaction.hovered.as_deref() == Some(path.as_str()),
+            pressed: interaction.interaction.pressed.as_deref() == Some(path.as_str())
+                && interaction.interaction.hovered.as_deref() == Some(path.as_str()),
             child: Box::new(expand_layout(child, interaction)),
         },
+        LayoutNode::Field { path, content, placeholder, .. } => {
+            let focused = interaction.focus == Some(path.as_str());
+            let state = interaction.carets.get(path).copied().unwrap_or_default();
+            // clampa contra o conteúdo ATUAL (o app pode ter trocado a
+            // string por fora do editor)
+            let clamp = |index: usize| crate::text_input::clamp_index(content, index);
+            LayoutNode::Field {
+                path: path.clone(),
+                content: content.clone(),
+                placeholder: placeholder.clone(),
+                focused,
+                caret: focused.then(|| clamp(state.caret)),
+                selection: focused
+                    .then(|| state.selection())
+                    .flatten()
+                    .map(|(start, end)| (clamp(start), clamp(end)))
+                    .filter(|(start, end)| start < end),
+            }
+        }
         leaf => leaf.clone(),
     }
 }

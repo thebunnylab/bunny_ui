@@ -49,6 +49,7 @@ mod reconciler;
 pub mod runtime;
 pub mod state_ext;
 pub mod text_engine;
+pub mod text_input;
 pub mod view;
 pub mod views;
 
@@ -57,6 +58,7 @@ pub mod prelude {
     pub use crate::ext::ViewExt;
     pub use crate::layout::{Color, VisualProps};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
+    pub use crate::text_input::{CaretState, EditCommand};
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
     pub use crate::runtime::Runtime;
     pub use crate::state_ext::{BindingExt, StateExt};
@@ -882,6 +884,78 @@ mod tests {
             })
             .unwrap();
         assert_eq!(line_y, -8.0);
+    }
+
+    #[test]
+    fn a_text_field_edits_through_focus_and_the_binding() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+        use crate::text_input::EditCommand;
+
+        #[derive(Clone, Copy)]
+        struct Form {
+            name: State<String>,
+        }
+
+        impl Component for Form {
+            fn body(&self, _ctx: &Context) -> impl View {
+                vstack((
+                    text(format!("hello {}", self.name.get())),
+                    text_field("Your name", self.name.binding()),
+                ))
+            }
+        }
+
+        let form = Form { name: State::new(String::new()) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&form);
+        let viewport = Proposal::exact(Size { width: 240.0, height: 100.0 });
+        let result = runtime.layout(&form, viewport);
+
+        // vazio: o placeholder pinta na cor própria, sem foco
+        let has_placeholder = result.display.iter().any(|command| matches!(
+            command,
+            DrawCommand::TextLine { color, content, .. }
+                if *color == Color::PLACEHOLDER && content == "Your name"
+        ));
+        assert!(has_placeholder);
+
+        // clicar no campo foca (up-inside → editor → foco)
+        let (field_path, rect) = result.hits.last().expect("o campo é alvo").clone();
+        let (cx, cy) = (
+            rect.origin.x + rect.size.width / 2.0,
+            rect.origin.y + rect.size.height / 2.0,
+        );
+        runtime.pointer_pressed(cx, cy);
+        assert_eq!(runtime.pointer_released(cx, cy), Some(field_path.clone()));
+        assert_eq!(runtime.focused(), Some(field_path.clone()));
+
+        // digitar flui pelo binding: o TÍTULO (outra view) vê a mudança
+        assert!(runtime.key(EditCommand::Insert("Deco".into())));
+        let printed = runtime.render_stable(&form);
+        assert!(printed.contains("hello Deco"), "{printed}");
+
+        // o frame focado pinta caret e borda de foco
+        let focused_frame = runtime.layout(&form, viewport);
+        assert!(focused_frame.display.iter().any(|command| matches!(
+            command,
+            DrawCommand::FillRect { rect, color, .. }
+                if *color == Color::BLACK && rect.size.width < 2.0
+        )));
+        assert!(focused_frame.display.iter().any(|command| matches!(
+            command,
+            DrawCommand::StrokeRect { color, .. } if *color == Color::FOCUS
+        )));
+
+        // edição continua: backspace come o "o"
+        assert!(runtime.key(EditCommand::Backspace));
+        assert!(runtime.render_stable(&form).contains("hello Dec"));
+
+        // clique fora tira o foco; teclar sem foco não faz nada
+        runtime.pointer_pressed(239.0, 99.0);
+        runtime.pointer_released(239.0, 99.0);
+        assert_eq!(runtime.focused(), None);
+        assert!(!runtime.key(EditCommand::Insert("x".into())));
+        assert!(runtime.render_stable(&form).contains("hello Dec"));
     }
 
     #[test]

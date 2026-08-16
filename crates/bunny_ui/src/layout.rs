@@ -160,6 +160,19 @@ pub enum LayoutNode {
     /// Propriedade visual semântica: background atrás do filho, border por
     /// cima, foreground herdado. Transparente para a medida — por tipo.
     Styled { props: VisualProps, child: Box<LayoutNode> },
+    /// Campo de texto de UMA linha — semântico de ponta a ponta (no Dom
+    /// vira `<input>`; no Gpu, chrome + texto + caret + seleção daqui).
+    /// `focused`/`caret`/`selection` são estampados POR FRAME na expansão
+    /// (offsets de byte já clampados no conteúdo corrente); a retenção
+    /// guarda o campo apagado.
+    Field {
+        path: String,
+        content: Rc<str>,
+        placeholder: Rc<str>,
+        focused: bool,
+        caret: Option<usize>,
+        selection: Option<(usize, usize)>,
+    },
     /// Fronteira de view (`Component`): grava o frame no caminho de
     /// identidade — o endereço dos testes e, adiante, do hit-testing.
     Boundary { path: String, children: Vec<LayoutNode> },
@@ -204,6 +217,12 @@ impl Color {
     pub const CANVAS: Color = Color::hex(0xF2F3F7);
     /// A thumb da scrollbar — véu translúcido (o blending é real).
     pub const SCROLLBAR: Color = Color { r: 0, g: 0, b: 0, a: 90 };
+    /// Borda de campo focado.
+    pub const FOCUS: Color = Color::hex(0x3B82F6);
+    /// Texto de placeholder.
+    pub const PLACEHOLDER: Color = Color::hex(0x9AA2B1);
+    /// Véu de seleção de texto.
+    pub const SELECTION: Color = Color::hex_a(0x3B82F640);
 
     pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
         Color { r, g, b, a: 255 }
@@ -497,6 +516,8 @@ impl LayoutNode {
         match self {
             LayoutNode::Spacer | LayoutNode::Fill => true,
             LayoutNode::Scroll { .. } => axis == Axis::Vertical,
+            // um campo toma a largura oferecida (como o TextField real)
+            LayoutNode::Field { .. } => axis == Axis::Horizontal,
             LayoutNode::MaxFrame { max_width, max_height, child, .. } => match axis {
                 Axis::Horizontal => max_width.is_infinite() || child.is_flexible(axis),
                 Axis::Vertical => max_height.is_infinite() || child.is_flexible(axis),
@@ -538,6 +559,17 @@ impl LayoutNode {
                 let size = Size {
                     width: proposal.width.unwrap_or(0.0),
                     height: proposal.height.unwrap_or(0.0),
+                };
+                (size, Fit::Leaf)
+            }
+
+            LayoutNode::Field { content, placeholder, .. } => {
+                let sample: &str = if content.is_empty() { placeholder } else { content };
+                let metrics = env.cache.get_or_measure(sample, &env.font, env.text);
+                let natural = metrics.width + 2.0 * FIELD_PAD_H;
+                let size = Size {
+                    width: proposal.width.unwrap_or(natural),
+                    height: metrics.height() + 2.0 * FIELD_PAD_V,
                 };
                 (size, Fit::Leaf)
             }
@@ -698,6 +730,89 @@ impl LayoutNode {
                     color: Color::FILL,
                     corner_radius: 0.0,
                 });
+            }
+
+            (
+                LayoutNode::Field { path, content, placeholder, focused, caret, selection },
+                Fit::Leaf,
+            ) => {
+                // chrome: poço branco com borda (a borda acende no foco)
+                out.display.push(DrawCommand::FillRect {
+                    rect: frame,
+                    color: Color::WHITE,
+                    corner_radius: FIELD_RADIUS,
+                });
+                let text_origin = Point {
+                    x: frame.origin.x + FIELD_PAD_H,
+                    y: frame.origin.y + FIELD_PAD_V,
+                };
+                let metrics = env.cache.get_or_measure(
+                    if content.is_empty() { placeholder } else { content },
+                    &env.font,
+                    env.text,
+                );
+                let prefix_width = |end: usize| {
+                    env.cache.get_or_measure(&content[..end], &env.font, env.text).width
+                };
+                // seleção atrás do texto
+                if let Some((start, end)) = selection {
+                    let x0 = text_origin.x + prefix_width(*start);
+                    let x1 = text_origin.x + prefix_width(*end);
+                    out.display.push(DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point { x: x0, y: text_origin.y },
+                            size: Size { width: x1 - x0, height: metrics.height() },
+                        },
+                        color: Color::SELECTION,
+                        corner_radius: 0.0,
+                    });
+                }
+                if content.is_empty() {
+                    if !placeholder.is_empty() {
+                        // o placeholder anda pelo MESMO caminho do texto
+                        // real: mesma origem, mesma fonte, só a cor cai
+                        out.display.push(DrawCommand::TextLine {
+                            origin: text_origin,
+                            content: placeholder.to_string(),
+                            color: Color::PLACEHOLDER,
+                            font: env.font,
+                        });
+                    }
+                } else {
+                    let color = out.foreground.last().copied().unwrap_or(Color::BLACK);
+                    out.display.push(DrawCommand::TextLine {
+                        origin: text_origin,
+                        content: content.to_string(),
+                        color,
+                        font: env.font,
+                    });
+                }
+                // caret por cima (estático nesta fase; blink com timers)
+                if *focused && let Some(caret) = caret {
+                    let x = text_origin.x + prefix_width(*caret);
+                    out.display.push(DrawCommand::FillRect {
+                        rect: Rect {
+                            origin: Point { x, y: text_origin.y },
+                            size: Size { width: FIELD_CARET_W, height: metrics.height() },
+                        },
+                        color: Color::BLACK,
+                        corner_radius: FIELD_CARET_W / 2.0,
+                    });
+                }
+                out.display.push(DrawCommand::StrokeRect {
+                    rect: frame,
+                    color: if *focused { Color::FOCUS } else { Color::OUTLINE },
+                    width: 1.0,
+                });
+                // o campo é alvo de ponteiro (clicar foca) — clipado como
+                // qualquer hit
+                let visible = match out.current_clip() {
+                    Some(clip) => frame.intersection(clip),
+                    None => Some(frame),
+                };
+                if let Some(visible) = visible {
+                    out.hits.push((path.clone(), visible));
+                }
             }
 
             (LayoutNode::Leaf { .. }, Fit::Leaf) => {
@@ -942,6 +1057,11 @@ fn measure_stack(
 const SCROLLBAR_W: Px = 4.0;
 const SCROLLBAR_INSET: Px = 6.0;
 const SCROLLBAR_MIN: Px = 24.0;
+
+const FIELD_PAD_H: Px = 8.0;
+const FIELD_PAD_V: Px = 5.0;
+const FIELD_RADIUS: Px = 5.0;
+const FIELD_CARET_W: Px = 1.5;
 
 /// A thumb da região — draw-only nesta fase (drag chega com pointer
 /// capture): 4px de largura a 6px da borda direita, trilho com inset 6,

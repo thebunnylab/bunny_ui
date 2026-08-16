@@ -90,6 +90,10 @@ unsafe extern "C" {
     -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_bool(obj: Id, sel: Sel) -> i8;
+    #[link_name = "objc_msgSend"]
+    fn msg_u16(obj: Id, sel: Sel) -> u16;
+    #[link_name = "objc_msgSend"]
+    fn msg_u64(obj: Id, sel: Sel) -> u64;
 }
 
 // AppKit/QuartzCore entram pelo runtime ObjC; o link garante as classes.
@@ -152,6 +156,11 @@ pub enum AppEvent {
     /// Rolagem: deltas em pontos (trackpad já vem preciso e com momentum;
     /// roda legada é convertida de linhas para pontos na chegada).
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
+    /// Tecla: keyCode de hardware + modificadores + o texto que o AppKit
+    /// traduziu. NOTA de dívida: composição por `characters` commita
+    /// direto — IME de verdade (marked text CJK) chega com o
+    /// NSTextInputClient.
+    Key { code: u16, shift: bool, command: bool, chars: String },
     /// A janela mudou de tamanho (ou precisa do primeiro frame).
     Redraw,
 }
@@ -205,6 +214,32 @@ extern "C" fn bunny_mouse_moved(this: Id, _sel: Sel, event: Id) {
 
 extern "C" fn bunny_mouse_exited(_this: Id, _sel: Sel, _event: Id) {
     dispatch(AppEvent::MouseExited);
+}
+
+/// O BunnyView aceita virar first responder — sem isso, keyDown não chega.
+extern "C" fn bunny_accepts_first_responder(_this: Id, _sel: Sel) -> i8 {
+    1
+}
+
+extern "C" fn bunny_key_down(_this: Id, _sel: Sel, event: Id) {
+    unsafe {
+        let code = msg_u16(event, sel("keyCode"));
+        let flags = msg_u64(event, sel("modifierFlags"));
+        let shift = flags & (1 << 17) != 0;
+        let command = flags & (1 << 20) != 0;
+        let ns_chars = msg_id(event, sel("characters"));
+        let chars = if ns_chars.is_null() {
+            String::new()
+        } else {
+            let utf8 = msg_id(ns_chars, sel("UTF8String")) as *const c_char;
+            if utf8.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+            }
+        };
+        dispatch(AppEvent::Key { code, shift, command, chars });
+    }
 }
 
 extern "C" fn bunny_scroll_wheel(this: Id, _sel: Sel, event: Id) {
@@ -280,6 +315,19 @@ unsafe fn register_classes() {
             sel("scrollWheel:"),
             bunny_scroll_wheel as *const c_void,
             types.as_ptr(),
+        );
+        class_addMethod(
+            view,
+            sel("keyDown:"),
+            bunny_key_down as *const c_void,
+            types.as_ptr(),
+        );
+        let bool_getter = CString::new("c@:").expect("type encoding");
+        class_addMethod(
+            view,
+            sel("acceptsFirstResponder"),
+            bunny_accepts_first_responder as *const c_void,
+            bool_getter.as_ptr(),
         );
         objc_registerClassPair(view);
 
@@ -447,6 +495,8 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
         msg_void_id(window, sel("setDelegate:"), delegate);
 
         msg_void_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
+        // o teclado nasce apontando para a view de eventos
+        msg_void_id(window, sel("makeFirstResponder:"), view);
         msg_void_bool(app, sel("activateIgnoringOtherApps:"), 1);
         objc_autoreleasePoolPop(pool);
 
