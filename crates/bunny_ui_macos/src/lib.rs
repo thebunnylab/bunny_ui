@@ -94,7 +94,13 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
             if metal::active() {
                 // GPU present: the same display list, no Surface in the
                 // path — the drawable is the frame
-                metal::present_window(&display, Size { width, height }, scale, canvas);
+                metal::present_window(
+                    &display,
+                    Size { width, height },
+                    scale,
+                    canvas,
+                    &*runtime.text(),
+                );
             } else {
                 let mut slot = surface.borrow_mut();
                 let stale = match &*slot {

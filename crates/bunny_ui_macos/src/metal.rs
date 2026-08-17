@@ -27,10 +27,13 @@
 //! blending and break parity.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::hash::{Hash, Hasher};
 use std::ptr::null_mut;
 
 use bunny_ui::layout::{Color, DisplayList, DrawCommand, Rect, Size};
+use bunny_ui::text_engine::{FontKey, FontSpec, TextEngine};
 
 use crate::ffi::{CGSize, Id, Sel, class, sel};
 
@@ -75,6 +78,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_cstr(obj: Id, sel: Sel) -> *const c_char;
     #[link_name = "objc_msgSend"]
+    fn msg_void_id_u64(obj: Id, sel: Sel, a: Id, b: u64);
+    #[link_name = "objc_msgSend"]
     fn msg_void_id_u64_u64(obj: Id, sel: Sel, a: Id, b: u64, c: u64);
     #[link_name = "objc_msgSend"]
     fn msg_void_ptr_u64_u64(obj: Id, sel: Sel, a: *const c_void, b: u64, c: u64);
@@ -106,6 +111,15 @@ unsafe extern "C" {
         region: MTLRegion,
         level: u64,
     );
+    #[link_name = "objc_msgSend"]
+    fn msg_void_region_u64_ptr_u64(
+        obj: Id,
+        sel: Sel,
+        region: MTLRegion,
+        level: u64,
+        bytes: *const c_void,
+        per_row: u64,
+    );
 }
 
 // MARK: - Metal vocabulary (constants live in source, like the CG ones)
@@ -125,6 +139,15 @@ const TEXTURE_USAGE_RENDER_TARGET: u64 = 4;
 const RESOURCE_SHARED_WRITE_COMBINED: u64 = 1;
 const PRIMITIVE_TRIANGLE: u64 = 3;
 const STATUS_COMPLETED: u64 = 4; // MTLCommandBufferStatus: Completed=4, Error=5
+
+// The run atlas: text tiles append into one shared texture. Runs wider
+// than a chunk split into seamless chunks (texel reads are 1:1, a seam
+// cannot show). Overflow drains the in-flight frames, resets the whole
+// atlas and re-inserts the current frame — a copying collector, not a
+// per-tile free list.
+const ATLAS_CHUNK_WIDTH: u32 = 1024;
+const ATLAS_INITIAL_SIZE: u32 = 2048;
+const ATLAS_MAX_SIZE: u32 = 4096;
 
 #[repr(C)]
 struct MTLClearColor {
@@ -362,6 +385,7 @@ struct Sels {
     set_fragment_buffer: Sel,
     set_vertex_bytes: Sel,
     draw: Sel,
+    set_fragment_texture: Sel,
     status: Sel,
     retain: Sel,
     release: Sel,
@@ -395,6 +419,7 @@ impl Sels {
                 set_fragment_buffer: sel("setFragmentBuffer:offset:atIndex:"),
                 set_vertex_bytes: sel("setVertexBytes:length:atIndex:"),
                 draw: sel("drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:"),
+                set_fragment_texture: sel("setFragmentTexture:atIndex:"),
                 status: sel("status"),
                 retain: sel("retain"),
                 release: sel("release"),
@@ -412,7 +437,6 @@ struct MetalStack {
     device: Id,
     queue: Id,
     rect_pipeline: Id,
-    #[allow(dead_code)] // the draw calls arrive with the sprite phase
     sprite_pipeline: Id,
     pass_class: Id, // MTLRenderPassDescriptor — the class object is stable
     sels: Sels,
@@ -500,16 +524,19 @@ impl MetalStack {
         }
     }
 
-    /// One pass over `target`: clear to `canvas`, then the instanced
-    /// draws. Returns the command buffer (autoreleased — the caller
-    /// holds the pool and decides how to present it).
+    /// One pass over `target`: clear to `canvas`, then the runs in paint
+    /// order — the pipeline swaps only where rects and text alternate.
+    /// Returns the command buffer (autoreleased — the caller holds the
+    /// pool and decides how to present it).
     unsafe fn encode_frame(
         &self,
         target: Id,
         canvas: Color,
         viewport: (f32, f32),
         instances: Id,
-        rect_count: usize,
+        sprite_offset: usize,
+        runs: &[DrawRun],
+        atlas_texture: Id,
     ) -> Id {
         unsafe {
             let pass = msg_id(self.pass_class, self.sels.render_pass_descriptor);
@@ -533,11 +560,10 @@ impl MetalStack {
             );
             let command = msg_id(self.queue, self.sels.command_buffer);
             let encoder = msg_id_arg(command, self.sels.encoder, pass);
-            if rect_count > 0 {
-                msg_void_id(encoder, self.sels.set_pipeline, self.rect_pipeline);
-                msg_void_id_u64_u64(encoder, self.sels.set_vertex_buffer, instances, 0, 0);
-                msg_void_id_u64_u64(encoder, self.sels.set_fragment_buffer, instances, 0, 0);
+            if !runs.is_empty() {
                 let size = [viewport.0, viewport.1];
+                // argument bindings persist across pipeline swaps — the
+                // uniforms bind once
                 msg_void_ptr_u64_u64(
                     encoder,
                     self.sels.set_vertex_bytes,
@@ -545,15 +571,63 @@ impl MetalStack {
                     8,
                     1,
                 );
-                msg_void_u64x5(
-                    encoder,
-                    self.sels.draw,
-                    PRIMITIVE_TRIANGLE,
-                    0,
-                    6,
-                    rect_count as u64,
-                    0,
-                );
+                let mut bound: Option<RunKind> = None;
+                for run in runs {
+                    if bound != Some(run.kind) {
+                        match run.kind {
+                            RunKind::Rects => {
+                                msg_void_id(encoder, self.sels.set_pipeline, self.rect_pipeline);
+                                msg_void_id_u64_u64(
+                                    encoder,
+                                    self.sels.set_vertex_buffer,
+                                    instances,
+                                    0,
+                                    0,
+                                );
+                                msg_void_id_u64_u64(
+                                    encoder,
+                                    self.sels.set_fragment_buffer,
+                                    instances,
+                                    0,
+                                    0,
+                                );
+                            }
+                            RunKind::Sprites => {
+                                msg_void_id(encoder, self.sels.set_pipeline, self.sprite_pipeline);
+                                msg_void_id_u64_u64(
+                                    encoder,
+                                    self.sels.set_vertex_buffer,
+                                    instances,
+                                    sprite_offset as u64,
+                                    0,
+                                );
+                                msg_void_id_u64_u64(
+                                    encoder,
+                                    self.sels.set_fragment_buffer,
+                                    instances,
+                                    sprite_offset as u64,
+                                    0,
+                                );
+                                msg_void_id_u64(
+                                    encoder,
+                                    self.sels.set_fragment_texture,
+                                    atlas_texture,
+                                    0,
+                                );
+                            }
+                        }
+                        bound = Some(run.kind);
+                    }
+                    msg_void_u64x5(
+                        encoder,
+                        self.sels.draw,
+                        PRIMITIVE_TRIANGLE,
+                        0,
+                        6,
+                        run.count as u64,
+                        run.base as u64,
+                    );
+                }
             }
             msg_void(encoder, self.sels.end_encoding);
             command
@@ -670,6 +744,250 @@ const KIND_FILL: f32 = 0.0;
 const KIND_STROKE: f32 = 1.0;
 const KIND_SHADOW: f32 = 2.0;
 
+// MARK: - The run atlas (text tiles, append-only shelves)
+
+/// One rectangle of atlas texels.
+#[derive(Clone, Copy)]
+struct Tile {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+struct Shelf {
+    y: u32,
+    height: u32,
+    cursor: u32,
+}
+
+/// Append-only shelf packing: a run lands on the first shelf of exactly
+/// its height with room, or opens a new shelf below. There is no
+/// per-tile free list — reclamation is the atlas RESET (drain, clear,
+/// re-insert the live frame), a copying collector in one move.
+struct ShelfPacker {
+    width: u32,
+    height: u32,
+    shelves: Vec<Shelf>,
+    next_y: u32,
+}
+
+impl ShelfPacker {
+    fn new(width: u32, height: u32) -> ShelfPacker {
+        ShelfPacker { width, height, shelves: Vec::new(), next_y: 0 }
+    }
+
+    fn place(&mut self, width: u32, height: u32) -> Option<(u32, u32)> {
+        if width > self.width || height == 0 || width == 0 {
+            return None;
+        }
+        for shelf in &mut self.shelves {
+            if shelf.height == height && shelf.cursor + width <= self.width {
+                let x = shelf.cursor;
+                shelf.cursor += width;
+                return Some((x, shelf.y));
+            }
+        }
+        if self.next_y + height <= self.height {
+            let y = self.next_y;
+            self.next_y += height;
+            self.shelves.push(Shelf { y, height, cursor: width });
+            return Some((0, y));
+        }
+        None
+    }
+
+    fn reset(&mut self) {
+        self.shelves.clear();
+        self.next_y = 0;
+    }
+}
+
+/// The atlas is full — the caller drains the in-flight frames, resets
+/// (growing once to the cap) and walks the frame again.
+struct AtlasFull;
+
+/// One cached run: the engine's raster uploaded as chunk tiles. The
+/// color sits IN the key — the engine bakes it, which keeps emoji true
+/// and byte parity possible; a theme flip mints new tiles and the old
+/// ones fall with the next reset.
+struct RunEntry {
+    font: FontKey,
+    color: u32,
+    scale: u32,
+    content: String,
+    tiles: Vec<Tile>,
+    width: u32,
+    height: u32,
+}
+
+fn packed_color(color: Color) -> u32 {
+    ((color.r as u32) << 24) | ((color.g as u32) << 16) | ((color.b as u32) << 8) | color.a as u32
+}
+
+/// The lookup hash — computed WITHOUT allocating (typing must never pay
+/// a String per warm frame); collisions resolve by comparing the entry.
+fn run_hash(font: FontKey, color: u32, scale: u32, content: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    font.hash(&mut hasher);
+    color.hash(&mut hasher);
+    scale.hash(&mut hasher);
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The text side of the GPU frame: one shared RGBA texture of run
+/// tiles, keyed by (font, color, scale, content).
+///
+/// The append-only INVARIANT: tiles are only ever written into virgin
+/// space, so a frame still riding the GPU never sees its texels change.
+/// The only operation that reuses space is `reset`, and reset requires
+/// the caller to DRAIN in-flight frames first.
+struct RunAtlas {
+    device: Id,
+    texture: Id,
+    size: u32,
+    packer: ShelfPacker,
+    entries: HashMap<u64, Vec<RunEntry>>,
+}
+
+impl RunAtlas {
+    fn new(device: Id) -> RunAtlas {
+        RunAtlas {
+            device,
+            texture: null_mut(),
+            size: ATLAS_INITIAL_SIZE,
+            packer: ShelfPacker::new(ATLAS_INITIAL_SIZE, ATLAS_INITIAL_SIZE),
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Drops every entry and every shelf. `grow` doubles the texture
+    /// once (2048 → 4096); the texture itself is re-made lazily. The
+    /// caller MUST have drained in-flight frames — this is the one
+    /// moment texel space is reused.
+    fn reset(&mut self, grow: bool) {
+        if grow && self.size < ATLAS_MAX_SIZE {
+            self.size = ATLAS_MAX_SIZE;
+            unsafe {
+                if !self.texture.is_null() {
+                    msg_void(self.texture, sel("release"));
+                    self.texture = null_mut();
+                }
+            }
+            self.packer = ShelfPacker::new(self.size, self.size);
+        } else {
+            self.packer.reset();
+        }
+        self.entries.clear();
+    }
+
+    unsafe fn ensure_texture(&mut self) -> bool {
+        unsafe {
+            if !self.texture.is_null() {
+                return true;
+            }
+            let descriptor = msg_id_u64_u64_u64_bool(
+                class("MTLTextureDescriptor"),
+                sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+                PIXEL_FORMAT_RGBA8,
+                self.size as u64,
+                self.size as u64,
+                0,
+            );
+            msg_void_u64(descriptor, sel("setUsage:"), TEXTURE_USAGE_SHADER_READ);
+            msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_SHARED);
+            self.texture = msg_id_arg(self.device, sel("newTextureWithDescriptor:"), descriptor);
+            !self.texture.is_null()
+        }
+    }
+
+    /// The tiles for one run — warm from the map, or rasterized by the
+    /// engine, chunked and uploaded. `Ok(None)` means the engine had
+    /// nothing to paint (the CPU path skips those too).
+    fn resolve(
+        &mut self,
+        slice: &str,
+        font: &FontSpec,
+        color: Color,
+        scale: usize,
+        engine: &dyn TextEngine,
+    ) -> Result<Option<&RunEntry>, AtlasFull> {
+        let key = font.key();
+        let packed = packed_color(color);
+        let hash = run_hash(key, packed, scale as u32, slice);
+        let warm = self.entries.get(&hash).is_some_and(|bucket| {
+            bucket.iter().any(|entry| {
+                entry.font == key
+                    && entry.color == packed
+                    && entry.scale == scale as u32
+                    && entry.content == slice
+            })
+        });
+        if !warm {
+            let Some(raster) = engine.raster_line(slice, font, color, scale) else {
+                return Ok(None);
+            };
+            unsafe {
+                if !self.ensure_texture() {
+                    return Err(AtlasFull);
+                }
+            }
+            let width = raster.width as u32;
+            let height = raster.height as u32;
+            let mut tiles = Vec::new();
+            let mut chunk_x: u32 = 0;
+            while chunk_x < width {
+                let chunk_width = (width - chunk_x).min(ATLAS_CHUNK_WIDTH);
+                let Some((x, y)) = self.packer.place(chunk_width, height) else {
+                    return Err(AtlasFull);
+                };
+                unsafe {
+                    msg_void_region_u64_ptr_u64(
+                        self.texture,
+                        sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
+                        MTLRegion {
+                            origin: MTLOrigin { x: x as u64, y: y as u64, z: 0 },
+                            size: MTLSize {
+                                width: chunk_width as u64,
+                                height: height as u64,
+                                depth: 1,
+                            },
+                        },
+                        0,
+                        raster.rgba.as_ptr().add(chunk_x as usize * 4) as *const c_void,
+                        (raster.width * 4) as u64,
+                    );
+                }
+                tiles.push(Tile { x, y, width: chunk_width, height });
+                chunk_x += chunk_width;
+            }
+            self.entries.entry(hash).or_default().push(RunEntry {
+                font: key,
+                color: packed,
+                scale: scale as u32,
+                content: slice.to_string(),
+                tiles,
+                width,
+                height,
+            });
+        }
+        let entry = self
+            .entries
+            .get(&hash)
+            .and_then(|bucket| {
+                bucket.iter().find(|entry| {
+                    entry.font == key
+                        && entry.color == packed
+                        && entry.scale == scale as u32
+                        && entry.content == slice
+                })
+            })
+            .expect("a run just resolved lives in the atlas");
+        Ok(Some(entry))
+    }
+}
+
 fn push_rect(
     out: &mut Vec<RectInstance>,
     quad: Box4,
@@ -689,17 +1007,54 @@ fn push_rect(
     });
 }
 
-/// Walks the display list in paint order and emits rect instances. The
-/// clip stack mirrors `Surface::walk_clips`: snapped, intersected in
+/// A maximal run of one instance kind, in paint order — the draw-call
+/// unit. Batches break only where rects and text alternate.
+#[derive(Clone, Copy, PartialEq)]
+enum RunKind {
+    Rects,
+    Sprites,
+}
+
+#[derive(Clone, Copy)]
+struct DrawRun {
+    kind: RunKind,
+    base: u32,
+    count: u32,
+}
+
+fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, index: usize) {
+    match runs.last_mut() {
+        Some(run) if run.kind == kind => run.count += 1,
+        _ => runs.push(DrawRun { kind, base: index as u32, count: 1 }),
+    }
+}
+
+/// The instance lists of one frame, retained so their capacity survives
+/// across frames.
+#[derive(Default)]
+struct FrameBatches {
+    rects: Vec<RectInstance>,
+    sprites: Vec<SpriteInstance>,
+    runs: Vec<DrawRun>,
+}
+
+/// Walks the display list in paint order and fills the frame batches.
+/// The clip stack mirrors `Surface::walk_clips`: snapped, intersected in
 /// integers, an empty intersection degenerating to a zero-area box.
-/// Text arrives with the atlas phase.
-fn build_rects(
+/// `Err(AtlasFull)` asks the caller to drain, reset the atlas and walk
+/// again.
+fn build_frame(
     display: &DisplayList,
     scale: usize,
     target: (usize, usize),
-    out: &mut Vec<RectInstance>,
-) {
-    out.clear();
+    engine: &dyn TextEngine,
+    atlas: &mut RunAtlas,
+    batches: &mut FrameBatches,
+) -> Result<(), AtlasFull> {
+    batches.rects.clear();
+    batches.sprites.clear();
+    batches.runs.clear();
+    let out = &mut batches.rects;
     let factor = scale as f64;
     let whole: Box4 = (0, 0, target.0 as i64, target.1 as i64);
     let mut clips: Vec<Box4> = Vec::new();
@@ -716,6 +1071,7 @@ fn build_rects(
                 }
                 let radius = corner_clamp(corner_radius * factor, snapped);
                 push_rect(out, snapped, clip, *color, radius, 0.0, KIND_FILL, 0.0);
+                note_run(&mut batches.runs, RunKind::Rects, out.len() - 1);
             }
             DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -731,6 +1087,7 @@ fn build_rects(
                 let thickness = (width * factor).max(1.0).round();
                 let radius = corner_clamp(corner_radius * factor, snapped);
                 push_rect(out, snapped, clip, *color, radius, thickness, KIND_STROKE, 0.0);
+                note_run(&mut batches.runs, RunKind::Rects, out.len() - 1);
             }
             DrawCommand::Shadow { rect, radius, color, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -751,9 +1108,46 @@ fn build_rects(
                     continue;
                 }
                 push_rect(out, expanded, clip, *color, corner, reach, KIND_SHADOW, reach_px as f64);
+                note_run(&mut batches.runs, RunKind::Rects, out.len() - 1);
             }
-            DrawCommand::TextLine { .. } => {
-                // text arrives with the atlas phase
+            DrawCommand::TextLine { origin, content, range, color, font } => {
+                let Some(clip) = effective_clip(&clips, whole) else { continue };
+                let slice = &content[range.0..range.1];
+                let Some(entry) = atlas.resolve(slice, font, *color, scale, engine)? else {
+                    continue;
+                };
+                // the composite_text mirror: one snap of the logical
+                // origin, texels copied 1:1 from there
+                let base_x = (origin.x * factor).round() as i64;
+                let base_y = (origin.y * factor).round() as i64;
+                let dest = (base_x, base_y, base_x + entry.width as i64, base_y + entry.height as i64);
+                if box_intersect(dest, clip).is_none() {
+                    continue;
+                }
+                let mut chunk_x: i64 = 0;
+                for tile in &entry.tiles {
+                    let chunk = (
+                        base_x + chunk_x,
+                        base_y,
+                        base_x + chunk_x + tile.width as i64,
+                        base_y + tile.height as i64,
+                    );
+                    chunk_x += tile.width as i64;
+                    if box_intersect(chunk, clip).is_none() {
+                        continue;
+                    }
+                    batches.sprites.push(SpriteInstance {
+                        dest: [chunk.0 as f32, chunk.1 as f32, chunk.2 as f32, chunk.3 as f32],
+                        tex: [
+                            tile.x as f32,
+                            tile.y as f32,
+                            (tile.x + tile.width) as f32,
+                            (tile.y + tile.height) as f32,
+                        ],
+                        clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
+                    });
+                    note_run(&mut batches.runs, RunKind::Sprites, batches.sprites.len() - 1);
+                }
             }
             DrawCommand::PushClip { rect } => {
                 let snapped = snap_scaled(*rect, factor);
@@ -769,6 +1163,7 @@ fn build_rects(
             }
         }
     }
+    Ok(())
 }
 
 /// The clip a primitive paints under: the stack top intersected with the
@@ -800,19 +1195,36 @@ impl FrameSlot {
     }
 }
 
-/// Copies the instance bytes into the slot's buffer, growing it when the
-/// frame outgrows the capacity — the size is EXACT before Metal is
-/// touched, so there is no speculative encode and no overflow retry.
-unsafe fn upload(slot: &mut FrameSlot, device: Id, sels: &Sels, bytes: &[u8]) {
+fn as_bytes<T>(items: &[T]) -> &[u8] {
     unsafe {
-        if bytes.is_empty() {
-            return;
+        std::slice::from_raw_parts(items.as_ptr() as *const u8, std::mem::size_of_val(items))
+    }
+}
+
+/// Copies the frame's instances into the slot's buffer — rects at zero,
+/// sprites 256-aligned after them — growing it when the frame outgrows
+/// the capacity. The size is EXACT before Metal is touched, so there is
+/// no speculative encode and no overflow retry. Returns the sprite
+/// byte offset.
+unsafe fn upload_frame(
+    slot: &mut FrameSlot,
+    device: Id,
+    sels: &Sels,
+    batches: &FrameBatches,
+) -> usize {
+    unsafe {
+        let rect_bytes = as_bytes(&batches.rects);
+        let sprite_bytes = as_bytes(&batches.sprites);
+        let sprite_offset = rect_bytes.len().next_multiple_of(256);
+        let total = sprite_offset + sprite_bytes.len();
+        if total == 0 {
+            return 0;
         }
-        if slot.buffer.is_null() || slot.capacity < bytes.len() {
+        if slot.buffer.is_null() || slot.capacity < total {
             if !slot.buffer.is_null() {
                 msg_void(slot.buffer, sels.release);
             }
-            let capacity = bytes.len().next_multiple_of(4096);
+            let capacity = total.next_multiple_of(4096);
             slot.buffer = msg_id_u64_u64(
                 device,
                 sel("newBufferWithLength:options:"),
@@ -821,17 +1233,16 @@ unsafe fn upload(slot: &mut FrameSlot, device: Id, sels: &Sels, bytes: &[u8]) {
             );
             slot.capacity = capacity;
         }
-        let contents = msg_id(slot.buffer, sels.contents);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents as *mut u8, bytes.len());
-    }
-}
-
-fn instance_bytes(rects: &[RectInstance]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            rects.as_ptr() as *const u8,
-            std::mem::size_of_val(rects),
-        )
+        let contents = msg_id(slot.buffer, sels.contents) as *mut u8;
+        std::ptr::copy_nonoverlapping(rect_bytes.as_ptr(), contents, rect_bytes.len());
+        if !sprite_bytes.is_empty() {
+            std::ptr::copy_nonoverlapping(
+                sprite_bytes.as_ptr(),
+                contents.add(sprite_offset),
+                sprite_bytes.len(),
+            );
+        }
+        sprite_offset
     }
 }
 
@@ -846,7 +1257,8 @@ struct MetalPresenter {
     scale: usize,
     slots: [FrameSlot; 3],
     cursor: usize,
-    rects: Vec<RectInstance>,
+    atlas: RunAtlas,
+    batches: FrameBatches,
 }
 
 thread_local! {
@@ -883,10 +1295,58 @@ impl MetalPresenter {
         }
     }
 
+    /// Waits out every in-flight frame — the precondition of an atlas
+    /// reset (the one moment texel space is reused).
+    fn drain_slots(&mut self) {
+        unsafe {
+            for slot in &mut self.slots {
+                if !slot.command.is_null() {
+                    msg_void(slot.command, self.stack.sels.wait_completed);
+                    msg_void(slot.command, self.stack.sels.release);
+                    slot.command = null_mut();
+                }
+            }
+        }
+    }
+
+    /// Walks the frame; on atlas overflow drains the GPU, resets the
+    /// atlas (growing once) and walks again — the copying collector.
+    fn build_with_retries(
+        &mut self,
+        display: &DisplayList,
+        scale: usize,
+        physical: (usize, usize),
+        text: &dyn TextEngine,
+    ) {
+        for attempt in 0..3 {
+            match build_frame(display, scale, physical, text, &mut self.atlas, &mut self.batches)
+            {
+                Ok(()) => return,
+                Err(AtlasFull) => {
+                    if attempt == 2 {
+                        // pathological frame: keep the rects, drop the
+                        // rest of the text — never a crash
+                        eprintln!("bunny_ui metal: atlas overflow survived two resets");
+                        return;
+                    }
+                    self.drain_slots();
+                    self.atlas.reset(true);
+                }
+            }
+        }
+    }
+
     /// One frame: walk the list, upload, resize the drawable if the
     /// window changed, take the drawable as LATE as possible, encode,
     /// present, commit.
-    fn present(&mut self, display: &DisplayList, size: Size, scale: usize, canvas: Color) {
+    fn present(
+        &mut self,
+        display: &DisplayList,
+        size: Size,
+        scale: usize,
+        canvas: Color,
+        text: &dyn TextEngine,
+    ) {
         unsafe {
             let pool = objc_autoreleasePoolPush();
             let physical = (
@@ -913,18 +1373,16 @@ impl MetalPresenter {
                 self.physical = physical;
                 self.scale = scale;
             }
-            let mut rects = std::mem::take(&mut self.rects);
-            build_rects(display, scale, physical, &mut rects);
+            self.build_with_retries(display, scale, physical, text);
             let index = self.acquire_slot();
-            upload(
+            let sprite_offset = upload_frame(
                 &mut self.slots[index],
                 self.stack.device,
                 &self.stack.sels,
-                instance_bytes(&rects),
+                &self.batches,
             );
             let drawable = msg_id(self.layer, self.stack.sels.next_drawable);
             if drawable.is_null() {
-                self.rects = rects;
                 objc_autoreleasePoolPop(pool);
                 return;
             }
@@ -934,12 +1392,13 @@ impl MetalPresenter {
                 canvas,
                 (physical.0 as f32, physical.1 as f32),
                 self.slots[index].buffer,
-                rects.len(),
+                sprite_offset,
+                &self.batches.runs,
+                self.atlas.texture,
             );
             msg_void_id(command, self.stack.sels.present_drawable, drawable);
             msg_void(command, self.stack.sels.commit);
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
-            self.rects = rects;
             objc_autoreleasePoolPop(pool);
         }
     }
@@ -976,6 +1435,7 @@ pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool
         msg_void_f64(layer, sel("setContentsScale:"), scale);
         msg_void_id(view, sel("setLayer:"), layer);
 
+        let device = stack.device;
         let mut presenter = MetalPresenter {
             stack,
             layer,
@@ -983,7 +1443,8 @@ pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool
             scale: 0,
             slots: [FrameSlot::empty(); 3],
             cursor: 0,
-            rects: Vec::new(),
+            atlas: RunAtlas::new(device),
+            batches: FrameBatches::default(),
         };
         // anti-flash: the first clear happens before the window shows —
         // a virgin CAMetalLayer would flash black on order-front
@@ -992,6 +1453,7 @@ pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool
             Size { width, height },
             scale as usize,
             bunny_ui::theme::canvas(),
+            &bunny_ui::text_engine::PixelFont,
         );
         PRESENTER.with(|slot| *slot.borrow_mut() = Some(presenter));
         objc_autoreleasePoolPop(pool);
@@ -1006,11 +1468,18 @@ pub(crate) fn active() -> bool {
 }
 
 /// The GPU twin of the Surface + blit path: same display list in, one
-/// presented frame out.
-pub(crate) fn present_window(display: &DisplayList, size: Size, scale: usize, canvas: Color) {
+/// presented frame out. `text` is the frame's engine — the atlas
+/// rasterizes through it, exactly like the CPU compositor.
+pub(crate) fn present_window(
+    display: &DisplayList,
+    size: Size,
+    scale: usize,
+    canvas: Color,
+    text: &dyn TextEngine,
+) {
     PRESENTER.with(|slot| {
         if let Some(presenter) = slot.borrow_mut().as_mut() {
-            presenter.present(display, size, scale, canvas);
+            presenter.present(display, size, scale, canvas, text);
         }
     });
 }
@@ -1026,7 +1495,8 @@ pub struct OffscreenGpu {
     width: usize,
     height: usize,
     slot: FrameSlot,
-    rects: Vec<RectInstance>,
+    atlas: RunAtlas,
+    batches: FrameBatches,
 }
 
 impl OffscreenGpu {
@@ -1060,43 +1530,80 @@ impl OffscreenGpu {
             if target.is_null() {
                 return None;
             }
+            let device = stack.device;
             Some(OffscreenGpu {
                 stack,
                 target,
                 width,
                 height,
                 slot: FrameSlot::empty(),
-                rects: Vec::new(),
+                atlas: RunAtlas::new(device),
+                batches: FrameBatches::default(),
             })
         }
     }
 
     /// Renders and WAITS — determinism for tests and honest numbers for
     /// the bench (walk + upload + encode + commit + GPU time, nothing
-    /// hidden). The wait also makes single-buffering safe.
-    pub fn present_wait(&mut self, display: &DisplayList, scale: usize, canvas: Color) {
+    /// hidden). The wait also makes single-buffering and mid-frame atlas
+    /// resets safe.
+    pub fn present_wait(
+        &mut self,
+        display: &DisplayList,
+        scale: usize,
+        canvas: Color,
+        text: &dyn TextEngine,
+    ) {
         unsafe {
             let pool = objc_autoreleasePoolPush();
-            let mut rects = std::mem::take(&mut self.rects);
-            build_rects(display, scale, (self.width, self.height), &mut rects);
-            upload(
+            for attempt in 0..3 {
+                match build_frame(
+                    display,
+                    scale,
+                    (self.width, self.height),
+                    text,
+                    &mut self.atlas,
+                    &mut self.batches,
+                ) {
+                    Ok(()) => break,
+                    Err(AtlasFull) => {
+                        // every offscreen frame is waited — no drain
+                        // needed before the reset
+                        if attempt == 2 {
+                            eprintln!("bunny_ui metal: atlas overflow survived two resets");
+                            break;
+                        }
+                        self.atlas.reset(true);
+                    }
+                }
+            }
+            let sprite_offset = upload_frame(
                 &mut self.slot,
                 self.stack.device,
                 &self.stack.sels,
-                instance_bytes(&rects),
+                &self.batches,
             );
             let command = self.stack.encode_frame(
                 self.target,
                 canvas,
                 (self.width as f32, self.height as f32),
                 self.slot.buffer,
-                rects.len(),
+                sprite_offset,
+                &self.batches.runs,
+                self.atlas.texture,
             );
             msg_void(command, self.stack.sels.commit);
             msg_void(command, self.stack.sels.wait_completed);
-            self.rects = rects;
             objc_autoreleasePoolPop(pool);
         }
+    }
+
+    /// The atlas footprint — how many cached runs and how deep the
+    /// shelves go. The warm-frame test pins tile reuse with it.
+    #[cfg(test)]
+    fn atlas_footprint(&self) -> (usize, u32) {
+        let entries = self.atlas.entries.values().map(Vec::len).sum();
+        (entries, self.atlas.packer.next_y)
     }
 
     /// The rendered bytes, R,G,B,A per pixel — the same order as the
@@ -1161,7 +1668,7 @@ mod tests {
         let cpu = rasterize_with(&display, physical.0, physical.1, scale, canvas, &PixelFont)
             .to_rgba_bytes();
         let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen gpu");
-        gpu.present_wait(&display, scale, canvas);
+        gpu.present_wait(&display, scale, canvas, &PixelFont);
         (gpu.read_rgba(), cpu)
     }
 
@@ -1220,7 +1727,7 @@ mod tests {
         // either alias corrupts the readback loudly
         let canvas = Color::hex(0x18181D);
         let mut gpu = OffscreenGpu::new(16, 16).expect("offscreen gpu");
-        gpu.present_wait(&DisplayList::default(), 2, canvas);
+        gpu.present_wait(&DisplayList::default(), 2, canvas, &PixelFont);
         let bytes = gpu.read_rgba();
         assert_eq!(bytes.len(), 16 * 16 * 4);
         for pixel in bytes.chunks_exact(4) {
@@ -1361,6 +1868,107 @@ mod tests {
         let (gpu, cpu) =
             scene_bytes(&root, Size { width: 140.0, height: 120.0 }, 2, Color::CANVAS);
         assert_close(&gpu, &cpu, 2, "degenerate rects");
+    }
+
+    #[test]
+    fn shelves_place_reset_and_reuse() {
+        // the pure allocator: exact-height reuse, new shelves below,
+        // refusal at the brim, a clean slate after reset
+        let mut packer = ShelfPacker::new(64, 32);
+        assert_eq!(packer.place(40, 10), Some((0, 0)));
+        assert_eq!(packer.place(30, 10), Some((0, 10)), "no room on the first shelf");
+        assert_eq!(packer.place(10, 10), Some((40, 0)), "exact height reuses shelf one");
+        assert_eq!(packer.place(64, 12), Some((0, 20)));
+        assert_eq!(packer.place(1, 1), None, "the atlas is full below");
+        assert_eq!(packer.place(65, 1), None, "wider than the atlas never fits");
+        packer.reset();
+        assert_eq!(packer.place(64, 32), Some((0, 0)), "reset reclaims everything");
+    }
+
+    #[test]
+    fn text_runs_match_byte_for_byte_with_the_pixel_font() {
+        if !device_present() {
+            return;
+        }
+        // the pixel font has no anti-aliasing: alpha is 0 or 255, so the
+        // sprite path must be EXACT — any drift is a texel-address bug
+        let root = vstack((
+            text("the quick brown bunny"),
+            text("jumps over the lazy dog").foreground_color(Color::hex(0x3B82F6)),
+        ))
+        .padding_length(8.0)
+        .background_color(Color::hex(0xFFFFFF));
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 240.0, height: 80.0 }, 2, Color::CANVAS);
+        assert!(
+            gpu == cpu,
+            "pixel-font text diverged (max channel delta {})",
+            max_channel_delta(&gpu, &cpu)
+        );
+    }
+
+    #[test]
+    fn core_text_runs_match_within_tolerance() {
+        if !device_present() {
+            return;
+        }
+        // the real engine, SAME instance on both sides: identical run
+        // rasters in, so only blend rounding may differ
+        let engine = crate::text::CoreTextEngine::new();
+        let logical = Size { width: 260.0, height: 100.0 };
+        let scale = 2usize;
+        let physical = (520, 200);
+        let runtime = Runtime::new().text_engine(Rc::new(crate::text::CoreTextEngine::new()));
+        let root = vstack((
+            text("Fjord glyphs vex quick waltz"),
+            text("bunny_ui presents by metal").foreground_color(Color::hex(0x3B82F6)),
+        ))
+        .padding_length(10.0)
+        .background_color(Color::hex(0xFFFFFF))
+        .corner_radius(9.0);
+        let display = runtime.display_frame(&root, logical);
+        let cpu = rasterize_with(&display, physical.0, physical.1, scale, Color::CANVAS, &engine)
+            .to_rgba_bytes();
+        let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen gpu");
+        gpu.present_wait(&display, scale, Color::CANVAS, &engine);
+        assert_close(&gpu.read_rgba(), &cpu, 2, "core-text runs");
+    }
+
+    #[test]
+    fn wide_run_chunks_are_seamless() {
+        if !device_present() {
+            return;
+        }
+        // 80 chars × 8 px × scale 2 = 1280 device px — wider than one
+        // chunk, so the run splits; texel copies are 1:1 and a seam
+        // would be a byte difference, not a smudge
+        let long = "abcdefghij".repeat(8);
+        let root = text(long).padding_length(4.0).background_color(Color::hex(0xFFFFFF));
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 700.0, height: 40.0 }, 2, Color::CANVAS);
+        assert!(
+            gpu == cpu,
+            "chunked run diverged (max channel delta {})",
+            max_channel_delta(&gpu, &cpu)
+        );
+    }
+
+    #[test]
+    fn a_warm_atlas_reuses_its_tiles() {
+        if !device_present() {
+            return;
+        }
+        let root = vstack((text("warm"), text("frame")));
+        let logical = Size { width: 120.0, height: 60.0 };
+        let runtime = Runtime::new();
+        let display = runtime.display_frame(&root, logical);
+        let mut gpu = OffscreenGpu::new(240, 120).expect("offscreen gpu");
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont);
+        let first = gpu.atlas_footprint();
+        assert!(first.0 > 0, "the frame rasterized runs into the atlas");
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont);
+        let second = gpu.atlas_footprint();
+        assert_eq!(first, second, "an identical frame must not mint new tiles");
     }
 
     #[test]
