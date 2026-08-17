@@ -82,6 +82,25 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.frame(width: 120)` — exact on one axis, natural on the other.
+    /// The panel column and the fixed-height row live here; `frame_max`
+    /// is a CEILING, not a size, and quietly hands back what the content
+    /// does not use.
+    fn frame_width(self, width: f64) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::FrameWidth(width),
+        }
+    }
+
+    /// `.frame(height: 80)` — the vertical sibling of [`ViewExt::frame_width`].
+    fn frame_height(self, height: f64) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::FrameHeight(height),
+        }
+    }
+
     /// `.frame(maxWidth: .infinity, maxHeight: 60, alignment: .leading)`
     fn frame_max(self, max_width: f64, max_height: f64, alignment: Alignment) -> Modified<Self> {
         Modified {

@@ -38,6 +38,8 @@ pub enum Modifier {
     PaddingLength(f64),
     PaddingEdge(Edge, f64),
     FrameWH(f64, f64),
+    FrameWidth(f64),
+    FrameHeight(f64),
     FrameMax(f64, f64, Alignment),
     NavigationTitle(String),
     NavigationBarTitle(String),
@@ -141,6 +143,8 @@ impl Modifier {
             Modifier::FrameWH(width, height) => {
                 format!(" [.frame(width: {width}, height: {height})]")
             }
+            Modifier::FrameWidth(width) => format!(" [.frame(width: {width})]"),
+            Modifier::FrameHeight(height) => format!(" [.frame(height: {height})]"),
             Modifier::FrameMax(max_width, max_height, alignment) => format!(
                 " [.frame(maxWidth: {max_width:?}, maxHeight: {max_height}, alignment: {alignment})]"
             ),
@@ -540,6 +544,22 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 let (width, height) = (Some(*width), Some(*height));
                 out.wrap_last_layout(|node| LayoutNode::Frame {
                     width,
+                    height,
+                    child: Box::new(node),
+                });
+            }
+            Modifier::FrameWidth(width) => {
+                let width = Some(*width);
+                out.wrap_last_layout(|node| LayoutNode::Frame {
+                    width,
+                    height: None,
+                    child: Box::new(node),
+                });
+            }
+            Modifier::FrameHeight(height) => {
+                let height = Some(*height);
+                out.wrap_last_layout(|node| LayoutNode::Frame {
+                    width: None,
                     height,
                     child: Box::new(node),
                 });
