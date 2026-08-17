@@ -3125,7 +3125,7 @@ mod tests {
         let runtime = Runtime::new();
         let view = Turning { side: State::new(0) };
         // the anchor sits at (80, 80)–(100, 100); the overlay is 40×30
-        let mut frame = |index: usize| {
+        let frame = |index: usize| {
             view.side.set(index);
             let result = runtime.layout(&view, window());
             assert_eq!(result.overlays.len(), 1, "one open popover");
