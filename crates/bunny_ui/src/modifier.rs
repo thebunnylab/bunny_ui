@@ -465,8 +465,10 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     node.children
                         .push(RenderNode::branch("Sheet", sheet_prints));
                 }
-                // in layout, the sheet overlays the base
+                // in layout, the sheet overlays the base — centered, the
+                // way a modal sits over what it covers
                 out.wrap_last_layout(|base| LayoutNode::Layered {
+                    align: CrossAlign::Center,
                     children: vec![base, wrap_layout(sheet_layouts)],
                 });
             }
@@ -569,11 +571,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             }
             Modifier::FrameMax(max_width, max_height, alignment) => {
                 let (max_width, max_height) = (*max_width, *max_height);
-                let align = match alignment {
-                    Alignment::Leading => CrossAlign::Start,
-                    Alignment::Center => CrossAlign::Center,
-                    Alignment::Trailing => CrossAlign::End,
-                };
+                let align = crate::views::cross_align(*alignment);
                 out.wrap_last_layout(|node| LayoutNode::MaxFrame {
                     max_width,
                     max_height,

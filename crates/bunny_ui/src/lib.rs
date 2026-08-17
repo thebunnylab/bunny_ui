@@ -1196,6 +1196,38 @@ mod tests {
     }
 
     #[test]
+    fn a_layered_stack_hugs_the_edge_it_was_given() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+
+        let accent = Color::hex(0xFF6600);
+        let runtime = Runtime::new();
+        // the active row: a 2pt accent bar layered over a background
+        // that fills the whole row
+        let bar_x = |alignment| {
+            let row = zstack!(
+                spacer().background_color(theme::panel()),
+                spacer().frame(2.0, 20.0).background_color(accent),
+            )
+            .alignment(alignment);
+            runtime
+                .layout(&row, Proposal::exact(Size { width: 120.0, height: 20.0 }))
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::FillRect { rect, color, .. } if *color == accent => {
+                        Some(rect.origin.x)
+                    }
+                    _ => None,
+                })
+                .expect("the bar paints")
+        };
+
+        assert_eq!(bar_x(Alignment::Leading), 0.0, "hugs the leading edge");
+        assert_eq!(bar_x(Alignment::Center), 59.0, "centered, as always");
+        assert_eq!(bar_x(Alignment::Trailing), 118.0, "hugs the trailing edge");
+    }
+
+    #[test]
     fn animated_rows_slide_on_reorder_and_settle_on_the_real_frame() {
         use crate::anim::Spring;
 

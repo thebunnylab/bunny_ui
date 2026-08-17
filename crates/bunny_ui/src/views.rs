@@ -509,6 +509,17 @@ fn stack_line(kind: &str, alignment: &str, spacing: Option<f64>) -> String {
     }
 }
 
+/// The full `Alignment` in layout terms. A ZStack aligns on both axes;
+/// what the enum names is the HORIZONTAL edge (`.leading` is leading
+/// and centered, as in SwiftUI).
+pub(crate) fn cross_align(alignment: Alignment) -> CrossAlign {
+    match alignment {
+        Alignment::Leading => CrossAlign::Start,
+        Alignment::Center => CrossAlign::Center,
+        Alignment::Trailing => CrossAlign::End,
+    }
+}
+
 fn render_stack<C: View>(
     children: &C,
     ctx: &Context,
@@ -516,7 +527,8 @@ fn render_stack<C: View>(
     kind: &str,
     alignment: &str,
     spacing: Option<f64>,
-    layout_axis: Option<(Axis, CrossAlign)>,
+    axis: Option<Axis>,
+    align: CrossAlign,
 ) {
     let mut nodes = NodeList::new();
     children.render_into(ctx, &mut nodes);
@@ -529,15 +541,15 @@ fn render_stack<C: View>(
         },
         prints,
     ));
-    out.push_layout(match layout_axis {
-        Some((axis, align)) => LayoutNode::Stack {
+    out.push_layout(match axis {
+        Some(axis) => LayoutNode::Stack {
             axis,
             spacing: spacing.unwrap_or(0.0),
             align,
             children: layouts,
         },
         // ZStack: all children in the same frame
-        None => LayoutNode::Layered { children: layouts },
+        None => LayoutNode::Layered { align, children: layouts },
     });
 }
 
@@ -561,7 +573,8 @@ impl<C: View> View for VStack<C> {
             "VStack",
             self.alignment.print(),
             self.spacing,
-            Some((Axis::Vertical, self.alignment.cross())),
+            Some(Axis::Vertical),
+            self.alignment.cross(),
         );
     }
 }
@@ -608,7 +621,8 @@ impl<C: View> View for HStack<C> {
             "HStack",
             self.alignment.print(),
             self.spacing,
-            Some((Axis::Horizontal, self.alignment.cross())),
+            Some(Axis::Horizontal),
+            self.alignment.cross(),
         );
     }
 }
@@ -649,12 +663,22 @@ impl<C: View> View for ZStack<C> {
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let alignment = self.alignment.to_string();
-        render_stack(&self.children, ctx, out, "ZStack", &alignment, None, None);
+        render_stack(
+            &self.children,
+            ctx,
+            out,
+            "ZStack",
+            &alignment,
+            None,
+            None,
+            cross_align(self.alignment),
+        );
     }
 }
 
 impl<C> ZStack<C> {
-    /// `ZStack(alignment: .leading)`
+    /// `ZStack(alignment: .leading)` — the children hug that horizontal
+    /// edge and stay centered vertically.
     pub fn alignment(mut self, alignment: Alignment) -> Self {
         self.alignment = alignment;
         self

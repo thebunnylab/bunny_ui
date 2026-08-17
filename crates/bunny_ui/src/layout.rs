@@ -286,7 +286,9 @@ pub enum LayoutNode {
     Fill,
     Stack { axis: Axis, spacing: Px, align: CrossAlign, children: Vec<LayoutNode> },
     /// Overlay: all children in the same frame (ZStack, sheet on top).
-    Layered { children: Vec<LayoutNode> },
+    /// `align` is the HORIZONTAL edge each child sits on; the vertical
+    /// one stays centered, exactly what SwiftUI's `.leading` means.
+    Layered { align: CrossAlign, children: Vec<LayoutNode> },
     Padding { edges: Edges, child: Box<LayoutNode> },
     /// `.frame(width:height:)` — `Some` axes override proposal and answer.
     Frame { width: Option<Px>, height: Option<Px>, child: Box<LayoutNode> },
@@ -1202,7 +1204,7 @@ impl LayoutNode {
             // a stack that HOLDS something flexible is itself flexible
             // (a panel with a scroll inside wants the leftover space —
             // nesting it must not freeze it at its natural extent)
-            LayoutNode::Stack { children, .. } | LayoutNode::Layered { children } => {
+            LayoutNode::Stack { children, .. } | LayoutNode::Layered { children, .. } => {
                 children.iter().any(|child| child.is_flexible(axis))
             }
             LayoutNode::Boundary { children, .. } => {
@@ -1393,7 +1395,7 @@ impl LayoutNode {
                 }
             }
 
-            LayoutNode::Layered { children } => {
+            LayoutNode::Layered { children, .. } => {
                 let measured: Vec<(Size, Fit)> =
                     children.iter().map(|child| child.measure(proposal, env)).collect();
                 let size = measured.iter().fold(Size::default(), |acc, (size, _)| Size {
@@ -1912,10 +1914,17 @@ impl LayoutNode {
                 });
             }
 
-            (LayoutNode::Layered { children }, Fit::Children(fits)) => {
+            (LayoutNode::Layered { align, children }, Fit::Children(fits)) => {
                 for (child, (size, fit)) in children.iter().zip(fits) {
+                    // the alignment edge is horizontal — a 2pt accent bar
+                    // hugs the leading side and still centers vertically
                     let origin = Point {
-                        x: frame.origin.x + (frame.size.width - size.width) / 2.0,
+                        x: frame.origin.x
+                            + match align {
+                                CrossAlign::Start | CrossAlign::Baseline => 0.0,
+                                CrossAlign::Center => (frame.size.width - size.width) / 2.0,
+                                CrossAlign::End => frame.size.width - size.width,
+                            },
                         y: frame.origin.y + (frame.size.height - size.height) / 2.0,
                     };
                     child.place(Rect { origin, size }, fit, env, out);
