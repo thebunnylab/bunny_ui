@@ -300,6 +300,34 @@ fn main() {
         std::hint::black_box(bitmap.width());
     }));
 
+    // incremental repaint: the surface retains the frame and repaints
+    // only the damage — the full frame above is the ceiling it beats
+    use bunny_ui::raster::Surface;
+    use bunny_ui::text_engine::PixelFont;
+    let mut surface = Surface::new(1520, 1280, 2, Color::CANVAS);
+    surface.frame(runtime.layout(&finder, viewport).display, &PixelFont);
+    let row = runtime.layout(&finder, viewport).hits.get(1).expect("row").1;
+    let mut inside = true;
+    reports.push(measure("hover repaint (damage)", 3, 200, 0, || {
+        let y = row.origin.y + row.size.height / 2.0;
+        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 });
+        inside = !inside;
+        let damage = surface.frame(runtime.layout(&finder, viewport).display, &PixelFont);
+        std::hint::black_box(damage.len());
+    }));
+    let mut forward = true;
+    reports.push(measure("keystroke repaint (damage)", 3, 200, 0, || {
+        if forward {
+            runtime.key(EditCommand::Insert("e".into()));
+        } else {
+            runtime.key(EditCommand::Backspace);
+        }
+        forward = !forward;
+        runtime.settle(&finder);
+        let damage = surface.frame(runtime.layout(&finder, viewport).display, &PixelFont);
+        std::hint::black_box(damage.len());
+    }));
+
     println!(
         "\n{:<30} {:>8} {:>8} {:>8} {:>8} {:>7} {:>8} {:>8}",
         "scenario (frame =)", "p50 ms", "p95 ms", "p99 ms", "max ms", "bodies", "allocs", "KiB"

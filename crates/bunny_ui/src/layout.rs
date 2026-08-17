@@ -367,7 +367,7 @@ pub struct Interaction {
 /// A draw command — the output of the placement pass, in paint order
 /// (whoever comes later paints on top; `Layered` counts on that).
 /// It is the rasterizer's interface and, later on, any backend's.
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum DrawCommand {
     /// `corner_radius: 0.0` = plain rectangle (the usual straight path).
     FillRect { rect: Rect, color: Color, corner_radius: Px },
@@ -394,7 +394,7 @@ pub enum DrawCommand {
 }
 
 /// The draw list of one frame.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct DisplayList {
     commands: Vec<DrawCommand>,
 }
@@ -406,6 +406,10 @@ impl DisplayList {
 
     pub fn iter(&self) -> impl Iterator<Item = &DrawCommand> {
         self.commands.iter()
+    }
+
+    pub fn as_slice(&self) -> &[DrawCommand] {
+        &self.commands
     }
 
     pub fn len(&self) -> usize {

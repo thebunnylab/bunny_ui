@@ -10,6 +10,7 @@
 mod ffi;
 mod text;
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use bunny_ui::action::{Key, KeyPattern};
@@ -72,15 +73,46 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
     let runtime = Rc::new(runtime);
     let root = Rc::new(root);
 
-    // one full frame: the Runtime settles, lays out, retains the hits
-    // for pointer events and rasterizes — the shell blits, aligns the
-    // cursor and mirrors the focused field for the input system (the
-    // IME's synchronous questions answer from this mirror)
-    let blit = move |runtime: &Runtime, root: &_| {
-        let (width, height) = window.content_size();
-        let canvas = bunny_ui::theme::canvas();
-        let bitmap = runtime.frame(root, Size { width, height }, window.scale(), canvas);
-        window.set_image(bitmap.width(), bitmap.height(), &bitmap.to_rgba_bytes());
+    // one frame: the Runtime settles, lays out, retains the hits for
+    // pointer events; the RETAINED surface repaints only the damage
+    // (hover repaints one row, not the window) — the shell blits, aligns
+    // the cursor and mirrors the focused field for the input system (the
+    // IME's synchronous questions answer from this mirror). Resize,
+    // scale or theme change retires the surface and starts a fresh one.
+    let surface: Rc<RefCell<Option<(bunny_ui::raster::Surface, usize, bunny_ui::layout::Color)>>> =
+        Rc::new(RefCell::new(None));
+    let blit = {
+        let surface = Rc::clone(&surface);
+        move |runtime: &Runtime, root: &_| {
+            let (width, height) = window.content_size();
+            let scale = window.scale();
+            let canvas = bunny_ui::theme::canvas();
+            let physical = ((width.round() as usize) * scale, (height.round() as usize) * scale);
+            let display = runtime.display_frame(root, Size { width, height });
+            let mut slot = surface.borrow_mut();
+            let stale = match &*slot {
+                Some((retained, retained_scale, retained_canvas)) => {
+                    retained.bitmap().width() != physical.0
+                        || retained.bitmap().height() != physical.1
+                        || *retained_scale != scale
+                        || *retained_canvas != canvas
+                }
+                None => true,
+            };
+            if stale {
+                *slot = Some((
+                    bunny_ui::raster::Surface::new(physical.0, physical.1, scale, canvas),
+                    scale,
+                    canvas,
+                ));
+            }
+            let (retained, _, _) = slot.as_mut().expect("surface for the frame");
+            let damage = retained.frame(display, &*runtime.text());
+            if !damage.is_empty() {
+                let bitmap = retained.bitmap();
+                window.set_image(bitmap.width(), bitmap.height(), &bitmap.to_rgba_bytes());
+            }
+            drop(slot);
         window.set_cursor_pointing(runtime.interaction().hovered.is_some());
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;
@@ -101,6 +133,7 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
                 ),
             )
         }));
+        }
     };
 
     // the gate: keymap BEFORE the input system — bare chars with a focused
@@ -109,6 +142,7 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
     ffi::set_key_gate(Box::new({
         let runtime = Rc::clone(&runtime);
         let root = Rc::clone(&root);
+        let blit = blit.clone();
         move |stroke: &ffi::KeyStroke| {
             let Some(pattern) = key_pattern(stroke) else {
                 return false;

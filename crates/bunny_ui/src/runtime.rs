@@ -487,6 +487,28 @@ impl Runtime {
         scale: usize,
         background: crate::layout::Color,
     ) -> crate::raster::Bitmap {
+        let display = self.display_frame(root, size);
+        crate::raster::rasterize_with(
+            &display,
+            (size.width.round() as usize) * scale,
+            (size.height.round() as usize) * scale,
+            scale,
+            background,
+            &*self.text,
+        )
+    }
+
+    /// The frame up to the display list — settle, layout, and the
+    /// bounded hover re-resolve (content may have moved under an idle
+    /// pointer). The incremental-repaint path: the shell hands this to
+    /// its retained [`Surface`] and blits only the damage.
+    ///
+    /// [`Surface`]: crate::raster::Surface
+    pub fn display_frame(
+        &self,
+        root: &impl View,
+        size: crate::layout::Size,
+    ) -> crate::layout::DisplayList {
         self.settle(root);
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
         let pointer = self.interaction.borrow().pointer;
@@ -495,14 +517,13 @@ impl Runtime {
         {
             result = self.layout(root, crate::layout::Proposal::exact(size));
         }
-        crate::raster::rasterize_with(
-            &result.display,
-            (size.width.round() as usize) * scale,
-            (size.height.round() as usize) * scale,
-            scale,
-            background,
-            &*self.text,
-        )
+        result.display
+    }
+
+    /// The text engine of this runtime — the shell pairs it with its
+    /// retained paint surface.
+    pub fn text(&self) -> Rc<dyn TextEngine> {
+        Rc::clone(&self.text)
     }
 
     pub fn render(&self, root: &impl View) -> String {

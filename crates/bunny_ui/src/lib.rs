@@ -1495,4 +1495,62 @@ mod tests {
         assert!(printed.contains("Text(\"third\")"));
         assert!(!printed.contains("TupleView"));
     }
+
+    #[test]
+    fn a_surface_repaints_a_real_hover_incrementally() {
+        use crate::layout::{Proposal, Size};
+        use crate::raster::{Surface, rasterize_scaled};
+        use crate::text_engine::PixelFont;
+
+        #[derive(Clone, Copy)]
+        struct Rows;
+
+        impl Component for Rows {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text("alpha")
+                        .padding_length(6.0)
+                        .background_color(Color::hex(0xEEEEF2))
+                        .background_hovered(Color::hex(0xD8DCE6))
+                        .on_click(|| {}),
+                    text("beta")
+                        .padding_length(6.0)
+                        .background_color(Color::hex(0xEEEEF2))
+                        .background_hovered(Color::hex(0xD8DCE6))
+                        .on_click(|| {}),
+                )
+            }
+        }
+
+        let viewport = Proposal::exact(Size { width: 120.0, height: 80.0 });
+        let runtime = Runtime::new();
+        runtime.settle(&Rows);
+
+        let mut surface = Surface::new(120, 80, 1, Color::CANVAS);
+        let first = surface.frame(runtime.layout(&Rows, viewport).display, &PixelFont);
+        assert_eq!(first, vec![(0, 0, 120, 80)], "first frame damages everything");
+
+        // hover the second row: the frame through the REAL pipeline
+        // (stamp → layout → surface) damages only that row, and the
+        // pixels match a full repaint byte for byte
+        let target = runtime
+            .layout(&Rows, viewport)
+            .hits
+            .get(1)
+            .expect("second row is a pointer target")
+            .1;
+        runtime.pointer_moved(target.origin.x + 4.0, target.origin.y + 4.0);
+        let result = runtime.layout(&Rows, viewport);
+        let oracle = rasterize_scaled(&result.display, 120, 80, 1, Color::CANVAS);
+        let damage = surface.frame(result.display, &PixelFont);
+
+        assert_eq!(surface.bitmap().pixels(), oracle.pixels(), "golden: incremental == full");
+        assert_eq!(damage.len(), 1, "one row hovered, one rect: {damage:?}");
+        let (_, y0, _, y1) = damage[0];
+        let row_height = (y1 - y0) as f64;
+        assert!(
+            row_height <= target.size.height + 4.0,
+            "damage is row-sized ({row_height}px tall), not the window"
+        );
+    }
 }
