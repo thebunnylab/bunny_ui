@@ -1196,6 +1196,47 @@ mod tests {
     }
 
     #[test]
+    fn what_a_task_lands_reaches_the_next_frame() {
+        #[derive(Clone, Copy)]
+        struct Panel {
+            lines: State<usize>,
+        }
+
+        impl Component for Panel {
+            fn body(self, _ctx: &Context) -> impl View {
+                text(format!("{} lines", self.lines.get()))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Panel { lines: State::new(0) };
+        assert!(runtime.render_stable(&view).contains("0 lines"));
+
+        // the APP owns the work and the thread; the bridge is the
+        // channel, and the engine only learns the result
+        let (sender, receiver) = motor::task::channel::<usize>();
+        let lines = view.lines;
+        let task = runtime.spawn(async move {
+            while let Some(count) = receiver.recv().await {
+                lines.set(count);
+            }
+        });
+        std::thread::spawn(move || {
+            sender.send(3).expect("the panel is reading");
+            sender.send(7).expect("the panel is reading");
+        })
+        .join()
+        .expect("the worker");
+
+        // one settle drains what landed and renders with it
+        assert!(runtime.render_stable(&view).contains("7 lines"));
+
+        // and the view stops hearing when the task is gone
+        drop(task);
+        assert_eq!(motor::task::pending(), 0);
+    }
+
+    #[test]
     fn a_layered_stack_hugs_the_edge_it_was_given() {
         use crate::layout::{DrawCommand, Proposal, Size};
 

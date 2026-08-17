@@ -24,6 +24,7 @@ pub mod loadable;
 pub mod modifiers;
 pub mod runtime;
 pub mod state;
+pub mod task;
 pub mod view;
 pub mod views;
 

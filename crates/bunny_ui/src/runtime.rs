@@ -1309,6 +1309,36 @@ impl Runtime {
         effects::take().iter().any(|effect| effect(&self.ctx))
     }
 
+    /// Puts a future on the engine's queue. It runs on the next turn —
+    /// never inside this call — and whatever it writes into `State`
+    /// reaches the scene through the ordinary invalidation.
+    ///
+    /// The handle OWNS the task: drop it and the task is cancelled.
+    /// `.task()` on a view is the front door; this is the raw one, for
+    /// a shell or an app that owns the lifetime itself.
+    #[must_use = "a dropped Spawned cancels its task — call detach() to let it run alone"]
+    pub fn spawn(
+        &self,
+        future: impl std::future::Future<Output = ()> + 'static,
+    ) -> motor::task::Spawned {
+        motor::task::spawn(future)
+    }
+
+    /// Polls every task that is ready. The frame path calls it at the
+    /// top of each cycle, so a result that landed since the last turn
+    /// is already state by the time the bodies run.
+    pub fn poll_tasks(&self) -> bool {
+        motor::task::poll_ready()
+    }
+
+    /// Installs how the shell asks itself for a turn when a task wakes
+    /// from somewhere else — another thread on the desktop, a browser
+    /// callback on the web. Without it a resolved task waits for the
+    /// next event.
+    pub fn set_wake_hook(&self, hook: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        motor::task::set_wake_hook(hook);
+    }
+
     /// The views `set()` dirtied since the last drain — the fine
     /// invalidation (whoever READ the written dependency), by identity
     /// path, scoped to this runtime's root.
@@ -1332,11 +1362,18 @@ impl Runtime {
     pub fn render_stable(&self, root: &impl View) -> String {
         let mut previous = String::new();
         for _ in 0..8 {
+            // what a task resolved since the last turn is state BEFORE
+            // the bodies read it
+            self.poll_tasks();
             let printed = self.render(root);
             // pump first: side effects fired by THIS render's onAppear
             // nodes must be observed before declaring the tree stable
             let observed_change = self.pump();
-            if printed == previous && !observed_change && !self.has_pending_dirty() {
+            if printed == previous
+                && !observed_change
+                && !self.has_pending_dirty()
+                && !motor::task::has_ready()
+            {
                 return printed;
             }
             previous = printed;
@@ -1352,9 +1389,12 @@ impl Runtime {
     /// consistent tree by definition; the next pass would be all-skip).
     pub fn settle(&self, root: &impl View) {
         for _ in 0..8 {
+            // the same order as the print path: a task that resolved
+            // writes its state, then the pass reads it
+            self.poll_tasks();
             self.frame_pass(root);
             let observed_change = self.pump();
-            if !observed_change && !self.has_pending_dirty() {
+            if !observed_change && !self.has_pending_dirty() && !motor::task::has_ready() {
                 return;
             }
         }
