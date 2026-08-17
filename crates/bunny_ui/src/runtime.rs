@@ -849,6 +849,10 @@ impl Runtime {
     /// the call is free — the shell pauses its frame driver while this
     /// stays false.
     pub fn tick(&self, dt: f64) -> bool {
+        // the engine's clock moves with the frames: a sleeping task
+        // wakes here, and its waker asks the shell for a settled turn
+        // (this path only repaints, and a task needs the bodies)
+        motor::task::advance(dt);
         let (moved, offsets) = self.animator.borrow_mut().tick(dt);
         // scroll flights write their in-flight value back into the
         // offsets the place consumes; a settled flight delivered its
@@ -864,7 +868,9 @@ impl Runtime {
     /// Does any animation still want a next frame? The shell syncs its
     /// frame driver (display link, rAF) with this after every present.
     pub fn wants_frame(&self) -> bool {
-        self.animator.borrow().wants_frame()
+        // a sleeping task needs the clock to keep moving, and the
+        // clock is the frame tick — the shell's driver stays awake
+        self.animator.borrow().wants_frame() || motor::task::has_timers()
     }
 
     /// Accessibility: on, every animation completes instantly. The

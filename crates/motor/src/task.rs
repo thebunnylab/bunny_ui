@@ -95,6 +95,11 @@ struct Executor {
     tasks: HashMap<TaskId, Option<BoxedTask>>,
     next: u64,
     shared: Arc<Shared>,
+    /// Sleepers by id, with the deadline they wait for. The clock is
+    /// the ENGINE's: the shell's frame tick advances it, so a test
+    /// moves time by hand and never really waits.
+    timers: HashMap<u64, (f64, Waker)>,
+    clock: f64,
 }
 
 thread_local! {
@@ -231,6 +236,82 @@ impl std::fmt::Debug for Spawned {
             None => f.write_str("Spawned(detached)"),
         }
     }
+}
+
+// MARK: - Waiting
+
+/// Waits `duration` before going on. The clock is the frame tick's, so
+/// a task that sleeps keeps the shell's driver awake until it wakes —
+/// the price of a debounce, and the reason to keep them short.
+///
+/// The recipe a search field wants: `.task_id(query, || async move {
+/// sleep(Duration::from_millis(250)).await; … })` — every keystroke
+/// restarts the task, so only the last one ever reaches the work.
+pub fn sleep(duration: std::time::Duration) -> Sleep {
+    EXECUTOR.with(|executor| {
+        let mut executor = executor.borrow_mut();
+        executor.next += 1;
+        Sleep { id: executor.next, deadline: executor.clock + duration.as_secs_f64() }
+    })
+}
+
+/// The future of [`sleep`]. Dropping it forgets the deadline.
+pub struct Sleep {
+    id: u64,
+    deadline: f64,
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        EXECUTOR.with(|executor| {
+            let mut executor = executor.borrow_mut();
+            if executor.clock >= self.deadline {
+                executor.timers.remove(&self.id);
+                return Poll::Ready(());
+            }
+            // one entry per sleeper: polling again REPLACES the waker
+            executor.timers.insert(self.id, (self.deadline, cx.waker().clone()));
+            Poll::Pending
+        })
+    }
+}
+
+impl Drop for Sleep {
+    fn drop(&mut self) {
+        let id = self.id;
+        let _ = EXECUTOR.try_with(|executor| executor.borrow_mut().timers.remove(&id));
+    }
+}
+
+/// Moves the engine's clock by `dt` seconds and wakes whoever waited
+/// that long. The shell's frame tick is what calls it.
+pub fn advance(dt: f64) -> bool {
+    let due: Vec<Waker> = EXECUTOR.with(|executor| {
+        let mut executor = executor.borrow_mut();
+        executor.clock += dt;
+        let clock = executor.clock;
+        let ripe: Vec<u64> = executor
+            .timers
+            .iter()
+            .filter(|(_, (deadline, _))| *deadline <= clock)
+            .map(|(id, _)| *id)
+            .collect();
+        ripe.iter().filter_map(|id| executor.timers.remove(id)).map(|(_, waker)| waker).collect()
+    });
+    let woke = !due.is_empty();
+    // outside the borrow: waking runs the shell's hook
+    for waker in due {
+        waker.wake();
+    }
+    woke
+}
+
+/// Is anyone sleeping? The shell keeps its frame driver awake while
+/// this is true — that is how the clock keeps moving.
+pub fn has_timers() -> bool {
+    EXECUTOR.with(|executor| !executor.borrow().timers.is_empty())
 }
 
 // MARK: - The channel: one value or a whole stream

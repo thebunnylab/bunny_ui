@@ -94,7 +94,9 @@ macro_rules! zstack {
 /// The engine's task queue: what `.task` runs on, and the channel a
 /// worker thread (or a browser callback) hands its results over.
 pub mod task {
-    pub use motor::task::{Receiver, Recv, SendError, Sender, Spawned, channel, spawn};
+    pub use motor::task::{
+        Receiver, Recv, SendError, Sender, Sleep, Spawned, channel, sleep, spawn,
+    };
 }
 
 pub mod prelude {
@@ -1295,6 +1297,56 @@ mod tests {
         view.open.set(false);
         runtime.render_stable(&view);
         assert_eq!(motor::task::pending(), 0, "the task died with the view");
+    }
+
+    #[test]
+    fn a_sleeping_task_wakes_on_the_engines_clock() {
+        #[derive(Clone, Copy)]
+        struct Debounced {
+            typed: State<usize>,
+            searched: State<usize>,
+        }
+
+        impl Component for Debounced {
+            fn body(self, _ctx: &Context) -> impl View {
+                let searched = self.searched;
+                let typed = self.typed;
+                // the search field's recipe: every keystroke restarts
+                // the task, so only the last one reaches the work
+                text(format!("searched {}", searched.get())).task_id(typed.get(), move || async move {
+                    task::sleep(std::time::Duration::from_millis(250)).await;
+                    searched.set(typed.get());
+                })
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Debounced { typed: State::new(1), searched: State::new(0) };
+        runtime.render_stable(&view);
+        assert!(runtime.wants_frame(), "a sleeper keeps the clock moving");
+
+        // 200ms of frames: still waiting
+        for _ in 0..12 {
+            runtime.tick(1.0 / 60.0);
+        }
+        runtime.render_stable(&view);
+        assert_eq!(view.searched.get(), 0, "not yet");
+
+        // a keystroke restarts the wait
+        view.typed.set(2);
+        runtime.render_stable(&view);
+        for _ in 0..12 {
+            runtime.tick(1.0 / 60.0);
+        }
+        runtime.render_stable(&view);
+        assert_eq!(view.searched.get(), 0, "the restart threw the wait away");
+
+        for _ in 0..4 {
+            runtime.tick(1.0 / 60.0);
+        }
+        runtime.render_stable(&view);
+        assert_eq!(view.searched.get(), 2, "the last keystroke is the one that searched");
+        assert!(!runtime.wants_frame(), "and the driver goes back to sleep");
     }
 
     #[test]
