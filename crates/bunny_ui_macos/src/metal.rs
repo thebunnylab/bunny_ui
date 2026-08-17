@@ -275,8 +275,33 @@ fragment float4 rect_fragment(RectVary in [[stage_in]],
                               device const RectInstance* rects [[buffer(0)]]) {
     RectInstance rect = rects[in.id];
     float2 p = in.position.xy;
-    // kind 0: fill — the ring and the halo arrive with the sdf phase
-    float coverage = rect_cov(p, rect.rect, rect.params.x);
+    float kind = rect.params.z;
+    float coverage;
+    if (kind == 0.0) {
+        // fill: the cpu corner ramp, clamp(radius - d + 0.5, 0, 1)
+        coverage = rect_cov(p, rect.rect, rect.params.x);
+    } else if (kind == 1.0) {
+        // stroke: outer coverage minus the inner rect's — the inset
+        // keeps the same corner center as the cpu ring, and integer
+        // edges keep the straight bars exact and never double-blended
+        float thickness = rect.params.y;
+        float4 inner = float4(rect.rect.xy + thickness, rect.rect.zw - thickness);
+        float inner_radius = max(rect.params.x - thickness, 0.0);
+        coverage = clamp(
+            rect_cov(p, rect.rect, rect.params.x) - rect_cov(p, inner, inner_radius),
+            0.0, 1.0);
+    } else {
+        // shadow: quadratic falloff outside the rounded core — the quad
+        // arrives pre-expanded, params.w undoes the expansion
+        float expansion = rect.params.w;
+        float4 base = float4(rect.rect.xy + expansion, rect.rect.zw - expansion);
+        float corner = rect.params.x;
+        float reach = rect.params.y;
+        float2 delta = p - clamp(p, base.xy + corner, base.zw - corner);
+        float distance = length(delta) - corner;
+        float strength = 1.0 - distance / reach;
+        coverage = (distance > 0.0 && distance < reach) ? strength * strength : 0.0;
+    }
     float4 color = float4(rect.color) / 255.0;
     return float4(color.rgb, color.a * coverage);
 }
@@ -642,6 +667,8 @@ fn corner_clamp(scaled_radius: f64, snapped: Box4) -> f64 {
 }
 
 const KIND_FILL: f32 = 0.0;
+const KIND_STROKE: f32 = 1.0;
+const KIND_SHADOW: f32 = 2.0;
 
 fn push_rect(
     out: &mut Vec<RectInstance>,
@@ -665,7 +692,7 @@ fn push_rect(
 /// Walks the display list in paint order and emits rect instances. The
 /// clip stack mirrors `Surface::walk_clips`: snapped, intersected in
 /// integers, an empty intersection degenerating to a zero-area box.
-/// Stroke, shadow and text arrive with their phases.
+/// Text arrives with the atlas phase.
 fn build_rects(
     display: &DisplayList,
     scale: usize,
@@ -690,8 +717,40 @@ fn build_rects(
                 let radius = corner_clamp(corner_radius * factor, snapped);
                 push_rect(out, snapped, clip, *color, radius, 0.0, KIND_FILL, 0.0);
             }
-            DrawCommand::StrokeRect { .. } | DrawCommand::Shadow { .. } => {
-                // the ring and the halo arrive with the sdf phase
+            DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
+                let Some(clip) = effective_clip(&clips, whole) else { continue };
+                let snapped = snap_scaled(*rect, factor);
+                if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
+                    continue;
+                }
+                if box_intersect(snapped, clip).is_none() {
+                    continue;
+                }
+                // the cpu's integer thickness, resolved here: at least
+                // one device pixel, rounded once
+                let thickness = (width * factor).max(1.0).round();
+                let radius = corner_clamp(corner_radius * factor, snapped);
+                push_rect(out, snapped, clip, *color, radius, thickness, KIND_STROKE, 0.0);
+            }
+            DrawCommand::Shadow { rect, radius, color, corner_radius } => {
+                let Some(clip) = effective_clip(&clips, whole) else { continue };
+                let snapped = snap_scaled(*rect, factor);
+                // reach stays unrounded for the falloff; its rounding
+                // only sizes the quad (the cpu loop bound) — any pixel
+                // beyond it computes coverage zero anyway
+                let reach = (radius * factor).max(1.0);
+                let reach_px = reach.round() as i64;
+                let corner = corner_clamp(corner_radius * factor, snapped);
+                let expanded = (
+                    snapped.0 - reach_px,
+                    snapped.1 - reach_px,
+                    snapped.2 + reach_px,
+                    snapped.3 + reach_px,
+                );
+                if box_intersect(expanded, clip).is_none() {
+                    continue;
+                }
+                push_rect(out, expanded, clip, *color, corner, reach, KIND_SHADOW, reach_px as f64);
             }
             DrawCommand::TextLine { .. } => {
                 // text arrives with the atlas phase
@@ -1110,6 +1169,29 @@ mod tests {
         a.iter().zip(b.iter()).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0)
     }
 
+    /// The parity gate for anti-aliased scenes: every channel within
+    /// `max_delta`, and at most 1% of channels beyond one step (float
+    /// coverage vs the cpu's two integer roundings).
+    fn assert_close(gpu: &[u8], cpu: &[u8], max_delta: u8, label: &str) {
+        assert_eq!(gpu.len(), cpu.len(), "{label}: byte lengths differ");
+        let mut worst = 0u8;
+        let mut beyond_one = 0usize;
+        for (a, b) in gpu.iter().zip(cpu.iter()) {
+            let delta = a.abs_diff(*b);
+            worst = worst.max(delta);
+            if delta > 1 {
+                beyond_one += 1;
+            }
+        }
+        assert!(worst <= max_delta, "{label}: worst channel delta {worst} (allowed {max_delta})");
+        let share = beyond_one as f64 / gpu.len() as f64;
+        assert!(
+            share <= 0.01,
+            "{label}: {beyond_one} channels beyond one step ({:.3}% > 1%)",
+            share * 100.0
+        );
+    }
+
     #[test]
     fn the_wire_structs_hold_their_layout() {
         // the const asserts already gate the build; this pins the numbers
@@ -1204,6 +1286,81 @@ mod tests {
             scene_bytes(&root, Size { width: 200.0, height: 120.0 }, 2, Color::CANVAS);
         let delta = max_channel_delta(&gpu, &cpu);
         assert!(delta <= 1, "clipped scene drifted by {delta} (allowed 1)");
+    }
+
+    #[test]
+    fn rounded_fill_within_tolerance() {
+        if !device_present() {
+            return;
+        }
+        // the finder radius and an exaggerated one, on a dark canvas —
+        // the corner-bug configuration, now judged by the oracle
+        let root = vstack((
+            empty().frame(140.0, 60.0).background_color(Color::hex(0xF2F3F7)).corner_radius(9.0),
+            empty().frame(140.0, 90.0).background_color(Color::hex(0x3B82F6)).corner_radius(40.0),
+        ));
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 180.0, height: 200.0 }, 2, Color::hex(0x18181D));
+        assert_close(&gpu, &cpu, 2, "rounded fills");
+    }
+
+    #[test]
+    fn stroke_ring_never_double_blends() {
+        if !device_present() {
+            return;
+        }
+        // a TRANSLUCENT border is the double-blend trap: straight bars
+        // must meet without overlap, the rounded ring must follow the
+        // curve — one blend per pixel on both backends
+        let veil = Color::rgba(0, 0, 0, 90);
+        let root = vstack((
+            empty().frame(120.0, 40.0).border(veil, 1.0),
+            empty().frame(120.0, 40.0).border(veil, 3.0).corner_radius(12.0),
+            empty()
+                .frame(120.0, 40.0)
+                .background_color(Color::hex(0xDDE1E9))
+                .border(Color::hex(0x3B82F6), 2.0)
+                .corner_radius(9.0),
+        ));
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 160.0, height: 160.0 }, 2, Color::CANVAS);
+        assert_close(&gpu, &cpu, 2, "stroke rings");
+    }
+
+    #[test]
+    fn shadow_quadratic_falloff_matches() {
+        if !device_present() {
+            return;
+        }
+        // the halo and the notch behind the rounded corner — quadratic
+        // falloff, strictly outside the shape
+        let root = empty()
+            .frame(120.0, 80.0)
+            .background_color(Color::hex(0xFFFFFF))
+            .corner_radius(9.0)
+            .shadow(24.0)
+            .padding_length(40.0);
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 200.0, height: 160.0 }, 2, Color::CANVAS);
+        assert_close(&gpu, &cpu, 2, "shadow halo");
+    }
+
+    #[test]
+    fn degenerate_thin_rects_survive() {
+        if !device_present() {
+            return;
+        }
+        // hairlines and borders thicker than the box: the clamps must
+        // agree on both backends, no panic, no stray ink
+        let root = vstack((
+            empty().frame(100.0, 1.0).background_color(Color::hex(0x18181D)),
+            empty().frame(1.0, 40.0).background_color(Color::hex(0x18181D)),
+            empty().frame(60.0, 10.0).border(Color::hex(0x3B82F6), 20.0),
+            empty().frame(40.0, 12.0).background_color(Color::hex(0xDDE1E9)).corner_radius(30.0),
+        ));
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 140.0, height: 120.0 }, 2, Color::CANVAS);
+        assert_close(&gpu, &cpu, 2, "degenerate rects");
     }
 
     #[test]
