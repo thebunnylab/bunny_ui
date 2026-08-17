@@ -90,6 +90,9 @@ pub struct Runtime {
     /// The fields of the last layout (geometry + effective font) —
     /// click-to-position and IME sync measure through here.
     last_fields: RefCell<Vec<FieldPlacement>>,
+    /// The splits of the last layout — a divider drag maps the pointer
+    /// back to a lane extent through this geometry.
+    last_splits: RefCell<Vec<crate::layout::SplitPlacement>>,
     /// The theme version the last pass saw — switching themes rebuilds
     /// the retention ONCE (tokens read in a body are baked into the
     /// scene).
@@ -233,6 +236,7 @@ impl Runtime {
             carets: RefCell::new(HashMap::default()),
             caret_visible: Cell::new(true),
             last_fields: RefCell::new(Vec::new()),
+            last_splits: RefCell::new(Vec::new()),
             theme_version: Cell::new(crate::theme::version()),
             keymap: RefCell::new(HashMap::default()),
             scoped_keymap: RefCell::new(HashMap::default()),
@@ -323,6 +327,7 @@ impl Runtime {
             effects::set_queue(reconciler::assemble_effects(pass_root));
             reconciler::assemble_actions(pass_root);
             reconciler::assemble_editors(pass_root);
+            reconciler::assemble_splits(pass_root);
             reconciler::assemble_handlers(pass_root);
             reconciler::assemble_contexts(pass_root);
             // with the editors of THIS pass assembled, dead fields
@@ -354,6 +359,14 @@ impl Runtime {
     /// pressed target: dragging out drops the visual, coming back
     /// re-arms it (AppKit).
     pub fn pointer_moved(&self, x: Px, y: Px) -> bool {
+        // a live divider drag owns the pointer: the move becomes a lane
+        // extent, the retained writer reaches the binding, and the app's
+        // state change re-lays the frame — hover stays untouched
+        let dragging = self.interaction.borrow().split_drag.clone();
+        if let Some(path) = dragging {
+            self.interaction.borrow_mut().pointer = Some(Point { x, y });
+            return self.drag_split(&path, x, y);
+        }
         let target = self.hover_target(x, y);
         let mut interaction = self.interaction.borrow_mut();
         let hovered = match &interaction.pressed {
@@ -364,6 +377,33 @@ impl Runtime {
         interaction.pointer = Some(Point { x, y });
         interaction.hovered = hovered;
         changed
+    }
+
+    /// One divider move: clamp the pointer into the split's lane range
+    /// and hand it to the retained writer. `true` = the position writer
+    /// ran (the state write re-renders; a clamped no-move still repaints
+    /// cheaply — the frame is stable and the pass settles at zero).
+    fn drag_split(&self, path: &str, x: Px, y: Px) -> bool {
+        let placement = self
+            .last_splits
+            .borrow()
+            .iter()
+            .find(|split| split.path == path)
+            .cloned();
+        let Some(split) = placement else {
+            return false;
+        };
+        let (pointer_main, origin_main, total) = match split.axis {
+            crate::layout::Axis::Horizontal => {
+                (x, split.frame.origin.x, split.frame.size.width)
+            }
+            crate::layout::Axis::Vertical => {
+                (y, split.frame.origin.y, split.frame.size.height)
+            }
+        };
+        let at = (pointer_main - origin_main)
+            .clamp(split.min_a, (total - split.min_b).max(split.min_a));
+        reconciler::run_split(path, at)
     }
 
     /// Button down: ARMS pressed on the target under the point — no
@@ -385,6 +425,15 @@ impl Runtime {
             return true;
         }
         let target = self.hover_target(x, y);
+        // a press on a grip band starts the divider drag — nothing arms
+        // (a divider has no up-inside action to mis-fire)
+        if let Some(grip) = target.as_deref().and_then(|t| t.strip_suffix("/#split")) {
+            let mut interaction = self.interaction.borrow_mut();
+            interaction.pointer = Some(Point { x, y });
+            interaction.split_drag = Some(grip.to_string());
+            interaction.pressed = None;
+            return true;
+        }
         let mut interaction = self.interaction.borrow_mut();
         interaction.pointer = Some(Point { x, y });
         let changed = interaction.pressed != target || interaction.hovered != target;
@@ -399,6 +448,13 @@ impl Runtime {
     /// click). Returns the fired/focused path; the pressed visual
     /// always clears.
     pub fn pointer_released(&self, x: Px, y: Px) -> Option<String> {
+        // a divider drag ends on release — no action fires, no focus moves
+        if self.interaction.borrow().split_drag.is_some() {
+            let mut interaction = self.interaction.borrow_mut();
+            interaction.split_drag = None;
+            interaction.pointer = Some(Point { x, y });
+            return None;
+        }
         let target = self.hover_target(x, y);
         let fired = {
             let mut interaction = self.interaction.borrow_mut();
@@ -1201,6 +1257,7 @@ impl Runtime {
         *self.last_hits.borrow_mut() = result.hits.clone();
         *self.last_scrolls.borrow_mut() = result.scrolls.clone();
         *self.last_fields.borrow_mut() = result.fields.clone();
+        *self.last_splits.borrow_mut() = result.splits.clone();
         *self.last_overlays.borrow_mut() = result.overlays.clone();
         *self.last_drag_regions.borrow_mut() = result.drag_regions.clone();
         // an applied-target memory whose region left the scene goes

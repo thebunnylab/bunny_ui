@@ -305,6 +305,23 @@ pub enum LayoutNode {
         target: Option<String>,
         child: Box<LayoutNode>,
     },
+    /// A two-lane split with a user-draggable divider. The position is
+    /// APP state — the view renders the binding's value into `at`, the
+    /// runtime writes the drag back through a retained closure — and
+    /// the node only resolves it against its clamps. Children are lane
+    /// A, the divider's own visual (an ORDINARY child: a 1px styled
+    /// strut that lowers honestly on every target), then lane B. Place
+    /// exposes a grip band over the divider to the hit-test as
+    /// `{path}/#split`; the band wins the reverse walk, so content
+    /// near the seam stays clickable right up to it.
+    Split {
+        path: String,
+        axis: Axis,
+        at: Px,
+        min_a: Px,
+        min_b: Px,
+        children: Vec<LayoutNode>,
+    },
     /// A virtualized vertical run: `count` rows, only a window of them
     /// materialized — each child carries its row index (the window
     /// plus pins need not be contiguous). The full extent keeps the
@@ -528,6 +545,9 @@ pub struct Interaction {
     pub pointer: Option<Point>,
     pub hovered: Option<String>,
     pub pressed: Option<String>,
+    /// The split whose divider is being dragged — moves route to its
+    /// retained position writer instead of hover until the release.
+    pub split_drag: Option<String>,
 }
 
 /// A draw command — the output of the placement pass, in paint order
@@ -708,6 +728,20 @@ pub struct FieldPlacement {
     pub auto_focus: bool,
 }
 
+/// A placed split — the geometry the runtime needs to route a divider
+/// drag back into layout coordinates (mirror of [`FieldPlacement`]).
+#[derive(Clone, Debug)]
+pub struct SplitPlacement {
+    pub path: String,
+    pub frame: Rect,
+    pub axis: Axis,
+    pub min_a: Px,
+    pub min_b: Px,
+}
+
+/// The grip band's thickness over a split divider, in points.
+pub const SPLIT_GRIP: Px = 6.0;
+
 #[derive(Default, Debug)]
 pub struct Placement {
     pub frames: Frames,
@@ -715,6 +749,7 @@ pub struct Placement {
     pub hits: Vec<(String, Rect)>,
     pub scrolls: Vec<ScrollRegion>,
     pub fields: Vec<FieldPlacement>,
+    pub splits: Vec<SplitPlacement>,
     /// Stack of the inherited foreground — the top colors the text.
     foreground: Vec<Color>,
     /// Stack of the nearest `Interactive`'s `(hovered, pressed)` — the
@@ -842,6 +877,7 @@ pub struct LayoutResult {
     pub hits: Vec<(String, Rect)>,
     pub scrolls: Vec<ScrollRegion>,
     pub fields: Vec<FieldPlacement>,
+    pub splits: Vec<SplitPlacement>,
     /// Virtual windows that failed to cover the visible band this
     /// frame — the runtime re-materializes them in a follow-up pass.
     pub misses: Vec<String>,
@@ -900,6 +936,7 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         hits: out.hits,
         scrolls: out.scrolls,
         fields: out.fields,
+        splits: out.splits,
         misses: out.misses,
         overlays: out.overlays,
         drag_regions: out.drag_regions,
@@ -933,6 +970,7 @@ pub fn layout_dom(
             hits: out.hits,
             scrolls: out.scrolls,
             fields: out.fields,
+            splits: out.splits,
             misses: out.misses,
             overlays: out.overlays,
         drag_regions: out.drag_regions,
@@ -1140,6 +1178,9 @@ impl LayoutNode {
     fn is_flexible(&self, axis: Axis) -> bool {
         match self {
             LayoutNode::Spacer | LayoutNode::Fill => true,
+            // a split FILLS the offer on both axes — its whole job is
+            // dividing the room it was given
+            LayoutNode::Split { .. } => true,
             LayoutNode::Scroll { .. } => axis == Axis::Vertical,
             // a field takes the offered width (like the real TextField)
             LayoutNode::Field { .. } => axis == Axis::Horizontal,
@@ -1202,6 +1243,10 @@ impl LayoutNode {
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
             | LayoutNode::Frame { child, .. } => child.first_baseline(env),
+            // lane A leads the seam — its text sets the shared line
+            LayoutNode::Split { children, .. } => {
+                children.first().and_then(|child| child.first_baseline(env))
+            }
             LayoutNode::Padding { edges, child } => {
                 child.first_baseline(env).map(|baseline| baseline + edges.top)
             }
@@ -1432,6 +1477,10 @@ impl LayoutNode {
                     height: proposal.height.unwrap_or(content.height),
                 };
                 (size, Fit::ScrollContent(content, Box::new(fit)))
+            }
+
+            LayoutNode::Split { axis, at, min_a, min_b, children, .. } => {
+                measure_split(*axis, *at, *min_a, *min_b, children, proposal, env)
             }
 
             LayoutNode::Interactive { child, .. } => {
@@ -1790,6 +1839,77 @@ impl LayoutNode {
 
             (LayoutNode::Stack { axis, spacing, align, children }, Fit::Children(fits)) => {
                 place_stack(*axis, *spacing, *align, children, frame, fits, env, out);
+            }
+
+            (
+                LayoutNode::Split { path, axis, min_a, min_b, children, .. },
+                Fit::Children(fits),
+            ) => {
+                // the seam's metrics, read before the fits move into
+                // the placing loop
+                let lane_main = |index: usize| {
+                    fits.get(index).map_or(0.0, |(size, _): &(Size, Fit)| match axis {
+                        Axis::Horizontal => size.width,
+                        Axis::Vertical => size.height,
+                    })
+                };
+                let seam_center = lane_main(0) + lane_main(1) / 2.0;
+                // lanes in measure order: A, divider, B — each filling
+                // the frame's cross extent
+                let mut cursor = 0.0;
+                for (child, (size, fit)) in children.iter().zip(fits) {
+                    let (origin, lane) = match axis {
+                        Axis::Horizontal => (
+                            Point { x: frame.origin.x + cursor, y: frame.origin.y },
+                            Size { width: size.width, height: frame.size.height },
+                        ),
+                        Axis::Vertical => (
+                            Point { x: frame.origin.x, y: frame.origin.y + cursor },
+                            Size { width: frame.size.width, height: size.height },
+                        ),
+                    };
+                    child.place(Rect { origin, size: lane }, fit, env, out);
+                    cursor += match axis {
+                        Axis::Horizontal => size.width,
+                        Axis::Vertical => size.height,
+                    };
+                }
+                // the grip band, centered on the divider — pushed AFTER
+                // the lanes so the reverse hit walk finds it first, and
+                // clipped like every hit (an off-screen seam cannot drag)
+                let seam = {
+                    let center = seam_center;
+                    match axis {
+                        Axis::Horizontal => Rect {
+                            origin: Point {
+                                x: frame.origin.x + center - SPLIT_GRIP / 2.0,
+                                y: frame.origin.y,
+                            },
+                            size: Size { width: SPLIT_GRIP, height: frame.size.height },
+                        },
+                        Axis::Vertical => Rect {
+                            origin: Point {
+                                x: frame.origin.x,
+                                y: frame.origin.y + center - SPLIT_GRIP / 2.0,
+                            },
+                            size: Size { width: frame.size.width, height: SPLIT_GRIP },
+                        },
+                    }
+                };
+                let visible = match out.current_clip() {
+                    Some(clip) => seam.intersection(clip),
+                    None => Some(seam),
+                };
+                if let Some(visible) = visible {
+                    out.hits.push((format!("{path}/#split"), visible));
+                }
+                out.splits.push(SplitPlacement {
+                    path: path.clone(),
+                    frame,
+                    axis: *axis,
+                    min_a: *min_a,
+                    min_b: *min_b,
+                });
             }
 
             (LayoutNode::Layered { children }, Fit::Children(fits)) => {
@@ -2223,6 +2343,85 @@ impl LayoutNode {
             _ => unreachable!("fit of one node used on another"),
         }
     }
+}
+
+/// The split's lane math: the divider child answers its own natural
+/// thickness, lane A gets `at` clamped between the minimums, lane B the
+/// rest. Unbounded on the main axis (a natural pass) the lanes answer
+/// their naturals — the clamp only means something against a real offer.
+fn measure_split(
+    axis: Axis,
+    at: Px,
+    min_a: Px,
+    min_b: Px,
+    children: &[LayoutNode],
+    proposal: Proposal,
+    env: LayoutEnv,
+) -> (Size, Fit) {
+    let lane = |main: Option<Px>| match axis {
+        Axis::Horizontal => Proposal { width: main, height: proposal.height },
+        Axis::Vertical => Proposal { width: proposal.width, height: main },
+    };
+    let main = |size: &Size| match axis {
+        Axis::Horizontal => size.width,
+        Axis::Vertical => size.height,
+    };
+    let cross = |size: &Size| match axis {
+        Axis::Horizontal => size.height,
+        Axis::Vertical => size.width,
+    };
+    let proposed_main = match axis {
+        Axis::Horizontal => proposal.width,
+        Axis::Vertical => proposal.height,
+    };
+
+    let (divider_size, divider_fit) = children[1].measure(lane(None), env);
+    let thickness = main(&divider_size);
+
+    let (a_main, b_main) = match proposed_main {
+        Some(total) => {
+            let a = at.clamp(min_a, (total - thickness - min_b).max(min_a));
+            (Some(a), Some((total - a - thickness).max(0.0)))
+        }
+        None => (None, None),
+    };
+    let (a_size, a_fit) = children[0].measure(lane(a_main), env);
+    let (b_size, b_fit) = children[2].measure(lane(b_main), env);
+
+    // the Fit carries the LANES, not the children's answers: a rigid
+    // child (a text) answers its natural, but its lane is still the
+    // lane — the child sits inside it, the seam does not chase content
+    let a_lane = a_main.unwrap_or_else(|| main(&a_size));
+    let b_lane = b_main.unwrap_or_else(|| main(&b_size));
+    let cross_extent = match axis {
+        Axis::Horizontal => proposal.height,
+        Axis::Vertical => proposal.width,
+    }
+    .unwrap_or_else(|| cross(&a_size).max(cross(&divider_size)).max(cross(&b_size)));
+    let lane_size = |lane_main: Px| match axis {
+        Axis::Horizontal => Size { width: lane_main, height: cross_extent },
+        Axis::Vertical => Size { width: cross_extent, height: lane_main },
+    };
+
+    let main_sum = a_lane + thickness + b_lane;
+    let size = match axis {
+        Axis::Horizontal => Size {
+            width: proposed_main.unwrap_or(main_sum),
+            height: cross_extent,
+        },
+        Axis::Vertical => Size {
+            width: cross_extent,
+            height: proposed_main.unwrap_or(main_sum),
+        },
+    };
+    (
+        size,
+        Fit::Children(vec![
+            (lane_size(a_lane), a_fit),
+            (lane_size(thickness), divider_fit),
+            (lane_size(b_lane), b_fit),
+        ]),
+    )
 }
 
 /// The stack algorithm: measures everyone ONCE with no restriction on the
@@ -2707,6 +2906,46 @@ mod tests {
         assert_eq!(result.frames.get("line").unwrap().size.width, 1.0);
         assert_eq!(result.frames.get("editor").unwrap().size.width, 939.0);
         assert_eq!(result.frames.get("editor").unwrap().origin.x, 261.0);
+    }
+
+    #[test]
+    fn a_split_lays_exact_lanes_and_offers_a_grip() {
+        let split = |at: f64| LayoutNode::Split {
+            path: "seam".into(),
+            axis: Axis::Horizontal,
+            at,
+            min_a: 100.0,
+            min_b: 100.0,
+            children: vec![
+                boundary("a", LayoutNode::Spacer),
+                LayoutNode::Frame {
+                    width: Some(1.0),
+                    height: None,
+                    child: Box::new(LayoutNode::Spacer),
+                },
+                boundary("b", LayoutNode::Spacer),
+            ],
+        };
+        let result = layout(&split(260.0), Proposal { width: Some(1200.0), height: Some(700.0) });
+
+        assert_eq!(result.frames.get("a").unwrap().size.width, 260.0);
+        assert_eq!(result.frames.get("b").unwrap().size.width, 939.0);
+        assert_eq!(result.frames.get("b").unwrap().origin.x, 261.0);
+        // the grip band rides the seam, wider than the hairline, and is
+        // the TOPMOST hit there
+        let (path, grip) = result.hits.last().expect("the seam registers a grip").clone();
+        assert_eq!(path, "seam/#split");
+        assert_eq!(grip.size.width, SPLIT_GRIP);
+        assert!(grip.origin.x < 260.5 && 260.5 < grip.origin.x + grip.size.width);
+        // the placement carries the drag's geometry
+        assert_eq!(result.splits.len(), 1);
+        assert_eq!(result.splits[0].min_b, 100.0);
+
+        // the clamps hold at both ends
+        let low = layout(&split(0.0), Proposal { width: Some(1200.0), height: Some(700.0) });
+        assert_eq!(low.frames.get("a").unwrap().size.width, 100.0);
+        let high = layout(&split(9999.0), Proposal { width: Some(1200.0), height: Some(700.0) });
+        assert_eq!(high.frames.get("a").unwrap().size.width, 1099.0);
     }
 
     #[test]

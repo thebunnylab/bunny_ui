@@ -1597,6 +1597,65 @@ mod tests {
     }
 
     #[test]
+    fn a_divider_drag_writes_the_binding_and_moves_the_seam() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Bench {
+            seam: State<f64>,
+        }
+
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                hsplit(
+                    self.seam.binding(),
+                    text("panel"),
+                    text("editor"),
+                )
+                .min_sizes(120.0, 200.0)
+            }
+        }
+
+        let bench = Bench { seam: State::new(260.0) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&bench);
+        let viewport = Proposal::exact(Size { width: 1200.0, height: 700.0 });
+        let result = runtime.layout(&bench, viewport);
+
+        // the grip is where the seam is
+        let (grip_path, grip) = result
+            .hits
+            .iter()
+            .find(|(path, _)| path.ends_with("/#split"))
+            .expect("the seam registers a grip")
+            .clone();
+        let grip_center_x = grip.origin.x + grip.size.width / 2.0;
+
+        // press the grip, drag right: the binding follows the pointer
+        assert!(runtime.pointer_pressed(grip_center_x, 300.0));
+        assert!(runtime.pointer_moved(400.0, 300.0));
+        assert_eq!(bench.seam.get(), 400.0);
+        let dragged = runtime.layout(&bench, viewport);
+        let moved = dragged
+            .hits
+            .iter()
+            .find(|(path, _)| path.ends_with("/#split"))
+            .expect("the seam persists")
+            .clone();
+        assert!((moved.1.origin.x + moved.1.size.width / 2.0 - 400.5).abs() < 0.75);
+
+        // past the floor the clamp holds — and a release fires nothing
+        runtime.pointer_moved(5.0, 300.0);
+        assert_eq!(bench.seam.get(), 120.0);
+        assert_eq!(runtime.pointer_released(5.0, 300.0), None);
+
+        // after the release the pointer is free again: moving does not drag
+        runtime.pointer_moved(700.0, 300.0);
+        assert_eq!(bench.seam.get(), 120.0);
+        let _ = grip_path;
+    }
+
+    #[test]
     fn a_click_routes_through_hit_test_to_the_action_and_repaints() {
         use crate::layout::{Proposal, Size, hit_test};
 

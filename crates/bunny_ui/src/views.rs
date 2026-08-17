@@ -226,6 +226,98 @@ impl View for TextField {
     }
 }
 
+/// `HSplitView { a; b }`, with the seam as APP state: the binding's value
+/// renders in as lane A's width, a drag on the divider writes back —
+/// clamped between the lanes' floors. The framework owns the grip (a 6pt
+/// band over the 1pt hairline) and the drag loop; the app owns where the
+/// seam rests, so persisting or animating it is ordinary state.
+#[derive(Clone)]
+pub struct HSplit<A, B> {
+    at: Binding<f64>,
+    min_a: f64,
+    min_b: f64,
+    a: A,
+    b: B,
+}
+
+/// `hsplit(at, leading, trailing)` — the two-lane split. Floors default
+/// to 100pt each; tune them with [`HSplit::min_sizes`].
+pub fn hsplit<A, B>(at: Binding<f64>, a: A, b: B) -> HSplit<A, B>
+where
+    A: View<Arity = Single>,
+    B: View<Arity = Single>,
+{
+    HSplit { at, min_a: 100.0, min_b: 100.0, a, b }
+}
+
+impl<A, B> HSplit<A, B> {
+    /// The lanes' floors, in points — the drag clamps against them.
+    pub fn min_sizes(mut self, min_a: f64, min_b: f64) -> Self {
+        self.min_a = min_a;
+        self.min_b = min_b;
+        self
+    }
+}
+
+impl<A, B> View for HSplit<A, B>
+where
+    A: View<Arity = Single>,
+    B: View<Arity = Single>,
+{
+    type Arity = Single;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let at = self.at.wrappedValue();
+        let mut nodes = NodeList::new();
+        // the divider is an ORDINARY child (a themed 1pt strut): it
+        // measures, paints and lowers like anything else on every target
+        let divider = crate::ext::ViewExt::background_color(
+            crate::ext::ViewExt::frame_width(spacer(), 1.0),
+            crate::theme::divider(),
+        );
+        (self.a.clone(), divider, self.b.clone()).render_into(ctx, &mut nodes);
+        let (prints, layouts) = nodes.into_parts();
+        out.push(RenderNode::branch(
+            if crate::view::print_enabled() {
+                format!("HSplitView(at: {at})")
+            } else {
+                String::new()
+            },
+            prints,
+        ));
+        match motor::identity::cursor_scope() {
+            Some(path) => {
+                let binding = self.at.clone();
+                crate::reconciler::attribute_split(
+                    path.clone(),
+                    Rc::new(move |new_at| {
+                        // the clamp can pin the seam: a repeated value
+                        // must not dirty the world
+                        if binding.wrappedValue() != new_at {
+                            binding.set(new_at);
+                        }
+                    }),
+                );
+                out.push_layout(LayoutNode::Split {
+                    path,
+                    axis: Axis::Horizontal,
+                    at,
+                    min_a: self.min_a,
+                    min_b: self.min_b,
+                    children: layouts,
+                });
+            }
+            // outside a pass (decorative use): the lanes become a row
+            None => out.push_layout(LayoutNode::Stack {
+                axis: Axis::Horizontal,
+                spacing: 0.0,
+                align: CrossAlign::Start,
+                children: layouts,
+            }),
+        }
+    }
+}
+
 pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> TextField {
     TextField { placeholder: Rc::from(placeholder.into()), text }
 }

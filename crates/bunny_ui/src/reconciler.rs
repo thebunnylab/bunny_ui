@@ -46,6 +46,12 @@ pub(crate) type ActionEntry = (String, Rc<dyn Fn()>);
 pub(crate) type EditorFn = Rc<dyn Fn(EditCommand, &mut CaretState) -> Option<String>>;
 pub(crate) type EditorEntry = (String, EditorFn);
 
+/// A split divider's position writer: the drag hands it the new lane-A
+/// extent in layout points and it reaches the app's binding. Retained
+/// like the actions — a skipped view's divider still drags.
+pub(crate) type SplitFn = Rc<dyn Fn(crate::layout::Px)>;
+pub(crate) type SplitEntry = (String, SplitFn);
+
 /// A NAMED action handler registered at render: (registration path,
 /// id, what runs). Retained like the actions — a skipped view's
 /// handler lives.
@@ -65,6 +71,8 @@ pub(crate) struct Entry {
     pub actions: Vec<ActionEntry>,
     /// The body's field editors — same retention.
     pub editors: Vec<EditorEntry>,
+    /// The body's split-position writers — same retention.
+    pub splits: Vec<SplitEntry>,
     /// The body's named-action handlers — same retention.
     pub handlers: Vec<HandlerEntry>,
     /// Key contexts declared in the body (`.key_context(name)`) — a
@@ -80,6 +88,7 @@ struct BuildingFrame {
     effects: Vec<EffectFn>,
     actions: Vec<ActionEntry>,
     editors: Vec<EditorEntry>,
+    splits: Vec<SplitEntry>,
     handlers: Vec<HandlerEntry>,
     contexts: Vec<&'static str>,
 }
@@ -96,6 +105,7 @@ struct PassState {
     root_effects: Vec<EffectFn>,
     root_actions: Vec<ActionEntry>,
     root_editors: Vec<EditorEntry>,
+    root_splits: Vec<SplitEntry>,
     root_handlers: Vec<HandlerEntry>,
     root_contexts: Vec<&'static str>,
     /// Instrumentation: bodies that ran in this pass.
@@ -190,14 +200,28 @@ pub(crate) fn finish_entry(
     node: RenderNode,
     layout: LayoutNode,
 ) {
-    let (effects, actions, editors, handlers, contexts) = PASS.with(|pass| {
+    let (effects, actions, editors, splits, handlers, contexts) = PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         match pass.building.pop() {
             Some(frame) => {
                 debug_assert_eq!(frame.path, path, "entries close in the order they open");
-                (frame.effects, frame.actions, frame.editors, frame.handlers, frame.contexts)
+                (
+                    frame.effects,
+                    frame.actions,
+                    frame.editors,
+                    frame.splits,
+                    frame.handlers,
+                    frame.contexts,
+                )
             }
-            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            None => (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
         }
     });
     let parent_segments = motor::identity::current_path_segments()
@@ -215,6 +239,7 @@ pub(crate) fn finish_entry(
                 effects,
                 actions,
                 editors,
+                splits,
                 handlers,
                 contexts,
                 parent_segments,
@@ -256,6 +281,19 @@ pub(crate) fn attribute_editor(path: String, editor: EditorFn) {
             frame.editors.push((path, editor));
         } else {
             pass.root_editors.push((path, editor));
+        }
+    });
+}
+
+/// A split-position writer registered during render — same attribution
+/// as the editors: entry being built, or the root region.
+pub(crate) fn attribute_split(path: String, split: SplitFn) {
+    PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        if let Some(frame) = pass.building.last_mut() {
+            frame.splits.push((path, split));
+        } else {
+            pass.root_splits.push((path, split));
         }
     });
 }
@@ -476,6 +514,7 @@ thread_local! {
     /// The live field-editor map — reassembled per pass, like the
     /// actions.
     static EDITORS: RefCell<HashMap<String, EditorFn>> = RefCell::new(HashMap::default());
+    static SPLITS: RefCell<HashMap<String, SplitFn>> = RefCell::new(HashMap::default());
 }
 
 /// Reassembles the editor map from retention under the root + root region.
@@ -496,6 +535,39 @@ pub(crate) fn assemble_editors(root: &str) {
         }
     });
     EDITORS.with(|editors| *editors.borrow_mut() = map);
+}
+
+/// Reassembles the split map from retention — the editors' twin.
+pub(crate) fn assemble_splits(root: &str) {
+    let mut map: HashMap<String, SplitFn> = HashMap::default();
+    RETAINED.with(|retained| {
+        for (path, entry) in retained.borrow().iter() {
+            if covers(root, path) {
+                for (key, split) in &entry.splits {
+                    map.insert(key.clone(), split.clone());
+                }
+            }
+        }
+    });
+    PASS.with(|pass| {
+        for (key, split) in std::mem::take(&mut pass.borrow_mut().root_splits) {
+            map.insert(key, split);
+        }
+    });
+    SPLITS.with(|splits| *splits.borrow_mut() = map);
+}
+
+/// Hands a dragged divider position to the split's retained writer.
+/// `false` = no split registered at the path.
+pub(crate) fn run_split(path: &str, at: crate::layout::Px) -> bool {
+    let split = SPLITS.with(|splits| splits.borrow().get(path).cloned());
+    match split {
+        Some(split) => {
+            split(at);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Is the target a text field? (decides if a click FOCUSES instead of acting)

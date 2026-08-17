@@ -248,7 +248,21 @@ pub fn run_window_chrome(
             ));
             let display = runtime.display_frame(root, Size { width, height });
             present(runtime, display);
-        window.set_cursor_pointing(runtime.interaction().hovered.is_some());
+        let interaction = runtime.interaction();
+        // a live divider drag keeps the resizer even while the pointer
+        // runs ahead of the seam; hovering the grip announces it
+        let over_grip = interaction.split_drag.is_some()
+            || interaction
+                .hovered
+                .as_deref()
+                .is_some_and(|target| target.ends_with("/#split"));
+        window.set_cursor(if over_grip {
+            ffi::Cursor::ResizeLeftRight
+        } else if interaction.hovered.is_some() {
+            ffi::Cursor::Pointing
+        } else {
+            ffi::Cursor::Arrow
+        });
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;
             (

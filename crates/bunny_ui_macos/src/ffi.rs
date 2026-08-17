@@ -1004,19 +1004,28 @@ impl WindowHandle {
         }
     }
 
-    /// Hand over an interactive target; arrow elsewhere. Direct `set` —
-    /// no cursor rects for now (AppKit may restore it at resize edges; a
-    /// cosmetic glitch we accept).
-    pub fn set_cursor_pointing(&self, pointing: bool) {
+    /// The pointer's outfit over the scene. Direct `set` — no cursor
+    /// rects for now (AppKit may restore it at resize edges; a cosmetic
+    /// glitch we accept).
+    pub fn set_cursor(&self, cursor: Cursor) {
+        let name = match cursor {
+            Cursor::Arrow => "arrowCursor",
+            Cursor::Pointing => "pointingHandCursor",
+            Cursor::ResizeLeftRight => "resizeLeftRightCursor",
+        };
         unsafe {
-            let cursor = if pointing {
-                msg_id(class("NSCursor"), sel("pointingHandCursor"))
-            } else {
-                msg_id(class("NSCursor"), sel("arrowCursor"))
-            };
-            msg_void(cursor, sel("set"));
+            msg_void(msg_id(class("NSCursor"), sel(name)), sel("set"));
         }
     }
+}
+
+/// What the pointer wears: the hand over an interactive target, the
+/// horizontal resizer over a split's grip, the arrow elsewhere.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Cursor {
+    Arrow,
+    Pointing,
+    ResizeLeftRight,
 }
 
 /// `kCGImageAlphaPremultipliedLast` — bytes R,G,B,A, alpha last.
