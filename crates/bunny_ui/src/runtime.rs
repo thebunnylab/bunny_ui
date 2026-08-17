@@ -89,6 +89,9 @@ pub struct Runtime {
     /// The app keymap: key pattern → action. Runtime config (like the
     /// text engine), not retention — bind is a declaration of intent.
     keymap: RefCell<HashMap<KeyPattern, ActionId>>,
+    /// The last APPLIED `.scroll_target` per region — the follow fires
+    /// only when the target changes; in between, the wheel is sovereign.
+    scroll_targets: RefCell<HashMap<String, String>>,
     /// Did the last pass see the root become ONE boundary
     /// (`Boundary`/ref)? Only then can the stable frame synthesize the
     /// reference without a pass — a boundary-less root comes fresh
@@ -140,6 +143,7 @@ impl Runtime {
             last_fields: RefCell::new(Vec::new()),
             theme_version: Cell::new(crate::theme::version()),
             keymap: RefCell::new(HashMap::new()),
+            scroll_targets: RefCell::new(HashMap::new()),
             root_is_boundary: Cell::new(false),
             printless: Cell::new(false),
         }
@@ -541,6 +545,47 @@ impl Runtime {
             .collect()
     }
 
+    /// Applies `.scroll_target(id)` requests: for each region whose
+    /// declared target CHANGED since the last application, scrolls just
+    /// enough to reveal the row (top-aligns when above, bottom-aligns
+    /// when below). Returns whether any offset moved. A target whose row
+    /// is not mounted this frame (filtered out) stays pending — it
+    /// applies when the row appears.
+    fn apply_scroll_targets(&self, result: &crate::layout::LayoutResult) -> bool {
+        let mut moved = false;
+        for region in &result.scrolls {
+            let Some(target) = &region.target else { continue };
+            if self.scroll_targets.borrow().get(&region.path) == Some(target) {
+                continue;
+            }
+            let key = format!("{}/[{}]", region.path, target);
+            let Some(row) = result.frames.get(&key) else { continue };
+            self.scroll_targets.borrow_mut().insert(region.path.clone(), target.clone());
+            let region_top = region.frame.origin.y;
+            let region_bottom = region_top + region.frame.size.height;
+            let row_top = row.origin.y;
+            let row_bottom = row_top + row.size.height;
+            let delta = if row_top < region_top {
+                row_top - region_top
+            } else if row_bottom > region_bottom {
+                row_bottom - region_bottom
+            } else {
+                0.0
+            };
+            if delta != 0.0 {
+                let current = self.scroll_offset(&region.path);
+                let travel =
+                    (region.content.height.round() - region.frame.size.height.round()).max(0.0);
+                let next = (current.y + delta).clamp(0.0, travel);
+                if next != current.y {
+                    self.set_scroll_offset(&region.path, Point { x: current.x, y: next });
+                    moved = true;
+                }
+            }
+        }
+        moved
+    }
+
     /// The FRAME-path pass: identical to the print one, but the printed
     /// tree's lines are not even formatted (printing is for people;
     /// frames are for pixels).
@@ -556,6 +601,21 @@ impl Runtime {
     /// tree = zero bodies), expands the retained layout tree, and
     /// answers the proposal with the frames by identity.
     pub fn layout(
+        &self,
+        root: &impl View,
+        proposal: crate::layout::Proposal,
+    ) -> crate::layout::LayoutResult {
+        let result = self.layout_once(root, proposal);
+        // a scroll target that CHANGED moves its region's offset — one
+        // bounded re-layout in the same frame (the wheel is untouched:
+        // an unchanged target never re-applies)
+        if self.apply_scroll_targets(&result) {
+            return self.layout_once(root, proposal);
+        }
+        result
+    }
+
+    fn layout_once(
         &self,
         root: &impl View,
         proposal: crate::layout::Proposal,

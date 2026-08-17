@@ -279,6 +279,16 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// The scroll region follows this item id: when the id CHANGES, the
+    /// region scrolls just enough to reveal the row (keyboard selection
+    /// stays visible); the wheel stays sovereign in between.
+    fn scroll_target(self, id: impl Into<String>) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::ScrollTarget(id.into()),
+        }
+    }
+
     // MARK: - Interaction
 
     /// `.onTapGesture { … }` — in the headless runtime it fires on render.

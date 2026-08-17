@@ -1497,6 +1497,58 @@ mod tests {
     }
 
     #[test]
+    fn scroll_target_reveals_the_selection_and_leaves_the_wheel_alone() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Rows {
+            selected: State<usize>,
+        }
+
+        impl Component for Rows {
+            fn body(self, _ctx: &Context) -> impl View {
+                let items: Vec<usize> = (0..10).collect();
+                let selected = self.selected.get();
+                list(items, |index| format!("row{index}"), |index| text(format!("r{index}")))
+                    .scroll_target(format!("row{selected}"))
+            }
+        }
+
+        // 10 rows × 16px in an 48px viewport: three rows visible
+        let viewport = Proposal::exact(Size { width: 120.0, height: 48.0 });
+        let rows = Rows { selected: State::new(0) };
+        let runtime = Runtime::new();
+        runtime.settle(&rows);
+        let result = runtime.layout(&rows, viewport);
+        let region = result.scrolls.first().expect("scroll region").path.clone();
+        assert_eq!(runtime.scroll_offset(&region).y, 0.0, "row0 already visible: no scroll");
+
+        // selection jumps below the fold: the region follows, bottom-aligned
+        rows.selected.set(8);
+        runtime.settle(&rows);
+        runtime.layout(&rows, viewport);
+        let offset = runtime.scroll_offset(&region).y;
+        assert_eq!(offset, 8.0 * 16.0 + 16.0 - 48.0, "row8 bottom-aligned into view");
+
+        // the wheel is sovereign while the target stays put
+        runtime.wheel(60.0, 24.0, 0.0, 30.0);
+        let wheeled = runtime.scroll_offset(&region).y;
+        assert_ne!(wheeled, offset, "the wheel moved the region");
+        runtime.layout(&rows, viewport);
+        assert_eq!(
+            runtime.scroll_offset(&region).y,
+            wheeled,
+            "an unchanged target never drags the wheel back"
+        );
+
+        // target changes again: reveal wins again
+        rows.selected.set(0);
+        runtime.settle(&rows);
+        runtime.layout(&rows, viewport);
+        assert_eq!(runtime.scroll_offset(&region).y, 0.0, "row0 top-aligned back into view");
+    }
+
+    #[test]
     fn a_surface_repaints_a_real_hover_incrementally() {
         use crate::layout::{Proposal, Size};
         use crate::raster::{Surface, rasterize_scaled};

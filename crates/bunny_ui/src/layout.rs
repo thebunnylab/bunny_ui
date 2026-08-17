@@ -213,7 +213,14 @@ pub enum LayoutNode {
     /// shrink contract). `path` is the region's structural identity — the
     /// address of the retained offset (scrolling restores when the list
     /// remounts).
-    Scroll { path: Option<String>, child: Box<LayoutNode> },
+    Scroll {
+        path: Option<String>,
+        /// The item id the region follows: when it CHANGES, the runtime
+        /// scrolls just enough to reveal the row — the wheel stays
+        /// sovereign in between (`.scroll_target(id)`).
+        target: Option<String>,
+        child: Box<LayoutNode>,
+    },
     /// Semantic visual property: background behind the child, border on
     /// top, foreground inherited. Transparent to the measure — by type.
     Styled { props: VisualProps, child: Box<LayoutNode> },
@@ -431,6 +438,8 @@ pub struct ScrollRegion {
     pub path: String,
     pub frame: Rect,
     pub content: Size,
+    /// The declared scroll target (`.scroll_target(id)`), if any.
+    pub target: Option<String>,
 }
 
 /// A placed text field: geometry + EFFECTIVE font at that point of the
@@ -1004,7 +1013,7 @@ impl LayoutNode {
                 child.place(Rect { origin: Point { x, y }, size: child_size }, *fit, env, out);
             }
 
-            (LayoutNode::Scroll { path, child }, Fit::ScrollContent(content, fit)) => {
+            (LayoutNode::Scroll { path, target, child }, Fit::ScrollContent(content, fit)) => {
                 // per-axis travel over SNAPPED values: "scrollable by
                 // 0.000001px" does not exist here by construction
                 let max_x = (content.width.round() - frame.size.width.round()).max(0.0);
@@ -1041,6 +1050,7 @@ impl LayoutNode {
                         path: path.clone(),
                         frame,
                         content,
+                        target: target.clone(),
                     });
                 }
             }
@@ -1521,6 +1531,7 @@ mod tests {
                     "region",
                     LayoutNode::Scroll {
                         path: None,
+                        target: None,
                         child: Box::new(boundary("content", text(1000))),
                     },
                 ),
@@ -1790,6 +1801,7 @@ mod tests {
 
         let root = LayoutNode::Scroll {
             path: Some("list".to_string()),
+            target: None,
             child: Box::new(rows(10)),
         };
         let result = layout_with(
@@ -1822,6 +1834,7 @@ mod tests {
         };
         let root = LayoutNode::Scroll {
             path: Some("list".to_string()),
+            target: None,
             child: Box::new(LayoutNode::Stack {
                 axis: Axis::Vertical,
                 spacing: 0.0,
@@ -1853,6 +1866,7 @@ mod tests {
     fn scrollbar_appears_only_with_overflow() {
         let scroll = |count: usize| LayoutNode::Scroll {
             path: Some("list".to_string()),
+            target: None,
             child: Box::new(rows(count)),
         };
         let viewport = Proposal::exact(Size { width: 100.0, height: 100.0 });

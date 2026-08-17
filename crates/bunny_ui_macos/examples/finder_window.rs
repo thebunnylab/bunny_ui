@@ -202,7 +202,10 @@ impl Component for Finder {
                 .background_pressed(theme::row_pressed())
                 .on_click(move || opened.set(label.clone()))
             },
-        );
+        )
+        // arrow keys move the selection below the fold — the region
+        // follows just enough to keep it visible; the wheel stays free
+        .scroll_target(labels.get(selected_index).cloned().unwrap_or_default());
 
         let body = if count == 0 {
             Either::Second(

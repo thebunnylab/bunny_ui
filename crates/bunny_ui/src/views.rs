@@ -605,6 +605,7 @@ where
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         debug_assert_unique_ids("list", self.items.iter().map(&self.id));
+        let scope = motor::identity::cursor_scope();
         let mut row_layouts = Vec::new();
         let rows = self
             .items
@@ -618,7 +619,17 @@ where
                 let mut row = NodeList::new();
                 (self.row)(item).render_into(ctx, &mut row);
                 let (prints, layouts) = row.into_parts();
-                row_layouts.push(wrap_layout(layouts));
+                // the row is addressable GEOMETRY: a boundary node under
+                // the row's identity records its frame — tests reach it,
+                // and `.scroll_target(id)` finds the rect to reveal
+                let row_layout = match &scope {
+                    Some(scope) => LayoutNode::Boundary {
+                        path: format!("{scope}/[{id}]"),
+                        children: vec![wrap_layout(layouts)],
+                    },
+                    None => wrap_layout(layouts),
+                };
+                row_layouts.push(row_layout);
                 RenderNode::branch(
                     if crate::view::print_enabled() {
                         format!("Row (id: {id})")
@@ -641,6 +652,7 @@ where
         // overflow stays inside; structural identity addresses the
         // retained offset (a remounted list restores the position)
         out.push_layout(LayoutNode::Scroll {
+            target: None,
             path: motor::identity::cursor_scope(),
             child: Box::new(LayoutNode::Stack {
                 axis: Axis::Vertical,
@@ -759,6 +771,7 @@ impl<H: View, C: View> View for Section<H, C> {
         // Section is just the stacking
         out.push_layout(if self.kind == "List" {
             LayoutNode::Scroll {
+                target: None,
                 path: motor::identity::cursor_scope(),
                 child: Box::new(stacked),
             }

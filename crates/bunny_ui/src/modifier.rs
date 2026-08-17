@@ -63,6 +63,8 @@ pub enum Modifier {
     BackgroundPressed(Color),
     Highlight(Rc<Vec<(usize, usize)>>, Color),
     TruncationMode(Truncation),
+    /// The scroll region follows this item id when it changes.
+    ScrollTarget(String),
 
     // MARK: - Real interaction (a pointer target without chrome — the Button
     // without the outfit; the action fires on up-inside like the Button's)
@@ -145,6 +147,7 @@ impl Modifier {
                 format!(" [.highlight({} ranges, {color})]", ranges.len())
             }
             Modifier::TruncationMode(mode) => format!(" [.truncationMode(.{mode:?})]"),
+            Modifier::ScrollTarget(id) => format!(" [.scrollTarget({id:?})]"),
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
@@ -179,6 +182,38 @@ impl Modifier {
 /// Rewrites the TEXT node under the `Styled` chain (if any) — the
 /// `.highlight()`/`.truncationMode()` path, immune to the order of the
 /// visual modifiers in the chain.
+/// Descends through wrappers to the `Scroll` node and rewrites it —
+/// modifier order stays irrelevant (`.scroll_target()` works before or
+/// after visual modifiers). Without a scroll region it is a no-op.
+fn rewrite_scroll_node(
+    node: LayoutNode,
+    rewrite: &impl Fn(Option<String>, Box<LayoutNode>) -> LayoutNode,
+) -> LayoutNode {
+    match node {
+        LayoutNode::Scroll { path, child, .. } => rewrite(path, child),
+        LayoutNode::Styled { props, child } => LayoutNode::Styled {
+            props,
+            child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
+        LayoutNode::Padding { edges, child } => LayoutNode::Padding {
+            edges,
+            child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
+        LayoutNode::Frame { width, height, child } => LayoutNode::Frame {
+            width,
+            height,
+            child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
+        LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
+            max_width,
+            max_height,
+            align,
+            child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
+        other => other,
+    }
+}
+
 fn rewrite_text_node(
     node: LayoutNode,
     rewrite: &impl Fn(
@@ -386,6 +421,13 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     content,
                     highlights,
                     truncation: Some(*mode),
+                })
+            }),
+            Modifier::ScrollTarget(id) => out.wrap_last_layout(|node| {
+                rewrite_scroll_node(node, &|path, child| LayoutNode::Scroll {
+                    path,
+                    target: Some(id.clone()),
+                    child,
                 })
             }),
             Modifier::OnClick(action) => {
