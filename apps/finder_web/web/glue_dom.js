@@ -15,6 +15,18 @@ const decoder = new TextDecoder();
 const elements = new Map([[0, app]]);
 const rules = new Map();
 
+// Registered images by split key ("hi:lo"): a blob URL the <img>
+// elements load from, plus the decoded size once the probe lands
+// (width 0 = still decoding; a broken blob never reports and its
+// element simply stays empty).
+const images = new Map();
+
+function imageKey(hi, lo) {
+  // wasm hands u32 arguments through the SIGNED i32 border while the
+  // patch decoder reads unsigned — normalize or the same key differs
+  return `${hi >>> 0}:${lo >>> 0}`;
+}
+
 // The engine measures text through the SAME canvas engine in this mode
 // (layout is always ours) — only the raster never runs: no bitmap here.
 let inkCanvas = null;
@@ -54,11 +66,19 @@ function flushRules() {
 }
 
 function createElementOf(kind) {
-  // 0 group, 1 box, 2 text, 3 field, 4 scroll, 5 content, 6 canvas
+  // 0 group, 1 box, 2 text, 3 field, 4 scroll, 5 content, 6 canvas,
+  // 7 image
   if (kind === 6) {
     const canvas = document.createElement("canvas");
     canvas.style.cssText = "position:absolute;left:0;top:0;";
     return canvas;
+  }
+  if (kind === 7) {
+    const img = document.createElement("img");
+    // the box underneath owns the clicks; our geometry owns the frame
+    img.style.cssText = "position:absolute;left:0;top:0;pointer-events:none;";
+    img.draggable = false;
+    return img;
   }
   if (kind === 3) {
     const input = document.createElement("input");
@@ -285,6 +305,18 @@ function applyPatches(view, length) {
         if (Math.abs(el.scrollLeft - x) >= 1) el.scrollLeft = x;
         if (Math.abs(el.scrollTop - y) >= 1) el.scrollTop = y;
       }
+    } else if (op === 9) {
+      const hi = u32();
+      const lo = u32();
+      const cover = u8();
+      const el = elements.get(id);
+      const entry = images.get(imageKey(hi, lo));
+      if (el && entry) {
+        el.src = entry.url;
+        // false: our frame IS the rect (contain and stretch resolve in
+        // the engine's geometry) — the element just fills it
+        el.style.objectFit = cover ? "cover" : "fill";
+      }
     }
   }
   // ONE stylesheet rebuild per batch — a window churn touches dozens
@@ -312,16 +344,44 @@ const imports = {
   bunny: {
     js_blit() {},
     js_request_frame() {},
-    // the image edge lands here with the <img> lowering; until then
-    // the stubs keep the single binary's import border whole
-    // ([0, 0] = never decoded — nothing measures, nothing paints)
-    js_image_register() {},
-    js_image_size(hi, lo, out) {
-      const view = new Uint32Array(wasm.memory.buffer, out, 2);
-      view[0] = 0;
-      view[1] = 0;
+    // The image edge, at home: the bytes become a blob URL the <img>
+    // elements load straight from — the browser decodes, caches and
+    // paints; no pixel ever crosses back for elements. The probe
+    // reports the intrinsic size so the engine's geometry reflows.
+    js_image_register(hi, lo, pointer, length) {
+      const key = imageKey(hi, lo);
+      const bytes = new Uint8Array(wasm.memory.buffer, pointer, length).slice();
+      const url = URL.createObjectURL(new Blob([bytes]));
+      const probe = new Image();
+      const entry = { url, probe, width: 0, height: 0 };
+      images.set(key, entry);
+      probe.onload = () => {
+        entry.width = probe.naturalWidth;
+        entry.height = probe.naturalHeight;
+        wasm.bunny_image_ready(hi, lo);
+      };
+      probe.src = url;
     },
-    js_image_raster() {},
+    js_image_size(hi, lo, out) {
+      const entry = images.get(imageKey(hi, lo));
+      const view = new Uint32Array(wasm.memory.buffer, out, 2);
+      view[0] = entry ? entry.width : 0;
+      view[1] = entry ? entry.height : 0;
+    },
+    // islands still composite in the engine — a `.rendering(Gpu)`
+    // subtree needs the pixels on our side of the border
+    js_image_raster(hi, lo, width, height, out) {
+      const entry = images.get(imageKey(hi, lo));
+      if (!entry || !entry.width) return;
+      const ink = inkSurface(width, height);
+      ink.setTransform(1, 0, 0, 1, 0, 0);
+      ink.clearRect(0, 0, width, height);
+      ink.imageSmoothingEnabled = true;
+      ink.imageSmoothingQuality = "high";
+      ink.drawImage(entry.probe, 0, 0, width, height);
+      const pixels = ink.getImageData(0, 0, width, height).data;
+      new Uint8Array(wasm.memory.buffer, out, width * height * 4).set(pixels);
+    },
     js_apply_patches(pointer, length) {
       const view = new DataView(wasm.memory.buffer, pointer, length);
       applyPatches(view, length);

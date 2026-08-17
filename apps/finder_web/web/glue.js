@@ -52,7 +52,9 @@ function requestFrame() {
 const images = new Map();
 
 function imageKey(hi, lo) {
-  return `${hi}:${lo}`;
+  // wasm hands u32 arguments through the SIGNED i32 border while the
+  // patch decoder reads unsigned — normalize or the same key differs
+  return `${hi >>> 0}:${lo >>> 0}`;
 }
 
 const imports = {
