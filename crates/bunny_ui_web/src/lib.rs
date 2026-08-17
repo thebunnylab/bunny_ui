@@ -13,13 +13,18 @@
 //! of the display link — armed only while an animation wants frames.
 #![cfg(target_arch = "wasm32")]
 
+mod text;
+
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use bunny_ui::layout::{Color, Size};
 use bunny_ui::prelude::*;
 use bunny_ui::raster::Surface;
 use bunny_ui::runtime::Runtime;
 use bunny_ui::text_input::EditCommand;
+
+pub use text::CanvasTextEngine;
 
 #[link(wasm_import_module = "bunny")]
 unsafe extern "C" {
@@ -61,7 +66,7 @@ fn dispatch(event: Event) {
 /// Boots the shell with the app's root view. The demo crate calls this
 /// from its exported `start`; everything after travels through events.
 pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
-    let runtime = Runtime::new();
+    let runtime = Runtime::new().text_engine(Rc::new(CanvasTextEngine::new()));
     let mut size = Size { width, height };
     // the surface wants an INTEGER scale (the snapping contract);
     // fractional device ratios round to the nearest whole step
