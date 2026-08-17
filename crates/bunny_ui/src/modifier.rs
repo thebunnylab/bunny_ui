@@ -276,12 +276,32 @@ fn rewrite_text_node(
     }
 }
 
+/// Consecutive paddings ADD instead of nesting — shrinking a proposal by
+/// `a` and then by `b` is shrinking it by `a + b`, so one node carries
+/// the sum and the chain of `.padding_edge(...)` calls stops paying one
+/// box per edge.
+fn wrap_padding(out: &mut NodeList, edges: Edges) {
+    out.wrap_last_layout(|node| match node {
+        LayoutNode::Padding { edges: inner, child } => LayoutNode::Padding {
+            edges: Edges {
+                top: inner.top + edges.top,
+                bottom: inner.bottom + edges.bottom,
+                leading: inner.leading + edges.leading,
+                trailing: inner.trailing + edges.trailing,
+            },
+            child,
+        },
+        node => LayoutNode::Padding { edges, child: Box::new(node) },
+    });
+}
+
 fn wrap_styled(out: &mut NodeList, delta: VisualProps) {
     out.wrap_last_layout(|node| match node {
-        LayoutNode::Styled { props, child } => {
-            LayoutNode::Styled { props: props.or(delta), child }
+        LayoutNode::Styled { mut props, child } => {
+            *props = (*props).or(delta);
+            LayoutNode::Styled { props, child }
         }
-        other => LayoutNode::Styled { props: delta, child: Box::new(other) },
+        other => LayoutNode::Styled { props: Box::new(delta), child: Box::new(other) },
     });
 }
 
@@ -354,17 +374,8 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         // LAYOUT modifiers wrap the base's node — this is where the typed
         // chain becomes proposal/response structure
         match &self.modifier {
-            Modifier::Padding => out.wrap_last_layout(|node| LayoutNode::Padding {
-                edges: Edges::uniform(16.0),
-                child: Box::new(node),
-            }),
-            Modifier::PaddingLength(length) => {
-                let edges = Edges::uniform(*length);
-                out.wrap_last_layout(|node| LayoutNode::Padding {
-                    edges,
-                    child: Box::new(node),
-                });
-            }
+            Modifier::Padding => wrap_padding(out, Edges::uniform(16.0)),
+            Modifier::PaddingLength(length) => wrap_padding(out, Edges::uniform(*length)),
             Modifier::PaddingEdge(edge, length) => {
                 let mut edges = Edges::default();
                 match edge {
@@ -373,10 +384,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     Edge::Leading => edges.leading = *length,
                     Edge::Trailing => edges.trailing = *length,
                 }
-                out.wrap_last_layout(|node| LayoutNode::Padding {
-                    edges,
-                    child: Box::new(node),
-                });
+                wrap_padding(out, edges);
             }
             Modifier::FrameWH(width, height) => {
                 let (width, height) = (Some(*width), Some(*height));

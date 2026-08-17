@@ -24,7 +24,9 @@
 //! `Sheet` node).
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+
+use motor::hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::rc::Rc;
 
 use motor::state::{Context, EffectFn};
@@ -274,13 +276,13 @@ pub(crate) fn attribute_context(name: &'static str) {
 }
 
 thread_local! {
-    static ACTIVE_CONTEXTS: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::new());
+    static ACTIVE_CONTEXTS: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::default());
 }
 
 /// Rebuilds the active-context set from the retention (the live
 /// declarations) — the twin of the handler assembly.
 pub(crate) fn assemble_contexts(root: &str) {
-    let mut active: HashSet<&'static str> = HashSet::new();
+    let mut active: HashSet<&'static str> = HashSet::default();
     RETAINED.with(|retained| {
         for (path, entry) in retained.borrow().iter() {
             if covers(root, path) {
@@ -315,7 +317,7 @@ thread_local! {
     /// Reassembled per pass, like actions and editors — the map is a
     /// stamp of the pass, never retained interaction state.
     static HANDLERS: RefCell<HashMap<crate::action::ActionId, (usize, HandlerFn)>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
 }
 
 /// Reassembles the handler map from the retention under the root + the
@@ -324,7 +326,7 @@ thread_local! {
 /// retention order, documented as NON-contractual — the semantic
 /// tiebreak arrives with key contexts).
 pub(crate) fn assemble_handlers(root: &str) {
-    let mut map: HashMap<crate::action::ActionId, (usize, HandlerFn)> = HashMap::new();
+    let mut map: HashMap<crate::action::ActionId, (usize, HandlerFn)> = HashMap::default();
     let place = |map: &mut HashMap<crate::action::ActionId, (usize, HandlerFn)>,
                      path: &str,
                      id: crate::action::ActionId,
@@ -432,13 +434,13 @@ pub(crate) fn assemble_effects(root: &str) -> Vec<EffectFn> {
 thread_local! {
     /// The live click map: target path → action. Reassembled on every
     /// pass, like the effect queue.
-    static ACTIONS: RefCell<HashMap<String, Rc<dyn Fn()>>> = RefCell::new(HashMap::new());
+    static ACTIONS: RefCell<HashMap<String, Rc<dyn Fn()>>> = RefCell::new(HashMap::default());
 }
 
 /// Reassembles the click map from the retention under the root (a
 /// skipped view's button stays clickable) + the root region.
 pub(crate) fn assemble_actions(root: &str) {
-    let mut map: HashMap<String, Rc<dyn Fn()>> = HashMap::new();
+    let mut map: HashMap<String, Rc<dyn Fn()>> = HashMap::default();
     RETAINED.with(|retained| {
         for (path, entry) in retained.borrow().iter() {
             if covers(root, path) {
@@ -473,12 +475,12 @@ pub(crate) fn run_action(path: &str) -> bool {
 thread_local! {
     /// The live field-editor map — reassembled per pass, like the
     /// actions.
-    static EDITORS: RefCell<HashMap<String, EditorFn>> = RefCell::new(HashMap::new());
+    static EDITORS: RefCell<HashMap<String, EditorFn>> = RefCell::new(HashMap::default());
 }
 
 /// Reassembles the editor map from retention under the root + root region.
 pub(crate) fn assemble_editors(root: &str) {
-    let mut map: HashMap<String, EditorFn> = HashMap::new();
+    let mut map: HashMap<String, EditorFn> = HashMap::default();
     RETAINED.with(|retained| {
         for (path, entry) in retained.borrow().iter() {
             if covers(root, path) {

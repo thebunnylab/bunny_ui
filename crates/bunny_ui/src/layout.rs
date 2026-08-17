@@ -27,7 +27,7 @@
 //!
 //! [`PixelFont`]: crate::text_engine::PixelFont
 
-use std::collections::HashMap;
+use motor::hash::FxHashMap as HashMap;
 use std::rc::Rc;
 
 use crate::text_engine::{FontPatch, FontSpec, MeasureCache, PixelFont, TextEngine};
@@ -223,7 +223,7 @@ pub enum LayoutNode {
     },
     /// Semantic visual property: background behind the child, border on
     /// top, foreground inherited. Transparent to the measure — by type.
-    Styled { props: VisualProps, child: Box<LayoutNode> },
+    Styled { props: Box<VisualProps>, child: Box<LayoutNode> },
     /// ONE-line text field — semantic end to end (in Dom it becomes an
     /// `<input>`; in Gpu, chrome + text + caret + selection from here).
     /// Focus, caret, selection and IME composition do NOT live here:
@@ -595,9 +595,9 @@ pub struct LayoutResult {
 pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
     let engine = PixelFont;
     let cache = MeasureCache::default();
-    let offsets = HashMap::new();
+    let offsets = HashMap::default();
     let interaction = Interaction::default();
-    let carets = HashMap::new();
+    let carets = HashMap::default();
     layout_with(
         root,
         proposal,
@@ -1617,9 +1617,9 @@ mod tests {
     fn measure_with_defaults(node: &LayoutNode, proposal: Proposal) -> Size {
         let engine = PixelFont;
         let cache = MeasureCache::default();
-        let offsets = HashMap::new();
+        let offsets = HashMap::default();
         let interaction = Interaction::default();
-        let carets = HashMap::new();
+        let carets = HashMap::default();
         let env = LayoutEnv {
             text: &engine,
             cache: &cache,
@@ -1639,8 +1639,8 @@ mod tests {
     ) -> LayoutResult {
         let engine = PixelFont;
         let cache = MeasureCache::default();
-        let offsets = HashMap::new();
-        let carets = HashMap::new();
+        let offsets = HashMap::default();
+        let carets = HashMap::default();
         layout_with(
             root,
             proposal,
@@ -1805,7 +1805,7 @@ mod tests {
     }
 
     fn styled(props: VisualProps, child: LayoutNode) -> LayoutNode {
-        LayoutNode::Styled { props, child: Box::new(child) }
+        LayoutNode::Styled { props: Box::new(props), child: Box::new(child) }
     }
 
     fn rows(count: usize) -> LayoutNode {
@@ -1823,10 +1823,10 @@ mod tests {
     fn scroll_offset_moves_content_under_the_clip() {
         let engine = PixelFont;
         let cache = MeasureCache::default();
-        let mut offsets = HashMap::new();
+        let mut offsets = HashMap::default();
         offsets.insert("list".to_string(), Point { x: 0.0, y: 40.0 });
         let interaction = Interaction::default();
-        let carets = HashMap::new();
+        let carets = HashMap::default();
         let env = LayoutEnv {
             text: &engine,
             cache: &cache,

@@ -15,7 +15,7 @@
 //! proposal is a classic bug.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use motor::hash::FxHashMap as HashMap;
 
 use crate::layout::{Color, Px};
 

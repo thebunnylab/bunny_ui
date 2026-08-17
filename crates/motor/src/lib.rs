@@ -17,6 +17,7 @@
 
 pub mod cancel_bag;
 pub mod combine;
+pub mod hash;
 pub mod identity;
 pub mod inspection;
 pub mod loadable;

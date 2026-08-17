@@ -75,25 +75,30 @@ const FILES: &[(&str, &str)] = &[
 const SELECT_NEXT: ActionId = ActionId("bench.select_next");
 const CLEAR: Color = Color::rgba(0, 0, 0, 0);
 
-fn matches(haystack: &str, needle: &str) -> bool {
-    let mut haystack = haystack.chars().map(|c| c.to_ascii_lowercase());
+/// Subsequence match over `dir` then `name`, no allocation — the row
+/// model shares `Rc<str>`s, so a keystroke filters and rebuilds rows
+/// without copying a byte of content.
+fn matches(dir: &str, name: &str, needle: &str) -> bool {
+    let mut haystack = dir.chars().chain(name.chars()).map(|c| c.to_ascii_lowercase());
     needle.chars().map(|c| c.to_ascii_lowercase()).all(|wanted| haystack.any(|c| c == wanted))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Finder {
     query: State<String>,
     selected: State<usize>,
+    files: Rc<Vec<(Rc<str>, Rc<str>)>>,
 }
 
 impl Component for Finder {
     fn body(self, _ctx: &Context) -> impl View {
         let query = self.query.get();
-        let items: Vec<(usize, String, String)> = FILES
+        let items: Vec<(usize, Rc<str>, Rc<str>)> = self
+            .files
             .iter()
-            .filter(|(name, dir)| query.is_empty() || matches(&format!("{dir}{name}"), &query))
+            .filter(|(name, dir)| query.is_empty() || matches(dir, name, &query))
             .enumerate()
-            .map(|(index, (name, dir))| (index, name.to_string(), dir.to_string()))
+            .map(|(index, (name, dir))| (index, name.clone(), dir.clone()))
             .collect();
         let count = items.len();
         let selected = self.selected;
@@ -186,7 +191,10 @@ fn measure(label: &'static str, warmup: usize, frames: usize, mut step: impl FnM
 
 fn main() {
     let viewport = Proposal::exact(Size { width: 760.0, height: 640.0 });
-    let finder = Finder { query: State::new(String::new()), selected: State::new(0) };
+    let files: Rc<Vec<(Rc<str>, Rc<str>)>> = Rc::new(
+        FILES.iter().map(|(name, dir)| (Rc::from(*name), Rc::from(*dir))).collect(),
+    );
+    let finder = Finder { query: State::new(String::new()), selected: State::new(0), files };
     let engine = std::rc::Rc::new(CoreTextEngine::new());
     let runtime = Runtime::new().text_engine(engine.clone());
     runtime.bind(KeyPattern::key(Key::Down), SELECT_NEXT);

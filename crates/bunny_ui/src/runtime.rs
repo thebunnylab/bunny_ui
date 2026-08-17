@@ -12,7 +12,7 @@
 //! [`Runtime::take_dirty`] and [`Runtime::body_runs`].
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use motor::hash::FxHashMap as HashMap;
 use std::rc::Rc;
 
 use motor::state::{Context, EnvironmentValues};
@@ -141,17 +141,17 @@ impl Runtime {
             interaction: RefCell::new(Interaction::default()),
             text,
             cache: MeasureCache::default(),
-            scroll_offsets: RefCell::new(HashMap::new()),
+            scroll_offsets: RefCell::new(HashMap::default()),
             last_scrolls: RefCell::new(Vec::new()),
             focus: RefCell::new(None),
-            carets: RefCell::new(HashMap::new()),
+            carets: RefCell::new(HashMap::default()),
             caret_visible: Cell::new(true),
             last_fields: RefCell::new(Vec::new()),
             theme_version: Cell::new(crate::theme::version()),
-            keymap: RefCell::new(HashMap::new()),
-            scoped_keymap: RefCell::new(HashMap::new()),
-            scroll_targets: RefCell::new(HashMap::new()),
-            auto_focused: RefCell::new(std::collections::HashSet::new()),
+            keymap: RefCell::new(HashMap::default()),
+            scoped_keymap: RefCell::new(HashMap::default()),
+            scroll_targets: RefCell::new(HashMap::default()),
+            auto_focused: RefCell::new(std::collections::HashSet::default()),
             root_is_boundary: Cell::new(false),
             printless: Cell::new(false),
         }

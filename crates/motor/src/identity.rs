@@ -35,7 +35,7 @@
 
 use std::any::TypeId;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::rc::Rc;
 
 use crate::runtime::Site;
@@ -55,6 +55,12 @@ struct Registry {
     /// First segment pushed in the pass — defines the swept root.
     pass_root: Option<String>,
     path: Vec<String>,
+    /// The path pre-joined with `/`, maintained incrementally by
+    /// push/truncate — reading the scope is one clone, never a walk.
+    joined: String,
+    /// Saved lengths of `joined`, one per open frame — the truncation
+    /// points of the drops.
+    joined_lens: Vec<usize>,
     /// Only the view wrappers — the target of read-tracking.
     views: Vec<String>,
     touched: HashSet<String>,
@@ -116,6 +122,8 @@ pub fn begin_pass() {
         registry.pass_active = true;
         registry.pass_root = None;
         registry.path.clear();
+        registry.joined.clear();
+        registry.joined_lens.clear();
         registry.views.clear();
         registry.touched.clear();
         registry.skipped.clear();
@@ -289,11 +297,12 @@ pub fn current_path_segments() -> Vec<String> {
 }
 
 /// The cursor's full path right now (`None` outside a pass) — the key
-/// interactive nodes register their actions under.
+/// interactive nodes register their actions under. One clone of the
+/// incrementally maintained path: no join walk, ever.
 pub fn cursor_scope() -> Option<String> {
     REGISTRY.with(|registry| {
         let registry = registry.borrow();
-        (registry.pass_active && !registry.path.is_empty()).then(|| registry.path.join("/"))
+        (registry.pass_active && !registry.joined.is_empty()).then(|| registry.joined.clone())
     })
 }
 
@@ -314,6 +323,10 @@ impl Drop for Frame {
         REGISTRY.with(|registry| {
             let mut registry = registry.borrow_mut();
             registry.path.pop();
+            // the joined path steps back by truncation — the bytes of
+            // the parent are still in place, untouched
+            let depth = registry.joined_lens.pop().unwrap_or(0);
+            registry.joined.truncate(depth);
             if self.pops_view {
                 registry.views.pop();
             }
@@ -330,11 +343,21 @@ fn push(segment: String, is_view: bool) -> Frame {
         if registry.pass_root.is_none() {
             registry.pass_root = Some(segment.clone());
         }
+        // the joined path grows in place: push_str now, truncate on the
+        // frame's drop — the per-step full-path JOIN died here
+        let depth = registry.joined.len();
+        registry.joined_lens.push(depth);
+        if !registry.joined.is_empty() {
+            registry.joined.push('/');
+        }
+        registry.joined.push_str(&segment);
         registry.path.push(segment);
-        let scope = registry.path.join("/");
-        registry.touched.insert(scope.clone());
+        let scope = registry.joined.clone();
         if is_view {
+            registry.touched.insert(scope.clone());
             registry.views.push(scope);
+        } else {
+            registry.touched.insert(scope);
         }
         Frame { pops_view: is_view, active: true }
     })
@@ -366,8 +389,8 @@ pub fn seed(segments: &[String]) -> Vec<Frame> {
 }
 
 fn current_scope(registry: &Registry) -> String {
-    if registry.pass_active && !registry.path.is_empty() {
-        registry.path.join("/")
+    if registry.pass_active && !registry.joined.is_empty() {
+        registry.joined.clone()
     } else {
         APP_SCOPE.to_string()
     }

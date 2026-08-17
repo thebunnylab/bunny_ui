@@ -71,8 +71,12 @@ impl View for Text {
     }
 }
 
-pub fn text(string: impl Into<String>) -> Text {
-    Text(Rc::from(string.into()))
+/// `Text` takes anything that becomes an `Rc<str>`: a literal or a
+/// `String` pay ONE allocation here, and an `Rc<str>` handed in (a row
+/// model that shares its strings) pays NOTHING — the body of a list
+/// clones pointers, not bytes.
+pub fn text(string: impl Into<Rc<str>>) -> Text {
+    Text(string.into())
 }
 
 // The button chrome geometry (Role/Size come later; the future
@@ -108,13 +112,13 @@ where
         // included — the hit-rect becomes the whole chrome, not just the label
         let theme = crate::theme::current();
         let chrome = LayoutNode::Styled {
-            props: VisualProps {
+            props: Box::new(VisualProps {
                 background: Some(theme.control),
                 background_hovered: Some(theme.control_hovered),
                 background_pressed: Some(theme.control_pressed),
                 corner_radius: Some(BUTTON_RADIUS),
                 ..VisualProps::default()
-            },
+            }),
             child: Box::new(LayoutNode::Padding {
                 edges: Edges {
                     top: BUTTON_PAD_V,
@@ -613,19 +617,33 @@ where
             .iter()
             .map(|item| {
                 let id = (self.id)(item);
-                // The item's key is the row's identity: the closure runs with
-                // the cursor already inside it, so state built here follows the
-                // item — reordering does not shuffle, removing unmounts.
-                let _frame = motor::identity::enter(format!("[{id}]"));
-                let mut row = NodeList::new();
-                (self.row)(item).render_into(ctx, &mut row);
-                let (prints, layouts) = row.into_parts();
+                // one bracketed key per row, built once — the identity
+                // frame and the boundary path share its bytes (the byte
+                // shapes "[id]" and "scope/[id]" are a public contract)
+                let mut key = String::with_capacity(id.len() + 2);
+                key.push('[');
+                key.push_str(&id);
+                key.push(']');
                 // the row is addressable GEOMETRY: a boundary node under
                 // the row's identity records its frame — tests reach it,
                 // and `.scroll_target(id)` finds the rect to reveal
-                let row_layout = match &scope {
-                    Some(scope) => LayoutNode::Boundary {
-                        path: format!("{scope}/[{id}]"),
+                let path = scope.as_ref().map(|scope| {
+                    let mut path = String::with_capacity(scope.len() + key.len() + 1);
+                    path.push_str(scope);
+                    path.push('/');
+                    path.push_str(&key);
+                    path
+                });
+                // The item's key is the row's identity: the closure runs with
+                // the cursor already inside it, so state built here follows the
+                // item — reordering does not shuffle, removing unmounts.
+                let _frame = motor::identity::enter(key);
+                let mut row = NodeList::new();
+                (self.row)(item).render_into(ctx, &mut row);
+                let (prints, layouts) = row.into_parts();
+                let row_layout = match path {
+                    Some(path) => LayoutNode::Boundary {
+                        path,
                         children: vec![wrap_layout(layouts)],
                     },
                     None => wrap_layout(layouts),
