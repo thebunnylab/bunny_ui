@@ -407,6 +407,37 @@ mod tests {
     }
 
     #[test]
+    fn a_tick_without_animations_asks_for_nothing() {
+        // the frame-driver contract: a tick on a runtime with no live
+        // animation reports no repaint and no wish for a next frame —
+        // the shell parks the display link on this answer
+        let runtime = Runtime::new();
+        assert!(!runtime.tick(1.0 / 120.0));
+        assert!(!runtime.wants_frame());
+    }
+
+    #[test]
+    fn the_animation_frame_runs_zero_bodies_on_a_stable_tree() {
+        #[derive(Clone, Copy)]
+        struct Label;
+
+        impl Component for Label {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("steady")
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        // a real event frame mounts the tree (settle + layout)
+        let event_frame = runtime.display_frame(&Label, size);
+        // the tick frame: layout only — same pixels, zero bodies
+        let tick_frame = runtime.animation_frame(&Label, size);
+        assert!(runtime.body_runs().is_empty(), "a tick never runs a body");
+        assert_eq!(tick_frame.as_slice(), event_frame.as_slice());
+    }
+
+    #[test]
     fn store_reads_in_the_body_are_dependencies_too() {
         // Object granularity: whoever read `store.value()` in the body depends
         // on the whole store — `send` re-runs the view, even with no State in

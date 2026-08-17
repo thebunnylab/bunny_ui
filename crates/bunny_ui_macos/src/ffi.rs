@@ -130,6 +130,10 @@ unsafe extern "C" {
     fn msg_bool_sel(obj: Id, sel: Sel, a: Sel) -> i8;
     #[link_name = "objc_msgSend"]
     fn msg_rect_rect(obj: Id, sel: Sel, rect: CGRect) -> CGRect;
+    #[link_name = "objc_msgSend"]
+    fn msg_id_id_sel(obj: Id, sel: Sel, target: Id, selector: Sel) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_void_id_id(obj: Id, sel: Sel, a: Id, b: Id);
 }
 
 // AppKit/QuartzCore come in via the ObjC runtime; the link guarantees the
@@ -138,6 +142,12 @@ unsafe extern "C" {
 unsafe extern "C" {
     /// The pasteboard string type (`public.utf8-plain-text`).
     static NSPasteboardTypeString: Id;
+}
+#[link(name = "Foundation", kind = "framework")]
+unsafe extern "C" {
+    /// The run-loop mode set that keeps a callback alive during event
+    /// tracking (live resize, menus) — the display link schedules here.
+    static NSRunLoopCommonModes: Id;
 }
 #[link(name = "QuartzCore", kind = "framework")]
 unsafe extern "C" {}
@@ -221,6 +231,9 @@ pub enum AppEvent {
     Command { selector: String },
     /// Half-period of the caret blink (the shell's NSTimer).
     Blink,
+    /// One display-link tick: compose the next animated frame. `dt` is
+    /// the interval this frame covers, in seconds, already clamped.
+    Frame { dt: f64 },
     /// The window changed size (or needs the first frame).
     Redraw,
 }
@@ -506,11 +519,49 @@ extern "C" fn bunny_blink(_this: Id, _sel: Sel, _timer: Id) {
     dispatch(AppEvent::Blink);
 }
 
+extern "C" fn bunny_frame(_this: Id, _sel: Sel, link: Id) {
+    let dt = unsafe {
+        let last = msg_f64(link, sel("timestamp"));
+        let next = msg_f64(link, sel("targetTimestamp"));
+        // the first tick after a resume reports the whole pause as the
+        // gap — a clamped step keeps springs continuous instead of
+        // teleporting them
+        (next - last).clamp(0.0, 1.0 / 30.0)
+    };
+    dispatch(AppEvent::Frame { dt });
+}
+
 extern "C" fn bunny_window_will_close(_this: Id, _sel: Sel, _note: Id) {
     unsafe {
+        // the link retains its target (the delegate) — break the tie
+        // before the app goes down
+        LINK.with(|slot| {
+            let link = slot.replace(std::ptr::null_mut());
+            if !link.is_null() {
+                msg_void(link, sel("invalidate"));
+            }
+        });
         let app = msg_id(class("NSApplication"), sel("sharedApplication"));
         msg_void_id(app, sel("terminate:"), std::ptr::null_mut());
     }
+}
+
+thread_local! {
+    /// The window's display link — born paused; the shell resumes it
+    /// only while animations run. Zero-ivar classes: per-window state
+    /// lives beside the run loop (the backing-store pattern).
+    static LINK: Cell<Id> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Pauses or resumes the per-frame driver. Without a link (an older
+/// macOS) this is a no-op — animations then complete instantly.
+pub fn set_frame_driver_paused(paused: bool) {
+    LINK.with(|slot| {
+        let link = slot.get();
+        if !link.is_null() {
+            unsafe { msg_void_bool(link, sel("setPaused:"), paused as i8) };
+        }
+    });
 }
 
 static REGISTER_CLASSES: Once = Once::new();
@@ -692,6 +743,12 @@ unsafe fn register_classes() {
             delegate,
             sel("bunnyBlink:"),
             bunny_blink as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            delegate,
+            sel("bunnyFrame:"),
+            bunny_frame as *const c_void,
             types.as_ptr(),
         );
         class_addMethod(
@@ -978,6 +1035,39 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
             std::ptr::null_mut(),
             1,
         );
+
+        // the frame driver: a display link owned by the view, delivered
+        // by SELECTOR on the main run loop (macOS 14+) — no blocks, no
+        // extra thread. Born PAUSED: events repaint by themselves; the
+        // link runs only while something animates. An older system
+        // skips it and animations snap to their target.
+        if msg_bool_sel(
+            view,
+            sel("respondsToSelector:"),
+            sel("displayLinkWithTarget:selector:"),
+        ) != 0
+        {
+            let link = msg_id_id_sel(
+                view,
+                sel("displayLinkWithTarget:selector:"),
+                delegate,
+                sel("bunnyFrame:"),
+            );
+            if !link.is_null() {
+                msg_void_bool(link, sel("setPaused:"), 1);
+                // the link arrives unscheduled — common modes keep the
+                // ticks coming during event tracking (live resize)
+                msg_void_id_id(
+                    link,
+                    sel("addToRunLoop:forMode:"),
+                    msg_id(class("NSRunLoop"), sel("mainRunLoop")),
+                    NSRunLoopCommonModes,
+                );
+                LINK.with(|slot| slot.set(link));
+            }
+        } else {
+            eprintln!("bunny_ui: this macOS has no view display link; animations snap");
+        }
 
         msg_void_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
         // the keyboard is born pointing at the event view

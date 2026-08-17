@@ -555,6 +555,43 @@ impl Runtime {
         result.display
     }
 
+    /// Advances the retained animations by `dt` seconds. `true` = a
+    /// value moved and the frame must repaint. With nothing animating
+    /// the call is free — the shell pauses its frame driver while this
+    /// stays false. The springs arrive in the next phase; the plumbing
+    /// contract is already final.
+    pub fn tick(&self, dt: f64) -> bool {
+        let _ = dt;
+        false
+    }
+
+    /// Does any animation still want a next frame? The shell syncs its
+    /// frame driver (display link, rAF) with this after every present.
+    pub fn wants_frame(&self) -> bool {
+        false
+    }
+
+    /// The frame a TICK drives: layout only — no settle, no effect
+    /// pump. A tick moves animated values, never state, so the pass
+    /// runs zero bodies on a stable tree; settle and effects stay on
+    /// the real-event path (the documented contract). Hover still
+    /// re-resolves: content slides under a still pointer while
+    /// something animates.
+    pub fn animation_frame(
+        &self,
+        root: &impl View,
+        size: crate::layout::Size,
+    ) -> crate::layout::DisplayList {
+        let mut result = self.layout(root, crate::layout::Proposal::exact(size));
+        let pointer = self.interaction.borrow().pointer;
+        if let Some(point) = pointer
+            && self.pointer_moved(point.x, point.y)
+        {
+            result = self.layout(root, crate::layout::Proposal::exact(size));
+        }
+        result.display
+    }
+
     /// The text engine of this runtime — the shell pairs it with its
     /// retained paint surface.
     pub fn text(&self) -> Rc<dyn TextEngine> {

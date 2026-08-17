@@ -83,14 +83,15 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
     // scale or theme change retires the surface and starts a fresh one.
     let surface: Rc<RefCell<Option<(bunny_ui::raster::Surface, usize, bunny_ui::layout::Color)>>> =
         Rc::new(RefCell::new(None));
-    let blit = {
+    // present takes a READY display list to the window — the tick path
+    // reuses it without paying settle, effects or the IME tail
+    let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
         let surface = Rc::clone(&surface);
-        move |runtime: &Runtime, root: &_| {
+        move |runtime: &Runtime, display: bunny_ui::layout::DisplayList| {
             let (width, height) = window.content_size();
             let scale = window.scale();
             let canvas = bunny_ui::theme::canvas();
             let physical = ((width.round() as usize) * scale, (height.round() as usize) * scale);
-            let display = runtime.display_frame(root, Size { width, height });
             if metal::active() {
                 // GPU present: the same display list, no Surface in the
                 // path — the drawable is the frame
@@ -129,6 +130,14 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
                     window.blit_partial(width, height, retained.rgba(), &damage);
                 }
             }
+        }
+    });
+    let blit = {
+        let present = Rc::clone(&present);
+        move |runtime: &Runtime, root: &_| {
+            let (width, height) = window.content_size();
+            let display = runtime.display_frame(root, Size { width, height });
+            present(runtime, display);
         window.set_cursor_pointing(runtime.interaction().hovered.is_some());
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;
@@ -149,6 +158,9 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
                 ),
             )
         }));
+        // wake or park the frame driver — the event may have started
+        // (or finished) an animation
+        ffi::set_frame_driver_paused(!runtime.wants_frame());
         }
     };
 
@@ -180,6 +192,7 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
 
     let handler_runtime = Rc::clone(&runtime);
     let handler_root = Rc::clone(&root);
+    let handler_present = Rc::clone(&present);
     ffi::set_handler(Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
@@ -265,6 +278,17 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
             if runtime.blink() {
                 blit(runtime, root);
             }
+        }
+        AppEvent::Frame { dt } => {
+            // the tick path: springs advance, then layout only — zero
+            // bodies on a stable tree; settle and effects belong to the
+            // real-event path
+            if runtime.tick(dt) {
+                let (width, height) = window.content_size();
+                let display = runtime.animation_frame(root, Size { width, height });
+                handler_present(runtime, display);
+            }
+            ffi::set_frame_driver_paused(!runtime.wants_frame());
         }
         AppEvent::ImeInsert { text } => {
             // the IME commit (or plain typing through the input system)
