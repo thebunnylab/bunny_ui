@@ -99,6 +99,17 @@ pub enum CrossAlign {
     Baseline,
 }
 
+/// The per-row extent closure of a variable-height virtual list —
+/// wrapped so the layout tree stays `Debug`.
+#[derive(Clone)]
+pub struct RowHeights(pub Rc<dyn Fn(usize) -> Px>);
+
+impl std::fmt::Debug for RowHeights {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("row-heights(fn)")
+    }
+}
+
 /// Which edge of its anchor a popover prefers. The cross axis centers
 /// on the anchor; when the preferred side has no room the frame flips,
 /// and what still does not fit clamps inside the overlay container.
@@ -294,15 +305,22 @@ pub enum LayoutNode {
         target: Option<String>,
         child: Box<LayoutNode>,
     },
-    /// A virtualized vertical run: `count` rows of ONE uniform extent,
-    /// only a window of them materialized — each child carries its row
-    /// index (the window plus pins need not be contiguous). The
-    /// extent×count keeps the scroll geometry honest (scrollbar, wheel
-    /// travel, clamps see the FULL content) while off-window rows do
-    /// not exist. `row_extent` is the body's estimate for the window
-    /// math; the measured first child is authoritative — a mismatch
-    /// surfaces as a window miss and heals in the follow-up pass.
-    VirtualStack { row_extent: Px, count: usize, children: Vec<(usize, LayoutNode)> },
+    /// A virtualized vertical run: `count` rows, only a window of them
+    /// materialized — each child carries its row index (the window
+    /// plus pins need not be contiguous). The full extent keeps the
+    /// scroll geometry honest (scrollbar, wheel travel, clamps see ALL
+    /// the content) while off-window rows do not exist. Uniform by
+    /// default (`row_extent` seeds the window math; the measured first
+    /// child is authoritative); with `heights` every row's extent
+    /// comes from the closure and offsets are prefix sums — the
+    /// closure is the AUTHORITY, and a row that measures taller than
+    /// its slot overlaps the next (the app's contract to keep).
+    VirtualStack {
+        row_extent: Px,
+        count: usize,
+        children: Vec<(usize, LayoutNode)>,
+        heights: Option<RowHeights>,
+    },
     /// Semantic visual property: background behind the child, border on
     /// top, foreground inherited. Transparent to the measure — by type.
     Styled { props: Box<VisualProps>, child: Box<LayoutNode> },
@@ -384,8 +402,14 @@ pub enum Fit {
     Children(Vec<(Size, Fit)>),
     /// The virtual run's handoff: the AUTHORITATIVE row extent (from
     /// the measured first child) plus the materialized window, each
-    /// child with its row index.
-    Virtual { row_extent: Px, children: Vec<(usize, Size, Fit)> },
+    /// child with its row index. Variable-height runs carry the
+    /// prefix-sum offsets instead (`offsets[i]` = row `i`'s start;
+    /// one extra entry holds the total).
+    Virtual {
+        row_extent: Px,
+        children: Vec<(usize, Size, Fit)>,
+        offsets: Option<Rc<Vec<Px>>>,
+    },
     Wrapped(Size, Box<Fit>),
     /// The real content size (it can exceed the frame — that is what scrolls).
     ScrollContent(Size, Box<Fit>),
@@ -641,6 +665,9 @@ pub struct ScrollRegion {
     /// A virtualized region's uniform row extent (measured) — the
     /// runtime snapshots it for the next body's window math.
     pub row_extent: Option<Px>,
+    /// A variable-height region's prefix-sum offsets (`offsets[i]` =
+    /// row `i`'s start; last entry = total) — snapshot material too.
+    pub row_offsets: Option<Rc<Vec<Px>>>,
 }
 
 /// One placed overlay: its identity, the anchor it hangs from, the
@@ -1264,7 +1291,7 @@ impl LayoutNode {
                 measure_stack(*axis, *spacing, children, proposal, env)
             }
 
-            LayoutNode::VirtualStack { row_extent, count, children } => {
+            LayoutNode::VirtualStack { row_extent, count, children, heights } => {
                 let child_proposal = Proposal { width: proposal.width, height: None };
                 let measured: Vec<(usize, Size, Fit)> = children
                     .iter()
@@ -1273,23 +1300,52 @@ impl LayoutNode {
                         (*index, size, fit)
                     })
                     .collect();
-                // the first measured row is the authoritative extent —
-                // the node's field only seeded the body's window math
-                let row = measured
-                    .first()
-                    .map(|(_, size, _)| size.height)
-                    .filter(|height| *height > 0.0)
-                    .unwrap_or(*row_extent)
-                    .max(0.0);
                 let width = proposal.width.unwrap_or_else(|| {
                     measured
                         .iter()
                         .fold(0.0_f64, |acc, (_, size, _)| acc.max(size.width))
                 });
-                (
-                    Size { width, height: row * *count as Px },
-                    Fit::Virtual { row_extent: row, children: measured },
-                )
+                match heights {
+                    // variable heights: the closure is the authority —
+                    // offsets are prefix sums, the total is honest to
+                    // every row that does not exist
+                    Some(heights) => {
+                        let mut offsets = Vec::with_capacity(*count + 1);
+                        let mut total: Px = 0.0;
+                        offsets.push(0.0);
+                        for index in 0..*count {
+                            total += (heights.0)(index).max(0.0);
+                            offsets.push(total);
+                        }
+                        (
+                            Size { width, height: total },
+                            Fit::Virtual {
+                                row_extent: 0.0,
+                                children: measured,
+                                offsets: Some(Rc::new(offsets)),
+                            },
+                        )
+                    }
+                    None => {
+                        // the first measured row is the authoritative
+                        // extent — the node's field only seeded the
+                        // body's window math
+                        let row = measured
+                            .first()
+                            .map(|(_, size, _)| size.height)
+                            .filter(|height| *height > 0.0)
+                            .unwrap_or(*row_extent)
+                            .max(0.0);
+                        (
+                            Size { width, height: row * *count as Px },
+                            Fit::Virtual {
+                                row_extent: row,
+                                children: measured,
+                                offsets: None,
+                            },
+                        )
+                    }
+                }
             }
 
             LayoutNode::Layered { children } => {
@@ -1796,10 +1852,12 @@ impl LayoutNode {
                 // scrolling moves them 1:1, never through a spring
                 out.anchors.push(content_origin);
                 // a virtual child reports misses against THIS region,
-                // and its measured row extent is snapshot material
-                let row_extent = match fit.as_ref() {
-                    Fit::Virtual { row_extent, .. } => Some(*row_extent),
-                    _ => None,
+                // and its measured geometry is snapshot material
+                let (row_extent, row_offsets) = match fit.as_ref() {
+                    Fit::Virtual { row_extent, offsets, .. } => {
+                        (Some(*row_extent), offsets.clone())
+                    }
+                    _ => (None, None),
                 };
                 if let Some(path) = path {
                     out.region_stack.push(path.clone());
@@ -1853,6 +1911,7 @@ impl LayoutNode {
                         // target through the spring instead of snapping
                         anim: env.anim.map(|scope| scope.spec),
                         row_extent,
+                        row_offsets,
                     });
                 }
             }
@@ -2031,15 +2090,21 @@ impl LayoutNode {
 
             (
                 LayoutNode::VirtualStack { count, children, .. },
-                Fit::Virtual { row_extent, children: fits },
+                Fit::Virtual { row_extent, children: fits, offsets },
             ) => {
+                let start_of = |index: usize| -> Px {
+                    match &offsets {
+                        Some(offsets) => offsets.get(index).copied().unwrap_or(0.0),
+                        None => index as Px * row_extent,
+                    }
+                };
                 let mut materialized: Vec<usize> = Vec::with_capacity(fits.len());
                 for ((index, child), (fit_index, size, fit)) in children.iter().zip(fits) {
                     debug_assert_eq!(*index, fit_index, "window and fit walk in step");
                     materialized.push(*index);
                     let origin = Point {
                         x: frame.origin.x,
-                        y: frame.origin.y + *index as Px * row_extent,
+                        y: frame.origin.y + start_of(*index),
                     };
                     child.place(Rect { origin, size }, fit, env, out);
                 }
@@ -2051,21 +2116,34 @@ impl LayoutNode {
                 // with fresh geometry — the capped loop guards us, and
                 // the 2× slack keeps the two window formulas from ever
                 // arguing (no thrash)
+                let geometry_known =
+                    row_extent > 0.0 || offsets.as_ref().is_some_and(|o| o.len() == count + 1);
                 if *count > 0
-                    && row_extent > 0.0
+                    && geometry_known
                     && let Some(clip) = out.current_clip()
                 {
-                    let top = ((clip.origin.y - frame.origin.y) / row_extent)
-                        .floor()
-                        .max(0.0) as usize;
-                    let bottom_edge = clip.origin.y + clip.size.height;
-                    let bottom = (((bottom_edge - frame.origin.y) / row_extent).ceil()
-                        as usize)
-                        .min(*count);
+                    let clip_top = clip.origin.y - frame.origin.y;
+                    let clip_bottom = clip_top + clip.size.height;
+                    let (top, bottom) = match &offsets {
+                        Some(offsets) => {
+                            // the row containing clip_top, and one past
+                            // the last row starting before clip_bottom
+                            let top = offsets
+                                .partition_point(|start| *start <= clip_top)
+                                .saturating_sub(1);
+                            let bottom = offsets
+                                .partition_point(|start| *start < clip_bottom)
+                                .min(*count);
+                            (top, bottom)
+                        }
+                        None => (
+                            (clip_top / row_extent).floor().max(0.0) as usize,
+                            ((clip_bottom / row_extent).ceil() as usize).min(*count),
+                        ),
+                    };
                     let uncovered =
                         (top..bottom).any(|index| !materialized.contains(&index));
-                    let rows_in_view =
-                        (clip.size.height / row_extent).ceil().max(1.0) as usize;
+                    let rows_in_view = bottom.saturating_sub(top).max(1);
                     let fat = materialized.len() > (3 * rows_in_view + 4) * 2;
                     if (uncovered || fat)
                         && let Some(path) = out.region_stack.last()

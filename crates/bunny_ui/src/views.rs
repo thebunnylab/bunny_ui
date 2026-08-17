@@ -749,6 +749,7 @@ pub struct VirtualList<I, F> {
     id: I,
     row: F,
     reveal: Option<usize>,
+    heights: Option<std::rc::Rc<dyn Fn(usize) -> f64>>,
 }
 
 impl<I, F> VirtualList<I, F> {
@@ -759,6 +760,17 @@ impl<I, F> VirtualList<I, F> {
     /// between; under `.animated`, the reveal flies.
     pub fn reveal(mut self, index: usize) -> Self {
         self.reveal = Some(index);
+        self
+    }
+
+    /// Every row's own height, by index — the closure is the
+    /// AUTHORITY: offsets, the scrollbar and the window math all come
+    /// from it (a row that measures taller than its slot overlaps the
+    /// next). Keep it cheap and deterministic; it runs once per row
+    /// per layout. Without it, rows stay uniform at the measured
+    /// height of the first one.
+    pub fn row_height_with(mut self, height: impl Fn(usize) -> f64 + 'static) -> Self {
+        self.heights = Some(std::rc::Rc::new(height));
         self
     }
 }
@@ -777,8 +789,33 @@ where
         // viewport, measured row height) — one frame of lag masked by
         // the buffer; a miss re-runs this body in the same frame
         let snapshot = crate::viewport::region(scope.as_deref());
-        let (first, last) = match &snapshot {
-            Some(snap) if snap.row_extent > 0.0 && self.count > 0 => {
+        // last frame's offsets, when they still describe THIS count —
+        // a count that changed falls back and heals by miss
+        let offsets = snapshot.as_ref().and_then(|snap| {
+            snap.offsets
+                .as_ref()
+                .filter(|offsets| offsets.len() == self.count + 1)
+                .cloned()
+        });
+        let (first, last) = match (&snapshot, &offsets) {
+            // variable heights: the band in px, rows by binary search,
+            // one viewport of buffer on each side
+            (Some(snap), Some(offsets)) if self.count > 0 => {
+                let total = *offsets.last().expect("offsets carry the total");
+                let offset = snap.offset_y.clamp(0.0, (total - snap.viewport).max(0.0));
+                let first_edge = (offset - snap.viewport).max(0.0);
+                let last_edge = offset + 2.0 * snap.viewport;
+                let first = offsets
+                    .partition_point(|start| *start <= first_edge)
+                    .saturating_sub(1)
+                    .min(self.count - 1);
+                let last = offsets
+                    .partition_point(|start| *start < last_edge)
+                    .saturating_sub(1)
+                    .min(self.count - 1);
+                (first, last)
+            }
+            (Some(snap), None) if snap.row_extent > 0.0 && self.count > 0 => {
                 let rows_in_view =
                     (snap.viewport / snap.row_extent).ceil().max(1.0) as usize + 1;
                 // the retained offset clamps HERE the way place will
@@ -811,14 +848,28 @@ where
         let pin = reveal
             .filter(|_| jump_pending)
             .filter(|index| *index < first || *index > last);
-        let pin_band = pin.map(|index| {
-            let buffer = match &snapshot {
-                Some(snap) if snap.row_extent > 0.0 => {
-                    (snap.viewport / snap.row_extent).ceil().max(1.0) as usize + 1
-                }
-                _ => 1,
-            };
-            (index.saturating_sub(buffer), (index + buffer).min(self.count - 1))
+        let pin_band = pin.map(|index| match (&snapshot, &offsets) {
+            // variable heights: the buffer is a viewport of px around
+            // the pinned row's own edges
+            (Some(snap), Some(offsets)) => {
+                let first_edge = (offsets[index] - snap.viewport).max(0.0);
+                let last_edge = offsets[index + 1] + snap.viewport;
+                let first = offsets
+                    .partition_point(|start| *start <= first_edge)
+                    .saturating_sub(1)
+                    .min(self.count - 1);
+                let last = offsets
+                    .partition_point(|start| *start < last_edge)
+                    .saturating_sub(1)
+                    .min(self.count - 1);
+                (first, last)
+            }
+            (Some(snap), None) if snap.row_extent > 0.0 => {
+                let buffer =
+                    (snap.viewport / snap.row_extent).ceil().max(1.0) as usize + 1;
+                (index.saturating_sub(buffer), (index + buffer).min(self.count - 1))
+            }
+            _ => (index.saturating_sub(1), (index + 1).min(self.count - 1)),
         });
         // a far pin REPLACES the stale window: the offset is about to
         // leave it anyway, so materializing it would be pure waste —
@@ -884,6 +935,7 @@ where
                 row_extent: snapshot.map(|snap| snap.row_extent).unwrap_or(0.0),
                 count: self.count,
                 children,
+                heights: self.heights.clone().map(crate::layout::RowHeights),
             }),
         });
     }
@@ -897,7 +949,7 @@ where
     F: Fn(usize) -> R + Clone + 'static,
     R: View,
 {
-    VirtualList { count, id, row, reveal: None }
+    VirtualList { count, id, row, reveal: None, heights: None }
 }
 
 /// `ForEach(collection, id: \.keyPath) { item in … }` — the `id` is the

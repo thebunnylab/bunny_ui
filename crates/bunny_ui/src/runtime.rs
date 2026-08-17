@@ -267,6 +267,7 @@ impl Runtime {
                                 .y,
                             viewport: region.frame.size.height,
                             row_extent,
+                            offsets: region.row_offsets.clone(),
                             applied: applied.get(&region.path).cloned(),
                         },
                     ))

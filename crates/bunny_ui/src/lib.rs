@@ -667,6 +667,106 @@ mod tests {
     }
 
     #[test]
+    fn variable_rows_keep_the_geometry_honest() {
+        #[derive(Clone, Copy)]
+        struct Varied;
+        impl Component for Varied {
+            fn body(self, _ctx: &Context) -> impl View {
+                virtual_list(300, |row| format!("row{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+                .row_height_with(|row| if row % 3 == 0 { 40.0 } else { 20.0 })
+            }
+        }
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&Varied, size);
+        let result = runtime.layout(&Varied, crate::layout::Proposal::exact(size));
+        let region = result.scrolls.first().expect("the region exists");
+        // one hundred tall rows, two hundred short ones — the closure
+        // is the authority and the extent stays honest to all of them
+        assert_eq!(region.content.height, 100.0 * 40.0 + 200.0 * 20.0);
+        let offsets =
+            region.row_offsets.as_ref().expect("variable offsets ride the region");
+        assert_eq!(offsets.len(), 301);
+        assert_eq!(offsets[1], 40.0, "row zero is tall");
+        assert_eq!(offsets[2], 60.0, "row one is short");
+
+        // roll deep: the fresh window finds its rows by binary search
+        // and places them by prefix sums — bounded, covering, exact
+        let region_path = region.path.clone();
+        runtime
+            .set_scroll_offset(&region_path, crate::layout::Point { x: 0.0, y: 4000.0 });
+        let result = runtime.layout(&Varied, crate::layout::Proposal::exact(size));
+        // offset 4000 = fifty groups of (40+20+20) — row 150 starts there
+        let frame = result
+            .frames
+            .find("[row150]")
+            .expect("the row under the offset is materialized");
+        assert_eq!(frame.origin.y, 0.0, "placed at its prefix-sum offset");
+        let lines = result
+            .display
+            .iter()
+            .filter(|command| {
+                matches!(command, crate::layout::DrawCommand::TextLine { .. })
+            })
+            .count();
+        assert!(lines < 40, "window-sized, not count-sized: {lines}");
+    }
+
+    #[test]
+    fn a_reveal_lands_on_a_variable_row() {
+        #[derive(Clone, Copy)]
+        struct Pinned;
+        impl Component for Pinned {
+            fn body(self, _ctx: &Context) -> impl View {
+                virtual_list(300, |row| format!("row{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+                .row_height_with(|row| if row % 3 == 0 { 40.0 } else { 20.0 })
+                .reveal(250)
+            }
+        }
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&Pinned, size);
+        let result = runtime.layout(&Pinned, crate::layout::Proposal::exact(size));
+        let frame = result.frames.find("[row250]").expect("the pinned row exists");
+        assert!(
+            frame.origin.y >= -1.0 && frame.origin.y < 100.0,
+            "the reveal scrolled the row into the viewport: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn a_variable_list_survives_a_count_change() {
+        #[derive(Clone)]
+        struct Shrinking {
+            count: State<usize>,
+        }
+        impl Component for Shrinking {
+            fn body(self, _ctx: &Context) -> impl View {
+                virtual_list(self.count.get(), |row| format!("row{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+                .row_height_with(|row| if row % 3 == 0 { 40.0 } else { 20.0 })
+            }
+        }
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        let runtime = Runtime::new();
+        let view = Shrinking { count: State::new(300) };
+        let _ = runtime.display_frame(&view, size);
+        let _ = runtime.display_frame(&view, size);
+
+        // stale offsets (len 301) no longer describe count 50 — the
+        // window falls back and the geometry re-answers honestly
+        view.count.set(50);
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let region = result.scrolls.first().expect("the region survives");
+        assert_eq!(region.content.height, 17.0 * 40.0 + 33.0 * 20.0);
+    }
+
+    #[test]
     fn a_small_virtual_list_paints_like_the_dense_one() {
         #[derive(Clone, Copy)]
         struct VirtualTen;
