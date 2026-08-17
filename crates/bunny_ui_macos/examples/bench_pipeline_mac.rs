@@ -270,6 +270,29 @@ fn main() {
         std::hint::black_box(damage.len());
     }));
 
+    // the WHOLE presentation cost of a hover frame: incremental repaint
+    // + damage-only sync of the RGBA mirror (what the shell blits from)
+    let mut inside = true;
+    reports.push(measure("hover present (repaint+rgba)", 3, 200, || {
+        let y = row.origin.y + row.size.height / 2.0;
+        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 });
+        inside = !inside;
+        surface.frame(runtime.layout(&finder, viewport).display, &*engine);
+        std::hint::black_box(surface.rgba().len());
+    }));
+    // the OLD presentation cost, for the record: full byte conversion
+    let bitmap = rasterize_with(
+        &runtime.layout(&finder, viewport).display,
+        1520,
+        1280,
+        2,
+        Color::CANVAS,
+        &*engine,
+    );
+    reports.push(measure("full rgba conversion (old blit)", 3, 60, || {
+        std::hint::black_box(bitmap.to_rgba_bytes().len());
+    }));
+
     println!(
         "\n{:<32} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
         "scenario (frame =)", "p50 ms", "p95 ms", "p99 ms", "max ms", "allocs", "KiB"

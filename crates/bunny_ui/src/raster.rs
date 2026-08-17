@@ -446,6 +446,13 @@ pub struct Surface {
     /// entries instead of re-shaping (typing alternates content — the
     /// same aging rule as the layout cache).
     cache: crate::text_engine::MeasureCache,
+    /// The PERSISTENT RGBA mirror of the bitmap — the bytes the backend
+    /// blits (`R,G,B,A` per pixel). Synced lazily, damage-only: a hover
+    /// converts one row, never the window.
+    rgba: Vec<u8>,
+    /// Damage waiting to be synced into the mirror — drained by
+    /// [`Surface::rgba`].
+    rgba_pending: Vec<DamageRect>,
 }
 
 impl Surface {
@@ -461,6 +468,8 @@ impl Surface {
             bounds: Vec::new(),
             primed: false,
             cache: crate::text_engine::MeasureCache::default(),
+            rgba: vec![0; width * height * 4],
+            rgba_pending: vec![(0, 0, width as i64, height as i64)],
         }
     }
 
@@ -672,7 +681,35 @@ impl Surface {
 
         self.display = display;
         self.bounds = new_bounds;
+        self.rgba_pending.extend(damage.iter().copied());
         damage
+    }
+
+    /// The RGBA mirror, synced: pending damage converts in place (a
+    /// hover converts one row of bytes, never the window) and the whole
+    /// buffer is returned for the backend to blit from — persistent, so
+    /// the backend can also present PARTIALLY from the same pointer.
+    pub fn rgba(&mut self) -> &[u8] {
+        let width = self.bitmap.width;
+        for &(x0, y0, x1, y1) in &self.rgba_pending {
+            let x0 = x0.clamp(0, width as i64) as usize;
+            let x1 = x1.clamp(0, width as i64) as usize;
+            let y0 = y0.clamp(0, self.bitmap.height as i64) as usize;
+            let y1 = y1.clamp(0, self.bitmap.height as i64) as usize;
+            for y in y0..y1 {
+                let row = y * width;
+                for x in x0..x1 {
+                    let pixel = self.bitmap.pixels[row + x];
+                    let out = (row + x) * 4;
+                    self.rgba[out] = (pixel >> 24) as u8;
+                    self.rgba[out + 1] = (pixel >> 16) as u8;
+                    self.rgba[out + 2] = (pixel >> 8) as u8;
+                    self.rgba[out + 3] = pixel as u8;
+                }
+            }
+        }
+        self.rgba_pending.clear();
+        &self.rgba
     }
 }
 
@@ -986,6 +1023,18 @@ mod tests {
         assert_eq!(surface.bitmap().pixels(), oracle.pixels(), "golden with shadow");
         let (x0, y0, x1, y1) = damage[0];
         assert!(x0 <= 22 && y0 <= 22 && x1 >= 58 && y1 >= 58, "halo box damaged: {damage:?}");
+    }
+
+    #[test]
+    fn the_rgba_mirror_stays_true_through_partial_syncs() {
+        // the mirror must equal a full conversion after every frame,
+        // even though only damaged rects are converted
+        let mut surface = Surface::new(120, 80, 1, Color::CANVAS);
+        for frame in hover_frames() {
+            surface.frame(frame, &PixelFont);
+            let full = surface.bitmap().to_rgba_bytes();
+            assert_eq!(surface.rgba(), &full[..], "mirror == full conversion");
+        }
     }
 
     #[test]

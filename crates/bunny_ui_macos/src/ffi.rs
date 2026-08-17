@@ -85,8 +85,6 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_void_bool(obj: Id, sel: Sel, a: i8);
     #[link_name = "objc_msgSend"]
-    fn msg_void_f64(obj: Id, sel: Sel, a: f64);
-    #[link_name = "objc_msgSend"]
     fn msg_f64(obj: Id, sel: Sel) -> f64;
     #[link_name = "objc_msgSend"]
     fn msg_bool_i64(obj: Id, sel: Sel, a: i64) -> i8;
@@ -98,6 +96,8 @@ unsafe extern "C" {
     fn msg_rect(obj: Id, sel: Sel) -> CGRect;
     #[link_name = "objc_msgSend"]
     fn msg_init_rect(obj: Id, sel: Sel, rect: CGRect) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_void_rect(obj: Id, sel: Sel, rect: CGRect);
     #[link_name = "objc_msgSend"]
     fn msg_init_window(obj: Id, sel: Sel, rect: CGRect, style: u64, backing: u64, defer: i8)
     -> Id;
@@ -146,8 +146,17 @@ unsafe extern "C" {}
 unsafe extern "C" {
     pub(crate) fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
     pub(crate) fn CGColorSpaceRelease(space: *mut c_void);
-    fn CGDataProviderCreateWithCFData(data: *const c_void) -> *mut c_void;
+    fn CGDataProviderCreateWithData(
+        info: *mut c_void,
+        data: *const u8,
+        size: usize,
+        release: *const c_void,
+    ) -> *mut c_void;
     fn CGDataProviderRelease(provider: *mut c_void);
+    fn CGContextDrawImage(context: Id, rect: CGRect, image: Id);
+    fn CGContextSetInterpolationQuality(context: Id, quality: i32);
+    fn CGContextSaveGState(context: Id);
+    fn CGContextRestoreGState(context: Id);
     #[allow(clippy::too_many_arguments)]
     fn CGImageCreate(
         width: usize,
@@ -167,7 +176,6 @@ unsafe extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
-    fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
     pub(crate) fn CFRelease(cf: *const c_void);
 }
 
@@ -559,6 +567,13 @@ unsafe fn register_classes() {
             bunny_key_down as *const c_void,
             types.as_ptr(),
         );
+        let draw_types = CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}").expect("type encoding");
+        class_addMethod(
+            view,
+            sel("drawRect:"),
+            bunny_draw_rect as *const c_void,
+            draw_types.as_ptr(),
+        );
         let bool_getter = CString::new("c@:").expect("type encoding");
         class_addMethod(
             view,
@@ -688,7 +703,6 @@ unsafe fn register_classes() {
 pub struct WindowHandle {
     window: Id,
     view: Id,
-    layer: Id,
 }
 
 impl WindowHandle {
@@ -705,13 +719,58 @@ impl WindowHandle {
         unsafe { msg_f64(self.window, sel("backingScaleFactor")).round().max(1.0) as usize }
     }
 
-    /// Blits an RGBA frame onto the layer.
-    pub fn set_image(&self, width: usize, height: usize, rgba: &[u8]) {
+    /// Presents damaged rects only: syncs the ffi-owned backing store
+    /// (partial copy — a hover copies one row of bytes) and marks each
+    /// rect dirty; AppKit calls `drawRect:` with the union and the view
+    /// paints from the backing through a NO-COPY CGImage. `damage` is in
+    /// PHYSICAL pixels, top-left origin.
+    pub fn blit_partial(
+        &self,
+        width: usize,
+        height: usize,
+        rgba: &[u8],
+        damage: &[(i64, i64, i64, i64)],
+    ) {
+        if damage.is_empty() {
+            return;
+        }
+        BACKING.with(|backing| {
+            let mut backing = backing.borrow_mut();
+            if backing.width != width || backing.height != height {
+                // fresh surface (first frame or resize): take everything
+                backing.width = width;
+                backing.height = height;
+                backing.bytes.clear();
+                backing.bytes.extend_from_slice(rgba);
+                return;
+            }
+            for &(x0, y0, x1, y1) in damage {
+                let x0 = x0.clamp(0, width as i64) as usize;
+                let x1 = x1.clamp(0, width as i64) as usize;
+                let y0 = y0.clamp(0, height as i64) as usize;
+                let y1 = y1.clamp(0, height as i64) as usize;
+                for y in y0..y1 {
+                    let from = (y * width + x0) * 4;
+                    let to = (y * width + x1) * 4;
+                    backing.bytes[from..to].copy_from_slice(&rgba[from..to]);
+                }
+            }
+        });
         unsafe {
-            let image = cg_image(width, height, rgba);
-            msg_void_f64(self.layer, sel("setContentsScale:"), self.scale() as f64);
-            msg_void_id(self.layer, sel("setContents:"), image);
-            CGImageRelease(image); // the layer retains
+            let scale = self.scale() as f64;
+            let bounds = msg_rect(self.view, sel("bounds"));
+            for &(x0, y0, x1, y1) in damage {
+                let x = x0 as f64 / scale;
+                let w = (x1 - x0) as f64 / scale;
+                let top = y0 as f64 / scale;
+                let h = (y1 - y0) as f64 / scale;
+                // AppKit flip: the view origin is bottom-left
+                let rect = CGRect {
+                    origin: CGPoint { x, y: bounds.size.height - top - h },
+                    size: CGSize { width: w, height: h },
+                };
+                msg_void_rect(self.view, sel("setNeedsDisplayInRect:"), rect);
+            }
         }
     }
 
@@ -746,30 +805,79 @@ impl WindowHandle {
 
 /// `kCGImageAlphaPremultipliedLast` — bytes R,G,B,A, alpha last.
 const ALPHA_PREMULTIPLIED_LAST: u32 = 1;
+/// `kCGInterpolationNone` — the backing is already pixel-exact.
+const INTERPOLATION_NONE: i32 = 1;
 
-unsafe fn cg_image(width: usize, height: usize, rgba: &[u8]) -> Id {
-    unsafe {
-        let data = CFDataCreate(std::ptr::null(), rgba.as_ptr(), rgba.len() as isize);
-        let provider = CGDataProviderCreateWithCFData(data);
-        let space = CGColorSpaceCreateDeviceRGB();
-        let image = CGImageCreate(
-            width,
-            height,
-            8,
-            32,
-            width * 4,
-            space,
-            ALPHA_PREMULTIPLIED_LAST,
-            provider,
-            std::ptr::null(),
-            false,
-            0,
-        );
-        CGColorSpaceRelease(space);
-        CGDataProviderRelease(provider);
-        CFRelease(data);
-        image
-    }
+/// The ffi-owned presentation backing: `drawRect:` always reads from
+/// here, so the pointer handed to CoreGraphics never dangles — the
+/// shell's surface can move freely. Synced by [`WindowHandle::blit_partial`]
+/// with damage-only copies.
+struct Backing {
+    width: usize,
+    height: usize,
+    bytes: Vec<u8>,
+}
+
+thread_local! {
+    static BACKING: RefCell<Backing> =
+        RefCell::new(Backing { width: 0, height: 0, bytes: Vec::new() });
+}
+
+/// `drawRect:` — paints the dirty union from the backing through a
+/// NO-COPY CGImage. The context arrives clipped to the dirty rect; the
+/// CTM flip converts our top-down rows to AppKit's bottom-up world.
+extern "C" fn bunny_draw_rect(this: Id, _sel: Sel, _dirty: CGRect) {
+    BACKING.with(|backing| {
+        let backing = backing.borrow();
+        if backing.bytes.is_empty() {
+            return;
+        }
+        unsafe {
+            let graphics = msg_id(class("NSGraphicsContext"), sel("currentContext"));
+            if graphics.is_null() {
+                return;
+            }
+            let context = msg_id(graphics, sel("CGContext"));
+            if context.is_null() {
+                return;
+            }
+            let provider = CGDataProviderCreateWithData(
+                std::ptr::null_mut(),
+                backing.bytes.as_ptr(),
+                backing.bytes.len(),
+                std::ptr::null(),
+            );
+            let space = CGColorSpaceCreateDeviceRGB();
+            let image = CGImageCreate(
+                backing.width,
+                backing.height,
+                8,
+                32,
+                backing.width * 4,
+                space,
+                ALPHA_PREMULTIPLIED_LAST,
+                provider,
+                std::ptr::null(),
+                false,
+                0,
+            );
+            let bounds = msg_rect(this, sel("bounds"));
+            CGContextSaveGState(context);
+            CGContextSetInterpolationQuality(context, INTERPOLATION_NONE);
+            // no CTM flip: Quartz draws a CGImage upright in the y-up
+            // context of a non-flipped view — flipping here would turn
+            // the world on its head
+            CGContextDrawImage(
+                context,
+                CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: bounds.size },
+                image,
+            );
+            CGContextRestoreGState(context);
+            CGImageRelease(image);
+            CGColorSpaceRelease(space);
+            CGDataProviderRelease(provider);
+        }
+    });
 }
 
 /// Creates the app + the window with the event view, ready for blit.
@@ -812,7 +920,6 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
         let view = msg_init_rect(view, sel("initWithFrame:"), rect);
         msg_void_bool(view, sel("setWantsLayer:"), 1);
         msg_void_id(window, sel("setContentView:"), view);
-        let layer = msg_id(view, sel("layer"));
 
         // moved/entered/exited arrive via the tracking area — no first
         // responder dance, and InVisibleRect tracks the resize by itself
@@ -853,7 +960,7 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
         msg_void_bool(app, sel("activateIgnoringOtherApps:"), 1);
         objc_autoreleasePoolPop(pool);
 
-        WindowHandle { window, view, layer }
+        WindowHandle { window, view }
     }
 }
 

@@ -109,8 +109,11 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
             let (retained, _, _) = slot.as_mut().expect("surface for the frame");
             let damage = retained.frame(display, &*runtime.text());
             if !damage.is_empty() {
-                let bitmap = retained.bitmap();
-                window.set_image(bitmap.width(), bitmap.height(), &bitmap.to_rgba_bytes());
+                // present only the wounds: damage-only mirror sync +
+                // damage-only backing copy + dirty-rect redraw
+                let (width, height) =
+                    (retained.bitmap().width(), retained.bitmap().height());
+                window.blit_partial(width, height, retained.rgba(), &damage);
             }
             drop(slot);
         window.set_cursor_pointing(runtime.interaction().hovered.is_some());
