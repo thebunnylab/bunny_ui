@@ -154,6 +154,76 @@ impl Component for Finder {
     }
 }
 
+/// The certified fixture with springs armed: rows fade and slide, the
+/// region reveals through a spring. A SEPARATE component so the plain
+/// rows above stay byte-identical to the certified table.
+#[derive(Clone)]
+struct AnimatedFinder {
+    query: State<String>,
+    selected: State<usize>,
+    files: Rc<Vec<(Rc<str>, Rc<str>)>>,
+}
+
+impl Component for AnimatedFinder {
+    fn body(self, _ctx: &Context) -> impl View {
+        let query = self.query.get();
+        let items: Vec<(usize, Rc<str>, Rc<str>)> = self
+            .files
+            .iter()
+            .filter(|(name, dir)| query.is_empty() || matches(dir, name, &query))
+            .enumerate()
+            .map(|(index, (name, dir))| (index, name.clone(), dir.clone()))
+            .collect();
+        let count = items.len();
+        let selected = self.selected;
+        let selected_index = selected.get().min(count.saturating_sub(1));
+
+        let rows = list(
+            items,
+            |(_, name, dir)| format!("{dir}{name}"),
+            move |(index, name, dir)| {
+                hstack!(
+                    text(name.clone()).foreground_color(theme::fg()),
+                    text(dir.clone())
+                        .font(Font::Subheadline)
+                        .monospaced()
+                        .foreground_color(theme::fg_secondary()),
+                    spacer(),
+                )
+                .spacing(8.0)
+                .alignment(VerticalAlignment::Center)
+                .padding_edge(Edge::Leading, 12.0)
+                .padding_edge(Edge::Trailing, 12.0)
+                .padding_edge(Edge::Top, 7.0)
+                .padding_edge(Edge::Bottom, 7.0)
+                .background_color(if *index == selected_index {
+                    theme::row_pressed()
+                } else {
+                    CLEAR
+                })
+                .background_hovered(theme::row_hover())
+                .animated(Spring::snappy())
+                .on_click(|| {})
+            },
+        );
+
+        vstack!(
+            hstack!(
+                text("›").foreground_color(theme::accent()),
+                text_field("Search files by name…", self.query.binding()).monospaced(),
+            )
+            .spacing(10.0)
+            .alignment(VerticalAlignment::Center)
+            .padding_length(10.0),
+            rows.animated(Spring::smooth()),
+        )
+        .alignment(HorizontalAlignment::Leading)
+        .frame(640.0, 480.0)
+        .background_color(theme::panel())
+        .corner_radius(9.0)
+    }
+}
+
 struct Report {
     label: &'static str,
     p50: f64,
@@ -194,7 +264,8 @@ fn main() {
     let files: Rc<Vec<(Rc<str>, Rc<str>)>> = Rc::new(
         FILES.iter().map(|(name, dir)| (Rc::from(*name), Rc::from(*dir))).collect(),
     );
-    let finder = Finder { query: State::new(String::new()), selected: State::new(0), files };
+    let finder =
+        Finder { query: State::new(String::new()), selected: State::new(0), files: Rc::clone(&files) };
     let engine = std::rc::Rc::new(CoreTextEngine::new());
     let runtime = Runtime::new().text_engine(engine.clone());
     runtime.bind(KeyPattern::key(Key::Down), SELECT_NEXT);
@@ -242,6 +313,29 @@ fn main() {
         runtime.wheel(320.0, 300.0, 0.0, if down { -8.0 } else { 8.0 });
         down = !down;
         runtime.layout(&finder, viewport);
+    }));
+
+    // the tick path: springs mid-flight, ZERO bodies — the engine-side
+    // cost of one animated frame. the selection retargets every 24
+    // ticks so the flight never lands (steady state is the story).
+    let animated = AnimatedFinder {
+        query: State::new(String::new()),
+        selected: State::new(0),
+        files: Rc::clone(&files),
+    };
+    let anim_runtime = Runtime::new().text_engine(engine.clone());
+    let window = Size { width: 760.0, height: 640.0 };
+    anim_runtime.settle(&animated);
+    anim_runtime.layout(&animated, viewport);
+    let mut ticks = 0usize;
+    reports.push(measure("animated frame (tick+layout)", 5, 200, || {
+        if ticks % 24 == 0 {
+            animated.selected.set(ticks / 24 % 12 + 1);
+            let _ = anim_runtime.display_frame(&animated, window);
+        }
+        ticks += 1;
+        anim_runtime.tick(1.0 / 120.0);
+        std::hint::black_box(anim_runtime.animation_frame(&animated, window).len());
     }));
 
     let laid_out = runtime.layout(&finder, viewport);
@@ -315,6 +409,20 @@ fn main() {
         // does — the twin of a present that never waits for the gpu
         reports.push(measure("present GPU (encode, no wait)", 3, 200, || {
             gpu.present_nowait(&laid_out.display, 2, Color::CANVAS, &*engine);
+        }));
+
+        // an animated frame END TO END: tick + layout + encode — the
+        // whole per-frame cost while springs fly (zero bodies inside)
+        let mut gpu_ticks = 0usize;
+        reports.push(measure("animated frame (tick+layout+encode)", 3, 200, || {
+            if gpu_ticks % 24 == 0 {
+                animated.selected.set(gpu_ticks / 24 % 12 + 1);
+                let _ = anim_runtime.display_frame(&animated, window);
+            }
+            gpu_ticks += 1;
+            anim_runtime.tick(1.0 / 120.0);
+            let display = anim_runtime.animation_frame(&animated, window);
+            gpu.present_nowait(&display, 2, Color::CANVAS, &*engine);
         }));
     }
 
