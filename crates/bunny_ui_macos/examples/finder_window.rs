@@ -170,6 +170,9 @@ impl Component for Finder {
                 let label = format!("{}{}", row.dir, row.name);
                 let is_selected = *index == selected_index;
                 hstack!(
+                    // the platform's file icon, crisp at row size — the
+                    // workspace picks the representation for 16pt
+                    image(file_icon(label.as_str())).resizable().frame(16.0, 16.0),
                     // name: MIDDLE ellipsis, 240 cap as the anatomy dictates
                     text(row.name)
                         .foreground_color(theme::fg())

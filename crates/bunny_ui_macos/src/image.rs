@@ -12,19 +12,21 @@
 //! leaving — the same pass the text engine does.
 //!
 //! Broken bytes stay a cached failure: nothing paints and the decoder
-//! is never asked twice. File icons arrive with the workspace bridge
-//! (a later phase) — until then they answer `None` here.
+//! is never asked twice. File icons come from the workspace: the icon
+//! for a path, drawn from the representation that matches the asked
+//! size — crisp at sixteen, crisp at sixty-four.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use bunny_ui::image_engine::{ImageEngine, ImageRaster, ImageSource};
+use bunny_ui::image_engine::{FILE_ICON_SIZE, ImageEngine, ImageRaster, ImageSource};
 
 use crate::ffi::{
     CFRelease, CGColorSpaceCreateDeviceRGB, CGColorSpaceRelease, CGContextDrawImage,
-    CGContextSetInterpolationQuality, CGImageRelease, CGPoint, CGRect, CGSize, Id,
+    CGContextSetInterpolationQuality, CGImageRelease, CGPoint, CGRect, CGSize, Id, Sel, class,
+    sel,
 };
 
 type CFDataRef = *const c_void;
@@ -82,6 +84,117 @@ impl Drop for OwnedImage {
     }
 }
 
+// The workspace bridge (file icons) — msgSend casts in the house
+// pattern, local to the messages this module sends.
+#[allow(clashing_extern_declarations)]
+#[link(name = "objc", kind = "dylib")]
+unsafe extern "C" {
+    #[link_name = "objc_msgSend"]
+    fn msg_id(obj: Id, sel: Sel) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_id_arg(obj: Id, sel: Sel, a: Id) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_id_cstr(obj: Id, sel: Sel, a: *const std::ffi::c_char) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_void_size(obj: Id, sel: Sel, size: CGSize);
+    #[link_name = "objc_msgSend"]
+    fn msg_image_rect(obj: Id, sel: Sel, rect: *mut CGRect, context: Id, hints: Id) -> Id;
+    fn objc_autoreleasePoolPush() -> *mut c_void;
+    fn objc_autoreleasePoolPop(pool: *mut c_void);
+}
+
+/// Draws a CGImage into a fresh buffer at EXACTLY width×height physical
+/// px, high interpolation — the one resample of the pipeline. The
+/// pixels come back PREMULTIPLIED (the context's only mode).
+unsafe fn draw_image(image: Id, width: usize, height: usize) -> Option<Vec<u8>> {
+    let mut rgba = vec![0u8; width * height * 4];
+    unsafe {
+        let space = CGColorSpaceCreateDeviceRGB();
+        let context = CGBitmapContextCreate(
+            rgba.as_mut_ptr() as *mut c_void,
+            width,
+            height,
+            8,
+            width * 4,
+            space,
+            ALPHA_PREMULTIPLIED_LAST,
+        );
+        CGColorSpaceRelease(space);
+        if context.is_null() {
+            return None;
+        }
+        CGContextSetInterpolationQuality(context, INTERPOLATION_HIGH);
+        CGContextDrawImage(
+            context,
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize { width: width as f64, height: height as f64 },
+            },
+            image,
+        );
+        CGContextRelease(context);
+    }
+    Some(rgba)
+}
+
+/// The compositor blends straight alpha — one pass over the rectangle.
+fn unpremultiply(rgba: &mut [u8]) {
+    for pixel in rgba.chunks_exact_mut(4) {
+        let alpha = pixel[3] as u32;
+        if alpha > 0 && alpha < 255 {
+            for channel in 0..3 {
+                pixel[channel] =
+                    ((pixel[channel] as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
+            }
+        }
+    }
+}
+
+/// The workspace icon for a path, drawn at the physical size — the
+/// workspace picks the sharpest representation for the box (16 stays
+/// crisp, 64 stays crisp, no upscaled thumbnail). Everything here is
+/// autoreleased, so the drawing happens inside the pool.
+unsafe fn icon_rgba(path: &str, width: usize, height: usize) -> Option<Vec<u8>> {
+    unsafe {
+        let pool = objc_autoreleasePoolPush();
+        let rgba = (|| {
+            let c_path = std::ffi::CString::new(path).ok()?;
+            let ns_path =
+                msg_id_cstr(class("NSString"), sel("stringWithUTF8String:"), c_path.as_ptr());
+            if ns_path.is_null() {
+                return None;
+            }
+            let workspace = msg_id(class("NSWorkspace"), sel("sharedWorkspace"));
+            let icon = msg_id_arg(workspace, sel("iconForFile:"), ns_path);
+            if icon.is_null() {
+                return None;
+            }
+            msg_void_size(
+                icon,
+                sel("setSize:"),
+                CGSize { width: width as f64, height: height as f64 },
+            );
+            let mut rect = CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize { width: width as f64, height: height as f64 },
+            };
+            let image = msg_image_rect(
+                icon,
+                sel("CGImageForProposedRect:context:hints:"),
+                &mut rect,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            if image.is_null() {
+                return None;
+            }
+            draw_image(image, width, height)
+        })();
+        objc_autoreleasePoolPop(pool);
+        rgba
+    }
+}
+
 /// Decodes the platform-encoded bytes once. Null = the platform could
 /// not read them (cached as a permanent failure by the caller).
 unsafe fn decode(bytes: &[u8]) -> Id {
@@ -128,7 +241,7 @@ impl CoreGraphicsImageEngine {
         }
         let image = match source {
             ImageSource::Bytes { bytes, .. } => unsafe { decode(bytes) },
-            // the workspace icon bridge is a later phase
+            // icons resolve per size through the workspace, never here
             ImageSource::FileIcon { .. } => std::ptr::null_mut(),
         };
         let entry = (!image.is_null()).then(|| OwnedImage(image));
@@ -145,6 +258,11 @@ impl Default for CoreGraphicsImageEngine {
 
 impl ImageEngine for CoreGraphicsImageEngine {
     fn intrinsic(&self, source: &ImageSource) -> Option<(u32, u32)> {
+        if let ImageSource::FileIcon { .. } = source {
+            // system icons are multi-representation; the fixed contract
+            // stands in — the normal use is `.resizable()` plus a frame
+            return Some((FILE_ICON_SIZE, FILE_ICON_SIZE));
+        }
         let image = self.image(source);
         if image.is_null() {
             return None;
@@ -165,49 +283,17 @@ impl ImageEngine for CoreGraphicsImageEngine {
         if let Some(raster) = self.rasters.borrow().get(&cache_key) {
             return Some(Rc::clone(raster));
         }
-        let image = self.image(source);
-        if image.is_null() {
-            return None;
-        }
-
-        let mut rgba = vec![0u8; width * height * 4];
-        unsafe {
-            let space = CGColorSpaceCreateDeviceRGB();
-            let context = CGBitmapContextCreate(
-                rgba.as_mut_ptr() as *mut c_void,
-                width,
-                height,
-                8,
-                width * 4,
-                space,
-                ALPHA_PREMULTIPLIED_LAST,
-            );
-            CGColorSpaceRelease(space);
-            if context.is_null() {
-                return None;
-            }
-            CGContextSetInterpolationQuality(context, INTERPOLATION_HIGH);
-            CGContextDrawImage(
-                context,
-                CGRect {
-                    origin: CGPoint { x: 0.0, y: 0.0 },
-                    size: CGSize { width: width as f64, height: height as f64 },
-                },
-                image,
-            );
-            CGContextRelease(context);
-        }
-
-        // unpremultiplies in place — the compositor blends straight alpha
-        for pixel in rgba.chunks_exact_mut(4) {
-            let alpha = pixel[3] as u32;
-            if alpha > 0 && alpha < 255 {
-                for channel in 0..3 {
-                    pixel[channel] =
-                        ((pixel[channel] as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
+        let mut rgba = match source {
+            ImageSource::Bytes { .. } => {
+                let image = self.image(source);
+                if image.is_null() {
+                    return None;
                 }
+                unsafe { draw_image(image, width, height) }?
             }
-        }
+            ImageSource::FileIcon { path, .. } => unsafe { icon_rgba(path, width, height) }?,
+        };
+        unpremultiply(&mut rgba);
 
         let raster = Rc::new(ImageRaster { width, height, rgba });
         let mut rasters = self.rasters.borrow_mut();
@@ -325,6 +411,24 @@ pub(crate) mod tests {
 
         let again = engine.raster(&source, 8, 8).expect("cached");
         assert!(Rc::ptr_eq(&raster, &again), "one resample per size");
+    }
+
+    #[test]
+    fn a_file_icon_arrives_from_the_workspace() {
+        let engine = CoreGraphicsImageEngine::new();
+        let icon = bunny_ui::image_engine::file_icon("/usr/bin");
+        assert_eq!(engine.intrinsic(&icon), Some((32, 32)), "the fixed contract");
+
+        let small = engine.raster(&icon, 16, 16).expect("an icon at sixteen");
+        assert_eq!((small.width, small.height), (16, 16));
+        assert!(small.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0), "the icon has ink");
+        let large = engine.raster(&icon, 64, 64).expect("an icon at sixty-four");
+        assert_eq!((large.width, large.height), (64, 64));
+
+        // the cache answers the scroll — the workspace never hears the
+        // same (path, size) twice
+        let again = engine.raster(&icon, 16, 16).expect("cached");
+        assert!(Rc::ptr_eq(&small, &again));
     }
 
     #[test]
