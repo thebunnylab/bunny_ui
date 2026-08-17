@@ -263,6 +263,8 @@ impl Component for Finder {
             .background_color(theme::panel())
             .corner_radius(9.0)
             .border(theme::border(), 1.0)
+            // the floating panel finally casts its shadow
+            .shadow(24.0)
             // ↓/↑ with wrap — they work WHILE typing (the gate consumes)
             .on_action(SELECT_NEXT, move || {
                 if count > 0 {

@@ -151,6 +151,47 @@ impl Bitmap {
         }
     }
 
+    /// A soft halo OUTSIDE the rect: quadratic falloff over `radius`
+    /// physical px. The inside of the rect is never touched — whoever
+    /// owns the frame paints it. Corners use euclidean distance (a sqrt
+    /// only there); edges fall off linearly per band.
+    fn shadow_rect(&mut self, rect: Rect, color: Color, radius: f64) {
+        let (x0, y0, x1, y1) = Self::snap(rect);
+        let reach = radius.max(1.0).round() as i64;
+        let (cx0, cy0, cx1, cy1) = self.clip_box();
+        let from_y = (y0 - reach).max(cy0);
+        let to_y = (y1 + reach).min(cy1);
+        let from_x = (x0 - reach).max(cx0);
+        let to_x = (x1 + reach).min(cx1);
+        for y in from_y..to_y {
+            let dy = if y < y0 { y0 - y } else if y >= y1 { y - y1 + 1 } else { 0 };
+            for x in from_x..to_x {
+                let dx = if x < x0 { x0 - x } else if x >= x1 { x - x1 + 1 } else { 0 };
+                if dx == 0 && dy == 0 {
+                    continue; // the inside belongs to the view
+                }
+                let distance = if dx > 0 && dy > 0 {
+                    ((dx * dx + dy * dy) as f64).sqrt()
+                } else {
+                    (dx + dy) as f64
+                };
+                if distance >= radius {
+                    continue;
+                }
+                let strength = 1.0 - distance / radius;
+                let alpha = (color.a as f64 * strength * strength).round() as u32;
+                if alpha == 0 {
+                    continue;
+                }
+                let packed = ((color.r as u32) << 24)
+                    | ((color.g as u32) << 16)
+                    | ((color.b as u32) << 8)
+                    | alpha;
+                self.set(x, y, packed);
+            }
+        }
+    }
+
     /// Edges rounded in device px — the single point of snapping.
     fn snap(rect: Rect) -> (i64, i64, i64, i64) {
         let x0 = rect.origin.x.round() as i64;
@@ -344,6 +385,9 @@ pub fn rasterize_with(
             DrawCommand::StrokeRect { rect, color, width } => {
                 bitmap.stroke_rect(scale_rect(*rect, factor), *color, width * factor)
             }
+            DrawCommand::Shadow { rect, radius, color } => {
+                bitmap.shadow_rect(scale_rect(*rect, factor), *color, radius * factor)
+            }
             DrawCommand::TextLine { origin, content, range, color, font } => {
                 let slice = &content[range.0..range.1];
                 if let Some(raster) = text.raster_line(slice, font, *color, scale) {
@@ -440,6 +484,11 @@ impl Surface {
         let raw = match command {
             DrawCommand::FillRect { rect, .. } | DrawCommand::StrokeRect { rect, .. } => {
                 Bitmap::snap(scale_rect(*rect, factor))
+            }
+            DrawCommand::Shadow { rect, radius, .. } => {
+                let (x0, y0, x1, y1) = Bitmap::snap(scale_rect(*rect, factor));
+                let reach = (radius * factor).max(1.0).round() as i64;
+                (x0 - reach, y0 - reach, x1 + reach, y1 + reach)
             }
             DrawCommand::TextLine { origin, content, range, font, .. } => {
                 let metrics = self.cache.get_or_measure(&content[range.0..range.1], font, text);
@@ -606,6 +655,9 @@ impl Surface {
                     DrawCommand::StrokeRect { rect, color, width } => self
                         .bitmap
                         .stroke_rect(scale_rect(*rect, factor), *color, width * factor),
+                    DrawCommand::Shadow { rect, radius, color } => self
+                        .bitmap
+                        .shadow_rect(scale_rect(*rect, factor), *color, radius * factor),
                     DrawCommand::TextLine { origin, content, range, color, font } => {
                         let slice = &content[range.0..range.1];
                         if let Some(raster) = text.raster_line(slice, font, *color, self.scale) {
@@ -883,6 +935,57 @@ mod tests {
         surface.frame(frames[0].clone(), &PixelFont);
         let damage = surface.frame(frames[0].clone(), &PixelFont);
         assert!(damage.is_empty(), "same list, no damage: {damage:?}");
+    }
+
+    #[test]
+    fn a_shadow_falls_off_outside_and_never_touches_the_inside() {
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::Shadow {
+            rect: Rect {
+                origin: Point { x: 20.0, y: 20.0 },
+                size: Size { width: 20.0, height: 20.0 },
+            },
+            radius: 10.0,
+            color: Color::rgba(0, 0, 0, 200),
+        });
+        let bitmap = rasterize(&display, 60, 60, Color::WHITE);
+
+        let white = super::pack(Color::WHITE);
+        assert_eq!(bitmap.pixel(30, 30), Some(white), "the inside belongs to the view");
+        let near = bitmap.pixel(30, 18).unwrap() & 0xFF00_0000;
+        let far = bitmap.pixel(30, 12).unwrap() & 0xFF00_0000;
+        assert!(near < 0xFF00_0000, "right at the edge the halo darkens");
+        assert!(far > near, "farther out the halo fades (quadratic falloff)");
+        assert_eq!(bitmap.pixel(30, 5), Some(white), "past the radius, nothing");
+        // corners fade too (euclidean distance, no square halo artifact)
+        assert!(bitmap.pixel(16, 16).unwrap() & 0xFF00_0000 > near, "corner is softer than edge");
+    }
+
+    #[test]
+    fn shadow_damage_covers_the_halo() {
+        // toggling a shadow must damage the halo box, not just the frame
+        let mut surface = Surface::new(80, 80, 1, Color::CANVAS);
+        let with = |shadow: bool| {
+            let mut display = DisplayList::default();
+            if shadow {
+                display.push(DrawCommand::Shadow {
+                    rect: Rect {
+                        origin: Point { x: 30.0, y: 30.0 },
+                        size: Size { width: 20.0, height: 20.0 },
+                    },
+                    radius: 8.0,
+                    color: Color::rgba(0, 0, 0, 90),
+                });
+            }
+            display.push(fill(30.0, 30.0, 20.0, 20.0, Color::WHITE));
+            display
+        };
+        surface.frame(with(false), &PixelFont);
+        let damage = surface.frame(with(true), &PixelFont);
+        let oracle = rasterize(&with(true), 80, 80, Color::CANVAS);
+        assert_eq!(surface.bitmap().pixels(), oracle.pixels(), "golden with shadow");
+        let (x0, y0, x1, y1) = damage[0];
+        assert!(x0 <= 22 && y0 <= 22 && x1 >= 58 && y1 >= 58, "halo box damaged: {damage:?}");
     }
 
     #[test]

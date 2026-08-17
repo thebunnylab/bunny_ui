@@ -299,6 +299,24 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// A soft shadow behind the view — panel-grade halo with the house
+    /// ink (quadratic falloff, paints outside the frame only).
+    fn shadow(self, radius: f64) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Shadow(radius, crate::layout::Color::rgba(0, 0, 0, 80)),
+        }
+    }
+
+    /// [`ViewExt::shadow`] with an explicit color (tinted halos, deeper
+    /// panels).
+    fn shadow_color(self, radius: f64, color: crate::layout::Color) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Shadow(radius, color),
+        }
+    }
+
     // MARK: - Interaction
 
     /// `.onTapGesture { … }` — in the headless runtime it fires on render.

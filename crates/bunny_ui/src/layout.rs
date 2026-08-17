@@ -344,6 +344,11 @@ pub struct VisualProps {
     /// already at measure time (hover state is still forbidden to touch
     /// it).
     pub font: FontPatch,
+    /// A soft halo behind the view: `(radius, color)`. The falloff is
+    /// quadratic; the halo paints OUTSIDE the frame (the frame itself is
+    /// untouched). Honest floor: the halo is rectangular even under
+    /// rounded corners — invisible at panel alphas.
+    pub shadow: Option<(Px, Color)>,
 }
 
 impl VisualProps {
@@ -359,6 +364,7 @@ impl VisualProps {
             background_hovered: self.background_hovered.or(outer.background_hovered),
             background_pressed: self.background_pressed.or(outer.background_pressed),
             font: self.font.or(outer.font),
+            shadow: self.shadow.or(outer.shadow),
         }
     }
 }
@@ -381,6 +387,9 @@ pub struct Interaction {
 pub enum DrawCommand {
     /// `corner_radius: 0.0` = plain rectangle (the usual straight path).
     FillRect { rect: Rect, color: Color, corner_radius: Px },
+    /// A soft halo OUTSIDE the rect: alpha falls off quadratically from
+    /// the edge over `radius` px. The rect's inside stays untouched.
+    Shadow { rect: Rect, radius: Px, color: Color },
     /// A border painted INWARD from the edge, `width` logical px.
     StrokeRect { rect: Rect, color: Color, width: Px },
     /// One already-wrapped line of text. `origin` is the TOP-left of the
@@ -1063,6 +1072,10 @@ impl LayoutNode {
 
             (LayoutNode::Styled { props, child }, Fit::Wrapped(_, fit)) => {
                 let env = LayoutEnv { font: props.font.apply_over(env.font), ..env };
+                // the halo goes first — everything else paints over it
+                if let Some((radius, color)) = props.shadow {
+                    out.display.push(DrawCommand::Shadow { rect: frame, radius, color });
+                }
                 let (hovered, pressed) = out.pointer.last().copied().unwrap_or((false, false));
                 // pressed > hovered > normal; a state without its own
                 // background falls back to the base one — a button with
