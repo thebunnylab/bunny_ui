@@ -91,6 +91,10 @@ pub enum CrossAlign {
     Start,
     Center,
     End,
+    /// Rows sit on a SHARED first baseline: text by its ascent, a
+    /// baselineless box by its bottom edge. Meaningful in horizontal
+    /// stacks; elsewhere it behaves as `Start`.
+    Baseline,
 }
 
 /// Padding insets, per edge.
@@ -722,6 +726,46 @@ impl LayoutNode {
         }
     }
 
+    /// The FIRST baseline of this subtree, in the node's own
+    /// coordinates — text answers with its ascent, wrappers forward
+    /// (padding adds its top inset, styled swaps the font first, the
+    /// way measure does), and a subtree with no text answers `None`:
+    /// the caller then uses the bottom edge (the rule for baselineless
+    /// boxes). Only the baseline alignment walks this; everyone else
+    /// pays nothing.
+    fn first_baseline(&self, env: LayoutEnv) -> Option<Px> {
+        match self {
+            LayoutNode::Text { content, .. } => {
+                Some(env.cache.get_or_measure(content, &env.font, env.text).ascent)
+            }
+            LayoutNode::Field { .. } => {
+                let metrics = env.cache.get_or_measure("0", &env.font, env.text);
+                Some(FIELD_PAD_V + metrics.ascent)
+            }
+            LayoutNode::Styled { props, child } => {
+                let env = LayoutEnv { font: props.font.apply_over(env.font), ..env };
+                child.first_baseline(env)
+            }
+            LayoutNode::Animated { child, .. }
+            | LayoutNode::Interactive { child, .. }
+            | LayoutNode::Frame { child, .. } => child.first_baseline(env),
+            LayoutNode::Padding { edges, child } => {
+                child.first_baseline(env).map(|baseline| baseline + edges.top)
+            }
+            LayoutNode::Stack { children, .. } => {
+                children.first().and_then(|child| child.first_baseline(env))
+            }
+            LayoutNode::Boundary { children, .. } => {
+                children.first().and_then(|child| child.first_baseline(env))
+            }
+            LayoutNode::BoundaryRef { path } => crate::reconciler::with_retained_layout(
+                path,
+                |layout| layout.and_then(|node| node.first_baseline(env)),
+            ),
+            _ => None,
+        }
+    }
+
     pub(crate) fn measure(&self, proposal: Proposal, env: LayoutEnv) -> (Size, Fit) {
         match self {
             LayoutNode::Text { content, truncation, .. } => {
@@ -1124,7 +1168,7 @@ impl LayoutNode {
             (LayoutNode::MaxFrame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
                 let x = frame.origin.x
                     + match align {
-                        CrossAlign::Start => 0.0,
+                        CrossAlign::Start | CrossAlign::Baseline => 0.0,
                         CrossAlign::Center => (frame.size.width - child_size.width) / 2.0,
                         CrossAlign::End => frame.size.width - child_size.width,
                     };
@@ -1729,11 +1773,34 @@ fn place_stack(
         Axis::Vertical => frame.origin.y,
         Axis::Horizontal => frame.origin.x,
     };
-    for (child, (size, fit)) in children.iter().zip(fits) {
+    // baseline alignment: every child sits on the SHARED first
+    // baseline — text by its ascent, a baselineless box by its bottom
+    // edge (its baseline IS its bottom, the SwiftUI rule). Computed
+    // only when asked; the other alignments pay nothing.
+    let baselines: Option<Vec<Px>> = (align == CrossAlign::Baseline
+        && axis == Axis::Horizontal)
+        .then(|| {
+            children
+                .iter()
+                .zip(&fits)
+                .map(|(child, (size, _))| {
+                    child.first_baseline(env).unwrap_or(size.height)
+                })
+                .collect()
+        });
+    let shared = baselines
+        .as_ref()
+        .map(|baselines| baselines.iter().fold(0.0_f64, |acc, b| acc.max(*b)));
+    for (index, (child, (size, fit))) in children.iter().zip(fits).enumerate() {
         let cross_offset = |extent: Px, len: Px| match align {
             CrossAlign::Start => 0.0,
             CrossAlign::Center => (extent - len) / 2.0,
             CrossAlign::End => extent - len,
+            CrossAlign::Baseline => match (&baselines, shared) {
+                (Some(baselines), Some(shared)) => shared - baselines[index],
+                // a vertical stack has no shared baseline: start
+                _ => 0.0,
+            },
         };
         let origin = match axis {
             Axis::Vertical => Point {

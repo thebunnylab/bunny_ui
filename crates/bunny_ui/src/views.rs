@@ -355,6 +355,9 @@ pub enum VerticalAlignment {
     Top,
     Center,
     Bottom,
+    /// Text sits on a shared first baseline; a box with no text below
+    /// aligns by its bottom edge.
+    Baseline,
 }
 
 impl VerticalAlignment {
@@ -363,6 +366,7 @@ impl VerticalAlignment {
             VerticalAlignment::Top => ".top",
             VerticalAlignment::Center => ".center",
             VerticalAlignment::Bottom => ".bottom",
+            VerticalAlignment::Baseline => ".firstTextBaseline",
         }
     }
 
@@ -371,6 +375,7 @@ impl VerticalAlignment {
             VerticalAlignment::Top => CrossAlign::Start,
             VerticalAlignment::Center => CrossAlign::Center,
             VerticalAlignment::Bottom => CrossAlign::End,
+            VerticalAlignment::Baseline => CrossAlign::Baseline,
         }
     }
 }

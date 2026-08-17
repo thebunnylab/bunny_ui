@@ -495,6 +495,46 @@ mod tests {
     }
 
     #[test]
+    fn rows_share_a_first_baseline_and_boxes_sit_on_their_bottom() {
+        #[derive(Clone, Copy)]
+        struct Rowline;
+
+        impl Component for Rowline {
+            fn body(self, _ctx: &Context) -> impl View {
+                hstack!(
+                    // a baselineless 20px box: its baseline IS its bottom
+                    spacer().frame(10.0, 20.0),
+                    // pixel font: ascent 13 — the text drops 20−13 = 7
+                    text("hi"),
+                    // padded text: ascent 13 + 5 of top inset = 18 —
+                    // the whole padded box drops 2, the glyph lands at 7
+                    text("pad").padding_edge(motor::views::Edge::Top, 5.0),
+                )
+                .alignment(VerticalAlignment::Baseline)
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 60.0 };
+        let runtime = Runtime::new();
+        let frame = runtime.display_frame(&Rowline, size);
+        let line_y = |needle: &str| {
+            frame
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { origin, content, .. }
+                        if content.as_ref() == needle =>
+                    {
+                        Some(origin.y)
+                    }
+                    _ => None,
+                })
+                .expect("the text paints")
+        };
+        assert_eq!(line_y("hi"), 7.0, "ascent 13 on a shared baseline of 20");
+        assert_eq!(line_y("pad"), 7.0, "padding forwards the baseline");
+    }
+
+    #[test]
     fn a_virtual_list_materializes_only_the_window() {
         #[derive(Clone, Copy)]
         struct Big;
