@@ -1155,6 +1155,47 @@ mod tests {
     }
 
     #[test]
+    fn a_dynamic_collection_lays_itself_out_on_either_axis() {
+        use crate::layout::{DrawCommand, Proposal};
+
+        let runtime = Runtime::new();
+        let items = vec!["one", "two"];
+        // a tab strip: the items sit side by side, the taller one sets
+        // the height and the shorter one centers against it
+        let strip = for_each(items.clone(), |id| id.to_string(), |id| match *id {
+            "one" => Either::First(text(*id)),
+            _ => Either::Second(text(*id).padding_length(4.0)),
+        })
+        .horizontal()
+        .spacing(6.0);
+
+        let ink: Vec<(f64, f64)> = runtime
+            .layout(&strip, Proposal::unspecified())
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::TextLine { origin, .. } => Some((origin.x, origin.y)),
+                _ => None,
+            })
+            .collect();
+        // PixelFont: 8px a glyph, 16 tall. "one" is 24 wide, the gap is
+        // 6, the padded "two" starts its ink 4 further in — and both
+        // sit at y = 4, the centered offset inside a 24pt strip
+        assert_eq!(ink, vec![(0.0, 4.0), (34.0, 4.0)]);
+
+        let printed = runtime.render_stable(&strip);
+        assert!(
+            printed.contains("ForEach (2, axis: .horizontal, spacing: 6)"),
+            "the print says how it lays out: {printed}"
+        );
+        let column = for_each(items, |id| id.to_string(), |id| text(*id));
+        assert!(
+            runtime.render_stable(&column).contains("ForEach (2)"),
+            "the default column prints as it always did"
+        );
+    }
+
+    #[test]
     fn animated_rows_slide_on_reorder_and_settle_on_the_real_frame() {
         use crate::anim::Spring;
 

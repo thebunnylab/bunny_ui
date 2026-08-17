@@ -1048,11 +1048,18 @@ where
 /// identity contract: it is what will let state and animation follow the item
 /// (reorder, insert in the middle) instead of the position. The headless
 /// runtime only enforces the verifiable part today: unique ids.
+///
+/// The collection lays itself out: a column by default,
+/// [`horizontal`](ForEach::horizontal) for a strip of tabs or chips,
+/// with the [`spacing`](ForEach::spacing) of a stack. Cross alignment
+/// follows the axis — leading down a column, centered along a row.
 #[derive(Clone)]
 pub struct ForEach<T, I, F> {
     items: Vec<T>,
     id: I,
     row: F,
+    axis: Axis,
+    spacing: Option<f64>,
 }
 
 impl<T, I, F, R> View for ForEach<T, I, F>
@@ -1073,16 +1080,55 @@ where
         }
         let (prints, layouts) = rows.into_parts();
         out.push(RenderNode::branch(
-            format!("ForEach ({})", self.items.len()),
+            for_each_line(self.items.len(), self.axis, self.spacing),
             prints,
         ));
         out.push_layout(LayoutNode::Stack {
-            axis: Axis::Vertical,
-            spacing: 0.0,
-            align: CrossAlign::Start,
+            axis: self.axis,
+            spacing: self.spacing.unwrap_or(0.0),
+            // a column reads leading, a strip reads centered — the same
+            // defaults the stacks carry
+            align: match self.axis {
+                Axis::Vertical => CrossAlign::Start,
+                Axis::Horizontal => CrossAlign::Center,
+            },
             children: layouts,
         });
     }
+}
+
+impl<T, I, F> ForEach<T, I, F> {
+    /// The items sit side by side instead of stacking down.
+    pub fn horizontal(mut self) -> Self {
+        self.axis = Axis::Horizontal;
+        self
+    }
+
+    /// The default, spelled out: the items stack down.
+    pub fn vertical(mut self) -> Self {
+        self.axis = Axis::Vertical;
+        self
+    }
+
+    /// `ForEach` inside a `VStack(spacing: 8)` — the gap between items.
+    pub fn spacing(mut self, spacing: f64) -> Self {
+        self.spacing = Some(spacing);
+        self
+    }
+}
+
+/// The default column prints as it always did; an axis or a spacing of
+/// its own says so.
+fn for_each_line(count: usize, axis: Axis, spacing: Option<f64>) -> String {
+    let mut line = format!("ForEach ({count}");
+    if let Axis::Horizontal = axis {
+        line.push_str(", axis: .horizontal");
+    }
+    if let Some(spacing) = spacing {
+        line.push_str(&format!(", spacing: {spacing}"));
+    }
+    line.push(')');
+    line
 }
 
 pub fn for_each<T, I, F, R>(items: Vec<T>, id: I, row: F) -> ForEach<T, I, F>
@@ -1092,7 +1138,7 @@ where
     F: Fn(&T) -> R + Clone + 'static,
     R: View,
 {
-    ForEach { items, id, row }
+    ForEach { items, id, row, axis: Axis::Vertical, spacing: None }
 }
 
 fn debug_assert_unique_ids(container: &str, ids: impl Iterator<Item = String>) {
