@@ -1237,6 +1237,149 @@ mod tests {
     }
 
     #[test]
+    fn a_task_starts_once_and_dies_with_its_view() {
+        use std::cell::Cell;
+
+        #[derive(Clone)]
+        struct Screen {
+            open: State<bool>,
+            other: State<usize>,
+            starts: Rc<Cell<usize>>,
+        }
+
+        impl Component for Screen {
+            fn body(self, _ctx: &Context) -> impl View {
+                let starts = Rc::clone(&self.starts);
+                if self.open.get() {
+                    Either::First(
+                        text(format!("watching {}", self.other.get())).task(move || {
+                            starts.set(starts.get() + 1);
+                            // a job that never finishes: what matters
+                            // here is who ends it
+                            std::future::pending::<()>()
+                        }),
+                    )
+                } else {
+                    Either::Second(text("closed"))
+                }
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Screen {
+            open: State::new(true),
+            other: State::new(0),
+            starts: Rc::new(Cell::new(0)),
+        };
+
+        let printed = runtime.render_stable(&view);
+        assert!(printed.contains("[.task()]"), "the print says it: {printed}");
+        assert_eq!(view.starts.get(), 1, "the task started on appearance");
+        assert_eq!(motor::task::pending(), 1);
+
+        // a re-render for another reason never restarts it
+        view.other.set(1);
+        runtime.render_stable(&view);
+        assert_eq!(view.starts.get(), 1, "a re-render is not a restart");
+        assert_eq!(motor::task::pending(), 1);
+
+        // the view leaves the tree: the identity sweep drops the slot,
+        // and dropping the handle cancels
+        view.open.set(false);
+        runtime.render_stable(&view);
+        assert_eq!(motor::task::pending(), 0, "the task died with the view");
+    }
+
+    #[test]
+    fn a_skipped_view_keeps_its_task() {
+        use std::cell::Cell;
+
+        #[derive(Clone)]
+        struct Watcher {
+            starts: Rc<Cell<usize>>,
+        }
+
+        impl Component for Watcher {
+            fn body(self, _ctx: &Context) -> impl View {
+                let starts = Rc::clone(&self.starts);
+                text("watching").task(move || {
+                    starts.set(starts.get() + 1);
+                    std::future::pending::<()>()
+                })
+            }
+        }
+
+        #[derive(Clone)]
+        struct Screen {
+            ticks: State<usize>,
+            starts: Rc<Cell<usize>>,
+        }
+
+        impl Component for Screen {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack((
+                    text(format!("tick {}", self.ticks.get())),
+                    Watcher { starts: Rc::clone(&self.starts) },
+                ))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Screen { ticks: State::new(0), starts: Rc::new(Cell::new(0)) };
+        runtime.render_stable(&view);
+        assert_eq!(motor::task::pending(), 1);
+
+        // the parent re-renders and the child is SKIPPED — its effects
+        // still come from the retention, so the task is still declared
+        view.ticks.set(1);
+        runtime.render_stable(&view);
+        assert!(
+            !runtime.body_runs().iter().any(|path| path.contains("Watcher")),
+            "the child was skipped: {:?}",
+            runtime.body_runs()
+        );
+        assert_eq!(view.starts.get(), 1, "and it was not restarted");
+        assert_eq!(motor::task::pending(), 1, "nor cancelled by the sweep");
+    }
+
+    #[test]
+    fn a_task_restarts_when_its_id_moves() {
+        use std::cell::Cell;
+
+        #[derive(Clone)]
+        struct Detail {
+            file: State<usize>,
+            starts: Rc<Cell<usize>>,
+        }
+
+        impl Component for Detail {
+            fn body(self, _ctx: &Context) -> impl View {
+                let starts = Rc::clone(&self.starts);
+                // the id is the file being read: another file, another
+                // read, and the one in flight is cancelled
+                text("detail").task_id(self.file.get(), move || {
+                    starts.set(starts.get() + 1);
+                    std::future::pending::<()>()
+                })
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Detail { file: State::new(0), starts: Rc::new(Cell::new(0)) };
+        let printed = runtime.render_stable(&view);
+        assert!(printed.contains("[.task(id:)]"), "{printed}");
+        assert_eq!(view.starts.get(), 1);
+
+        runtime.render_stable(&view);
+        assert_eq!(view.starts.get(), 1, "the same id keeps the same task");
+
+        view.file.set(1);
+        runtime.render_stable(&view);
+        assert_eq!(view.starts.get(), 2, "a new id starts the work again");
+        assert_eq!(motor::task::pending(), 1, "and the old one is gone");
+    }
+
+    #[test]
     fn a_layered_stack_hugs_the_edge_it_was_given() {
         use crate::layout::{DrawCommand, Proposal, Size};
 

@@ -1369,6 +1369,8 @@ impl Runtime {
             // pump first: side effects fired by THIS render's onAppear
             // nodes must be observed before declaring the tree stable
             let observed_change = self.pump();
+            // whoever stopped being declared stops running
+            effects::sweep_tasks();
             if printed == previous
                 && !observed_change
                 && !self.has_pending_dirty()
@@ -1394,6 +1396,7 @@ impl Runtime {
             self.poll_tasks();
             self.frame_pass(root);
             let observed_change = self.pump();
+            effects::sweep_tasks();
             if !observed_change && !self.has_pending_dirty() && !motor::task::has_ready() {
                 return;
             }

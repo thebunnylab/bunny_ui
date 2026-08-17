@@ -488,6 +488,71 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.task { await … }` — work that belongs to this view. It starts
+    /// on the view's first appearance, never restarts on a re-render,
+    /// and is CANCELLED when the view leaves the tree.
+    ///
+    /// The framework opens no file and no socket: the task is where the
+    /// app does that. What the future needs to own it creates inside
+    /// itself, which is what lets the closure stay `Fn` (and a
+    /// [`ViewExt::task_id`] restart possible):
+    ///
+    /// ```ignore
+    /// row.task(move || async move {
+    ///     let (lines, reader) = task::channel();
+    ///     std::thread::spawn(move || read_the_log(lines));
+    ///     while let Some(line) = reader.recv().await {
+    ///         log.update(|all| all.push(line));
+    ///     }
+    /// })
+    /// ```
+    ///
+    /// Cancelling drops the future where it stands: the reader dies,
+    /// the worker's next `send` answers `Err`, and that is the signal
+    /// to stop working.
+    #[track_caller]
+    fn task<F, Fut>(self, start: F) -> Modified<Self>
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.task_keyed(Location::caller(), None, start)
+    }
+
+    /// `.task(id:) { await … }` — the same, plus a restart: an `id`
+    /// that moves cancels what runs and starts the work again.
+    #[track_caller]
+    fn task_id<I, F, Fut>(self, id: I, start: F) -> Modified<Self>
+    where
+        I: std::fmt::Display,
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.task_keyed(Location::caller(), Some(id.to_string()), start)
+    }
+
+    /// `.task` with an explicit site — same case as
+    /// [`ViewExt::on_change_keyed`].
+    fn task_keyed<F, Fut>(
+        self,
+        site: impl Into<Site>,
+        id: Option<String>,
+        start: F,
+    ) -> Modified<Self>
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        Modified {
+            base: self,
+            modifier: Modifier::Effect {
+                name: "task",
+                detail: if id.is_some() { "(id:)" } else { "()" },
+                effect: effects::task_effect(site.into(), id, start),
+            },
+        }
+    }
+
     /// `.searchable(text: $searchText)`
     fn searchable(self, _text: Binding<String>) -> Modified<Self> {
         Modified {

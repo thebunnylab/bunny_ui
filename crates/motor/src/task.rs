@@ -185,8 +185,14 @@ pub fn set_wake_hook(hook: Arc<dyn Fn() + Send + Sync>) {
 /// Ends a task now. The future drops where it stands, which is what
 /// tells whoever waits on the other side of a [`channel`] to stop.
 pub fn cancel(id: TaskId) {
-    // out first, drop after: the future's own Drop may reach back here
-    let task = EXECUTOR.with(|executor| executor.borrow_mut().tasks.remove(&id));
+    // `try_with`: a handle held in a thread-local slot is dropped while
+    // the thread tears its locals down, and the queue may already be
+    // gone by then — there is nothing left to cancel in that case.
+    // Out first, drop after: the future's own Drop may reach back here.
+    let task = EXECUTOR
+        .try_with(|executor| executor.borrow_mut().tasks.remove(&id))
+        .ok()
+        .flatten();
     drop(task);
 }
 
