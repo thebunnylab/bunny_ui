@@ -356,6 +356,11 @@ pub enum LayoutNode {
         overlay: Rc<LayoutNode>,
         child: Box<LayoutNode>,
     },
+    /// `.window_drag_region()`: pressing the child's frame (where no
+    /// interactive target wins) drags the WINDOW — the scene's own
+    /// title bar on a chrome-less window. Transparent to geometry;
+    /// shells without windows ignore it honestly.
+    DragRegion { child: Box<LayoutNode> },
 }
 
 /// Where a subtree renders when the scene lowers to elements. The v1
@@ -706,6 +711,9 @@ pub struct Placement {
     overlay_queue: Vec<QueuedOverlay>,
     /// The placed overlays, in paint order (last = topmost).
     pub overlays: Vec<OverlayPlacement>,
+    /// Window-drag regions (clipped) — where a press with no
+    /// interactive target drags the window on the desktop shell.
+    pub drag_regions: Vec<Rect>,
     /// The Dom capture, when that mode is on ([`layout_dom`]) — the
     /// placement braços feed it the SEMANTIC scene while they walk.
     /// `None` costs one branch per hook and nothing else.
@@ -813,6 +821,9 @@ pub struct LayoutResult {
     /// The placed popovers, in paint order (last = topmost) — each one
     /// a suffix slice of `display`.
     pub overlays: Vec<OverlayPlacement>,
+    /// Window-drag regions — a press here with no interactive target
+    /// drags the window on the desktop shell.
+    pub drag_regions: Vec<Rect>,
 }
 
 /// Runs both phases from the root with the default environment — the
@@ -864,6 +875,7 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         fields: out.fields,
         misses: out.misses,
         overlays: out.overlays,
+        drag_regions: out.drag_regions,
     }
 }
 
@@ -896,6 +908,7 @@ pub fn layout_dom(
             fields: out.fields,
             misses: out.misses,
             overlays: out.overlays,
+        drag_regions: out.drag_regions,
         },
         scene,
     )
@@ -1116,7 +1129,8 @@ impl LayoutNode {
             | LayoutNode::Styled { child, .. }
             | LayoutNode::Animated { child, .. }
             | LayoutNode::Island { child }
-            | LayoutNode::Anchored { child, .. } => child.is_flexible(axis),
+            | LayoutNode::Anchored { child, .. }
+            | LayoutNode::DragRegion { child } => child.is_flexible(axis),
             // a stack that HOLDS something flexible is itself flexible
             // (a panel with a scroll inside wants the leftover space —
             // nesting it must not freeze it at its natural extent)
@@ -1159,6 +1173,7 @@ impl LayoutNode {
             | LayoutNode::Island { child }
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::Anchored { child, .. }
+            | LayoutNode::DragRegion { child }
             | LayoutNode::Frame { child, .. } => child.first_baseline(env),
             LayoutNode::Padding { edges, child } => {
                 child.first_baseline(env).map(|baseline| baseline + edges.top)
@@ -1236,6 +1251,11 @@ impl LayoutNode {
             // the anchor's geometry IS the node's — the overlay never
             // participates in the measure
             LayoutNode::Anchored { child, .. } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            LayoutNode::DragRegion { child } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -1651,6 +1671,18 @@ impl LayoutNode {
                     anchor,
                     anchor_visible,
                 });
+            }
+
+            (LayoutNode::DragRegion { child }, Fit::Wrapped(_, fit)) => {
+                child.place(frame, *fit, env, out);
+                // clipped like a hit: what is not visible cannot drag
+                let region = match out.current_clip() {
+                    Some(clip) => frame.intersection(clip),
+                    None => Some(frame),
+                };
+                if let Some(region) = region {
+                    out.drag_regions.push(region);
+                }
             }
 
             (LayoutNode::Image { source, fit, .. }, Fit::Leaf) => match source {

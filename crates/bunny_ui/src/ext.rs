@@ -471,6 +471,17 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// Marks THIS view as a window-drag handle: on a chrome-less
+    /// desktop window (`Chrome::Scene`), pressing it where no button
+    /// wins drags the window — the scene's own title bar. Shells
+    /// without a window to drag ignore it honestly (web, headless).
+    fn window_drag_region(self) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::WindowDragRegion,
+        }
+    }
+
     /// An anchored popover: THIS view is the anchor, `side` the
     /// preferred edge (flip-then-clamp when there is no room). Closes
     /// on Escape and on a press outside — the press is consumed, never

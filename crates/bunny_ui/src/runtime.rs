@@ -117,6 +117,9 @@ pub struct Runtime {
     /// topmost) — the outside-press dismissal and the shells' second
     /// surfaces read from here.
     last_overlays: RefCell<Vec<OverlayPlacement>>,
+    /// Window-drag regions of the last layout — the desktop shell's
+    /// press gate consults them.
+    last_drag_regions: RefCell<Vec<Rect>>,
     /// Where popovers may live, in layout coordinates. `None` = the
     /// viewport; the desktop shell sets the SCREEN — overflow becomes
     /// plain geometry.
@@ -187,6 +190,16 @@ impl Runtime {
         self.overlay_bounds.set(bounds);
     }
 
+    /// Should a press at this point drag the WINDOW? True inside a
+    /// `.window_drag_region()` where no interactive target wins — a
+    /// button on the scene's own title bar still clicks.
+    pub fn window_drag_at(&self, x: Px, y: Px) -> bool {
+        if crate::layout::hit_test(&self.last_hits.borrow(), x, y).is_some() {
+            return false;
+        }
+        self.last_drag_regions.borrow().iter().any(|region| region.contains(x, y))
+    }
+
     fn with_parts(ctx: Context, text: Rc<dyn TextEngine>) -> Self {
         let runtime = Runtime {
             ctx,
@@ -210,6 +223,7 @@ impl Runtime {
             animator: RefCell::new(crate::anim::Animator::default()),
             last_proposal: Cell::new(None),
             last_overlays: RefCell::new(Vec::new()),
+            last_drag_regions: RefCell::new(Vec::new()),
             overlay_bounds: Cell::new(None),
             dom: RefCell::new(crate::dom::DomLowering::default()),
             root_is_boundary: Cell::new(false),
@@ -1169,6 +1183,7 @@ impl Runtime {
         *self.last_scrolls.borrow_mut() = result.scrolls.clone();
         *self.last_fields.borrow_mut() = result.fields.clone();
         *self.last_overlays.borrow_mut() = result.overlays.clone();
+        *self.last_drag_regions.borrow_mut() = result.drag_regions.clone();
         // an applied-target memory whose region left the scene goes
         // with it — live regions keep theirs (the wheel stays sovereign)
         self.scroll_targets

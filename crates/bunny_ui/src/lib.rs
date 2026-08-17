@@ -2711,6 +2711,48 @@ mod tests {
         );
     }
 
+    // MARK: - Window drag regions
+
+    #[test]
+    fn a_drag_region_reports_its_frame_and_yields_to_buttons() {
+        #[derive(Clone)]
+        struct Barred;
+        impl Component for Barred {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    hstack!(text("title"), spacer(), button(text("act"), || {}))
+                        .frame(200.0, 40.0)
+                        .window_drag_region(),
+                    spacer().frame(200.0, 160.0),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        let result = runtime.layout(
+            &Barred,
+            crate::layout::Proposal::exact(crate::layout::Size {
+                width: 200.0,
+                height: 200.0,
+            }),
+        );
+        assert_eq!(result.drag_regions.len(), 1, "one bar, one region");
+        let bar = result.drag_regions[0];
+        assert_eq!((bar.size.width, bar.size.height), (200.0, 40.0));
+
+        // empty bar space drags; the button on it still clicks; the
+        // body below never drags
+        assert!(runtime.window_drag_at(10.0, 20.0), "bare bar drags");
+        let (_, button_rect) = result.hits.last().expect("the bar's button").clone();
+        assert!(
+            !runtime.window_drag_at(
+                button_rect.origin.x + button_rect.size.width / 2.0,
+                button_rect.origin.y + button_rect.size.height / 2.0,
+            ),
+            "an interactive target wins over the drag"
+        );
+        assert!(!runtime.window_drag_at(100.0, 120.0), "the body is not a handle");
+    }
+
     // MARK: - Popovers
 
     use crate::action::{Key, KeyPattern, OVERLAY_DISMISS};

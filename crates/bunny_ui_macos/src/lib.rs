@@ -71,11 +71,37 @@ pub fn run_window(title: &str, size: Size, root: impl View) {
     run_window_with(title, size, runtime, root)
 }
 
+/// Who draws the window's top edge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Chrome {
+    /// The system title bar.
+    Native,
+    /// The SCENE draws the bar: transparent titlebar, hidden title,
+    /// native traffic lights preserved at the top-left corner (reserve
+    /// roughly 78×28 logical points around them). Mark the bar with
+    /// [`ViewExt::window_drag_region`] so the window drags by it.
+    ///
+    /// [`ViewExt::window_drag_region`]: bunny_ui::ext::ViewExt::window_drag_region
+    Scene,
+}
+
 /// Like [`run_window`], but with the `Runtime` assembled by the caller —
 /// the path for apps with their own environment (the text engine is still
 /// the assembler's responsibility).
 pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl View) {
-    let window = ffi::create_window(title, size.width, size.height);
+    run_window_chrome(title, size, Chrome::Native, runtime, root)
+}
+
+/// Like [`run_window_with`], choosing who draws the window's top edge.
+pub fn run_window_chrome(
+    title: &str,
+    size: Size,
+    chrome: Chrome,
+    runtime: Runtime,
+    root: impl View,
+) {
+    let window =
+        ffi::create_window(title, size.width, size.height, chrome == Chrome::Scene);
     // two owners: the keyboard gate and the event handler
     let runtime = Rc::new(runtime);
     let root = Rc::new(root);
@@ -248,6 +274,14 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
         ffi::set_frame_driver_paused(!runtime.wants_frame());
         }
     };
+
+    // the drag gate: a press on a `.window_drag_region()` (with no
+    // interactive target above it) moves the window — the scene's own
+    // title bar on a chrome-less window
+    ffi::set_drag_gate(Box::new({
+        let runtime = Rc::clone(&runtime);
+        move |x, y| runtime.window_drag_at(x, y)
+    }));
 
     // the gate: keymap BEFORE the input system — bare chars with a focused
     // field pass straight through (typing is never stolen); a binding with

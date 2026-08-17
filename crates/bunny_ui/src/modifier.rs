@@ -77,6 +77,9 @@ pub enum Modifier {
     Rendering(crate::layout::Rendering),
     /// Declares a key context active while this view is mounted.
     KeyContext(&'static str),
+    /// Pressing this view (where no interactive target wins) drags the
+    /// WINDOW — the scene's own title bar on a chrome-less window.
+    WindowDragRegion,
 
     // MARK: - Real interaction (a pointer target without chrome — the Button
     // without the outfit; the action fires on up-inside like the Button's)
@@ -175,6 +178,7 @@ impl Modifier {
             ),
             Modifier::Rendering(mode) => format!(" [.rendering(.{mode:?})]"),
             Modifier::KeyContext(name) => format!(" [.keyContext({name})]"),
+            Modifier::WindowDragRegion => " [.windowDragRegion()]".into(),
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
@@ -668,6 +672,11 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 // declaration, not paint: retained with the entry — the
                 // context deactivates when the view unmounts
                 crate::reconciler::attribute_context(name);
+            }
+            Modifier::WindowDragRegion => {
+                out.wrap_last_layout(|node| LayoutNode::DragRegion {
+                    child: Box::new(node),
+                });
             }
             Modifier::OnClick(action) => {
                 // the same registration as the Button: action retained in the

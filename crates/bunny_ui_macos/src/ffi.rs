@@ -141,6 +141,8 @@ unsafe extern "C" {
     fn msg_void_id_i64(obj: Id, sel: Sel, a: Id, b: i64);
     #[link_name = "objc_msgSend"]
     fn msg_void_rect_bool(obj: Id, sel: Sel, rect: CGRect, flag: i8);
+    #[link_name = "objc_msgSend"]
+    fn msg_void_i64(obj: Id, sel: Sel, a: i64);
 }
 
 // AppKit/QuartzCore come in via the ObjC runtime; the link guarantees the
@@ -286,8 +288,33 @@ unsafe fn event_layout_point(this: Id, event: Id) -> (f64, f64) {
     }
 }
 
+thread_local! {
+    /// The window-drag gate: `true` = this press drags the window (the
+    /// scene declared a drag region there and nothing interactive won).
+    static DRAG_GATE: RefCell<Option<Box<dyn Fn(f64, f64) -> bool>>> =
+        const { RefCell::new(None) };
+}
+
+/// Installs the drag gate — the shell wires it to the runtime's drag
+/// regions once, at boot.
+pub fn set_drag_gate(gate: Box<dyn Fn(f64, f64) -> bool>) {
+    DRAG_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
 extern "C" fn bunny_mouse_down(this: Id, _sel: Sel, event: Id) {
     let (x, y) = unsafe { event_layout_point(this, event) };
+    // the scene's own title bar: a press on a drag region (with no
+    // interactive target above it) moves the WINDOW — the event goes
+    // to AppKit whole and never reaches the runtime
+    let dragging =
+        DRAG_GATE.with(|gate| gate.borrow().as_ref().is_some_and(|gate| gate(x, y)));
+    if dragging {
+        unsafe {
+            let window = msg_id(this, sel("window"));
+            msg_void_id(window, sel("performWindowDragWithEvent:"), event);
+        }
+        return;
+    }
     dispatch(AppEvent::MouseDown { x, y });
 }
 
@@ -1060,7 +1087,15 @@ extern "C" fn bunny_draw_rect(this: Id, _sel: Sel, _dirty: CGRect) {
 }
 
 /// Creates the app + the window with the event view, ready for blit.
-pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
+/// `scene_chrome` hides the system title bar: full-size content, a
+/// transparent titlebar and no title text — the native traffic lights
+/// stay at the corner and the SCENE draws the bar.
+pub fn create_window(
+    title: &str,
+    width: f64,
+    height: f64,
+    scene_chrome: bool,
+) -> WindowHandle {
     unsafe {
         let pool = objc_autoreleasePoolPush();
         register_classes();
@@ -1074,7 +1109,12 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
             size: CGSize { width, height },
         };
         // titled | closable | miniaturizable | resizable
-        let style: u64 = 1 | 2 | 4 | 8;
+        // (+ full-size content when the scene owns the chrome)
+        let style: u64 = if scene_chrome {
+            1 | 2 | 4 | 8 | (1 << 15)
+        } else {
+            1 | 2 | 4 | 8
+        };
         let window = msg_id(class("NSWindow"), sel("alloc"));
         let window = msg_init_window(
             window,
@@ -1084,6 +1124,12 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
             2, // buffered
             0,
         );
+        if scene_chrome {
+            msg_void_bool(window, sel("setTitlebarAppearsTransparent:"), 1);
+            // NSWindowTitleHidden = 1 — the title still names the
+            // window in Mission Control and the Dock
+            msg_void_i64(window, sel("setTitleVisibility:"), 1);
+        }
 
         let title = CString::new(title).expect("title without NUL");
         let ns_title = msg_id_cstr(
