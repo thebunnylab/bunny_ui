@@ -29,7 +29,7 @@ use motor::state::{Context, EffectFn};
 use motor::view::RenderNode;
 
 use crate::erased::Erased;
-use crate::layout::{Interaction, LayoutNode};
+use crate::layout::LayoutNode;
 use crate::text_input::{CaretState, EditCommand};
 
 /// Uma ação interativa registrada durante o render: (caminho do alvo, o
@@ -99,6 +99,33 @@ thread_local! {
     static RETAINED: RefCell<BTreeMap<String, Entry>> = const { RefCell::new(BTreeMap::new()) };
     static PASS: RefCell<PassState> = RefCell::new(PassState::default());
     static LAST_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A árvore de layout retida de uma fronteira, emprestada no lugar — o
+/// measure e o place resolvem `BoundaryRef` por aqui, SEM costurar cópia
+/// expandida. Empréstimos aninham (ref dentro de ref = borrows
+/// compartilhados do mesmo RefCell); nenhum body roda durante o layout,
+/// então não há re-empréstimo mutável possível.
+pub(crate) fn with_retained_layout<R>(
+    path: &str,
+    reader: impl FnOnce(Option<&LayoutNode>) -> R,
+) -> R {
+    RETAINED.with(|retained| {
+        let retained = retained.borrow();
+        reader(retained.get(path).map(|entry| &entry.layout))
+    })
+}
+
+/// A fronteira está retida? (O guarda do frame estável do `Runtime`.)
+pub(crate) fn is_retained(path: &str) -> bool {
+    RETAINED.with(|retained| retained.borrow().contains_key(path))
+}
+
+/// Registra que o frame corrente foi servido SEM pass (raiz estável
+/// sintetizada) — o contrato observável de `body_runs` continua: este
+/// frame rodou zero bodies.
+pub(crate) fn note_stable_frame() {
+    LAST_BODY_RUNS.with(|last| last.borrow_mut().clear());
 }
 
 const REF_MARK: char = '\u{1}';
@@ -501,108 +528,6 @@ fn parse_ref(line: &str) -> Option<(&str, &str)> {
     let rest = line.strip_prefix(REF_MARK)?;
     let end = rest.find(REF_MARK)?;
     Some((&rest[..end], &rest[end + REF_MARK.len_utf8()..]))
-}
-
-/// O estado de frame que a expansão estampa na cópia expandida: ponteiro
-/// (hover/pressed nos `Interactive`) e edição (foco/caret/seleção nos
-/// `Field`). A retenção nunca guarda nada disso.
-pub(crate) struct Stamp<'a> {
-    pub interaction: &'a Interaction,
-    pub focus: Option<&'a str>,
-    pub carets: &'a HashMap<String, CaretState>,
-    /// Fase do blink — o caret só pinta quando visível.
-    pub caret_visible: bool,
-}
-
-/// Resolve referências da árvore de LAYOUT contra a retenção — o gêmeo do
-/// [`expand`] para a outra saída do render — e ESTAMPA o estado de frame
-/// (ver [`Stamp`]). Hover/caret re-expandem e re-pintam sem re-rodar body
-/// nenhum.
-pub(crate) fn expand_layout(node: &LayoutNode, interaction: &Stamp) -> LayoutNode {
-    match node {
-        LayoutNode::BoundaryRef { path } => {
-            let retained = RETAINED.with(|retained| {
-                retained.borrow().get(path).map(|entry| entry.layout.clone())
-            });
-            let Some(inner) = retained else {
-                debug_assert!(false, "referência de layout sem retenção: {path}");
-                return LayoutNode::Leaf { size: crate::layout::Size::default() };
-            };
-            expand_layout(&inner, interaction)
-        }
-        LayoutNode::Stack { axis, spacing, align, children } => LayoutNode::Stack {
-            axis: *axis,
-            spacing: *spacing,
-            align: *align,
-            children: children.iter().map(|child| expand_layout(child, interaction)).collect(),
-        },
-        LayoutNode::Layered { children } => LayoutNode::Layered {
-            children: children.iter().map(|child| expand_layout(child, interaction)).collect(),
-        },
-        LayoutNode::Boundary { path, children } => LayoutNode::Boundary {
-            path: path.clone(),
-            children: children.iter().map(|child| expand_layout(child, interaction)).collect(),
-        },
-        LayoutNode::Padding { edges, child } => LayoutNode::Padding {
-            edges: *edges,
-            child: Box::new(expand_layout(child, interaction)),
-        },
-        LayoutNode::Frame { width, height, child } => LayoutNode::Frame {
-            width: *width,
-            height: *height,
-            child: Box::new(expand_layout(child, interaction)),
-        },
-        LayoutNode::MaxFrame { max_width, max_height, align, child } => {
-            LayoutNode::MaxFrame {
-                max_width: *max_width,
-                max_height: *max_height,
-                align: *align,
-                child: Box::new(expand_layout(child, interaction)),
-            }
-        }
-        LayoutNode::Scroll { path, child } => LayoutNode::Scroll {
-            path: path.clone(),
-            child: Box::new(expand_layout(child, interaction)),
-        },
-        LayoutNode::Styled { props, child } => LayoutNode::Styled {
-            props: *props,
-            child: Box::new(expand_layout(child, interaction)),
-        },
-        LayoutNode::Interactive { path, child, .. } => LayoutNode::Interactive {
-            path: path.clone(),
-            hovered: interaction.interaction.hovered.as_deref() == Some(path.as_str()),
-            // pressed VISUAL só com o ponteiro dentro do alvo (semântica
-            // AppKit: arrastar para fora solta, voltar re-arma)
-            pressed: interaction.interaction.pressed.as_deref() == Some(path.as_str())
-                && interaction.interaction.hovered.as_deref() == Some(path.as_str()),
-            child: Box::new(expand_layout(child, interaction)),
-        },
-        LayoutNode::Field { path, content, placeholder, .. } => {
-            let focused = interaction.focus == Some(path.as_str());
-            let state = interaction.carets.get(path).copied().unwrap_or_default();
-            // clampa contra o conteúdo ATUAL (o app pode ter trocado a
-            // string por fora do editor)
-            let clamp = |index: usize| crate::text_input::clamp_index(content, index);
-            LayoutNode::Field {
-                path: path.clone(),
-                content: content.clone(),
-                placeholder: placeholder.clone(),
-                focused,
-                caret: (focused && interaction.caret_visible).then(|| clamp(state.caret)),
-                selection: focused
-                    .then(|| state.selection())
-                    .flatten()
-                    .map(|(start, end)| (clamp(start), clamp(end)))
-                    .filter(|(start, end)| start < end),
-                marked: focused
-                    .then_some(state.marked)
-                    .flatten()
-                    .map(|(start, end)| (clamp(start), clamp(end)))
-                    .filter(|(start, end)| start < end),
-            }
-        }
-        leaf => leaf.clone(),
-    }
 }
 
 /// Resolve referências contra a retenção: expande o nó retido (recursivo —

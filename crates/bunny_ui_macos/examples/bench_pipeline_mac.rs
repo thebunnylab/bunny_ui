@@ -191,7 +191,7 @@ fn main() {
     let engine = std::rc::Rc::new(CoreTextEngine::new());
     let runtime = Runtime::new().text_engine(engine.clone());
     runtime.bind(KeyPattern::key(Key::Down), SELECT_NEXT);
-    runtime.render_stable(&finder);
+    runtime.settle(&finder);
     runtime.layout(&finder, viewport);
 
     let result = runtime.layout(&finder, viewport);
@@ -209,14 +209,14 @@ fn main() {
             runtime.key(EditCommand::Backspace);
         }
         forward = !forward;
-        runtime.render_stable(&finder);
+        runtime.settle(&finder);
         runtime.layout(&finder, viewport);
     }));
 
     let select = runtime.match_key(&KeyPattern::key(Key::Down)).unwrap();
     reports.push(measure("select_next (dispatch+layout)", 5, 200, || {
         runtime.dispatch_action(select);
-        runtime.render_stable(&finder);
+        runtime.settle(&finder);
         runtime.layout(&finder, viewport);
     }));
 
@@ -263,3 +263,4 @@ fn main() {
     }
     println!("\nfixture: finder 30 rows; viewport 760×640; texto CoreText (shaping real)");
 }
+

@@ -946,8 +946,8 @@ mod tests {
         // vazio: o placeholder pinta na cor própria, sem foco
         let has_placeholder = result.display.iter().any(|command| matches!(
             command,
-            DrawCommand::TextLine { color, content, .. }
-                if *color == Color::PLACEHOLDER && content == "Your name"
+            DrawCommand::TextLine { color, content, range, .. }
+                if *color == Color::PLACEHOLDER && &content[range.0..range.1] == "Your name"
         ));
         assert!(has_placeholder);
 

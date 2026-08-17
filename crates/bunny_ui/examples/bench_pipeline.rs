@@ -211,7 +211,7 @@ fn main() {
     let finder = Finder { query: State::new(String::new()), selected: State::new(0) };
     let runtime = Runtime::new();
     runtime.bind(KeyPattern::key(Key::Down), SELECT_NEXT);
-    runtime.render_stable(&finder);
+    runtime.settle(&finder);
     runtime.layout(&finder, viewport);
 
     // foca o campo (digitação vai pelo caminho real do editor)
@@ -228,13 +228,14 @@ fn main() {
         runtime.layout(&finder, viewport);
     }));
 
-    // bodies do PRIMEIRO pass de um frame (o render_stable termina num
-    // pass estável de zero bodies — o que interessa é o primeiro)
+    // bodies do PRIMEIRO pass de frame de uma mutação: o layout com
+    // sujeira pendente roda exatamente um pass real — os bodies dele são
+    // os do frame (o settle na sequência só confirma)
     let first_pass_bodies = |mutate: &dyn Fn()| {
         mutate();
-        runtime.render(&finder);
+        runtime.layout(&finder, viewport);
         let bodies = runtime.body_runs().len();
-        runtime.render_stable(&finder);
+        runtime.settle(&finder);
         runtime.layout(&finder, viewport);
         bodies
     };
@@ -243,7 +244,7 @@ fn main() {
     let typing_bodies =
         first_pass_bodies(&|| _ = runtime.key(EditCommand::Insert("e".into())));
     let _ = runtime.key(EditCommand::Backspace);
-    runtime.render_stable(&finder);
+    runtime.settle(&finder);
     let mut forward = true;
     let typing = measure("keystroke (filter+layout)", 5, 200, 0, || {
         if forward {
@@ -252,7 +253,7 @@ fn main() {
             runtime.key(EditCommand::Backspace);
         }
         forward = !forward;
-        runtime.render_stable(&finder);
+        runtime.settle(&finder);
         runtime.layout(&finder, viewport);
     });
     reports.push(Report { bodies: typing_bodies, ..typing });
@@ -262,7 +263,7 @@ fn main() {
     let selection_bodies = first_pass_bodies(&|| _ = runtime.dispatch_action(select));
     let selection = measure("select_next (dispatch+layout)", 5, 200, 0, || {
         runtime.dispatch_action(select);
-        runtime.render_stable(&finder);
+        runtime.settle(&finder);
         runtime.layout(&finder, viewport);
     });
     reports.push(Report { bodies: selection_bodies, ..selection });
@@ -282,7 +283,7 @@ fn main() {
     // 5. wheel: offset do engine + layout, zero render
     runtime.key(EditCommand::SelectAll);
     runtime.key(EditCommand::Backspace); // lista cheia de volta
-    runtime.render_stable(&finder);
+    runtime.settle(&finder);
     runtime.layout(&finder, viewport);
     let mut down = true;
     reports.push(measure("wheel (offset+layout)", 5, 200, 0, || {

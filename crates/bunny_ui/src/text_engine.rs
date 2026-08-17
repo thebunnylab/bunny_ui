@@ -6,9 +6,10 @@
 //! componente sabe qual engine está ativo — [`TextEngine`] é a única
 //! porta (uma borda declarada: `Rc<dyn TextEngine>` no `Runtime`).
 //!
-//! O [`MeasureCache`] é double-buffer por passada (prev/current): um hit
-//! promove, a troca de frame descarta o que ninguém pediu — LRU de frame
-//! exato, sem timer. Nota para o sistema de wrap real (shape separado de
+//! O [`MeasureCache`] envelhece por passada: um hit rejuvenesce a
+//! entrada, e quem fica [`CACHE_KEEP_FRAMES`] passadas sem uso cai —
+//! digitar ALTERNA conteúdo (backspace restaura, filtro esconde e
+//! revela), e shaping não se re-paga por um frame de ausência. Nota para o sistema de wrap real (shape separado de
 //! quebra, cache em 2 níveis): a chave GANHA o modo da sondagem — cache de
 //! linha envenenado por proposta é bug clássico.
 
@@ -380,31 +381,49 @@ pub fn break_lines(
 
 // MARK: - Cache de medição
 
-type BreakKey = (String, FontKey, u32);
 type BreakLines = std::rc::Rc<Vec<(usize, usize)>>;
 
 /// Double-buffer prev/current trocado por passada de layout: hit promove
 /// para o current, a troca descarta o que ninguém pediu no frame — LRU de
 /// frame exato, sem timer.
 ///
-/// A quebra tem mapa PRÓPRIO com a LARGURA na chave — o modo da sondagem
-/// nunca compartilha entrada com a medição irrestrita (cache de linha
-/// envenenado por proposta é bug clássico; aqui é irrepresentável).
+/// Os mapas são ANINHADOS por fonte (e por largura, nas quebras): o
+/// lookup do caminho quente consulta por `&str` sem alocar chave nenhuma
+/// — só o MISS paga o `to_string`. A quebra tem mapa próprio com a
+/// LARGURA na chave — o modo da sondagem nunca compartilha entrada com a
+/// medição irrestrita (cache envenenado por proposta é irrepresentável).
 #[derive(Default)]
 pub struct MeasureCache {
-    prev: RefCell<HashMap<(String, FontKey), LineMetrics>>,
-    current: RefCell<HashMap<(String, FontKey), LineMetrics>>,
-    breaks_prev: RefCell<HashMap<BreakKey, BreakLines>>,
-    breaks_current: RefCell<HashMap<BreakKey, BreakLines>>,
+    /// O relógio do cache: um tick por passada de layout — a idade das
+    /// entradas se mede nele.
+    frame: std::cell::Cell<u32>,
+    lines: RefCell<HashMap<FontKey, HashMap<String, (LineMetrics, std::cell::Cell<u32>)>>>,
+    breaks:
+        RefCell<HashMap<(FontKey, u32), HashMap<String, (BreakLines, std::cell::Cell<u32>)>>>,
 }
 
+/// Quantos frames uma entrada sobrevive sem uso. Digitar ALTERNA conteúdo
+/// (backspace restaura a string de dois frames atrás; filtro esconde e
+/// revela rows) — shaping é caro demais para re-pagar por causa de um
+/// frame de ausência. Oito frames de folga custam alguns KiB.
+const CACHE_KEEP_FRAMES: u32 = 8;
+
 impl MeasureCache {
-    /// Início de uma passada de layout: o current vira prev.
+    /// Início de uma passada de layout: tick do relógio + varredura de
+    /// idade (solta o que ficou [`CACHE_KEEP_FRAMES`] sem uso).
     pub fn begin_frame(&self) {
-        let current = std::mem::take(&mut *self.current.borrow_mut());
-        *self.prev.borrow_mut() = current;
-        let breaks = std::mem::take(&mut *self.breaks_current.borrow_mut());
-        *self.breaks_prev.borrow_mut() = breaks;
+        let frame = self.frame.get().wrapping_add(1);
+        self.frame.set(frame);
+        let mut lines = self.lines.borrow_mut();
+        for by_text in lines.values_mut() {
+            by_text.retain(|_, (_, used)| frame.wrapping_sub(used.get()) <= CACHE_KEEP_FRAMES);
+        }
+        lines.retain(|_, by_text| !by_text.is_empty());
+        let mut breaks = self.breaks.borrow_mut();
+        for by_text in breaks.values_mut() {
+            by_text.retain(|_, (_, used)| frame.wrapping_sub(used.get()) <= CACHE_KEEP_FRAMES);
+        }
+        breaks.retain(|_, by_text| !by_text.is_empty());
     }
 
     pub fn get_or_measure(
@@ -413,18 +432,23 @@ impl MeasureCache {
         font: &FontSpec,
         engine: &dyn TextEngine,
     ) -> LineMetrics {
-        // (chave aloca por consulta — o cache de glyph-run futuro troca
-        // isto por identidade de Rc; anotado, não agora)
-        let key = (text.to_string(), font.key());
-        if let Some(hit) = self.current.borrow().get(&key) {
-            return *hit;
-        }
-        if let Some(hit) = self.prev.borrow_mut().remove(&key) {
-            self.current.borrow_mut().insert(key, hit);
-            return hit;
+        let font_key = font.key();
+        if let Some((metrics, used)) = self
+            .lines
+            .borrow()
+            .get(&font_key)
+            .and_then(|by_text| by_text.get(text))
+        {
+            // hit quente: zero alocação, zero movimentação — só rejuvenesce
+            used.set(self.frame.get());
+            return *metrics;
         }
         let measured = engine.measure_line(text, font);
-        self.current.borrow_mut().insert(key, measured);
+        self.lines
+            .borrow_mut()
+            .entry(font_key)
+            .or_default()
+            .insert(text.to_string(), (measured, std::cell::Cell::new(self.frame.get())));
         measured
     }
 
@@ -436,17 +460,22 @@ impl MeasureCache {
         max_width: Px,
         engine: &dyn TextEngine,
     ) -> BreakLines {
-        let key = (text.to_string(), font.key(), (max_width * 1000.0).round() as u32);
-        if let Some(hit) = self.breaks_current.borrow().get(&key) {
-            return hit.clone();
+        let mode = (font.key(), (max_width * 1000.0).round() as u32);
+        if let Some((broken, used)) = self
+            .breaks
+            .borrow()
+            .get(&mode)
+            .and_then(|by_text| by_text.get(text))
+        {
+            used.set(self.frame.get());
+            return broken.clone();
         }
-        if let Some(hit) = self.breaks_prev.borrow_mut().remove(&key) {
-            self.breaks_current.borrow_mut().insert(key, hit.clone());
-            return hit;
-        }
-        let broken =
-            std::rc::Rc::new(break_lines(text, font, max_width, engine, self));
-        self.breaks_current.borrow_mut().insert(key, broken.clone());
+        let broken = std::rc::Rc::new(break_lines(text, font, max_width, engine, self));
+        self.breaks
+            .borrow_mut()
+            .entry(mode)
+            .or_default()
+            .insert(text.to_string(), (broken.clone(), std::cell::Cell::new(self.frame.get())));
         broken
     }
 }
@@ -479,14 +508,14 @@ mod tests {
         let narrow = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 40.0, &PixelFont);
         assert_eq!(narrow.len(), 2, "larguras NUNCA compartilham entrada");
 
-        // double-buffer: o frame seguinte promove a MESMA alocação
+        // idade: o frame seguinte devolve a MESMA alocação
         cache.begin_frame();
         let promoted = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 40.0, &PixelFont);
         assert!(std::rc::Rc::ptr_eq(&narrow, &promoted));
     }
 
     #[test]
-    fn measure_cache_double_buffers_between_frames() {
+    fn measure_cache_ages_out_after_keep_frames() {
         use std::cell::Cell;
         use std::rc::Rc;
 
@@ -512,11 +541,20 @@ mod tests {
 
         cache.begin_frame();
         cache.get_or_measure("hello", &FontSpec::DEFAULT, &engine);
-        assert_eq!(calls.get(), 1, "o frame seguinte promove do prev — zero medições novas");
+        assert_eq!(calls.get(), 1, "o frame seguinte rejuvenesce — zero medições novas");
 
-        cache.begin_frame();
-        cache.begin_frame();
+        // dentro da janela de idade a entrada sobrevive SEM uso — digitar
+        // alterna conteúdo e shaping não se re-paga por um frame de ausência
+        for _ in 0..CACHE_KEEP_FRAMES {
+            cache.begin_frame();
+        }
         cache.get_or_measure("hello", &FontSpec::DEFAULT, &engine);
-        assert_eq!(calls.get(), 2, "dois frames sem uso descartam a entrada");
+        assert_eq!(calls.get(), 1, "ausência DENTRO da janela não descarta");
+
+        for _ in 0..=CACHE_KEEP_FRAMES {
+            cache.begin_frame();
+        }
+        cache.get_or_measure("hello", &FontSpec::DEFAULT, &engine);
+        assert_eq!(calls.get(), 2, "passar da janela descarta a entrada");
     }
 }

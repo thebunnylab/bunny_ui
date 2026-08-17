@@ -86,6 +86,14 @@ pub struct Runtime {
     /// O keymap do app: padrão de tecla → ação. Config do Runtime (como o
     /// engine de texto), não retenção — bind é declaração de intenção.
     keymap: RefCell<HashMap<KeyPattern, ActionId>>,
+    /// O último pass viu a raiz virar UMA fronteira (`Boundary`/ref)? Só
+    /// então o frame estável pode sintetizar a referência sem andar o
+    /// pass — raiz sem fronteira sai fresca do walk a cada frame.
+    root_is_boundary: Cell<bool>,
+    /// A retenção pode conter entries SEM linhas de print (construídas no
+    /// caminho de frame, que não formata) — imprimir de novo reconstrói
+    /// uma vez, e o oráculo full == incremental segue byte a byte.
+    printless: Cell<bool>,
 }
 
 impl Default for Runtime {
@@ -128,6 +136,8 @@ impl Runtime {
             last_fields: RefCell::new(Vec::new()),
             theme_version: Cell::new(crate::theme::version()),
             keymap: RefCell::new(HashMap::new()),
+            root_is_boundary: Cell::new(false),
+            printless: Cell::new(false),
         }
     }
 
@@ -467,7 +477,7 @@ impl Runtime {
         scale: usize,
         background: crate::layout::Color,
     ) -> crate::raster::Bitmap {
-        self.render_stable(root);
+        self.settle(root);
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
         let pointer = self.interaction.borrow().pointer;
         if let Some(point) = pointer
@@ -486,11 +496,29 @@ impl Runtime {
     }
 
     pub fn render(&self, root: &impl View) -> String {
+        // retenção construída sem print não tem linha para expandir —
+        // reconstrói uma vez e volta ao incremental normal
+        if self.printless.get() {
+            reconciler::clear();
+            self.printless.set(false);
+        }
+        crate::view::set_print(true);
         self.render_pass(root)
             .into_nodes()
             .iter()
             .map(|node| reconciler::expand(node).print())
             .collect()
+    }
+
+    /// O pass do caminho de FRAME: idêntico ao de print, mas as linhas da
+    /// árvore impressa nem são formatadas (imprimir é para gente; frame é
+    /// para pixel).
+    fn frame_pass(&self, root: &impl View) -> NodeList {
+        crate::view::set_print(false);
+        self.printless.set(true);
+        let nodes = self.render_pass(root);
+        crate::view::set_print(true);
+        nodes
     }
 
     /// Layout do frame atual: roda um pass (incremental — árvore estável =
@@ -501,33 +529,54 @@ impl Runtime {
         root: &impl View,
         proposal: crate::layout::Proposal,
     ) -> crate::layout::LayoutResult {
-        let mut nodes = self.render_pass(root);
-        // o estado de frame é estampado na CÓPIA expandida — a retenção
-        // nunca guarda ponteiro nem caret
+        // frame ESTÁVEL de raiz-fronteira (hover, wheel, blink, o layout
+        // pós-settle): nada sujo, mesmo tema, raiz retida — o walk seria
+        // all-skip e emitiria exatamente UMA referência; sintetiza a
+        // referência e pula o pass inteiro. Qualquer outra situação anda
+        // o pass de verdade.
+        let stable_root = (self.root_is_boundary.get()
+            && crate::theme::version() == self.theme_version.get()
+            && !self.has_pending_dirty())
+        .then(|| self.last_root.borrow().clone())
+        .flatten()
+        .filter(|path| reconciler::is_retained(path));
+        let tree = match stable_root {
+            Some(path) => {
+                // o contrato observável fica: ESTE frame rodou zero bodies
+                reconciler::note_stable_frame();
+                crate::layout::LayoutNode::BoundaryRef { path }
+            }
+            None => {
+                let mut nodes = self.frame_pass(root);
+                let mut roots = nodes.take_layout();
+                self.root_is_boundary.set(matches!(
+                    roots.as_slice(),
+                    [crate::layout::LayoutNode::Boundary { .. }]
+                        | [crate::layout::LayoutNode::BoundaryRef { .. }]
+                ));
+                if roots.len() == 1 {
+                    roots.remove(0)
+                } else {
+                    crate::layout::LayoutNode::Stack {
+                        axis: crate::layout::Axis::Vertical,
+                        spacing: 0.0,
+                        align: crate::layout::CrossAlign::Start,
+                        children: roots,
+                    }
+                }
+            }
+        };
+        // o layout anda pela retenção NO LUGAR (`BoundaryRef` resolve
+        // on-the-fly) e o estado de frame vai no ENV — frame nenhum clona
+        // árvore nenhuma
         let interaction = self.interaction.borrow().clone();
         let focus = self.focus.borrow().clone();
         let carets = self.carets.borrow();
-        let stamp = reconciler::Stamp {
+        let stamp = crate::layout::FrameStamp {
             interaction: &interaction,
             focus: focus.as_deref(),
             carets: &carets,
             caret_visible: self.caret_visible.get(),
-        };
-        let mut roots: Vec<crate::layout::LayoutNode> = nodes
-            .take_layout()
-            .iter()
-            .map(|node| reconciler::expand_layout(node, &stamp))
-            .collect();
-        drop(carets);
-        let tree = if roots.len() == 1 {
-            roots.remove(0)
-        } else {
-            crate::layout::LayoutNode::Stack {
-                axis: crate::layout::Axis::Vertical,
-                spacing: 0.0,
-                align: crate::layout::CrossAlign::Start,
-                children: roots,
-            }
         };
         self.cache.begin_frame();
         let offsets = self.scroll_offsets.borrow();
@@ -539,9 +588,11 @@ impl Runtime {
                 cache: &self.cache,
                 scroll_offsets: &offsets,
                 font: FontSpec::DEFAULT,
+                stamp,
             },
         );
         drop(offsets);
+        drop(carets);
         *self.last_hits.borrow_mut() = result.hits.clone();
         *self.last_scrolls.borrow_mut() = result.scrolls.clone();
         *self.last_fields.borrow_mut() = result.fields.clone();
@@ -621,6 +672,22 @@ impl Runtime {
             previous = printed;
         }
         previous
+    }
+
+    /// O [`Runtime::render_stable`] do caminho de FRAME: estabiliza SEM
+    /// montar a árvore impressa (imprimir é para gente; frame é para
+    /// pixel). Estável = o pass não deixou NADA para trás: nenhum efeito
+    /// observou mudança e nenhuma view suja — bodies terem rodado não
+    /// pede confirmação (um pass sem sujeira nova produziu uma árvore
+    /// consistente por definição; o pass seguinte seria all-skip).
+    pub fn settle(&self, root: &impl View) {
+        for _ in 0..8 {
+            self.frame_pass(root);
+            let observed_change = self.pump();
+            if !observed_change && !self.has_pending_dirty() {
+                return;
+            }
+        }
     }
 
     fn has_pending_dirty(&self) -> bool {

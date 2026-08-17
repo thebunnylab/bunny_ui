@@ -129,6 +129,33 @@ pub struct LayoutEnv<'a> {
     pub cache: &'a MeasureCache,
     pub scroll_offsets: &'a HashMap<String, Point>,
     pub font: FontSpec,
+    /// O estado de frame do pass — consultado POR CAMINHO na colocação.
+    pub stamp: FrameStamp<'a>,
+}
+
+/// O estado de FRAME que a colocação consulta por caminho: ponteiro
+/// (hover/pressed dos `Interactive`), foco e caret (dos `Field`). Mora no
+/// ENV, nunca na árvore — retenção e árvore de layout ficam livres de
+/// estado de frame por construção (a LEI do hover, agora por tipo), e um
+/// frame de hover/blink re-coloca sem clonar nó nenhum.
+#[derive(Clone, Copy)]
+pub struct FrameStamp<'a> {
+    pub interaction: &'a Interaction,
+    pub focus: Option<&'a str>,
+    pub carets: &'a HashMap<String, crate::text_input::CaretState>,
+    /// Fase do blink — o caret só pinta quando visível.
+    pub caret_visible: bool,
+}
+
+impl<'a> FrameStamp<'a> {
+    /// Frame sem ponteiro, sem foco — o default dos testes e do
+    /// [`layout`] direto.
+    pub fn idle(
+        interaction: &'a Interaction,
+        carets: &'a HashMap<String, crate::text_input::CaretState>,
+    ) -> Self {
+        FrameStamp { interaction, focus: None, carets, caret_visible: true }
+    }
 }
 
 /// Trechos coloridos POR CIMA do texto (o highlight de match de um
@@ -187,29 +214,25 @@ pub enum LayoutNode {
     Styled { props: VisualProps, child: Box<LayoutNode> },
     /// Campo de texto de UMA linha — semântico de ponta a ponta (no Dom
     /// vira `<input>`; no Gpu, chrome + texto + caret + seleção daqui).
-    /// `focused`/`caret`/`selection` são estampados POR FRAME na expansão
-    /// (offsets de byte já clampados no conteúdo corrente); a retenção
-    /// guarda o campo apagado.
+    /// Foco, caret, seleção e composição de IME NÃO moram aqui: a
+    /// colocação consulta o [`FrameStamp`] do env pelo `path` — a árvore
+    /// nunca carrega estado de frame.
     Field {
         path: String,
         content: Rc<str>,
         placeholder: Rc<str>,
-        focused: bool,
-        caret: Option<usize>,
-        selection: Option<(usize, usize)>,
-        /// Composição de IME viva — pinta sublinhada.
-        marked: Option<(usize, usize)>,
     },
     /// Fronteira de view (`Component`): grava o frame no caminho de
     /// identidade — o endereço dos testes e, adiante, do hit-testing.
     Boundary { path: String, children: Vec<LayoutNode> },
     /// Alvo de interação (Button): o frame entra na lista de hit-test com
-    /// o caminho que indexa a ação registrada no reconciler. `hovered`/
-    /// `pressed` são estampados POR FRAME na expansão — a retenção guarda
-    /// sempre `false` (estado de ponteiro nunca gruda no cache).
-    Interactive { path: String, hovered: bool, pressed: bool, child: Box<LayoutNode> },
-    /// Referência a uma fronteira retida (pulada pelo reconciler); a
-    /// expansão resolve antes do measure — nunca chega ao algoritmo.
+    /// o caminho que indexa a ação registrada no reconciler. Hover e
+    /// pressed NÃO moram aqui — a colocação consulta o [`FrameStamp`] do
+    /// env pelo `path` (estado de ponteiro nunca gruda em árvore).
+    Interactive { path: String, child: Box<LayoutNode> },
+    /// Referência a uma fronteira retida (pulada pelo reconciler); o
+    /// measure e o place resolvem ON-THE-FLY contra a retenção — a árvore
+    /// do frame nunca é costurada em cópia.
     BoundaryRef { path: String },
 }
 
@@ -342,8 +365,16 @@ pub enum DrawCommand {
     StrokeRect { rect: Rect, color: Color, width: Px },
     /// Uma linha de texto já quebrada. `origin` é o TOPO-esquerda da caixa
     /// de linha (o engine converte para baseline internamente); `font` é a
-    /// fonte efetiva herdada no ponto da cena.
-    TextLine { origin: Point, content: String, color: Color, font: FontSpec },
+    /// fonte efetiva herdada. O trecho pintado é `content[range.0..range.1]`
+    /// — a FATIA do conteúdo inteiro do nó (o `Rc` clona barato; nenhuma
+    /// String nasce por linha no caminho quente).
+    TextLine {
+        origin: Point,
+        content: Rc<str>,
+        range: (usize, usize),
+        color: Color,
+        font: FontSpec,
+    },
     /// Daqui até o [`DrawCommand::PopClip`] par, todo desenho intersecta
     /// este rect (o rect já chega intersectado com o clip de fora).
     PushClip { rect: Rect },
@@ -521,6 +552,8 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
     let engine = PixelFont;
     let cache = MeasureCache::default();
     let offsets = HashMap::new();
+    let interaction = Interaction::default();
+    let carets = HashMap::new();
     layout_with(
         root,
         proposal,
@@ -529,6 +562,7 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
             cache: &cache,
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
+            stamp: FrameStamp::idle(&interaction, &carets),
         },
     )
 }
@@ -572,6 +606,11 @@ impl LayoutNode {
             LayoutNode::Boundary { children, .. } => {
                 children.len() == 1 && children[0].is_flexible(axis)
             }
+            // fronteira pulada: a flexibilidade é a da árvore retida
+            LayoutNode::BoundaryRef { path } => crate::reconciler::with_retained_layout(
+                path,
+                |layout| layout.map(|node| node.is_flexible(axis)).unwrap_or(false),
+            ),
             _ => false,
         }
     }
@@ -737,9 +776,16 @@ impl LayoutNode {
                 }
             }
 
+            // fronteira pulada: mede a árvore RETIDA no lugar — sem
+            // costurar cópia nenhuma (o layout do frame lê a retenção)
             LayoutNode::BoundaryRef { path } => {
-                debug_assert!(false, "BoundaryRef não expandida chegou ao measure: {path}");
-                (Size::default(), Fit::Leaf)
+                crate::reconciler::with_retained_layout(path, |layout| match layout {
+                    Some(node) => node.measure(proposal, env),
+                    None => {
+                        debug_assert!(false, "referência de layout sem retenção: {path}");
+                        (Size::default(), Fit::Leaf)
+                    }
+                })
             }
         }
     }
@@ -768,10 +814,25 @@ impl LayoutNode {
                 });
             }
 
-            (
-                LayoutNode::Field { path, content, placeholder, focused, caret, selection, marked },
-                Fit::Leaf,
-            ) => {
+            (LayoutNode::Field { path, content, placeholder }, Fit::Leaf) => {
+                // foco/caret/seleção lidos do STAMP do env, clampados no
+                // conteúdo corrente (o app pode ter trocado a string por
+                // fora do editor) — a árvore nunca carregou nada disso
+                let focused = env.stamp.focus == Some(path.as_str());
+                let state =
+                    env.stamp.carets.get(path.as_str()).copied().unwrap_or_default();
+                let clamp = |index: usize| crate::text_input::clamp_index(content, index);
+                let caret = (focused && env.stamp.caret_visible).then(|| clamp(state.caret));
+                let selection = focused
+                    .then(|| state.selection())
+                    .flatten()
+                    .map(|(start, end)| (clamp(start), clamp(end)))
+                    .filter(|(start, end)| start < end);
+                let marked = focused
+                    .then_some(state.marked)
+                    .flatten()
+                    .map(|(start, end)| (clamp(start), clamp(end)))
+                    .filter(|(start, end)| start < end);
                 // chrome do campo: tokens lidos na COLOCAÇÃO — retheme
                 // repinta sem re-rodar body nenhum
                 let theme = crate::theme::current();
@@ -794,8 +855,8 @@ impl LayoutNode {
                 };
                 // seleção atrás do texto
                 if let Some((start, end)) = selection {
-                    let x0 = text_origin.x + prefix_width(*start);
-                    let x1 = text_origin.x + prefix_width(*end);
+                    let x0 = text_origin.x + prefix_width(start);
+                    let x1 = text_origin.x + prefix_width(end);
                     out.display.push(DrawCommand::FillRect {
                         rect: Rect {
                             origin: Point { x: x0, y: text_origin.y },
@@ -811,7 +872,8 @@ impl LayoutNode {
                         // real: mesma origem, mesma fonte, só a cor cai
                         out.display.push(DrawCommand::TextLine {
                             origin: text_origin,
-                            content: placeholder.to_string(),
+                            content: placeholder.clone(),
+                            range: (0, placeholder.len()),
                             color: theme.placeholder,
                             font: env.font,
                         });
@@ -820,7 +882,8 @@ impl LayoutNode {
                     let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
                     out.display.push(DrawCommand::TextLine {
                         origin: text_origin,
-                        content: content.to_string(),
+                        content: content.clone(),
+                        range: (0, content.len()),
                         color,
                         font: env.font,
                     });
@@ -828,8 +891,8 @@ impl LayoutNode {
                 // a composição viva ganha o sublinhado do IME (a tinta do
                 // caret — o par visual da composição)
                 if let Some((start, end)) = marked {
-                    let x0 = text_origin.x + prefix_width(*start);
-                    let x1 = text_origin.x + prefix_width(*end);
+                    let x0 = text_origin.x + prefix_width(start);
+                    let x1 = text_origin.x + prefix_width(end);
                     out.display.push(DrawCommand::FillRect {
                         rect: Rect {
                             origin: Point { x: x0, y: text_origin.y + metrics.height() - 1.0 },
@@ -840,8 +903,8 @@ impl LayoutNode {
                     });
                 }
                 // caret por cima (o blink alterna via estampa)
-                if *focused && let Some(caret) = caret {
-                    let x = text_origin.x + prefix_width(*caret);
+                if let Some(caret) = caret {
+                    let x = text_origin.x + prefix_width(caret);
                     out.display.push(DrawCommand::FillRect {
                         rect: Rect {
                             origin: Point { x, y: text_origin.y },
@@ -853,7 +916,7 @@ impl LayoutNode {
                 }
                 out.display.push(DrawCommand::StrokeRect {
                     rect: frame,
-                    color: if *focused { theme.focus } else { theme.field_border },
+                    color: if focused { theme.focus } else { theme.field_border },
                     width: 1.0,
                 });
                 // o campo é alvo de ponteiro (clicar foca) — clipado como
@@ -994,7 +1057,7 @@ impl LayoutNode {
                 }
             }
 
-            (LayoutNode::Interactive { path, hovered, pressed, child }, Fit::Wrapped(size, fit)) => {
+            (LayoutNode::Interactive { path, child }, Fit::Wrapped(size, fit)) => {
                 let _ = size;
                 // fora do viewport o hit NÃO existe; row meio-visível
                 // clica só na parte visível (o rect registrado é a
@@ -1006,7 +1069,14 @@ impl LayoutNode {
                 if let Some(visible) = visible {
                     out.hits.push((path.clone(), visible));
                 }
-                out.pointer.push((*hovered, *pressed));
+                // hover/pressed do STAMP do env; pressed VISUAL só com o
+                // ponteiro dentro do alvo (semântica AppKit: arrastar
+                // para fora solta, voltar re-arma)
+                let hovered =
+                    env.stamp.interaction.hovered.as_deref() == Some(path.as_str());
+                let pressed = hovered
+                    && env.stamp.interaction.pressed.as_deref() == Some(path.as_str());
+                out.pointer.push((hovered, pressed));
                 child.place(frame, *fit, env, out);
                 out.pointer.pop();
             }
@@ -1030,6 +1100,17 @@ impl LayoutNode {
                         out,
                     );
                 }
+            }
+
+            // fronteira pulada: coloca a árvore RETIDA no lugar (o par do
+            // measure — as duas fases resolvem a MESMA retenção, o Fit
+            // espelha por construção)
+            (LayoutNode::BoundaryRef { path }, fit) => {
+                crate::reconciler::with_retained_layout(path, |layout| {
+                    if let Some(node) = layout {
+                        node.place(frame, fit, env, out);
+                    }
+                });
             }
 
             (_, Fit::Leaf) => {}
@@ -1136,10 +1217,12 @@ fn place_text(
     if let Some(mode) = truncation {
         // highlight não sobrevive à elipse (os ranges do original não
         // mapeiam no texto composto) — v1 honesto, anotado
-        let composed = truncate_to_width(content, mode, frame.size.width, env);
+        let composed: Rc<str> = Rc::from(truncate_to_width(content, mode, frame.size.width, env));
+        let length = composed.len();
         out.display.push(DrawCommand::TextLine {
             origin: frame.origin,
             content: composed,
+            range: (0, length),
             color: base_color,
             font: env.font,
         });
@@ -1175,7 +1258,8 @@ fn emit_text_runs(
     let (line_start, line_end) = line;
     let whole = || DrawCommand::TextLine {
         origin,
-        content: content[line_start..line_end].to_string(),
+        content: content.clone(),
+        range: (line_start, line_end),
         color: base_color,
         font: env.font,
     };
@@ -1216,7 +1300,8 @@ fn emit_text_runs(
         };
         out.display.push(DrawCommand::TextLine {
             origin: Point { x: origin.x + offset, y: origin.y },
-            content: content[start..end].to_string(),
+            content: content.clone(),
+            range: (start, end),
             color: if hot { highlight.color } else { base_color },
             font: env.font,
         });
@@ -1465,13 +1550,41 @@ mod tests {
         let engine = PixelFont;
         let cache = MeasureCache::default();
         let offsets = HashMap::new();
+        let interaction = Interaction::default();
+        let carets = HashMap::new();
         let env = LayoutEnv {
             text: &engine,
             cache: &cache,
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
+            stamp: FrameStamp::idle(&interaction, &carets),
         };
         node.measure(proposal, env).0
+    }
+
+    /// Layout completo com um ponteiro estampado no env — o jeito dos
+    /// testes dirigirem hover/pressed depois que o estado de frame saiu
+    /// da árvore.
+    fn layout_with_pointer(
+        root: &LayoutNode,
+        proposal: Proposal,
+        interaction: &Interaction,
+    ) -> LayoutResult {
+        let engine = PixelFont;
+        let cache = MeasureCache::default();
+        let offsets = HashMap::new();
+        let carets = HashMap::new();
+        layout_with(
+            root,
+            proposal,
+            LayoutEnv {
+                text: &engine,
+                cache: &cache,
+                scroll_offsets: &offsets,
+                font: FontSpec::DEFAULT,
+                stamp: FrameStamp::idle(interaction, &carets),
+            },
+        )
     }
 
     #[test]
@@ -1508,7 +1621,7 @@ mod tests {
             .display
             .iter()
             .filter_map(|command| match command {
-                DrawCommand::TextLine { content, .. } => Some(content.clone()),
+                DrawCommand::TextLine { content, range, .. } => Some(content[range.0..range.1].to_string()),
                 _ => None,
             })
             .collect();
@@ -1529,8 +1642,8 @@ mod tests {
             .display
             .iter()
             .filter_map(|command| match command {
-                DrawCommand::TextLine { content, color, origin, .. } => {
-                    Some((content.clone(), *color, origin.x))
+                DrawCommand::TextLine { content, range, color, origin, .. } => {
+                    Some((content[range.0..range.1].to_string(), *color, origin.x))
                 }
                 _ => None,
             })
@@ -1565,8 +1678,8 @@ mod tests {
             .display
             .iter()
             .filter_map(|command| match command {
-                DrawCommand::TextLine { content, color, origin, .. } if *color == hot => {
-                    Some((content.clone(), origin.x, origin.y))
+                DrawCommand::TextLine { content, range, color, origin, .. } if *color == hot => {
+                    Some((content[range.0..range.1].to_string(), origin.x, origin.y))
                 }
                 _ => None,
             })
@@ -1595,7 +1708,7 @@ mod tests {
                 .display
                 .iter()
                 .find_map(|command| match command {
-                    DrawCommand::TextLine { content, .. } => Some(content.clone()),
+                    DrawCommand::TextLine { content, range, .. } => Some(content[range.0..range.1].to_string()),
                     _ => None,
                 })
                 .unwrap()
@@ -1617,7 +1730,7 @@ mod tests {
             .display
             .iter()
             .filter_map(|command| match command {
-                DrawCommand::TextLine { content, .. } => Some(content.clone()),
+                DrawCommand::TextLine { content, range, .. } => Some(content[range.0..range.1].to_string()),
                 _ => None,
             })
             .collect();
@@ -1645,11 +1758,14 @@ mod tests {
         let cache = MeasureCache::default();
         let mut offsets = HashMap::new();
         offsets.insert("lista".to_string(), Point { x: 0.0, y: 40.0 });
+        let interaction = Interaction::default();
+        let carets = HashMap::new();
         let env = LayoutEnv {
             text: &engine,
             cache: &cache,
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
+            stamp: FrameStamp::idle(&interaction, &carets),
         };
 
         let root = LayoutNode::Scroll {
@@ -1682,8 +1798,6 @@ mod tests {
     fn hits_outside_the_viewport_do_not_exist() {
         let interactive = |path: &str| LayoutNode::Interactive {
             path: path.to_string(),
-            hovered: false,
-            pressed: false,
             child: Box::new(text(4)),
         };
         let root = LayoutNode::Scroll {
@@ -1823,10 +1937,10 @@ mod tests {
 
     #[test]
     fn hovered_swaps_paint_but_never_frames() {
-        let node = |hovered: bool| LayoutNode::Interactive {
+        // o hover mora no ENV, nunca no nó: a MESMA árvore com estampas
+        // diferentes tem que dar frames idênticos (a LEI, agora por tipo)
+        let node = LayoutNode::Interactive {
             path: "botao".to_string(),
-            hovered,
-            pressed: false,
             child: Box::new(styled(
                 VisualProps {
                     background: Some(Color::hex(0x111111)),
@@ -1836,8 +1950,11 @@ mod tests {
                 boundary("label", text(4)),
             )),
         };
-        let cold = layout(&node(false), Proposal::unspecified());
-        let hot = layout(&node(true), Proposal::unspecified());
+        let idle = Interaction::default();
+        let hovering =
+            Interaction { hovered: Some("botao".to_string()), ..Interaction::default() };
+        let cold = layout_with_pointer(&node, Proposal::unspecified(), &idle);
+        let hot = layout_with_pointer(&node, Proposal::unspecified(), &hovering);
 
         assert_eq!(cold.size, hot.size);
         assert_eq!(
@@ -1863,8 +1980,6 @@ mod tests {
     fn pressed_beats_hovered() {
         let root = LayoutNode::Interactive {
             path: "botao".to_string(),
-            hovered: true,
-            pressed: true,
             child: Box::new(styled(
                 VisualProps {
                     background: Some(Color::hex(0x111111)),
@@ -1875,7 +1990,12 @@ mod tests {
                 text(2),
             )),
         };
-        let result = layout(&root, Proposal::unspecified());
+        let pressing = Interaction {
+            hovered: Some("botao".to_string()),
+            pressed: Some("botao".to_string()),
+            ..Interaction::default()
+        };
+        let result = layout_with_pointer(&root, Proposal::unspecified(), &pressing);
 
         let background = result
             .display

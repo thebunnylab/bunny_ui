@@ -395,8 +395,6 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     crate::reconciler::attribute_action(path.clone(), action.clone());
                     out.wrap_last_layout(|node| LayoutNode::Interactive {
                         path,
-                        hovered: false,
-                        pressed: false,
                         child: Box::new(node),
                     });
                 }
@@ -412,7 +410,10 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         }
 
         if let Some(node) = out.last_mut() {
-            node.line.push_str(&self.modifier.suffix());
+            // frame não imprime: o sufixo nem é formatado
+            if crate::view::print_enabled() {
+                node.line.push_str(&self.modifier.suffix());
+            }
         }
     }
 }

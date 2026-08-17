@@ -80,6 +80,24 @@ pub struct NodeList {
     layout: Vec<crate::layout::LayoutNode>,
 }
 
+thread_local! {
+    /// A árvore impressa liga e desliga por pass: imprimir é para gente
+    /// (testes, oráculo incremental-vs-full); o caminho de FRAME
+    /// (settle/layout/paint) desliga e as linhas nem são formatadas —
+    /// `format!` de sufixo por nó era custo real de frame.
+    static PRINT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// O pass corrente monta a árvore impressa? Sites quentes de `format!`
+/// consultam antes de formatar.
+pub(crate) fn print_enabled() -> bool {
+    PRINT.with(|print| print.get())
+}
+
+pub(crate) fn set_print(enabled: bool) {
+    PRINT.with(|print| print.set(enabled));
+}
+
 impl NodeList {
     pub(crate) fn new() -> Self {
         Self::default()

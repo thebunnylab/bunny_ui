@@ -58,7 +58,11 @@ impl View for Text {
     type Arity = Single;
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf(format!("Text({:?})", self.0)));
+        out.push(RenderNode::leaf(if crate::view::print_enabled() {
+            format!("Text({:?})", self.0)
+        } else {
+            String::new()
+        }));
         out.push_layout(LayoutNode::Text {
             content: self.0.clone(),
             highlights: None,
@@ -131,8 +135,6 @@ where
                 crate::reconciler::attribute_action(path.clone(), Rc::new(move || action()));
                 out.push_layout(LayoutNode::Interactive {
                     path,
-                    hovered: false,
-                    pressed: false,
                     child: Box::new(chrome),
                 });
             }
@@ -177,10 +179,11 @@ impl View for TextField {
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
         let value = self.text.wrappedValue();
-        out.push(RenderNode::leaf(format!(
-            "TextField({:?}, text: {:?})",
-            self.placeholder, value
-        )));
+        out.push(RenderNode::leaf(if crate::view::print_enabled() {
+            format!("TextField({:?}, text: {:?})", self.placeholder, value)
+        } else {
+            String::new()
+        }));
         match motor::identity::cursor_scope() {
             Some(path) => {
                 let binding = self.text.clone();
@@ -202,10 +205,6 @@ impl View for TextField {
                     path,
                     content: Rc::from(value),
                     placeholder: self.placeholder.clone(),
-                    focused: false,
-                    caret: None,
-                    selection: None,
-                    marked: None,
                 });
             }
             // fora de um pass (uso decorativo): o valor vira texto puro
@@ -390,7 +389,14 @@ fn render_stack<C: View>(
     let mut nodes = NodeList::new();
     children.render_into(ctx, &mut nodes);
     let (prints, layouts) = nodes.into_parts();
-    out.push(RenderNode::branch(stack_line(kind, alignment, spacing), prints));
+    out.push(RenderNode::branch(
+        if crate::view::print_enabled() {
+            stack_line(kind, alignment, spacing)
+        } else {
+            String::new()
+        },
+        prints,
+    ));
     out.push_layout(match layout_axis {
         Some((axis, align)) => LayoutNode::Stack {
             axis,
@@ -613,11 +619,22 @@ where
                 (self.row)(item).render_into(ctx, &mut row);
                 let (prints, layouts) = row.into_parts();
                 row_layouts.push(wrap_layout(layouts));
-                RenderNode::branch(format!("Row (id: {id})"), prints)
+                RenderNode::branch(
+                    if crate::view::print_enabled() {
+                        format!("Row (id: {id})")
+                    } else {
+                        String::new()
+                    },
+                    prints,
+                )
             })
             .collect();
         out.push(RenderNode::branch(
-            format!("List ({})", self.items.len()),
+            if crate::view::print_enabled() {
+                format!("List ({})", self.items.len())
+            } else {
+                String::new()
+            },
             rows,
         ));
         // List é uma região de rolagem por natureza: as rows empilham e o

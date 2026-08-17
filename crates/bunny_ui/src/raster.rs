@@ -271,8 +271,9 @@ pub fn rasterize_with(
             DrawCommand::StrokeRect { rect, color, width } => {
                 bitmap.stroke_rect(scale_rect(*rect, factor), *color, width * factor)
             }
-            DrawCommand::TextLine { origin, content, color, font } => {
-                if let Some(raster) = text.raster_line(content, font, *color, scale) {
+            DrawCommand::TextLine { origin, content, range, color, font } => {
+                let slice = &content[range.0..range.1];
+                if let Some(raster) = text.raster_line(slice, font, *color, scale) {
                     bitmap.composite_text(origin.x, origin.y, scale, &raster);
                 }
             }
@@ -305,7 +306,8 @@ mod tests {
         let mut display = DisplayList::default();
         display.push(DrawCommand::TextLine {
             origin: Point { x: 0.0, y: 0.0 },
-            content: "1".to_string(),
+            content: std::rc::Rc::from("1"),
+            range: (0, 1),
             color: Color::BLACK,
             font: crate::text_engine::FontSpec::DEFAULT,
         });
