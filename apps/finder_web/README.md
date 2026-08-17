@@ -47,3 +47,10 @@ and reports back — the first paint ships without it, the ready event
 reflows. On the canvas page the decoded pixels come back once and our
 compositor blends them; on the dom page the mark is a native `<img>`
 on a blob URL and not one pixel crosses the border.
+
+Popovers too: click the selected row and its details card anchors at
+the row's trailing edge, clamped inside the viewport — the web
+fallback of a scene that, on the desktop shell, steps OUTSIDE the
+window on a child panel. Escape closes it; a press outside closes it
+and is consumed. In dom mode the card mounts as the root's last child
+(the portal), so no scroll container ever clips it.

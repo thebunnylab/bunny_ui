@@ -105,6 +105,31 @@ fn divider() -> impl UnaryView {
     spacer().frame(PANEL_W, 1.0).background_color(theme::divider())
 }
 
+/// The details popover — a card past the panel's edge: on the mac it
+/// rides its own child panel and leaves the window when the screen has
+/// the room (escape or a click outside closes it).
+fn details_card(name: String, full: String) -> Erased {
+    erased(
+        vstack!(
+            text(name).font(Font::Headline),
+            text(full)
+                .font(Font::Subheadline)
+                .monospaced()
+                .foreground_color(theme::fg_secondary()),
+            text("escape or click outside to close")
+                .font(Font::Footnote)
+                .foreground_color(theme::fg_faint()),
+        )
+        .alignment(HorizontalAlignment::Leading)
+        .spacing(6.0)
+        .padding_length(12.0)
+        .background_color(theme::panel())
+        .corner_radius(10.0)
+        .border(theme::border(), 1.0)
+        .shadow(24.0),
+    )
+}
+
 #[derive(Clone, Copy)]
 struct Finder {
     query: State<String>,
@@ -112,6 +137,9 @@ struct Finder {
     dark: State<bool>,
     /// Selected index in the FILTERED list (clamped at display time).
     selected: State<usize>,
+    /// A click on the SELECTED row opens its details popover — which
+    /// steps OUTSIDE the window when the screen has the room.
+    details: State<bool>,
 }
 
 impl Component for Finder {
@@ -148,6 +176,7 @@ impl Component for Finder {
         let count = items.len();
         let opened = self.opened;
         let selected = self.selected;
+        let details = self.details;
         // the read registers the dependency: moving selection repaints the row
         let selected_index = selected.get().min(count.saturating_sub(1));
 
@@ -168,8 +197,9 @@ impl Component for Finder {
             move |(index, row)| {
                 let row = row.clone();
                 let label = format!("{}{}", row.dir, row.name);
+                let file_name = row.name.clone();
                 let is_selected = *index == selected_index;
-                hstack!(
+                let base = hstack!(
                     // the platform's file icon, crisp at row size — the
                     // workspace picks the representation for 16pt
                     image(file_icon(label.as_str())).resizable().frame(16.0, 16.0),
@@ -206,7 +236,26 @@ impl Component for Finder {
                 // the row breathes: hover and selection fade, and the
                 // row slides when the filter reorders the list
                 .animated(Spring::snappy())
-                .on_click(move || opened.set(label.clone()))
+                // a click on the selected row shows its details; on any
+                // other it opens, as always
+                .on_click({
+                    let label = label.clone();
+                    move || {
+                        if is_selected {
+                            details.set(true);
+                        } else {
+                            opened.set(label.clone());
+                        }
+                    }
+                });
+                if is_selected {
+                    let full = label.clone();
+                    erased(base.popover(details.binding(), Side::Trailing, move |_| {
+                        details_card(file_name.clone(), full.clone())
+                    }))
+                } else {
+                    erased(base)
+                }
             },
         )
         // arrow keys move the selection below the fold — the region
@@ -278,20 +327,26 @@ impl Component for Finder {
             // ↓/↑ with wrap — they work WHILE typing (the gate consumes)
             .on_action(SELECT_NEXT, move || {
                 if count > 0 {
+                    details.set(false);
                     selected.set((selected.get().min(count - 1) + 1) % count)
                 }
             })
             .on_action(SELECT_PREV, move || {
                 if count > 0 {
+                    details.set(false);
                     selected.set((selected.get().min(count - 1) + count - 1) % count)
                 }
             })
             .on_action(PAGE_FORWARD, move || {
                 if count > 0 {
+                    details.set(false);
                     selected.set((selected.get() + 10).min(count - 1))
                 }
             })
-            .on_action(PAGE_BACK, move || selected.set(selected.get().saturating_sub(10)))
+            .on_action(PAGE_BACK, move || {
+                details.set(false);
+                selected.set(selected.get().saturating_sub(10))
+            })
             .on_action(OPEN, {
                 let open_at = open_at.clone();
                 move || open_at("")
@@ -312,8 +367,9 @@ impl Component for Finder {
 }
 
 fn main() {
-    let runtime =
-        Runtime::new().text_engine(Rc::new(bunny_ui_macos::CoreTextEngine::new()));
+    let runtime = Runtime::new()
+        .text_engine(Rc::new(bunny_ui_macos::CoreTextEngine::new()))
+        .image_engine(Rc::new(bunny_ui_macos::CoreGraphicsImageEngine::new()));
     // the app keymap: key → intent (the handlers live in the screen)
     runtime.bind_in("finder", KeyPattern::key(Key::Down), SELECT_NEXT);
     runtime.bind_in("finder", KeyPattern::key(Key::Up), SELECT_PREV);
@@ -332,6 +388,7 @@ fn main() {
             opened: State::new(String::new()),
             dark: State::new(false),
             selected: State::new(0),
+            details: State::new(false),
         },
     );
 }
