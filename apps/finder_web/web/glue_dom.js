@@ -4,6 +4,9 @@
 // carries momentum, the input owns the editing — the browser at home.
 
 const app = document.getElementById("app");
+// the root element IS scene node 0 — its backdrop arrives through the
+// patches (the theme's canvas), like every other color here
+app.dataset.n = "0";
 const sheet = document.createElement("style");
 document.head.appendChild(sheet);
 

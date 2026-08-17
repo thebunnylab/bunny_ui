@@ -166,13 +166,18 @@ pub(crate) struct DomCapture {
 
 impl DomCapture {
     pub(crate) fn new(size: Size) -> DomCapture {
+        // the scene's floor is the THEME's canvas — the same contract
+        // as the raster surface's background, never a page stylesheet
         let root = DomNode {
             kind: DomKind::Root,
             x: 0.0,
             y: 0.0,
             width: size.width,
             height: size.height,
-            style: DomStyle::default(),
+            style: DomStyle {
+                background: Some(crate::theme::current().canvas),
+                ..DomStyle::default()
+            },
             children: Vec::new(),
         };
         DomCapture {
@@ -443,6 +448,9 @@ impl DomLowering {
                     width: scene.width,
                     height: scene.height,
                 });
+                if scene.style != DomStyle::default() {
+                    patches.push(DomPatch::SetStyle { id: 0, style: scene.style.clone() });
+                }
                 let mut next_id = self.next_id;
                 let mut ctx = LowerCtx {
                     next_id: &mut next_id,

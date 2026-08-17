@@ -29,7 +29,9 @@ impl Component for Finder {
         let selected_index = selected.get().min(count.saturating_sub(1));
         let id_files = Rc::clone(&files);
         let id_visible = Rc::clone(&visible);
-        vstack!(
+        // a floating panel over the theme's canvas — rounded, bordered,
+        // with a soft shadow: the SAME chrome on every rendering
+        vstack!(vstack!(
             hstack!(
                 text("›").foreground_color(theme::accent()),
                 text_field("Search ten thousand files…", self.query.binding()).monospaced(),
@@ -69,7 +71,12 @@ impl Component for Finder {
             .reveal(selected_index),
         )
         .alignment(HorizontalAlignment::Leading)
+        .padding_edge(Edge::Bottom, 10.0)
         .background_color(theme::panel())
+        .corner_radius(12.0)
+        .border(theme::border(), 1.0)
+        .shadow(28.0))
+        .padding_length(28.0)
         .on_change(
             {
                 let query = self.query;
