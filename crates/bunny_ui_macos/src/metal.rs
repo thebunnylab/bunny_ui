@@ -14,6 +14,11 @@
 //! polls `status`, because the whole shell is one thread and a completion
 //! handler would be the only concurrent code in the codebase.
 //!
+//! The GPU is the DEFAULT presentation of a window; `BUNNY_PRESENT=cpu`
+//! forces the CPU raster, and any Metal failure falls back to it with
+//! one line on stderr. The choice happens ONCE, at window creation —
+//! a window never switches backends mid-flight.
+//!
 //! The LAW of the port: every policy decision — snapping, radius clamps,
 //! stroke thickness, shadow reach, the clip stack — is resolved on the
 //! CPU in f64, operation by operation the way raster.rs resolves it. The
@@ -1467,10 +1472,15 @@ impl MetalPresenter {
 /// Grafts the CAMetalLayer onto the view — called by `create_window`
 /// BEFORE `setWantsLayer:`, so the view becomes layer-HOSTING and
 /// `drawRect:` never runs. Returns false (and touches nothing) when the
-/// GPU path is not requested or cannot come up; the caller proceeds with
-/// today's CPU path.
+/// GPU path is refused or cannot come up; the caller proceeds with the
+/// CPU path.
+///
+/// The default is the GPU. `BUNNY_PRESENT=cpu` forces the CPU raster
+/// forever; any failure to come up (no device, a shader that does not
+/// compile) prints one line and falls back — a window never fails to
+/// open because of Metal.
 pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool {
-    if std::env::var("BUNNY_PRESENT").ok().as_deref() != Some("gpu") {
+    if std::env::var("BUNNY_PRESENT").ok().as_deref() == Some("cpu") {
         return false;
     }
     let Some(stack) = MetalStack::create(PIXEL_FORMAT_BGRA8) else {
