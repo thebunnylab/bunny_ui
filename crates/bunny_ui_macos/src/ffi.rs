@@ -679,6 +679,15 @@ unsafe fn register_classes() {
             bunny_window_did_resize as *const c_void,
             types.as_ptr(),
         );
+        // a monitor drag or scale flip must repaint NOW — without this,
+        // the next pointer wiggle would be the first frame at the new
+        // scale (blurry until then on a CAMetalLayer)
+        class_addMethod(
+            delegate,
+            sel("windowDidChangeBackingProperties:"),
+            bunny_window_did_resize as *const c_void,
+            types.as_ptr(),
+        );
         class_addMethod(
             delegate,
             sel("bunnyBlink:"),

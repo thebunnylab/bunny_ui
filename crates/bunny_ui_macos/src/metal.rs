@@ -68,6 +68,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_u64(obj: Id, sel: Sel) -> u64;
     #[link_name = "objc_msgSend"]
+    fn msg_bool(obj: Id, sel: Sel) -> i8;
+    #[link_name = "objc_msgSend"]
     fn msg_id_cstr(obj: Id, sel: Sel, a: *const c_char) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_id_arg(obj: Id, sel: Sel, a: Id) -> Id;
@@ -386,6 +388,10 @@ struct Sels {
     set_vertex_bytes: Sel,
     draw: Sel,
     set_fragment_texture: Sel,
+    in_live_resize: Sel,
+    set_presents_with_transaction: Sel,
+    wait_scheduled: Sel,
+    present: Sel,
     status: Sel,
     retain: Sel,
     release: Sel,
@@ -420,6 +426,10 @@ impl Sels {
                 set_vertex_bytes: sel("setVertexBytes:length:atIndex:"),
                 draw: sel("drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:"),
                 set_fragment_texture: sel("setFragmentTexture:atIndex:"),
+                in_live_resize: sel("inLiveResize"),
+                set_presents_with_transaction: sel("setPresentsWithTransaction:"),
+                wait_scheduled: sel("waitUntilScheduled"),
+                present: sel("present"),
                 status: sel("status"),
                 retain: sel("retain"),
                 release: sel("release"),
@@ -1253,12 +1263,38 @@ unsafe fn upload_frame(
 struct MetalPresenter {
     stack: MetalStack,
     layer: Id,
+    view: Id,
     physical: (usize, usize),
     scale: usize,
     slots: [FrameSlot; 3],
     cursor: usize,
     atlas: RunAtlas,
     batches: FrameBatches,
+    /// The last presented frame's key — an identical frame skips the
+    /// encode entirely.
+    retained: Option<(DisplayList, (usize, usize), usize, Color)>,
+    /// Whether the layer currently presents inside the CATransaction —
+    /// toggled ON only during live resize.
+    transactional: bool,
+}
+
+/// The skip key: the SAME list on the SAME target needs no new frame.
+/// The list alone is not enough — a resize or a theme flip with an
+/// unchanged list must still re-present, so the physical size, the
+/// scale and the clear color all sit in the key (the CPU staleness
+/// quadruple, verbatim).
+fn frame_repeats(
+    retained: &Option<(DisplayList, (usize, usize), usize, Color)>,
+    display: &DisplayList,
+    physical: (usize, usize),
+    scale: usize,
+    canvas: Color,
+) -> bool {
+    matches!(retained, Some((list, kept_physical, kept_scale, kept_canvas))
+        if *kept_physical == physical
+            && *kept_scale == scale
+            && *kept_canvas == canvas
+            && list.as_slice() == display.as_slice())
 }
 
 thread_local! {
@@ -1358,6 +1394,12 @@ impl MetalPresenter {
                 objc_autoreleasePoolPop(pool);
                 return;
             }
+            if frame_repeats(&self.retained, display, physical, scale, canvas) {
+                // the caret blink and friends land here every half
+                // second — nothing changed, nothing encodes
+                objc_autoreleasePoolPop(pool);
+                return;
+            }
             if physical != self.physical || scale != self.scale {
                 // the drawable must resize BEFORE nextDrawable, or the
                 // frame comes back at the old size
@@ -1396,9 +1438,29 @@ impl MetalPresenter {
                 &self.batches.runs,
                 self.atlas.texture,
             );
-            msg_void_id(command, self.stack.sels.present_drawable, drawable);
-            msg_void(command, self.stack.sels.commit);
+            // live resize presents INSIDE the CATransaction: commit,
+            // wait for the schedule, present — layer content and window
+            // frame land together (the anti-tear toggle). every other
+            // frame presents async, no stall.
+            let live = msg_bool(self.view, self.stack.sels.in_live_resize) != 0;
+            if live != self.transactional {
+                msg_void_bool(
+                    self.layer,
+                    self.stack.sels.set_presents_with_transaction,
+                    live as i8,
+                );
+                self.transactional = live;
+            }
+            if live {
+                msg_void(command, self.stack.sels.commit);
+                msg_void(command, self.stack.sels.wait_scheduled);
+                msg_void(drawable, self.stack.sels.present);
+            } else {
+                msg_void_id(command, self.stack.sels.present_drawable, drawable);
+                msg_void(command, self.stack.sels.commit);
+            }
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
+            self.retained = Some((display.clone(), physical, scale, canvas));
             objc_autoreleasePoolPop(pool);
         }
     }
@@ -1439,12 +1501,15 @@ pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool
         let mut presenter = MetalPresenter {
             stack,
             layer,
+            view,
             physical: (0, 0),
             scale: 0,
             slots: [FrameSlot::empty(); 3],
             cursor: 0,
             atlas: RunAtlas::new(device),
             batches: FrameBatches::default(),
+            retained: None,
+            transactional: false,
         };
         // anti-flash: the first clear happens before the window shows —
         // a virgin CAMetalLayer would flash black on order-front
@@ -1868,6 +1933,24 @@ mod tests {
         let (gpu, cpu) =
             scene_bytes(&root, Size { width: 140.0, height: 120.0 }, 2, Color::CANVAS);
         assert_close(&gpu, &cpu, 2, "degenerate rects");
+    }
+
+    #[test]
+    fn the_skip_key_watches_list_size_scale_and_canvas() {
+        // the whole quadruple guards the skip: a repeated frame skips,
+        // and ANY leg changing — list, physical, scale or clear color —
+        // must present again
+        let runtime = Runtime::new();
+        let logical = Size { width: 100.0, height: 60.0 };
+        let quiet = runtime.display_frame(&text("still"), logical);
+        let changed = runtime.display_frame(&text("moved"), logical);
+        let retained = Some((quiet.clone(), (200usize, 120usize), 2usize, Color::CANVAS));
+        assert!(frame_repeats(&retained, &quiet, (200, 120), 2, Color::CANVAS));
+        assert!(!frame_repeats(&retained, &changed, (200, 120), 2, Color::CANVAS));
+        assert!(!frame_repeats(&retained, &quiet, (210, 120), 2, Color::CANVAS));
+        assert!(!frame_repeats(&retained, &quiet, (200, 120), 1, Color::CANVAS));
+        assert!(!frame_repeats(&retained, &quiet, (200, 120), 2, Color::hex(0x18181D)));
+        assert!(!frame_repeats(&None, &quiet, (200, 120), 2, Color::CANVAS));
     }
 
     #[test]
