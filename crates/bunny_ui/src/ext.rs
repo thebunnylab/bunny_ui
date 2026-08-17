@@ -42,6 +42,18 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.font(.system(size: 9))` — a measure the preset scale does not
+    /// have. Only the size travels, so `.font_size(9.0).bold()` keeps
+    /// the weight and the design in scope. A `.font(.title)` CLOSER to
+    /// the view brings its own size and wins: the nearest patch always
+    /// does.
+    fn font_size(self, size: f64) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::FontSize(size),
+        }
+    }
+
     /// `.bold()`
     fn bold(self) -> Modified<Self> {
         Modified {

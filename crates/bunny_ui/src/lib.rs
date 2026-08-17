@@ -2550,6 +2550,31 @@ mod tests {
     }
 
     #[test]
+    fn a_size_off_the_scale_keeps_the_rest_of_the_font() {
+        use crate::layout::{DrawCommand, Proposal};
+        use crate::text_engine::Weight;
+
+        let runtime = Runtime::new();
+        // 9pt and 26pt are not on the preset scale; the weight still
+        // comes from the font around each one
+        let view = vstack((
+            text("badge").font_size(9.0).bold(),
+            text("mark").font_size(26.0),
+        ));
+        let result = runtime.layout(&view, Proposal::unspecified());
+
+        let fonts: Vec<(f64, Weight)> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::TextLine { font, .. } => Some((font.size, font.weight)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fonts, vec![(9.0, Weight::Bold), (26.0, Weight::Regular)]);
+    }
+
+    #[test]
     fn paint_puts_ink_where_the_layout_put_the_text() {
         use crate::layout::Size;
 

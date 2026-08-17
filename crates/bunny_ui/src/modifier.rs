@@ -59,6 +59,8 @@ pub enum Modifier {
     Border(Color, f64),
     CornerRadius(f64),
     Monospaced,
+    /// A size out of the preset scale — the rest of the font stays.
+    FontSize(f64),
     BackgroundHovered(Color),
     BackgroundPressed(Color),
     Highlight(Rc<Vec<(usize, usize)>>, Color),
@@ -170,6 +172,7 @@ impl Modifier {
             Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
             Modifier::CornerRadius(radius) => format!(" [.cornerRadius({radius})]"),
             Modifier::Monospaced => " [.monospaced()]".into(),
+            Modifier::FontSize(size) => format!(" [.font(.system(size: {size}))]"),
             Modifier::BackgroundHovered(color) => format!(" [.backgroundHovered({color})]"),
             Modifier::BackgroundPressed(color) => format!(" [.backgroundPressed({color})]"),
             Modifier::Highlight(ranges, color) => {
@@ -618,6 +621,15 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 out,
                 VisualProps {
                     font: FontPatch { design: Some(FontDesign::Mono), ..FontPatch::default() },
+                    ..VisualProps::default()
+                },
+            ),
+            // only the size travels: a `.bold()` or a `.font(.title)`
+            // around it keeps its weight and its design
+            Modifier::FontSize(size) => wrap_styled(
+                out,
+                VisualProps {
+                    font: FontPatch { size: Some(*size), ..FontPatch::default() },
                     ..VisualProps::default()
                 },
             ),
