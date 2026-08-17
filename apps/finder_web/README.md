@@ -27,14 +27,23 @@ while the filter types.
 Build and run:
 
 ```
-cargo build --release -p finder-web --target wasm32-unknown-unknown
-cp ../../target/wasm32-unknown-unknown/release/finder_web.wasm web/
+cargo build --profile web -p finder-web --target wasm32-unknown-unknown
+cp ../../target/wasm32-unknown-unknown/web/finder_web.wasm web/
 python3 -m http.server 8871 --directory web
 ```
 
 Then open http://localhost:8871 (canvas) or
 http://localhost:8871/dom.html (dom + island).
 
-One binary carries both shells (~590 KB, `opt-level = "z"` + lto). Ten
-thousand rows stay virtualized in both modes: the scroll geometry is
-honest to the full extent, and only the visible window exists.
+One binary carries both shells (~520 KB through the `web` profile —
+`opt-level = "z"` + lto). Ten thousand rows stay virtualized in both
+modes: the scroll geometry is honest to the full extent, and only the
+visible window exists.
+
+Images ride the same premise. The header's bunny mark is a real PNG
+written by hand in the demo; the browser decodes it asynchronously
+(one crossing per identity, `createImageBitmap` off the main thread)
+and reports back — the first paint ships without it, the ready event
+reflows. On the canvas page the decoded pixels come back once and our
+compositor blends them; on the dom page the mark is a native `<img>`
+on a blob URL and not one pixel crosses the border.
