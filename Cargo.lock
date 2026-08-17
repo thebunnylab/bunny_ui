@@ -19,6 +19,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bunny-ui-web"
+version = "0.1.0"
+dependencies = [
+ "bunny-ui",
+]
+
+[[package]]
 name = "countries-core"
 version = "0.1.0"
 dependencies = [
@@ -33,6 +40,14 @@ version = "0.1.0"
 dependencies = [
  "bunny-ui",
  "countries-core",
+]
+
+[[package]]
+name = "finder-web"
+version = "0.1.0"
+dependencies = [
+ "bunny-ui",
+ "bunny-ui-web",
 ]
 
 [[package]]

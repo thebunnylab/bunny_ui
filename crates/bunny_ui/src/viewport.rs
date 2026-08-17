@@ -15,11 +15,15 @@ use crate::layout::Px;
 use motor::hash::FxHashMap;
 
 /// What the body needs for the window math, all from the LAST frame.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct RegionSnapshot {
     pub offset_y: Px,
     pub viewport: Px,
     pub row_extent: Px,
+    /// The scroll target the runtime already APPLIED for this region —
+    /// a reveal equal to it is settled history, not a pending jump,
+    /// and must not fight the wheel for the window.
+    pub applied: Option<String>,
 }
 
 thread_local! {
@@ -39,5 +43,5 @@ pub(crate) fn publish(regions: impl Iterator<Item = (String, RegionSnapshot)>) {
 /// The retained geometry of one region, if it virtualized last frame.
 pub(crate) fn region(path: Option<&str>) -> Option<RegionSnapshot> {
     let path = path?;
-    SNAPSHOT.with(|slot| slot.borrow().get(path).copied())
+    SNAPSHOT.with(|slot| slot.borrow().get(path).cloned())
 }

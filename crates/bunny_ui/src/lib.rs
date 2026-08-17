@@ -749,6 +749,65 @@ mod tests {
     }
 
     #[test]
+    fn web_shaped_fixture_heals_after_a_violent_wheel() {
+        use crate::anim::Spring;
+        use std::rc::Rc as StdRc;
+
+        #[derive(Clone)]
+        struct WebFinder {
+            selected: State<usize>,
+            visible: State<StdRc<Vec<usize>>>,
+        }
+
+        impl Component for WebFinder {
+            fn body(self, _ctx: &Context) -> impl View {
+                let visible = self.visible.get();
+                let count = visible.len();
+                let selected = self.selected;
+                let selected_index = selected.get().min(count.saturating_sub(1));
+                virtual_list(count, move |row| format!("row{row}"), move |row| {
+                    let on = row == selected_index;
+                    text(format!("item {row}"))
+                        .background_color(if on {
+                            crate::layout::Color { r: 9, g: 9, b: 9, a: 255 }
+                        } else {
+                            crate::layout::Color { r: 0, g: 0, b: 0, a: 0 }
+                        })
+                        .animated(Spring::snappy())
+                        .on_click(move || selected.set(row))
+                })
+                .reveal(selected_index)
+            }
+        }
+
+        let size = crate::layout::Size { width: 300.0, height: 200.0 };
+        let finder = WebFinder {
+            selected: State::new(0),
+            visible: State::new(StdRc::new((0..10_000).collect())),
+        };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&finder, size);
+        let _ = runtime.display_frame(&finder, size);
+        // a violent wheel: thousands of px in one event
+        assert!(runtime.wheel(50.0, 100.0, 0.0, -50000.0));
+        let frame = runtime.display_frame(&finder, size);
+        let lines = frame
+            .iter()
+            .filter_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { content, .. } => {
+                    Some(content.as_ref().to_string())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!lines.is_empty(), "the band re-materialized: {lines:?}");
+        assert!(
+            lines.iter().any(|line| line.contains("item 312")),
+            "rows near the far offset painted: {lines:?}"
+        );
+    }
+
+    #[test]
     fn a_jump_past_the_buffer_heals_in_the_same_frame() {
         #[derive(Clone, Copy)]
         struct Big;

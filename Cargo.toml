@@ -4,8 +4,10 @@ members = [
     "crates/motor",
     "crates/bunny_ui",
     "crates/bunny_ui_macos",
+    "crates/bunny_ui_web",
     "crates/countries_core",
     "apps/countries_pure",
+    "apps/finder_web",
 ]
 
 [workspace.package]

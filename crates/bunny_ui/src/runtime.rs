@@ -175,6 +175,7 @@ impl Runtime {
         // math) — published fresh before every pass
         {
             let offsets = self.scroll_offsets.borrow();
+            let applied = self.scroll_targets.borrow();
             crate::viewport::publish(self.last_scrolls.borrow().iter().filter_map(
                 |region| {
                     let row_extent = region.row_extent?;
@@ -188,6 +189,7 @@ impl Runtime {
                                 .y,
                             viewport: region.frame.size.height,
                             row_extent,
+                            applied: applied.get(&region.path).cloned(),
                         },
                     ))
                 },

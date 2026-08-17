@@ -747,7 +747,7 @@ where
         // viewport, measured row height) — one frame of lag masked by
         // the buffer; a miss re-runs this body in the same frame
         let snapshot = crate::viewport::region(scope.as_deref());
-        let (first, last) = match snapshot {
+        let (first, last) = match &snapshot {
             Some(snap) if snap.row_extent > 0.0 && self.count > 0 => {
                 let rows_in_view =
                     (snap.viewport / snap.row_extent).ceil().max(1.0) as usize + 1;
@@ -765,16 +765,24 @@ where
             _ => (0, self.count.min(FIRST_WINDOW).saturating_sub(1)),
         };
         debug_assert_unique_ids("virtual_list", (first..=last).map(&self.id));
-        // the pin: the revealed row exists even far outside the window —
+        // the pin: a PENDING reveal exists even far outside the window —
         // WITH its own buffered band, so when the follow-up scrolls to
         // it the fresh viewport is already covered (one body, no extra
-        // invalidation round)
-        let pin = self
-            .reveal
-            .filter(|index| self.count > 0 && *index < self.count)
+        // invalidation round). A reveal the runtime already APPLIED is
+        // settled history: it never replaces the window — the wheel
+        // that scrolled away stays sovereign.
+        let reveal = self.reveal.filter(|index| self.count > 0 && *index < self.count);
+        let reveal_id = reveal.map(|index| (self.id)(index));
+        let jump_pending = match (&reveal_id, &snapshot) {
+            (Some(id), Some(snap)) => snap.applied.as_deref() != Some(id.as_str()),
+            (Some(_), None) => true,
+            _ => false,
+        };
+        let pin = reveal
+            .filter(|_| jump_pending)
             .filter(|index| *index < first || *index > last);
         let pin_band = pin.map(|index| {
-            let buffer = match snapshot {
+            let buffer = match &snapshot {
                 Some(snap) if snap.row_extent > 0.0 => {
                     (snap.viewport / snap.row_extent).ceil().max(1.0) as usize + 1
                 }
@@ -840,10 +848,7 @@ where
             prints,
         ));
         out.push_layout(LayoutNode::Scroll {
-            target: self
-                .reveal
-                .filter(|index| self.count > 0 && *index < self.count)
-                .map(&self.id),
+            target: reveal_id,
             path: motor::identity::cursor_scope(),
             child: Box::new(LayoutNode::VirtualStack {
                 row_extent: snapshot.map(|snap| snap.row_extent).unwrap_or(0.0),

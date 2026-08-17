@@ -1,3 +1,6 @@
 /target
 .DS_Store
 gitignore/
+# tool state and build artifacts
+.claude/
+apps/finder_web/web/*.wasm
