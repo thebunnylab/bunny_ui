@@ -88,15 +88,85 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
     // scale or theme change retires the surface and starts a fresh one.
     let surface: Rc<RefCell<Option<(bunny_ui::raster::Surface, usize, bunny_ui::layout::Color)>>> =
         Rc::new(RefCell::new(None));
+    // the open popovers' child panels, pooled by identity path
+    let panels: Rc<RefCell<std::collections::HashMap<String, ffi::WindowHandle>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
     // present takes a READY display list to the window — the tick path
     // reuses it without paying settle, effects or the IME tail
     let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
         let surface = Rc::clone(&surface);
-        move |runtime: &Runtime, display: bunny_ui::layout::DisplayList| {
+        let panels = Rc::clone(&panels);
+        move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
             let (width, height) = window.content_size();
             let scale = window.scale();
             let canvas = bunny_ui::theme::canvas();
             let physical = ((width.round() as usize) * scale, (height.round() as usize) * scale);
+            // the window presents everything BEFORE the first popover;
+            // each popover re-presents its own slice on a child panel
+            // in screen coordinates — that is how it leaves the window
+            let overlays = runtime.overlays();
+            let display = match overlays.first() {
+                Some(first) => full_display.translated_slice((0, first.display.0), 0.0, 0.0),
+                None => full_display.clone(),
+            };
+            {
+                let mut store = panels.borrow_mut();
+                let mut dead: Vec<String> = store
+                    .keys()
+                    .filter(|path| !overlays.iter().any(|overlay| &overlay.path == *path))
+                    .cloned()
+                    .collect();
+                for path in dead.drain(..) {
+                    if let Some(panel) = store.remove(&path) {
+                        panel.close_panel(&window);
+                    }
+                }
+                for overlay in &overlays {
+                    // the panel is BLED around the frame so the card's
+                    // own shadow has room — the same pixels every
+                    // target paints, no system shadow involved
+                    const BLEED: f64 = 32.0;
+                    let x = overlay.frame.origin.x - BLEED;
+                    let y = overlay.frame.origin.y - BLEED;
+                    let w = overlay.frame.size.width + 2.0 * BLEED;
+                    let h = overlay.frame.size.height + 2.0 * BLEED;
+                    let panel = store
+                        .entry(overlay.path.clone())
+                        .or_insert_with(|| ffi::create_panel(&window, w, h));
+                    panel.set_frame_screen(window.layout_rect_to_screen(x, y, w, h));
+                    panel.set_scene_origin(x, y);
+                    let slice = full_display.translated_slice(overlay.display, -x, -y);
+                    let panel_physical =
+                        ((w.round() as usize) * scale, (h.round() as usize) * scale);
+                    let bitmap = bunny_ui::raster::rasterize_with(
+                        &slice,
+                        panel_physical.0,
+                        panel_physical.1,
+                        scale,
+                        bunny_ui::layout::Color { r: 0, g: 0, b: 0, a: 0 },
+                        &*runtime.text(),
+                        &*runtime.images(),
+                    );
+                    // the panel's CGImage is premultiplied; the house
+                    // compositor is straight — one pass, panel-sized
+                    let mut rgba = bitmap.to_rgba_bytes();
+                    for pixel in rgba.chunks_exact_mut(4) {
+                        let alpha = pixel[3] as u32;
+                        if alpha < 255 {
+                            for channel in 0..3 {
+                                pixel[channel] =
+                                    (pixel[channel] as u32 * alpha / 255) as u8;
+                            }
+                        }
+                    }
+                    panel.blit_partial(
+                        panel_physical.0,
+                        panel_physical.1,
+                        &rgba,
+                        &[(0, 0, panel_physical.0 as i64, panel_physical.1 as i64)],
+                    );
+                }
+            }
             if metal::active() {
                 // GPU present: the same display list, no Surface in the
                 // path — the drawable is the frame
@@ -142,6 +212,14 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
         let present = Rc::clone(&present);
         move |runtime: &Runtime, root: &_| {
             let (width, height) = window.content_size();
+            // popovers position against the SCREEN, in layout
+            // coordinates — overflow becomes plain geometry
+            runtime.set_overlay_bounds(window.screen_bounds_in_layout().map(
+                |(x, y, w, h)| bunny_ui::layout::Rect {
+                    origin: bunny_ui::layout::Point { x, y },
+                    size: Size { width: w, height: h },
+                },
+            ));
             let display = runtime.display_frame(root, Size { width, height });
             present(runtime, display);
         window.set_cursor_pointing(runtime.interaction().hovered.is_some());

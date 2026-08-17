@@ -570,6 +570,52 @@ impl DisplayList {
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
     }
+
+    /// A translated copy of `commands[range]` — what a second surface
+    /// (a popover's child panel, a canvas island) re-presents in its
+    /// own coordinates. Clip pairs inside an overlay slice are
+    /// balanced by construction: the subtree closes what it opens.
+    pub fn translated_slice(&self, range: (usize, usize), dx: Px, dy: Px) -> DisplayList {
+        let shift_rect = |rect: Rect| Rect {
+            origin: Point { x: rect.origin.x + dx, y: rect.origin.y + dy },
+            size: rect.size,
+        };
+        let commands = self
+            .commands
+            .get(range.0..range.1)
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .map(|command| match command {
+                DrawCommand::FillRect { rect, color, corner_radius } => {
+                    DrawCommand::FillRect { rect: shift_rect(rect), color, corner_radius }
+                }
+                DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
+                    DrawCommand::StrokeRect { rect: shift_rect(rect), color, width, corner_radius }
+                }
+                DrawCommand::Shadow { rect, radius, color, corner_radius } => {
+                    DrawCommand::Shadow { rect: shift_rect(rect), radius, color, corner_radius }
+                }
+                DrawCommand::TextLine { origin, content, range, color, font } => {
+                    DrawCommand::TextLine {
+                        origin: Point { x: origin.x + dx, y: origin.y + dy },
+                        content,
+                        range,
+                        color,
+                        font,
+                    }
+                }
+                DrawCommand::Image { rect, source } => {
+                    DrawCommand::Image { rect: shift_rect(rect), source }
+                }
+                DrawCommand::PushClip { rect } => {
+                    DrawCommand::PushClip { rect: shift_rect(rect) }
+                }
+                DrawCommand::PopClip => DrawCommand::PopClip,
+            })
+            .collect();
+        DisplayList { commands }
+    }
 }
 
 /// The outputs of the placement pass: frames by identity (tests), the

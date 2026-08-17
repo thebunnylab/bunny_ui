@@ -20,6 +20,7 @@
 //! AppKit run loop is single-thread, like the rest of the engine).
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
 use std::sync::Once;
 
@@ -136,6 +137,10 @@ unsafe extern "C" {
     fn msg_void_id_id(obj: Id, sel: Sel, a: Id, b: Id);
     #[link_name = "objc_msgSend"]
     fn msg_point_point(obj: Id, sel: Sel, point: CGPoint) -> CGPoint;
+    #[link_name = "objc_msgSend"]
+    fn msg_void_id_i64(obj: Id, sel: Sel, a: Id, b: i64);
+    #[link_name = "objc_msgSend"]
+    fn msg_void_rect_bool(obj: Id, sel: Sel, rect: CGRect, flag: i8);
 }
 
 // AppKit/QuartzCore come in via the ObjC runtime; the link guarantees the
@@ -259,13 +264,25 @@ pub fn dispatch(event: AppEvent) {
     });
 }
 
+thread_local! {
+    /// The SCENE origin of every panel view — a popover's events
+    /// translate back into scene coordinates here, so the runtime's
+    /// hit-test never learns which surface the pointer touched.
+    static PANEL_ORIGINS: RefCell<HashMap<usize, (f64, f64)>> =
+        RefCell::new(HashMap::new());
+}
+
 /// The event position in layout coordinates — AppKit counts from the
 /// bottom, the layout counts from the top; the flip lives here, once.
+/// A panel view adds its scene origin: one translation, one place.
 unsafe fn event_layout_point(this: Id, event: Id) -> (f64, f64) {
     unsafe {
         let point = msg_point(event, sel("locationInWindow"));
         let bounds = msg_rect(this, sel("bounds"));
-        (point.x, bounds.size.height - point.y)
+        let (dx, dy) = PANEL_ORIGINS
+            .with(|origins| origins.borrow().get(&(this as usize)).copied())
+            .unwrap_or((0.0, 0.0));
+        (point.x + dx, bounds.size.height - point.y + dy)
     }
 }
 
@@ -813,6 +830,15 @@ unsafe fn register_classes() {
             bunny_window_did_resize as *const c_void,
             types.as_ptr(),
         );
+        // a moved window re-clamps its popovers against the screen —
+        // the child panels FOLLOW by AppKit's own hand; this repaint
+        // only re-runs the overlay geometry
+        class_addMethod(
+            delegate,
+            sel("windowDidMove:"),
+            bunny_window_did_resize as *const c_void,
+            types.as_ptr(),
+        );
         class_addMethod(
             delegate,
             sel("bunnyBlink:"),
@@ -874,8 +900,11 @@ impl WindowHandle {
         if damage.is_empty() {
             return;
         }
-        BACKING.with(|backing| {
-            let mut backing = backing.borrow_mut();
+        BACKING.with(|stores| {
+            let mut stores = stores.borrow_mut();
+            let backing = stores
+                .entry(self.view as usize)
+                .or_insert_with(|| Backing { width: 0, height: 0, bytes: Vec::new() });
             if backing.width != width || backing.height != height {
                 // fresh surface (first frame or resize): take everything
                 backing.width = width;
@@ -965,16 +994,20 @@ struct Backing {
 }
 
 thread_local! {
-    static BACKING: RefCell<Backing> =
-        RefCell::new(Backing { width: 0, height: 0, bytes: Vec::new() });
+    /// One backing per VIEW — the main window and every popover panel
+    /// present through the same `drawRect:`, each from its own store.
+    static BACKING: RefCell<HashMap<usize, Backing>> = RefCell::new(HashMap::new());
 }
 
 /// `drawRect:` — paints the dirty union from the backing through a
 /// NO-COPY CGImage. The context arrives clipped to the dirty rect; the
 /// CTM flip converts our top-down rows to AppKit's bottom-up world.
 extern "C" fn bunny_draw_rect(this: Id, _sel: Sel, _dirty: CGRect) {
-    BACKING.with(|backing| {
-        let backing = backing.borrow();
+    BACKING.with(|stores| {
+        let stores = stores.borrow();
+        let Some(backing) = stores.get(&(this as usize)) else {
+            return;
+        };
         if backing.bytes.is_empty() {
             return;
         }
@@ -1150,6 +1183,122 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
         objc_autoreleasePoolPop(pool);
 
         WindowHandle { window, view }
+    }
+}
+
+/// `NSWindowStyleMaskNonactivatingPanel` — borderless, and NEVER key:
+/// the keyboard and the IME stay with the parent window.
+const PANEL_STYLE: u64 = 1 << 7;
+
+/// Creates a borderless, transparent child panel over `parent` — the
+/// popover's own surface. It follows the parent on move by AppKit's
+/// child-window contract; it carries NO delegate (closing it must
+/// never terminate), no timer and no display link — the parent drives
+/// every frame. The panel's chrome (background, border, shadow) is the
+/// scene's own paint on a clear backdrop.
+pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHandle {
+    unsafe {
+        let pool = objc_autoreleasePoolPush();
+        register_classes();
+
+        let rect = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize { width, height },
+        };
+        let panel = msg_id(class("NSPanel"), sel("alloc"));
+        let panel = msg_init_window(
+            panel,
+            sel("initWithContentRect:styleMask:backing:defer:"),
+            rect,
+            PANEL_STYLE,
+            2, // buffered
+            0,
+        );
+        // the panel is a transparent sheet of glass: our scene paints
+        // the popover's card, shadow included — the system shadow
+        // would double it (and borderless panels default it ON)
+        msg_void_bool(panel, sel("setOpaque:"), 0);
+        msg_void_id(panel, sel("setBackgroundColor:"), msg_id(class("NSColor"), sel("clearColor")));
+        msg_void_bool(panel, sel("setHasShadow:"), 0);
+        // the store manages the lifetime — never AppKit's release
+        msg_void_bool(panel, sel("setReleasedWhenClosed:"), 0);
+
+        let view = msg_id(class("BunnyView"), sel("alloc"));
+        let view = msg_init_rect(view, sel("initWithFrame:"), rect);
+        // CPU present only: no metal graft on panels (v1)
+        msg_void_bool(view, sel("setWantsLayer:"), 1);
+        msg_void_id(panel, sel("setContentView:"), view);
+
+        // hover and exit work inside the panel like anywhere else
+        let area = msg_id(class("NSTrackingArea"), sel("alloc"));
+        let area = msg_init_tracking(
+            area,
+            sel("initWithRect:options:owner:userInfo:"),
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize { width: 0.0, height: 0.0 },
+            },
+            0x223,
+            view,
+            std::ptr::null_mut(),
+        );
+        msg_void_id(view, sel("addTrackingArea:"), area);
+
+        // the child contract: the panel rides every parent move
+        msg_void_id_i64(parent.window, sel("addChildWindow:ordered:"), panel, 1);
+
+        objc_autoreleasePoolPop(pool);
+        WindowHandle { window: panel, view }
+    }
+}
+
+impl WindowHandle {
+    /// Places the panel at a SCREEN rect (AppKit coordinates, y-up) —
+    /// the parent's `layout_rect_to_screen` produces it.
+    pub fn set_frame_screen(&self, rect: CGRect) {
+        unsafe { msg_void_rect_bool(self.window, sel("setFrame:display:"), rect, 1) };
+    }
+
+    /// Registers where this panel's view sits in SCENE coordinates —
+    /// its pointer events translate back through it.
+    pub fn set_scene_origin(&self, x: f64, y: f64) {
+        PANEL_ORIGINS.with(|origins| {
+            origins.borrow_mut().insert(self.view as usize, (x, y));
+        });
+    }
+
+    /// Detaches and hides a child panel, and forgets its stores. The
+    /// panel object stays reusable-dead (released when the process
+    /// goes) — panels are few and pooled by path.
+    pub fn close_panel(&self, parent: &WindowHandle) {
+        unsafe {
+            msg_void_id(parent.window, sel("removeChildWindow:"), self.window);
+            msg_void_id(self.window, sel("orderOut:"), std::ptr::null_mut());
+        }
+        PANEL_ORIGINS.with(|origins| {
+            origins.borrow_mut().remove(&(self.view as usize));
+        });
+        BACKING.with(|stores| {
+            stores.borrow_mut().remove(&(self.view as usize));
+        });
+    }
+
+    /// The screen's visible frame in this window's LAYOUT coordinates
+    /// (top-left origin; left/above the window comes out negative).
+    /// `None` when the window is off every screen.
+    pub fn screen_bounds_in_layout(&self) -> Option<(f64, f64, f64, f64)> {
+        unsafe {
+            let screen = msg_id(self.window, sel("screen"));
+            if screen.is_null() {
+                return None;
+            }
+            let visible = msg_rect(screen, sel("visibleFrame"));
+            let in_window = msg_rect_rect(self.window, sel("convertRectFromScreen:"), visible);
+            let bounds = msg_rect(self.view, sel("bounds"));
+            // AppKit flip: y-up window coords → top-left layout coords
+            let top = bounds.size.height - in_window.origin.y - in_window.size.height;
+            Some((in_window.origin.x, top, in_window.size.width, in_window.size.height))
+        }
     }
 }
 
