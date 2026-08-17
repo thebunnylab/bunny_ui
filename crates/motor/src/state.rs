@@ -100,27 +100,27 @@ impl<T: FromEnvironment> Clone for Environment<T> {
 
 /// `@State private var x = value` — value-type view, arena-backed storage.
 ///
-/// O handle é `Copy` (índice + geração + id de dependência): closures
-/// capturam cópias implicitamente, como structs Swift — sem o cortejo de
-/// `let this = self.clone()` por closure.
+/// The handle is `Copy` (index + generation + dependency id): closures
+/// capture copies implicitly, like Swift structs — without the
+/// `let this = self.clone()` ceremony per closure.
 ///
-/// A posse é do runtime, ancorada na identidade estrutural
-/// ([`crate::identity`]): `new` DENTRO de um pass de render é declaração —
-/// se a identidade já montou esse estado, o handle aponta para o slot vivo
-/// e o valor inicial é descartado (o inicial só semeia o primeiro mount,
-/// como o `@State` do Swift). Identidade que sai da árvore leva o slot
-/// junto; a geração avança e um handle retido falha alto em vez de ler
-/// slot reciclado. Fora de render (roots que o app segura), o slot é do
-/// app e vive para sempre.
+/// Ownership belongs to the runtime, anchored on structural identity
+/// ([`crate::identity`]): `new` INSIDE a render pass is a declaration — if
+/// the identity already mounted this state, the handle points to the live
+/// slot and the initial value is discarded (the initial only seeds the
+/// first mount, like Swift's `@State`). An identity that leaves the tree
+/// takes the slot with it; the generation advances and a retained handle
+/// fails loudly instead of reading a recycled slot. Outside render (roots
+/// the app holds), the slot belongs to the app and lives forever.
 ///
-/// O storage é uma **arena por tipo** (`Vec<Slot<T>>` com valores inline):
-/// o caminho quente indexa slots tipados sem downcast por valor nem caixa
-/// por slot — o apagamento recua para a borda fria (o registro de arenas e
-/// o ponteiro de função que a varredura usa para liberar sem conhecer `T`).
+/// Storage is a **per-type arena** (`Vec<Slot<T>>` with inline values):
+/// the hot path indexes typed slots with no per-value downcast and no
+/// per-slot box — erasure retreats to the cold edge (the arena registry and
+/// the function pointer the sweep uses to free without knowing `T`).
 pub struct State<T> {
     index: usize,
     generation: u32,
-    /// Identidade para o grafo de leitura — global, nunca reciclada.
+    /// Identity for the read graph — global, never recycled.
     dep: u64,
     _marker: PhantomData<fn() -> T>,
 }
@@ -151,8 +151,8 @@ impl<T> TypedArena<T> {
         }
     }
 
-    /// Geração avança (handle retido não enxerga o slot reciclado) e o
-    /// valor morre agora.
+    /// Generation advances (a retained handle cannot see the recycled
+    /// slot) and the value dies now.
     fn free(&mut self, index: usize) {
         if let Some(slot) = self.slots.get_mut(index) {
             slot.generation += 1;
@@ -163,11 +163,11 @@ impl<T> TypedArena<T> {
 }
 
 thread_local! {
-    /// Uma arena por `TypeId` — o `dyn Any` embrulha a ARENA (borda fria,
-    /// um downcast por acesso ao contêiner tipado), nunca o valor.
+    /// One arena per `TypeId` — the `dyn Any` wraps the ARENA (cold edge,
+    /// one downcast per access to the typed container), never the value.
     static ARENAS: RefCell<HashMap<TypeId, Rc<dyn Any>>> = RefCell::new(HashMap::new());
-    /// Como a varredura libera sem conhecer `T`: um ponteiro de função por
-    /// tipo, registrado quando a arena nasce.
+    /// How the sweep frees without knowing `T`: one function pointer per
+    /// type, registered when the arena is born.
     static FREERS: RefCell<HashMap<TypeId, fn(usize)>> = RefCell::new(HashMap::new());
     static NEXT_DEP: Cell<u64> = const { Cell::new(0) };
 }
@@ -185,7 +185,7 @@ fn with_arena<T: 'static, R>(f: impl FnOnce(&mut TypedArena<T>) -> R) -> R {
             })
             .clone()
             .downcast::<RefCell<TypedArena<T>>>()
-            .expect("arena registrada por TypeId é sempre do próprio tipo")
+            .expect("an arena registered by TypeId is always its own type")
     });
     let result = f(&mut cell.borrow_mut());
     result
@@ -195,7 +195,7 @@ fn free_typed<T: 'static>(index: usize) {
     with_arena::<T, _>(|arena| arena.free(index));
 }
 
-/// A varredura de identidades mortas passa por aqui.
+/// The sweep of dead identities goes through here.
 pub(crate) fn free_slot(type_id: TypeId, index: usize) {
     let Some(freer) = FREERS.with(|freers| freers.borrow().get(&type_id).copied()) else {
         return;
@@ -203,8 +203,8 @@ pub(crate) fn free_slot(type_id: TypeId, index: usize) {
     freer(index);
 }
 
-const DEAD_STATE: &str = "State de uma identidade desmontada (ou de outra thread) — \
-                          o slot morreu junto com a view";
+const DEAD_STATE: &str = "State of an unmounted identity (or from another thread) — \
+                          the slot died together with the view";
 
 impl<T> Clone for State<T> {
     fn clone(&self) -> Self {
@@ -218,7 +218,7 @@ impl<T: Clone + 'static> State<T> {
     pub fn new(value: T) -> Self {
         match crate::identity::claim_anchor(TypeId::of::<T>()) {
             crate::identity::Claim::Existing { index, generation, dep } => {
-                // identidade já montada: revive o slot, descarta o inicial
+                // identity already mounted: revive the slot, discard the initial
                 State { index, generation, dep, _marker: PhantomData }
             }
             crate::identity::Claim::Fresh(token) => {
@@ -258,9 +258,10 @@ impl<T: Clone + 'static> State<T> {
         crate::identity::record_write(crate::identity::DepKey::State(self.dep));
     }
 
-    /// Mutação composta. O valor sai da arena enquanto `f` roda (a arena
-    /// não fica emprestada durante código do usuário — `f` pode ler OUTROS
-    /// `State`s do mesmo tipo); acesso reentrante ao MESMO slot falha alto.
+    /// Compound mutation. The value leaves the arena while `f` runs (the
+    /// arena is not left borrowed during user code — `f` may read OTHER
+    /// `State`s of the same type); reentrant access to the SAME slot fails
+    /// loudly.
     pub fn update<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         let mut value = with_arena::<T, _>(|arena| {
             arena
@@ -291,8 +292,9 @@ impl<T: Clone + 'static> State<T> {
     }
 }
 
-/// Exibir um `State` LÊ o valor — a dependência registra sozinha. É o que
-/// faz `text!("count: {}", self.count)` reagir sem `.get()` nenhum.
+/// Displaying a `State` READS the value — the dependency records itself.
+/// It is what makes `text!("count: {}", self.count)` react with no `.get()`
+/// at all.
 impl<T: Clone + std::fmt::Display + 'static> std::fmt::Display for State<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.wrappedValue().fmt(f)

@@ -1,8 +1,8 @@
 //
 //  ModalFlagView.swift — CountriesSwiftUI
 //
-//  Desvios do port: o `Inspection` (ViewInspector) fica de fora — a demo
-//  headless já é a inspeção.
+//  Port deviations: `Inspection` (ViewInspector) stays out — the headless
+//  demo already is the inspection.
 //
 
 use countries_core::Foundation::URL;
@@ -28,9 +28,10 @@ impl ModalFlagView {
 }
 
 impl Component for ModalFlagView {
-    /// Os modifiers moram dentro do `map`: aplicar num `Option` (aridade
-    /// zero-ou-um) decoraria o nada quando `None` — a aridade no tipo barra
-    /// isso, então o título e a toolbar seguem o conteúdo que existe.
+    /// The modifiers live inside the `map`: applying them on an `Option`
+    /// (zero-or-one arity) would decorate the nothing when `None` — the
+    /// arity in the type forbids that, so the title and the toolbar follow
+    /// the content that exists.
     fn body(self, _ctx: &Context) -> impl View {
         let flag_item = self.country.flag.clone().map(|url| {
             self.clone()
@@ -52,8 +53,8 @@ impl ModalFlagView {
         hstack((spacer(), ImageView::new(url).frame(300.0, 200.0), spacer()))
     }
 
-    /// `closeButton` — `Button("Close") { isDisplayed = false }` (o
-    /// `.toolbar` do runtime fake é inert e nunca o monta, como no motor).
+    /// `closeButton` — `Button("Close") { isDisplayed = false }` (the fake
+    /// runtime's `.toolbar` is inert and never mounts it, as in the engine).
     fn close_button(self) -> impl UnaryView {
         button(text("Close"), move || self.is_displayed.set(false))
     }

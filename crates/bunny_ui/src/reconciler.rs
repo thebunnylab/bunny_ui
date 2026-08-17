@@ -1,25 +1,27 @@
-//! O reconciler — a árvore retida por identidade.
+//! The reconciler — the tree retained by identity.
 //!
-//! Cada fronteira de view (`Component`) deixa aqui uma [`Entry`]: o
-//! VALOR da view (re-rodável, apagado atrás de um `Erased`), o `Context`
-//! com que rendeu (environment de ancestrais já aplicado), a saída
-//! impressa e os efeitos que o body registrou.
+//! Each view boundary (`Component`) leaves an [`Entry`] here: the
+//! view's VALUE (re-runnable, erased behind an `Erased`), the `Context`
+//! it rendered with (ancestor environment already applied), the printed
+//! output, and the effects the body registered.
 //!
-//! No render, a fronteira decide: limpa e retida → PULA o body e emite uma
-//! referência (a montagem final expande do cache); suja, nova, ou dentro
-//! de um body que re-rodou (o pai construiu valores novos — config pode
-//! ter mudado) → roda e re-retém. View suja atrás de pai pulado re-roda
-//! ISOLADA a partir do valor retido, com o cursor re-semeado no caminho.
+//! At render, the boundary decides: clean and retained → SKIP the body
+//! and emit a reference (the final assembly expands from the cache);
+//! dirty, new, or inside a body that re-ran (the parent built new
+//! values — the config may have changed) → run and re-retain. A dirty
+//! view behind a skipped parent re-runs ISOLATED from the retained
+//! value, with the cursor re-seeded on the path.
 //!
-//! Efeitos de views puladas continuam bombeando: a fila de cada pass é
-//! remontada da retenção (elas são a subscription vigente). `onAppear` de
-//! view pulada NÃO dispara — o que aproxima o fake da semântica real
-//! (appear é mount, não frame).
+//! Effects of skipped views keep pumping: each pass's queue is
+//! reassembled from the retention (they are the live subscription).
+//! `onAppear` of a skipped view does NOT fire — which brings the fake
+//! closer to the real semantics (appear is mount, not frame).
 //!
-//! A saída referencia fronteiras por um marcador na própria linha
-//! (`\u{1}caminho\u{1}sufixos…`) — interno à [`NodeList`] opaca; a
-//! expansão resolve recursivamente contra a retenção, aplica sufixos de
-//! modifier acumulados e re-appende filhos extra (o nó `Sheet`).
+//! The output references boundaries by a marker on the line itself
+//! (`\u{1}path\u{1}suffixes…`) — internal to the opaque [`NodeList`];
+//! expansion resolves recursively against the retention, applies the
+//! accumulated modifier suffixes, and re-appends extra children (the
+//! `Sheet` node).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -32,18 +34,19 @@ use crate::erased::Erased;
 use crate::layout::LayoutNode;
 use crate::text_input::{CaretState, EditCommand};
 
-/// Uma ação interativa registrada durante o render: (caminho do alvo, o
-/// que o clique dispara).
+/// An interactive action registered during render: (target path, what
+/// the click fires).
 pub(crate) type ActionEntry = (String, Rc<dyn Fn()>);
 
-/// O editor de um campo de texto: aplica um comando ao par
-/// (binding, caret) e devolve a saída de `Read`/`Copy`/`Cut`. Retido como
-/// as ações — campo de view pulada edita.
+/// A text field's editor: applies a command to the (binding, caret)
+/// pair and returns the output of `Read`/`Copy`/`Cut`. Retained like
+/// the actions — a skipped view's field still edits.
 pub(crate) type EditorFn = Rc<dyn Fn(EditCommand, &mut CaretState) -> Option<String>>;
 pub(crate) type EditorEntry = (String, EditorFn);
 
-/// Handler de ação NOMEADA registrado no render: (caminho do registro,
-/// id, o que roda). Retido como as ações — handler de view pulada vive.
+/// A NAMED action handler registered at render: (registration path,
+/// id, what runs). Retained like the actions — a skipped view's
+/// handler lives.
 pub(crate) type HandlerFn = Rc<dyn Fn()>;
 pub(crate) type HandlerEntry = (String, crate::action::ActionId, HandlerFn);
 
@@ -51,18 +54,18 @@ pub(crate) struct Entry {
     pub value: Erased,
     pub ctx: Context,
     pub node: RenderNode,
-    /// A árvore de layout do body — retida junto com o print (as duas
-    /// saídas do mesmo body-eval).
+    /// The body's layout tree — retained along with the print (the two
+    /// outputs of the same body-eval).
     pub layout: LayoutNode,
     pub effects: Vec<EffectFn>,
-    /// As ações interativas do body — retidas como os efeitos: botão de
-    /// view pulada continua clicável.
+    /// The body's interactive actions — retained like the effects: a
+    /// skipped view's button stays clickable.
     pub actions: Vec<ActionEntry>,
-    /// Os editores de campo do body — mesma retenção.
+    /// The body's field editors — same retention.
     pub editors: Vec<EditorEntry>,
-    /// Os handlers de ação nomeada do body — mesma retenção.
+    /// The body's named-action handlers — same retention.
     pub handlers: Vec<HandlerEntry>,
-    /// Segmentos do caminho do PAI — a semente do cursor num re-run isolado.
+    /// The PARENT's path segments — the cursor seed for an isolated re-run.
     pub parent_segments: Vec<String>,
 }
 
@@ -78,20 +81,20 @@ struct BuildingFrame {
 #[derive(Default)]
 struct PassState {
     active: bool,
-    /// Snapshot dos sujos no início do pass — decide quem re-roda.
+    /// Snapshot of the dirty set at pass start — decides who re-runs.
     dirty: HashSet<String>,
-    /// Pilha de entries em construção (o topo coleta efeitos e ações).
+    /// Stack of entries being built (the top collects effects and actions).
     building: Vec<BuildingFrame>,
-    /// Efeitos da região do root (fora de qualquer fronteira) — re-rodam
-    /// a cada walk.
+    /// Effects from the root region (outside any boundary) — they
+    /// re-run on every walk.
     root_effects: Vec<EffectFn>,
     root_actions: Vec<ActionEntry>,
     root_editors: Vec<EditorEntry>,
     root_handlers: Vec<HandlerEntry>,
-    /// Instrumentação: bodies que rodaram neste pass.
+    /// Instrumentation: bodies that ran in this pass.
     body_runs: Vec<String>,
-    /// Fronteiras PULADAS neste pass — a subtree de uma pulada sobrevive
-    /// à varredura de entries (o walk não entrou nela de propósito).
+    /// Boundaries SKIPPED in this pass — a skipped one's subtree
+    /// survives the entry sweep (the walk stayed out on purpose).
     skipped: Vec<String>,
 }
 
@@ -101,11 +104,11 @@ thread_local! {
     static LAST_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
-/// A árvore de layout retida de uma fronteira, emprestada no lugar — o
-/// measure e o place resolvem `BoundaryRef` por aqui, SEM costurar cópia
-/// expandida. Empréstimos aninham (ref dentro de ref = borrows
-/// compartilhados do mesmo RefCell); nenhum body roda durante o layout,
-/// então não há re-empréstimo mutável possível.
+/// A boundary's retained layout tree, borrowed in place — measure and
+/// place resolve `BoundaryRef` through here, WITHOUT stitching an
+/// expanded copy. Borrows nest (ref inside ref = shared borrows of the
+/// same RefCell); no body runs during layout, so no mutable re-borrow
+/// is possible.
 pub(crate) fn with_retained_layout<R>(
     path: &str,
     reader: impl FnOnce(Option<&LayoutNode>) -> R,
@@ -116,14 +119,14 @@ pub(crate) fn with_retained_layout<R>(
     })
 }
 
-/// A fronteira está retida? (O guarda do frame estável do `Runtime`.)
+/// Is the boundary retained? (The guard for the `Runtime` stable frame.)
 pub(crate) fn is_retained(path: &str) -> bool {
     RETAINED.with(|retained| retained.borrow().contains_key(path))
 }
 
-/// Registra que o frame corrente foi servido SEM pass (raiz estável
-/// sintetizada) — o contrato observável de `body_runs` continua: este
-/// frame rodou zero bodies.
+/// Records that the current frame was served WITHOUT a pass (stable
+/// root synthesized) — the observable `body_runs` contract holds: this
+/// frame ran zero bodies.
 pub(crate) fn note_stable_frame() {
     LAST_BODY_RUNS.with(|last| last.borrow_mut().clear());
 }
@@ -145,9 +148,9 @@ pub(crate) enum Decision {
     Render,
 }
 
-/// Fronteira alcançada no walk: pula se está limpa, retida, e nenhum body
-/// acima dela rodou neste pass (um pai que rodou construiu valores novos —
-/// a config pode ter mudado sem passar por `State`).
+/// A boundary reached in the walk: skip if it is clean, retained, and
+/// no body above it ran in this pass (a parent that ran built new
+/// values — the config may have changed without going through `State`).
 pub(crate) fn decide(path: &str) -> Decision {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
@@ -184,7 +187,7 @@ pub(crate) fn finish_entry(
         let mut pass = pass.borrow_mut();
         match pass.building.pop() {
             Some(frame) => {
-                debug_assert_eq!(frame.path, path, "entries fecham na ordem que abrem");
+                debug_assert_eq!(frame.path, path, "entries close in the order they open");
                 (frame.effects, frame.actions, frame.editors, frame.handlers)
             }
             None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
@@ -212,8 +215,8 @@ pub(crate) fn finish_entry(
     });
 }
 
-/// Um efeito registrado durante o render: vai para a entry em construção,
-/// ou para a região do root quando não há fronteira aberta.
+/// An effect registered during render: goes to the entry being built,
+/// or to the root region when no boundary is open.
 pub(crate) fn attribute_effect(effect: EffectFn) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
@@ -225,7 +228,7 @@ pub(crate) fn attribute_effect(effect: EffectFn) {
     });
 }
 
-/// Uma ação interativa registrada durante o render — mesma atribuição.
+/// An interactive action registered during render — same attribution.
 pub(crate) fn attribute_action(path: String, action: Rc<dyn Fn()>) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
@@ -237,7 +240,7 @@ pub(crate) fn attribute_action(path: String, action: Rc<dyn Fn()>) {
     });
 }
 
-/// Um editor de campo registrado durante o render — mesma atribuição.
+/// A field editor registered during render — same attribution.
 pub(crate) fn attribute_editor(path: String, editor: EditorFn) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
@@ -249,8 +252,8 @@ pub(crate) fn attribute_editor(path: String, editor: EditorFn) {
     });
 }
 
-/// Um handler de ação nomeada registrado durante o render — mesma
-/// atribuição das ações: entry em construção, ou região do root.
+/// A named-action handler registered during render — same attribution
+/// as the actions: entry being built, or the root region.
 pub(crate) fn attribute_handler(path: String, id: crate::action::ActionId, handler: HandlerFn) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
@@ -263,18 +266,18 @@ pub(crate) fn attribute_handler(path: String, id: crate::action::ActionId, handl
 }
 
 thread_local! {
-    /// O mapa de handlers vigente: id → (profundidade do registro,
-    /// handler). Remontado por pass, como ações e editores — o mapa é
-    /// estampa do pass, nunca estado retido de interação.
+    /// The live handler map: id → (registration depth, handler).
+    /// Reassembled per pass, like actions and editors — the map is a
+    /// stamp of the pass, never retained interaction state.
     static HANDLERS: RefCell<HashMap<crate::action::ActionId, (usize, HandlerFn)>> =
         RefCell::new(HashMap::new());
 }
 
-/// Remonta o mapa de handlers da retenção sob o root + região do root.
-/// Precedência: o caminho mais FUNDO vence (mais interno na árvore);
-/// empate de profundidade → o montado por último (determinístico pela
-/// ordem da retenção, documentado como NÃO-contratual — o desempate
-/// semântico chega com key contexts).
+/// Reassembles the handler map from the retention under the root + the
+/// root region. Precedence: the DEEPEST path wins (innermost in the
+/// tree); a depth tie → the last one mounted (deterministic from the
+/// retention order, documented as NON-contractual — the semantic
+/// tiebreak arrives with key contexts).
 pub(crate) fn assemble_handlers(root: &str) {
     let mut map: HashMap<crate::action::ActionId, (usize, HandlerFn)> = HashMap::new();
     let place = |map: &mut HashMap<crate::action::ActionId, (usize, HandlerFn)>,
@@ -306,14 +309,14 @@ pub(crate) fn assemble_handlers(root: &str) {
     HANDLERS.with(|handlers| *handlers.borrow_mut() = map);
 }
 
-/// Roda o handler mais interno do id. `false` = ninguém registrou — a
-/// tecla NÃO é consumida (segue para o campo/sistema de input).
+/// Runs the innermost handler for the id. `false` = nobody registered —
+/// the key is NOT consumed (it continues to the field/input system).
 pub(crate) fn run_handler(id: crate::action::ActionId) -> bool {
     let handler = HANDLERS
         .with(|handlers| handlers.borrow().get(&id).map(|(_, handler)| handler.clone()));
     match handler {
         Some(handler) => {
-            // fora do borrow: o handler pode escrever estado à vontade
+            // outside the borrow: the handler can write state freely
             handler();
             true
         }
@@ -321,9 +324,10 @@ pub(crate) fn run_handler(id: crate::action::ActionId) -> bool {
     }
 }
 
-/// Views sujas que o walk não alcançou (pai pulado): re-roda cada uma a
-/// partir do valor retido, com o cursor semeado no caminho do pai —
-/// ancestral primeiro, porque o re-run de um pai cobre os descendentes.
+/// Dirty views the walk did not reach (skipped parent): re-runs each
+/// one from the retained value, with the cursor seeded on the parent's
+/// path — ancestors first, because a parent's re-run covers the
+/// descendants.
 pub(crate) fn run_isolated(root: &str) {
     let mut pending: Vec<String> = PASS.with(|pass| {
         let pass = pass.borrow();
@@ -349,13 +353,14 @@ pub(crate) fn run_isolated(root: &str) {
                 (entry.value.clone(), entry.ctx.clone(), entry.parent_segments.clone())
             })
         }) else {
-            continue; // suja mas nunca montada (ou já varrida): nada a re-rodar
+            continue; // dirty but never mounted (or already swept): nothing to re-run
         };
         let _frames = motor::identity::seed(&parents);
         let mut scratch = crate::view::NodeList::new();
         use crate::view::View;
-        // o valor retido re-renderiza pelo caminho normal do blanket: a
-        // fronteira está no snapshot de sujos, então roda e re-retém
+        // the retained value re-renders through the blanket's normal
+        // path: the boundary is in the dirty snapshot, so it runs and
+        // re-retains
         value.render_into(&ctx, &mut scratch);
     }
 }
@@ -364,8 +369,9 @@ fn covers(ancestor: &str, path: &str) -> bool {
     path == ancestor || path.starts_with(&format!("{ancestor}/"))
 }
 
-/// A fila de efeitos do pass: região do root + a retenção inteira sob o
-/// root atual (pulada ou não — efeito retido é subscription vigente).
+/// The pass's effect queue: the root region + the whole retention under
+/// the current root (skipped or not — a retained effect is a live
+/// subscription).
 pub(crate) fn assemble_effects(root: &str) -> Vec<EffectFn> {
     let mut queue = PASS.with(|pass| std::mem::take(&mut pass.borrow_mut().root_effects));
     RETAINED.with(|retained| {
@@ -379,13 +385,13 @@ pub(crate) fn assemble_effects(root: &str) -> Vec<EffectFn> {
 }
 
 thread_local! {
-    /// O mapa de cliques vigente: caminho do alvo → ação. Remontado a cada
-    /// pass, como a fila de efeitos.
+    /// The live click map: target path → action. Reassembled on every
+    /// pass, like the effect queue.
     static ACTIONS: RefCell<HashMap<String, Rc<dyn Fn()>>> = RefCell::new(HashMap::new());
 }
 
-/// Remonta o mapa de cliques da retenção sob o root (botão de view pulada
-/// continua clicável) + região do root.
+/// Reassembles the click map from the retention under the root (a
+/// skipped view's button stays clickable) + the root region.
 pub(crate) fn assemble_actions(root: &str) {
     let mut map: HashMap<String, Rc<dyn Fn()>> = HashMap::new();
     RETAINED.with(|retained| {
@@ -405,8 +411,9 @@ pub(crate) fn assemble_actions(root: &str) {
     ACTIONS.with(|actions| *actions.borrow_mut() = map);
 }
 
-/// Dispara a ação do alvo (a chave vem do hit-test). `false` = alvo não
-/// registrado (identidade morreu entre o frame e o clique — inofensivo).
+/// Fires the target's action (the key comes from the hit-test).
+/// `false` = target not registered (the identity died between frame and
+/// click — harmless).
 pub(crate) fn run_action(path: &str) -> bool {
     let action = ACTIONS.with(|actions| actions.borrow().get(path).cloned());
     match action {
@@ -419,12 +426,12 @@ pub(crate) fn run_action(path: &str) -> bool {
 }
 
 thread_local! {
-    /// O mapa de editores de campo vigente — remontado por pass, como as
-    /// ações.
+    /// The live field-editor map — reassembled per pass, like the
+    /// actions.
     static EDITORS: RefCell<HashMap<String, EditorFn>> = RefCell::new(HashMap::new());
 }
 
-/// Remonta o mapa de editores da retenção sob o root + região do root.
+/// Reassembles the editor map from retention under the root + root region.
 pub(crate) fn assemble_editors(root: &str) {
     let mut map: HashMap<String, EditorFn> = HashMap::new();
     RETAINED.with(|retained| {
@@ -444,14 +451,14 @@ pub(crate) fn assemble_editors(root: &str) {
     EDITORS.with(|editors| *editors.borrow_mut() = map);
 }
 
-/// O alvo é um campo de texto? (decide se um clique FOCA em vez de agir)
+/// Is the target a text field? (decides if a click FOCUSES instead of acting)
 pub(crate) fn has_editor(path: &str) -> bool {
     EDITORS.with(|editors| editors.borrow().contains_key(path))
 }
 
-/// Aplica um comando ao campo — o closure retido é quem alcança o
-/// binding. `None` externo = campo não registrado; o `Option` interno é a
-/// saída do comando.
+/// Applies a command to the field — the retained closure is what
+/// reaches the binding. Outer `None` = field not registered; the inner
+/// `Option` is the command's output.
 pub(crate) fn run_editor(
     path: &str,
     command: EditCommand,
@@ -461,7 +468,7 @@ pub(crate) fn run_editor(
     editor.map(|editor| editor(command, state))
 }
 
-/// Identidades varridas pelo `end_pass`: as entries delas caem juntas.
+/// Identities swept by `end_pass`: their entries fall with them.
 pub(crate) fn forget(dead: &[String]) {
     RETAINED.with(|retained| {
         let mut retained = retained.borrow_mut();
@@ -471,14 +478,15 @@ pub(crate) fn forget(dead: &[String]) {
     });
 }
 
-/// A varredura-GÊMEA da de identidade, para views SEM estado próprio: a
-/// varredura do motor só conhece fronteiras com slots/âncoras (owners);
-/// uma view apátrida que desmonta deixaria a entry retida — e com ela
-/// handlers/ações/editores ZUMBIS respondendo depois do desmonte. Regra:
-/// sob o root, sobrevive quem re-rodou, quem foi pulado, ou quem vive sob
-/// uma fronteira PULADA (o walk não entrou nela de propósito). Descendente
-/// não-visitado de um pai que RE-RODOU está morto — o pai revisitou os
-/// filhos vivos um a um.
+/// The TWIN of the identity sweep, for views with NO state of their
+/// own: the motor's sweep only knows boundaries with slots/anchors
+/// (owners); a stateless view that unmounts would leave its entry
+/// retained — and with it ZOMBIE handlers/actions/editors answering
+/// after the unmount. The rule: under the root, survivors are who
+/// re-ran, who was skipped, or who lives under a SKIPPED boundary (the
+/// walk stayed out of it on purpose). An unvisited descendant of a
+/// parent that RE-RAN is dead — the parent revisited its living
+/// children one by one.
 pub(crate) fn sweep_stale(root: &str) {
     let (runs, skipped) = PASS.with(|pass| {
         let pass = pass.borrow();
@@ -490,15 +498,15 @@ pub(crate) fn sweep_stale(root: &str) {
     RETAINED.with(|retained| {
         retained.borrow_mut().retain(|path, _| {
             if !covers(root, path) {
-                return true; // outra árvore montada na mesma thread
+                return true; // another tree mounted on the same thread
             }
             runs.contains(path) || skipped.iter().any(|skip| covers(skip, path))
         });
     });
 }
 
-/// Descarta a retenção inteira — o próximo pass roda todos os bodies (o
-/// `render_full` dos testes; o estado nas arenas de identidade fica).
+/// Drops the whole retention — the next pass runs every body (the
+/// tests' `render_full`; the state in the identity arenas stays).
 pub(crate) fn clear() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
 }
@@ -512,13 +520,13 @@ pub(crate) fn end_pass() {
     });
 }
 
-/// Instrumentação: os bodies que rodaram no último pass (caminhos de
-/// identidade) — a prova de incrementalidade nos testes.
+/// Instrumentation: the bodies that ran in the last pass (identity
+/// paths) — the proof of incrementality in the tests.
 pub(crate) fn last_body_runs() -> Vec<String> {
     LAST_BODY_RUNS.with(|last| last.borrow().clone())
 }
 
-// MARK: - Referências e expansão
+// MARK: - References and expansion
 
 pub(crate) fn ref_line(path: &str) -> String {
     format!("{REF_MARK}{path}{REF_MARK}")
@@ -530,17 +538,17 @@ fn parse_ref(line: &str) -> Option<(&str, &str)> {
     Some((&rest[..end], &rest[end + REF_MARK.len_utf8()..]))
 }
 
-/// Resolve referências contra a retenção: expande o nó retido (recursivo —
-/// o cache também referencia), re-aplica os sufixos de modifier acumulados
-/// na linha da referência e re-appende filhos extra (o nó `Sheet` que o
-/// modifier pendura na fronteira).
+/// Resolves references against the retention: expands the retained node
+/// (recursive — the cache references too), re-applies the modifier
+/// suffixes accumulated on the reference line, and re-appends extra
+/// children (the `Sheet` node the modifier hangs on the boundary).
 pub(crate) fn expand(node: &RenderNode) -> RenderNode {
     if let Some((path, suffix)) = parse_ref(&node.line) {
         let retained = RETAINED.with(|retained| {
             retained.borrow().get(path).map(|entry| entry.node.clone())
         });
         let Some(inner) = retained else {
-            debug_assert!(false, "referência a fronteira sem retenção: {path}");
+            debug_assert!(false, "boundary reference without retention: {path}");
             return RenderNode::leaf("");
         };
         let mut expanded = expand(&inner);

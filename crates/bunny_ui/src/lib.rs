@@ -1,10 +1,10 @@
-//! `bunny_ui` — a camada tipada sobre o motor do `motor`.
+//! `bunny_ui` — the typed layer over the `motor` engine.
 //!
-//! O mesmo runtime instrumentado (árvore de render, `render_stable`,
-//! efeitos por site), agora monomórfico: views são valores genéricos
-//! (`VStack<(Text, Button<…>)>`), `body` devolve `impl View` e o
-//! apagamento vive só nas bordas de dinamismo real — [`Erased`] para
-//! sheets e `ViewModifier`s, a fila de efeitos e os slots por site.
+//! The same instrumented runtime (render tree, `render_stable`,
+//! per-site effects), now monomorphic: views are generic values
+//! (`VStack<(Text, Button<…>)>`), `body` returns `impl View` and
+//! erasure lives only at the borders of real dynamism — [`Erased`] for
+//! sheets and `ViewModifier`s, the effect queue and the per-site slots.
 //!
 //! ```ignore
 //! #[derive(Clone, Copy)]
@@ -22,14 +22,14 @@
 //! }
 //! ```
 //!
-//! Três garantias desta camada, além do motor:
+//! Three guarantees from this layer, on top of the engine:
 //!
-//! - `State<T>` é `Copy` — views só de estado derivam `Copy` e closures
-//!   capturam `self` sem cerimônia, como structs Swift;
-//! - os sites de `on_change`/`on_receive` saem de `#[track_caller]` — cada
-//!   callsite é seu próprio slot, sem string manual;
-//! - aridade no tipo ([`Single`]/[`Many`]) — modifier em tupla crua não
-//!   compila, em vez de decorar o nó errado em silêncio.
+//! - `State<T>` is `Copy` — state-only views derive `Copy` and closures
+//!   capture `self` without ceremony, like Swift structs;
+//! - `on_change`/`on_receive` sites come from `#[track_caller]` — each
+//!   callsite is its own slot, no manual string;
+//! - arity in the type ([`Single`]/[`Many`]) — a modifier on a raw tuple
+//!   does not compile, instead of silently decorating the wrong node.
 //!
 //! [`Erased`]: crate::erased::Erased
 //! [`Single`]: crate::view::Single
@@ -54,8 +54,8 @@ pub mod theme;
 pub mod view;
 pub mod views;
 
-/// `text!("Count: {}", self.count)` — o `format!` embutido do texto.
-/// Exibir um `State` LÊ o valor: a dependência registra sozinha.
+/// `text!("Count: {}", self.count)` — the built-in `format!` of text.
+/// Displaying a `State` READS the value: the dependency registers itself.
 #[macro_export]
 macro_rules! text {
     ($($arg:tt)*) => {
@@ -63,7 +63,7 @@ macro_rules! text {
     };
 }
 
-/// `vstack!(a, b, c)` — os filhos sem os parênteses dobrados da tupla.
+/// `vstack!(a, b, c)` — the children without the tuple's doubled parentheses.
 #[macro_export]
 macro_rules! vstack {
     ($($child:expr),+ $(,)?) => {
@@ -71,7 +71,7 @@ macro_rules! vstack {
     };
 }
 
-/// `hstack!(a, b, c)` — ver [`vstack!`].
+/// `hstack!(a, b, c)` — see [`vstack!`].
 #[macro_export]
 macro_rules! hstack {
     ($($child:expr),+ $(,)?) => {
@@ -79,7 +79,7 @@ macro_rules! hstack {
     };
 }
 
-/// `zstack!(a, b, c)` — ver [`vstack!`].
+/// `zstack!(a, b, c)` — see [`vstack!`].
 #[macro_export]
 macro_rules! zstack {
     ($($child:expr),+ $(,)?) => {
@@ -102,8 +102,8 @@ pub mod prelude {
     pub use crate::view::{Component, Either, Many, Single, UnaryView, View};
     pub use crate::views::*;
 
-    // O motor, re-exportado: o app só precisa desta prelude. Nomes
-    // nominais do port espelhado não atravessam a borda pública.
+    // The engine, re-exported: the app only needs this prelude. Nominal
+    // names from the mirrored port do not cross the public border.
     pub use std::rc::Rc;
     pub use motor::combine::{AnyPublisher, IntoPublisher, PassthroughSubject, Store};
     pub use motor::loadable::{Loadable, LoadableSubject, LoadError};
@@ -152,9 +152,9 @@ mod tests {
 
     #[test]
     fn state_handles_are_copy_so_views_can_be_too() {
-        // O handle é Copy: cada closure captura a sua cópia implícita —
-        // nenhum `let this = self.clone()` nomeado por papel. (As views de
-        // estado derivam `Copy` inteiras; ver os testes de on_change.)
+        // The handle is Copy: each closure captures its own implicit copy —
+        // no `let this = self.clone()` named per role. (State-only views
+        // derive `Copy` whole; see the on_change tests.)
         let count = State::new(0);
         let increment = button(text("increment"), move || count.update(|c| *c += 1));
         increment.tap();
@@ -186,11 +186,11 @@ mod tests {
         };
         let runtime = Runtime::new();
 
-        // initial: false → o slot apenas aprende o valor, nada dispara
+        // initial: false → the slot just learns the value, nothing fires
         runtime.render_stable(&probe);
         assert!(probe.seen.get().is_empty());
 
-        // o valor anda → dispara uma vez, e estabiliza
+        // the value moves → fires once, and settles
         probe.flag.set(true);
         runtime.render_stable(&probe);
         assert_eq!(probe.seen.get(), vec![true]);
@@ -198,8 +198,8 @@ mod tests {
 
     #[test]
     fn distinct_callsites_get_distinct_slots() {
-        // Dois `on_change` do mesmo tipo, sem site manual: `#[track_caller]`
-        // dá um slot para cada linha — nenhum vaza no do outro.
+        // Two `on_change` of the same type, no manual site: `#[track_caller]`
+        // gives each line its own slot — neither leaks into the other's.
         #[derive(Clone, Copy)]
         struct Pair {
             value: State<i32>,
@@ -239,10 +239,10 @@ mod tests {
 
     #[test]
     fn row_state_follows_the_item_key_and_dies_with_it() {
-        // A prova das três semânticas de posse: estado de row (a) revive
-        // entre renders, (b) segue a chave numa reordenação, (c) morre com
-        // a identidade e volta zerado num remount. O log de onAppear é o
-        // detector: um mount = um appear.
+        // The proof of the three ownership semantics: row state (a) survives
+        // across renders, (b) follows the key through a reorder, (c) dies
+        // with the identity and comes back zeroed on a remount. The onAppear
+        // log is the detector: one mount = one appear.
         #[derive(Clone)]
         struct LoadRow {
             name: String,
@@ -280,7 +280,7 @@ mod tests {
                     |item| item.to_string(),
                     move |item| LoadRow {
                         name: item.to_string(),
-                        // construído DENTRO da row: ancora na chave do item
+                        // built INSIDE the row: anchors to the item's key
                         loaded: State::new(false),
                         appeared: appeared.clone(),
                     },
@@ -298,13 +298,13 @@ mod tests {
         assert!(printed.contains("A ready") && printed.contains("B ready"));
         assert_eq!(*board.appeared.borrow(), vec!["A", "B"]);
 
-        // reordenar não zera: o estado seguiu a chave, nenhum appear novo
+        // reordering does not reset: the state followed the key, no new appear
         board.items.set(vec!["B", "A"]);
         let printed = runtime.render_stable(&board);
         assert!(printed.contains("A ready") && printed.contains("B ready"));
         assert_eq!(*board.appeared.borrow(), vec!["A", "B"]);
 
-        // remover desmonta; recolocar é mount novo — estado zerado, appear de novo
+        // removing unmounts; putting back is a new mount — state zeroed, appear again
         board.items.set(vec!["B"]);
         runtime.render_stable(&board);
         board.items.set(vec!["B", "A"]);
@@ -345,13 +345,13 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&duo);
 
-        // escrever no estado de `a` suja SÓ quem o leu — o Digit da posição
-        // #0 — nunca o irmão. É a invalidação fina que o motor real usará
-        // para re-rodar apenas os bodies atingidos.
+        // writing to `a`'s state dirties ONLY who read it — the Digit at
+        // position #0 — never the sibling. This is the fine-grained
+        // invalidation the real engine will use to re-run only the hit bodies.
         duo.a.n.set(1);
         let dirty = runtime.take_dirty();
-        assert_eq!(dirty.len(), 1, "exatamente uma view suja: {dirty:?}");
-        assert!(dirty[0].contains("#0"), "a posição da tupla identifica o irmão: {dirty:?}");
+        assert_eq!(dirty.len(), 1, "exactly one dirty view: {dirty:?}");
+        assert!(dirty[0].contains("#0"), "the tuple position identifies the sibling: {dirty:?}");
         assert!(dirty[0].ends_with("Digit"));
     }
 
@@ -387,20 +387,20 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&duo);
 
-        // um set no estado de `a`: o pai (Duo) fica PULADO — só o Digit #0
-        // re-roda, isolado, a partir do valor retido; o irmão vem do cache
+        // a set on `a`'s state: the parent (Duo) stays SKIPPED — only Digit #0
+        // re-runs, isolated, from the retained value; the sibling comes from the cache
         duo.a.n.set(5);
         let printed = runtime.render(&duo);
         assert_eq!(runtime.body_runs(), vec!["Duo/#0/Digit".to_string()]);
         assert!(printed.contains("Text(\"5\")"));
-        assert!(printed.contains("Text(\"0\")"), "o irmão intocado, do cache");
+        assert!(printed.contains("Text(\"0\")"), "the untouched sibling, from the cache");
 
-        // e o pass sem sujeira nenhuma não roda body algum
+        // and the pass with no dirt at all runs no body
         let printed = runtime.render(&duo);
         assert!(runtime.body_runs().is_empty());
         assert!(printed.contains("Text(\"5\")"));
 
-        // oráculo: o incremental imprime byte a byte o que o full imprime
+        // oracle: the incremental prints byte for byte what the full prints
         let incremental = runtime.render(&duo);
         let full = runtime.render_full(&duo);
         assert_eq!(incremental, full);
@@ -408,9 +408,9 @@ mod tests {
 
     #[test]
     fn store_reads_in_the_body_are_dependencies_too() {
-        // Granularidade de objeto: quem leu `store.value()` no body depende
-        // do store inteiro — `send` re-roda a view, mesmo sem State no meio
-        // (o caso sheet/blur: bindings despachados leem o store direto).
+        // Object granularity: whoever read `store.value()` in the body depends
+        // on the whole store — `send` re-runs the view, even with no State in
+        // between (the sheet/blur case: dispatched bindings read the store directly).
         #[derive(Clone)]
         struct Badge {
             store: Store<i32>,
@@ -444,7 +444,7 @@ mod tests {
 
         impl Component for Watcher {
             fn body(self, _ctx: &Context) -> impl View {
-                // o publisher é recomputado a cada body — como no app real
+                // the publisher is recomputed on every body — as in the real app
                 text("w").on_receive(self.store.updates(|value| *value), move |value| {
                     self.seen.borrow_mut().push(value)
                 })
@@ -457,13 +457,13 @@ mod tests {
         };
         let runtime = Runtime::new();
 
-        // dois render_stable completos: o valor inicial entrega UMA vez,
-        // por menor que seja a vida do publisher recriado por body
+        // two full render_stable passes: the initial value delivers ONCE,
+        // however short the life of the publisher recreated per body
         runtime.render_stable(&watcher);
         runtime.render_stable(&watcher);
         assert_eq!(*watcher.seen.borrow(), vec![1]);
 
-        // o valor anda → entrega de novo
+        // the value moves → delivers again
         watcher.store.send(5);
         runtime.render_stable(&watcher);
         assert_eq!(*watcher.seen.borrow(), vec![1, 5]);
@@ -473,9 +473,9 @@ mod tests {
     fn a_real_view_tree_lays_out_through_the_runtime() {
         use crate::layout::{LINE_H, Proposal};
 
-        // A tela: título + spacer + botão, num viewport de 200×100 — o
-        // caminho inteiro (body-eval → árvore de layout → retenção →
-        // expansão → frames) numa view com estado de verdade.
+        // The screen: title + spacer + button, in a 200×100 viewport — the
+        // whole path (body-eval → layout tree → retention →
+        // expansion → frames) in a view with real state.
         #[derive(Clone, Copy)]
         struct Title {
             count: State<i32>,
@@ -517,13 +517,13 @@ mod tests {
         assert_eq!(title.origin.y, 0.0);
         assert_eq!(title.size.height, LINE_H);
 
-        // muda o estado → só o Title re-roda (invalidação fina) e o layout
-        // seguinte reflete o texto novo — com o RESTO vindo do cache
+        // change the state → only the Title re-runs (fine invalidation) and
+        // the next layout reflects the new text — with the REST from the cache
         screen.title.count.set(42);
         let result = runtime.layout(&screen, viewport);
         assert_eq!(runtime.body_runs(), vec!["Screen/#0/Title".to_string()]);
         let title = result.frames.get("Screen/#0/Title").unwrap();
-        // "count: 42" = 9 chars × 8px — o frame acompanha o conteúdo
+        // "count: 42" = 9 chars × 8px — the frame follows the content
         assert_eq!(title.size.width, 72.0);
     }
 
@@ -552,43 +552,43 @@ mod tests {
         let viewport = Proposal::exact(Size { width: 200.0, height: 100.0 });
         let result = runtime.layout(&tapper, viewport);
 
-        // o botão está nos alvos de hit-test; um "clique" no meio dele
-        // resolve para a chave da ação
-        let (path, rect) = result.hits.last().expect("o botão registra um alvo").clone();
+        // the button is among the hit-test targets; a "click" at its center
+        // resolves to the action key
+        let (path, rect) = result.hits.last().expect("the button registers a target").clone();
         let key = hit_test(
             &result.hits,
             rect.origin.x + rect.size.width / 2.0,
             rect.origin.y + rect.size.height / 2.0,
         )
-        .expect("o clique acerta o botão");
+        .expect("the click hits the button");
         assert_eq!(key, path);
 
-        // clique fora não acerta nada
+        // a click outside hits nothing
         assert!(hit_test(&result.hits, 199.0, 99.0).is_none());
 
-        // disparar a ação muda o estado; o próximo frame re-roda SÓ o
-        // Tapper e o layout reflete o texto novo — o ciclo vivo, headless
+        // firing the action changes the state; the next frame re-runs ONLY the
+        // Tapper and the layout reflects the new text — the live loop, headless
         assert!(runtime.activate(key));
         let result = runtime.layout(&tapper, viewport);
         assert_eq!(runtime.body_runs(), vec!["Tapper".to_string()]);
         let title = result.frames.get("Tapper").unwrap();
-        // sem flexível no body, o root responde o natural, não o viewport —
-        // proposta é oferta, não imposição. Natural = linha do título (16)
-        // + botão com chrome (16 do label + 2×6 de padding embutido = 28)
+        // with nothing flexible in the body, the root answers its natural
+        // size, not the viewport — a proposal is an offer, not an imposition.
+        // Natural = title line (16) + button with chrome (16 label + 2×6 built-in padding = 28)
         assert_eq!(title.size.height, 44.0);
         assert!(runtime.render(&tapper).contains("count: 1"));
 
-        // e um clique num frame de view PULADA continua funcionando (a
-        // ação é retida como os efeitos)
+        // and a click on a SKIPPED view's frame keeps working (the
+        // action is retained like the effects)
         let result = runtime.layout(&tapper, viewport);
-        assert!(runtime.body_runs().is_empty(), "tudo do cache");
+        assert!(runtime.body_runs().is_empty(), "everything from the cache");
         let (path, _) = result.hits.last().unwrap().clone();
         assert!(runtime.activate(&path));
         assert!(runtime.render(&tapper).contains("count: 2"));
     }
 
-    /// O par (runtime estabilizado, centro do botão) que os testes de
-    /// ponteiro compartilham.
+    /// The pair (settled runtime, button center) that the pointer tests
+    /// share.
     fn pressable() -> (Runtime, TapperFixture, f64, f64) {
         use crate::layout::{Proposal, Size};
 
@@ -597,7 +597,7 @@ mod tests {
         runtime.render_stable(&tapper);
         let result =
             runtime.layout(&tapper, Proposal::exact(Size { width: 200.0, height: 100.0 }));
-        let (_, rect) = result.hits.last().expect("o botão registra um alvo").clone();
+        let (_, rect) = result.hits.last().expect("the button registers a target").clone();
         let cx = rect.origin.x + rect.size.width / 2.0;
         let cy = rect.origin.y + rect.size.height / 2.0;
         (runtime, tapper, cx, cy)
@@ -625,11 +625,11 @@ mod tests {
         let viewport = Proposal::exact(Size { width: 200.0, height: 100.0 });
         let cold = runtime.layout(&tapper, viewport);
 
-        assert!(runtime.pointer_moved(cx, cy), "entrar no alvo muda o estado");
+        assert!(runtime.pointer_moved(cx, cy), "entering the target changes the state");
         let hot = runtime.layout(&tapper, viewport);
-        assert!(runtime.body_runs().is_empty(), "hover repinta com ZERO bodies");
+        assert!(runtime.body_runs().is_empty(), "hover repaints with ZERO bodies");
 
-        // a LEI: frames byte-idênticos sob qualquer interação
+        // the LAW: byte-identical frames under any interaction
         for (path, frame) in cold.frames.iter() {
             assert_eq!(Some(frame), hot.frames.get(path));
         }
@@ -643,9 +643,9 @@ mod tests {
                 })
                 .collect()
         };
-        assert_ne!(backgrounds(&cold), backgrounds(&hot), "a pintura muda");
+        assert_ne!(backgrounds(&cold), backgrounds(&hot), "the paint changes");
 
-        // 1px dentro do mesmo alvo: nada a repintar
+        // 1px within the same target: nothing to repaint
         assert!(!runtime.pointer_moved(cx + 1.0, cy));
     }
 
@@ -656,9 +656,9 @@ mod tests {
         assert!(runtime.pointer_pressed(cx, cy));
         assert!(
             runtime.render_stable(&tapper).contains("count: 0"),
-            "down sozinho não dispara"
+            "down alone does not fire"
         );
-        assert!(runtime.pointer_released(cx, cy).is_some(), "up-inside dispara");
+        assert!(runtime.pointer_released(cx, cy).is_some(), "up-inside fires");
         assert!(runtime.render_stable(&tapper).contains("count: 1"));
     }
 
@@ -667,9 +667,9 @@ mod tests {
         let (runtime, tapper, cx, cy) = pressable();
 
         runtime.pointer_pressed(cx, cy);
-        assert_eq!(runtime.pointer_released(199.0, 99.0), None, "soltou fora");
+        assert_eq!(runtime.pointer_released(199.0, 99.0), None, "released outside");
         runtime.pointer_pressed(199.0, 99.0);
-        assert_eq!(runtime.pointer_released(cx, cy), None, "press fora, up dentro");
+        assert_eq!(runtime.pointer_released(cx, cy), None, "press outside, up inside");
         assert!(runtime.render_stable(&tapper).contains("count: 0"));
     }
 
@@ -681,13 +681,13 @@ mod tests {
         runtime.pointer_moved(199.0, 99.0);
         assert!(
             runtime.interaction().hovered.is_none(),
-            "arrastar para fora solta o visual"
+            "dragging out releases the visual"
         );
         runtime.pointer_moved(cx, cy);
         assert_eq!(
             runtime.interaction().hovered,
             runtime.interaction().pressed,
-            "voltar re-arma"
+            "coming back re-arms"
         );
         assert!(runtime.pointer_released(cx, cy).is_some());
         assert!(runtime.render_stable(&tapper).contains("count: 1"));
@@ -700,7 +700,7 @@ mod tests {
         runtime.pointer_moved(cx, cy);
         assert!(runtime.pointer_exited());
         assert!(runtime.interaction().hovered.is_none());
-        assert!(!runtime.pointer_exited(), "já limpo — nada a repintar");
+        assert!(!runtime.pointer_exited(), "already clear — nothing to repaint");
     }
 
     #[test]
@@ -724,7 +724,7 @@ mod tests {
         assert_eq!(
             fills,
             vec![(Color::hex(0x123456), 5.0)],
-            "um Styled só — o raio arredonda ESTE fundo"
+            "a single Styled — the radius rounds THIS background"
         );
     }
 
@@ -749,7 +749,7 @@ mod tests {
         assert_eq!(
             fills,
             vec![Color::hex(0x111111)],
-            "o mais próximo da view vence; um comando só"
+            "the one nearest the view wins; a single command"
         );
     }
 
@@ -777,8 +777,8 @@ mod tests {
                 })
                 .unwrap()
         };
-        // fundo por fora do padding cobre a área acolchoada; por dentro,
-        // só o conteúdo — o tamanho total não muda, muda quem pinta o quê
+        // background outside the padding covers the padded area; inside,
+        // only the content — total size does not change, who paints what does
         assert_eq!(fill_rect(&outer).size.width, 36.0);
         assert_eq!(fill_rect(&inner).size.width, 16.0);
         assert_eq!(outer.size, inner.size);
@@ -817,7 +817,7 @@ mod tests {
         runtime.render_stable(&One);
         let result = runtime.layout(&One, Proposal::unspecified());
 
-        // o fundo do chrome vem antes do texto do label, com os cantos
+        // the chrome background comes before the label text, with the corners
         let mut fill_before_text = false;
         let mut saw_text = false;
         for command in result.display.iter() {
@@ -832,9 +832,9 @@ mod tests {
         }
         assert!(fill_before_text && saw_text);
 
-        // o hit-rect é o chrome inteiro: label + padding embutido
+        // the hit-rect is the whole chrome: label + built-in padding
         let (_, rect) = result.hits.last().unwrap().clone();
-        assert_eq!(rect.size.height, 28.0, "16 do label + 2×6");
+        assert_eq!(rect.size.height, 28.0, "16 from the label + 2×6");
         assert_eq!(rect.size.width, 44.0, "2 chars × 8 + 2×14");
     }
 
@@ -849,7 +849,7 @@ mod tests {
 
         impl Component for Rows {
             fn body(self, _ctx: &Context) -> impl View {
-                let _ = self.flip.get(); // lida: o set() invalida este body
+                let _ = self.flip.get(); // read: set() invalidates this body
                 list(
                     (0..10).map(|index| index.to_string()).collect(),
                     |item: &String| item.clone(),
@@ -864,19 +864,19 @@ mod tests {
         let viewport = Proposal::exact(Size { width: 120.0, height: 100.0 });
         let result = runtime.layout(&rows, viewport);
 
-        assert_eq!(result.scrolls.len(), 1, "a List é uma região com identidade");
+        assert_eq!(result.scrolls.len(), 1, "the List is a region with identity");
         let path = result.scrolls[0].path.clone();
 
-        // delta negativo (conteúdo para cima) → offset cresce
+        // negative delta (content moves up) → offset grows
         assert!(runtime.wheel(10.0, 10.0, 0.0, -30.0));
         assert_eq!(runtime.scroll_offset(&path).y, 30.0);
-        // clamp snapado no fim do curso: 10×16 − 100 = 60
+        // clamp snapped at the end of travel: 10×16 − 100 = 60
         assert!(runtime.wheel(10.0, 10.0, 0.0, -500.0));
         assert_eq!(runtime.scroll_offset(&path).y, 60.0);
-        assert!(!runtime.wheel(10.0, 10.0, 0.0, -1.0), "no fim do curso não há repaint");
-        assert!(!runtime.wheel(500.0, 500.0, 0.0, -10.0), "fora de qualquer região");
+        assert!(!runtime.wheel(10.0, 10.0, 0.0, -1.0), "no repaint at the end of travel");
+        assert!(!runtime.wheel(500.0, 500.0, 0.0, -10.0), "outside any region");
 
-        // o offset aplica no layout: a primeira linha de texto sobe 60
+        // the offset applies in layout: the first text line moves up 60
         let scrolled = runtime.layout(&rows, viewport);
         let first_line_y = scrolled
             .display
@@ -888,8 +888,8 @@ mod tests {
             .unwrap();
         assert_eq!(first_line_y, -60.0);
 
-        // invalidação e re-render NÃO perdem a posição — restauração por
-        // identidade estrutural
+        // invalidation and re-render do NOT lose the position — restoration
+        // by structural identity
         rows.flip.set(true);
         runtime.render_stable(&rows);
         let after = runtime.layout(&rows, viewport);
@@ -904,7 +904,7 @@ mod tests {
             .unwrap();
         assert_eq!(line_y, -60.0);
 
-        // rolagem programática vale no MESMO frame
+        // programmatic scrolling counts in the SAME frame
         runtime.set_scroll_offset(&path, crate::layout::Point { x: 0.0, y: 8.0 });
         let programmatic = runtime.layout(&rows, viewport);
         let line_y = programmatic
@@ -943,7 +943,7 @@ mod tests {
         let viewport = Proposal::exact(Size { width: 240.0, height: 100.0 });
         let result = runtime.layout(&form, viewport);
 
-        // vazio: o placeholder pinta na cor própria, sem foco
+        // empty: the placeholder paints in its own color, no focus
         let has_placeholder = result.display.iter().any(|command| matches!(
             command,
             DrawCommand::TextLine { color, content, range, .. }
@@ -951,8 +951,8 @@ mod tests {
         ));
         assert!(has_placeholder);
 
-        // clicar no campo foca (up-inside → editor → foco)
-        let (field_path, rect) = result.hits.last().expect("o campo é alvo").clone();
+        // clicking the field focuses (up-inside → editor → focus)
+        let (field_path, rect) = result.hits.last().expect("the field is a target").clone();
         let (cx, cy) = (
             rect.origin.x + rect.size.width / 2.0,
             rect.origin.y + rect.size.height / 2.0,
@@ -961,12 +961,12 @@ mod tests {
         assert_eq!(runtime.pointer_released(cx, cy), Some(field_path.clone()));
         assert_eq!(runtime.focused(), Some(field_path.clone()));
 
-        // digitar flui pelo binding: o TÍTULO (outra view) vê a mudança
+        // typing flows through the binding: the TITLE (another view) sees the change
         assert!(runtime.key(EditCommand::Insert("Deco".into())).applied);
         let printed = runtime.render_stable(&form);
         assert!(printed.contains("hello Deco"), "{printed}");
 
-        // o frame focado pinta caret e borda de foco
+        // the focused frame paints caret and focus border
         let focused_frame = runtime.layout(&form, viewport);
         assert!(focused_frame.display.iter().any(|command| matches!(
             command,
@@ -978,18 +978,18 @@ mod tests {
             DrawCommand::StrokeRect { color, .. } if *color == Color::FOCUS
         )));
 
-        // edição continua: backspace come o "o"
+        // editing continues: backspace eats the "o"
         assert!(runtime.key(EditCommand::Backspace).applied);
         assert!(runtime.render_stable(&form).contains("hello Dec"));
 
-        // copy/cut extraem pela saída (a ponte do clipboard)
+        // copy/cut extract through the output (the clipboard bridge)
         assert!(runtime.key(EditCommand::SelectAll).applied);
         assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some("Dec"));
         assert_eq!(runtime.key(EditCommand::Cut).output.as_deref(), Some("Dec"));
-        assert!(!runtime.render_stable(&form).contains("hello Dec"), "o cut removeu");
+        assert!(!runtime.render_stable(&form).contains("hello Dec"), "the cut removed it");
         assert!(runtime.key(EditCommand::Insert("Dec".into())).applied);
 
-        // clique fora tira o foco; teclar sem foco não faz nada
+        // clicking outside removes focus; keying without focus does nothing
         runtime.pointer_pressed(239.0, 99.0);
         runtime.pointer_released(239.0, 99.0);
         assert_eq!(runtime.focused(), None);
@@ -1028,18 +1028,18 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&outer);
 
-        // o handler mais FUNDO (Inner) vence o do Outer
+        // the DEEPEST handler (Inner) beats Outer's
         assert!(runtime.dispatch_action(PING));
         assert_eq!(outer.hits.get(), 10);
-        assert!(!runtime.dispatch_action(ActionId("test.nope")), "id sem handler");
+        assert!(!runtime.dispatch_action(ActionId("test.nope")), "id with no handler");
 
-        // bind + match compõem; modificador é exato
+        // bind + match compose; the modifier is exact
         const NEXT: ActionId = ActionId("test.next");
         runtime.bind(KeyPattern::key(Key::Down), NEXT);
         assert_eq!(runtime.match_key(&KeyPattern::key(Key::Down)), Some(NEXT));
         assert_eq!(runtime.match_key(&KeyPattern::command(Key::Down)), None);
-        // binding sem handler montado NÃO consome — a propriedade que
-        // deixa a tecla seguir para o campo
+        // a binding with no mounted handler does NOT consume — the property
+        // that lets the key flow on to the field
         assert!(!runtime.dispatch_action(NEXT));
     }
 
@@ -1084,16 +1084,16 @@ mod tests {
         let runtime = Runtime::new();
         runtime.render_stable(&holder);
 
-        // pass estável (Palette PULADA): o handler retido continua vivo
+        // stable pass (Palette SKIPPED): the retained handler stays alive
         runtime.render(&holder);
         assert!(runtime.dispatch_action(POKE));
         assert_eq!(holder.hits.get(), 1);
 
-        // desmontar a Palette varre a entry — o handler morre junto
+        // unmounting the Palette sweeps the entry — the handler dies with it
         holder.mounted.set(false);
         runtime.render_stable(&holder);
-        eprintln!("PRINT POS-DESMONTE: {}", runtime.render(&holder));
-        assert!(!runtime.dispatch_action(POKE), "handler desmontado não responde");
+        eprintln!("POST-UNMOUNT PRINT: {}", runtime.render(&holder));
+        assert!(!runtime.dispatch_action(POKE), "an unmounted handler does not respond");
     }
 
     #[test]
@@ -1102,8 +1102,8 @@ mod tests {
         const NEXT: ActionId = ActionId("test.select_next");
         const DISMISS: ActionId = ActionId("test.dismiss");
 
-        // o finder-shape inteiro: campo + lista filtrada + seleção com
-        // wrap capturando o COUNT do body corrente
+        // the whole finder shape: field + filtered list + selection with
+        // wrap capturing the COUNT of the current body
         #[derive(Clone, Copy)]
         struct MiniPalette {
             query: State<String>,
@@ -1135,7 +1135,7 @@ mod tests {
         runtime.bind(KeyPattern::key(Key::Escape), DISMISS);
         runtime.render_stable(&palette);
 
-        // foca o campo e digita — o filtro encolhe para 1 ("beta")
+        // focus the field and type — the filter shrinks to 1 ("beta")
         let result =
             runtime.layout(&palette, Proposal::exact(Size { width: 200.0, height: 80.0 }));
         let (_, rect) = result.hits.first().unwrap().clone();
@@ -1144,17 +1144,17 @@ mod tests {
         runtime.key(EditCommand::Insert("bet".into()));
         runtime.render_stable(&palette);
 
-        // o handler re-registrado capturou o count NOVO: wrap em 1
+        // the re-registered handler captured the NEW count: wrap at 1
         let action = runtime.match_key(&KeyPattern::key(Key::Down)).unwrap();
         assert!(runtime.dispatch_action(action));
-        assert_eq!(palette.selected.get(), 0, "wrap com count=1 volta para 0");
+        assert_eq!(palette.selected.get(), 0, "wrap with count=1 goes back to 0");
 
-        // Esc despacha a ação e o FOCO fica (blur é fallback do shell)
+        // Esc dispatches the action and FOCUS stays (blur is the shell's fallback)
         let action = runtime.match_key(&KeyPattern::key(Key::Escape)).unwrap();
         assert!(runtime.dispatch_action(action));
         runtime.render_stable(&palette);
         assert_eq!(palette.query.get(), "");
-        assert!(runtime.focused().is_some(), "dismiss não rouba o foco");
+        assert!(runtime.focused().is_some(), "dismiss does not steal the focus");
     }
 
     #[test]
@@ -1166,8 +1166,8 @@ mod tests {
 
         impl Component for Chip {
             fn body(self, _ctx: &Context) -> impl View {
-                // token lido no BODY fica gravado na cena retida — o
-                // install tem que reconstruir sem nenhum estado sujo
+                // a token read in the BODY gets baked into the retained scene —
+                // install has to rebuild with no dirty state at all
                 button(text("go").foreground_color(theme::accent()), || {})
             }
         }
@@ -1203,8 +1203,8 @@ mod tests {
 
         theme::install(Theme::dark());
         let dark = runtime.layout(&Chip, viewport);
-        assert_eq!(control_of(&dark), Theme::dark().control, "chrome re-lido");
-        assert_eq!(text_of(&dark), Theme::dark().accent, "token de body re-lido");
+        assert_eq!(control_of(&dark), Theme::dark().control, "chrome re-read");
+        assert_eq!(text_of(&dark), Theme::dark().accent, "body token re-read");
 
         theme::install(Theme::light());
     }
@@ -1213,9 +1213,9 @@ mod tests {
     fn the_dream_snippet_compiles_and_reacts() {
         use crate::layout::{Proposal, Size};
 
-        // O código que a LEI de ergonomia pede: sem `let this`, sem
-        // `.get()`, sem `format!`, sem parênteses dobrados — e por baixo,
-        // o MESMO pipeline incremental de sempre.
+        // The code the ergonomics LAW demands: no `let this`, no
+        // `.get()`, no `format!`, no doubled parentheses — and underneath,
+        // the SAME incremental pipeline as always.
         #[derive(Clone, Copy)]
         struct Counter {
             count: State<i32>,
@@ -1242,7 +1242,7 @@ mod tests {
         runtime.pointer_pressed(cx, cy);
         runtime.pointer_released(cx, cy);
 
-        // o Display do State LÊ — o clique invalida SÓ o Counter
+        // State's Display READS — the click invalidates ONLY the Counter
         runtime.render(&counter);
         assert_eq!(runtime.body_runs(), vec!["Counter".to_string()]);
         assert!(runtime.render_stable(&counter).contains("Count: 1"));
@@ -1274,7 +1274,7 @@ mod tests {
         runtime.pointer_pressed(rect.origin.x + 4.0, rect.origin.y + 4.0);
         runtime.pointer_released(rect.origin.x + 4.0, rect.origin.y + 4.0);
 
-        // composição viva: o texto entra MARCADO (sublinhado, no binding)
+        // live composition: the text enters MARKED (underlined, in the binding)
         let mark = EditCommand::SetMarked { text: "にほん".into(), caret_utf16: (3, 0) };
         assert!(runtime.key(mark).applied);
         assert!(runtime.render_stable(&form).contains("にほん"));
@@ -1290,14 +1290,14 @@ mod tests {
                 ))
                 .count()
         };
-        assert_eq!(underline(&composing), 1, "a composição pinta sublinhada");
+        assert_eq!(underline(&composing), 1, "the composition paints underlined");
 
-        // o snapshot fala UTF-16 com a plataforma
-        let snapshot = runtime.ime_snapshot().expect("campo focado");
+        // the snapshot speaks UTF-16 with the platform
+        let snapshot = runtime.ime_snapshot().expect("focused field");
         assert_eq!(snapshot.marked, Some((0, 3)));
-        assert_eq!(snapshot.selected, (3, 0), "caret colapsado no fim da composição");
+        assert_eq!(snapshot.selected, (3, 0), "caret collapsed at the end of the composition");
 
-        // o commit troca o marcado pelo texto final e o sublinhado some
+        // the commit swaps the marked text for the final text and the underline goes away
         assert!(runtime.key(EditCommand::Insert("日本".into())).applied);
         let committed = runtime.render_stable(&form);
         assert!(committed.contains("日本"), "{committed}");
@@ -1328,19 +1328,19 @@ mod tests {
         runtime.render_stable(&form);
         let viewport = Proposal::exact(Size { width: 240.0, height: 40.0 });
         let result = runtime.layout(&form, viewport);
-        let field = result.fields.first().expect("campo colocado").clone();
+        let field = result.fields.first().expect("field placed").clone();
 
-        // clique no meio do "abcdef" (PixelFont: 8px/char): entre c e d
+        // click in the middle of "abcdef" (PixelFont: 8px/char): between c and d
         let x = field.text_origin.x + 3.0 * 8.0 + 2.0;
         let y = field.frame.origin.y + field.frame.size.height / 2.0;
         runtime.pointer_pressed(x, y);
         runtime.pointer_released(x, y);
         assert_eq!(runtime.focused(), Some(field.path.clone()));
-        // digitar no ponto clicado prova a posição sem expor o índice
+        // typing at the clicked point proves the position without exposing the index
         runtime.key(EditCommand::Insert("X".into()));
         assert!(runtime.render_stable(&form).contains("abcXdef"));
 
-        // blink: o tick alterna a pintura do caret sem tocar em nada mais
+        // blink: the tick toggles the caret paint without touching anything else
         let caret_count = |result: &crate::layout::LayoutResult| {
             result
                 .display
@@ -1354,18 +1354,18 @@ mod tests {
         };
         let visible = runtime.layout(&form, viewport);
         assert_eq!(caret_count(&visible), 1);
-        assert!(runtime.blink(), "focado: o tick pede repaint");
+        assert!(runtime.blink(), "focused: the tick requests a repaint");
         let hidden = runtime.layout(&form, viewport);
-        assert_eq!(caret_count(&hidden), 0, "meio-período apagado");
+        assert_eq!(caret_count(&hidden), 0, "off half-period");
         assert!(runtime.blink());
         let back = runtime.layout(&form, viewport);
         assert_eq!(caret_count(&back), 1);
-        // digitar volta para sólido mesmo no meio-período apagado
+        // typing goes back to solid even in the off half-period
         runtime.blink();
         runtime.key(EditCommand::Insert("!".into()));
         let typing = runtime.layout(&form, viewport);
-        assert_eq!(caret_count(&typing), 1, "caret ativo não pisca");
-        // sem foco, o tick não pede repaint
+        assert_eq!(caret_count(&typing), 1, "an active caret does not blink");
+        // without focus, the tick requests no repaint
         runtime.blur();
         assert!(!runtime.blink());
     }
@@ -1375,8 +1375,8 @@ mod tests {
         use crate::layout::{Proposal, Size};
         use crate::text_engine::{LineMetrics, TextRaster};
 
-        // um engine de 10px/char prova a borda plugável: o frame muda sem
-        // NENHUM componente saber qual engine está ativo
+        // a 10px/char engine proves the pluggable border: the frame changes
+        // with NO component knowing which engine is active
         struct Wide;
         impl TextEngine for Wide {
             fn measure_line(&self, text: &str, _font: &FontSpec) -> LineMetrics {
@@ -1418,7 +1418,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(sizes, vec![22.0, 10.0], "Title herdado; Caption vence no filho");
+        assert_eq!(sizes, vec![22.0, 10.0], "Title inherited; Caption wins in the child");
     }
 
     #[test]
@@ -1451,12 +1451,12 @@ mod tests {
                 .count()
         };
         let before = ink_count(&bitmap);
-        assert!(before > 0, "o texto pinta tinta");
+        assert!(before > 0, "the text paints ink");
 
-        // o estado muda → re-render incremental → o bitmap muda junto
+        // the state changes → incremental re-render → the bitmap changes with it
         badge.n.set(42);
         let after = ink_count(&runtime.paint(&badge, size));
-        assert!(after > before, "\"n: 42\" tem mais tinta que \"n: 0\"");
+        assert!(after > before, "\"n: 42\" has more ink than \"n: 0\"");
     }
 
     #[test]
@@ -1477,8 +1477,8 @@ mod tests {
 
         impl Component for Row {
             fn body(self, _ctx: &Context) -> impl View {
-                // Option None não imprime; Either/OneOf escolhem o braço em
-                // compile time — o tipo é a soma, o discriminante é runtime
+                // Option None does not print; Either/OneOf pick the arm at
+                // compile time — the type is the sum, the discriminant is runtime
                 vstack((
                     None::<Text>,
                     text("kept"),

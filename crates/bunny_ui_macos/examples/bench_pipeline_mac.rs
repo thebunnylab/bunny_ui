@@ -1,7 +1,6 @@
-//! O harness de frames com o engine de texto da PLATAFORMA (CoreText) —
-//! o gêmeo de `bench_pipeline` do bunny-ui com shaping real, para
-//! comparação justa com qualquer baseline que também molde texto de
-//! verdade.
+//! The frame harness with the PLATFORM text engine (CoreText) — the twin
+//! of bunny-ui's `bench_pipeline` with real shaping, for a fair
+//! comparison against any baseline that also shapes real text.
 //!
 //! ```sh
 //! cargo run --release -p bunny-ui-macos --example bench_pipeline_mac
@@ -195,7 +194,7 @@ fn main() {
     runtime.layout(&finder, viewport);
 
     let result = runtime.layout(&finder, viewport);
-    let field = result.fields.first().expect("campo").clone();
+    let field = result.fields.first().expect("field").clone();
     runtime.pointer_pressed(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
     runtime.pointer_released(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
 
@@ -246,7 +245,7 @@ fn main() {
 
     println!(
         "\n{:<32} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "cenário (frame =)", "p50 ms", "p95 ms", "p99 ms", "max ms", "allocs", "KiB"
+        "scenario (frame =)", "p50 ms", "p95 ms", "p99 ms", "max ms", "allocs", "KiB"
     );
     println!("{}", "─".repeat(86));
     for report in &reports {
@@ -261,6 +260,6 @@ fn main() {
             report.kibibytes
         );
     }
-    println!("\nfixture: finder 30 rows; viewport 760×640; texto CoreText (shaping real)");
+    println!("\nfixture: finder 30 rows; viewport 760×640; CoreText text (real shaping)");
 }
 

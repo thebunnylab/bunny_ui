@@ -1,5 +1,5 @@
-//! countries-pure como biblioteca: o bin (a demo headless de 4 atos) e o
-//! example de janela nativa reusam o mesmo root e as mesmas views.
+//! countries-pure as a library: the bin (the 4-act headless demo) and the
+//! native-window example reuse the same root and the same views.
 
 pub mod root;
 pub mod ui;

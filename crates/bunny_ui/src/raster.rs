@@ -1,31 +1,33 @@
-//! Rasterizador CPU — 100% std, o mesmo para os quatro alvos.
+//! CPU rasterizer — 100% std, the same one for all four targets.
 //!
-//! Pinta uma [`DisplayList`] num [`Bitmap`] RGBA. É o capital portátil do
-//! primeiro pixel: no Mac o buffer vira `CGImage`, na web `putImageData`,
-//! no Android `Bitmap` — o backend de plataforma só blita. GPU chega
-//! quando o benchmark mandar; a interface (a display list) não muda.
+//! Paints a [`DisplayList`] into an RGBA [`Bitmap`]. It is the portable
+//! capital of the first pixel: on the Mac the buffer becomes `CGImage`,
+//! on the web `putImageData`, on Android `Bitmap` — the platform backend
+//! only blits. GPU arrives when the benchmark says so; the interface
+//! (the display list) does not change.
 //!
-//! O snapping acontece AQUI, uma vez, ao converter as coordenadas lógicas
-//! em pixels: arestas arredondadas em espaço de dispositivo (vizinhos que
-//! convergem para a mesma coluna fecham sem fresta), decisão documentada e
-//! localizada — nunca espalhada pelo layout.
+//! Snapping happens HERE, once, when converting logical coordinates into
+//! pixels: edges rounded in device space (neighbors that converge to the
+//! same column close without a gap), a documented and localized decision
+//! — never scattered through the layout.
 //!
-//! Texto entra pelo [`TextEngine`] do frame: o engine rasteriza a linha
-//! num retângulo RGBA de alfa reto e o compositor daqui blenda no bitmap
-//! — um único caminho de composição para a fonte pixel da casa e para o
-//! CoreText do Mac (e para o canvas da web, um dia).
+//! Text enters through the frame's [`TextEngine`]: the engine rasterizes
+//! the line into an RGBA rectangle of straight alpha and the compositor
+//! here blends it into the bitmap — a single compositing path for the
+//! house pixel font and for the Mac's CoreText (and for the web's
+//! canvas, one day).
 
 use crate::layout::{Color, DisplayList, DrawCommand, Rect};
 use crate::text_engine::{PixelFont, TextEngine, TextRaster};
 
-/// Um buffer RGBA (um `u32` `0xRRGGBBAA` por pixel, linhas de cima para
-/// baixo) — o que o backend de plataforma blita na janela.
+/// An RGBA buffer (one `0xRRGGBBAA` `u32` per pixel, rows top to
+/// bottom) — what the platform backend blits into the window.
 pub struct Bitmap {
     width: usize,
     height: usize,
     pixels: Vec<u32>,
-    /// Pilha de clip em px físicos (interseções já resolvidas) — `set`
-    /// consulta o topo; fill, stroke e texto respeitam de graça.
+    /// Clip stack in physical px (intersections already resolved) — `set`
+    /// checks the top; fill, stroke and text respect it for free.
     clip: Vec<(i64, i64, i64, i64)>,
 }
 
@@ -33,16 +35,16 @@ fn pack(color: Color) -> u32 {
     ((color.r as u32) << 24) | ((color.g as u32) << 16) | ((color.b as u32) << 8) | color.a as u32
 }
 
-/// Divisão exata por 255 com arredondamento — o clássico de compositing
-/// inteiro: `round(x / 255)` sem float.
+/// Exact division by 255 with rounding — the integer-compositing
+/// classic: `round(x / 255)` without float.
 fn div255(x: u32) -> u32 {
     let x = x + 128;
     (x + (x >> 8)) >> 8
 }
 
-/// Source-over de `src` sobre `dst` (ambos `0xRRGGBBAA`, alfa reto):
-/// `out = src·sa + dst·(1−sa)` por canal. Fast paths: opaco sobrescreve,
-/// invisível não toca.
+/// Source-over of `src` onto `dst` (both `0xRRGGBBAA`, straight alpha):
+/// `out = src·sa + dst·(1−sa)` per channel. Fast paths: opaque
+/// overwrites, invisible does not touch.
 fn blend_px(src: u32, dst: u32) -> u32 {
     let sa = src & 0xFF;
     if sa == 255 {
@@ -74,7 +76,7 @@ impl Bitmap {
         self.height
     }
 
-    /// Os bytes crus, para o blit do backend.
+    /// The raw bytes, for the backend's blit.
     pub fn pixels(&self) -> &[u32] {
         &self.pixels
     }
@@ -83,8 +85,8 @@ impl Bitmap {
         (x < self.width && y < self.height).then(|| self.pixels[y * self.width + x])
     }
 
-    /// Bytes `R,G,B,A` por pixel, linha a linha — o formato que os blits de
-    /// plataforma esperam sem discussão de endianness.
+    /// `R,G,B,A` bytes per pixel, row by row — the format platform blits
+    /// expect with no endianness argument.
     pub fn to_rgba_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(self.pixels.len() * 4);
         for pixel in &self.pixels {
@@ -109,7 +111,7 @@ impl Bitmap {
         self.pixels[index] = blend_px(color, self.pixels[index]);
     }
 
-    /// Empilha o clip snapado, já intersectado com o topo corrente.
+    /// Pushes the snapped clip, already intersected with the current top.
     fn push_clip(&mut self, rect: Rect) {
         let (x0, y0, x1, y1) = Self::snap(rect);
         let clipped = match self.clip.last().copied() {
@@ -123,7 +125,7 @@ impl Bitmap {
         self.clip.pop();
     }
 
-    /// Arestas arredondadas em device px — o ponto único de snapping.
+    /// Edges rounded in device px — the single point of snapping.
     fn snap(rect: Rect) -> (i64, i64, i64, i64) {
         let x0 = rect.origin.x.round() as i64;
         let y0 = rect.origin.y.round() as i64;
@@ -132,9 +134,9 @@ impl Bitmap {
         (x0, y0, x1, y1)
     }
 
-    /// Preenchimento com cantos opcionais: inset por linha de varredura,
-    /// círculo por canto, UMA raiz quadrada por linha — nunca por pixel.
-    /// `corner_radius: 0.0` reproduz o retângulo reto byte a byte.
+    /// Fill with optional corners: inset per scanline, a circle per
+    /// corner, ONE square root per row — never per pixel.
+    /// `corner_radius: 0.0` reproduces the straight rectangle byte for byte.
     fn fill_rect(&mut self, rect: Rect, color: Color, corner_radius: f64) {
         let (x0, y0, x1, y1) = Self::snap(rect);
         if x1 <= x0 || y1 <= y0 {
@@ -147,7 +149,7 @@ impl Bitmap {
             .min((x1 - x0) as f64 / 2.0)
             .min(height / 2.0);
         for y in y0..y1 {
-            // distância do centro da linha à banda reta entre os cantos
+            // distance from the row center to the straight band between corners
             let center = (y - y0) as f64 + 0.5;
             let dy = if center < radius {
                 radius - center
@@ -167,8 +169,8 @@ impl Bitmap {
         }
     }
 
-    /// Moldura para dentro da aresta, em 4 barras SEM sobreposição — uma
-    /// borda translúcida não pode blendar o canto duas vezes.
+    /// A frame inward from the edge, in 4 bars with NO overlap — a
+    /// translucent border cannot blend the corner twice.
     fn stroke_rect(&mut self, rect: Rect, color: Color, width: f64) {
         let (x0, y0, x1, y1) = Self::snap(rect);
         if x1 <= x0 || y1 <= y0 {
@@ -200,8 +202,8 @@ impl Bitmap {
         }
     }
 
-    /// Compõe uma linha rasterizada pelo engine no origin lógico, snapado
-    /// UMA vez (o raster já vem em pixels físicos).
+    /// Composites a line rasterized by the engine at the logical origin,
+    /// snapped ONCE (the raster already comes in physical pixels).
     fn composite_text(&mut self, origin_x: f64, origin_y: f64, scale: usize, raster: &TextRaster) {
         let base_x = (origin_x * scale as f64).round() as i64;
         let base_y = (origin_y * scale as f64).round() as i64;
@@ -232,15 +234,15 @@ fn scale_rect(rect: Rect, scale: f64) -> Rect {
     }
 }
 
-/// Pinta a lista na ordem — quem vem depois pinta por cima. Texto sai da
-/// fonte pixel da casa (o engine default).
+/// Paints the list in order — whoever comes later paints on top. Text
+/// comes from the house pixel font (the default engine).
 pub fn rasterize(display: &DisplayList, width: usize, height: usize, background: Color) -> Bitmap {
     rasterize_scaled(display, width, height, 1, background)
 }
 
-/// Como [`rasterize`], mas com `width`/`height` em pixels FÍSICOS e as
-/// coordenadas lógicas da display list multiplicadas por `scale` — o
-/// caminho retina (o backend consulta o scale factor da janela).
+/// Like [`rasterize`], but with `width`/`height` in PHYSICAL pixels and
+/// the display list's logical coordinates multiplied by `scale` — the
+/// retina path (the backend asks the window for its scale factor).
 pub fn rasterize_scaled(
     display: &DisplayList,
     width: usize,
@@ -251,8 +253,9 @@ pub fn rasterize_scaled(
     rasterize_with(display, width, height, scale, background, &PixelFont)
 }
 
-/// O caminho completo: pinta a lista com o [`TextEngine`] do frame — é o
-/// que o `Runtime` chama (PixelFont no headless, CoreText no Mac).
+/// The full path: paints the list with the frame's [`TextEngine`] — it
+/// is what the `Runtime` calls (PixelFont in headless, CoreText on the
+/// Mac).
 pub fn rasterize_with(
     display: &DisplayList,
     width: usize,
@@ -289,7 +292,7 @@ mod tests {
     use super::*;
     use crate::layout::{DrawCommand, Point};
 
-    /// Desenha o retrato ascii de um trecho do bitmap — golden legível.
+    /// Draws the ascii portrait of a bitmap patch — a readable golden.
     fn portrait(bitmap: &Bitmap, x: usize, y: usize, w: usize, h: usize, ink: u32) -> String {
         let mut out = String::new();
         for row in y..y + h {
@@ -315,10 +318,10 @@ mod tests {
 
         let ink = super::pack(Color::BLACK);
         let picture = portrait(&bitmap, 0, 0, 8, 16, ink);
-        // folga vertical de 3px no topo, glifo de 10px, resto limpo
+        // 3px of vertical slack on top, a 10px glyph, the rest clean
         assert!(picture.lines().take(3).all(|line| !line.contains('#')));
         assert!(picture.lines().nth(13).is_some_and(|line| !line.contains('#')));
-        assert!(picture.contains('#'), "o corpo do glifo tem tinta:\n{picture}");
+        assert!(picture.contains('#'), "the glyph body has ink:\n{picture}");
     }
 
     #[test]
@@ -337,15 +340,15 @@ mod tests {
         let fill = super::pack(Color::FILL);
         let white = super::pack(Color::WHITE);
         assert_eq!(bitmap.pixel(2, 2), Some(fill));
-        assert_eq!(bitmap.pixel(5, 5), Some(fill), "aresta [2,6): o 5 é o último dentro");
-        assert_eq!(bitmap.pixel(6, 6), Some(white), "o 6 já é fora");
+        assert_eq!(bitmap.pixel(5, 5), Some(fill), "edge [2,6): 5 is the last one inside");
+        assert_eq!(bitmap.pixel(6, 6), Some(white), "6 is already outside");
         assert_eq!(bitmap.pixel(1, 1), Some(white));
     }
 
     #[test]
     fn source_over_blends_the_veil_exactly() {
-        // véu de azul a 128/255 sobre branco: cada canal sai do div255,
-        // valor inteiro exato — nada de "quase"
+        // a veil of blue at 128/255 over white: each channel comes out of
+        // div255, an exact integer value — no "almost"
         let mut display = DisplayList::default();
         display.push(DrawCommand::FillRect {
             rect: Rect {
@@ -398,17 +401,17 @@ mod tests {
 
         let ink = super::pack(Color::BLACK);
         let white = super::pack(Color::WHITE);
-        assert_eq!(bitmap.pixel(0, 0), Some(white), "canto recuado");
-        assert_eq!(bitmap.pixel(7, 7), Some(white), "canto oposto recuado");
-        assert_eq!(bitmap.pixel(4, 0), Some(ink), "meio da aresta superior pintado");
-        assert_eq!(bitmap.pixel(0, 4), Some(ink), "meio da aresta esquerda pintado");
-        assert_eq!(bitmap.pixel(4, 4), Some(ink), "centro pintado");
+        assert_eq!(bitmap.pixel(0, 0), Some(white), "corner inset");
+        assert_eq!(bitmap.pixel(7, 7), Some(white), "opposite corner inset");
+        assert_eq!(bitmap.pixel(4, 0), Some(ink), "middle of the top edge painted");
+        assert_eq!(bitmap.pixel(0, 4), Some(ink), "middle of the left edge painted");
+        assert_eq!(bitmap.pixel(4, 4), Some(ink), "center painted");
     }
 
     #[test]
     fn stroke_width_never_double_blends_the_corners() {
-        // moldura translúcida: canto e aresta têm o MESMO valor — cada
-        // pixel da borda blendou exatamente uma vez
+        // translucent frame: corner and edge have the SAME value — every
+        // border pixel blended exactly once
         let mut display = DisplayList::default();
         display.push(DrawCommand::StrokeRect {
             rect: Rect {
@@ -420,8 +423,8 @@ mod tests {
         });
         let bitmap = rasterize(&display, 6, 6, Color::WHITE);
 
-        assert_eq!(bitmap.pixel(0, 0), bitmap.pixel(3, 0), "canto == topo");
-        assert_eq!(bitmap.pixel(0, 3), bitmap.pixel(3, 0), "lateral == topo");
-        assert_eq!(bitmap.pixel(3, 3), Some(super::pack(Color::WHITE)), "interior intocado");
+        assert_eq!(bitmap.pixel(0, 0), bitmap.pixel(3, 0), "corner == top");
+        assert_eq!(bitmap.pixel(0, 3), bitmap.pixel(3, 0), "side == top");
+        assert_eq!(bitmap.pixel(3, 3), Some(super::pack(Color::WHITE)), "interior untouched");
     }
 }

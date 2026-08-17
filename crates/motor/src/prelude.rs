@@ -13,9 +13,9 @@ pub use std::rc::Rc;
 pub use crate::view::{AnyView, RenderNode, Component, View};
 pub use crate::views::*;
 
-/// Swift's `Optional(x)` constructor — a promoção implícita `T` → `T?` dos
-/// call sites do Swift não é verificável sem tipos no macro, então o port
-/// escreve `Optional(x)` onde o Swift promove implicitamente.
+/// Swift's `Optional(x)` constructor — the implicit `T` → `T?` promotion at
+/// Swift call sites cannot be checked without types in the macro, so the
+/// port writes `Optional(x)` where Swift promotes implicitly.
 pub fn Optional<T>(value: T) -> Option<T> {
     Some(value)
 }

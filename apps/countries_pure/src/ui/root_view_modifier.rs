@@ -1,18 +1,19 @@
 //
 //  RootViewModifier.swift — RootViewAppearance
 //
-//  `ViewModifier` → `CustomModifier`: o `apply` re-roda a cada render, que é
-//  o que faz o `blur(radius:)` recomputar quando o `isActive` anda (numa
-//  cadeia de modifiers comum o detalhe seria assado no build da árvore).
+//  `ViewModifier` → `CustomModifier`: the `apply` re-runs on every render,
+//  which is what makes the `blur(radius:)` recompute when `isActive` moves
+//  (in a plain modifier chain the detail would be baked into the tree build).
 //
-//  Nota: o `on_receive` do bunny_ui retém a subscription por site, então o
-//  blur de verdade cai pra zero quando `sceneDidBecomeActive` seta
-//  `system.isActive` — sem a retenção, o publisher recriado a cada render
-//  entregaria o valor atual de novo e a entrega nunca estabilizaria.
+//  Note: bunny_ui's `on_receive` retains the subscription per site, so the
+//  blur really does drop to zero when `sceneDidBecomeActive` sets
+//  `system.isActive` — without the retention, the publisher recreated on
+//  every render would deliver the current value again and the delivery
+//  would never stabilize.
 //
-//  O `content:` chega apagado (`Erased`) — é a borda dinâmica do
-//  `body(content:)`; o wrap que ele devolve volta a ser tipado até a
-//  próxima borda.
+//  The `content:` arrives erased (`Erased`) — it is the dynamic boundary of
+//  `body(content:)`; the wrap it returns goes back to being typed until the
+//  next boundary.
 //
 
 use countries_core::DependencyInjection::DIContainer::DIContainer;
@@ -26,8 +27,9 @@ pub struct RootViewAppearance {
 }
 
 impl RootViewAppearance {
-    /// `RootViewAppearance()` — o `@Environment(\.injected)` chega aqui como
-    /// parâmetro (o modifier vive fora da subárvore que o `.inject` rega).
+    /// `RootViewAppearance()` — the `@Environment(\.injected)` arrives here
+    /// as a parameter (the modifier lives outside the subtree that `.inject`
+    /// waters).
     pub fn new(injected: &DIContainer) -> Self {
         Self {
             is_active: State::new(false),

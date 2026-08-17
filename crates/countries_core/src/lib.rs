@@ -1,5 +1,5 @@
-//! Port manual das camadas não-UI do CountriesSwiftUI.
-//! Mantém nomes camelCase e a estrutura de pastas do Swift.
+//! Hand-written port of the non-UI layers of CountriesSwiftUI.
+//! Keeps the camelCase names and the Swift folder structure.
 
 #![allow(non_snake_case)]
 

@@ -1,9 +1,9 @@
 //
 //  ErrorView.swift — CountriesSwiftUI
 //
-//  O `retryAction` chega como `Rc<dyn Fn()>` porque a view o guarda num
-//  campo entre renders (é o design do Swift: closure injetada) — o
-//  `Button` continua tipado, com a ação num campo `F: Fn()`.
+//  The `retryAction` arrives as `Rc<dyn Fn()>` because the view keeps it in
+//  a field across renders (it is the Swift design: an injected closure) —
+//  the `Button` stays typed, with the action in an `F: Fn()` field.
 //
 
 use bunny_ui::prelude::*;
@@ -34,8 +34,8 @@ impl Component for ErrorView {
                 .multiline_text_alignment(TextAlignment::Center)
                 .padding_edge(Edge::Bottom, 40.0)
                 .padding(),
-            // `Rc<dyn Fn()>` não implementa `Fn` (só `&F` o faz) — a
-            // ação embrulhada numa closure que a desreferencia.
+            // `Rc<dyn Fn()>` does not implement `Fn` (only `&F` does) — the
+            // action wrapped in a closure that dereferences it.
             button(text("Retry").bold(), move || retry_action()),
         ))
     }

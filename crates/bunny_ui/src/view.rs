@@ -1,40 +1,40 @@
-//! `View` — a árvore tipada.
+//! `View` — the typed tree.
 //!
-//! Aqui não há `AnyView`: cada view é um valor genérico (`VStack<C>` com
-//! filhos em tupla, `Button<L, F>` com a ação num campo), o dispatch é
-//! estático de ponta a ponta e nenhuma `Rc` nasce durante o render. O
-//! apagamento existe só nas bordas de dinamismo real — [`Erased`] (sheets,
-//! `ViewModifier`), a fila de efeitos e os slots por site.
+//! There is no `AnyView` here: each view is a generic value (`VStack<C>` with
+//! tuple children, `Button<L, F>` with the action in a field), dispatch is
+//! static end to end and no `Rc` is born during render. Erasure
+//! exists only at the borders of real dynamism — [`Erased`] (sheets,
+//! `ViewModifier`), the effect queue and the per-site slots.
 //!
-//! `render_into` appende nós numa [`NodeList`] (uma tupla appende vários,
-//! `EmptyView`/`None` nenhum) — é o achatamento que o `@ViewBuilder` do
-//! SwiftUI faz no codegen. A `NodeList` é opaca de propósito: o formato de
-//! saída é detalhe do motor, e vai mudar quando ele deixar de ser headless.
+//! `render_into` appends nodes to a [`NodeList`] (a tuple appends several,
+//! `EmptyView`/`None` none) — the flattening SwiftUI's `@ViewBuilder`
+//! does in codegen. The `NodeList` is opaque on purpose: the output
+//! format is engine detail, and will change when it stops being headless.
 //!
 //! [`Erased`]: crate::erased::Erased
 
 use motor::state::Context;
 use motor::view::RenderNode;
 
-/// Quantos nós uma view appende — parte do tipo, para o compilador barrar
-/// o que não faz sentido. Modificar `(a, b).padding()` decoraria só o `b`;
-/// com `Arity` isso nem compila: [`ViewExt`] exige `Arity = Single`.
-/// (Para agrupar de verdade, [`tuple`] imprime o próprio nó — e aí aceita
+/// How many nodes a view appends — part of the type, so the compiler blocks
+/// what makes no sense. Modifying `(a, b).padding()` would decorate only `b`;
+/// with `Arity` it does not even compile: [`ViewExt`] demands `Arity = Single`.
+/// (To truly group, [`tuple`] prints its own node — and then accepts a
 /// modifier.)
 ///
 /// [`ViewExt`]: crate::ext::ViewExt
 /// [`tuple`]: crate::views::tuple
 pub struct Single;
 
-/// O outro lado de [`Single`]: zero-ou-vários nós (tuplas, `Option`).
+/// The other side of [`Single`]: zero-or-several nodes (tuples, `Option`).
 pub struct Many;
 
 /// SwiftUI's `View`: a renderable blueprint. Built-ins implement
 /// `render_into` directly; user views get it for free from
 /// [`Component::body`].
 ///
-/// Não implemente `View` à mão: o contrato de render é interno e vai
-/// trocar junto com o motor. Views próprias implementam [`Component`].
+/// Do not implement `View` by hand: the render contract is internal and will
+/// change together with the engine. Your own views implement [`Component`].
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a View",
     label = "a view is expected here",
@@ -42,8 +42,8 @@ pub struct Many;
     note = "put many children in one tuple: `vstack((a, b, c))` — a tuple holds up to 12; nest tuples for more"
 )]
 pub trait View: Clone + 'static {
-    /// [`Single`] quando a view appende exatamente um nó; [`Many`] quando
-    /// pode appender zero ou vários. Modifiers só existem para `Single`.
+    /// [`Single`] when the view appends exactly one node; [`Many`] when it
+    /// can append zero or several. Modifiers only exist for `Single`.
     type Arity;
 
     /// Appends this view's nodes to `out` (a tuple appends several,
@@ -52,10 +52,10 @@ pub trait View: Clone + 'static {
     fn render_into(&self, ctx: &Context, out: &mut NodeList);
 }
 
-/// Atalho para "view de exatamente um nó" em assinaturas de helpers:
-/// `-> impl UnaryView`. Um `-> impl View` esconderia a aridade (opacos só
-/// revelam o que a assinatura promete) e o callsite não conseguiria nem
-/// aplicar modifier nem entrar num braço de `OneOf`.
+/// Shorthand for "view of exactly one node" in helper signatures:
+/// `-> impl UnaryView`. A `-> impl View` would hide the arity (opaque types
+/// only reveal what the signature promises) and the callsite could neither
+/// apply a modifier nor enter a `OneOf` arm.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` can render many nodes — exactly one is required here",
     note = "to decorate a group, wrap it with `tuple(…)` — the wrapper has its own node"
@@ -64,14 +64,14 @@ pub trait UnaryView: View<Arity = Single> {}
 
 impl<V: View<Arity = Single>> UnaryView for V {}
 
-/// A saída do render — opaca fora do crate (os mutadores são `pub(crate)`):
-/// implementar `View` por fora até compila, mas não produz nó nenhum, que é
-/// o jeito educado de dizer "implemente `Component`".
+/// The render output — opaque outside the crate (mutators are `pub(crate)`):
+/// implementing `View` from outside even compiles, but produces no node at
+/// all — the polite way of saying "implement `Component`".
 ///
-/// Carrega as DUAS saídas do único body-eval por pass: a árvore impressa
-/// (`RenderNode`) e a árvore de layout ([`LayoutNode`]) — avaliar o body
-/// duas vezes duplicaria âncoras de identidade, então print e layout saem
-/// juntos.
+/// Carries the TWO outputs of the single body-eval per pass: the printed
+/// tree (`RenderNode`) and the layout tree ([`LayoutNode`]) — evaluating the
+/// body twice would duplicate identity anchors, so print and layout come
+/// out together.
 ///
 /// [`LayoutNode`]: crate::layout::LayoutNode
 #[derive(Default)]
@@ -81,15 +81,15 @@ pub struct NodeList {
 }
 
 thread_local! {
-    /// A árvore impressa liga e desliga por pass: imprimir é para gente
-    /// (testes, oráculo incremental-vs-full); o caminho de FRAME
-    /// (settle/layout/paint) desliga e as linhas nem são formatadas —
-    /// `format!` de sufixo por nó era custo real de frame.
+    /// The printed tree turns on and off per pass: printing is for people
+    /// (tests, the incremental-vs-full oracle); the FRAME path
+    /// (settle/layout/paint) turns it off and the lines are not even
+    /// formatted — per-node suffix `format!` was real frame cost.
     static PRINT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
-/// O pass corrente monta a árvore impressa? Sites quentes de `format!`
-/// consultam antes de formatar.
+/// Does the current pass build the printed tree? Hot `format!` sites
+/// check before formatting.
 pub(crate) fn print_enabled() -> bool {
     PRINT.with(|print| print.get())
 }
@@ -111,8 +111,8 @@ impl NodeList {
         self.layout.push(node);
     }
 
-    /// Embrulha o último nó de layout (o da view Single que acabou de
-    /// render) — o caminho dos modifiers de layout (`.padding()`, frames).
+    /// Wraps the last layout node (the one from the Single view that just
+    /// rendered) — the path of the layout modifiers (`.padding()`, frames).
     pub(crate) fn wrap_last_layout(
         &mut self,
         wrap: impl FnOnce(crate::layout::LayoutNode) -> crate::layout::LayoutNode,
@@ -122,9 +122,9 @@ impl NodeList {
         }
     }
 
-    /// Uma fronteira retida: entra como referência (a linha marcada no
-    /// print, o nó-referência no layout) e a montagem final expande contra
-    /// o reconciler.
+    /// A retained boundary: enters as a reference (the marked line in the
+    /// print, the reference node in the layout) and the final assembly
+    /// expands against the reconciler.
     pub(crate) fn push_view_ref(&mut self, path: &str) {
         self.nodes.push(RenderNode::leaf(crate::reconciler::ref_line(path)));
         self.layout
@@ -160,14 +160,14 @@ impl NodeList {
 /// The conformance every `struct X: View` writes by hand.
 ///
 /// (`var body: some View` → `fn body(self, ctx: &Context) -> impl View` —
-/// return-position `impl Trait` in trait, estável desde o Rust 1.75. O tipo
-/// concreto da árvore inteira fica conhecido em compile time.)
+/// return-position `impl Trait` in trait, stable since Rust 1.75. The
+/// concrete type of the whole tree is known at compile time.)
 ///
-/// O body recebe `self` POR VALOR de propósito: closures capturam os
-/// campos que usam (captura disjunta do Rust 2021) — `move ||
-/// self.count.add(1)` funciona direto, sem o `let this = *self` que a
-/// forma `&self` obrigava. Views são valores baratos (`State` é Copy); o
-/// runtime clona antes de chamar.
+/// The body takes `self` BY VALUE on purpose: closures capture the
+/// fields they use (Rust 2021 disjoint capture) — `move ||
+/// self.count.add(1)` just works, without the `let this = *self` the
+/// `&self` form demanded. Views are cheap values (`State` is Copy); the
+/// runtime clones before calling.
 pub trait Component: Clone + 'static {
     fn body(self, ctx: &Context) -> impl View;
 }
@@ -176,12 +176,12 @@ impl<T: Component> View for T {
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
-        // O frame cobre a construção do body E a descida: todo `State::new`
-        // disparado pelos construtores dos filhos ancora nesta identidade.
+        // The frame covers the body construction AND the descent: every
+        // `State::new` fired by the children's constructors anchors to this identity.
         let _frame = motor::identity::enter_view(short_type_name::<T>());
 
-        // Sem pass ativo (render fora do Runtime): caminho direto, sem
-        // retenção — o comportamento pré-reconciler.
+        // No active pass (render outside the Runtime): direct path, no
+        // retention — the pre-reconciler behavior.
         let Some(path) = motor::identity::current_view_path() else {
             let mut body = NodeList::new();
             self.clone().body(ctx).render_into(ctx, &mut body);
@@ -194,17 +194,17 @@ impl<T: Component> View for T {
             return;
         };
 
-        // Fronteira limpa e retida, fora de qualquer body re-rodando: o
-        // body NÃO roda — sai uma referência e o cache responde por ela.
+        // A clean, retained boundary, outside any re-running body: the
+        // body does NOT run — a reference goes out and the cache answers for it.
         if let crate::reconciler::Decision::Skip = crate::reconciler::decide(&path) {
             motor::identity::mark_skipped(&path);
             out.push_view_ref(&path);
             return;
         }
 
-        // O body vai rodar: as leituras antigas desta view caem (o conjunto
-        // novo é o que este body registrar) e os efeitos que ele empurrar
-        // pertencem à entry nova.
+        // The body will run: this view's old reads drop (the new set is
+        // whatever this body registers) and the effects it pushes
+        // belong to the new entry.
         motor::identity::mark_reran(&path);
         motor::identity::begin_view_reads(&path);
         crate::reconciler::begin_entry(&path);
@@ -227,10 +227,10 @@ impl<T: Component> View for T {
     }
 }
 
-/// SwiftUI's `_ConditionalContent` — o `if/else` de um `@ViewBuilder`.
-/// Os dois ramos precisam da mesma aridade (senão `.padding()` no `Either`
-/// significaria coisas diferentes por ramo). Para `match` com mais braços,
-/// use os [`OneOf3`]…[`OneOf8`].
+/// SwiftUI's `_ConditionalContent` — the `if/else` of a `@ViewBuilder`.
+/// Both branches need the same arity (otherwise `.padding()` on the `Either`
+/// would mean different things per branch). For `match` with more arms,
+/// use [`OneOf3`]…[`OneOf8`].
 ///
 /// [`OneOf3`]: crate::one_of::OneOf3
 /// [`OneOf8`]: crate::one_of::OneOf8
@@ -244,8 +244,8 @@ impl<A: View, B: View<Arity = A::Arity>> View for Either<A, B> {
     type Arity = A::Arity;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
-        // O braço entra na identidade: trocar de ramo desmonta o que o
-        // outro ramo montou (estado de views sob o braço morre junto).
+        // The arm joins the identity: switching branches unmounts what the
+        // other branch mounted (state of views under the arm dies with it).
         match self {
             Either::First(view) => {
                 let _frame = motor::identity::enter("@First");
@@ -261,8 +261,8 @@ impl<A: View, B: View<Arity = A::Arity>> View for Either<A, B> {
 
 /// SwiftUI's optional-view handling: `country.flag.map { … }` renders the
 /// content when the optional has a value, nothing when it doesn't — zero
-/// nós, para não deslocar o conector `└─` do irmão anterior (o `Vec`
-/// condicional do motor também não deixava placeholder).
+/// nodes, so the previous sibling's `└─` connector does not shift (the
+/// engine's conditional `Vec` left no placeholder either).
 impl<C: View> View for Option<C> {
     type Arity = Many;
 
@@ -274,7 +274,7 @@ impl<C: View> View for Option<C> {
 }
 
 /// SwiftUI's `TupleView` — the implicit container of a multi-statement
-/// `@ViewBuilder` block, achatado nos filhos do pai.
+/// `@ViewBuilder` block, flattened into the parent's children.
 macro_rules! tuple_view {
     ($($name:ident),+) => {
         #[allow(non_snake_case)]
@@ -283,9 +283,9 @@ macro_rules! tuple_view {
 
             fn render_into(&self, ctx: &Context, out: &mut NodeList) {
                 let ($(ref $name,)+) = *self;
-                // A posição na tupla é identidade estrutural: dois irmãos do
-                // mesmo tipo não se confundem, e `Option` vazio não desloca
-                // os índices (a estrutura é estática, não os nós emitidos).
+                // The tuple position is structural identity: two siblings of
+                // the same type do not get confused, and an empty `Option` does
+                // not shift the indices (the structure is static, not the emitted nodes).
                 let mut position = 0usize;
                 $(
                     {
@@ -315,8 +315,8 @@ tuple_view!(A, B, C, D, E, F, G, H, I, J, K, L);
 
 /// Renders a view to its single printed line (used by inert modifiers that
 /// describe content they never mount: `.background { … }`,
-/// `NavigationLink(destination:)`). Expande referências: uma fronteira
-/// retida descreve pela linha do cache, não pelo marcador.
+/// `NavigationLink(destination:)`). Expands references: a retained
+/// boundary describes through the cache line, not the marker.
 pub(crate) fn render_line(view: &impl View) -> String {
     let mut out = NodeList::new();
     view.render_into(&Context::default(), &mut out);
@@ -328,7 +328,7 @@ pub(crate) fn render_line(view: &impl View) -> String {
 
 pub(crate) fn short_type_name<T: ?Sized>() -> String {
     let full = std::any::type_name::<T>();
-    // genéricos: `path::DetailRow<bunny_ui::views::Text>` → `DetailRow`
+    // generics: `path::DetailRow<bunny_ui::views::Text>` → `DetailRow`
     let base = full.split('<').next().unwrap_or(full);
     base.rsplit("::").next().unwrap_or(base).to_string()
 }

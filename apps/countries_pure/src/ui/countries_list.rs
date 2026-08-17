@@ -1,19 +1,19 @@
 //
 //  CountriesList.swift — CountriesSwiftUI
 //
-//  Desvios do port (documentados):
-//  - `LocaleReader` não existe aqui: views leem o locale direto do `ctx` —
-//    o container do Swift servia para reach de fora da view.
-//  - `Inspection` (ViewInspector) fica de fora — a demo headless inspeciona.
-//  - Os `site`s de `on_change`/`on_receive` saem de `#[track_caller]` —
-//    cada callsite é seu próprio slot, nada a nomear.
+//  Port deviations (documented):
+//  - `LocaleReader` does not exist here: views read the locale straight from
+//    the `ctx` — the Swift container was there for reach from outside the view.
+//  - `Inspection` (ViewInspector) stays out — the headless demo inspects.
+//  - The `site`s of `on_change`/`on_receive` come from `#[track_caller]` —
+//    each callsite is its own slot, nothing to name.
 //
-//  A view é toda `State<_>`, então deriva `Copy` e o body recebe `self`
-//  POR VALOR: cada closure captura os campos que usa (captura disjunta) —
-//  o espelho do que o Swift faz com structs, sem cerimônia nenhuma.
+//  The view is all `State<_>`, so it derives `Copy` and the body takes `self`
+//  BY VALUE: each closure captures the fields it uses (disjoint capture) —
+//  the mirror of what Swift does with structs, with no ceremony at all.
 //
-//  O `match` do `content` é um `OneOf4` — os quatro braços do `Loadable`
-//  com nome próprio, no lugar do `_ConditionalContent` binário aninhado.
+//  The `content` `match` is a `OneOf4` — the four `Loadable` arms with names
+//  of their own, in place of the nested binary `_ConditionalContent`.
 //
 
 use countries_core::Core::AppState::{CountriesListRouting, PermissionStatus};
@@ -136,9 +136,9 @@ impl CountriesList {
 // MARK: - Displaying Content
 
 impl CountriesList {
-    /// `loadedView()` — o `@ViewBuilder` com `if` + `List` vira uma tupla
-    /// com `Option` (o `if let` do codegen) e o `TupleView` explícito que
-    /// imprime o próprio nó.
+    /// `loadedView()` — the `@ViewBuilder` with `if` + `List` becomes a tuple
+    /// with an `Option` (the codegen's `if let`) and the explicit `TupleView`
+    /// that prints its own node.
     fn loaded_view(self, ctx: &Context) -> impl UnaryView {
         let injected = ctx.environment::<DIContainer>();
 
@@ -267,7 +267,7 @@ impl CountriesList {
 
 // MARK: - Query
 
-/// `Query(filter: #Predicate { … }, sort: \.name)` — o builder do
+/// `Query(filter: #Predicate { … }, sort: \.name)` — the builder behind
 /// `.query(searchText:results:)`.
 fn build_query(search: String) -> Query<DBModel::Country> {
     Query::new(

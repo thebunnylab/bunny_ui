@@ -1,18 +1,19 @@
-//! O harness de frames — a régua de performance do pipeline, headless.
+//! The frame harness — the pipeline's performance ruler, headless.
 //!
 //! ```sh
 //! cargo run --release -p bunny-ui --example bench_pipeline
 //! ```
 //!
-//! Mede o custo POR FRAME de cada tipo de interação sobre uma tela real
-//! (o finder de exemplo): frame frio, tecla digitada, seleção movida,
-//! wheel, hover e a rasterização pura. Para cada cenário: p50/p95/p99 de
-//! tempo de parede, bodies re-rodados e alocações — o argumento
-//! competitivo é mensurável: custo proporcional à MUDANÇA, não à árvore.
+//! Measures the PER-FRAME cost of each kind of interaction over a real
+//! screen (the example finder): cold frame, typed key, moved selection,
+//! wheel, hover and pure rasterization. For each scenario: p50/p95/p99
+//! of wall time, re-run bodies and allocations — the competitive
+//! argument is measurable: cost proportional to the CHANGE, not to the
+//! tree.
 //!
-//! Métricas de texto vêm do `PixelFont` (determinísticas em qualquer
-//! máquina); a rasterização com fonte de plataforma é o mesmo caminho com
-//! outro engine e mede-se no shell.
+//! Text metrics come from the `PixelFont` (deterministic on any
+//! machine); rasterization with a platform font is the same path with
+//! another engine and is measured in the shell.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,7 +23,7 @@ use bunny_ui::layout::{Proposal, Size};
 use bunny_ui::prelude::*;
 use bunny_ui::raster::rasterize_scaled;
 
-// MARK: - Alocador contador (zero deps: o System embrulhado)
+// MARK: - Counting allocator (zero deps: the wrapped System)
 
 struct CountingAllocator;
 
@@ -48,7 +49,7 @@ fn allocation_snapshot() -> (u64, u64) {
     (ALLOCATIONS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed))
 }
 
-// MARK: - A fixture (o finder de exemplo, encolhido)
+// MARK: - The fixture (the example finder, shrunk)
 
 const FILES: &[(&str, &str)] = &[
     ("main.rs", "src/"),
@@ -160,7 +161,7 @@ impl Component for Finder {
     }
 }
 
-// MARK: - O relógio
+// MARK: - The clock
 
 struct Report {
     label: &'static str,
@@ -173,7 +174,7 @@ struct Report {
     kibibytes: u64,
 }
 
-/// Roda `frames` iterações medindo parede + alocações; `step` é UM frame.
+/// Runs `frames` iterations measuring wall time + allocations; `step` is ONE frame.
 fn measure(
     label: &'static str,
     warmup: usize,
@@ -214,23 +215,23 @@ fn main() {
     runtime.settle(&finder);
     runtime.layout(&finder, viewport);
 
-    // foca o campo (digitação vai pelo caminho real do editor)
+    // focus the field (typing goes through the editor's real path)
     let result = runtime.layout(&finder, viewport);
-    let field = result.fields.first().expect("campo").clone();
+    let field = result.fields.first().expect("field").clone();
     runtime.pointer_pressed(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
     runtime.pointer_released(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
 
     let mut reports = Vec::new();
 
-    // 1. frame FRIO: retenção descartada, todos os bodies + layout
+    // 1. COLD frame: retention discarded, all bodies + layout
     reports.push(measure("cold_full (build+layout)", 3, 40, usize::MAX, || {
         runtime.render_full(&finder);
         runtime.layout(&finder, viewport);
     }));
 
-    // bodies do PRIMEIRO pass de frame de uma mutação: o layout com
-    // sujeira pendente roda exatamente um pass real — os bodies dele são
-    // os do frame (o settle na sequência só confirma)
+    // bodies of a mutation's FIRST frame pass: the layout with pending
+    // dirt runs exactly one real pass — its bodies are the frame's (the
+    // settle right after only confirms)
     let first_pass_bodies = |mutate: &dyn Fn()| {
         mutate();
         runtime.layout(&finder, viewport);
@@ -240,7 +241,7 @@ fn main() {
         bodies
     };
 
-    // 2. tecla digitada: editor → binding → re-render incremental + layout
+    // 2. typed key: editor → binding → incremental re-render + layout
     let typing_bodies =
         first_pass_bodies(&|| _ = runtime.key(EditCommand::Insert("e".into())));
     let _ = runtime.key(EditCommand::Backspace);
@@ -258,7 +259,7 @@ fn main() {
     });
     reports.push(Report { bodies: typing_bodies, ..typing });
 
-    // 3. seleção movida por ação (a invalidação fina em ação)
+    // 3. selection moved by action (the fine invalidation in action)
     let select = runtime.match_key(&KeyPattern::key(Key::Down)).unwrap();
     let selection_bodies = first_pass_bodies(&|| _ = runtime.dispatch_action(select));
     let selection = measure("select_next (dispatch+layout)", 5, 200, 0, || {
@@ -268,7 +269,7 @@ fn main() {
     });
     reports.push(Report { bodies: selection_bodies, ..selection });
 
-    // 4. hover: estampa + layout, ZERO bodies por contrato (nem render há)
+    // 4. hover: stamp + layout, ZERO bodies by contract (no render at all)
     let result = runtime.layout(&finder, viewport);
     let row = result.hits.get(1).expect("row").1;
     let mut inside = true;
@@ -280,9 +281,9 @@ fn main() {
     });
     reports.push(Report { bodies: 0, ..hover });
 
-    // 5. wheel: offset do engine + layout, zero render
+    // 5. wheel: engine offset + layout, zero render
     runtime.key(EditCommand::SelectAll);
-    runtime.key(EditCommand::Backspace); // lista cheia de volta
+    runtime.key(EditCommand::Backspace); // the full list back
     runtime.settle(&finder);
     runtime.layout(&finder, viewport);
     let mut down = true;
@@ -292,7 +293,7 @@ fn main() {
         runtime.layout(&finder, viewport);
     }));
 
-    // 6. rasterização pura da display list (760×640 @2x, PixelFont)
+    // 6. pure rasterization of the display list (760×640 @2x, PixelFont)
     let laid_out = runtime.layout(&finder, viewport);
     reports.push(measure("raster 1520×1280 (paint)", 3, 60, 0, || {
         let bitmap = rasterize_scaled(&laid_out.display, 1520, 1280, 2, Color::CANVAS);
@@ -301,12 +302,12 @@ fn main() {
 
     println!(
         "\n{:<30} {:>8} {:>8} {:>8} {:>8} {:>7} {:>8} {:>8}",
-        "cenário (frame =)", "p50 ms", "p95 ms", "p99 ms", "max ms", "bodies", "allocs", "KiB"
+        "scenario (frame =)", "p50 ms", "p95 ms", "p99 ms", "max ms", "bodies", "allocs", "KiB"
     );
     println!("{}", "─".repeat(92));
     for report in &reports {
         let bodies = if report.bodies == usize::MAX {
-            "todos".to_string()
+            "all".to_string()
         } else {
             report.bodies.to_string()
         };
@@ -323,7 +324,7 @@ fn main() {
         );
     }
     println!(
-        "\nfixture: finder com {} rows; viewport 760×640; texto PixelFont (determinístico)",
+        "\nfixture: finder with {} rows; viewport 760×640; PixelFont text (deterministic)",
         FILES.len()
     );
 }

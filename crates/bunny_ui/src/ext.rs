@@ -1,17 +1,18 @@
-//! Modificadores de view — a `ViewExt` idiomática.
+//! View modifiers — the idiomatic `ViewExt`.
 //!
-//! Cada método devolve um [`Modified<Self>`] tipado: encadear `.font(…)`
-//! não aloca nada nem apaga o tipo — a cadeia inteira vira um valor
-//! monomórfico conhecido em compile time.
+//! Each method returns a typed [`Modified<Self>`]: chaining `.font(…)`
+//! allocates nothing and erases no type — the whole chain becomes a
+//! monomorphic value known at compile time.
 //!
-//! A trait só existe para `Arity = Single` (um nó): modifier em tupla crua
-//! não compila — ver [`Modified`].
+//! The trait only exists for `Arity = Single` (one node): a modifier on
+//! a raw tuple does not compile — see [`Modified`].
 //!
-//! Os `site`s de `on_change`/`on_receive` — a identidade que o slot de
-//! change-detection precisa entre renders — saem de `#[track_caller]`:
-//! cada ponto de chamada é seu próprio site, sem string manual para
-//! inventar (nem colidir). Quando a mesma chamada é compartilhada por um
-//! helper e precisa se distinguir por uso, há as variantes `_keyed`.
+//! The `site`s of `on_change`/`on_receive` — the identity the
+//! change-detection slot needs across renders — come from
+//! `#[track_caller]`: each call site is its own site, with no manual
+//! string to invent (nor collide). When the same call is shared by a
+//! helper and needs to tell its uses apart, there are the `_keyed`
+//! variants.
 
 use std::panic::Location;
 use std::rc::Rc;
@@ -31,7 +32,7 @@ use crate::views::Alignment;
 use motor::views::{ContentMode, Edge, Font, ListStyle, ProgressViewStyle, TextAlignment};
 
 pub trait ViewExt: View<Arity = Single> + Sized {
-    // MARK: - Formatação
+    // MARK: - Formatting
 
     /// `.font(.title)`
     fn font(self, font: Font) -> Modified<Self> {
@@ -57,7 +58,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.padding(12)` — uniforme com medida explícita.
+    /// `.padding(12)` — uniform with an explicit measure.
     fn padding_length(self, length: f64) -> Modified<Self> {
         Modified {
             base: self,
@@ -161,7 +162,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.background { … }` — descreve o conteúdo sem montá-lo.
+    /// `.background { … }` — describes the content without mounting it.
     fn background<C: View<Arity = Single>>(self, content: C) -> Modified<Self> {
         Modified {
             base: self,
@@ -177,10 +178,10 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    // MARK: - Visuais (propriedades semânticas do nó — `Styled` na cena)
+    // MARK: - Visuals (semantic node properties — `Styled` in the scene)
 
-    /// `.background(Color.red)` — cor sólida como propriedade do nó (o
-    /// `.background { view }` de conteúdo é o outro método).
+    /// `.background(Color.red)` — a solid color as a node property (the
+    /// content `.background { view }` is the other method).
     fn background_color(self, color: Color) -> Modified<Self> {
         Modified {
             base: self,
@@ -188,7 +189,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.foregroundColor(.secondary)` — herdado pelo texto abaixo.
+    /// `.foregroundColor(.secondary)` — inherited by the text below.
     fn foreground_color(self, color: Color) -> Modified<Self> {
         Modified {
             base: self,
@@ -196,7 +197,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.border(Color.gray, width: 1)` — moldura para dentro da aresta.
+    /// `.border(Color.gray, width: 1)` — a frame inward from the edge.
     fn border(self, color: Color, width: f64) -> Modified<Self> {
         Modified {
             base: self,
@@ -204,7 +205,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.cornerRadius(8)` — arredonda o fundo DESTE nó.
+    /// `.cornerRadius(8)` — rounds THIS node's background.
     fn corner_radius(self, radius: f64) -> Modified<Self> {
         Modified {
             base: self,
@@ -212,7 +213,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.monospaced()` — troca o design da fonte herdada (grades).
+    /// `.monospaced()` — swaps the inherited font's design (grids).
     fn monospaced(self) -> Modified<Self> {
         Modified {
             base: self,
@@ -220,8 +221,8 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// Fundo alternativo sob o hover do alvo interativo mais próximo
-    /// (rows de lista, chips) — pintura pura, layout intocado (a LEI).
+    /// Alternate background under the nearest interactive target's hover
+    /// (list rows, chips) — pure paint, layout untouched (the LAW).
     fn background_hovered(self, color: Color) -> Modified<Self> {
         Modified {
             base: self,
@@ -229,7 +230,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// Fundo alternativo sob o pressed — par do
+    /// Alternate background under pressed — the pair of
     /// [`ViewExt::background_hovered`].
     fn background_pressed(self, color: Color) -> Modified<Self> {
         Modified {
@@ -238,9 +239,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.onClick { … }` — a view vira alvo de ponteiro SEM o chrome do
-    /// `Button`: mesma retenção de ação, mesmo up-inside. É a row de
-    /// lista clicável.
+    /// `.onClick { … }` — the view becomes a pointer target WITHOUT the
+    /// `Button` chrome: same action retention, same up-inside. It is the
+    /// clickable list row.
     fn on_click(self, action: impl Fn() + 'static) -> Modified<Self> {
         Modified {
             base: self,
@@ -248,10 +249,11 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.on_action(SELECT_NEXT, move || …)` — registra o handler da ação
-    /// nomeada nesta subárvore. Dois handlers do mesmo id: o mais interno
-    /// vence. Retido como as ações de clique: view pulada responde. A
-    /// tecla chega pelo keymap do `Runtime` (`bind` + o gate do shell).
+    /// `.on_action(SELECT_NEXT, move || …)` — registers the named
+    /// action's handler in this subtree. Two handlers with the same id:
+    /// the innermost wins. Retained like the click actions: a skipped
+    /// view responds. The key arrives through the `Runtime`'s keymap
+    /// (`bind` + the shell's gate).
     fn on_action(self, id: ActionId, handler: impl Fn() + 'static) -> Modified<Self> {
         Modified {
             base: self,
@@ -259,8 +261,8 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// Pinta trechos do TEXTO em outra cor (ranges de byte no conteúdo) —
-    /// o highlight de match de um finder. Só faz efeito em `text(…)`.
+    /// Paints stretches of the TEXT in another color (byte ranges into
+    /// the content) — a finder's match highlight. Only affects `text(…)`.
     fn highlight(self, ranges: Vec<(usize, usize)>, color: Color) -> Modified<Self> {
         Modified {
             base: self,
@@ -268,8 +270,8 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.truncationMode(.middle)` — desliga a quebra: o texto vira UMA
-    /// linha com elipse no lugar escolhido quando não cabe.
+    /// `.truncationMode(.middle)` — turns wrapping off: the text becomes
+    /// ONE line with an ellipsis at the chosen spot when it does not fit.
     fn truncation_mode(self, mode: crate::layout::Truncation) -> Modified<Self> {
         Modified {
             base: self,
@@ -277,9 +279,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    // MARK: - Interação
+    // MARK: - Interaction
 
-    /// `.onTapGesture { … }` — no runtime headless dispara no render.
+    /// `.onTapGesture { … }` — in the headless runtime it fires on render.
     fn on_tap(self, action: impl Fn() + 'static) -> Modified<Self> {
         Modified {
             base: self,
@@ -287,7 +289,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.onAppear { … }` — dispara no render (paridade do motor).
+    /// `.onAppear { … }` — fires on render (motor parity).
     fn on_appear(self, action: impl Fn() + 'static) -> Modified<Self> {
         Modified {
             base: self,
@@ -297,9 +299,9 @@ pub trait ViewExt: View<Arity = Single> + Sized {
 
     /// `.onChange(of:initial:) { old, new in … }`
     ///
-    /// O site do slot de change-detection é o próprio callsite
-    /// (`#[track_caller]`). Se a chamada mora num helper reusado e cada uso
-    /// precisa do seu slot, use [`ViewExt::on_change_keyed`].
+    /// The change-detection slot's site is the callsite itself
+    /// (`#[track_caller]`). If the call lives in a reused helper and each
+    /// use needs its own slot, use [`ViewExt::on_change_keyed`].
     #[track_caller]
     fn on_change<V: Clone + PartialEq + 'static>(
         self,
@@ -310,8 +312,8 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         self.on_change_keyed(Location::caller(), of, initial, action)
     }
 
-    /// `.onChange` com site explícito — para helpers que emitem o mesmo
-    /// callsite para usos que precisam de slots distintos.
+    /// `.onChange` with an explicit site — for helpers that emit the same
+    /// callsite for uses that need distinct slots.
     fn on_change_keyed<V: Clone + PartialEq + 'static>(
         self,
         site: impl Into<Site>,
@@ -331,10 +333,11 @@ pub trait ViewExt: View<Arity = Single> + Sized {
 
     /// `.onReceive(publisher) { value in … }`
     ///
-    /// O site (`#[track_caller]`) retém a subscription entre renders — a
-    /// identidade de view do SwiftUI. Sem ele, cada re-render criaria um
-    /// publisher novo (célula de dedup zerada) que entregaria o valor atual
-    /// de novo, reportando "mudança" a cada pump e nunca estabilizando.
+    /// The site (`#[track_caller]`) retains the subscription across
+    /// renders — SwiftUI's view identity. Without it, every re-render
+    /// would create a new publisher (zeroed dedup cell) that would
+    /// deliver the current value again, reporting a "change" on every
+    /// pump and never stabilizing.
     #[track_caller]
     fn on_receive<V: Clone + PartialEq + 'static>(
         self,
@@ -344,7 +347,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         self.on_receive_keyed(Location::caller(), publisher, action)
     }
 
-    /// `.onReceive` com site explícito — mesmo caso do
+    /// `.onReceive` with an explicit site — same case as
     /// [`ViewExt::on_change_keyed`].
     fn on_receive_keyed<V: Clone + PartialEq + 'static>(
         self,
@@ -370,7 +373,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.refreshable { … }` — gesto de usuário; inert headless.
+    /// `.refreshable { … }` — a user gesture; inert headless.
     fn refreshable(self, _action: impl Fn() + 'static) -> Modified<Self> {
         Modified {
             base: self,
@@ -378,8 +381,8 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.sheet(isPresented: $flag) { … }` — o conteúdo é a borda apagada:
-    /// monta só quando apresentada (feche com [`erased`]).
+    /// `.sheet(isPresented: $flag) { … }` — the content is the erased
+    /// boundary: mounts only when presented (close it with [`erased`]).
     ///
     /// [`erased`]: crate::erased::erased
     fn sheet(
@@ -396,7 +399,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.toolbar { … }` — inert no runtime fake, como no motor.
+    /// `.toolbar { … }` — inert in the fake runtime, as in the motor.
     fn toolbar(self, _items: impl View) -> Modified<Self> {
         Modified {
             base: self,
@@ -404,7 +407,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    // MARK: - Dados & environment
+    // MARK: - Data & environment
 
     /// `.inject(diContainer)`
     fn inject<T: 'static>(self, container: Rc<T>) -> Modified<Self> {
@@ -436,7 +439,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.modifier(RootViewAppearance(…))` — re-aplicado a cada render.
+    /// `.modifier(RootViewAppearance(…))` — re-applied on every render.
     fn modifier(self, custom: impl crate::erased::CustomModifier + 'static) -> Modified<Self> {
         Modified {
             base: self,
@@ -444,7 +447,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.query(searchText:results:) { search in Query(…) }` — o @Query fake.
+    /// `.query(searchText:results:) { search in Query(…) }` — the fake @Query.
     fn query<T: Clone + PartialEq + 'static>(
         self,
         search_text: String,
@@ -493,10 +496,11 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    // MARK: - Paridade inert
+    // MARK: - Inert parity
 
-    /// `.navigationDestination(for:) { … }` — inert (o NavigationPath fake
-    /// carrega só descrições; o destino não monta).
+    /// `.navigationDestination(for:) { … }` — inert (the fake
+    /// NavigationPath carries only descriptions; the destination does not
+    /// mount).
     fn navigation_destination(self) -> Modified<Self> {
         Modified {
             base: self,

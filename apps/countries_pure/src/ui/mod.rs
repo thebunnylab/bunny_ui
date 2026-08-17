@@ -1,5 +1,5 @@
-//! UI — os arquivos de view do CountriesSwiftUI, um módulo por arquivo
-//! Swift (snake_case), do mais simples ao mais composto.
+//! UI — the view files of CountriesSwiftUI, one module per Swift file
+//! (snake_case), from the simplest to the most composed.
 
 pub mod countries_list;
 pub mod country_cell;

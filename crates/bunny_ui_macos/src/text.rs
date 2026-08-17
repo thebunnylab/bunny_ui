@@ -1,19 +1,19 @@
-//! CoreText pela FFI da casa — o engine de texto do Mac.
+//! CoreText through the house FFI — the Mac's text engine.
 //!
-//! Implementa a borda [`TextEngine`] do bunny-ui: medição pelas métricas
-//! da FONTE (estáveis — as da linha pulam quando um fallback de glifo
-//! entra, e a altura de linha não pode pular por string) e raster de uma
-//! linha num `CGBitmapContext` sobre buffer nosso.
+//! Implements the bunny-ui [`TextEngine`] border: measuring by the FONT's
+//! metrics (stable — the line's metrics jump when a glyph fallback kicks
+//! in, and line height must not jump per string) and rastering one line
+//! into a `CGBitmapContext` over our own buffer.
 //!
-//! O contexto de CG só desenha pré-multiplicado; o compositor do bunny-ui
-//! blenda alfa RETO (um caminho único para todos os engines — na web o
-//! `putImageData` também é reto), então o retângulo é des-premultiplicado
-//! in place antes de sair — uma passada num retângulo pequeno de texto.
+//! The CG context only draws premultiplied; the bunny-ui compositor
+//! blends STRAIGHT alpha (a single path for all engines — on the web
+//! `putImageData` is straight too), so the rectangle is unpremultiplied
+//! in place before leaving — one pass over a small text rectangle.
 //!
-//! Fontes: o design `Default` sai de `CTFontCreateUIFontForLanguage` (a
-//! fonte de interface do sistema); `Mono` tenta Menlo e, se a família não
-//! existir, DEGRADA para a fonte do sistema — nunca falha. Cada `CTFont`
-//! é criado uma vez por `FontKey` e retido no engine.
+//! Fonts: the `Default` design comes from `CTFontCreateUIFontForLanguage`
+//! (the system interface font); `Mono` tries Menlo and, if the family
+//! does not exist, DEGRADES to the system font — it never fails. Each
+//! `CTFont` is created once per `FontKey` and retained in the engine.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -40,8 +40,8 @@ struct CFRange {
 }
 
 const KCF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
-/// `kCGImageAlphaPremultipliedLast` — o único layout RGBA que um contexto
-/// de desenho aceita.
+/// `kCGImageAlphaPremultipliedLast` — the only RGBA layout a drawing
+/// context accepts.
 const ALPHA_PREMULTIPLIED_LAST: u32 = 1;
 /// `kCTFontUIFontSystem` / `kCTFontUIFontEmphasizedSystem`.
 const UI_FONT_SYSTEM: u32 = 2;
@@ -79,7 +79,7 @@ unsafe extern "C" {
         encoding: u32,
         external: u8,
     ) -> CFStringRef;
-    /// Unidades UTF-16 — é a contagem que o `CFRange` dos atributos usa.
+    /// UTF-16 units — the count the attributes' `CFRange` uses.
     fn CFStringGetLength(string: CFStringRef) -> isize;
     fn CFAttributedStringCreateMutable(
         allocator: *const c_void,
@@ -128,7 +128,7 @@ unsafe fn cf_string(text: &str) -> CFStringRef {
     }
 }
 
-/// Um CTFont retido — solta no Drop (o engine é o dono).
+/// A retained CTFont — released on Drop (the engine is the owner).
 struct OwnedFont(*const c_void);
 
 impl Drop for OwnedFont {
@@ -143,8 +143,8 @@ unsafe fn create_font(spec: &FontSpec) -> CTFontRef {
     unsafe {
         match spec.design {
             FontDesign::Default => {
-                // pesos finos via CTFontDescriptor ficam para depois — o
-                // emphasized cobre Semibold/Bold com dignidade
+                // fine-grained weights via CTFontDescriptor come later —
+                // emphasized covers Semibold/Bold with dignity
                 let kind = match spec.weight {
                     Weight::Regular | Weight::Medium => UI_FONT_SYSTEM,
                     Weight::Semibold | Weight::Bold => UI_FONT_EMPHASIZED,
@@ -160,7 +160,7 @@ unsafe fn create_font(spec: &FontSpec) -> CTFontRef {
                 let font = CTFontCreateWithName(cf_name, spec.size, std::ptr::null());
                 CFRelease(cf_name);
                 if font.is_null() {
-                    // família desconhecida degrada, nunca falha
+                    // an unknown family degrades, never fails
                     CTFontCreateUIFontForLanguage(UI_FONT_SYSTEM, spec.size, std::ptr::null())
                 } else {
                     font
@@ -170,8 +170,9 @@ unsafe fn create_font(spec: &FontSpec) -> CTFontRef {
     }
 }
 
-/// A CTLine do texto com a fonte + cor-do-contexto (a cor entra pelo fill
-/// color na hora do draw — sem criar CGColor). Quem chama solta a line.
+/// The text's CTLine with the font + context color (the color enters as
+/// fill color at draw time — no CGColor created). The caller releases the
+/// line.
 unsafe fn make_line(text: &str, font: CTFontRef) -> CTLineRef {
     unsafe {
         let string = cf_string(text);
@@ -196,7 +197,7 @@ unsafe fn make_line(text: &str, font: CTFontRef) -> CTLineRef {
     }
 }
 
-/// O engine de texto do Mac. Single-thread, como o resto do shell.
+/// The Mac text engine. Single-thread, like the rest of the shell.
 pub struct CoreTextEngine {
     fonts: RefCell<HashMap<FontKey, OwnedFont>>,
 }
@@ -228,10 +229,10 @@ impl TextEngine for CoreTextEngine {
         let ct_font = self.font(font);
         unsafe {
             let ascent = CTFontGetAscent(ct_font);
-            // o leading dobra no descent — o contrato do LineMetrics
+            // the leading folds into the descent — the LineMetrics contract
             let descent = CTFontGetDescent(ct_font) + CTFontGetLeading(ct_font);
             if text.is_empty() {
-                // altura de linha preservada sem criar CTLine
+                // line height preserved without creating a CTLine
                 return LineMetrics { width: 0.0, ascent, descent };
             }
             let line = make_line(text, ct_font);
@@ -282,10 +283,10 @@ impl TextEngine for CoreTextEngine {
                 CFRelease(line);
                 return None;
             }
-            // desenho em pontos lógicos, contexto em px físicos (retina)
+            // drawing in logical points, context in physical px (retina)
             CGContextScaleCTM(context, scale as f64, scale as f64);
-            // CG conta y para cima: o baseline fica a `descent` do fundo
-            // da caixa de linha (a folga do ceil sobra no topo, sub-pixel)
+            // CG counts y upward: the baseline sits `descent` from the
+            // bottom of the line box (the ceil slack stays on top, sub-pixel)
             CGContextSetTextPosition(context, 0.0, metrics.descent);
             CGContextSetRGBFillColor(
                 context,
@@ -299,7 +300,7 @@ impl TextEngine for CoreTextEngine {
             CFRelease(line);
         }
 
-        // des-premultiplica in place — o compositor blenda alfa reto
+        // unpremultiplies in place — the compositor blends straight alpha
         for pixel in rgba.chunks_exact_mut(4) {
             let alpha = pixel[3] as u32;
             if alpha > 0 && alpha < 255 {
@@ -328,17 +329,17 @@ mod tests {
         let engine = CoreTextEngine::new();
 
         let metrics = engine.measure_line("Hello", &FontSpec::DEFAULT);
-        assert!(metrics.width > 10.0, "largura real: {}", metrics.width);
+        assert!(metrics.width > 10.0, "real width: {}", metrics.width);
         assert!(metrics.ascent > 5.0);
         assert!(metrics.height() > metrics.ascent);
 
         let empty = engine.measure_line("", &FontSpec::DEFAULT);
         assert_eq!(empty.width, 0.0);
-        assert_eq!(empty.height(), metrics.height(), "linha vazia preserva a altura");
+        assert_eq!(empty.height(), metrics.height(), "empty line preserves the height");
 
         let raster = engine
             .raster_line("Hello", &FontSpec::DEFAULT, Color::rgb(10, 20, 30), 2)
-            .expect("tem tinta");
+            .expect("has ink");
         assert!(raster.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
         assert!(raster.baseline > 0 && raster.baseline <= raster.height);
     }
@@ -352,8 +353,8 @@ mod tests {
         let text = "hello world hello world";
         let lines = break_lines(text, &FontSpec::DEFAULT, 60.0, &engine, &cache);
 
-        assert!(lines.len() > 1, "60px não segura a frase: {lines:?}");
-        // cobertura contígua do texto inteiro, quebras em fronteira limpa
+        assert!(lines.len() > 1, "60px does not hold the sentence: {lines:?}");
+        // contiguous coverage of the whole text, breaks on clean boundaries
         assert_eq!(lines.first().unwrap().0, 0);
         assert_eq!(lines.last().unwrap().1, text.len());
         for window in lines.windows(2) {
@@ -369,12 +370,12 @@ mod tests {
         let engine = CoreTextEngine::new();
         let mono = FontSpec { design: FontDesign::Mono, ..FontSpec::DEFAULT };
 
-        // "iiii" em mono tem a MESMA largura de "mmmm" — a prova da grade
+        // "iiii" in mono has the SAME width as "mmmm" — the grid's proof
         let narrow = engine.measure_line("iiii", &mono);
         let wide = engine.measure_line("mmmm", &mono);
         assert!(
             (narrow.width - wide.width).abs() < 0.01,
-            "grade mono: {} vs {}",
+            "mono grid: {} vs {}",
             narrow.width,
             wide.width
         );

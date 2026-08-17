@@ -16,8 +16,8 @@ impl LoadError {
         LoadError { localizedDescription: localizedDescription.into() }
     }
 
-    /// O lado snake_case de `localizedDescription` — é o que a camada
-    /// tipada expõe; o campo camelCase fica para o port espelhado.
+    /// The snake_case side of `localizedDescription` — it is what the typed
+    /// layer exposes; the camelCase field stays for the mirrored port.
     pub fn message(&self) -> &str {
         &self.localizedDescription
     }

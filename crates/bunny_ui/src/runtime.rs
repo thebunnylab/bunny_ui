@@ -1,15 +1,15 @@
-//! `Runtime` — o fake main-thread desta camada: renderiza a árvore tipada,
-//! bombeia efeitos e estabiliza (re-render até a árvore impressa parar de
-//! mudar — o stand-in do loop de frames).
+//! `Runtime` — the fake main-thread of this layer: it renders the typed
+//! tree, pumps effects, and settles (re-render until the printed tree
+//! stops changing — the stand-in for the frame loop).
 //!
-//! Cada `render` é um pass de identidade ([`motor::identity`]) dirigido
-//! pelo reconciler: fronteiras limpas e retidas PULAM o body (o cache
-//! responde), sujas re-rodam — mesmo atrás de pai pulado (re-run isolado a
-//! partir do valor retido). A fila de efeitos é remontada da retenção, a
-//! varredura desmonta o que saiu da árvore, e a montagem final expande as
-//! referências. `set()` marca de sujo quem LEU — a invalidação fina entra
-//! na condição de estabilidade e fica visível em [`Runtime::take_dirty`] e
-//! [`Runtime::body_runs`].
+//! Each `render` is an identity pass ([`motor::identity`]) driven by the
+//! reconciler: clean, retained boundaries SKIP the body (the cache
+//! answers), dirty ones re-run — even behind a skipped parent (isolated
+//! re-run from the retained value). The effect queue is reassembled from
+//! the retention, the sweep unmounts what left the tree, and the final
+//! assembly expands the references. `set()` marks dirty whoever READ —
+//! the fine invalidation joins the stability condition and is visible in
+//! [`Runtime::take_dirty`] and [`Runtime::body_runs`].
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -25,74 +25,78 @@ use crate::text_engine::{FontSpec, MeasureCache, PixelFont, TextEngine, caret_fr
 use crate::text_input::{CaretState, EditCommand};
 use crate::view::{NodeList, View};
 
-/// O resultado de um comando de edição: `applied` = houve campo focado
-/// para receber (o shell repinta); `output` = o texto que `Read`/`Copy`/
-/// `Cut` extraem (a ponte do clipboard e da sincronização de IME).
+/// The result of an edit command: `applied` = a focused field was there
+/// to receive it (the shell repaints); `output` = the text that `Read`/
+/// `Copy`/`Cut` extract (the bridge for the clipboard and for IME sync).
 pub struct Edited {
     pub applied: bool,
     pub output: Option<String>,
 }
 
-/// O que a plataforma pergunta ao campo focado (NSTextInputClient e
-/// afins): texto, seleção e composição em UTF-16 — o vocabulário dela —
-/// e o rect do caret em coordenadas de LAYOUT (o shell converte para
-/// tela; é onde a janela de candidatos do IME aterrissa).
+/// What the platform asks the focused field (NSTextInputClient and
+/// friends): text, selection, and composition in UTF-16 — its
+/// vocabulary — and the caret rect in LAYOUT coordinates (the shell
+/// converts to screen; it is where the IME candidate window lands).
 pub struct ImeSnapshot {
     pub text: String,
-    /// (location, length) em UTF-16.
+    /// (location, length) in UTF-16.
     pub selected: (usize, usize),
-    /// Range marcado em UTF-16, se houver composição viva.
+    /// Marked range in UTF-16, if a composition is live.
     pub marked: Option<(usize, usize)>,
     pub caret_rect: Rect,
 }
 
 pub struct Runtime {
     ctx: Context,
-    /// O root do último pass — escopa `take_dirty` para não drenar sujeira
-    /// de outra árvore montada na mesma thread.
+    /// The root of the last pass — scopes `take_dirty` so it does not
+    /// drain dirt from another tree mounted on the same thread.
     last_root: RefCell<Option<String>>,
-    /// Os alvos do último layout, na ordem de pintura — o mapa do
-    /// hit-test dos eventos de ponteiro.
+    /// The targets of the last layout, in paint order — the hit-test
+    /// map for pointer events.
     last_hits: RefCell<Vec<(String, Rect)>>,
-    /// Estado de ponteiro do frame — resolvido ANTES do layout (a LEI:
-    /// hover troca pintura, nunca medida) e estampado na expansão.
+    /// Pointer state for the frame — resolved BEFORE layout (the LAW:
+    /// hover swaps paint, never measurement) and stamped at expansion.
     interaction: RefCell<Interaction>,
-    /// A borda de texto do frame — PixelFont por default (headless
-    /// byte-estável); o shell instala o engine da plataforma.
+    /// The text edge of the frame — PixelFont by default (headless,
+    /// byte-stable); the shell installs the platform engine.
     text: Rc<dyn TextEngine>,
-    /// Cache de medição double-buffer, trocado a cada passada de layout.
+    /// Double-buffered measure cache, swapped on every layout pass.
     cache: MeasureCache,
-    /// Offsets de rolagem por identidade — engine-owned (a posse dupla da
-    /// premissa: no Dom o backend será o dono e observaremos). Não são
-    /// podados quando a identidade some: a lista remontada RESTAURA a
-    /// posição (GC atado à varredura fica anotado como futuro).
+    /// Scroll offsets by identity — engine-owned (the premise's dual
+    /// ownership: on the DOM the backend will own them and we will
+    /// observe). Not pruned when the identity goes away: a remounted
+    /// list RESTORES the position (GC tied to the sweep is noted as
+    /// future work).
     scroll_offsets: RefCell<HashMap<String, Point>>,
-    /// As regiões de rolagem do último layout — o mapa do wheel.
+    /// The scroll regions of the last layout — the wheel map.
     last_scrolls: RefCell<Vec<ScrollRegion>>,
-    /// O campo focado (caminho de identidade) — dono do teclado.
+    /// The focused field (identity path) — owner of the keyboard.
     focus: RefCell<Option<String>>,
-    /// Caret + seleção por campo — sobrevivem a blur/refoco e a
-    /// remontagem (restauração por identidade, como o scroll).
+    /// Caret + selection per field — they survive blur/refocus and
+    /// remount (restored by identity, like scroll).
     carets: RefCell<HashMap<String, CaretState>>,
-    /// Fase do blink: o caret some e volta no tick do shell; digitar ou
-    /// focar volta para sólido (caret parado pisca, caret ativo não).
+    /// Blink phase: the caret goes and comes back on the shell tick;
+    /// typing or focusing returns it to solid (an idle caret blinks,
+    /// an active one does not).
     caret_visible: Cell<bool>,
-    /// Os campos do último layout (geometria + fonte efetiva) — o
-    /// clique-posiciona e a sincronização de IME medem por aqui.
+    /// The fields of the last layout (geometry + effective font) —
+    /// click-to-position and IME sync measure through here.
     last_fields: RefCell<Vec<FieldPlacement>>,
-    /// A versão do tema vista pelo último pass — trocar tema reconstrói a
-    /// retenção UMA vez (tokens lidos em body ficam gravados na cena).
+    /// The theme version the last pass saw — switching themes rebuilds
+    /// the retention ONCE (tokens read in a body are baked into the
+    /// scene).
     theme_version: Cell<u64>,
-    /// O keymap do app: padrão de tecla → ação. Config do Runtime (como o
-    /// engine de texto), não retenção — bind é declaração de intenção.
+    /// The app keymap: key pattern → action. Runtime config (like the
+    /// text engine), not retention — bind is a declaration of intent.
     keymap: RefCell<HashMap<KeyPattern, ActionId>>,
-    /// O último pass viu a raiz virar UMA fronteira (`Boundary`/ref)? Só
-    /// então o frame estável pode sintetizar a referência sem andar o
-    /// pass — raiz sem fronteira sai fresca do walk a cada frame.
+    /// Did the last pass see the root become ONE boundary
+    /// (`Boundary`/ref)? Only then can the stable frame synthesize the
+    /// reference without a pass — a boundary-less root comes fresh
+    /// from the walk on every frame.
     root_is_boundary: Cell<bool>,
-    /// A retenção pode conter entries SEM linhas de print (construídas no
-    /// caminho de frame, que não formata) — imprimir de novo reconstrói
-    /// uma vez, e o oráculo full == incremental segue byte a byte.
+    /// The retention can hold entries WITHOUT print lines (built on the
+    /// frame path, which does not format) — printing again rebuilds
+    /// once, and the full == incremental oracle stays byte-for-byte.
     printless: Cell<bool>,
 }
 
@@ -113,7 +117,7 @@ impl Runtime {
         Self::with_parts(ctx, Rc::new(PixelFont))
     }
 
-    /// Troca o engine de texto (builder — compõe com `with_environment`):
+    /// Swaps the text engine (builder — composes with `with_environment`):
     /// `Runtime::new().text_engine(Rc::new(CoreTextEngine::new()))`.
     pub fn text_engine(mut self, engine: Rc<dyn TextEngine>) -> Self {
         self.text = engine;
@@ -145,12 +149,12 @@ impl Runtime {
         self.ctx.clone()
     }
 
-    /// Um pass incremental: walk com pulos, re-runs isolados dos sujos que
-    /// o walk não alcançou, remontagem da fila de efeitos e varredura.
-    /// Devolve as duas saídas (print e layout) ainda com referências.
+    /// One incremental pass: walk with skips, isolated re-runs of dirty
+    /// views the walk missed, effect-queue reassembly, and the sweep.
+    /// Returns both outputs (print and layout) still holding references.
     fn render_pass(&self, root: &impl View) -> NodeList {
-        // tema novo = retenção velha (bodies gravaram tokens antigos na
-        // cena): reconstrói uma vez e segue incremental
+        // new theme = stale retention (bodies baked old tokens into
+        // the scene): rebuild once and continue incremental
         let theme_version = crate::theme::version();
         if self.theme_version.get() != theme_version {
             self.theme_version.set(theme_version);
@@ -172,7 +176,7 @@ impl Runtime {
         let dead = motor::identity::end_pass();
         reconciler::forget(&dead);
         if let Some(pass_root) = &pass_root {
-            // a gêmea da varredura acima, para views sem estado próprio
+            // the twin of the sweep above, for views with no state of their own
             reconciler::sweep_stale(pass_root);
         }
 
@@ -188,22 +192,24 @@ impl Runtime {
         nodes
     }
 
-    /// Dispara a ação do alvo interativo (a chave vem do hit-test sobre
-    /// `LayoutResult::hits`). `false` = alvo não registrado.
+    /// Fires the interactive target's action (the key comes from the
+    /// hit-test over `LayoutResult::hits`). `false` = target not
+    /// registered.
     pub fn activate(&self, path: &str) -> bool {
         reconciler::run_action(path)
     }
 
-    // MARK: - Ponteiro (resolvido ANTES do layout — a LEI)
+    // MARK: - Pointer (resolved BEFORE layout — the LAW)
 
-    /// O alvo sob o ponto, contra os hits do último layout.
+    /// The target under the point, against the last layout's hits.
     fn hover_target(&self, x: Px, y: Px) -> Option<String> {
         crate::layout::hit_test(&self.last_hits.borrow(), x, y).map(str::to_string)
     }
 
-    /// Ponteiro moveu. `true` = o estado visível mudou (o shell repinta).
-    /// Durante um press, o hover só re-resolve contra o alvo pressionado:
-    /// arrastar para fora solta o visual, voltar re-arma (AppKit).
+    /// Pointer moved. `true` = the visible state changed (the shell
+    /// repaints). During a press, hover only re-resolves against the
+    /// pressed target: dragging out drops the visual, coming back
+    /// re-arms it (AppKit).
     pub fn pointer_moved(&self, x: Px, y: Px) -> bool {
         let target = self.hover_target(x, y);
         let mut interaction = self.interaction.borrow_mut();
@@ -217,8 +223,9 @@ impl Runtime {
         changed
     }
 
-    /// Botão desceu: ARMA o pressed no alvo sob o ponto — a ação não
-    /// dispara aqui (up-inside é a semântica de botão). `true` = repaint.
+    /// Button down: ARMS pressed on the target under the point — no
+    /// action fires here (up-inside is button semantics). `true` =
+    /// repaint.
     pub fn pointer_pressed(&self, x: Px, y: Px) -> bool {
         let target = self.hover_target(x, y);
         let mut interaction = self.interaction.borrow_mut();
@@ -229,10 +236,11 @@ impl Runtime {
         changed
     }
 
-    /// Botão subiu: dispara a ação SE soltou dentro do alvo pressionado —
-    /// ou FOCA, se o alvo é um campo de texto. Soltar fora de qualquer
-    /// campo tira o foco (first responder segue o clique). Devolve o
-    /// caminho disparado/focado; o visual de pressed limpa sempre.
+    /// Button up: fires the action IF released inside the pressed
+    /// target — or FOCUSES, if the target is a text field. Releasing
+    /// outside any field drops focus (first responder follows the
+    /// click). Returns the fired/focused path; the pressed visual
+    /// always clears.
     pub fn pointer_released(&self, x: Px, y: Px) -> Option<String> {
         let target = self.hover_target(x, y);
         let fired = {
@@ -245,7 +253,7 @@ impl Runtime {
                 _ => None,
             }
         };
-        // fora do borrow: a ação pode escrever estado e re-entrar aqui
+        // outside the borrow: the action can write state and re-enter here
         match fired {
             Some(path) if reconciler::has_editor(&path) => {
                 self.focus_at(&path, x);
@@ -262,8 +270,8 @@ impl Runtime {
         }
     }
 
-    /// O ponteiro saiu da janela: limpa o hover (um press em andamento já
-    /// teve o visual solto pelo `pointer_moved` do drag).
+    /// The pointer left the window: clears hover (an in-flight press
+    /// already had its visual dropped by the drag's `pointer_moved`).
     pub fn pointer_exited(&self) -> bool {
         let mut interaction = self.interaction.borrow_mut();
         let changed = interaction.hovered.is_some();
@@ -272,17 +280,17 @@ impl Runtime {
         changed
     }
 
-    /// Snapshot do estado de ponteiro — o cursor do shell e os asserts.
+    /// Snapshot of the pointer state — the shell cursor and the asserts.
     pub fn interaction(&self) -> Interaction {
         self.interaction.borrow().clone()
     }
 
-    // MARK: - Rolagem (offset é estado do ENGINE: nenhuma view invalida)
+    // MARK: - Scrolling (offset is ENGINE state: no view invalidates)
 
-    /// Roteia o wheel para a região mais interna sob o ponto COM curso no
-    /// eixo do delta. Convenção AppKit: delta positivo revela conteúdo
-    /// acima — o offset diminui. `true` = moveu (o shell repinta; sem
-    /// render: zero bodies).
+    /// Routes the wheel to the innermost region under the point WITH
+    /// travel on the delta's axis. AppKit convention: positive delta
+    /// reveals content above — the offset shrinks. `true` = it moved
+    /// (the shell repaints; no render: zero bodies).
     pub fn wheel(&self, x: Px, y: Px, dx: Px, dy: Px) -> bool {
         let scrolls = self.last_scrolls.borrow();
         let travel = |region: &ScrollRegion| {
@@ -314,8 +322,8 @@ impl Runtime {
         moved
     }
 
-    /// Rolagem programática — o PRÓXIMO layout (mesmo frame) já aplica,
-    /// com clamp no place.
+    /// Programmatic scrolling — the NEXT layout (same frame) already
+    /// applies it, clamped at place.
     pub fn set_scroll_offset(&self, path: &str, offset: Point) {
         self.scroll_offsets.borrow_mut().insert(path.to_string(), offset);
     }
@@ -324,35 +332,36 @@ impl Runtime {
         self.scroll_offsets.borrow().get(path).copied().unwrap_or_default()
     }
 
-    // MARK: - Ações nomeadas + keymap
+    // MARK: - Named actions + keymap
 
-    /// Liga um padrão de tecla a uma ação — rebind sobrescreve. Nenhum
-    /// default: o app declara o mapa (os atalhos de edição do campo
-    /// continuam sendo do shell). Casamento de modificadores é EXATO.
+    /// Binds a key pattern to an action — rebind overwrites. No
+    /// defaults: the app declares the map (the field editing shortcuts
+    /// stay with the shell). Modifier matching is EXACT.
     pub fn bind(&self, pattern: KeyPattern, action: ActionId) {
         self.keymap.borrow_mut().insert(pattern, action);
     }
 
-    /// O binding do padrão, se houver.
+    /// The binding for the pattern, if any.
     pub fn match_key(&self, pattern: &KeyPattern) -> Option<ActionId> {
         self.keymap.borrow().get(pattern).copied()
     }
 
-    /// Dispara o handler mais interno vigente. `false` = nenhum handler
-    /// montado — quem chamou decide o fallback (o gate deixa a tecla
-    /// seguir para o campo).
+    /// Fires the innermost live handler. `false` = no handler mounted —
+    /// the caller decides the fallback (the gate lets the key continue
+    /// on to the field).
     pub fn dispatch_action(&self, id: ActionId) -> bool {
         reconciler::run_handler(id)
     }
 
-    // MARK: - Foco e teclado (o campo focado é o dono do teclado)
+    // MARK: - Focus and keyboard (the focused field owns the keyboard)
 
     pub fn focused(&self) -> Option<String> {
         self.focus.borrow().clone()
     }
 
-    /// Foca um campo. O caret vai para o FIM na primeira vez (o clamp da
-    /// estampa resolve o `usize::MAX`); refocar restaura a posição retida.
+    /// Focuses a field. The caret goes to the END the first time (the
+    /// stamp's clamp resolves the `usize::MAX`); refocusing restores
+    /// the retained position.
     pub fn focus(&self, path: &str) {
         self.caret_visible.set(true);
         *self.focus.borrow_mut() = Some(path.to_string());
@@ -362,8 +371,9 @@ impl Runtime {
             .or_insert(CaretState { caret: usize::MAX, anchor: None, marked: None });
     }
 
-    /// Foca posicionando o caret pelo X do clique — medição de prefixos
-    /// com a FONTE efetiva do campo (retida do último layout).
+    /// Focuses and places the caret from the click's X — prefix
+    /// measurement with the field's effective FONT (retained from the
+    /// last layout).
     fn focus_at(&self, path: &str, x: Px) {
         self.caret_visible.set(true);
         *self.focus.borrow_mut() = Some(path.to_string());
@@ -399,8 +409,8 @@ impl Runtime {
         self.focus.borrow_mut().take().is_some()
     }
 
-    /// Meio-período do blink (o shell chama num timer): alterna a
-    /// visibilidade do caret. `true` = há campo focado — repaint.
+    /// Half-period of the blink (the shell calls it on a timer):
+    /// toggles caret visibility. `true` = a field is focused — repaint.
     pub fn blink(&self) -> bool {
         if self.focus.borrow().is_none() {
             self.caret_visible.set(true);
@@ -410,9 +420,9 @@ impl Runtime {
         true
     }
 
-    /// O snapshot de IME do campo focado — `None` sem foco. Índices já em
-    /// UTF-16 pela borda do framework; o caret rect sai da geometria
-    /// retida do último layout.
+    /// The IME snapshot of the focused field — `None` without focus.
+    /// Indices already in UTF-16 at the framework edge; the caret rect
+    /// comes from the geometry retained from the last layout.
     pub fn ime_snapshot(&self) -> Option<ImeSnapshot> {
         use crate::text_input::byte_to_utf16;
 
@@ -446,15 +456,15 @@ impl Runtime {
         Some(ImeSnapshot { text, selected, marked, caret_rect })
     }
 
-    /// Aplica um comando de edição ao campo focado. A escrita no binding
-    /// já sujou quem lê; digitar volta o caret para sólido.
+    /// Applies an edit command to the focused field. The binding write
+    /// already dirtied whoever reads; typing returns the caret to solid.
     pub fn key(&self, command: EditCommand) -> Edited {
         let Some(path) = self.focus.borrow().clone() else {
             return Edited { applied: false, output: None };
         };
         let mut state = self.carets.borrow().get(&path).copied().unwrap_or_default();
-        // fora do borrow do mapa: o editor escreve no binding e pode
-        // re-entrar no runtime
+        // outside the map borrow: the editor writes to the binding and
+        // can re-enter the runtime
         match reconciler::run_editor(&path, command, &mut state) {
             Some(output) => {
                 self.carets.borrow_mut().insert(path, state);
@@ -465,11 +475,11 @@ impl Runtime {
         }
     }
 
-    /// Um frame completo para o shell: estabiliza, layout no viewport,
-    /// raster no scale — os hits ficam retidos para os eventos. Se o
-    /// conteúdo andou sob o ponteiro parado (uma ação inseriu/removeu), o
-    /// hover re-resolve contra os hits novos e roda UMA passada extra —
-    /// interação sempre resolvida ANTES da passada que a pinta.
+    /// A full frame for the shell: settle, layout at the viewport,
+    /// raster at the scale — the hits stay retained for the events. If
+    /// content moved under a still pointer (an action inserted/removed),
+    /// hover re-resolves against the new hits and runs ONE extra pass —
+    /// interaction always resolved BEFORE the pass that paints it.
     pub fn frame(
         &self,
         root: &impl View,
@@ -496,8 +506,8 @@ impl Runtime {
     }
 
     pub fn render(&self, root: &impl View) -> String {
-        // retenção construída sem print não tem linha para expandir —
-        // reconstrói uma vez e volta ao incremental normal
+        // retention built without print has no line to expand —
+        // rebuild once and go back to normal incremental
         if self.printless.get() {
             reconciler::clear();
             self.printless.set(false);
@@ -510,9 +520,9 @@ impl Runtime {
             .collect()
     }
 
-    /// O pass do caminho de FRAME: idêntico ao de print, mas as linhas da
-    /// árvore impressa nem são formatadas (imprimir é para gente; frame é
-    /// para pixel).
+    /// The FRAME-path pass: identical to the print one, but the printed
+    /// tree's lines are not even formatted (printing is for people;
+    /// frames are for pixels).
     fn frame_pass(&self, root: &impl View) -> NodeList {
         crate::view::set_print(false);
         self.printless.set(true);
@@ -521,19 +531,19 @@ impl Runtime {
         nodes
     }
 
-    /// Layout do frame atual: roda um pass (incremental — árvore estável =
-    /// zero bodies), expande a árvore de layout retida e responde à
-    /// proposta com os frames por identidade.
+    /// Layout of the current frame: runs one pass (incremental — stable
+    /// tree = zero bodies), expands the retained layout tree, and
+    /// answers the proposal with the frames by identity.
     pub fn layout(
         &self,
         root: &impl View,
         proposal: crate::layout::Proposal,
     ) -> crate::layout::LayoutResult {
-        // frame ESTÁVEL de raiz-fronteira (hover, wheel, blink, o layout
-        // pós-settle): nada sujo, mesmo tema, raiz retida — o walk seria
-        // all-skip e emitiria exatamente UMA referência; sintetiza a
-        // referência e pula o pass inteiro. Qualquer outra situação anda
-        // o pass de verdade.
+        // STABLE boundary-root frame (hover, wheel, blink, the
+        // post-settle layout): nothing dirty, same theme, retained
+        // root — the walk would be all-skip and emit exactly ONE
+        // reference; synthesize the reference and skip the whole pass.
+        // Any other situation walks the real pass.
         let stable_root = (self.root_is_boundary.get()
             && crate::theme::version() == self.theme_version.get()
             && !self.has_pending_dirty())
@@ -542,7 +552,7 @@ impl Runtime {
         .filter(|path| reconciler::is_retained(path));
         let tree = match stable_root {
             Some(path) => {
-                // o contrato observável fica: ESTE frame rodou zero bodies
+                // the observable contract holds: THIS frame ran zero bodies
                 reconciler::note_stable_frame();
                 crate::layout::LayoutNode::BoundaryRef { path }
             }
@@ -566,9 +576,9 @@ impl Runtime {
                 }
             }
         };
-        // o layout anda pela retenção NO LUGAR (`BoundaryRef` resolve
-        // on-the-fly) e o estado de frame vai no ENV — frame nenhum clona
-        // árvore nenhuma
+        // layout walks the retention IN PLACE (`BoundaryRef` resolves
+        // on-the-fly) and frame state rides in the ENV — no frame
+        // clones any tree
         let interaction = self.interaction.borrow().clone();
         let focus = self.focus.borrow().clone();
         let carets = self.carets.borrow();
@@ -599,23 +609,23 @@ impl Runtime {
         result
     }
 
-    /// Força todos os bodies (descarta a retenção antes do pass) — o
-    /// oráculo dos testes: o incremental tem que imprimir byte a byte o
-    /// que o full imprime.
+    /// Forces every body (drops the retention before the pass) — the
+    /// test oracle: incremental must print byte-for-byte what full
+    /// prints.
     pub fn render_full(&self, root: &impl View) -> String {
         reconciler::clear();
         self.render(root)
     }
 
-    /// Um frame completo até o bitmap: layout na proposta exata do
-    /// viewport e rasterização da display list — o que o backend de
-    /// plataforma blita na janela.
+    /// A full frame down to the bitmap: layout at the viewport's exact
+    /// proposal and rasterization of the display list — what the
+    /// platform backend blits to the window.
     pub fn paint(&self, root: &impl View, size: crate::layout::Size) -> crate::raster::Bitmap {
         self.paint_at_scale(root, size, 1)
     }
 
-    /// [`Runtime::paint`] em retina: layout em pontos lógicos, bitmap em
-    /// pixels físicos (`size × scale`).
+    /// [`Runtime::paint`] at retina: layout in logical points, bitmap
+    /// in physical pixels (`size × scale`).
     pub fn paint_at_scale(
         &self,
         root: &impl View,
@@ -639,9 +649,9 @@ impl Runtime {
         effects::take().iter().any(|effect| effect(&self.ctx))
     }
 
-    /// As views sujadas por `set()` desde a última drenagem — a invalidação
-    /// fina (quem LEU a dependência escrita), por caminho de identidade,
-    /// escopada ao root deste runtime.
+    /// The views `set()` dirtied since the last drain — the fine
+    /// invalidation (whoever READ the written dependency), by identity
+    /// path, scoped to this runtime's root.
     pub fn take_dirty(&self) -> Vec<String> {
         match self.last_root.borrow().as_deref() {
             Some(root) => motor::identity::take_dirty_matching(root),
@@ -649,16 +659,16 @@ impl Runtime {
         }
     }
 
-    /// Instrumentação: os bodies que o último [`Runtime::render`] rodou —
-    /// a prova de incrementalidade (o resto veio do cache).
+    /// Instrumentation: the bodies the last [`Runtime::render`] ran —
+    /// the proof of incrementality (the rest came from the cache).
     pub fn body_runs(&self) -> Vec<String> {
         reconciler::last_body_runs()
     }
 
     /// Render → pump → re-render until the tree is stable (max 8 cycles).
-    /// Estável = árvore impressa parada, nenhum efeito observou mudança e
-    /// nenhuma view suja. A checagem de sujeira ESPIA sem drenar — a
-    /// sujeira pendente é insumo do próximo pass, não do loop.
+    /// Stable = printed tree still, no effect observed a change, and no
+    /// view dirty. The dirt check PEEKS without draining — pending dirt
+    /// is input for the next pass, not for the loop.
     pub fn render_stable(&self, root: &impl View) -> String {
         let mut previous = String::new();
         for _ in 0..8 {
@@ -674,12 +684,12 @@ impl Runtime {
         previous
     }
 
-    /// O [`Runtime::render_stable`] do caminho de FRAME: estabiliza SEM
-    /// montar a árvore impressa (imprimir é para gente; frame é para
-    /// pixel). Estável = o pass não deixou NADA para trás: nenhum efeito
-    /// observou mudança e nenhuma view suja — bodies terem rodado não
-    /// pede confirmação (um pass sem sujeira nova produziu uma árvore
-    /// consistente por definição; o pass seguinte seria all-skip).
+    /// The FRAME-path [`Runtime::render_stable`]: settles WITHOUT
+    /// building the printed tree (printing is for people; frames are
+    /// for pixels). Stable = the pass left NOTHING behind: no effect
+    /// observed a change and no view is dirty — bodies having run asks
+    /// for no confirmation (a pass with no new dirt produced a
+    /// consistent tree by definition; the next pass would be all-skip).
     pub fn settle(&self, root: &impl View) {
         for _ in 0..8 {
             self.frame_pass(root);

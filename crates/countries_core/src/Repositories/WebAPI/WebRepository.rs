@@ -12,7 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 
-/// `async throws` em trait: futuro boxed (single-thread, como o app todo).
+/// `async throws` in a trait: boxed future (single-thread, like the whole app).
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T>>>;
 
 pub type HTTPCode = i64;
@@ -48,7 +48,7 @@ impl APICall for () {
     }
 }
 
-/// `URLRequest` fake — tudo que o `urlRequest(baseURL:)` monta.
+/// Fake `URLRequest` — everything `urlRequest(baseURL:)` assembles.
 #[derive(Clone, Debug)]
 pub struct URLRequest {
     pub url: URL,
@@ -113,15 +113,15 @@ pub struct HTTPURLResponse {
     pub statusCode: HTTPCode,
 }
 
-/// `URLSession` fake — trait para o MockUrlSession (e um real que não faz rede).
+/// Fake `URLSession` — a trait for the MockUrlSession (and a real one that does no networking).
 pub trait UrlSession {
     /// `session.data(for:)`
     fn data(&self, request: URLRequest) -> BoxFuture<Result<(Vec<u8>, HTTPURLResponse), LoadError>>;
-    /// `session.download(from:)` — devolve os bytes (UIImage fake é unit).
+    /// `session.download(from:)` — returns the bytes (the fake UIImage is unit).
     fn download(&self, url: URL) -> BoxFuture<Result<Vec<u8>, LoadError>>;
 }
 
-/// `URLSession(configuration:)` — no headless port nenhuma rede acontece.
+/// `URLSession(configuration:)` — in the headless port no networking happens.
 pub struct RealUrlSession;
 
 impl UrlSession for RealUrlSession {
@@ -142,8 +142,8 @@ pub trait WebRepository {
 }
 
 /// `extension WebRepository { func call<Value>(endpoint:decoder:httpCodes:) }` —
-/// o método genérico com default implementation do Swift vira esta fn livre
-/// (Rust não tem default method genérica em trait object).
+/// Swift's generic method with a default implementation becomes this free fn
+/// (Rust has no generic default method on a trait object).
 pub async fn call<Value: serde::de::DeserializeOwned>(
     repository: &dyn WebRepository,
     endpoint: &dyn APICall,

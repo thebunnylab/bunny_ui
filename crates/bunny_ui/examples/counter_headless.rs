@@ -1,6 +1,6 @@
-//! O counter pintado headless — o primeiro elemento "na tela" antes de
-//! existir janela: body → identidade → layout → display list → bitmap,
-//! impresso como retrato ascii (cada caractere ≈ um bloco de 2×2 px).
+//! The counter painted headless — the first element "on screen" before
+//! any window exists: body → identity → layout → display list → bitmap,
+//! printed as an ascii portrait (each character ≈ one 2×2 px block).
 //!
 //! ```sh
 //! cargo run -p bunny-ui --example counter_headless
@@ -53,8 +53,8 @@ fn main() {
     println!("── count = 0 ──");
     print!("{}", portrait(&runtime.paint(&counter, size)));
 
-    // três taps depois (o body reconstruído revive o botão pela identidade)
+    // three taps later (the rebuilt body revives the button through identity)
     counter.count.update(|n| *n += 3);
-    println!("── count = 3 (após interação) ──");
+    println!("── count = 3 (after interaction) ──");
     print!("{}", portrait(&runtime.paint(&counter, size)));
 }

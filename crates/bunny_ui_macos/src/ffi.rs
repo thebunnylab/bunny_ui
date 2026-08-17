@@ -1,22 +1,23 @@
-//! FFI Objective-C / CoreGraphics escrita à mão — zero dependências.
+//! Hand-written Objective-C / CoreGraphics FFI — zero dependencies.
 //!
-//! Este módulo é a borda sancionada de `unsafe` do projeto: o runtime
-//! Objective-C é chamado por `objc_msgSend` re-declarado com a assinatura
-//! concreta de cada mensagem (em arm64 há UM único entry point para todas
-//! as mensagens — structs pequenos vão e voltam em registrador, sem
-//! variante `_stret`), e duas classes nascem em runtime via
-//! `objc_allocateClassPair`/`class_addMethod`:
+//! This module is the project's sanctioned `unsafe` border: the
+//! Objective-C runtime is called through `objc_msgSend` re-declared with
+//! the concrete signature of each message (on arm64 there is ONE single
+//! entry point for all messages — small structs go and come back in
+//! registers, no `_stret` variant), and two classes are born at runtime
+//! via `objc_allocateClassPair`/`class_addMethod`:
 //!
-//! - `BunnyView` (NSView) — recebe o ciclo completo de ponteiro
-//!   (`mouseDown:`/`mouseUp:`/`mouseMoved:`/`mouseDragged:`/entrada e
-//!   saída via NSTrackingArea) e converte cada posição para as coordenadas
-//!   do layout (AppKit conta de baixo para cima; o flip acontece aqui,
-//!   uma vez);
-//! - `BunnyDelegate` (NSObject) — `windowDidResize:` re-pinta e
-//!   `windowWillClose:` encerra o app (fechar a janela fecha o processo).
+//! - `BunnyView` (NSView) — receives the full pointer cycle
+//!   (`mouseDown:`/`mouseUp:`/`mouseMoved:`/`mouseDragged:`/enter and
+//!   exit via NSTrackingArea) and converts each position to layout
+//!   coordinates (AppKit counts from the bottom up; the flip happens
+//!   here, once);
+//! - `BunnyDelegate` (NSObject) — `windowDidResize:` repaints and
+//!   `windowWillClose:` quits the app (closing the window closes the
+//!   process).
 //!
-//! Os callbacks alcançam o mundo Rust por um handler thread-local (o run
-//! loop do AppKit é single-thread, como o resto do motor).
+//! Callbacks reach the Rust world through a thread-local handler (the
+//! AppKit run loop is single-thread, like the rest of the engine).
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{CString, c_char, c_void};
@@ -25,8 +26,8 @@ use std::sync::Once;
 pub type Id = *mut c_void;
 pub type Sel = *const c_void;
 
-/// `NSRange` — (location, length) em unidades UTF-16, o vocabulário do
-/// sistema de input.
+/// `NSRange` — (location, length) in UTF-16 units, the vocabulary of the
+/// input system.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct NSRange {
@@ -34,7 +35,7 @@ pub struct NSRange {
     pub length: u64,
 }
 
-/// `NSNotFound` (NSIntegerMax) — o "range nenhum" do AppKit.
+/// `NSNotFound` (NSIntegerMax) — AppKit's "no range".
 pub const NS_NOT_FOUND: u64 = i64::MAX as u64;
 
 #[repr(C)]
@@ -58,9 +59,9 @@ pub struct CGRect {
     pub size: CGSize,
 }
 
-// Redeclarar `objc_msgSend` com a assinatura concreta de cada mensagem é o
-// modo de uso desenhado do runtime (o símbolo é um trampolim que preserva a
-// ABI da chamada) — o lint de declarações conflitantes não se aplica.
+// Re-declaring `objc_msgSend` with the concrete signature of each message
+// is the runtime's designed usage (the symbol is a trampoline that
+// preserves the call ABI) — the clashing-declarations lint does not apply.
 #[allow(clashing_extern_declarations)]
 #[link(name = "objc", kind = "dylib")]
 unsafe extern "C" {
@@ -131,10 +132,11 @@ unsafe extern "C" {
     fn msg_rect_rect(obj: Id, sel: Sel, rect: CGRect) -> CGRect;
 }
 
-// AppKit/QuartzCore entram pelo runtime ObjC; o link garante as classes.
+// AppKit/QuartzCore come in via the ObjC runtime; the link guarantees the
+// classes.
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {
-    /// O tipo de string do pasteboard (`public.utf8-plain-text`).
+    /// The pasteboard string type (`public.utf8-plain-text`).
     static NSPasteboardTypeString: Id;
 }
 #[link(name = "QuartzCore", kind = "framework")]
@@ -170,47 +172,48 @@ unsafe extern "C" {
 }
 
 unsafe fn class(name: &str) -> Id {
-    let name = CString::new(name).expect("nome de classe sem NUL");
+    let name = CString::new(name).expect("class name without NUL");
     unsafe { objc_getClass(name.as_ptr()) }
 }
 
 unsafe fn sel(name: &str) -> Sel {
-    let name = CString::new(name).expect("seletor sem NUL");
+    let name = CString::new(name).expect("selector without NUL");
     unsafe { sel_registerName(name.as_ptr()) }
 }
 
-// MARK: - Eventos
+// MARK: - Events
 
-/// O que a plataforma entrega ao mundo Rust. Posições em coordenadas do
-/// LAYOUT (origem no topo-esquerda, pontos lógicos) — o flip do AppKit já
-/// aconteceu.
+/// What the platform delivers to the Rust world. Positions in LAYOUT
+/// coordinates (origin at top-left, logical points) — the AppKit flip
+/// already happened.
 pub enum AppEvent {
     MouseDown { x: f64, y: f64 },
     MouseUp { x: f64, y: f64 },
     MouseMoved { x: f64, y: f64 },
-    /// O ponteiro saiu da janela — sem este evento o hover ficaria preso
-    /// na borda (a razão de usar NSTrackingArea).
+    /// The pointer left the window — without this event the hover would
+    /// stay stuck at the edge (the reason for using NSTrackingArea).
     MouseExited,
-    /// Rolagem: deltas em pontos (trackpad já vem preciso e com momentum;
-    /// roda legada é convertida de linhas para pontos na chegada).
+    /// Scrolling: deltas in points (trackpad arrives precise and with
+    /// momentum; the legacy wheel is converted from lines to points on
+    /// arrival).
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
-    /// Tecla CRUA — só chega aqui quando o campo focado NÃO está no
-    /// caminho (sem foco, ou com cmd pressionado): atalhos e teclas de
-    /// função. Com foco, o evento entra no sistema de input
-    /// (`interpretKeyEvents:`) e volta pelos eventos de IME abaixo.
+    /// RAW key — only arrives here when the focused field is NOT in the
+    /// path (no focus, or cmd held): shortcuts and function keys. With
+    /// focus, the event enters the input system (`interpretKeyEvents:`)
+    /// and comes back through the IME events below.
     Key { code: u16, shift: bool, command: bool, chars: String },
-    /// O IME committou texto final (ou digitação simples via input system).
+    /// The IME committed final text (or plain typing via the input system).
     ImeInsert { text: String },
-    /// Composição viva: o texto marcado + a seleção DENTRO dele (UTF-16).
+    /// Live composition: the marked text + the selection INSIDE it (UTF-16).
     ImeMark { text: String, location: u64, length: u64 },
-    /// A composição encerrou committando o que estava marcado.
+    /// The composition ended by committing what was marked.
     ImeUnmark,
-    /// `doCommandBySelector:` — movimento/edição pelo nome do seletor
-    /// ("moveLeft:", "deleteBackward:", …); a política mora no shell.
+    /// `doCommandBySelector:` — movement/editing by selector name
+    /// ("moveLeft:", "deleteBackward:", …); the policy lives in the shell.
     Command { selector: String },
-    /// Meio-período do blink do caret (o NSTimer do shell).
+    /// Half-period of the caret blink (the shell's NSTimer).
     Blink,
-    /// A janela mudou de tamanho (ou precisa do primeiro frame).
+    /// The window changed size (or needs the first frame).
     Redraw,
 }
 
@@ -218,13 +221,13 @@ thread_local! {
     static HANDLER: RefCell<Option<Box<dyn FnMut(AppEvent)>>> = const { RefCell::new(None) };
 }
 
-/// Registra quem recebe os eventos (o loop do shell).
+/// Registers who receives the events (the shell's loop).
 pub fn set_handler(handler: Box<dyn FnMut(AppEvent)>) {
     HANDLER.with(|slot| *slot.borrow_mut() = Some(handler));
 }
 
-/// Entrega um evento ao handler — usado pelos callbacks e pelo primeiro
-/// frame.
+/// Delivers an event to the handler — used by the callbacks and by the
+/// first frame.
 pub fn dispatch(event: AppEvent) {
     HANDLER.with(|slot| {
         if let Some(handler) = slot.borrow_mut().as_mut() {
@@ -233,8 +236,8 @@ pub fn dispatch(event: AppEvent) {
     });
 }
 
-/// A posição do evento em coordenadas do layout — AppKit conta de baixo,
-/// o layout conta de cima; o flip mora aqui, uma vez.
+/// The event position in layout coordinates — AppKit counts from the
+/// bottom, the layout counts from the top; the flip lives here, once.
 unsafe fn event_layout_point(this: Id, event: Id) -> (f64, f64) {
     unsafe {
         let point = msg_point(event, sel("locationInWindow"));
@@ -253,9 +256,9 @@ extern "C" fn bunny_mouse_up(this: Id, _sel: Sel, event: Id) {
     dispatch(AppEvent::MouseUp { x, y });
 }
 
-/// `mouseMoved:`, `mouseDragged:` e `mouseEntered:` caem todos aqui —
-/// dragged é OBRIGATÓRIO: com o botão pressionado o AppKit manda dragged,
-/// nunca moved (sem ele o visual de pressed não solta ao arrastar fora).
+/// `mouseMoved:`, `mouseDragged:` and `mouseEntered:` all land here —
+/// dragged is MANDATORY: with the button held AppKit sends dragged, never
+/// moved (without it the pressed visual won't release when dragging out).
 extern "C" fn bunny_mouse_moved(this: Id, _sel: Sel, event: Id) {
     let (x, y) = unsafe { event_layout_point(this, event) };
     dispatch(AppEvent::MouseMoved { x, y });
@@ -265,12 +268,12 @@ extern "C" fn bunny_mouse_exited(_this: Id, _sel: Sel, _event: Id) {
     dispatch(AppEvent::MouseExited);
 }
 
-/// O BunnyView aceita virar first responder — sem isso, keyDown não chega.
+/// BunnyView accepts first responder — without this, keyDown never arrives.
 extern "C" fn bunny_accepts_first_responder(_this: Id, _sel: Sel) -> i8 {
     1
 }
 
-/// A tecla crua do AppKit já extraída — o vocabulário do gate de keymap.
+/// The raw AppKit key already extracted — the keymap gate's vocabulary.
 pub struct KeyStroke {
     pub code: u16,
     pub shift: bool,
@@ -278,19 +281,19 @@ pub struct KeyStroke {
     pub option: bool,
     pub command: bool,
     pub chars: String,
-    /// `charactersIgnoringModifiers` — o char BASE: padrões `Char` casam
-    /// por aqui (shift/option não mudam a identidade da tecla).
+    /// `charactersIgnoringModifiers` — the BASE char: `Char` patterns
+    /// match through here (shift/option do not change the key's identity).
     pub chars_ignoring: String,
 }
 
 thread_local! {
-    /// O gate de teclado do shell: vê o keyDown ANTES do sistema de input.
-    /// `true` = o keymap despachou — o evento morre aqui.
+    /// The shell's keyboard gate: sees keyDown BEFORE the input system.
+    /// `true` = the keymap dispatched — the event dies here.
     static KEY_GATE: RefCell<Option<Box<dyn FnMut(&KeyStroke) -> bool>>> =
         const { RefCell::new(None) };
 }
 
-/// Registra o gate (o shell instala junto do handler de eventos).
+/// Registers the gate (the shell installs it along with the event handler).
 pub fn set_key_gate(gate: Box<dyn FnMut(&KeyStroke) -> bool>) {
     KEY_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
 }
@@ -299,11 +302,11 @@ fn gate_consumed(stroke: &KeyStroke) -> bool {
     KEY_GATE.with(|slot| slot.borrow_mut().as_mut().is_some_and(|gate| gate(stroke)))
 }
 
-// MARK: - Sincronização de IME (as perguntas SÍNCRONAS do input system)
+// MARK: - IME sync (the input system's SYNCHRONOUS questions)
 
-/// O espelho do campo focado que o `NSTextInputClient` responde na hora —
-/// o shell re-sincroniza a cada frame (a mutação anda por eventos; a
-/// leitura anda por aqui).
+/// The focused-field mirror that `NSTextInputClient` answers from on the
+/// spot — the shell re-syncs it every frame (mutation travels through
+/// events; reading travels through here).
 #[derive(Clone, Copy)]
 struct ImeMirror {
     selected: NSRange,
@@ -313,12 +316,12 @@ struct ImeMirror {
 
 thread_local! {
     static IME: Cell<Option<ImeMirror>> = const { Cell::new(None) };
-    /// keyDown entra no input system (composição) só quando o shell
-    /// diz que há campo focado.
+    /// keyDown enters the input system (composition) only when the shell
+    /// says a field is focused.
     static INTERPRET: Cell<bool> = const { Cell::new(false) };
 }
 
-/// O shell sincroniza o espelho do campo focado (`None` = sem foco).
+/// The shell syncs the focused-field mirror (`None` = no focus).
 pub fn sync_ime(state: Option<(NSRange, Option<NSRange>, CGRect)>) {
     INTERPRET.with(|flag| flag.set(state.is_some()));
     IME.with(|ime| {
@@ -334,7 +337,7 @@ fn ime_mirror() -> Option<ImeMirror> {
     IME.with(|ime| ime.get())
 }
 
-/// NSString OU NSAttributedString → Rust (o input system manda os dois).
+/// NSString OR NSAttributedString → Rust (the input system sends both).
 unsafe fn text_argument_to_string(object: Id) -> String {
     unsafe {
         if object.is_null() {
@@ -395,8 +398,8 @@ extern "C" fn bunny_attributed_substring(
     _range: NSRange,
     _actual: *mut NSRange,
 ) -> Id {
-    // piso honesto: alguns IMEs consultam para reconversão — sem isto a
-    // composição normal segue funcionando
+    // honest floor: some IMEs query this for reconversion — without it
+    // normal composition keeps working
     std::ptr::null_mut()
 }
 
@@ -404,7 +407,7 @@ extern "C" fn bunny_valid_attributes(_this: Id, _sel: Sel) -> Id {
     unsafe { msg_id(class("NSArray"), sel("array")) }
 }
 
-/// Onde a janela de candidatos aterrissa: o rect do caret, em tela.
+/// Where the candidate window lands: the caret rect, on screen.
 extern "C" fn bunny_first_rect(
     _this: Id,
     _sel: Sel,
@@ -418,7 +421,7 @@ extern "C" fn bunny_first_rect(
 }
 
 extern "C" fn bunny_character_index(_this: Id, _sel: Sel, _point: CGPoint) -> u64 {
-    // piso honesto (lookup de dicionário por mouse fica para depois)
+    // honest floor (dictionary lookup by mouse comes later)
     0
 }
 
@@ -449,15 +452,15 @@ extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
             ),
         };
 
-        // composição de IME viva: as teclas pertencem ao IME (Esc fecha
-        // candidatos, setas andam na composição) — o keymap não rouba
+        // live IME composition: the keys belong to the IME (Esc closes
+        // candidates, arrows walk the composition) — the keymap doesn't steal
         let composing = ime_mirror().is_some_and(|ime| ime.marked.location != NS_NOT_FOUND);
         if !composing && gate_consumed(&stroke) {
-            return; // o keymap despachou — o evento morre aqui
+            return; // the keymap dispatched — the event dies here
         }
 
-        // campo focado sem cmd: o evento entra no sistema de input — a
-        // composição de IME volta por insertText/setMarkedText/doCommand
+        // focused field without cmd: the event enters the input system —
+        // IME composition comes back via insertText/setMarkedText/doCommand
         if INTERPRET.with(|flag| flag.get()) && !stroke.command {
             let array = msg_id_arg(class("NSArray"), sel("arrayWithObject:"), event);
             msg_void_id(this, sel("interpretKeyEvents:"), array);
@@ -477,8 +480,8 @@ extern "C" fn bunny_scroll_wheel(this: Id, _sel: Sel, event: Id) {
         let (x, y) = event_layout_point(this, event);
         let mut dx = msg_f64(event, sel("scrollingDeltaX"));
         let mut dy = msg_f64(event, sel("scrollingDeltaY"));
-        // trackpad entrega pontos precisos; roda legada entrega TIQUES de
-        // linha — converte para pontos aqui, uma vez
+        // trackpad delivers precise points; the legacy wheel delivers line
+        // TICKS — converted to points here, once
         if msg_bool(event, sel("hasPreciseScrollingDeltas")) == 0 {
             dx *= 16.0;
             dy *= 16.0;
@@ -510,7 +513,7 @@ unsafe fn register_classes() {
 
         let view = objc_allocateClassPair(
             class("NSView"),
-            CString::new("BunnyView").expect("nome").as_ptr(),
+            CString::new("BunnyView").expect("name").as_ptr(),
             0,
         );
         class_addMethod(
@@ -564,7 +567,7 @@ unsafe fn register_classes() {
             bool_getter.as_ptr(),
         );
 
-        // NSTextInputClient — a porta do sistema de input (IME de verdade)
+        // NSTextInputClient — the input system's door (real IME)
         let encode = |types: &str| CString::new(types).expect("type encoding");
         let insert_types = encode("v@:@{_NSRange=QQ}");
         class_addMethod(
@@ -642,7 +645,7 @@ unsafe fn register_classes() {
             command_types.as_ptr(),
         );
         let protocol = objc_getProtocol(
-            CString::new("NSTextInputClient").expect("nome").as_ptr(),
+            CString::new("NSTextInputClient").expect("name").as_ptr(),
         );
         if !protocol.is_null() {
             class_addProtocol(view, protocol);
@@ -652,7 +655,7 @@ unsafe fn register_classes() {
 
         let delegate = objc_allocateClassPair(
             class("NSObject"),
-            CString::new("BunnyDelegate").expect("nome").as_ptr(),
+            CString::new("BunnyDelegate").expect("name").as_ptr(),
             0,
         );
         class_addMethod(
@@ -677,10 +680,10 @@ unsafe fn register_classes() {
     });
 }
 
-// MARK: - Janela
+// MARK: - Window
 
-/// Handles crus da janela — `Copy`, mesma thread, embrulhados pelas
-/// operações seguras abaixo.
+/// Raw window handles — `Copy`, same thread, wrapped by the safe
+/// operations below.
 #[derive(Clone, Copy)]
 pub struct WindowHandle {
     window: Id,
@@ -689,7 +692,7 @@ pub struct WindowHandle {
 }
 
 impl WindowHandle {
-    /// Tamanho lógico da área de conteúdo (o viewport do layout).
+    /// Logical size of the content area (the layout viewport).
     pub fn content_size(&self) -> (f64, f64) {
         unsafe {
             let bounds = msg_rect(self.view, sel("bounds"));
@@ -697,27 +700,27 @@ impl WindowHandle {
         }
     }
 
-    /// O scale factor da tela (retina = 2).
+    /// The screen's scale factor (retina = 2).
     pub fn scale(&self) -> usize {
         unsafe { msg_f64(self.window, sel("backingScaleFactor")).round().max(1.0) as usize }
     }
 
-    /// Blita um frame RGBA na layer.
+    /// Blits an RGBA frame onto the layer.
     pub fn set_image(&self, width: usize, height: usize, rgba: &[u8]) {
         unsafe {
             let image = cg_image(width, height, rgba);
             msg_void_f64(self.layer, sel("setContentsScale:"), self.scale() as f64);
             msg_void_id(self.layer, sel("setContents:"), image);
-            CGImageRelease(image); // a layer retém
+            CGImageRelease(image); // the layer retains
         }
     }
 
-    /// Um rect em coordenadas de LAYOUT (topo-esquerda) convertido para a
-    /// TELA do AppKit — onde a janela de candidatos do IME aterrissa.
+    /// A rect in LAYOUT coordinates (top-left) converted to AppKit's
+    /// SCREEN — where the IME candidate window lands.
     pub fn layout_rect_to_screen(&self, x: f64, y: f64, width: f64, height: f64) -> CGRect {
         unsafe {
             let bounds = msg_rect(self.view, sel("bounds"));
-            // flip do AppKit + view == contentView (origem da janela)
+            // AppKit flip + view == contentView (window origin)
             let window_rect = CGRect {
                 origin: CGPoint { x, y: bounds.size.height - y - height },
                 size: CGSize { width, height },
@@ -726,9 +729,9 @@ impl WindowHandle {
         }
     }
 
-    /// Mão sobre alvo interativo; seta fora. `set` direto — sem cursor
-    /// rects por ora (o AppKit pode restaurar nas bordas de resize; glitch
-    /// cosmético aceito).
+    /// Hand over an interactive target; arrow elsewhere. Direct `set` —
+    /// no cursor rects for now (AppKit may restore it at resize edges; a
+    /// cosmetic glitch we accept).
     pub fn set_cursor_pointing(&self, pointing: bool) {
         unsafe {
             let cursor = if pointing {
@@ -741,7 +744,7 @@ impl WindowHandle {
     }
 }
 
-/// `kCGImageAlphaPremultipliedLast` — bytes R,G,B,A, alfa por último.
+/// `kCGImageAlphaPremultipliedLast` — bytes R,G,B,A, alpha last.
 const ALPHA_PREMULTIPLIED_LAST: u32 = 1;
 
 unsafe fn cg_image(width: usize, height: usize, rgba: &[u8]) -> Id {
@@ -769,14 +772,14 @@ unsafe fn cg_image(width: usize, height: usize, rgba: &[u8]) -> Id {
     }
 }
 
-/// Cria o app + a janela com a view de eventos, pronta para blit.
+/// Creates the app + the window with the event view, ready for blit.
 pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
     unsafe {
         let pool = objc_autoreleasePoolPush();
         register_classes();
 
         let app = msg_id(class("NSApplication"), sel("sharedApplication"));
-        // Regular: app de terminal ganha janela, dock e foco
+        // Regular: a terminal app gets a window, the Dock and focus
         let _ = msg_bool_i64(app, sel("setActivationPolicy:"), 0);
 
         let rect = CGRect {
@@ -795,7 +798,7 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
             0,
         );
 
-        let title = CString::new(title).expect("título sem NUL");
+        let title = CString::new(title).expect("title without NUL");
         let ns_title = msg_id_cstr(
             class("NSString"),
             sel("stringWithUTF8String:"),
@@ -804,16 +807,16 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
         msg_void_id(window, sel("setTitle:"), ns_title);
         msg_void(window, sel("center"));
 
-        // a view de eventos vira o content view, com layer própria
+        // the event view becomes the content view, with its own layer
         let view = msg_id(class("BunnyView"), sel("alloc"));
         let view = msg_init_rect(view, sel("initWithFrame:"), rect);
         msg_void_bool(view, sel("setWantsLayer:"), 1);
         msg_void_id(window, sel("setContentView:"), view);
         let layer = msg_id(view, sel("layer"));
 
-        // moved/entered/exited chegam pelo tracking area — sem dança de
-        // first responder, e InVisibleRect acompanha o resize sozinho
-        // (o rect passado é ignorado). 0x223 = MouseEnteredAndExited |
+        // moved/entered/exited arrive via the tracking area — no first
+        // responder dance, and InVisibleRect tracks the resize by itself
+        // (the rect passed in is ignored). 0x223 = MouseEnteredAndExited |
         // MouseMoved | ActiveInKeyWindow | InVisibleRect.
         let area = msg_id(class("NSTrackingArea"), sel("alloc"));
         let area = msg_init_tracking(
@@ -829,11 +832,11 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
         );
         msg_void_id(view, sel("addTrackingArea:"), area);
 
-        // delegate: resize re-pinta, fechar encerra
+        // delegate: resize repaints, closing quits
         let delegate = msg_id(msg_id(class("BunnyDelegate"), sel("alloc")), sel("init"));
         msg_void_id(window, sel("setDelegate:"), delegate);
 
-        // o meio-período do blink do caret — o run loop retém o timer
+        // the caret blink half-period — the run loop retains the timer
         let _ = msg_timer(
             class("NSTimer"),
             sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
@@ -845,7 +848,7 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
         );
 
         msg_void_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
-        // o teclado nasce apontando para a view de eventos
+        // the keyboard is born pointing at the event view
         msg_void_id(window, sel("makeFirstResponder:"), view);
         msg_void_bool(app, sel("activateIgnoringOtherApps:"), 1);
         objc_autoreleasePoolPop(pool);
@@ -854,7 +857,7 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
     }
 }
 
-/// Entra no run loop do AppKit — retorna quando o app termina.
+/// Enters the AppKit run loop — returns when the app terminates.
 pub fn run() {
     unsafe {
         let app = msg_id(class("NSApplication"), sel("sharedApplication"));
@@ -864,7 +867,7 @@ pub fn run() {
 
 // MARK: - Clipboard
 
-/// Escreve texto no pasteboard geral do sistema.
+/// Writes text to the system's general pasteboard.
 pub fn clipboard_write(text: &str) {
     unsafe {
         let pasteboard = msg_id(class("NSPasteboard"), sel("generalPasteboard"));
@@ -880,7 +883,7 @@ pub fn clipboard_write(text: &str) {
     }
 }
 
-/// Lê o texto do pasteboard geral (`None` = vazio ou não-texto).
+/// Reads the general pasteboard's text (`None` = empty or non-text).
 pub fn clipboard_read() -> Option<String> {
     unsafe {
         let pasteboard = msg_id(class("NSPasteboard"), sel("generalPasteboard"));

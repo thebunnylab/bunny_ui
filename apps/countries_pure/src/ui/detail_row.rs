@@ -1,8 +1,8 @@
 //
 //  DetailRow.swift — CountriesSwiftUI
 //
-//  As sobrecargas `leftLabel:`/`rightLabel:` de Text e Image do Swift
-//  colapsam numa struct genérica só — os labels são views tipadas.
+//  Swift's `leftLabel:`/`rightLabel:` overloads for Text and Image collapse
+//  into a single generic struct — the labels are typed views.
 //
 
 use bunny_ui::prelude::*;

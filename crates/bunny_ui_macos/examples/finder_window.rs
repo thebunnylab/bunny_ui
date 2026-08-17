@@ -1,14 +1,14 @@
-//! Um "go to file" completo — a primeira TELA de verdade do bunny_ui.
+//! A complete "go to file" — the first real SCREEN of bunny_ui.
 //!
 //! ```sh
 //! cargo run -p bunny-ui-macos --example finder_window
 //! ```
 //!
-//! Tudo junto num lugar só: backdrop translúcido, painel flutuante, campo
-//! de busca REAL (foco, caret, IME, clipboard), lista filtrada reativa
-//! (digite e ela responde — só este body re-roda), rows com hover e
-//! clique sem chrome de botão, rolagem com clip e thumb. O rodapé mostra
-//! o que o clique "abriu".
+//! Everything together in one place: translucent backdrop, floating
+//! panel, REAL search field (focus, caret, IME, clipboard), reactive
+//! filtered list (type and it responds — only this body re-runs), rows
+//! with hover and click without button chrome, scrolling with clip and
+//! thumb. The footer shows what the click "opened".
 
 use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
@@ -17,7 +17,7 @@ const PANEL_W: f64 = 640.0;
 const PANEL_H: f64 = 480.0;
 const PANEL_TOP: f64 = 120.0;
 
-// as ações do finder — tecla vira intenção no keymap do main()
+// the finder actions — key becomes intent in main()'s keymap
 const SELECT_NEXT: ActionId = ActionId("finder.select_next");
 const SELECT_PREV: ActionId = ActionId("finder.select_prev");
 const PAGE_FORWARD: ActionId = ActionId("finder.page_forward");
@@ -28,7 +28,7 @@ const DISMISS: ActionId = ActionId("finder.dismiss");
 
 const CLEAR: Color = Color::rgba(0, 0, 0, 0);
 
-/// (nome, diretório, recente?) — o mock de um projeto plausível.
+/// (name, directory, recent?) — the mock of a plausible project.
 const FILES: &[(&str, &str, bool)] = &[
     ("main.rs", "src/", true),
     ("layout.rs", "crates/ui/src/", true),
@@ -67,8 +67,8 @@ const FILES: &[(&str, &str, bool)] = &[
     ),
 ];
 
-/// Subsequência case-insensitive com as posições casadas (ranges de byte
-/// coalescidos) — o piso honesto de um fuzzy, com highlight de verdade.
+/// Case-insensitive subsequence with the matched positions (coalesced
+/// byte ranges) — the honest floor of a fuzzy, with real highlighting.
 fn match_ranges(haystack: &str, needle: &str) -> Option<Vec<(usize, usize)>> {
     if needle.is_empty() {
         return Some(Vec::new());
@@ -110,7 +110,7 @@ struct Finder {
     query: State<String>,
     opened: State<String>,
     dark: State<bool>,
-    /// Índice selecionado na lista FILTRADA (clamp na exibição).
+    /// Selected index in the FILTERED list (clamped at display time).
     selected: State<usize>,
 }
 
@@ -122,7 +122,7 @@ impl Component for Finder {
             .filter_map(|(name, dir, recent)| {
                 let full = format!("{dir}{name}");
                 let ranges = match_ranges(&full, &query)?;
-                // reparte os ranges do caminho completo entre dir e nome
+                // splits the full path's ranges between dir and name
                 let split = dir.len();
                 let mut dir_ranges = Vec::new();
                 let mut name_ranges = Vec::new();
@@ -148,7 +148,7 @@ impl Component for Finder {
         let count = items.len();
         let opened = self.opened;
         let selected = self.selected;
-        // a leitura registra a dependência: mover a seleção repinta a row
+        // the read registers the dependency: moving selection repaints the row
         let selected_index = selected.get().min(count.saturating_sub(1));
 
         let header = hstack!(
@@ -170,14 +170,14 @@ impl Component for Finder {
                 let label = format!("{}{}", row.dir, row.name);
                 let is_selected = *index == selected_index;
                 hstack!(
-                    // nome: elipse no MEIO, teto de 240 como manda a anatomia
+                    // name: MIDDLE ellipsis, 240 cap as the anatomy dictates
                     text(row.name)
                         .foreground_color(theme::fg())
                         .highlight(row.name_ranges, theme::accent())
                         .truncation_mode(Truncation::Middle)
                         .frame_max(240.0, f64::INFINITY, Alignment::Leading),
-                    // caminho: preenche o resto, elipse no COMEÇO (o fim
-                    // do path é o que importa)
+                    // path: fills the rest, ellipsis at the START (the
+                    // end of the path is what matters)
                     text(row.dir)
                         .font(Font::Subheadline)
                         .monospaced()
@@ -195,8 +195,8 @@ impl Component for Finder {
                 .padding_edge(Edge::Trailing, 12.0)
                 .padding_edge(Edge::Top, 7.0)
                 .padding_edge(Edge::Bottom, 7.0)
-                // seleção por teclado pinta o fundo base; hover refina por
-                // cima (o mesmo contrato do Styled)
+                // keyboard selection paints the base background; hover
+                // refines on top (the same contract as Styled)
                 .background_color(if is_selected { theme::row_pressed() } else { CLEAR })
                 .background_hovered(theme::row_hover())
                 .background_pressed(theme::row_pressed())
@@ -227,7 +227,7 @@ impl Component for Finder {
                 .font(Font::Subheadline)
                 .monospaced()
                 .foreground_color(theme::fg_secondary()),
-            // retheme AO VIVO: o install reconstrói a cena no próximo pass
+            // LIVE retheme: the install rebuilds the scene on the next pass
             button(
                 text(if dark_on { "light" } else { "dark" }).font(Font::Footnote),
                 move || {
@@ -246,8 +246,8 @@ impl Component for Finder {
         .padding_edge(Edge::Top, 8.0)
         .padding_edge(Edge::Bottom, 8.0);
 
-        // abre o selecionado; os handlers capturam a lista FILTRADA do
-        // body corrente — filtro novo = body re-roda = capturas frescas
+        // opens the selected one; the handlers capture the current body's
+        // FILTERED list — new filter = body re-runs = fresh captures
         let open_at = move |prefix: &'static str| {
             if let Some(label) = labels.get(selected.get().min(count.saturating_sub(1))) {
                 opened.set(format!("{prefix}{label}"));
@@ -260,7 +260,7 @@ impl Component for Finder {
             .background_color(theme::panel())
             .corner_radius(9.0)
             .border(theme::border(), 1.0)
-            // ↓/↑ com wrap — funcionam ENQUANTO digita (o gate consome)
+            // ↓/↑ with wrap — they work WHILE typing (the gate consumes)
             .on_action(SELECT_NEXT, move || {
                 if count > 0 {
                     selected.set((selected.get().min(count - 1) + 1) % count)
@@ -286,7 +286,7 @@ impl Component for Finder {
                 query_state.set(String::new());
                 selected.set(0);
             })
-            // filtro novo = seleção volta ao topo
+            // new filter = selection returns to the top
             .on_change(move || query_state.get(), false, move |_, _| selected.set(0));
 
         zstack!(
@@ -299,7 +299,7 @@ impl Component for Finder {
 fn main() {
     let runtime =
         Runtime::new().text_engine(Rc::new(bunny_ui_macos::CoreTextEngine::new()));
-    // o keymap do app: tecla → intenção (os handlers moram na tela)
+    // the app keymap: key → intent (the handlers live in the screen)
     runtime.bind(KeyPattern::key(Key::Down), SELECT_NEXT);
     runtime.bind(KeyPattern::key(Key::Up), SELECT_PREV);
     runtime.bind(KeyPattern::key(Key::PageDown), PAGE_FORWARD);

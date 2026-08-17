@@ -2,12 +2,12 @@
 name = "bunny-ui-macos"
 version = "0.1.0"
 edition.workspace = true
-description = "Shell macOS do bunny-ui — janela nativa e blit do bitmap, FFI Objective-C sem dependências"
+description = "bunny-ui macOS shell — native window and bitmap blit, dependency-free Objective-C FFI"
 
 [dependencies]
 bunny-ui.workspace = true
 
 [dev-dependencies]
-# só para os examples (o countries de verdade numa janela nativa)
+# examples only (the real countries app in a native window)
 countries-core.workspace = true
 countries-pure.workspace = true

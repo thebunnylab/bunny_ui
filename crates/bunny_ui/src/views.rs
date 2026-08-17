@@ -1,4 +1,4 @@
-//! As views built-in, escritas do jeito Rust — genéricas de ponta a ponta.
+//! The built-in views, written the Rust way — generic end to end.
 //!
 //! | Swift                            | bunny_ui                          |
 //! |----------------------------------|-----------------------------------|
@@ -12,13 +12,13 @@
 //! | `ForEach(items, id: \.id) { }`   | [`for_each(items, id, row)`]      |
 //! | `EmptyView`                      | [`empty()`]                       |
 //!
-//! Os filhos são tuplas (o `TupleView` implícito de um bloco
-//! `@ViewBuilder`), não `Vec<AnyView>` — aridade em compile time, zero
-//! apagamento. Onde o Swift imprime um nó `TupleView` explícito, o port
-//! chama [`tuple`]. Configuração fica *depois* dos filhos, em métodos
-//! (`.alignment(…)`, `.spacing(…)`) — o default some do callsite, como o
-//! argumento omitido do Swift. Convenção de assinatura: conteúdo primeiro,
-//! comportamento (closures) por último.
+//! Children are tuples (the implicit `TupleView` of a `@ViewBuilder`
+//! block), not `Vec<AnyView>` — arity at compile time, zero
+//! erasure. Where Swift prints an explicit `TupleView` node, the port
+//! calls [`tuple`]. Configuration goes *after* the children, in methods
+//! (`.alignment(…)`, `.spacing(…)`) — the default vanishes from the
+//! callsite, like Swift's omitted argument. Signature convention: content
+//! first, behavior (closures) last.
 
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -32,8 +32,8 @@ use crate::layout::{Axis, CrossAlign, Edges, LayoutNode, Size as LayoutSize, Vis
 use crate::state_ext::BindingExt;
 use crate::view::{NodeList, Single, View, render_line};
 
-/// Vários nós de layout virando UM (labels compostos, seções, tuplas
-/// explícitas): um filho passa direto; vários empilham na vertical.
+/// Several layout nodes becoming ONE (composite labels, sections, explicit
+/// tuples): one child passes straight through; several stack vertically.
 pub(crate) fn wrap_layout(children: Vec<LayoutNode>) -> LayoutNode {
     let mut children = children;
     if children.len() == 1 {
@@ -48,9 +48,9 @@ pub(crate) fn wrap_layout(children: Vec<LayoutNode>) -> LayoutNode {
     }
 }
 
-// MARK: - Folhas
+// MARK: - Leaves
 
-/// `Text("…")` — `Rc<str>` para clonar barato (views são valores).
+/// `Text("…")` — `Rc<str>` for cheap clones (views are values).
 #[derive(Clone)]
 pub struct Text(pub Rc<str>);
 
@@ -75,15 +75,15 @@ pub fn text(string: impl Into<String>) -> Text {
     Text(Rc::from(string.into()))
 }
 
-// A geometria do chrome de botão (Role/Size ficam para depois; a
-// referência futura é altura 26/34/44 com texto 11/13/15). As CORES vêm
-// do tema, lidas no render — retheme reconstrói a cena.
+// The button chrome geometry (Role/Size come later; the future
+// reference is height 26/34/44 with text 11/13/15). The COLORS come
+// from the theme, read at render — retheme rebuilds the scene.
 const BUTTON_RADIUS: f64 = 6.0;
 const BUTTON_PAD_H: f64 = 14.0;
 const BUTTON_PAD_V: f64 = 6.0;
 
-/// `Button(action:) { label }` — a ação mora num campo `F: Fn()`, chamada
-/// estaticamente (não há `Rc<dyn Fn()>` aqui).
+/// `Button(action:) { label }` — the action lives in an `F: Fn()` field,
+/// called statically (there is no `Rc<dyn Fn()>` here).
 #[derive(Clone)]
 pub struct Button<L, F> {
     label: L,
@@ -103,9 +103,9 @@ where
         let (prints, layouts) = label.into_parts();
         out.push(RenderNode::branch("Button", prints));
 
-        // o chrome default vive na CENA (o print fica como era): fundo com
-        // cantos + padding embutido, estados de hover/pressed inclusos —
-        // o hit-rect passa a ser o chrome inteiro, não só o label
+        // the default chrome lives in the SCENE (the print stays as it was):
+        // background with corners + built-in padding, hover/pressed states
+        // included — the hit-rect becomes the whole chrome, not just the label
         let theme = crate::theme::current();
         let chrome = LayoutNode::Styled {
             props: VisualProps {
@@ -126,9 +126,9 @@ where
             }),
         };
 
-        // dentro de um pass, o botão é um alvo de interação: o frame entra
-        // no hit-test com o caminho de identidade, e a ação fica registrada
-        // no reconciler (retida como os efeitos — view pulada, botão vivo)
+        // inside a pass, the button is an interaction target: the frame joins
+        // the hit-test under the identity path, and the action stays registered
+        // in the reconciler (retained like the effects — skipped view, live button)
         match motor::identity::cursor_scope() {
             Some(path) => {
                 let action = self.action.clone();
@@ -153,9 +153,9 @@ where
     }
 }
 
-/// `Button(action:) { label }` — o label primeiro (é o que se lê), a ação
-/// por último (closures longas formatam melhor no fim, e é a convenção de
-/// toda a API: conteúdo antes, comportamento depois).
+/// `Button(action:) { label }` — the label first (it is what you read), the
+/// action last (long closures format better at the end, and it is the
+/// convention of the whole API: content before, behavior after).
 pub fn button<L, F>(label: L, action: F) -> Button<L, F>
 where
     L: View,
@@ -164,10 +164,10 @@ where
     Button { label, action }
 }
 
-/// `TextField("Placeholder", text: $binding)` — campo de UMA linha. O app
-/// é dono da STRING (o binding); o framework é dono de caret, seleção e
-/// foco (por identidade estrutural, como o scroll). A edição chega por um
-/// closure retido no reconciler — campo de view pulada continua editável.
+/// `TextField("Placeholder", text: $binding)` — a ONE-line field. The app
+/// owns the STRING (the binding); the framework owns caret, selection and
+/// focus (by structural identity, like scroll). Editing arrives through a
+/// closure retained in the reconciler — a skipped view's field stays editable.
 #[derive(Clone)]
 pub struct TextField {
     placeholder: Rc<str>,
@@ -193,8 +193,8 @@ impl View for TextField {
                         let mut value = binding.wrappedValue();
                         let original = value.clone();
                         let output = crate::text_input::apply(&mut value, state, command);
-                        // o set suja quem LÊ — só quando o texto mudou de
-                        // fato (Read/Copy não podem invalidar o mundo)
+                        // the set dirties whoever READS — only when the text
+                        // actually changed (Read/Copy must not invalidate the world)
                         if value != original {
                             binding.set(value);
                         }
@@ -207,7 +207,7 @@ impl View for TextField {
                     placeholder: self.placeholder.clone(),
                 });
             }
-            // fora de um pass (uso decorativo): o valor vira texto puro
+            // outside a pass (decorative use): the value becomes plain text
             None => out.push_layout(LayoutNode::Text {
                 content: if value.is_empty() {
                     self.placeholder.clone()
@@ -294,7 +294,7 @@ pub fn empty() -> EmptyView {
     EmptyView
 }
 
-/// `Image(uiImage: …)` — segura a descrição formatada, como o motor.
+/// `Image(uiImage: …)` — holds the formatted description, like the engine.
 #[derive(Clone)]
 pub struct ImageUiImage(pub String);
 
@@ -313,12 +313,12 @@ pub fn image_ui<T: Debug>(image: T) -> ImageUiImage {
     ImageUiImage(format!("{image:?}"))
 }
 
-// MARK: - Contêineres
+// MARK: - Containers
 
 pub use motor::views::Alignment;
 
-/// Alinhamento no eixo transversal de um `VStack` — só o que faz sentido
-/// para colunas. (`vstack` com `.bottom` não é um estado representável.)
+/// Cross-axis alignment of a `VStack` — only what makes sense
+/// for columns. (`vstack` with `.bottom` is not a representable state.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HorizontalAlignment {
     Leading,
@@ -344,7 +344,7 @@ impl HorizontalAlignment {
     }
 }
 
-/// Alinhamento no eixo transversal de um `HStack`.
+/// Cross-axis alignment of an `HStack`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerticalAlignment {
     Top,
@@ -404,13 +404,13 @@ fn render_stack<C: View>(
             align,
             children: layouts,
         },
-        // ZStack: todos os filhos no mesmo frame
+        // ZStack: all children in the same frame
         None => LayoutNode::Layered { children: layouts },
     });
 }
 
-/// `VStack { … }` — filhos primeiro; alinhamento e spacing nos métodos,
-/// com os defaults do Swift (center, spacing automático).
+/// `VStack { … }` — children first; alignment and spacing in methods,
+/// with Swift's defaults (center, automatic spacing).
 #[derive(Clone)]
 pub struct VStack<C> {
     alignment: HorizontalAlignment,
@@ -504,8 +504,8 @@ pub fn hstack<C: View>(children: C) -> HStack<C> {
     }
 }
 
-/// `ZStack { … }` — profundidade alinha nos dois eixos, então aqui é o
-/// `Alignment` completo.
+/// `ZStack { … }` — depth aligns on both axes, so here it is the
+/// full `Alignment`.
 #[derive(Clone)]
 pub struct ZStack<C> {
     alignment: Alignment,
@@ -537,34 +537,34 @@ pub fn zstack<C: View>(children: C) -> ZStack<C> {
     }
 }
 
-/// Grafia alternativa, namespace associado: `Stack::vertical((…))`.
+/// Alternative spelling, associated namespace: `Stack::vertical((…))`.
 ///
-/// Em avaliação lado a lado com `vstack((…))` — mesma view por baixo, só o
-/// nome muda. Uma das duas vira a canônica antes do release; a perdedora
-/// sai.
+/// Under side-by-side evaluation with `vstack((…))` — same view underneath,
+/// only the name changes. One of the two becomes canonical before release;
+/// the loser leaves.
 pub struct Stack;
 
 impl Stack {
-    /// `vstack((…))` por outro nome.
+    /// `vstack((…))` by another name.
     pub fn vertical<C: View>(children: C) -> VStack<C> {
         vstack(children)
     }
 
-    /// `hstack((…))` por outro nome.
+    /// `hstack((…))` by another name.
     pub fn horizontal<C: View>(children: C) -> HStack<C> {
         hstack(children)
     }
 
-    /// `zstack((…))` por outro nome.
+    /// `zstack((…))` by another name.
     pub fn layered<C: View>(children: C) -> ZStack<C> {
         zstack(children)
     }
 }
 
-/// `TupleView(…)` — o contêiner que IMPRIME o próprio nó (o bloco implícito
-/// de um `@ViewBuilder` com várias views; tuplas cruas achatam nos filhos
-/// do pai, sem nó próprio). Por ter nó próprio, aceita modifiers — é o
-/// `Group` de quem quer decorar vários de uma vez.
+/// `TupleView(…)` — the container that PRINTS its own node (the implicit
+/// block of a `@ViewBuilder` with several views; raw tuples flatten into the
+/// parent's children, no node of their own). Having its own node, it accepts
+/// modifiers — it is the `Group` for decorating several at once.
 #[derive(Clone)]
 pub struct TupleView<C> {
     children: C,
@@ -611,9 +611,9 @@ where
             .iter()
             .map(|item| {
                 let id = (self.id)(item);
-                // A chave do item é a identidade da row: a closure roda com o
-                // cursor já dentro dela, então estado construído aqui segue o
-                // item — reordenar não embaralha, remover desmonta.
+                // The item's key is the row's identity: the closure runs with
+                // the cursor already inside it, so state built here follows the
+                // item — reordering does not shuffle, removing unmounts.
                 let _frame = motor::identity::enter(format!("[{id}]"));
                 let mut row = NodeList::new();
                 (self.row)(item).render_into(ctx, &mut row);
@@ -637,9 +637,9 @@ where
             },
             rows,
         ));
-        // List é uma região de rolagem por natureza: as rows empilham e o
-        // excedente fica por dentro; a identidade estrutural endereça o
-        // offset retido (a lista remontada restaura a posição)
+        // List is a scroll region by nature: the rows stack and the
+        // overflow stays inside; structural identity addresses the
+        // retained offset (a remounted list restores the position)
         out.push_layout(LayoutNode::Scroll {
             path: motor::identity::cursor_scope(),
             child: Box::new(LayoutNode::Stack {
@@ -662,10 +662,10 @@ where
     List { items, id, row }
 }
 
-/// `ForEach(collection, id: \.keyPath) { item in … }` — o `id` é o contrato
-/// de identidade: é ele que vai deixar estado e animação seguirem o item
-/// (reordenar, inserir no meio) em vez da posição. O runtime headless só
-/// cobra a parte verificável hoje: ids únicos.
+/// `ForEach(collection, id: \.keyPath) { item in … }` — the `id` is the
+/// identity contract: it is what will let state and animation follow the item
+/// (reorder, insert in the middle) instead of the position. The headless
+/// runtime only enforces the verifiable part today: unique ids.
 #[derive(Clone)]
 pub struct ForEach<T, I, F> {
     items: Vec<T>,
@@ -719,14 +719,14 @@ fn debug_assert_unique_ids(container: &str, ids: impl Iterator<Item = String>) {
         for id in ids {
             assert!(
                 seen.insert(id.clone()),
-                "{container}: id duplicado {id:?} — identidade por item precisa ser única"
+                "{container}: duplicate id {id:?} — per-item identity must be unique"
             );
         }
     }
 }
 
-/// `Section(header: …) { … }` — e o `List { Section { … } }` da view de
-/// detalhes, via [`list_content`].
+/// `Section(header: …) { … }` — and the detail view's
+/// `List { Section { … } }`, via [`list_content`].
 #[derive(Clone)]
 pub struct Section<H, C> {
     header: Option<H>,
@@ -755,8 +755,8 @@ impl<H: View, C: View> View for Section<H, C> {
             align: CrossAlign::Start,
             children: layouts,
         };
-        // a List de sections (list_content) é região de rolagem; a Section
-        // comum é só o empilhamento
+        // the List of sections (list_content) is a scroll region; the plain
+        // Section is just the stacking
         out.push_layout(if self.kind == "List" {
             LayoutNode::Scroll {
                 path: motor::identity::cursor_scope(),
@@ -777,7 +777,7 @@ pub fn section<H: View, C: View>(header: H, children: C) -> Section<H, C> {
     }
 }
 
-/// `Section { … }` — sem header.
+/// `Section { … }` — no header.
 pub fn section_plain<C: View>(children: C) -> Section<EmptyView, C> {
     Section {
         header: None,
@@ -786,7 +786,7 @@ pub fn section_plain<C: View>(children: C) -> Section<EmptyView, C> {
     }
 }
 
-/// `List { Section { … } }` — a List construída de sections, sem coleção.
+/// `List { Section { … } }` — the List built from sections, no collection.
 pub fn list_content<C: View>(children: C) -> Section<EmptyView, C> {
     Section {
         header: None,
@@ -795,9 +795,9 @@ pub fn list_content<C: View>(children: C) -> Section<EmptyView, C> {
     }
 }
 
-// MARK: - Navegação
+// MARK: - Navigation
 
-/// `NavigationStack(path: $path) { … }` (ou sem binding).
+/// `NavigationStack(path: $path) { … }` (or without a binding).
 #[derive(Clone)]
 pub struct NavigationStack<C> {
     path: Option<Binding<NavigationPath>>,
@@ -831,7 +831,7 @@ pub fn navigation_stack<C: View>(path: Binding<NavigationPath>, children: C) -> 
     }
 }
 
-/// `NavigationStack { … }` (sem binding de path)
+/// `NavigationStack { … }` (no path binding)
 pub fn navigation_stack_content<C: View>(children: C) -> NavigationStack<C> {
     NavigationStack {
         path: None,
@@ -861,8 +861,8 @@ impl<L: View> View for NavigationLink<L> {
     }
 }
 
-/// `NavigationLink(destination: …) { label }` — o destino nunca monta no
-/// runtime fake, só se descreve.
+/// `NavigationLink(destination: …) { label }` — the destination never mounts
+/// in the fake runtime, it only describes itself.
 pub fn navigation_link<D: View<Arity = Single>, L: View>(
     destination: D,
     label: L,
@@ -881,8 +881,8 @@ pub fn nav_link_value<V: Debug + 'static, L: View>(value: V, label: L) -> Naviga
     }
 }
 
-/// `ToolbarItem { … }` — existe na API; o `.toolbar` do runtime fake é inert
-/// e nunca o monta (paridade com o motor, que também descarta o conteúdo).
+/// `ToolbarItem { … }` — exists in the API; the fake runtime's `.toolbar` is
+/// inert and never mounts it (parity with the engine, which also drops the content).
 #[derive(Clone)]
 pub struct ToolbarItem;
 
@@ -898,7 +898,7 @@ pub fn toolbar_item<C: View>(_content: C) -> ToolbarItem {
     ToolbarItem
 }
 
-/// `WindowGroup { … }` (nível de Scene)
+/// `WindowGroup { … }` (Scene level)
 #[derive(Clone)]
 pub struct WindowGroup<C> {
     children: C,

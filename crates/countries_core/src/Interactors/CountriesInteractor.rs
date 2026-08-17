@@ -11,8 +11,8 @@ use crate::Repositories::WebAPI::CountriesWebRepository::CountriesWebRepository;
 use crate::Repositories::WebAPI::WebRepository::BoxFuture;
 use motor::loadable::LoadError;
 
-/// `struct ValueIsMissingError()` — usado como falha quando o store não devolve
-/// o que acabou de ser gravado.
+/// `struct ValueIsMissingError()` — used as the failure when the store does not
+/// return what was just written.
 pub fn ValueIsMissingError() -> LoadError {
     LoadError::new("Value is missing")
 }
@@ -95,7 +95,7 @@ use std::rc::Rc;
 
 // MARK: - UnitTests
 
-/// Port de `UnitTests/Mocks/{Mock,MockedWebRepositories,MockedDBRepositories}.swift`
+/// Port of `UnitTests/Mocks/{Mock,MockedWebRepositories,MockedDBRepositories}.swift`
 /// + `UnitTests/Mocks/Interactors/CountriesInteractorTests.swift`.
 #[cfg(test)]
 mod tests {

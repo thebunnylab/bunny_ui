@@ -1,38 +1,37 @@
-//! Identidade estrutural + posse do estado pelo runtime.
+//! Structural identity + runtime ownership of state.
 //!
-//! O cursor de render mantém o caminho até o ponto atual da árvore —
-//! wrapper de view (`CountriesList`), posição na tupla (`#0`), braço de
-//! condicional (`@First`), chave de row (`[USA]`), conteúdo de sheet
-//! (`sheet`). Esse caminho é a identidade estrutural: é nele que o estado
-//! ancora, é por ele que o estado morre, e é ele que o reconciler usa para
-//! decidir qual body re-roda.
+//! The render cursor keeps the path down to the current point of the tree —
+//! view wrapper (`CountriesList`), tuple position (`#0`), conditional arm
+//! (`@First`), row key (`[USA]`), sheet content (`sheet`). That path is the
+//! structural identity: it is where state anchors, it is what state dies
+//! by, and it is what the reconciler uses to decide which body re-runs.
 //!
-//! Papéis, uma arena:
+//! Roles, one arena:
 //!
-//! - **Âncora**: `State::new` DENTRO de um pass de render não aloca às
-//!   cegas — pergunta aqui por (escopo de construção, tipo, seq). Se a
-//!   identidade já tem o slot, o handle novo aponta para ele e o valor
-//!   inicial é descartado (o inicial só semeia o primeiro mount, como o
-//!   `@State` do Swift). Fora de render, escopo do app: aloca uma vez e
-//!   vive para sempre — o caso dos roots que o app segura.
-//! - **Dono**: cada identidade tocada num pass fica viva; ao fim do pass,
-//!   identidades do mesmo root que não apareceram são varridas — slots
-//!   liberados (geração avança: handle velho falha alto, não lê slot
-//!   reciclado), âncoras e slots de efeito removidos. Subárvores que o
-//!   reconciler PULOU (cache limpo) contam como vivas sem serem visitadas.
-//! - **Grafo de leitura**: `get()` durante render registra "esta view leu
-//!   esta dependência" — `State` (slot) ou `Store` (id). O conjunto de
-//!   leituras de uma view persiste até o próximo re-render DELA (views
-//!   puladas não perdem dependências). `set()`/`send()` marca de sujo
-//!   exatamente quem leu.
+//! - **Anchor**: `State::new` INSIDE a render pass does not allocate
+//!   blindly — it asks here for (construction scope, type, seq). If the
+//!   identity already owns the slot, the new handle points to it and the
+//!   initial value is discarded (the initial only seeds the first mount,
+//!   like Swift's `@State`). Outside render, app scope: allocate once and
+//!   live forever — the case of the roots the app holds.
+//! - **Owner**: every identity touched in a pass stays alive; at the end of
+//!   the pass, identities under the same root that did not show up are
+//!   swept — slots freed (generation advances: a stale handle fails loudly
+//!   instead of reading a recycled slot), anchors and effect slots removed.
+//!   Subtrees the reconciler SKIPPED (clean cache) count as alive without
+//!   being visited.
+//! - **Read graph**: `get()` during render records "this view read this
+//!   dependency" — `State` (slot) or `Store` (id). A view's read set
+//!   persists until ITS next re-render (skipped views do not lose
+//!   dependencies). `set()`/`send()` marks dirty exactly who read.
 //!
-//! Limite conhecido (documentado, não acidental): âncoras nascem no escopo
-//! de CONSTRUÇÃO. Closures de row e de sheet rodam durante o render — com
-//! o cursor já dentro da chave — então estado de row segue o item. Mas
-//! braços de um mesmo `body` constroem tudo no mesmo escopo: dois braços
-//! que construíssem `State` do MESMO tipo colidiriam na âncora. O motor
-//! real, com metadados de campo por view, apura isso; o fake escolhe a
-//! regra simples e verificável.
+//! Known limit (documented, not accidental): anchors are born in the
+//! CONSTRUCTION scope. Row and sheet closures run during render — with the
+//! cursor already inside the key — so row state follows the item. But arms
+//! of one same `body` build everything in the same scope: two arms that
+//! built `State` of the SAME type would collide on the anchor. The real
+//! engine, with per-view field metadata, gets this right; the fake picks
+//! the simple, verifiable rule.
 
 use std::any::TypeId;
 use std::cell::RefCell;
@@ -41,8 +40,8 @@ use std::rc::Rc;
 
 use crate::runtime::Site;
 
-/// Uma dependência observável: um `State` (pelo id global do slot, nunca
-/// reciclado) ou um `Store` inteiro (granularidade de objeto, como um
+/// An observable dependency: a `State` (by the slot's global id, never
+/// recycled) or a whole `Store` (object granularity, like an
 /// ObservableObject).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum DepKey {
@@ -53,30 +52,30 @@ pub enum DepKey {
 #[derive(Default)]
 struct Registry {
     pass_active: bool,
-    /// Primeiro segmento empurrado no pass — define o root varrido.
+    /// First segment pushed in the pass — defines the swept root.
     pass_root: Option<String>,
     path: Vec<String>,
-    /// Só os wrappers de view — o alvo do read-tracking.
+    /// Only the view wrappers — the target of read-tracking.
     views: Vec<String>,
     touched: HashSet<String>,
-    /// Fronteiras que o reconciler pulou neste pass (cache limpo): a
-    /// subárvore delas conta como viva na varredura.
+    /// Boundaries the reconciler skipped this pass (clean cache): their
+    /// subtree counts as alive in the sweep.
     skipped: HashSet<String>,
-    /// Fronteiras cujo body RODOU neste pass: dentro delas a varredura
-    /// segue a regra normal (o que não apareceu, morreu).
+    /// Boundaries whose body RAN this pass: inside them the sweep follows
+    /// the normal rule (what did not show up, died).
     reran: HashSet<String>,
-    /// Identidade → recursos que morrem com ela.
+    /// Identity → resources that die with it.
     owners: HashMap<String, OwnerRecord>,
-    /// (escopo, tipo, seq) → (índice na arena do tipo, geração, dep-id).
+    /// (scope, type, seq) → (index in the type's arena, generation, dep-id).
     anchors: HashMap<AnchorKey, (usize, u32, u64)>,
-    /// Contadores por pass: quantos `State::new` de cada tipo cada escopo já fez.
+    /// Per-pass counters: how many `State::new` of each type each scope has done.
     seqs: HashMap<(String, TypeId), u32>,
-    /// view → dependências lidas no ÚLTIMO body dela (persiste entre passes).
+    /// view → dependencies read in its LAST body (persists across passes).
     reads_by_view: HashMap<String, HashSet<DepKey>>,
-    /// índice invertido: dependência → views leitoras.
+    /// inverted index: dependency → reader views.
     readers: HashMap<DepKey, HashSet<String>>,
     dirty: HashSet<String>,
-    /// Slots de efeito por (site, escopo) — a retenção de `on_change`/`on_receive`.
+    /// Effect slots by (site, scope) — the retention behind `on_change`/`on_receive`.
     effect_cells: HashMap<(Site, String), Rc<dyn std::any::Any>>,
     next_store_id: u64,
 }
@@ -85,8 +84,8 @@ type AnchorKey = (String, TypeId, u32);
 
 #[derive(Default)]
 struct OwnerRecord {
-    /// (tipo, índice na arena do tipo) — a varredura libera via o registro
-    /// de arenas sem conhecer o tipo estaticamente.
+    /// (type, index in the type's arena) — the sweep frees through the
+    /// arena registry without knowing the type statically.
     slots: Vec<(TypeId, usize)>,
     anchors: Vec<AnchorKey>,
     effect_sites: Vec<(Site, String)>,
@@ -96,21 +95,21 @@ thread_local! {
     static REGISTRY: RefCell<Registry> = RefCell::new(Registry::default());
 }
 
-/// Escopo dos `State` criados fora de qualquer pass (roots do app).
+/// Scope of the `State`s created outside any pass (app roots).
 const APP_SCOPE: &str = "@app";
 
-/// Leituras fora de qualquer wrapper de view (a região do root — free fns,
-/// custom modifiers no topo). Essa região re-roda em todo pass, então as
-/// dependências dela zeram a cada begin.
+/// Reads outside any view wrapper (the root region — free fns, custom
+/// modifiers at the top). That region re-runs on every pass, so its
+/// dependencies reset on each begin.
 const ROOT_READER: &str = "@root";
 
 // MARK: - Pass
 
-/// Abre um pass de render: zera contadores de âncora, marca de vivos e as
-/// leituras da região do root (que sempre re-roda). As leituras das views
-/// retidas FICAM — view pulada não perde dependência. Chamado pelo
-/// `Runtime` da camada tipada — o motor espelhado nunca abre pass, então
-/// mantém a semântica antiga intacta.
+/// Opens a render pass: resets anchor counters, the alive marks and the
+/// reads of the root region (which always re-runs). The reads of retained
+/// views STAY — a skipped view does not lose dependencies. Called by the
+/// typed layer's `Runtime` — the mirrored engine never opens a pass, so it
+/// keeps the old semantics intact.
 pub fn begin_pass() {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
@@ -126,17 +125,17 @@ pub fn begin_pass() {
     });
 }
 
-/// Fecha o pass e varre. Um dono morre se: está sob o root deste pass, não
-/// foi tocado, e a fronteira retida mais próxima acima dele NÃO foi pulada
-/// (prefixo mais longo vence: sob um pulo a subárvore vive; sob um body
-/// que rodou, vale a regra normal). Devolve os caminhos mortos para o
-/// reconciler descartar as entradas retidas correspondentes.
+/// Closes the pass and sweeps. An owner dies if: it sits under this pass's
+/// root, it was not touched, and the nearest retained boundary above it was
+/// NOT skipped (longest prefix wins: under a skip the subtree lives; under
+/// a body that ran, the normal rule applies). Returns the dead paths so the
+/// reconciler can drop the matching retained entries.
 pub fn end_pass() -> Vec<String> {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         registry.pass_active = false;
-        // o root fica legível até o próximo begin_pass (o runtime consulta
-        // para escopar dirty e efeitos)
+        // the root stays readable until the next begin_pass (the runtime
+        // consults it to scope dirty state and effects)
         let Some(root) = registry.pass_root.clone() else {
             return Vec::new();
         };
@@ -173,8 +172,8 @@ pub fn end_pass() -> Vec<String> {
     })
 }
 
-/// Prefixo mais longo entre pulados e re-rodados decide: pulado protege,
-/// re-rodado (ou nenhum) deixa a regra normal valer.
+/// Longest prefix among skipped and re-run boundaries decides: skipped
+/// protects, re-run (or none) lets the normal rule apply.
 fn protected_by_skip(registry: &Registry, owner: &str) -> bool {
     let mut best_len = 0usize;
     let mut best_is_skip = false;
@@ -196,23 +195,23 @@ fn protected_by_skip(registry: &Registry, owner: &str) -> bool {
     best_is_skip
 }
 
-/// O reconciler avisa: esta fronteira foi pulada (cache limpo) — a
-/// subárvore dela conta como viva.
+/// The reconciler reports: this boundary was skipped (clean cache) — its
+/// subtree counts as alive.
 pub fn mark_skipped(path: &str) {
     REGISTRY.with(|registry| {
         registry.borrow_mut().skipped.insert(path.to_string());
     });
 }
 
-/// O reconciler avisa: o body desta fronteira rodou neste pass.
+/// The reconciler reports: this boundary's body ran this pass.
 pub fn mark_reran(path: &str) {
     REGISTRY.with(|registry| {
         registry.borrow_mut().reran.insert(path.to_string());
     });
 }
 
-/// Views sujadas por escritas desde a última drenagem — a invalidação
-/// fina, exposta para o loop de estabilidade e para os testes.
+/// Views dirtied by writes since the last drain — the fine-grained
+/// invalidation, exposed for the stability loop and for the tests.
 pub fn take_dirty() -> Vec<String> {
     REGISTRY.with(|registry| {
         let mut dirty: Vec<String> = registry.borrow_mut().dirty.drain().collect();
@@ -221,8 +220,8 @@ pub fn take_dirty() -> Vec<String> {
     })
 }
 
-/// Drena só a sujeira deste root (mais a região do root, que qualquer pass
-/// consome). Sujeira de OUTRO root fica na fila para o render dele.
+/// Drains only this root's dirt (plus the root region, which any pass
+/// consumes). Dirt from ANOTHER root stays queued for that root's render.
 pub fn take_dirty_matching(root: &str) -> Vec<String> {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
@@ -241,15 +240,16 @@ pub fn take_dirty_matching(root: &str) -> Vec<String> {
     })
 }
 
-/// Cópia dos sujos agora — o snapshot que decide o pass, sem drenar
-/// (escritas DURANTE o pass precisam sobreviver para o próximo ciclo).
+/// Copy of the dirty set right now — the snapshot that decides the pass,
+/// without draining (writes DURING the pass must survive into the next
+/// cycle).
 pub fn dirty_snapshot() -> HashSet<String> {
     REGISTRY.with(|registry| registry.borrow().dirty.clone())
 }
 
-/// Há sujeira pendente deste root? Espia sem drenar — a condição de
-/// estabilidade usa isto; quem CONSOME sujeira é o pass de render
-/// (snapshot + consume), nunca o loop.
+/// Is there pending dirt for this root? Peeks without draining — the
+/// stability condition uses this; who CONSUMES dirt is the render pass
+/// (snapshot + consume), never the loop.
 pub fn has_dirty_matching(root: &str) -> bool {
     REGISTRY.with(|registry| {
         let registry = registry.borrow();
@@ -261,9 +261,10 @@ pub fn has_dirty_matching(root: &str) -> bool {
     })
 }
 
-/// Fim do pass: consome do registro a sujeira que este pass atendeu — a
-/// interseção do snapshot com o root (e a região do root). O que veio de
-/// escritas durante o render fica; o que é de outro root fica.
+/// End of the pass: consumes from the registry the dirt this pass served —
+/// the intersection of the snapshot with the root (and the root region).
+/// What came from writes during render stays; what belongs to another root
+/// stays.
 pub fn consume_dirty(root: &str, snapshot: &HashSet<String>) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
@@ -276,19 +277,19 @@ pub fn consume_dirty(root: &str, snapshot: &HashSet<String>) {
     });
 }
 
-/// O primeiro segmento empurrado no pass corrente (ou no último encerrado).
+/// The first segment pushed in the current pass (or in the last one closed).
 pub fn current_pass_root() -> Option<String> {
     REGISTRY.with(|registry| registry.borrow().pass_root.clone())
 }
 
-/// Os segmentos do cursor agora — a entry retida guarda o caminho do pai
-/// para semear re-runs isolados.
+/// The cursor's segments right now — the retained entry stores the parent
+/// path to seed isolated re-runs.
 pub fn current_path_segments() -> Vec<String> {
     REGISTRY.with(|registry| registry.borrow().path.clone())
 }
 
-/// O caminho completo do cursor agora (`None` fora de pass) — a chave com
-/// que nós interativos registram suas ações.
+/// The cursor's full path right now (`None` outside a pass) — the key
+/// interactive nodes register their actions under.
 pub fn cursor_scope() -> Option<String> {
     REGISTRY.with(|registry| {
         let registry = registry.borrow();
@@ -298,8 +299,8 @@ pub fn cursor_scope() -> Option<String> {
 
 // MARK: - Cursor
 
-/// Um degrau do cursor — solta no drop, então o caminho sobrevive a early
-/// returns e panics de debug_assert.
+/// One step of the cursor — released on drop, so the path survives early
+/// returns and debug_assert panics.
 pub struct Frame {
     pops_view: bool,
     active: bool,
@@ -339,26 +340,27 @@ fn push(segment: String, is_view: bool) -> Frame {
     })
 }
 
-/// Desce um degrau estrutural: posição de tupla (`#0`), braço (`@First`),
-/// chave de row (`[USA]`), conteúdo de sheet (`sheet`).
+/// Steps down one structural level: tuple position (`#0`), arm (`@First`),
+/// row key (`[USA]`), sheet content (`sheet`).
 pub fn enter(segment: impl Into<String>) -> Frame {
     push(segment.into(), false)
 }
 
-/// Desce no wrapper de uma view (`Component`) — além do caminho, entra na
-/// pilha de views que o read-tracking usa como alvo.
+/// Steps down into a view's wrapper (`Component`) — besides the path, it
+/// enters the view stack that read-tracking uses as its target.
 pub fn enter_view(name: impl Into<String>) -> Frame {
     push(name.into(), true)
 }
 
-/// O caminho da view mais interna em render — a chave do reconciler.
+/// The path of the innermost view being rendered — the reconciler's key.
 pub fn current_view_path() -> Option<String> {
     REGISTRY.with(|registry| registry.borrow().views.last().cloned())
 }
 
-/// Re-semeia o cursor com o caminho do PAI de uma fronteira retida, para o
-/// reconciler re-rodar um body isolado (view suja atrás de pai pulado) com
-/// âncoras e identidades corretas. Os frames devolvidos desfazem no drop.
+/// Re-seeds the cursor with the PARENT path of a retained boundary, so the
+/// reconciler can re-run one body in isolation (dirty view behind a skipped
+/// parent) with correct anchors and identities. The returned frames undo on
+/// drop.
 pub fn seed(segments: &[String]) -> Vec<Frame> {
     segments.iter().map(|segment| enter(segment.clone())).collect()
 }
@@ -371,13 +373,13 @@ fn current_scope(registry: &Registry) -> String {
     }
 }
 
-// MARK: - Âncoras de estado
+// MARK: - State anchors
 
-/// O que `State::new` recebe de volta ao declarar estado.
+/// What `State::new` gets back when declaring state.
 pub(crate) enum Claim {
-    /// A identidade já tem esse estado: reusa o slot, descarta o inicial.
+    /// The identity already owns this state: reuse the slot, discard the initial.
     Existing { index: usize, generation: u32, dep: u64 },
-    /// Primeiro mount (ou escopo do app): aloca e registra com o token.
+    /// First mount (or app scope): allocate and register with the token.
     Fresh(AnchorToken),
 }
 
@@ -408,7 +410,7 @@ pub(crate) fn claim_anchor(type_id: TypeId) -> Claim {
 
 pub(crate) fn fulfill_anchor(token: AnchorToken, index: usize, generation: u32, dep: u64) {
     let Some(key) = token.key else {
-        return; // escopo do app: sem âncora, sem dono, vive para sempre
+        return; // app scope: no anchor, no owner, lives forever
     };
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
@@ -419,10 +421,10 @@ pub(crate) fn fulfill_anchor(token: AnchorToken, index: usize, generation: u32, 
     });
 }
 
-// MARK: - Grafo de leitura
+// MARK: - Read graph
 
-/// O body desta view vai (re)rodar: as leituras antigas dela caem — o
-/// conjunto novo é o que o body registrar agora.
+/// This view's body is about to (re)run: its old reads fall away — the new
+/// set is whatever the body records now.
 pub fn begin_view_reads(view: &str) {
     REGISTRY.with(|registry| {
         clear_view_reads(&mut registry.borrow_mut(), view);
@@ -477,12 +479,12 @@ pub(crate) fn next_store_id() -> u64 {
     })
 }
 
-// MARK: - Slots de efeito por identidade
+// MARK: - Per-identity effect slots
 
-/// O slot de `on_change`/`on_receive`, chaveado por (site, escopo atual):
-/// duas instâncias da mesma view no mesmo callsite têm slots separados, e
-/// o slot morre com a identidade. Fora de pass cai no escopo do app — o
-/// comportamento global de antes.
+/// The `on_change`/`on_receive` slot, keyed by (site, current scope): two
+/// instances of the same view at the same callsite get separate slots, and
+/// the slot dies with the identity. Outside a pass it falls back to the app
+/// scope — the global behavior from before.
 pub fn scoped_effect_slot<V: 'static>(site: impl Into<Site>) -> Rc<RefCell<Option<V>>> {
     let site = site.into();
     REGISTRY.with(|registry| {

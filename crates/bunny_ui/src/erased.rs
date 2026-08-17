@@ -1,9 +1,9 @@
-//! A borda apagada — onde o dinamismo é de verdade.
+//! The erased boundary — where the dynamism is real.
 //!
-//! `Erased` é o `AnyView` desta camada, mas existe em exatamente dois
-//! lugares: o conteúdo de uma `.sheet` (closure que monta view só quando
-//! apresentada — `Fn() -> impl View` não se escreve) e o `content:` de um
-//! [`CustomModifier`]. Todo o resto da árvore é tipada.
+//! `Erased` is this layer's `AnyView`, but it exists in exactly two
+//! places: the content of a `.sheet` (a closure that mounts the view
+//! only when presented — `Fn() -> impl View` cannot be written) and the
+//! `content:` of a [`CustomModifier`]. All the rest of the tree is typed.
 
 use std::rc::Rc;
 
@@ -21,10 +21,10 @@ impl<V: View> ErasedDyn for V {
     }
 }
 
-/// Type erasure sobre a árvore tipada — um `Rc` por borda, não por nó.
-/// Só apaga views de um nó (`Arity = Single`): o apagamento não pode
-/// esconder aridade, senão `.blur(…)` num `content:` apagado voltaria a
-/// decorar o nó errado.
+/// Type erasure over the typed tree — one `Rc` per boundary, not per
+/// node. Only erases one-node views (`Arity = Single`): erasure cannot
+/// hide arity, or `.blur(…)` on an erased `content:` would go back to
+/// decorating the wrong node.
 #[derive(Clone)]
 pub struct Erased(Rc<dyn ErasedDyn>);
 
@@ -42,15 +42,16 @@ impl View for Erased {
     }
 }
 
-/// Apaga uma view para atravessar uma borda dinâmica (o `AnyView::new`
-/// com cara de construtor comum — fim das closures de sheet).
+/// Erases a view to cross a dynamic boundary (the `AnyView::new` that
+/// looks like an ordinary constructor — how sheet closures end).
 pub fn erased<V: View<Arity = Single>>(view: V) -> Erased {
     Erased::new(view)
 }
 
-/// `ViewModifier` / `EnvironmentalModifier` — o `func body(content:)` do
-/// Swift, re-aplicado a cada render (é o que faz o `blur(radius:)` do
-/// `RootViewAppearance` recomputar quando o `isActive` anda).
+/// `ViewModifier` / `EnvironmentalModifier` — Swift's
+/// `func body(content:)`, re-applied on every render (it is what makes
+/// `RootViewAppearance`'s `blur(radius:)` recompute when `isActive`
+/// moves).
 pub trait CustomModifier {
     fn name(&self) -> String;
     fn apply(&self, ctx: &Context, content: Erased) -> Erased;

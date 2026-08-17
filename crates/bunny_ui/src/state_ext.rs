@@ -1,14 +1,15 @@
-//! `wrappedValue` com cara de Rust — `state.get()` / `binding.get()`.
+//! `wrappedValue` that looks like Rust — `state.get()` / `binding.get()`.
 
 use motor::state::{Binding, State};
 
-/// `State<T>::get()` — o `wrappedValue` do `@State`.
+/// `State<T>::get()` — the `wrappedValue` of `@State`.
 pub trait StateExt<T: Clone + 'static> {
     fn get(&self) -> T;
 
-    /// `state.add(1)` — o `+=` que funciona dentro de closures `Fn`: a
-    /// mutação é interior, o handle nem precisa de `&mut`. (Um `+=`
-    /// literal exigiria `FnMut` e não compilaria num `button(…)`.)
+    /// `state.add(1)` — the `+=` that works inside `Fn` closures: the
+    /// mutation is interior, the handle does not even need `&mut`. (A
+    /// literal `+=` would demand `FnMut` and would not compile in a
+    /// `button(…)`.)
     fn add(&self, delta: T)
     where
         T: std::ops::AddAssign<T>;
@@ -27,7 +28,7 @@ impl<T: Clone + 'static> StateExt<T> for State<T> {
     }
 }
 
-/// `Binding<T>::get()` — o `wrappedValue` do `@Binding`/`$x`.
+/// `Binding<T>::get()` — the `wrappedValue` of `@Binding`/`$x`.
 pub trait BindingExt<T: Clone + 'static> {
     fn get(&self) -> T;
 }

@@ -41,8 +41,9 @@ impl AppEnvironment {
     pub fn bootstrap() -> AppEnvironment {
         let appState = Store::<AppState>::new(AppState::default());
         /*
-         To see the deep linking in action (no fake do Swift era o simulador +
-         "push_with_deeplink.apns"; aqui disparamos o deep link direto):
+         To see the deep linking in action (in the Swift original it was the
+         simulator + "push_with_deeplink.apns"; here we fire the deep link
+         directly):
 
              deepLinksHandler.open(deepLink: .showCountryFlag(alpha3Code: "AFG"))
         */
@@ -73,9 +74,9 @@ impl AppEnvironment {
 
 /// `extension AppEnvironment { private static func … }`
 impl AppEnvironment {
-    /// `configuredURLSession()` — `URLSessionConfiguration.default` com
-    /// timeouts etc; no fake a "rede" é o `MockUrlSession` servindo o
-    /// `MockedData` (o pipeline de decode roda de verdade).
+    /// `configuredURLSession()` — `URLSessionConfiguration.default` with
+    /// timeouts etc.; in the fake the "network" is the `MockUrlSession`
+    /// serving the `MockedData` (the decode pipeline runs for real).
     fn configuredURLSession() -> Rc<dyn UrlSession> {
         Rc::new(MockUrlSession)
     }
@@ -112,7 +113,7 @@ impl AppEnvironment {
         ));
         let userPermissions = Rc::new(RealUserPermissionsInteractor::new(
             appState.clone(),
-            // UIApplication.shared.open(openSettingsURLString) — no-op headless
+            // UIApplication.shared.open(openSettingsURLString) — headless no-op
             Rc::new(|| {}),
         ));
         Interactors { images, countries, userPermissions }

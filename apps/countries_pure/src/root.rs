@@ -1,15 +1,15 @@
 //
 //  CountriesApp.swift (rootView) — countries-pure
 //
-//  `extension AppEnvironment { var rootView: some View }` vira uma free fn:
-//  aqui não há macro para espelhar a sintaxe, e a orphan rule nem precisa
-//  ser driblada. O `if app.isRunningTests` do `@ViewBuilder` é o
-//  `Either` (_ConditionalContent); o `if isStub` vira `Option` na tupla.
+//  `extension AppEnvironment { var rootView: some View }` becomes a free fn:
+//  there is no macro here to mirror the syntax, and the orphan rule does not
+//  even need dodging. The `@ViewBuilder`'s `if app.isRunningTests` is the
+//  `Either` (_ConditionalContent); the `if isStub` becomes an `Option` in the tuple.
 //
-//  O handler de `attachEnvironmentOverrides(onChange:)` do Swift existe
-//  para resetar o ViewRouting quando locale/sizeCategory mudam — no port
-//  headless o modifier é inert e ninguém dispara o handler, então ele não
-//  aparece.
+//  Swift's `attachEnvironmentOverrides(onChange:)` handler exists to reset
+//  the ViewRouting when locale/sizeCategory change — in the headless port
+//  the modifier is inert and nobody fires the handler, so it does not
+//  appear.
 //
 
 use countries_core::DependencyInjection::AppEnvironment::AppEnvironment;

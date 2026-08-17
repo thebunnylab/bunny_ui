@@ -1,10 +1,10 @@
 //
 //  CountryCell.swift — CountriesSwiftUI
 //
-//  Desvios do port (documentados):
-//  - `LocaleReader` não existe aqui: views leem o locale direto do `ctx` —
-//    o container do Swift servia para reach de fora da view.
-//  - `Inspection` (ViewInspector) fica de fora — a demo headless inspeciona.
+//  Port deviations (documented):
+//  - `LocaleReader` does not exist here: views read the locale straight from
+//    the `ctx` — the Swift container was there for reach from outside the view.
+//  - `Inspection` (ViewInspector) stays out — the headless demo inspects.
 //
 
 use countries_core::Repositories::Models::DBModel;

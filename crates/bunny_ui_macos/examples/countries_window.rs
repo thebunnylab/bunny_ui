@@ -1,13 +1,13 @@
-//! O CountriesSwiftUI de verdade numa janela nativa — lista com texto da
-//! plataforma e rolagem real:
+//! The real CountriesSwiftUI in a native window — a list with platform
+//! text and real scrolling:
 //!
 //! ```sh
 //! cargo run -p bunny-ui-macos --example countries_window
 //! ```
 //!
-//! Limitações desta fase (anotadas, não escondidas): `navigation_link`
-//! ainda não monta destino (clicar numa row não navega); `.searchable`/
-//! `.refreshable`/`.toolbar` são inertes; imagens são caixas 40×40.
+//! Limitations of this phase (noted, not hidden): `navigation_link` does
+//! not mount a destination yet (clicking a row does not navigate);
+//! `.searchable`/`.refreshable`/`.toolbar` are inert; images are 40×40 boxes.
 
 use std::rc::Rc;
 
@@ -18,7 +18,7 @@ use countries_core::DependencyInjection::AppEnvironment::AppEnvironment;
 use countries_pure::root_view;
 
 fn main() {
-    // mesma ordem de montagem da demo headless
+    // same assembly order as the headless demo
     let app = AppEnvironment::bootstrap();
     let mut environment = EnvironmentValues::default();
     environment.locale = Locale::new("en");
@@ -27,8 +27,8 @@ fn main() {
     let ctx = runtime.context();
     let root = root_view(&app, &ctx);
 
-    // a cena ativa antes do primeiro frame (blur → 0, push resolve) — o
-    // hook real de applicationDidBecomeActive é etapa de lifecycle futura
+    // the scene activates before the first frame (blur → 0, push resolves)
+    // — the real applicationDidBecomeActive hook is a future lifecycle step
     app.systemEventsHandler.sceneDidBecomeActive();
 
     bunny_ui_macos::run_window_with(

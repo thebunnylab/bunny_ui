@@ -1,17 +1,17 @@
-//! Modificadores de view — o enum fechado no lugar do `Rc<dyn>` do motor.
+//! View modifiers — the closed enum in place of the engine's `Rc<dyn>`.
 //!
-//! `Modifier` é um enum nosso (o conjunto é fechado por construção), então
-//! `.font(.title)` não aloca nada: a variante mora inline no
-//! [`Modified<C>`] e o dispatch é um jump table. As strings do `[.…]`
-//! impresso são computadas no render, a partir da variante.
+//! `Modifier` is our own enum (the set is closed by construction), so
+//! `.font(.title)` allocates nothing: the variant lives inline in
+//! [`Modified<C>`] and dispatch is a jump table. The strings of the
+//! printed `[.…]` are computed at render, from the variant.
 //!
-//! Os behaviors (`onAppear`, efeitos, `sheet`, `EnvSet`, `Custom`) carregam
-//! closures `Rc<dyn Fn>` — são as bordas de dinamismo declaradas: a fila de
-//! efeitos e o conteúdo de sheet são heterogêneos por natureza.
+//! The behaviors (`onAppear`, effects, `sheet`, `EnvSet`, `Custom`) carry
+//! `Rc<dyn Fn>` closures — they are the declared borders of dynamism: the
+//! effect queue and sheet content are heterogeneous by nature.
 //!
-//! `Modified<C>` exige `C: View<Arity = Single>`: decorar uma tupla crua
-//! (`(a, b).padding()`) aplicaria o modifier só no último nó — então não
-//! compila. Quem quer decorar um grupo usa [`tuple`], que tem nó próprio.
+//! `Modified<C>` demands `C: View<Arity = Single>`: decorating a raw tuple
+//! (`(a, b).padding()`) would apply the modifier only to the last node — so
+//! it does not compile. To decorate a group, use [`tuple`], which has its own node.
 //!
 //! [`tuple`]: crate::views::tuple
 
@@ -31,7 +31,7 @@ use motor::views::{ContentMode, Edge, Font, ListStyle, ProgressViewStyle, TextAl
 /// Every modifier in the UI layer, as data.
 #[derive(Clone)]
 pub enum Modifier {
-    // MARK: - Formatação (inert)
+    // MARK: - Formatting (inert)
     Font(Font),
     Bold,
     Padding,
@@ -53,7 +53,7 @@ pub enum Modifier {
     Hidden,
     Equatable,
 
-    // MARK: - Visuais (dados puros → `Styled` na cena)
+    // MARK: - Visuals (pure data → `Styled` in the scene)
     BackgroundColor(Color),
     ForegroundColor(Color),
     Border(Color, f64),
@@ -64,23 +64,23 @@ pub enum Modifier {
     Highlight(Rc<Vec<(usize, usize)>>, Color),
     TruncationMode(Truncation),
 
-    // MARK: - Interação real (alvo de ponteiro sem chrome — o Button sem
-    // a roupa; a ação dispara no up-inside como a dele)
+    // MARK: - Real interaction (a pointer target without chrome — the Button
+    // without the outfit; the action fires on up-inside like the Button's)
     OnClick(Rc<dyn Fn()>),
     OnAction(crate::action::ActionId, Rc<dyn Fn()>),
 
-    // MARK: - Interação (a ação dispara no render, como no motor headless)
+    // MARK: - Interaction (the action fires at render, as in the headless engine)
     OnAppear(Rc<dyn Fn()>),
     OnTapGesture(Rc<dyn Fn()>),
 
-    // MARK: - Efeitos (onChange / onReceive / query — drenados pelo pump)
+    // MARK: - Effects (onChange / onReceive / query — drained by the pump)
     Effect {
         name: &'static str,
         detail: &'static str,
         effect: EffectFn,
     },
 
-    // MARK: - Bordas dinâmicas
+    // MARK: - Dynamic borders
     Sheet {
         is_presented: Binding<bool>,
         content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
@@ -92,7 +92,7 @@ pub enum Modifier {
     },
     Custom(Rc<dyn CustomModifier>),
 
-    // MARK: - Paridade inert
+    // MARK: - Inert parity
     Searchable,
     Refreshable,
     Toolbar,
@@ -103,7 +103,7 @@ pub enum Modifier {
 }
 
 impl Modifier {
-    /// O `[.name(detail)]` appendo à linha do nó renderizado.
+    /// The `[.name(detail)]` appended to the rendered node's line.
     fn suffix(&self) -> String {
         match self {
             Modifier::Font(font) => format!(" [.font({font})]"),
@@ -168,17 +168,17 @@ impl Modifier {
     }
 }
 
-/// Regra de merge dos modifiers visuais: estilos empilhados na MESMA view
-/// fundem num único `Styled` — campo em conflito, o modifier mais PRÓXIMO
-/// da view vence; campos distintos se acumulam
-/// (`.background_color(a).corner_radius(r)` = UM nó, e o raio arredonda
-/// ESTE fundo). Véu sobre véu na mesma view não compõe — camadas são do
-/// `zstack`. O merge só acontece com `Styled` literal no topo:
-/// `.background_color(a).padding().background_color(b)` aninha de verdade
-/// (geometrias diferentes, os dois pintam).
-/// Reescreve o nó de TEXTO sob a cadeia de `Styled` (se houver) — o
-/// caminho de `.highlight()`/`.truncationMode()`, imunes à ordem dos
-/// modifiers visuais na cadeia.
+/// Merge rule for the visual modifiers: styles stacked on the SAME view
+/// fuse into a single `Styled` — on a conflicting field, the modifier
+/// NEAREST the view wins; distinct fields accumulate
+/// (`.background_color(a).corner_radius(r)` = ONE node, and the radius
+/// rounds THIS background). Veil over veil on the same view does not compose
+/// — layers belong to `zstack`. The merge only happens with a literal
+/// `Styled` on top: `.background_color(a).padding().background_color(b)`
+/// truly nests (different geometries, both paint).
+/// Rewrites the TEXT node under the `Styled` chain (if any) — the
+/// `.highlight()`/`.truncationMode()` path, immune to the order of the
+/// visual modifiers in the chain.
 fn rewrite_text_node(
     node: LayoutNode,
     rewrite: &impl Fn(
@@ -208,7 +208,7 @@ fn wrap_styled(out: &mut NodeList, delta: VisualProps) {
     });
 }
 
-/// A view modificada — `ModifiedContent` do Swift com o modifier inline.
+/// The modified view — Swift's `ModifiedContent` with the modifier inline.
 #[derive(Clone)]
 pub struct Modified<C> {
     pub(crate) base: C,
@@ -219,8 +219,8 @@ impl<C: View<Arity = Single>> View for Modified<C> {
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
-        // `.modifier(…)` re-renderiza através do body(content:) do próprio
-        // custom modifier, e marca o nó — é o caminho do blur recomputável.
+        // `.modifier(…)` re-renders through the custom modifier's own
+        // body(content:), and marks the node — the recomputable blur path.
         if let Modifier::Custom(custom) = &self.modifier {
             let applied = custom.apply(ctx, crate::erased::erased(self.base.clone()));
             let mut nodes = NodeList::new();
@@ -233,7 +233,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             return;
         }
 
-        // `.inject()` / `.modelContainer()` regam a subárvore.
+        // `.inject()` / `.modelContainer()` water the subtree.
         let mut base_ctx = ctx.clone();
         if let Modifier::EnvSet { set, .. } = &self.modifier {
             set(&mut base_ctx.values);
@@ -244,8 +244,8 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         match &self.modifier {
             Modifier::OnAppear(action) | Modifier::OnTapGesture(action) => action(),
             Modifier::Effect { effect, .. } => {
-                // O efeito vê o environment da subárvore — o pump só tem o
-                // ctx do root em mãos.
+                // The effect sees the subtree's environment — the pump only
+                // has the root ctx at hand.
                 let effect = effect.clone();
                 let subtree_ctx = base_ctx.clone();
                 crate::effects::push(Rc::new(move |_: &Context| effect(&subtree_ctx)));
@@ -256,8 +256,8 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             } if is_presented.get() => {
                 let mut sheet_nodes = NodeList::new();
                 {
-                    // A sheet é uma sub-raiz com identidade própria: o que a
-                    // closure constrói ancora aqui e morre quando ela fecha.
+                    // The sheet is a sub-root with its own identity: what the
+                    // closure builds anchors here and dies when it closes.
                     let _frame = motor::identity::enter("sheet");
                     content(ctx).render_into(ctx, &mut sheet_nodes);
                 }
@@ -266,7 +266,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     node.children
                         .push(RenderNode::branch("Sheet", sheet_prints));
                 }
-                // no layout, a sheet sobrepõe a base
+                // in layout, the sheet overlays the base
                 out.wrap_last_layout(|base| LayoutNode::Layered {
                     children: vec![base, wrap_layout(sheet_layouts)],
                 });
@@ -274,8 +274,8 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             _ => {}
         }
 
-        // modifiers de LAYOUT embrulham o nó da base — é aqui que a cadeia
-        // tipada vira estrutura de proposta/resposta
+        // LAYOUT modifiers wrap the base's node — this is where the typed
+        // chain becomes proposal/response structure
         match &self.modifier {
             Modifier::Padding => out.wrap_last_layout(|node| LayoutNode::Padding {
                 edges: Edges::uniform(16.0),
@@ -339,8 +339,8 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 out,
                 VisualProps { corner_radius: Some(*radius), ..VisualProps::default() },
             ),
-            // fonte é propriedade herdada da cena — o mesmo Styled dos
-            // visuais carrega o patch (o measure aplica por cima do env)
+            // font is an inherited scene property — the same Styled as the
+            // visuals carries the patch (measure applies it on top of the env)
             Modifier::Font(font) => wrap_styled(
                 out,
                 VisualProps {
@@ -370,10 +370,10 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 out,
                 VisualProps { background_pressed: Some(*color), ..VisualProps::default() },
             ),
-            // os dois abaixo reescrevem o NÓ DE TEXTO, descendo através de
-            // `Styled` (`.font()`/`.foreground_color()` antes ou depois, a
-            // ordem não importa) — em não-texto são no-op de propósito
-            // (paridade SwiftUI: truncationMode fora de texto não faz nada)
+            // the two below rewrite the TEXT NODE, descending through
+            // `Styled` (`.font()`/`.foreground_color()` before or after, the
+            // order does not matter) — on non-text they are no-ops on purpose
+            // (SwiftUI parity: truncationMode outside text does nothing)
             Modifier::Highlight(ranges, color) => out.wrap_last_layout(|node| {
                 rewrite_text_node(node, &|content, _, truncation| LayoutNode::Text {
                     content,
@@ -389,8 +389,8 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 })
             }),
             Modifier::OnClick(action) => {
-                // o mesmo registro do Button: ação retida no reconciler,
-                // frame no hit-test pela identidade do cursor
+                // the same registration as the Button: action retained in the
+                // reconciler, frame in the hit-test under the cursor identity
                 if let Some(path) = motor::identity::cursor_scope() {
                     crate::reconciler::attribute_action(path.clone(), action.clone());
                     out.wrap_last_layout(|node| LayoutNode::Interactive {
@@ -400,8 +400,8 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 }
             }
             Modifier::OnAction(id, handler) => {
-                // registro puro: nada de alvo de ponteiro nem nó de layout
-                // — a ação chega por dispatch (teclado), não por hit-test
+                // pure registration: no pointer target, no layout node
+                // — the action arrives by dispatch (keyboard), not hit-test
                 if let Some(path) = motor::identity::cursor_scope() {
                     crate::reconciler::attribute_handler(path, *id, handler.clone());
                 }
@@ -410,7 +410,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         }
 
         if let Some(node) = out.last_mut() {
-            // frame não imprime: o sufixo nem é formatado
+            // frame does not print: the suffix is not even formatted
             if crate::view::print_enabled() {
                 node.line.push_str(&self.modifier.suffix());
             }

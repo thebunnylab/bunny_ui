@@ -9,9 +9,9 @@ use crate::Repositories::Models::{AppSchema, DBModel};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// O storage por modelo (`Mutex<Vec<T>>` virou `RefCell<Vec<T>>` —
-/// single-thread como o `@MainActor` do app). `countries` fica num `Rc`
-/// próprio porque é o que o `Query<DBModel.Country>` do runtime lê via
+/// The per-model storage (`Mutex<Vec<T>>` became `RefCell<Vec<T>>` —
+/// single-thread like the app's `@MainActor`). `countries` sits in its own
+/// `Rc` because it is what the runtime's `Query<DBModel.Country>` reads via
 /// `ProvidesQueries`.
 #[derive(Default)]
 pub struct DBStorage {
@@ -20,10 +20,10 @@ pub struct DBStorage {
     pub currencies: Vec<DBModel::Currency>,
 }
 
-/// `ModelContainer` fake (SwiftData) — in-memory, um storage compartilhado.
+/// Fake `ModelContainer` (SwiftData) — in-memory, one shared storage.
 #[derive(Clone)]
 pub struct ModelContainer {
-    /// `configurations.first?.name` (só para o `isStub`)
+    /// `configurations.first?.name` (only for `isStub`)
     pub name: Option<String>,
     pub schema: AppSchema::Schema,
     storage: Rc<RefCell<DBStorage>>,
@@ -56,7 +56,7 @@ impl ModelContainer {
     }
 }
 
-/// `FetchDescriptor(predicate: #Predicate { … })` — closure no lugar do macro.
+/// `FetchDescriptor(predicate: #Predicate { … })` — a closure in place of the macro.
 pub struct FetchDescriptor<T> {
     pub predicate: Box<dyn Fn(&T) -> bool>,
 }
@@ -67,7 +67,7 @@ impl<T> FetchDescriptor<T> {
     }
 }
 
-/// `ModelContext` fake — fetch/insert/transaction direto no storage.
+/// Fake `ModelContext` — fetch/insert/transaction straight on the storage.
 #[derive(Clone)]
 pub struct ModelContext {
     storage: Rc<RefCell<DBStorage>>,
@@ -122,8 +122,8 @@ impl ModelContext {
     }
 }
 
-/// `@ModelActor final actor MainDBRepository { }` — o "ator" virou um struct
-/// com o container (tudo roda na thread única do app).
+/// `@ModelActor final actor MainDBRepository { }` — the "actor" became a struct
+/// holding the container (everything runs on the app's single thread).
 pub struct MainDBRepository {
     pub modelContainer: ModelContainer,
     pub modelContext: ModelContext,
@@ -137,8 +137,8 @@ impl MainDBRepository {
     }
 }
 
-/// `.modelContainer(container)` — expõe o storage de cada modelo para o
-/// `Query<T>` do runtime (chaveado por `type_name::<T>()`).
+/// `.modelContainer(container)` — exposes each model's storage to the
+/// runtime's `Query<T>` (keyed by `type_name::<T>()`).
 impl motor::state::ProvidesQueries for ModelContainer {
     fn querySource(&self) -> Rc<dyn Fn(&'static str) -> Option<Rc<dyn std::any::Any>>> {
         let countries = self.storage().borrow().countries.clone();

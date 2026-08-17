@@ -1,5 +1,5 @@
 //  Foundation (fake) — URL / URLComponents / UIImage / NotificationCenter,
-//  o bastante para as views e os handlers de Core.
+//  just enough for the views and the Core handlers.
 //
 
 use motor::combine::PassthroughSubject;
@@ -11,7 +11,7 @@ pub struct URL {
 }
 
 impl URL {
-    /// `URL(string:)` — aceita tudo (sem validação real).
+    /// `URL(string:)` — accepts anything (no real validation).
     pub fn new(string: String) -> Option<URL> {
         Some(URL { absoluteString: string })
     }
@@ -24,7 +24,7 @@ pub struct URLQueryItem {
     pub value: Option<String>,
 }
 
-/// `Foundation.URLComponents` (o suficiente: host + query)
+/// `Foundation.URLComponents` (just enough: host + query)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct URLComponents {
     pub host: Option<String>,
@@ -75,9 +75,9 @@ pub enum UIBackgroundFetchResult {
     Failed,
 }
 
-/// `Foundation.NotificationCenter.default` (fake) — só o teclado interessa.
-/// `keyboardWillShowNotification`/`keyboardWillHideNotification` colapsam num
-/// único subject de altura (hide envia 0), como o `Publishers.Merge` do Swift.
+/// `Foundation.NotificationCenter.default` (fake) — only the keyboard matters.
+/// `keyboardWillShowNotification`/`keyboardWillHideNotification` collapse into
+/// a single height subject (hide sends 0), like Swift's `Publishers.Merge`.
 pub struct NotificationCenter;
 
 thread_local! {
@@ -95,8 +95,8 @@ impl NotificationCenter {
         KEYBOARD_HEIGHT.with(|subject| subject.clone())
     }
 
-    /// Simula `keyboardWillShowNotification` (height) ou
-    /// `keyboardWillHideNotification` (0) chegando do UIKit.
+    /// Simulates `keyboardWillShowNotification` (height) or
+    /// `keyboardWillHideNotification` (0) arriving from UIKit.
     pub fn postKeyboardHeight(&self, height: f64) {
         KEYBOARD_HEIGHT.with(|subject| subject.send(height));
     }

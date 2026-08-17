@@ -1,17 +1,18 @@
-//! A borda plugável de texto — medição e raster de UMA linha.
+//! The pluggable text boundary — measurement and raster of ONE line.
 //!
-//! O layout é sempre nosso, em todos os alvos; o que a plataforma empresta
-//! é a MEDIÇÃO e o desenho dos glifos: a fonte pixel da casa no headless,
-//! CoreText no Mac, `measureText`/DOM na web um dia. Nenhuma API de
-//! componente sabe qual engine está ativo — [`TextEngine`] é a única
-//! porta (uma borda declarada: `Rc<dyn TextEngine>` no `Runtime`).
+//! Layout is always ours, on every target; what the platform lends is
+//! the MEASUREMENT and the drawing of glyphs: the house pixel font in
+//! headless, CoreText on the Mac, `measureText`/DOM on the web one day.
+//! No component API knows which engine is active — [`TextEngine`] is the
+//! only door (a declared boundary: `Rc<dyn TextEngine>` in the `Runtime`).
 //!
-//! O [`MeasureCache`] envelhece por passada: um hit rejuvenesce a
-//! entrada, e quem fica [`CACHE_KEEP_FRAMES`] passadas sem uso cai —
-//! digitar ALTERNA conteúdo (backspace restaura, filtro esconde e
-//! revela), e shaping não se re-paga por um frame de ausência. Nota para o sistema de wrap real (shape separado de
-//! quebra, cache em 2 níveis): a chave GANHA o modo da sondagem — cache de
-//! linha envenenado por proposta é bug clássico.
+//! The [`MeasureCache`] ages per pass: a hit rejuvenates the entry, and
+//! whatever sits [`CACHE_KEEP_FRAMES`] passes without use falls out —
+//! typing ALTERNATES content (backspace restores, a filter hides and
+//! reveals), and shaping does not re-pay itself for one frame of absence.
+//! Note for the real wrap system (shape separate from breaking, 2-level
+//! cache): the key GAINS the probing mode — a line cache poisoned by a
+//! proposal is a classic bug.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -28,14 +29,14 @@ pub enum Weight {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FontDesign {
-    /// A fonte de interface do sistema.
+    /// The system interface font.
     Default,
-    /// Monoespaçada — cidadã de primeira classe (grades de código).
+    /// Monospaced — a first-class citizen (code grids).
     Mono,
 }
 
-/// Fonte resolvida — o que o layout carrega e o engine consome. `size` é
-/// fracionário por contrato (10.5px é caso real de UI densa).
+/// A resolved font — what the layout carries and the engine consumes.
+/// `size` is fractional by contract (10.5px is a real dense-UI case).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct FontSpec {
     pub size: Px,
@@ -47,7 +48,7 @@ impl FontSpec {
     pub const DEFAULT: FontSpec =
         FontSpec { size: 13.0, weight: Weight::Regular, design: FontDesign::Default };
 
-    /// Os estilos de texto da API, em métricas de desktop.
+    /// The API text styles, in desktop metrics.
     pub fn resolve(font: motor::views::Font) -> FontSpec {
         use motor::views::Font;
         let (size, weight) = match font {
@@ -64,8 +65,8 @@ impl FontSpec {
         FontSpec { size, weight, design: FontDesign::Default }
     }
 
-    /// A chave hasheável (f64 não é `Eq`): tamanho quantizado em milésimos
-    /// de ponto — nenhum uso real distingue menos que isso.
+    /// The hashable key (f64 is not `Eq`): size quantized in thousandths
+    /// of a point — no real use distinguishes less than that.
     pub fn key(&self) -> FontKey {
         FontKey {
             size_milli: (self.size * 1000.0).round() as u32,
@@ -75,7 +76,7 @@ impl FontSpec {
     }
 }
 
-/// A identidade de cache/fonte de um [`FontSpec`].
+/// The cache/font identity of a [`FontSpec`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FontKey {
     size_milli: u32,
@@ -83,9 +84,9 @@ pub struct FontKey {
     design: FontDesign,
 }
 
-/// Patch parcial de fonte para a herança: `.font(…)` seta os três campos;
-/// `.bold()` só o peso; `.monospaced()` só o design — cada um aplica por
-/// cima do herdado, campo a campo.
+/// A partial font patch for inheritance: `.font(…)` sets all three
+/// fields; `.bold()` only the weight; `.monospaced()` only the design —
+/// each one applies on top of the inherited spec, field by field.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct FontPatch {
     pub size: Option<Px>,
@@ -98,7 +99,7 @@ impl FontPatch {
         FontPatch { size: Some(spec.size), weight: Some(spec.weight), design: Some(spec.design) }
     }
 
-    /// Merge dos modifiers empilhados — o definido (mais próximo) vence.
+    /// Merge of the stacked modifiers — the defined (closest) one wins.
     pub fn or(self, outer: FontPatch) -> FontPatch {
         FontPatch {
             size: self.size.or(outer.size),
@@ -116,9 +117,9 @@ impl FontPatch {
     }
 }
 
-/// Métricas de UMA linha. A altura de linha é DERIVADA — `ascent +
-/// descent`; o engine dobra o leading dentro do descent (uma soma, um
-/// contrato).
+/// Metrics of ONE line. The line height is DERIVED — `ascent +
+/// descent`; the engine folds the leading into the descent (one sum, one
+/// contract).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct LineMetrics {
     pub width: Px,
@@ -132,11 +133,11 @@ impl LineMetrics {
     }
 }
 
-/// Uma linha rasterizada: retângulo RGBA de alfa RETO (não pré-
-/// multiplicado — o compositor da casa blenda reto, em todos os alvos),
-/// origem no topo-esquerda da caixa de linha, já em pixels FÍSICOS.
-/// `baseline` é a linha de base a partir do topo (informativo/testes — a
-/// composição usa o topo-esquerda direto).
+/// A rasterized line: an RGBA rectangle of STRAIGHT alpha (not pre-
+/// multiplied — the house compositor blends straight, on every target),
+/// origin at the top-left of the line box, already in PHYSICAL pixels.
+/// `baseline` is the baseline measured from the top (informative/tests —
+/// compositing uses the top-left directly).
 pub struct TextRaster {
     pub width: usize,
     pub height: usize,
@@ -144,13 +145,13 @@ pub struct TextRaster {
     pub rgba: Vec<u8>,
 }
 
-/// A borda: quem mede e desenha texto. Object-safe de propósito —
-/// `Rc<dyn TextEngine>` é a forma que atravessa o `Runtime`.
+/// The boundary: who measures and draws text. Object-safe on purpose —
+/// `Rc<dyn TextEngine>` is the shape that crosses the `Runtime`.
 pub trait TextEngine {
     fn measure_line(&self, text: &str, font: &FontSpec) -> LineMetrics;
 
-    /// `None` = nada a pintar (string vazia, largura zero). `scale` é o
-    /// fator retina — o raster sai em pixels físicos.
+    /// `None` = nothing to paint (empty string, zero width). `scale` is
+    /// the retina factor — the raster comes out in physical pixels.
     fn raster_line(
         &self,
         text: &str,
@@ -160,16 +161,16 @@ pub trait TextEngine {
     ) -> Option<TextRaster>;
 }
 
-// MARK: - PixelFont, o engine default
+// MARK: - PixelFont, the default engine
 
-/// A fonte da casa: 3×5 pixels por glifo, célula FIXA de 8×16 (ignora
-/// size/weight/design de propósito) — métricas determinísticas que mantêm
-/// os testes headless byte-estáveis. Maiúsculas caem nas minúsculas; o que
-/// não existe não pinta (a caixa vazia é honesta).
+/// The house font: 3×5 pixels per glyph, FIXED 8×16 cell (ignores
+/// size/weight/design on purpose) — deterministic metrics that keep the
+/// headless tests byte-stable. Uppercase falls into lowercase; what does
+/// not exist does not paint (the empty box is honest).
 pub struct PixelFont;
 
-/// Célula da fonte pixel: baseline no pé do glifo (3 de folga no topo +
-/// 10 de corpo), 13 acima + 3 abaixo = os 16 da célula.
+/// The pixel font cell: baseline at the glyph's foot (3 of slack on top
+/// + 10 of body), 13 above + 3 below = the cell's 16.
 const PIXEL_ASCENT: Px = 13.0;
 const PIXEL_DESCENT: Px = 3.0;
 const PIXEL_ADVANCE: Px = 8.0;
@@ -205,8 +206,8 @@ impl TextEngine for PixelFont {
             rgba[index + 3] = color.a;
         };
 
-        // os MESMOS offsets do rasterizador original: glifo ×(2·scale)
-        // com folga de (1, 3) lógicos na célula 8×16
+        // the SAME offsets as the original rasterizer: glyph ×(2·scale)
+        // with a logical (1, 3) slack in the 8×16 cell
         let block = 2 * scale;
         for (index, ch) in chars.iter().enumerate() {
             let Some(rows) = glyph(*ch) else { continue };
@@ -230,8 +231,8 @@ impl TextEngine for PixelFont {
     }
 }
 
-/// A fonte da casa: 15 bits por glifo (3 colunas × 5 linhas, MSB = canto
-/// superior esquerdo).
+/// The house font: 15 bits per glyph (3 columns × 5 rows, MSB = top-left
+/// corner).
 fn glyph(ch: char) -> Option<u16> {
     let rows = match ch.to_ascii_lowercase() {
         '0' => 0b111_101_101_101_111,
@@ -283,9 +284,9 @@ fn glyph(ch: char) -> Option<u16> {
     Some(rows)
 }
 
-/// O índice de caret mais próximo do X (px lógicos a partir do início do
-/// texto) — o caminho do clique-posiciona: mede prefixos por fronteira de
-/// char e fica com o mais perto (o cache segura o custo).
+/// The caret index closest to X (logical px from the start of the text)
+/// — the click-to-place path: measures prefixes per char boundary and
+/// keeps the closest one (the cache holds the cost).
 pub fn caret_from_x(
     text: &str,
     x: Px,
@@ -311,18 +312,18 @@ pub fn caret_from_x(
             best_distance = distance;
         }
         if width > x {
-            break; // já passou do clique — o mais próximo ficou para trás
+            break; // already past the click — the closest one is behind us
         }
     }
     best
 }
 
-// MARK: - Quebra de linha (shape emprestado do engine, quebra nossa)
+// MARK: - Line breaking (shape borrowed from the engine, breaking ours)
 
-/// Quebra GREEDY por palavra com as medições reais do engine: ranges de
-/// byte contíguos, um por linha. Palavra maior que a linha quebra por
-/// char (nunca menos de um). Espaços penduram no fim da linha (não forçam
-/// quebra — o comportamento clássico).
+/// GREEDY breaking by word with the engine's real measurements:
+/// contiguous byte ranges, one per line. A word wider than the line
+/// breaks per char (never less than one). Spaces hang at the end of the
+/// line (they do not force a break — the classic behavior).
 pub fn break_lines(
     text: &str,
     font: &FontSpec,
@@ -347,15 +348,15 @@ pub fn break_lines(
         if !is_space {
             let width = cache.get_or_measure(&text[line_start..token_end], font, engine).width;
             if width > max_width && cursor > line_start {
-                // a palavra não coube: quebra ANTES dela (os espaços já
-                // percorridos penduram no fim da linha anterior)
+                // the word did not fit: break BEFORE it (the spaces
+                // already walked hang at the end of the previous line)
                 lines.push((line_start, cursor));
                 line_start = cursor;
                 continue;
             }
             if width > max_width {
-                // palavra sozinha maior que a linha: quebra por char no
-                // maior prefixo que couber — no mínimo um
+                // a lone word wider than the line: break per char at the
+                // largest prefix that fits — at least one
                 let mut end = cursor + rest.chars().next().map(char::len_utf8).unwrap_or(1);
                 for (offset, _) in rest[..token_len].char_indices().skip(1) {
                     if cache
@@ -379,38 +380,39 @@ pub fn break_lines(
     lines
 }
 
-// MARK: - Cache de medição
+// MARK: - Measurement cache
 
 type BreakLines = std::rc::Rc<Vec<(usize, usize)>>;
 
-/// Double-buffer prev/current trocado por passada de layout: hit promove
-/// para o current, a troca descarta o que ninguém pediu no frame — LRU de
-/// frame exato, sem timer.
+/// A prev/current double-buffer swapped per layout pass: a hit promotes
+/// to current, the swap discards what nobody asked for in the frame — an
+/// exact-frame LRU, no timer.
 ///
-/// Os mapas são ANINHADOS por fonte (e por largura, nas quebras): o
-/// lookup do caminho quente consulta por `&str` sem alocar chave nenhuma
-/// — só o MISS paga o `to_string`. A quebra tem mapa próprio com a
-/// LARGURA na chave — o modo da sondagem nunca compartilha entrada com a
-/// medição irrestrita (cache envenenado por proposta é irrepresentável).
+/// The maps are NESTED by font (and by width, for the breaks): the
+/// hot-path lookup queries by `&str` without allocating any key — only
+/// the MISS pays the `to_string`. Breaking has its own map with the
+/// WIDTH in the key — the probing mode never shares an entry with the
+/// unrestricted measurement (a cache poisoned by a proposal is
+/// unrepresentable).
 #[derive(Default)]
 pub struct MeasureCache {
-    /// O relógio do cache: um tick por passada de layout — a idade das
-    /// entradas se mede nele.
+    /// The cache clock: one tick per layout pass — entry age is measured
+    /// against it.
     frame: std::cell::Cell<u32>,
     lines: RefCell<HashMap<FontKey, HashMap<String, (LineMetrics, std::cell::Cell<u32>)>>>,
     breaks:
         RefCell<HashMap<(FontKey, u32), HashMap<String, (BreakLines, std::cell::Cell<u32>)>>>,
 }
 
-/// Quantos frames uma entrada sobrevive sem uso. Digitar ALTERNA conteúdo
-/// (backspace restaura a string de dois frames atrás; filtro esconde e
-/// revela rows) — shaping é caro demais para re-pagar por causa de um
-/// frame de ausência. Oito frames de folga custam alguns KiB.
+/// How many frames an entry survives without use. Typing ALTERNATES
+/// content (backspace restores the string from two frames ago; a filter
+/// hides and reveals rows) — shaping is too expensive to re-pay over one
+/// frame of absence. Eight frames of slack cost a few KiB.
 const CACHE_KEEP_FRAMES: u32 = 8;
 
 impl MeasureCache {
-    /// Início de uma passada de layout: tick do relógio + varredura de
-    /// idade (solta o que ficou [`CACHE_KEEP_FRAMES`] sem uso).
+    /// The start of a layout pass: clock tick + age sweep (drops what
+    /// went [`CACHE_KEEP_FRAMES`] without use).
     pub fn begin_frame(&self) {
         let frame = self.frame.get().wrapping_add(1);
         self.frame.set(frame);
@@ -439,7 +441,7 @@ impl MeasureCache {
             .get(&font_key)
             .and_then(|by_text| by_text.get(text))
         {
-            // hit quente: zero alocação, zero movimentação — só rejuvenesce
+            // hot hit: zero allocation, zero movement — just rejuvenates
             used.set(self.frame.get());
             return *metrics;
         }
@@ -452,7 +454,7 @@ impl MeasureCache {
         measured
     }
 
-    /// As quebras do texto para ESTA largura (quantizada em milésimos).
+    /// The text's breaks for THIS width (quantized in thousandths).
     pub fn get_or_break(
         &self,
         text: &str,
@@ -504,11 +506,11 @@ mod tests {
         cache.begin_frame();
 
         let wide = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 100.0, &PixelFont);
-        assert_eq!(wide.len(), 1, "cabe inteiro");
+        assert_eq!(wide.len(), 1, "fits whole");
         let narrow = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 40.0, &PixelFont);
-        assert_eq!(narrow.len(), 2, "larguras NUNCA compartilham entrada");
+        assert_eq!(narrow.len(), 2, "widths NEVER share an entry");
 
-        // idade: o frame seguinte devolve a MESMA alocação
+        // age: the next frame returns the SAME allocation
         cache.begin_frame();
         let promoted = cache.get_or_break("aa bb cc", &FontSpec::DEFAULT, 40.0, &PixelFont);
         assert!(std::rc::Rc::ptr_eq(&narrow, &promoted));
@@ -537,24 +539,24 @@ mod tests {
         cache.begin_frame();
         cache.get_or_measure("hello", &FontSpec::DEFAULT, &engine);
         cache.get_or_measure("hello", &FontSpec::DEFAULT, &engine);
-        assert_eq!(calls.get(), 1, "hit dentro do frame");
+        assert_eq!(calls.get(), 1, "hit within the frame");
 
         cache.begin_frame();
         cache.get_or_measure("hello", &FontSpec::DEFAULT, &engine);
-        assert_eq!(calls.get(), 1, "o frame seguinte rejuvenesce — zero medições novas");
+        assert_eq!(calls.get(), 1, "the next frame rejuvenates — zero new measurements");
 
-        // dentro da janela de idade a entrada sobrevive SEM uso — digitar
-        // alterna conteúdo e shaping não se re-paga por um frame de ausência
+        // within the age window the entry survives WITHOUT use — typing
+        // alternates content; shaping does not re-pay for a frame of absence
         for _ in 0..CACHE_KEEP_FRAMES {
             cache.begin_frame();
         }
         cache.get_or_measure("hello", &FontSpec::DEFAULT, &engine);
-        assert_eq!(calls.get(), 1, "ausência DENTRO da janela não descarta");
+        assert_eq!(calls.get(), 1, "absence WITHIN the window does not discard");
 
         for _ in 0..=CACHE_KEEP_FRAMES {
             cache.begin_frame();
         }
         cache.get_or_measure("hello", &FontSpec::DEFAULT, &engine);
-        assert_eq!(calls.get(), 2, "passar da janela descarta a entrada");
+        assert_eq!(calls.get(), 2, "going past the window discards the entry");
     }
 }

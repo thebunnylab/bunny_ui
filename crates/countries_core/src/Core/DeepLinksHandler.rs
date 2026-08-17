@@ -20,7 +20,7 @@ pub enum DeepLink {
 }
 
 impl DeepLink {
-    /// `init?(url: URL)` — failable init vira factory `Option`.
+    /// `init?(url: URL)` — the failable init becomes an `Option` factory.
     pub fn new(url: &URL) -> Option<DeepLink> {
         let Some(components) = URLComponents::new(url, true) else { return None };
         if components.host.as_deref() != Some("www.example.com") {
@@ -76,8 +76,8 @@ impl DeepLinksHandler for RealDeepLinksHandler {
                 let defaultRouting = ViewRouting::default();
                 if self.container.appState.value().routing != defaultRouting {
                     self.container.appState.update(|state| state.routing = defaultRouting);
-                    // DispatchQueue.main.asyncAfter(deadline:) — o fake é
-                    // síncrono: roteia já na sequência.
+                    // DispatchQueue.main.asyncAfter(deadline:) — the fake is
+                    // synchronous: routes right away, in sequence.
                     routeToDestination();
                 } else {
                     routeToDestination();
@@ -120,7 +120,7 @@ mod tests {
         let routing = container.appState.value().routing;
         assert_eq!(routing.countriesList.countryCode.as_deref(), Some("USA"));
         assert!(routing.countryDetails.detailsSheet);
-        // segunda chamada cai no caminho "reset then route" do workaround
+        // the second call hits the workaround's "reset then route" path
         handler.open(DeepLink::ShowCountryFlag { alpha3Code: "GEO".into() });
         assert_eq!(container.appState.value().routing.countriesList.countryCode.as_deref(), Some("GEO"));
     }

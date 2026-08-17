@@ -1,9 +1,9 @@
-//! Shell macOS do bunny-ui: janela nativa, eventos de ponteiro e o ciclo
-//! vivo — hover/press → repaint por evento; ação no up-inside → estado →
-//! render incremental → blit. Sem uma dependência sequer.
+//! The bunny-ui macOS shell: native window, pointer events and the live
+//! cycle — hover/press → repaint per event; action on up-inside → state →
+//! incremental render → blit. Not a single dependency.
 //!
-//! O `unsafe` do projeto mora SÓ aqui (a FFI de [`ffi`]), embrulhado nesta
-//! API segura. O core e a fachada seguem `#![forbid(unsafe_code)]`.
+//! The project's `unsafe` lives ONLY here (the [`ffi`] FFI), wrapped in
+//! this safe API. The core and the facade keep `#![forbid(unsafe_code)]`.
 
 #![cfg(target_os = "macos")]
 
@@ -20,16 +20,16 @@ use bunny_ui::view::View;
 use ffi::AppEvent;
 pub use text::CoreTextEngine;
 
-/// keyCode do AppKit → o vocabulário do keymap. Nomeadas pela tabela de
-/// virtual keys; o resto vira `Char` pelo char base (ignorando
-/// modificadores), minúsculo. `None` = modificador solto/tecla de função.
+/// AppKit keyCode → the keymap vocabulary. Named keys come from the
+/// virtual-key table; the rest becomes `Char` through the base char
+/// (ignoring modifiers), lowercased. `None` = lone modifier/function key.
 fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
     let named = match stroke.code {
         125 => Some(Key::Down),
         126 => Some(Key::Up),
         123 => Some(Key::Left),
         124 => Some(Key::Right),
-        36 | 76 => Some(Key::Enter), // Return e o Enter do teclado numérico
+        36 | 76 => Some(Key::Enter), // Return and the numeric keypad Enter
         53 => Some(Key::Escape),
         48 => Some(Key::Tab),
         116 => Some(Key::PageUp),
@@ -42,7 +42,7 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
     };
     let key = named.or_else(|| {
         let base = stroke.chars_ignoring.chars().next()?;
-        // PUA F700–F8FF: teclas de função do AppKit — nunca texto
+        // PUA F700–F8FF: AppKit function keys — never text
         (!base.is_control() && !('\u{F700}'..='\u{F8FF}').contains(&base))
             .then(|| Key::Char(base.to_ascii_lowercase()))
     })?;
@@ -55,27 +55,27 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
     })
 }
 
-/// Abre a janela e entra no ciclo vivo. Retorna quando o app encerra
-/// (fechar a janela encerra).
+/// Opens the window and enters the live cycle. Returns when the app quits
+/// (closing the window quits).
 pub fn run_window(title: &str, size: Size, root: impl View) {
-    // texto de verdade: o engine da plataforma entra no lugar do PixelFont
+    // real text: the platform engine takes the place of the PixelFont
     let runtime = Runtime::new().text_engine(Rc::new(CoreTextEngine::new()));
     run_window_with(title, size, runtime, root)
 }
 
-/// Como [`run_window`], mas com o `Runtime` montado pelo caller — o
-/// caminho de apps com environment próprio (o engine de texto ainda é
-/// responsabilidade de quem monta).
+/// Like [`run_window`], but with the `Runtime` assembled by the caller —
+/// the path for apps with their own environment (the text engine is still
+/// the assembler's responsibility).
 pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl View) {
     let window = ffi::create_window(title, size.width, size.height);
-    // dois donos: o gate de teclado e o handler de eventos
+    // two owners: the keyboard gate and the event handler
     let runtime = Rc::new(runtime);
     let root = Rc::new(root);
 
-    // um frame completo: o Runtime estabiliza, faz layout, retém os hits
-    // para os eventos de ponteiro e rasteriza — o shell blita, alinha o
-    // cursor e espelha o campo focado para o sistema de input (as
-    // perguntas síncronas do IME respondem deste espelho)
+    // one full frame: the Runtime settles, lays out, retains the hits
+    // for pointer events and rasterizes — the shell blits, aligns the
+    // cursor and mirrors the focused field for the input system (the
+    // IME's synchronous questions answer from this mirror)
     let blit = move |runtime: &Runtime, root: &_| {
         let (width, height) = window.content_size();
         let canvas = bunny_ui::theme::canvas();
@@ -103,9 +103,9 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
         }));
     };
 
-    // o gate: keymap ANTES do sistema de input — chars nus com campo
-    // focado passam direto (digitação nunca é roubada); binding sem
-    // handler montado não consome (a tela sem a palette digita normal)
+    // the gate: keymap BEFORE the input system — bare chars with a focused
+    // field pass straight through (typing is never stolen); a binding with
+    // no handler mounted does not consume (the palette-less screen types fine)
     ffi::set_key_gate(Box::new({
         let runtime = Rc::clone(&runtime);
         let root = Rc::clone(&root);
@@ -146,7 +146,7 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
             }
         }
         AppEvent::MouseUp { x, y } => {
-            // dispara no up-inside; o visual de pressed limpa sempre
+            // fires on up-inside; the pressed visual always clears
             let _ = runtime.pointer_released(x, y);
             blit(runtime, root);
         }
@@ -156,14 +156,14 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
             }
         }
         AppEvent::Wheel { x, y, dx, dy } => {
-            // offset é estado do engine: repaint sem render (zero bodies)
+            // offset is engine state: repaint without render (zero bodies)
             if runtime.wheel(x, y, dx, dy) {
                 blit(runtime, root);
             }
         }
         AppEvent::Key { code, shift, command, chars } => {
-            // teclas imprimíveis viram Insert; PUA F700–F8FF são as teclas
-            // de função do AppKit — nunca texto
+            // printable keys become Insert; PUA F700–F8FF are AppKit
+            // function keys — never text
             let printable = |c: char| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(&c);
             let edit = match code {
                 51 => Some(EditCommand::Backspace),
@@ -173,7 +173,7 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
                 115 => Some(EditCommand::Home(shift)),
                 119 => Some(EditCommand::End(shift)),
                 53 => {
-                    // esc solta o foco
+                    // esc releases focus
                     if runtime.blur() {
                         blit(runtime, root);
                     }
@@ -181,7 +181,7 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
                 }
                 0 if command => Some(EditCommand::SelectAll),
                 8 if command => {
-                    // cmd+C — a saída do campo vai para o sistema
+                    // cmd+C — the field's output goes to the system
                     if let Some(text) = runtime.key(EditCommand::Copy).output {
                         ffi::clipboard_write(&text);
                     }
@@ -211,13 +211,13 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
             }
         }
         AppEvent::Blink => {
-            // caret parado pisca; sem foco o tick é silêncio
+            // an idle caret blinks; without focus the tick is silence
             if runtime.blink() {
                 blit(runtime, root);
             }
         }
         AppEvent::ImeInsert { text } => {
-            // o commit do IME (ou digitação simples pelo input system)
+            // the IME commit (or plain typing through the input system)
             if runtime.key(EditCommand::Insert(text)).applied {
                 blit(runtime, root);
             }
@@ -256,14 +256,14 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
                 | "moveToRightEndOfLineAndModifySelection:" => Some(EditCommand::End(true)),
                 "selectAll:" => Some(EditCommand::SelectAll),
                 "cancelOperation:" => {
-                    // esc solta o foco
+                    // esc releases focus
                     if runtime.blur() {
                         blit(runtime, root);
                     }
                     None
                 }
-                // insertNewline:/insertTab: — submit/troca de foco são a
-                // próxima fase de eventos tipados do campo
+                // insertNewline:/insertTab: — submit/focus switch are the
+                // field's next phase of typed events
                 _ => None,
             };
             if let Some(edit) = edit
@@ -275,7 +275,7 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
         }
     }));
 
-    // primeiro frame, e o run loop assume
+    // first frame, and the run loop takes over
     ffi::dispatch(AppEvent::Redraw);
     ffi::run();
 }

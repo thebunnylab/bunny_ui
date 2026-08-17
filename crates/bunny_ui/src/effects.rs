@@ -1,12 +1,12 @@
-//! Efeitos — o registro coletado no render e drenado pelo pump.
+//! Effects — the registry collected on render and drained by the pump.
 //!
-//! O `ctx.effects` do motor é `pub(crate)`; esta camada mantém o próprio
-//! registro thread-local com a mesma semântica (o "main actor" é
-//! single-threaded por design). Os builders de efeito carregam a lógica
-//! exata do motor, com a retenção por site do `on_receive`.
+//! The motor's `ctx.effects` is `pub(crate)`; this layer keeps its own
+//! thread-local registry with the same semantics (the "main actor" is
+//! single-threaded by design). The effect builders carry the motor's
+//! exact logic, with `on_receive`'s per-site retention.
 //!
-//! O [`Site`] chega pronto da `ViewExt` — o callsite de `#[track_caller]`
-//! no caminho comum, um nome explícito nas variantes `_keyed`.
+//! The [`Site`] arrives ready from `ViewExt` — the `#[track_caller]`
+//! callsite on the common path, an explicit name in the `_keyed` variants.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -24,14 +24,15 @@ pub(crate) fn reset() {
     EFFECTS.with(|effects| effects.borrow_mut().clear());
 }
 
-/// Um efeito registrado durante o render vai para o reconciler: entra na
-/// entry da fronteira em construção (e re-bombeia dela enquanto a view
-/// estiver montada, rodando ou pulada), ou na região do root.
+/// An effect registered during render goes to the reconciler: it enters
+/// the entry of the boundary under construction (and re-pumps from it
+/// while the view stays mounted, running or skipped), or the root's
+/// region.
 pub(crate) fn push(effect: EffectFn) {
     crate::reconciler::attribute_effect(effect);
 }
 
-/// A fila do pass, remontada pelo runtime a partir da retenção.
+/// The pass's queue, reassembled by the runtime from the retention.
 pub(crate) fn set_queue(effects: Vec<EffectFn>) {
     EFFECTS.with(|queue| *queue.borrow_mut() = effects);
 }
@@ -40,9 +41,10 @@ pub(crate) fn take() -> Vec<EffectFn> {
     EFFECTS.with(|effects| std::mem::take(&mut *effects.borrow_mut()))
 }
 
-/// `.onChange(of:initial:)` — o slot por (site, identidade) aprende o valor
-/// e só dispara quando ele anda. O slot resolve na CONSTRUÇÃO (o cursor de
-/// identidade só existe durante o render); o pump já recebe a célula.
+/// `.onChange(of:initial:)` — the per-(site, identity) slot learns the
+/// value and only fires when it moves. The slot resolves at CONSTRUCTION
+/// (the identity cursor only exists during render); the pump already
+/// receives the cell.
 pub fn change_effect<V, OF, AC>(site: Site, of: OF, initial: bool, action: AC) -> EffectFn
 where
     V: Clone + PartialEq + 'static,
@@ -77,12 +79,13 @@ where
     })
 }
 
-/// `.onReceive(publisher)` — com retenção por (site, identidade): o
-/// primeiro publisher vive num slot e os recriados por cada `body()` são
-/// ignorados (a dedup da subscription é o `last` compartilhado do retido).
-/// Sem isso, cada re-render criaria um publisher de célula zerada que
-/// entregaria o valor atual de novo — o pump reportaria mudança a cada
-/// ciclo e o `render_stable` sairia por exaustão.
+/// `.onReceive(publisher)` — with per-(site, identity) retention: the
+/// first publisher lives in a slot and the ones recreated by each
+/// `body()` are ignored (the subscription's dedup is the retained one's
+/// shared `last`). Without it, every re-render would create a zeroed-cell
+/// publisher that would deliver the current value again — the pump would
+/// report a change every cycle and `render_stable` would exit by
+/// exhaustion.
 pub fn receive_effect<V, AC>(site: Site, publisher: AnyPublisher<V>, action: AC) -> EffectFn
 where
     V: Clone + PartialEq + 'static,

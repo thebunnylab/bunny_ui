@@ -15,8 +15,8 @@ pub struct AppState {
     pub permissions: Permissions,
 }
 
-/// `extension AppState { struct ViewRouting }` — os `CountriesList.Routing` /
-/// `CountryDetails.Routing` das views vivem aqui (como no Swift).
+/// `extension AppState { struct ViewRouting }` — the views' `CountriesList.Routing` /
+/// `CountryDetails.Routing` live here (as in Swift).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ViewRouting {
     pub countriesList: CountriesListRouting,
@@ -64,8 +64,8 @@ pub struct Permissions {
 }
 
 impl AppState {
-    /// `static func permissionKeyPath(for:) -> WritableKeyPath` — keypath não
-    /// existe em Rust; o par de accessors cumpre o mesmo papel.
+    /// `static func permissionKeyPath(for:) -> WritableKeyPath` — keypaths do
+    /// not exist in Rust; the accessor pair plays the same role.
     pub fn permissionStatus(&self, _permission: &Permission) -> PermissionStatus {
         self.permissions.push
     }

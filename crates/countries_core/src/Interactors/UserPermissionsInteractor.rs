@@ -15,8 +15,8 @@ pub enum Permission {
     PushNotifications,
 }
 
-/// `extension Permission { enum Status }` — vive no AppState no port
-/// (`PermissionStatus`) porque o AppState o referencia.
+/// `extension Permission { enum Status }` — lives in AppState in the port
+/// (`PermissionStatus`) because AppState references it.
 
 /// `protocol SystemNotificationsSettings { var authorizationStatus }`
 pub trait SystemNotificationsSettings {
@@ -50,7 +50,7 @@ pub enum UNAuthorizationOptions {
     Badge,
 }
 
-/// o existencial `any SystemNotificationsSettings` (methods não-Sized)
+/// the `any SystemNotificationsSettings` existential (non-Sized methods)
 pub type SystemNotificationsSettingsBox = Rc<dyn SystemNotificationsSettings>;
 
 /// `extension UNAuthorizationStatus { var map: Permission.Status }`
@@ -70,8 +70,8 @@ impl AuthorizationStatusMap for UNAuthorizationStatus {
     }
 }
 
-/// `UNUserNotificationCenter.current()` fake — concedido por padrão (a demo
-/// precisa do fluxo de push funcionando headless).
+/// Fake `UNUserNotificationCenter.current()` — granted by default (the demo
+/// needs the push flow working headless).
 pub struct UNUserNotificationCenter;
 
 impl UNUserNotificationCenter {
@@ -124,8 +124,8 @@ impl RealUserPermissionsInteractor {
         }
     }
 
-    /// `AppState.permissionKeyPath(for:)` — keypath do Swift vira par
-    /// getter/setter sobre o store.
+    /// `AppState.permissionKeyPath(for:)` — the Swift keypath becomes a
+    /// getter/setter pair over the store.
     fn permissionKeyPath(&self, permission: &Permission) -> PermissionStatus {
         self.appState.value().permissionStatus(permission)
     }
@@ -162,7 +162,7 @@ impl UserPermissionsInteractor for RealUserPermissionsInteractor {
         if currentStatus != PermissionStatus::Unknown {
             return;
         }
-        // Task { @MainActor in … } — tudo é síncrono no fake single-thread
+        // Task { @MainActor in … } — everything is synchronous in the single-thread fake
         let status = motor::block_on(self.pushNotificationsPermissionStatus());
         self.setPermissionKeyPath(&permission, status);
     }

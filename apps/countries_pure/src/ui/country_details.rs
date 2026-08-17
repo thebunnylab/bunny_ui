@@ -1,17 +1,17 @@
 //
 //  CountryDetails.swift — CountriesSwiftUI
 //
-//  O `Routing` é uma struct local da view, então aqui ele é snake_case;
-//  o `CountriesListRouting` do core (o valor que vive no AppState) continua
-//  camelCase — é o seam do port espelhado.
+//  `Routing` is a view-local struct, so here it is snake_case; the core's
+//  `CountriesListRouting` (the value that lives in the AppState) stays
+//  camelCase — it is the seam of the mirrored port.
 //
-//  A view carrega o `country` (dado, não estado), então não é `Copy` como a
-//  CountriesList — os closures clonam `self` (barato: os campos de estado
-//  são handles). É o caso que pede um `Stored<T>` copiável para config no
-//  futuro.
+//  The view carries the `country` (data, not state), so it is not `Copy`
+//  like CountriesList — the closures clone `self` (cheap: the state fields
+//  are handles). It is the case that asks for a copyable `Stored<T>` for
+//  config in the future.
 //
-//  O `match` do `content` é um `OneOf4`; os `if`s do `loadedView` viram
-//  `Option` na tupla — achatam em nada.
+//  The `content` `match` is a `OneOf4`; the `loadedView` `if`s become
+//  `Option`s in the tuple — they flatten into nothing.
 //
 
 use countries_core::Core::AppState::CountryDetailsRouting;
@@ -61,7 +61,7 @@ impl Component for CountryDetails {
     fn body(self, ctx: &Context) -> impl View {
         let injected = ctx.environment::<DIContainer>();
         let locale = ctx.environment::<Locale>();
-        // State é Copy: sai da struct antes de `self` entrar no content
+        // State is Copy: it leaves the struct before `self` moves into the content
         let routing_state = self.routing_state;
         let title = self.country.name_locale(locale);
 
@@ -119,8 +119,8 @@ impl CountryDetails {
             .clone()
             .filter(|neighbors| !neighbors.is_empty())
             .map(|neighbors| self.clone().neighbors_section_view(ctx, neighbors));
-        // a view carrega DADOS (Clone, não Copy): cada sub-view leva a sua
-        // cópia — explícito, e barato no tamanho que isso tem
+        // the view carries DATA (Clone, not Copy): each sub-view takes its
+        // own copy — explicit, and cheap at the size this has
         let sheet_view = self.clone();
 
         list_content((
@@ -144,8 +144,8 @@ impl CountryDetails {
 // MARK: - Displaying Content
 
 impl CountryDetails {
-    /// `flagView(url:)` — o `onTapGesture` do runtime headless dispara no
-    /// render (não há dedo), então a sheet abre igual à demo.
+    /// `flagView(url:)` — the headless runtime's `onTapGesture` fires at
+    /// render (there is no finger), so the sheet opens just like the demo.
     fn flag_view(self, ctx: &Context, url: URL) -> impl UnaryView {
         let injected = ctx.environment::<DIContainer>();
         hstack((
@@ -157,9 +157,9 @@ impl CountryDetails {
         ))
     }
 
-    /// `basicInfoSectionView(countryDetails:)` — recebe os dados owned: em
-    /// edition 2021 um `impl View` de retorno capturaria o lifetime do
-    /// `&CountryDetails` e não provaria `'static`.
+    /// `basicInfoSectionView(countryDetails:)` — takes the data owned: in
+    /// edition 2021 a returned `impl View` would capture the lifetime of the
+    /// `&CountryDetails` and would not prove `'static`.
     fn basic_info_section_view(self, country_details: DBModel::CountryDetails) -> impl UnaryView {
         section(
             text("Basic Info"),
@@ -205,12 +205,12 @@ impl CountryDetails {
         )
     }
 
-    /// `neighbourDetailsView(country:)` — o destino do link do vizinho.
+    /// `neighbourDetailsView(country:)` — the destination of the neighbor's link.
     fn neighbour_details_view(country: DBModel::Country) -> CountryDetails {
         CountryDetails::new(country)
     }
 
-    /// `modalDetailsView()` — o conteúdo da sheet (borda apagada).
+    /// `modalDetailsView()` — the sheet's content (an erased boundary).
     fn modal_details_view(self, ctx: &Context) -> impl UnaryView {
         let injected = ctx.environment::<DIContainer>();
         let details_sheet = self

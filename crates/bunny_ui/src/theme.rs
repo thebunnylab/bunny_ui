@@ -1,18 +1,19 @@
-//! O tema — tokens semânticos resolvidos em RUNTIME.
+//! The theme — semantic tokens resolved at RUNTIME.
 //!
-//! O vocabulário é uma struct plana de tokens nomeados (descobrível,
-//! tipada) com um acessor global por token: `theme::accent()` no call
-//! site, sem contexto nenhum — é assim que centenas de leituras por
-//! frame ficam ergonômicas. O store é um `Cell` thread-local (o mundo é
-//! single-thread por design): trocar o tema é um `install(...)` — a
-//! VERSÃO global bumpa e o próximo pass reconstrói a retenção (tokens
-//! lidos em body ficam gravados na cena retida; a reconstrução é o preço
-//! de UMA vez por troca, não por frame).
+//! The vocabulary is a flat struct of named tokens (discoverable, typed)
+//! with one global accessor per token: `theme::accent()` at the call
+//! site, no context at all — that is how hundreds of reads per frame
+//! stay ergonomic. The store is a thread-local `Cell` (the world is
+//! single-thread by design): swapping the theme is an `install(...)` —
+//! the global VERSION bumps and the next pass rebuilds the retention
+//! (tokens read in body get recorded into the retained scene; the
+//! rebuild is a price paid ONCE per swap, not per frame).
 //!
-//! Regra de leitura: chrome BUILT-IN (Button, Field, scrollbar) lê o
-//! token na COLOCAÇÃO (place) — retheme repinta sem re-rodar body; app
-//! lê onde quiser (`.foreground_color(theme::accent())` no body é o
-//! comum, e a versão cobre a invalidação).
+//! Reading rule: BUILT-IN chrome (Button, Field, scrollbar) reads the
+//! token at PLACEMENT (place) — a retheme repaints without re-running
+//! body; the app reads wherever it wants
+//! (`.foreground_color(theme::accent())` in body is the common case,
+//! and the version covers the invalidation).
 
 use std::cell::Cell;
 
@@ -20,8 +21,8 @@ use crate::layout::Color;
 
 macro_rules! theme_tokens {
     ($($(#[$doc:meta])* $name:ident),+ $(,)?) => {
-        /// O conjunto de tokens de um tema — plano, `Copy`, aberto a
-        /// crescer junto com o chrome.
+        /// A theme's token set — flat, `Copy`, open to grow along with
+        /// the chrome.
         #[derive(Clone, Copy, PartialEq, Debug)]
         pub struct Theme {
             $($(#[$doc])* pub $name: Color,)+
@@ -37,59 +38,59 @@ macro_rules! theme_tokens {
 }
 
 theme_tokens! {
-    /// O chão da janela.
+    /// The window's floor.
     canvas,
-    /// Superfície elevada (painéis, cards).
+    /// Raised surface (panels, cards).
     panel,
-    /// Texto principal.
+    /// Primary text.
     fg,
-    /// Texto secundário (metadados, caminhos).
+    /// Secondary text (metadata, paths).
     fg_secondary,
-    /// Texto apagado (badges, estados vazios).
+    /// Faint text (badges, empty states).
     fg_faint,
-    /// Texto de placeholder de campo.
+    /// Field placeholder text.
     placeholder,
-    /// A cor da marca — foco, links, highlights de match.
+    /// The brand color — focus, links, match highlights.
     accent,
-    /// Borda de superfície.
+    /// Surface border.
     border,
-    /// Linha divisória interna.
+    /// Internal divider line.
     divider,
-    /// Fundo de row sob o ponteiro.
+    /// Row background under the pointer.
     row_hover,
-    /// Fundo de row pressionada/ativa.
+    /// Pressed/active row background.
     row_pressed,
-    /// Véu de seleção de texto.
+    /// Text selection veil.
     selection,
-    /// Borda de campo focado.
+    /// Focused field border.
     focus,
-    /// O caret.
+    /// The caret.
     caret,
-    /// Fundo de controle (botão).
+    /// Control background (button).
     control,
-    /// Fundo de controle sob hover.
+    /// Control background under hover.
     control_hovered,
-    /// Fundo de controle pressionado.
+    /// Pressed control background.
     control_pressed,
-    /// Poço de campo de texto.
+    /// The text field well.
     field,
-    /// Borda de campo em repouso.
+    /// Field border at rest.
     field_border,
-    /// A thumb da scrollbar.
+    /// The scrollbar thumb.
     scrollbar,
-    /// O véu atrás de overlays.
+    /// The veil behind overlays.
     backdrop,
 }
 
 impl Theme {
-    /// O tema-de-um-lápis claro — os valores que o framework sempre usou
-    /// (os defaults dos testes dependem desta igualdade).
+    /// The light one-pencil theme — the values the framework always used
+    /// (the test defaults depend on this equality).
     pub const fn light() -> Theme {
         Theme {
             canvas: Color::hex(0xF2F3F7),
             panel: Color::WHITE,
-            // o BLACK exato da casa: a tinta default de texto É este token
-            // (os goldens headless contam com a igualdade)
+            // the house's exact BLACK: the default text ink IS this token
+            // (the headless goldens count on the equality)
             fg: Color::BLACK,
             fg_secondary: Color::hex(0x8A94A6),
             fg_faint: Color::hex(0xB3BAC7),
@@ -112,7 +113,7 @@ impl Theme {
         }
     }
 
-    /// O lado escuro do mesmo lápis.
+    /// The dark side of the same pencil.
     pub const fn dark() -> Theme {
         Theme {
             canvas: Color::hex(0x101014),
@@ -145,19 +146,19 @@ thread_local! {
     static VERSION: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Troca o tema INTEIRO entre frames. A versão global bumpa — o próximo
-/// pass de qualquer `Runtime` reconstrói a retenção uma vez.
+/// Swaps the WHOLE theme between frames. The global version bumps — the
+/// next pass of any `Runtime` rebuilds the retention once.
 pub fn install(theme: Theme) {
     THEME.with(|current| current.set(theme));
     VERSION.with(|version| version.set(version.get() + 1));
 }
 
-/// O snapshot corrente — para hot loops que leem muitos tokens.
+/// The current snapshot — for hot loops that read many tokens.
 pub fn current() -> Theme {
     THEME.with(|theme| theme.get())
 }
 
-/// A versão do tema instalado — quem retém saída derivada compara.
+/// The installed theme's version — whoever retains derived output compares it.
 pub fn version() -> u64 {
     VERSION.with(|version| version.get())
 }

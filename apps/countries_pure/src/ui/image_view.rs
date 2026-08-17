@@ -1,10 +1,10 @@
 //
 //  ImageView.swift — CountriesSwiftUI
 //
-//  O switch do `Loadable` vira um `OneOf4` no body — cada braço com nome
-//  próprio, no lugar do `_ConditionalContent` binário que o codegen do
-//  SwiftUI aninha. O `Inspection` (ViewInspector) fica de fora: a demo
-//  headless já é a inspeção.
+//  The `Loadable` switch becomes a `OneOf4` in the body — each arm with a
+//  name of its own, in place of the binary `_ConditionalContent` that
+//  SwiftUI's codegen nests. `Inspection` (ViewInspector) stays out: the
+//  headless demo already is the inspection.
 //
 
 use countries_core::DependencyInjection::DIContainer::DIContainer;
@@ -68,7 +68,7 @@ impl ImageView {
     }
 
     fn failed_view(error: LoadError) -> impl UnaryView {
-        let _ = error; // `error.localizedDescription` não aparece na UI do Swift
+        let _ = error; // `error.localizedDescription` does not show in the Swift UI
         text("Unable to load image")
             .font(Font::Footnote)
             .multiline_text_alignment(TextAlignment::Center)

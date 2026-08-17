@@ -2,7 +2,7 @@
 name = "countries-pure"
 version = "0.1.0"
 edition.workspace = true
-description = "CountriesSwiftUI com a camada de UI em Rust idiomático sobre o bunny-ui — mesmo espírito, sem macro"
+description = "CountriesSwiftUI with the UI layer in idiomatic Rust on top of bunny-ui — same spirit, no macro"
 
 [dependencies]
 bunny-ui.workspace = true

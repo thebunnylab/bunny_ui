@@ -50,8 +50,8 @@ impl WebRepository for RealCountriesWebRepository {
 
 impl CountriesWebRepository for RealCountriesWebRepository {
     fn countries(&self) -> super::WebRepository::BoxFuture<Result<Vec<ApiModel::Country>, LoadError>> {
-        // `try await call(self, …)` — o repository é clonado para o future
-        // (BoxFuture é 'static).
+        // `try await call(self, …)` — the repository is cloned into the future
+        // (BoxFuture is 'static).
         let repository = self.clone();
         Box::pin(async move {
             let value: Vec<ApiModel::Country> =
@@ -113,8 +113,8 @@ impl APICall for API {
     }
 }
 
-/// `addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)` — o
-/// mínimo que o endpoint precisa (letras/dígitos passam, espaços viram %20).
+/// `addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)` — the
+/// minimum the endpoint needs (letters/digits pass, spaces become %20).
 fn addingPercentEncoding(string: &str) -> Option<String> {
     let mut out = String::new();
     for byte in string.bytes() {
@@ -130,8 +130,8 @@ fn addingPercentEncoding(string: &str) -> Option<String> {
 
 // MARK: - MockUrlSession
 
-/// `MockUrlSession` — serve o JSON serializado do `MockedData`; o pipeline de
-/// decode roda de verdade.
+/// `MockUrlSession` — serves the serialized JSON of the `MockedData`; the
+/// decode pipeline runs for real.
 pub struct MockUrlSession;
 
 impl UrlSession for MockUrlSession {
@@ -163,7 +163,7 @@ impl UrlSession for MockUrlSession {
     }
 
     fn download(&self, _url: URL) -> super::WebRepository::BoxFuture<Result<Vec<u8>, LoadError>> {
-        // `UIImage(data:)` fake: qualquer byte vira a imagem unitária
+        // fake `UIImage(data:)`: any byte becomes the unit image
         Box::pin(async { Ok(vec![0u8; 4]) })
     }
 }

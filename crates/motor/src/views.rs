@@ -482,7 +482,7 @@ impl NavigationPath {
         self.entries.borrow().is_empty()
     }
 
-    /// snake_case alias — o lado idiomático chama por aqui
+    /// snake_case alias — the idiomatic side calls through here
     pub fn is_empty(&self) -> bool {
         self.isEmpty()
     }

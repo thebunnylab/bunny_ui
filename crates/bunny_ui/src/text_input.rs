@@ -1,15 +1,16 @@
-//! O modelo de edição de texto de UMA linha — headless por decisão.
+//! The ONE-line text editing model — headless by decision.
 //!
-//! O app é dono da STRING (via `Binding<String>`); o framework é dono do
-//! caret e da seleção. Os índices internos são offsets de BYTE sempre em
-//! fronteira de `char`; a borda de IME fala UTF-16 — a conversão mora
-//! aqui, UMA vez, em vez de copiada em cada campo artesanal.
+//! The app owns the STRING (via `Binding<String>`); the framework owns
+//! the caret and the selection. The internal indices are BYTE offsets
+//! always on a `char` boundary; the IME boundary speaks UTF-16 — the
+//! conversion lives here, ONCE, instead of copied into every handmade
+//! field.
 
-/// Caret + âncora de seleção de um campo, por identidade. `caret` é o
-/// ponto ativo; `anchor` marca o outro lado da seleção (None = sem
-/// seleção); `marked` é a composição de IME viva (sublinhada, ainda não
-/// committed). Offsets de byte; valores fora do texto clampam na
-/// aplicação.
+/// A field's caret + selection anchor, per identity. `caret` is the
+/// active point; `anchor` marks the other side of the selection (None =
+/// no selection); `marked` is the live IME composition (underlined, not
+/// yet committed). Byte offsets; values outside the text clamp on
+/// apply.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct CaretState {
     pub caret: usize,
@@ -18,7 +19,7 @@ pub struct CaretState {
 }
 
 impl CaretState {
-    /// A seleção normalizada `[início, fim)` — `None` = colapsada.
+    /// The normalized selection `[start, end)` — `None` = collapsed.
     pub fn selection(&self) -> Option<(usize, usize)> {
         let anchor = self.anchor?;
         if anchor == self.caret {
@@ -28,9 +29,9 @@ impl CaretState {
     }
 }
 
-/// O que teclado e IME pedem a um campo. `bool` = estender a seleção
-/// (shift pressionado). `Read`/`Copy`/`Cut` devolvem texto pela saída de
-/// [`apply`] — a ponte de clipboard e de sincronização com a plataforma.
+/// What keyboard and IME ask of a field. `bool` = extend the selection
+/// (shift held). `Read`/`Copy`/`Cut` return text through the output of
+/// [`apply`] — the clipboard and platform-synchronization bridge.
 #[derive(Clone, PartialEq, Debug)]
 pub enum EditCommand {
     Insert(String),
@@ -41,22 +42,22 @@ pub enum EditCommand {
     Home(bool),
     End(bool),
     SelectAll,
-    /// Lê o texto inteiro sem mutar (a sincronização de IME usa).
+    /// Reads the whole text without mutating (IME synchronization uses it).
     Read,
-    /// Devolve a seleção sem mutar (`None` = colapsada).
+    /// Returns the selection without mutating (`None` = collapsed).
     Copy,
-    /// Devolve a seleção e a remove.
+    /// Returns the selection and removes it.
     Cut,
-    /// Composição de IME: substitui o range marcado (ou a seleção) pelo
-    /// texto em composição e o mantém MARCADO (sublinhado, não
-    /// committed). `caret_utf16` = (location, length) DENTRO do texto
-    /// marcado — o vocabulário da plataforma.
+    /// IME composition: replaces the marked range (or the selection) with
+    /// the composing text and keeps it MARKED (underlined, not
+    /// committed). `caret_utf16` = (location, length) INSIDE the marked
+    /// text — the platform's vocabulary.
     SetMarked { text: String, caret_utf16: (usize, usize) },
-    /// Encerra a composição committando o texto marcado como está.
+    /// Ends the composition, committing the marked text as it stands.
     Unmark,
 }
 
-/// Fronteira de char anterior (ou 0).
+/// The previous char boundary (or 0).
 fn previous_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
     loop {
@@ -70,7 +71,7 @@ fn previous_boundary(text: &str, index: usize) -> usize {
     }
 }
 
-/// Fronteira de char seguinte (ou o fim).
+/// The next char boundary (or the end).
 fn next_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
     loop {
@@ -93,12 +94,12 @@ fn clamp_to_boundary(text: &str, index: usize) -> usize {
     }
 }
 
-/// Clamp de um índice retido contra o texto corrente — a estampa usa.
+/// Clamps a retained index against the current text — the stamp uses it.
 pub(crate) fn clamp_index(text: &str, index: usize) -> usize {
     clamp_to_boundary(text, index)
 }
 
-/// Fronteiras expostas ao crate (a elipse do layout caminha por elas).
+/// Boundaries exposed to the crate (the layout's ellipsis walks them).
 pub(crate) fn boundary_after(text: &str, index: usize) -> usize {
     next_boundary(text, index)
 }
@@ -107,9 +108,9 @@ pub(crate) fn boundary_before(text: &str, index: usize) -> usize {
     previous_boundary(text, index)
 }
 
-/// Aplica um comando ao par (texto, caret) — a ÚNICA porta de mutação.
-/// Estado fora do texto (o app trocou a string por fora) clampa aqui.
-/// A saída é o texto que `Read`/`Copy`/`Cut` extraem.
+/// Applies a command to the (text, caret) pair — the ONLY mutation door.
+/// State outside the text (the app swapped the string from outside)
+/// clamps here. The output is the text `Read`/`Copy`/`Cut` extract.
 pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) -> Option<String> {
     state.caret = clamp_to_boundary(text, state.caret);
     if let Some(anchor) = state.anchor {
@@ -121,9 +122,9 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
         state.marked = (start < end).then_some((start, end));
     }
 
-    // qualquer comando que não seja de composição nem de leitura encerra
-    // a composição viva (committa como está) antes de agir — exceto
-    // Insert, que é o COMMIT da composição
+    // any command that is not composition or reading ends the live
+    // composition (commits it as it stands) before acting — except
+    // Insert, which is the composition's COMMIT
     if state.marked.is_some()
         && !matches!(
             command,
@@ -136,7 +137,7 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
         state.marked = None;
     }
 
-    // edição sobre seleção remove a seleção primeiro
+    // editing over a selection removes the selection first
     let remove_selection = |text: &mut String, state: &mut CaretState| {
         if let Some((start, end)) = state.selection() {
             text.replace_range(start..end, "");
@@ -149,8 +150,8 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
         }
     };
 
-    // movimento: com shift, a âncora arma no ponto atual e fica; sem
-    // shift, uma seleção viva colapsa para a borda do movimento
+    // movement: with shift, the anchor arms at the current point and
+    // stays; without shift, a live selection collapses to the move's edge
     let moved = |state: &mut CaretState, select: bool, target: usize, collapse: usize| {
         if select {
             if state.anchor.is_none() {
@@ -168,7 +169,7 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
 
     match command {
         EditCommand::Insert(insertion) => {
-            // o commit da composição: o texto final substitui o marcado
+            // the composition's commit: the final text replaces the marked one
             if let Some((start, end)) = state.marked.take() {
                 text.replace_range(start..end, &insertion);
                 state.caret = start + insertion.len();
@@ -187,7 +188,7 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
             text.replace_range(start..end, &composition);
             state.anchor = None;
             if composition.is_empty() {
-                // composição esvaziada = cancelada
+                // an emptied composition = canceled
                 state.marked = None;
                 state.caret = start;
             } else {
@@ -197,7 +198,7 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
             }
         }
         EditCommand::Unmark => {
-            // o clamp/commit lá em cima já limpou; nada mais a fazer
+            // the clamp/commit up top already cleaned it; nothing more to do
         }
         EditCommand::Read => return Some(text.clone()),
         EditCommand::Copy => {
@@ -246,7 +247,7 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
     None
 }
 
-// MARK: - A borda UTF-16 (IME e plataformas falam UTF-16; nós, bytes)
+// MARK: - The UTF-16 boundary (IME and platforms speak UTF-16; we speak bytes)
 
 pub fn utf16_to_byte(text: &str, utf16: usize) -> usize {
     let mut count = 0;
@@ -281,7 +282,7 @@ mod tests {
 
         apply(&mut text, &mut caret, EditCommand::Backspace);
         apply(&mut text, &mut caret, EditCommand::Backspace);
-        assert_eq!(text, "ca", "o é (2 bytes) sai inteiro");
+        assert_eq!(text, "ca", "the é (2 bytes) comes out whole");
         assert_eq!(caret.caret, 2);
 
         let mut caret = state(0);
@@ -299,13 +300,13 @@ mod tests {
         assert_eq!(caret.selection(), Some((0, 11)));
 
         apply(&mut text, &mut caret, EditCommand::Insert("hi".into()));
-        assert_eq!(text, "hi", "digitar sobre a seleção substitui");
+        assert_eq!(text, "hi", "typing over the selection replaces it");
         assert_eq!(caret.caret, 2);
 
-        // shift+left arma a âncora e estende
+        // shift+left arms the anchor and extends
         apply(&mut text, &mut caret, EditCommand::Left(true));
         assert_eq!(caret.selection(), Some((1, 2)));
-        // left sem shift colapsa para a borda esquerda
+        // left without shift collapses to the left edge
         apply(&mut text, &mut caret, EditCommand::Left(false));
         assert_eq!(caret.caret, 1);
         assert_eq!(caret.selection(), None);
@@ -313,13 +314,13 @@ mod tests {
         apply(&mut text, &mut caret, EditCommand::End(true));
         assert_eq!(caret.selection(), Some((1, 2)));
         apply(&mut text, &mut caret, EditCommand::Backspace);
-        assert_eq!(text, "h", "backspace come a seleção");
+        assert_eq!(text, "h", "backspace eats the selection");
     }
 
     #[test]
     fn stale_caret_from_an_outside_write_clamps() {
-        // o app trocou a string por fora — o estado retido clampa em vez
-        // de estourar
+        // the app swapped the string from outside — the retained state
+        // clamps instead of blowing up
         let mut text = String::from("ab");
         let mut caret = state(usize::MAX);
         apply(&mut text, &mut caret, EditCommand::Insert("c".into()));
@@ -330,9 +331,9 @@ mod tests {
     #[test]
     fn ime_composition_marks_replaces_and_commits() {
         let mut text = String::from("ab");
-        let mut state = state(1); // entre a e b
+        let mut state = state(1); // between a and b
 
-        // composição incremental: cada SetMarked substitui o marcado
+        // incremental composition: each SetMarked replaces the marked text
         apply(
             &mut text,
             &mut state,
@@ -348,13 +349,13 @@ mod tests {
         assert_eq!(text, "aにb");
         assert_eq!(state.marked, Some((1, 1 + "に".len())));
 
-        // o commit: Insert troca o marcado pelo texto final
+        // the commit: Insert swaps the marked text for the final one
         apply(&mut text, &mut state, EditCommand::Insert("日本".into()));
         assert_eq!(text, "a日本b");
         assert_eq!(state.marked, None);
         assert_eq!(state.caret, 1 + "日本".len());
 
-        // composição esvaziada = cancelada
+        // an emptied composition = canceled
         apply(
             &mut text,
             &mut state,
@@ -368,7 +369,7 @@ mod tests {
         assert_eq!(text, "a日本b");
         assert_eq!(state.marked, None);
 
-        // movimento no meio da composição committa como está
+        // movement mid-composition commits it as it stands
         apply(
             &mut text,
             &mut state,
@@ -376,20 +377,20 @@ mod tests {
         );
         apply(&mut text, &mut state, EditCommand::Left(false));
         assert_eq!(state.marked, None);
-        assert!(text.contains('y'), "committado como estava: {text}");
+        assert!(text.contains('y'), "committed as it was: {text}");
     }
 
     #[test]
     fn the_utf16_border_translates_both_ways() {
-        let text = "a🐰b"; // 🐰 = 4 bytes, 2 unidades UTF-16
+        let text = "a🐰b"; // 🐰 = 4 bytes, 2 UTF-16 units
         assert_eq!(byte_to_utf16(text, 0), 0);
         assert_eq!(byte_to_utf16(text, 1), 1);
-        assert_eq!(byte_to_utf16(text, 5), 3, "depois do coelho: 1 + 2");
+        assert_eq!(byte_to_utf16(text, 5), 3, "after the rabbit: 1 + 2");
         assert_eq!(utf16_to_byte(text, 1), 1);
         assert_eq!(utf16_to_byte(text, 3), 5);
         assert_eq!(utf16_to_byte(text, 99), text.len());
-        // índice no MEIO do par substituto arredonda para a fronteira
-        // SEGUINTE — nunca parte um char
-        assert_eq!(utf16_to_byte(text, 2), 5, "meio do surrogate cai na fronteira seguinte");
+        // an index in the MIDDLE of the surrogate pair rounds to the
+        // NEXT boundary — never splits a char
+        assert_eq!(utf16_to_byte(text, 2), 5, "middle of the surrogate lands on the next boundary");
     }
 }

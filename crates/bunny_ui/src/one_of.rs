@@ -1,8 +1,9 @@
-//! `OneOf3`…`OneOf8` — o `_ConditionalContent` de um `match` com N braços.
+//! `OneOf3`…`OneOf8` — the `_ConditionalContent` of an N-arm `match`.
 //!
-//! O `@ViewBuilder` do SwiftUI esconde o aninhamento binário no codegen;
-//! sem codegen, `Second(Second(First(…)))` vaza para o cliente — e inserir
-//! um braço no meio renumera todos. Aqui cada braço tem nome próprio:
+//! SwiftUI's `@ViewBuilder` hides the binary nesting in codegen; without
+//! codegen, `Second(Second(First(…)))` leaks to the client — and
+//! inserting an arm in the middle renumbers them all. Here every arm has
+//! its own name:
 //!
 //! ```ignore
 //! match self.details.get() {
@@ -13,8 +14,8 @@
 //! }
 //! ```
 //!
-//! Como no [`Either`], todos os braços exigem a mesma aridade — o tipo
-//! resultante continua monomórfico, só o discriminante decide em runtime.
+//! As with [`Either`], all arms demand the same arity — the resulting
+//! type stays monomorphic, only the discriminant decides at runtime.
 //!
 //! [`Either`]: crate::view::Either
 
@@ -34,8 +35,8 @@ macro_rules! one_of {
             type Arity = Ar;
 
             fn render_into(&self, ctx: &Context, out: &mut NodeList) {
-                // Como no `Either`: o braço é identidade — trocar de braço
-                // desmonta o que o anterior montou.
+                // As in `Either`: the arm is identity — switching arms
+                // unmounts what the previous one mounted.
                 match self {
                     $($name::$variant(view) => {
                         let _frame =
@@ -49,26 +50,26 @@ macro_rules! one_of {
 }
 
 one_of!(
-    /// `match` de três braços.
+    /// A three-arm `match`.
     OneOf3 { A, B, C }
 );
 one_of!(
-    /// `match` de quatro braços — o formato de um `Loadable`.
+    /// A four-arm `match` — the shape of a `Loadable`.
     OneOf4 { A, B, C, D }
 );
 one_of!(
-    /// `match` de cinco braços.
+    /// A five-arm `match`.
     OneOf5 { A, B, C, D, E }
 );
 one_of!(
-    /// `match` de seis braços.
+    /// A six-arm `match`.
     OneOf6 { A, B, C, D, E, F }
 );
 one_of!(
-    /// `match` de sete braços.
+    /// A seven-arm `match`.
     OneOf7 { A, B, C, D, E, F, G }
 );
 one_of!(
-    /// `match` de oito braços.
+    /// An eight-arm `match`.
     OneOf8 { A, B, C, D, E, F, G, H }
 );

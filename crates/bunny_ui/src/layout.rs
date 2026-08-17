@@ -1,28 +1,29 @@
-//! Layout proposta/resposta — o protocolo e os algoritmos, headless.
+//! Proposal/response layout — the protocol and the algorithms, headless.
 //!
-//! O contrato tem duas fases e três regras:
+//! The contract has two phases and three rules:
 //!
-//! 1. **O pai propõe** ([`Proposal`] — `None` = "você decide"), **o filho
-//!    responde** um [`Size`], **o pai posiciona**. A resposta é uma função
-//!    TOTAL da proposta: toda proposta tem resposta, não existe erro de
-//!    layout.
-//! 2. **Medir devolve um [`Fit`]** — o que a medição descobriu e a
-//!    colocação reaproveita. `place` consome o `Fit` **por valor**: o
-//!    sistema de tipos garante a ordem das fases (não há posicionar sem
-//!    medir, nem posicionar duas vezes) e que nada se mede em dobro.
-//! 3. **Encolher é decisão do container, na proposta.** Não existe "mínimo
-//!    automático" que vaze do conteúdo por baixo do pano, nem propriedade
-//!    visual mudando semântica de tamanho: uma [`LayoutNode::Scroll`]
-//!    responde o que lhe foi oferecido no eixo de rolagem e guarda o
-//!    tamanho do conteúdo para si — nenhum `min_h(0)` em lugar nenhum.
+//! 1. **The parent proposes** ([`Proposal`] — `None` = "you decide"),
+//!    **the child answers** with a [`Size`], **the parent positions**. The
+//!    answer is a TOTAL function of the proposal: every proposal has an
+//!    answer, there is no layout error.
+//! 2. **Measuring returns a [`Fit`]** — what measurement found and
+//!    placement reuses. `place` consumes the `Fit` **by value**: the type
+//!    system guarantees the phase order (no placing without measuring, no
+//!    placing twice) and that nothing gets measured twice.
+//! 3. **Shrinking is the container's decision, in the proposal.** There is
+//!    no "automatic minimum" that leaks from the content behind the
+//!    scenes, and no visual property that changes size semantics: a
+//!    [`LayoutNode::Scroll`] answers what it was offered on the scroll
+//!    axis and keeps the content size to itself — no `min_h(0)` anywhere.
 //!
-//! A [`LayoutNode`] é a árvore de RUNTIME que o render produz: o body roda
-//! UMA vez por pass e emite print e layout juntos (avaliar duas vezes
-//! duplicaria âncoras de identidade). Depois da avaliação dos bodies, tudo
-//! se reduz aos built-ins — um conjunto fechado, então enum. As métricas de
-//! texto vêm do [`TextEngine`] do frame (o [`PixelFont`] determinístico da
-//! casa por default — 8px por caractere, 16px por linha; CoreText no Mac);
-//! os frames saem endereçados pelo caminho de identidade das fronteiras.
+//! The [`LayoutNode`] is the RUNTIME tree that render produces: the body
+//! runs ONCE per pass and emits print and layout together (evaluating
+//! twice would duplicate identity anchors). After the bodies are
+//! evaluated, everything reduces to the built-ins — a closed set, so an
+//! enum. Text metrics come from the frame's [`TextEngine`] (the house's
+//! deterministic [`PixelFont`] by default — 8px per character, 16px per
+//! line; CoreText on Mac); the frames come out addressed by the identity
+//! path of the boundaries.
 //!
 //! [`PixelFont`]: crate::text_engine::PixelFont
 
@@ -31,8 +32,8 @@ use std::rc::Rc;
 
 use crate::text_engine::{FontPatch, FontSpec, MeasureCache, PixelFont, TextEngine};
 
-/// Pixels lógicos. O snapping para pixels de dispositivo é decisão do
-/// backend real, num ponto único do pipeline — nunca espalhado.
+/// Logical pixels. Snapping to device pixels is the real backend's
+/// decision, at a single point of the pipeline — never spread around.
 pub type Px = f64;
 
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -53,10 +54,10 @@ pub struct Rect {
     pub size: Size,
 }
 
-/// A proposta do pai. `None` num eixo = "responda seu tamanho ideal".
+/// The parent's proposal. `None` on an axis = "answer your ideal size".
 ///
-/// Deliberadamente **sem `Default`**: um valor esquecido não pode degradar
-/// silenciosamente para "mínimo" — quem propõe escolhe, sempre.
+/// Deliberately **no `Default`**: a forgotten value cannot silently
+/// degrade into "minimum" — whoever proposes chooses, always.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Proposal {
     pub width: Option<Px>,
@@ -64,27 +65,27 @@ pub struct Proposal {
 }
 
 impl Proposal {
-    /// Proposta exata nos dois eixos.
+    /// An exact proposal on both axes.
     pub fn exact(size: Size) -> Self {
         Proposal { width: Some(size.width), height: Some(size.height) }
     }
 
-    /// "Você decide" nos dois eixos — o tamanho ideal do filho.
+    /// "You decide" on both axes — the child's ideal size.
     pub fn unspecified() -> Self {
         Proposal { width: None, height: None }
     }
 }
 
-/// O eixo principal de um stack.
+/// The main axis of a stack.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Axis {
     Vertical,
     Horizontal,
 }
 
-/// Alinhamento no eixo transversal, já em termos de layout (os tipos por
-/// eixo da API — `HorizontalAlignment`/`VerticalAlignment` — convergem
-/// para cá na construção do nó).
+/// Alignment on the cross axis, already in layout terms (the per-axis API
+/// types — `HorizontalAlignment`/`VerticalAlignment` — converge here when
+/// the node is built).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CrossAlign {
     Start,
@@ -92,7 +93,7 @@ pub enum CrossAlign {
     End,
 }
 
-/// Insets de padding, por aresta.
+/// Padding insets, per edge.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct Edges {
     pub top: Px,
@@ -115,41 +116,43 @@ impl Edges {
     }
 }
 
-/// Altura de linha do [`PixelFont`] — pública para os testes de frames.
+/// Line height of the [`PixelFont`] — public for the frame tests.
 ///
 /// [`PixelFont`]: crate::text_engine::PixelFont
 pub const LINE_H: Px = 16.0;
 
-/// O contexto que desce pelas duas fases: o engine de texto do frame, o
-/// cache de medição, os offsets de rolagem (dono é o `Runtime`) e a fonte
-/// HERDADA corrente — [`LayoutNode::Styled`] troca ao descer.
+/// The context that goes down through both phases: the frame's text
+/// engine, the measure cache, the scroll offsets (the `Runtime` owns
+/// them) and the current INHERITED font — [`LayoutNode::Styled`] swaps it
+/// on the way down.
 #[derive(Clone, Copy)]
 pub struct LayoutEnv<'a> {
     pub text: &'a dyn TextEngine,
     pub cache: &'a MeasureCache,
     pub scroll_offsets: &'a HashMap<String, Point>,
     pub font: FontSpec,
-    /// O estado de frame do pass — consultado POR CAMINHO na colocação.
+    /// The pass's frame state — consulted BY PATH during placement.
     pub stamp: FrameStamp<'a>,
 }
 
-/// O estado de FRAME que a colocação consulta por caminho: ponteiro
-/// (hover/pressed dos `Interactive`), foco e caret (dos `Field`). Mora no
-/// ENV, nunca na árvore — retenção e árvore de layout ficam livres de
-/// estado de frame por construção (a LEI do hover, agora por tipo), e um
-/// frame de hover/blink re-coloca sem clonar nó nenhum.
+/// The FRAME state that placement consults by path: pointer
+/// (hover/pressed of the `Interactive`s), focus and caret (of the
+/// `Field`s). It lives in the ENV, never in the tree — retention and the
+/// layout tree stay free of frame state by construction (the hover LAW,
+/// now by type), and a hover/blink frame re-places without cloning a
+/// single node.
 #[derive(Clone, Copy)]
 pub struct FrameStamp<'a> {
     pub interaction: &'a Interaction,
     pub focus: Option<&'a str>,
     pub carets: &'a HashMap<String, crate::text_input::CaretState>,
-    /// Fase do blink — o caret só pinta quando visível.
+    /// Blink phase — the caret only paints when visible.
     pub caret_visible: bool,
 }
 
 impl<'a> FrameStamp<'a> {
-    /// Frame sem ponteiro, sem foco — o default dos testes e do
-    /// [`layout`] direto.
+    /// A frame with no pointer and no focus — the default for tests and
+    /// for direct [`layout`].
     pub fn idle(
         interaction: &'a Interaction,
         carets: &'a HashMap<String, crate::text_input::CaretState>,
@@ -158,98 +161,102 @@ impl<'a> FrameStamp<'a> {
     }
 }
 
-/// Trechos coloridos POR CIMA do texto (o highlight de match de um
-/// finder): ranges de BYTE no conteúdo + a cor. A fonte não muda — só a
-/// tinta; a medida fica intacta por construção.
+/// Colored spans ON TOP of the text (the match highlight of a finder):
+/// BYTE ranges into the content + the color. The font does not change —
+/// only the ink; the measure stays intact by construction.
 #[derive(Clone, Debug)]
 pub struct TextHighlight {
     pub ranges: Rc<Vec<(usize, usize)>>,
     pub color: Color,
 }
 
-/// Onde a elipse mora quando o texto não cabe e a quebra está desligada.
+/// Where the ellipsis lives when the text does not fit and wrapping is off.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Truncation {
-    /// `…fim/do/caminho` — preserva o fim (paths).
+    /// `…end/of/path` — keeps the end (paths).
     Start,
-    /// `começo…fim` — preserva as pontas (nomes de arquivo).
+    /// `start…end` — keeps both ends (file names).
     Middle,
-    /// `começo…` — o clássico.
+    /// `start…` — the classic.
     End,
 }
 
-/// A árvore de layout que um pass de render emite. Conjunto fechado (tudo
-/// se reduz aos built-ins depois dos bodies), filhos em `Vec` — o dispatch
-/// estático mora na árvore de VIEWS; esta é a estrutura de runtime.
+/// The layout tree that a render pass emits. A closed set (everything
+/// reduces to the built-ins after the bodies), children in a `Vec` — the
+/// static dispatch lives in the VIEW tree; this is the runtime structure.
 #[derive(Clone, Debug)]
 pub enum LayoutNode {
-    /// Texto: quebra por palavra contra a proposta, ou elipse quando a
-    /// truncation está ligada; highlight pinta trechos sem tocar a medida.
+    /// Text: wraps by word against the proposal, or shows an ellipsis
+    /// when truncation is on; highlight paints spans without touching the
+    /// measure.
     Text {
         content: Rc<str>,
         highlights: Option<TextHighlight>,
         truncation: Option<Truncation>,
     },
-    /// Flexível no eixo principal do stack que o contém.
+    /// Flexible on the main axis of the stack that contains it.
     Spacer,
-    /// Caixa rígida (ProgressView, Image e afins, até existir de verdade).
+    /// Rigid box (ProgressView, Image and friends, until they exist for real).
     Leaf { size: Size },
-    /// Preenche o que a proposta der (Rectangle).
+    /// Fills whatever the proposal gives (Rectangle).
     Fill,
     Stack { axis: Axis, spacing: Px, align: CrossAlign, children: Vec<LayoutNode> },
-    /// Sobreposição: todos os filhos no mesmo frame (ZStack, sheet por cima).
+    /// Overlay: all children in the same frame (ZStack, sheet on top).
     Layered { children: Vec<LayoutNode> },
     Padding { edges: Edges, child: Box<LayoutNode> },
-    /// `.frame(width:height:)` — eixos `Some` sobrescrevem proposta e resposta.
+    /// `.frame(width:height:)` — `Some` axes override proposal and answer.
     Frame { width: Option<Px>, height: Option<Px>, child: Box<LayoutNode> },
-    /// `.frame(maxWidth:maxHeight:)` — `∞` = "preencha o proposto".
+    /// `.frame(maxWidth:maxHeight:)` — `∞` = "fill what was proposed".
     MaxFrame { max_width: Px, max_height: Px, align: CrossAlign, child: Box<LayoutNode> },
-    /// Região de rolagem vertical: responde o oferecido, mede o conteúdo
-    /// sem restrição e guarda o excedente para si (o contrato de shrink).
-    /// `path` é a identidade estrutural da região — o endereço do offset
-    /// retido (rolagem restaura quando a lista remonta).
+    /// Vertical scroll region: answers what it was offered, measures the
+    /// content without restriction and keeps the excess to itself (the
+    /// shrink contract). `path` is the region's structural identity — the
+    /// address of the retained offset (scrolling restores when the list
+    /// remounts).
     Scroll { path: Option<String>, child: Box<LayoutNode> },
-    /// Propriedade visual semântica: background atrás do filho, border por
-    /// cima, foreground herdado. Transparente para a medida — por tipo.
+    /// Semantic visual property: background behind the child, border on
+    /// top, foreground inherited. Transparent to the measure — by type.
     Styled { props: VisualProps, child: Box<LayoutNode> },
-    /// Campo de texto de UMA linha — semântico de ponta a ponta (no Dom
-    /// vira `<input>`; no Gpu, chrome + texto + caret + seleção daqui).
-    /// Foco, caret, seleção e composição de IME NÃO moram aqui: a
-    /// colocação consulta o [`FrameStamp`] do env pelo `path` — a árvore
-    /// nunca carrega estado de frame.
+    /// ONE-line text field — semantic end to end (in Dom it becomes an
+    /// `<input>`; in Gpu, chrome + text + caret + selection from here).
+    /// Focus, caret, selection and IME composition do NOT live here:
+    /// placement consults the env's [`FrameStamp`] by `path` — the tree
+    /// never carries frame state.
     Field {
         path: String,
         content: Rc<str>,
         placeholder: Rc<str>,
     },
-    /// Fronteira de view (`Component`): grava o frame no caminho de
-    /// identidade — o endereço dos testes e, adiante, do hit-testing.
+    /// View boundary (`Component`): records the frame at the identity
+    /// path — the address for tests and, later on, for hit-testing.
     Boundary { path: String, children: Vec<LayoutNode> },
-    /// Alvo de interação (Button): o frame entra na lista de hit-test com
-    /// o caminho que indexa a ação registrada no reconciler. Hover e
-    /// pressed NÃO moram aqui — a colocação consulta o [`FrameStamp`] do
-    /// env pelo `path` (estado de ponteiro nunca gruda em árvore).
+    /// Interaction target (Button): the frame enters the hit-test list
+    /// with the path that indexes the action registered in the
+    /// reconciler. Hover and pressed do NOT live here — placement
+    /// consults the env's [`FrameStamp`] by `path` (pointer state never
+    /// sticks to a tree).
     Interactive { path: String, child: Box<LayoutNode> },
-    /// Referência a uma fronteira retida (pulada pelo reconciler); o
-    /// measure e o place resolvem ON-THE-FLY contra a retenção — a árvore
-    /// do frame nunca é costurada em cópia.
+    /// Reference to a retained boundary (skipped by the reconciler);
+    /// measure and place resolve ON-THE-FLY against the retention — the
+    /// frame's tree is never stitched into a copy.
     BoundaryRef { path: String },
 }
 
-/// O handoff entre as fases — o espelho estrutural do [`LayoutNode`],
-/// consumido por valor: não há posicionar sem medir, nem duas vezes.
+/// The handoff between the phases — the structural mirror of the
+/// [`LayoutNode`], consumed by value: no placing without measuring, and
+/// never twice.
 #[derive(Debug)]
 pub enum Fit {
     Leaf,
-    /// Tamanhos e fits dos filhos, na ordem — medidos UMA vez.
+    /// Sizes and fits of the children, in order — measured ONCE.
     Children(Vec<(Size, Fit)>),
     Wrapped(Size, Box<Fit>),
-    /// O tamanho real do conteúdo (pode exceder o frame — é o que rola).
+    /// The real content size (it can exceed the frame — that is what scrolls).
     ScrollContent(Size, Box<Fit>),
 }
 
-/// Cor RGBA, sem drama. Estilização de verdade chega com os modifiers
-/// visuais; por ora o pipeline usa os defaults do tema-de-um-lápis.
+/// RGBA color, no drama. Real styling arrives with the visual modifiers;
+/// for now the pipeline uses the one-pencil-theme defaults.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Color {
     pub r: u8,
@@ -263,15 +270,15 @@ impl Color {
     pub const WHITE: Color = Color { r: 255, g: 255, b: 255, a: 255 };
     pub const FILL: Color = Color { r: 200, g: 205, b: 215, a: 255 };
     pub const OUTLINE: Color = Color { r: 150, g: 155, b: 165, a: 255 };
-    /// Fundo padrão de janela — off-white frio, o chão do tema-de-um-lápis.
+    /// Default window background — cool off-white, the floor of the one-pencil theme.
     pub const CANVAS: Color = Color::hex(0xF2F3F7);
-    /// A thumb da scrollbar — véu translúcido (o blending é real).
+    /// The scrollbar thumb — a translucent veil (the blending is real).
     pub const SCROLLBAR: Color = Color { r: 0, g: 0, b: 0, a: 90 };
-    /// Borda de campo focado.
+    /// Border of a focused field.
     pub const FOCUS: Color = Color::hex(0x3B82F6);
-    /// Texto de placeholder.
+    /// Placeholder text.
     pub const PLACEHOLDER: Color = Color::hex(0x9AA2B1);
-    /// Véu de seleção de texto.
+    /// Text selection veil.
     pub const SELECTION: Color = Color::hex_a(0x3B82F640);
 
     pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
@@ -282,20 +289,20 @@ impl Color {
         Color { r, g, b, a }
     }
 
-    /// `0xRRGGBB`, alfa 255 — cor escrita do jeito que se lê.
+    /// `0xRRGGBB`, alpha 255 — color written the way you read it.
     pub const fn hex(rgb: u32) -> Color {
         Color { r: (rgb >> 16) as u8, g: (rgb >> 8) as u8, b: rgb as u8, a: 255 }
     }
 
-    /// `0xRRGGBBAA` — os véus do mundo real carregam alfa a sério.
+    /// `0xRRGGBBAA` — real-world veils carry alpha for real.
     pub const fn hex_a(rgba: u32) -> Color {
         Color { r: (rgba >> 24) as u8, g: (rgba >> 16) as u8, b: (rgba >> 8) as u8, a: rgba as u8 }
     }
 }
 
 impl std::fmt::Display for Color {
-    /// `#RRGGBB` (alfa só quando não é 255) — sufixos de print e mensagens
-    /// de teste legíveis.
+    /// `#RRGGBB` (alpha only when it is not 255) — readable print
+    /// suffixes and test messages.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.a == 255 {
             write!(f, "#{:02X}{:02X}{:02X}", self.r, self.g, self.b)
@@ -305,32 +312,34 @@ impl std::fmt::Display for Color {
     }
 }
 
-/// Propriedades VISUAIS de um nó da cena — só pintura, por construção:
-/// nenhum campo aqui altera medida (a LEI "hover não mexe em layout"
-/// garantida pelo tipo). No modo Dom isto vira CSS do elemento; no Gpu,
-/// comandos de desenho — a semântica nunca morre antes de o backend
-/// escolher.
+/// VISUAL properties of a scene node — paint only, by construction: no
+/// field here changes measure (the "hover does not touch layout" LAW,
+/// guaranteed by the type). In Dom mode this becomes the element's CSS;
+/// in Gpu, draw commands — the semantics never die before the backend
+/// gets to choose.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct VisualProps {
     pub background: Option<Color>,
-    /// Herdado para baixo: o texto abaixo pinta com o foreground corrente.
+    /// Inherited downward: the text below paints with the current foreground.
     pub foreground: Option<Color>,
     pub border: Option<(Color, Px)>,
     pub corner_radius: Option<Px>,
-    /// Fundo alternativo sob hover/pressed do `Interactive` ancestral —
-    /// no Dom, `:hover`/`:active`. (Generalizar o estado para o
-    /// `VisualProps` inteiro fica para o port do tema.)
+    /// Alternate background under hover/pressed of the ancestor
+    /// `Interactive` — in Dom, `:hover`/`:active`. (Generalizing the
+    /// state to the whole `VisualProps` waits for the theme port.)
     pub background_hovered: Option<Color>,
     pub background_pressed: Option<Color>,
-    /// Patch de fonte herdado — a EXCEÇÃO da regra "props é só pintura":
-    /// fonte muda medida, então desce pelo `LayoutEnv` já na medição (o
-    /// estado de hover continua proibido de tocá-la).
+    /// Inherited font patch — the EXCEPTION to the "props is paint only"
+    /// rule: font changes measure, so it goes down the `LayoutEnv`
+    /// already at measure time (hover state is still forbidden to touch
+    /// it).
     pub font: FontPatch,
 }
 
 impl VisualProps {
-    /// Merge de modifiers empilhados na mesma view: o já definido (mais
-    /// PRÓXIMO da view) vence; o de fora só preenche o que falta.
+    /// Merge of modifiers stacked on the same view: what is already set
+    /// (CLOSEST to the view) wins; the outer one only fills what is
+    /// missing.
     pub fn or(self, outer: VisualProps) -> VisualProps {
         VisualProps {
             background: self.background.or(outer.background),
@@ -344,9 +353,10 @@ impl VisualProps {
     }
 }
 
-/// Estado de interação de um frame — resolvido ANTES do layout e estampado
-/// na expansão (a LEI: hover troca pintura, nunca medida). O dono é o
-/// `Runtime`; mora aqui por ser vocabulário da cena (caminhos + ponto).
+/// Interaction state of a frame — resolved BEFORE layout and stamped into
+/// the expansion (the LAW: hover swaps paint, never measure). The
+/// `Runtime` owns it; it lives here because it is scene vocabulary
+/// (paths + point).
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Interaction {
     pub pointer: Option<Point>,
@@ -354,20 +364,21 @@ pub struct Interaction {
     pub pressed: Option<String>,
 }
 
-/// Um comando de desenho — a saída do passe de colocação, na ordem de
-/// pintura (quem vem depois pinta por cima; `Layered` conta com isso).
-/// É a interface do rasterizador e, adiante, de qualquer backend.
+/// A draw command — the output of the placement pass, in paint order
+/// (whoever comes later paints on top; `Layered` counts on that).
+/// It is the rasterizer's interface and, later on, any backend's.
 #[derive(Clone, Debug)]
 pub enum DrawCommand {
-    /// `corner_radius: 0.0` = retângulo puro (o caminho reto de sempre).
+    /// `corner_radius: 0.0` = plain rectangle (the usual straight path).
     FillRect { rect: Rect, color: Color, corner_radius: Px },
-    /// Moldura pintada PARA DENTRO da aresta, `width` px lógicos.
+    /// A border painted INWARD from the edge, `width` logical px.
     StrokeRect { rect: Rect, color: Color, width: Px },
-    /// Uma linha de texto já quebrada. `origin` é o TOPO-esquerda da caixa
-    /// de linha (o engine converte para baseline internamente); `font` é a
-    /// fonte efetiva herdada. O trecho pintado é `content[range.0..range.1]`
-    /// — a FATIA do conteúdo inteiro do nó (o `Rc` clona barato; nenhuma
-    /// String nasce por linha no caminho quente).
+    /// One already-wrapped line of text. `origin` is the TOP-left of the
+    /// line box (the engine converts to baseline internally); `font` is
+    /// the effective inherited font. The painted span is
+    /// `content[range.0..range.1]` — a SLICE of the node's whole content
+    /// (the `Rc` clones cheap; no String is born per line on the hot
+    /// path).
     TextLine {
         origin: Point,
         content: Rc<str>,
@@ -375,13 +386,14 @@ pub enum DrawCommand {
         color: Color,
         font: FontSpec,
     },
-    /// Daqui até o [`DrawCommand::PopClip`] par, todo desenho intersecta
-    /// este rect (o rect já chega intersectado com o clip de fora).
+    /// From here to the paired [`DrawCommand::PopClip`], every draw
+    /// intersects this rect (the rect arrives already intersected with
+    /// the outer clip).
     PushClip { rect: Rect },
     PopClip,
 }
 
-/// A lista de desenho de um frame.
+/// The draw list of one frame.
 #[derive(Default, Debug)]
 pub struct DisplayList {
     commands: Vec<DrawCommand>,
@@ -405,12 +417,11 @@ impl DisplayList {
     }
 }
 
-/// As saídas do passe de colocação: frames por identidade (testes), a
-/// lista de desenho (rasterizador/backends) e os alvos de interação (na
-/// ordem de pintura — o hit-test varre de trás para frente, o de cima
-/// ganha).
-/// Uma região de rolagem colocada — o mapa do wheel. As regiões entram
-/// filho-antes-do-pai: a mais interna sob o ponto decide primeiro.
+/// The outputs of the placement pass: frames by identity (tests), the
+/// draw list (rasterizer/backends) and the interaction targets (in paint
+/// order — hit-testing scans back to front, the top one wins).
+/// A placed scroll region — the wheel's map. Regions enter
+/// child-before-parent: the innermost one under the point decides first.
 #[derive(Clone, Debug)]
 pub struct ScrollRegion {
     pub path: String,
@@ -418,8 +429,8 @@ pub struct ScrollRegion {
     pub content: Size,
 }
 
-/// Um campo de texto colocado: geometria + fonte EFETIVA no ponto da cena
-/// — o clique-posiciona e a sincronização de IME medem por aqui.
+/// A placed text field: geometry + EFFECTIVE font at that point of the
+/// scene — click-to-position and IME sync measure through here.
 #[derive(Clone, Debug)]
 pub struct FieldPlacement {
     pub path: String,
@@ -435,13 +446,14 @@ pub struct Placement {
     pub hits: Vec<(String, Rect)>,
     pub scrolls: Vec<ScrollRegion>,
     pub fields: Vec<FieldPlacement>,
-    /// Pilha do foreground herdado — o topo colore o texto.
+    /// Stack of the inherited foreground — the top colors the text.
     foreground: Vec<Color>,
-    /// Pilha do `(hovered, pressed)` do `Interactive` mais próximo — o
-    /// `Styled` escolhe o fundo por ela.
+    /// Stack of the nearest `Interactive`'s `(hovered, pressed)` — the
+    /// `Styled` picks its background by it.
     pointer: Vec<(bool, bool)>,
-    /// Pilha do clip corrente (interseções em coordenadas lógicas) — quem
-    /// registra hit consulta; o raster refaz o corte em px físicos.
+    /// Stack of the current clip (intersections in logical coordinates) —
+    /// whoever records a hit consults it; the raster redoes the cut in
+    /// physical px.
     clip: Vec<Rect>,
 }
 
@@ -475,7 +487,7 @@ impl Rect {
             && y < self.origin.y + self.size.height
     }
 
-    /// `None` = interseção vazia.
+    /// `None` = empty intersection.
     pub fn intersection(&self, other: Rect) -> Option<Rect> {
         let x0 = self.origin.x.max(other.origin.x);
         let y0 = self.origin.y.max(other.origin.y);
@@ -488,7 +500,7 @@ impl Rect {
     }
 }
 
-/// O alvo mais ao topo sob o ponto — a chave da ação registrada.
+/// The topmost target under the point — the key of the registered action.
 pub fn hit_test(hits: &[(String, Rect)], x: Px, y: Px) -> Option<&str> {
     hits.iter()
         .rev()
@@ -496,8 +508,8 @@ pub fn hit_test(hits: &[(String, Rect)], x: Px, y: Px) -> Option<&str> {
         .map(|(path, _)| path.as_str())
 }
 
-/// Os frames absolutos que o passe de colocação produz, endereçáveis pelo
-/// caminho de identidade das fronteiras.
+/// The absolute frames the placement pass produces, addressable by the
+/// identity path of the boundaries.
 #[derive(Default, Debug)]
 pub struct Frames {
     entries: Vec<(String, Rect)>,
@@ -508,7 +520,7 @@ impl Frames {
         self.entries.push((path.to_string(), frame));
     }
 
-    /// O frame exato do caminho (o primeiro, se houver repetição).
+    /// The exact frame for the path (the first one, if repeated).
     pub fn get(&self, path: &str) -> Option<Rect> {
         self.entries
             .iter()
@@ -516,8 +528,8 @@ impl Frames {
             .map(|(_, frame)| *frame)
     }
 
-    /// O primeiro frame cujo caminho termina no sufixo — endereço curto
-    /// para testes (`"CountryCell"` em vez do caminho inteiro).
+    /// The first frame whose path ends with the suffix — a short address
+    /// for tests (`"CountryCell"` instead of the whole path).
     pub fn find(&self, suffix: &str) -> Option<Rect> {
         self.entries
             .iter()
@@ -530,8 +542,8 @@ impl Frames {
     }
 }
 
-/// Resultado do passe completo: o tamanho respondido pelo root, os frames,
-/// a lista de desenho e os alvos de interação.
+/// The result of the full pass: the size the root answered, the frames,
+/// the draw list and the interaction targets.
 #[derive(Debug)]
 pub struct LayoutResult {
     pub size: Size,
@@ -542,9 +554,9 @@ pub struct LayoutResult {
     pub fields: Vec<FieldPlacement>,
 }
 
-/// Roda as duas fases a partir do root com o ambiente default — o
-/// [`PixelFont`] determinístico, cache fresco, sem offsets de rolagem
-/// (testes e uso direto; o `Runtime` monta o env real em
+/// Runs both phases from the root with the default environment — the
+/// deterministic [`PixelFont`], a fresh cache, no scroll offsets (tests
+/// and direct use; the `Runtime` builds the real env in
 /// [`layout_with`]).
 ///
 /// [`PixelFont`]: crate::text_engine::PixelFont
@@ -567,7 +579,7 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
     )
 }
 
-/// Roda as duas fases com o ambiente do frame.
+/// Runs both phases with the frame's environment.
 pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> LayoutResult {
     let (size, fit) = root.measure(proposal, env);
     let mut out = Placement::default();
@@ -583,14 +595,14 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
 }
 
 impl LayoutNode {
-    /// Flexível = quer o espaço que sobrar no eixo (a base da distribuição
-    /// dos stacks). Prioridade explícita, nunca efeito colateral de
+    /// Flexible = wants the leftover space on the axis (the basis of
+    /// stack distribution). Explicit priority, never a side effect of
     /// overflow.
     fn is_flexible(&self, axis: Axis) -> bool {
         match self {
             LayoutNode::Spacer | LayoutNode::Fill => true,
             LayoutNode::Scroll { .. } => axis == Axis::Vertical,
-            // um campo toma a largura oferecida (como o TextField real)
+            // a field takes the offered width (like the real TextField)
             LayoutNode::Field { .. } => axis == Axis::Horizontal,
             LayoutNode::MaxFrame { max_width, max_height, child, .. } => match axis {
                 Axis::Horizontal => max_width.is_infinite() || child.is_flexible(axis),
@@ -606,7 +618,7 @@ impl LayoutNode {
             LayoutNode::Boundary { children, .. } => {
                 children.len() == 1 && children[0].is_flexible(axis)
             }
-            // fronteira pulada: a flexibilidade é a da árvore retida
+            // skipped boundary: the flexibility is the retained tree's
             LayoutNode::BoundaryRef { path } => crate::reconciler::with_retained_layout(
                 path,
                 |layout| layout.map(|node| node.is_flexible(axis)).unwrap_or(false),
@@ -621,9 +633,9 @@ impl LayoutNode {
                 let metrics = env.cache.get_or_measure(content, &env.font, env.text);
                 let natural = metrics.width;
                 let line_h = metrics.height();
-                // quebra REAL por palavra, com as medições do engine — a
-                // largura entra na chave do cache (modo da sondagem);
-                // truncation desliga a quebra: uma linha, sempre
+                // REAL word wrapping, with the engine's measurements —
+                // the width goes into the cache key (probe mode);
+                // truncation turns wrapping off: one line, always
                 let size = match proposal.width {
                     Some(width) if width > 0.0 && width < natural => {
                         if truncation.is_some() {
@@ -720,7 +732,7 @@ impl LayoutNode {
                     },
                     env,
                 );
-                // ∞ = preencha o proposto; finito = teto sobre o filho
+                // ∞ = fill what was proposed; finite = a ceiling over the child
                 let resolve = |proposed: Option<Px>, max: Px, child_len: Px| {
                     if max.is_infinite() {
                         proposed.unwrap_or(child_len)
@@ -756,16 +768,16 @@ impl LayoutNode {
             }
 
             LayoutNode::Styled { props, child } => {
-                // a fonte herdada troca AQUI, já na medição — é a exceção
-                // sancionada do VisualProps (fonte muda medida)
+                // the inherited font swaps HERE, at measure time — the
+                // sanctioned VisualProps exception (font changes measure)
                 let env = LayoutEnv { font: props.font.apply_over(env.font), ..env };
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             LayoutNode::Boundary { children, .. } => {
-                // fronteira com um filho é transparente; com vários, os
-                // filhos empilham na vertical (o TupleView implícito)
+                // a boundary with one child is transparent; with several,
+                // the children stack vertically (the implicit TupleView)
                 if children.len() == 1 {
                     let (size, fit) = children[0].measure(proposal, env);
                     (size, Fit::Children(vec![(size, fit)]))
@@ -776,13 +788,14 @@ impl LayoutNode {
                 }
             }
 
-            // fronteira pulada: mede a árvore RETIDA no lugar — sem
-            // costurar cópia nenhuma (o layout do frame lê a retenção)
+            // skipped boundary: measures the RETAINED tree in its place —
+            // no copy stitched anywhere (the frame's layout reads the
+            // retention)
             LayoutNode::BoundaryRef { path } => {
                 crate::reconciler::with_retained_layout(path, |layout| match layout {
                     Some(node) => node.measure(proposal, env),
                     None => {
-                        debug_assert!(false, "referência de layout sem retenção: {path}");
+                        debug_assert!(false, "layout reference without retention: {path}");
                         (Size::default(), Fit::Leaf)
                     }
                 })
@@ -792,7 +805,7 @@ impl LayoutNode {
 
     pub(crate) fn place(&self, frame: Rect, fit: Fit, env: LayoutEnv, out: &mut Placement) {
         match (self, fit) {
-            // folhas visuais: aqui nasce a lista de desenho
+            // visual leaves: the draw list is born here
             (LayoutNode::Text { content, highlights, truncation }, Fit::Leaf) => {
                 let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
                 place_text(
@@ -815,9 +828,10 @@ impl LayoutNode {
             }
 
             (LayoutNode::Field { path, content, placeholder }, Fit::Leaf) => {
-                // foco/caret/seleção lidos do STAMP do env, clampados no
-                // conteúdo corrente (o app pode ter trocado a string por
-                // fora do editor) — a árvore nunca carregou nada disso
+                // focus/caret/selection read from the env's STAMP, clamped
+                // to the current content (the app may have swapped the
+                // string outside the editor) — the tree never carried any
+                // of this
                 let focused = env.stamp.focus == Some(path.as_str());
                 let state =
                     env.stamp.carets.get(path.as_str()).copied().unwrap_or_default();
@@ -833,8 +847,8 @@ impl LayoutNode {
                     .flatten()
                     .map(|(start, end)| (clamp(start), clamp(end)))
                     .filter(|(start, end)| start < end);
-                // chrome do campo: tokens lidos na COLOCAÇÃO — retheme
-                // repinta sem re-rodar body nenhum
+                // field chrome: tokens read at PLACEMENT — a retheme
+                // repaints without re-running a single body
                 let theme = crate::theme::current();
                 out.display.push(DrawCommand::FillRect {
                     rect: frame,
@@ -853,7 +867,7 @@ impl LayoutNode {
                 let prefix_width = |end: usize| {
                     env.cache.get_or_measure(&content[..end], &env.font, env.text).width
                 };
-                // seleção atrás do texto
+                // selection behind the text
                 if let Some((start, end)) = selection {
                     let x0 = text_origin.x + prefix_width(start);
                     let x1 = text_origin.x + prefix_width(end);
@@ -868,8 +882,9 @@ impl LayoutNode {
                 }
                 if content.is_empty() {
                     if !placeholder.is_empty() {
-                        // o placeholder anda pelo MESMO caminho do texto
-                        // real: mesma origem, mesma fonte, só a cor cai
+                        // the placeholder walks the SAME path as the real
+                        // text: same origin, same font, only the color
+                        // drops
                         out.display.push(DrawCommand::TextLine {
                             origin: text_origin,
                             content: placeholder.clone(),
@@ -888,8 +903,8 @@ impl LayoutNode {
                         font: env.font,
                     });
                 }
-                // a composição viva ganha o sublinhado do IME (a tinta do
-                // caret — o par visual da composição)
+                // the live composition gets the IME underline (the
+                // caret's ink — the composition's visual pair)
                 if let Some((start, end)) = marked {
                     let x0 = text_origin.x + prefix_width(start);
                     let x1 = text_origin.x + prefix_width(end);
@@ -902,7 +917,7 @@ impl LayoutNode {
                         corner_radius: 0.0,
                     });
                 }
-                // caret por cima (o blink alterna via estampa)
+                // caret on top (the blink alternates via the stamp)
                 if let Some(caret) = caret {
                     let x = text_origin.x + prefix_width(caret);
                     out.display.push(DrawCommand::FillRect {
@@ -919,8 +934,8 @@ impl LayoutNode {
                     color: if focused { theme.focus } else { theme.field_border },
                     width: 1.0,
                 });
-                // o campo é alvo de ponteiro (clicar foca) — clipado como
-                // qualquer hit
+                // the field is a pointer target (clicking focuses) —
+                // clipped like any hit
                 let visible = match out.current_clip() {
                     Some(clip) => frame.intersection(clip),
                     None => Some(frame),
@@ -986,8 +1001,8 @@ impl LayoutNode {
             }
 
             (LayoutNode::Scroll { path, child }, Fit::ScrollContent(content, fit)) => {
-                // curso por eixo sobre valores SNAPADOS: "rolável por
-                // 0.000001px" não existe aqui por construção
+                // per-axis travel over SNAPPED values: "scrollable by
+                // 0.000001px" does not exist here by construction
                 let max_x = (content.width.round() - frame.size.width.round()).max(0.0);
                 let max_y = (content.height.round() - frame.size.height.round()).max(0.0);
                 let raw = path
@@ -995,8 +1010,8 @@ impl LayoutNode {
                     .and_then(|path| env.scroll_offsets.get(path))
                     .copied()
                     .unwrap_or_default();
-                // conteúdo que encolheu re-clampa aqui — o offset retido
-                // nunca deixa a região em terra de ninguém
+                // content that shrank re-clamps here — the retained
+                // offset never leaves the region in no man's land
                 let offset =
                     Point { x: raw.x.clamp(0.0, max_x), y: raw.y.clamp(0.0, max_y) };
                 out.push_clip(frame);
@@ -1017,7 +1032,7 @@ impl LayoutNode {
                 }
                 out.pop_clip();
                 if let Some(path) = path {
-                    // depois do filho: regiões internas ficam ANTES no vec
+                    // after the child: inner regions come EARLIER in the vec
                     out.scrolls.push(ScrollRegion {
                         path: path.clone(),
                         frame,
@@ -1029,8 +1044,9 @@ impl LayoutNode {
             (LayoutNode::Styled { props, child }, Fit::Wrapped(_, fit)) => {
                 let env = LayoutEnv { font: props.font.apply_over(env.font), ..env };
                 let (hovered, pressed) = out.pointer.last().copied().unwrap_or((false, false));
-                // pressed > hovered > normal; estado sem fundo próprio cai
-                // no fundo base — um botão sem hover definido não pisca
+                // pressed > hovered > normal; a state without its own
+                // background falls back to the base one — a button with
+                // no hover defined does not flicker
                 let background = if pressed {
                     props.background_pressed.or(props.background)
                 } else if hovered {
@@ -1059,9 +1075,9 @@ impl LayoutNode {
 
             (LayoutNode::Interactive { path, child }, Fit::Wrapped(size, fit)) => {
                 let _ = size;
-                // fora do viewport o hit NÃO existe; row meio-visível
-                // clica só na parte visível (o rect registrado é a
-                // interseção com o clip corrente)
+                // outside the viewport the hit does NOT exist; a
+                // half-visible row clicks only on its visible part (the
+                // recorded rect is the intersection with the current clip)
                 let visible = match out.current_clip() {
                     Some(clip) => frame.intersection(clip),
                     None => Some(frame),
@@ -1069,9 +1085,9 @@ impl LayoutNode {
                 if let Some(visible) = visible {
                     out.hits.push((path.clone(), visible));
                 }
-                // hover/pressed do STAMP do env; pressed VISUAL só com o
-                // ponteiro dentro do alvo (semântica AppKit: arrastar
-                // para fora solta, voltar re-arma)
+                // hover/pressed from the env's STAMP; VISUAL pressed only
+                // with the pointer inside the target (AppKit semantics:
+                // dragging out releases, coming back re-arms)
                 let hovered =
                     env.stamp.interaction.hovered.as_deref() == Some(path.as_str());
                 let pressed = hovered
@@ -1102,9 +1118,9 @@ impl LayoutNode {
                 }
             }
 
-            // fronteira pulada: coloca a árvore RETIDA no lugar (o par do
-            // measure — as duas fases resolvem a MESMA retenção, o Fit
-            // espelha por construção)
+            // skipped boundary: places the RETAINED tree in its place
+            // (measure's pair — both phases resolve the SAME retention,
+            // the Fit mirrors by construction)
             (LayoutNode::BoundaryRef { path }, fit) => {
                 crate::reconciler::with_retained_layout(path, |layout| {
                     if let Some(node) = layout {
@@ -1115,17 +1131,18 @@ impl LayoutNode {
 
             (_, Fit::Leaf) => {}
 
-            // o enum permite representar o par errado; a integração com Fit
-            // associado por nó torna isso irrepresentável — aqui é bug nosso
-            _ => unreachable!("fit de um nó usado em outro"),
+            // the enum can represent the wrong pair; wiring a per-node
+            // associated Fit makes that unrepresentable — here it is our
+            // own bug
+            _ => unreachable!("fit of one node used on another"),
         }
     }
 }
 
-/// O algoritmo dos stacks: mede todo mundo UMA vez sem restrição no eixo
-/// principal (naturais + quem é flexível), divide o que sobrar entre os
-/// flexíveis e só re-mede esses. Encolher nunca acontece por baixo do pano:
-/// rígido fica com o natural.
+/// The stack algorithm: measures everyone ONCE with no restriction on the
+/// main axis (naturals + who is flexible), splits the leftover among the
+/// flexibles and re-measures only those. Shrinking never happens behind
+/// the scenes: rigid keeps its natural size.
 fn measure_stack(
     axis: Axis,
     spacing: Px,
@@ -1150,7 +1167,7 @@ fn measure_stack(
         Axis::Horizontal => proposal.width,
     };
 
-    // fase 1: naturais (proposta irrestrita no eixo principal)
+    // phase 1: naturals (unrestricted proposal on the main axis)
     let mut measured: Vec<(Size, Fit)> = children
         .iter()
         .map(|child| child.measure(cross_proposal(None), env))
@@ -1164,7 +1181,7 @@ fn measure_stack(
         .map(|(index, _)| index)
         .collect();
 
-    // fase 2: só os flexíveis re-medem, com a divisão do que sobrou
+    // phase 2: only the flexibles re-measure, with the leftover split
     if let Some(total) = proposed_main
         && !flexible.is_empty()
     {
@@ -1193,8 +1210,8 @@ fn measure_stack(
     (size, Fit::Children(measured))
 }
 
-/// Pinta um texto colocado: linha única, quebrado por palavra, ou
-/// truncado com elipse — sempre pelos MESMOS caches da medição.
+/// Paints a placed text: single line, word-wrapped, or truncated with an
+/// ellipsis — always through the SAME caches as measurement.
 fn place_text(
     content: &Rc<str>,
     highlights: Option<&TextHighlight>,
@@ -1215,8 +1232,8 @@ fn place_text(
         return;
     }
     if let Some(mode) = truncation {
-        // highlight não sobrevive à elipse (os ranges do original não
-        // mapeiam no texto composto) — v1 honesto, anotado
+        // highlight does not survive the ellipsis (the original's ranges
+        // do not map onto the composed text) — honest v1, noted
         let composed: Rc<str> = Rc::from(truncate_to_width(content, mode, frame.size.width, env));
         let length = composed.len();
         out.display.push(DrawCommand::TextLine {
@@ -1242,10 +1259,10 @@ fn place_text(
     }
 }
 
-/// Emite os `TextLine`s de UMA linha: inteira na cor base, ou fatiada em
-/// segmentos quando há highlight — cada segmento na posição do prefixo
-/// medido (kerning entre segmentos é aproximado; o shape por runs de
-/// verdade chega com o sistema de texto atribuído).
+/// Emits the `TextLine`s of ONE line: whole in the base color, or sliced
+/// into segments when there is a highlight — each segment at its measured
+/// prefix position (kerning between segments is approximate; real
+/// shaping by runs arrives with the attributed text system).
 fn emit_text_runs(
     content: &Rc<str>,
     line: (usize, usize),
@@ -1268,7 +1285,7 @@ fn emit_text_runs(
         return;
     };
 
-    // segmentos cobrindo a linha inteira, alternando base/destacado
+    // segments covering the whole line, alternating base/highlighted
     let clamp = |index: usize| crate::text_input::clamp_index(content, index);
     let mut segments: Vec<(usize, usize, bool)> = Vec::new();
     let mut cursor = line_start;
@@ -1310,8 +1327,8 @@ fn emit_text_runs(
 
 const ELLIPSIS: &str = "…";
 
-/// Compõe a versão com elipse que cabe na largura — maior conteúdo
-/// possível, medido de verdade (cada candidato passa pelo cache).
+/// Composes the ellipsis version that fits the width — the most content
+/// possible, measured for real (every candidate goes through the cache).
 fn truncate_to_width(content: &str, mode: Truncation, width: Px, env: LayoutEnv) -> String {
     let fits = |candidate: &str| {
         env.cache.get_or_measure(candidate, &env.font, env.text).width <= width
@@ -1334,7 +1351,7 @@ fn truncate_to_width(content: &str, mode: Truncation, width: Px, env: LayoutEnv)
             let starts: Vec<usize> = content.char_indices().map(|(index, _)| index).collect();
             for &start in starts.iter().rev() {
                 if start == 0 {
-                    break; // o conteúdo inteiro não coube lá atrás
+                    break; // the whole content did not fit back there
                 }
                 let candidate = format!("{ELLIPSIS}{}", &content[start..]);
                 if fits(&candidate) {
@@ -1388,10 +1405,10 @@ const FIELD_PAD_V: Px = 5.0;
 const FIELD_RADIUS: Px = 5.0;
 const FIELD_CARET_W: Px = 1.5;
 
-/// A thumb da região — draw-only nesta fase (drag chega com pointer
-/// capture): 4px de largura a 6px da borda direita, trilho com inset 6,
-/// piso de 24, proporcional ao viewport — e só existe quando há overflow
-/// (conteúdo curto nunca ganha barra).
+/// The region's thumb — draw-only at this stage (drag arrives with
+/// pointer capture): 4px wide at 6px from the right edge, track with
+/// inset 6, floor of 24, proportional to the viewport — and it only
+/// exists when there is overflow (short content never gets a bar).
 fn draw_scrollbar(frame: Rect, content_h: Px, offset_y: Px, max_y: Px, out: &mut Placement) {
     let track = frame.size.height - 2.0 * SCROLLBAR_INSET;
     if track <= 0.0 {
@@ -1486,10 +1503,10 @@ mod tests {
 
     #[test]
     fn scroll_region_never_propagates_the_content_minimum() {
-        // A dor clássica de flexbox, morta por construção: header + scroll
-        // de conteúdo gigante num viewport de 300 — o header fica natural,
-        // a região responde o que sobrou e o conteúdo excede POR DENTRO.
-        // Nenhum min_h(0), nenhum overflow mágico.
+        // The classic flexbox pain, dead by construction: header + scroll
+        // of giant content in a 300 viewport — the header stays natural,
+        // the region answers what was left and the content overflows ON
+        // THE INSIDE. No min_h(0), no magic overflow.
         let root = LayoutNode::Stack {
             axis: Axis::Vertical,
             spacing: 0.0,
@@ -1512,10 +1529,10 @@ mod tests {
         let content = result.frames.get("content").unwrap();
 
         assert_eq!(header.size.height, LINE_H);
-        assert_eq!(region.size.height, 300.0 - LINE_H, "a região pega o que sobrou");
+        assert_eq!(region.size.height, 300.0 - LINE_H, "the region takes what was left");
         assert!(
             content.size.height > region.size.height,
-            "o conteúdo excede por dentro — é isso que rola: {} > {}",
+            "the content overflows on the inside — that is what scrolls: {} > {}",
             content.size.height,
             region.size.height
         );
@@ -1545,7 +1562,7 @@ mod tests {
         assert_eq!(result.size, Size { width: 100.0, height: LINE_H });
     }
 
-    /// Mede um nó com o ambiente default dos testes (PixelFont).
+    /// Measures a node with the tests' default environment (PixelFont).
     fn measure_with_defaults(node: &LayoutNode, proposal: Proposal) -> Size {
         let engine = PixelFont;
         let cache = MeasureCache::default();
@@ -1562,9 +1579,8 @@ mod tests {
         node.measure(proposal, env).0
     }
 
-    /// Layout completo com um ponteiro estampado no env — o jeito dos
-    /// testes dirigirem hover/pressed depois que o estado de frame saiu
-    /// da árvore.
+    /// Full layout with a pointer stamped into the env — how tests drive
+    /// hover/pressed now that frame state has left the tree.
     fn layout_with_pointer(
         root: &LayoutNode,
         proposal: Proposal,
@@ -1604,9 +1620,9 @@ mod tests {
     fn text_wraps_against_the_proposed_width() {
         let size =
             measure_with_defaults(&text(100), Proposal { width: Some(100.0), height: None });
-        // 100 chars sem espaço em 100px: hard-break por CHAR inteiro —
-        // 12 por linha (96px ≤ 100) → 9 linhas (a quebra real não
-        // fraciona caracteres como a média antiga fazia)
+        // 100 chars with no space in 100px: hard-break by whole CHAR —
+        // 12 per line (96px ≤ 100) → 9 lines (real wrapping does not
+        // split characters the way the old average math did)
         assert_eq!(size, Size { width: 100.0, height: 144.0 });
     }
 
@@ -1615,7 +1631,7 @@ mod tests {
         let node = LayoutNode::Text { content: Rc::from("aa bb cc"), highlights: None, truncation: None };
         let result = layout(&node, Proposal { width: Some(40.0), height: None });
 
-        // "aa bb" (40px) cabe; "cc" desce inteiro — nunca "c" órfão
+        // "aa bb" (40px) fits; "cc" goes down whole — never an orphan "c"
         assert_eq!(result.size.height, 2.0 * LINE_H);
         let lines: Vec<String> = result
             .display
@@ -1655,15 +1671,15 @@ mod tests {
                 ("cd".to_string(), hot, 16.0),
                 ("ef".to_string(), Color::BLACK, 32.0),
             ],
-            "segmentos nas posições dos prefixos medidos"
+            "segments at the measured prefix positions"
         );
     }
 
     #[test]
     fn highlight_survives_the_word_wrap() {
         let hot = Color::hex(0xFF0000);
-        // "aa bb cc" em 40px quebra em "aa bb " + "cc"; os ranges cobrem
-        // o "bb" (linha 1) e o "cc" (linha 2)
+        // "aa bb cc" at 40px breaks into "aa bb " + "cc"; the ranges
+        // cover the "bb" (line 1) and the "cc" (line 2)
         let node = LayoutNode::Text {
             content: Rc::from("aa bb cc"),
             highlights: Some(TextHighlight {
@@ -1690,7 +1706,7 @@ mod tests {
                 ("bb".to_string(), 24.0, 0.0),
                 ("cc".to_string(), 0.0, LINE_H),
             ],
-            "cada linha recorta os ranges que a intersectam"
+            "each line crops the ranges that intersect it"
         );
     }
 
@@ -1703,7 +1719,7 @@ mod tests {
                 truncation: Some(mode),
             };
             let result = layout(&node, Proposal { width: Some(40.0), height: None });
-            assert_eq!(result.size.height, LINE_H, "truncation nunca quebra linha");
+            assert_eq!(result.size.height, LINE_H, "truncation never wraps a line");
             result
                 .display
                 .iter()
@@ -1713,7 +1729,7 @@ mod tests {
                 })
                 .unwrap()
         };
-        // PixelFont: 8px por char, "…" também
+        // PixelFont: 8px per char, "…" too
         assert_eq!(truncated(Truncation::End), "abcd…");
         assert_eq!(truncated(Truncation::Start), "…efgh");
         assert_eq!(truncated(Truncation::Middle), "ab…gh");
@@ -1724,7 +1740,7 @@ mod tests {
         let node = LayoutNode::Text { content: Rc::from("aaaaaaaaaa"), highlights: None, truncation: None };
         let result = layout(&node, Proposal { width: Some(40.0), height: None });
 
-        // 10 chars de 8px em 40px: 5 por linha
+        // 10 chars of 8px in 40px: 5 per line
         assert_eq!(result.size.height, 2.0 * LINE_H);
         let lines: Vec<String> = result
             .display
@@ -1757,7 +1773,7 @@ mod tests {
         let engine = PixelFont;
         let cache = MeasureCache::default();
         let mut offsets = HashMap::new();
-        offsets.insert("lista".to_string(), Point { x: 0.0, y: 40.0 });
+        offsets.insert("list".to_string(), Point { x: 0.0, y: 40.0 });
         let interaction = Interaction::default();
         let carets = HashMap::new();
         let env = LayoutEnv {
@@ -1769,7 +1785,7 @@ mod tests {
         };
 
         let root = LayoutNode::Scroll {
-            path: Some("lista".to_string()),
+            path: Some("list".to_string()),
             child: Box::new(rows(10)),
         };
         let result = layout_with(
@@ -1779,18 +1795,18 @@ mod tests {
         );
 
         assert_eq!(result.scrolls.len(), 1);
-        assert_eq!(result.scrolls[0].content.height, 160.0, "o content real fica na região");
+        assert_eq!(result.scrolls[0].content.height, 160.0, "the real content stays in the region");
         assert_eq!(
             result.frames.get("row0").unwrap().origin.y,
             -40.0,
-            "offset 40 empurra a row 0 para cima do viewport"
+            "offset 40 pushes row 0 up above the viewport"
         );
         assert!(
             result.display.iter().any(|command| matches!(
                 command,
                 DrawCommand::PushClip { rect } if rect.size.height == 100.0
             )),
-            "a região clipa no frame dela"
+            "the region clips at its own frame"
         );
     }
 
@@ -1801,38 +1817,38 @@ mod tests {
             child: Box::new(text(4)),
         };
         let root = LayoutNode::Scroll {
-            path: Some("lista".to_string()),
+            path: Some("list".to_string()),
             child: Box::new(LayoutNode::Stack {
                 axis: Axis::Vertical,
                 spacing: 0.0,
                 align: CrossAlign::Start,
                 children: vec![
-                    interactive("dentro"), // y [0, 16)
-                    interactive("metade"), // y [16, 32) — o viewport corta em 24
-                    interactive("fora"),   // y [32, 48) — invisível
+                    interactive("inside"),  // y [0, 16)
+                    interactive("half"),    // y [16, 32) — the viewport cuts at 24
+                    interactive("outside"), // y [32, 48) — invisible
                 ],
             }),
         };
         let result = layout(&root, Proposal::exact(Size { width: 100.0, height: 24.0 }));
 
-        assert!(result.hits.iter().any(|(path, _)| path == "dentro"));
-        let metade = result
+        assert!(result.hits.iter().any(|(path, _)| path == "inside"));
+        let half = result
             .hits
             .iter()
-            .find(|(path, _)| path == "metade")
+            .find(|(path, _)| path == "half")
             .map(|(_, rect)| *rect)
-            .expect("meio-visível existe");
-        assert_eq!(metade.size.height, 8.0, "o hit é só a parte visível");
+            .expect("the half-visible one exists");
+        assert_eq!(half.size.height, 8.0, "the hit is only the visible part");
         assert!(
-            !result.hits.iter().any(|(path, _)| path == "fora"),
-            "fora do viewport o hit NÃO existe"
+            !result.hits.iter().any(|(path, _)| path == "outside"),
+            "outside the viewport the hit does NOT exist"
         );
     }
 
     #[test]
     fn scrollbar_appears_only_with_overflow() {
         let scroll = |count: usize| LayoutNode::Scroll {
-            path: Some("lista".to_string()),
+            path: Some("list".to_string()),
             child: Box::new(rows(count)),
         };
         let viewport = Proposal::exact(Size { width: 100.0, height: 100.0 });
@@ -1846,11 +1862,11 @@ mod tests {
         };
 
         let fits = layout(&scroll(2), viewport);
-        assert!(thumb_of(&fits).is_none(), "conteúdo curto nunca ganha barra");
+        assert!(thumb_of(&fits).is_none(), "short content never gets a bar");
 
         let over = layout(&scroll(10), viewport);
-        let thumb = thumb_of(&over).expect("overflow ganha thumb");
-        // trilho 88 (inset 6 dos dois lados), proporcional 100/160
+        let thumb = thumb_of(&over).expect("overflow gets a thumb");
+        // track 88 (inset 6 on both sides), proportional 100/160
         assert_eq!(thumb.size.height, (100.0 / 160.0_f64 * 88.0).max(24.0));
         assert_eq!(thumb.size.width, 4.0);
         assert_eq!(thumb.origin.x, 100.0 - 6.0 - 4.0);
@@ -1870,7 +1886,7 @@ mod tests {
         let result = layout(&root, Proposal::unspecified());
 
         let commands: Vec<_> = result.display.iter().collect();
-        assert_eq!(commands.len(), 3, "fundo, texto, borda — nesta ordem");
+        assert_eq!(commands.len(), 3, "background, text, border — in this order");
         assert!(matches!(
             commands[0],
             DrawCommand::FillRect { color, corner_radius, .. }
@@ -1886,7 +1902,7 @@ mod tests {
 
     #[test]
     fn styled_never_changes_measurement() {
-        // a LEI no nível do nó: VisualProps é pintura pura
+        // the LAW at node level: VisualProps is pure paint
         let plain = layout(&text(7), Proposal::unspecified());
         let dressed = layout(
             &styled(
@@ -1937,10 +1953,11 @@ mod tests {
 
     #[test]
     fn hovered_swaps_paint_but_never_frames() {
-        // o hover mora no ENV, nunca no nó: a MESMA árvore com estampas
-        // diferentes tem que dar frames idênticos (a LEI, agora por tipo)
+        // hover lives in the ENV, never in the node: the SAME tree with
+        // different stamps must give identical frames (the LAW, now by
+        // type)
         let node = LayoutNode::Interactive {
-            path: "botao".to_string(),
+            path: "button".to_string(),
             child: Box::new(styled(
                 VisualProps {
                     background: Some(Color::hex(0x111111)),
@@ -1952,7 +1969,7 @@ mod tests {
         };
         let idle = Interaction::default();
         let hovering =
-            Interaction { hovered: Some("botao".to_string()), ..Interaction::default() };
+            Interaction { hovered: Some("button".to_string()), ..Interaction::default() };
         let cold = layout_with_pointer(&node, Proposal::unspecified(), &idle);
         let hot = layout_with_pointer(&node, Proposal::unspecified(), &hovering);
 
@@ -1960,7 +1977,7 @@ mod tests {
         assert_eq!(
             cold.frames.get("label"),
             hot.frames.get("label"),
-            "a LEI: hover nunca mexe em frame"
+            "the LAW: hover never touches a frame"
         );
         let background = |result: &LayoutResult| {
             result
@@ -1979,7 +1996,7 @@ mod tests {
     #[test]
     fn pressed_beats_hovered() {
         let root = LayoutNode::Interactive {
-            path: "botao".to_string(),
+            path: "button".to_string(),
             child: Box::new(styled(
                 VisualProps {
                     background: Some(Color::hex(0x111111)),
@@ -1991,8 +2008,8 @@ mod tests {
             )),
         };
         let pressing = Interaction {
-            hovered: Some("botao".to_string()),
-            pressed: Some("botao".to_string()),
+            hovered: Some("button".to_string()),
+            pressed: Some("button".to_string()),
             ..Interaction::default()
         };
         let result = layout_with_pointer(&root, Proposal::unspecified(), &pressing);

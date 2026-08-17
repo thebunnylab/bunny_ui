@@ -8,9 +8,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 struct StoreInner<T> {
-    /// Identidade de dependência: uma view que leu `value()` durante o
-    /// body depende do store INTEIRO (granularidade de objeto, como um
-    /// ObservableObject) — `send`/`update` sujam quem leu.
+    /// Dependency identity: a view that read `value()` during its body
+    /// depends on the WHOLE store (object granularity, like an
+    /// ObservableObject) — `send`/`update` dirty whoever read.
     dep_id: u64,
     value: RefCell<T>,
     watchers: RefCell<Vec<Rc<dyn Fn(&T)>>>,
@@ -149,9 +149,9 @@ impl<V: Clone + PartialEq + 'static> PassthroughSubject<V> {
         }
     }
 
-    /// `subject.sink { … }` — registra o watcher; `.store(in:)` guarda o
-    /// cancellable num `CancelBag` (o handle descartado continua inscrito,
-    /// como uma subscription retida do Combine).
+    /// `subject.sink { … }` — registers the watcher; `.store(in:)` keeps
+    /// the cancellable in a `CancelBag` (a discarded handle stays
+    /// subscribed, like a retained Combine subscription).
     pub fn sink(&self, f: impl Fn(&V) + 'static) -> Subscription {
         let watcher: Rc<dyn Fn(&V)> = Rc::new(f);
         self.watchers.borrow_mut().push(watcher.clone());
@@ -170,7 +170,7 @@ impl<V: Clone + PartialEq + 'static> PassthroughSubject<V> {
 
 }
 
-/// Combine's `AnyCancellable` (o retorno de `sink`).
+/// Combine's `AnyCancellable` (the return of `sink`).
 pub struct Subscription {
     remove: Rc<dyn Fn()>,
 }

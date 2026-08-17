@@ -62,9 +62,9 @@ impl Runtime {
     }
 }
 
-/// A identidade de um efeito entre renders — ou um nome escolhido à mão
-/// (o `concat!(file!(), …)` do motor), ou o callsite capturado por
-/// `#[track_caller]` (o caminho sem cerimônia da camada tipada).
+/// The identity of an effect across renders — either a hand-picked name
+/// (the engine's `concat!(file!(), …)`), or the callsite captured by
+/// `#[track_caller]` (the ceremony-free path of the typed layer).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Site {
     Named(&'static str),
