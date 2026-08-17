@@ -2229,6 +2229,13 @@ impl LayoutNode {
 /// main axis (naturals + who is flexible), splits the leftover among the
 /// flexibles and re-measures only those. Shrinking never happens behind
 /// the scenes: rigid keeps its natural size.
+///
+/// The split is a waterfall, not one equal cut. A flexible child can be
+/// bounded (a `frame_max` title bar over a spacer): offered its equal
+/// share, it takes less. What it leaves is not lost — the pool re-splits
+/// among the still-hungry and offers again. Every round retires at least
+/// one child, so the loop is bounded by the child count; shares within a
+/// round are equal, so no child's position buys it space.
 fn measure_stack(
     axis: Axis,
     spacing: Px,
@@ -2267,19 +2274,37 @@ fn measure_stack(
         .map(|(index, _)| index)
         .collect();
 
-    // phase 2: only the flexibles re-measure, with the leftover split
+    // phase 2: only the flexibles re-measure — the waterfall. Offer equal
+    // shares; a child that takes less than its offer is satisfied and its
+    // leftover re-splits among the rest, until a round leaves nothing.
     if let Some(total) = proposed_main
         && !flexible.is_empty()
     {
+        // Under-consumption within half a device pixel is arithmetic, not
+        // appetite — it must not spin another round.
+        const SETTLED: Px = 0.5;
         let rigid: Px = measured
             .iter()
             .enumerate()
             .filter(|(index, _)| !flexible.contains(index))
             .map(|(_, (size, _))| main(size))
             .sum();
-        let share = ((total - rigid - spacing_total) / flexible.len() as Px).max(0.0);
-        for &index in &flexible {
-            measured[index] = children[index].measure(cross_proposal(Some(share)), env);
+        let mut budget = (total - rigid - spacing_total).max(0.0);
+        let mut pool = flexible;
+        loop {
+            let share = budget / pool.len() as Px;
+            for &index in &pool {
+                measured[index] = children[index].measure(cross_proposal(Some(share)), env);
+            }
+            let (under, full): (Vec<usize>, Vec<usize>) = pool
+                .into_iter()
+                .partition(|&index| main(&measured[index].0) < share - SETTLED);
+            if under.is_empty() || full.is_empty() {
+                break;
+            }
+            budget -= under.iter().map(|&index| main(&measured[index].0)).sum::<Px>();
+            budget = budget.max(0.0);
+            pool = full;
         }
     }
 
@@ -2608,6 +2633,96 @@ mod tests {
         assert_eq!(result.frames.get("top").unwrap().origin.y, 0.0);
         assert_eq!(result.frames.get("gap").unwrap().size.height, 68.0);
         assert_eq!(result.frames.get("bottom").unwrap().origin.y, 84.0);
+    }
+
+    #[test]
+    fn the_waterfall_hands_a_capped_flexible_leftover_to_the_hungry() {
+        // The workbench frame in miniature: a title bar and a footer are
+        // flexible (a spacer lives in each) but bounded, the body is not.
+        // One equal cut would hand every child 800/3 and lose what the
+        // bars decline; the waterfall re-offers it to the body.
+        let capped = |name: &str, cap: f64| {
+            boundary(
+                name,
+                LayoutNode::MaxFrame {
+                    max_width: f64::INFINITY,
+                    max_height: cap,
+                    align: CrossAlign::Start,
+                    child: Box::new(LayoutNode::Spacer),
+                },
+            )
+        };
+        let root = LayoutNode::Stack {
+            axis: Axis::Vertical,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children: vec![
+                capped("bar", 40.0),
+                boundary("body", LayoutNode::Spacer),
+                capped("foot", 26.0),
+            ],
+        };
+        let result = layout(&root, Proposal { width: Some(1280.0), height: Some(800.0) });
+
+        assert_eq!(result.size.height, 800.0);
+        assert_eq!(result.frames.get("bar").unwrap().size.height, 40.0);
+        assert_eq!(result.frames.get("body").unwrap().size.height, 734.0);
+        assert_eq!(result.frames.get("foot").unwrap().origin.y, 774.0);
+    }
+
+    #[test]
+    fn the_waterfall_settles_a_side_panel_against_a_hungry_editor() {
+        // The other axis of the same screen: a 260-capped panel, a 1px
+        // divider, an editor that wants the rest. Equal thirds would give
+        // the editor 399; the waterfall gives it everything the panel and
+        // the divider do not use.
+        let root = LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children: vec![
+                boundary(
+                    "panel",
+                    LayoutNode::MaxFrame {
+                        max_width: 260.0,
+                        max_height: f64::INFINITY,
+                        align: CrossAlign::Start,
+                        child: Box::new(LayoutNode::Spacer),
+                    },
+                ),
+                boundary(
+                    "line",
+                    LayoutNode::Frame {
+                        width: Some(1.0),
+                        height: None,
+                        child: Box::new(LayoutNode::Spacer),
+                    },
+                ),
+                boundary("editor", LayoutNode::Spacer),
+            ],
+        };
+        let result = layout(&root, Proposal { width: Some(1200.0), height: Some(700.0) });
+
+        assert_eq!(result.frames.get("panel").unwrap().size.width, 260.0);
+        assert_eq!(result.frames.get("line").unwrap().size.width, 1.0);
+        assert_eq!(result.frames.get("editor").unwrap().size.width, 939.0);
+        assert_eq!(result.frames.get("editor").unwrap().origin.x, 261.0);
+    }
+
+    #[test]
+    fn a_single_axis_frame_pins_one_axis_and_asks_the_other() {
+        // `.frame(height: 22)` on a row: the height is EXACT — not a
+        // ceiling — while the width still follows the proposal through.
+        let root = LayoutNode::Frame {
+            width: None,
+            height: Some(22.0),
+            child: Box::new(boundary("row", LayoutNode::Spacer)),
+        };
+        let result = layout(&root, Proposal { width: Some(300.0), height: Some(600.0) });
+
+        assert_eq!(result.size.height, 22.0);
+        assert_eq!(result.size.width, 300.0);
+        assert_eq!(result.frames.get("row").unwrap().size.height, 22.0);
     }
 
     #[test]
