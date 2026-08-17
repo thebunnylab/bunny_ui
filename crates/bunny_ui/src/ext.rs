@@ -289,6 +289,16 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// The field receives focus on its FIRST appearance — and never
+    /// again (a user blur is final; remount under the same identity
+    /// does not re-focus).
+    fn auto_focus(self) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::AutoFocus,
+        }
+    }
+
     // MARK: - Interaction
 
     /// `.onTapGesture { … }` — in the headless runtime it fires on render.

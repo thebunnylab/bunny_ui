@@ -205,6 +205,7 @@ impl View for TextField {
                     path,
                     content: Rc::from(value),
                     placeholder: self.placeholder.clone(),
+                    auto_focus: false,
                 });
             }
             // outside a pass (decorative use): the value becomes plain text

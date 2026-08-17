@@ -1549,6 +1549,40 @@ mod tests {
     }
 
     #[test]
+    fn auto_focus_takes_the_keyboard_once_and_respects_blur() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Form {
+            name: State<String>,
+        }
+
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                text_field("Your name", self.name.binding()).monospaced().auto_focus()
+            }
+        }
+
+        let viewport = Proposal::exact(Size { width: 200.0, height: 60.0 });
+        let form = Form { name: State::new(String::new()) };
+        let runtime = Runtime::new();
+        runtime.settle(&form);
+        runtime.layout(&form, viewport);
+        let path = runtime.focused().expect("first appearance focuses the field");
+
+        // typing goes straight in — the field already owns the keyboard
+        assert!(runtime.key(EditCommand::Insert("d".into())).applied);
+        assert_eq!(form.name.get(), "d");
+
+        // a user blur is final: the next frames never steal focus back
+        runtime.blur();
+        runtime.settle(&form);
+        runtime.layout(&form, viewport);
+        assert_eq!(runtime.focused(), None, "auto focus fires once per identity");
+        let _ = path;
+    }
+
+    #[test]
     fn a_surface_repaints_a_real_hover_incrementally() {
         use crate::layout::{Proposal, Size};
         use crate::raster::{Surface, rasterize_scaled};

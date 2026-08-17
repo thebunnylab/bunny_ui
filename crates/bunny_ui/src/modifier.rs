@@ -65,6 +65,8 @@ pub enum Modifier {
     TruncationMode(Truncation),
     /// The scroll region follows this item id when it changes.
     ScrollTarget(String),
+    /// The field asks for focus on its first appearance.
+    AutoFocus,
 
     // MARK: - Real interaction (a pointer target without chrome — the Button
     // without the outfit; the action fires on up-inside like the Button's)
@@ -148,6 +150,7 @@ impl Modifier {
             }
             Modifier::TruncationMode(mode) => format!(" [.truncationMode(.{mode:?})]"),
             Modifier::ScrollTarget(id) => format!(" [.scrollTarget({id:?})]"),
+            Modifier::AutoFocus => " [.autoFocus()]".into(),
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
@@ -209,6 +212,39 @@ fn rewrite_scroll_node(
             max_height,
             align,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
+        other => other,
+    }
+}
+
+/// Descends through wrappers to the `Field` node and rewrites it —
+/// same order-immunity as the text and scroll rewrites.
+fn rewrite_field_node(
+    node: LayoutNode,
+    rewrite: &impl Fn(String, std::rc::Rc<str>, std::rc::Rc<str>) -> LayoutNode,
+) -> LayoutNode {
+    match node {
+        LayoutNode::Field { path, content, placeholder, .. } => {
+            rewrite(path, content, placeholder)
+        }
+        LayoutNode::Styled { props, child } => LayoutNode::Styled {
+            props,
+            child: Box::new(rewrite_field_node(*child, rewrite)),
+        },
+        LayoutNode::Padding { edges, child } => LayoutNode::Padding {
+            edges,
+            child: Box::new(rewrite_field_node(*child, rewrite)),
+        },
+        LayoutNode::Frame { width, height, child } => LayoutNode::Frame {
+            width,
+            height,
+            child: Box::new(rewrite_field_node(*child, rewrite)),
+        },
+        LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
+            max_width,
+            max_height,
+            align,
+            child: Box::new(rewrite_field_node(*child, rewrite)),
         },
         other => other,
     }
@@ -428,6 +464,14 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     path,
                     target: Some(id.clone()),
                     child,
+                })
+            }),
+            Modifier::AutoFocus => out.wrap_last_layout(|node| {
+                rewrite_field_node(node, &|path, content, placeholder| LayoutNode::Field {
+                    path,
+                    content,
+                    placeholder,
+                    auto_focus: true,
                 })
             }),
             Modifier::OnClick(action) => {

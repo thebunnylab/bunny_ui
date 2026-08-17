@@ -92,6 +92,9 @@ pub struct Runtime {
     /// The last APPLIED `.scroll_target` per region — the follow fires
     /// only when the target changes; in between, the wheel is sovereign.
     scroll_targets: RefCell<HashMap<String, String>>,
+    /// Fields whose `.auto_focus()` already fired — first appearance
+    /// only; a user blur is final.
+    auto_focused: RefCell<std::collections::HashSet<String>>,
     /// Did the last pass see the root become ONE boundary
     /// (`Boundary`/ref)? Only then can the stable frame synthesize the
     /// reference without a pass — a boundary-less root comes fresh
@@ -144,6 +147,7 @@ impl Runtime {
             theme_version: Cell::new(crate::theme::version()),
             keymap: RefCell::new(HashMap::new()),
             scroll_targets: RefCell::new(HashMap::new()),
+            auto_focused: RefCell::new(std::collections::HashSet::new()),
             root_is_boundary: Cell::new(false),
             printless: Cell::new(false),
         }
@@ -606,13 +610,32 @@ impl Runtime {
         proposal: crate::layout::Proposal,
     ) -> crate::layout::LayoutResult {
         let result = self.layout_once(root, proposal);
-        // a scroll target that CHANGED moves its region's offset — one
-        // bounded re-layout in the same frame (the wheel is untouched:
-        // an unchanged target never re-applies)
-        if self.apply_scroll_targets(&result) {
+        // declared follow-ups: a scroll target that CHANGED moves its
+        // region's offset; a field's first `.auto_focus()` takes the
+        // keyboard. Either one re-lays out ONCE in the same frame (the
+        // wheel and a user blur are never fought).
+        let moved = self.apply_scroll_targets(&result);
+        let focused = self.apply_auto_focus(&result);
+        if moved || focused {
             return self.layout_once(root, proposal);
         }
         result
+    }
+
+    /// Focuses the first `.auto_focus()` field never seen before — once
+    /// per identity: blur is final, remounting does not re-focus.
+    fn apply_auto_focus(&self, result: &crate::layout::LayoutResult) -> bool {
+        for field in &result.fields {
+            if !field.auto_focus || self.auto_focused.borrow().contains(&field.path) {
+                continue;
+            }
+            self.auto_focused.borrow_mut().insert(field.path.clone());
+            if self.focus.borrow().is_none() {
+                self.focus(&field.path);
+                return true;
+            }
+        }
+        false
     }
 
     fn layout_once(

@@ -233,6 +233,9 @@ pub enum LayoutNode {
         path: String,
         content: Rc<str>,
         placeholder: Rc<str>,
+        /// `.auto_focus()`: the runtime focuses this field on its FIRST
+        /// appearance — and never again (a user blur is final).
+        auto_focus: bool,
     },
     /// View boundary (`Component`): records the frame at the identity
     /// path — the address for tests and, later on, for hit-testing.
@@ -450,6 +453,8 @@ pub struct FieldPlacement {
     pub frame: Rect,
     pub text_origin: Point,
     pub font: FontSpec,
+    /// The field asked for focus on first appearance.
+    pub auto_focus: bool,
 }
 
 #[derive(Default, Debug)]
@@ -840,7 +845,7 @@ impl LayoutNode {
                 });
             }
 
-            (LayoutNode::Field { path, content, placeholder }, Fit::Leaf) => {
+            (LayoutNode::Field { path, content, placeholder, auto_focus }, Fit::Leaf) => {
                 // focus/caret/selection read from the env's STAMP, clamped
                 // to the current content (the app may have swapped the
                 // string outside the editor) — the tree never carried any
@@ -961,6 +966,7 @@ impl LayoutNode {
                     frame,
                     text_origin,
                     font: env.font,
+                    auto_focus: *auto_focus,
                 });
             }
 
