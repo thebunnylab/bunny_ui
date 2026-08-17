@@ -224,6 +224,88 @@ impl Component for AnimatedFinder {
     }
 }
 
+/// Ten thousand rows behind a virtual window — the scale story. The
+/// filter lives in retained state and recomputes ONLY when the query
+/// changes (the on_change effect) — moving the selection re-runs the
+/// body without walking ten thousand rows. The other runner mirrors
+/// the same hoisting for a fair ruler.
+#[derive(Clone)]
+struct VirtualFinder {
+    query: State<String>,
+    selected: State<usize>,
+    visible: State<Rc<Vec<usize>>>,
+    files: Rc<Vec<(Rc<str>, Rc<str>)>>,
+}
+
+impl Component for VirtualFinder {
+    fn body(self, _ctx: &Context) -> impl View {
+        let files = Rc::clone(&self.files);
+        let visible = self.visible.get();
+        let count = visible.len();
+        let selected_index = self.selected.get().min(count.saturating_sub(1));
+        let id_files = Rc::clone(&files);
+        let id_visible = Rc::clone(&visible);
+        vstack!(
+            hstack!(
+                text("›").foreground_color(theme::accent()),
+                text_field("Search files by name…", self.query.binding()).monospaced(),
+            )
+            .spacing(10.0)
+            .alignment(VerticalAlignment::Center)
+            .padding_length(10.0),
+            virtual_list(
+                count,
+                move |row| {
+                    let (name, dir) = &id_files[id_visible[row]];
+                    format!("{dir}{name}")
+                },
+                move |row| {
+                    let (name, dir) = &files[visible[row]];
+                    hstack!(
+                        text(name.clone()).foreground_color(theme::fg()),
+                        text(dir.clone())
+                            .font(Font::Subheadline)
+                            .monospaced()
+                            .foreground_color(theme::fg_secondary()),
+                        spacer(),
+                    )
+                    .spacing(8.0)
+                    .alignment(VerticalAlignment::Center)
+                    .padding_edge(Edge::Leading, 12.0)
+                    .padding_edge(Edge::Trailing, 12.0)
+                    .padding_edge(Edge::Top, 7.0)
+                    .padding_edge(Edge::Bottom, 7.0)
+                    .background_color(if row == selected_index {
+                        theme::row_pressed()
+                    } else {
+                        CLEAR
+                    })
+                    .on_click(|| {})
+                },
+            )
+            .reveal(selected_index),
+        )
+        .alignment(HorizontalAlignment::Leading)
+        .frame(640.0, 480.0)
+        .background_color(theme::panel())
+        .corner_radius(9.0)
+    }
+}
+
+/// The eager derivation a real app performs ON the keystroke — the
+/// exact mirror of the other runner's update-then-refilter.
+fn refilter(finder: &VirtualFinder) {
+    let query = finder.query.get();
+    finder.visible.set(Rc::new(
+        (0..finder.files.len())
+            .filter(|index| {
+                let (name, dir) = &finder.files[*index];
+                query.is_empty() || matches(dir, name, &query)
+            })
+            .collect(),
+    ));
+}
+
 struct Report {
     label: &'static str,
     p50: f64,
@@ -425,6 +507,65 @@ fn main() {
             gpu.present_nowait(&display, 2, Color::CANVAS, &*engine);
         }));
     }
+
+    // ten thousand rows behind the virtual window — the scale story.
+    // the fixture is generated ONCE, outside every step.
+    let big: Rc<Vec<(Rc<str>, Rc<str>)>> = Rc::new(
+        (0..10_000)
+            .map(|index| {
+                (
+                    Rc::from(format!("file_{index:04}.rs")),
+                    Rc::from(format!("src/mod_{:02}/", index % 100)),
+                )
+            })
+            .collect(),
+    );
+    let big_finder = VirtualFinder {
+        query: State::new(String::new()),
+        selected: State::new(0),
+        visible: State::new(Rc::new((0..10_000).collect())),
+        files: big,
+    };
+    let big_runtime = Runtime::new().text_engine(engine.clone());
+    big_runtime.settle(&big_finder);
+    big_runtime.layout(&big_finder, viewport);
+    big_runtime.layout(&big_finder, viewport);
+    let result = big_runtime.layout(&big_finder, viewport);
+    let field = result.fields.first().expect("field").clone();
+    big_runtime.pointer_pressed(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
+    big_runtime.pointer_released(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
+
+    let mut forward = true;
+    reports.push(measure("keystroke 10k (filter+layout)", 5, 200, || {
+        if forward {
+            big_runtime.key(EditCommand::Insert("e".into()));
+        } else {
+            big_runtime.key(EditCommand::Backspace);
+        }
+        forward = !forward;
+        refilter(&big_finder);
+        big_runtime.settle(&big_finder);
+        big_runtime.layout(&big_finder, viewport);
+    }));
+
+    let mut down = true;
+    reports.push(measure("wheel 10k (offset+layout)", 5, 200, || {
+        big_runtime.wheel(320.0, 300.0, 0.0, if down { -8.0 } else { 8.0 });
+        down = !down;
+        big_runtime.layout(&big_finder, viewport);
+    }));
+
+    let mut far = true;
+    reports.push(measure("reveal 10k (jump+layout)", 5, 200, || {
+        big_finder.selected.set(if far { 9_999 } else { 0 });
+        far = !far;
+        big_runtime.settle(&big_finder);
+        big_runtime.layout(&big_finder, viewport);
+    }));
+
+    reports.push(measure("layout 10k (no change)", 5, 200, || {
+        std::hint::black_box(big_runtime.layout(&big_finder, viewport).display.len());
+    }));
 
     // editor-class window: where a cpu full frame stops scaling and the
     // gpu must not care — the same scene laid out at 3024×1964 logical

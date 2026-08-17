@@ -760,17 +760,36 @@ where
             _ => (0, self.count.min(FIRST_WINDOW).saturating_sub(1)),
         };
         debug_assert_unique_ids("virtual_list", (first..=last).map(&self.id));
-        // the pin: the revealed row exists even far outside the window,
-        // so the follow-up that scrolls to it finds a real frame
+        // the pin: the revealed row exists even far outside the window —
+        // WITH its own buffered band, so when the follow-up scrolls to
+        // it the fresh viewport is already covered (one body, no extra
+        // invalidation round)
         let pin = self
             .reveal
             .filter(|index| self.count > 0 && *index < self.count)
             .filter(|index| *index < first || *index > last);
+        let pin_band = pin.map(|index| {
+            let buffer = match snapshot {
+                Some(snap) if snap.row_extent > 0.0 => {
+                    (snap.viewport / snap.row_extent).ceil().max(1.0) as usize + 1
+                }
+                _ => 1,
+            };
+            (index.saturating_sub(buffer), (index + buffer).min(self.count - 1))
+        });
+        // a far pin REPLACES the stale window: the offset is about to
+        // leave it anyway, so materializing it would be pure waste —
+        // the frame in flight is never presented (the follow-up layout
+        // is), and the fresh viewport lands covered
+        let (first, last) = match pin_band {
+            Some(band) => band,
+            None => (first, last),
+        };
 
         let mut children = Vec::new();
         let mut prints = Vec::new();
         if self.count > 0 {
-            for index in (first..=last).chain(pin) {
+            for index in first..=last {
                 let id = (self.id)(index);
                 // the same byte contract as the dense list: "[id]" is
                 // the identity frame, "scope/[id]" the boundary path

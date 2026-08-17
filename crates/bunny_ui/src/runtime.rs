@@ -740,7 +740,14 @@ impl Runtime {
         for _ in 0..2 {
             let moved = self.apply_scroll_targets(&result);
             let focused = self.apply_auto_focus(&result);
-            let missed = self.invalidate_window_misses(&result);
+            // a miss measured on the round a target just moved is
+            // spurious — it audited the PRE-jump offset; the relayout
+            // below re-audits against the real one
+            let missed = if moved {
+                false
+            } else {
+                self.invalidate_window_misses(&result)
+            };
             if !moved && !focused && !missed {
                 break;
             }
