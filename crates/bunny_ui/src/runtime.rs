@@ -576,6 +576,38 @@ impl Runtime {
         })
     }
 
+    /// Dom mode's sync door: the BROWSER's input owns the editing there,
+    /// and this mirrors its value back into the binding. Focus follows
+    /// the input; a changed value replaces the whole content in one
+    /// binding write; `caret_utf16` is the input's `selectionStart`
+    /// (UTF-16 units, the browser's vocabulary). Never called during a
+    /// live composition — the glue guards that boundary.
+    pub fn sync_field(&self, path: &str, content: &str, caret_utf16: usize) -> bool {
+        if !reconciler::has_editor(path) {
+            return false;
+        }
+        if self.focus.borrow().as_deref() != Some(path) {
+            self.focus(path);
+        }
+        let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
+        let current = reconciler::run_editor(path, EditCommand::Read, &mut state)
+            .flatten()
+            .unwrap_or_default();
+        if current != content {
+            let _ = reconciler::run_editor(path, EditCommand::SelectAll, &mut state);
+            let _ = reconciler::run_editor(
+                path,
+                EditCommand::Insert(content.to_string()),
+                &mut state,
+            );
+        }
+        state.caret = crate::text_input::utf16_to_byte(content, caret_utf16);
+        state.anchor = None;
+        state.marked = None;
+        self.carets.borrow_mut().insert(path.to_string(), state);
+        true
+    }
+
     /// Applies an edit command to the focused field. The binding write
     /// already dirtied whoever reads; typing returns the caret to solid.
     pub fn key(&self, command: EditCommand) -> Edited {

@@ -988,6 +988,29 @@ mod tests {
     }
 
     #[test]
+    fn hover_variants_ride_into_the_scene() {
+        #[derive(Clone, Copy)]
+        struct Hoverable;
+
+        impl Component for Hoverable {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("hi")
+                    .background_color(Color::hex(0x111111))
+                    .background_hovered(Color::hex(0x222222))
+                    .animated(crate::anim::Spring::snappy())
+                    .on_click(|| {})
+            }
+        }
+
+        let runtime = Runtime::new();
+        let patches = runtime.dom_frame(&Hoverable, Size { width: 100.0, height: 50.0 });
+        let hovered = patches.iter().any(|patch| {
+            matches!(patch, DomPatch::SetStyle { style, .. } if style.hover_background.is_some())
+        });
+        assert!(hovered, "the :hover alternative reached the patches: {patches:#?}");
+    }
+
+    #[test]
     fn the_encoding_is_byte_stable() {
         let patches = vec![
             DomPatch::Create { id: 7, parent: 0, kind: CreateKind::Box },

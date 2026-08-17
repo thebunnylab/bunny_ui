@@ -33,6 +33,10 @@ unsafe extern "C" {
     /// The glue schedules ONE requestAnimationFrame that calls
     /// `bunny_frame` back — the browser's display link.
     fn js_request_frame();
+    /// Dom mode: the glue walks this patch stream (the fixed
+    /// little-endian ABI of `bunny_ui::dom::encode`) and mutates the
+    /// element tree.
+    fn js_apply_patches(pointer: *const u8, len: usize);
 }
 
 /// What the exports feed the shell — the web twin of the mac AppEvent.
@@ -45,6 +49,11 @@ enum Event {
     Key(u32, bool),
     Frame { dt: f64 },
     Resize { width: f64, height: f64, scale: f64 },
+    /// Dom mode: the browser's scroll observer — the element scrolled
+    /// and the engine mirrors the offset (the dual ownership).
+    DomScroll { id: u32, x: f64, y: f64 },
+    /// Dom mode: the browser's input edited — value + selectionStart.
+    Field { path: String, value: String, caret: usize },
 }
 
 struct Shell {
@@ -173,12 +182,70 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 scale = (ratio.round() as usize).max(1);
                 present(&runtime, &full, size, scale, &mut surface);
             }
+            // Dom-mode traffic — this shell rasterizes, nothing to do
+            Event::DomScroll { .. } | Event::Field { .. } => {}
         }
     });
     SHELL.with(|slot| {
         *slot.borrow_mut() = Some(Shell { handle });
     });
     dispatch(Event::Resize { width, height, scale: scale as f64 });
+}
+
+/// Boots the DOM mode: the same scene lowers to element patches and
+/// the browser renders at home — native text selection, momentum
+/// scroll, the platform's own input. The engine never ticks springs
+/// here (reduce-motion on): animation specs lower to CSS transitions
+/// and programmatic scrolls ride `scroll-behavior`, so the browser
+/// animates while the engine stays event-driven.
+pub fn start_dom(width: f64, height: f64, root: impl View + 'static) {
+    let runtime = Runtime::new().text_engine(Rc::new(CanvasTextEngine::new()));
+    runtime.set_reduce_motion(true);
+    let mut size = Size { width, height };
+
+    fn apply(patches: Vec<bunny_ui::dom::DomPatch>) {
+        if !patches.is_empty() {
+            let bytes = bunny_ui::dom::encode(&patches);
+            unsafe { js_apply_patches(bytes.as_ptr(), bytes.len()) };
+        }
+    }
+
+    let handle = Box::new(move |event: Event| {
+        match event {
+            Event::PointerDown { x, y } => {
+                let _ = runtime.pointer_pressed(x, y);
+                apply(runtime.dom_frame(&root, size));
+            }
+            Event::PointerUp { x, y } => {
+                let _ = runtime.pointer_released(x, y);
+                apply(runtime.dom_frame(&root, size));
+            }
+            Event::DomScroll { id, x, y } => {
+                // the browser moved the element; the engine mirrors the
+                // offset so windows re-materialize and reveals compose
+                if let Some(path) = runtime.dom_scroll_path(id) {
+                    runtime.set_scroll_offset(&path, bunny_ui::layout::Point { x, y });
+                    apply(runtime.dom_frame(&root, size));
+                }
+            }
+            Event::Field { path, value, caret } => {
+                if runtime.sync_field(&path, &value, caret) {
+                    apply(runtime.dom_frame(&root, size));
+                }
+            }
+            Event::Resize { width, height, .. } => {
+                size = Size { width, height };
+                apply(runtime.dom_frame(&root, size));
+            }
+            // hover, wheel, keys and ticks belong to the browser in
+            // this mode — nothing to do on our side of the border
+            _ => {}
+        }
+    });
+    SHELL.with(|slot| {
+        *slot.borrow_mut() = Some(Shell { handle });
+    });
+    dispatch(Event::Resize { width, height, scale: 1.0 });
 }
 
 // MARK: - Exports (the glue's side of the border)
@@ -232,4 +299,27 @@ pub extern "C" fn bunny_frame(dt: f64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_resize(width: f64, height: f64, scale: f64) {
     dispatch(Event::Resize { width, height, scale });
+}
+
+/// Dom mode: a scroll element moved (by finger, wheel or momentum) —
+/// reported by element id, in logical px.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_dom_scroll(id: u32, x: f64, y: f64) {
+    dispatch(Event::DomScroll { id, x, y });
+}
+
+/// Dom mode: the input edited. Both strings arrive through
+/// `bunny_alloc` buffers (ownership comes back here); `caret` is the
+/// input's `selectionStart` in UTF-16 units.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_field(
+    path_pointer: *mut u8,
+    path_len: usize,
+    value_pointer: *mut u8,
+    value_len: usize,
+    caret: usize,
+) {
+    let path = unsafe { String::from_raw_parts(path_pointer, path_len, path_len.max(1)) };
+    let value = unsafe { String::from_raw_parts(value_pointer, value_len, value_len.max(1)) };
+    dispatch(Event::Field { path, value, caret });
 }

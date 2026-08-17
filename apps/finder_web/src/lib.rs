@@ -95,9 +95,7 @@ impl Component for Finder {
 
 const CLEAR: Color = Color { r: 0, g: 0, b: 0, a: 0 };
 
-/// The glue calls this once, with the canvas geometry.
-#[unsafe(no_mangle)]
-pub extern "C" fn start(width: f64, height: f64, scale: f64) {
+fn finder() -> Finder {
     let files: Rc<Vec<(Rc<str>, Rc<str>)>> = Rc::new(
         (0..10_000)
             .map(|index| {
@@ -108,11 +106,22 @@ pub extern "C" fn start(width: f64, height: f64, scale: f64) {
             })
             .collect(),
     );
-    let finder = Finder {
+    Finder {
         query: State::new(String::new()),
         selected: State::new(0),
         visible: State::new(Rc::new((0..10_000).collect())),
         files,
-    };
-    bunny_ui_web::start(width, height, scale, finder);
+    }
+}
+
+/// The glue calls this once, with the canvas geometry.
+#[unsafe(no_mangle)]
+pub extern "C" fn start(width: f64, height: f64, scale: f64) {
+    bunny_ui_web::start(width, height, scale, finder());
+}
+
+/// The Dom page calls this one — the SAME scene, rendered at home.
+#[unsafe(no_mangle)]
+pub extern "C" fn start_dom(width: f64, height: f64) {
+    bunny_ui_web::start_dom(width, height, finder());
 }
