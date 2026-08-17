@@ -102,6 +102,10 @@ pub struct Runtime {
     /// The retained animations — springs keyed by identity, resolved
     /// at place through the env, advanced by the shell's tick.
     animator: RefCell<crate::anim::Animator>,
+    /// The proposal of the last layout pass — a pass with a DIFFERENT
+    /// one is a resize, and a resize snaps animated retargets (the
+    /// window tracks the mouse; nothing wobbles after it).
+    last_proposal: Cell<Option<crate::layout::Proposal>>,
     /// The Dom mode's retained scene — [`Runtime::dom_frame`] diffs
     /// each new capture against it. Empty (and free) in every other
     /// mode.
@@ -161,6 +165,7 @@ impl Runtime {
             scroll_targets: RefCell::new(HashMap::default()),
             auto_focused: RefCell::new(std::collections::HashSet::default()),
             animator: RefCell::new(crate::anim::Animator::default()),
+            last_proposal: Cell::new(None),
             dom: RefCell::new(crate::dom::DomLowering::default()),
             root_is_boundary: Cell::new(false),
             printless: Cell::new(false),
@@ -1035,8 +1040,16 @@ impl Runtime {
         };
         self.cache.begin_frame();
         // the animator's sweep clock follows PLACES, not ticks — this
-        // pass's touches mark who is still mounted
-        self.animator.borrow_mut().note_place();
+        // pass's touches mark who is still mounted. A pass whose
+        // proposal CHANGED is a resize: geometry moved because the
+        // window did, and that is not an animation — retargets snap.
+        let resized = self.last_proposal.get() != Some(proposal);
+        self.last_proposal.set(Some(proposal));
+        {
+            let mut animator = self.animator.borrow_mut();
+            animator.note_place();
+            animator.set_snap_retargets(resized);
+        }
         let offsets = self.scroll_offsets.borrow();
         let env = LayoutEnv {
             text: &*self.text,

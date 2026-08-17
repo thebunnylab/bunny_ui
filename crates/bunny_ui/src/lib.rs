@@ -750,6 +750,45 @@ mod tests {
     }
 
     #[test]
+    fn a_window_resize_snaps_animated_origins() {
+        use crate::anim::Spring;
+
+        // the spacer pushes the text to the trailing edge — every width
+        // change moves the animated view
+        #[derive(Clone, Copy)]
+        struct Trailing;
+
+        impl Component for Trailing {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::hstack!(
+                    spacer(),
+                    text("steady")
+                        .background_color(crate::layout::Color::hex(0x334455))
+                        .animated(Spring::smooth())
+                )
+            }
+        }
+
+        let narrow = crate::layout::Size { width: 300.0, height: 100.0 };
+        let wide = crate::layout::Size { width: 500.0, height: 100.0 };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&Trailing, narrow);
+        let _ = runtime.display_frame(&Trailing, narrow);
+
+        // a resize is not an animation: the very first frame at the new
+        // size paints exactly where a fresh runtime would — no flight,
+        // no trail behind a live-resizing window
+        let resized = runtime.display_frame(&Trailing, wide);
+        let fresh = Runtime::new().display_frame(&Trailing, wide);
+        assert_eq!(
+            resized.as_slice(),
+            fresh.as_slice(),
+            "the resized frame snapped to the new geometry"
+        );
+        assert!(!runtime.wants_frame(), "nothing left mid-flight after the snap");
+    }
+
+    #[test]
     fn web_shaped_fixture_heals_after_a_violent_wheel() {
         use crate::anim::Spring;
         use std::rc::Rc as StdRc;

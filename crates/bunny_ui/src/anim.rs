@@ -175,6 +175,12 @@ pub struct Animator {
     places: u64,
     /// Accessibility: every animation completes instantly.
     reduce_motion: bool,
+    /// A RESIZE is not an animation: while this pass flag is on, a
+    /// changed target SNAPS instead of starting a flight. The runtime
+    /// raises it for any pass whose proposal differs from the last —
+    /// live-resizing a window must track the mouse, never wobble after
+    /// it. Flights whose target did not change keep flying.
+    snap_retargets: bool,
 }
 
 fn color_tracks(color: Color) -> [Track; 4] {
@@ -195,6 +201,12 @@ impl Animator {
     /// this pass's touches are distinguishable from the last one's.
     pub(crate) fn note_place(&mut self) {
         self.places += 1;
+    }
+
+    /// Raised for a pass whose PROPOSAL changed (a resize): geometry
+    /// moved because the window did, and that is not an animation.
+    pub(crate) fn set_snap_retargets(&mut self, on: bool) {
+        self.snap_retargets = on;
     }
 
     /// The place asks: which entry answers for `key`? Seeds a fresh one
@@ -223,12 +235,17 @@ impl Animator {
         if self.reduce_motion {
             return target;
         }
+        let snap = self.snap_retargets;
         let entry = self.entry(key, spec);
         let tracks = entry.colors[slot as usize].get_or_insert_with(|| color_tracks(target));
         let want = [target.r as f64, target.g as f64, target.b as f64, target.a as f64];
         for (track, want) in tracks.iter_mut().zip(want) {
             if track.target != want {
-                track.retarget(want);
+                if snap {
+                    *track = Track::at(want);
+                } else {
+                    track.retarget(want);
+                }
             }
         }
         Color {
@@ -251,13 +268,18 @@ impl Animator {
         if self.reduce_motion {
             return target;
         }
+        let snap = self.snap_retargets;
         let entry = self.entry(key, spec);
         let tracks = entry
             .origin
             .get_or_insert_with(|| [Track::at(target.0), Track::at(target.1)]);
         for (track, want) in tracks.iter_mut().zip([target.0, target.1]) {
             if track.target != want {
-                track.retarget(want);
+                if snap {
+                    *track = Track::at(want);
+                } else {
+                    track.retarget(want);
+                }
             }
         }
         (tracks[0].value, tracks[1].value)
