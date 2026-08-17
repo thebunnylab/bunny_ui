@@ -28,24 +28,23 @@ impl Component for App {
         let active = tab.get();
         let titles = ["Code", "Pareto", "Infra", "Atrium"];
 
+        // a FLAT tab is a click target without the button's outfit:
+        // `.on_click` arms the press and the style is all ours — a
+        // `button(...)` here would paint its own control chrome INSIDE
+        // this background and the padding would read as a lopsided ring
         let tabs = titles.iter().enumerate().map(|(index, title)| {
             let on = index == active;
-            button(
-                text(*title).foreground_color(if on {
-                    Color::WHITE
-                } else {
-                    theme::fg_secondary()
-                }),
-                move || tab.set(index),
-            )
-            .padding_edge(Edge::Leading, 12.0)
-            .padding_edge(Edge::Trailing, 12.0)
-            .padding_edge(Edge::Top, 6.0)
-            .padding_edge(Edge::Bottom, 6.0)
-            .background_color(if on { theme::accent() } else { CLEAR })
-            .background_hovered(theme::row_hover())
-            .corner_radius(8.0)
-            .animated(Spring::snappy())
+            text(*title)
+                .foreground_color(if on { Color::WHITE } else { theme::fg_secondary() })
+                .padding_edge(Edge::Leading, 12.0)
+                .padding_edge(Edge::Trailing, 12.0)
+                .padding_edge(Edge::Top, 6.0)
+                .padding_edge(Edge::Bottom, 6.0)
+                .background_color(if on { theme::accent() } else { CLEAR })
+                .background_hovered(theme::row_hover())
+                .corner_radius(8.0)
+                .animated(Spring::snappy())
+                .on_click(move || tab.set(index))
         });
         let (t0, t1, t2, t3) = {
             let mut tabs = tabs;
