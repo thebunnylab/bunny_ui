@@ -765,6 +765,12 @@ impl LayoutNode {
             | LayoutNode::Styled { child, .. }
             | LayoutNode::Animated { child, .. }
             | LayoutNode::Island { child } => child.is_flexible(axis),
+            // a stack that HOLDS something flexible is itself flexible
+            // (a panel with a scroll inside wants the leftover space —
+            // nesting it must not freeze it at its natural extent)
+            LayoutNode::Stack { children, .. } | LayoutNode::Layered { children } => {
+                children.iter().any(|child| child.is_flexible(axis))
+            }
             LayoutNode::Boundary { children, .. } => {
                 children.len() == 1 && children[0].is_flexible(axis)
             }

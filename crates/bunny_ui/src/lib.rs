@@ -750,6 +750,44 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_panel_with_a_scroll_stays_inside_the_window() {
+        #[derive(Clone, Copy)]
+        struct Launcher;
+
+        impl Component for Launcher {
+            fn body(self, _ctx: &Context) -> impl View {
+                // the launcher shape: a padded, styled panel WRAPPING a
+                // scroll — the stack must stay flexible through the
+                // nesting, never freeze at the content's full extent
+                crate::vstack!(crate::vstack!(
+                    text("header"),
+                    virtual_list(10_000, |row| format!("row{row}"), |row| {
+                        text(format!("item {row}"))
+                    })
+                )
+                .background_color(crate::layout::Color::WHITE)
+                .corner_radius(12.0))
+                .padding_length(20.0)
+            }
+        }
+
+        let size = crate::layout::Size { width: 400.0, height: 300.0 };
+        let runtime = Runtime::new();
+        let result = runtime.layout(&Launcher, crate::layout::Proposal::exact(size));
+        let region = result.scrolls.first().expect("the list scrolls");
+        assert!(
+            region.frame.size.height <= 300.0,
+            "the panel's scroll is bounded by the window: {:?}",
+            region.frame
+        );
+        assert!(
+            region.content.height > 100_000.0,
+            "the content is still the honest full extent: {:?}",
+            region.content
+        );
+    }
+
+    #[test]
     fn a_window_resize_snaps_animated_origins() {
         use crate::anim::Spring;
 
