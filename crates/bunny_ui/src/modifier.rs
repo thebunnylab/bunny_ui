@@ -69,6 +69,8 @@ pub enum Modifier {
     AutoFocus,
     /// A soft halo behind the view: (radius, color).
     Shadow(f64, Color),
+    /// Declares a key context active while this view is mounted.
+    KeyContext(&'static str),
 
     // MARK: - Real interaction (a pointer target without chrome — the Button
     // without the outfit; the action fires on up-inside like the Button's)
@@ -154,6 +156,7 @@ impl Modifier {
             Modifier::ScrollTarget(id) => format!(" [.scrollTarget({id:?})]"),
             Modifier::AutoFocus => " [.autoFocus()]".into(),
             Modifier::Shadow(radius, color) => format!(" [.shadow(radius: {radius}, {color})]"),
+            Modifier::KeyContext(name) => format!(" [.keyContext({name})]"),
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
@@ -481,6 +484,11 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     auto_focus: true,
                 })
             }),
+            Modifier::KeyContext(name) => {
+                // declaration, not paint: retained with the entry — the
+                // context deactivates when the view unmounts
+                crate::reconciler::attribute_context(name);
+            }
             Modifier::OnClick(action) => {
                 // the same registration as the Button: action retained in the
                 // reconciler, frame in the hit-test under the cursor identity

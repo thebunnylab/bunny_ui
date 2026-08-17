@@ -317,6 +317,16 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// Declares a key context ACTIVE while this view is mounted —
+    /// `Runtime::bind_in(context, …)` bindings answer only then. The
+    /// palette closes, its keys go quiet.
+    fn key_context(self, name: &'static str) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::KeyContext(name),
+        }
+    }
+
     // MARK: - Interaction
 
     /// `.onTapGesture { … }` — in the headless runtime it fires on render.

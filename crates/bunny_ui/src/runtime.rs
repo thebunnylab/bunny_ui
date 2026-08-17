@@ -89,6 +89,9 @@ pub struct Runtime {
     /// The app keymap: key pattern → action. Runtime config (like the
     /// text engine), not retention — bind is a declaration of intent.
     keymap: RefCell<HashMap<KeyPattern, ActionId>>,
+    /// Context-scoped bindings (`bind_in`): active only while a mounted
+    /// view declares the context (`.key_context(name)`).
+    scoped_keymap: RefCell<HashMap<&'static str, HashMap<KeyPattern, ActionId>>>,
     /// The last APPLIED `.scroll_target` per region — the follow fires
     /// only when the target changes; in between, the wheel is sovereign.
     scroll_targets: RefCell<HashMap<String, String>>,
@@ -146,6 +149,7 @@ impl Runtime {
             last_fields: RefCell::new(Vec::new()),
             theme_version: Cell::new(crate::theme::version()),
             keymap: RefCell::new(HashMap::new()),
+            scoped_keymap: RefCell::new(HashMap::new()),
             scroll_targets: RefCell::new(HashMap::new()),
             auto_focused: RefCell::new(std::collections::HashSet::new()),
             root_is_boundary: Cell::new(false),
@@ -193,6 +197,7 @@ impl Runtime {
             reconciler::assemble_actions(pass_root);
             reconciler::assemble_editors(pass_root);
             reconciler::assemble_handlers(pass_root);
+            reconciler::assemble_contexts(pass_root);
             motor::identity::consume_dirty(pass_root, &snapshot);
             *self.last_root.borrow_mut() = Some(pass_root.clone());
         }
@@ -349,8 +354,30 @@ impl Runtime {
         self.keymap.borrow_mut().insert(pattern, action);
     }
 
-    /// The binding for the pattern, if any.
+    /// Binds the pattern INSIDE a key context: the binding only answers
+    /// while some mounted view declares `.key_context(context)`. Scoped
+    /// bindings beat global ones on the same pattern.
+    pub fn bind_in(&self, context: &'static str, pattern: KeyPattern, action: ActionId) {
+        self.scoped_keymap
+            .borrow_mut()
+            .entry(context)
+            .or_default()
+            .insert(pattern, action);
+    }
+
+    /// The binding for the pattern: ACTIVE scoped contexts first (a
+    /// mounted `.key_context` turns its bindings on), the global map as
+    /// the fallback.
     pub fn match_key(&self, pattern: &KeyPattern) -> Option<ActionId> {
+        let scoped = self.scoped_keymap.borrow();
+        for (context, map) in scoped.iter() {
+            if let Some(action) = map.get(pattern)
+                && reconciler::context_active(context)
+            {
+                return Some(*action);
+            }
+        }
+        drop(scoped);
         self.keymap.borrow().get(pattern).copied()
     }
 

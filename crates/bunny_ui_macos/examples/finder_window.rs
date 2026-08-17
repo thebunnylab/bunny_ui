@@ -265,6 +265,8 @@ impl Component for Finder {
             .border(theme::border(), 1.0)
             // the floating panel finally casts its shadow
             .shadow(24.0)
+            // the finder keys answer only while the panel is mounted
+            .key_context("finder")
             // ↓/↑ with wrap — they work WHILE typing (the gate consumes)
             .on_action(SELECT_NEXT, move || {
                 if count > 0 {
@@ -305,13 +307,13 @@ fn main() {
     let runtime =
         Runtime::new().text_engine(Rc::new(bunny_ui_macos::CoreTextEngine::new()));
     // the app keymap: key → intent (the handlers live in the screen)
-    runtime.bind(KeyPattern::key(Key::Down), SELECT_NEXT);
-    runtime.bind(KeyPattern::key(Key::Up), SELECT_PREV);
-    runtime.bind(KeyPattern::key(Key::PageDown), PAGE_FORWARD);
-    runtime.bind(KeyPattern::key(Key::PageUp), PAGE_BACK);
-    runtime.bind(KeyPattern::key(Key::Enter), OPEN);
-    runtime.bind(KeyPattern::command(Key::Enter), OPEN_SPLIT);
-    runtime.bind(KeyPattern::key(Key::Escape), DISMISS);
+    runtime.bind_in("finder", KeyPattern::key(Key::Down), SELECT_NEXT);
+    runtime.bind_in("finder", KeyPattern::key(Key::Up), SELECT_PREV);
+    runtime.bind_in("finder", KeyPattern::key(Key::PageDown), PAGE_FORWARD);
+    runtime.bind_in("finder", KeyPattern::key(Key::PageUp), PAGE_BACK);
+    runtime.bind_in("finder", KeyPattern::key(Key::Enter), OPEN);
+    runtime.bind_in("finder", KeyPattern::command(Key::Enter), OPEN_SPLIT);
+    runtime.bind_in("finder", KeyPattern::key(Key::Escape), DISMISS);
 
     bunny_ui_macos::run_window_with(
         "Finder",

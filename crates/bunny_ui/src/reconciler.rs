@@ -65,6 +65,9 @@ pub(crate) struct Entry {
     pub editors: Vec<EditorEntry>,
     /// The body's named-action handlers — same retention.
     pub handlers: Vec<HandlerEntry>,
+    /// Key contexts declared in the body (`.key_context(name)`) — a
+    /// context is ACTIVE while a view declaring it stays mounted.
+    pub contexts: Vec<&'static str>,
     /// The PARENT's path segments — the cursor seed for an isolated re-run.
     pub parent_segments: Vec<String>,
 }
@@ -76,6 +79,7 @@ struct BuildingFrame {
     actions: Vec<ActionEntry>,
     editors: Vec<EditorEntry>,
     handlers: Vec<HandlerEntry>,
+    contexts: Vec<&'static str>,
 }
 
 #[derive(Default)]
@@ -91,6 +95,7 @@ struct PassState {
     root_actions: Vec<ActionEntry>,
     root_editors: Vec<EditorEntry>,
     root_handlers: Vec<HandlerEntry>,
+    root_contexts: Vec<&'static str>,
     /// Instrumentation: bodies that ran in this pass.
     body_runs: Vec<String>,
     /// Boundaries SKIPPED in this pass — a skipped one's subtree
@@ -183,14 +188,14 @@ pub(crate) fn finish_entry(
     node: RenderNode,
     layout: LayoutNode,
 ) {
-    let (effects, actions, editors, handlers) = PASS.with(|pass| {
+    let (effects, actions, editors, handlers, contexts) = PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         match pass.building.pop() {
             Some(frame) => {
                 debug_assert_eq!(frame.path, path, "entries close in the order they open");
-                (frame.effects, frame.actions, frame.editors, frame.handlers)
+                (frame.effects, frame.actions, frame.editors, frame.handlers, frame.contexts)
             }
-            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         }
     });
     let parent_segments = motor::identity::current_path_segments()
@@ -209,6 +214,7 @@ pub(crate) fn finish_entry(
                 actions,
                 editors,
                 handlers,
+                contexts,
                 parent_segments,
             },
         );
@@ -254,6 +260,45 @@ pub(crate) fn attribute_editor(path: String, editor: EditorFn) {
 
 /// A named-action handler registered during render — same attribution
 /// as the actions: entry being built, or the root region.
+/// A key context declared during render — active while its view stays
+/// mounted (retained like the handlers; the sweep deactivates it).
+pub(crate) fn attribute_context(name: &'static str) {
+    PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        if let Some(frame) = pass.building.last_mut() {
+            frame.contexts.push(name);
+        } else {
+            pass.root_contexts.push(name);
+        }
+    });
+}
+
+thread_local! {
+    static ACTIVE_CONTEXTS: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::new());
+}
+
+/// Rebuilds the active-context set from the retention (the live
+/// declarations) — the twin of the handler assembly.
+pub(crate) fn assemble_contexts(root: &str) {
+    let mut active: HashSet<&'static str> = HashSet::new();
+    RETAINED.with(|retained| {
+        for (path, entry) in retained.borrow().iter() {
+            if covers(root, path) {
+                active.extend(entry.contexts.iter().copied());
+            }
+        }
+    });
+    PASS.with(|pass| {
+        active.extend(std::mem::take(&mut pass.borrow_mut().root_contexts));
+    });
+    ACTIVE_CONTEXTS.with(|contexts| *contexts.borrow_mut() = active);
+}
+
+/// Is the context declared by any mounted view?
+pub(crate) fn context_active(name: &str) -> bool {
+    ACTIVE_CONTEXTS.with(|contexts| contexts.borrow().contains(name))
+}
+
 pub(crate) fn attribute_handler(path: String, id: crate::action::ActionId, handler: HandlerFn) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();

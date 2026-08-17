@@ -1583,6 +1583,53 @@ mod tests {
     }
 
     #[test]
+    fn scoped_bindings_answer_only_while_their_context_is_mounted() {
+        use crate::layout::{Proposal, Size};
+
+        const CLOSE: ActionId = ActionId("palette.close");
+        const GLOBAL: ActionId = ActionId("app.global");
+
+        #[derive(Clone, Copy)]
+        struct App {
+            palette_open: State<bool>,
+        }
+
+        impl Component for App {
+            fn body(self, _ctx: &Context) -> impl View {
+                let palette = self
+                    .palette_open
+                    .get()
+                    .then(|| text("palette").key_context("palette"));
+                vstack!(text("app"), palette)
+            }
+        }
+
+        let viewport = Proposal::exact(Size { width: 200.0, height: 100.0 });
+        let app = App { palette_open: State::new(false) };
+        let runtime = Runtime::new();
+        let escape = KeyPattern::key(Key::Escape);
+        runtime.bind(escape, GLOBAL);
+        runtime.bind_in("palette", escape, CLOSE);
+
+        // palette closed: the scoped binding is silent, the global answers
+        runtime.settle(&app);
+        runtime.layout(&app, viewport);
+        assert_eq!(runtime.match_key(&escape), Some(GLOBAL), "context down, global wins");
+
+        // palette mounts: its binding takes the same key over the global
+        app.palette_open.set(true);
+        runtime.settle(&app);
+        runtime.layout(&app, viewport);
+        assert_eq!(runtime.match_key(&escape), Some(CLOSE), "mounted context wins the key");
+
+        // palette unmounts: the sweep deactivates the context
+        app.palette_open.set(false);
+        runtime.settle(&app);
+        runtime.layout(&app, viewport);
+        assert_eq!(runtime.match_key(&escape), Some(GLOBAL), "unmounted context goes quiet");
+    }
+
+    #[test]
     fn a_surface_repaints_a_real_hover_incrementally() {
         use crate::layout::{Proposal, Size};
         use crate::raster::{Surface, rasterize_scaled};
