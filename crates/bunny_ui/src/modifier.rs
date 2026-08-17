@@ -103,10 +103,13 @@ pub enum Modifier {
         content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
     },
     /// An anchored popover: the modified view is the ANCHOR, `side`
-    /// the preferred edge. Closes on Escape and on a press outside.
+    /// the preferred edge. Closes on Escape and on a press outside;
+    /// `on_dismiss` runs after any of the framework's dismissal doors
+    /// (never when the app clears the binding itself).
     Popover {
         is_presented: Binding<bool>,
         side: crate::layout::Side,
+        on_dismiss: Option<Rc<dyn Fn()>>,
         content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
     },
     EnvSet {
@@ -463,6 +466,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             Modifier::Popover {
                 is_presented,
                 side,
+                on_dismiss,
                 content,
             } if is_presented.get() => {
                 let mut popover_nodes = NodeList::new();
@@ -487,7 +491,13 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     // nested popovers close from the inside out)
                     let close: Rc<dyn Fn()> = {
                         let is_presented = is_presented.clone();
-                        Rc::new(move || is_presented.set(false))
+                        let on_dismiss = on_dismiss.clone();
+                        Rc::new(move || {
+                            is_presented.set(false);
+                            if let Some(on_dismiss) = &on_dismiss {
+                                on_dismiss();
+                            }
+                        })
                     };
                     crate::reconciler::attribute_action(
                         format!("{path}/#dismiss"),

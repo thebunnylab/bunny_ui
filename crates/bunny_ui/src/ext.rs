@@ -504,6 +504,30 @@ pub trait ViewExt: View<Arity = Single> + Sized {
             modifier: Modifier::Popover {
                 is_presented,
                 side,
+                on_dismiss: None,
+                content: Rc::new(content),
+            },
+        }
+    }
+
+    /// [`Self::popover`] with a dismissal callback: it runs after ANY
+    /// of the framework's dismissal doors closes the popover — the
+    /// outside press, Escape, a scrolled-away anchor, an app switch.
+    /// The app clearing the binding itself does not count (it already
+    /// knows).
+    fn popover_on_dismiss(
+        self,
+        is_presented: Binding<bool>,
+        side: crate::layout::Side,
+        on_dismiss: impl Fn() + 'static,
+        content: impl Fn(&Context) -> Erased + 'static,
+    ) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Popover {
+                is_presented,
+                side,
+                on_dismiss: Some(Rc::new(on_dismiss)),
                 content: Rc::new(content),
             },
         }

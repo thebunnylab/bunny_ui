@@ -190,6 +190,24 @@ impl Runtime {
         self.overlay_bounds.set(bounds);
     }
 
+    /// Closes every open popover, outermost last — the app-switch
+    /// behavior (the desktop shell calls it when the window resigns
+    /// key). `true` = something closed and the shell repaints.
+    pub fn dismiss_all_overlays(&self) -> bool {
+        let paths: Vec<String> = self
+            .last_overlays
+            .borrow()
+            .iter()
+            .rev()
+            .map(|overlay| overlay.path.clone())
+            .collect();
+        let mut closed = false;
+        for path in paths {
+            closed |= reconciler::run_action(&format!("{path}/#dismiss"));
+        }
+        closed
+    }
+
     /// Should a press at this point drag the WINDOW? True inside a
     /// `.window_drag_region()` where no interactive target wins — a
     /// button on the scene's own title bar still clicks.

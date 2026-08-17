@@ -245,6 +245,9 @@ pub enum AppEvent {
     Frame { dt: f64 },
     /// The window changed size (or needs the first frame).
     Redraw,
+    /// The window stopped being key (the user switched apps or
+    /// windows) — open popovers close, the platform's own manner.
+    ResignKey,
 }
 
 thread_local! {
@@ -629,6 +632,10 @@ extern "C" fn bunny_scroll_wheel(this: Id, _sel: Sel, event: Id) {
     }
 }
 
+extern "C" fn bunny_window_did_resign_key(_this: Id, _sel: Sel, _note: Id) {
+    dispatch(AppEvent::ResignKey);
+}
+
 extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, _note: Id) {
     dispatch(AppEvent::Redraw);
 }
@@ -864,6 +871,13 @@ unsafe fn register_classes() {
             delegate,
             sel("windowDidMove:"),
             bunny_window_did_resize as *const c_void,
+            types.as_ptr(),
+        );
+        // switching away closes the open popovers, the platform's way
+        class_addMethod(
+            delegate,
+            sel("windowDidResignKey:"),
+            bunny_window_did_resign_key as *const c_void,
             types.as_ptr(),
         );
         class_addMethod(

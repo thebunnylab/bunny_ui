@@ -340,6 +340,14 @@ pub fn run_window_chrome(
         let root = &*handler_root;
         match event {
         AppEvent::Redraw => blit(runtime, root),
+        AppEvent::ResignKey => {
+            // the user switched away: popovers close like the
+            // platform's own (their panels never take key, so this
+            // only ever fires on the parent)
+            if runtime.dismiss_all_overlays() {
+                blit(runtime, root);
+            }
+        }
         AppEvent::MouseMoved { x, y } => {
             if runtime.pointer_moved(x, y) {
                 blit(runtime, root);

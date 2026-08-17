@@ -3163,6 +3163,59 @@ mod tests {
     }
 
     #[test]
+    fn dismissal_tells_the_app_through_every_door() {
+        #[derive(Clone)]
+        struct Told {
+            open: State<bool>,
+            told: State<usize>,
+        }
+        impl Component for Told {
+            fn body(self, _ctx: &Context) -> impl View {
+                let told = self.told;
+                vstack!(
+                    spacer().frame(180.0, 80.0),
+                    spacer().frame(20.0, 20.0).popover_on_dismiss(
+                        self.open.binding(),
+                        Side::Bottom,
+                        move || told.set(told.get() + 1),
+                        |_| erased(spacer().frame(40.0, 30.0)),
+                    ),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        let view = Told { open: State::new(true), told: State::new(0) };
+        let _ = runtime.layout(&view, window());
+
+        // door one: the outside press
+        runtime.pointer_pressed(5.0, 5.0);
+        assert_eq!(view.told.get(), 1);
+        assert!(!view.open.get());
+
+        // door two: escape
+        view.open.set(true);
+        let _ = runtime.layout(&view, window());
+        let escape = KeyPattern::key(Key::Escape);
+        assert!(runtime.dispatch_action(runtime.match_key(&escape).expect("bound")));
+        assert_eq!(view.told.get(), 2);
+
+        // door three: the app switch — every open popover closes
+        view.open.set(true);
+        let _ = runtime.layout(&view, window());
+        assert!(runtime.dismiss_all_overlays());
+        assert_eq!(view.told.get(), 3);
+        assert!(!view.open.get());
+
+        // the app clearing the binding itself does not count — it
+        // already knows
+        view.open.set(true);
+        let _ = runtime.layout(&view, window());
+        view.open.set(false);
+        let _ = runtime.layout(&view, window());
+        assert_eq!(view.told.get(), 3, "self-service closing is not a dismissal");
+    }
+
+    #[test]
     fn a_closed_popover_costs_nothing() {
         let closed = {
             let (runtime, view) = opened(Side::Bottom, 80.0);
