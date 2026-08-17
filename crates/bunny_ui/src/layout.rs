@@ -136,9 +136,26 @@ pub struct LayoutEnv<'a> {
     /// The frame's animator — `None` in bare layouts (tests, direct
     /// [`layout`]): animated props then paint their targets.
     pub animator: Option<&'a std::cell::RefCell<crate::anim::Animator>>,
-    /// The animation scope opened by the nearest `Animated` ancestor —
-    /// the key and spring the next styled node consumes.
-    pub anim: Option<(&'a str, crate::anim::Spring)>,
+    /// The animation scope opened by the nearest `Animated` ancestor.
+    pub anim: Option<AnimScope<'a>>,
+}
+
+/// An open animation scope, walking down with the placement. The
+/// `Animated` node itself flies its origin (anchored to the enclosing
+/// scroll box); the nearest styled below takes the colors and disarms
+/// them; crossing a boundary closes the scope — `.animated` styles the
+/// view that declared it, never a child component's — and the boundary
+/// un-shifts its recorded frame, so retained frames stay the REAL
+/// target (scroll-to never chases a moving row).
+#[derive(Clone, Copy)]
+pub struct AnimScope<'a> {
+    /// The identity captured when `.animated` applied.
+    pub key: &'a str,
+    pub spec: crate::anim::Spring,
+    /// The nearest styled below still animates its colors.
+    pub colors: bool,
+    /// Painted-minus-real origin of the flight in progress.
+    pub shift: (Px, Px),
 }
 
 /// The FRAME state that placement consults by path: pointer
@@ -468,6 +485,9 @@ pub struct ScrollRegion {
     pub content: Size,
     /// The declared scroll target (`.scroll_target(id)`), if any.
     pub target: Option<String>,
+    /// A region under an animation scope reveals its target through
+    /// this spring instead of snapping.
+    pub anim: Option<crate::anim::Spring>,
 }
 
 /// A placed text field: geometry + EFFECTIVE font at that point of the
@@ -498,6 +518,9 @@ pub struct Placement {
     /// whoever records a hit consults it; the raster redoes the cut in
     /// physical px.
     clip: Vec<Rect>,
+    /// Stack of scroll CONTENT origins — animated origins anchor here,
+    /// so scrolling moves content 1:1 and never bends a spring.
+    anchors: Vec<Point>,
 }
 
 impl Placement {
@@ -1070,18 +1093,20 @@ impl LayoutNode {
                 let offset =
                     Point { x: raw.x.clamp(0.0, max_x), y: raw.y.clamp(0.0, max_y) };
                 out.push_clip(frame);
+                let content_origin = Point {
+                    x: frame.origin.x - offset.x,
+                    y: frame.origin.y - offset.y,
+                };
+                // animated origins below anchor to the content box —
+                // scrolling moves them 1:1, never through a spring
+                out.anchors.push(content_origin);
                 child.place(
-                    Rect {
-                        origin: Point {
-                            x: frame.origin.x - offset.x,
-                            y: frame.origin.y - offset.y,
-                        },
-                        size: content,
-                    },
+                    Rect { origin: content_origin, size: content },
                     *fit,
                     env,
                     out,
                 );
+                out.anchors.pop();
                 if max_y > 0.0 {
                     draw_scrollbar(frame, content.height, offset.y, max_y, out);
                 }
@@ -1093,23 +1118,37 @@ impl LayoutNode {
                         frame,
                         content,
                         target: target.clone(),
+                        // a region inside an animation scope reveals its
+                        // target through the spring instead of snapping
+                        anim: env.anim.map(|scope| scope.spec),
                     });
                 }
             }
 
             (LayoutNode::Styled { props, child }, Fit::Wrapped(_, fit)) => {
-                // the nearest styled EATS the animation scope: its colors
+                // the nearest styled EATS the color scope: its colors
                 // move, deeper styled nodes paint plain (no shared-key
                 // thrash between siblings of one scope)
-                let anim = env.anim;
-                let env =
-                    LayoutEnv { font: props.font.apply_over(env.font), anim: None, ..env };
+                let colors = env.anim.filter(|scope| scope.colors);
+                let env = LayoutEnv {
+                    font: props.font.apply_over(env.font),
+                    anim: env.anim.map(|scope| AnimScope { colors: false, ..scope }),
+                    ..env
+                };
+                // the animator paints the value in flight, never the
+                // target — it seeds, retargets and snaps behind this
+                let animated = |slot, color| match (colors, env.animator) {
+                    (Some(scope), Some(animator)) => animator
+                        .borrow_mut()
+                        .resolve_color(scope.key, scope.spec, slot, color),
+                    _ => color,
+                };
                 // the halo goes first — everything else paints over it
                 if let Some((radius, color)) = props.shadow {
                     out.display.push(DrawCommand::Shadow {
                         rect: frame,
                         radius,
-                        color,
+                        color: animated(crate::anim::Channel::Shadow, color),
                         corner_radius: props.corner_radius.unwrap_or(0.0),
                     });
                 }
@@ -1125,22 +1164,14 @@ impl LayoutNode {
                     props.background
                 };
                 if let Some(color) = background {
-                    // an animated background paints the value in flight,
-                    // never the target — the animator seeds, retargets
-                    // and snaps (bit-exact) behind this call
-                    let color = match (anim, env.animator) {
-                        (Some((key, spec)), Some(animator)) => {
-                            animator.borrow_mut().resolve_background(key, spec, color)
-                        }
-                        _ => color,
-                    };
                     out.display.push(DrawCommand::FillRect {
                         rect: frame,
-                        color,
+                        color: animated(crate::anim::Channel::Background, color),
                         corner_radius: props.corner_radius.unwrap_or(0.0),
                     });
                 }
                 if let Some(color) = props.foreground {
+                    let color = animated(crate::anim::Channel::Foreground, color);
                     out.foreground.push(color);
                 }
                 child.place(frame, *fit, env, out);
@@ -1150,7 +1181,7 @@ impl LayoutNode {
                 if let Some((color, width)) = props.border {
                     out.display.push(DrawCommand::StrokeRect {
                         rect: frame,
-                        color,
+                        color: animated(crate::anim::Channel::Border, color),
                         width,
                         corner_radius: props.corner_radius.unwrap_or(0.0),
                     });
@@ -1158,13 +1189,43 @@ impl LayoutNode {
             }
 
             (LayoutNode::Animated { key, spec, child }, Fit::Wrapped(_, fit)) => {
-                // open the scope for the subtree; a keyless scope
-                // (built outside a pass) stays inert
-                let env = match key {
-                    Some(key) => LayoutEnv { anim: Some((key.as_ref(), *spec)), ..env },
-                    None => env,
+                // a keyless scope (built outside a pass) stays inert
+                let Some(key) = key else {
+                    child.place(frame, *fit, env, out);
+                    return;
                 };
-                child.place(frame, *fit, env, out);
+                // the node flies its OWN origin, anchored to the scroll
+                // content box — scrolling moves content 1:1 and never
+                // bends the spring. row keys carry the row identity
+                // ("scope/[id]"), so sibling rows fly independently.
+                let painted = match env.animator {
+                    Some(animator) => {
+                        let anchor = out.anchors.last().copied().unwrap_or_default();
+                        let rel =
+                            (frame.origin.x - anchor.x, frame.origin.y - anchor.y);
+                        let (x, y) = animator
+                            .borrow_mut()
+                            .resolve_origin(key.as_ref(), *spec, rel);
+                        Point { x: anchor.x + x, y: anchor.y + y }
+                    }
+                    None => frame.origin,
+                };
+                let shift = (painted.x - frame.origin.x, painted.y - frame.origin.y);
+                let env = LayoutEnv {
+                    anim: Some(AnimScope {
+                        key: key.as_ref(),
+                        spec: *spec,
+                        colors: true,
+                        shift,
+                    }),
+                    ..env
+                };
+                child.place(
+                    Rect { origin: painted, size: frame.size },
+                    *fit,
+                    env,
+                    out,
+                );
             }
 
             (LayoutNode::Interactive { path, child }, Fit::Wrapped(size, fit)) => {
@@ -1192,7 +1253,23 @@ impl LayoutNode {
             }
 
             (LayoutNode::Boundary { path, children }, Fit::Children(fits)) => {
-                out.frames.record(path, frame);
+                // the recorded frame is the REAL target: a flight in
+                // progress above un-shifts here, so scroll-to and tests
+                // never chase a moving row. crossing the boundary also
+                // closes the scope (`.animated` styles its own view,
+                // never a child component's).
+                let real = match env.anim {
+                    Some(scope) => Rect {
+                        origin: Point {
+                            x: frame.origin.x - scope.shift.0,
+                            y: frame.origin.y - scope.shift.1,
+                        },
+                        size: frame.size,
+                    },
+                    None => frame,
+                };
+                out.frames.record(path, real);
+                let env = LayoutEnv { anim: None, ..env };
                 if children.len() == 1 {
                     let mut fits = fits;
                     let (size, fit) = fits.remove(0);

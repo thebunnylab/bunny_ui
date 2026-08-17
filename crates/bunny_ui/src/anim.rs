@@ -113,21 +113,66 @@ impl Track {
     }
 }
 
-/// The animated channels of one identity. Today: the background color.
+/// The color slots one identity can animate — indices into the entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Channel {
+    Background = 0,
+    Foreground = 1,
+    Border = 2,
+    Shadow = 3,
+}
+
+/// The animated channels of one identity: the four color slots and the
+/// origin (a visual translation, anchored to the enclosing scroll box).
 struct NodeAnim {
     spec: Spring,
-    background: Option<[Track; 4]>,
+    colors: [Option<[Track; 4]>; 4],
+    origin: Option<[Track; 2]>,
     /// The tick generation that last touched this entry at place —
     /// stops advancing when the node unmounts.
     touched: u64,
+}
+
+impl NodeAnim {
+    fn fresh(spec: Spring, touched: u64) -> Self {
+        NodeAnim { spec, colors: [None, None, None, None], origin: None, touched }
+    }
+
+    fn tracks(&mut self) -> impl Iterator<Item = &mut Track> {
+        self.colors
+            .iter_mut()
+            .flatten()
+            .flat_map(|tracks| tracks.iter_mut())
+            .chain(self.origin.iter_mut().flat_map(|tracks| tracks.iter_mut()))
+    }
+
+    fn active(&self) -> bool {
+        self.colors
+            .iter()
+            .flatten()
+            .flat_map(|tracks| tracks.iter())
+            .chain(self.origin.iter().flat_map(|tracks| tracks.iter()))
+            .any(Track::active)
+    }
+}
+
+/// A scroll offset in flight (`.scroll_target` under an animation
+/// scope). Keyed by region path, exempt from the touch sweep: it
+/// removes itself on settle, and the wheel cancels it.
+struct ScrollAnim {
+    spec: Spring,
+    tracks: [Track; 2],
 }
 
 /// Every live animation, keyed by the identity captured at render.
 #[derive(Default)]
 pub struct Animator {
     entries: FxHashMap<Rc<str>, NodeAnim>,
-    /// The sweep clock — bumped once per tick.
-    generation: u64,
+    scrolls: FxHashMap<Rc<str>, ScrollAnim>,
+    /// The sweep clock: bumped when a PLACE begins, never by ticks. An
+    /// entry the newest place did not touch belongs to an unmounted
+    /// node; ticks alone (with no frame between them) sweep nothing.
+    places: u64,
     /// Accessibility: every animation completes instantly.
     reduce_motion: bool,
 }
@@ -146,26 +191,40 @@ fn channel(value: f64) -> u8 {
 }
 
 impl Animator {
-    /// The value to paint NOW for this identity's background. The first
-    /// sighting seeds silently (nothing animates on mount); a changed
-    /// target retargets the springs in place, keeping velocity; the
-    /// return is the current interpolated color.
-    pub(crate) fn resolve_background(&mut self, key: &str, spec: Spring, target: Color) -> Color {
+    /// A layout pass is about to place — the sweep clock advances so
+    /// this pass's touches are distinguishable from the last one's.
+    pub(crate) fn note_place(&mut self) {
+        self.places += 1;
+    }
+
+    /// The place asks: which entry answers for `key`? Seeds a fresh one
+    /// on the first sighting and stamps the touch either way.
+    fn entry(&mut self, key: &str, spec: Spring) -> &mut NodeAnim {
+        let places = self.places;
+        if !self.entries.contains_key(key) {
+            self.entries.insert(Rc::from(key), NodeAnim::fresh(spec, places));
+        }
+        let entry = self.entries.get_mut(key).expect("entry just seeded");
+        entry.spec = spec;
+        entry.touched = places;
+        entry
+    }
+
+    /// The color to paint NOW for one of this identity's slots. The
+    /// first sighting seeds silently (nothing animates on mount); a
+    /// changed target retargets in place, keeping velocity.
+    pub(crate) fn resolve_color(
+        &mut self,
+        key: &str,
+        spec: Spring,
+        slot: Channel,
+        target: Color,
+    ) -> Color {
         if self.reduce_motion {
             return target;
         }
-        let generation = self.generation;
-        if !self.entries.contains_key(key) {
-            self.entries.insert(
-                Rc::from(key),
-                NodeAnim { spec, background: Some(color_tracks(target)), touched: generation },
-            );
-            return target;
-        }
-        let entry = self.entries.get_mut(key).expect("entry just checked");
-        entry.spec = spec;
-        entry.touched = generation;
-        let tracks = entry.background.get_or_insert_with(|| color_tracks(target));
+        let entry = self.entry(key, spec);
+        let tracks = entry.colors[slot as usize].get_or_insert_with(|| color_tracks(target));
         let want = [target.r as f64, target.g as f64, target.b as f64, target.a as f64];
         for (track, want) in tracks.iter_mut().zip(want) {
             if track.target != want {
@@ -180,40 +239,96 @@ impl Animator {
         }
     }
 
-    /// Advances every live track by `dt` seconds. `true` = something
-    /// moved and the frame must repaint. Also the sweep: an entry no
-    /// place touched since the previous tick belongs to an unmounted
-    /// node and is dropped.
-    pub(crate) fn tick(&mut self, dt: f64) -> bool {
-        self.generation += 1;
-        let generation = self.generation;
+    /// The origin to paint NOW — coordinates RELATIVE to the enclosing
+    /// scroll box, so scrolling moves the content 1:1 and never bends a
+    /// spring. Same lifecycle as the colors.
+    pub(crate) fn resolve_origin(
+        &mut self,
+        key: &str,
+        spec: Spring,
+        target: (f64, f64),
+    ) -> (f64, f64) {
+        if self.reduce_motion {
+            return target;
+        }
+        let entry = self.entry(key, spec);
+        let tracks = entry
+            .origin
+            .get_or_insert_with(|| [Track::at(target.0), Track::at(target.1)]);
+        for (track, want) in tracks.iter_mut().zip([target.0, target.1]) {
+            if track.target != want {
+                track.retarget(want);
+            }
+        }
+        (tracks[0].value, tracks[1].value)
+    }
+
+    /// Starts (or bends) a scroll-offset flight for a region.
+    pub(crate) fn animate_scroll(
+        &mut self,
+        path: &str,
+        from: (f64, f64),
+        to: (f64, f64),
+        spec: Spring,
+    ) {
+        if self.reduce_motion {
+            return;
+        }
+        match self.scrolls.get_mut(path) {
+            Some(flight) => {
+                flight.spec = spec;
+                flight.tracks[0].retarget(to.0);
+                flight.tracks[1].retarget(to.1);
+            }
+            None => {
+                let mut tracks = [Track::at(from.0), Track::at(from.1)];
+                tracks[0].retarget(to.0);
+                tracks[1].retarget(to.1);
+                self.scrolls.insert(Rc::from(path), ScrollAnim { spec, tracks });
+            }
+        }
+    }
+
+    /// The wheel is sovereign: a user scroll kills the flight.
+    pub(crate) fn cancel_scroll(&mut self, path: &str) {
+        self.scrolls.remove(path);
+    }
+
+    /// Advances every live track by `dt` seconds. Returns whether
+    /// anything moved plus the scroll offsets to write back — a settled
+    /// flight delivers its final (snapped) value once and leaves.
+    pub(crate) fn tick(&mut self, dt: f64) -> (bool, Vec<(Rc<str>, (f64, f64))>) {
+        let places = self.places;
         let mut moved = false;
         self.entries.retain(|_, entry| {
-            if entry.touched + 1 < generation {
+            if entry.touched < places {
                 return false;
             }
-            if let Some(tracks) = &mut entry.background {
-                for track in tracks {
-                    if track.active() {
-                        moved = true;
-                        track.step(entry.spec, dt);
-                    }
+            let spec = entry.spec;
+            for track in entry.tracks() {
+                if track.active() {
+                    moved = true;
+                    track.step(spec, dt);
                 }
             }
             true
         });
-        moved
+        let mut offsets = Vec::new();
+        self.scrolls.retain(|path, flight| {
+            moved = true;
+            for track in &mut flight.tracks {
+                track.step(flight.spec, dt);
+            }
+            offsets.push((Rc::clone(path), (flight.tracks[0].value, flight.tracks[1].value)));
+            flight.tracks.iter().any(Track::active)
+        });
+        (moved, offsets)
     }
 
     /// Does any track still move? The shell parks its frame driver on a
     /// false.
     pub(crate) fn wants_frame(&self) -> bool {
-        self.entries.values().any(|entry| {
-            entry
-                .background
-                .as_ref()
-                .is_some_and(|tracks| tracks.iter().any(Track::active))
-        })
+        self.entries.values().any(NodeAnim::active) || !self.scrolls.is_empty()
     }
 
     /// Accessibility switch: on, every animation completes instantly
@@ -222,7 +337,14 @@ impl Animator {
         self.reduce_motion = on;
         if on {
             self.entries.clear();
+            self.scrolls.clear();
         }
+    }
+
+    /// Reduce motion, read by the runtime — an animated reveal snaps
+    /// instead of flying while this is on.
+    pub(crate) fn reduce_motion(&self) -> bool {
+        self.reduce_motion
     }
 
     #[cfg(test)]
@@ -307,49 +429,68 @@ mod tests {
     fn the_animator_seeds_silently_and_then_moves() {
         let mut animator = Animator::default();
         // first sighting: the target itself, at rest
-        let seeded = animator.resolve_background("chip", Spring::smooth(), BLUE);
+        let seeded = animator.resolve_color("chip", Spring::smooth(), Channel::Background, BLUE);
         assert_eq!(seeded, BLUE);
         assert!(!animator.wants_frame());
         // the target changes: the painted value stays put until a tick
-        let held = animator.resolve_background("chip", Spring::smooth(), RED);
+        let held = animator.resolve_color("chip", Spring::smooth(), Channel::Background, RED);
         assert_eq!(held, BLUE);
         assert!(animator.wants_frame());
-        assert!(animator.tick(1.0 / 120.0));
-        let moving = animator.resolve_background("chip", Spring::smooth(), RED);
+        assert!(animator.tick(1.0 / 120.0).0);
+        let moving = animator.resolve_color("chip", Spring::smooth(), Channel::Background, RED);
         assert_ne!(moving, BLUE);
         assert_ne!(moving, RED);
         // run it dry: the final resolve is the target, bit-exact
         let mut guard = 0;
         while animator.wants_frame() && guard < 1000 {
             animator.tick(1.0 / 120.0);
-            let _ = animator.resolve_background("chip", Spring::smooth(), RED);
+            let _ = animator.resolve_color("chip", Spring::smooth(), Channel::Background, RED);
             guard += 1;
         }
         assert!(guard < 1000, "the spring settles");
-        assert_eq!(animator.resolve_background("chip", Spring::smooth(), RED), RED);
+        assert_eq!(animator.resolve_color("chip", Spring::smooth(), Channel::Background, RED), RED);
     }
 
     #[test]
-    fn an_untouched_entry_dies_on_the_next_tick() {
+    fn an_entry_the_newest_place_missed_dies_on_the_next_tick() {
         let mut animator = Animator::default();
-        let _ = animator.resolve_background("gone", Spring::smooth(), RED);
-        let _ = animator.resolve_background("gone", Spring::smooth(), BLUE);
+        animator.note_place();
+        let _ = animator.resolve_color("gone", Spring::smooth(), Channel::Background, RED);
+        let _ = animator.resolve_color("gone", Spring::smooth(), Channel::Background, BLUE);
         assert!(animator.wants_frame());
-        // two ticks with no place in between: the node unmounted
-        animator.tick(1.0 / 120.0);
+        // a NEW place runs and never touches it: the node unmounted
+        animator.note_place();
         animator.tick(1.0 / 120.0);
         assert_eq!(animator.len(), 0, "the sweep collected the orphan");
         assert!(!animator.wants_frame());
     }
 
     #[test]
+    fn ticks_alone_never_sweep_a_live_flight() {
+        // the regression: a burst of ticks with no frame between them
+        // must not kill mounted entries (that re-seeds at the target
+        // and swallows the animation whole)
+        let mut animator = Animator::default();
+        animator.note_place();
+        let _ = animator.resolve_color("chip", Spring::smooth(), Channel::Background, BLUE);
+        let _ = animator.resolve_color("chip", Spring::smooth(), Channel::Background, RED);
+        animator.tick(1.0 / 120.0);
+        animator.tick(1.0 / 120.0);
+        animator.tick(1.0 / 120.0);
+        assert!(animator.wants_frame(), "the flight survives the burst");
+        let moving = animator.resolve_color("chip", Spring::smooth(), Channel::Background, RED);
+        assert_ne!(moving, BLUE);
+        assert_ne!(moving, RED);
+    }
+
+    #[test]
     fn reduce_motion_paints_targets_and_retains_nothing() {
         let mut animator = Animator::default();
-        let _ = animator.resolve_background("chip", Spring::smooth(), BLUE);
+        let _ = animator.resolve_color("chip", Spring::smooth(), Channel::Background, BLUE);
         animator.set_reduce_motion(true);
-        assert_eq!(animator.resolve_background("chip", Spring::smooth(), RED), RED);
+        assert_eq!(animator.resolve_color("chip", Spring::smooth(), Channel::Background, RED), RED);
         assert_eq!(animator.len(), 0);
         assert!(!animator.wants_frame());
-        assert!(!animator.tick(1.0 / 120.0));
+        assert!(!animator.tick(1.0 / 120.0).0);
     }
 }

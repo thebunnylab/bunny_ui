@@ -326,6 +326,8 @@ impl Runtime {
             return false;
         };
         let (max_x, max_y) = travel(region);
+        // the wheel is sovereign: a reveal in flight dies on the spot
+        self.animator.borrow_mut().cancel_scroll(&region.path);
         let mut offsets = self.scroll_offsets.borrow_mut();
         let current = offsets.get(&region.path).copied().unwrap_or_default();
         let next = Point {
@@ -564,7 +566,16 @@ impl Runtime {
     /// the call is free — the shell pauses its frame driver while this
     /// stays false.
     pub fn tick(&self, dt: f64) -> bool {
-        self.animator.borrow_mut().tick(dt)
+        let (moved, offsets) = self.animator.borrow_mut().tick(dt);
+        // scroll flights write their in-flight value back into the
+        // offsets the place consumes; a settled flight delivered its
+        // final (snapped) value and already left the animator
+        for (path, (x, y)) in offsets {
+            self.scroll_offsets
+                .borrow_mut()
+                .insert(path.as_ref().to_string(), Point { x, y });
+        }
+        moved
     }
 
     /// Does any animation still want a next frame? The shell syncs its
@@ -654,8 +665,22 @@ impl Runtime {
                     (region.content.height.round() - region.frame.size.height.round()).max(0.0);
                 let next = (current.y + delta).clamp(0.0, travel);
                 if next != current.y {
-                    self.set_scroll_offset(&region.path, Point { x: current.x, y: next });
-                    moved = true;
+                    let mut animator = self.animator.borrow_mut();
+                    match region.anim.filter(|_| !animator.reduce_motion()) {
+                        // an animated region REVEALS: the offset flies
+                        // there over the next ticks (the wheel cancels)
+                        Some(spring) => animator.animate_scroll(
+                            &region.path,
+                            (current.x, current.y),
+                            (current.x, next),
+                            spring,
+                        ),
+                        None => {
+                            drop(animator);
+                            self.set_scroll_offset(&region.path, Point { x: current.x, y: next });
+                            moved = true;
+                        }
+                    }
                 }
             }
         }
@@ -765,6 +790,9 @@ impl Runtime {
             caret_visible: self.caret_visible.get(),
         };
         self.cache.begin_frame();
+        // the animator's sweep clock follows PLACES, not ticks — this
+        // pass's touches mark who is still mounted
+        self.animator.borrow_mut().note_place();
         let offsets = self.scroll_offsets.borrow();
         let result = crate::layout::layout_with(
             &tree,

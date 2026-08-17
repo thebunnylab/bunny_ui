@@ -200,11 +200,16 @@ impl Component for Finder {
                 .background_color(if is_selected { theme::row_pressed() } else { CLEAR })
                 .background_hovered(theme::row_hover())
                 .background_pressed(theme::row_pressed())
+                // the row breathes: hover and selection fade, and the
+                // row slides when the filter reorders the list
+                .animated(Spring::snappy())
                 .on_click(move || opened.set(label.clone()))
             },
         )
         // arrow keys move the selection below the fold — the region
-        // follows just enough to keep it visible; the wheel stays free
+        // follows just enough to keep it visible, FLYING there through
+        // the spring; the wheel stays free and cancels the flight
+        .animated(Spring::smooth())
         .scroll_target(labels.get(selected_index).cloned().unwrap_or_default());
 
         let body = if count == 0 {

@@ -494,6 +494,257 @@ mod tests {
     }
 
     #[test]
+    fn animated_rows_slide_on_reorder_and_settle_on_the_real_frame() {
+        use crate::anim::Spring;
+
+        #[derive(Clone, Copy)]
+        struct Board {
+            flipped: State<bool>,
+        }
+
+        impl Component for Board {
+            fn body(self, _ctx: &Context) -> impl View {
+                let items =
+                    if self.flipped.get() { vec!["b", "a"] } else { vec!["a", "b"] };
+                for_each(items, |id| id.to_string(), |id| {
+                    text(*id).animated(Spring::smooth())
+                })
+            }
+        }
+
+        let size = crate::layout::Size { width: 80.0, height: 64.0 };
+        let line_of = |display: &crate::layout::DisplayList, needle: &str| {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { origin, content, .. }
+                        if content.as_ref() == needle =>
+                    {
+                        Some(origin.y)
+                    }
+                    _ => None,
+                })
+                .expect("the row paints its text")
+        };
+
+        let board = Board { flipped: State::new(false) };
+        let runtime = Runtime::new();
+        let mounted = runtime.display_frame(&board, size);
+        assert_eq!(line_of(&mounted, "a"), 0.0);
+        assert_eq!(line_of(&mounted, "b"), 16.0);
+        assert!(!runtime.wants_frame(), "mount seeds at rest");
+
+        // the flip: same frame still paints the OLD positions
+        board.flipped.set(true);
+        let held = runtime.display_frame(&board, size);
+        assert_eq!(line_of(&held, "a"), 0.0, "the flight starts from rest");
+        assert_eq!(line_of(&held, "b"), 16.0);
+        assert!(runtime.wants_frame());
+
+        // in flight: strictly between the endpoints
+        runtime.tick(1.0 / 120.0);
+        let flying = runtime.animation_frame(&board, size);
+        let a = line_of(&flying, "a");
+        let b = line_of(&flying, "b");
+        assert!(a > 0.0 && a < 16.0, "a slides down: {a}");
+        assert!(b > 0.0 && b < 16.0, "b slides up: {b}");
+
+        // run dry: the settled frame IS the plain frame
+        let mut guard = 0;
+        while runtime.wants_frame() && guard < 600 {
+            runtime.tick(1.0 / 120.0);
+            let _ = runtime.animation_frame(&board, size);
+            guard += 1;
+        }
+        assert!(guard < 600, "the slide settles");
+        let settled = runtime.animation_frame(&board, size);
+        let control = Runtime::new();
+        let target =
+            control.display_frame(&Board { flipped: State::new(true) }, size);
+        assert_eq!(settled.as_slice(), target.as_slice());
+    }
+
+    #[test]
+    fn scrolling_never_bends_an_animated_row() {
+        use crate::anim::Spring;
+
+        #[derive(Clone, Copy)]
+        struct Rows;
+
+        impl Component for Rows {
+            fn body(self, _ctx: &Context) -> impl View {
+                list(
+                    (0..10).collect::<Vec<_>>(),
+                    |row| format!("row{row}"),
+                    |row| text(format!("item {row}")).animated(Spring::smooth()),
+                )
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Plain;
+
+        impl Component for Plain {
+            fn body(self, _ctx: &Context) -> impl View {
+                list(
+                    (0..10).collect::<Vec<_>>(),
+                    |row| format!("row{row}"),
+                    |row| text(format!("item {row}")),
+                )
+            }
+        }
+
+        let size = crate::layout::Size { width: 100.0, height: 100.0 };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&Rows, size);
+        assert!(!runtime.wants_frame());
+
+        // a wheel scroll moves the anchor, not the springs
+        assert!(runtime.wheel(10.0, 10.0, 0.0, -40.0));
+        let scrolled = runtime.display_frame(&Rows, size);
+        assert!(
+            !runtime.wants_frame(),
+            "scrolling is 1:1 — no spring armed by the offset"
+        );
+
+        let control = Runtime::new();
+        let _ = control.display_frame(&Plain, size);
+        assert!(control.wheel(10.0, 10.0, 0.0, -40.0));
+        let plain = control.display_frame(&Plain, size);
+        assert_eq!(scrolled.as_slice(), plain.as_slice());
+    }
+
+    #[test]
+    fn an_animated_region_reveals_over_ticks_and_the_wheel_cancels() {
+        use crate::anim::Spring;
+
+        #[derive(Clone, Copy)]
+        struct Revealer {
+            selected: State<usize>,
+        }
+
+        impl Component for Revealer {
+            fn body(self, _ctx: &Context) -> impl View {
+                list(
+                    (0..10).collect::<Vec<_>>(),
+                    |row| format!("row{row}"),
+                    |row| text(format!("item {row}")),
+                )
+                .animated(Spring::smooth())
+                .scroll_target(format!("row{}", self.selected.get()))
+            }
+        }
+
+        let size = crate::layout::Size { width: 100.0, height: 48.0 };
+        let revealer = Revealer { selected: State::new(0) };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&revealer, size);
+        assert_eq!(runtime.scroll_offset("Revealer").y, 0.0);
+
+        // the reveal flies instead of snapping
+        revealer.selected.set(8);
+        let _ = runtime.display_frame(&revealer, size);
+        assert_eq!(
+            runtime.scroll_offset("Revealer").y,
+            0.0,
+            "the offset has not jumped"
+        );
+        assert!(runtime.wants_frame(), "the flight is armed");
+        runtime.tick(1.0 / 120.0);
+        let mid = runtime.scroll_offset("Revealer").y;
+        assert!(mid > 0.0, "the offset is moving: {mid}");
+
+        let mut guard = 0;
+        while runtime.wants_frame() && guard < 600 {
+            runtime.tick(1.0 / 120.0);
+            let _ = runtime.animation_frame(&revealer, size);
+            guard += 1;
+        }
+        assert!(guard < 600, "the reveal settles");
+        // the settled offset equals the snap the plain path would take:
+        // row 8 bottom (144) minus the viewport (48) = 96
+        assert_eq!(runtime.scroll_offset("Revealer").y, 96.0);
+
+        // a new flight, and the wheel kills it mid-air
+        revealer.selected.set(2);
+        let _ = runtime.display_frame(&revealer, size);
+        assert!(runtime.wants_frame());
+        assert!(runtime.wheel(10.0, 10.0, 0.0, 8.0));
+        assert!(!runtime.wants_frame(), "the wheel is sovereign");
+        assert_eq!(runtime.scroll_offset("Revealer").y, 88.0);
+    }
+
+    #[test]
+    fn borders_animate_and_a_boundary_closes_the_color_scope() {
+        use crate::anim::Spring;
+        use crate::layout::Color;
+
+        const OFF: Color = Color { r: 40, g: 40, b: 200, a: 255 };
+        const ON: Color = Color { r: 200, g: 40, b: 40, a: 255 };
+
+        // the border color moves through the spring…
+        #[derive(Clone, Copy)]
+        struct Framed {
+            on: State<bool>,
+        }
+
+        impl Component for Framed {
+            fn body(self, _ctx: &Context) -> impl View {
+                let color = if self.on.get() { ON } else { OFF };
+                text("x").border(color, 1.0).animated(Spring::smooth())
+            }
+        }
+
+        let size = crate::layout::Size { width: 80.0, height: 32.0 };
+        let framed = Framed { on: State::new(false) };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&framed, size);
+        framed.on.set(true);
+        let _ = runtime.display_frame(&framed, size);
+        assert!(runtime.wants_frame(), "the border is in flight");
+
+        // …but a child component's colors are its own business: the
+        // scope closes at the boundary
+        #[derive(Clone, Copy)]
+        struct Inner {
+            on: State<bool>,
+        }
+
+        impl Component for Inner {
+            fn body(self, _ctx: &Context) -> impl View {
+                let color = if self.on.get() { ON } else { OFF };
+                text("i").background_color(color)
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Outer {
+            inner: Inner,
+        }
+
+        impl Component for Outer {
+            fn body(self, _ctx: &Context) -> impl View {
+                self.inner.animated(Spring::smooth())
+            }
+        }
+
+        let outer = Outer { inner: Inner { on: State::new(false) } };
+        let sealed = Runtime::new();
+        let _ = sealed.display_frame(&outer, size);
+        outer.inner.on.set(true);
+        let flipped = sealed.display_frame(&outer, size);
+        let fill = flipped
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::FillRect { color, .. } => Some(*color),
+                _ => None,
+            })
+            .expect("the inner chip paints");
+        assert_eq!(fill, ON, "the child's color jumps — the scope closed");
+        assert!(!sealed.wants_frame());
+    }
+
+    #[test]
     fn reduce_motion_completes_instantly() {
         use crate::anim::Spring;
         use crate::layout::Color;
