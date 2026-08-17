@@ -520,6 +520,51 @@ impl Runtime {
         Some(ImeSnapshot { text, selected, marked, caret_rect })
     }
 
+    /// The UTF-16 index in the FOCUSED field at a layout point — `None`
+    /// off the field or without focus. The input system's
+    /// characterIndexForPoint (dictionary lookup by mouse) answers
+    /// through this.
+    pub fn ime_index_at(&self, x: Px, y: Px) -> Option<usize> {
+        let path = self.focus.borrow().clone()?;
+        let field = self
+            .last_fields
+            .borrow()
+            .iter()
+            .find(|field| field.path == path)
+            .cloned()?;
+        if !field.frame.contains(x, y) {
+            return None;
+        }
+        let mut probe = CaretState::default();
+        let text = reconciler::run_editor(&path, EditCommand::Read, &mut probe)??;
+        let byte =
+            caret_from_x(&text, x - field.text_origin.x, &field.font, &*self.text, &self.cache);
+        Some(crate::text_input::byte_to_utf16(&text, byte))
+    }
+
+    /// The caret-shaped rect at a UTF-16 index of the focused field, in
+    /// LAYOUT coordinates — the real answer for a ranged
+    /// firstRectForCharacterRange (the candidate window placed at the
+    /// COMPOSITION's start, not always at the caret).
+    pub fn ime_rect_for(&self, utf16: usize) -> Option<Rect> {
+        let path = self.focus.borrow().clone()?;
+        let field = self
+            .last_fields
+            .borrow()
+            .iter()
+            .find(|field| field.path == path)
+            .cloned()?;
+        let mut probe = CaretState::default();
+        let text = reconciler::run_editor(&path, EditCommand::Read, &mut probe)??;
+        let byte = crate::text_input::utf16_to_byte(&text, utf16);
+        let metrics = self.cache.get_or_measure(&text, &field.font, &*self.text);
+        let prefix = self.cache.get_or_measure(&text[..byte], &field.font, &*self.text).width;
+        Some(Rect {
+            origin: Point { x: field.text_origin.x + prefix, y: field.text_origin.y },
+            size: crate::layout::Size { width: 1.5, height: metrics.height() },
+        })
+    }
+
     /// Applies an edit command to the focused field. The binding write
     /// already dirtied whoever reads; typing returns the caret to solid.
     pub fn key(&self, command: EditCommand) -> Edited {

@@ -495,6 +495,46 @@ mod tests {
     }
 
     #[test]
+    fn the_input_system_reads_indices_and_rects_from_the_live_field() {
+        #[derive(Clone, Copy)]
+        struct Form {
+            value: State<String>,
+        }
+
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                text_field("type…", self.value.binding())
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 60.0 };
+        let form = Form { value: State::new("hello".to_string()) };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&form, size);
+        let field = runtime
+            .layout(&form, crate::layout::Proposal::exact(size))
+            .fields
+            .first()
+            .expect("the field placed")
+            .clone();
+        runtime.focus(&field.path);
+        let _ = runtime.display_frame(&form, size);
+
+        // pixel font: 8px per glyph — 20px in sits inside glyph 2
+        let index = runtime
+            .ime_index_at(field.text_origin.x + 20.0, field.frame.origin.y + 4.0)
+            .expect("inside the field");
+        assert_eq!(index, 2);
+        // outside the field there is no index
+        assert!(runtime.ime_index_at(field.frame.origin.x - 5.0, 500.0).is_none());
+
+        // the rect for index 2 sits two glyphs in
+        let rect = runtime.ime_rect_for(2).expect("focused field answers");
+        assert_eq!(rect.origin.x, field.text_origin.x + 16.0);
+        assert!(rect.size.height > 0.0);
+    }
+
+    #[test]
     fn rows_share_a_first_baseline_and_boxes_sit_on_their_bottom() {
         #[derive(Clone, Copy)]
         struct Rowline;

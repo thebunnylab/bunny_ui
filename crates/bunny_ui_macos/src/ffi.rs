@@ -134,6 +134,8 @@ unsafe extern "C" {
     fn msg_id_id_sel(obj: Id, sel: Sel, target: Id, selector: Sel) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_void_id_id(obj: Id, sel: Sel, a: Id, b: Id);
+    #[link_name = "objc_msgSend"]
+    fn msg_point_point(obj: Id, sel: Sel, point: CGPoint) -> CGPoint;
 }
 
 // AppKit/QuartzCore come in via the ObjC runtime; the link guarantees the
@@ -327,35 +329,57 @@ fn gate_consumed(stroke: &KeyStroke) -> bool {
 
 /// The focused-field mirror that `NSTextInputClient` answers from on the
 /// spot — the shell re-syncs it every frame (mutation travels through
-/// events; reading travels through here).
-#[derive(Clone, Copy)]
+/// events; reading travels through here). It carries the WHOLE text:
+/// reconversion asks for arbitrary substrings.
+#[derive(Clone)]
 struct ImeMirror {
+    text: std::rc::Rc<str>,
     selected: NSRange,
     marked: NSRange,
     caret_screen: CGRect,
 }
 
 thread_local! {
-    static IME: Cell<Option<ImeMirror>> = const { Cell::new(None) };
+    static IME: RefCell<Option<ImeMirror>> = const { RefCell::new(None) };
     /// keyDown enters the input system (composition) only when the shell
     /// says a field is focused.
     static INTERPRET: Cell<bool> = const { Cell::new(false) };
+    /// "Which UTF-16 index sits at this LAYOUT point?" — installed by
+    /// the shell, capturing the runtime (zero-ivar classes: state lives
+    /// beside the run loop).
+    static IME_INDEX: RefCell<Option<Box<dyn Fn(f64, f64) -> Option<u64>>>> =
+        const { RefCell::new(None) };
+    /// "Where, on screen, is the caret rect for this UTF-16 index?" —
+    /// the ranged half of firstRectForCharacterRange.
+    static IME_RECT: RefCell<Option<Box<dyn Fn(u64) -> Option<CGRect>>>> =
+        const { RefCell::new(None) };
+}
+
+/// The shell installs the two synchronous answers the input system may
+/// ask beyond the mirror: index-at-point and rect-at-index.
+pub fn set_ime_resolvers(
+    index_at: Box<dyn Fn(f64, f64) -> Option<u64>>,
+    rect_for: Box<dyn Fn(u64) -> Option<CGRect>>,
+) {
+    IME_INDEX.with(|slot| *slot.borrow_mut() = Some(index_at));
+    IME_RECT.with(|slot| *slot.borrow_mut() = Some(rect_for));
 }
 
 /// The shell syncs the focused-field mirror (`None` = no focus).
-pub fn sync_ime(state: Option<(NSRange, Option<NSRange>, CGRect)>) {
+pub fn sync_ime(state: Option<(std::rc::Rc<str>, NSRange, Option<NSRange>, CGRect)>) {
     INTERPRET.with(|flag| flag.set(state.is_some()));
     IME.with(|ime| {
-        ime.set(state.map(|(selected, marked, caret_screen)| ImeMirror {
+        *ime.borrow_mut() = state.map(|(text, selected, marked, caret_screen)| ImeMirror {
+            text,
             selected,
             marked: marked.unwrap_or(NSRange { location: NS_NOT_FOUND, length: 0 }),
             caret_screen,
-        }));
+        });
     });
 }
 
 fn ime_mirror() -> Option<ImeMirror> {
-    IME.with(|ime| ime.get())
+    IME.with(|ime| ime.borrow().clone())
 }
 
 /// NSString OR NSAttributedString → Rust (the input system sends both).
@@ -416,34 +440,84 @@ extern "C" fn bunny_selected_range(_this: Id, _sel: Sel) -> NSRange {
 extern "C" fn bunny_attributed_substring(
     _this: Id,
     _sel: Sel,
-    _range: NSRange,
-    _actual: *mut NSRange,
+    range: NSRange,
+    actual: *mut NSRange,
 ) -> Id {
-    // honest floor: some IMEs query this for reconversion — without it
-    // normal composition keeps working
-    std::ptr::null_mut()
+    // reconversion and candidate previews ask for arbitrary substrings
+    // — answered from the mirror's full text, clamped to what exists
+    let Some(ime) = ime_mirror() else {
+        return std::ptr::null_mut();
+    };
+    let text: &str = &ime.text;
+    let total = text.encode_utf16().count() as u64;
+    let location = range.location.min(total);
+    let length = range.length.min(total - location);
+    let start = bunny_ui::text_input::utf16_to_byte(text, location as usize);
+    let end = bunny_ui::text_input::utf16_to_byte(text, (location + length) as usize);
+    let Ok(slice) = CString::new(&text[start..end]) else {
+        return std::ptr::null_mut();
+    };
+    unsafe {
+        if !actual.is_null() {
+            *actual = NSRange { location, length };
+        }
+        let string =
+            msg_id_cstr(class("NSString"), sel("stringWithUTF8String:"), slice.as_ptr());
+        let attributed = msg_id_arg(
+            msg_id(class("NSAttributedString"), sel("alloc")),
+            sel("initWithString:"),
+            string,
+        );
+        // the input system owns the answer from here
+        msg_id(attributed, sel("autorelease"))
+    }
 }
 
 extern "C" fn bunny_valid_attributes(_this: Id, _sel: Sel) -> Id {
     unsafe { msg_id(class("NSArray"), sel("array")) }
 }
 
-/// Where the candidate window lands: the caret rect, on screen.
+/// Where the candidate window lands: the rect at the REQUESTED index
+/// (the composition's start, usually) — the caret rect as fallback.
 extern "C" fn bunny_first_rect(
     _this: Id,
     _sel: Sel,
-    _range: NSRange,
-    _actual: *mut NSRange,
+    range: NSRange,
+    actual: *mut NSRange,
 ) -> CGRect {
-    ime_mirror().map(|ime| ime.caret_screen).unwrap_or(CGRect {
-        origin: CGPoint { x: 0.0, y: 0.0 },
-        size: CGSize { width: 0.0, height: 0.0 },
-    })
+    if !actual.is_null() {
+        unsafe { *actual = NSRange { location: range.location, length: 0 } };
+    }
+    let ranged = (range.location != NS_NOT_FOUND)
+        .then(|| {
+            IME_RECT.with(|slot| {
+                slot.borrow().as_ref().and_then(|resolve| resolve(range.location))
+            })
+        })
+        .flatten();
+    ranged
+        .or_else(|| ime_mirror().map(|ime| ime.caret_screen))
+        .unwrap_or(CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize { width: 0.0, height: 0.0 },
+        })
 }
 
-extern "C" fn bunny_character_index(_this: Id, _sel: Sel, _point: CGPoint) -> u64 {
-    // honest floor (dictionary lookup by mouse comes later)
-    0
+extern "C" fn bunny_character_index(this: Id, _sel: Sel, point: CGPoint) -> u64 {
+    // dictionary lookup by mouse: screen → window → layout, then the
+    // shell's resolver answers from the live field
+    unsafe {
+        let window = msg_id(this, sel("window"));
+        if window.is_null() {
+            return NS_NOT_FOUND;
+        }
+        let in_window = msg_point_point(window, sel("convertPointFromScreen:"), point);
+        let bounds = msg_rect(this, sel("bounds"));
+        let (x, y) = (in_window.x, bounds.size.height - in_window.y);
+        IME_INDEX
+            .with(|slot| slot.borrow().as_ref().and_then(|resolve| resolve(x, y)))
+            .unwrap_or(NS_NOT_FOUND)
+    }
 }
 
 extern "C" fn bunny_do_command(_this: Id, _sel: Sel, command: Sel) {

@@ -142,6 +142,7 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;
             (
+                std::rc::Rc::from(snapshot.text),
                 ffi::NSRange {
                     location: snapshot.selected.0 as u64,
                     length: snapshot.selected.1 as u64,
@@ -189,6 +190,29 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
             }
         }
     }));
+
+    // the input system's questions BEYOND the mirror: index under the
+    // mouse (dictionary lookup) and rect at a composition index — both
+    // answered live by the runtime
+    ffi::set_ime_resolvers(
+        Box::new({
+            let runtime = Rc::clone(&runtime);
+            move |x, y| runtime.ime_index_at(x, y).map(|index| index as u64)
+        }),
+        Box::new({
+            let runtime = Rc::clone(&runtime);
+            move |utf16| {
+                runtime.ime_rect_for(utf16 as usize).map(|rect| {
+                    window.layout_rect_to_screen(
+                        rect.origin.x,
+                        rect.origin.y,
+                        rect.size.width,
+                        rect.size.height,
+                    )
+                })
+            }
+        }),
+    );
 
     let handler_runtime = Rc::clone(&runtime);
     let handler_root = Rc::clone(&root);
