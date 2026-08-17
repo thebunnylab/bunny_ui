@@ -120,6 +120,7 @@ function applyPatches(view, length) {
   };
   const text = (count) => decoder.decode(bytes(count));
 
+  let rulesTouched = false;
   const count = u32();
   for (let i = 0; i < count; i++) {
     const op = u8();
@@ -141,7 +142,7 @@ function applyPatches(view, length) {
       el?.remove();
       elements.delete(id);
       rules.delete(id);
-      flushRules();
+      rulesTouched = true;
     } else if (op === 3) {
       const el = elements.get(id);
       const x = f32();
@@ -203,7 +204,7 @@ function applyPatches(view, length) {
       if (hover) rule += `\n${name}:hover{background:${hover}}`;
       if (pressed) rule += `\n${name}:active{background:${pressed}}`;
       rules.set(id, rule);
-      flushRules();
+      rulesTouched = true;
     } else if (op === 6) {
       const el = elements.get(id);
       const color = rgba(u32());
@@ -271,6 +272,9 @@ function applyPatches(view, length) {
       }
     }
   }
+  // ONE stylesheet rebuild per batch — a window churn touches dozens
+  // of rules and must not pay the whole sheet for each
+  if (rulesTouched) flushRules();
 }
 
 function sendField(path, value, caret) {

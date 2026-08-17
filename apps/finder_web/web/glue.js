@@ -63,6 +63,10 @@ const imports = {
     js_request_frame() {
       requestFrame();
     },
+    // dom-mode imports — the single binary carries both shells, and
+    // this page only ever drives the canvas one
+    js_apply_patches() {},
+    js_island() {},
     // Writes [width, ascent, descent] as three f64 at `out` — logical
     // px. Ascent/descent come from the FONT's bounding box (stable per
     // font); an empty string keeps the metrics and reports width 0.
