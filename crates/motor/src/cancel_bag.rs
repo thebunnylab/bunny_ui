@@ -55,6 +55,27 @@ impl std::fmt::Debug for CancelBag {
     }
 }
 
+/// A running task in a bag: `bag.cancel()` drops what it holds, and
+/// dropping the handle ends the task where it stands.
+pub struct RunningTask {
+    task: RefCell<Option<crate::task::Spawned>>,
+}
+
+impl RunningTask {
+    pub fn new(task: crate::task::Spawned) -> Rc<RunningTask> {
+        Rc::new(RunningTask { task: RefCell::new(Some(task)) })
+    }
+}
+
+impl Cancellable for RunningTask {
+    fn cancel(&self) {
+        // out of the cell before it drops — the future's own Drop must
+        // not find this borrowed
+        let task = self.task.borrow_mut().take();
+        drop(task);
+    }
+}
+
 /// A fake `Task` handle — cancelling flags a shared bool.
 pub struct TaskHandle {
     cancelled: Rc<std::cell::Cell<bool>>,

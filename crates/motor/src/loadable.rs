@@ -103,8 +103,11 @@ pub type LoadableSubject<T> = Binding<Loadable<T>>;
 impl<T: Clone + PartialEq + 'static> Binding<Loadable<T>> {
     /// `subject.load { try await resource() }`
     ///
-    /// The future is driven to completion synchronously with the crate-local
-    /// `block_on` — the mocked web repository resolves instantly.
+    /// The resource goes on the engine's queue: the subject turns
+    /// `.isLoading` NOW and takes its value (or its error) on the turn
+    /// the future resolves. The `CancelBag` owns the running task, so
+    /// `cancelLoading()` — and the bag dying with its view — ends the
+    /// work where it stands.
     pub fn load<F, E>(&self, resource: F)
     where
         F: Future<Output = Result<T, E>> + 'static,
@@ -115,14 +118,15 @@ impl<T: Clone + PartialEq + 'static> Binding<Loadable<T>> {
         value.setIsLoading(cancelBag.clone());
         self.set(value);
 
-        let (task, _cancelled) = crate::cancel_bag::TaskHandle::new();
+        let subject = self.clone();
+        let task = crate::task::spawn(async move {
+            match resource.await {
+                Ok(value) => subject.set(Loadable::Loaded(value)),
+                Err(error) => subject.set(Loadable::Failed(error.into())),
+            }
+        });
         // task.store(in: cancelBag)
-        cancelBag.store(task);
-
-        match crate::block_on(resource) {
-            Ok(value) => self.set(Loadable::Loaded(value)),
-            Err(error) => self.set(Loadable::Failed(error.into())),
-        }
+        cancelBag.store(crate::cancel_bag::RunningTask::new(task));
     }
 }
 
@@ -135,13 +139,31 @@ mod tests {
     fn load_roundtrip_through_a_binding() {
         let state = State::new(Loadable::<u32>::NotRequested);
         state.binding().load(async { Ok::<_, LoadError>(42) });
+        assert!(
+            matches!(state.wrappedValue(), Loadable::IsLoading(..)),
+            "the subject says loading until the turn runs the task"
+        );
+        crate::task::poll_ready();
         assert_eq!(state.wrappedValue(), Loadable::Loaded(42));
 
         state.binding().load(async { Err::<u32, _>(LoadError::new("boom")) });
+        crate::task::poll_ready();
         assert_eq!(
             state.wrappedValue(),
             Loadable::Failed(LoadError::new("boom"))
         );
+    }
+
+    #[test]
+    fn cancel_loading_ends_the_task_it_owns() {
+        let state = State::new(Loadable::<u32>::NotRequested);
+        state.binding().load(std::future::pending::<Result<u32, LoadError>>());
+        crate::task::poll_ready();
+        assert_eq!(crate::task::pending(), 1, "a resource still in flight");
+
+        // `cancelLoading` clears the bag; the bag held the task
+        state.update(|value| value.cancelLoading());
+        assert_eq!(crate::task::pending(), 0, "the work stopped with it");
     }
 
     #[test]
