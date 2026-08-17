@@ -23,6 +23,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
 use std::sync::Once;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 pub type Id = *mut c_void;
 pub type Sel = *const c_void;
@@ -196,6 +197,32 @@ unsafe extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     pub(crate) fn CFRelease(cf: *const c_void);
+    fn CFRunLoopGetMain() -> Id;
+    fn CFRunLoopSourceCreate(
+        allocator: Id,
+        order: isize,
+        context: *mut CFRunLoopSourceContext,
+    ) -> Id;
+    fn CFRunLoopAddSource(loop_: Id, source: Id, mode: Id);
+    fn CFRunLoopSourceSignal(source: Id);
+    fn CFRunLoopWakeUp(loop_: Id);
+    static kCFRunLoopCommonModes: Id;
+}
+
+/// The version-0 source context. Only `perform` matters here: the
+/// source carries no state of its own, so every other hook stays null.
+#[repr(C)]
+struct CFRunLoopSourceContext {
+    version: isize,
+    info: *mut c_void,
+    retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
+    release: Option<extern "C" fn(*const c_void)>,
+    copy_description: Option<extern "C" fn(*const c_void) -> Id>,
+    equal: Option<extern "C" fn(*const c_void, *const c_void) -> u8>,
+    hash: Option<extern "C" fn(*const c_void) -> usize>,
+    schedule: Option<extern "C" fn(*mut c_void, Id, Id)>,
+    cancel: Option<extern "C" fn(*mut c_void, Id, Id)>,
+    perform: Option<extern "C" fn(*mut c_void)>,
 }
 
 pub(crate) unsafe fn class(name: &str) -> Id {
@@ -248,6 +275,10 @@ pub enum AppEvent {
     /// The window stopped being key (the user switched apps or
     /// windows) — open popovers close, the platform's own manner.
     ResignKey,
+    /// A task woke from somewhere else — a worker thread finished a
+    /// step. The frame the shell already knows how to draw drains the
+    /// queue on its way.
+    Wake,
 }
 
 thread_local! {
@@ -267,6 +298,57 @@ pub fn dispatch(event: AppEvent) {
             handler(event);
         }
     });
+}
+
+/// The run loop source a background thread knocks on. It lives in a
+/// static (not a thread-local) because the signal comes from ANY
+/// thread — `CFRunLoopSourceSignal` and `CFRunLoopWakeUp` are the
+/// thread-safe half of CoreFoundation.
+static WAKE_SOURCE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+extern "C" fn perform_wake(_info: *mut c_void) {
+    dispatch(AppEvent::Wake);
+}
+
+/// Opens that door. Called once, on the main thread, while the window
+/// is being built.
+pub fn install_wake_source() {
+    if !WAKE_SOURCE.load(Ordering::SeqCst).is_null() {
+        return;
+    }
+    unsafe {
+        let mut context = CFRunLoopSourceContext {
+            version: 0,
+            info: std::ptr::null_mut(),
+            retain: None,
+            release: None,
+            copy_description: None,
+            equal: None,
+            hash: None,
+            schedule: None,
+            cancel: None,
+            perform: Some(perform_wake),
+        };
+        let source = CFRunLoopSourceCreate(std::ptr::null_mut(), 0, &mut context);
+        // COMMON modes: a live resize or a tracking loop must not
+        // silence a task that just landed
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+        WAKE_SOURCE.store(source, Ordering::SeqCst);
+    }
+}
+
+/// Asks the main run loop for one more turn. Safe from any thread, and
+/// never re-entrant: a signal raised DURING a frame lands on the next
+/// turn instead of nesting inside this one.
+pub fn wake_from_any_thread() {
+    let source = WAKE_SOURCE.load(Ordering::SeqCst);
+    if source.is_null() {
+        return;
+    }
+    unsafe {
+        CFRunLoopSourceSignal(source);
+        CFRunLoopWakeUp(CFRunLoopGetMain());
+    }
 }
 
 thread_local! {

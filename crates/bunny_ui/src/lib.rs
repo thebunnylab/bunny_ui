@@ -91,6 +91,12 @@ macro_rules! zstack {
     };
 }
 
+/// The engine's task queue: what `.task` runs on, and the channel a
+/// worker thread (or a browser callback) hands its results over.
+pub mod task {
+    pub use motor::task::{Receiver, Recv, SendError, Sender, Spawned, channel, spawn};
+}
+
 pub mod prelude {
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::Spring;
@@ -105,6 +111,7 @@ pub mod prelude {
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
     pub use crate::runtime::{Edited, ImeSnapshot, Runtime};
     pub use crate::state_ext::{BindingExt, StateExt};
+    pub use crate::task;
     pub use crate::view::{Component, Either, Many, Single, UnaryView, View};
     pub use crate::views::*;
 
@@ -1288,6 +1295,33 @@ mod tests {
         view.open.set(false);
         runtime.render_stable(&view);
         assert_eq!(motor::task::pending(), 0, "the task died with the view");
+    }
+
+    #[test]
+    fn an_empty_virtual_list_asks_for_no_row() {
+        use crate::layout::{Proposal, Size};
+        use std::cell::Cell;
+
+        let asked = Rc::new(Cell::new(0));
+        let list = {
+            let asked = Rc::clone(&asked);
+            virtual_list(
+                0,
+                move |index| {
+                    asked.set(asked.get() + 1);
+                    index.to_string()
+                },
+                |index| text(format!("row {index}")),
+            )
+        };
+
+        let runtime = Runtime::new();
+        runtime.layout(&list, Proposal::exact(Size { width: 200.0, height: 100.0 }));
+        assert_eq!(
+            asked.get(),
+            0,
+            "a list still waiting for its data has no row to ask about"
+        );
     }
 
     #[test]

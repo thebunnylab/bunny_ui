@@ -102,6 +102,10 @@ pub fn run_window_chrome(
 ) {
     let window =
         ffi::create_window(title, size.width, size.height, chrome == Chrome::Scene);
+    // a task that lands on a worker thread asks the main run loop for
+    // one more turn; the frame it takes drains the queue on its way
+    ffi::install_wake_source();
+    runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
     // two owners: the keyboard gate and the event handler
     let runtime = Rc::new(runtime);
     let root = Rc::new(root);
@@ -353,7 +357,7 @@ pub fn run_window_chrome(
         let runtime = &handler_runtime;
         let root = &*handler_root;
         match event {
-        AppEvent::Redraw => blit(runtime, root),
+        AppEvent::Redraw | AppEvent::Wake => blit(runtime, root),
         AppEvent::ResignKey => {
             // the user switched away: popovers close like the
             // platform's own (their panels never take key, so this

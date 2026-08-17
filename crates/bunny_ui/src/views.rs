@@ -947,7 +947,12 @@ where
             }
             _ => (0, self.count.min(FIRST_WINDOW).saturating_sub(1)),
         };
-        debug_assert_unique_ids("virtual_list", (first..=last).map(&self.id));
+        // an EMPTY list has no window: `first..=last` is (0, 0) there,
+        // and asking for row zero is asking the app for a row it does
+        // not have — the shape of every list that waits for data
+        if self.count > 0 {
+            debug_assert_unique_ids("virtual_list", (first..=last).map(&self.id));
+        }
         // the pin: a PENDING reveal exists even far outside the window —
         // WITH its own buffered band, so when the follow-up scrolls to
         // it the fresh viewport is already covered (one body, no extra
