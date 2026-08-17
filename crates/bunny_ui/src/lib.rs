@@ -2772,6 +2772,44 @@ mod tests {
     }
 
     #[test]
+    fn an_async_engine_reflows_when_it_reports_in() {
+        use crate::image_engine::{ImageEngine, ImageRaster, ImageSource};
+        use crate::layout::{Proposal, Size};
+
+        // the web shape: intrinsic answers None until the platform
+        // reports in — the same scene then measures for real
+        struct Late {
+            ready: std::cell::Cell<bool>,
+        }
+        impl ImageEngine for Late {
+            fn intrinsic(&self, _: &ImageSource) -> Option<(u32, u32)> {
+                self.ready.get().then_some((30, 10))
+            }
+            fn raster(&self, _: &ImageSource, _: usize, _: usize) -> Option<Rc<ImageRaster>> {
+                None
+            }
+        }
+
+        let engine = Rc::new(Late { ready: std::cell::Cell::new(false) });
+        let runtime = Runtime::new().image_engine(engine.clone());
+        let root = image(ImageSource::bytes_keyed(1, &b"pending"[..]))
+            .resizable()
+            .aspect_ratio(ContentMode::Fit);
+
+        let proposal = Proposal { width: Some(60.0), height: None };
+        let before = runtime.layout(&root, proposal);
+        assert_eq!(before.size, Size::default(), "undecoded measures zero");
+
+        engine.ready.set(true);
+        let after = runtime.layout(&root, proposal);
+        assert_eq!(
+            after.size,
+            Size { width: 60.0, height: 20.0 },
+            "the ready callback reflows to the real ratio"
+        );
+    }
+
+    #[test]
     fn a_fill_image_covers_and_clips_inside_its_frame() {
         use crate::layout::{DrawCommand, LayoutNode, Proposal, layout};
         // a wide red 4×2 inside a TALL 20×40 frame: cover scales by

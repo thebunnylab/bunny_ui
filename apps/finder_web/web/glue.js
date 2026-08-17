@@ -46,6 +46,15 @@ function requestFrame() {
   });
 }
 
+// Decoded images by split key ("hi:lo"). A missing entry = still
+// decoding; null = the browser could not read the bytes (permanent —
+// the engine never re-registers, nothing loops).
+const images = new Map();
+
+function imageKey(hi, lo) {
+  return `${hi}:${lo}`;
+}
+
 const imports = {
   bunny: {
     js_blit(pointer, width, height) {
@@ -67,6 +76,42 @@ const imports = {
     // this page only ever drives the canvas one
     js_apply_patches() {},
     js_island() {},
+    // The image edge: the engine hands the encoded bytes ONCE; the
+    // browser decodes off-thread and calls bunny_image_ready when the
+    // bitmap lands. Broken bytes park a null and never call back.
+    js_image_register(hi, lo, pointer, length) {
+      const key = imageKey(hi, lo);
+      const bytes = new Uint8Array(wasm.memory.buffer, pointer, length).slice();
+      createImageBitmap(new Blob([bytes]))
+        .then((bitmap) => {
+          images.set(key, bitmap);
+          wasm.bunny_image_ready(hi, lo);
+        })
+        .catch(() => {
+          images.set(key, null);
+        });
+    },
+    // Writes [width, height] as two u32 at `out`; [0, 0] = not decoded.
+    js_image_size(hi, lo, out) {
+      const bitmap = images.get(imageKey(hi, lo));
+      const view = new Uint32Array(wasm.memory.buffer, out, 2);
+      view[0] = bitmap ? bitmap.width : 0;
+      view[1] = bitmap ? bitmap.height : 0;
+    },
+    // Draws the bitmap at exactly width×height physical px and writes
+    // the straight-alpha RGBA back (getImageData is straight by spec).
+    js_image_raster(hi, lo, width, height, out) {
+      const bitmap = images.get(imageKey(hi, lo));
+      if (!bitmap) return;
+      const ink = inkSurface(width, height);
+      ink.setTransform(1, 0, 0, 1, 0, 0);
+      ink.clearRect(0, 0, width, height);
+      ink.imageSmoothingEnabled = true;
+      ink.imageSmoothingQuality = "high";
+      ink.drawImage(bitmap, 0, 0, width, height);
+      const pixels = ink.getImageData(0, 0, width, height).data;
+      new Uint8Array(wasm.memory.buffer, out, width * height * 4).set(pixels);
+    },
     // Writes [width, ascent, descent] as three f64 at `out` — logical
     // px. Ascent/descent come from the FONT's bounding box (stable per
     // font); an empty string keeps the metrics and reports width 0.

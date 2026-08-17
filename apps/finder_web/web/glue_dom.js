@@ -312,6 +312,16 @@ const imports = {
   bunny: {
     js_blit() {},
     js_request_frame() {},
+    // the image edge lands here with the <img> lowering; until then
+    // the stubs keep the single binary's import border whole
+    // ([0, 0] = never decoded — nothing measures, nothing paints)
+    js_image_register() {},
+    js_image_size(hi, lo, out) {
+      const view = new Uint32Array(wasm.memory.buffer, out, 2);
+      view[0] = 0;
+      view[1] = 0;
+    },
+    js_image_raster() {},
     js_apply_patches(pointer, length) {
       const view = new DataView(wasm.memory.buffer, pointer, length);
       applyPatches(view, length);

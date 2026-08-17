@@ -18,6 +18,9 @@ struct Finder {
     selected: State<usize>,
     visible: State<Rc<Vec<usize>>>,
     files: Rc<Vec<(Rc<str>, Rc<str>)>>,
+    /// Built ONCE (hash + registration happen per identity, never per
+    /// body) — the browser decodes it and reports back.
+    logo: ImageSource,
 }
 
 impl Component for Finder {
@@ -33,6 +36,7 @@ impl Component for Finder {
         // with a soft shadow: the SAME chrome on every rendering
         vstack!(vstack!(
             hstack!(
+                image(self.logo.clone()).resizable().frame(18.0, 18.0),
                 text("›").foreground_color(theme::accent()),
                 text_field("Search ten thousand files…", self.query.binding()).monospaced(),
                 count_meter(count),
@@ -103,6 +107,83 @@ impl Component for Finder {
 
 const CLEAR: Color = Color { r: 0, g: 0, b: 0, a: 0 };
 
+// MARK: - The logo, a png written by hand
+
+/// Bitwise CRC-32 (the PNG polynomial) — tiny, demo-only.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc: u32 = 0xffff_ffff;
+    for byte in bytes {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+fn adler32(bytes: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for byte in bytes {
+        a = (a + *byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+fn chunk(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut body = kind.to_vec();
+    body.extend_from_slice(payload);
+    let mut out = (payload.len() as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(&body).to_be_bytes());
+    out
+}
+
+/// The 12×12 bunny mark, one bit per pixel — ears, head, eyes.
+const BUNNY: [u16; 12] = [
+    0b0110_0000_0110,
+    0b0110_0000_0110,
+    0b0110_0000_0110,
+    0b0111_1111_1110,
+    0b1111_1111_1111,
+    0b1111_1111_1111,
+    0b1101_1111_1011,
+    0b1111_1111_1111,
+    0b1111_1111_1111,
+    0b0111_1111_1110,
+    0b0011_1111_1100,
+    0b0000_0000_0000,
+];
+
+/// A REAL png (zlib with one stored deflate block needs no
+/// compressor) — the browser decodes it like any other asset.
+fn logo() -> ImageSource {
+    let accent = theme::accent();
+    let mut raw = Vec::new();
+    for row in BUNNY {
+        raw.push(0); // filter: none
+        for column in 0..12u16 {
+            let on = row >> (11 - column) & 1 == 1;
+            let alpha = if on { 255 } else { 0 };
+            raw.extend_from_slice(&[accent.r, accent.g, accent.b, alpha]);
+        }
+    }
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&12u32.to_be_bytes());
+    ihdr.extend_from_slice(&12u32.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+    let mut idat = vec![0x78, 0x01, 0x01];
+    idat.extend_from_slice(&(raw.len() as u16).to_le_bytes());
+    idat.extend_from_slice(&(!(raw.len() as u16)).to_le_bytes());
+    idat.extend_from_slice(&raw);
+    idat.extend_from_slice(&adler32(&raw).to_be_bytes());
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    png.extend_from_slice(&chunk(b"IHDR", &ihdr));
+    png.extend_from_slice(&chunk(b"IDAT", &idat));
+    png.extend_from_slice(&chunk(b"IEND", &[]));
+    ImageSource::from_bytes(png)
+}
+
 /// The visible count, drawn as five digit bars — custom pixels. On the
 /// Dom page this subtree claims a CANVAS ISLAND (`.rendering(Gpu)`):
 /// our layout positions the element, our rasterizer fills it, and the
@@ -138,6 +219,7 @@ fn finder() -> Finder {
         selected: State::new(0),
         visible: State::new(Rc::new((0..10_000).collect())),
         files,
+        logo: logo(),
     }
 }
 

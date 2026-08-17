@@ -13,6 +13,7 @@
 //! of the display link — armed only while an animation wants frames.
 #![cfg(target_arch = "wasm32")]
 
+mod image;
 mod text;
 
 use std::cell::RefCell;
@@ -24,6 +25,7 @@ use bunny_ui::raster::Surface;
 use bunny_ui::runtime::Runtime;
 use bunny_ui::text_input::EditCommand;
 
+pub use image::CanvasImageEngine;
 pub use text::CanvasTextEngine;
 
 #[link(wasm_import_module = "bunny")]
@@ -51,6 +53,9 @@ enum Event {
     Key(u32, bool),
     Frame { dt: f64 },
     Resize { width: f64, height: f64, scale: f64 },
+    /// The browser finished decoding a registered image — measure and
+    /// paint can answer for real now.
+    ImageReady,
     /// Dom mode: the browser's scroll observer — the element scrolled
     /// and the engine mirrors the offset (the dual ownership).
     DomScroll { id: u32, x: f64, y: f64 },
@@ -77,7 +82,9 @@ fn dispatch(event: Event) {
 /// Boots the shell with the app's root view. The demo crate calls this
 /// from its exported `start`; everything after travels through events.
 pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
-    let runtime = Runtime::new().text_engine(Rc::new(CanvasTextEngine::new()));
+    let runtime = Runtime::new()
+        .text_engine(Rc::new(CanvasTextEngine::new()))
+        .image_engine(Rc::new(CanvasImageEngine::new()));
     let mut size = Size { width, height };
     // the surface wants an INTEGER scale (the snapping contract);
     // fractional device ratios round to the nearest whole step
@@ -184,6 +191,11 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 scale = (ratio.round() as usize).max(1);
                 present(&runtime, &full, size, scale, &mut surface);
             }
+            Event::ImageReady => {
+                // the layout reflows around the fresh intrinsic size
+                // and the paint asks the engine again — one full frame
+                present(&runtime, &full, size, scale, &mut surface);
+            }
             // Dom-mode traffic — this shell rasterizes, nothing to do
             Event::DomScroll { .. } | Event::Field { .. } => {}
         }
@@ -201,7 +213,9 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
 /// and programmatic scrolls ride `scroll-behavior`, so the browser
 /// animates while the engine stays event-driven.
 pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static) {
-    let runtime = Runtime::new().text_engine(Rc::new(CanvasTextEngine::new()));
+    let runtime = Runtime::new()
+        .text_engine(Rc::new(CanvasTextEngine::new()))
+        .image_engine(Rc::new(CanvasImageEngine::new()));
     runtime.set_reduce_motion(true);
     let mut size = Size { width, height };
     let scale = (scale.round() as usize).max(1);
@@ -250,6 +264,11 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
             }
             Event::Resize { width, height, .. } => {
                 size = Size { width, height };
+                present(&runtime, runtime.dom_frame(&root, size), scale);
+            }
+            Event::ImageReady => {
+                // geometry reflows around the fresh intrinsic size;
+                // the <img> elements themselves paint on their own
                 present(&runtime, runtime.dom_frame(&root, size), scale);
             }
             // hover, wheel, keys and ticks belong to the browser in
@@ -321,6 +340,13 @@ pub extern "C" fn bunny_resize(width: f64, height: f64, scale: f64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_dom_scroll(id: u32, x: f64, y: f64) {
     dispatch(Event::DomScroll { id, x, y });
+}
+
+/// The browser decoded a registered image (the async half of the
+/// image engine) — the shell repaints so measure and paint see it.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_image_ready(_key_hi: u32, _key_lo: u32) {
+    dispatch(Event::ImageReady);
 }
 
 /// Dom mode: the input edited. Both strings arrive through
