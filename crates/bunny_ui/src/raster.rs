@@ -151,43 +151,54 @@ impl Bitmap {
         }
     }
 
-    /// A soft halo OUTSIDE the rect: quadratic falloff over `radius`
-    /// physical px. The inside of the rect is never touched — whoever
-    /// owns the frame paints it. Corners use euclidean distance (a sqrt
-    /// only there); edges fall off linearly per band.
-    fn shadow_rect(&mut self, rect: Rect, color: Color, radius: f64) {
+    /// A soft halo OUTSIDE the rounded rect: quadratic falloff over
+    /// `radius` px, measured from the ROUNDED edge (distance to the
+    /// rect's core shrunk by `corner_radius`, minus the corner radius —
+    /// the classic signed distance). The notch BEHIND a rounded corner
+    /// gets shadow too: it is outside the shape, so it belongs to the
+    /// halo, not to the backdrop.
+    fn shadow_rect(&mut self, rect: Rect, color: Color, radius: f64, corner_radius: f64) {
         let (x0, y0, x1, y1) = Self::snap(rect);
-        let reach = radius.max(1.0).round() as i64;
+        let reach = radius.max(1.0);
+        let reach_px = reach.round() as i64;
+        let corner = corner_radius
+            .max(0.0)
+            .min((x1 - x0) as f64 / 2.0)
+            .min((y1 - y0) as f64 / 2.0);
+        let core_x0 = x0 as f64 + corner;
+        let core_x1 = x1 as f64 - corner;
+        let core_y0 = y0 as f64 + corner;
+        let core_y1 = y1 as f64 - corner;
+        let corner_px = corner.ceil() as i64;
         let (cx0, cy0, cx1, cy1) = self.clip_box();
-        let from_y = (y0 - reach).max(cy0);
-        let to_y = (y1 + reach).min(cy1);
-        let from_x = (x0 - reach).max(cx0);
-        let to_x = (x1 + reach).min(cx1);
+        let from_y = (y0 - reach_px).max(cy0);
+        let to_y = (y1 + reach_px).min(cy1);
         for y in from_y..to_y {
-            let dy = if y < y0 { y0 - y } else if y >= y1 { y - y1 + 1 } else { 0 };
-            for x in from_x..to_x {
-                let dx = if x < x0 { x0 - x } else if x >= x1 { x - x1 + 1 } else { 0 };
-                if dx == 0 && dy == 0 {
-                    continue; // the inside belongs to the view
+            // rows across the straight middle skip the interior: only
+            // the bands outside the rect can hold shadow there
+            let straight_row = y >= y0 + corner_px && y < y1 - corner_px;
+            let ranges: [(i64, i64); 2] = if straight_row {
+                [((x0 - reach_px).max(cx0), x0.min(cx1)), (x1.max(cx0), (x1 + reach_px).min(cx1))]
+            } else {
+                [((x0 - reach_px).max(cx0), (x1 + reach_px).min(cx1)), (0, 0)]
+            };
+            let py = y as f64 + 0.5;
+            for (from, to) in ranges {
+                for x in from..to {
+                    let px = x as f64 + 0.5;
+                    let dx = px - px.clamp(core_x0, core_x1);
+                    let dy = py - py.clamp(core_y0, core_y1);
+                    let distance = if dx == 0.0 || dy == 0.0 {
+                        dx.abs() + dy.abs() - corner
+                    } else {
+                        dx.hypot(dy) - corner
+                    };
+                    if distance <= 0.0 || distance >= reach {
+                        continue;
+                    }
+                    let strength = 1.0 - distance / reach;
+                    self.set_covered(x, y, color, strength * strength);
                 }
-                let distance = if dx > 0 && dy > 0 {
-                    ((dx * dx + dy * dy) as f64).sqrt()
-                } else {
-                    (dx + dy) as f64
-                };
-                if distance >= radius {
-                    continue;
-                }
-                let strength = 1.0 - distance / radius;
-                let alpha = (color.a as f64 * strength * strength).round() as u32;
-                if alpha == 0 {
-                    continue;
-                }
-                let packed = ((color.r as u32) << 24)
-                    | ((color.g as u32) << 16)
-                    | ((color.b as u32) << 8)
-                    | alpha;
-                self.set(x, y, packed);
             }
         }
     }
@@ -218,9 +229,46 @@ impl Bitmap {
         }
     }
 
-    /// Fill with optional corners: inset per scanline, a circle per
-    /// corner, ONE square root per row — never per pixel.
-    /// `corner_radius: 0.0` reproduces the straight rectangle byte for byte.
+    /// Paints one horizontal span with the clip applied — opaque colors
+    /// write the row slice in one go, translucent ones blend per pixel.
+    fn span(&mut self, y: i64, from: i64, to: i64, color: Color, packed: u32) {
+        let (cx0, cy0, cx1, cy1) = self.clip_box();
+        if y < cy0 || y >= cy1 {
+            return;
+        }
+        let from = from.max(cx0);
+        let to = to.min(cx1);
+        if from >= to {
+            return;
+        }
+        if color.a == 255 {
+            let row = y as usize * self.width;
+            self.pixels[row + from as usize..row + to as usize].fill(packed);
+        } else {
+            for x in from..to {
+                self.set(x, y, packed);
+            }
+        }
+    }
+
+    /// One anti-aliased pixel: `coverage` scales the color's alpha.
+    fn set_covered(&mut self, x: i64, y: i64, color: Color, coverage: f64) {
+        let alpha = (color.a as f64 * coverage).round() as u32;
+        if alpha == 0 {
+            return;
+        }
+        let packed = ((color.r as u32) << 24)
+            | ((color.g as u32) << 16)
+            | ((color.b as u32) << 8)
+            | alpha;
+        self.set(x, y, packed);
+    }
+
+    /// Fill with optional corners: straight rows paint as wide spans;
+    /// corner pixels get circle-coverage anti-aliasing (one hypot per
+    /// corner pixel — the corner square is tiny, the curve comes out
+    /// smooth). `corner_radius: 0.0` reproduces the straight rectangle
+    /// byte for byte.
     fn fill_rect(&mut self, rect: Rect, color: Color, corner_radius: f64) {
         let (x0, y0, x1, y1) = Self::snap(rect);
         if x1 <= x0 || y1 <= y0 {
@@ -231,47 +279,47 @@ impl Bitmap {
             return;
         }
         let packed = pack(color);
-        let height = (y1 - y0) as f64;
         let radius = corner_radius
             .max(0.0)
             .min((x1 - x0) as f64 / 2.0)
-            .min(height / 2.0);
+            .min((y1 - y0) as f64 / 2.0);
+        if radius < 0.5 {
+            for y in y0.max(cy0)..y1.min(cy1) {
+                self.span(y, x0, x1, color, packed);
+            }
+            return;
+        }
+        let reach = radius.ceil() as i64;
+        let left_center = x0 as f64 + radius;
+        let right_center = x1 as f64 - radius;
         for y in y0.max(cy0)..y1.min(cy1) {
-            // distance from the row center to the straight band between corners
-            let center = (y - y0) as f64 + 0.5;
-            let dy = if center < radius {
-                radius - center
-            } else if center > height - radius {
-                center - (height - radius)
-            } else {
-                0.0
-            };
-            let inset = if dy > 0.0 {
-                (radius - (radius * radius - dy * dy).sqrt()).round() as i64
-            } else {
-                0
-            };
-            let from = (x0 + inset).max(cx0);
-            let to = (x1 - inset).min(cx1);
-            if from >= to {
+            let in_top = y < y0 + reach;
+            let in_bottom = y >= y1 - reach;
+            if !in_top && !in_bottom {
+                self.span(y, x0, x1, color, packed);
                 continue;
             }
-            if color.a == 255 {
-                // opaque span: one wide write per row — the clip and the
-                // surface are already inside [from, to)
-                let row = y as usize * self.width;
-                self.pixels[row + from as usize..row + to as usize].fill(packed);
-            } else {
-                for x in from..to {
-                    self.set(x, y, packed);
-                }
+            let center_y = if in_top { y0 as f64 + radius } else { y1 as f64 - radius };
+            self.span(y, x0 + reach, x1 - reach, color, packed);
+            let py = y as f64 + 0.5;
+            for x in x0.max(cx0)..(x0 + reach).min(cx1) {
+                let distance = (x as f64 + 0.5 - left_center).hypot(py - center_y);
+                self.set_covered(x, y, color, (radius - distance + 0.5).clamp(0.0, 1.0));
+            }
+            for x in (x1 - reach).max(cx0)..x1.min(cx1) {
+                let distance = (x as f64 + 0.5 - right_center).hypot(py - center_y);
+                self.set_covered(x, y, color, (radius - distance + 0.5).clamp(0.0, 1.0));
             }
         }
     }
 
-    /// A frame inward from the edge, in 4 bars with NO overlap — a
-    /// translucent border cannot blend the corner twice.
-    fn stroke_rect(&mut self, rect: Rect, color: Color, width: f64) {
+    /// A frame inward from the edge. With `corner_radius` the border
+    /// FOLLOWS the curve — an anti-aliased ring between the outer circle
+    /// and the inner one (outer minus `width`); a straight bar cutting
+    /// across the arc is exactly the bug this kills. `0.0` keeps the
+    /// four straight non-overlapping bars byte for byte (a translucent
+    /// border cannot blend a corner twice).
+    fn stroke_rect(&mut self, rect: Rect, color: Color, width: f64, corner_radius: f64) {
         let (x0, y0, x1, y1) = Self::snap(rect);
         if x1 <= x0 || y1 <= y0 {
             return;
@@ -282,26 +330,58 @@ impl Bitmap {
         }
         let packed = pack(color);
         let thickness = width.max(1.0).round() as i64;
-        let top_end = (y0 + thickness).min(y1);
-        let bottom_start = (y1 - thickness).max(top_end);
-        let left_end = (x0 + thickness).min(x1);
-        let right_start = (x1 - thickness).max(left_end);
-        for y in y0.max(cy0)..top_end.min(cy1) {
-            for x in x0.max(cx0)..x1.min(cx1) {
-                self.set(x, y, packed);
+        let radius = corner_radius
+            .max(0.0)
+            .min((x1 - x0) as f64 / 2.0)
+            .min((y1 - y0) as f64 / 2.0);
+        if radius < 0.5 {
+            let top_end = (y0 + thickness).min(y1);
+            let bottom_start = (y1 - thickness).max(top_end);
+            let left_end = (x0 + thickness).min(x1);
+            let right_start = (x1 - thickness).max(left_end);
+            for y in y0.max(cy0)..top_end.min(cy1) {
+                self.span(y, x0, x1, color, packed);
             }
+            for y in bottom_start.max(cy0)..y1.min(cy1) {
+                self.span(y, x0, x1, color, packed);
+            }
+            for y in top_end.max(cy0)..bottom_start.min(cy1) {
+                self.span(y, x0, left_end, color, packed);
+                self.span(y, right_start, x1, color, packed);
+            }
+            return;
         }
-        for y in bottom_start.max(cy0)..y1.min(cy1) {
-            for x in x0.max(cx0)..x1.min(cx1) {
-                self.set(x, y, packed);
+        let reach = radius.ceil() as i64;
+        let inner = (radius - thickness as f64).max(0.0);
+        let left_center = x0 as f64 + radius;
+        let right_center = x1 as f64 - radius;
+        for y in y0.max(cy0)..y1.min(cy1) {
+            let in_top = y < y0 + reach;
+            let in_bottom = y >= y1 - reach;
+            if !in_top && !in_bottom {
+                // straight sides between the corners
+                self.span(y, x0, x0 + thickness, color, packed);
+                self.span(y, x1 - thickness, x1, color, packed);
+                continue;
             }
-        }
-        for y in top_end.max(cy0)..bottom_start.min(cy1) {
-            for x in x0.max(cx0)..left_end.min(cx1) {
-                self.set(x, y, packed);
+            // the straight middle of the horizontal bars
+            if y < y0 + thickness || y >= y1 - thickness {
+                self.span(y, x0 + reach, x1 - reach, color, packed);
             }
-            for x in right_start.max(cx0)..x1.min(cx1) {
-                self.set(x, y, packed);
+            let center_y = if in_top { y0 as f64 + radius } else { y1 as f64 - radius };
+            let py = y as f64 + 0.5;
+            let ring = |distance: f64| {
+                ((radius - distance + 0.5).clamp(0.0, 1.0)
+                    - (inner - distance + 0.5).clamp(0.0, 1.0))
+                    .clamp(0.0, 1.0)
+            };
+            for x in x0.max(cx0)..(x0 + reach).min(cx1) {
+                let distance = (x as f64 + 0.5 - left_center).hypot(py - center_y);
+                self.set_covered(x, y, color, ring(distance));
+            }
+            for x in (x1 - reach).max(cx0)..x1.min(cx1) {
+                let distance = (x as f64 + 0.5 - right_center).hypot(py - center_y);
+                self.set_covered(x, y, color, ring(distance));
             }
         }
     }
@@ -382,12 +462,19 @@ pub fn rasterize_with(
             DrawCommand::FillRect { rect, color, corner_radius } => {
                 bitmap.fill_rect(scale_rect(*rect, factor), *color, corner_radius * factor)
             }
-            DrawCommand::StrokeRect { rect, color, width } => {
-                bitmap.stroke_rect(scale_rect(*rect, factor), *color, width * factor)
-            }
-            DrawCommand::Shadow { rect, radius, color } => {
-                bitmap.shadow_rect(scale_rect(*rect, factor), *color, radius * factor)
-            }
+            DrawCommand::StrokeRect { rect, color, width, corner_radius } => bitmap
+                .stroke_rect(
+                    scale_rect(*rect, factor),
+                    *color,
+                    width * factor,
+                    corner_radius * factor,
+                ),
+            DrawCommand::Shadow { rect, radius, color, corner_radius } => bitmap.shadow_rect(
+                scale_rect(*rect, factor),
+                *color,
+                radius * factor,
+                corner_radius * factor,
+            ),
             DrawCommand::TextLine { origin, content, range, color, font } => {
                 let slice = &content[range.0..range.1];
                 if let Some(raster) = text.raster_line(slice, font, *color, scale) {
@@ -661,12 +748,22 @@ impl Surface {
                     DrawCommand::FillRect { rect, color, corner_radius } => self
                         .bitmap
                         .fill_rect(scale_rect(*rect, factor), *color, corner_radius * factor),
-                    DrawCommand::StrokeRect { rect, color, width } => self
-                        .bitmap
-                        .stroke_rect(scale_rect(*rect, factor), *color, width * factor),
-                    DrawCommand::Shadow { rect, radius, color } => self
-                        .bitmap
-                        .shadow_rect(scale_rect(*rect, factor), *color, radius * factor),
+                    DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
+                        self.bitmap.stroke_rect(
+                            scale_rect(*rect, factor),
+                            *color,
+                            width * factor,
+                            corner_radius * factor,
+                        )
+                    }
+                    DrawCommand::Shadow { rect, radius, color, corner_radius } => {
+                        self.bitmap.shadow_rect(
+                            scale_rect(*rect, factor),
+                            *color,
+                            radius * factor,
+                            corner_radius * factor,
+                        )
+                    }
                     DrawCommand::TextLine { origin, content, range, color, font } => {
                         let slice = &content[range.0..range.1];
                         if let Some(raster) = text.raster_line(slice, font, *color, self.scale) {
@@ -846,6 +943,7 @@ mod tests {
             },
             color: Color { r: 0, g: 0, b: 0, a: 128 },
             width: 2.0,
+            corner_radius: 0.0,
         });
         let bitmap = rasterize(&display, 6, 6, Color::WHITE);
 
@@ -975,6 +1073,57 @@ mod tests {
     }
 
     #[test]
+    fn a_rounded_stroke_follows_the_curve_and_leaves_the_square_corner_empty() {
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::StrokeRect {
+            rect: Rect {
+                origin: Point { x: 10.0, y: 10.0 },
+                size: Size { width: 40.0, height: 40.0 },
+            },
+            color: Color::BLACK,
+            width: 2.0,
+            corner_radius: 12.0,
+        });
+        let bitmap = rasterize(&display, 60, 60, Color::WHITE);
+
+        let white = super::pack(Color::WHITE);
+        let ink = |x: usize, y: usize| bitmap.pixel(x, y) != Some(white);
+        assert!(!ink(11, 11), "the square corner is OUTSIDE the curve — no straight bar");
+        // the arc: points at ~radius distance from the corner center (22, 22)
+        assert!(ink(22, 10), "top bar starts after the corner");
+        assert!(ink(13, 14), "the ring passes through the diagonal of the arc");
+        assert!(ink(10, 22), "left bar starts after the corner");
+        assert!(!ink(16, 16), "inside the ring is empty (border, not fill)");
+        assert!(!ink(30, 30), "the middle stays untouched");
+    }
+
+    #[test]
+    fn a_rounded_shadow_fills_the_notch_behind_the_corner() {
+        // a rounded panel recedes at the corner; the notch belongs to
+        // the halo, not to the backdrop
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::Shadow {
+            rect: Rect {
+                origin: Point { x: 20.0, y: 20.0 },
+                size: Size { width: 30.0, height: 30.0 },
+            },
+            radius: 8.0,
+            color: Color::rgba(0, 0, 0, 200),
+            corner_radius: 10.0,
+        });
+        let bitmap = rasterize(&display, 70, 70, Color::WHITE);
+
+        let white = super::pack(Color::WHITE);
+        assert_ne!(
+            bitmap.pixel(21, 21),
+            Some(white),
+            "the notch behind the rounded corner holds shadow"
+        );
+        assert_eq!(bitmap.pixel(35, 35), Some(white), "the middle of the shape stays clean");
+        assert_eq!(bitmap.pixel(30, 24), Some(white), "inside the rounded edge stays clean");
+    }
+
+    #[test]
     fn a_shadow_falls_off_outside_and_never_touches_the_inside() {
         let mut display = DisplayList::default();
         display.push(DrawCommand::Shadow {
@@ -984,6 +1133,7 @@ mod tests {
             },
             radius: 10.0,
             color: Color::rgba(0, 0, 0, 200),
+            corner_radius: 0.0,
         });
         let bitmap = rasterize(&display, 60, 60, Color::WHITE);
 
@@ -1012,6 +1162,7 @@ mod tests {
                     },
                     radius: 8.0,
                     color: Color::rgba(0, 0, 0, 90),
+                    corner_radius: 0.0,
                 });
             }
             display.push(fill(30.0, 30.0, 20.0, 20.0, Color::WHITE));

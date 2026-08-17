@@ -345,9 +345,9 @@ pub struct VisualProps {
     /// it).
     pub font: FontPatch,
     /// A soft halo behind the view: `(radius, color)`. The falloff is
-    /// quadratic; the halo paints OUTSIDE the frame (the frame itself is
-    /// untouched). Honest floor: the halo is rectangular even under
-    /// rounded corners — invisible at panel alphas.
+    /// quadratic; the halo paints OUTSIDE the shape and follows the
+    /// corner radius — including the notch behind a rounded corner,
+    /// which belongs to the shadow, not to the backdrop.
     pub shadow: Option<(Px, Color)>,
 }
 
@@ -387,11 +387,16 @@ pub struct Interaction {
 pub enum DrawCommand {
     /// `corner_radius: 0.0` = plain rectangle (the usual straight path).
     FillRect { rect: Rect, color: Color, corner_radius: Px },
-    /// A soft halo OUTSIDE the rect: alpha falls off quadratically from
-    /// the edge over `radius` px. The rect's inside stays untouched.
-    Shadow { rect: Rect, radius: Px, color: Color },
-    /// A border painted INWARD from the edge, `width` logical px.
-    StrokeRect { rect: Rect, color: Color, width: Px },
+    /// A soft halo OUTSIDE the rounded rect: alpha falls off
+    /// quadratically from the edge over `radius` px. `corner_radius`
+    /// makes the halo follow the corners — including the little notch
+    /// BEHIND a rounded corner, which belongs to the shadow, not to the
+    /// backdrop.
+    Shadow { rect: Rect, radius: Px, color: Color, corner_radius: Px },
+    /// A border painted INWARD from the edge, `width` logical px —
+    /// it follows `corner_radius` around the corners (an anti-aliased
+    /// ring; `0.0` = the four straight bars).
+    StrokeRect { rect: Rect, color: Color, width: Px, corner_radius: Px },
     /// One already-wrapped line of text. `origin` is the TOP-left of the
     /// line box (the engine converts to baseline internally); `font` is
     /// the effective inherited font. The painted span is
@@ -960,6 +965,7 @@ impl LayoutNode {
                     rect: frame,
                     color: if focused { theme.focus } else { theme.field_border },
                     width: 1.0,
+                    corner_radius: FIELD_RADIUS,
                 });
                 // the field is a pointer target (clicking focuses) —
                 // clipped like any hit
@@ -984,6 +990,7 @@ impl LayoutNode {
                     rect: frame,
                     color: Color::OUTLINE,
                     width: 1.0,
+                    corner_radius: 0.0,
                 });
             }
 
@@ -1074,7 +1081,12 @@ impl LayoutNode {
                 let env = LayoutEnv { font: props.font.apply_over(env.font), ..env };
                 // the halo goes first — everything else paints over it
                 if let Some((radius, color)) = props.shadow {
-                    out.display.push(DrawCommand::Shadow { rect: frame, radius, color });
+                    out.display.push(DrawCommand::Shadow {
+                        rect: frame,
+                        radius,
+                        color,
+                        corner_radius: props.corner_radius.unwrap_or(0.0),
+                    });
                 }
                 let (hovered, pressed) = out.pointer.last().copied().unwrap_or((false, false));
                 // pressed > hovered > normal; a state without its own
@@ -1102,7 +1114,12 @@ impl LayoutNode {
                     out.foreground.pop();
                 }
                 if let Some((color, width)) = props.border {
-                    out.display.push(DrawCommand::StrokeRect { rect: frame, color, width });
+                    out.display.push(DrawCommand::StrokeRect {
+                        rect: frame,
+                        color,
+                        width,
+                        corner_radius: props.corner_radius.unwrap_or(0.0),
+                    });
                 }
             }
 
