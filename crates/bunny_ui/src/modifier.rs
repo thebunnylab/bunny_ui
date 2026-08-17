@@ -71,6 +71,8 @@ pub enum Modifier {
     Shadow(f64, Color),
     /// Colors under this view move through a spring when they change.
     Animated(crate::anim::Spring),
+    /// Where this subtree renders when the scene lowers to elements.
+    Rendering(crate::layout::Rendering),
     /// Declares a key context active while this view is mounted.
     KeyContext(&'static str),
 
@@ -162,6 +164,7 @@ impl Modifier {
                 " [.animated(response: {}, damping: {})]",
                 spec.response, spec.damping
             ),
+            Modifier::Rendering(mode) => format!(" [.rendering(.{mode:?})]"),
             Modifier::KeyContext(name) => format!(" [.keyContext({name})]"),
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
@@ -215,6 +218,9 @@ fn rewrite_scroll_node(
             spec,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
+        LayoutNode::Island { child } => LayoutNode::Island {
+            child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
         LayoutNode::Padding { edges, child } => LayoutNode::Padding {
             edges,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
@@ -251,6 +257,9 @@ fn rewrite_field_node(
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
             spec,
+            child: Box::new(rewrite_field_node(*child, rewrite)),
+        },
+        LayoutNode::Island { child } => LayoutNode::Island {
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
         LayoutNode::Padding { edges, child } => LayoutNode::Padding {
@@ -291,6 +300,9 @@ fn rewrite_text_node(
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
             spec,
+            child: Box::new(rewrite_text_node(*child, rewrite)),
+        },
+        LayoutNode::Island { child } => LayoutNode::Island {
             child: Box::new(rewrite_text_node(*child, rewrite)),
         },
         other => other,
@@ -517,6 +529,15 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     spec,
                     child: Box::new(node),
                 });
+            }
+            Modifier::Rendering(mode) => {
+                // Auto is the table's business (v1: everything lowers
+                // to Dom); only an explicit Gpu claims an island node
+                if *mode == crate::layout::Rendering::Gpu {
+                    out.wrap_last_layout(|node| LayoutNode::Island {
+                        child: Box::new(node),
+                    });
+                }
             }
             Modifier::AutoFocus => out.wrap_last_layout(|node| {
                 rewrite_field_node(node, &|path, content, placeholder| LayoutNode::Field {

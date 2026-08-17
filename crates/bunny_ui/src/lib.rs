@@ -96,7 +96,7 @@ pub mod prelude {
     pub use crate::erased::{CustomModifier, Erased, erased};
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
-    pub use crate::layout::{Color, Truncation, VisualProps};
+    pub use crate::layout::{Color, Rendering, Truncation, VisualProps};
     pub use crate::theme::{self, Theme};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
     pub use crate::text_input::{CaretState, EditCommand};

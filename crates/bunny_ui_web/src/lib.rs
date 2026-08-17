@@ -37,6 +37,8 @@ unsafe extern "C" {
     /// little-endian ABI of `bunny_ui::dom::encode`) and mutates the
     /// element tree.
     fn js_apply_patches(pointer: *const u8, len: usize);
+    /// Dom mode: fresh pixels for one canvas island (physical size).
+    fn js_island(id: u32, pointer: *const u8, width: u32, height: u32);
 }
 
 /// What the exports feed the shell — the web twin of the mac AppEvent.
@@ -198,15 +200,28 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
 /// here (reduce-motion on): animation specs lower to CSS transitions
 /// and programmatic scrolls ride `scroll-behavior`, so the browser
 /// animates while the engine stays event-driven.
-pub fn start_dom(width: f64, height: f64, root: impl View + 'static) {
+pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static) {
     let runtime = Runtime::new().text_engine(Rc::new(CanvasTextEngine::new()));
     runtime.set_reduce_motion(true);
     let mut size = Size { width, height };
+    let scale = (scale.round() as usize).max(1);
 
-    fn apply(patches: Vec<bunny_ui::dom::DomPatch>) {
+    // patches first, then any island whose pixels changed — the
+    // element exists before its bitmap arrives
+    fn present(runtime: &Runtime, patches: Vec<bunny_ui::dom::DomPatch>, scale: usize) {
         if !patches.is_empty() {
             let bytes = bunny_ui::dom::encode(&patches);
             unsafe { js_apply_patches(bytes.as_ptr(), bytes.len()) };
+        }
+        for island in runtime.dom_islands(scale) {
+            unsafe {
+                js_island(
+                    island.id,
+                    island.rgba.as_ptr(),
+                    island.width as u32,
+                    island.height as u32,
+                );
+            }
         }
     }
 
@@ -214,28 +229,28 @@ pub fn start_dom(width: f64, height: f64, root: impl View + 'static) {
         match event {
             Event::PointerDown { x, y } => {
                 let _ = runtime.pointer_pressed(x, y);
-                apply(runtime.dom_frame(&root, size));
+                present(&runtime, runtime.dom_frame(&root, size), scale);
             }
             Event::PointerUp { x, y } => {
                 let _ = runtime.pointer_released(x, y);
-                apply(runtime.dom_frame(&root, size));
+                present(&runtime, runtime.dom_frame(&root, size), scale);
             }
             Event::DomScroll { id, x, y } => {
                 // the browser moved the element; the engine mirrors the
                 // offset so windows re-materialize and reveals compose
                 if let Some(path) = runtime.dom_scroll_path(id) {
                     runtime.set_scroll_offset(&path, bunny_ui::layout::Point { x, y });
-                    apply(runtime.dom_frame(&root, size));
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
             Event::Field { path, value, caret } => {
                 if runtime.sync_field(&path, &value, caret) {
-                    apply(runtime.dom_frame(&root, size));
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
             Event::Resize { width, height, .. } => {
                 size = Size { width, height };
-                apply(runtime.dom_frame(&root, size));
+                present(&runtime, runtime.dom_frame(&root, size), scale);
             }
             // hover, wheel, keys and ticks belong to the browser in
             // this mode — nothing to do on our side of the border

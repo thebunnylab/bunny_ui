@@ -17,13 +17,15 @@ const rules = new Map();
 let inkCanvas = null;
 let inkContext = null;
 
-function inkSurface() {
+function inkSurface(width, height) {
   if (!inkCanvas) {
     inkCanvas = document.createElement("canvas");
     inkCanvas.width = 256;
     inkCanvas.height = 64;
     inkContext = inkCanvas.getContext("2d", { willReadFrequently: true });
   }
+  if (width && inkCanvas.width < width) inkCanvas.width = width;
+  if (height && inkCanvas.height < height) inkCanvas.height = height;
   return inkContext;
 }
 
@@ -49,7 +51,12 @@ function flushRules() {
 }
 
 function createElementOf(kind) {
-  // 0 group, 1 box, 2 text, 3 field, 4 scroll, 5 content
+  // 0 group, 1 box, 2 text, 3 field, 4 scroll, 5 content, 6 canvas
+  if (kind === 6) {
+    const canvas = document.createElement("canvas");
+    canvas.style.cssText = "position:absolute;left:0;top:0;";
+    return canvas;
+  }
   if (kind === 3) {
     const input = document.createElement("input");
     input.type = "text";
@@ -149,6 +156,12 @@ function applyPatches(view, length) {
         el.style.height = `${height}px`;
         if (el.tagName === "DIV" && el.style.whiteSpace === "pre") {
           el.style.lineHeight = `${height}px`;
+        }
+        if (el.tagName === "CANVAS") {
+          // backing store in physical px; the island blit matches
+          const dpr = Math.max(1, Math.round(window.devicePixelRatio || 1));
+          el.width = Math.max(1, Math.round(width * dpr));
+          el.height = Math.max(1, Math.round(height * dpr));
         }
       }
     } else if (op === 5) {
@@ -284,6 +297,19 @@ const imports = {
       const view = new DataView(wasm.memory.buffer, pointer, length);
       applyPatches(view, length);
     },
+    // fresh pixels for one canvas island, straight onto its element
+    js_island(id, pointer, width, height) {
+      const el = elements.get(id);
+      if (!el || el.tagName !== "CANVAS") return;
+      if (el.width !== width) el.width = width;
+      if (el.height !== height) el.height = height;
+      const pixels = new Uint8ClampedArray(
+        wasm.memory.buffer,
+        pointer,
+        width * height * 4,
+      );
+      el.getContext("2d").putImageData(new ImageData(pixels, width, height), 0, 0);
+    },
     js_measure_text(pointer, length, size, weight, mono, out) {
       const text = decoder.decode(
         new Uint8Array(wasm.memory.buffer, pointer, length),
@@ -296,8 +322,39 @@ const imports = {
       metrics[1] = probe.fontBoundingBoxAscent ?? size * 0.8;
       metrics[2] = probe.fontBoundingBoxDescent ?? size * 0.25;
     },
-    // never called in this mode — the Dom paints, not a bitmap
-    js_raster_text() {},
+    // canvas islands raster their text through the engine — the same
+    // contract as the full-canvas mode
+    js_raster_text(
+      pointer,
+      length,
+      size,
+      weight,
+      mono,
+      scale,
+      width,
+      height,
+      descent,
+      color,
+      out,
+    ) {
+      const text = decoder.decode(
+        new Uint8Array(wasm.memory.buffer, pointer, length),
+      );
+      const ink = inkSurface(width, height);
+      ink.setTransform(1, 0, 0, 1, 0, 0);
+      ink.clearRect(0, 0, width, height);
+      ink.setTransform(scale, 0, 0, scale, 0, 0);
+      ink.font = cssFont(size, weight, mono);
+      ink.textBaseline = "alphabetic";
+      const r = (color >>> 24) & 0xff;
+      const g = (color >>> 16) & 0xff;
+      const b = (color >>> 8) & 0xff;
+      const a = color & 0xff;
+      ink.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
+      ink.fillText(text, 0, height / scale - descent);
+      const pixels = ink.getImageData(0, 0, width, height).data;
+      new Uint8Array(wasm.memory.buffer, out, width * height * 4).set(pixels);
+    },
   },
 };
 
@@ -305,7 +362,11 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
   ({ instance }) => {
     wasm = instance.exports;
     window.__bunny = wasm;
-    wasm.start_dom(app.clientWidth, app.clientHeight);
+    wasm.start_dom(
+      app.clientWidth,
+      app.clientHeight,
+      window.devicePixelRatio || 1,
+    );
 
     const point = (event) => {
       const rect = app.getBoundingClientRect();

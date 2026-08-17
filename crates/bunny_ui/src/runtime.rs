@@ -735,16 +735,51 @@ impl Runtime {
         root: &impl View,
         size: crate::layout::Size,
     ) -> Vec<crate::dom::DomPatch> {
-        // the display list is not the product — the pass settles state,
-        // applies scroll targets and heals virtual windows
+        // the pass settles state, applies scroll targets and heals
+        // virtual windows; its display list feeds the canvas islands
         let _ = self.display_frame(root, size);
-        let (_, scene) = self.layout_once_with(
+        let (result, scene) = self.layout_once_with(
             root,
             crate::layout::Proposal::exact(size),
             true,
         );
         let scene = scene.expect("the capture rode the pass");
-        self.dom.borrow_mut().lower(&scene)
+        self.dom.borrow_mut().lower(&scene, &result.display)
+    }
+
+    /// The canvas islands whose pixels changed since the last call —
+    /// rasterized at `scale` and ready to blit. Empty when the scene
+    /// has no islands or nothing inside one moved.
+    pub fn dom_islands(&self, scale: usize) -> Vec<crate::dom::IslandFrame> {
+        self.dom
+            .borrow_mut()
+            .take_dirty_islands()
+            .into_iter()
+            .map(|(id, width, height, commands)| {
+                let mut display = crate::layout::DisplayList::default();
+                for command in commands {
+                    display.push(command);
+                }
+                let physical = (
+                    ((width.round() as usize) * scale).max(1),
+                    ((height.round() as usize) * scale).max(1),
+                );
+                let bitmap = crate::raster::rasterize_with(
+                    &display,
+                    physical.0,
+                    physical.1,
+                    scale,
+                    crate::layout::Color::rgba(0, 0, 0, 0),
+                    &*self.text,
+                );
+                crate::dom::IslandFrame {
+                    id,
+                    width: physical.0,
+                    height: physical.1,
+                    rgba: bitmap.to_rgba_bytes(),
+                }
+            })
+            .collect()
     }
 
     /// The scroll region path behind a Dom element id — the glue's

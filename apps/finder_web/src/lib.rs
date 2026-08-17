@@ -33,6 +33,7 @@ impl Component for Finder {
             hstack!(
                 text("›").foreground_color(theme::accent()),
                 text_field("Search ten thousand files…", self.query.binding()).monospaced(),
+                count_meter(count),
             )
             .spacing(10.0)
             .alignment(VerticalAlignment::Center)
@@ -95,6 +96,25 @@ impl Component for Finder {
 
 const CLEAR: Color = Color { r: 0, g: 0, b: 0, a: 0 };
 
+/// The visible count, drawn as five digit bars — custom pixels. On the
+/// Dom page this subtree claims a CANVAS ISLAND (`.rendering(Gpu)`):
+/// our layout positions the element, our rasterizer fills it, and the
+/// bars redraw live as the filter types. On the canvas page the
+/// modifier dissolves — everything is pixels there already.
+fn count_meter(count: usize) -> impl View {
+    let digit = |place: u32| ((count / 10usize.pow(place)) % 10) as f64;
+    let bar = |place: u32| {
+        spacer()
+            .frame(6.0, 6.0 + digit(place) * 2.0)
+            .background_color(theme::accent())
+            .corner_radius(2.0)
+    };
+    hstack!(bar(4), bar(3), bar(2), bar(1), bar(0))
+        .spacing(2.0)
+        .alignment(VerticalAlignment::Bottom)
+        .rendering(Rendering::Gpu)
+}
+
 fn finder() -> Finder {
     let files: Rc<Vec<(Rc<str>, Rc<str>)>> = Rc::new(
         (0..10_000)
@@ -121,7 +141,8 @@ pub extern "C" fn start(width: f64, height: f64, scale: f64) {
 }
 
 /// The Dom page calls this one — the SAME scene, rendered at home.
+/// `scale` rasters the canvas islands at the device's density.
 #[unsafe(no_mangle)]
-pub extern "C" fn start_dom(width: f64, height: f64) {
-    bunny_ui_web::start_dom(width, height, finder());
+pub extern "C" fn start_dom(width: f64, height: f64, scale: f64) {
+    bunny_ui_web::start_dom(width, height, scale, finder());
 }

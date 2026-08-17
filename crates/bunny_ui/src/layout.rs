@@ -291,6 +291,23 @@ pub enum LayoutNode {
     /// measure and place resolve ON-THE-FLY against the retention — the
     /// frame's tree is never stitched into a copy.
     BoundaryRef { path: String },
+    /// `.rendering(Gpu)`: this subtree insists on the pixel pipeline.
+    /// Transparent to geometry everywhere; in Dom mode it becomes a
+    /// CANVAS ISLAND — an element our layout positions, filled with the
+    /// subtree's own draw commands. On pixel targets it dissolves:
+    /// everything is the pixel pipeline there already.
+    Island { child: Box<LayoutNode> },
+}
+
+/// Where a subtree renders when the scene lowers to elements. The v1
+/// capability table is total and deterministic: every built-in lowers
+/// to Dom; only an explicit [`Rendering::Gpu`] claims a canvas island.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rendering {
+    /// The table decides (v1: everything lowers to Dom).
+    Auto,
+    /// Force the subtree onto a canvas island.
+    Gpu,
 }
 
 /// The handoff between the phases — the structural mirror of the
@@ -746,7 +763,8 @@ impl LayoutNode {
             LayoutNode::Padding { child, .. }
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::Styled { child, .. }
-            | LayoutNode::Animated { child, .. } => child.is_flexible(axis),
+            | LayoutNode::Animated { child, .. }
+            | LayoutNode::Island { child } => child.is_flexible(axis),
             LayoutNode::Boundary { children, .. } => {
                 children.len() == 1 && children[0].is_flexible(axis)
             }
@@ -780,6 +798,7 @@ impl LayoutNode {
                 child.first_baseline(env)
             }
             LayoutNode::Animated { child, .. }
+            | LayoutNode::Island { child }
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::Frame { child, .. } => child.first_baseline(env),
             LayoutNode::Padding { edges, child } => {
@@ -977,6 +996,12 @@ impl LayoutNode {
 
             // the animation scope never touches geometry — by type
             LayoutNode::Animated { child, .. } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            // the island claims a renderer, never a pixel of geometry
+            LayoutNode::Island { child } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -1449,6 +1474,26 @@ impl LayoutNode {
                 );
                 if let Some(dom) = out.dom.as_mut() {
                     dom.disarm();
+                }
+            }
+
+            (LayoutNode::Island { child }, Fit::Wrapped(_, fit)) => {
+                // Dom mode: a canvas element in the flow, filled with
+                // the subtree's OWN draw commands (the display range
+                // between open and close). Pixel targets place through:
+                // everything is the pixel pipeline there already.
+                if out.dom.is_some() {
+                    let start = out.display.len();
+                    if let Some(dom) = out.dom.as_mut() {
+                        dom.open_canvas(frame, start);
+                    }
+                    child.place(frame, *fit, env, out);
+                    let end = out.display.len();
+                    if let Some(dom) = out.dom.as_mut() {
+                        dom.close_canvas(end);
+                    }
+                } else {
+                    child.place(frame, *fit, env, out);
                 }
             }
 

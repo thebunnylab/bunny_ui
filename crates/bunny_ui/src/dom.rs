@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::layout::{
-    Color, Point, Px, Rect, Size, Truncation, VisualProps,
+    Color, DrawCommand, Point, Px, Rect, Size, Truncation, VisualProps,
 };
 use crate::text_engine::{FontDesign, FontSpec, Weight};
 
@@ -56,6 +56,11 @@ pub enum DomKind {
     /// The sized content inside a scroll — the extent the browser
     /// scrolls through (a virtual list sizes it to ALL rows).
     Content,
+    /// A canvas island (`.rendering(Gpu)`): our layout positions the
+    /// element; the subtree's draw commands fill it. `origin` is the
+    /// island's ABSOLUTE frame origin (the commands translate by it)
+    /// and `display` the `[start, end)` range into the pass's list.
+    Canvas { origin: (Px, Px), display: (usize, usize) },
 }
 
 /// The visual record of a node — everything CSS will say about it.
@@ -142,6 +147,12 @@ pub(crate) struct DomCapture {
     pending_transition: Option<(f64, f64)>,
     /// Armed by an `Interactive`; the next opened box takes it.
     pending_interactive: Option<String>,
+    /// Island nesting depth. Above zero the subtree is PIXELS, not
+    /// elements: every open/leaf below the canvas node is swallowed —
+    /// the draw commands already carry the content.
+    island: usize,
+    /// Opens swallowed while inside an island — their closes pair up.
+    swallowed: usize,
 }
 
 impl DomCapture {
@@ -159,6 +170,8 @@ impl DomCapture {
             stack: vec![(Point { x: 0.0, y: 0.0 }, root)],
             pending_transition: None,
             pending_interactive: None,
+            island: 0,
+            swallowed: 0,
         }
     }
 
@@ -168,6 +181,10 @@ impl DomCapture {
     ///
     /// [`close`]: DomCapture::close
     pub(crate) fn open(&mut self, kind: DomKind, frame: Rect, child_origin: Point) {
+        if self.island > 0 {
+            self.swallowed += 1;
+            return;
+        }
         let parent_origin = self.stack.last().map(|(origin, _)| *origin).unwrap_or_default();
         let mut style = match &kind {
             DomKind::Box => DomStyle::default(),
@@ -191,6 +208,10 @@ impl DomCapture {
 
     /// Opens a styled box straight from a `Styled` node's props.
     pub(crate) fn open_styled(&mut self, props: &VisualProps, frame: Rect) {
+        if self.island > 0 {
+            self.swallowed += 1;
+            return;
+        }
         let interactive = self.pending_interactive.take();
         let transition = self.pending_transition.take();
         self.open(DomKind::Box, frame, frame.origin);
@@ -204,17 +225,27 @@ impl DomCapture {
 
     /// Paints the OPEN node's background (the plain-box leaves).
     pub(crate) fn set_background(&mut self, color: Color) {
+        if self.island > 0 {
+            return;
+        }
         let (_, node) = self.stack.last_mut().expect("an open node");
         node.style.background = Some(color);
     }
 
     /// Strokes the OPEN node's border (the stub leaves).
     pub(crate) fn set_border(&mut self, color: Color, width: Px) {
+        if self.island > 0 {
+            return;
+        }
         let (_, node) = self.stack.last_mut().expect("an open node");
         node.style.border = Some((color, width));
     }
 
     pub(crate) fn close(&mut self) {
+        if self.swallowed > 0 {
+            self.swallowed -= 1;
+            return;
+        }
         let (_, node) = self.stack.pop().expect("close pairs with open");
         let (_, parent) = self.stack.last_mut().expect("the root never closes");
         parent.children.push(node);
@@ -222,6 +253,9 @@ impl DomCapture {
 
     /// A childless element — open and close in one move.
     pub(crate) fn leaf(&mut self, kind: DomKind, frame: Rect) {
+        if self.island > 0 {
+            return;
+        }
         self.open(kind, frame, frame.origin);
         self.close();
     }
@@ -239,6 +273,39 @@ impl DomCapture {
     pub(crate) fn disarm(&mut self) {
         self.pending_transition = None;
         self.pending_interactive = None;
+    }
+
+    /// Opens a canvas island at `frame`; `start` is where the island's
+    /// draw commands begin in the pass's display list. An island inside
+    /// an island dissolves — the outer one already owns the pixels.
+    pub(crate) fn open_canvas(&mut self, frame: Rect, start: usize) {
+        if self.island > 0 {
+            self.island += 1;
+            return;
+        }
+        self.open(
+            DomKind::Canvas {
+                origin: (frame.origin.x, frame.origin.y),
+                display: (start, start),
+            },
+            frame,
+            frame.origin,
+        );
+        self.island = 1;
+    }
+
+    /// Closes the island, sealing the display range at `end`.
+    pub(crate) fn close_canvas(&mut self, end: usize) {
+        if self.island > 1 {
+            self.island -= 1;
+            return;
+        }
+        self.island = 0;
+        let (_, node) = self.stack.last_mut().expect("an open island");
+        if let DomKind::Canvas { display, .. } = &mut node.kind {
+            display.1 = end;
+        }
+        self.close();
     }
 
     pub(crate) fn finish(mut self) -> DomNode {
@@ -259,6 +326,16 @@ pub enum CreateKind {
     Field,
     Scroll,
     Content,
+    Canvas,
+}
+
+/// One island's fresh pixels — the shell blits them into the island's
+/// `<canvas>`. Only islands whose commands actually changed re-raster.
+pub struct IslandFrame {
+    pub id: u32,
+    pub width: usize,
+    pub height: usize,
+    pub rgba: Vec<u8>,
 }
 
 /// One mutation of the element tree. A frame's worth of patches is the
@@ -291,6 +368,25 @@ struct Retained {
     children: Vec<Retained>,
 }
 
+/// One retained island: its commands already TRANSLATED to island-
+/// local coordinates, plus the logical size. `dirty` = the pixels no
+/// longer match — the shell asks for them via `take_dirty_islands`.
+struct Island {
+    commands: Vec<DrawCommand>,
+    width: Px,
+    height: Px,
+    dirty: bool,
+}
+
+/// What the lowering walk threads besides the retention itself: the id
+/// well, the pass's display list (islands slice it) and the island
+/// registry.
+struct LowerCtx<'a> {
+    next_id: &'a mut u32,
+    display: &'a [DrawCommand],
+    islands: &'a mut HashMap<u32, Island>,
+}
+
 /// The retained side of the Dom mode: last frame's scene with ids.
 /// One per runtime; [`lower`] turns each new scene into patches.
 ///
@@ -299,13 +395,19 @@ struct Retained {
 pub struct DomLowering {
     root: Option<Retained>,
     next_id: u32,
+    islands: HashMap<u32, Island>,
 }
 
 impl DomLowering {
     /// Diffs `scene` against the retained one and returns the patch
     /// list that brings the element tree up to date. The first call
-    /// mounts everything.
-    pub fn lower(&mut self, scene: &DomNode) -> Vec<DomPatch> {
+    /// mounts everything. `display` is the SAME pass's draw list —
+    /// canvas islands slice their command ranges out of it.
+    pub fn lower(
+        &mut self,
+        scene: &DomNode,
+        display: &crate::layout::DisplayList,
+    ) -> Vec<DomPatch> {
         let mut patches = Vec::new();
         match self.root.as_mut() {
             None => {
@@ -321,17 +423,41 @@ impl DomLowering {
                     height: scene.height,
                 });
                 let mut next_id = self.next_id;
-                root.children = create_children(scene, 0, &mut next_id, &mut patches);
+                let mut ctx = LowerCtx {
+                    next_id: &mut next_id,
+                    display: display.as_slice(),
+                    islands: &mut self.islands,
+                };
+                root.children = create_children(scene, 0, &mut ctx, &mut patches);
                 self.next_id = next_id;
                 self.root = Some(root);
             }
             Some(root) => {
                 let mut next_id = self.next_id;
-                diff_node(root, scene, &mut next_id, &mut patches);
+                let mut ctx = LowerCtx {
+                    next_id: &mut next_id,
+                    display: display.as_slice(),
+                    islands: &mut self.islands,
+                };
+                diff_node(root, scene, &mut ctx, &mut patches);
                 self.next_id = next_id;
             }
         }
         patches
+    }
+
+    /// The islands whose pixels no longer match, cleared of their flag.
+    /// Each returns `(id, logical width, logical height, commands)` —
+    /// the caller rasterizes and blits.
+    pub(crate) fn take_dirty_islands(&mut self) -> Vec<(u32, Px, Px, Vec<DrawCommand>)> {
+        self.islands
+            .iter_mut()
+            .filter(|(_, island)| island.dirty)
+            .map(|(id, island)| {
+                island.dirty = false;
+                (*id, island.width, island.height, island.commands.clone())
+            })
+            .collect()
     }
 
     /// The scroll region path an element id belongs to — the glue's
@@ -364,6 +490,70 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::Field(_) => CreateKind::Field,
         DomKind::Scroll { .. } => CreateKind::Scroll,
         DomKind::Content => CreateKind::Content,
+        DomKind::Canvas { .. } => CreateKind::Canvas,
+    }
+}
+
+/// The island's slice of the pass's display list, moved to island-
+/// local coordinates (the raster surface starts at zero).
+fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
+    let DomKind::Canvas { origin, display } = &node.kind else {
+        return Vec::new();
+    };
+    let slice = ctx
+        .display
+        .get(display.0..display.1)
+        .unwrap_or_default();
+    let (dx, dy) = (-origin.0, -origin.1);
+    let shift = |rect: Rect| Rect {
+        origin: Point { x: rect.origin.x + dx, y: rect.origin.y + dy },
+        size: rect.size,
+    };
+    slice
+        .iter()
+        .cloned()
+        .map(|command| match command {
+            DrawCommand::FillRect { rect, color, corner_radius } => {
+                DrawCommand::FillRect { rect: shift(rect), color, corner_radius }
+            }
+            DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
+                DrawCommand::StrokeRect { rect: shift(rect), color, width, corner_radius }
+            }
+            DrawCommand::Shadow { rect, radius, color, corner_radius } => {
+                DrawCommand::Shadow { rect: shift(rect), radius, color, corner_radius }
+            }
+            DrawCommand::TextLine { origin, content, range, color, font } => {
+                DrawCommand::TextLine {
+                    origin: Point { x: origin.x + dx, y: origin.y + dy },
+                    content,
+                    range,
+                    color,
+                    font,
+                }
+            }
+            DrawCommand::PushClip { rect } => DrawCommand::PushClip { rect: shift(rect) },
+            DrawCommand::PopClip => DrawCommand::PopClip,
+        })
+        .collect()
+}
+
+/// Registers (or refreshes) the island behind a canvas node; the dirty
+/// flag rises only when the pixels would actually change.
+fn note_island(id: u32, node: &DomNode, ctx: &mut LowerCtx) {
+    let commands = island_commands(node, ctx);
+    let entry = ctx.islands.entry(id).or_insert(Island {
+        commands: Vec::new(),
+        width: 0.0,
+        height: 0.0,
+        dirty: true,
+    });
+    if entry.commands != commands
+        || (entry.width, entry.height) != (node.width, node.height)
+    {
+        entry.commands = commands;
+        entry.width = node.width;
+        entry.height = node.height;
+        entry.dirty = true;
     }
 }
 
@@ -372,11 +562,11 @@ fn create_kind(kind: &DomKind) -> CreateKind {
 fn create_subtree(
     node: &DomNode,
     parent: u32,
-    next_id: &mut u32,
+    ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) -> Retained {
-    let id = *next_id;
-    *next_id += 1;
+    let id = *ctx.next_id;
+    *ctx.next_id += 1;
     patches.push(DomPatch::Create { id, parent, kind: create_kind(&node.kind) });
     patches.push(DomPatch::SetTransform { id, x: node.x, y: node.y });
     patches.push(DomPatch::SetSize { id, width: node.width, height: node.height });
@@ -393,34 +583,45 @@ fn create_subtree(
         DomKind::Scroll { offset, .. } if *offset != (0.0, 0.0) => {
             patches.push(DomPatch::SetScroll { id, x: offset.0, y: offset.1 });
         }
+        DomKind::Canvas { .. } => note_island(id, node, ctx),
         _ => {}
     }
-    let children = create_children(node, id, next_id, patches);
+    let children = create_children(node, id, ctx, patches);
     Retained { id, node: shallow(node), children }
 }
 
 fn create_children(
     node: &DomNode,
     parent: u32,
-    next_id: &mut u32,
+    ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) -> Vec<Retained> {
     node.children
         .iter()
-        .map(|child| create_subtree(child, parent, next_id, patches))
+        .map(|child| create_subtree(child, parent, ctx, patches))
         .collect()
 }
 
-/// Every element id in the subtree — freed when the root goes.
-fn remove_subtree(retained: &Retained, patches: &mut Vec<DomPatch>) {
+/// One remove patch frees the whole subtree on the glue's side; the
+/// island registry forgets every canvas underneath.
+fn remove_subtree(retained: &Retained, ctx: &mut LowerCtx, patches: &mut Vec<DomPatch>) {
     patches.push(DomPatch::Remove { id: retained.id });
+    fn forget_islands(retained: &Retained, islands: &mut HashMap<u32, Island>) {
+        if matches!(retained.node.kind, DomKind::Canvas { .. }) {
+            islands.remove(&retained.id);
+        }
+        for child in &retained.children {
+            forget_islands(child, islands);
+        }
+    }
+    forget_islands(retained, ctx.islands);
 }
 
 /// Diffs one matched pair: geometry, style, kind payload, children.
 fn diff_node(
     retained: &mut Retained,
     new: &DomNode,
-    next_id: &mut u32,
+    ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
     let id = retained.id;
@@ -447,10 +648,11 @@ fn diff_node(
         ) if before != after => {
             patches.push(DomPatch::SetScroll { id, x: after.0, y: after.1 });
         }
+        (_, DomKind::Canvas { .. }) => note_island(id, new, ctx),
         _ => {}
     }
     retained.node = shallow(new);
-    diff_children(retained, new, next_id, patches);
+    diff_children(retained, new, ctx, patches);
 }
 
 /// Matches the children lists: groups by identity path (a slid window
@@ -459,7 +661,7 @@ fn diff_node(
 fn diff_children(
     retained: &mut Retained,
     new: &DomNode,
-    next_id: &mut u32,
+    ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
     let old_children = std::mem::take(&mut retained.children);
@@ -487,18 +689,18 @@ fn diff_children(
         };
         match matched {
             Some(mut old) => {
-                diff_node(&mut old, child, next_id, patches);
+                diff_node(&mut old, child, ctx, patches);
                 next.push(old);
             }
-            None => next.push(create_subtree(child, retained.id, next_id, patches)),
+            None => next.push(create_subtree(child, retained.id, ctx, patches)),
         }
     }
 
     for (_, leftover) in by_path {
-        remove_subtree(&leftover, patches);
+        remove_subtree(&leftover, ctx, patches);
     }
     for leftover in by_index.into_iter().flatten() {
-        remove_subtree(&leftover, patches);
+        remove_subtree(&leftover, ctx, patches);
     }
     retained.children = next;
 }
@@ -547,6 +749,7 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
                     CreateKind::Field => 3,
                     CreateKind::Scroll => 4,
                     CreateKind::Content => 5,
+                    CreateKind::Canvas => 6,
                 });
             }
             DomPatch::Remove { id } => {
@@ -1008,6 +1211,67 @@ mod tests {
             matches!(patch, DomPatch::SetStyle { style, .. } if style.hover_background.is_some())
         });
         assert!(hovered, "the :hover alternative reached the patches: {patches:#?}");
+    }
+
+    #[test]
+    fn an_island_mounts_as_one_canvas_and_redraws_only_on_change() {
+        #[derive(Clone)]
+        struct WithIsland {
+            level: State<f64>,
+        }
+
+        impl Component for WithIsland {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("above the island"),
+                    spacer()
+                        .frame(20.0, self.level.get())
+                        .background_color(Color::hex(0x3B82F6))
+                        .rendering(Rendering::Gpu)
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = WithIsland { level: State::new(10.0) };
+        let size = Size { width: 120.0, height: 80.0 };
+        let mount = runtime.dom_frame(&view, size);
+
+        let canvases = mount
+            .iter()
+            .filter(|patch| {
+                matches!(patch, DomPatch::Create { kind: CreateKind::Canvas, .. })
+            })
+            .count();
+        assert_eq!(canvases, 1, "one island, one element: {mount:?}");
+        // the subtree below the island is PIXELS — no box mounts for it
+        let boxes = mount
+            .iter()
+            .filter(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Box, .. }))
+            .count();
+        assert_eq!(boxes, 0, "the styled inside drew, never lowered: {mount:?}");
+
+        let islands = runtime.dom_islands(1);
+        assert_eq!(islands.len(), 1);
+        assert!(
+            islands[0].rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            "the island has ink"
+        );
+
+        // an unchanged frame re-rasters nothing
+        let _ = runtime.dom_frame(&view, size);
+        assert!(runtime.dom_islands(1).is_empty(), "clean pixels stay put");
+
+        // content change → the island redraws (and only the island)
+        view.level.set(40.0);
+        let patches = runtime.dom_frame(&view, size);
+        assert!(
+            patches
+                .iter()
+                .all(|patch| !matches!(patch, DomPatch::Create { .. } | DomPatch::Remove { .. })),
+            "no structure churn on a redraw: {patches:?}"
+        );
+        assert_eq!(runtime.dom_islands(1).len(), 1, "fresh pixels follow the state");
     }
 
     #[test]

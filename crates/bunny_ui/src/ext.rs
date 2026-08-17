@@ -189,6 +189,19 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.rendering(Rendering::Gpu)` — on the web's element lowering
+    /// this subtree insists on the pixel pipeline: a canvas island our
+    /// layout positions, filled with the subtree's own draw commands.
+    /// Everywhere else the modifier dissolves (pixel targets already
+    /// are the pixel pipeline). `Rendering::Auto` is the default table:
+    /// v1 lowers everything to elements.
+    fn rendering(self, mode: crate::layout::Rendering) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Rendering(mode),
+        }
+    }
+
     /// `.animated(Spring::smooth())` — colors under this view move
     /// through the spring when they change (state, hover) instead of
     /// jumping. Put it AFTER the props it animates; the nearest styled
