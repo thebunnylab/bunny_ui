@@ -1,0 +1,328 @@
+//! O harness de frames — a régua de performance do pipeline, headless.
+//!
+//! ```sh
+//! cargo run --release -p bunny-ui --example bench_pipeline
+//! ```
+//!
+//! Mede o custo POR FRAME de cada tipo de interação sobre uma tela real
+//! (o finder de exemplo): frame frio, tecla digitada, seleção movida,
+//! wheel, hover e a rasterização pura. Para cada cenário: p50/p95/p99 de
+//! tempo de parede, bodies re-rodados e alocações — o argumento
+//! competitivo é mensurável: custo proporcional à MUDANÇA, não à árvore.
+//!
+//! Métricas de texto vêm do `PixelFont` (determinísticas em qualquer
+//! máquina); a rasterização com fonte de plataforma é o mesmo caminho com
+//! outro engine e mede-se no shell.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use bunny_ui::layout::{Proposal, Size};
+use bunny_ui::prelude::*;
+use bunny_ui::raster::rasterize_scaled;
+
+// MARK: - Alocador contador (zero deps: o System embrulhado)
+
+struct CountingAllocator;
+
+static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static BYTES: AtomicU64 = AtomicU64::new(0);
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(pointer, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+fn allocation_snapshot() -> (u64, u64) {
+    (ALLOCATIONS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed))
+}
+
+// MARK: - A fixture (o finder de exemplo, encolhido)
+
+const FILES: &[(&str, &str)] = &[
+    ("main.rs", "src/"),
+    ("layout.rs", "crates/ui/src/"),
+    ("raster.rs", "crates/ui/src/"),
+    ("runtime.rs", "crates/ui/src/"),
+    ("reconciler.rs", "crates/ui/src/"),
+    ("text_engine.rs", "crates/ui/src/"),
+    ("text_input.rs", "crates/ui/src/"),
+    ("views.rs", "crates/ui/src/"),
+    ("modifier.rs", "crates/ui/src/"),
+    ("identity.rs", "crates/engine/src/"),
+    ("state.rs", "crates/engine/src/"),
+    ("combine.rs", "crates/engine/src/"),
+    ("loadable.rs", "crates/engine/src/"),
+    ("ffi.rs", "crates/shell/src/"),
+    ("window.rs", "crates/shell/src/"),
+    ("text.rs", "crates/shell/src/"),
+    ("Cargo.toml", ""),
+    ("README.md", ""),
+    ("countries_list.rs", "apps/countries/src/ui/"),
+    ("country_cell.rs", "apps/countries/src/ui/"),
+    ("country_details.rs", "apps/countries/src/ui/"),
+    ("image_view.rs", "apps/countries/src/ui/"),
+    ("error_view.rs", "apps/countries/src/ui/"),
+    ("detail_row.rs", "apps/countries/src/ui/"),
+    ("root.rs", "apps/countries/src/"),
+    ("finder_window.rs", "examples/"),
+    ("counter_window.rs", "examples/"),
+    ("benchmark.rs", "tools/src/"),
+    ("glyphs.rs", "tools/src/"),
+    ("palette.rs", "tools/src/"),
+];
+
+const SELECT_NEXT: ActionId = ActionId("bench.select_next");
+const CLEAR: Color = Color::rgba(0, 0, 0, 0);
+
+fn matches(haystack: &str, needle: &str) -> bool {
+    let mut haystack = haystack.chars().map(|c| c.to_ascii_lowercase());
+    needle.chars().map(|c| c.to_ascii_lowercase()).all(|wanted| haystack.any(|c| c == wanted))
+}
+
+#[derive(Clone, Copy)]
+struct Finder {
+    query: State<String>,
+    selected: State<usize>,
+}
+
+impl Component for Finder {
+    fn body(self, _ctx: &Context) -> impl View {
+        let query = self.query.get();
+        let items: Vec<(usize, String, String)> = FILES
+            .iter()
+            .filter(|(name, dir)| query.is_empty() || matches(&format!("{dir}{name}"), &query))
+            .enumerate()
+            .map(|(index, (name, dir))| (index, name.to_string(), dir.to_string()))
+            .collect();
+        let count = items.len();
+        let selected = self.selected;
+        let selected_index = selected.get().min(count.saturating_sub(1));
+
+        let rows = list(
+            items,
+            |(_, name, dir)| format!("{dir}{name}"),
+            move |(index, name, dir)| {
+                hstack!(
+                    text(name.clone()).foreground_color(theme::fg()),
+                    text(dir.clone())
+                        .font(Font::Subheadline)
+                        .monospaced()
+                        .foreground_color(theme::fg_secondary()),
+                    spacer(),
+                )
+                .spacing(8.0)
+                .alignment(VerticalAlignment::Center)
+                .padding_edge(Edge::Leading, 12.0)
+                .padding_edge(Edge::Trailing, 12.0)
+                .padding_edge(Edge::Top, 7.0)
+                .padding_edge(Edge::Bottom, 7.0)
+                .background_color(if *index == selected_index {
+                    theme::row_pressed()
+                } else {
+                    CLEAR
+                })
+                .background_hovered(theme::row_hover())
+                .on_click(|| {})
+            },
+        );
+
+        vstack!(
+            hstack!(
+                text("›").foreground_color(theme::accent()),
+                text_field("Search files by name…", self.query.binding()).monospaced(),
+            )
+            .spacing(10.0)
+            .alignment(VerticalAlignment::Center)
+            .padding_length(10.0),
+            rows,
+        )
+        .alignment(HorizontalAlignment::Leading)
+        .frame(640.0, 480.0)
+        .background_color(theme::panel())
+        .corner_radius(9.0)
+        .on_action(SELECT_NEXT, move || {
+            if count > 0 {
+                selected.set((selected.get().min(count - 1) + 1) % count)
+            }
+        })
+    }
+}
+
+// MARK: - O relógio
+
+struct Report {
+    label: &'static str,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    max: f64,
+    bodies: usize,
+    allocations: u64,
+    kibibytes: u64,
+}
+
+/// Roda `frames` iterações medindo parede + alocações; `step` é UM frame.
+fn measure(
+    label: &'static str,
+    warmup: usize,
+    frames: usize,
+    bodies: usize,
+    mut step: impl FnMut(),
+) -> Report {
+    for _ in 0..warmup {
+        step();
+    }
+    let mut samples = Vec::with_capacity(frames);
+    let (allocations_before, bytes_before) = allocation_snapshot();
+    for _ in 0..frames {
+        let start = Instant::now();
+        step();
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    let (allocations_after, bytes_after) = allocation_snapshot();
+    samples.sort_by(f64::total_cmp);
+    let at = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
+    Report {
+        label,
+        p50: at(0.50),
+        p95: at(0.95),
+        p99: at(0.99),
+        max: *samples.last().unwrap(),
+        bodies,
+        allocations: (allocations_after - allocations_before) / frames as u64,
+        kibibytes: (bytes_after - bytes_before) / frames as u64 / 1024,
+    }
+}
+
+fn main() {
+    let viewport = Proposal::exact(Size { width: 760.0, height: 640.0 });
+    let finder = Finder { query: State::new(String::new()), selected: State::new(0) };
+    let runtime = Runtime::new();
+    runtime.bind(KeyPattern::key(Key::Down), SELECT_NEXT);
+    runtime.render_stable(&finder);
+    runtime.layout(&finder, viewport);
+
+    // foca o campo (digitação vai pelo caminho real do editor)
+    let result = runtime.layout(&finder, viewport);
+    let field = result.fields.first().expect("campo").clone();
+    runtime.pointer_pressed(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
+    runtime.pointer_released(field.frame.origin.x + 8.0, field.frame.origin.y + 8.0);
+
+    let mut reports = Vec::new();
+
+    // 1. frame FRIO: retenção descartada, todos os bodies + layout
+    reports.push(measure("cold_full (build+layout)", 3, 40, usize::MAX, || {
+        runtime.render_full(&finder);
+        runtime.layout(&finder, viewport);
+    }));
+
+    // bodies do PRIMEIRO pass de um frame (o render_stable termina num
+    // pass estável de zero bodies — o que interessa é o primeiro)
+    let first_pass_bodies = |mutate: &dyn Fn()| {
+        mutate();
+        runtime.render(&finder);
+        let bodies = runtime.body_runs().len();
+        runtime.render_stable(&finder);
+        runtime.layout(&finder, viewport);
+        bodies
+    };
+
+    // 2. tecla digitada: editor → binding → re-render incremental + layout
+    let typing_bodies =
+        first_pass_bodies(&|| _ = runtime.key(EditCommand::Insert("e".into())));
+    let _ = runtime.key(EditCommand::Backspace);
+    runtime.render_stable(&finder);
+    let mut forward = true;
+    let typing = measure("keystroke (filter+layout)", 5, 200, 0, || {
+        if forward {
+            runtime.key(EditCommand::Insert("e".into()));
+        } else {
+            runtime.key(EditCommand::Backspace);
+        }
+        forward = !forward;
+        runtime.render_stable(&finder);
+        runtime.layout(&finder, viewport);
+    });
+    reports.push(Report { bodies: typing_bodies, ..typing });
+
+    // 3. seleção movida por ação (a invalidação fina em ação)
+    let select = runtime.match_key(&KeyPattern::key(Key::Down)).unwrap();
+    let selection_bodies = first_pass_bodies(&|| _ = runtime.dispatch_action(select));
+    let selection = measure("select_next (dispatch+layout)", 5, 200, 0, || {
+        runtime.dispatch_action(select);
+        runtime.render_stable(&finder);
+        runtime.layout(&finder, viewport);
+    });
+    reports.push(Report { bodies: selection_bodies, ..selection });
+
+    // 4. hover: estampa + layout, ZERO bodies por contrato (nem render há)
+    let result = runtime.layout(&finder, viewport);
+    let row = result.hits.get(1).expect("row").1;
+    let mut inside = true;
+    let hover = measure("hover (stamp+layout)", 5, 200, 0, || {
+        let y = row.origin.y + row.size.height / 2.0;
+        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 });
+        inside = !inside;
+        runtime.layout(&finder, viewport);
+    });
+    reports.push(Report { bodies: 0, ..hover });
+
+    // 5. wheel: offset do engine + layout, zero render
+    runtime.key(EditCommand::SelectAll);
+    runtime.key(EditCommand::Backspace); // lista cheia de volta
+    runtime.render_stable(&finder);
+    runtime.layout(&finder, viewport);
+    let mut down = true;
+    reports.push(measure("wheel (offset+layout)", 5, 200, 0, || {
+        runtime.wheel(320.0, 300.0, 0.0, if down { -8.0 } else { 8.0 });
+        down = !down;
+        runtime.layout(&finder, viewport);
+    }));
+
+    // 6. rasterização pura da display list (760×640 @2x, PixelFont)
+    let laid_out = runtime.layout(&finder, viewport);
+    reports.push(measure("raster 1520×1280 (paint)", 3, 60, 0, || {
+        let bitmap = rasterize_scaled(&laid_out.display, 1520, 1280, 2, Color::CANVAS);
+        std::hint::black_box(bitmap.width());
+    }));
+
+    println!(
+        "\n{:<30} {:>8} {:>8} {:>8} {:>8} {:>7} {:>8} {:>8}",
+        "cenário (frame =)", "p50 ms", "p95 ms", "p99 ms", "max ms", "bodies", "allocs", "KiB"
+    );
+    println!("{}", "─".repeat(92));
+    for report in &reports {
+        let bodies = if report.bodies == usize::MAX {
+            "todos".to_string()
+        } else {
+            report.bodies.to_string()
+        };
+        println!(
+            "{:<30} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>7} {:>8} {:>8}",
+            report.label,
+            report.p50,
+            report.p95,
+            report.p99,
+            report.max,
+            bodies,
+            report.allocations,
+            report.kibibytes
+        );
+    }
+    println!(
+        "\nfixture: finder com {} rows; viewport 760×640; texto PixelFont (determinístico)",
+        FILES.len()
+    );
+}
