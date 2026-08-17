@@ -15,8 +15,10 @@ text border.
 to element patches — a fixed little-endian stream the glue walks with
 one `DataView`. Text selects natively, scroll carries real momentum,
 the input owns the editing. Hover and pressed states are `:hover` and
-`:active` rules; animation specs become CSS transitions. The browser
-renders at home; the engine still owns every position.
+`:active` rules — including the INK a subtree inherits, so the row's
+path text brightens under the pointer without one patch crossing;
+animation specs become CSS transitions. The browser renders at home;
+the engine still owns every position.
 
 **Islands**: inside the Dom page, `.rendering(Rendering::Gpu)` claims a
 canvas island for one subtree — our layout positions the element, our

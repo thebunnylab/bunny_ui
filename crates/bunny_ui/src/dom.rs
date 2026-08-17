@@ -85,6 +85,12 @@ pub struct DomStyle {
     pub background: Option<Color>,
     pub hover_background: Option<Color>,
     pub pressed_background: Option<Color>,
+    /// The ink this box hands DOWN. It only travels when a state below
+    /// needs it: the text inherits instead of painting its own color,
+    /// so the browser flips the whole subtree on `:hover`.
+    pub color: Option<Color>,
+    pub hover_color: Option<Color>,
+    pub pressed_color: Option<Color>,
     pub border: Option<(Color, Px)>,
     pub corner_radius: Option<Px>,
     pub shadow: Option<(Px, Color)>,
@@ -107,6 +113,9 @@ impl DomStyle {
             background: props.background,
             hover_background: props.background_hovered,
             pressed_background: props.background_pressed,
+            color: None,
+            hover_color: props.foreground_hovered,
+            pressed_color: props.foreground_pressed,
             border: props.border,
             corner_radius: props.corner_radius,
             shadow: props.shadow,
@@ -124,6 +133,10 @@ impl DomStyle {
 pub struct DomText {
     pub content: Rc<str>,
     pub color: Color,
+    /// Under a hover ink the element takes NO color of its own: the box
+    /// above declares both states and CSS inheritance carries them
+    /// down. `color` stays as the record of what it inherits.
+    pub inherits_ink: bool,
     pub font: FontSpec,
     /// Match highlight spans (byte ranges) + their color.
     pub highlights: Option<(Rc<Vec<(usize, usize)>>, Color)>,
@@ -170,6 +183,14 @@ pub(crate) struct DomCapture {
     pending_transition: Option<(f64, f64)>,
     /// Armed by an `Interactive`; the next opened box takes it.
     pending_interactive: Option<String>,
+    /// The BASE ink of every open node, in step with `stack` — the
+    /// color a text inherits, never the hovered one the pointer
+    /// resolved. This is what keeps the capture pointer-invariant.
+    ink: Vec<Color>,
+    /// Stack depths where a box declared a hover/pressed ink. While one
+    /// is open the text below inherits its color instead of setting it,
+    /// which is what lets the browser flip the whole subtree.
+    ink_scopes: Vec<usize>,
     /// Island nesting depth. Above zero the subtree is PIXELS, not
     /// elements: every open/leaf below the canvas node is swallowed —
     /// the draw commands already carry the content.
@@ -198,6 +219,10 @@ impl DomCapture {
             stack: vec![(Point { x: 0.0, y: 0.0 }, root)],
             pending_transition: None,
             pending_interactive: None,
+            // the scene's ink floor is the theme's, the same one the
+            // place walk starts from
+            ink: vec![crate::theme::current().fg],
+            ink_scopes: Vec::new(),
             island: 0,
             swallowed: 0,
         }
@@ -231,6 +256,8 @@ impl DomCapture {
             style,
             children: Vec::new(),
         };
+        // the node inherits the ink until a `Styled` says otherwise
+        self.ink.push(self.current_ink());
         self.stack.push((child_origin, node));
     }
 
@@ -242,13 +269,33 @@ impl DomCapture {
         }
         let interactive = self.pending_interactive.take();
         let transition = self.pending_transition.take();
+        let states = props.foreground_hovered.is_some() || props.foreground_pressed.is_some();
+        // inside a hover ink the text inherits, so a box that changes
+        // the ink must SAY so — otherwise the inheritance walks past it
+        let inheriting = !self.ink_scopes.is_empty() && props.foreground.is_some();
         self.open(DomKind::Box, frame, frame.origin);
+        if let Some(color) = props.foreground {
+            *self.ink.last_mut().expect("the open node owns an ink") = color;
+        }
+        let ink = self.current_ink();
         let (_, node) = self.stack.last_mut().expect("just opened");
         node.style = DomStyle {
             interactive,
             transition,
             ..DomStyle::from_props(props)
         };
+        if states || inheriting {
+            node.style.color = Some(ink);
+        }
+        if states {
+            self.ink_scopes.push(self.stack.len());
+        }
+    }
+
+    /// The ink the open node hands down: the BASE color, never the
+    /// hovered one. The scene the browser gets stays pointer-invariant.
+    fn current_ink(&self) -> Color {
+        *self.ink.last().expect("the root seeds the ink")
     }
 
     /// Paints the OPEN node's background (the plain-box leaves).
@@ -274,6 +321,10 @@ impl DomCapture {
             self.swallowed -= 1;
             return;
         }
+        if self.ink_scopes.last() == Some(&self.stack.len()) {
+            self.ink_scopes.pop();
+        }
+        self.ink.pop();
         let (_, node) = self.stack.pop().expect("close pairs with open");
         let (_, parent) = self.stack.last_mut().expect("the root never closes");
         parent.children.push(node);
@@ -284,6 +335,14 @@ impl DomCapture {
         if self.island > 0 {
             return;
         }
+        let mut kind = kind;
+        if let DomKind::Text(text) = &mut kind {
+            // the ink is the INHERITED one, never the resolved paint —
+            // and under a hover ink the element sets no color at all,
+            // or its own would outrank the rule that flips it
+            text.color = self.current_ink();
+            text.inherits_ink = !self.ink_scopes.is_empty();
+        }
         self.open(kind, frame, frame.origin);
         self.close();
     }
@@ -293,6 +352,13 @@ impl DomCapture {
     pub(crate) fn leaf_styled(&mut self, kind: DomKind, frame: Rect, style: DomStyle) {
         if self.island > 0 {
             return;
+        }
+        let mut kind = kind;
+        if let DomKind::Field(field) = &mut kind {
+            // the input keeps an inline ink (it never inherits a hover
+            // state) — but the INHERITED one, so the record stays
+            // pointer-invariant
+            field.color = self.current_ink();
         }
         self.open(kind, frame, frame.origin);
         let (_, node) = self.stack.last_mut().expect("just opened");
@@ -792,7 +858,11 @@ fn diff_children(
 ///                   6 transition f32 response + f32 damping
 ///                   7 interactive u16 len + utf8
 ///                   8 focus border u32 rgba   9 placeholder u32 rgba
-///   6 set text      u32 rgba, f32 size, u8 weight, u8 mono,
+///                   10 ink u32 rgba (what the subtree inherits)
+///                   11 hover ink u32 rgba     12 pressed ink u32 rgba
+///   6 set text      u32 rgba, u8 inherits ink (1 = no color of its
+///                   own — the box above owns both states),
+///                   f32 size, u8 weight, u8 mono,
 ///                   u8 truncation (0 none, 1 start, 2 middle, 3 end),
 ///                   u32 len + utf8, u16 span count,
 ///                   spans (u32 start, u32 end), u32 span rgba
@@ -848,6 +918,8 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
                 out.push(6);
                 push_u32(&mut out, *id);
                 push_u32(&mut out, pack_color(text.color));
+                // 1 = take no color of your own; the box above owns it
+                out.push(text.inherits_ink as u8);
                 push_f32(&mut out, text.font.size);
                 out.push(weight_code(text.font.weight));
                 out.push(matches!(text.font.design, FontDesign::Mono) as u8);
@@ -934,6 +1006,15 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     if style.placeholder_color.is_some() {
         mask |= 1 << 9;
     }
+    if style.color.is_some() {
+        mask |= 1 << 10;
+    }
+    if style.hover_color.is_some() {
+        mask |= 1 << 11;
+    }
+    if style.pressed_color.is_some() {
+        mask |= 1 << 12;
+    }
     push_u16(out, mask);
     if let Some(color) = style.background {
         push_u32(out, pack_color(color));
@@ -966,6 +1047,15 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
         push_u32(out, pack_color(color));
     }
     if let Some(color) = style.placeholder_color {
+        push_u32(out, pack_color(color));
+    }
+    if let Some(color) = style.color {
+        push_u32(out, pack_color(color));
+    }
+    if let Some(color) = style.hover_color {
+        push_u32(out, pack_color(color));
+    }
+    if let Some(color) = style.pressed_color {
         push_u32(out, pack_color(color));
     }
 }
@@ -1339,6 +1429,58 @@ mod tests {
             matches!(patch, DomPatch::SetStyle { style, .. } if style.hover_background.is_some())
         });
         assert!(hovered, "the :hover alternative reached the patches: {patches:#?}");
+    }
+
+    #[test]
+    fn a_hover_ink_lowers_to_inheritance() {
+        const FAINT: Color = Color::hex(0x8A8A8A);
+        const BRIGHT: Color = Color::hex(0xF5F5F5);
+
+        #[derive(Clone, Copy)]
+        struct CloseGlyph;
+
+        impl Component for CloseGlyph {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("x")
+                    .foreground_color(FAINT)
+                    .foreground_hovered(BRIGHT)
+                    .on_click(|| {})
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 100.0, height: 50.0 };
+        let patches = runtime.dom_frame(&CloseGlyph, size);
+
+        // the box declares both inks; the browser owns the swap
+        let ink = patches
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::SetStyle { style, .. } if style.hover_color.is_some() => {
+                    Some((style.color, style.hover_color))
+                }
+                _ => None,
+            })
+            .expect("the box declares the ink it hands down");
+        assert_eq!(ink, (Some(FAINT), Some(BRIGHT)));
+        // and the text takes NO color of its own: an inline one would
+        // outrank the rule that flips it
+        let inherits = patches.iter().any(|patch| {
+            matches!(patch, DomPatch::SetText { text, .. } if text.inherits_ink)
+        });
+        assert!(inherits, "the glyph inherits its ink: {patches:#?}");
+
+        // the LAW still holds: hovering patches nothing
+        let target = runtime
+            .layout(&CloseGlyph, crate::layout::Proposal::exact(size))
+            .hits
+            .last()
+            .map(|(_, rect)| {
+                (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)
+            })
+            .expect("the glyph is a target");
+        assert!(runtime.pointer_moved(target.0, target.1), "the hover state flipped");
+        assert_eq!(runtime.dom_frame(&CloseGlyph, size), vec![], "hover is the browser's");
     }
 
     #[test]

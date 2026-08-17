@@ -57,11 +57,11 @@ impl Component for Finder {
                     let (name, dir) = &files[visible[row]];
                     let on = row == selected_index;
                     let details = details;
+                    // the path takes NO ink of its own: the row hands it
+                    // down, faint at rest and bright under the pointer
                     let base = hstack!(
                         text(name.clone()).foreground_color(theme::fg()),
-                        text(dir.clone())
-                            .monospaced()
-                            .foreground_color(theme::fg_secondary()),
+                        text(dir.clone()).monospaced(),
                         spacer(),
                     )
                     .spacing(8.0)
@@ -72,6 +72,8 @@ impl Component for Finder {
                     .padding_edge(Edge::Bottom, 6.0)
                     .background_color(if on { theme::row_pressed() } else { CLEAR })
                     .background_hovered(theme::row_hover())
+                    .foreground_color(theme::fg_secondary())
+                    .foreground_hovered(theme::fg())
                     .animated(Spring::snappy())
                     // first click selects; a second click on the
                     // selected row opens its details popover

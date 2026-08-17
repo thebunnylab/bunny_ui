@@ -1851,6 +1851,60 @@ mod tests {
     }
 
     #[test]
+    fn the_ink_answers_to_hover_and_press() {
+        use crate::layout::{DrawCommand, LayoutResult, Proposal, Size};
+
+        const FAINT: Color = Color::hex(0x8A8A8A);
+        const BRIGHT: Color = Color::hex(0xF5F5F5);
+        const SUNK: Color = Color::hex(0x3B82F6);
+
+        #[derive(Clone, Copy)]
+        struct CloseGlyph;
+
+        impl Component for CloseGlyph {
+            fn body(self, _ctx: &Context) -> impl View {
+                // the tab's ✕: faint until the pointer arrives
+                text("x")
+                    .foreground_color(FAINT)
+                    .foreground_hovered(BRIGHT)
+                    .foreground_pressed(SUNK)
+                    .padding_length(4.0)
+                    .on_click(|| {})
+            }
+        }
+
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 60.0, height: 30.0 });
+        let ink = |result: &LayoutResult| {
+            result
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::TextLine { color, .. } => Some(*color),
+                    _ => None,
+                })
+                .expect("the glyph paints")
+        };
+
+        let cold = runtime.layout(&CloseGlyph, viewport);
+        assert_eq!(ink(&cold), FAINT, "at rest the glyph stays faint");
+        let (_, target) = cold.hits.last().expect("the glyph is a target").clone();
+        let cx = target.origin.x + target.size.width / 2.0;
+        let cy = target.origin.y + target.size.height / 2.0;
+
+        runtime.pointer_moved(cx, cy);
+        let hot = runtime.layout(&CloseGlyph, viewport);
+        assert_eq!(ink(&hot), BRIGHT, "the pointer brightens it");
+        // the LAW: ink is paint — no frame moves under the pointer
+        for (path, frame) in cold.frames.iter() {
+            assert_eq!(Some(frame), hot.frames.get(path));
+        }
+
+        runtime.pointer_pressed(cx, cy);
+        assert_eq!(ink(&runtime.layout(&CloseGlyph, viewport)), SUNK, "press sinks it");
+    }
+
+    #[test]
     fn up_inside_fires_and_down_alone_does_not() {
         let (runtime, tapper, cx, cy) = pressable();
 

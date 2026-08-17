@@ -508,6 +508,11 @@ pub struct VisualProps {
     /// state to the whole `VisualProps` waits for the theme port.)
     pub background_hovered: Option<Color>,
     pub background_pressed: Option<Color>,
+    /// The same two states for the INK the text below inherits — a
+    /// faint glyph that brightens under the pointer. Paint only, like
+    /// its background twins: the measure never hears about it.
+    pub foreground_hovered: Option<Color>,
+    pub foreground_pressed: Option<Color>,
     /// Inherited font patch — the EXCEPTION to the "props is paint only"
     /// rule: font changes measure, so it goes down the `LayoutEnv`
     /// already at measure time (hover state is still forbidden to touch
@@ -532,6 +537,8 @@ impl VisualProps {
             corner_radius: self.corner_radius.or(outer.corner_radius),
             background_hovered: self.background_hovered.or(outer.background_hovered),
             background_pressed: self.background_pressed.or(outer.background_pressed),
+            foreground_hovered: self.foreground_hovered.or(outer.foreground_hovered),
+            foreground_pressed: self.foreground_pressed.or(outer.foreground_pressed),
             font: self.font.or(outer.font),
             shadow: self.shadow.or(outer.shadow),
         }
@@ -1550,6 +1557,9 @@ impl LayoutNode {
                         crate::dom::DomKind::Text(crate::dom::DomText {
                             content: content.clone(),
                             color,
+                            // the capture decides: it knows whether a
+                            // hover ink is open above this leaf
+                            inherits_ink: false,
                             font: env.font,
                             highlights: highlights
                                 .as_ref()
@@ -2067,6 +2077,7 @@ impl LayoutNode {
                     // base + hover + pressed side by side, never the
                     // pointer-resolved paint: the scene stays pointer-
                     // invariant and a hover frame diffs to zero patches
+                    // (the capture keeps the base ink of its own)
                     dom.open_styled(props, frame);
                 }
                 // the halo goes first — everything else paints over it
@@ -2096,12 +2107,21 @@ impl LayoutNode {
                         corner_radius: props.corner_radius.unwrap_or(0.0),
                     });
                 }
-                if let Some(color) = props.foreground {
+                // the ink walks the same ladder as the background: a
+                // state with no ink of its own falls back to the base
+                let ink = if pressed {
+                    props.foreground_pressed.or(props.foreground)
+                } else if hovered {
+                    props.foreground_hovered.or(props.foreground)
+                } else {
+                    props.foreground
+                };
+                if let Some(color) = ink {
                     let color = animated(crate::anim::Channel::Foreground, color);
                     out.foreground.push(color);
                 }
                 child.place(frame, *fit, env, out);
-                if props.foreground.is_some() {
+                if ink.is_some() {
                     out.foreground.pop();
                 }
                 if let Some((color, width)) = props.border {

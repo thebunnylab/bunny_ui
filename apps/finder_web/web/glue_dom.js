@@ -228,10 +228,19 @@ function applyPatches(view, length) {
       let placeholder = null;
       if (mask & 256) focus = rgba(u32());
       if (mask & 512) placeholder = rgba(u32());
+      // the ink the subtree INHERITS: the text below sets no color of
+      // its own, so these two rules flip the whole box at once
+      let hoverInk = null;
+      let pressedInk = null;
+      if (mask & 1024) base.push(`color:${rgba(u32())}`);
+      if (mask & 2048) hoverInk = rgba(u32());
+      if (mask & 4096) pressedInk = rgba(u32());
       const name = `[data-n="${id}"]`;
       let rule = `${name}{${base.join(";")}}`;
       if (hover) rule += `\n${name}:hover{background:${hover}}`;
       if (pressed) rule += `\n${name}:active{background:${pressed}}`;
+      if (hoverInk) rule += `\n${name}:hover{color:${hoverInk}}`;
+      if (pressedInk) rule += `\n${name}:active{color:${pressedInk}}`;
       if (focus) {
         rule += `\n${name}:focus{border-color:${focus};caret-color:${focus}}`;
       }
@@ -241,6 +250,7 @@ function applyPatches(view, length) {
     } else if (op === 6) {
       const el = elements.get(id);
       const color = rgba(u32());
+      const inheritsInk = u8();
       const size = f32();
       const weight = CSS_WEIGHTS[u8()];
       const mono = u8();
@@ -252,7 +262,9 @@ function applyPatches(view, length) {
       const spanColor = rgba(u32());
       if (el) {
         el.style.font = cssFont(size, weight, mono);
-        el.style.color = color;
+        // an inherited ink takes NO inline color: an inline one would
+        // outrank the :hover rule of the box that owns both states
+        el.style.color = inheritsInk ? "" : color;
         if (truncation !== 0) {
           el.style.overflow = "hidden";
           el.style.textOverflow = "ellipsis";

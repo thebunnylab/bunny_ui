@@ -294,6 +294,26 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// Alternate INK under the nearest interactive target's hover: a
+    /// faint glyph that brightens when the pointer arrives. It reaches
+    /// every text below, the way `.foreground_color` does, and it is
+    /// paint only — the measure never hears about it (the LAW).
+    fn foreground_hovered(self, color: Color) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::ForegroundHovered(color),
+        }
+    }
+
+    /// Alternate ink under pressed — the pair of
+    /// [`ViewExt::foreground_hovered`].
+    fn foreground_pressed(self, color: Color) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::ForegroundPressed(color),
+        }
+    }
+
     /// `.onClick { … }` — the view becomes a pointer target WITHOUT the
     /// `Button` chrome: same action retention, same up-inside. It is the
     /// clickable list row.

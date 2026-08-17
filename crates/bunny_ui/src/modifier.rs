@@ -63,6 +63,8 @@ pub enum Modifier {
     FontSize(f64),
     BackgroundHovered(Color),
     BackgroundPressed(Color),
+    ForegroundHovered(Color),
+    ForegroundPressed(Color),
     Highlight(Rc<Vec<(usize, usize)>>, Color),
     TruncationMode(Truncation),
     /// The scroll region follows this item id when it changes.
@@ -174,6 +176,8 @@ impl Modifier {
             Modifier::Monospaced => " [.monospaced()]".into(),
             Modifier::FontSize(size) => format!(" [.font(.system(size: {size}))]"),
             Modifier::BackgroundHovered(color) => format!(" [.backgroundHovered({color})]"),
+            Modifier::ForegroundHovered(color) => format!(" [.foregroundHovered({color})]"),
+            Modifier::ForegroundPressed(color) => format!(" [.foregroundPressed({color})]"),
             Modifier::BackgroundPressed(color) => format!(" [.backgroundPressed({color})]"),
             Modifier::Highlight(ranges, color) => {
                 format!(" [.highlight({} ranges, {color})]", ranges.len())
@@ -638,6 +642,14 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             Modifier::BackgroundPressed(color) => wrap_styled(
                 out,
                 VisualProps { background_pressed: Some(*color), ..VisualProps::default() },
+            ),
+            Modifier::ForegroundHovered(color) => wrap_styled(
+                out,
+                VisualProps { foreground_hovered: Some(*color), ..VisualProps::default() },
+            ),
+            Modifier::ForegroundPressed(color) => wrap_styled(
+                out,
+                VisualProps { foreground_pressed: Some(*color), ..VisualProps::default() },
             ),
             // the two below rewrite the TEXT NODE, descending through
             // `Styled` (`.font()`/`.foreground_color()` before or after, the
