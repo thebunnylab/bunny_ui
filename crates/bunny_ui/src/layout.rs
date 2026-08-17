@@ -547,6 +547,10 @@ pub struct Placement {
     /// Regions whose virtual window failed to cover the visible band —
     /// the runtime invalidates their boundary for a follow-up pass.
     pub misses: Vec<String>,
+    /// The Dom capture, when that mode is on ([`layout_dom`]) — the
+    /// placement braços feed it the SEMANTIC scene while they walk.
+    /// `None` costs one branch per hook and nothing else.
+    pub(crate) dom: Option<crate::dom::DomCapture>,
 }
 
 impl Placement {
@@ -690,6 +694,35 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         fields: out.fields,
         misses: out.misses,
     }
+}
+
+/// Runs both phases WITH the Dom capture on: the same walk, plus the
+/// semantic scene collected on the way ([`crate::dom`]). The regular
+/// [`layout_with`] never pays for the sink.
+pub fn layout_dom(
+    root: &LayoutNode,
+    proposal: Proposal,
+    env: LayoutEnv,
+) -> (LayoutResult, crate::dom::DomNode) {
+    let (size, fit) = root.measure(proposal, env);
+    let mut out = Placement {
+        dom: Some(crate::dom::DomCapture::new(size)),
+        ..Placement::default()
+    };
+    root.place(Rect { origin: Point::default(), size }, fit, env, &mut out);
+    let scene = out.dom.take().expect("the capture stays for the whole walk").finish();
+    (
+        LayoutResult {
+            size,
+            frames: out.frames,
+            display: out.display,
+            hits: out.hits,
+            scrolls: out.scrolls,
+            fields: out.fields,
+            misses: out.misses,
+        },
+        scene,
+    )
 }
 
 impl LayoutNode {
@@ -981,6 +1014,22 @@ impl LayoutNode {
             // visual leaves: the draw list is born here
             (LayoutNode::Text { content, highlights, truncation }, Fit::Leaf) => {
                 let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
+                if let Some(dom) = out.dom.as_mut() {
+                    // the WHOLE content, unwrapped: the browser re-breaks
+                    // lines inside the same box with the same measures
+                    dom.leaf(
+                        crate::dom::DomKind::Text(crate::dom::DomText {
+                            content: content.clone(),
+                            color,
+                            font: env.font,
+                            highlights: highlights
+                                .as_ref()
+                                .map(|h| (Rc::clone(&h.ranges), h.color)),
+                            truncation: *truncation,
+                        }),
+                        frame,
+                    );
+                }
                 place_text(
                     content,
                     highlights.as_ref(),
@@ -993,6 +1042,11 @@ impl LayoutNode {
             }
 
             (LayoutNode::Fill, Fit::Leaf) => {
+                if let Some(dom) = out.dom.as_mut() {
+                    dom.open(crate::dom::DomKind::Box, frame, frame.origin);
+                    dom.set_background(Color::FILL);
+                    dom.close();
+                }
                 out.display.push(DrawCommand::FillRect {
                     rect: frame,
                     color: Color::FILL,
@@ -1001,6 +1055,19 @@ impl LayoutNode {
             }
 
             (LayoutNode::Field { path, content, placeholder, auto_focus }, Fit::Leaf) => {
+                if let Some(dom) = out.dom.as_mut() {
+                    // the browser's input owns focus, caret and
+                    // composition — the record carries what to SHOW
+                    dom.leaf(
+                        crate::dom::DomKind::Field(crate::dom::DomField {
+                            path: path.clone(),
+                            content: content.clone(),
+                            placeholder: placeholder.clone(),
+                            font: env.font,
+                        }),
+                        frame,
+                    );
+                }
                 // focus/caret/selection read from the env's STAMP, clamped
                 // to the current content (the app may have swapped the
                 // string outside the editor) — the tree never carried any
@@ -1127,6 +1194,11 @@ impl LayoutNode {
             }
 
             (LayoutNode::Leaf { .. }, Fit::Leaf) => {
+                if let Some(dom) = out.dom.as_mut() {
+                    dom.open(crate::dom::DomKind::Box, frame, frame.origin);
+                    dom.set_border(Color::OUTLINE, 1.0);
+                    dom.close();
+                }
                 out.display.push(DrawCommand::StrokeRect {
                     rect: frame,
                     color: Color::OUTLINE,
@@ -1207,12 +1279,36 @@ impl LayoutNode {
                 if let Some(path) = path {
                     out.region_stack.push(path.clone());
                 }
+                if let Some(dom) = out.dom.as_mut() {
+                    // viewport element + a content element sized to the
+                    // FULL extent (the browser scrolls through it; a
+                    // virtual list keeps the geometry honest the same
+                    // way). the offset lives on the scroll node — the
+                    // content and its children never move
+                    dom.open(
+                        crate::dom::DomKind::Scroll {
+                            path: path.clone(),
+                            offset: (offset.x, offset.y),
+                        },
+                        frame,
+                        frame.origin,
+                    );
+                    dom.open(
+                        crate::dom::DomKind::Content,
+                        Rect { origin: frame.origin, size: content },
+                        content_origin,
+                    );
+                }
                 child.place(
                     Rect { origin: content_origin, size: content },
                     *fit,
                     env,
                     out,
                 );
+                if let Some(dom) = out.dom.as_mut() {
+                    dom.close();
+                    dom.close();
+                }
                 if path.is_some() {
                     out.region_stack.pop();
                 }
@@ -1254,6 +1350,12 @@ impl LayoutNode {
                         .resolve_color(scope.key, scope.spec, slot, color),
                     _ => color,
                 };
+                if let Some(dom) = out.dom.as_mut() {
+                    // base + hover + pressed side by side, never the
+                    // pointer-resolved paint: the scene stays pointer-
+                    // invariant and a hover frame diffs to zero patches
+                    dom.open_styled(props, frame);
+                }
                 // the halo goes first — everything else paints over it
                 if let Some((radius, color)) = props.shadow {
                     out.display.push(DrawCommand::Shadow {
@@ -1297,6 +1399,9 @@ impl LayoutNode {
                         corner_radius: props.corner_radius.unwrap_or(0.0),
                     });
                 }
+                if let Some(dom) = out.dom.as_mut() {
+                    dom.close();
+                }
             }
 
             (LayoutNode::Animated { key, spec, child }, Fit::Wrapped(_, fit)) => {
@@ -1331,12 +1436,20 @@ impl LayoutNode {
                     }),
                     ..env
                 };
+                if let Some(dom) = out.dom.as_mut() {
+                    // in Dom the browser animates: the spec lowers to a
+                    // CSS transition on the next element opened below
+                    dom.arm_transition(spec.response, spec.damping);
+                }
                 child.place(
                     Rect { origin: painted, size: frame.size },
                     *fit,
                     env,
                     out,
                 );
+                if let Some(dom) = out.dom.as_mut() {
+                    dom.disarm();
+                }
             }
 
             (LayoutNode::Interactive { path, child }, Fit::Wrapped(size, fit)) => {
@@ -1359,7 +1472,15 @@ impl LayoutNode {
                 let pressed = hovered
                     && env.stamp.interaction.pressed.as_deref() == Some(path.as_str());
                 out.pointer.push((hovered, pressed));
+                if let Some(dom) = out.dom.as_mut() {
+                    // the styled below takes the path: the glue posts
+                    // clicks with it and scopes `:hover` to the element
+                    dom.arm_interactive(path);
+                }
                 child.place(frame, *fit, env, out);
+                if let Some(dom) = out.dom.as_mut() {
+                    dom.disarm();
+                }
                 out.pointer.pop();
             }
 
@@ -1426,6 +1547,17 @@ impl LayoutNode {
                     None => frame,
                 };
                 out.frames.record(path, real);
+                if let Some(dom) = out.dom.as_mut() {
+                    // the diff matches this node by identity path; the
+                    // recorded frame is the REAL one and the children
+                    // measure from the same origin, so a flight above
+                    // never bends the captured interior
+                    dom.open(
+                        crate::dom::DomKind::Group { path: path.clone() },
+                        real,
+                        real.origin,
+                    );
+                }
                 let env = LayoutEnv { anim: None, ..env };
                 if children.len() == 1 {
                     let mut fits = fits;
@@ -1443,6 +1575,9 @@ impl LayoutNode {
                         env,
                         out,
                     );
+                }
+                if let Some(dom) = out.dom.as_mut() {
+                    dom.close();
                 }
             }
 

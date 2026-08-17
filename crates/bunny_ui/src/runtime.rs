@@ -102,6 +102,10 @@ pub struct Runtime {
     /// The retained animations — springs keyed by identity, resolved
     /// at place through the env, advanced by the shell's tick.
     animator: RefCell<crate::anim::Animator>,
+    /// The Dom mode's retained scene — [`Runtime::dom_frame`] diffs
+    /// each new capture against it. Empty (and free) in every other
+    /// mode.
+    dom: RefCell<crate::dom::DomLowering>,
     /// Did the last pass see the root become ONE boundary
     /// (`Boundary`/ref)? Only then can the stable frame synthesize the
     /// reference without a pass — a boundary-less root comes fresh
@@ -157,6 +161,7 @@ impl Runtime {
             scroll_targets: RefCell::new(HashMap::default()),
             auto_focused: RefCell::new(std::collections::HashSet::default()),
             animator: RefCell::new(crate::anim::Animator::default()),
+            dom: RefCell::new(crate::dom::DomLowering::default()),
             root_is_boundary: Cell::new(false),
             printless: Cell::new(false),
         }
@@ -685,6 +690,37 @@ impl Runtime {
         result.display
     }
 
+    /// The frame in DOM mode: the same settle + layout machinery as
+    /// [`Runtime::display_frame`], then ONE capture pass over the now-
+    /// stable tree and the diff against the retained scene. The result
+    /// is the patch list that brings the element tree up to date —
+    /// empty when nothing observable changed (a hover, a caret blink).
+    ///
+    /// The engine never ticks springs here: animation specs lower into
+    /// the patches as CSS transitions and the browser animates.
+    pub fn dom_frame(
+        &self,
+        root: &impl View,
+        size: crate::layout::Size,
+    ) -> Vec<crate::dom::DomPatch> {
+        // the display list is not the product — the pass settles state,
+        // applies scroll targets and heals virtual windows
+        let _ = self.display_frame(root, size);
+        let (_, scene) = self.layout_once_with(
+            root,
+            crate::layout::Proposal::exact(size),
+            true,
+        );
+        let scene = scene.expect("the capture rode the pass");
+        self.dom.borrow_mut().lower(&scene)
+    }
+
+    /// The scroll region path behind a Dom element id — the glue's
+    /// scroll observer reports by id, the runtime scrolls by path.
+    pub fn dom_scroll_path(&self, id: u32) -> Option<String> {
+        self.dom.borrow().scroll_path(id)
+    }
+
     /// The text engine of this runtime — the shell pairs it with its
     /// retained paint surface.
     pub fn text(&self) -> Rc<dyn TextEngine> {
@@ -871,6 +907,16 @@ impl Runtime {
         root: &impl View,
         proposal: crate::layout::Proposal,
     ) -> crate::layout::LayoutResult {
+        self.layout_once_with(root, proposal, false).0
+    }
+
+    /// One layout pass, optionally with the Dom capture riding it.
+    fn layout_once_with(
+        &self,
+        root: &impl View,
+        proposal: crate::layout::Proposal,
+        dom: bool,
+    ) -> (crate::layout::LayoutResult, Option<crate::dom::DomNode>) {
         // STABLE boundary-root frame (hover, wheel, blink, the
         // post-settle layout): nothing dirty, same theme, retained
         // root — the walk would be all-skip and emit exactly ONE
@@ -925,19 +971,21 @@ impl Runtime {
         // pass's touches mark who is still mounted
         self.animator.borrow_mut().note_place();
         let offsets = self.scroll_offsets.borrow();
-        let result = crate::layout::layout_with(
-            &tree,
-            proposal,
-            LayoutEnv {
-                text: &*self.text,
-                cache: &self.cache,
-                scroll_offsets: &offsets,
-                font: FontSpec::DEFAULT,
-                stamp,
-                animator: Some(&self.animator),
-                anim: None,
-            },
-        );
+        let env = LayoutEnv {
+            text: &*self.text,
+            cache: &self.cache,
+            scroll_offsets: &offsets,
+            font: FontSpec::DEFAULT,
+            stamp,
+            animator: Some(&self.animator),
+            anim: None,
+        };
+        let (result, scene) = if dom {
+            let (result, scene) = crate::layout::layout_dom(&tree, proposal, env);
+            (result, Some(scene))
+        } else {
+            (crate::layout::layout_with(&tree, proposal, env), None)
+        };
         drop(offsets);
         drop(carets);
         *self.last_hits.borrow_mut() = result.hits.clone();
@@ -948,7 +996,7 @@ impl Runtime {
         self.scroll_targets
             .borrow_mut()
             .retain(|path, _| result.scrolls.iter().any(|region| region.path == *path));
-        result
+        (result, scene)
     }
 
     /// Forces every body (drops the retention before the pass) — the

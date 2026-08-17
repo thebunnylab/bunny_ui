@@ -39,6 +39,7 @@
 
 pub mod action;
 pub mod anim;
+pub mod dom;
 pub mod effects;
 pub mod erased;
 pub mod ext;
