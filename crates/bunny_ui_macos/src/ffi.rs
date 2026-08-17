@@ -771,6 +771,12 @@ impl WindowHandle {
                 };
                 msg_void_rect(self.view, sel("setNeedsDisplayInRect:"), rect);
             }
+            // present NOW: without this the dirty rects wait for a
+            // future run-loop turn and every event shows the PREVIOUS
+            // frame (a theme toggle looked dead on the first click and
+            // flashed one frame late on the second). displayIfNeeded
+            // draws synchronously and is a no-op when nothing is dirty.
+            msg_void(self.view, sel("displayIfNeeded"));
         }
     }
 

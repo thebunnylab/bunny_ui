@@ -1630,6 +1630,61 @@ mod tests {
     }
 
     #[test]
+    fn one_click_swaps_the_theme_scene_and_one_click_swaps_it_back() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct App {
+            dark: State<bool>,
+        }
+
+        impl Component for App {
+            fn body(self, _ctx: &Context) -> impl View {
+                let dark_on = self.dark.get();
+                vstack!(
+                    text("hello").foreground_color(theme::fg()),
+                    button(text(if dark_on { "light" } else { "dark" }), move || {
+                        let next = !self.dark.get();
+                        self.dark.set(next);
+                        theme::install(if next { Theme::dark() } else { Theme::light() });
+                    }),
+                )
+                .background_color(theme::panel())
+            }
+        }
+
+        theme::install(Theme::light());
+        let size = Size { width: 200.0, height: 120.0 };
+        let app = App { dark: State::new(false) };
+        let runtime = Runtime::new();
+        runtime.settle(&app);
+        let target = runtime.layout(&app, Proposal::exact(size)).hits.first().expect("toggle").1;
+        let (x, y) = (target.origin.x + 4.0, target.origin.y + 4.0);
+        let panel = |runtime: &Runtime| {
+            runtime
+                .display_frame(&app, size)
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::FillRect { color, .. } => Some(*color),
+                    _ => None,
+                })
+                .expect("panel fill")
+        };
+
+        let light = panel(&runtime);
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        let dark = panel(&runtime);
+        assert_ne!(dark, light, "ONE click reskins the scene");
+        assert_eq!(dark, Theme::dark().panel, "the dark panel token landed");
+
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        assert_eq!(panel(&runtime), light, "one more click swaps it back");
+        theme::install(Theme::light());
+    }
+
+    #[test]
     fn a_surface_repaints_a_real_hover_incrementally() {
         use crate::layout::{Proposal, Size};
         use crate::raster::{Surface, rasterize_scaled};
