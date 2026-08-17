@@ -133,6 +133,12 @@ pub struct LayoutEnv<'a> {
     pub font: FontSpec,
     /// The pass's frame state — consulted BY PATH during placement.
     pub stamp: FrameStamp<'a>,
+    /// The frame's animator — `None` in bare layouts (tests, direct
+    /// [`layout`]): animated props then paint their targets.
+    pub animator: Option<&'a std::cell::RefCell<crate::anim::Animator>>,
+    /// The animation scope opened by the nearest `Animated` ancestor —
+    /// the key and spring the next styled node consumes.
+    pub anim: Option<(&'a str, crate::anim::Spring)>,
 }
 
 /// The FRAME state that placement consults by path: pointer
@@ -224,6 +230,11 @@ pub enum LayoutNode {
     /// Semantic visual property: background behind the child, border on
     /// top, foreground inherited. Transparent to the measure — by type.
     Styled { props: Box<VisualProps>, child: Box<LayoutNode> },
+    /// An animation scope: the nearest styled below interpolates its
+    /// colors through this spring, keyed by the identity captured at
+    /// render (`key` is `None` outside a pass — the scope is inert).
+    /// Transparent to geometry; in Dom it lowers to a CSS transition.
+    Animated { key: Option<Rc<str>>, spec: crate::anim::Spring, child: Box<LayoutNode> },
     /// ONE-line text field — semantic end to end (in Dom it becomes an
     /// `<input>`; in Gpu, chrome + text + caret + selection from here).
     /// Focus, caret, selection and IME composition do NOT live here:
@@ -607,6 +618,8 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             stamp: FrameStamp::idle(&interaction, &carets),
+            animator: None,
+            anim: None,
         },
     )
 }
@@ -646,7 +659,8 @@ impl LayoutNode {
             },
             LayoutNode::Padding { child, .. }
             | LayoutNode::Interactive { child, .. }
-            | LayoutNode::Styled { child, .. } => child.is_flexible(axis),
+            | LayoutNode::Styled { child, .. }
+            | LayoutNode::Animated { child, .. } => child.is_flexible(axis),
             LayoutNode::Boundary { children, .. } => {
                 children.len() == 1 && children[0].is_flexible(axis)
             }
@@ -803,6 +817,12 @@ impl LayoutNode {
                 // the inherited font swaps HERE, at measure time — the
                 // sanctioned VisualProps exception (font changes measure)
                 let env = LayoutEnv { font: props.font.apply_over(env.font), ..env };
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            // the animation scope never touches geometry — by type
+            LayoutNode::Animated { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -1078,7 +1098,12 @@ impl LayoutNode {
             }
 
             (LayoutNode::Styled { props, child }, Fit::Wrapped(_, fit)) => {
-                let env = LayoutEnv { font: props.font.apply_over(env.font), ..env };
+                // the nearest styled EATS the animation scope: its colors
+                // move, deeper styled nodes paint plain (no shared-key
+                // thrash between siblings of one scope)
+                let anim = env.anim;
+                let env =
+                    LayoutEnv { font: props.font.apply_over(env.font), anim: None, ..env };
                 // the halo goes first — everything else paints over it
                 if let Some((radius, color)) = props.shadow {
                     out.display.push(DrawCommand::Shadow {
@@ -1100,6 +1125,15 @@ impl LayoutNode {
                     props.background
                 };
                 if let Some(color) = background {
+                    // an animated background paints the value in flight,
+                    // never the target — the animator seeds, retargets
+                    // and snaps (bit-exact) behind this call
+                    let color = match (anim, env.animator) {
+                        (Some((key, spec)), Some(animator)) => {
+                            animator.borrow_mut().resolve_background(key, spec, color)
+                        }
+                        _ => color,
+                    };
                     out.display.push(DrawCommand::FillRect {
                         rect: frame,
                         color,
@@ -1121,6 +1155,16 @@ impl LayoutNode {
                         corner_radius: props.corner_radius.unwrap_or(0.0),
                     });
                 }
+            }
+
+            (LayoutNode::Animated { key, spec, child }, Fit::Wrapped(_, fit)) => {
+                // open the scope for the subtree; a keyless scope
+                // (built outside a pass) stays inert
+                let env = match key {
+                    Some(key) => LayoutEnv { anim: Some((key.as_ref(), *spec)), ..env },
+                    None => env,
+                };
+                child.place(frame, *fit, env, out);
             }
 
             (LayoutNode::Interactive { path, child }, Fit::Wrapped(size, fit)) => {
@@ -1626,6 +1670,8 @@ mod tests {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             stamp: FrameStamp::idle(&interaction, &carets),
+            animator: None,
+            anim: None,
         };
         node.measure(proposal, env).0
     }
@@ -1650,6 +1696,8 @@ mod tests {
                 scroll_offsets: &offsets,
                 font: FontSpec::DEFAULT,
                 stamp: FrameStamp::idle(interaction, &carets),
+                animator: None,
+                anim: None,
             },
         )
     }
@@ -1833,6 +1881,8 @@ mod tests {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             stamp: FrameStamp::idle(&interaction, &carets),
+            animator: None,
+            anim: None,
         };
 
         let root = LayoutNode::Scroll {

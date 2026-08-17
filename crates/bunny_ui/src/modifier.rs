@@ -69,6 +69,8 @@ pub enum Modifier {
     AutoFocus,
     /// A soft halo behind the view: (radius, color).
     Shadow(f64, Color),
+    /// Colors under this view move through a spring when they change.
+    Animated(crate::anim::Spring),
     /// Declares a key context active while this view is mounted.
     KeyContext(&'static str),
 
@@ -156,6 +158,10 @@ impl Modifier {
             Modifier::ScrollTarget(id) => format!(" [.scrollTarget({id:?})]"),
             Modifier::AutoFocus => " [.autoFocus()]".into(),
             Modifier::Shadow(radius, color) => format!(" [.shadow(radius: {radius}, {color})]"),
+            Modifier::Animated(spec) => format!(
+                " [.animated(response: {}, damping: {})]",
+                spec.response, spec.damping
+            ),
             Modifier::KeyContext(name) => format!(" [.keyContext({name})]"),
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
@@ -204,6 +210,11 @@ fn rewrite_scroll_node(
             props,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
+        LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
+            key,
+            spec,
+            child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
         LayoutNode::Padding { edges, child } => LayoutNode::Padding {
             edges,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
@@ -235,6 +246,11 @@ fn rewrite_field_node(
         }
         LayoutNode::Styled { props, child } => LayoutNode::Styled {
             props,
+            child: Box::new(rewrite_field_node(*child, rewrite)),
+        },
+        LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
+            key,
+            spec,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
         LayoutNode::Padding { edges, child } => LayoutNode::Padding {
@@ -270,6 +286,11 @@ fn rewrite_text_node(
         }
         LayoutNode::Styled { props, child } => LayoutNode::Styled {
             props,
+            child: Box::new(rewrite_text_node(*child, rewrite)),
+        },
+        LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
+            key,
+            spec,
             child: Box::new(rewrite_text_node(*child, rewrite)),
         },
         other => other,
@@ -484,6 +505,19 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     child,
                 })
             }),
+            Modifier::Animated(spec) => {
+                // the key is captured NOW, at render — the cursor is
+                // gone by place time. Sibling views sit in distinct
+                // tuple scopes; two `.animated` stacked on one view
+                // share the key and the outer spec wins (documented).
+                let key = motor::identity::cursor_scope().map(Rc::from);
+                let spec = *spec;
+                out.wrap_last_layout(|node| LayoutNode::Animated {
+                    key,
+                    spec,
+                    child: Box::new(node),
+                });
+            }
             Modifier::AutoFocus => out.wrap_last_layout(|node| {
                 rewrite_field_node(node, &|path, content, placeholder| LayoutNode::Field {
                     path,

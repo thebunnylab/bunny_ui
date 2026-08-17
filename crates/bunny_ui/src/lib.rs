@@ -38,6 +38,7 @@
 #![forbid(unsafe_code)]
 
 pub mod action;
+pub mod anim;
 pub mod effects;
 pub mod erased;
 pub mod ext;
@@ -89,6 +90,7 @@ macro_rules! zstack {
 
 pub mod prelude {
     pub use crate::action::{ActionId, Key, KeyPattern};
+    pub use crate::anim::Spring;
     pub use crate::erased::{CustomModifier, Erased, erased};
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
@@ -404,6 +406,130 @@ mod tests {
         let incremental = runtime.render(&duo);
         let full = runtime.render_full(&duo);
         assert_eq!(incremental, full);
+    }
+
+    #[test]
+    fn animated_colors_move_then_snap_and_the_skip_reconverges() {
+        use crate::anim::Spring;
+        use crate::layout::Color;
+
+        const OFF: Color = Color { r: 40, g: 40, b: 200, a: 255 };
+        const ON: Color = Color { r: 200, g: 40, b: 40, a: 255 };
+
+        #[derive(Clone, Copy)]
+        struct Chip {
+            on: State<bool>,
+        }
+
+        impl Component for Chip {
+            fn body(self, _ctx: &Context) -> impl View {
+                let color = if self.on.get() { ON } else { OFF };
+                text("chip").background_color(color).animated(Spring::smooth())
+            }
+        }
+
+        // the control: the same scene, never animated — the oracle for
+        // both endpoints of the motion
+        #[derive(Clone, Copy)]
+        struct Plain {
+            on: State<bool>,
+        }
+
+        impl Component for Plain {
+            fn body(self, _ctx: &Context) -> impl View {
+                let color = if self.on.get() { ON } else { OFF };
+                text("chip").background_color(color)
+            }
+        }
+
+        let size = crate::layout::Size { width: 120.0, height: 40.0 };
+        let fill_of = |display: &crate::layout::DisplayList| {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::FillRect { color, .. } => Some(*color),
+                    _ => None,
+                })
+                .expect("the chip paints a background")
+        };
+
+        let chip = Chip { on: State::new(false) };
+        let runtime = Runtime::new();
+        // mount seeds silently: the animated frame IS the plain frame
+        let mounted = runtime.display_frame(&chip, size);
+        assert_eq!(fill_of(&mounted), OFF, "first appearance does not animate");
+        assert!(!runtime.wants_frame());
+
+        // the state flips: the same frame still paints the OLD color —
+        // motion starts on the next tick, not with a jump
+        chip.on.set(true);
+        let flipped = runtime.display_frame(&chip, size);
+        assert_eq!(fill_of(&flipped), OFF, "the flip frame holds the start value");
+        assert!(runtime.wants_frame(), "the spring is armed");
+
+        // one tick: the color is in flight, strictly between the ends
+        assert!(runtime.tick(1.0 / 120.0));
+        let moving = fill_of(&runtime.animation_frame(&chip, size));
+        assert_ne!(moving, OFF);
+        assert_ne!(moving, ON);
+
+        // run it dry: bounded, and the settle SNAPS bit-exact
+        let mut guard = 0;
+        while runtime.wants_frame() && guard < 600 {
+            runtime.tick(1.0 / 120.0);
+            let _ = runtime.animation_frame(&chip, size);
+            guard += 1;
+        }
+        assert!(guard < 600, "the spring settles");
+        let settled = runtime.animation_frame(&chip, size);
+
+        let plain = Plain { on: State::new(true) };
+        let control = Runtime::new();
+        let target = control.display_frame(&plain, size);
+        assert_eq!(
+            settled.as_slice(),
+            target.as_slice(),
+            "a finished animation repaints byte-for-byte the plain frame — the skip reconverges"
+        );
+    }
+
+    #[test]
+    fn reduce_motion_completes_instantly() {
+        use crate::anim::Spring;
+        use crate::layout::Color;
+
+        const OFF: Color = Color { r: 40, g: 40, b: 200, a: 255 };
+        const ON: Color = Color { r: 200, g: 40, b: 40, a: 255 };
+
+        #[derive(Clone, Copy)]
+        struct Chip {
+            on: State<bool>,
+        }
+
+        impl Component for Chip {
+            fn body(self, _ctx: &Context) -> impl View {
+                let color = if self.on.get() { ON } else { OFF };
+                text("chip").background_color(color).animated(Spring::smooth())
+            }
+        }
+
+        let size = crate::layout::Size { width: 120.0, height: 40.0 };
+        let chip = Chip { on: State::new(false) };
+        let runtime = Runtime::new();
+        runtime.set_reduce_motion(true);
+        let _ = runtime.display_frame(&chip, size);
+        chip.on.set(true);
+        let flipped = runtime.display_frame(&chip, size);
+        let fill = flipped
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::FillRect { color, .. } => Some(*color),
+                _ => None,
+            })
+            .expect("the chip paints a background");
+        assert_eq!(fill, ON, "reduce motion jumps to the target");
+        assert!(!runtime.wants_frame());
+        assert!(!runtime.tick(1.0 / 120.0));
     }
 
     #[test]

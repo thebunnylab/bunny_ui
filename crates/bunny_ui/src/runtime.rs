@@ -98,6 +98,9 @@ pub struct Runtime {
     /// Fields whose `.auto_focus()` already fired — first appearance
     /// only; a user blur is final.
     auto_focused: RefCell<std::collections::HashSet<String>>,
+    /// The retained animations — springs keyed by identity, resolved
+    /// at place through the env, advanced by the shell's tick.
+    animator: RefCell<crate::anim::Animator>,
     /// Did the last pass see the root become ONE boundary
     /// (`Boundary`/ref)? Only then can the stable frame synthesize the
     /// reference without a pass — a boundary-less root comes fresh
@@ -152,6 +155,7 @@ impl Runtime {
             scoped_keymap: RefCell::new(HashMap::default()),
             scroll_targets: RefCell::new(HashMap::default()),
             auto_focused: RefCell::new(std::collections::HashSet::default()),
+            animator: RefCell::new(crate::anim::Animator::default()),
             root_is_boundary: Cell::new(false),
             printless: Cell::new(false),
         }
@@ -558,17 +562,21 @@ impl Runtime {
     /// Advances the retained animations by `dt` seconds. `true` = a
     /// value moved and the frame must repaint. With nothing animating
     /// the call is free — the shell pauses its frame driver while this
-    /// stays false. The springs arrive in the next phase; the plumbing
-    /// contract is already final.
+    /// stays false.
     pub fn tick(&self, dt: f64) -> bool {
-        let _ = dt;
-        false
+        self.animator.borrow_mut().tick(dt)
     }
 
     /// Does any animation still want a next frame? The shell syncs its
     /// frame driver (display link, rAF) with this after every present.
     pub fn wants_frame(&self) -> bool {
-        false
+        self.animator.borrow().wants_frame()
+    }
+
+    /// Accessibility: on, every animation completes instantly. The
+    /// shell mirrors the system setting; an app may also set it.
+    pub fn set_reduce_motion(&self, on: bool) {
+        self.animator.borrow_mut().set_reduce_motion(on);
     }
 
     /// The frame a TICK drives: layout only — no settle, no effect
@@ -767,6 +775,8 @@ impl Runtime {
                 scroll_offsets: &offsets,
                 font: FontSpec::DEFAULT,
                 stamp,
+                animator: Some(&self.animator),
+                anim: None,
             },
         );
         drop(offsets);

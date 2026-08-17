@@ -189,6 +189,17 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.animated(Spring::smooth())` — colors under this view move
+    /// through the spring when they change (state, hover) instead of
+    /// jumping. Put it AFTER the props it animates; the nearest styled
+    /// below consumes the scope.
+    fn animated(self, spring: crate::anim::Spring) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Animated(spring),
+        }
+    }
+
     /// `.foregroundColor(.secondary)` — inherited by the text below.
     fn foreground_color(self, color: Color) -> Modified<Self> {
         Modified {
