@@ -16,6 +16,8 @@ fn matches(dir: &str, name: &str, needle: &str) -> bool {
 struct Finder {
     query: State<String>,
     selected: State<usize>,
+    /// A second click on the selected row opens its details popover.
+    details: State<bool>,
     visible: State<Rc<Vec<usize>>>,
     files: Rc<Vec<(Rc<str>, Rc<str>)>>,
     /// Built ONCE (hash + registration happen per identity, never per
@@ -29,6 +31,7 @@ impl Component for Finder {
         let visible = self.visible.get();
         let count = visible.len();
         let selected = self.selected;
+        let details = self.details;
         let selected_index = selected.get().min(count.saturating_sub(1));
         let id_files = Rc::clone(&files);
         let id_visible = Rc::clone(&visible);
@@ -53,7 +56,8 @@ impl Component for Finder {
                 move |row| {
                     let (name, dir) = &files[visible[row]];
                     let on = row == selected_index;
-                    hstack!(
+                    let details = details;
+                    let base = hstack!(
                         text(name.clone()).foreground_color(theme::fg()),
                         text(dir.clone())
                             .monospaced()
@@ -69,7 +73,24 @@ impl Component for Finder {
                     .background_color(if on { theme::row_pressed() } else { CLEAR })
                     .background_hovered(theme::row_hover())
                     .animated(Spring::snappy())
-                    .on_click(move || selected.set(row))
+                    // first click selects; a second click on the
+                    // selected row opens its details popover
+                    .on_click(move || {
+                        if on {
+                            details.set(true);
+                        } else {
+                            selected.set(row);
+                        }
+                    });
+                    if on {
+                        let name = name.clone();
+                        let dir = dir.clone();
+                        erased(base.popover(details.binding(), Side::Trailing, move |_| {
+                            details_card(name.clone(), dir.clone())
+                        }))
+                    } else {
+                        erased(base)
+                    }
                 },
             )
             .reveal(selected_index),
@@ -106,6 +127,28 @@ impl Component for Finder {
 }
 
 const CLEAR: Color = Color { r: 0, g: 0, b: 0, a: 0 };
+
+/// The details popover — the same card chrome on every rendering (and
+/// on the mac, its own little window past the edge).
+fn details_card(name: Rc<str>, dir: Rc<str>) -> Erased {
+    erased(
+        vstack!(
+            text(name.clone()).bold(),
+            text(format!("{dir}{name}"))
+                .monospaced()
+                .foreground_color(theme::fg_secondary()),
+            text("press escape or click outside to close")
+                .foreground_color(theme::placeholder()),
+        )
+        .alignment(HorizontalAlignment::Leading)
+        .spacing(6.0)
+        .padding_length(12.0)
+        .background_color(theme::panel())
+        .corner_radius(10.0)
+        .border(theme::border(), 1.0)
+        .shadow(24.0),
+    )
+}
 
 // MARK: - The logo, a png written by hand
 
@@ -217,6 +260,7 @@ fn finder() -> Finder {
     Finder {
         query: State::new(String::new()),
         selected: State::new(0),
+        details: State::new(false),
         visible: State::new(Rc::new((0..10_000).collect())),
         files,
         logo: logo(),

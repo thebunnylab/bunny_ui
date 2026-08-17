@@ -1603,6 +1603,72 @@ mod tests {
         );
     }
 
+    // MARK: - Popovers (the portal)
+
+    #[derive(Clone)]
+    struct Popped {
+        open: State<bool>,
+    }
+
+    impl Component for Popped {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::vstack!(
+                text("base"),
+                text("anchor").popover(self.open.binding(), crate::layout::Side::Bottom, |_| {
+                    erased(text("tip").background_color(Color::hex(0x334455)))
+                }),
+            )
+        }
+    }
+
+    #[test]
+    fn a_popover_mounts_under_the_root_and_unmounts_clean() {
+        let runtime = Runtime::new();
+        let view = Popped { open: State::new(false) };
+        let size = Size { width: 200.0, height: 120.0 };
+        let mounted: Vec<u32> = runtime
+            .dom_frame(&view, size)
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Create { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+
+        // opening mounts the popover as a child of the ROOT — the
+        // portal: outside every scroll element, last in paint order —
+        // and never touches the siblings that were already there
+        view.open.set(true);
+        let patches = runtime.dom_frame(&view, size);
+        let top_level: Vec<(u32, u32)> = patches
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Create { id, parent, .. } => Some((*id, *parent)),
+                _ => None,
+            })
+            .collect();
+        assert!(!top_level.is_empty(), "the popover mounted: {patches:?}");
+        assert_eq!(top_level[0].1, 0, "the first created node hangs off the root");
+        let fresh: Vec<u32> = top_level.iter().map(|(id, _)| *id).collect();
+        for patch in &patches {
+            assert!(
+                !mounted.contains(&patch_id(patch)) || fresh.contains(&patch_id(patch)),
+                "an old sibling moved on open: {patch:?}"
+            );
+        }
+
+        // closing removes the subtree and, again, nothing else
+        view.open.set(false);
+        let patches = runtime.dom_frame(&view, size);
+        assert!(
+            patches
+                .iter()
+                .all(|patch| matches!(patch, DomPatch::Remove { id } if fresh.contains(id))),
+            "closing is removal only: {patches:?}"
+        );
+        assert!(!patches.is_empty());
+    }
+
     #[test]
     fn the_image_encoding_is_byte_stable() {
         let bytes = encode(&[DomPatch::SetImage {

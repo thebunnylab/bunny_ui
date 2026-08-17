@@ -469,5 +469,10 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
       const [x, y] = point(event);
       wasm.bunny_pointer_up(x, y);
     });
+    // the browser owns typing in this mode; Escape is the engine's —
+    // it dismisses the open popover through the keymap
+    window.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") wasm.bunny_key(7, 0);
+    });
   },
 );

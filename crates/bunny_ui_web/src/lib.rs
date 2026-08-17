@@ -158,6 +158,16 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 }
             }
             Event::Key(code, shift) => {
+                // the keymap first — the mac gate's order: Escape with
+                // a popover open dismisses; without one it blurs below
+                if code == 7
+                    && let Some(action) =
+                        runtime.match_key(&KeyPattern::key(bunny_ui::action::Key::Escape))
+                    && runtime.dispatch_action(action)
+                {
+                    present(&runtime, &full, size, scale, &mut surface);
+                    return;
+                }
                 let edit = match code {
                     1 => Some(EditCommand::Backspace),
                     2 => Some(EditCommand::Delete),
@@ -271,8 +281,18 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
                 // the <img> elements themselves paint on their own
                 present(&runtime, runtime.dom_frame(&root, size), scale);
             }
-            // hover, wheel, keys and ticks belong to the browser in
-            // this mode — nothing to do on our side of the border
+            Event::Key(7, _) => {
+                // the browser owns editing here; Escape is the
+                // keymap's business — a popover dismisses through it
+                if let Some(action) =
+                    runtime.match_key(&KeyPattern::key(bunny_ui::action::Key::Escape))
+                    && runtime.dispatch_action(action)
+                {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
+            // hover, wheel, other keys and ticks belong to the browser
+            // in this mode — nothing to do on our side of the border
             _ => {}
         }
     });
