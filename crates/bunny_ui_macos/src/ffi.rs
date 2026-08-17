@@ -179,12 +179,12 @@ unsafe extern "C" {
     pub(crate) fn CFRelease(cf: *const c_void);
 }
 
-unsafe fn class(name: &str) -> Id {
+pub(crate) unsafe fn class(name: &str) -> Id {
     let name = CString::new(name).expect("class name without NUL");
     unsafe { objc_getClass(name.as_ptr()) }
 }
 
-unsafe fn sel(name: &str) -> Sel {
+pub(crate) unsafe fn sel(name: &str) -> Sel {
     let name = CString::new(name).expect("selector without NUL");
     unsafe { sel_registerName(name.as_ptr()) }
 }
@@ -924,6 +924,16 @@ pub fn create_window(title: &str, width: f64, height: f64) -> WindowHandle {
         // the event view becomes the content view, with its own layer
         let view = msg_id(class("BunnyView"), sel("alloc"));
         let view = msg_init_rect(view, sel("initWithFrame:"), rect);
+        // the GPU graft goes BEFORE setWantsLayer: — a layer set first
+        // makes the view layer-HOSTING (drawRect: never runs) and the
+        // window presents by Metal; otherwise today's layer-backed CPU
+        // path, byte for byte
+        let _ = crate::metal::try_install(
+            view,
+            msg_f64(window, sel("backingScaleFactor")),
+            width,
+            height,
+        );
         msg_void_bool(view, sel("setWantsLayer:"), 1);
         msg_void_id(window, sel("setContentView:"), view);
 

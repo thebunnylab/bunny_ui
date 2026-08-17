@@ -8,6 +8,7 @@
 #![cfg(target_os = "macos")]
 
 mod ffi;
+mod metal;
 mod text;
 
 use std::cell::RefCell;
@@ -19,6 +20,7 @@ use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
+pub use metal::OffscreenGpu;
 pub use text::CoreTextEngine;
 
 /// AppKit keyCode → the keymap vocabulary. Named keys come from the
@@ -89,33 +91,38 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
             let canvas = bunny_ui::theme::canvas();
             let physical = ((width.round() as usize) * scale, (height.round() as usize) * scale);
             let display = runtime.display_frame(root, Size { width, height });
-            let mut slot = surface.borrow_mut();
-            let stale = match &*slot {
-                Some((retained, retained_scale, retained_canvas)) => {
-                    retained.bitmap().width() != physical.0
-                        || retained.bitmap().height() != physical.1
-                        || *retained_scale != scale
-                        || *retained_canvas != canvas
+            if metal::active() {
+                // GPU present: the same display list, no Surface in the
+                // path — the drawable is the frame
+                metal::present_window(&display, Size { width, height }, scale, canvas);
+            } else {
+                let mut slot = surface.borrow_mut();
+                let stale = match &*slot {
+                    Some((retained, retained_scale, retained_canvas)) => {
+                        retained.bitmap().width() != physical.0
+                            || retained.bitmap().height() != physical.1
+                            || *retained_scale != scale
+                            || *retained_canvas != canvas
+                    }
+                    None => true,
+                };
+                if stale {
+                    *slot = Some((
+                        bunny_ui::raster::Surface::new(physical.0, physical.1, scale, canvas),
+                        scale,
+                        canvas,
+                    ));
                 }
-                None => true,
-            };
-            if stale {
-                *slot = Some((
-                    bunny_ui::raster::Surface::new(physical.0, physical.1, scale, canvas),
-                    scale,
-                    canvas,
-                ));
+                let (retained, _, _) = slot.as_mut().expect("surface for the frame");
+                let damage = retained.frame(display, &*runtime.text());
+                if !damage.is_empty() {
+                    // present only the wounds: damage-only mirror sync +
+                    // damage-only backing copy + dirty-rect redraw
+                    let (width, height) =
+                        (retained.bitmap().width(), retained.bitmap().height());
+                    window.blit_partial(width, height, retained.rgba(), &damage);
+                }
             }
-            let (retained, _, _) = slot.as_mut().expect("surface for the frame");
-            let damage = retained.frame(display, &*runtime.text());
-            if !damage.is_empty() {
-                // present only the wounds: damage-only mirror sync +
-                // damage-only backing copy + dirty-rect redraw
-                let (width, height) =
-                    (retained.bitmap().width(), retained.bitmap().height());
-                window.blit_partial(width, height, retained.rgba(), &damage);
-            }
-            drop(slot);
         window.set_cursor_pointing(runtime.interaction().hovered.is_some());
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;
