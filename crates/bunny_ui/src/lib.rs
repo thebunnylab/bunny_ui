@@ -495,6 +495,56 @@ mod tests {
     }
 
     #[test]
+    fn dead_identities_release_their_input_state() {
+        #[derive(Clone, Copy)]
+        struct Swap {
+            editing: State<bool>,
+            value: State<String>,
+        }
+
+        impl Component for Swap {
+            fn body(self, _ctx: &Context) -> impl View {
+                if self.editing.get() {
+                    Either::First(
+                        list(
+                            vec![1],
+                            |row| format!("row{row}"),
+                            move |_| text_field("type…", self.value.binding()),
+                        ),
+                    )
+                } else {
+                    Either::Second(text("plain"))
+                }
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        let swap = Swap { editing: State::new(true), value: State::new("hi".into()) };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&swap, size);
+        let field = runtime
+            .layout(&swap, crate::layout::Proposal::exact(size))
+            .fields
+            .first()
+            .expect("field placed")
+            .clone();
+        runtime.focus(&field.path);
+        assert!(runtime.focused().is_some());
+        // the list retains a scroll offset at its region site
+        runtime.set_scroll_offset("Swap/@First", crate::layout::Point { x: 0.0, y: 3.0 });
+
+        // the arm swaps: the field's identity dies — focus and caret go
+        swap.editing.set(false);
+        let _ = runtime.display_frame(&swap, size);
+        assert_eq!(runtime.focused(), None, "a dead field cannot own the keyboard");
+
+        // the offset SURVIVES the unmount: remounting restores it
+        swap.editing.set(true);
+        let _ = runtime.display_frame(&swap, size);
+        assert_eq!(runtime.scroll_offset("Swap/@First").y, 3.0);
+    }
+
+    #[test]
     fn the_input_system_reads_indices_and_rects_from_the_live_field() {
         #[derive(Clone, Copy)]
         struct Form {

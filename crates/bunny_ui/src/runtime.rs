@@ -64,9 +64,10 @@ pub struct Runtime {
     cache: MeasureCache,
     /// Scroll offsets by identity — engine-owned (the premise's dual
     /// ownership: on the DOM the backend will own them and we will
-    /// observe). Not pruned when the identity goes away: a remounted
-    /// list RESTORES the position (GC tied to the sweep is noted as
-    /// future work).
+    /// observe). DELIBERATELY not pruned when the identity goes away:
+    /// a remounted list RESTORES the position, and the map is bounded
+    /// by region SITES, never by rows. The other input maps (carets,
+    /// targets, auto-focus) release on the sweep.
     scroll_offsets: RefCell<HashMap<String, Point>>,
     /// The scroll regions of the last layout — the wheel map.
     last_scrolls: RefCell<Vec<ScrollRegion>>,
@@ -225,6 +226,9 @@ impl Runtime {
             reconciler::assemble_editors(pass_root);
             reconciler::assemble_handlers(pass_root);
             reconciler::assemble_contexts(pass_root);
+            // with the editors of THIS pass assembled, dead fields
+            // release their carets, auto-focus memory and the focus
+            self.release_dead_input();
             motor::identity::consume_dirty(pass_root, &snapshot);
             *self.last_root.borrow_mut() = Some(pass_root.clone());
         }
@@ -824,6 +828,26 @@ impl Runtime {
         any
     }
 
+    /// A dead field releases its input state. The EDITOR map is the
+    /// truth: fields re-register on every pass they exist, so a caret,
+    /// an auto-focus memory or the focus itself whose path has no
+    /// editor belongs to an unmounted field. (The identity sweeps
+    /// cannot see these — a field row owns no state and is no
+    /// component boundary.) A remounted field's `.auto_focus()` fires
+    /// again: the identity is genuinely new, deliberately.
+    fn release_dead_input(&self) {
+        self.carets.borrow_mut().retain(|path, _| reconciler::has_editor(path));
+        self.auto_focused.borrow_mut().retain(|path| reconciler::has_editor(path));
+        let focus_died = self
+            .focus
+            .borrow()
+            .as_deref()
+            .is_some_and(|path| !reconciler::has_editor(path));
+        if focus_died {
+            *self.focus.borrow_mut() = None;
+        }
+    }
+
     /// Focuses the first `.auto_focus()` field never seen before — once
     /// per identity: blur is final, remounting does not re-focus.
     fn apply_auto_focus(&self, result: &crate::layout::LayoutResult) -> bool {
@@ -917,6 +941,11 @@ impl Runtime {
         *self.last_hits.borrow_mut() = result.hits.clone();
         *self.last_scrolls.borrow_mut() = result.scrolls.clone();
         *self.last_fields.borrow_mut() = result.fields.clone();
+        // an applied-target memory whose region left the scene goes
+        // with it — live regions keep theirs (the wheel stays sovereign)
+        self.scroll_targets
+            .borrow_mut()
+            .retain(|path, _| result.scrolls.iter().any(|region| region.path == *path));
         result
     }
 
