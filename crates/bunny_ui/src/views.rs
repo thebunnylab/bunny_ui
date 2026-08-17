@@ -300,6 +300,8 @@ pub fn empty() -> EmptyView {
 }
 
 /// `Image(uiImage: …)` — holds the formatted description, like the engine.
+/// The layout node carries NO source: it measures the classic rigid
+/// 40×40 and paints the outline box (print parity holds byte for byte).
 #[derive(Clone)]
 pub struct ImageUiImage(pub String);
 
@@ -308,14 +310,42 @@ impl View for ImageUiImage {
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
         out.push(RenderNode::leaf(format!("Image ({})", self.0)));
-        out.push_layout(LayoutNode::Leaf {
-            size: LayoutSize { width: 40.0, height: 40.0 },
-        });
+        out.push_layout(LayoutNode::Image { source: None, resizable: false, fit: None });
     }
 }
 
 pub fn image_ui<T: Debug>(image: T) -> ImageUiImage {
     ImageUiImage(format!("{image:?}"))
+}
+
+/// An image with real pixels. The platform decodes and resamples; the
+/// layout owns geometry. Draws at the intrinsic size (1 pixel = 1
+/// point) until `.resizable()` lets it negotiate — then
+/// `.aspect_ratio(ContentMode::Fit)` contains and `Fill` covers with a
+/// built-in clip.
+///
+/// ```ignore
+/// image(ImageSource::from_bytes(LOGO)).resizable().aspect_ratio(ContentMode::Fit)
+/// image(file_icon(path)).resizable().frame(16.0, 16.0)
+/// ```
+#[derive(Clone)]
+pub struct Image(pub crate::image_engine::ImageSource);
+
+impl View for Image {
+    type Arity = Single;
+
+    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
+        out.push(RenderNode::leaf(format!("Image ({:?})", self.0)));
+        out.push_layout(LayoutNode::Image {
+            source: Some(self.0.clone()),
+            resizable: false,
+            fit: None,
+        });
+    }
+}
+
+pub fn image(source: crate::image_engine::ImageSource) -> Image {
+    Image(source)
 }
 
 // MARK: - Containers

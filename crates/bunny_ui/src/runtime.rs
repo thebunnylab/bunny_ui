@@ -21,6 +21,7 @@ use crate::action::{ActionId, KeyPattern};
 use crate::effects;
 use crate::layout::{FieldPlacement, Interaction, LayoutEnv, Point, Px, Rect, ScrollRegion};
 use crate::reconciler;
+use crate::image_engine::{ImageEngine, RawImages};
 use crate::text_engine::{FontSpec, MeasureCache, PixelFont, TextEngine, caret_from_x};
 use crate::text_input::{CaretState, EditCommand};
 use crate::view::{NodeList, View};
@@ -60,6 +61,10 @@ pub struct Runtime {
     /// The text edge of the frame — PixelFont by default (headless,
     /// byte-stable); the shell installs the platform engine.
     text: Rc<dyn TextEngine>,
+    /// The image edge — RawImages by default (the house raw format +
+    /// deterministic file-icon checkers); the shell installs the
+    /// platform decoder.
+    images: Rc<dyn ImageEngine>,
     /// Double-buffered measure cache, swapped on every layout pass.
     cache: MeasureCache,
     /// Scroll offsets by identity — engine-owned (the premise's dual
@@ -145,6 +150,18 @@ impl Runtime {
         self
     }
 
+    /// Swaps the image engine (builder, mirror of [`Self::text_engine`]).
+    pub fn image_engine(mut self, engine: Rc<dyn ImageEngine>) -> Self {
+        self.images = engine;
+        self
+    }
+
+    /// The frame's image edge — the shell hands it to its presenters
+    /// (the GPU atlas and the CPU surface resolve pixels through it).
+    pub fn images(&self) -> Rc<dyn ImageEngine> {
+        Rc::clone(&self.images)
+    }
+
     fn with_parts(ctx: Context, text: Rc<dyn TextEngine>) -> Self {
         Runtime {
             ctx,
@@ -152,6 +169,7 @@ impl Runtime {
             last_hits: RefCell::new(Vec::new()),
             interaction: RefCell::new(Interaction::default()),
             text,
+            images: Rc::new(RawImages::default()),
             cache: MeasureCache::default(),
             scroll_offsets: RefCell::new(HashMap::default()),
             last_scrolls: RefCell::new(Vec::new()),
@@ -652,6 +670,7 @@ impl Runtime {
             scale,
             background,
             &*self.text,
+            &*self.images,
         )
     }
 
@@ -776,6 +795,7 @@ impl Runtime {
                     scale,
                     crate::layout::Color::rgba(0, 0, 0, 0),
                     &*self.text,
+                    &*self.images,
                 );
                 crate::dom::IslandFrame {
                     id,
@@ -1053,6 +1073,7 @@ impl Runtime {
         let offsets = self.scroll_offsets.borrow();
         let env = LayoutEnv {
             text: &*self.text,
+            images: &*self.images,
             cache: &self.cache,
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
@@ -1110,6 +1131,7 @@ impl Runtime {
             scale,
             crate::layout::Color::WHITE,
             &*self.text,
+            &*self.images,
         )
     }
 

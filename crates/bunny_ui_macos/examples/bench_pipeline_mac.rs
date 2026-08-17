@@ -423,7 +423,7 @@ fn main() {
     let laid_out = runtime.layout(&finder, viewport);
     reports.push(measure("raster 1520×1280 @2x (paint)", 3, 60, || {
         let bitmap =
-            rasterize_with(&laid_out.display, 1520, 1280, 2, Color::CANVAS, &*engine);
+            rasterize_with(&laid_out.display, 1520, 1280, 2, Color::CANVAS, &*engine, &RawImages::default());
         std::hint::black_box(bitmap.width());
     }));
 
@@ -431,14 +431,14 @@ fn main() {
     // only the damage — the full frame above is the ceiling it beats
     use bunny_ui::raster::Surface;
     let mut surface = Surface::new(1520, 1280, 2, Color::CANVAS);
-    surface.frame(runtime.layout(&finder, viewport).display, &*engine);
+    surface.frame(runtime.layout(&finder, viewport).display, &*engine, &RawImages::default());
     let row = runtime.layout(&finder, viewport).hits.get(1).expect("row").1;
     let mut inside = true;
     reports.push(measure("hover repaint (damage)", 3, 200, || {
         let y = row.origin.y + row.size.height / 2.0;
         runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 });
         inside = !inside;
-        let damage = surface.frame(runtime.layout(&finder, viewport).display, &*engine);
+        let damage = surface.frame(runtime.layout(&finder, viewport).display, &*engine, &RawImages::default());
         std::hint::black_box(damage.len());
     }));
     let mut forward = true;
@@ -450,7 +450,7 @@ fn main() {
         }
         forward = !forward;
         runtime.settle(&finder);
-        let damage = surface.frame(runtime.layout(&finder, viewport).display, &*engine);
+        let damage = surface.frame(runtime.layout(&finder, viewport).display, &*engine, &RawImages::default());
         std::hint::black_box(damage.len());
     }));
 
@@ -461,7 +461,7 @@ fn main() {
         let y = row.origin.y + row.size.height / 2.0;
         runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 });
         inside = !inside;
-        surface.frame(runtime.layout(&finder, viewport).display, &*engine);
+        surface.frame(runtime.layout(&finder, viewport).display, &*engine, &RawImages::default());
         std::hint::black_box(surface.rgba().len());
     }));
     // the OLD presentation cost, for the record: full byte conversion
@@ -472,6 +472,7 @@ fn main() {
         2,
         Color::CANVAS,
         &*engine,
+        &RawImages::default(),
     );
     reports.push(measure("full rgba conversion (old blit)", 3, 60, || {
         std::hint::black_box(bitmap.to_rgba_bytes().len());
@@ -573,7 +574,7 @@ fn main() {
     let editor_layout = runtime.layout(&finder, editor);
     reports.push(measure("raster 6048×3928 @2x (paint)", 3, 20, || {
         let bitmap =
-            rasterize_with(&editor_layout.display, 6048, 3928, 2, Color::CANVAS, &*engine);
+            rasterize_with(&editor_layout.display, 6048, 3928, 2, Color::CANVAS, &*engine, &RawImages::default());
         std::hint::black_box(bitmap.width());
     }));
     if let Some(mut gpu) = OffscreenGpu::new(6048, 3928) {

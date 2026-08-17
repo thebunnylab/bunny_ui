@@ -43,6 +43,7 @@ pub mod dom;
 pub mod effects;
 pub mod erased;
 pub mod ext;
+pub mod image_engine;
 pub mod layout;
 pub mod modifier;
 pub mod one_of;
@@ -96,6 +97,7 @@ pub mod prelude {
     pub use crate::erased::{CustomModifier, Erased, erased};
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
+    pub use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, RawImages, file_icon};
     pub use crate::layout::{Color, Rendering, Truncation, VisualProps};
     pub use crate::theme::{self, Theme};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
@@ -2682,7 +2684,7 @@ mod tests {
         runtime.settle(&Rows);
 
         let mut surface = Surface::new(120, 80, 1, Color::CANVAS);
-        let first = surface.frame(runtime.layout(&Rows, viewport).display, &PixelFont);
+        let first = surface.frame(runtime.layout(&Rows, viewport).display, &PixelFont, &RawImages::default());
         assert_eq!(first, vec![(0, 0, 120, 80)], "first frame damages everything");
 
         // hover the second row: the frame through the REAL pipeline
@@ -2697,7 +2699,7 @@ mod tests {
         runtime.pointer_moved(target.origin.x + 4.0, target.origin.y + 4.0);
         let result = runtime.layout(&Rows, viewport);
         let oracle = rasterize_scaled(&result.display, 120, 80, 1, Color::CANVAS);
-        let damage = surface.frame(result.display, &PixelFont);
+        let damage = surface.frame(result.display, &PixelFont, &RawImages::default());
 
         assert_eq!(surface.bitmap().pixels(), oracle.pixels(), "golden: incremental == full");
         assert_eq!(damage.len(), 1, "one row hovered, one rect: {damage:?}");
@@ -2707,5 +2709,100 @@ mod tests {
             row_height <= target.size.height + 4.0,
             "damage is row-sized ({row_height}px tall), not the window"
         );
+    }
+
+    // MARK: - Images
+
+    #[test]
+    fn the_image_measure_table_holds() {
+        use crate::layout::{LayoutNode, Proposal, Size, layout};
+        let wide = ImageSource::from_bytes(RawImages::encode(4, 2, &[255u8; 32]));
+        let node = |resizable: bool, fit: Option<ContentMode>| LayoutNode::Image {
+            source: Some(wide.clone()),
+            resizable,
+            fit,
+        };
+        let size = |node: &LayoutNode, width: Option<f64>, height: Option<f64>| {
+            layout(node, Proposal { width, height }).size
+        };
+
+        // rigid: the intrinsic size, 1 pixel = 1 point, proposal ignored
+        assert_eq!(
+            size(&node(false, None), Some(100.0), Some(100.0)),
+            Size { width: 4.0, height: 2.0 }
+        );
+        // resizable stretches to the box; an open axis stays intrinsic
+        assert_eq!(
+            size(&node(true, None), Some(100.0), Some(50.0)),
+            Size { width: 100.0, height: 50.0 }
+        );
+        assert_eq!(
+            size(&node(true, None), Some(100.0), None),
+            Size { width: 100.0, height: 2.0 }
+        );
+        // Fit contains, keeping the ratio; an open axis derives
+        assert_eq!(
+            size(&node(true, Some(ContentMode::Fit)), Some(100.0), Some(100.0)),
+            Size { width: 100.0, height: 50.0 }
+        );
+        assert_eq!(
+            size(&node(true, Some(ContentMode::Fit)), Some(100.0), None),
+            Size { width: 100.0, height: 50.0 }
+        );
+        assert_eq!(
+            size(&node(true, Some(ContentMode::Fit)), None, None),
+            Size { width: 4.0, height: 2.0 }
+        );
+        // Fill answers the box exactly (the paint covers and clips)
+        assert_eq!(
+            size(&node(true, Some(ContentMode::Fill)), Some(60.0), Some(60.0)),
+            Size { width: 60.0, height: 60.0 }
+        );
+        // undecoded measures zero on every path — reflow on ready
+        let broken = ImageSource::from_bytes(&b"junk"[..]);
+        let pending =
+            LayoutNode::Image { source: Some(broken), resizable: true, fit: Some(ContentMode::Fit) };
+        assert_eq!(size(&pending, Some(100.0), Some(100.0)), Size::default());
+        // the stub keeps the classic rigid box
+        let stub = LayoutNode::Image { source: None, resizable: false, fit: None };
+        assert_eq!(
+            size(&stub, Some(100.0), Some(100.0)),
+            Size { width: 40.0, height: 40.0 }
+        );
+    }
+
+    #[test]
+    fn a_fill_image_covers_and_clips_inside_its_frame() {
+        use crate::layout::{DrawCommand, LayoutNode, Proposal, layout};
+        // a wide red 4×2 inside a TALL 20×40 frame: cover scales by
+        // height (×20) and spills horizontally — the built-in clip eats
+        // the spill, no `.clipped()` anywhere
+        let red: Vec<u8> = [[255u8, 0, 0, 255]; 8].concat();
+        let source = ImageSource::from_bytes(RawImages::encode(4, 2, &red));
+        let node = LayoutNode::Frame {
+            width: Some(20.0),
+            height: Some(40.0),
+            child: Box::new(LayoutNode::Image {
+                source: Some(source),
+                resizable: true,
+                fit: Some(ContentMode::Fill),
+            }),
+        };
+        let result = layout(&node, Proposal { width: Some(60.0), height: Some(40.0) });
+        let rect = result
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("the image painted");
+        assert_eq!((rect.size.width, rect.size.height), (80.0, 40.0), "cover spills: {rect:?}");
+        assert!(rect.origin.x < 0.0, "spills left of the frame: {rect:?}");
+
+        let bitmap =
+            crate::raster::rasterize_scaled(&result.display, 60, 40, 1, Color::WHITE);
+        assert_eq!(bitmap.pixel(10, 20), Some(0xFF00_00FF), "inside the frame: red");
+        assert_eq!(bitmap.pixel(30, 20), Some(0xFFFF_FFFF), "outside the frame: canvas");
     }
 }

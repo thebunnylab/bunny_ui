@@ -106,7 +106,7 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
             *surface = Some((Surface::new(physical.0, physical.1, scale, canvas), scale, canvas));
         }
         let (retained, _, _) = surface.as_mut().expect("surface for the frame");
-        let damage = retained.frame(display, &*runtime.text());
+        let damage = retained.frame(display, &*runtime.text(), &*runtime.images());
         if !damage.is_empty() || stale {
             let (width, height) = (retained.bitmap().width(), retained.bitmap().height());
             let rgba = retained.rgba();

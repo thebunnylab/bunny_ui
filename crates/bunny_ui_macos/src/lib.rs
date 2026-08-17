@@ -121,7 +121,7 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
                     ));
                 }
                 let (retained, _, _) = slot.as_mut().expect("surface for the frame");
-                let damage = retained.frame(display, &*runtime.text());
+                let damage = retained.frame(display, &*runtime.text(), &*runtime.images());
                 if !damage.is_empty() {
                     // present only the wounds: damage-only mirror sync +
                     // damage-only backing copy + dirty-rect redraw

@@ -61,6 +61,20 @@ pub enum DomKind {
     /// island's ABSOLUTE frame origin (the commands translate by it)
     /// and `display` the `[start, end)` range into the pass's list.
     Canvas { origin: (Px, Px), display: (usize, usize) },
+    /// An `<img>` — the browser fetches, decodes and paints it. The
+    /// record carries the IDENTITY; the shell's registry maps it to a
+    /// URL the browser can load.
+    Image(DomImage),
+}
+
+/// One image element. `key` is the source identity ([`crate::
+/// image_engine::ImageSource::key`]); `cover` picks `object-fit`
+/// (`false` = our frame IS the rect, the element just fills it;
+/// `true` = the browser covers-and-clips with the same centered math).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DomImage {
+    pub key: u64,
+    pub cover: bool,
 }
 
 /// The visual record of a node — everything CSS will say about it.
@@ -353,6 +367,7 @@ pub enum CreateKind {
     Scroll,
     Content,
     Canvas,
+    Image,
 }
 
 /// One island's fresh pixels — the shell blits them into the island's
@@ -382,6 +397,7 @@ pub enum DomPatch {
     SetText { id: u32, text: DomText },
     SetField { id: u32, field: DomField },
     SetScroll { id: u32, x: f64, y: f64 },
+    SetImage { id: u32, image: DomImage },
 }
 
 // MARK: - Lowering (retained scene + diff)
@@ -520,6 +536,7 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::Scroll { .. } => CreateKind::Scroll,
         DomKind::Content => CreateKind::Content,
         DomKind::Canvas { .. } => CreateKind::Canvas,
+        DomKind::Image(_) => CreateKind::Image,
     }
 }
 
@@ -559,6 +576,9 @@ fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
                     color,
                     font,
                 }
+            }
+            DrawCommand::Image { rect, source } => {
+                DrawCommand::Image { rect: shift(rect), source }
             }
             DrawCommand::PushClip { rect } => DrawCommand::PushClip { rect: shift(rect) },
             DrawCommand::PopClip => DrawCommand::PopClip,
@@ -613,6 +633,9 @@ fn create_subtree(
             patches.push(DomPatch::SetScroll { id, x: offset.0, y: offset.1 });
         }
         DomKind::Canvas { .. } => note_island(id, node, ctx),
+        DomKind::Image(image) => {
+            patches.push(DomPatch::SetImage { id, image: *image });
+        }
         _ => {}
     }
     let children = create_children(node, id, ctx, patches);
@@ -678,6 +701,9 @@ fn diff_node(
             patches.push(DomPatch::SetScroll { id, x: after.0, y: after.1 });
         }
         (_, DomKind::Canvas { .. }) => note_island(id, new, ctx),
+        (DomKind::Image(before), DomKind::Image(after)) if before != after => {
+            patches.push(DomPatch::SetImage { id, image: *after });
+        }
         _ => {}
     }
     retained.node = shallow(new);
@@ -709,12 +735,23 @@ fn diff_children(
     for (index, child) in new.children.iter().enumerate() {
         let matched = match &child.kind {
             DomKind::Group { path } => by_path.remove(path),
-            kind => by_index
-                .get_mut(index)
-                .and_then(Option::take)
-                .filter(|old| {
-                    std::mem::discriminant(&old.node.kind) == std::mem::discriminant(kind)
-                }),
+            // a kind change at the same index is remove+create — the
+            // mismatched retained goes BACK to its slot so the leftover
+            // sweep emits its remove (taking and filtering would drop
+            // it silently and leak the element on the browser's side)
+            kind => by_index.get_mut(index).and_then(|slot| match slot.take() {
+                Some(old)
+                    if std::mem::discriminant(&old.node.kind)
+                        == std::mem::discriminant(kind) =>
+                {
+                    Some(old)
+                }
+                Some(old) => {
+                    *slot = Some(old);
+                    None
+                }
+                None => None,
+            }),
         };
         match matched {
             Some(mut old) => {
@@ -743,7 +780,8 @@ fn diff_children(
 /// u32 count
 /// per patch: u8 op, u32 id, payload
 ///   1 create        u32 parent, u8 kind (0 group, 1 box, 2 text,
-///                                        3 field, 4 scroll, 5 content)
+///                                        3 field, 4 scroll, 5 content,
+///                                        6 canvas, 7 image)
 ///   2 remove        —
 ///   3 set transform f32 x, f32 y
 ///   4 set size      f32 w, f32 h
@@ -762,6 +800,8 @@ fn diff_children(
 ///                   u32 len + utf8 content, u32 len + utf8 placeholder,
 ///                   u16 len + utf8 path
 ///   8 set scroll    f32 x, f32 y
+///   9 set image     u32 key hi, u32 key lo, u8 cover — identity as a
+///                   NUMBER (the shell's registry maps key → URL)
 /// ```
 pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
     let mut out = Vec::with_capacity(patches.len() * 16 + 4);
@@ -780,6 +820,7 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
                     CreateKind::Scroll => 4,
                     CreateKind::Content => 5,
                     CreateKind::Canvas => 6,
+                    CreateKind::Image => 7,
                 });
             }
             DomPatch::Remove { id } => {
@@ -848,6 +889,13 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
                 push_u32(&mut out, *id);
                 push_f32(&mut out, *x);
                 push_f32(&mut out, *y);
+            }
+            DomPatch::SetImage { id, image } => {
+                out.push(9);
+                push_u32(&mut out, *id);
+                push_u32(&mut out, (image.key >> 32) as u32);
+                push_u32(&mut out, image.key as u32);
+                out.push(image.cover as u8);
             }
         }
     }
@@ -973,6 +1021,7 @@ mod tests {
             | DomPatch::SetStyle { id, .. }
             | DomPatch::SetText { id, .. }
             | DomPatch::SetField { id, .. }
+            | DomPatch::SetImage { id, .. }
             | DomPatch::SetScroll { id, .. } => *id,
         }
     }
@@ -1387,6 +1436,186 @@ mod tests {
             b"go",
             &[2],
             &7u32.to_le_bytes()[..],
+        ]
+        .concat();
+        assert_eq!(bytes, expected);
+    }
+
+    // MARK: - Images
+
+    fn tiny_image(seed: u8) -> ImageSource {
+        ImageSource::from_bytes(RawImages::encode(2, 2, &[seed; 16]))
+    }
+
+    #[derive(Clone)]
+    struct Gallery {
+        source: State<ImageSource>,
+    }
+
+    impl Component for Gallery {
+        fn body(self, _ctx: &Context) -> impl View {
+            image(self.source.get()).resizable().frame(24.0, 24.0)
+        }
+    }
+
+    #[test]
+    fn an_image_mounts_and_retargets_by_key() {
+        let runtime = Runtime::new();
+        let view = Gallery { source: State::new(tiny_image(10)) };
+        let size = Size { width: 100.0, height: 60.0 };
+
+        let patches = runtime.dom_frame(&view, size);
+        let creates = patches
+            .iter()
+            .filter(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Image, .. }))
+            .count();
+        assert_eq!(creates, 1, "one element for one image: {patches:?}");
+        assert!(
+            patches.iter().any(|patch| matches!(
+                patch,
+                DomPatch::SetImage { image, .. }
+                    if image.key == tiny_image(10).key() && !image.cover
+            )),
+            "the mount dresses the element with the identity: {patches:?}"
+        );
+
+        // the same source again: nothing moves
+        assert_eq!(runtime.dom_frame(&view, size), vec![]);
+
+        // a new source under the same geometry is ONE image patch
+        view.source.set(tiny_image(11));
+        let patches = runtime.dom_frame(&view, size);
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        assert!(matches!(
+            &patches[0],
+            DomPatch::SetImage { image, .. } if image.key == tiny_image(11).key()
+        ));
+    }
+
+    #[derive(Clone)]
+    struct Sized {
+        width: State<f64>,
+    }
+
+    impl Component for Sized {
+        fn body(self, _ctx: &Context) -> impl View {
+            image(tiny_image(10)).resizable().frame(self.width.get(), 24.0)
+        }
+    }
+
+    #[test]
+    fn a_resize_moves_geometry_never_the_image() {
+        let runtime = Runtime::new();
+        let view = Sized { width: State::new(24.0) };
+        let size = Size { width: 100.0, height: 60.0 };
+        let _ = runtime.dom_frame(&view, size);
+
+        view.width.set(48.0);
+        let patches = runtime.dom_frame(&view, size);
+        assert!(!patches.is_empty());
+        for patch in &patches {
+            assert!(
+                matches!(patch, DomPatch::SetSize { .. } | DomPatch::SetTransform { .. }),
+                "a resize is geometry only: {patch:?}"
+            );
+        }
+    }
+
+    #[derive(Clone)]
+    struct Swaps {
+        image_on: State<bool>,
+    }
+
+    impl Component for Swaps {
+        fn body(self, _ctx: &Context) -> impl View {
+            if self.image_on.get() {
+                erased(image(tiny_image(10)).resizable().frame(24.0, 24.0))
+            } else {
+                erased(spacer().frame(24.0, 24.0).background_color(Color::hex(0x334455)))
+            }
+        }
+    }
+
+    #[test]
+    fn a_kind_swap_recreates_the_element() {
+        let runtime = Runtime::new();
+        let view = Swaps { image_on: State::new(true) };
+        let size = Size { width: 100.0, height: 60.0 };
+        let patches = runtime.dom_frame(&view, size);
+        let image_id = patches
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Image, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the image mounted");
+
+        view.image_on.set(false);
+        let patches = runtime.dom_frame(&view, size);
+        assert!(
+            patches.iter().any(|patch| matches!(
+                patch,
+                DomPatch::Remove { id } if *id == image_id
+            )),
+            "a kind change never mutates in place: {patches:?}"
+        );
+        assert!(patches
+            .iter()
+            .any(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Box, .. })));
+    }
+
+    #[derive(Clone)]
+    struct Isle;
+
+    impl Component for Isle {
+        fn body(self, _ctx: &Context) -> impl View {
+            image(tiny_image(200))
+                .resizable()
+                .frame(8.0, 8.0)
+                .rendering(Rendering::Gpu)
+        }
+    }
+
+    #[test]
+    fn an_image_inside_an_island_stays_pixels() {
+        let runtime = Runtime::new();
+        let size = Size { width: 40.0, height: 20.0 };
+        let patches = runtime.dom_frame(&Isle, size);
+        assert!(
+            !patches
+                .iter()
+                .any(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Image, .. })),
+            "the island swallows the element: {patches:?}"
+        );
+        assert_eq!(
+            patches
+                .iter()
+                .filter(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Canvas, .. }))
+                .count(),
+            1
+        );
+        // and the island's pixels carry the image
+        let islands = runtime.dom_islands(1);
+        assert_eq!(islands.len(), 1);
+        assert!(
+            islands[0].rgba.chunks(4).any(|pixel| pixel[3] != 0),
+            "the image landed in the island's raster"
+        );
+    }
+
+    #[test]
+    fn the_image_encoding_is_byte_stable() {
+        let bytes = encode(&[DomPatch::SetImage {
+            id: 7,
+            image: DomImage { key: 0x1122_3344_5566_7788, cover: true },
+        }]);
+        let expected: Vec<u8> = [
+            &1u32.to_le_bytes()[..],
+            &[9],
+            &7u32.to_le_bytes()[..],
+            &0x1122_3344u32.to_le_bytes()[..],
+            &0x5566_7788u32.to_le_bytes()[..],
+            &[1],
         ]
         .concat();
         assert_eq!(bytes, expected);

@@ -45,8 +45,6 @@ pub enum Modifier {
     ProgressViewStyle(ProgressViewStyle),
     NavigationViewStyle,
     MultilineTextAlignment(TextAlignment),
-    AspectRatio(ContentMode),
-    Resizable,
     Blur(f64),
     IgnoresSafeArea,
     Background(String),
@@ -69,6 +67,10 @@ pub enum Modifier {
     AutoFocus,
     /// A soft halo behind the view: (radius, color).
     Shadow(f64, Color),
+    /// The image below negotiates size with the proposal.
+    Resizable,
+    /// How a resizable image maps into its box: contain or cover.
+    AspectRatio(ContentMode),
     /// Colors under this view move through a spring when they change.
     Animated(crate::anim::Spring),
     /// Where this subtree renders when the scene lowers to elements.
@@ -276,6 +278,51 @@ fn rewrite_field_node(
             max_height,
             align,
             child: Box::new(rewrite_field_node(*child, rewrite)),
+        },
+        other => other,
+    }
+}
+
+/// Descends through wrappers to the `Image` node and rewrites it —
+/// `.resizable()`/`.aspect_ratio()` work before or after the visual
+/// modifiers; on anything that is not an image they are no-ops on
+/// purpose (SwiftUI parity, like truncationMode outside text).
+fn rewrite_image_node(
+    node: LayoutNode,
+    rewrite: &impl Fn(
+        Option<crate::image_engine::ImageSource>,
+        bool,
+        Option<ContentMode>,
+    ) -> LayoutNode,
+) -> LayoutNode {
+    match node {
+        LayoutNode::Image { source, resizable, fit } => rewrite(source, resizable, fit),
+        LayoutNode::Styled { props, child } => LayoutNode::Styled {
+            props,
+            child: Box::new(rewrite_image_node(*child, rewrite)),
+        },
+        LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
+            key,
+            spec,
+            child: Box::new(rewrite_image_node(*child, rewrite)),
+        },
+        LayoutNode::Island { child } => LayoutNode::Island {
+            child: Box::new(rewrite_image_node(*child, rewrite)),
+        },
+        LayoutNode::Padding { edges, child } => LayoutNode::Padding {
+            edges,
+            child: Box::new(rewrite_image_node(*child, rewrite)),
+        },
+        LayoutNode::Frame { width, height, child } => LayoutNode::Frame {
+            width,
+            height,
+            child: Box::new(rewrite_image_node(*child, rewrite)),
+        },
+        LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
+            max_width,
+            max_height,
+            align,
+            child: Box::new(rewrite_image_node(*child, rewrite)),
         },
         other => other,
     }
@@ -515,6 +562,20 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     path,
                     target: Some(id.clone()),
                     child,
+                })
+            }),
+            Modifier::Resizable => out.wrap_last_layout(|node| {
+                rewrite_image_node(node, &|source, _, fit| LayoutNode::Image {
+                    source,
+                    resizable: true,
+                    fit,
+                })
+            }),
+            Modifier::AspectRatio(mode) => out.wrap_last_layout(|node| {
+                rewrite_image_node(node, &|source, resizable, _| LayoutNode::Image {
+                    source,
+                    resizable,
+                    fit: Some(*mode),
                 })
             }),
             Modifier::Animated(spec) => {

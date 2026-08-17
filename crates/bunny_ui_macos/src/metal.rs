@@ -1164,6 +1164,10 @@ fn build_frame(
                     note_run(&mut batches.runs, RunKind::Sprites, batches.sprites.len() - 1);
                 }
             }
+            // the GPU image path arrives with the platform decoder
+            // (until then the CPU present paints images; the GPU frame
+            // skips them rather than guessing pixels)
+            DrawCommand::Image { .. } => {}
             DrawCommand::PushClip { rect } => {
                 let snapped = snap_scaled(*rect, factor);
                 let top = match clips.last().copied() {
@@ -1778,7 +1782,7 @@ mod tests {
         );
         let runtime = Runtime::new();
         let display = runtime.display_frame(root, logical);
-        let cpu = rasterize_with(&display, physical.0, physical.1, scale, canvas, &PixelFont)
+        let cpu = rasterize_with(&display, physical.0, physical.1, scale, canvas, &PixelFont, &RawImages::default())
             .to_rgba_bytes();
         let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen gpu");
         gpu.present_wait(&display, scale, canvas, &PixelFont);
@@ -2058,7 +2062,7 @@ mod tests {
         .background_color(Color::hex(0xFFFFFF))
         .corner_radius(9.0);
         let display = runtime.display_frame(&root, logical);
-        let cpu = rasterize_with(&display, physical.0, physical.1, scale, Color::CANVAS, &engine)
+        let cpu = rasterize_with(&display, physical.0, physical.1, scale, Color::CANVAS, &engine, &RawImages::default())
             .to_rgba_bytes();
         let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen gpu");
         gpu.present_wait(&display, scale, Color::CANVAS, &engine);

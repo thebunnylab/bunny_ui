@@ -28,8 +28,10 @@
 //! [`PixelFont`]: crate::text_engine::PixelFont
 
 use motor::hash::FxHashMap as HashMap;
+use motor::views::ContentMode;
 use std::rc::Rc;
 
+use crate::image_engine::{ImageEngine, ImageSource, RawImages};
 use crate::text_engine::{FontPatch, FontSpec, MeasureCache, PixelFont, TextEngine};
 
 /// Logical pixels. Snapping to device pixels is the real backend's
@@ -132,6 +134,9 @@ pub const LINE_H: Px = 16.0;
 #[derive(Clone, Copy)]
 pub struct LayoutEnv<'a> {
     pub text: &'a dyn TextEngine,
+    /// The frame's image edge — decode and resample stay the
+    /// platform's; geometry consults it for intrinsic sizes.
+    pub images: &'a dyn ImageEngine,
     pub cache: &'a MeasureCache,
     pub scroll_offsets: &'a HashMap<String, Point>,
     pub font: FontSpec,
@@ -223,8 +228,22 @@ pub enum LayoutNode {
     },
     /// Flexible on the main axis of the stack that contains it.
     Spacer,
-    /// Rigid box (ProgressView, Image and friends, until they exist for real).
+    /// Rigid box (ProgressView and friends, until they exist for real).
     Leaf { size: Size },
+    /// An image: the platform decodes and resamples ([`ImageEngine`]),
+    /// the layout owns geometry. `source: None` is the print-parity
+    /// stub — a rigid 40×40 outline box. Non-resizable draws at the
+    /// intrinsic size (1 pixel = 1 point); `.resizable()` negotiates
+    /// with the proposal, and `fit` picks contain ([`ContentMode::Fit`])
+    /// or cover-with-built-in-clip ([`ContentMode::Fill`]). While the
+    /// platform has not decoded (async web), the node measures zero and
+    /// reflows when the engine reports in — pin a `.frame` around it
+    /// when the layout must not shift.
+    Image {
+        source: Option<ImageSource>,
+        resizable: bool,
+        fit: Option<ContentMode>,
+    },
     /// Fills whatever the proposal gives (Rectangle).
     Fill,
     Stack { axis: Axis, spacing: Px, align: CrossAlign, children: Vec<LayoutNode> },
@@ -472,6 +491,12 @@ pub enum DrawCommand {
         color: Color,
         font: FontSpec,
     },
+    /// One image. `rect` is the destination in logical px — the backend
+    /// asks the frame's [`ImageEngine`] for pixels at the rect's
+    /// PHYSICAL size, so every pipeline composites the same bytes. The
+    /// command carries identity, never pixels (equality is the source
+    /// key — cheap for the damage diff).
+    Image { rect: Rect, source: ImageSource },
     /// From here to the paired [`DrawCommand::PopClip`], every draw
     /// intersects this rect (the rect arrives already intersected with
     /// the outer clip).
@@ -678,6 +703,7 @@ pub struct LayoutResult {
 /// [`PixelFont`]: crate::text_engine::PixelFont
 pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
     let engine = PixelFont;
+    let images = RawImages::default();
     let cache = MeasureCache::default();
     let offsets = HashMap::default();
     let interaction = Interaction::default();
@@ -687,6 +713,7 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
         proposal,
         LayoutEnv {
             text: &engine,
+            images: &images,
             cache: &cache,
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
@@ -740,6 +767,65 @@ pub fn layout_dom(
         },
         scene,
     )
+}
+
+/// The image's answer to a proposal. Not decoded yet (`None`
+/// dimensions) answers zero on every path — the layout reflows when the
+/// platform reports in.
+fn image_size(
+    intrinsic: Option<(u32, u32)>,
+    resizable: bool,
+    fit: Option<ContentMode>,
+    proposal: Proposal,
+) -> Size {
+    let Some((width, height)) = intrinsic else {
+        return Size::default();
+    };
+    let (width, height) = (width as Px, height as Px);
+    if !resizable {
+        // 1 pixel = 1 point in v1 — the browser's own default contract
+        return Size { width, height };
+    }
+    match fit {
+        // contain: the largest rect with the intrinsic ratio inside the
+        // proposed box; one open axis derives from the other
+        Some(ContentMode::Fit) => {
+            let scale = match (proposal.width, proposal.height) {
+                (Some(pw), Some(ph)) => (pw / width).min(ph / height),
+                (Some(pw), None) => pw / width,
+                (None, Some(ph)) => ph / height,
+                (None, None) => 1.0,
+            }
+            .max(0.0);
+            Size { width: width * scale, height: height * scale }
+        }
+        // cover (`Fill`) and plain stretch both answer the box EXACTLY;
+        // an open axis falls back to the intrinsic length
+        Some(ContentMode::Fill) | None => Size {
+            width: proposal.width.unwrap_or(width).max(0.0),
+            height: proposal.height.unwrap_or(height).max(0.0),
+        },
+    }
+}
+
+/// The cover rect: the smallest rect with the intrinsic ratio that
+/// fills the frame completely, centered. `None` = nothing to size
+/// against (undecoded, zero anywhere).
+fn cover_rect(frame: Rect, intrinsic: Option<(u32, u32)>) -> Option<Rect> {
+    let (width, height) = intrinsic?;
+    let (width, height) = (width as Px, height as Px);
+    if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+        return None;
+    }
+    let scale = (frame.size.width / width).max(frame.size.height / height);
+    let size = Size { width: width * scale, height: height * scale };
+    Some(Rect {
+        origin: Point {
+            x: frame.origin.x + (frame.size.width - size.width) / 2.0,
+            y: frame.origin.y + (frame.size.height - size.height) / 2.0,
+        },
+        size,
+    })
 }
 
 impl LayoutNode {
@@ -868,6 +954,17 @@ impl LayoutNode {
             }
 
             LayoutNode::Leaf { size } => (*size, Fit::Leaf),
+
+            LayoutNode::Image { source, resizable, fit } => {
+                let size = match source {
+                    // the print-parity stub keeps the old rigid box
+                    None => Size { width: 40.0, height: 40.0 },
+                    Some(source) => {
+                        image_size(env.images.intrinsic(source), *resizable, *fit, proposal)
+                    }
+                };
+                (size, Fit::Leaf)
+            }
 
             LayoutNode::Stack { axis, spacing, children, .. } => {
                 measure_stack(*axis, *spacing, children, proposal, env)
@@ -1256,6 +1353,53 @@ impl LayoutNode {
                     corner_radius: 0.0,
                 });
             }
+
+            (LayoutNode::Image { source, fit, .. }, Fit::Leaf) => match source {
+                // the print-parity stub draws the SAME outline box the
+                // old Leaf did — goldens hold by construction
+                None => {
+                    if let Some(dom) = out.dom.as_mut() {
+                        dom.open(crate::dom::DomKind::Box, frame, frame.origin);
+                        dom.set_border(Color::OUTLINE, 1.0);
+                        dom.close();
+                    }
+                    out.display.push(DrawCommand::StrokeRect {
+                        rect: frame,
+                        color: Color::OUTLINE,
+                        width: 1.0,
+                        corner_radius: 0.0,
+                    });
+                }
+                Some(source) => {
+                    let cover = *fit == Some(ContentMode::Fill);
+                    if let Some(dom) = out.dom.as_mut() {
+                        dom.leaf(
+                            crate::dom::DomKind::Image(crate::dom::DomImage {
+                                key: source.key(),
+                                cover,
+                            }),
+                            frame,
+                        );
+                    }
+                    if cover {
+                        // Fill spills over the frame on one axis — the
+                        // clip is built in, never a separate modifier
+                        if let Some(rect) = cover_rect(frame, env.images.intrinsic(source)) {
+                            out.push_clip(frame);
+                            out.display.push(DrawCommand::Image {
+                                rect,
+                                source: source.clone(),
+                            });
+                            out.pop_clip();
+                        }
+                    } else if frame.size.width > 0.0 && frame.size.height > 0.0 {
+                        out.display.push(DrawCommand::Image {
+                            rect: frame,
+                            source: source.clone(),
+                        });
+                    }
+                }
+            },
 
             (LayoutNode::Stack { axis, spacing, align, children }, Fit::Children(fits)) => {
                 place_stack(*axis, *spacing, *align, children, frame, fits, env, out);
@@ -2122,12 +2266,14 @@ mod tests {
     /// Measures a node with the tests' default environment (PixelFont).
     fn measure_with_defaults(node: &LayoutNode, proposal: Proposal) -> Size {
         let engine = PixelFont;
+        let images = RawImages::default();
         let cache = MeasureCache::default();
         let offsets = HashMap::default();
         let interaction = Interaction::default();
         let carets = HashMap::default();
         let env = LayoutEnv {
             text: &engine,
+            images: &images,
             cache: &cache,
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
@@ -2146,6 +2292,7 @@ mod tests {
         interaction: &Interaction,
     ) -> LayoutResult {
         let engine = PixelFont;
+        let images = RawImages::default();
         let cache = MeasureCache::default();
         let offsets = HashMap::default();
         let carets = HashMap::default();
@@ -2154,6 +2301,7 @@ mod tests {
             proposal,
             LayoutEnv {
                 text: &engine,
+                images: &images,
                 cache: &cache,
                 scroll_offsets: &offsets,
                 font: FontSpec::DEFAULT,
@@ -2332,6 +2480,7 @@ mod tests {
     #[test]
     fn scroll_offset_moves_content_under_the_clip() {
         let engine = PixelFont;
+        let images = RawImages::default();
         let cache = MeasureCache::default();
         let mut offsets = HashMap::default();
         offsets.insert("list".to_string(), Point { x: 0.0, y: 40.0 });
@@ -2339,6 +2488,7 @@ mod tests {
         let carets = HashMap::default();
         let env = LayoutEnv {
             text: &engine,
+            images: &images,
             cache: &cache,
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,

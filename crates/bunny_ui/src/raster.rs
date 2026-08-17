@@ -17,6 +17,7 @@
 //! house pixel font and for the Mac's CoreText (and for the web's
 //! canvas, one day).
 
+use crate::image_engine::{ImageEngine, RawImages};
 use crate::layout::{Color, DisplayList, DrawCommand, Rect};
 use crate::text_engine::{PixelFont, TextEngine, TextRaster};
 
@@ -389,30 +390,52 @@ impl Bitmap {
     /// Composites a line rasterized by the engine at the logical origin,
     /// snapped ONCE (the raster already comes in physical pixels).
     fn composite_text(&mut self, origin_x: f64, origin_y: f64, scale: usize, raster: &TextRaster) {
+        self.composite_rgba(origin_x, origin_y, scale, raster.width, raster.height, &raster.rgba);
+    }
+
+    /// Source-over blit of ANY straight-alpha RGBA rectangle (text
+    /// rasters, images) at the logical origin, snapped ONCE — the
+    /// pixels already come in physical size.
+    fn composite_rgba(
+        &mut self,
+        origin_x: f64,
+        origin_y: f64,
+        scale: usize,
+        width: usize,
+        height: usize,
+        rgba: &[u8],
+    ) {
         let base_x = (origin_x * scale as f64).round() as i64;
         let base_y = (origin_y * scale as f64).round() as i64;
         // clamp the loop to the clip: a long line under a small damage
         // rect must cost the visible slice, not the line
         let (cx0, cy0, cx1, cy1) = self.clip_box();
         let row_first = (cy0 - base_y).max(0) as usize;
-        let row_last = ((cy1 - base_y).max(0) as usize).min(raster.height);
+        let row_last = ((cy1 - base_y).max(0) as usize).min(height);
         let col_first = (cx0 - base_x).max(0) as usize;
-        let col_last = ((cx1 - base_x).max(0) as usize).min(raster.width);
+        let col_last = ((cx1 - base_x).max(0) as usize).min(width);
         for row in row_first..row_last {
             for col in col_first..col_last {
-                let index = (row * raster.width + col) * 4;
-                let alpha = raster.rgba[index + 3];
+                let index = (row * width + col) * 4;
+                let alpha = rgba[index + 3];
                 if alpha == 0 {
                     continue;
                 }
-                let packed = ((raster.rgba[index] as u32) << 24)
-                    | ((raster.rgba[index + 1] as u32) << 16)
-                    | ((raster.rgba[index + 2] as u32) << 8)
+                let packed = ((rgba[index] as u32) << 24)
+                    | ((rgba[index + 1] as u32) << 16)
+                    | ((rgba[index + 2] as u32) << 8)
                     | alpha as u32;
                 self.set(base_x + col as i64, base_y + row as i64, packed);
             }
         }
     }
+}
+
+/// The physical pixel count of one logical rect edge — the SAME
+/// rounding on every pipeline, so the engine rasters once and the
+/// bytes agree everywhere.
+pub(crate) fn physical_extent(length: f64, scale: usize) -> usize {
+    (length * scale as f64).round().max(0.0) as usize
 }
 
 fn scale_rect(rect: Rect, scale: f64) -> Rect {
@@ -441,12 +464,12 @@ pub fn rasterize_scaled(
     scale: usize,
     background: Color,
 ) -> Bitmap {
-    rasterize_with(display, width, height, scale, background, &PixelFont)
+    rasterize_with(display, width, height, scale, background, &PixelFont, &RawImages::default())
 }
 
-/// The full path: paints the list with the frame's [`TextEngine`] — it
-/// is what the `Runtime` calls (PixelFont in headless, CoreText on the
-/// Mac).
+/// The full path: paints the list with the frame's [`TextEngine`] and
+/// [`ImageEngine`] — it is what the `Runtime` calls (the house engines
+/// in headless, the platform's on a shell).
 pub fn rasterize_with(
     display: &DisplayList,
     width: usize,
@@ -454,6 +477,7 @@ pub fn rasterize_with(
     scale: usize,
     background: Color,
     text: &dyn TextEngine,
+    images: &dyn ImageEngine,
 ) -> Bitmap {
     let mut bitmap = Bitmap::new(width, height, background);
     let factor = scale as f64;
@@ -479,6 +503,20 @@ pub fn rasterize_with(
                 let slice = &content[range.0..range.1];
                 if let Some(raster) = text.raster_line(slice, font, *color, scale) {
                     bitmap.composite_text(origin.x, origin.y, scale, &raster);
+                }
+            }
+            DrawCommand::Image { rect, source } => {
+                let width = physical_extent(rect.size.width, scale);
+                let height = physical_extent(rect.size.height, scale);
+                if let Some(raster) = images.raster(source, width, height) {
+                    bitmap.composite_rgba(
+                        rect.origin.x,
+                        rect.origin.y,
+                        scale,
+                        raster.width,
+                        raster.height,
+                        &raster.rgba,
+                    );
                 }
             }
             DrawCommand::PushClip { rect } => bitmap.push_clip(scale_rect(*rect, factor)),
@@ -599,6 +637,8 @@ impl Surface {
                     y + (metrics.height() * factor).ceil() as i64 + 2,
                 )
             }
+            // the destination rect is the whole truth — no slack needed
+            DrawCommand::Image { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
             DrawCommand::PushClip { .. } | DrawCommand::PopClip => return None,
         };
         let clipped = match clip {
@@ -642,7 +682,12 @@ impl Surface {
     /// Paints the new frame incrementally and returns the damaged rects
     /// (physical) — what the backend needs to blit. An identical list
     /// returns no damage and touches no pixel.
-    pub fn frame(&mut self, display: DisplayList, text: &dyn TextEngine) -> Vec<DamageRect> {
+    pub fn frame(
+        &mut self,
+        display: DisplayList,
+        text: &dyn TextEngine,
+        images: &dyn ImageEngine,
+    ) -> Vec<DamageRect> {
         self.cache.begin_frame();
         let old = self.display.as_slice();
         let new = display.as_slice();
@@ -768,6 +813,20 @@ impl Surface {
                         let slice = &content[range.0..range.1];
                         if let Some(raster) = text.raster_line(slice, font, *color, self.scale) {
                             self.bitmap.composite_text(origin.x, origin.y, self.scale, &raster);
+                        }
+                    }
+                    DrawCommand::Image { rect: image_rect, source } => {
+                        let width = physical_extent(image_rect.size.width, self.scale);
+                        let height = physical_extent(image_rect.size.height, self.scale);
+                        if let Some(raster) = images.raster(source, width, height) {
+                            self.bitmap.composite_rgba(
+                                image_rect.origin.x,
+                                image_rect.origin.y,
+                                self.scale,
+                                raster.width,
+                                raster.height,
+                                &raster.rgba,
+                            );
                         }
                     }
                     DrawCommand::PushClip { .. } | DrawCommand::PopClip => unreachable!(),
@@ -1053,7 +1112,7 @@ mod tests {
             let mut surface = Surface::new(120, 80, 1, Color::CANVAS);
             for frame in frames {
                 let oracle = rasterize(&frame, 120, 80, Color::CANVAS);
-                surface.frame(frame, &PixelFont);
+                surface.frame(frame, &PixelFont, &RawImages::default());
                 assert_eq!(
                     surface.bitmap().pixels(),
                     oracle.pixels(),
@@ -1067,8 +1126,8 @@ mod tests {
     fn an_identical_frame_damages_nothing() {
         let mut surface = Surface::new(120, 80, 1, Color::CANVAS);
         let frames = hover_frames();
-        surface.frame(frames[0].clone(), &PixelFont);
-        let damage = surface.frame(frames[0].clone(), &PixelFont);
+        surface.frame(frames[0].clone(), &PixelFont, &RawImages::default());
+        let damage = surface.frame(frames[0].clone(), &PixelFont, &RawImages::default());
         assert!(damage.is_empty(), "same list, no damage: {damage:?}");
     }
 
@@ -1168,8 +1227,8 @@ mod tests {
             display.push(fill(30.0, 30.0, 20.0, 20.0, Color::WHITE));
             display
         };
-        surface.frame(with(false), &PixelFont);
-        let damage = surface.frame(with(true), &PixelFont);
+        surface.frame(with(false), &PixelFont, &RawImages::default());
+        let damage = surface.frame(with(true), &PixelFont, &RawImages::default());
         let oracle = rasterize(&with(true), 80, 80, Color::CANVAS);
         assert_eq!(surface.bitmap().pixels(), oracle.pixels(), "golden with shadow");
         let (x0, y0, x1, y1) = damage[0];
@@ -1182,7 +1241,7 @@ mod tests {
         // even though only damaged rects are converted
         let mut surface = Surface::new(120, 80, 1, Color::CANVAS);
         for frame in hover_frames() {
-            surface.frame(frame, &PixelFont);
+            surface.frame(frame, &PixelFont, &RawImages::default());
             let full = surface.bitmap().to_rgba_bytes();
             assert_eq!(surface.rgba(), &full[..], "mirror == full conversion");
         }
@@ -1192,12 +1251,45 @@ mod tests {
     fn a_hover_swap_damages_only_the_row() {
         let mut surface = Surface::new(120, 80, 1, Color::CANVAS);
         let frames = hover_frames();
-        let first = surface.frame(frames[0].clone(), &PixelFont);
+        let first = surface.frame(frames[0].clone(), &PixelFont, &RawImages::default());
         assert_eq!(first, vec![(0, 0, 120, 80)], "first frame damages the whole surface");
-        let damage = surface.frame(frames[1].clone(), &PixelFont);
+        let damage = surface.frame(frames[1].clone(), &PixelFont, &RawImages::default());
         assert_eq!(damage.len(), 1, "one row changed, one rect: {damage:?}");
         let (x0, y0, x1, y1) = damage[0];
         // the changed row lives at (8, 32)–(112, 52); text slack may pad
         assert!(x0 >= 8 && y0 >= 28 && x1 <= 114 && y1 <= 56, "row-sized damage: {damage:?}");
+    }
+
+    #[test]
+    fn an_image_swap_damages_only_its_rect() {
+        use crate::image_engine::ImageSource;
+        let paint = |seed: u8| {
+            // opaque pixels: the compare below reads them back verbatim
+            let source =
+                ImageSource::from_bytes(RawImages::encode(2, 2, &[seed, seed, seed, 255].repeat(4)));
+            let mut display = DisplayList::default();
+            display.push(DrawCommand::FillRect {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: crate::layout::Size { width: 100.0, height: 40.0 },
+                },
+                color: Color::CANVAS,
+                corner_radius: 0.0,
+            });
+            display.push(DrawCommand::Image {
+                rect: Rect {
+                    origin: Point { x: 10.0, y: 10.0 },
+                    size: crate::layout::Size { width: 16.0, height: 16.0 },
+                },
+                source,
+            });
+            display
+        };
+        let mut surface = Surface::new(100, 40, 1, Color::CANVAS);
+        surface.frame(paint(60), &PixelFont, &RawImages::default());
+        let damage = surface.frame(paint(200), &PixelFont, &RawImages::default());
+        assert_eq!(damage, vec![(10, 10, 26, 26)], "only the image rect repaints");
+        // and the pixels landed: the new seed shows at the center
+        assert_eq!(surface.bitmap().pixel(18, 18), Some(0xC8C8_C8FF), "seed 200 everywhere");
     }
 }
