@@ -255,6 +255,16 @@ pub fn dirty_snapshot() -> HashSet<String> {
     REGISTRY.with(|registry| registry.borrow().dirty.clone())
 }
 
+/// Marks the view at `path` dirty from OUTSIDE the read-tracking — the
+/// runtime's hook for follow-up passes (a virtualized window that must
+/// re-materialize after its offset moved). The next pass re-runs the
+/// view like any dirty one; consumption stays with the pass.
+pub fn invalidate(path: &str) {
+    REGISTRY.with(|registry| {
+        registry.borrow_mut().dirty.insert(path.to_string());
+    });
+}
+
 /// Is there pending dirt for this root? Peeks without draining — the
 /// stability condition uses this; who CONSUMES dirt is the render pass
 /// (snapshot + consume), never the loop.

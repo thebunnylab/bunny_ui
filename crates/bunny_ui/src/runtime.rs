@@ -169,6 +169,29 @@ impl Runtime {
     /// views the walk missed, effect-queue reassembly, and the sweep.
     /// Returns both outputs (print and layout) still holding references.
     fn render_pass(&self, root: &impl View) -> NodeList {
+        // virtualized bodies read LAST frame's region geometry (offset
+        // taken NOW — a wheel that just moved it must reach the window
+        // math) — published fresh before every pass
+        {
+            let offsets = self.scroll_offsets.borrow();
+            crate::viewport::publish(self.last_scrolls.borrow().iter().filter_map(
+                |region| {
+                    let row_extent = region.row_extent?;
+                    Some((
+                        region.path.clone(),
+                        crate::viewport::RegionSnapshot {
+                            offset_y: offsets
+                                .get(&region.path)
+                                .copied()
+                                .unwrap_or_default()
+                                .y,
+                            viewport: region.frame.size.height,
+                            row_extent,
+                        },
+                    ))
+                },
+            ));
+        }
         // new theme = stale retention (bodies baked old tokens into
         // the scene): rebuild once and continue incremental
         let theme_version = crate::theme::version();
@@ -706,17 +729,47 @@ impl Runtime {
         root: &impl View,
         proposal: crate::layout::Proposal,
     ) -> crate::layout::LayoutResult {
-        let result = self.layout_once(root, proposal);
-        // declared follow-ups: a scroll target that CHANGED moves its
+        let mut result = self.layout_once(root, proposal);
+        // follow-ups, capped: a scroll target that CHANGED moves its
         // region's offset; a field's first `.auto_focus()` takes the
-        // keyboard. Either one re-lays out ONCE in the same frame (the
-        // wheel and a user blur are never fought).
-        let moved = self.apply_scroll_targets(&result);
-        let focused = self.apply_auto_focus(&result);
-        if moved || focused {
-            return self.layout_once(root, proposal);
+        // keyboard; a virtualized window that missed re-materializes
+        // (its boundary re-runs on the next round). The cap is the
+        // livelock guard — a broken row extent degrades to a blank
+        // strip for a frame, never a hang. The wheel and a user blur
+        // are never fought.
+        for _ in 0..2 {
+            let moved = self.apply_scroll_targets(&result);
+            let focused = self.apply_auto_focus(&result);
+            let missed = self.invalidate_window_misses(&result);
+            if !moved && !focused && !missed {
+                break;
+            }
+            result = self.layout_once(root, proposal);
         }
         result
+    }
+
+    /// A virtual window that failed to cover the visible band asks its
+    /// nearest RETAINED boundary to re-run — walking prefixes of the
+    /// region path finds it. `true` = something was invalidated and the
+    /// next layout embeds a fresh pass.
+    fn invalidate_window_misses(&self, result: &crate::layout::LayoutResult) -> bool {
+        let mut any = false;
+        for path in &result.misses {
+            let mut probe = path.as_str();
+            loop {
+                if reconciler::is_retained(probe) {
+                    motor::identity::invalidate(probe);
+                    any = true;
+                    break;
+                }
+                match probe.rfind('/') {
+                    Some(cut) => probe = &probe[..cut],
+                    None => break,
+                }
+            }
+        }
+        any
     }
 
     /// Focuses the first `.auto_focus()` field never seen before — once

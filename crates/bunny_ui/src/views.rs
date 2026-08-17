@@ -693,6 +693,126 @@ where
     List { items, id, row }
 }
 
+/// Rows materialized on the first frame, before any geometry is known —
+/// generous enough to cover any plausible viewport at uniform heights;
+/// the window-miss pass corrects the rare shortfall.
+const FIRST_WINDOW: usize = 256;
+
+/// A virtualized list: `count` rows of ONE uniform height, and only the
+/// visible window (plus one viewport of buffer on each side) exists.
+/// Closures take the row INDEX — no collection is cloned into the view.
+///
+/// LAZY semantics, named and deliberate: a row outside the window is
+/// not entered, so its identity dies in the normal sweep and its state
+/// is born again when it scrolls back in (`onAppear` fires again) —
+/// the industry contract for virtualized rows. State that must survive
+/// scrolling lives ABOVE the list. The dense [`list`] keeps full
+/// retention; choose by need.
+#[derive(Clone)]
+pub struct VirtualList<I, F> {
+    count: usize,
+    id: I,
+    row: F,
+}
+
+impl<I, F, R> View for VirtualList<I, F>
+where
+    I: Fn(usize) -> String + Clone + 'static,
+    F: Fn(usize) -> R + Clone + 'static,
+    R: View,
+{
+    type Arity = Single;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let scope = motor::identity::cursor_scope();
+        // the window comes from LAST frame's retained geometry (offset,
+        // viewport, measured row height) — one frame of lag masked by
+        // the buffer; a miss re-runs this body in the same frame
+        let snapshot = crate::viewport::region(scope.as_deref());
+        let (first, last) = match snapshot {
+            Some(snap) if snap.row_extent > 0.0 && self.count > 0 => {
+                let rows_in_view =
+                    (snap.viewport / snap.row_extent).ceil().max(1.0) as usize + 1;
+                let top = (snap.offset_y / snap.row_extent).floor().max(0.0) as usize;
+                let first = top.saturating_sub(rows_in_view).min(self.count - 1);
+                let last = (top + 2 * rows_in_view).min(self.count - 1);
+                (first, last)
+            }
+            _ => (0, self.count.min(FIRST_WINDOW).saturating_sub(1)),
+        };
+        debug_assert_unique_ids("virtual_list", (first..=last).map(&self.id));
+
+        let mut children = Vec::new();
+        let mut prints = Vec::new();
+        if self.count > 0 {
+            for index in first..=last {
+                let id = (self.id)(index);
+                // the same byte contract as the dense list: "[id]" is
+                // the identity frame, "scope/[id]" the boundary path
+                let mut key = String::with_capacity(id.len() + 2);
+                key.push('[');
+                key.push_str(&id);
+                key.push(']');
+                let path = scope.as_ref().map(|scope| {
+                    let mut path = String::with_capacity(scope.len() + key.len() + 1);
+                    path.push_str(scope);
+                    path.push('/');
+                    path.push_str(&key);
+                    path
+                });
+                let _frame = motor::identity::enter(key);
+                let mut row = NodeList::new();
+                (self.row)(index).render_into(ctx, &mut row);
+                let (row_prints, layouts) = row.into_parts();
+                let row_layout = match path {
+                    Some(path) => LayoutNode::Boundary {
+                        path,
+                        children: vec![wrap_layout(layouts)],
+                    },
+                    None => wrap_layout(layouts),
+                };
+                children.push((index, row_layout));
+                prints.push(RenderNode::branch(
+                    if crate::view::print_enabled() {
+                        format!("Row (id: {id})")
+                    } else {
+                        String::new()
+                    },
+                    row_prints,
+                ));
+            }
+        }
+        out.push(RenderNode::branch(
+            if crate::view::print_enabled() {
+                format!("VirtualList ({} of {})", children.len(), self.count)
+            } else {
+                String::new()
+            },
+            prints,
+        ));
+        out.push_layout(LayoutNode::Scroll {
+            target: None,
+            path: motor::identity::cursor_scope(),
+            child: Box::new(LayoutNode::VirtualStack {
+                row_extent: snapshot.map(|snap| snap.row_extent).unwrap_or(0.0),
+                count: self.count,
+                children,
+            }),
+        });
+    }
+}
+
+/// The virtualized sibling of [`list`]: `virtual_list(count, id, row)`
+/// with closures by INDEX. See [`VirtualList`] for the lazy contract.
+pub fn virtual_list<I, F, R>(count: usize, id: I, row: F) -> VirtualList<I, F>
+where
+    I: Fn(usize) -> String + Clone + 'static,
+    F: Fn(usize) -> R + Clone + 'static,
+    R: View,
+{
+    VirtualList { count, id, row }
+}
+
 /// `ForEach(collection, id: \.keyPath) { item in … }` — the `id` is the
 /// identity contract: it is what will let state and animation follow the item
 /// (reorder, insert in the middle) instead of the position. The headless

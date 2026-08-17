@@ -53,6 +53,7 @@ pub mod text_engine;
 pub mod text_input;
 pub mod theme;
 pub mod view;
+pub(crate) mod viewport;
 pub mod views;
 
 /// `text!("Count: {}", self.count)` — the built-in `format!` of text.
@@ -490,6 +491,171 @@ mod tests {
             settled.as_slice(),
             target.as_slice(),
             "a finished animation repaints byte-for-byte the plain frame — the skip reconverges"
+        );
+    }
+
+    #[test]
+    fn a_virtual_list_materializes_only_the_window() {
+        #[derive(Clone, Copy)]
+        struct Big;
+
+        impl Component for Big {
+            fn body(self, _ctx: &Context) -> impl View {
+                virtual_list(10_000, |row| format!("row{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        let lines = |display: &crate::layout::DisplayList| {
+            display
+                .iter()
+                .filter(|command| {
+                    matches!(command, crate::layout::DrawCommand::TextLine { .. })
+                })
+                .count()
+        };
+
+        let runtime = Runtime::new();
+        // first frame: no geometry yet — the fixed first window rules
+        let mounted = runtime.display_frame(&Big, size);
+        assert!(lines(&mounted) <= 256, "first window is bounded");
+        // second frame: the retained geometry shrinks the window to the
+        // viewport plus one viewport of buffer on each side
+        let settled = runtime.display_frame(&Big, size);
+        let visible = lines(&settled);
+        assert!(visible < 40, "window-sized, not count-sized: {visible}");
+        // the scroll geometry still sees ALL ten thousand rows
+        let result = runtime.layout(&Big, crate::layout::Proposal::exact(size));
+        let region = result.scrolls.first().expect("the region exists");
+        assert_eq!(region.content.height, 16.0 * 10_000.0);
+        assert_eq!(region.row_extent, Some(16.0));
+    }
+
+    #[test]
+    fn a_small_virtual_list_paints_like_the_dense_one() {
+        #[derive(Clone, Copy)]
+        struct VirtualTen;
+
+        impl Component for VirtualTen {
+            fn body(self, _ctx: &Context) -> impl View {
+                virtual_list(10, |row| format!("row{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct DenseTen;
+
+        impl Component for DenseTen {
+            fn body(self, _ctx: &Context) -> impl View {
+                list(
+                    (0..10).collect::<Vec<_>>(),
+                    |row| format!("row{row}"),
+                    |row| text(format!("item {row}")),
+                )
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 400.0 };
+        let virtual_runtime = Runtime::new();
+        let dense_runtime = Runtime::new();
+        let virtual_frame = virtual_runtime.display_frame(&VirtualTen, size);
+        let dense_frame = dense_runtime.display_frame(&DenseTen, size);
+        assert_eq!(
+            virtual_frame.as_slice(),
+            dense_frame.as_slice(),
+            "everything fits: the virtual list IS the dense list, byte for byte"
+        );
+    }
+
+    #[test]
+    fn empty_and_tiny_virtual_lists_hold() {
+        #[derive(Clone, Copy)]
+        struct Empty;
+
+        impl Component for Empty {
+            fn body(self, _ctx: &Context) -> impl View {
+                virtual_list(0, |row| format!("row{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct One;
+
+        impl Component for One {
+            fn body(self, _ctx: &Context) -> impl View {
+                virtual_list(1, |row| format!("row{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        let runtime = Runtime::new();
+        let empty = runtime.display_frame(&Empty, size);
+        assert_eq!(
+            empty
+                .iter()
+                .filter(|command| {
+                    matches!(command, crate::layout::DrawCommand::TextLine { .. })
+                })
+                .count(),
+            0
+        );
+        let one = Runtime::new().display_frame(&One, size);
+        assert!(one.iter().any(|command| matches!(
+            command,
+            crate::layout::DrawCommand::TextLine { .. }
+        )));
+        // degenerate viewport: nothing to see, nothing to break
+        let flat = Runtime::new()
+            .display_frame(&One, crate::layout::Size { width: 200.0, height: 0.0 });
+        let _ = flat.len();
+    }
+
+    #[test]
+    fn a_jump_past_the_buffer_heals_in_the_same_frame() {
+        #[derive(Clone, Copy)]
+        struct Big;
+
+        impl Component for Big {
+            fn body(self, _ctx: &Context) -> impl View {
+                virtual_list(10_000, |row| format!("row{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        let has_line = |display: &crate::layout::DisplayList, needle: &str| {
+            display.iter().any(|command| match command {
+                crate::layout::DrawCommand::TextLine { content, .. } => {
+                    content.as_ref() == needle
+                }
+                _ => false,
+            })
+        };
+
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&Big, size);
+        let _ = runtime.display_frame(&Big, size);
+        // a jump FAR past the buffer: the retained window cannot cover
+        // it — the miss invalidates the boundary and the same frame
+        // re-materializes around the new offset
+        runtime.set_scroll_offset("Big", crate::layout::Point { x: 0.0, y: 8000.0 });
+        let jumped = runtime.display_frame(&Big, size);
+        assert!(
+            has_line(&jumped, "item 500"),
+            "the window re-materialized around row 500"
+        );
+        assert!(
+            !has_line(&jumped, "item 0"),
+            "the old window is gone"
         );
     }
 
