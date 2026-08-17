@@ -293,6 +293,39 @@ fn main() {
         std::hint::black_box(bitmap.to_rgba_bytes().len());
     }));
 
+    // the second backend: the SAME display list presented by metal —
+    // walk + upload + encode + commit + the GPU itself, WAITED, so the
+    // number hides nothing. the twin of the cpu paint row above.
+    use bunny_ui_macos::OffscreenGpu;
+    if let Some(mut gpu) = OffscreenGpu::new(1520, 1280) {
+        // warm the atlas first — steady state is the story
+        gpu.present_wait(&laid_out.display, 2, Color::CANVAS, &*engine);
+        reports.push(measure("present GPU 1520×1280 (full)", 3, 200, || {
+            gpu.present_wait(&laid_out.display, 2, Color::CANVAS, &*engine);
+        }));
+        // the cpu-side cost alone: commit and move on, like a window
+        // does — the twin of a present that never waits for the gpu
+        reports.push(measure("present GPU (encode, no wait)", 3, 200, || {
+            gpu.present_nowait(&laid_out.display, 2, Color::CANVAS, &*engine);
+        }));
+    }
+
+    // editor-class window: where a cpu full frame stops scaling and the
+    // gpu must not care — the same scene laid out at 3024×1964 logical
+    let editor = Proposal::exact(Size { width: 3024.0, height: 1964.0 });
+    let editor_layout = runtime.layout(&finder, editor);
+    reports.push(measure("raster 6048×3928 @2x (paint)", 3, 20, || {
+        let bitmap =
+            rasterize_with(&editor_layout.display, 6048, 3928, 2, Color::CANVAS, &*engine);
+        std::hint::black_box(bitmap.width());
+    }));
+    if let Some(mut gpu) = OffscreenGpu::new(6048, 3928) {
+        gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine);
+        reports.push(measure("present GPU 6048×3928 (full)", 3, 100, || {
+            gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine);
+        }));
+    }
+
     println!(
         "\n{:<32} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
         "scenario (frame =)", "p50 ms", "p95 ms", "p99 ms", "max ms", "allocs", "KiB"
@@ -311,5 +344,9 @@ fn main() {
         );
     }
     println!("\nfixture: finder 30 rows; viewport 760×640; CoreText text (real shaping)");
+    println!(
+        "gpu rows: walk + upload + encode + commit + WAIT on an offscreen target — \
+         nothing deferred; alloc columns count rust allocations only"
+    );
 }
 

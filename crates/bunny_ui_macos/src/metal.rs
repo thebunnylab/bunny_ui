@@ -1205,6 +1205,33 @@ impl FrameSlot {
     }
 }
 
+/// A free slot from a ring: polled by `status`, oldest-first. When all
+/// ride the GPU (a burst above the refresh rate), waits for the oldest
+/// — bounded by one sub-millisecond frame.
+fn acquire_slot(slots: &mut [FrameSlot; 3], cursor: &mut usize, sels: &Sels) -> usize {
+    unsafe {
+        for offset in 0..slots.len() {
+            let index = (*cursor + offset) % slots.len();
+            let free = slots[index].command.is_null()
+                || msg_u64(slots[index].command, sels.status) >= STATUS_COMPLETED;
+            if free {
+                if !slots[index].command.is_null() {
+                    msg_void(slots[index].command, sels.release);
+                    slots[index].command = null_mut();
+                }
+                *cursor = (index + 1) % slots.len();
+                return index;
+            }
+        }
+        let index = *cursor;
+        msg_void(slots[index].command, sels.wait_completed);
+        msg_void(slots[index].command, sels.release);
+        slots[index].command = null_mut();
+        *cursor = (index + 1) % slots.len();
+        index
+    }
+}
+
 fn as_bytes<T>(items: &[T]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(items.as_ptr() as *const u8, std::mem::size_of_val(items))
@@ -1302,35 +1329,6 @@ thread_local! {
 }
 
 impl MetalPresenter {
-    /// A free slot from the ring: polled by `status`, oldest-first. When
-    /// all three ride the GPU (a burst above the refresh rate, which
-    /// AppKit's event coalescing already prevents), waits for the oldest
-    /// — bounded by one sub-millisecond frame.
-    fn acquire_slot(&mut self) -> usize {
-        unsafe {
-            for offset in 0..self.slots.len() {
-                let index = (self.cursor + offset) % self.slots.len();
-                let free = self.slots[index].command.is_null()
-                    || msg_u64(self.slots[index].command, self.stack.sels.status)
-                        >= STATUS_COMPLETED;
-                if free {
-                    if !self.slots[index].command.is_null() {
-                        msg_void(self.slots[index].command, self.stack.sels.release);
-                        self.slots[index].command = null_mut();
-                    }
-                    self.cursor = (index + 1) % self.slots.len();
-                    return index;
-                }
-            }
-            let index = self.cursor;
-            msg_void(self.slots[index].command, self.stack.sels.wait_completed);
-            msg_void(self.slots[index].command, self.stack.sels.release);
-            self.slots[index].command = null_mut();
-            self.cursor = (index + 1) % self.slots.len();
-            index
-        }
-    }
-
     /// Waits out every in-flight frame — the precondition of an atlas
     /// reset (the one moment texel space is reused).
     fn drain_slots(&mut self) {
@@ -1416,7 +1414,7 @@ impl MetalPresenter {
                 self.scale = scale;
             }
             self.build_with_retries(display, scale, physical, text);
-            let index = self.acquire_slot();
+            let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
             let sprite_offset = upload_frame(
                 &mut self.slots[index],
                 self.stack.device,
@@ -1559,7 +1557,8 @@ pub struct OffscreenGpu {
     target: Id,
     width: usize,
     height: usize,
-    slot: FrameSlot,
+    slots: [FrameSlot; 3],
+    cursor: usize,
     atlas: RunAtlas,
     batches: FrameBatches,
 }
@@ -1601,23 +1600,33 @@ impl OffscreenGpu {
                 target,
                 width,
                 height,
-                slot: FrameSlot::empty(),
+                slots: [FrameSlot::empty(); 3],
+                cursor: 0,
                 atlas: RunAtlas::new(device),
                 batches: FrameBatches::default(),
             })
         }
     }
 
-    /// Renders and WAITS — determinism for tests and honest numbers for
-    /// the bench (walk + upload + encode + commit + GPU time, nothing
-    /// hidden). The wait also makes single-buffering and mid-frame atlas
-    /// resets safe.
-    pub fn present_wait(
+    fn drain(&mut self) {
+        unsafe {
+            for slot in &mut self.slots {
+                if !slot.command.is_null() {
+                    msg_void(slot.command, self.stack.sels.wait_completed);
+                    msg_void(slot.command, self.stack.sels.release);
+                    slot.command = null_mut();
+                }
+            }
+        }
+    }
+
+    fn present_inner(
         &mut self,
         display: &DisplayList,
         scale: usize,
         canvas: Color,
         text: &dyn TextEngine,
+        wait: bool,
     ) {
         unsafe {
             let pool = objc_autoreleasePoolPush();
@@ -1632,18 +1641,18 @@ impl OffscreenGpu {
                 ) {
                     Ok(()) => break,
                     Err(AtlasFull) => {
-                        // every offscreen frame is waited — no drain
-                        // needed before the reset
                         if attempt == 2 {
                             eprintln!("bunny_ui metal: atlas overflow survived two resets");
                             break;
                         }
+                        self.drain();
                         self.atlas.reset(true);
                     }
                 }
             }
+            let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
             let sprite_offset = upload_frame(
-                &mut self.slot,
+                &mut self.slots[index],
                 self.stack.device,
                 &self.stack.sels,
                 &self.batches,
@@ -1652,15 +1661,44 @@ impl OffscreenGpu {
                 self.target,
                 canvas,
                 (self.width as f32, self.height as f32),
-                self.slot.buffer,
+                self.slots[index].buffer,
                 sprite_offset,
                 &self.batches.runs,
                 self.atlas.texture,
             );
             msg_void(command, self.stack.sels.commit);
-            msg_void(command, self.stack.sels.wait_completed);
+            self.slots[index].command = msg_id(command, self.stack.sels.retain);
+            if wait {
+                msg_void(command, self.stack.sels.wait_completed);
+            }
             objc_autoreleasePoolPop(pool);
         }
+    }
+
+    /// Renders and WAITS — determinism for tests and honest numbers for
+    /// the bench (walk + upload + encode + commit + GPU time, nothing
+    /// hidden).
+    pub fn present_wait(
+        &mut self,
+        display: &DisplayList,
+        scale: usize,
+        canvas: Color,
+        text: &dyn TextEngine,
+    ) {
+        self.present_inner(display, scale, canvas, text, true);
+    }
+
+    /// Renders and RETURNS after the commit — the CPU-side cost of a
+    /// production present (a window commits and moves on; the ring keeps
+    /// the in-flight frames safe).
+    pub fn present_nowait(
+        &mut self,
+        display: &DisplayList,
+        scale: usize,
+        canvas: Color,
+        text: &dyn TextEngine,
+    ) {
+        self.present_inner(display, scale, canvas, text, false);
     }
 
     /// The atlas footprint — how many cached runs and how deep the
