@@ -17,9 +17,11 @@ use std::rc::Rc;
 
 use motor::state::{Context, EnvironmentValues};
 
-use crate::action::{ActionId, KeyPattern};
+use crate::action::{ActionId, KeyPattern, OVERLAY_CONTEXT, OVERLAY_DISMISS};
 use crate::effects;
-use crate::layout::{FieldPlacement, Interaction, LayoutEnv, Point, Px, Rect, ScrollRegion};
+use crate::layout::{
+    FieldPlacement, Interaction, LayoutEnv, OverlayPlacement, Point, Px, Rect, ScrollRegion,
+};
 use crate::reconciler;
 use crate::image_engine::{ImageEngine, RawImages};
 use crate::text_engine::{FontSpec, MeasureCache, PixelFont, TextEngine, caret_from_x};
@@ -111,6 +113,14 @@ pub struct Runtime {
     /// one is a resize, and a resize snaps animated retargets (the
     /// window tracks the mouse; nothing wobbles after it).
     last_proposal: Cell<Option<crate::layout::Proposal>>,
+    /// The popovers of the last layout, in paint order (last =
+    /// topmost) — the outside-press dismissal and the shells' second
+    /// surfaces read from here.
+    last_overlays: RefCell<Vec<OverlayPlacement>>,
+    /// Where popovers may live, in layout coordinates. `None` = the
+    /// viewport; the desktop shell sets the SCREEN — overflow becomes
+    /// plain geometry.
+    overlay_bounds: Cell<Option<Rect>>,
     /// The Dom mode's retained scene — [`Runtime::dom_frame`] diffs
     /// each new capture against it. Empty (and free) in every other
     /// mode.
@@ -162,8 +172,23 @@ impl Runtime {
         Rc::clone(&self.images)
     }
 
+    /// The popovers of the last layout, in paint order — a shell that
+    /// presents them on their own surfaces re-slices the display list
+    /// by each placement.
+    pub fn overlays(&self) -> Vec<OverlayPlacement> {
+        self.last_overlays.borrow().clone()
+    }
+
+    /// Where popovers may live, in LAYOUT coordinates. The desktop
+    /// shell sets the screen's visible frame (an origin left of or
+    /// above the window is negative); everyone else leaves the
+    /// default — the viewport.
+    pub fn set_overlay_bounds(&self, bounds: Option<Rect>) {
+        self.overlay_bounds.set(bounds);
+    }
+
     fn with_parts(ctx: Context, text: Rc<dyn TextEngine>) -> Self {
-        Runtime {
+        let runtime = Runtime {
             ctx,
             last_root: RefCell::new(None),
             last_hits: RefCell::new(Vec::new()),
@@ -184,10 +209,21 @@ impl Runtime {
             auto_focused: RefCell::new(std::collections::HashSet::default()),
             animator: RefCell::new(crate::anim::Animator::default()),
             last_proposal: Cell::new(None),
+            last_overlays: RefCell::new(Vec::new()),
+            overlay_bounds: Cell::new(None),
             dom: RefCell::new(crate::dom::DomLowering::default()),
             root_is_boundary: Cell::new(false),
             printless: Cell::new(false),
-        }
+        };
+        // Escape closes the innermost popover — pre-bound in the
+        // reserved context so apps never wire it (and never lose it)
+        runtime
+            .scoped_keymap
+            .borrow_mut()
+            .entry(OVERLAY_CONTEXT)
+            .or_default()
+            .insert(KeyPattern::key(crate::action::Key::Escape), OVERLAY_DISMISS);
+        runtime
     }
 
     pub fn context(&self) -> Context {
@@ -301,6 +337,20 @@ impl Runtime {
     /// action fires here (up-inside is button semantics). `true` =
     /// repaint.
     pub fn pointer_pressed(&self, x: Px, y: Px) -> bool {
+        // an open popover eats the press outside its frame: the
+        // TOPMOST one closes and nothing underneath arms (the press
+        // is consumed — AppKit semantics, no accidental activation)
+        let outside = {
+            let overlays = self.last_overlays.borrow();
+            overlays
+                .last()
+                .filter(|top| !top.frame.contains(x, y))
+                .map(|top| top.path.clone())
+        };
+        if let Some(path) = outside {
+            reconciler::run_action(&format!("{path}/#dismiss"));
+            return true;
+        }
         let target = self.hover_target(x, y);
         let mut interaction = self.interaction.borrow_mut();
         interaction.pointer = Some(Point { x, y });
@@ -433,6 +483,15 @@ impl Runtime {
     /// the fallback.
     pub fn match_key(&self, pattern: &KeyPattern) -> Option<ActionId> {
         let scoped = self.scoped_keymap.borrow();
+        // the reserved popover context wins DETERMINISTICALLY — the
+        // map below iterates in arbitrary order, and an app binding
+        // Escape in its own active context must not shadow the dismiss
+        if reconciler::context_active(OVERLAY_CONTEXT)
+            && let Some(action) =
+                scoped.get(OVERLAY_CONTEXT).and_then(|map| map.get(pattern))
+        {
+            return Some(*action);
+        }
         for (context, map) in scoped.iter() {
             if let Some(action) = map.get(pattern)
                 && reconciler::context_active(context)
@@ -927,12 +986,28 @@ impl Runtime {
             } else {
                 self.invalidate_window_misses(&result)
             };
-            if !moved && !focused && !missed {
+            // a popover whose anchor scrolled out of view closes here
+            // — one dismissal, one relayout, converged
+            let orphaned = self.dismiss_orphaned_overlays(&result);
+            if !moved && !focused && !missed && !orphaned {
                 break;
             }
             result = self.layout_once(root, proposal);
         }
         result
+    }
+
+    /// Closes every popover whose anchor no longer intersects its clip
+    /// (the row scrolled away). `true` = something closed and the
+    /// caller relayouts.
+    fn dismiss_orphaned_overlays(&self, result: &crate::layout::LayoutResult) -> bool {
+        let mut closed = false;
+        for overlay in &result.overlays {
+            if !overlay.anchor_visible {
+                closed |= reconciler::run_action(&format!("{}/#dismiss", overlay.path));
+            }
+        }
+        closed
     }
 
     /// A virtual window that failed to cover the visible band asks its
@@ -1080,6 +1155,7 @@ impl Runtime {
             stamp,
             animator: Some(&self.animator),
             anim: None,
+            overlay_bounds: self.overlay_bounds.get(),
         };
         let (result, scene) = if dom {
             let (result, scene) = crate::layout::layout_dom(&tree, proposal, env);
@@ -1092,6 +1168,7 @@ impl Runtime {
         *self.last_hits.borrow_mut() = result.hits.clone();
         *self.last_scrolls.borrow_mut() = result.scrolls.clone();
         *self.last_fields.borrow_mut() = result.fields.clone();
+        *self.last_overlays.borrow_mut() = result.overlays.clone();
         // an applied-target memory whose region left the scene goes
         // with it — live regions keep theirs (the wheel stays sovereign)
         self.scroll_targets

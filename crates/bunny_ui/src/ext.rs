@@ -471,6 +471,33 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// An anchored popover: THIS view is the anchor, `side` the
+    /// preferred edge (flip-then-clamp when there is no room). Closes
+    /// on Escape and on a press outside — the press is consumed, never
+    /// forwarded. On the desktop shell the popover may leave the
+    /// window; everywhere else it clamps inside the viewport.
+    ///
+    /// ```ignore
+    /// row.popover(showing.binding(), Side::Trailing, move |_| {
+    ///     details_card(&item).erased()
+    /// })
+    /// ```
+    fn popover(
+        self,
+        is_presented: Binding<bool>,
+        side: crate::layout::Side,
+        content: impl Fn(&Context) -> Erased + 'static,
+    ) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Popover {
+                is_presented,
+                side,
+                content: Rc::new(content),
+            },
+        }
+    }
+
     /// `.toolbar { … }` — inert in the fake runtime, as in the motor.
     fn toolbar(self, _items: impl View) -> Modified<Self> {
         Modified {

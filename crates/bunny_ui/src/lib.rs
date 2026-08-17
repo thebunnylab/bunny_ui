@@ -98,7 +98,7 @@ pub mod prelude {
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
     pub use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, RawImages, file_icon};
-    pub use crate::layout::{Color, Rendering, Truncation, VisualProps};
+    pub use crate::layout::{Color, Rendering, Side, Truncation, VisualProps};
     pub use crate::theme::{self, Theme};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
     pub use crate::text_input::{CaretState, EditCommand};
@@ -2709,6 +2709,335 @@ mod tests {
             row_height <= target.size.height + 4.0,
             "damage is row-sized ({row_height}px tall), not the window"
         );
+    }
+
+    // MARK: - Popovers
+
+    use crate::action::{Key, KeyPattern, OVERLAY_DISMISS};
+    use crate::layout::Rect;
+
+    #[derive(Clone)]
+    struct Anchored {
+        open: State<bool>,
+        side: Side,
+        /// Height of the filler ABOVE the anchor — moves it around.
+        above: f64,
+    }
+
+    impl Component for Anchored {
+        fn body(self, _ctx: &Context) -> impl View {
+            vstack!(
+                spacer().frame(180.0, self.above),
+                spacer().frame(20.0, 20.0).popover(self.open.binding(), self.side, |_| {
+                    erased(spacer().frame(40.0, 30.0))
+                }),
+            )
+        }
+    }
+
+    fn opened(side: Side, above: f64) -> (Runtime, Anchored) {
+        let runtime = Runtime::new();
+        let view = Anchored { open: State::new(true), side, above };
+        (runtime, view)
+    }
+
+    fn window() -> crate::layout::Proposal {
+        crate::layout::Proposal::exact(crate::layout::Size { width: 200.0, height: 200.0 })
+    }
+
+    #[test]
+    fn a_popover_hangs_off_every_side_with_the_gap() {
+        // ONE runtime, the side in state: retention is thread-local by
+        // identity, so a fresh runtime with the same component type
+        // would keep the FIRST side's tree — the set marks dirty and
+        // the body re-runs for real
+        #[derive(Clone)]
+        struct Turning {
+            side: State<usize>,
+        }
+        impl Component for Turning {
+            fn body(self, _ctx: &Context) -> impl View {
+                let side =
+                    [Side::Bottom, Side::Top, Side::Trailing, Side::Leading][self.side.get()];
+                vstack!(
+                    spacer().frame(180.0, 80.0),
+                    spacer().frame(20.0, 20.0).popover(
+                        State::new(true).binding(),
+                        side,
+                        |_| erased(spacer().frame(40.0, 30.0)),
+                    ),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        let view = Turning { side: State::new(0) };
+        // the anchor sits at (80, 80)–(100, 100); the overlay is 40×30
+        let mut frame = |index: usize| {
+            view.side.set(index);
+            let result = runtime.layout(&view, window());
+            assert_eq!(result.overlays.len(), 1, "one open popover");
+            result.overlays[0].frame
+        };
+        let bottom = frame(0);
+        assert_eq!((bottom.origin.x, bottom.origin.y), (70.0, 106.0), "below, centered");
+        let top = frame(1);
+        assert_eq!((top.origin.x, top.origin.y), (70.0, 44.0), "above, centered");
+        let trailing = frame(2);
+        assert_eq!((trailing.origin.x, trailing.origin.y), (106.0, 75.0), "after, centered");
+        let leading = frame(3);
+        assert_eq!((leading.origin.x, leading.origin.y), (34.0, 75.0), "before, centered");
+    }
+
+    #[test]
+    fn a_popover_flips_when_its_side_has_no_room() {
+        // anchor at y 160–180: below wants 186..216, past the window —
+        // the frame flips above instead
+        let (runtime, view) = opened(Side::Bottom, 160.0);
+        let result = runtime.layout(&view, window());
+        assert_eq!(result.overlays[0].frame.origin.y, 124.0, "flipped above the anchor");
+    }
+
+    #[test]
+    fn a_popover_clamps_inside_its_container() {
+        let runtime = Runtime::new();
+        let view = {
+            #[derive(Clone)]
+            struct Wide {
+                open: State<bool>,
+            }
+            impl Component for Wide {
+                fn body(self, _ctx: &Context) -> impl View {
+                    vstack!(
+                        spacer().frame(180.0, 80.0),
+                        spacer().frame(20.0, 20.0).popover(
+                            self.open.binding(),
+                            Side::Bottom,
+                            |_| erased(spacer().frame(190.0, 30.0)),
+                        ),
+                    )
+                }
+            }
+            Wide { open: State::new(true) }
+        };
+        let result = runtime.layout(&view, window());
+        // centered would start at -5; the clamp holds the left edge
+        assert_eq!(result.overlays[0].frame.origin.x, 0.0, "clamped to the container");
+    }
+
+    #[test]
+    fn overlay_bounds_let_a_popover_leave_the_window() {
+        // the mac shape, headless: the container is the SCREEN, larger
+        // than the window — the same anchor no longer flips, it spills
+        let (runtime, view) = opened(Side::Bottom, 160.0);
+        runtime.set_overlay_bounds(Some(Rect {
+            origin: crate::layout::Point { x: -100.0, y: -100.0 },
+            size: crate::layout::Size { width: 400.0, height: 400.0 },
+        }));
+        let result = runtime.layout(&view, window());
+        let frame = result.overlays[0].frame;
+        assert_eq!(frame.origin.y, 186.0, "no flip — the screen has room");
+        assert!(
+            frame.origin.y + frame.size.height > 200.0,
+            "the popover overflows the window: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn a_popover_paints_on_top_and_wins_the_hit() {
+        #[derive(Clone)]
+        struct Covered {
+            open: State<bool>,
+        }
+        impl Component for Covered {
+            fn body(self, _ctx: &Context) -> impl View {
+                zstack!(
+                    button(text("under"), || {}).frame(120.0, 120.0),
+                    spacer().frame(20.0, 20.0).popover(self.open.binding(), Side::Bottom, |_| {
+                        erased(button(text("over"), || {}).frame(60.0, 30.0))
+                    }),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        let view = Covered { open: State::new(true) };
+        let result = runtime.layout(&view, window());
+
+        let overlay = &result.overlays[0];
+        // the slice is a SUFFIX of the display list
+        assert_eq!(overlay.display.1, result.display.len(), "the popover paints last");
+        assert!(overlay.display.0 < overlay.display.1, "and it painted something");
+        // the hit inside the overlay resolves to the popover's button
+        let inside = (
+            overlay.frame.origin.x + overlay.frame.size.width / 2.0,
+            overlay.frame.origin.y + overlay.frame.size.height / 2.0,
+        );
+        let path = crate::layout::hit_test(&result.hits, inside.0, inside.1)
+            .expect("the popover is clickable");
+        assert!(path.contains("popover"), "the popover's own button wins: {path}");
+    }
+
+    /// A list whose FIRST row anchors a popover — the scroll shape of
+    /// the scroll tests.
+    #[derive(Clone)]
+    struct RowAnchored {
+        open: State<bool>,
+    }
+
+    impl Component for RowAnchored {
+        fn body(self, _ctx: &Context) -> impl View {
+            let open = self.open;
+            vstack!(
+                list(
+                    (0..20).collect::<Vec<_>>(),
+                    |row| row.to_string(),
+                    move |row| {
+                        if *row == 0 {
+                            erased(spacer().frame(20.0, 20.0).popover(
+                                open.binding(),
+                                Side::Trailing,
+                                |_| {
+                                    erased(
+                                        spacer()
+                                            .frame(20.0, 20.0)
+                                            .background_color(Color::hex(0x123456)),
+                                    )
+                                },
+                            ))
+                        } else {
+                            erased(spacer().frame(120.0, 20.0))
+                        }
+                    },
+                )
+                .frame(160.0, 60.0)
+            )
+        }
+    }
+
+    #[test]
+    fn a_popover_escapes_a_scroll_clip() {
+        let runtime = Runtime::new();
+        let view = RowAnchored { open: State::new(true) };
+        let result = runtime.layout(&view, window());
+        let overlay = &result.overlays[0];
+        // the popover paints, and its slice sits AFTER every clip of
+        // the walk — the scroll viewport cannot cut it
+        assert!(overlay.display.0 < overlay.display.1, "the popover painted");
+        let clips_before_overlay = result.display.as_slice()[..overlay.display.0]
+            .iter()
+            .fold(0i32, |depth, command| match command {
+                crate::layout::DrawCommand::PushClip { .. } => depth + 1,
+                crate::layout::DrawCommand::PopClip => depth - 1,
+                _ => depth,
+            });
+        assert_eq!(clips_before_overlay, 0, "no clip is open where the popover paints");
+    }
+
+    #[test]
+    fn a_press_outside_closes_and_consumes() {
+        let (runtime, view) = opened(Side::Bottom, 80.0);
+        let _ = runtime.layout(&view, window());
+
+        // outside the popover (and over nothing clickable): closes
+        assert!(runtime.pointer_pressed(5.0, 5.0), "the press repaints");
+        assert!(!view.open.get(), "the popover closed");
+        // the press was CONSUMED: nothing armed, so the release fires
+        // nothing either
+        assert_eq!(runtime.pointer_released(5.0, 5.0), None);
+
+        // reopen; a press INSIDE stays open
+        view.open.set(true);
+        let result = runtime.layout(&view, window());
+        let frame = result.overlays[0].frame;
+        runtime.pointer_pressed(
+            frame.origin.x + frame.size.width / 2.0,
+            frame.origin.y + frame.size.height / 2.0,
+        );
+        assert!(view.open.get(), "a press inside never dismisses");
+    }
+
+    #[test]
+    fn escape_closes_from_the_inside_out() {
+        #[derive(Clone)]
+        struct Nested {
+            outer: State<bool>,
+            inner: State<bool>,
+        }
+        impl Component for Nested {
+            fn body(self, _ctx: &Context) -> impl View {
+                let inner = self.inner;
+                vstack!(
+                    spacer().frame(180.0, 80.0),
+                    spacer().frame(20.0, 20.0).popover(
+                        self.outer.binding(),
+                        Side::Bottom,
+                        move |_| {
+                            erased(
+                                spacer()
+                                    .frame(30.0, 20.0)
+                                    .popover(inner.binding(), Side::Trailing, |_| {
+                                        erased(spacer().frame(20.0, 20.0))
+                                    }),
+                            )
+                        },
+                    ),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        let view =
+            Nested { outer: State::new(true), inner: State::new(true) };
+        let result = runtime.layout(&view, window());
+        assert_eq!(result.overlays.len(), 2, "both popovers open");
+
+        let escape = KeyPattern::key(Key::Escape);
+        let action = runtime.match_key(&escape).expect("escape binds while a popover is open");
+        assert_eq!(action, OVERLAY_DISMISS);
+        assert!(runtime.dispatch_action(action));
+        assert!(!view.inner.get(), "the INNERMOST closes first");
+        assert!(view.outer.get(), "the outer stays");
+
+        let _ = runtime.layout(&view, window());
+        assert!(runtime.dispatch_action(runtime.match_key(&escape).expect("still bound")));
+        assert!(!view.outer.get(), "the second escape closes the outer");
+
+        // with nothing open, escape stops matching (the context died)
+        let _ = runtime.layout(&view, window());
+        assert_eq!(runtime.match_key(&escape), None, "no popover, no binding");
+    }
+
+    #[test]
+    fn a_scrolled_away_anchor_dismisses_its_popover() {
+        let runtime = Runtime::new();
+        let view = RowAnchored { open: State::new(true) };
+        let result = runtime.layout(&view, window());
+        assert!(view.open.get());
+
+        // roll the anchor out of the viewport; the follow-up closes it
+        let region = result.scrolls.first().expect("a scroll region").path.clone();
+        runtime.set_scroll_offset(&region, crate::layout::Point { x: 0.0, y: 300.0 });
+        let result = runtime.layout(&view, window());
+        assert!(!view.open.get(), "the orphaned popover closed");
+        assert!(result.overlays.is_empty(), "and the relayout dropped it");
+    }
+
+    #[test]
+    fn a_closed_popover_costs_nothing() {
+        let closed = {
+            let (runtime, view) = opened(Side::Bottom, 80.0);
+            view.open.set(false);
+            runtime.layout(&view, window()).display
+        };
+        let bare = {
+            #[derive(Clone)]
+            struct Bare;
+            impl Component for Bare {
+                fn body(self, _ctx: &Context) -> impl View {
+                    vstack!(spacer().frame(180.0, 80.0), spacer().frame(20.0, 20.0))
+                }
+            }
+            Runtime::new().layout(&Bare, window()).display
+        };
+        assert_eq!(closed.as_slice(), bare.as_slice(), "closed = not there, byte for byte");
     }
 
     // MARK: - Images

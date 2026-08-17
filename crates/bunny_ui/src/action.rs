@@ -14,6 +14,15 @@
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ActionId(pub &'static str);
 
+/// Closes the innermost open popover. Every mounted popover registers
+/// a handler for it, and the runtime pre-binds Escape inside the
+/// reserved [`OVERLAY_CONTEXT`] — apps never wire this themselves.
+pub const OVERLAY_DISMISS: ActionId = ActionId("bunny.popover.dismiss");
+
+/// The key context every open popover declares. The `bunny.` prefix is
+/// reserved for the framework's own contexts.
+pub const OVERLAY_CONTEXT: &str = "bunny.popover";
+
 impl std::fmt::Display for ActionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.0)

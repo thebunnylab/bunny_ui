@@ -99,6 +99,13 @@ pub enum Modifier {
         is_presented: Binding<bool>,
         content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
     },
+    /// An anchored popover: the modified view is the ANCHOR, `side`
+    /// the preferred edge. Closes on Escape and on a press outside.
+    Popover {
+        is_presented: Binding<bool>,
+        side: crate::layout::Side,
+        content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
+    },
     EnvSet {
         name: &'static str,
         detail: String,
@@ -174,6 +181,7 @@ impl Modifier {
             Modifier::OnTapGesture(_) => " [.onTapGesture()]".into(),
             Modifier::Effect { name, detail, .. } => format!(" [.{name}{detail}]"),
             Modifier::Sheet { .. } => " [.sheet(isPresented: $…)]".into(),
+            Modifier::Popover { side, .. } => format!(" [.popover(.{side:?})]"),
             Modifier::EnvSet { name, detail, .. } => format!(" [.{name}{detail}]"),
             Modifier::Custom(custom) => format!(" [.modifier({})]", custom.name()),
             Modifier::Searchable => " [.searchable(text: $…)]".into(),
@@ -446,6 +454,54 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 // in layout, the sheet overlays the base
                 out.wrap_last_layout(|base| LayoutNode::Layered {
                     children: vec![base, wrap_layout(sheet_layouts)],
+                });
+            }
+            Modifier::Popover {
+                is_presented,
+                side,
+                content,
+            } if is_presented.get() => {
+                let mut popover_nodes = NodeList::new();
+                let path;
+                {
+                    // its own identity sub-root, like the sheet: what
+                    // the closure builds anchors here and dies when it
+                    // closes (auto-focus re-fires on every open)
+                    let _frame = motor::identity::enter("popover");
+                    path = motor::identity::cursor_scope();
+                    content(ctx).render_into(ctx, &mut popover_nodes);
+                }
+                let (popover_prints, popover_layouts) = popover_nodes.into_parts();
+                if let Some(node) = out.last_mut() {
+                    node.children
+                        .push(RenderNode::branch("Popover", popover_prints));
+                }
+                if let Some(path) = &path {
+                    // both dismiss triggers close through ONE machine:
+                    // the outside press fires the action; Escape
+                    // arrives by dispatch (innermost handler wins, so
+                    // nested popovers close from the inside out)
+                    let close: Rc<dyn Fn()> = {
+                        let is_presented = is_presented.clone();
+                        Rc::new(move || is_presented.set(false))
+                    };
+                    crate::reconciler::attribute_action(
+                        format!("{path}/#dismiss"),
+                        close.clone(),
+                    );
+                    crate::reconciler::attribute_handler(
+                        path.clone(),
+                        crate::action::OVERLAY_DISMISS,
+                        close,
+                    );
+                    crate::reconciler::attribute_context(crate::action::OVERLAY_CONTEXT);
+                }
+                let side = *side;
+                out.wrap_last_layout(|base| LayoutNode::Anchored {
+                    path: path.unwrap_or_default(),
+                    side,
+                    overlay: Rc::new(wrap_layout(popover_layouts)),
+                    child: Box::new(base),
                 });
             }
             _ => {}

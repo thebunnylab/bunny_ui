@@ -99,6 +99,28 @@ pub enum CrossAlign {
     Baseline,
 }
 
+/// Which edge of its anchor a popover prefers. The cross axis centers
+/// on the anchor; when the preferred side has no room the frame flips,
+/// and what still does not fit clamps inside the overlay container.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Side {
+    Top,
+    Bottom,
+    Leading,
+    Trailing,
+}
+
+impl Side {
+    fn opposite(self) -> Side {
+        match self {
+            Side::Top => Side::Bottom,
+            Side::Bottom => Side::Top,
+            Side::Leading => Side::Trailing,
+            Side::Trailing => Side::Leading,
+        }
+    }
+}
+
 /// Padding insets, per edge.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct Edges {
@@ -147,6 +169,11 @@ pub struct LayoutEnv<'a> {
     pub animator: Option<&'a std::cell::RefCell<crate::anim::Animator>>,
     /// The animation scope opened by the nearest `Animated` ancestor.
     pub anim: Option<AnimScope<'a>>,
+    /// Where overlays may live. `None` = the pass's viewport (web,
+    /// headless); the mac shell sets the SCREEN in layout coordinates —
+    /// a popover then overflows the window by plain geometry, and the
+    /// whole policy stays testable headless.
+    pub overlay_bounds: Option<Rect>,
 }
 
 /// An open animation scope, walking down with the placement. The
@@ -316,6 +343,19 @@ pub enum LayoutNode {
     /// subtree's own draw commands. On pixel targets it dissolves:
     /// everything is the pixel pipeline there already.
     Island { child: Box<LayoutNode> },
+    /// `.popover(...)`: the child is the ANCHOR; the overlay does not
+    /// descend here. Placement queues it — the pass places every
+    /// overlay AFTER the root, so the popover paints on top, its hits
+    /// win, no scroll clip cuts it, and the Dom capture mounts it as
+    /// the root's last child (the portal, by construction). The anchor
+    /// re-resolves on every layout: scroll and resize re-anchor free.
+    Anchored {
+        /// The popover's identity (dismiss registrations key on it).
+        path: String,
+        side: Side,
+        overlay: Rc<LayoutNode>,
+        child: Box<LayoutNode>,
+    },
 }
 
 /// Where a subtree renders when the scene lowers to elements. The v1
@@ -552,6 +592,32 @@ pub struct ScrollRegion {
     pub row_extent: Option<Px>,
 }
 
+/// One placed overlay: its identity, the anchor it hangs from, the
+/// resolved frame, and its slice `[start, end)` of the display list —
+/// a shell that wants the popover on its own surface (the mac child
+/// panel) re-presents exactly that slice, translated.
+#[derive(Clone, Debug)]
+pub struct OverlayPlacement {
+    pub path: String,
+    pub anchor: Rect,
+    pub frame: Rect,
+    pub display: (usize, usize),
+    /// The anchor still intersects its clip — a popover whose anchor
+    /// scrolled away dismisses on the follow-up.
+    pub anchor_visible: bool,
+}
+
+/// An overlay waiting for the deferred pass (the anchor placed, the
+/// popover not yet).
+#[derive(Debug)]
+struct QueuedOverlay {
+    path: String,
+    side: Side,
+    node: Rc<LayoutNode>,
+    anchor: Rect,
+    anchor_visible: bool,
+}
+
 /// A placed text field: geometry + EFFECTIVE font at that point of the
 /// scene — click-to-position and IME sync measure through here.
 #[derive(Clone, Debug)]
@@ -589,6 +655,11 @@ pub struct Placement {
     /// Regions whose virtual window failed to cover the visible band —
     /// the runtime invalidates their boundary for a follow-up pass.
     pub misses: Vec<String>,
+    /// Overlays queued by `Anchored` during the walk — drained AFTER
+    /// the root places (an empty scene never allocates).
+    overlay_queue: Vec<QueuedOverlay>,
+    /// The placed overlays, in paint order (last = topmost).
+    pub overlays: Vec<OverlayPlacement>,
     /// The Dom capture, when that mode is on ([`layout_dom`]) — the
     /// placement braços feed it the SEMANTIC scene while they walk.
     /// `None` costs one branch per hook and nothing else.
@@ -693,6 +764,9 @@ pub struct LayoutResult {
     /// Virtual windows that failed to cover the visible band this
     /// frame — the runtime re-materializes them in a follow-up pass.
     pub misses: Vec<String>,
+    /// The placed popovers, in paint order (last = topmost) — each one
+    /// a suffix slice of `display`.
+    pub overlays: Vec<OverlayPlacement>,
 }
 
 /// Runs both phases from the root with the default environment — the
@@ -720,6 +794,7 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
+            overlay_bounds: None,
         },
     )
 }
@@ -729,6 +804,11 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
     let (size, fit) = root.measure(proposal, env);
     let mut out = Placement::default();
     root.place(Rect { origin: Point::default(), size }, fit, env, &mut out);
+    // popovers place AFTER the root: painted on top, hit first, free
+    // of every scroll clip. Their default container is the WINDOW (the
+    // proposal), never the root's answer — a small scene must not
+    // shrink the room a popover positions in.
+    place_overlays(window_bounds(proposal, size), env, &mut out);
     LayoutResult {
         size,
         frames: out.frames,
@@ -737,6 +817,7 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         scrolls: out.scrolls,
         fields: out.fields,
         misses: out.misses,
+        overlays: out.overlays,
     }
 }
 
@@ -754,6 +835,10 @@ pub fn layout_dom(
         ..Placement::default()
     };
     root.place(Rect { origin: Point::default(), size }, fit, env, &mut out);
+    // the capture is still open at the root here, so every popover
+    // mounts as the root's LAST child — outside every scroll element,
+    // stacked on top by document order: the portal, by construction
+    place_overlays(window_bounds(proposal, size), env, &mut out);
     let scene = out.dom.take().expect("the capture stays for the whole walk").finish();
     (
         LayoutResult {
@@ -764,6 +849,7 @@ pub fn layout_dom(
             scrolls: out.scrolls,
             fields: out.fields,
             misses: out.misses,
+            overlays: out.overlays,
         },
         scene,
     )
@@ -805,6 +891,139 @@ fn image_size(
             width: proposal.width.unwrap_or(width).max(0.0),
             height: proposal.height.unwrap_or(height).max(0.0),
         },
+    }
+}
+
+/// The window rect overlays position against when no explicit bounds
+/// are set: the PROPOSAL when the axis was proposed, the root's answer
+/// where it was open.
+fn window_bounds(proposal: Proposal, size: Size) -> Rect {
+    Rect {
+        origin: Point::default(),
+        size: Size {
+            width: proposal.width.unwrap_or(size.width),
+            height: proposal.height.unwrap_or(size.height),
+        },
+    }
+}
+
+/// The gap between an anchor and its popover, logical px — fixed in
+/// v1 (a knob waits for a real need).
+const OVERLAY_GAP: Px = 6.0;
+
+/// How many queued overlays one pass resolves — nested popovers queue
+/// while their parent places; the cap is the livelock guard.
+const OVERLAY_CAP: usize = 8;
+
+/// The popover frame for one anchor: the preferred side first, the
+/// FLIP when it has no room, the roomier side when neither fits — and
+/// a final clamp into the container on both axes. The size never
+/// shrinks here (the measure already capped it at the container).
+fn anchored_frame(anchor: Rect, side: Side, size: Size, container: Rect) -> Rect {
+    let origin_for = |side: Side| -> Point {
+        match side {
+            Side::Bottom => Point {
+                x: anchor.origin.x + (anchor.size.width - size.width) / 2.0,
+                y: anchor.origin.y + anchor.size.height + OVERLAY_GAP,
+            },
+            Side::Top => Point {
+                x: anchor.origin.x + (anchor.size.width - size.width) / 2.0,
+                y: anchor.origin.y - OVERLAY_GAP - size.height,
+            },
+            Side::Trailing => Point {
+                x: anchor.origin.x + anchor.size.width + OVERLAY_GAP,
+                y: anchor.origin.y + (anchor.size.height - size.height) / 2.0,
+            },
+            Side::Leading => Point {
+                x: anchor.origin.x - OVERLAY_GAP - size.width,
+                y: anchor.origin.y + (anchor.size.height - size.height) / 2.0,
+            },
+        }
+    };
+    // room on the MAIN axis only — the cross axis always clamps
+    let fits = |side: Side| -> bool {
+        let origin = origin_for(side);
+        match side {
+            Side::Top | Side::Bottom => {
+                origin.y >= container.origin.y
+                    && origin.y + size.height <= container.origin.y + container.size.height
+            }
+            Side::Leading | Side::Trailing => {
+                origin.x >= container.origin.x
+                    && origin.x + size.width <= container.origin.x + container.size.width
+            }
+        }
+    };
+    let chosen = if fits(side) {
+        side
+    } else if fits(side.opposite()) {
+        side.opposite()
+    } else {
+        // neither fits whole: the roomier side keeps more visible
+        let room = |side: Side| -> Px {
+            match side {
+                Side::Bottom => {
+                    container.origin.y + container.size.height
+                        - (anchor.origin.y + anchor.size.height)
+                }
+                Side::Top => anchor.origin.y - container.origin.y,
+                Side::Trailing => {
+                    container.origin.x + container.size.width
+                        - (anchor.origin.x + anchor.size.width)
+                }
+                Side::Leading => anchor.origin.x - container.origin.x,
+            }
+        };
+        if room(side) >= room(side.opposite()) { side } else { side.opposite() }
+    };
+    let origin = origin_for(chosen);
+    let clamp = |value: Px, low: Px, high: Px| value.min(high).max(low);
+    Rect {
+        origin: Point {
+            x: clamp(
+                origin.x,
+                container.origin.x,
+                container.origin.x + (container.size.width - size.width).max(0.0),
+            ),
+            y: clamp(
+                origin.y,
+                container.origin.y,
+                container.origin.y + (container.size.height - size.height).max(0.0),
+            ),
+        },
+        size,
+    }
+}
+
+/// Drains the overlay queue AFTER the root placed: every popover
+/// measures against the container, resolves its side and lands at the
+/// END of the display list — on top by paint order, hit-priority by
+/// position, outside every clip (the stack is empty here), and inside
+/// the still-open Dom root (the portal). A popover opened inside a
+/// popover queues during its parent's place and drains in the same
+/// loop.
+fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
+    let container = env.overlay_bounds.unwrap_or(viewport);
+    let mut placed = 0;
+    while !out.overlay_queue.is_empty() && placed < OVERLAY_CAP {
+        placed += 1;
+        let queued = out.overlay_queue.remove(0);
+        let proposal = Proposal {
+            width: Some(container.size.width),
+            height: Some(container.size.height),
+        };
+        let (size, fit) = queued.node.measure(proposal, env);
+        let frame = anchored_frame(queued.anchor, queued.side, size, container);
+        let start = out.display.len();
+        queued.node.place(frame, fit, env, out);
+        let end = out.display.len();
+        out.overlays.push(OverlayPlacement {
+            path: queued.path,
+            anchor: queued.anchor,
+            frame,
+            display: (start, end),
+            anchor_visible: queued.anchor_visible,
+        });
     }
 }
 
@@ -850,7 +1069,8 @@ impl LayoutNode {
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::Styled { child, .. }
             | LayoutNode::Animated { child, .. }
-            | LayoutNode::Island { child } => child.is_flexible(axis),
+            | LayoutNode::Island { child }
+            | LayoutNode::Anchored { child, .. } => child.is_flexible(axis),
             // a stack that HOLDS something flexible is itself flexible
             // (a panel with a scroll inside wants the leftover space —
             // nesting it must not freeze it at its natural extent)
@@ -892,6 +1112,7 @@ impl LayoutNode {
             LayoutNode::Animated { child, .. }
             | LayoutNode::Island { child }
             | LayoutNode::Interactive { child, .. }
+            | LayoutNode::Anchored { child, .. }
             | LayoutNode::Frame { child, .. } => child.first_baseline(env),
             LayoutNode::Padding { edges, child } => {
                 child.first_baseline(env).map(|baseline| baseline + edges.top)
@@ -964,6 +1185,13 @@ impl LayoutNode {
                     }
                 };
                 (size, Fit::Leaf)
+            }
+
+            // the anchor's geometry IS the node's — the overlay never
+            // participates in the measure
+            LayoutNode::Anchored { child, .. } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             LayoutNode::Stack { axis, spacing, children, .. } => {
@@ -1351,6 +1579,31 @@ impl LayoutNode {
                     color: Color::OUTLINE,
                     width: 1.0,
                     corner_radius: 0.0,
+                });
+            }
+
+            (LayoutNode::Anchored { path, side, overlay, child }, Fit::Wrapped(_, fit)) => {
+                child.place(frame, *fit, env, out);
+                // the REAL anchor: un-shift the in-flight animation
+                // (the popover never chases a sliding row — the same
+                // contract as the retained boundary frames)
+                let shift = env.anim.map(|scope| scope.shift).unwrap_or((0.0, 0.0));
+                let anchor = Rect {
+                    origin: Point {
+                        x: frame.origin.x - shift.0,
+                        y: frame.origin.y - shift.1,
+                    },
+                    size: frame.size,
+                };
+                let anchor_visible = out
+                    .current_clip()
+                    .is_none_or(|clip| anchor.intersection(clip).is_some());
+                out.overlay_queue.push(QueuedOverlay {
+                    path: path.clone(),
+                    side: *side,
+                    node: Rc::clone(overlay),
+                    anchor,
+                    anchor_visible,
                 });
             }
 
@@ -2280,6 +2533,7 @@ mod tests {
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
+            overlay_bounds: None,
         };
         node.measure(proposal, env).0
     }
@@ -2308,6 +2562,7 @@ mod tests {
                 stamp: FrameStamp::idle(interaction, &carets),
                 animator: None,
                 anim: None,
+                overlay_bounds: None,
             },
         )
     }
@@ -2495,6 +2750,7 @@ mod tests {
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
+            overlay_bounds: None,
         };
 
         let root = LayoutNode::Scroll {
