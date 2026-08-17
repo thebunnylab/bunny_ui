@@ -713,6 +713,19 @@ pub struct VirtualList<I, F> {
     count: usize,
     id: I,
     row: F,
+    reveal: Option<usize>,
+}
+
+impl<I, F> VirtualList<I, F> {
+    /// Scrolls just enough to show this row INDEX, materializing it
+    /// even when it sits far outside the window (the pin) — the
+    /// virtualized sibling of `.scroll_target(id)`, by index because
+    /// the list never walks all ids. The wheel stays sovereign in
+    /// between; under `.animated`, the reveal flies.
+    pub fn reveal(mut self, index: usize) -> Self {
+        self.reveal = Some(index);
+        self
+    }
 }
 
 impl<I, F, R> View for VirtualList<I, F>
@@ -733,7 +746,13 @@ where
             Some(snap) if snap.row_extent > 0.0 && self.count > 0 => {
                 let rows_in_view =
                     (snap.viewport / snap.row_extent).ceil().max(1.0) as usize + 1;
-                let top = (snap.offset_y / snap.row_extent).floor().max(0.0) as usize;
+                // the retained offset clamps HERE the way place will
+                // clamp it — a count that just shrank must not leave
+                // the window math pointing at rows that no longer exist
+                let travel = (snap.row_extent * self.count as f64 - snap.viewport)
+                    .max(0.0);
+                let offset = snap.offset_y.clamp(0.0, travel);
+                let top = (offset / snap.row_extent).floor().max(0.0) as usize;
                 let first = top.saturating_sub(rows_in_view).min(self.count - 1);
                 let last = (top + 2 * rows_in_view).min(self.count - 1);
                 (first, last)
@@ -741,11 +760,17 @@ where
             _ => (0, self.count.min(FIRST_WINDOW).saturating_sub(1)),
         };
         debug_assert_unique_ids("virtual_list", (first..=last).map(&self.id));
+        // the pin: the revealed row exists even far outside the window,
+        // so the follow-up that scrolls to it finds a real frame
+        let pin = self
+            .reveal
+            .filter(|index| self.count > 0 && *index < self.count)
+            .filter(|index| *index < first || *index > last);
 
         let mut children = Vec::new();
         let mut prints = Vec::new();
         if self.count > 0 {
-            for index in first..=last {
+            for index in (first..=last).chain(pin) {
                 let id = (self.id)(index);
                 // the same byte contract as the dense list: "[id]" is
                 // the identity frame, "scope/[id]" the boundary path
@@ -791,7 +816,10 @@ where
             prints,
         ));
         out.push_layout(LayoutNode::Scroll {
-            target: None,
+            target: self
+                .reveal
+                .filter(|index| self.count > 0 && *index < self.count)
+                .map(&self.id),
             path: motor::identity::cursor_scope(),
             child: Box::new(LayoutNode::VirtualStack {
                 row_extent: snapshot.map(|snap| snap.row_extent).unwrap_or(0.0),
@@ -810,7 +838,7 @@ where
     F: Fn(usize) -> R + Clone + 'static,
     R: View,
 {
-    VirtualList { count, id, row }
+    VirtualList { count, id, row, reveal: None }
 }
 
 /// `ForEach(collection, id: \.keyPath) { item in … }` — the `id` is the

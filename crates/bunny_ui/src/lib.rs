@@ -660,6 +660,132 @@ mod tests {
     }
 
     #[test]
+    fn reveal_reaches_a_row_far_outside_the_window() {
+        #[derive(Clone, Copy)]
+        struct Picker {
+            selected: State<usize>,
+        }
+
+        impl Component for Picker {
+            fn body(self, _ctx: &Context) -> impl View {
+                virtual_list(10_000, |row| format!("row{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+                .reveal(self.selected.get())
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        let picker = Picker { selected: State::new(0) };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&picker, size);
+        assert_eq!(runtime.scroll_offset("Picker").y, 0.0);
+
+        // the selection jumps to row 9000: the pin gives the follow-up
+        // a real frame, the offset bottom-aligns it, and the window
+        // re-materializes around it — all inside one frame
+        picker.selected.set(9000);
+        let jumped = runtime.display_frame(&picker, size);
+        assert_eq!(
+            runtime.scroll_offset("Picker").y,
+            9000.0 * 16.0 + 16.0 - 100.0,
+            "the region bottom-aligns the revealed row"
+        );
+        assert!(jumped.iter().any(|command| match command {
+            crate::layout::DrawCommand::TextLine { content, .. } => {
+                content.as_ref() == "item 9000"
+            }
+            _ => false,
+        }));
+        // the wheel stays sovereign afterwards
+        assert!(runtime.wheel(10.0, 10.0, 0.0, 32.0));
+        let _ = runtime.display_frame(&picker, size);
+        assert_eq!(runtime.scroll_offset("Picker").y, 9000.0 * 16.0 + 16.0 - 132.0);
+    }
+
+    #[test]
+    fn off_window_rows_die_and_are_born_again() {
+        use std::cell::RefCell;
+
+        thread_local! {
+            static APPEARED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+        }
+
+        #[derive(Clone, Copy)]
+        struct Lazy;
+
+        impl Component for Lazy {
+            fn body(self, _ctx: &Context) -> impl View {
+                virtual_list(10_000, |row| format!("row{row}"), |row| {
+                    text(format!("item {row}"))
+                        .on_appear(move || APPEARED.with(|log| log.borrow_mut().push(row)))
+                })
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        let runtime = Runtime::new();
+        APPEARED.with(|log| log.borrow_mut().clear());
+        let _ = runtime.display_frame(&Lazy, size);
+        runtime.pump();
+        let first_mount =
+            APPEARED.with(|log| log.borrow().iter().filter(|row| **row == 0).count());
+        assert!(first_mount >= 1, "row 0 appeared on mount");
+
+        // jump far away: the old window unmounts (lazy, by contract)…
+        runtime.set_scroll_offset("Lazy", crate::layout::Point { x: 0.0, y: 8000.0 });
+        let _ = runtime.display_frame(&Lazy, size);
+        runtime.pump();
+        // …and coming back REMOUNTS row 0: onAppear fires again
+        runtime.set_scroll_offset("Lazy", crate::layout::Point { x: 0.0, y: 0.0 });
+        let _ = runtime.display_frame(&Lazy, size);
+        runtime.pump();
+        let reborn =
+            APPEARED.with(|log| log.borrow().iter().filter(|row| **row == 0).count());
+        assert!(
+            reborn > first_mount,
+            "the row was born again: {first_mount} then {reborn}"
+        );
+    }
+
+    #[test]
+    fn a_shrinking_count_clamps_the_window_and_the_offset() {
+        #[derive(Clone, Copy)]
+        struct Shrinker {
+            count: State<usize>,
+        }
+
+        impl Component for Shrinker {
+            fn body(self, _ctx: &Context) -> impl View {
+                let count = self.count.get();
+                virtual_list(count, |row| format!("row{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        let shrinker = Shrinker { count: State::new(10_000) };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&shrinker, size);
+        runtime.set_scroll_offset("Shrinker", crate::layout::Point { x: 0.0, y: 8000.0 });
+        let _ = runtime.display_frame(&shrinker, size);
+
+        // the filter empties almost everything: the window clamps, the
+        // retained offset re-clamps at place, the content shrinks
+        shrinker.count.set(5);
+        let shrunk = runtime.display_frame(&shrinker, size);
+        assert!(shrunk.iter().any(|command| match command {
+            crate::layout::DrawCommand::TextLine { content, .. } => {
+                content.as_ref() == "item 0"
+            }
+            _ => false,
+        }));
+        let result = runtime.layout(&shrinker, crate::layout::Proposal::exact(size));
+        assert_eq!(result.scrolls.first().expect("region").content.height, 80.0);
+    }
+
+    #[test]
     fn animated_rows_slide_on_reorder_and_settle_on_the_real_frame() {
         use crate::anim::Spring;
 
