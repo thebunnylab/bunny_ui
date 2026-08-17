@@ -60,10 +60,12 @@ function createElementOf(kind) {
   if (kind === 3) {
     const input = document.createElement("input");
     input.type = "text";
+    // padding mirrors the engine's FIELD_PAD; every color and border
+    // arrives through the patches — the theme owns the chrome, and no
+    // inline border may outrank the stylesheet rule
     input.style.cssText =
       "position:absolute;left:0;top:0;box-sizing:border-box;" +
-      "padding:5px 8px;border:1px solid #c6cad3;border-radius:5px;" +
-      "background:transparent;outline:none;";
+      "padding:5px 8px;outline:none;";
     let composing = false;
     input.addEventListener("compositionstart", () => {
       composing = true;
@@ -199,10 +201,18 @@ function applyPatches(view, length) {
           el.style.cursor = "default";
         }
       }
+      let focus = null;
+      let placeholder = null;
+      if (mask & 256) focus = rgba(u32());
+      if (mask & 512) placeholder = rgba(u32());
       const name = `[data-n="${id}"]`;
       let rule = `${name}{${base.join(";")}}`;
       if (hover) rule += `\n${name}:hover{background:${hover}}`;
       if (pressed) rule += `\n${name}:active{background:${pressed}}`;
+      if (focus) {
+        rule += `\n${name}:focus{border-color:${focus};caret-color:${focus}}`;
+      }
+      if (placeholder) rule += `\n${name}::placeholder{color:${placeholder}}`;
       rules.set(id, rule);
       rulesTouched = true;
     } else if (op === 6) {
@@ -248,6 +258,7 @@ function applyPatches(view, length) {
       }
     } else if (op === 7) {
       const el = elements.get(id);
+      const color = rgba(u32());
       const size = f32();
       const weight = CSS_WEIGHTS[u8()];
       const mono = u8();
@@ -256,6 +267,7 @@ function applyPatches(view, length) {
       const path = text(u16());
       if (el) {
         el.style.font = cssFont(size, weight, mono);
+        el.style.color = color;
         el.placeholder = placeholder;
         el.dataset.path = path;
         // write only when the value differs — echoing the browser's own

@@ -1080,18 +1080,37 @@ impl LayoutNode {
             }
 
             (LayoutNode::Field { path, content, placeholder, auto_focus }, Fit::Leaf) => {
-                if let Some(dom) = out.dom.as_mut() {
+                if out.dom.is_some() {
                     // the browser's input owns focus, caret and
-                    // composition — the record carries what to SHOW
-                    dom.leaf(
-                        crate::dom::DomKind::Field(crate::dom::DomField {
-                            path: path.clone(),
-                            content: content.clone(),
-                            placeholder: placeholder.clone(),
-                            font: env.font,
-                        }),
-                        frame,
-                    );
+                    // composition — the record carries what to SHOW,
+                    // and the THEME chrome rides the node's style (the
+                    // same tokens the pixel paint below reads)
+                    let theme = crate::theme::current();
+                    let color = out
+                        .foreground
+                        .last()
+                        .copied()
+                        .unwrap_or(theme.fg);
+                    if let Some(dom) = out.dom.as_mut() {
+                        dom.leaf_styled(
+                            crate::dom::DomKind::Field(crate::dom::DomField {
+                                path: path.clone(),
+                                content: content.clone(),
+                                placeholder: placeholder.clone(),
+                                font: env.font,
+                                color,
+                            }),
+                            frame,
+                            crate::dom::DomStyle {
+                                background: Some(theme.field),
+                                border: Some((theme.field_border, 1.0)),
+                                corner_radius: Some(FIELD_RADIUS),
+                                focus_border: Some(theme.focus),
+                                placeholder_color: Some(theme.placeholder),
+                                ..crate::dom::DomStyle::default()
+                            },
+                        );
+                    }
                 }
                 // focus/caret/selection read from the env's STAMP, clamped
                 // to the current content (the app may have swapped the

@@ -80,6 +80,11 @@ pub struct DomStyle {
     /// `(response, damping)` of the enclosing animation scope — the
     /// glue lowers it to a CSS transition; the engine never ticks here.
     pub transition: Option<(f64, f64)>,
+    /// A field's border while focused — the glue's `:focus` rule (and
+    /// its caret color): the browser flips it, the engine never hears.
+    pub focus_border: Option<Color>,
+    /// A field's placeholder ink — the glue's `::placeholder` rule.
+    pub placeholder_color: Option<Color>,
 }
 
 impl DomStyle {
@@ -93,6 +98,8 @@ impl DomStyle {
             shadow: props.shadow,
             interactive: None,
             transition: None,
+            focus_border: None,
+            placeholder_color: None,
         }
     }
 }
@@ -110,13 +117,15 @@ pub struct DomText {
 }
 
 /// One text field. Focus, caret and composition stay with the browser;
-/// the record carries what the input must SHOW.
+/// the record carries what the input must SHOW — including its text
+/// ink (the chrome rides the node's [`DomStyle`], from the theme).
 #[derive(Clone, Debug, PartialEq)]
 pub struct DomField {
     pub path: String,
     pub content: Rc<str>,
     pub placeholder: Rc<str>,
     pub font: FontSpec,
+    pub color: Color,
 }
 
 /// A captured scene node: kind + parent-relative frame + style +
@@ -257,6 +266,18 @@ impl DomCapture {
             return;
         }
         self.open(kind, frame, frame.origin);
+        self.close();
+    }
+
+    /// A childless element that carries its own style (the field's
+    /// theme chrome travels in the record, never hardcoded in a glue).
+    pub(crate) fn leaf_styled(&mut self, kind: DomKind, frame: Rect, style: DomStyle) {
+        if self.island > 0 {
+            return;
+        }
+        self.open(kind, frame, frame.origin);
+        let (_, node) = self.stack.last_mut().expect("just opened");
+        node.style = style;
         self.close();
     }
 
@@ -724,11 +745,12 @@ fn diff_children(
 ///                   5 shadow f32 radius + u32 rgba
 ///                   6 transition f32 response + f32 damping
 ///                   7 interactive u16 len + utf8
+///                   8 focus border u32 rgba   9 placeholder u32 rgba
 ///   6 set text      u32 rgba, f32 size, u8 weight, u8 mono,
 ///                   u8 truncation (0 none, 1 start, 2 middle, 3 end),
 ///                   u32 len + utf8, u16 span count,
 ///                   spans (u32 start, u32 end), u32 span rgba
-///   7 set field     f32 size, u8 weight, u8 mono,
+///   7 set field     u32 rgba text ink, f32 size, u8 weight, u8 mono,
 ///                   u32 len + utf8 content, u32 len + utf8 placeholder,
 ///                   u16 len + utf8 path
 ///   8 set scroll    f32 x, f32 y
@@ -805,6 +827,7 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
             DomPatch::SetField { id, field } => {
                 out.push(7);
                 push_u32(&mut out, *id);
+                push_u32(&mut out, pack_color(field.color));
                 push_f32(&mut out, field.font.size);
                 out.push(weight_code(field.font.weight));
                 out.push(matches!(field.font.design, FontDesign::Mono) as u8);
@@ -849,6 +872,12 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     if style.interactive.is_some() {
         mask |= 1 << 7;
     }
+    if style.focus_border.is_some() {
+        mask |= 1 << 8;
+    }
+    if style.placeholder_color.is_some() {
+        mask |= 1 << 9;
+    }
     push_u16(out, mask);
     if let Some(color) = style.background {
         push_u32(out, pack_color(color));
@@ -876,6 +905,12 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     }
     if let Some(path) = &style.interactive {
         push_bytes_u16(out, path.as_bytes());
+    }
+    if let Some(color) = style.focus_border {
+        push_u32(out, pack_color(color));
+    }
+    if let Some(color) = style.placeholder_color {
+        push_u32(out, pack_color(color));
     }
 }
 
@@ -1179,7 +1214,14 @@ mod tests {
         let runtime = Runtime::new();
         let view = WithField { query: State::new(String::new()) };
         let size = Size { width: 200.0, height: 60.0 };
-        let _ = runtime.dom_frame(&view, size);
+        let mount = runtime.dom_frame(&view, size);
+        let chrome = mount.iter().any(|patch| {
+            matches!(patch, DomPatch::SetStyle { style, .. }
+                if style.focus_border.is_some()
+                    && style.background.is_some()
+                    && style.placeholder_color.is_some())
+        });
+        assert!(chrome, "the input mounts wearing the theme: {mount:?}");
 
         assert!(runtime.key(crate::text_input::EditCommand::Insert("x".into())).applied);
         let patches = runtime.dom_frame(&view, size);
@@ -1188,6 +1230,35 @@ mod tests {
             DomPatch::SetField { field, .. } => assert_eq!(field.content.as_ref(), "x"),
             other => panic!("a field patch, not {other:?}"),
         }
+    }
+
+    #[test]
+    fn border_radius_and_shadow_ride_into_the_scene() {
+        #[derive(Clone, Copy)]
+        struct Panel;
+
+        impl Component for Panel {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("chrome")
+                    .background_color(Color::hex(0xFFFFFF))
+                    .corner_radius(12.0)
+                    .border(Color::hex(0xDDDDE2), 1.0)
+                    .shadow_color(24.0, Color::hex_a(0x0000_0040))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let patches = runtime.dom_frame(&Panel, Size { width: 200.0, height: 100.0 });
+        let style = patches
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::SetStyle { style, .. } if style.border.is_some() => Some(style),
+                _ => None,
+            })
+            .expect("the panel chrome reached the patches");
+        assert_eq!(style.corner_radius, Some(12.0));
+        assert_eq!(style.border, Some((Color::hex(0xDDDDE2), 1.0)));
+        assert_eq!(style.shadow, Some((24.0, Color::hex_a(0x0000_0040))));
     }
 
     #[test]
