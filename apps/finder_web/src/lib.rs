@@ -3,9 +3,35 @@
 //! animations, all rasterized by the engine and blitted to a canvas.
 #![cfg(target_arch = "wasm32")]
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use bunny_ui::prelude::*;
+
+#[link(wasm_import_module = "app")]
+unsafe extern "C" {
+    /// The APP's own door to the network. The engine opens no socket:
+    /// this import belongs to the demo, and the answer comes back
+    /// through [`finder_fetched`].
+    fn js_fetch(pointer: *const u8, len: usize);
+}
+
+thread_local! {
+    /// Where the answer of the fetch in flight goes. The task takes it
+    /// with it when it is cancelled, so a late answer finds nobody.
+    static ANSWER: RefCell<Option<task::Sender<String>>> = const { RefCell::new(None) };
+}
+
+/// The glue calls this when the fetch resolves — an empty body means
+/// it failed. The bytes come from `bunny_alloc`, so ownership crosses
+/// back here.
+#[unsafe(no_mangle)]
+pub extern "C" fn finder_fetched(pointer: *mut u8, len: usize) {
+    let body = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
+    if let Some(answer) = ANSWER.with(|slot| slot.borrow_mut().take()) {
+        let _ = answer.send(body);
+    }
+}
 
 fn matches(dir: &str, name: &str, needle: &str) -> bool {
     let mut haystack = dir.chars().chain(name.chars()).map(|c| c.to_ascii_lowercase());
@@ -19,6 +45,9 @@ struct Finder {
     /// A second click on the selected row opens its details popover.
     details: State<bool>,
     visible: State<Rc<Vec<usize>>>,
+    /// What the page's own manifest says — fetched by a task, so the
+    /// header shows the crossing landing.
+    manifest: State<Rc<str>>,
     files: Rc<Vec<(Rc<str>, Rc<str>)>>,
     /// Built ONCE (hash + registration happen per identity, never per
     /// body) — the browser decodes it and reports back.
@@ -43,6 +72,9 @@ impl Component for Finder {
                 text("›").foreground_color(theme::accent()),
                 text_field("Search ten thousand files…", self.query.binding()).monospaced(),
                 count_meter(count),
+                text(self.manifest.get())
+                    .font_size(11.0)
+                    .foreground_color(theme::fg_faint()),
             )
             .spacing(10.0)
             .alignment(VerticalAlignment::Center)
@@ -125,6 +157,24 @@ impl Component for Finder {
                 }
             },
         )
+        // the page's own manifest, fetched once: the app opens the
+        // request, the glue answers through `finder_fetched`, and the
+        // channel wakes this task with the body
+        .task({
+            let manifest = self.manifest;
+            move || async move {
+                let (answer, reply) = task::channel::<String>();
+                ANSWER.with(|slot| *slot.borrow_mut() = Some(answer));
+                let url = "manifest.txt";
+                unsafe { js_fetch(url.as_ptr(), url.len()) };
+                if let Some(body) = reply.recv().await {
+                    let line = body.lines().next().unwrap_or_default().trim();
+                    if !line.is_empty() {
+                        manifest.set(Rc::from(line));
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -264,6 +314,7 @@ fn finder() -> Finder {
         selected: State::new(0),
         details: State::new(false),
         visible: State::new(Rc::new((0..10_000).collect())),
+        manifest: State::new(Rc::from("reading the manifest…")),
         files,
         logo: logo(),
     }

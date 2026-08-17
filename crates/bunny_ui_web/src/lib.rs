@@ -35,6 +35,11 @@ unsafe extern "C" {
     /// The glue schedules ONE requestAnimationFrame that calls
     /// `bunny_frame` back — the browser's display link.
     fn js_request_frame();
+    /// A task woke and asks for one turn: the glue calls `bunny_wake`
+    /// back, once, out of the current job. NOT the frame driver — the
+    /// tick path never settles, and a task landing is exactly what a
+    /// settle is for.
+    fn js_request_wake();
     /// Dom mode: the glue walks this patch stream (the fixed
     /// little-endian ABI of `bunny_ui::dom::encode`) and mutates the
     /// element tree.
@@ -56,6 +61,8 @@ enum Event {
     /// The browser finished decoding a registered image — measure and
     /// paint can answer for real now.
     ImageReady,
+    /// A task has something to run: a fetch came back, a callback fired.
+    Wake,
     /// Dom mode: the browser's scroll observer — the element scrolled
     /// and the engine mirrors the offset (the dual ownership).
     DomScroll { id: u32, x: f64, y: f64 },
@@ -85,6 +92,9 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
     let runtime = Runtime::new()
         .text_engine(Rc::new(CanvasTextEngine::new()))
         .image_engine(Rc::new(CanvasImageEngine::new()));
+    // a task that woke asks the page for one turn — the browser's
+    // answer to the desktop's run loop source
+    runtime.set_wake_hook(std::sync::Arc::new(|| unsafe { js_request_wake() }));
     let mut size = Size { width, height };
     // the surface wants an INTEGER scale (the snapping contract);
     // fractional device ratios round to the nearest whole step
@@ -201,9 +211,10 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 scale = (ratio.round() as usize).max(1);
                 present(&runtime, &full, size, scale, &mut surface);
             }
-            Event::ImageReady => {
+            Event::ImageReady | Event::Wake => {
                 // the layout reflows around the fresh intrinsic size
-                // and the paint asks the engine again — one full frame
+                // (or around what a task just wrote) and the paint asks
+                // the engine again — one full frame, settle included
                 present(&runtime, &full, size, scale, &mut surface);
             }
             // Dom-mode traffic — this shell rasterizes, nothing to do
@@ -226,6 +237,9 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
     let runtime = Runtime::new()
         .text_engine(Rc::new(CanvasTextEngine::new()))
         .image_engine(Rc::new(CanvasImageEngine::new()));
+    // a task that woke asks the page for one turn — the browser's
+    // answer to the desktop's run loop source
+    runtime.set_wake_hook(std::sync::Arc::new(|| unsafe { js_request_wake() }));
     runtime.set_reduce_motion(true);
     let mut size = Size { width, height };
     let scale = (scale.round() as usize).max(1);
@@ -276,9 +290,10 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
                 size = Size { width, height };
                 present(&runtime, runtime.dom_frame(&root, size), scale);
             }
-            Event::ImageReady => {
-                // geometry reflows around the fresh intrinsic size;
-                // the <img> elements themselves paint on their own
+            Event::ImageReady | Event::Wake => {
+                // geometry reflows around the fresh intrinsic size (or
+                // around what a task just wrote); the <img> elements
+                // themselves paint on their own
                 present(&runtime, runtime.dom_frame(&root, size), scale);
             }
             Event::Key(7, _) => {
@@ -367,6 +382,14 @@ pub extern "C" fn bunny_dom_scroll(id: u32, x: f64, y: f64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_image_ready(_key_hi: u32, _key_lo: u32) {
     dispatch(Event::ImageReady);
+}
+
+/// A task is ready to run: the app's own callback (a fetch that came
+/// back, a socket message) sent on a channel, and the glue delivers
+/// this out of that job. The turn drains the queue on its way.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_wake() {
+    dispatch(Event::Wake);
 }
 
 /// Dom mode: the input edited. Both strings arrive through

@@ -8,6 +8,7 @@ const context = canvas.getContext("2d");
 
 let wasm = null;
 let frameArmed = false;
+let wakeArmed = false;
 let lastTick = 0;
 
 // The hidden ink canvas: the engine's TextEngine measures and rasters
@@ -73,6 +74,17 @@ const imports = {
     },
     js_request_frame() {
       requestFrame();
+    },
+    // A task woke: ONE turn, out of the current job. The flag folds a
+    // burst of sends into a single wake, and the microtask keeps the
+    // engine off the stack of whatever called back.
+    js_request_wake() {
+      if (wakeArmed) return;
+      wakeArmed = true;
+      queueMicrotask(() => {
+        wakeArmed = false;
+        wasm.bunny_wake();
+      });
     },
     // dom-mode imports — the single binary carries both shells, and
     // this page only ever drives the canvas one
@@ -164,6 +176,26 @@ const imports = {
       ink.fillText(text, 0, height / scale - descent);
       const pixels = ink.getImageData(0, 0, width, height).data;
       new Uint8Array(wasm.memory.buffer, out, width * height * 4).set(pixels);
+    },
+  },
+  // The APP's own door to the network, in its own module: the engine
+  // opens no socket, and the answer goes back through an export the
+  // app declared. A failed fetch answers with an empty body — the task
+  // decides what that means.
+  app: {
+    js_fetch(pointer, length) {
+      const url = decoder.decode(
+        new Uint8Array(wasm.memory.buffer, pointer, length),
+      );
+      fetch(url)
+        .then((response) => (response.ok ? response.text() : ""))
+        .catch(() => "")
+        .then((text) => {
+          const bytes = new TextEncoder().encode(text);
+          const out = wasm.bunny_alloc(bytes.length);
+          new Uint8Array(wasm.memory.buffer, out, bytes.length).set(bytes);
+          wasm.finder_fetched(out, bytes.length);
+        });
     },
   },
 };
