@@ -165,8 +165,8 @@ unsafe extern "C" {
         release: *const c_void,
     ) -> *mut c_void;
     fn CGDataProviderRelease(provider: *mut c_void);
-    fn CGContextDrawImage(context: Id, rect: CGRect, image: Id);
-    fn CGContextSetInterpolationQuality(context: Id, quality: i32);
+    pub(crate) fn CGContextDrawImage(context: Id, rect: CGRect, image: Id);
+    pub(crate) fn CGContextSetInterpolationQuality(context: Id, quality: i32);
     fn CGContextSaveGState(context: Id);
     fn CGContextRestoreGState(context: Id);
     #[allow(clippy::too_many_arguments)]
@@ -183,7 +183,7 @@ unsafe extern "C" {
         should_interpolate: bool,
         intent: i32,
     ) -> Id;
-    fn CGImageRelease(image: Id);
+    pub(crate) fn CGImageRelease(image: Id);
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]

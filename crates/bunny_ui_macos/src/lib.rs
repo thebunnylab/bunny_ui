@@ -8,6 +8,7 @@
 #![cfg(target_os = "macos")]
 
 mod ffi;
+mod image;
 mod metal;
 mod text;
 
@@ -20,6 +21,7 @@ use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
+pub use image::CoreGraphicsImageEngine;
 pub use metal::OffscreenGpu;
 pub use text::CoreTextEngine;
 
@@ -61,8 +63,11 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
 /// Opens the window and enters the live cycle. Returns when the app quits
 /// (closing the window quits).
 pub fn run_window(title: &str, size: Size, root: impl View) {
-    // real text: the platform engine takes the place of the PixelFont
-    let runtime = Runtime::new().text_engine(Rc::new(CoreTextEngine::new()));
+    // real text and real images: the platform engines take the place
+    // of the house defaults
+    let runtime = Runtime::new()
+        .text_engine(Rc::new(CoreTextEngine::new()))
+        .image_engine(Rc::new(CoreGraphicsImageEngine::new()));
     run_window_with(title, size, runtime, root)
 }
 
@@ -101,6 +106,7 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
                     scale,
                     canvas,
                     &*runtime.text(),
+                    &*runtime.images(),
                 );
             } else {
                 let mut slot = surface.borrow_mut();

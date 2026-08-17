@@ -484,14 +484,14 @@ fn main() {
     use bunny_ui_macos::OffscreenGpu;
     if let Some(mut gpu) = OffscreenGpu::new(1520, 1280) {
         // warm the atlas first — steady state is the story
-        gpu.present_wait(&laid_out.display, 2, Color::CANVAS, &*engine);
+        gpu.present_wait(&laid_out.display, 2, Color::CANVAS, &*engine, &RawImages::default());
         reports.push(measure("present GPU 1520×1280 (full)", 3, 200, || {
-            gpu.present_wait(&laid_out.display, 2, Color::CANVAS, &*engine);
+            gpu.present_wait(&laid_out.display, 2, Color::CANVAS, &*engine, &RawImages::default());
         }));
         // the cpu-side cost alone: commit and move on, like a window
         // does — the twin of a present that never waits for the gpu
         reports.push(measure("present GPU (encode, no wait)", 3, 200, || {
-            gpu.present_nowait(&laid_out.display, 2, Color::CANVAS, &*engine);
+            gpu.present_nowait(&laid_out.display, 2, Color::CANVAS, &*engine, &RawImages::default());
         }));
 
         // an animated frame END TO END: tick + layout + encode — the
@@ -505,7 +505,7 @@ fn main() {
             gpu_ticks += 1;
             anim_runtime.tick(1.0 / 120.0);
             let display = anim_runtime.animation_frame(&animated, window);
-            gpu.present_nowait(&display, 2, Color::CANVAS, &*engine);
+            gpu.present_nowait(&display, 2, Color::CANVAS, &*engine, &RawImages::default());
         }));
     }
 
@@ -578,9 +578,9 @@ fn main() {
         std::hint::black_box(bitmap.width());
     }));
     if let Some(mut gpu) = OffscreenGpu::new(6048, 3928) {
-        gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine);
+        gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine, &RawImages::default());
         reports.push(measure("present GPU 6048×3928 (full)", 3, 100, || {
-            gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine);
+            gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine, &RawImages::default());
         }));
     }
 

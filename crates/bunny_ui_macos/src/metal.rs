@@ -37,7 +37,9 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::hash::{Hash, Hasher};
 use std::ptr::null_mut;
 
+use bunny_ui::image_engine::{ImageEngine, ImageSource};
 use bunny_ui::layout::{Color, DisplayList, DrawCommand, Rect, Size};
+use bunny_ui::raster::physical_extent;
 use bunny_ui::text_engine::{FontKey, FontSpec, TextEngine};
 
 use crate::ffi::{CGSize, Id, Sel, class, sel};
@@ -552,6 +554,7 @@ impl MetalStack {
         sprite_offset: usize,
         runs: &[DrawRun],
         atlas_texture: Id,
+        textures: &[Id],
     ) -> Id {
         unsafe {
             let pass = msg_id(self.pass_class, self.sels.render_pass_descriptor);
@@ -607,7 +610,7 @@ impl MetalStack {
                                     0,
                                 );
                             }
-                            RunKind::Sprites => {
+                            RunKind::Sprites | RunKind::Texture(_) => {
                                 msg_void_id(encoder, self.sels.set_pipeline, self.sprite_pipeline);
                                 msg_void_id_u64_u64(
                                     encoder,
@@ -623,10 +626,16 @@ impl MetalStack {
                                     sprite_offset as u64,
                                     0,
                                 );
+                                // the shared atlas, or the run's own
+                                // dedicated texture — same pipeline
+                                let texture = match run.kind {
+                                    RunKind::Texture(index) => textures[index as usize],
+                                    _ => atlas_texture,
+                                };
                                 msg_void_id_u64(
                                     encoder,
                                     self.sels.set_fragment_texture,
-                                    atlas_texture,
+                                    texture,
                                     0,
                                 );
                             }
@@ -864,7 +873,37 @@ struct RunAtlas {
     size: u32,
     packer: ShelfPacker,
     entries: HashMap<u64, Vec<RunEntry>>,
+    /// Resampled images riding the SHARED texture, keyed by
+    /// (source key, physical width, physical height) — icons and
+    /// thumbnails, the many and the hot.
+    images: HashMap<(u64, u32, u32), ImageEntry>,
+    /// Images too big for a shelf get a texture of their own (a shelf
+    /// eats its full height across the atlas width, and anything larger
+    /// than the atlas would LIVELOCK the reset-retry). Capped; overflow
+    /// rides the same reset the atlas already does.
+    dedicated: HashMap<(u64, u32, u32), Id>,
 }
+
+/// One cached image on the shared atlas: its chunk tiles at one
+/// physical size.
+struct ImageEntry {
+    tiles: Vec<Tile>,
+}
+
+/// What `resolve_image` hands the frame walk: shared tiles, or one
+/// whole dedicated texture.
+enum ResolvedImage<'a> {
+    Tiles(&'a ImageEntry),
+    Dedicated(Id, u32, u32),
+}
+
+/// The shelf ceiling: taller goes dedicated (uniform shelf heights
+/// pack well; one tall image would burn a whole shelf band)…
+const DEDICATED_HEIGHT: u32 = 256;
+/// …and so does anything larger than this area, atlas-budget-wise.
+const DEDICATED_AREA: u32 = 512 * 512;
+/// Dedicated textures retained before the reset collects them.
+const DEDICATED_KEEP: usize = 8;
 
 impl RunAtlas {
     fn new(device: Id) -> RunAtlas {
@@ -874,6 +913,8 @@ impl RunAtlas {
             size: ATLAS_INITIAL_SIZE,
             packer: ShelfPacker::new(ATLAS_INITIAL_SIZE, ATLAS_INITIAL_SIZE),
             entries: HashMap::new(),
+            images: HashMap::new(),
+            dedicated: HashMap::new(),
         }
     }
 
@@ -895,6 +936,12 @@ impl RunAtlas {
             self.packer.reset();
         }
         self.entries.clear();
+        self.images.clear();
+        // the dedicated textures ride the same collector: the caller
+        // drained the GPU before any reset, so releasing here is safe
+        for (_, texture) in self.dedicated.drain() {
+            unsafe { msg_void(texture, sel("release")) };
+        }
     }
 
     unsafe fn ensure_texture(&mut self) -> bool {
@@ -1001,6 +1048,107 @@ impl RunAtlas {
             .expect("a run just resolved lives in the atlas");
         Ok(Some(entry))
     }
+
+    /// The texels for one image at one physical size — warm from a map,
+    /// or resampled by the engine and uploaded: small rides the shared
+    /// atlas in chunk tiles, big claims a dedicated texture. `Ok(None)`
+    /// = the engine has nothing yet (async decode, broken bytes).
+    fn resolve_image(
+        &mut self,
+        source: &ImageSource,
+        width: u32,
+        height: u32,
+        engine: &dyn ImageEngine,
+    ) -> Result<Option<ResolvedImage<'_>>, AtlasFull> {
+        let cache_key = (source.key(), width, height);
+        if let Some(texture) = self.dedicated.get(&cache_key) {
+            return Ok(Some(ResolvedImage::Dedicated(*texture, width, height)));
+        }
+        let shared = height <= DEDICATED_HEIGHT && width * height <= DEDICATED_AREA;
+        if shared && !self.images.contains_key(&cache_key) {
+            let Some(raster) = engine.raster(source, width as usize, height as usize) else {
+                return Ok(None);
+            };
+            unsafe {
+                if !self.ensure_texture() {
+                    return Err(AtlasFull);
+                }
+            }
+            let mut tiles = Vec::new();
+            let mut chunk_x: u32 = 0;
+            while chunk_x < width {
+                let chunk_width = (width - chunk_x).min(ATLAS_CHUNK_WIDTH);
+                let Some((x, y)) = self.packer.place(chunk_width, height) else {
+                    return Err(AtlasFull);
+                };
+                unsafe {
+                    msg_void_region_u64_ptr_u64(
+                        self.texture,
+                        sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
+                        MTLRegion {
+                            origin: MTLOrigin { x: x as u64, y: y as u64, z: 0 },
+                            size: MTLSize {
+                                width: chunk_width as u64,
+                                height: height as u64,
+                                depth: 1,
+                            },
+                        },
+                        0,
+                        raster.rgba.as_ptr().add(chunk_x as usize * 4) as *const c_void,
+                        (raster.width * 4) as u64,
+                    );
+                }
+                tiles.push(Tile { x, y, width: chunk_width, height });
+                chunk_x += chunk_width;
+            }
+            self.images.insert(cache_key, ImageEntry { tiles });
+        }
+        if shared {
+            return Ok(self
+                .images
+                .get(&cache_key)
+                .map(ResolvedImage::Tiles));
+        }
+
+        // dedicated: over the cap, the frame asks for the collector —
+        // after the drain+reset the map is empty and the walk re-runs
+        if self.dedicated.len() >= DEDICATED_KEEP {
+            return Err(AtlasFull);
+        }
+        let Some(raster) = engine.raster(source, width as usize, height as usize) else {
+            return Ok(None);
+        };
+        let texture = unsafe {
+            let descriptor = msg_id_u64_u64_u64_bool(
+                class("MTLTextureDescriptor"),
+                sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+                PIXEL_FORMAT_RGBA8,
+                width as u64,
+                height as u64,
+                0,
+            );
+            msg_void_u64(descriptor, sel("setUsage:"), TEXTURE_USAGE_SHADER_READ);
+            msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_SHARED);
+            let texture = msg_id_arg(self.device, sel("newTextureWithDescriptor:"), descriptor);
+            if texture.is_null() {
+                return Err(AtlasFull);
+            }
+            msg_void_region_u64_ptr_u64(
+                texture,
+                sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
+                MTLRegion {
+                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: MTLSize { width: width as u64, height: height as u64, depth: 1 },
+                },
+                0,
+                raster.rgba.as_ptr() as *const c_void,
+                (raster.width * 4) as u64,
+            );
+            texture
+        };
+        self.dedicated.insert(cache_key, texture);
+        Ok(Some(ResolvedImage::Dedicated(texture, width, height)))
+    }
 }
 
 fn push_rect(
@@ -1028,6 +1176,9 @@ fn push_rect(
 enum RunKind {
     Rects,
     Sprites,
+    /// Sprites read from a DEDICATED texture (an image too big for the
+    /// shared atlas) — the index points into the frame's texture list.
+    Texture(u16),
 }
 
 #[derive(Clone, Copy)]
@@ -1051,6 +1202,9 @@ struct FrameBatches {
     rects: Vec<RectInstance>,
     sprites: Vec<SpriteInstance>,
     runs: Vec<DrawRun>,
+    /// Dedicated textures this frame reads (borrowed from the atlas's
+    /// cache — the atlas owns and releases them).
+    textures: Vec<Id>,
 }
 
 /// Walks the display list in paint order and fills the frame batches.
@@ -1063,12 +1217,14 @@ fn build_frame(
     scale: usize,
     target: (usize, usize),
     engine: &dyn TextEngine,
+    images: &dyn ImageEngine,
     atlas: &mut RunAtlas,
     batches: &mut FrameBatches,
 ) -> Result<(), AtlasFull> {
     batches.rects.clear();
     batches.sprites.clear();
     batches.runs.clear();
+    batches.textures.clear();
     let out = &mut batches.rects;
     let factor = scale as f64;
     let whole: Box4 = (0, 0, target.0 as i64, target.1 as i64);
@@ -1164,10 +1320,91 @@ fn build_frame(
                     note_run(&mut batches.runs, RunKind::Sprites, batches.sprites.len() - 1);
                 }
             }
-            // the GPU image path arrives with the platform decoder
-            // (until then the CPU present paints images; the GPU frame
-            // skips them rather than guessing pixels)
-            DrawCommand::Image { .. } => {}
+            DrawCommand::Image { rect, source } => {
+                let Some(clip) = effective_clip(&clips, whole) else { continue };
+                let width = physical_extent(rect.size.width, scale) as u32;
+                let height = physical_extent(rect.size.height, scale) as u32;
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                // the composite_rgba mirror: one snap of the logical
+                // origin, texels pasted 1:1 from there
+                let base_x = (rect.origin.x * factor).round() as i64;
+                let base_y = (rect.origin.y * factor).round() as i64;
+                let dest =
+                    (base_x, base_y, base_x + width as i64, base_y + height as i64);
+                if box_intersect(dest, clip).is_none() {
+                    continue;
+                }
+                match atlas.resolve_image(source, width, height, images)? {
+                    None => {}
+                    Some(ResolvedImage::Tiles(entry)) => {
+                        let mut chunk_x: i64 = 0;
+                        for tile in &entry.tiles {
+                            let chunk = (
+                                base_x + chunk_x,
+                                base_y,
+                                base_x + chunk_x + tile.width as i64,
+                                base_y + tile.height as i64,
+                            );
+                            chunk_x += tile.width as i64;
+                            if box_intersect(chunk, clip).is_none() {
+                                continue;
+                            }
+                            batches.sprites.push(SpriteInstance {
+                                dest: [
+                                    chunk.0 as f32,
+                                    chunk.1 as f32,
+                                    chunk.2 as f32,
+                                    chunk.3 as f32,
+                                ],
+                                tex: [
+                                    tile.x as f32,
+                                    tile.y as f32,
+                                    (tile.x + tile.width) as f32,
+                                    (tile.y + tile.height) as f32,
+                                ],
+                                clip: [
+                                    clip.0 as f32,
+                                    clip.1 as f32,
+                                    clip.2 as f32,
+                                    clip.3 as f32,
+                                ],
+                            });
+                            note_run(
+                                &mut batches.runs,
+                                RunKind::Sprites,
+                                batches.sprites.len() - 1,
+                            );
+                        }
+                    }
+                    Some(ResolvedImage::Dedicated(texture, tex_w, tex_h)) => {
+                        let index = match batches.textures.iter().position(|t| *t == texture)
+                        {
+                            Some(index) => index,
+                            None => {
+                                batches.textures.push(texture);
+                                batches.textures.len() - 1
+                            }
+                        };
+                        batches.sprites.push(SpriteInstance {
+                            dest: [dest.0 as f32, dest.1 as f32, dest.2 as f32, dest.3 as f32],
+                            tex: [0.0, 0.0, tex_w as f32, tex_h as f32],
+                            clip: [
+                                clip.0 as f32,
+                                clip.1 as f32,
+                                clip.2 as f32,
+                                clip.3 as f32,
+                            ],
+                        });
+                        note_run(
+                            &mut batches.runs,
+                            RunKind::Texture(index as u16),
+                            batches.sprites.len() - 1,
+                        );
+                    }
+                }
+            }
             DrawCommand::PushClip { rect } => {
                 let snapped = snap_scaled(*rect, factor);
                 let top = match clips.last().copied() {
@@ -1360,10 +1597,18 @@ impl MetalPresenter {
         scale: usize,
         physical: (usize, usize),
         text: &dyn TextEngine,
+        images: &dyn ImageEngine,
     ) {
         for attempt in 0..3 {
-            match build_frame(display, scale, physical, text, &mut self.atlas, &mut self.batches)
-            {
+            match build_frame(
+                display,
+                scale,
+                physical,
+                text,
+                images,
+                &mut self.atlas,
+                &mut self.batches,
+            ) {
                 Ok(()) => return,
                 Err(AtlasFull) => {
                     if attempt == 2 {
@@ -1389,6 +1634,7 @@ impl MetalPresenter {
         scale: usize,
         canvas: Color,
         text: &dyn TextEngine,
+        images: &dyn ImageEngine,
     ) {
         unsafe {
             let pool = objc_autoreleasePoolPush();
@@ -1422,7 +1668,7 @@ impl MetalPresenter {
                 self.physical = physical;
                 self.scale = scale;
             }
-            self.build_with_retries(display, scale, physical, text);
+            self.build_with_retries(display, scale, physical, text, images);
             let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
             let sprite_offset = upload_frame(
                 &mut self.slots[index],
@@ -1444,6 +1690,7 @@ impl MetalPresenter {
                 sprite_offset,
                 &self.batches.runs,
                 self.atlas.texture,
+                &self.batches.textures,
             );
             // live resize presents INSIDE the CATransaction: commit,
             // wait for the schedule, present — layer content and window
@@ -1531,6 +1778,7 @@ pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool
             scale as usize,
             bunny_ui::theme::canvas(),
             &bunny_ui::text_engine::PixelFont,
+            &bunny_ui::image_engine::RawImages::default(),
         );
         PRESENTER.with(|slot| *slot.borrow_mut() = Some(presenter));
         objc_autoreleasePoolPop(pool);
@@ -1553,10 +1801,11 @@ pub(crate) fn present_window(
     scale: usize,
     canvas: Color,
     text: &dyn TextEngine,
+    images: &dyn ImageEngine,
 ) {
     PRESENTER.with(|slot| {
         if let Some(presenter) = slot.borrow_mut().as_mut() {
-            presenter.present(display, size, scale, canvas, text);
+            presenter.present(display, size, scale, canvas, text, images);
         }
     });
 }
@@ -1640,6 +1889,7 @@ impl OffscreenGpu {
         scale: usize,
         canvas: Color,
         text: &dyn TextEngine,
+        images: &dyn ImageEngine,
         wait: bool,
     ) {
         unsafe {
@@ -1650,6 +1900,7 @@ impl OffscreenGpu {
                     scale,
                     (self.width, self.height),
                     text,
+                    images,
                     &mut self.atlas,
                     &mut self.batches,
                 ) {
@@ -1679,6 +1930,7 @@ impl OffscreenGpu {
                 sprite_offset,
                 &self.batches.runs,
                 self.atlas.texture,
+                &self.batches.textures,
             );
             msg_void(command, self.stack.sels.commit);
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
@@ -1698,8 +1950,9 @@ impl OffscreenGpu {
         scale: usize,
         canvas: Color,
         text: &dyn TextEngine,
+        images: &dyn ImageEngine,
     ) {
-        self.present_inner(display, scale, canvas, text, true);
+        self.present_inner(display, scale, canvas, text, images, true);
     }
 
     /// Renders and RETURNS after the commit — the CPU-side cost of a
@@ -1711,16 +1964,21 @@ impl OffscreenGpu {
         scale: usize,
         canvas: Color,
         text: &dyn TextEngine,
+        images: &dyn ImageEngine,
     ) {
-        self.present_inner(display, scale, canvas, text, false);
+        self.present_inner(display, scale, canvas, text, images, false);
     }
 
-    /// The atlas footprint — how many cached runs and how deep the
-    /// shelves go. The warm-frame test pins tile reuse with it.
+    /// The atlas footprint — how many cached runs, images and dedicated
+    /// textures, and how deep the shelves go. The warm-frame tests pin
+    /// upload reuse with it.
     #[cfg(test)]
     fn atlas_footprint(&self) -> (usize, u32) {
-        let entries = self.atlas.entries.values().map(Vec::len).sum();
-        (entries, self.atlas.packer.next_y)
+        let entries: usize = self.atlas.entries.values().map(Vec::len).sum();
+        (
+            entries + self.atlas.images.len() + self.atlas.dedicated.len(),
+            self.atlas.packer.next_y,
+        )
     }
 
     /// The rendered bytes, R,G,B,A per pixel — the same order as the
@@ -1785,7 +2043,7 @@ mod tests {
         let cpu = rasterize_with(&display, physical.0, physical.1, scale, canvas, &PixelFont, &RawImages::default())
             .to_rgba_bytes();
         let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen gpu");
-        gpu.present_wait(&display, scale, canvas, &PixelFont);
+        gpu.present_wait(&display, scale, canvas, &PixelFont, &RawImages::default());
         (gpu.read_rgba(), cpu)
     }
 
@@ -1844,7 +2102,7 @@ mod tests {
         // either alias corrupts the readback loudly
         let canvas = Color::hex(0x18181D);
         let mut gpu = OffscreenGpu::new(16, 16).expect("offscreen gpu");
-        gpu.present_wait(&DisplayList::default(), 2, canvas, &PixelFont);
+        gpu.present_wait(&DisplayList::default(), 2, canvas, &PixelFont, &RawImages::default());
         let bytes = gpu.read_rgba();
         assert_eq!(bytes.len(), 16 * 16 * 4);
         for pixel in bytes.chunks_exact(4) {
@@ -2065,7 +2323,7 @@ mod tests {
         let cpu = rasterize_with(&display, physical.0, physical.1, scale, Color::CANVAS, &engine, &RawImages::default())
             .to_rgba_bytes();
         let mut gpu = OffscreenGpu::new(physical.0, physical.1).expect("offscreen gpu");
-        gpu.present_wait(&display, scale, Color::CANVAS, &engine);
+        gpu.present_wait(&display, scale, Color::CANVAS, &engine, &RawImages::default());
         assert_close(&gpu.read_rgba(), &cpu, 2, "core-text runs");
     }
 
@@ -2098,10 +2356,10 @@ mod tests {
         let runtime = Runtime::new();
         let display = runtime.display_frame(&root, logical);
         let mut gpu = OffscreenGpu::new(240, 120).expect("offscreen gpu");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
         let first = gpu.atlas_footprint();
         assert!(first.0 > 0, "the frame rasterized runs into the atlas");
-        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont);
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &RawImages::default());
         let second = gpu.atlas_footprint();
         assert_eq!(first, second, "an identical frame must not mint new tiles");
     }
@@ -2124,5 +2382,81 @@ mod tests {
         for pixel in gpu.chunks_exact(4) {
             assert_eq!(pixel, [0xF2, 0xF3, 0xF7, 0xFF], "a clipped-out row leaked ink");
         }
+    }
+
+    // MARK: - Images
+
+    /// A 32×32 deterministic gradient in the house raw format.
+    fn gradient_source(key: u64) -> ImageSource {
+        let mut rgba = Vec::with_capacity(32 * 32 * 4);
+        for y in 0..32u32 {
+            for x in 0..32u32 {
+                rgba.extend_from_slice(&[(x * 8) as u8, (y * 8) as u8, 128, 255]);
+            }
+        }
+        ImageSource::bytes_keyed(key, RawImages::encode(32, 32, &rgba))
+    }
+
+    fn image_scene() -> impl View {
+        let icon = gradient_source(1);
+        // small rides the atlas; 300pt at scale 2 is 600×600 physical —
+        // over the area threshold, a dedicated texture
+        vstack((
+            image(icon.clone()).resizable().frame(24.0, 24.0),
+            image(gradient_source(2)).resizable().frame(300.0, 300.0),
+            image(ImageSource::from_bytes(&b"junk"[..])).resizable().frame(40.0, 40.0),
+            image(icon).resizable().aspect_ratio(ContentMode::Fill).frame(60.0, 20.0),
+        ))
+    }
+
+    #[test]
+    fn images_match_byte_for_byte() {
+        if !device_present() {
+            return;
+        }
+        // 1:1 texel blits on both sides, no anti-aliasing anywhere —
+        // the engines hand both pipelines the SAME resampled bytes
+        let (gpu, cpu) =
+            scene_bytes(&image_scene(), Size { width: 320.0, height: 400.0 }, 2, Color::CANVAS);
+        assert!(
+            gpu == cpu,
+            "image scene diverged (max channel delta {})",
+            max_channel_delta(&gpu, &cpu)
+        );
+    }
+
+    #[test]
+    fn a_warm_image_frame_reuses_every_upload() {
+        if !device_present() {
+            return;
+        }
+        let runtime = Runtime::new();
+        let root = image_scene();
+        let display = runtime.display_frame(&root, Size { width: 320.0, height: 400.0 });
+        let engine = RawImages::default();
+        let mut gpu = OffscreenGpu::new(640, 800).expect("offscreen gpu");
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        let first = gpu.atlas_footprint();
+        assert!(first.0 >= 3, "atlas icon + cover + dedicated photo: {first:?}");
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        assert_eq!(first, gpu.atlas_footprint(), "a warm frame re-uploads nothing");
+    }
+
+    #[test]
+    fn an_ultra_wide_image_never_touches_the_shelf() {
+        if !device_present() {
+            return;
+        }
+        // 2100pt at scale 2 = 4200 physical — wider than the atlas can
+        // ever grow; the dedicated path must carry it without a single
+        // reset-retry (the old livelock shape)
+        let root = image(gradient_source(3)).resizable().frame(2100.0, 60.0);
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 400.0, height: 100.0 }, 2, Color::CANVAS);
+        assert!(gpu == cpu, "ultra-wide image diverged");
+        assert!(
+            gpu.chunks_exact(4).any(|pixel| pixel[..3] != [0xF2, 0xF3, 0xF7]),
+            "the image painted through the dedicated texture"
+        );
     }
 }

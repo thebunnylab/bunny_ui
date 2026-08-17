@@ -432,9 +432,9 @@ impl Bitmap {
 }
 
 /// The physical pixel count of one logical rect edge — the SAME
-/// rounding on every pipeline, so the engine rasters once and the
-/// bytes agree everywhere.
-pub(crate) fn physical_extent(length: f64, scale: usize) -> usize {
+/// rounding on every pipeline (CPU compositor, GPU atlas, canvas), so
+/// the engine rasters once and the bytes agree everywhere.
+pub fn physical_extent(length: f64, scale: usize) -> usize {
     (length * scale as f64).round().max(0.0) as usize
 }
 
