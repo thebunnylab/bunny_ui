@@ -37,10 +37,10 @@ python3 -m http.server 8871 --directory web
 Then open http://localhost:8871 (canvas) or
 http://localhost:8871/dom.html (dom + island).
 
-One binary carries both shells (~520 KB through the `web` profile —
-`opt-level = "z"` + lto). Ten thousand rows stay virtualized in both
-modes: the scroll geometry is honest to the full extent, and only the
-visible window exists.
+One binary carries both shells (~493 KB through the `web` profile —
+`opt-level = "z"`, lto, and the name table stripped). Ten thousand rows
+stay virtualized in both modes: the scroll geometry is honest to the
+full extent, and only the visible window exists.
 
 Images ride the same premise. The header's bunny mark is a real PNG
 written by hand in the demo; the browser decodes it asynchronously

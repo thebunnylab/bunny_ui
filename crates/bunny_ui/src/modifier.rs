@@ -645,11 +645,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             let applied = custom.apply(ctx, crate::erased::erased(self.base.clone()));
             let mut nodes = NodeList::new();
             applied.render_into(ctx, &mut nodes);
-            if let Some(node) = nodes.last_mut() {
-                node.line
-                    .push_str(&format!(" [.modifier({})]", custom.name()));
-            }
-            out.extend(nodes);
+            seal_custom(&**custom, nodes, out);
             return;
         }
 
@@ -659,13 +655,10 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         if let Modifier::Id(name) = &self.modifier {
             let mut nodes = NodeList::new();
             {
-                let _frame = motor::identity::enter(format!("[{name}]"));
+                let _frame = motor::identity::enter(named_segment(name));
                 self.base.render_into(ctx, &mut nodes);
             }
-            if let Some(node) = nodes.last_mut() {
-                node.line.push_str(&format!(" [.id({name:?})]"));
-            }
-            out.extend(nodes);
+            seal_id(name, nodes, out);
             return;
         }
 
@@ -680,414 +673,467 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         let mark = out.layout_mark();
         self.base.render_into(&base_ctx, out);
 
-        match &self.modifier {
-            Modifier::OnAppear(action) | Modifier::OnTapGesture(action) => action(),
-            Modifier::Effect { effect, .. } => {
-                // The effect sees the subtree's environment — the pump only
-                // has the root ctx at hand.
-                let effect = effect.clone();
-                let subtree_ctx = base_ctx.clone();
-                crate::effects::push(Rc::new(move |_: &Context| effect(&subtree_ctx)));
+        // …and everything the modifier does AFTER the base is
+        // generic-free, so it lives in ONE function instead of
+        // one copy per chain in the program
+        apply(&self.modifier, ctx, &base_ctx, out, mark);
+    }
+}
+
+/// The three lines below carry no type of their own either. They are
+/// split out for the same reason `apply` is: whatever the shim holds is
+/// paid once per chain of modifiers in the program, and a `format!` is
+/// never cheap.
+#[inline(never)]
+fn named_segment(name: &std::rc::Rc<str>) -> String {
+    format!("[{name}]")
+}
+
+#[inline(never)]
+fn seal_id(name: &std::rc::Rc<str>, mut nodes: NodeList, out: &mut NodeList) {
+    if crate::view::print_enabled() {
+        if let Some(node) = nodes.last_mut() {
+            node.line.push_str(&format!(" [.id({name:?})]"));
+        }
+    }
+    out.extend(nodes);
+}
+
+#[inline(never)]
+fn seal_custom(custom: &dyn crate::erased::CustomModifier, mut nodes: NodeList, out: &mut NodeList) {
+    if crate::view::print_enabled() {
+        if let Some(node) = nodes.last_mut() {
+            node.line.push_str(&format!(" [.modifier({})]", custom.name()));
+        }
+    }
+    out.extend(nodes);
+}
+
+/// What a modifier does to the node its base just rendered.
+///
+/// It is deliberately NOT generic. Only three things about a modifier
+/// need the base's type — re-rendering it under a name, re-rendering it
+/// through a custom body, and rendering it at all — and those stay in
+/// the `impl` above as a small shim. Everything else works on a
+/// `&Modifier` and the list the base left behind, so the whole match
+/// below exists ONCE in a binary instead of once per chain of
+/// modifiers an app writes. It was thirty-six copies and a third of
+/// all the code in the web build.
+#[inline(never)]
+fn apply(
+    modifier: &Modifier,
+    ctx: &Context,
+    base_ctx: &Context,
+    out: &mut NodeList,
+    mark: usize,
+) {
+    match modifier {
+        Modifier::OnAppear(action) | Modifier::OnTapGesture(action) => action(),
+        Modifier::Effect { effect, .. } => {
+            // The effect sees the subtree's environment — the pump only
+            // has the root ctx at hand.
+            let effect = effect.clone();
+            let subtree_ctx = base_ctx.clone();
+            crate::effects::push(Rc::new(move |_: &Context| effect(&subtree_ctx)));
+        }
+        Modifier::Sheet {
+            is_presented,
+            content,
+        } if is_presented.get() => {
+            let mut sheet_nodes = NodeList::new();
+            {
+                // The sheet is a sub-root with its own identity: what the
+                // closure builds anchors here and dies when it closes.
+                let _frame = motor::identity::enter("sheet");
+                content(ctx).render_into(ctx, &mut sheet_nodes);
             }
-            Modifier::Sheet {
-                is_presented,
-                content,
-            } if is_presented.get() => {
-                let mut sheet_nodes = NodeList::new();
-                {
-                    // The sheet is a sub-root with its own identity: what the
-                    // closure builds anchors here and dies when it closes.
-                    let _frame = motor::identity::enter("sheet");
-                    content(ctx).render_into(ctx, &mut sheet_nodes);
-                }
-                let (sheet_prints, sheet_layouts) = sheet_nodes.into_parts();
-                if let Some(node) = out.last_mut() {
-                    node.children
-                        .push(RenderNode::branch("Sheet", sheet_prints));
-                }
-                // in layout, the sheet overlays the base — centered, the
-                // way a modal sits over what it covers
-                out.wrap_layout_from(mark, |base| LayoutNode::Layered {
-                    align: CrossAlign::Center,
-                    children: vec![base, wrap_layout(sheet_layouts)],
+            let (sheet_prints, sheet_layouts) = sheet_nodes.into_parts();
+            if let Some(node) = out.last_mut() {
+                node.children
+                    .push(RenderNode::branch("Sheet", sheet_prints));
+            }
+            // in layout, the sheet overlays the base — centered, the
+            // way a modal sits over what it covers
+            out.wrap_layout_from(mark, |base| LayoutNode::Layered {
+                align: CrossAlign::Center,
+                children: vec![base, wrap_layout(sheet_layouts)],
+            });
+        }
+        Modifier::Popover {
+            is_presented,
+            side,
+            on_dismiss,
+            content,
+        } if is_presented.get() => {
+            let mut popover_nodes = NodeList::new();
+            let path;
+            {
+                // its own identity sub-root, like the sheet: what
+                // the closure builds anchors here and dies when it
+                // closes (auto-focus re-fires on every open)
+                let _frame = motor::identity::enter("popover");
+                path = motor::identity::cursor_scope();
+                content(ctx).render_into(ctx, &mut popover_nodes);
+            }
+            let (popover_prints, popover_layouts) = popover_nodes.into_parts();
+            if let Some(node) = out.last_mut() {
+                node.children
+                    .push(RenderNode::branch("Popover", popover_prints));
+            }
+            if let Some(path) = &path {
+                // both dismiss triggers close through ONE machine:
+                // the outside press fires the action; Escape
+                // arrives by dispatch (innermost handler wins, so
+                // nested popovers close from the inside out)
+                let close: Rc<dyn Fn()> = {
+                    let is_presented = is_presented.clone();
+                    let on_dismiss = on_dismiss.clone();
+                    Rc::new(move || {
+                        is_presented.set(false);
+                        if let Some(on_dismiss) = &on_dismiss {
+                            on_dismiss();
+                        }
+                    })
+                };
+                crate::reconciler::attribute_action(format!("{path}/#dismiss"), {
+                    // a dismiss has no count to hear: the same
+                    // closure the keyboard's Escape handler holds
+                    let close = close.clone();
+                    Rc::new(move |_| close())
                 });
+                crate::reconciler::attribute_handler(
+                    path.clone(),
+                    crate::action::OVERLAY_DISMISS,
+                    close,
+                );
+                crate::reconciler::attribute_context(crate::action::OVERLAY_CONTEXT);
             }
-            Modifier::Popover {
-                is_presented,
+            let side = *side;
+            out.wrap_layout_from(mark, |base| LayoutNode::Anchored {
+                path: path.unwrap_or_default(),
                 side,
-                on_dismiss,
+                overlay: Rc::new(wrap_layout(popover_layouts)),
+                child: Box::new(base),
+            });
+        }
+        _ => {}
+    }
+
+    // LAYOUT modifiers wrap the base's node — this is where the typed
+    // chain becomes proposal/response structure
+    match modifier {
+        Modifier::Padding => wrap_padding(out, mark, Edges::uniform(16.0)),
+        Modifier::PaddingLength(length) => wrap_padding(out, mark, Edges::uniform(*length)),
+        Modifier::PaddingEdge(edge, length) => {
+            let mut edges = Edges::default();
+            match edge {
+                Edge::Top => edges.top = *length,
+                Edge::Bottom => edges.bottom = *length,
+                Edge::Leading => edges.leading = *length,
+                Edge::Trailing => edges.trailing = *length,
+            }
+            wrap_padding(out, mark, edges);
+        }
+        Modifier::FrameWH(width, height) => {
+            let (width, height) = (Some(*width), Some(*height));
+            out.wrap_layout_from(mark, |node| LayoutNode::Frame {
+                width,
+                height,
+                child: Box::new(node),
+            });
+        }
+        Modifier::FrameWidth(width) => {
+            let width = Some(*width);
+            out.wrap_layout_from(mark, |node| LayoutNode::Frame {
+                width,
+                height: None,
+                child: Box::new(node),
+            });
+        }
+        Modifier::FrameHeight(height) => {
+            let height = Some(*height);
+            out.wrap_layout_from(mark, |node| LayoutNode::Frame {
+                width: None,
+                height,
+                child: Box::new(node),
+            });
+        }
+        Modifier::FrameMax(max_width, max_height, alignment) => {
+            let (max_width, max_height) = (*max_width, *max_height);
+            let align = crate::views::cross_align(*alignment);
+            out.wrap_layout_from(mark, |node| LayoutNode::MaxFrame {
+                max_width,
+                max_height,
+                align,
+                child: Box::new(node),
+            });
+        }
+        Modifier::BackgroundColor(color) => wrap_styled(
+            out,
+            mark,
+            VisualProps { background: Some(*color), ..VisualProps::default() },
+        ),
+        Modifier::BackgroundGradient(gradient) => wrap_styled(
+            out,
+            mark,
+            VisualProps { gradient: Some(*gradient), ..VisualProps::default() },
+        ),
+        Modifier::Shadow(radius, color) => wrap_styled(
+            out,
+            mark,
+            VisualProps { shadow: Some((*radius, *color)), ..VisualProps::default() },
+        ),
+        Modifier::ForegroundColor(color) => wrap_styled(
+            out,
+            mark,
+            VisualProps { foreground: Some(*color), ..VisualProps::default() },
+        ),
+        Modifier::Border(color, width) => wrap_styled(
+            out,
+            mark,
+            VisualProps { border: Some((*color, *width)), ..VisualProps::default() },
+        ),
+        Modifier::CornerRadius(radius) => wrap_styled(
+            out,
+            mark,
+            VisualProps { corner_radius: Some(*radius), ..VisualProps::default() },
+        ),
+        Modifier::Clipped => {
+            wrap_styled(out, mark, VisualProps { clip: true, ..VisualProps::default() })
+        }
+        Modifier::Tooltip(text, side) => out.wrap_layout_from(mark, |node| {
+            LayoutNode::Tooltip {
+                text: text.clone(),
+                side: *side,
+                child: Box::new(node),
+            }
+        }),
+        Modifier::ContextMenu(items) => out.wrap_layout_from(mark, |node| {
+            LayoutNode::ContextSource { items: items.clone(), child: Box::new(node) }
+        }),
+        Modifier::OnDrag(payload) => out.wrap_layout_from(mark, |node| {
+            LayoutNode::DragSource { payload: payload.clone(), child: Box::new(node) }
+        }),
+        Modifier::OnDrop { accepts, action, over } => out.wrap_layout_from(mark, |node| {
+            LayoutNode::DropTarget {
+                accepts: *accepts,
+                action: action.clone(),
+                over: over.clone(),
+                child: Box::new(node),
+            }
+        }),
+        // font is an inherited scene property — the same Styled as the
+        // visuals carries the patch (measure applies it on top of the env)
+        Modifier::Font(font) => wrap_styled(
+            out,
+            mark,
+            VisualProps {
+                font: FontPatch::full(FontSpec::resolve(*font)),
+                ..VisualProps::default()
+            },
+        ),
+        Modifier::Bold => wrap_styled(
+            out,
+            mark,
+            VisualProps {
+                font: FontPatch { weight: Some(Weight::Bold), ..FontPatch::default() },
+                ..VisualProps::default()
+            },
+        ),
+        Modifier::Italic => wrap_styled(
+            out,
+            mark,
+            VisualProps {
+                font: FontPatch {
+                    slant: Some(crate::text_engine::Slant::Italic),
+                    ..FontPatch::default()
+                },
+                ..VisualProps::default()
+            },
+        ),
+        Modifier::Monospaced => wrap_styled(
+            out,
+            mark,
+            VisualProps {
+                font: FontPatch { design: Some(FontDesign::Mono), ..FontPatch::default() },
+                ..VisualProps::default()
+            },
+        ),
+        // only the size travels: a `.bold()` or a `.font(.title)`
+        // around it keeps its weight and its design
+        Modifier::FontSize(size) => wrap_styled(
+            out,
+            mark,
+            VisualProps {
+                font: FontPatch { size: Some(*size), ..FontPatch::default() },
+                ..VisualProps::default()
+            },
+        ),
+        Modifier::BackgroundHovered(color) => wrap_styled(
+            out,
+            mark,
+            VisualProps { background_hovered: Some(*color), ..VisualProps::default() },
+        ),
+        Modifier::BackgroundPressed(color) => wrap_styled(
+            out,
+            mark,
+            VisualProps { background_pressed: Some(*color), ..VisualProps::default() },
+        ),
+        Modifier::ForegroundHovered(color) => wrap_styled(
+            out,
+            mark,
+            VisualProps { foreground_hovered: Some(*color), ..VisualProps::default() },
+        ),
+        Modifier::ForegroundPressed(color) => wrap_styled(
+            out,
+            mark,
+            VisualProps { foreground_pressed: Some(*color), ..VisualProps::default() },
+        ),
+        Modifier::Opacity(value) => wrap_styled(
+            out,
+            mark,
+            VisualProps { opacity: Some(*value), ..VisualProps::default() },
+        ),
+        Modifier::OpacityHovered(value) => wrap_styled(
+            out,
+            mark,
+            VisualProps { opacity_hovered: Some(*value), ..VisualProps::default() },
+        ),
+        Modifier::OpacityPressed(value) => wrap_styled(
+            out,
+            mark,
+            VisualProps { opacity_pressed: Some(*value), ..VisualProps::default() },
+        ),
+        Modifier::GroupHovered => wrap_styled(
+            out,
+            mark,
+            VisualProps { from_group: true, ..VisualProps::default() },
+        ),
+        Modifier::HoverGroup => {
+            if let Some(path) = motor::identity::cursor_scope() {
+                out.wrap_layout_from(mark, |node| LayoutNode::HoverGroup {
+                    path,
+                    child: Box::new(node),
+                });
+            }
+        }
+        // the two below rewrite the TEXT NODE, descending through
+        // `Styled` (`.font()`/`.foreground_color()` before or after, the
+        // order does not matter) — on non-text they are no-ops on purpose
+        // (SwiftUI parity: truncationMode outside text does nothing)
+        Modifier::Highlight(ranges, color) => out.wrap_layout_from(mark, |node| {
+            rewrite_text_node(node, &|content, _, truncation| LayoutNode::Text {
                 content,
-            } if is_presented.get() => {
-                let mut popover_nodes = NodeList::new();
-                let path;
-                {
-                    // its own identity sub-root, like the sheet: what
-                    // the closure builds anchors here and dies when it
-                    // closes (auto-focus re-fires on every open)
-                    let _frame = motor::identity::enter("popover");
-                    path = motor::identity::cursor_scope();
-                    content(ctx).render_into(ctx, &mut popover_nodes);
-                }
-                let (popover_prints, popover_layouts) = popover_nodes.into_parts();
-                if let Some(node) = out.last_mut() {
-                    node.children
-                        .push(RenderNode::branch("Popover", popover_prints));
-                }
-                if let Some(path) = &path {
-                    // both dismiss triggers close through ONE machine:
-                    // the outside press fires the action; Escape
-                    // arrives by dispatch (innermost handler wins, so
-                    // nested popovers close from the inside out)
-                    let close: Rc<dyn Fn()> = {
-                        let is_presented = is_presented.clone();
-                        let on_dismiss = on_dismiss.clone();
-                        Rc::new(move || {
-                            is_presented.set(false);
-                            if let Some(on_dismiss) = &on_dismiss {
-                                on_dismiss();
-                            }
-                        })
-                    };
-                    crate::reconciler::attribute_action(format!("{path}/#dismiss"), {
-                        // a dismiss has no count to hear: the same
-                        // closure the keyboard's Escape handler holds
-                        let close = close.clone();
-                        Rc::new(move |_| close())
-                    });
-                    crate::reconciler::attribute_handler(
-                        path.clone(),
-                        crate::action::OVERLAY_DISMISS,
-                        close,
-                    );
-                    crate::reconciler::attribute_context(crate::action::OVERLAY_CONTEXT);
-                }
-                let side = *side;
-                out.wrap_layout_from(mark, |base| LayoutNode::Anchored {
-                    path: path.unwrap_or_default(),
-                    side,
-                    overlay: Rc::new(wrap_layout(popover_layouts)),
-                    child: Box::new(base),
-                });
-            }
-            _ => {}
+                highlights: Some(TextHighlight { ranges: ranges.clone(), color: *color }),
+                truncation,
+            })
+        }),
+        Modifier::TruncationMode(mode) => out.wrap_layout_from(mark, |node| {
+            rewrite_text_node(node, &|content, highlights, _| LayoutNode::Text {
+                content,
+                highlights,
+                truncation: Some(*mode),
+            })
+        }),
+        Modifier::ScrollTarget(id) => out.wrap_layout_from(mark, |node| {
+            rewrite_scroll_node(node, &|path, axes, child| LayoutNode::Scroll {
+                path,
+                target: Some(id.clone()),
+                axes,
+                child,
+            })
+        }),
+        Modifier::Resizable => out.wrap_layout_from(mark, |node| {
+            rewrite_pixel_node(
+                node,
+                &|source, _, fit| LayoutNode::Image { source, resizable: true, fit },
+                &|symbol, _| LayoutNode::Icon { symbol, resizable: true },
+            )
+        }),
+        Modifier::AspectRatio(mode) => out.wrap_layout_from(mark, |node| {
+            rewrite_pixel_node(
+                node,
+                &|source, resizable, _| LayoutNode::Image {
+                    source,
+                    resizable,
+                    fit: Some(*mode),
+                },
+                // a glyph is a square — it has its one ratio already
+                &|symbol, resizable| LayoutNode::Icon { symbol, resizable },
+            )
+        }),
+        Modifier::Animated(spec) => {
+            // the key is captured NOW, at render — the cursor is
+            // gone by place time. Sibling views sit in distinct
+            // tuple scopes; two `.animated` stacked on one view
+            // share the key and the outer spec wins (documented).
+            let key = motor::identity::cursor_scope().map(Rc::from);
+            let spec = *spec;
+            out.wrap_layout_from(mark, |node| LayoutNode::Animated {
+                key,
+                spec,
+                child: Box::new(node),
+            });
         }
-
-        // LAYOUT modifiers wrap the base's node — this is where the typed
-        // chain becomes proposal/response structure
-        match &self.modifier {
-            Modifier::Padding => wrap_padding(out, mark, Edges::uniform(16.0)),
-            Modifier::PaddingLength(length) => wrap_padding(out, mark, Edges::uniform(*length)),
-            Modifier::PaddingEdge(edge, length) => {
-                let mut edges = Edges::default();
-                match edge {
-                    Edge::Top => edges.top = *length,
-                    Edge::Bottom => edges.bottom = *length,
-                    Edge::Leading => edges.leading = *length,
-                    Edge::Trailing => edges.trailing = *length,
-                }
-                wrap_padding(out, mark, edges);
-            }
-            Modifier::FrameWH(width, height) => {
-                let (width, height) = (Some(*width), Some(*height));
-                out.wrap_layout_from(mark, |node| LayoutNode::Frame {
-                    width,
-                    height,
+        Modifier::Rendering(mode) => {
+            // Auto is the table's business (v1: everything lowers
+            // to Dom); only an explicit Gpu claims an island node
+            if *mode == crate::layout::Rendering::Gpu {
+                out.wrap_layout_from(mark, |node| LayoutNode::Island {
                     child: Box::new(node),
                 });
             }
-            Modifier::FrameWidth(width) => {
-                let width = Some(*width);
-                out.wrap_layout_from(mark, |node| LayoutNode::Frame {
-                    width,
-                    height: None,
-                    child: Box::new(node),
-                });
-            }
-            Modifier::FrameHeight(height) => {
-                let height = Some(*height);
-                out.wrap_layout_from(mark, |node| LayoutNode::Frame {
-                    width: None,
-                    height,
-                    child: Box::new(node),
-                });
-            }
-            Modifier::FrameMax(max_width, max_height, alignment) => {
-                let (max_width, max_height) = (*max_width, *max_height);
-                let align = crate::views::cross_align(*alignment);
-                out.wrap_layout_from(mark, |node| LayoutNode::MaxFrame {
-                    max_width,
-                    max_height,
-                    align,
-                    child: Box::new(node),
-                });
-            }
-            Modifier::BackgroundColor(color) => wrap_styled(
-                out,
-                mark,
-                VisualProps { background: Some(*color), ..VisualProps::default() },
-            ),
-            Modifier::BackgroundGradient(gradient) => wrap_styled(
-                out,
-                mark,
-                VisualProps { gradient: Some(*gradient), ..VisualProps::default() },
-            ),
-            Modifier::Shadow(radius, color) => wrap_styled(
-                out,
-                mark,
-                VisualProps { shadow: Some((*radius, *color)), ..VisualProps::default() },
-            ),
-            Modifier::ForegroundColor(color) => wrap_styled(
-                out,
-                mark,
-                VisualProps { foreground: Some(*color), ..VisualProps::default() },
-            ),
-            Modifier::Border(color, width) => wrap_styled(
-                out,
-                mark,
-                VisualProps { border: Some((*color, *width)), ..VisualProps::default() },
-            ),
-            Modifier::CornerRadius(radius) => wrap_styled(
-                out,
-                mark,
-                VisualProps { corner_radius: Some(*radius), ..VisualProps::default() },
-            ),
-            Modifier::Clipped => {
-                wrap_styled(out, mark, VisualProps { clip: true, ..VisualProps::default() })
-            }
-            Modifier::Tooltip(text, side) => out.wrap_layout_from(mark, |node| {
-                LayoutNode::Tooltip {
-                    text: text.clone(),
-                    side: *side,
-                    child: Box::new(node),
-                }
-            }),
-            Modifier::ContextMenu(items) => out.wrap_layout_from(mark, |node| {
-                LayoutNode::ContextSource { items: items.clone(), child: Box::new(node) }
-            }),
-            Modifier::OnDrag(payload) => out.wrap_layout_from(mark, |node| {
-                LayoutNode::DragSource { payload: payload.clone(), child: Box::new(node) }
-            }),
-            Modifier::OnDrop { accepts, action, over } => out.wrap_layout_from(mark, |node| {
-                LayoutNode::DropTarget {
-                    accepts: *accepts,
-                    action: action.clone(),
-                    over: over.clone(),
-                    child: Box::new(node),
-                }
-            }),
-            // font is an inherited scene property — the same Styled as the
-            // visuals carries the patch (measure applies it on top of the env)
-            Modifier::Font(font) => wrap_styled(
-                out,
-                mark,
-                VisualProps {
-                    font: FontPatch::full(FontSpec::resolve(*font)),
-                    ..VisualProps::default()
-                },
-            ),
-            Modifier::Bold => wrap_styled(
-                out,
-                mark,
-                VisualProps {
-                    font: FontPatch { weight: Some(Weight::Bold), ..FontPatch::default() },
-                    ..VisualProps::default()
-                },
-            ),
-            Modifier::Italic => wrap_styled(
-                out,
-                mark,
-                VisualProps {
-                    font: FontPatch {
-                        slant: Some(crate::text_engine::Slant::Italic),
-                        ..FontPatch::default()
-                    },
-                    ..VisualProps::default()
-                },
-            ),
-            Modifier::Monospaced => wrap_styled(
-                out,
-                mark,
-                VisualProps {
-                    font: FontPatch { design: Some(FontDesign::Mono), ..FontPatch::default() },
-                    ..VisualProps::default()
-                },
-            ),
-            // only the size travels: a `.bold()` or a `.font(.title)`
-            // around it keeps its weight and its design
-            Modifier::FontSize(size) => wrap_styled(
-                out,
-                mark,
-                VisualProps {
-                    font: FontPatch { size: Some(*size), ..FontPatch::default() },
-                    ..VisualProps::default()
-                },
-            ),
-            Modifier::BackgroundHovered(color) => wrap_styled(
-                out,
-                mark,
-                VisualProps { background_hovered: Some(*color), ..VisualProps::default() },
-            ),
-            Modifier::BackgroundPressed(color) => wrap_styled(
-                out,
-                mark,
-                VisualProps { background_pressed: Some(*color), ..VisualProps::default() },
-            ),
-            Modifier::ForegroundHovered(color) => wrap_styled(
-                out,
-                mark,
-                VisualProps { foreground_hovered: Some(*color), ..VisualProps::default() },
-            ),
-            Modifier::ForegroundPressed(color) => wrap_styled(
-                out,
-                mark,
-                VisualProps { foreground_pressed: Some(*color), ..VisualProps::default() },
-            ),
-            Modifier::Opacity(value) => wrap_styled(
-                out,
-                mark,
-                VisualProps { opacity: Some(*value), ..VisualProps::default() },
-            ),
-            Modifier::OpacityHovered(value) => wrap_styled(
-                out,
-                mark,
-                VisualProps { opacity_hovered: Some(*value), ..VisualProps::default() },
-            ),
-            Modifier::OpacityPressed(value) => wrap_styled(
-                out,
-                mark,
-                VisualProps { opacity_pressed: Some(*value), ..VisualProps::default() },
-            ),
-            Modifier::GroupHovered => wrap_styled(
-                out,
-                mark,
-                VisualProps { from_group: true, ..VisualProps::default() },
-            ),
-            Modifier::HoverGroup => {
-                if let Some(path) = motor::identity::cursor_scope() {
-                    out.wrap_layout_from(mark, |node| LayoutNode::HoverGroup {
-                        path,
-                        child: Box::new(node),
-                    });
-                }
-            }
-            // the two below rewrite the TEXT NODE, descending through
-            // `Styled` (`.font()`/`.foreground_color()` before or after, the
-            // order does not matter) — on non-text they are no-ops on purpose
-            // (SwiftUI parity: truncationMode outside text does nothing)
-            Modifier::Highlight(ranges, color) => out.wrap_layout_from(mark, |node| {
-                rewrite_text_node(node, &|content, _, truncation| LayoutNode::Text {
-                    content,
-                    highlights: Some(TextHighlight { ranges: ranges.clone(), color: *color }),
-                    truncation,
-                })
-            }),
-            Modifier::TruncationMode(mode) => out.wrap_layout_from(mark, |node| {
-                rewrite_text_node(node, &|content, highlights, _| LayoutNode::Text {
-                    content,
-                    highlights,
-                    truncation: Some(*mode),
-                })
-            }),
-            Modifier::ScrollTarget(id) => out.wrap_layout_from(mark, |node| {
-                rewrite_scroll_node(node, &|path, axes, child| LayoutNode::Scroll {
-                    path,
-                    target: Some(id.clone()),
-                    axes,
-                    child,
-                })
-            }),
-            Modifier::Resizable => out.wrap_layout_from(mark, |node| {
-                rewrite_pixel_node(
-                    node,
-                    &|source, _, fit| LayoutNode::Image { source, resizable: true, fit },
-                    &|symbol, _| LayoutNode::Icon { symbol, resizable: true },
-                )
-            }),
-            Modifier::AspectRatio(mode) => out.wrap_layout_from(mark, |node| {
-                rewrite_pixel_node(
-                    node,
-                    &|source, resizable, _| LayoutNode::Image {
-                        source,
-                        resizable,
-                        fit: Some(*mode),
-                    },
-                    // a glyph is a square — it has its one ratio already
-                    &|symbol, resizable| LayoutNode::Icon { symbol, resizable },
-                )
-            }),
-            Modifier::Animated(spec) => {
-                // the key is captured NOW, at render — the cursor is
-                // gone by place time. Sibling views sit in distinct
-                // tuple scopes; two `.animated` stacked on one view
-                // share the key and the outer spec wins (documented).
-                let key = motor::identity::cursor_scope().map(Rc::from);
-                let spec = *spec;
-                out.wrap_layout_from(mark, |node| LayoutNode::Animated {
-                    key,
-                    spec,
-                    child: Box::new(node),
-                });
-            }
-            Modifier::Rendering(mode) => {
-                // Auto is the table's business (v1: everything lowers
-                // to Dom); only an explicit Gpu claims an island node
-                if *mode == crate::layout::Rendering::Gpu {
-                    out.wrap_layout_from(mark, |node| LayoutNode::Island {
-                        child: Box::new(node),
-                    });
-                }
-            }
-            Modifier::AutoFocus => out.wrap_layout_from(mark, |node| {
-                rewrite_field_node(node, &|path, content, placeholder| LayoutNode::Field {
-                    path,
-                    content,
-                    placeholder,
-                    auto_focus: true,
-                })
-            }),
-            Modifier::KeyContext(name) => {
-                // declaration, not paint: retained with the entry — the
-                // context deactivates when the view unmounts
-                crate::reconciler::attribute_context(name);
-            }
-            Modifier::WindowControl(control) => {
-                let control = *control;
-                out.wrap_layout_from(mark, move |node| LayoutNode::ControlRegion {
-                    control,
-                    child: Box::new(node),
-                });
-            }
-            Modifier::WindowDragRegion => {
-                out.wrap_layout_from(mark, |node| LayoutNode::DragRegion {
-                    child: Box::new(node),
-                });
-            }
-            Modifier::OnClick(action) => {
-                // the same registration as the Button: action retained in the
-                // reconciler, frame in the hit-test under the cursor identity
-                if let Some(path) = motor::identity::cursor_scope() {
-                    crate::reconciler::attribute_action(path.clone(), action.clone());
-                    out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
-                        path,
-                        child: Box::new(node),
-                    });
-                }
-            }
-            Modifier::OnAction(id, handler) => {
-                // pure registration: no pointer target, no layout node
-                // — the action arrives by dispatch (keyboard), not hit-test
-                if let Some(path) = motor::identity::cursor_scope() {
-                    crate::reconciler::attribute_handler(path, *id, handler.clone());
-                }
-            }
-            _ => {}
         }
-
-        if let Some(node) = out.last_mut() {
-            // frame does not print: the suffix is not even formatted
-            if crate::view::print_enabled() {
-                node.line.push_str(&self.modifier.suffix());
+        Modifier::AutoFocus => out.wrap_layout_from(mark, |node| {
+            rewrite_field_node(node, &|path, content, placeholder| LayoutNode::Field {
+                path,
+                content,
+                placeholder,
+                auto_focus: true,
+            })
+        }),
+        Modifier::KeyContext(name) => {
+            // declaration, not paint: retained with the entry — the
+            // context deactivates when the view unmounts
+            crate::reconciler::attribute_context(name);
+        }
+        Modifier::WindowControl(control) => {
+            let control = *control;
+            out.wrap_layout_from(mark, move |node| LayoutNode::ControlRegion {
+                control,
+                child: Box::new(node),
+            });
+        }
+        Modifier::WindowDragRegion => {
+            out.wrap_layout_from(mark, |node| LayoutNode::DragRegion {
+                child: Box::new(node),
+            });
+        }
+        Modifier::OnClick(action) => {
+            // the same registration as the Button: action retained in the
+            // reconciler, frame in the hit-test under the cursor identity
+            if let Some(path) = motor::identity::cursor_scope() {
+                crate::reconciler::attribute_action(path.clone(), action.clone());
+                out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
+                    path,
+                    child: Box::new(node),
+                });
             }
+        }
+        Modifier::OnAction(id, handler) => {
+            // pure registration: no pointer target, no layout node
+            // — the action arrives by dispatch (keyboard), not hit-test
+            if let Some(path) = motor::identity::cursor_scope() {
+                crate::reconciler::attribute_handler(path, *id, handler.clone());
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(node) = out.last_mut() {
+        // frame does not print: the suffix is not even formatted
+        if crate::view::print_enabled() {
+            node.line.push_str(&modifier.suffix());
         }
     }
 }

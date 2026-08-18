@@ -30,3 +30,7 @@ motor = { path = "crates/motor" }
 inherits = "release"
 opt-level = "z"
 lto = true
+# the name table is 17% of the download and nothing but a debugger's
+# comfort: the glue never reads it, and a stack trace from a shipped
+# build was never going to be read by a person anyway
+strip = true
