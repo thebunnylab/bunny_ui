@@ -98,6 +98,17 @@ pub(crate) fn set_print(enabled: bool) {
     PRINT.with(|print| print.set(enabled));
 }
 
+/// A box of nothing: zero on both axes, no paint, no hit — what a
+/// modifier wraps when the view below it has no geometry at all.
+fn nothing_node() -> crate::layout::LayoutNode {
+    crate::layout::LayoutNode::Stack {
+        axis: crate::layout::Axis::Vertical,
+        spacing: 0.0,
+        align: crate::layout::CrossAlign::Start,
+        children: Vec::new(),
+    }
+}
+
 impl NodeList {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -113,13 +124,18 @@ impl NodeList {
 
     /// Wraps the last layout node (the one from the Single view that just
     /// rendered) — the path of the layout modifiers (`.padding()`, frames).
+    /// A view with NO geometry of its own (`empty()`) still gets its
+    /// modifier: the wrap lands on a BOX OF NOTHING. That is what makes
+    /// `empty().frame(w, h).background_color(c)` a real painted box —
+    /// SwiftUI's own answer, where the frame IS a view and `EmptyView`
+    /// merely fills none of it. Bare `empty()` still contributes
+    /// nothing to a stack: only a modifier mints the box.
     pub(crate) fn wrap_last_layout(
         &mut self,
         wrap: impl FnOnce(crate::layout::LayoutNode) -> crate::layout::LayoutNode,
     ) {
-        if let Some(last) = self.layout.pop() {
-            self.layout.push(wrap(last));
-        }
+        let last = self.layout.pop().unwrap_or_else(nothing_node);
+        self.layout.push(wrap(last));
     }
 
     /// A retained boundary: enters as a reference (the marked line in the
