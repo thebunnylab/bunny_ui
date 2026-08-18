@@ -5200,6 +5200,262 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_innermost_explanation_wins_the_hover() {
+        // the same disease the drop had: a tooltip on a chip inside a
+        // card must be the CHIP's, not the card's
+        #[derive(Clone, Copy)]
+        struct Card;
+        impl Component for Card {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("chip").frame(60.0, 20.0).tooltip("the chip"), spacer())
+                    .frame(200.0, 80.0)
+                    .tooltip("the card")
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 300.0, height: 200.0 };
+        let result = runtime.layout(&Card, crate::layout::Proposal::exact(size));
+        let chip = result
+            .tooltips
+            .iter()
+            .find(|region| region.rect.size.width == 60.0)
+            .expect("the chip explains itself")
+            .rect;
+        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 4.0);
+        for _ in 0..40 {
+            runtime.tooltip_tick();
+        }
+        let shown = runtime.interaction().tooltip.map(|(text, _, _)| text.to_string());
+        assert_eq!(shown.as_deref(), Some("the chip"));
+    }
+
+    #[test]
+    fn the_innermost_source_is_what_the_hand_lifts() {
+        // and again for the lift: pressing a chip inside a draggable
+        // card carries the CHIP
+        #[derive(Clone, Copy)]
+        struct Card;
+        impl Component for Card {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text("chip")
+                        .frame(60.0, 20.0)
+                        .on_drag(|| drag(TabDrag { index: 1 }, "chip")),
+                    spacer(),
+                )
+                .frame(200.0, 80.0)
+                .on_drag(|| drag(TabDrag { index: 9 }, "card"))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 300.0, height: 200.0 };
+        let result = runtime.layout(&Card, crate::layout::Proposal::exact(size));
+        let chip = result
+            .drag_sources
+            .iter()
+            .find(|region| region.rect.size.width == 60.0)
+            .expect("the chip lifts")
+            .rect;
+        runtime.pointer_pressed(chip.origin.x + 4.0, chip.origin.y + 4.0);
+        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 40.0);
+        let label = runtime.interaction().drag.map(|live| live.label.to_string());
+        assert_eq!(label.as_deref(), Some("chip"));
+    }
+
+    /// The nested fixture of PAIN 36: a pane whose strip holds a chip,
+    /// both taking the same drag. The chip is strictly inside.
+    #[derive(Clone)]
+    struct NestedBoard {
+        on_chip: State<usize>,
+        on_pane: State<usize>,
+    }
+
+    impl Component for NestedBoard {
+        fn body(self, _ctx: &Context) -> impl View {
+            let on_chip = self.on_chip;
+            let on_pane = self.on_pane;
+            vstack!(
+                text("tab 7").on_drag(|| drag(TabDrag { index: 7 }, "tab 7")),
+                vstack!(
+                    text("chip")
+                        .frame(60.0, 20.0)
+                        .on_drop(move |tab: &TabDrag| on_chip.set(tab.index)),
+                    spacer(),
+                )
+                .frame(200.0, 80.0)
+                .on_drop(move |tab: &TabDrag| on_pane.set(tab.index)),
+            )
+            .spacing(10.0)
+        }
+    }
+
+    /// The two targets by their GEOMETRY — never by their index in the
+    /// vector, which is the very thing under test.
+    fn chip_and_pane(result: &crate::layout::LayoutResult) -> (crate::layout::Rect, crate::layout::Rect) {
+        let by_width = |width: f64| {
+            result
+                .drops
+                .iter()
+                .find(|region| region.frame.size.width == width)
+                .unwrap_or_else(|| panic!("no drop target {width} wide"))
+                .frame
+        };
+        (by_width(60.0), by_width(200.0))
+    }
+
+    fn nested_board() -> (Runtime, NestedBoard, Size) {
+        let runtime = Runtime::new();
+        let view =
+            NestedBoard { on_chip: State::new(usize::MAX), on_pane: State::new(usize::MAX) };
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        (runtime, view, size)
+    }
+
+    #[test]
+    fn the_drops_run_outer_before_inner() {
+        // the invariant itself, with no pointer in sight: an ancestor is
+        // recorded BEFORE the subtree it holds
+        let (runtime, view, size) = nested_board();
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        assert_eq!(result.drops.len(), 2);
+        let (pane, chip) = (result.drops[0].frame, result.drops[1].frame);
+        assert_eq!(pane.size, Size { width: 200.0, height: 80.0 }, "the outer comes first");
+        assert_eq!(chip.size, Size { width: 60.0, height: 20.0 }, "the inner comes second");
+        assert!(
+            chip.origin.x >= pane.origin.x
+                && chip.origin.y >= pane.origin.y
+                && chip.origin.x + chip.size.width <= pane.origin.x + pane.size.width
+                && chip.origin.y + chip.size.height <= pane.origin.y + pane.size.height,
+            "and the second really sits inside the first"
+        );
+    }
+
+    #[test]
+    fn the_innermost_drop_target_takes_the_drop() {
+        let (runtime, view, size) = nested_board();
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let source = result.drag_sources.first().expect("the chip lifts").rect;
+        let (chip, _) = chip_and_pane(&result);
+
+        runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0);
+        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0);
+        let (x, y) = (chip.origin.x + 4.0, chip.origin.y + 4.0);
+        runtime.pointer_moved(x, y);
+        runtime.pointer_released(x, y);
+
+        assert_eq!(view.on_chip.get(), 7, "the chip took its own drop");
+        assert_eq!(view.on_pane.get(), usize::MAX, "and the pane never saw it");
+    }
+
+    #[test]
+    fn a_drop_outside_the_inner_target_still_reaches_the_ancestor() {
+        // the ancestor keeps the ground its children do not cover
+        let (runtime, view, size) = nested_board();
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let source = result.drag_sources.first().expect("the chip lifts").rect;
+        let (_, pane) = chip_and_pane(&result);
+
+        runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0);
+        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0);
+        let (x, y) = (pane.origin.x + 4.0, pane.origin.y + pane.size.height - 4.0);
+        runtime.pointer_moved(x, y);
+        runtime.pointer_released(x, y);
+
+        assert_eq!(view.on_pane.get(), 7);
+        assert_eq!(view.on_chip.get(), usize::MAX);
+    }
+
+    #[test]
+    fn an_inner_target_of_the_wrong_type_lets_the_ancestor_catch() {
+        // the depth rule never eats the TYPE filter: an inner target
+        // that cannot take this drag is not in the way
+        #[derive(Clone)]
+        struct Mixed {
+            landed: State<usize>,
+        }
+
+        impl Component for Mixed {
+            fn body(self, _ctx: &Context) -> impl View {
+                let landed = self.landed;
+                vstack!(
+                    text("tab 3").on_drag(|| drag(TabDrag { index: 3 }, "tab 3")),
+                    vstack!(
+                        text("chip").frame(60.0, 20.0).on_drop(move |_: &String| {}),
+                        spacer(),
+                    )
+                    .frame(200.0, 80.0)
+                    .on_drop(move |tab: &TabDrag| landed.set(tab.index)),
+                )
+                .spacing(10.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Mixed { landed: State::new(usize::MAX) };
+        let size = Size { width: 300.0, height: 200.0 };
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let source = result.drag_sources.first().expect("it lifts").rect;
+        let chip = result
+            .drops
+            .iter()
+            .find(|region| region.frame.size.width == 60.0)
+            .expect("the wrong-typed chip is still a region")
+            .frame;
+
+        runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0);
+        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0);
+        let (x, y) = (chip.origin.x + 4.0, chip.origin.y + 4.0);
+        runtime.pointer_moved(x, y);
+        runtime.pointer_released(x, y);
+
+        assert_eq!(view.landed.get(), 3, "the pane caught what the chip cannot take");
+    }
+
+    #[test]
+    fn the_ring_follows_the_innermost_target_and_paints_over_the_child() {
+        let (runtime, view, size) = nested_board();
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let source = result.drag_sources.first().expect("the chip lifts").rect;
+        let (chip, _) = chip_and_pane(&result);
+
+        runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0);
+        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0);
+        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 4.0);
+        let over = runtime.layout(&view, crate::layout::Proposal::exact(size));
+
+        let accent = crate::theme::current().accent;
+        let rings: Vec<(usize, crate::layout::Rect)> = over
+            .display
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| match command {
+                crate::layout::DrawCommand::StrokeRect { rect, color, width, .. }
+                    if *color == accent && *width == 2.0 =>
+                {
+                    Some((index, *rect))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rings.len(), 1, "one target, one ring");
+        assert_eq!(rings[0].1, chip, "and it is the INNERMOST target's box");
+
+        // the ring is paint: it covers the child it rings
+        let label = over
+            .display
+            .iter()
+            .position(|command| {
+                matches!(command, crate::layout::DrawCommand::TextLine { content, .. }
+                    if &**content == "chip")
+            })
+            .expect("the chip's own text is drawn");
+        assert!(rings[0].0 > label, "the ring paints AFTER what it rings");
+    }
+
     fn drag_board() -> (Runtime, DragBoard, Size) {
         let runtime = Runtime::new();
         let view = DragBoard {

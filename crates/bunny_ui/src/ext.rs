@@ -394,6 +394,12 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// accepts exactly a `TabDrag` drag. Targets are found by
     /// GEOMETRY, through every hover gate: the transparent catcher.
     ///
+    /// Nested targets resolve INNERMOST first. A chip inside a pane
+    /// takes its own drop, so an ancestor that accepts the same type
+    /// is no longer a catch-all for what lands on its children — give
+    /// the ancestor the area the children do not cover, the way the
+    /// body of a pane is not its tab strip.
+    ///
     /// ```ignore
     /// pane.on_drop(move |tab: &TabDrag| adopt(tab))
     /// ```

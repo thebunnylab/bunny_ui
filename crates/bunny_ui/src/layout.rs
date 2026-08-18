@@ -457,6 +457,10 @@ pub enum LayoutNode {
     /// value. The runtime finds targets by GEOMETRY — a drop lands
     /// through any opaque hover gate, which is the transparent catcher
     /// the dock asked for.
+    ///
+    /// Nested targets resolve INNERMOST first: a chip inside a pane
+    /// takes its own drop, and an ancestor of the same type stops being
+    /// a catch-all for what lands on its own children.
     DropTarget {
         accepts: std::any::TypeId,
         action: DropAction,
@@ -1428,17 +1432,24 @@ pub struct Placement {
     pub drag_regions: Vec<Rect>,
     /// The window's own buttons on a scene-drawn bar, in paint order.
     pub control_regions: Vec<(WindowControl, Rect)>,
-    /// Tooltip regions in paint order (last = topmost) — what the
-    /// runtime's hover consults. Never a hit: a tooltip explains,
-    /// it does not intercept.
+    /// Tooltip regions, OUTER before INNER and siblings in paint order
+    /// — what the runtime's hover consults, walking back so the
+    /// innermost of the topmost answers. Never a hit: a tooltip
+    /// explains, it does not intercept.
     pub tooltips: Vec<TooltipRegion>,
-    /// Context-menu regions in paint order (last = topmost) — what a
-    /// right press consults.
+    /// Context-menu regions, in the same order — what a right press
+    /// consults.
     pub menus: Vec<MenuRegion>,
-    /// Drag sources in paint order — what a press arms.
+    /// Drag sources, in the same order — what a press arms.
     pub drag_sources: Vec<DragSourceRegion>,
-    /// Drop targets in paint order — what a live drag consults, by
+    /// Drop targets, in the same order — what a live drag consults, by
     /// geometry, through every hover gate.
+    ///
+    /// The order is the one [`Placement::hits`] keeps and the only one
+    /// that answers BOTH questions a pointer asks: an ancestor is
+    /// recorded before the subtree it holds, so the reverse walk finds
+    /// the innermost target; siblings keep paint order, so the one
+    /// drawn later still wins where they overlap.
     pub drops: Vec<DropRegion>,
     /// The Dom capture, when that mode is on ([`layout_dom`]) — the
     /// placement braços feed it the SEMANTIC scene while they walk.
@@ -1560,17 +1571,24 @@ pub struct LayoutResult {
     pub drag_regions: Vec<Rect>,
     /// The window's own buttons on a scene-drawn bar, in paint order.
     pub control_regions: Vec<(WindowControl, Rect)>,
-    /// Tooltip regions in paint order (last = topmost) — what the
-    /// runtime's hover consults. Never a hit: a tooltip explains,
-    /// it does not intercept.
+    /// Tooltip regions, OUTER before INNER and siblings in paint order
+    /// — what the runtime's hover consults, walking back so the
+    /// innermost of the topmost answers. Never a hit: a tooltip
+    /// explains, it does not intercept.
     pub tooltips: Vec<TooltipRegion>,
-    /// Context-menu regions in paint order (last = topmost) — what a
-    /// right press consults.
+    /// Context-menu regions, in the same order — what a right press
+    /// consults.
     pub menus: Vec<MenuRegion>,
-    /// Drag sources in paint order — what a press arms.
+    /// Drag sources, in the same order — what a press arms.
     pub drag_sources: Vec<DragSourceRegion>,
-    /// Drop targets in paint order — what a live drag consults, by
+    /// Drop targets, in the same order — what a live drag consults, by
     /// geometry, through every hover gate.
+    ///
+    /// The order is the one [`Placement::hits`] keeps and the only one
+    /// that answers BOTH questions a pointer asks: an ancestor is
+    /// recorded before the subtree it holds, so the reverse walk finds
+    /// the innermost target; siblings keep paint order, so the one
+    /// drawn later still wins where they overlap.
     pub drops: Vec<DropRegion>,
 }
 
@@ -2931,45 +2949,55 @@ impl LayoutNode {
                     // the child's own element
                     dom.arm_tooltip(text.clone());
                 }
-                child.place(frame, *fit, env, out);
-                // clipped like a hit: what is not visible explains nothing
-                let region = match out.current_clip() {
-                    Some(clip) => frame.intersection(clip),
-                    None => Some(frame),
-                };
-                if let Some(rect) = region {
+                // recorded BEFORE the child, so the vector runs outer
+                // to inner and the reverse walk finds the INNERMOST
+                // explanation first — a tooltip on a chip inside a card
+                // is the chip's. Clipped like a hit: what is not visible
+                // explains nothing.
+                if let Some(rect) = clip_of(out, frame) {
                     out.tooltips.push(TooltipRegion { text: text.clone(), side: *side, rect });
                 }
+                child.place(frame, *fit, env, out);
             }
 
             (LayoutNode::ContextSource { items, child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
-                let region = match out.current_clip() {
-                    Some(clip) => frame.intersection(clip),
-                    None => Some(frame),
-                };
-                if let Some(rect) = region {
+                // outer before inner: the innermost menu wins the press
+                if let Some(rect) = clip_of(out, frame) {
                     out.menus.push(MenuRegion { items: items.clone(), rect });
                 }
+                child.place(frame, *fit, env, out);
             }
 
             (LayoutNode::DragSource { payload, child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
-                let region = match out.current_clip() {
-                    Some(clip) => frame.intersection(clip),
-                    None => Some(frame),
-                };
-                if let Some(rect) = region {
+                // outer before inner: what the hand lifts is the
+                // innermost thing under it, never the card around it
+                if let Some(rect) = clip_of(out, frame) {
                     out.drag_sources.push(DragSourceRegion { payload: payload.clone(), rect });
                 }
+                child.place(frame, *fit, env, out);
             }
 
             (LayoutNode::DropTarget { accepts, action, over, child }, Fit::Wrapped(_, fit)) => {
+                let region = clip_of(out, frame);
+                // the ROUTE is recorded before the descent, so the
+                // vector runs outer to inner and the runtime's reverse
+                // walk answers with the innermost target — a chip
+                // inside a pane takes its own drop. Siblings are
+                // untouched: the one placed later still enters later.
+                if let Some(rect) = region {
+                    out.drops.push(DropRegion {
+                        accepts: *accepts,
+                        action: action.clone(),
+                        over: over.clone(),
+                        rect,
+                        frame,
+                    });
+                }
                 child.place(frame, *fit, env, out);
-                let region = match out.current_clip() {
-                    Some(clip) => frame.intersection(clip),
-                    None => Some(frame),
-                };
+                // the RING is paint, and paint runs the other way: it
+                // has to cover the child in the draw list and be the
+                // later sibling in the element tree. Routing order and
+                // paint order are deliberately opposite here.
                 if let Some(rect) = region {
                     // a compatible drag over THIS box: the framework
                     // rings it — the drop focus every platform draws.
@@ -3005,13 +3033,6 @@ impl LayoutNode {
                             );
                         }
                     }
-                    out.drops.push(DropRegion {
-                        accepts: *accepts,
-                        action: action.clone(),
-                        over: over.clone(),
-                        rect,
-                        frame,
-                    });
                 }
             }
 
@@ -4170,8 +4191,9 @@ fn draw_scrollbar(
     }
 }
 
-/// What the current clip lets through of a rect — the door every hit
-/// goes through (an off-screen thumb cannot be grabbed).
+/// What the current clip lets through of a rect — the door every
+/// geometry-routed region goes through. What is not visible cannot be
+/// grabbed, explained, dropped on or dragged from.
 fn clip_of(out: &Placement, rect: Rect) -> Option<Rect> {
     match out.current_clip() {
         Some(clip) => rect.intersection(clip),

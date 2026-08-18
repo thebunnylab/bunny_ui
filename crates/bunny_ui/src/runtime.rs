@@ -62,7 +62,8 @@ pub struct Runtime {
     /// The root of the last pass — scopes `take_dirty` so it does not
     /// drain dirt from another tree mounted on the same thread.
     last_root: RefCell<Option<String>>,
-    /// The targets of the last layout, in paint order — the hit-test
+    /// The targets of the last layout, OUTER before INNER with siblings
+    /// in paint order — the hit-test
     /// map for pointer events.
     last_hits: RefCell<Vec<(String, Rect)>>,
     /// Pointer state for the frame — resolved BEFORE layout (the LAW:
@@ -341,9 +342,15 @@ impl Runtime {
     /// lift — under it, a click stays a click.
     const DRAG_THRESHOLD: Px = 4.0;
 
-    /// The compatible drop region under a point — topmost first, by
-    /// GEOMETRY: a drag lands through every opaque hover gate, which
-    /// is the transparent catcher the dock wanted.
+    /// The compatible drop region under a point — the INNERMOST of the
+    /// topmost, by GEOMETRY: a drag lands through every opaque hover
+    /// gate, which is the transparent catcher the dock wanted.
+    ///
+    /// The reverse walk is load-bearing twice. The regions are recorded
+    /// outer before inner, so walking back answers with the innermost
+    /// accepting target; and overlays are drained AFTER the root, so
+    /// walking back is also the only reason a target inside a popover
+    /// beats the one on the page underneath it.
     fn drop_at(&self, x: Px, y: Px, value: &dyn std::any::Any) -> Option<crate::layout::DropRegion> {
         self.last_drops
             .borrow()
