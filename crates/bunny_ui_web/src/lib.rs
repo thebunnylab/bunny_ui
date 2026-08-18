@@ -470,6 +470,14 @@ pub extern "C" fn bunny_wake() {
     dispatch(Event::Wake);
 }
 
+/// The wire contract this binary encodes. The glue reads it before it
+/// boots and refuses a stream it was not written for — see
+/// `bunny_ui::dom::ABI_VERSION` for the bump checklist.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_abi_version() -> u32 {
+    bunny_ui::dom::ABI_VERSION
+}
+
 /// Dom mode: the input edited. Both strings arrive through
 /// `bunny_alloc` buffers (ownership comes back here); `caret` is the
 /// input's `selectionStart` in UTF-16 units.

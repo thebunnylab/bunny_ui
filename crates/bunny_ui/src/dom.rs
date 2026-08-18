@@ -893,6 +893,27 @@ fn diff_children(
 
 // MARK: - The wire encoding
 
+/// The version of the wire contract between [`encode`] and the glue.
+///
+/// The glue is a hand-written mirror of this module, and the two bind
+/// once, at page load. So the gate lives at boot: the shell exports
+/// this number, the glue compares it with the number it was written
+/// for, and refuses to start on a mismatch. A stale pairing dies with
+/// one clear sentence — never with a `RangeError` half-way down a
+/// stream it cannot read.
+///
+/// Bump this constant when ANY of these change:
+/// - the op codes or their payloads (the table on [`encode`])
+/// - the create kinds (0 group .. 7 image)
+/// - the style mask bits or their field order
+/// - the weight or truncation codes
+/// - the key table or the modifier bits (the shell's `named_key`)
+/// - the field padding the glue mirrors (`FIELD_PAD_V`/`FIELD_PAD_H`)
+///
+/// A test pins the glue to this number: bump one side alone and the
+/// suite goes red before the browser ever gets the chance to.
+pub const ABI_VERSION: u32 = 1;
+
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
 ///
@@ -2146,5 +2167,43 @@ mod tests {
             DomPatch::SetIcon { icon, .. }
                 if icon.color == Color::hex(0xAA2211) && !icon.inherits_ink
         ));
+    }
+
+    // MARK: - The ABI handshake
+
+    /// The glue mirrors this module by hand, so the two halves of the
+    /// contract are pinned to one number. Bump [`ABI_VERSION`] without
+    /// touching the glue — or the other way around — and this test
+    /// goes red before any browser meets the mismatch.
+    #[test]
+    fn the_glue_expects_this_abi() {
+        let pin = format!("const EXPECTED_ABI = {};", ABI_VERSION);
+        let element = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        assert!(
+            element.contains(&pin),
+            "glue_dom.js expects a different ABI than the engine encodes"
+        );
+        let canvas = include_str!("../../bunny_ui_web/glue/glue.js");
+        assert!(
+            canvas.contains(&pin),
+            "glue.js expects a different ABI than the engine encodes"
+        );
+    }
+
+    /// The canonical glue lives beside the shell crate; every app
+    /// ships a byte-identical copy. One diverging copy is a fork of
+    /// the wire contract — this keeps the fleet on one file.
+    #[test]
+    fn the_shipped_glue_is_the_canonical_glue() {
+        assert_eq!(
+            include_str!("../../bunny_ui_web/glue/glue_dom.js"),
+            include_str!("../../../apps/finder_web/web/glue_dom.js"),
+            "finder_web ships a glue_dom.js that drifted from the canonical copy"
+        );
+        assert_eq!(
+            include_str!("../../bunny_ui_web/glue/glue.js"),
+            include_str!("../../../apps/finder_web/web/glue.js"),
+            "finder_web ships a glue.js that drifted from the canonical copy"
+        );
     }
 }
