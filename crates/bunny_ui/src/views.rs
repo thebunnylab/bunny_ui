@@ -910,6 +910,7 @@ pub struct VirtualList<I, F> {
     row: F,
     reveal: Option<usize>,
     heights: Option<std::rc::Rc<dyn Fn(usize) -> f64>>,
+    declared_extent: Option<f64>,
 }
 
 impl<I, F> VirtualList<I, F> {
@@ -933,6 +934,17 @@ impl<I, F> VirtualList<I, F> {
         self.heights = Some(std::rc::Rc::new(height));
         self
     }
+
+    /// One declared height for every row — the uniform twin of
+    /// [`VirtualList::row_height_with`], and the same authority: the
+    /// window math reads it before any measured geometry. The flow
+    /// lowering NEEDS one of the two (the browser owns layout there,
+    /// so a measured extent never exists); the pixel targets take it
+    /// as a welcome shortcut.
+    pub fn row_height(mut self, extent: f64) -> Self {
+        self.declared_extent = Some(extent);
+        self
+    }
 }
 
 impl<I, F, R> View for VirtualList<I, F>
@@ -949,13 +961,31 @@ where
         // viewport, measured row height) — one frame of lag masked by
         // the buffer; a miss re-runs this body in the same frame
         let snapshot = crate::viewport::region(scope.as_deref());
+        // the LOCAL authority speaks first: a heights closure gives
+        // exact prefix sums, a declared extent gives the uniform math.
+        // Measured geometry (last frame's snapshot) only fills in when
+        // the app declared nothing — which the flow lowering cannot
+        // accept, because there the browser owns layout and a measured
+        // extent never exists.
+        let local_offsets = self.heights.as_ref().map(|rows| {
+            let mut acc = 0.0;
+            let mut offsets = Vec::with_capacity(self.count + 1);
+            offsets.push(0.0);
+            for index in 0..self.count {
+                acc += rows(index);
+                offsets.push(acc);
+            }
+            std::rc::Rc::new(offsets)
+        });
         // last frame's offsets, when they still describe THIS count —
         // a count that changed falls back and heals by miss
-        let offsets = snapshot.as_ref().and_then(|snap| {
-            snap.offsets
-                .as_ref()
-                .filter(|offsets| offsets.len() == self.count + 1)
-                .cloned()
+        let offsets = local_offsets.or_else(|| {
+            snapshot.as_ref().and_then(|snap| {
+                snap.offsets
+                    .as_ref()
+                    .filter(|offsets| offsets.len() == self.count + 1)
+                    .cloned()
+            })
         });
         let (first, last) = match (&snapshot, &offsets) {
             // variable heights: the band in px, rows by binary search,
@@ -975,16 +1005,19 @@ where
                     .min(self.count - 1);
                 (first, last)
             }
-            (Some(snap), None) if snap.row_extent > 0.0 && self.count > 0 => {
+            (Some(snap), None)
+                if (self.declared_extent.unwrap_or(snap.row_extent)) > 0.0
+                    && self.count > 0 =>
+            {
+                let extent = self.declared_extent.unwrap_or(snap.row_extent);
                 let rows_in_view =
-                    (snap.viewport / snap.row_extent).ceil().max(1.0) as usize + 1;
+                    (snap.viewport / extent).ceil().max(1.0) as usize + 1;
                 // the retained offset clamps HERE the way place will
                 // clamp it — a count that just shrank must not leave
                 // the window math pointing at rows that no longer exist
-                let travel = (snap.row_extent * self.count as f64 - snap.viewport)
-                    .max(0.0);
+                let travel = (extent * self.count as f64 - snap.viewport).max(0.0);
                 let offset = snap.offset_y.clamp(0.0, travel);
-                let top = (offset / snap.row_extent).floor().max(0.0) as usize;
+                let top = (offset / extent).floor().max(0.0) as usize;
                 let first = top.saturating_sub(rows_in_view).min(self.count - 1);
                 let last = (top + 2 * rows_in_view).min(self.count - 1);
                 (first, last)
@@ -1029,9 +1062,11 @@ where
                     .min(self.count - 1);
                 (first, last)
             }
-            (Some(snap), None) if snap.row_extent > 0.0 => {
-                let buffer =
-                    (snap.viewport / snap.row_extent).ceil().max(1.0) as usize + 1;
+            (Some(snap), None)
+                if self.declared_extent.unwrap_or(snap.row_extent) > 0.0 =>
+            {
+                let extent = self.declared_extent.unwrap_or(snap.row_extent);
+                let buffer = (snap.viewport / extent).ceil().max(1.0) as usize + 1;
                 (index.saturating_sub(buffer), (index + buffer).min(self.count - 1))
             }
             _ => (index.saturating_sub(1), (index + 1).min(self.count - 1)),
@@ -1097,7 +1132,10 @@ where
             target: reveal_id,
             path: motor::identity::cursor_scope(),
             child: Box::new(LayoutNode::VirtualStack {
-                row_extent: snapshot.map(|snap| snap.row_extent).unwrap_or(0.0),
+                row_extent: self
+                    .declared_extent
+                    .or(snapshot.map(|snap| snap.row_extent))
+                    .unwrap_or(0.0),
                 count: self.count,
                 children,
                 heights: self.heights.clone().map(crate::layout::RowHeights),
@@ -1114,7 +1152,7 @@ where
     F: Fn(usize) -> R + Clone + 'static,
     R: View,
 {
-    VirtualList { count, id, row, reveal: None, heights: None }
+    VirtualList { count, id, row, reveal: None, heights: None, declared_extent: None }
 }
 
 /// `ForEach(collection, id: \.keyPath) { item in … }` — the `id` is the
