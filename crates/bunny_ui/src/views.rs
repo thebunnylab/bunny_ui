@@ -480,6 +480,26 @@ impl View for Icon {
     }
 }
 
+/// What a drag carries: the typed value, erased for the wire between
+/// source and target, and the label the cursor wears on the way.
+#[derive(Clone)]
+pub struct DragPayload {
+    pub value: Rc<dyn std::any::Any>,
+    pub label: Arc<str>,
+}
+
+impl std::fmt::Debug for DragPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DragPayload({})", self.label)
+    }
+}
+
+/// A typed drag: the value any `.on_drop(|v: &T| …)` of the same type
+/// accepts, and the label that follows the pointer.
+pub fn drag<T: 'static>(value: T, label: impl Into<Arc<str>>) -> DragPayload {
+    DragPayload { value: Rc::new(value), label: label.into() }
+}
+
 /// One entry of a context menu: a labelled action, or the quiet line
 /// between groups.
 #[derive(Clone)]

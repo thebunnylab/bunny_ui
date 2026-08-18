@@ -343,6 +343,48 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified { base: self, modifier: Modifier::ContextMenu(items.into()) }
     }
 
+    /// `.on_drag(…)` — pressing this view and moving past the
+    /// threshold lifts a typed drag. The closure builds the payload AT
+    /// LIFT (fresh state, never a stale capture); the label follows
+    /// the cursor, and a click that never moves stays a click.
+    ///
+    /// ```ignore
+    /// tab.on_drag(move || drag(TabDrag { pane, index }, title.clone()))
+    /// ```
+    fn on_drag(
+        self,
+        payload: impl Fn() -> crate::views::DragPayload + 'static,
+    ) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::OnDrag(crate::layout::DragBuilder(std::rc::Rc::new(payload))),
+        }
+    }
+
+    /// `.on_drop(…)` — while a drag of the closure's type is over this
+    /// view the framework rings it, and the release lands the value
+    /// here. The type is read from the closure — `|tab: &TabDrag| …`
+    /// accepts exactly a `TabDrag` drag. Targets are found by
+    /// GEOMETRY, through every hover gate: the transparent catcher.
+    ///
+    /// ```ignore
+    /// pane.on_drop(move |tab: &TabDrag| adopt(tab))
+    /// ```
+    fn on_drop<T: 'static>(self, action: impl Fn(&T) + 'static) -> Modified<Self> {
+        let erased = move |any: &dyn std::any::Any| {
+            if let Some(value) = any.downcast_ref::<T>() {
+                action(value);
+            }
+        };
+        Modified {
+            base: self,
+            modifier: Modifier::OnDrop {
+                accepts: std::any::TypeId::of::<T>(),
+                action: crate::layout::DropAction(std::rc::Rc::new(erased)),
+            },
+        }
+    }
+
     /// `.clipped()` — the subtree cannot paint outside this box, and
     /// the cut FOLLOWS `.corner_radius(…)` when there is one (a plain
     /// rectangle without it). The island that finally holds its

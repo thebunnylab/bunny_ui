@@ -4225,4 +4225,146 @@ mod tests {
         assert_eq!(view.fired.get(), 0, "a divider fires nothing");
         assert!(runtime.interaction().menu.is_none(), "but the press still closes");
     }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    struct TabDrag {
+        index: usize,
+    }
+
+    #[derive(Clone)]
+    struct DragBoard {
+        clicked: State<usize>,
+        landed: State<usize>,
+        wrong: State<usize>,
+    }
+
+    impl Component for DragBoard {
+        fn body(self, _ctx: &Context) -> impl View {
+            let clicked = self.clicked;
+            let landed = self.landed;
+            let wrong = self.wrong;
+            vstack!(
+                text("tab 2")
+                    .on_drag(|| drag(TabDrag { index: 2 }, "tab 2"))
+                    .on_click(move || clicked.set(clicked.get() + 1)),
+                text("pane").on_drop(move |tab: &TabDrag| landed.set(tab.index)),
+                text("trash").on_drop(move |_: &String| wrong.set(wrong.get() + 1)),
+            )
+            .spacing(30.0)
+        }
+    }
+
+    fn drag_board() -> (Runtime, DragBoard, Size) {
+        let runtime = Runtime::new();
+        let view = DragBoard {
+            clicked: State::new(0),
+            landed: State::new(usize::MAX),
+            wrong: State::new(0),
+        };
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        (runtime, view, size)
+    }
+
+    #[test]
+    fn a_click_that_never_moves_stays_a_click() {
+        let (runtime, view, _) = drag_board();
+        runtime.pointer_pressed(20.0, 8.0);
+        runtime.pointer_released(20.0, 8.0);
+        assert_eq!(view.clicked.get(), 1, "the press never lifted");
+        assert!(runtime.interaction().drag.is_none());
+    }
+
+    #[test]
+    fn a_lift_carries_the_typed_value_to_its_target() {
+        use crate::layout::DRAG_LABEL_PATH;
+        let (runtime, view, size) = drag_board();
+        // press on the tab, move past the threshold: the drag lifts
+        runtime.pointer_pressed(20.0, 8.0);
+        assert!(runtime.pointer_moved(30.0, 20.0), "the lift repaints");
+        let live = runtime.interaction().drag.expect("a drag is live");
+        assert_eq!(&*live.label, "tab 2");
+        // the chip follows the cursor as an overlay
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let chip = result
+            .overlays
+            .iter()
+            .find(|overlay| overlay.path == DRAG_LABEL_PATH)
+            .expect("the label rides the pointer");
+        let says: Vec<String> = result
+            .display
+            .iter()
+            .skip(chip.display.0)
+            .filter_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { content, .. } => {
+                    Some(content.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(says, vec!["tab 2".to_string()]);
+        // over the compatible pane: the target rings
+        let target = result
+            .drops
+            .iter()
+            .find(|region| region.accepts == std::any::TypeId::of::<TabDrag>())
+            .expect("the pane is a target")
+            .rect;
+        let (cx, cy) =
+            (target.origin.x + target.size.width / 2.0, target.origin.y + target.size.height / 2.0);
+        assert!(runtime.pointer_moved(cx, cy));
+        assert_eq!(runtime.interaction().drag.unwrap().over, Some(target));
+        let ringed = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let accent = crate::theme::current().accent;
+        assert!(
+            ringed.display.iter().any(|command| matches!(
+                command,
+                crate::layout::DrawCommand::StrokeRect { color, width, .. }
+                    if *color == accent && *width == 2.0
+            )),
+            "the framework rings the target"
+        );
+        // the release lands the value, typed — and the click never fired
+        runtime.pointer_released(cx, cy);
+        assert_eq!(view.landed.get(), 2, "the pane took TabDrag {{ index: 2 }}");
+        assert_eq!(view.clicked.get(), 0, "the click died at the lift");
+        assert!(runtime.interaction().drag.is_none(), "the drag went home");
+        assert_eq!(view.wrong.get(), 0);
+    }
+
+    #[test]
+    fn a_wrong_type_never_lights_nor_lands() {
+        let (runtime, view, size) = drag_board();
+        runtime.pointer_pressed(20.0, 8.0);
+        runtime.pointer_moved(30.0, 20.0);
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let trash = result
+            .drops
+            .iter()
+            .find(|region| region.accepts == std::any::TypeId::of::<String>())
+            .expect("the decoy is a target")
+            .rect;
+        let (cx, cy) =
+            (trash.origin.x + trash.size.width / 2.0, trash.origin.y + trash.size.height / 2.0);
+        runtime.pointer_moved(cx, cy);
+        assert_eq!(runtime.interaction().drag.unwrap().over, None, "the types do not meet");
+        runtime.pointer_released(cx, cy);
+        assert_eq!(view.wrong.get(), 0, "nothing landed");
+        assert_eq!(view.landed.get(), usize::MAX);
+    }
+
+    #[test]
+    fn escape_sends_the_drag_home() {
+        let (runtime, view, _) = drag_board();
+        runtime.pointer_pressed(20.0, 8.0);
+        runtime.pointer_moved(60.0, 40.0);
+        assert!(runtime.interaction().drag.is_some());
+        let handled = runtime
+            .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape));
+        assert!(handled.handled);
+        assert!(runtime.interaction().drag.is_none());
+        runtime.pointer_released(60.0, 40.0);
+        assert_eq!(view.landed.get(), usize::MAX, "a cancelled drag lands nowhere");
+        assert_eq!(view.clicked.get(), 0, "and the click stayed dead");
+    }
 }

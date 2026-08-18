@@ -65,6 +65,10 @@ pub enum Modifier {
     Tooltip(std::sync::Arc<str>, crate::layout::Side),
     /// `.context_menu(…)` — items a right press offers at the pointer.
     ContextMenu(std::rc::Rc<[crate::views::MenuItem]>),
+    /// `.on_drag(…)` — the view lifts into a typed drag.
+    OnDrag(crate::layout::DragBuilder),
+    /// `.on_drop(…)` — the view takes a typed drag.
+    OnDrop { accepts: std::any::TypeId, action: crate::layout::DropAction },
     Monospaced,
     /// A size out of the preset scale — the rest of the font stays.
     FontSize(f64),
@@ -194,6 +198,8 @@ impl Modifier {
             Modifier::Clipped => " [.clipped()]".into(),
             Modifier::Tooltip(text, _) => format!(" [.tooltip({text:?})]"),
             Modifier::ContextMenu(items) => format!(" [.contextMenu({} items)]", items.len()),
+            Modifier::OnDrag(_) => " [.onDrag()]".into(),
+            Modifier::OnDrop { .. } => " [.onDrop()]".into(),
             Modifier::Monospaced => " [.monospaced()]".into(),
             Modifier::Id(name) => format!(" [.id({name:?})]"),
             Modifier::FontSize(size) => format!(" [.font(.system(size: {size}))]"),
@@ -660,6 +666,16 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             }),
             Modifier::ContextMenu(items) => out.wrap_last_layout(|node| {
                 LayoutNode::ContextSource { items: items.clone(), child: Box::new(node) }
+            }),
+            Modifier::OnDrag(payload) => out.wrap_last_layout(|node| {
+                LayoutNode::DragSource { payload: payload.clone(), child: Box::new(node) }
+            }),
+            Modifier::OnDrop { accepts, action } => out.wrap_last_layout(|node| {
+                LayoutNode::DropTarget {
+                    accepts: *accepts,
+                    action: action.clone(),
+                    child: Box::new(node),
+                }
             }),
             // font is an inherited scene property — the same Styled as the
             // visuals carries the patch (measure applies it on top of the env)

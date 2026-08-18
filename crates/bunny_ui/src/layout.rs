@@ -423,6 +423,16 @@ pub enum LayoutNode {
     /// no app state for menus and neither do we); the panel rides the
     /// overlay machinery and leaves the window on the desktop.
     ContextSource { items: std::rc::Rc<[crate::views::MenuItem]>, child: Box<LayoutNode> },
+    /// `.on_drag(…)`: pressing the child and moving past the threshold
+    /// begins a typed drag. The closure builds the payload AT LIFT —
+    /// fresh state, never a stale capture.
+    DragSource { payload: DragBuilder, child: Box<LayoutNode> },
+    /// `.on_drop(…)`: while a drag of the accepted type is over the
+    /// child, the framework rings it; on release the action takes the
+    /// value. The runtime finds targets by GEOMETRY — a drop lands
+    /// through any opaque hover gate, which is the transparent catcher
+    /// the dock asked for.
+    DropTarget { accepts: std::any::TypeId, action: DropAction, child: Box<LayoutNode> },
     /// The escape hatch (`custom(…)` / `canvas(…)`): a box the APP
     /// measures and paints, in the same command vocabulary the built-ins
     /// emit. `path` is its identity — the address of the events it
@@ -820,6 +830,8 @@ pub struct Interaction {
     pub tooltip: Option<(Arc<str>, Side, Rect)>,
     /// The open context menu — the runtime's, resolved before layout.
     pub menu: Option<MenuOpen>,
+    /// The live drag — the runtime's, resolved before layout.
+    pub drag: Option<DragLive>,
 }
 
 /// A draw command — the output of the placement pass, in paint order
@@ -1006,6 +1018,67 @@ pub struct MenuRegion {
     pub rect: Rect,
 }
 
+/// The closure that builds a payload at lift — a cheap handle that
+/// keeps the tree `Debug` (the pattern `Custom` set).
+#[derive(Clone)]
+pub struct DragBuilder(pub std::rc::Rc<dyn Fn() -> crate::views::DragPayload>);
+
+impl std::fmt::Debug for DragBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("on_drag")
+    }
+}
+
+/// The closure a drop lands in — same story.
+#[derive(Clone)]
+pub struct DropAction(pub std::rc::Rc<dyn Fn(&dyn std::any::Any)>);
+
+impl std::fmt::Debug for DropAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("on_drop")
+    }
+}
+
+/// One `.on_drag(…)` region of the placed scene.
+#[derive(Clone)]
+pub struct DragSourceRegion {
+    pub payload: DragBuilder,
+    pub rect: Rect,
+}
+
+impl std::fmt::Debug for DragSourceRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DragSourceRegion({:?})", self.rect)
+    }
+}
+
+/// One `.on_drop(…)` region of the placed scene.
+#[derive(Clone)]
+pub struct DropRegion {
+    pub accepts: std::any::TypeId,
+    pub action: DropAction,
+    pub rect: Rect,
+}
+
+impl std::fmt::Debug for DropRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DropRegion({:?})", self.rect)
+    }
+}
+
+/// A live drag as the STAMP carries it — data only, the value stays
+/// with the runtime and lands on the drop.
+#[derive(Clone, PartialEq, Debug)]
+pub struct DragLive {
+    /// The label the cursor wears.
+    pub label: Arc<str>,
+    /// Where the pointer is.
+    pub at: Point,
+    /// The compatible target under the pointer, by its region RECT —
+    /// geometry needs no identity, and the ring compares its own.
+    pub over: Option<Rect>,
+}
+
 /// The open context menu as the STAMP carries it — data only, the
 /// actions stay with the runtime and fire by index.
 #[derive(Clone, PartialEq, Debug)]
@@ -1112,6 +1185,11 @@ pub struct Placement {
     /// Context-menu regions in paint order (last = topmost) — what a
     /// right press consults.
     pub menus: Vec<MenuRegion>,
+    /// Drag sources in paint order — what a press arms.
+    pub drag_sources: Vec<DragSourceRegion>,
+    /// Drop targets in paint order — what a live drag consults, by
+    /// geometry, through every hover gate.
+    pub drops: Vec<DropRegion>,
     /// The Dom capture, when that mode is on ([`layout_dom`]) — the
     /// placement braços feed it the SEMANTIC scene while they walk.
     /// `None` costs one branch per hook and nothing else.
@@ -1237,6 +1315,11 @@ pub struct LayoutResult {
     /// Context-menu regions in paint order (last = topmost) — what a
     /// right press consults.
     pub menus: Vec<MenuRegion>,
+    /// Drag sources in paint order — what a press arms.
+    pub drag_sources: Vec<DragSourceRegion>,
+    /// Drop targets in paint order — what a live drag consults, by
+    /// geometry, through every hover gate.
+    pub drops: Vec<DropRegion>,
 }
 
 /// Runs both phases from the root with the default environment — the
@@ -1293,6 +1376,8 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         drag_regions: out.drag_regions,
         tooltips: out.tooltips,
         menus: out.menus,
+        drag_sources: out.drag_sources,
+        drops: out.drops,
     }
 }
 
@@ -1330,6 +1415,8 @@ pub fn layout_dom(
             drag_regions: out.drag_regions,
             tooltips: out.tooltips,
             menus: out.menus,
+            drag_sources: out.drag_sources,
+            drops: out.drops,
         },
         scene,
     )
@@ -1490,6 +1577,9 @@ pub const TOOLTIP_PATH: &str = "bunny.tooltip";
 /// The context menu's overlay path — pooled like a popover's panel,
 /// but the RUNTIME owns its doors, not the reconciler.
 pub const MENU_PATH: &str = "bunny.menu";
+
+/// The drag label's overlay path — the chip that follows the cursor.
+pub const DRAG_LABEL_PATH: &str = "bunny.drag";
 
 /// The menu's shared geometry — the builder below and the runtime's
 /// row mapping must walk the SAME numbers, so they live in one place.
@@ -1733,6 +1823,44 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
             anchor_visible: true,
         });
     }
+    // the drag label rides the cursor — the same bubble the tooltip
+    // wears, hung off the pointer, above everything (on the desktop it
+    // leaves the window with the pointer)
+    if let Some(live) = env.stamp.interaction.drag.clone() {
+        let node = tooltip_node(live.label);
+        let proposal = Proposal {
+            width: Some(container.size.width),
+            height: Some(container.size.height),
+        };
+        let (size, fit) = node.measure(proposal, env);
+        let at = Point { x: live.at.x + 14.0, y: live.at.y + 16.0 };
+        let clamp = |value: Px, low: Px, high: Px| value.min(high).max(low);
+        let frame = Rect {
+            origin: Point {
+                x: clamp(
+                    at.x,
+                    container.origin.x,
+                    container.origin.x + (container.size.width - size.width).max(0.0),
+                ),
+                y: clamp(
+                    at.y,
+                    container.origin.y,
+                    container.origin.y + (container.size.height - size.height).max(0.0),
+                ),
+            },
+            size,
+        };
+        let start = out.display.len();
+        node.place(frame, fit, env, out);
+        let end = out.display.len();
+        out.overlays.push(OverlayPlacement {
+            path: DRAG_LABEL_PATH.to_string(),
+            anchor: Rect { origin: live.at, size: Size::default() },
+            frame,
+            display: (start, end),
+            anchor_visible: true,
+        });
+    }
     // the tooltip lands LAST — above every popover, outside every
     // clip, and on the desktop it leaves the window like they do
     if let Some((text, side, anchor)) = env.stamp.interaction.tooltip.clone() {
@@ -1805,7 +1933,9 @@ impl LayoutNode {
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
             | LayoutNode::Tooltip { child, .. }
-            | LayoutNode::ContextSource { child, .. } => child.is_flexible(axis),
+            | LayoutNode::ContextSource { child, .. }
+            | LayoutNode::DragSource { child, .. }
+            | LayoutNode::DropTarget { child, .. } => child.is_flexible(axis),
             // a stack that HOLDS something flexible is itself flexible
             // (a panel with a scroll inside wants the leftover space —
             // nesting it must not freeze it at its natural extent)
@@ -1854,6 +1984,8 @@ impl LayoutNode {
             | LayoutNode::DragRegion { child }
             | LayoutNode::Tooltip { child, .. }
             | LayoutNode::ContextSource { child, .. }
+            | LayoutNode::DragSource { child, .. }
+            | LayoutNode::DropTarget { child, .. }
             | LayoutNode::Frame { child, .. } => child.first_baseline(env),
             // lane A leads the seam — its text sets the shared line
             LayoutNode::Split { children, .. } => {
@@ -1963,6 +2095,11 @@ impl LayoutNode {
             }
 
             LayoutNode::ContextSource { child, .. } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            LayoutNode::DragSource { child, .. } | LayoutNode::DropTarget { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -2511,6 +2648,48 @@ impl LayoutNode {
                 };
                 if let Some(rect) = region {
                     out.menus.push(MenuRegion { items: items.clone(), rect });
+                }
+            }
+
+            (LayoutNode::DragSource { payload, child }, Fit::Wrapped(_, fit)) => {
+                child.place(frame, *fit, env, out);
+                let region = match out.current_clip() {
+                    Some(clip) => frame.intersection(clip),
+                    None => Some(frame),
+                };
+                if let Some(rect) = region {
+                    out.drag_sources.push(DragSourceRegion { payload: payload.clone(), rect });
+                }
+            }
+
+            (LayoutNode::DropTarget { accepts, action, child }, Fit::Wrapped(_, fit)) => {
+                child.place(frame, *fit, env, out);
+                let region = match out.current_clip() {
+                    Some(clip) => frame.intersection(clip),
+                    None => Some(frame),
+                };
+                if let Some(rect) = region {
+                    // a compatible drag over THIS box: the framework
+                    // rings it — the drop focus every platform draws
+                    let ringed = env
+                        .stamp
+                        .interaction
+                        .drag
+                        .as_ref()
+                        .is_some_and(|live| live.over == Some(rect));
+                    if ringed {
+                        out.display.push(DrawCommand::StrokeRect {
+                            rect: frame,
+                            color: crate::theme::current().accent,
+                            width: 2.0,
+                            corner_radius: 6.0,
+                        });
+                    }
+                    out.drops.push(DropRegion {
+                        accepts: *accepts,
+                        action: action.clone(),
+                        rect,
+                    });
                 }
             }
 

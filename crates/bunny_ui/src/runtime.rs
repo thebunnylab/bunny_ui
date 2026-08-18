@@ -138,6 +138,16 @@ pub struct Runtime {
     /// The open menu's ACTIONS, by row index — the stamp carries only
     /// the labels; the closures stay here and fire on the pick.
     menu_items: RefCell<Option<std::rc::Rc<[crate::views::MenuItem]>>>,
+    /// The `.on_drag(…)` regions of the last layout.
+    last_drag_sources: RefCell<Vec<crate::layout::DragSourceRegion>>,
+    /// The `.on_drop(…)` regions of the last layout.
+    last_drops: RefCell<Vec<crate::layout::DropRegion>>,
+    /// The pressed-but-not-lifted drag: its builder and where the
+    /// press landed. Past the threshold it becomes the live value.
+    drag_armed: RefCell<Option<(crate::layout::DragBuilder, Point)>>,
+    /// The lifted drag's VALUE — the stamp carries only label and
+    /// geometry; the typed value stays here and lands on the drop.
+    drag_value: RefCell<Option<std::rc::Rc<dyn std::any::Any>>>,
     /// The tooltip's whole life — the runtime owns it, the scene only
     /// declares. CLOCKLESS: the delay is the shell's tick seen twice,
     /// so no Instant crosses into wasm and the tests drive it by hand.
@@ -313,6 +323,70 @@ impl Runtime {
         self.interaction.borrow_mut().menu.take().is_some()
     }
 
+    /// How far a pressed pointer travels before the press becomes a
+    /// lift — under it, a click stays a click.
+    const DRAG_THRESHOLD: Px = 4.0;
+
+    /// The compatible drop region under a point — topmost first, by
+    /// GEOMETRY: a drag lands through every opaque hover gate, which
+    /// is the transparent catcher the dock wanted.
+    fn drop_at(&self, x: Px, y: Px, value: &dyn std::any::Any) -> Option<crate::layout::DropRegion> {
+        self.last_drops
+            .borrow()
+            .iter()
+            .rev()
+            .find(|region| region.rect.contains(x, y) && region.accepts == value.type_id())
+            .cloned()
+    }
+
+    /// A live drag follows the pointer: the label chip moves, the
+    /// compatible target under it rings, the scene's hover stays
+    /// quiet. `Some(repaint)` when a drag owns the move.
+    fn note_drag_move(&self, x: Px, y: Px) -> Option<bool> {
+        // past the threshold, the armed press lifts
+        let lift = {
+            let armed = self.drag_armed.borrow();
+            armed.as_ref().and_then(|(builder, pressed_at)| {
+                let far = (x - pressed_at.x).hypot(y - pressed_at.y) >= Self::DRAG_THRESHOLD;
+                (far && self.drag_value.borrow().is_none()).then(|| builder.clone())
+            })
+        };
+        if let Some(builder) = lift {
+            let payload = (builder.0)();
+            let over = self.drop_at(x, y, &*payload.value).map(|region| region.rect);
+            *self.drag_value.borrow_mut() = Some(payload.value);
+            let mut interaction = self.interaction.borrow_mut();
+            // the click dies at the lift: nothing fires on the release
+            interaction.pressed = None;
+            interaction.hovered = None;
+            interaction.pointer = Some(Point { x, y });
+            interaction.drag = Some(crate::layout::DragLive {
+                label: payload.label,
+                at: Point { x, y },
+                over,
+            });
+            drop(interaction);
+            let _ = self.clear_tooltip();
+            return Some(true);
+        }
+        let value = self.drag_value.borrow().clone()?;
+        let over = self.drop_at(x, y, &*value).map(|region| region.rect);
+        let mut interaction = self.interaction.borrow_mut();
+        let live = interaction.drag.as_mut()?;
+        let moved = live.at != (Point { x, y }) || live.over != over;
+        live.at = Point { x, y };
+        live.over = over;
+        interaction.pointer = Some(Point { x, y });
+        Some(moved)
+    }
+
+    /// Ends the drag without landing it. `true` = one was live.
+    fn cancel_drag(&self) -> bool {
+        self.drag_armed.borrow_mut().take();
+        self.drag_value.borrow_mut().take();
+        self.interaction.borrow_mut().drag.take().is_some()
+    }
+
     /// The row under a point of the OPEN menu — the same walk the
     /// panel painted, shared in the layout module.
     fn menu_row_at(&self, x: Px, y: Px) -> Option<(Option<usize>, bool)> {
@@ -417,6 +491,10 @@ impl Runtime {
             last_tooltips: RefCell::new(Vec::new()),
             last_menus: RefCell::new(Vec::new()),
             menu_items: RefCell::new(None),
+            last_drag_sources: RefCell::new(Vec::new()),
+            last_drops: RefCell::new(Vec::new()),
+            drag_armed: RefCell::new(None),
+            drag_value: RefCell::new(None),
             tooltip: RefCell::new(TooltipLife::default()),
             last_drag_regions: RefCell::new(Vec::new()),
             overlay_bounds: Cell::new(None),
@@ -554,6 +632,10 @@ impl Runtime {
             // the box left the scene mid-drag: the gesture ends with it
             self.interaction.borrow_mut().element_grab = None;
             return false;
+        }
+        // a live (or lifting) drag owns the move whole
+        if let Some(repaint) = self.note_drag_move(x, y) {
+            return repaint;
         }
         // an open menu sits above the scene: a move inside it moves
         // the row highlight and nothing underneath hears a thing
@@ -703,8 +785,10 @@ impl Runtime {
     /// the app's bindings.
     pub fn key_stroke(&self, pattern: &KeyPattern) -> crate::custom::Response {
         // an open menu takes Escape before anyone — its owner is the
-        // runtime, so no reconciler handler could
-        if *pattern == KeyPattern::key(crate::action::Key::Escape) && self.close_menu() {
+        // runtime, so no reconciler handler could; a live drag is next
+        if *pattern == KeyPattern::key(crate::action::Key::Escape)
+            && (self.close_menu() || self.cancel_drag())
+        {
             return crate::custom::Response::handled();
         }
         let Some(placement) = self.focused_custom() else {
@@ -745,6 +829,17 @@ impl Runtime {
             }
             return true;
         }
+        // a press on a drag source ARMS the lift — and the press goes
+        // on: a click that never moves stays a click
+        let source = self
+            .last_drag_sources
+            .borrow()
+            .iter()
+            .rev()
+            .find(|region| region.rect.contains(x, y))
+            .map(|region| region.payload.clone());
+        *self.drag_armed.borrow_mut() =
+            source.map(|payload| (payload, Point { x, y }));
         // a press ends any explanation, and never the other way round:
         // the tooltip is not a popover — it cannot eat a click
         let explained = self.clear_tooltip();
@@ -756,7 +851,10 @@ impl Runtime {
             overlays
                 .iter()
                 .rev()
-                .find(|top| top.path != crate::layout::TOOLTIP_PATH)
+                .find(|top| {
+                    top.path != crate::layout::TOOLTIP_PATH
+                        && top.path != crate::layout::DRAG_LABEL_PATH
+                })
                 .filter(|top| !top.frame.contains(x, y))
                 .map(|top| top.path.clone())
         };
@@ -803,6 +901,18 @@ impl Runtime {
     /// click). Returns the fired/focused path; the pressed visual
     /// always clears.
     pub fn pointer_released(&self, x: Px, y: Px) -> Option<String> {
+        // a live drag ends here: over a compatible target the value
+        // lands (the drag clears FIRST — the action writes state into
+        // a world without it); anywhere else it just goes home
+        self.drag_armed.borrow_mut().take();
+        if let Some(value) = self.drag_value.borrow_mut().take() {
+            let target = self.drop_at(x, y, &*value);
+            self.interaction.borrow_mut().drag = None;
+            if let Some(region) = target {
+                (region.action.0)(&*value);
+            }
+            return None;
+        }
         // the box that owns the pointer hears the release and the
         // gesture ends there: no action fires under it
         let grabbed = self.interaction.borrow().element_grab.clone();
@@ -1755,6 +1865,8 @@ impl Runtime {
         *self.last_overlays.borrow_mut() = result.overlays.clone();
         *self.last_tooltips.borrow_mut() = result.tooltips.clone();
         *self.last_menus.borrow_mut() = result.menus.clone();
+        *self.last_drag_sources.borrow_mut() = result.drag_sources.clone();
+        *self.last_drops.borrow_mut() = result.drops.clone();
         *self.last_drag_regions.borrow_mut() = result.drag_regions.clone();
         // an applied-target memory whose region left the scene goes
         // with it — live regions keep theirs (the wheel stays sovereign)

@@ -117,6 +117,12 @@ fn matches(dir: &str, name: &str, needle: &str) -> bool {
     needle.chars().map(|c| c.to_ascii_lowercase()).all(|wanted| haystack.any(|c| c == wanted))
 }
 
+/// The typed cargo a row lifts — the search field takes it.
+#[derive(Clone)]
+struct FileDrag {
+    name: std::sync::Arc<str>,
+}
+
 #[derive(Clone)]
 struct Finder {
     query: State<String>,
@@ -153,7 +159,13 @@ impl Component for Finder {
                 icon(symbol::CHEVRON_RIGHT)
                     .foreground_color(theme::accent())
                     .tooltip("The selected file opens here"),
-                text_field("Search ten thousand files…", self.query.binding()).monospaced(),
+                {
+                    let query = self.query;
+                    text_field("Search ten thousand files…", self.query.binding())
+                        .monospaced()
+                        // drop a row here: the search becomes the file
+                        .on_drop(move |file: &FileDrag| query.set(file.name.to_string()))
+                },
                 count_meter(count),
                 text(self.manifest.get())
                     .font_size(11.0)
@@ -206,6 +218,10 @@ impl Component for Finder {
                     // the right press offers the row's own menu — the
                     // runtime opens it at the pointer and closes it
                     // through the popover's doors
+                    .on_drag({
+                        let name = name.clone();
+                        move || drag(FileDrag { name: name.clone() }, name.clone())
+                    })
                     .context_menu(vec![
                         menu_item("Open", move || {
                             selected.set(row);
