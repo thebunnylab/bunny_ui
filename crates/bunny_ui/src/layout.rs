@@ -411,6 +411,11 @@ pub enum LayoutNode {
     /// title bar on a chrome-less window. Transparent to geometry;
     /// shells without windows ignore it honestly.
     DragRegion { child: Box<LayoutNode> },
+    /// A class for the ENCLOSING boundary's element, declared from
+    /// inside its body — the door a row uses to flip its own `<tr>`
+    /// class without its parent hearing. Invisible everywhere: zero
+    /// size, no paint, no hit.
+    BoundaryHint { class: Option<String> },
     /// Element hints for the Dom lowering — a real tag, a class, an
     /// id. Transparent everywhere else, like `.rendering()`: a pixel
     /// target never knows the child was ever going to be a `<tr>`.
@@ -1689,6 +1694,8 @@ impl LayoutNode {
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
+            LayoutNode::BoundaryHint { .. } => (Size::default(), Fit::Leaf),
+
             LayoutNode::Stack { axis, spacing, children, .. } => {
                 measure_stack(*axis, *spacing, children, proposal, env)
             }
@@ -2199,6 +2206,8 @@ impl LayoutNode {
             (LayoutNode::Hinted { child, .. }, Fit::Wrapped(_, fit)) => {
                 child.place(frame, *fit, env, out);
             }
+
+            (LayoutNode::BoundaryHint { .. }, Fit::Leaf) => {}
 
             (LayoutNode::DragRegion { child }, Fit::Wrapped(_, fit)) => {
                 child.place(frame, *fit, env, out);

@@ -66,6 +66,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         display: crate::layout::DisplayList::default(),
         fields: Vec::new(),
         slot: (None, None),
+        pending_boundary_class: None,
     };
     let mut children = Vec::new();
     walk.lower_into(root, &mut children);
@@ -106,6 +107,9 @@ struct Walk<'a> {
     overlays: Vec<DomNode>,
     display: crate::layout::DisplayList,
     fields: Vec<(String, bool)>,
+    /// A class the current boundary's body declared for its OWN
+    /// group element (`boundary_class`), consumed when it closes.
+    pending_boundary_class: Option<String>,
     /// The nearest ancestor Frame's declared box — the proposal an
     /// island under it measures against (a flexible island learns its
     /// real box from the browser, in the island round).
@@ -473,9 +477,16 @@ impl Walk<'_> {
                     return;
                 }
                 let mut group = node(DomKind::Group { path: path.clone() });
+                let outer_pending = self.pending_boundary_class.take();
                 for child in children {
                     self.lower_into(child, &mut group.children);
                 }
+                if let Some(class) = self.pending_boundary_class.take() {
+                    // the body spoke about its own element: an empty
+                    // class clears, anything else attributes
+                    group.hints.class = (!class.is_empty()).then_some(class);
+                }
+                self.pending_boundary_class = outer_pending;
                 out.push(group);
             }
             LayoutNode::BoundaryRef { path } => {
@@ -503,6 +514,9 @@ impl Walk<'_> {
                 self.pending_transition = Some((spec.response, spec.damping));
                 self.lower_into(child, out);
                 self.pending_transition = None;
+            }
+            LayoutNode::BoundaryHint { class } => {
+                self.pending_boundary_class = Some(class.clone().unwrap_or_default());
             }
             LayoutNode::DragRegion { child } => {
                 // a window drag region means nothing in a browser tab

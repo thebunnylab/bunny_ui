@@ -179,30 +179,39 @@ pub mod keyed {
     /// One row: the component wears the `<tr>` (its identity group IS
     /// the element), and its body is the cells — DIRECT children, the
     /// exact nesting the harness pierces.
-    #[derive(Clone)]
+    #[derive(Clone, Copy)]
     struct KeyedRow {
-        id: usize,
-        label: String,
-        selected_now: bool,
-        rows: State<Rc<Vec<(usize, String)>>>,
-        selected: State<Option<usize>>,
+        seed: RowSeed,
+        rows: State<Rc<Vec<RowSeed>>>,
+        selected: State<Option<RowSeed>>,
     }
 
     impl Component for KeyedRow {
         fn body(self, _ctx: &Context) -> impl View {
-            let id = self.id;
+            let seed = self.seed;
+            let id = seed.id;
             let rows = self.rows;
             let selected = self.selected;
             (
-                text(self.id.to_string())
+                // the row's OWN selection flag flips its own <tr>
+                boundary_class(if seed.selected.get() { "danger" } else { "" }),
+                text(id.to_string())
                     .foreground_color(theme::fg())
                     .element("td")
                     .css_class("col-md-1"),
                 hstack!(
-                    text(self.label.clone())
+                    text(seed.label.get().to_string())
                         .foreground_color(theme::fg())
                         .element("a")
-                        .on_click(move || selected.set(Some(id)))
+                        .on_click(move || {
+                            // the two rows that change are the only
+                            // ones that hear about it
+                            if let Some(was) = selected.get() {
+                                was.selected.set(false);
+                            }
+                            seed.selected.set(true);
+                            selected.set(Some(seed));
+                        })
                 )
                 .element("td")
                 .css_class("col-md-4"),
@@ -216,7 +225,7 @@ pub mod keyed {
                     .element("a")
                     .on_click(move || {
                         let mut kept = (*rows.get()).clone();
-                        kept.retain(|(kept_id, _)| *kept_id != id);
+                        kept.retain(|seed| seed.id != id);
                         rows.set(Rc::new(kept));
                     })
                 )
@@ -227,10 +236,22 @@ pub mod keyed {
         }
     }
 
+    /// One row's signals: the label and the selection flag are the
+    /// row's OWN state, so updating a label or moving the selection
+    /// dirties that row alone — the reuse promise covers the rest.
+    /// (Handler-created states live at app scope for now: the state
+    /// lifecycle for collections is an open design note.)
+    #[derive(Clone, Copy)]
+    pub struct RowSeed {
+        pub id: usize,
+        pub label: State<Rc<str>>,
+        pub selected: State<bool>,
+    }
+
     #[derive(Clone)]
     pub struct App {
-        pub rows: State<Rc<Vec<(usize, String)>>>,
-        pub selected: State<Option<usize>>,
+        pub rows: State<Rc<Vec<RowSeed>>>,
+        pub selected: State<Option<RowSeed>>,
         pub next_id: State<usize>,
     }
 
@@ -242,8 +263,14 @@ pub mod keyed {
         }
     }
 
-    fn build(from: usize, count: usize) -> Vec<(usize, String)> {
-        (0..count).map(|i| (from + i, label_for(from + i))).collect()
+    fn build(from: usize, count: usize) -> Vec<RowSeed> {
+        (0..count)
+            .map(|i| RowSeed {
+                id: from + i,
+                label: State::new(Rc::from(label_for(from + i).as_str())),
+                selected: State::new(false),
+            })
+            .collect()
     }
 
     impl Component for App {
@@ -282,11 +309,12 @@ pub mod keyed {
                     next_id.set(from + 1_000);
                 }),
                 chip("Update every 10th row", "update").on_click(move || {
-                    let mut touched = (*rows.get()).clone();
-                    for entry in touched.iter_mut().step_by(10) {
-                        entry.1.push_str(" !!!");
+                    // one hundred signals flip; nine hundred rows
+                    // never hear about it
+                    for seed in rows.get().iter().step_by(10) {
+                        let grown = format!("{} !!!", seed.label.get());
+                        seed.label.set(Rc::from(grown.as_str()));
                     }
-                    rows.set(Rc::new(touched));
                 }),
                 chip("Clear", "clear").on_click(move || {
                     rows.set(Rc::new(Vec::new()));
@@ -305,19 +333,8 @@ pub mod keyed {
 
             let table = for_each(
                 (*data).clone(),
-                |(id, _)| id.to_string(),
-                move |(id, label)| {
-                    let is_selected = selected.get() == Some(*id);
-                    KeyedRow {
-                        id: *id,
-                        label: label.clone(),
-                        selected_now: is_selected,
-                        rows,
-                        selected,
-                    }
-                    .element("tr")
-                    .css_class(if is_selected { "danger" } else { "" })
-                },
+                |seed| seed.id.to_string(),
+                move |seed| KeyedRow { seed: *seed, rows, selected }.element("tr"),
             );
 
             vstack!(

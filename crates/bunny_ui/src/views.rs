@@ -1242,6 +1242,32 @@ fn for_each_line(count: usize, axis: Axis, spacing: Option<f64>) -> String {
     line
 }
 
+/// Declares a class for the ENCLOSING component's own element — the
+/// row flips its `<tr>`'s class from inside, and the parent never
+/// re-runs for it. Only the Dom lowering listens; everywhere else
+/// this renders nothing at all.
+pub fn boundary_class(class: impl Into<String>) -> BoundaryClass {
+    BoundaryClass { class: class.into() }
+}
+
+#[derive(Clone)]
+pub struct BoundaryClass {
+    class: String,
+}
+
+impl View for BoundaryClass {
+    type Arity = Single;
+
+    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
+        out.push(RenderNode::leaf(if crate::view::print_enabled() {
+            format!("BoundaryClass({:?})", self.class)
+        } else {
+            String::new()
+        }));
+        out.push_layout(LayoutNode::BoundaryHint { class: Some(self.class.clone()) });
+    }
+}
+
 pub fn for_each<T, I, F, R>(items: Vec<T>, id: I, row: F) -> ForEach<T, I, F>
 where
     T: Clone + 'static,
