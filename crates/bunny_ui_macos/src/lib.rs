@@ -80,7 +80,7 @@ pub fn run_window(title: &str, size: Size, root: impl View) {
 }
 
 /// Who draws the window's top edge.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Chrome {
     /// The system title bar.
     Native,
@@ -91,6 +91,39 @@ pub enum Chrome {
     ///
     /// [`ViewExt::window_drag_region`]: bunny_ui::ext::ViewExt::window_drag_region
     Scene,
+    /// [`Chrome::Scene`], and the app says WHERE the native buttons
+    /// sit: points from the window's top-left corner.
+    ///
+    /// It is the one piece of the frame an app could not reach. With a
+    /// transparent titlebar the system centres the buttons in the bar
+    /// it WOULD have drawn — a standard 28 points — so a scene that
+    /// draws a taller bar gets them sitting high, and there is no
+    /// AppKit call to say otherwise. This moves them by hand, and puts
+    /// them back after every resize and every trip through full screen.
+    ///
+    /// ```ignore
+    /// // a bar of forty points wants its lights at (16, 14)
+    /// run_window_chrome(title, size, Chrome::SceneAt { x: 16.0, y: 14.0 }, runtime, root)
+    /// ```
+    ///
+    /// The spacing BETWEEN the three stays the system's own: the group
+    /// moves, the buttons keep their manners.
+    SceneAt { x: f64, y: f64 },
+}
+
+impl Chrome {
+    /// Does the scene draw the bar?
+    fn scene(self) -> bool {
+        matches!(self, Chrome::Scene | Chrome::SceneAt { .. })
+    }
+
+    /// Where the app wants the native buttons, if it said.
+    fn lights(self) -> Option<(f64, f64)> {
+        match self {
+            Chrome::SceneAt { x, y } => Some((x, y)),
+            _ => None,
+        }
+    }
 }
 
 /// Like [`run_window`], but with the `Runtime` assembled by the caller —
@@ -108,8 +141,10 @@ pub fn run_window_chrome(
     runtime: Runtime,
     root: impl View,
 ) {
-    let window =
-        ffi::create_window(title, size.width, size.height, chrome == Chrome::Scene);
+    // the placement is armed before the window exists: the buttons are
+    // born with it, and the first frame already has them in place
+    ffi::set_traffic_lights(chrome.lights());
+    let window = ffi::create_window(title, size.width, size.height, chrome.scene());
     // a task that lands on a worker thread asks the main run loop for
     // one more turn; the frame it takes drains the queue on its way
     ffi::install_wake_source();

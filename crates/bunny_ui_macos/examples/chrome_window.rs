@@ -123,7 +123,9 @@ fn main() {
     bunny_ui_macos::run_window_chrome(
         "bunny — scene chrome",
         Size { width: 860.0, height: 560.0 },
-        Chrome::Scene,
+        // the bar is 44 points, so the lights are placed by hand: the
+        // system would centre them in a bar of 28 and leave them high
+        Chrome::SceneAt { x: 16.0, y: (BAR_H - 14.0) / 2.0 },
         runtime,
         App { tab: State::new(0) },
     );

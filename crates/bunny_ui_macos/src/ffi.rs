@@ -760,8 +760,94 @@ extern "C" fn bunny_window_did_resign_key(_this: Id, _sel: Sel, _note: Id) {
     dispatch(AppEvent::ResignKey);
 }
 
-extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, _note: Id) {
+extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, note: Id) {
+    // AppKit re-lays the titlebar container on every resize and on the
+    // way in and out of full screen, putting the buttons back where it
+    // wants them — so the app's placement is re-applied here. The
+    // notification names the window, so nothing global is needed.
+    let window = unsafe { msg_id(note, sel("object")) };
+    place_traffic_lights(window);
     dispatch(AppEvent::Redraw);
+}
+
+thread_local! {
+    /// Where the app asked for the native buttons, in points from the
+    /// window's TOP-LEFT corner. `None` = wherever macOS puts them.
+    static TRAFFIC_LIGHTS: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
+}
+
+/// The app's answer to "where do the buttons sit", set once before the
+/// window is built.
+pub fn set_traffic_lights(at: Option<(f64, f64)>) {
+    TRAFFIC_LIGHTS.with(|slot| slot.set(at));
+}
+
+/// The three standard buttons, in the order they sit.
+const WINDOW_BUTTONS: [u64; 3] = [0, 1, 2]; // close, miniaturize, zoom
+
+/// One button's frame, moved. The container counts from the BOTTOM,
+/// like every AppKit view, and the app counts from the top, like every
+/// designer: the flip lives here, alone, where a test can reach it
+/// without a window.
+///
+/// `shift` is how far this button sits from the first one — the
+/// system's own spacing, which the placement never touches.
+fn light_frame(container_height: f64, frame: CGRect, at: (f64, f64), shift: f64) -> CGRect {
+    let (x, y) = at;
+    CGRect {
+        origin: CGPoint {
+            x: x + shift,
+            y: container_height - y - frame.size.height,
+        },
+        size: frame.size,
+    }
+}
+
+/// Moves the traffic lights to where the app asked.
+///
+/// There is no AppKit call for this: with a transparent titlebar and
+/// full-size content, the system leaves the buttons centred in the bar
+/// it WOULD have drawn — a standard 28 points — and a scene that draws
+/// a taller bar gets them sitting high. So the buttons are moved by
+/// hand inside the titlebar container that holds them.
+///
+/// The container counts from the BOTTOM, like every AppKit view, and
+/// the app counts from the top, like every designer: the flip happens
+/// here, once. The horizontal spacing between the three is the
+/// system's own — only the group moves.
+pub fn place_traffic_lights(window: Id) {
+    let Some((x, y)) = TRAFFIC_LIGHTS.with(|slot| slot.get()) else {
+        return;
+    };
+    if window.is_null() {
+        return;
+    }
+    unsafe {
+        let mut first_origin: Option<CGPoint> = None;
+        for kind in WINDOW_BUTTONS {
+            let button = msg_id_u64(window, sel("standardWindowButton:"), kind);
+            if button.is_null() {
+                continue;
+            }
+            let frame = msg_rect(button, sel("frame"));
+            let container = msg_id(button, sel("superview"));
+            if container.is_null() {
+                continue;
+            }
+            let bounds = msg_rect(container, sel("bounds"));
+            // the group keeps the system's own spacing: only the first
+            // button is placed, and the rest follow by their offset
+            let shift = match first_origin {
+                None => {
+                    first_origin = Some(frame.origin);
+                    0.0
+                }
+                Some(first) => frame.origin.x - first.x,
+            };
+            let placed = light_frame(bounds.size.height, frame, (x, y), shift);
+            msg_void_rect(button, sel("setFrame:"), placed);
+        }
+    }
 }
 
 extern "C" fn bunny_blink(_this: Id, _sel: Sel, _timer: Id) {
@@ -1282,6 +1368,7 @@ pub fn create_window(
             // NSWindowTitleHidden = 1 — the title still names the
             // window in Mission Control and the Dock
             msg_void_i64(window, sel("setTitleVisibility:"), 1);
+            place_traffic_lights(window);
         }
 
         let title = CString::new(title).expect("title without NUL");
@@ -1558,6 +1645,53 @@ mod tests {
     ///
     /// It arrived in macOS 10.15. This test is the proof that it is
     /// here, and the alarm if a build target ever predates it.
+    #[test]
+    fn the_lights_flip_from_the_top_into_the_container() {
+        // the numbers of the pain: a bar of forty points wants its
+        // lights at (16, 14) from the window's top-left corner
+        let button = CGRect {
+            origin: CGPoint { x: 7.0, y: 6.0 },
+            size: CGSize { width: 14.0, height: 14.0 },
+        };
+        let placed = light_frame(40.0, button, (16.0, 14.0), 0.0);
+        assert_eq!(placed.origin.x, 16.0, "sixteen from the leading edge");
+        // AppKit counts up from the bottom: 40 - 14 - 14
+        assert_eq!(placed.origin.y, 12.0, "and fourteen from the top, flipped");
+        assert_eq!(
+            (placed.size.width, placed.size.height),
+            (button.size.width, button.size.height),
+            "the button never changes size"
+        );
+    }
+
+    #[test]
+    fn the_group_keeps_the_systems_own_spacing() {
+        let button = CGRect {
+            origin: CGPoint { x: 7.0, y: 6.0 },
+            size: CGSize { width: 14.0, height: 14.0 },
+        };
+        // the second and third buttons carry their distance from the
+        // first: only the GROUP moves
+        let first = light_frame(40.0, button, (16.0, 14.0), 0.0);
+        let second = light_frame(40.0, button, (16.0, 14.0), 20.0);
+        assert_eq!(second.origin.x - first.origin.x, 20.0);
+        assert_eq!(second.origin.y, first.origin.y, "and they stay on one line");
+    }
+
+    #[test]
+    fn appkit_still_hands_out_the_window_buttons() {
+        // the one thing that could rot under us: the selector the
+        // placement rides on
+        unsafe {
+            let responds = msg_bool_sel(
+                class("NSWindow"),
+                sel("instancesRespondToSelector:"),
+                sel("standardWindowButton:"),
+            );
+            assert_ne!(responds, 0, "NSWindow has no standardWindowButton:");
+        }
+    }
+
     #[test]
     fn appkit_can_report_a_key_without_its_modifiers() {
         unsafe {
