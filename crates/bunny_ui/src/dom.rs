@@ -644,6 +644,11 @@ fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
                     font,
                 }
             }
+            DrawCommand::Gradient { rect, paint, corner_radius } => DrawCommand::Gradient {
+                rect: shift(rect),
+                paint: paint.shifted(dx, dy),
+                corner_radius,
+            },
             DrawCommand::Image { rect, source } => {
                 DrawCommand::Image { rect: shift(rect), source }
             }

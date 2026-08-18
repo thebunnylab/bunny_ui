@@ -55,6 +55,7 @@ pub enum Modifier {
 
     // MARK: - Visuals (pure data → `Styled` in the scene)
     BackgroundColor(Color),
+    BackgroundGradient(crate::layout::Gradient),
     ForegroundColor(Color),
     Border(Color, f64),
     CornerRadius(f64),
@@ -173,6 +174,14 @@ impl Modifier {
             Modifier::Hidden => " [.hidden()]".into(),
             Modifier::Equatable => " [.equatable()]".into(),
             Modifier::BackgroundColor(color) => format!(" [.background({color})]"),
+            Modifier::BackgroundGradient(gradient) => match gradient {
+                crate::layout::Gradient::Radial { inner, outer, .. } => {
+                    format!(" [.background(RadialGradient({inner} → {outer}))]")
+                }
+                crate::layout::Gradient::Linear { from, to, .. } => {
+                    format!(" [.background(LinearGradient({from} → {to}))]")
+                }
+            },
             Modifier::ForegroundColor(color) => format!(" [.foregroundColor({color})]"),
             Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
             Modifier::CornerRadius(radius) => format!(" [.cornerRadius({radius})]"),
@@ -606,6 +615,10 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             Modifier::BackgroundColor(color) => wrap_styled(
                 out,
                 VisualProps { background: Some(*color), ..VisualProps::default() },
+            ),
+            Modifier::BackgroundGradient(gradient) => wrap_styled(
+                out,
+                VisualProps { gradient: Some(*gradient), ..VisualProps::default() },
             ),
             Modifier::Shadow(radius, color) => wrap_styled(
                 out,

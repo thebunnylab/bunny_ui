@@ -489,6 +489,14 @@ impl Color {
     pub const fn hex_a(rgba: u32) -> Color {
         Color { r: (rgba >> 24) as u8, g: (rgba >> 16) as u8, b: (rgba >> 8) as u8, a: rgba as u8 }
     }
+
+    /// The same color with no alpha — where a ramp fades OUT.
+    /// Interpolation is straight, so a glow that ends at
+    /// `rgba(0,0,0,0)` drags its ramp through grey; ending at its own
+    /// color with alpha zero keeps the hue to the last pixel.
+    pub const fn fade(self) -> Color {
+        Color { a: 0, ..self }
+    }
 }
 
 impl std::fmt::Display for Color {
@@ -503,6 +511,211 @@ impl std::fmt::Display for Color {
     }
 }
 
+/// A point inside a box, in its own proportions: `(0, 0)` is the
+/// top-left corner and `(1, 1)` the bottom-right. What a gradient
+/// anchors to, so one declaration follows a box of any size.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct UnitPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl UnitPoint {
+    pub const TOP_LEADING: UnitPoint = UnitPoint { x: 0.0, y: 0.0 };
+    pub const TOP: UnitPoint = UnitPoint { x: 0.5, y: 0.0 };
+    pub const TOP_TRAILING: UnitPoint = UnitPoint { x: 1.0, y: 0.0 };
+    pub const LEADING: UnitPoint = UnitPoint { x: 0.0, y: 0.5 };
+    pub const CENTER: UnitPoint = UnitPoint { x: 0.5, y: 0.5 };
+    pub const TRAILING: UnitPoint = UnitPoint { x: 1.0, y: 0.5 };
+    pub const BOTTOM_LEADING: UnitPoint = UnitPoint { x: 0.0, y: 1.0 };
+    pub const BOTTOM: UnitPoint = UnitPoint { x: 0.5, y: 1.0 };
+    pub const BOTTOM_TRAILING: UnitPoint = UnitPoint { x: 1.0, y: 1.0 };
+
+    pub const fn new(x: f64, y: f64) -> UnitPoint {
+        UnitPoint { x, y }
+    }
+
+    /// The point in the scene's coordinates.
+    fn resolve(self, rect: Rect) -> Point {
+        Point {
+            x: rect.origin.x + self.x * rect.size.width,
+            y: rect.origin.y + self.y * rect.size.height,
+        }
+    }
+}
+
+/// A two-stop paint ramp behind a view — the glow of a hero panel, the
+/// sheen of a bar.
+///
+/// Declared in the box's own proportions (a [`UnitPoint`] centre, a
+/// direction) so it survives a resize, and resolved to px once the
+/// frame is known. Deliberately TWO stops: what a UI paints is a ramp,
+/// and two colors keep every backend's wire format fixed.
+///
+/// A ramp that fades out must fade to the SAME color with no alpha
+/// ([`Color::fade`]): interpolation is straight, so fading to a
+/// transparent black drags the ramp through grey.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Gradient {
+    /// Rings around `center`: `inner` at `start` px, `outer` at `end`
+    /// px. `end: None` = the box's own reach — the farthest corner.
+    Radial {
+        center: UnitPoint,
+        start: Px,
+        end: Option<Px>,
+        inner: Color,
+        outer: Color,
+    },
+    /// A ramp along the line from `start` to `end`.
+    Linear { start: UnitPoint, end: UnitPoint, from: Color, to: Color },
+}
+
+impl Gradient {
+    /// Rings from the centre, reaching the box's farthest corner.
+    pub fn radial(inner: Color, outer: Color) -> Gradient {
+        Gradient::Radial { center: UnitPoint::CENTER, start: 0.0, end: None, inner, outer }
+    }
+
+    /// A ramp from the top edge to the bottom one.
+    pub fn linear(from: Color, to: Color) -> Gradient {
+        Gradient::Linear { start: UnitPoint::TOP, end: UnitPoint::BOTTOM, from, to }
+    }
+
+    /// Moves a radial gradient's centre (a linear one keeps its line).
+    pub fn center(self, center: UnitPoint) -> Gradient {
+        match self {
+            Gradient::Radial { start, end, inner, outer, .. } => {
+                Gradient::Radial { center, start, end, inner, outer }
+            }
+            other => other,
+        }
+    }
+
+    /// The two radii of a radial gradient, in px.
+    pub fn radius(self, start: Px, end: Px) -> Gradient {
+        match self {
+            Gradient::Radial { center, inner, outer, .. } => {
+                Gradient::Radial { center, start, end: Some(end), inner, outer }
+            }
+            other => other,
+        }
+    }
+
+    /// The line a linear gradient runs along (a radial one keeps its
+    /// rings).
+    pub fn direction(self, start: UnitPoint, end: UnitPoint) -> Gradient {
+        match self {
+            Gradient::Linear { from, to, .. } => Gradient::Linear { start, end, from, to },
+            other => other,
+        }
+    }
+
+    /// The gradient in px against the box that carries it — the form
+    /// every rasterizer consumes (the CPU resolves in f64; the shaders
+    /// only evaluate).
+    pub fn resolve(self, rect: Rect) -> GradientPaint {
+        match self {
+            Gradient::Radial { center, start, end, inner, outer } => {
+                let center = center.resolve(rect);
+                let reach = end.unwrap_or_else(|| corner_reach(center, rect));
+                GradientPaint::Radial {
+                    center,
+                    start,
+                    end: reach.max(start + 0.001),
+                    inner,
+                    outer,
+                }
+            }
+            Gradient::Linear { start, end, from, to } => GradientPaint::Linear {
+                start: start.resolve(rect),
+                end: end.resolve(rect),
+                from,
+                to,
+            },
+        }
+    }
+}
+
+/// The distance from `center` to the farthest corner of `rect`.
+fn corner_reach(center: Point, rect: Rect) -> Px {
+    let x = (center.x - rect.origin.x).max(rect.origin.x + rect.size.width - center.x);
+    let y = (center.y - rect.origin.y).max(rect.origin.y + rect.size.height - center.y);
+    x.hypot(y)
+}
+
+/// A [`Gradient`] with its geometry in logical px — what a draw command
+/// carries.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum GradientPaint {
+    Radial { center: Point, start: Px, end: Px, inner: Color, outer: Color },
+    Linear { start: Point, end: Point, from: Color, to: Color },
+}
+
+impl GradientPaint {
+    /// The color at a point, straight sRGB — the one formula, which the
+    /// shaders repeat.
+    pub fn at(&self, point: Point) -> Color {
+        match *self {
+            GradientPaint::Radial { center, start, end, inner, outer } => {
+                let distance = (point.x - center.x).hypot(point.y - center.y);
+                mix(inner, outer, ((distance - start) / (end - start)).clamp(0.0, 1.0))
+            }
+            GradientPaint::Linear { start, end, from, to } => {
+                let (dx, dy) = (end.x - start.x, end.y - start.y);
+                let length = dx * dx + dy * dy;
+                if length <= 0.0 {
+                    return to;
+                }
+                let along = ((point.x - start.x) * dx + (point.y - start.y) * dy) / length;
+                mix(from, to, along.clamp(0.0, 1.0))
+            }
+        }
+    }
+
+    /// The same ramp in device pixels — the rasterizers work there.
+    pub fn scaled(self, factor: f64) -> GradientPaint {
+        let scale = |point: Point| Point { x: point.x * factor, y: point.y * factor };
+        match self {
+            GradientPaint::Radial { center, start, end, inner, outer } => {
+                GradientPaint::Radial {
+                    center: scale(center),
+                    start: start * factor,
+                    end: end * factor,
+                    inner,
+                    outer,
+                }
+            }
+            GradientPaint::Linear { start, end, from, to } => {
+                GradientPaint::Linear { start: scale(start), end: scale(end), from, to }
+            }
+        }
+    }
+
+    /// Shifted into another surface's coordinates.
+    pub(crate) fn shifted(self, dx: Px, dy: Px) -> GradientPaint {
+        let shift = |point: Point| Point { x: point.x + dx, y: point.y + dy };
+        match self {
+            GradientPaint::Radial { center, start, end, inner, outer } => {
+                GradientPaint::Radial { center: shift(center), start, end, inner, outer }
+            }
+            GradientPaint::Linear { start, end, from, to } => {
+                GradientPaint::Linear { start: shift(start), end: shift(end), from, to }
+            }
+        }
+    }
+}
+
+/// Straight per-channel interpolation — the formula both shaders repeat.
+fn mix(from: Color, to: Color, t: f64) -> Color {
+    let channel = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * t).round() as u8;
+    Color {
+        r: channel(from.r, to.r),
+        g: channel(from.g, to.g),
+        b: channel(from.b, to.b),
+        a: channel(from.a, to.a),
+    }
+}
+
 /// VISUAL properties of a scene node — paint only, by construction: no
 /// field here changes measure (the "hover does not touch layout" LAW,
 /// guaranteed by the type). In Dom mode this becomes the element's CSS;
@@ -511,6 +724,9 @@ impl std::fmt::Display for Color {
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct VisualProps {
     pub background: Option<Color>,
+    /// A ramp painted OVER the flat background and under the child —
+    /// the two compose (`.background_color(base).background_gradient(…)`).
+    pub gradient: Option<Gradient>,
     /// Inherited downward: the text below paints with the current foreground.
     pub foreground: Option<Color>,
     pub border: Option<(Color, Px)>,
@@ -544,6 +760,7 @@ impl VisualProps {
     pub fn or(self, outer: VisualProps) -> VisualProps {
         VisualProps {
             background: self.background.or(outer.background),
+            gradient: self.gradient.or(outer.gradient),
             foreground: self.foreground.or(outer.foreground),
             border: self.border.or(outer.border),
             corner_radius: self.corner_radius.or(outer.corner_radius),
@@ -582,6 +799,9 @@ pub struct Interaction {
 pub enum DrawCommand {
     /// `corner_radius: 0.0` = plain rectangle (the usual straight path).
     FillRect { rect: Rect, color: Color, corner_radius: Px },
+    /// A two-stop ramp inside the rounded rect — the same shape a
+    /// `FillRect` covers, with the color resolved per pixel.
+    Gradient { rect: Rect, paint: GradientPaint, corner_radius: Px },
     /// A soft halo OUTSIDE the rounded rect: alpha falls off
     /// quadratically from the edge over `radius` px. `corner_radius`
     /// makes the halo follow the corners — including the little notch
@@ -667,6 +887,11 @@ impl DisplayList {
                 DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
                     DrawCommand::StrokeRect { rect: shift_rect(rect), color, width, corner_radius }
                 }
+                DrawCommand::Gradient { rect, paint, corner_radius } => DrawCommand::Gradient {
+                    rect: shift_rect(rect),
+                    paint: paint.shifted(dx, dy),
+                    corner_radius,
+                },
                 DrawCommand::Shadow { rect, radius, color, corner_radius } => {
                     DrawCommand::Shadow { rect: shift_rect(rect), radius, color, corner_radius }
                 }
@@ -2210,6 +2435,16 @@ impl LayoutNode {
                         corner_radius: props.corner_radius.unwrap_or(0.0),
                     });
                 }
+                // the ramp paints OVER the flat color and under the
+                // child: the two compose, and the geometry resolves to
+                // px here — the shaders only evaluate
+                if let Some(gradient) = props.gradient {
+                    out.display.push(DrawCommand::Gradient {
+                        rect: frame,
+                        paint: gradient.resolve(frame),
+                        corner_radius: props.corner_radius.unwrap_or(0.0),
+                    });
+                }
                 // the ink walks the same ladder as the background: a
                 // state with no ink of its own falls back to the base
                 let ink = if pressed {
@@ -3190,6 +3425,43 @@ mod tests {
         };
         let result = layout(&root, Proposal::unspecified());
         assert_eq!(result.size, Size { width: 100.0, height: LINE_H });
+    }
+
+    #[test]
+    fn a_gradient_resolves_against_the_box_it_paints() {
+        // the declaration is proportional; what the rasterizers get is
+        // px, resolved once, here
+        let frame = Rect {
+            origin: Point { x: 10.0, y: 20.0 },
+            size: Size { width: 100.0, height: 40.0 },
+        };
+        let inner = Color::hex(0xFF0000);
+        let outer = Color::hex(0x0000FF);
+        match Gradient::radial(inner, outer).resolve(frame) {
+            GradientPaint::Radial { center, start, end, .. } => {
+                assert_eq!(center, Point { x: 60.0, y: 40.0 }, "the centre of the box");
+                assert_eq!(start, 0.0);
+                // the default reach is the farthest corner
+                assert!((end - 50.0_f64.hypot(20.0)).abs() < 0.001, "reach {end}");
+            }
+            other => panic!("a radial gradient stays radial: {other:?}"),
+        }
+        // a corner centre reaches the OPPOSITE corner
+        let corner = Gradient::radial(inner, outer).center(UnitPoint::TOP_LEADING);
+        match corner.resolve(frame) {
+            GradientPaint::Radial { center, end, .. } => {
+                assert_eq!(center, frame.origin);
+                assert!((end - 100.0_f64.hypot(40.0)).abs() < 0.001);
+            }
+            other => panic!("{other:?}"),
+        }
+        match Gradient::linear(inner, outer).resolve(frame) {
+            GradientPaint::Linear { start, end, .. } => {
+                assert_eq!(start, Point { x: 60.0, y: 20.0 });
+                assert_eq!(end, Point { x: 60.0, y: 60.0 });
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Measures a node with the tests' default environment (PixelFont).

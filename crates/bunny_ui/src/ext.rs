@@ -234,6 +234,26 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.background(RadialGradient(…))` — a two-stop ramp behind the
+    /// view, over whatever flat background it already has.
+    ///
+    /// ```ignore
+    /// // the glow of a hero panel: violet at the top, fading out
+    /// .background_gradient(
+    ///     Gradient::radial(VIOLET, VIOLET.fade())
+    ///         .center(UnitPoint::TOP)
+    ///         .radius(0.0, 420.0),
+    /// )
+    /// // a bar with a sheen
+    /// .background_gradient(Gradient::linear(TOP_INK, BOTTOM_INK))
+    /// ```
+    fn background_gradient(self, gradient: crate::layout::Gradient) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::BackgroundGradient(gradient),
+        }
+    }
+
     /// `.rendering(Rendering::Gpu)` — on the web's element lowering
     /// this subtree insists on the pixel pipeline: a canvas island our
     /// layout positions, filled with the subtree's own draw commands.

@@ -201,8 +201,11 @@ struct MTLRegion {
 struct RectInstance {
     rect: [f32; 4],   // x0, y0, x1, y1 (the shadow ships its EXPANDED box)
     clip: [f32; 4],   // the snapped clip-stack top
-    params: [f32; 4], // corner_radius, thickness or reach, kind (0/1/2), expansion
+    params: [f32; 4], // corner_radius, thickness/reach/first, kind, expansion/second
     color: [u8; 4],   // straight RGBA
+    // A gradient's second half rides here: the far color plus one
+    // point (centre for the rings, end for the line). The struct does
+    // not grow — the ramp fits the twelve bytes that were padding.
     pad: [u8; 12],
 }
 
@@ -251,7 +254,8 @@ struct RectInstance {
     float4 clip;
     float4 params;
     uchar4 color;
-    uchar  pad[12];
+    uchar4 color2;   // a gradient's far color (padding otherwise)
+    float2 point2;   // rings: the centre; line: its end (padding otherwise)
 };
 
 struct SpriteInstance {
@@ -322,7 +326,7 @@ fragment float4 rect_fragment(RectVary in [[stage_in]],
         coverage = clamp(
             rect_cov(p, rect.rect, rect.params.x) - rect_cov(p, inner, inner_radius),
             0.0, 1.0);
-    } else {
+    } else if (kind == 2.0) {
         // shadow: quadratic falloff outside the rounded core — the quad
         // arrives pre-expanded, params.w undoes the expansion
         float expansion = rect.params.w;
@@ -333,6 +337,28 @@ fragment float4 rect_fragment(RectVary in [[stage_in]],
         float distance = length(delta) - corner;
         float strength = 1.0 - distance / reach;
         coverage = (distance > 0.0 && distance < reach) ? strength * strength : 0.0;
+    } else {
+        // the gradients cover the fill's shape and change color per
+        // pixel: rings from point2 (params.y and .w are the radii), or
+        // a ramp from rect.xy to point2. The cpu resolved every number
+        // in f64 — this only mixes.
+        coverage = rect_cov(p, rect.rect, rect.params.x);
+        float t;
+        if (kind == 3.0) {
+            float distance = length(p - rect.point2);
+            t = saturate((distance - rect.params.y) / (rect.params.w - rect.params.y));
+        } else {
+            float2 origin = float2(rect.params.y, rect.params.w);
+            float2 axis = rect.point2 - origin;
+            float length2 = dot(axis, axis);
+            t = length2 > 0.0 ? saturate(dot(p - origin, axis) / length2) : 1.0;
+        }
+        // the cpu rounds the mixed color to bytes before blending;
+        // rounding here keeps the two within one step
+        float4 near = float4(rect.color);
+        float4 far = float4(rect.color2);
+        float4 mixed = floor(mix(near, far, t) + 0.5) / 255.0;
+        return float4(mixed.rgb, mixed.a * coverage);
     }
     float4 color = float4(rect.color) / 255.0;
     return float4(color.rgb, color.a * coverage);
@@ -767,6 +793,8 @@ fn corner_clamp(scaled_radius: f64, snapped: Box4) -> f64 {
 const KIND_FILL: f32 = 0.0;
 const KIND_STROKE: f32 = 1.0;
 const KIND_SHADOW: f32 = 2.0;
+const KIND_RADIAL: f32 = 3.0;
+const KIND_LINEAR: f32 = 4.0;
 
 // MARK: - The run atlas (text tiles, append-only shelves)
 
@@ -1170,6 +1198,34 @@ fn push_rect(
     });
 }
 
+/// One gradient instance: the fill's quad and corner, plus the second
+/// half of the ramp packed into the bytes the struct already had.
+#[allow(clippy::too_many_arguments)]
+fn push_gradient(
+    out: &mut Vec<RectInstance>,
+    quad: Box4,
+    clip: Box4,
+    near: Color,
+    far: Color,
+    radius: f64,
+    first: f64,
+    second: f64,
+    point: (f64, f64),
+    kind: f32,
+) {
+    let mut pad = [0u8; 12];
+    pad[0..4].copy_from_slice(&[far.r, far.g, far.b, far.a]);
+    pad[4..8].copy_from_slice(&(point.0 as f32).to_ne_bytes());
+    pad[8..12].copy_from_slice(&(point.1 as f32).to_ne_bytes());
+    out.push(RectInstance {
+        rect: [quad.0 as f32, quad.1 as f32, quad.2 as f32, quad.3 as f32],
+        clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
+        params: [radius as f32, first as f32, kind, second as f32],
+        color: [near.r, near.g, near.b, near.a],
+        pad,
+    });
+}
+
 /// A maximal run of one instance kind, in paint order — the draw-call
 /// unit. Batches break only where rects and text alternate.
 #[derive(Clone, Copy, PartialEq)]
@@ -1242,6 +1298,55 @@ fn build_frame(
                 }
                 let radius = corner_clamp(corner_radius * factor, snapped);
                 push_rect(out, snapped, clip, *color, radius, 0.0, KIND_FILL, 0.0);
+                note_run(&mut batches.runs, RunKind::Rects, out.len() - 1);
+            }
+            DrawCommand::Gradient { rect, paint, corner_radius } => {
+                let Some(clip) = effective_clip(&clips, whole) else { continue };
+                let snapped = snap_scaled(*rect, factor);
+                if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
+                    continue;
+                }
+                if box_intersect(snapped, clip).is_none() {
+                    continue;
+                }
+                let radius = corner_clamp(corner_radius * factor, snapped);
+                match paint.scaled(factor) {
+                    bunny_ui::layout::GradientPaint::Radial {
+                        center,
+                        start,
+                        end,
+                        inner,
+                        outer,
+                    } => push_gradient(
+                        out,
+                        snapped,
+                        clip,
+                        inner,
+                        outer,
+                        radius,
+                        start,
+                        end,
+                        (center.x, center.y),
+                        KIND_RADIAL,
+                    ),
+                    // the line's two ends fill the four numbers the
+                    // struct still had: its start in the params, its
+                    // end in the point — the quad stays the box
+                    bunny_ui::layout::GradientPaint::Linear { start, end, from, to } => {
+                        push_gradient(
+                            out,
+                            snapped,
+                            clip,
+                            from,
+                            to,
+                            radius,
+                            start.x,
+                            start.y,
+                            (end.x, end.y),
+                            KIND_LINEAR,
+                        )
+                    }
+                }
                 note_run(&mut batches.runs, RunKind::Rects, out.len() - 1);
             }
             DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
@@ -2207,6 +2312,38 @@ mod tests {
         let (gpu, cpu) =
             scene_bytes(&root, Size { width: 160.0, height: 160.0 }, 2, Color::CANVAS);
         assert_close(&gpu, &cpu, 2, "stroke rings");
+    }
+
+    #[test]
+    fn the_gradients_ramp_the_same_on_both_backends() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::{Gradient, UnitPoint};
+        // rings off-centre with a rounded box, a ramp across a wide
+        // one, and a glow that fades to its own color with no alpha —
+        // the three shapes a product paints
+        let violet = Color::hex(0x8B5CF6);
+        let root = vstack((
+            empty()
+                .frame(120.0, 60.0)
+                .background_gradient(
+                    Gradient::radial(Color::hex(0xE879F9), Color::hex(0x1E1B4B))
+                        .center(UnitPoint::TOP_LEADING)
+                        .radius(4.0, 90.0),
+                )
+                .corner_radius(12.0),
+            empty().frame(120.0, 40.0).background_gradient(Gradient::linear(
+                Color::hex(0x0EA5E9),
+                Color::hex(0x14532D),
+            )),
+            empty().frame(120.0, 60.0).background_gradient(
+                Gradient::radial(violet, violet.fade()).center(UnitPoint::BOTTOM),
+            ),
+        ));
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 160.0, height: 180.0 }, 2, Color::CANVAS);
+        assert_close(&gpu, &cpu, 2, "gradients");
     }
 
     #[test]

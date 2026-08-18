@@ -18,7 +18,7 @@
 //! canvas, one day).
 
 use crate::image_engine::{ImageEngine, RawImages};
-use crate::layout::{Color, DisplayList, DrawCommand, Rect};
+use crate::layout::{Color, DisplayList, DrawCommand, GradientPaint, Point, Rect};
 use crate::text_engine::{PixelFont, TextEngine, TextRaster};
 
 /// An RGBA buffer (one `0xRRGGBBAA` `u32` per pixel, rows top to
@@ -200,6 +200,53 @@ impl Bitmap {
                     let strength = 1.0 - distance / reach;
                     self.set_covered(x, y, color, strength * strength);
                 }
+            }
+        }
+    }
+
+    /// A two-stop ramp inside the shape [`Bitmap::fill_rect`] covers:
+    /// the same coverage — straight spans full, corners on the circle
+    /// ramp — with the color resolved per pixel. A ramp whose two
+    /// colors are equal paints exactly what the flat fill paints.
+    fn fill_gradient(&mut self, rect: Rect, paint: GradientPaint, corner_radius: f64) {
+        let (x0, y0, x1, y1) = Self::snap(rect);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (cx0, cy0, cx1, cy1) = self.clip_box();
+        if x0 >= cx1 || x1 <= cx0 || y0 >= cy1 || y1 <= cy0 {
+            return;
+        }
+        let radius = corner_radius
+            .max(0.0)
+            .min((x1 - x0) as f64 / 2.0)
+            .min((y1 - y0) as f64 / 2.0);
+        let reach = radius.ceil() as i64;
+        let left_center = x0 as f64 + radius;
+        let right_center = x1 as f64 - radius;
+        for y in y0.max(cy0)..y1.min(cy1) {
+            let py = y as f64 + 0.5;
+            let rounded = radius >= 0.5;
+            let in_top = rounded && y < y0 + reach;
+            let in_bottom = rounded && y >= y1 - reach;
+            let center_y = if in_top { y0 as f64 + radius } else { y1 as f64 - radius };
+            for x in x0.max(cx0)..x1.min(cx1) {
+                let px = x as f64 + 0.5;
+                let coverage = if !(in_top || in_bottom) {
+                    1.0
+                } else if x < x0 + reach {
+                    let distance = (px - left_center).hypot(py - center_y);
+                    (radius - distance + 0.5).clamp(0.0, 1.0)
+                } else if x >= x1 - reach {
+                    let distance = (px - right_center).hypot(py - center_y);
+                    (radius - distance + 0.5).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                if coverage <= 0.0 {
+                    continue;
+                }
+                self.set_covered(x, y, paint.at(Point { x: px, y: py }), coverage);
             }
         }
     }
@@ -486,6 +533,11 @@ pub fn rasterize_with(
             DrawCommand::FillRect { rect, color, corner_radius } => {
                 bitmap.fill_rect(scale_rect(*rect, factor), *color, corner_radius * factor)
             }
+            DrawCommand::Gradient { rect, paint, corner_radius } => bitmap.fill_gradient(
+                scale_rect(*rect, factor),
+                paint.scaled(factor),
+                corner_radius * factor,
+            ),
             DrawCommand::StrokeRect { rect, color, width, corner_radius } => bitmap
                 .stroke_rect(
                     scale_rect(*rect, factor),
@@ -616,9 +668,9 @@ impl Surface {
     ) -> Option<DamageRect> {
         let factor = self.scale as f64;
         let raw = match command {
-            DrawCommand::FillRect { rect, .. } | DrawCommand::StrokeRect { rect, .. } => {
-                Bitmap::snap(scale_rect(*rect, factor))
-            }
+            DrawCommand::FillRect { rect, .. }
+            | DrawCommand::StrokeRect { rect, .. }
+            | DrawCommand::Gradient { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
             DrawCommand::Shadow { rect, radius, .. } => {
                 let (x0, y0, x1, y1) = Bitmap::snap(scale_rect(*rect, factor));
                 let reach = (radius * factor).max(1.0).round() as i64;
@@ -793,6 +845,13 @@ impl Surface {
                     DrawCommand::FillRect { rect, color, corner_radius } => self
                         .bitmap
                         .fill_rect(scale_rect(*rect, factor), *color, corner_radius * factor),
+                    DrawCommand::Gradient { rect, paint, corner_radius } => {
+                        self.bitmap.fill_gradient(
+                            scale_rect(*rect, factor),
+                            paint.scaled(factor),
+                            corner_radius * factor,
+                        )
+                    }
                     DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
                         self.bitmap.stroke_rect(
                             scale_rect(*rect, factor),
@@ -1021,6 +1080,122 @@ mod tests {
             color,
             corner_radius: 0.0,
         }
+    }
+
+    /// The RGBA of one pixel, unpacked.
+    fn channels(bitmap: &Bitmap, x: usize, y: usize) -> (u8, u8, u8, u8) {
+        let pixel = bitmap.pixel(x, y).expect("inside the bitmap");
+        (
+            (pixel >> 24) as u8,
+            (pixel >> 16) as u8,
+            (pixel >> 8) as u8,
+            pixel as u8,
+        )
+    }
+
+    fn gradient(rect: Rect, paint: crate::layout::GradientPaint, corner: f64) -> DrawCommand {
+        DrawCommand::Gradient { rect, paint, corner_radius: corner }
+    }
+
+    #[test]
+    fn a_flat_ramp_paints_what_a_flat_fill_paints() {
+        // the coverage of a gradient IS the fill's: same shape, same
+        // anti-aliased corners — only the color moves
+        let box_rect = Rect {
+            origin: Point { x: 6.0, y: 4.0 },
+            size: Size { width: 40.0, height: 30.0 },
+        };
+        let ink = Color::hex(0x3B82F6);
+        let mut ramp = DisplayList::default();
+        ramp.push(gradient(
+            box_rect,
+            crate::layout::Gradient::radial(ink, ink).resolve(box_rect),
+            9.0,
+        ));
+        let mut flat = DisplayList::default();
+        flat.push(DrawCommand::FillRect { rect: box_rect, color: ink, corner_radius: 9.0 });
+        assert_eq!(
+            rasterize(&ramp, 60, 40, Color::CANVAS).pixels(),
+            rasterize(&flat, 60, 40, Color::CANVAS).pixels(),
+            "one ramp with one color is a fill"
+        );
+    }
+
+    #[test]
+    fn a_radial_ramp_runs_from_the_centre_outwards() {
+        let box_rect = Rect {
+            origin: Point::ZERO,
+            size: Size { width: 40.0, height: 40.0 },
+        };
+        let inner = Color::hex(0xFF0000);
+        let outer = Color::hex(0x0000FF);
+        let mut display = DisplayList::default();
+        display.push(gradient(
+            box_rect,
+            crate::layout::Gradient::radial(inner, outer).resolve(box_rect),
+            0.0,
+        ));
+        let bitmap = rasterize(&display, 40, 40, Color::CANVAS);
+        let (r, g, b, _) = channels(&bitmap, 20, 20);
+        assert!(r > 240 && b < 16, "the centre is the inner color: {r},{g},{b}");
+        let (r, _, b, _) = channels(&bitmap, 0, 0);
+        assert!(b > 240 && r < 16, "the farthest corner is the outer one");
+        // and the ramp only ever moves one way along a radius
+        let mut last = 0;
+        for x in 20..40 {
+            let (_, _, blue, _) = channels(&bitmap, x, 20);
+            assert!(blue >= last, "the ramp never turns back at x={x}");
+            last = blue;
+        }
+    }
+
+    #[test]
+    fn a_linear_ramp_runs_along_its_line() {
+        let box_rect = Rect {
+            origin: Point::ZERO,
+            size: Size { width: 20.0, height: 40.0 },
+        };
+        let from = Color::hex(0x000000);
+        let to = Color::hex(0xFFFFFF);
+        let mut display = DisplayList::default();
+        display.push(gradient(
+            box_rect,
+            crate::layout::Gradient::linear(from, to).resolve(box_rect),
+            0.0,
+        ));
+        let bitmap = rasterize(&display, 20, 40, Color::CANVAS);
+        let (top, _, _, _) = channels(&bitmap, 10, 0);
+        let (middle, _, _, _) = channels(&bitmap, 10, 20);
+        let (bottom, _, _, _) = channels(&bitmap, 10, 39);
+        assert!(top < 16, "it starts at the from color: {top}");
+        assert!(bottom > 240, "and ends at the to color: {bottom}");
+        assert!((middle as i16 - 128).abs() <= 8, "half way is half way: {middle}");
+        // the line runs down, not across
+        assert_eq!(channels(&bitmap, 2, 20), channels(&bitmap, 17, 20));
+    }
+
+    #[test]
+    fn a_ramp_that_fades_out_keeps_its_hue() {
+        // fading to a transparent BLACK drags the ramp through grey;
+        // fading to the same color with no alpha keeps it clean
+        let box_rect = Rect {
+            origin: Point::ZERO,
+            size: Size { width: 40.0, height: 8.0 },
+        };
+        let violet = Color::hex(0x8B5CF6);
+        let mut display = DisplayList::default();
+        display.push(gradient(
+            box_rect,
+            crate::layout::Gradient::linear(violet, violet.fade())
+                .direction(crate::layout::UnitPoint::LEADING, crate::layout::UnitPoint::TRAILING)
+                .resolve(box_rect),
+            0.0,
+        ));
+        let bitmap = rasterize(&display, 40, 8, Color::WHITE);
+        let (r, g, b, _) = channels(&bitmap, 20, 4);
+        // halfway over white: the hue survives (red still leads blue's
+        // neighbourhood, green stays the lowest channel)
+        assert!(g < r && g < b, "the violet is still violet: {r},{g},{b}");
     }
 
     fn line(x: f64, y: f64, text: &str, color: Color) -> DrawCommand {
