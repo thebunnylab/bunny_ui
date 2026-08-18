@@ -4367,4 +4367,78 @@ mod tests {
         assert_eq!(view.landed.get(), usize::MAX, "a cancelled drag lands nowhere");
         assert_eq!(view.clicked.get(), 0, "and the click stayed dead");
     }
+
+    #[test]
+    fn a_rising_press_reaches_the_pane_around_the_box() {
+        use std::cell::Cell;
+
+        use crate::custom::{CustomElement, ElementEvent, EventCtx, PaintCtx, Painter, Response};
+
+        struct Surface {
+            rises: bool,
+            downs: Rc<Cell<usize>>,
+        }
+        impl CustomElement for Surface {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
+                match event {
+                    ElementEvent::PointerDown { .. } => {
+                        self.downs.set(self.downs.get() + 1);
+                        if self.rises {
+                            Response::handled_rising()
+                        } else {
+                            Response::handled()
+                        }
+                    }
+                    _ => Response::ignored(),
+                }
+            }
+            fn name(&self) -> &str {
+                "surface"
+            }
+        }
+
+        #[derive(Clone)]
+        struct Pane {
+            rises: State<bool>,
+            focused: State<usize>,
+            downs: Rc<Cell<usize>>,
+        }
+        impl Component for Pane {
+            fn body(self, _ctx: &Context) -> impl View {
+                let focused = self.focused;
+                custom(Surface { rises: self.rises.get(), downs: Rc::clone(&self.downs) })
+                    .frame(120.0, 80.0)
+                    .on_click(move || focused.set(focused.get() + 1))
+            }
+        }
+
+        let size = Size { width: 160.0, height: 100.0 };
+        let runtime = Runtime::new();
+        let pane = Pane {
+            rises: State::new(false),
+            focused: State::new(0),
+            downs: Rc::new(Cell::new(0)),
+        };
+        let _ = runtime.layout(&pane, crate::layout::Proposal::exact(size));
+        // the old manners: the box swallows, the pane never hears
+        runtime.pointer_pressed(60.0, 40.0);
+        runtime.pointer_released(60.0, 40.0);
+        assert_eq!(pane.downs.get(), 1, "the box heard the press");
+        assert_eq!(pane.focused.get(), 0, "a handled press stops, as ever");
+
+        // the new answer: handled AND rising — one click does both
+        pane.rises.set(true);
+        let _ = runtime.layout(&pane, crate::layout::Proposal::exact(size));
+        runtime.pointer_pressed(60.0, 40.0);
+        let fired = runtime.pointer_released(60.0, 40.0);
+        assert_eq!(pane.downs.get(), 2, "the box still heard the press");
+        assert_eq!(pane.focused.get(), 1, "and the pane's click fired");
+        assert!(fired.is_some());
+
+        // released OUTSIDE the pane: the risen press dies quietly
+        runtime.pointer_pressed(60.0, 40.0);
+        runtime.pointer_released(150.0, 95.0);
+        assert_eq!(pane.focused.get(), 1, "up-outside is button manners");
+    }
 }

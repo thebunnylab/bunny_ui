@@ -471,12 +471,24 @@ pub struct ImeContext {
 pub struct Response {
     pub handled: bool,
     pub text: Option<String>,
+    /// Handled AND the gesture still rises: the enclosing pane's
+    /// `.on_click` fires, a card can still select. The box keeps its
+    /// caret; the ancestors keep their affordances.
+    pub rises: bool,
 }
 
 impl Response {
     /// The box used the event: it stops here.
     pub fn handled() -> Response {
-        Response { handled: true, text: None }
+        Response { handled: true, text: None, rises: false }
+    }
+
+    /// The box used the event — and lets it RISE: the nearest
+    /// interactive ancestor still arms and can fire on the release.
+    /// A press that positions a caret while the pane takes focus is
+    /// one click, not a stolen one.
+    pub fn handled_rising() -> Response {
+        Response { handled: true, text: None, rises: true }
     }
 
     /// The box did not use it: the scene takes over.
@@ -486,7 +498,7 @@ impl Response {
 
     /// Handled, with text for the clipboard.
     pub fn text(text: impl Into<String>) -> Response {
-        Response { handled: true, text: Some(text.into()) }
+        Response { handled: true, text: Some(text.into()), rises: false }
     }
 }
 

@@ -402,6 +402,27 @@ impl Runtime {
         Some((crate::layout::menu_row_at(frame, &open.entries, x, y), inside))
     }
 
+    /// The nearest interactive hit under the point that is NOT the
+    /// box's own — the ancestor a RISING press arms. Only the TOPMOST
+    /// entry of the box's path is skipped: a `.on_click` wrapped
+    /// straight around the box shares its identity scope, and that
+    /// wrapper is exactly the affordance the rise exists to reach.
+    fn hit_above(&self, own: &str, x: Px, y: Px) -> Option<String> {
+        let hits = self.last_hits.borrow();
+        let mut skipped_own = false;
+        for (path, rect) in hits.iter().rev() {
+            if !rect.contains(x, y) {
+                continue;
+            }
+            if !skipped_own && path == own {
+                skipped_own = true;
+                continue;
+            }
+            return Some(path.clone());
+        }
+        None
+    }
+
     /// The topmost tooltip region under the pointer — paint order, so
     /// the last one wins, mirroring the hits.
     fn tooltip_at(&self, x: Px, y: Px) -> Option<crate::layout::TooltipRegion> {
@@ -871,8 +892,11 @@ impl Runtime {
         }
         let target = self.hover_target(x, y);
         // a press inside the app's box hands it the pointer: nothing
-        // arms (a box has no up-inside action to mis-fire) and the
-        // moves keep coming until the release
+        // arms by default (a box has no up-inside action to mis-fire)
+        // and the moves keep coming until the release — unless the box
+        // answers that the gesture RISES, and then the nearest
+        // interactive ancestor arms too, exactly as if the box were
+        // glass for that one purpose
         if let Some(placement) = target.as_deref().and_then(|path| self.custom_at(path)) {
             {
                 let mut interaction = self.interaction.borrow_mut();
@@ -882,10 +906,14 @@ impl Runtime {
                 interaction.element_grab = Some(placement.path.clone());
             }
             let at = Self::local(&placement, x, y);
-            self.deliver(
+            let response = self.deliver(
                 &placement,
                 crate::custom::ElementEvent::PointerDown { at, clicks },
             );
+            if response.rises {
+                let above = self.hit_above(&placement.path, x, y);
+                self.interaction.borrow_mut().pressed = above;
+            }
             return true;
         }
         // a press on a grip band starts the divider drag — nothing arms
@@ -927,11 +955,12 @@ impl Runtime {
         // gesture ends there: no action fires under it
         let grabbed = self.interaction.borrow().element_grab.clone();
         if let Some(path) = grabbed {
-            {
+            let risen = {
                 let mut interaction = self.interaction.borrow_mut();
                 interaction.element_grab = None;
                 interaction.pointer = Some(Point { x, y });
-            }
+                interaction.pressed.take()
+            };
             if let Some(placement) = self.custom_at(&path) {
                 let at = Self::local(&placement, x, y);
                 self.deliver(&placement, crate::custom::ElementEvent::PointerUp { at });
@@ -942,6 +971,19 @@ impl Runtime {
                     self.focus_element(&placement.path);
                 } else {
                     self.blur();
+                }
+            }
+            // the RISEN press fires like any button: released inside
+            // the same target — the pane focuses while the box keeps
+            // its caret, one click doing both jobs
+            if let Some(above) = risen {
+                let inside = self
+                    .last_hits
+                    .borrow()
+                    .iter()
+                    .any(|(path, rect)| *path == above && rect.contains(x, y));
+                if inside && self.activate(&above) {
+                    return Some(above);
                 }
             }
             return None;
