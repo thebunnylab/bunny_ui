@@ -21,7 +21,7 @@ use std::ffi::c_void;
 
 use bunny_ui::layout::Color;
 use bunny_ui::text_engine::{
-    FontDesign, FontKey, FontSpec, LineMetrics, TextEngine, TextRaster, Weight,
+    FontDesign, FontKey, FontSpec, Slant, LineMetrics, TextEngine, TextRaster, Weight,
 };
 
 use crate::ffi::{CFRelease, CGColorSpaceCreateDeviceRGB, CGColorSpaceRelease};
@@ -50,6 +50,16 @@ const UI_FONT_EMPHASIZED: u32 = 3;
 #[link(name = "CoreText", kind = "framework")]
 unsafe extern "C" {
     fn CTFontCreateWithName(name: CFStringRef, size: f64, matrix: *const c_void) -> CTFontRef;
+    /// The SAME font, asked to lean. `mask` says which traits to look
+    /// at, `traits` what to want — and it answers NULL when the family
+    /// has no such face, which is the whole error handling we need.
+    fn CTFontCreateCopyWithSymbolicTraits(
+        font: CTFontRef,
+        size: f64,
+        matrix: *const c_void,
+        traits: u32,
+        mask: u32,
+    ) -> CTFontRef;
     fn CTFontCreateUIFontForLanguage(
         ui_type: u32,
         size: f64,
@@ -139,7 +149,34 @@ impl Drop for OwnedFont {
     }
 }
 
+/// `kCTFontItalicTrait` — bit 0 of the symbolic traits.
+const FONT_TRAIT_ITALIC: u32 = 1;
+
 unsafe fn create_font(spec: &FontSpec) -> CTFontRef {
+    let upright = unsafe { create_upright(spec) };
+    if spec.slant == Slant::Upright {
+        return upright;
+    }
+    // ask the family to lean; a family with no italic face answers
+    // NULL and keeps its upright font — the lean degrades, never fails
+    unsafe {
+        let leaning = CTFontCreateCopyWithSymbolicTraits(
+            upright,
+            spec.size,
+            std::ptr::null(),
+            FONT_TRAIT_ITALIC,
+            FONT_TRAIT_ITALIC,
+        );
+        if leaning.is_null() {
+            upright
+        } else {
+            CFRelease(upright as *const c_void);
+            leaning
+        }
+    }
+}
+
+unsafe fn create_upright(spec: &FontSpec) -> CTFontRef {
     unsafe {
         match spec.design {
             FontDesign::Default => {

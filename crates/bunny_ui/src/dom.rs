@@ -951,11 +951,12 @@ fn diff_children(
 ///                      CSS rule), the way it owns hover and inputs
 ///   6 set text      u32 rgba, u8 inherits ink (1 = no color of its
 ///                   own — the box above owns both states),
-///                   f32 size, u8 weight, u8 mono,
+///                   f32 size, u8 weight, u8 mono, u8 italic,
 ///                   u8 truncation (0 none, 1 start, 2 middle, 3 end),
 ///                   u32 len + utf8, u16 span count,
 ///                   spans (u32 start, u32 end), u32 span rgba
 ///   7 set field     u32 rgba text ink, f32 size, u8 weight, u8 mono,
+///                   u8 italic,
 ///                   u32 len + utf8 content, u32 len + utf8 placeholder,
 ///                   u16 len + utf8 path
 ///   8 set scroll    f32 x, f32 y
@@ -1028,6 +1029,7 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
                 push_f32(&mut out, text.font.size);
                 out.push(weight_code(text.font.weight));
                 out.push(matches!(text.font.design, FontDesign::Mono) as u8);
+                out.push(matches!(text.font.slant, crate::text_engine::Slant::Italic) as u8);
                 out.push(match text.truncation {
                     None => 0,
                     Some(Truncation::Start) => 1,
@@ -1057,6 +1059,7 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
                 push_f32(&mut out, field.font.size);
                 out.push(weight_code(field.font.weight));
                 out.push(matches!(field.font.design, FontDesign::Mono) as u8);
+                out.push(matches!(field.font.slant, crate::text_engine::Slant::Italic) as u8);
                 push_bytes_u32(&mut out, field.content.as_bytes());
                 push_bytes_u32(&mut out, field.placeholder.as_bytes());
                 push_bytes_u16(&mut out, field.path.as_bytes());

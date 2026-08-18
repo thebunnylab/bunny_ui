@@ -215,8 +215,17 @@ impl Component for Finder {
                     let details = details;
                     // the path takes NO ink of its own: the row hands it
                     // down, faint at rest and bright under the pointer
+                    // every fourth row reads as a PREVIEW tab would in
+                    // an editor — leaning says "you are only looking"
+                    let preview = row % 4 == 3;
                     let base = hstack!(
-                        text(name.clone()).foreground_color(theme::fg()),
+                        if preview {
+                            Either::First(
+                                text(name.clone()).foreground_color(theme::fg()).italic(),
+                            )
+                        } else {
+                            Either::Second(text(name.clone()).foreground_color(theme::fg()))
+                        },
                         text(dir.clone()).monospaced(),
                         spacer(),
                     )

@@ -76,6 +76,20 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.italic()` — the text leans. Only the SLANT travels, like
+    /// `.bold()` carries only the weight, so a bold italic is the two
+    /// modifiers and nothing is lost between them.
+    ///
+    /// The lean is CONTENT where an editor uses it: a preview tab says
+    /// "you are only looking" by leaning its label, and a reader who
+    /// cannot see it cannot tell the tab from a permanent one.
+    fn italic(self) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Italic,
+        }
+    }
+
     /// `.padding()`
     fn padding(self) -> Modified<Self> {
         Modified {

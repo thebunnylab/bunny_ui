@@ -29,7 +29,7 @@ use std::ffi::c_void;
 
 use bunny_ui::layout::Color;
 use bunny_ui::text_engine::{
-    FontDesign, FontKey, FontSpec, LineMetrics, PixelFont, TextEngine, TextRaster, Weight,
+    FontDesign, FontKey, FontSpec, LineMetrics, PixelFont, Slant, TextEngine, TextRaster, Weight,
 };
 
 use crate::ffi::{
@@ -428,6 +428,18 @@ fn family_of(design: FontDesign) -> &'static str {
     }
 }
 
+/// `DWRITE_FONT_STYLE_ITALIC` — the family's own leaning face when it
+/// has one; DirectWrite falls back to a simulated oblique when it does
+/// not, which is the same dignity CoreText gives.
+const DWRITE_FONT_STYLE_ITALIC: u32 = 2;
+
+fn style_of(slant: Slant) -> u32 {
+    match slant {
+        Slant::Upright => DWRITE_FONT_STYLE_NORMAL,
+        Slant::Italic => DWRITE_FONT_STYLE_ITALIC,
+    }
+}
+
 fn weight_of(weight: Weight) -> u32 {
     match weight {
         Weight::Regular => 400,
@@ -561,7 +573,7 @@ fn create_slot(factories: &Factories, spec: &FontSpec) -> Option<FontSlot> {
             family_object.as_ptr(),
             weight_of(spec.weight),
             DWRITE_FONT_STRETCH_NORMAL,
-            DWRITE_FONT_STYLE_NORMAL,
+            style_of(spec.slant),
             &mut font,
         );
         if !com_ok(hr) {

@@ -34,6 +34,8 @@ pub enum Modifier {
     // MARK: - Formatting (inert)
     Font(Font),
     Bold,
+    /// `.italic()` — only the slant travels, like `.bold()`.
+    Italic,
     Padding,
     PaddingLength(f64),
     PaddingEdge(Edge, f64),
@@ -161,6 +163,7 @@ impl Modifier {
         match self {
             Modifier::Font(font) => format!(" [.font({font})]"),
             Modifier::Bold => " [.bold()]".into(),
+            Modifier::Italic => " [.italic()]".into(),
             Modifier::Padding => " [.padding()]".into(),
             Modifier::PaddingLength(length) => format!(" [.padding({length})]"),
             Modifier::PaddingEdge(edge, length) => format!(" [.padding({edge}, {length})]"),
@@ -780,6 +783,17 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 mark,
                 VisualProps {
                     font: FontPatch { weight: Some(Weight::Bold), ..FontPatch::default() },
+                    ..VisualProps::default()
+                },
+            ),
+            Modifier::Italic => wrap_styled(
+                out,
+                mark,
+                VisualProps {
+                    font: FontPatch {
+                        slant: Some(crate::text_engine::Slant::Italic),
+                        ..FontPatch::default()
+                    },
                     ..VisualProps::default()
                 },
             ),

@@ -4977,4 +4977,94 @@ mod tests {
             "the ring element dies with the drag: {after:#?}"
         );
     }
+
+    #[test]
+    fn the_text_can_lean_and_the_lean_is_its_own_font() {
+        use crate::text_engine::{FontSpec, Slant, Weight};
+
+        #[derive(Clone, Copy)]
+        struct Tabs;
+        impl Component for Tabs {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    // the preview tab of an editor: leaning says "you
+                    // are only looking"
+                    text("preview.rs").italic(),
+                    text("pinned.rs"),
+                    text("both").bold().italic(),
+                )
+                .spacing(0.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let result =
+            runtime.layout(&Tabs, crate::layout::Proposal::exact(Size { width: 200.0, height: 90.0 }));
+        let fonts: Vec<(String, FontSpec)> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { content, font, .. } => {
+                    Some((content.to_string(), *font))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fonts[0].1.slant, Slant::Italic, "the preview leans");
+        assert_eq!(fonts[1].1.slant, Slant::Upright, "the pinned one does not");
+        // the two modifiers compose: each carries only its own field
+        assert_eq!(fonts[2].1.slant, Slant::Italic);
+        assert_eq!(fonts[2].1.weight, Weight::Bold);
+
+        // the LEAN is part of the font's identity: an upright and a
+        // leaning line are two cache entries, never one answering for
+        // the other
+        let upright = FontSpec::DEFAULT;
+        let leaning = FontSpec { slant: Slant::Italic, ..FontSpec::DEFAULT };
+        assert_ne!(upright.key(), leaning.key());
+
+        // and the print says it, beside .bold()
+        let printed = runtime.render(&text("x").italic());
+        assert!(printed.contains("[.italic()]"), "{printed}");
+    }
+
+    #[test]
+    fn the_lean_reaches_the_browser_on_the_wire() {
+        use crate::text_engine::{FontSpec, Slant};
+
+        let leaning = crate::dom::DomText {
+            content: std::sync::Arc::from("preview.rs"),
+            color: Color::hex(0x202531),
+            inherits_ink: false,
+            font: FontSpec { slant: Slant::Italic, ..FontSpec::DEFAULT },
+            highlights: None,
+            truncation: None,
+        };
+        let bytes = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: leaning }]);
+        let upright = crate::dom::DomText {
+            content: std::sync::Arc::from("preview.rs"),
+            color: Color::hex(0x202531),
+            inherits_ink: false,
+            font: FontSpec::DEFAULT,
+            highlights: None,
+            truncation: None,
+        };
+        let plain = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: upright }]);
+
+        // the same stream, ONE byte apart — the slant is a flag beside
+        // mono, not a payload that grows the wire
+        assert_eq!(plain.len(), bytes.len(), "one byte either way");
+        let differing: Vec<usize> = plain
+            .iter()
+            .zip(&bytes)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(differing.len(), 1, "exactly one byte says it leans: {differing:?}");
+        let at = differing[0];
+        assert_eq!((plain[at], bytes[at]), (0, 1));
+        // and it rides right after the mono flag
+        assert_eq!(bytes[at - 1], 0, "mono sits before it");
+    }
 }

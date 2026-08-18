@@ -36,6 +36,7 @@ unsafe extern "C" {
         size: f64,
         weight: u32,
         mono: u32,
+        italic: u32,
         out: *mut f64,
     );
     /// Draws one line into a `width × height` physical rectangle and
@@ -49,6 +50,7 @@ unsafe extern "C" {
         size: f64,
         weight: u32,
         mono: u32,
+        italic: u32,
         scale: f64,
         width: u32,
         height: u32,
@@ -56,6 +58,11 @@ unsafe extern "C" {
         color: u32,
         out: *mut u8,
     );
+}
+
+/// Does this font lean? One bit across the border, like the mono flag.
+fn italic_flag(font: &FontSpec) -> u32 {
+    matches!(font.slant, bunny_ui::text_engine::Slant::Italic) as u32
 }
 
 /// The numeric weights `ctx.font` understands.
@@ -132,6 +139,7 @@ impl TextEngine for CanvasTextEngine {
                 font.size,
                 css_weight(font.weight),
                 mono_flag(font),
+                italic_flag(font),
                 out.as_mut_ptr(),
             );
         }
@@ -172,6 +180,7 @@ impl TextEngine for CanvasTextEngine {
                 font.size,
                 css_weight(font.weight),
                 mono_flag(font),
+                italic_flag(font),
                 scale as f64,
                 width as u32,
                 height as u32,

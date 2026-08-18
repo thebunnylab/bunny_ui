@@ -27,6 +27,15 @@ pub enum Weight {
     Bold,
 }
 
+/// Upright, or leaning. The preview tab of an editor writes its label
+/// in italic — the VS Code idiom for "you are only looking" — and that
+/// is content, not decoration: the reader must see the lean.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Slant {
+    Upright,
+    Italic,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FontDesign {
     /// The system interface font.
@@ -42,11 +51,16 @@ pub struct FontSpec {
     pub size: Px,
     pub weight: Weight,
     pub design: FontDesign,
+    pub slant: Slant,
 }
 
 impl FontSpec {
-    pub const DEFAULT: FontSpec =
-        FontSpec { size: 13.0, weight: Weight::Regular, design: FontDesign::Default };
+    pub const DEFAULT: FontSpec = FontSpec {
+        size: 13.0,
+        weight: Weight::Regular,
+        design: FontDesign::Default,
+        slant: Slant::Upright,
+    };
 
     /// The API text styles, in desktop metrics.
     pub fn resolve(font: motor::views::Font) -> FontSpec {
@@ -62,7 +76,7 @@ impl FontSpec {
             Font::Caption => (10.0, Weight::Regular),
             Font::Caption2 => (10.0, Weight::Regular),
         };
-        FontSpec { size, weight, design: FontDesign::Default }
+        FontSpec { size, weight, design: FontDesign::Default, slant: Slant::Upright }
     }
 
     /// The hashable key (f64 is not `Eq`): size quantized in thousandths
@@ -72,6 +86,7 @@ impl FontSpec {
             size_milli: (self.size * 1000.0).round() as u32,
             weight: self.weight,
             design: self.design,
+            slant: self.slant,
         }
     }
 }
@@ -82,6 +97,9 @@ pub struct FontKey {
     size_milli: u32,
     weight: Weight,
     design: FontDesign,
+    /// In the KEY as well: an upright and a leaning line are two
+    /// rasters, and one cache entry must never answer for the other.
+    slant: Slant,
 }
 
 /// A partial font patch for inheritance: `.font(…)` sets all three
@@ -92,11 +110,17 @@ pub struct FontPatch {
     pub size: Option<Px>,
     pub weight: Option<Weight>,
     pub design: Option<FontDesign>,
+    pub slant: Option<Slant>,
 }
 
 impl FontPatch {
     pub fn full(spec: FontSpec) -> FontPatch {
-        FontPatch { size: Some(spec.size), weight: Some(spec.weight), design: Some(spec.design) }
+        FontPatch {
+            size: Some(spec.size),
+            weight: Some(spec.weight),
+            design: Some(spec.design),
+            slant: Some(spec.slant),
+        }
     }
 
     /// Merge of the stacked modifiers — the defined (closest) one wins.
@@ -105,6 +129,7 @@ impl FontPatch {
             size: self.size.or(outer.size),
             weight: self.weight.or(outer.weight),
             design: self.design.or(outer.design),
+            slant: self.slant.or(outer.slant),
         }
     }
 
@@ -113,6 +138,7 @@ impl FontPatch {
             size: self.size.unwrap_or(base.size),
             weight: self.weight.unwrap_or(base.weight),
             design: self.design.unwrap_or(base.design),
+            slant: self.slant.unwrap_or(base.slant),
         }
     }
 }

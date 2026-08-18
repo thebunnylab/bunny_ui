@@ -29,11 +29,13 @@ function inkSurface(width, height) {
   return inkContext;
 }
 
-function cssFont(size, weight, mono) {
+function cssFont(size, weight, mono, italic) {
   const family = mono
     ? 'ui-monospace, Menlo, Consolas, monospace'
     : 'system-ui, -apple-system, "Segoe UI", sans-serif';
-  return `${weight} ${size}px ${family}`;
+  // CSS order is style, then weight, then size — a leaning label is a
+  // real face, never a skew we paint ourselves
+  return `${italic ? "italic " : ""}${weight} ${size}px ${family}`;
 }
 
 function requestFrame() {
@@ -129,12 +131,12 @@ const imports = {
     // Writes [width, ascent, descent] as three f64 at `out` — logical
     // px. Ascent/descent come from the FONT's bounding box (stable per
     // font); an empty string keeps the metrics and reports width 0.
-    js_measure_text(pointer, length, size, weight, mono, out) {
+    js_measure_text(pointer, length, size, weight, mono, italic, out) {
       const text = decoder.decode(
         new Uint8Array(wasm.memory.buffer, pointer, length),
       );
       const ink = inkSurface(1, 1);
-      ink.font = cssFont(size, weight, mono);
+      ink.font = cssFont(size, weight, mono, italic);
       const probe = ink.measureText(text || "Mg");
       const metrics = new Float64Array(wasm.memory.buffer, out, 3);
       metrics[0] = text ? probe.width : 0;
@@ -150,6 +152,7 @@ const imports = {
       size,
       weight,
       mono,
+      italic,
       scale,
       width,
       height,
@@ -164,7 +167,7 @@ const imports = {
       ink.setTransform(1, 0, 0, 1, 0, 0);
       ink.clearRect(0, 0, width, height);
       ink.setTransform(scale, 0, 0, scale, 0, 0);
-      ink.font = cssFont(size, weight, mono);
+      ink.font = cssFont(size, weight, mono, italic);
       ink.textBaseline = "alphabetic";
       const r = (color >>> 24) & 0xff;
       const g = (color >>> 16) & 0xff;
