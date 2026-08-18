@@ -316,6 +316,18 @@ function applyPatches(view, length) {
   const text = (count) => decoder.decode(bytes(count));
 
   let removedAny = false;
+  // fresh siblings gather in fragments and land on the LIVE tree once
+  // per parent — a thousand appended rows must not pay a thousand
+  // live-tree insertions
+  const staged = new Map();
+  const stagedFor = (parentId, parentEl) => {
+    let fragment = staged.get(parentId);
+    if (!fragment) {
+      fragment = { holder: document.createDocumentFragment(), parent: parentEl };
+      staged.set(parentId, fragment);
+    }
+    return fragment.holder;
+  };
   const count = u32();
   for (let i = 0; i < count; i++) {
     const op = u8();
@@ -335,8 +347,19 @@ function applyPatches(view, length) {
         wireScroll(el, id);
       }
       const home = elements.get(parent);
-      const anchor = before ? elements.get(before) : null;
-      home?.insertBefore(el, anchor ?? null);
+      if (home) {
+        const anchor = before ? elements.get(before) : null;
+        if (anchor) {
+          // relative to wherever the anchor LIVES — it may still sit
+          // in a staged fragment on its way to the tree
+          (anchor.parentNode ?? home).insertBefore(el, anchor);
+        } else if (home.isConnected) {
+          // stage appends to live parents; detached ones are cheap
+          stagedFor(parent, home).appendChild(el);
+        } else {
+          home.appendChild(el);
+        }
+      }
       elements.set(id, el);
     } else if (op === 2) {
       const el = elements.get(id);
@@ -704,6 +727,9 @@ function applyPatches(view, length) {
         placePopover(el);
       }
     }
+  }
+  for (const { holder, parent } of staged.values()) {
+    parent.appendChild(holder);
   }
   if (removedAny) {
     // one pass over the registry: whatever a removal detached loses
