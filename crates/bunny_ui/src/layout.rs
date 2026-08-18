@@ -1849,10 +1849,13 @@ impl LayoutNode {
                         },
                         size: clip.size,
                     });
+                let focused = env.stamp.focus == Some(path.as_str()) && !path.is_empty();
                 let ctx = crate::custom::PaintCtx {
                     frame,
                     visible,
                     metrics: crate::custom::Metrics::new(env.text, env.cache, env.font),
+                    focused,
+                    caret_visible: focused && env.stamp.caret_visible,
                 };
                 let ink = out.foreground.last().copied().unwrap_or(Color::BLACK);
                 let mut painter =

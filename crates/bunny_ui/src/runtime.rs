@@ -462,9 +462,57 @@ impl Runtime {
         placement.element.element().event(&event, &ctx)
     }
 
+    /// A rect of the box's own coordinates, in the scene's.
+    fn to_layout(placement: &crate::layout::CustomPlacement, rect: Rect) -> Rect {
+        Rect {
+            origin: Point {
+                x: rect.origin.x + placement.frame.origin.x,
+                y: rect.origin.y + placement.frame.origin.y,
+            },
+            size: rect.size,
+        }
+    }
+
     /// A point in the box's own coordinates.
     fn local(placement: &crate::layout::CustomPlacement, x: Px, y: Px) -> Point {
         Point { x: x - placement.frame.origin.x, y: y - placement.frame.origin.y }
+    }
+
+    /// The app's box that holds the keyboard, if the focus is on one.
+    fn focused_custom(&self) -> Option<crate::layout::CustomPlacement> {
+        let path = self.focus.borrow().clone()?;
+        self.custom_at(&path)
+    }
+
+    /// Hands the keyboard to the app's box (no caret state: the caret
+    /// belongs to the app).
+    fn focus_element(&self, path: &str) {
+        if self.focus.borrow().as_deref() == Some(path) {
+            return;
+        }
+        self.blur();
+        self.caret_visible.set(true);
+        *self.focus.borrow_mut() = Some(path.to_string());
+        if let Some(placement) = self.custom_at(path) {
+            self.deliver(&placement, crate::custom::ElementEvent::Focused(true));
+        }
+    }
+
+    /// One keystroke offered to the focused box BEFORE the keymap: an
+    /// editor owns its arrows, its Enter and its Tab while it has the
+    /// keyboard. The answer's `text` is what a copy hands the
+    /// platform's clipboard; `handled: false` sends the stroke on to
+    /// the app's bindings.
+    pub fn key_stroke(&self, pattern: &KeyPattern) -> crate::custom::Response {
+        let Some(placement) = self.focused_custom() else {
+            return crate::custom::Response::ignored();
+        };
+        let response =
+            self.deliver(&placement, crate::custom::ElementEvent::Key(*pattern));
+        if response.handled {
+            self.caret_visible.set(true);
+        }
+        response
     }
 
     /// Button down: ARMS pressed on the target under the point — no
@@ -536,6 +584,14 @@ impl Runtime {
             if let Some(placement) = self.custom_at(&path) {
                 let at = Self::local(&placement, x, y);
                 self.deliver(&placement, crate::custom::ElementEvent::PointerUp { at });
+                // a box that takes the keyboard takes it on the click,
+                // the way a field does — the caret is the app's, so
+                // nothing here measures a column
+                if placement.element.element().accepts_keys() {
+                    self.focus_element(&placement.path);
+                } else {
+                    self.blur();
+                }
             }
             return None;
         }
@@ -762,7 +818,13 @@ impl Runtime {
     }
 
     pub fn blur(&self) -> bool {
-        self.focus.borrow_mut().take().is_some()
+        let dropped = self.focus.borrow_mut().take();
+        // the box hears the keyboard leave — a selection that only
+        // means something while focused goes quiet
+        if let Some(placement) = dropped.as_deref().and_then(|path| self.custom_at(path)) {
+            self.deliver(&placement, crate::custom::ElementEvent::Focused(false));
+        }
+        dropped.is_some()
     }
 
     /// Half-period of the blink (the shell calls it on a timer):
@@ -783,6 +845,17 @@ impl Runtime {
         use crate::text_input::byte_to_utf16;
 
         let path = self.focus.borrow().clone()?;
+        // the app's box answers for itself; only the caret rect
+        // changes hands, from the box's coordinates into the scene's
+        if let Some(placement) = self.custom_at(&path) {
+            let context = placement.element.element().ime()?;
+            return Some(ImeSnapshot {
+                text: context.text,
+                selected: context.selected,
+                marked: context.marked,
+                caret_rect: Self::to_layout(&placement, context.caret_rect),
+            });
+        }
         let mut probe = CaretState::default();
         let text = reconciler::run_editor(&path, EditCommand::Read, &mut probe)??;
         let state = self.carets.borrow().get(&path).copied().unwrap_or_default();
@@ -818,6 +891,13 @@ impl Runtime {
     /// through this.
     pub fn ime_index_at(&self, x: Px, y: Px) -> Option<usize> {
         let path = self.focus.borrow().clone()?;
+        if let Some(placement) = self.custom_at(&path) {
+            if !placement.frame.contains(x, y) {
+                return None;
+            }
+            let local = Self::local(&placement, x, y);
+            return placement.element.element().ime_index_at(local);
+        }
         let field = self
             .last_fields
             .borrow()
@@ -840,6 +920,10 @@ impl Runtime {
     /// COMPOSITION's start, not always at the caret).
     pub fn ime_rect_for(&self, utf16: usize) -> Option<Rect> {
         let path = self.focus.borrow().clone()?;
+        if let Some(placement) = self.custom_at(&path) {
+            let rect = placement.element.element().ime_rect_for(utf16)?;
+            return Some(Self::to_layout(&placement, rect));
+        }
         let field = self
             .last_fields
             .borrow()
@@ -895,6 +979,32 @@ impl Runtime {
         let Some(path) = self.focus.borrow().clone() else {
             return Edited { applied: false, output: None };
         };
+        // the app's box speaks its own vocabulary: what the shell means
+        // by "insert this text" or "this is the marked text" arrives as
+        // an event, and the box owns the rest (a document's caret is
+        // not a field's)
+        if let Some(placement) = self.custom_at(&path) {
+            let event = match command {
+                EditCommand::Insert(text) => crate::custom::ElementEvent::Text(text),
+                EditCommand::SetMarked { text, caret_utf16 } => {
+                    crate::custom::ElementEvent::Marked { text, caret_utf16 }
+                }
+                EditCommand::Unmark => crate::custom::ElementEvent::Unmark,
+                EditCommand::Copy => crate::custom::ElementEvent::Copy,
+                EditCommand::Cut => crate::custom::ElementEvent::Cut,
+                // everything else is a stroke, and a stroke has one
+                // door: the gate offered it before the keymap
+                other => {
+                    let _ = other;
+                    return Edited { applied: false, output: None };
+                }
+            };
+            let response = self.deliver(&placement, event);
+            if response.handled {
+                self.caret_visible.set(true);
+            }
+            return Edited { applied: response.handled, output: response.text };
+        }
         let mut state = self.carets.borrow().get(&path).copied().unwrap_or_default();
         // outside the map borrow: the editor writes to the binding and
         // can re-enter the runtime

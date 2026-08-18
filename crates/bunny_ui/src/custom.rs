@@ -87,6 +87,39 @@ pub trait CustomElement: 'static {
         true
     }
 
+    /// Does the box take the keyboard? A `true` here makes a click
+    /// FOCUS it: the strokes, the typed text and the composition
+    /// arrive as events, and the caret blink runs for it.
+    fn accepts_keys(&self) -> bool {
+        false
+    }
+
+    /// What the platform's input system sees while the box is focused —
+    /// the text around the caret, the selection, the live composition
+    /// and the caret rect in LOCAL coordinates. `None` = no composition
+    /// is offered (the box still types).
+    ///
+    /// A document answers with the CONTEXT it wants the input system to
+    /// know, not with its whole content: the current line is a good
+    /// answer, as long as the indices below agree with it.
+    fn ime(&self) -> Option<ImeContext> {
+        None
+    }
+
+    /// The UTF-16 index under a LOCAL point — the input system asks
+    /// this to look a word up under the mouse.
+    fn ime_index_at(&self, local: Point) -> Option<usize> {
+        let _ = local;
+        None
+    }
+
+    /// The caret-shaped rect at a UTF-16 index of [`CustomElement::ime`],
+    /// in LOCAL coordinates — where the candidate window lands.
+    fn ime_rect_for(&self, utf16: usize) -> Option<Rect> {
+        let _ = utf16;
+        None
+    }
+
     /// The name in the printed tree: `Custom(editor)`.
     fn name(&self) -> &str {
         "custom"
@@ -168,6 +201,11 @@ pub struct PaintCtx<'a> {
     pub visible: Rect,
     /// Text measurement, cached.
     pub metrics: Metrics<'a>,
+    /// Does the box hold the keyboard right now?
+    pub focused: bool,
+    /// The blink phase the caret follows — the box paints its own
+    /// caret, the runtime only says when it shows.
+    pub caret_visible: bool,
 }
 
 impl PaintCtx<'_> {
@@ -337,6 +375,44 @@ pub enum ElementEvent {
     Wheel { at: Point, dx: Px, dy: Px },
     /// The pointer left the box (or the window).
     PointerExited,
+    /// A keystroke, while the box has focus — arrows, Enter, Tab and
+    /// the shortcuts, exactly as the keymap spells them. What the box
+    /// ignores goes on to the app's key bindings.
+    Key(crate::action::KeyPattern),
+    /// Text to insert: typing, a paste, or the commit of a
+    /// composition. The framework opens no clipboard — the shell reads
+    /// it and the text arrives here.
+    Text(String),
+    /// A live composition: the marked text replaces the previous mark
+    /// (or the selection) and stays MARKED — underlined, not
+    /// committed. `caret_utf16` is (location, length) INSIDE the marked
+    /// text, the platform's own vocabulary.
+    Marked { text: String, caret_utf16: (usize, usize) },
+    /// The composition ended: what is marked stands as typed.
+    Unmark,
+    /// Answer with [`Response::text`] and the shell writes the
+    /// clipboard.
+    Copy,
+    /// The same, and the box removes what it handed over.
+    Cut,
+    /// The box took the keyboard (or lost it).
+    Focused(bool),
+}
+
+/// What the platform's input system reads from a focused box.
+///
+/// The indices are UTF-16 — the vocabulary of the input systems — and
+/// they index [`ImeContext::text`], which is the editing CONTEXT the
+/// box chose to expose.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImeContext {
+    pub text: String,
+    /// (location, length) of the selection, in UTF-16.
+    pub selected: (usize, usize),
+    /// The marked range while a composition is live.
+    pub marked: Option<(usize, usize)>,
+    /// The caret, in LOCAL coordinates.
+    pub caret_rect: Rect,
 }
 
 /// What the app answers.
@@ -449,6 +525,7 @@ mod tests {
     use super::*;
     use crate::layout::{Axis, CrossAlign, DrawCommand, LayoutNode, Proposal};
     use crate::runtime::Runtime;
+    use crate::text_input::EditCommand;
     use crate::view::Component;
     use motor::state::Context as ViewContext;
 
@@ -832,6 +909,247 @@ mod tests {
         );
         runtime.pointer_exited();
         assert_eq!(log.borrow().last(), Some(&ElementEvent::PointerExited));
+    }
+
+    // MARK: - The keyboard
+
+    /// A one-line editor built from the app's own parts — enough to
+    /// prove the keyboard, the clipboard and the input system reach a
+    /// box the framework knows nothing about.
+    #[derive(Clone, Default)]
+    struct MiniEditor {
+        text: Rc<std::cell::RefCell<String>>,
+        marked: Rc<Cell<Option<(usize, usize)>>>,
+        focus_log: Rc<std::cell::RefCell<Vec<bool>>>,
+        caret_shown: Rc<Cell<bool>>,
+    }
+
+    /// One monospaced column of the deterministic test font.
+    const COLUMN: Px = 8.0;
+
+    impl CustomElement for MiniEditor {
+        fn paint(&self, ctx: &PaintCtx, _painter: &mut Painter) {
+            self.caret_shown.set(ctx.caret_visible);
+        }
+
+        fn accepts_keys(&self) -> bool {
+            true
+        }
+
+        fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
+            match event {
+                ElementEvent::Text(text) => {
+                    self.marked.set(None);
+                    self.text.borrow_mut().push_str(text);
+                    Response::handled()
+                }
+                ElementEvent::Marked { text, .. } => {
+                    let start = self.text.borrow().len();
+                    self.text.borrow_mut().push_str(text);
+                    self.marked.set(Some((start, start + text.len())));
+                    Response::handled()
+                }
+                ElementEvent::Unmark => {
+                    self.marked.set(None);
+                    Response::handled()
+                }
+                ElementEvent::Copy => Response::text(self.text.borrow().clone()),
+                ElementEvent::Cut => {
+                    let text = self.text.replace(String::new());
+                    Response::text(text)
+                }
+                ElementEvent::Key(pattern)
+                    if pattern.key == crate::action::Key::Backspace =>
+                {
+                    self.text.borrow_mut().pop();
+                    Response::handled()
+                }
+                ElementEvent::Focused(on) => {
+                    self.focus_log.borrow_mut().push(*on);
+                    Response::handled()
+                }
+                _ => Response::ignored(),
+            }
+        }
+
+        fn ime(&self) -> Option<ImeContext> {
+            let text = self.text.borrow().clone();
+            let caret = text.chars().count();
+            Some(ImeContext {
+                selected: (caret, 0),
+                marked: self.marked.get().map(|(start, end)| (start, end - start)),
+                caret_rect: Rect {
+                    origin: Point { x: caret as Px * COLUMN, y: 0.0 },
+                    size: Size { width: 1.5, height: 16.0 },
+                },
+                text,
+            })
+        }
+
+        fn ime_index_at(&self, local: Point) -> Option<usize> {
+            Some((local.x / COLUMN).round().max(0.0) as usize)
+        }
+
+        fn ime_rect_for(&self, utf16: usize) -> Option<Rect> {
+            Some(Rect {
+                origin: Point { x: utf16 as Px * COLUMN, y: 0.0 },
+                size: Size { width: 1.5, height: 16.0 },
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct Editing {
+        editor: MiniEditor,
+    }
+
+    impl Component for Editing {
+        fn body(self, _ctx: &ViewContext) -> impl View {
+            use crate::ext::ViewExt;
+            crate::vstack!(
+                crate::views::text("above"),
+                custom(self.editor).frame(200.0, 40.0),
+            )
+        }
+    }
+
+    /// A focused editor at (0, 16) — the click that focused it included.
+    fn focused_editor() -> (Runtime, MiniEditor) {
+        let editor = MiniEditor::default();
+        let runtime = Runtime::new();
+        let view = Editing { editor: editor.clone() };
+        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(80.0) });
+        runtime.pointer_pressed(10.0, 30.0);
+        runtime.pointer_released(10.0, 30.0);
+        (runtime, editor)
+    }
+
+    #[test]
+    fn the_keyboard_reaches_the_box_that_asked_for_it() {
+        let (runtime, editor) = focused_editor();
+        assert_eq!(runtime.focused().as_deref(), Some("Editing/#1"));
+        assert_eq!(editor.focus_log.borrow().as_slice(), &[true]);
+
+        // typing, pasting and the commit of a composition are all Text
+        assert!(runtime.key(EditCommand::Insert("let ".into())).applied);
+        assert!(runtime.key(EditCommand::Insert("x".into())).applied);
+        assert_eq!(&*editor.text.borrow(), "let x");
+
+        // the strokes come through the gate's door
+        assert!(
+            runtime
+                .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Backspace))
+                .handled
+        );
+        assert_eq!(&*editor.text.borrow(), "let ");
+    }
+
+    #[test]
+    fn one_key_has_one_door() {
+        // what the box took at the gate never arrives again as an edit,
+        // and what the box ignores is the keymap's
+        let (runtime, editor) = focused_editor();
+        assert!(!runtime.key(EditCommand::Backspace).applied, "the gate owns the strokes");
+        assert!(!runtime.key(EditCommand::Left(false)).applied);
+        assert!(editor.text.borrow().is_empty());
+
+        const NEXT: crate::action::ActionId = crate::action::ActionId("test.next");
+        let pattern = crate::action::KeyPattern::key(crate::action::Key::Down);
+        runtime.bind(pattern, NEXT);
+        assert!(!runtime.key_stroke(&pattern).handled, "the editor ignores Down");
+        assert_eq!(runtime.match_key(&pattern), Some(NEXT), "so the keymap answers");
+    }
+
+    #[test]
+    fn the_box_answers_the_input_system() {
+        let (runtime, editor) = focused_editor();
+        runtime.key(EditCommand::Insert("ab".into()));
+
+        // a live composition, and the marked range comes back
+        assert!(
+            runtime
+                .key(EditCommand::SetMarked {
+                    text: "に".into(),
+                    caret_utf16: (0, 1)
+                })
+                .applied
+        );
+        let snapshot = runtime.ime_snapshot().expect("the box answers");
+        assert_eq!(snapshot.text, "abに");
+        assert!(snapshot.marked.is_some(), "the composition is live");
+        // the caret rect crossed from the box's coordinates into the
+        // scene's: the box sits under one line of text
+        assert_eq!(snapshot.caret_rect.origin, Point { x: 3.0 * COLUMN, y: crate::layout::LINE_H });
+        assert!(runtime.key(EditCommand::Unmark).applied);
+        assert!(runtime.ime_snapshot().unwrap().marked.is_none());
+
+        // the questions the input system asks about geometry
+        assert_eq!(runtime.ime_index_at(2.0 * COLUMN, 20.0), Some(2));
+        assert_eq!(runtime.ime_index_at(2.0 * COLUMN, 400.0), None, "outside the box");
+        assert_eq!(
+            runtime.ime_rect_for(1).map(|rect| rect.origin),
+            Some(Point { x: COLUMN, y: crate::layout::LINE_H })
+        );
+        assert_eq!(&*editor.text.borrow(), "abに");
+    }
+
+    #[test]
+    fn a_copy_hands_the_selection_to_the_shell() {
+        let (runtime, _) = focused_editor();
+        runtime.key(EditCommand::Insert("copy me".into()));
+        assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some("copy me"));
+        assert_eq!(runtime.key(EditCommand::Cut).output.as_deref(), Some("copy me"));
+        assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn the_caret_blinks_for_the_box_and_the_focus_leaves_with_a_click() {
+        let editor = MiniEditor::default();
+        let runtime = Runtime::new();
+        let view = Editing { editor: editor.clone() };
+        let proposal = Proposal { width: Some(200.0), height: Some(80.0) };
+        runtime.layout(&view, proposal);
+        runtime.pointer_pressed(10.0, 30.0);
+        runtime.pointer_released(10.0, 30.0);
+
+        assert!(runtime.blink(), "a focused box blinks");
+        runtime.layout(&view, proposal);
+        assert!(!editor.caret_shown.get(), "the box paints the phase it was told");
+        assert!(runtime.blink());
+        runtime.layout(&view, proposal);
+        assert!(editor.caret_shown.get());
+
+        // a click above the box (on plain text) drops the keyboard
+        runtime.pointer_pressed(10.0, 5.0);
+        runtime.pointer_released(10.0, 5.0);
+        assert_eq!(runtime.focused(), None);
+        assert_eq!(editor.focus_log.borrow().as_slice(), &[true, false]);
+    }
+
+    #[test]
+    fn a_box_that_does_not_ask_never_takes_the_keyboard() {
+        #[derive(Clone)]
+        struct Screen {
+            log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
+        }
+        impl Component for Screen {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                custom(Recorder::new(&self.log))
+            }
+        }
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let runtime = Runtime::new();
+        let view = Screen { log: Rc::clone(&log) };
+        runtime.layout(&view, Proposal { width: Some(40.0), height: Some(40.0) });
+        runtime.pointer_pressed(10.0, 10.0);
+        runtime.pointer_released(10.0, 10.0);
+        assert_eq!(runtime.focused(), None);
+        assert!(
+            !runtime
+                .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Enter))
+                .handled,
+            "no focus, no keys"
+        );
     }
 
     /// Lays a node out at an exact proposal.
