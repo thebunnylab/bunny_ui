@@ -14,12 +14,52 @@ mod text;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use bunny_ui::action::{Key, KeyPattern};
 use bunny_ui::layout::Size;
-use bunny_ui::prelude::Runtime;
+use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
 pub use text::DirectWriteEngine;
+
+/// Virtual key → the keymap vocabulary. Named keys come from the
+/// VK table; the rest becomes `Char` through the base char (a clean
+/// keyboard state), lowercased. `None` = lone modifier/function key.
+///
+/// The modifier mapping is the platform's: Ctrl is the accelerator,
+/// so Ctrl carries `command`; Alt carries `option`; the `control`
+/// flag stays false (the Windows key belongs to the system). An
+/// AltGr chord that types (`types_text`) never reaches this table —
+/// the gate lets it through to the character road first.
+fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
+    let named = match stroke.vk {
+        0x28 => Some(Key::Down),
+        0x26 => Some(Key::Up),
+        0x25 => Some(Key::Left),
+        0x27 => Some(Key::Right),
+        0x0D => Some(Key::Enter), // Return and the numeric keypad Enter share it
+        0x1B => Some(Key::Escape),
+        0x09 => Some(Key::Tab),
+        0x21 => Some(Key::PageUp),
+        0x22 => Some(Key::PageDown),
+        0x08 => Some(Key::Backspace),
+        0x2E => Some(Key::Delete),
+        0x24 => Some(Key::Home),
+        0x23 => Some(Key::End),
+        _ => None,
+    };
+    let key = named.or_else(|| {
+        let base = stroke.chars_ignoring.chars().next()?;
+        (!base.is_control()).then(|| Key::Char(base.to_ascii_lowercase()))
+    })?;
+    Some(KeyPattern {
+        key,
+        shift: stroke.shift,
+        command: stroke.control,
+        option: stroke.alt,
+        control: false,
+    })
+}
 
 /// Opens the window and enters the live cycle. Returns when the app
 /// quits (closing the window quits).
@@ -35,6 +75,10 @@ pub fn run_window(title: &str, size: Size, root: impl View) {
 /// still the assembler's responsibility).
 pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl View) {
     let window = ffi::create_window(title, size.width, size.height, false);
+    // a task that lands on a worker thread asks the pump for one more
+    // turn; the frame it takes drains the queue on its way
+    runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
+    // two owners: the keyboard gate and the event handler
     let runtime = Rc::new(runtime);
     let root = Rc::new(root);
 
@@ -119,6 +163,49 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
         }
     };
 
+    // the gate: keymap BEFORE the input system — bare chars with a
+    // focused field pass straight through (typing is never stolen); a
+    // binding with no handler mounted does not consume (the
+    // palette-less screen types fine); an AltGr chord that types IS
+    // text and never enters. The composition-first step arrives with
+    // the IME phase.
+    ffi::set_key_gate(Box::new({
+        let runtime = Rc::clone(&runtime);
+        let root = Rc::clone(&root);
+        let blit = blit.clone();
+        move |stroke: &ffi::KeyStroke| {
+            if stroke.types_text {
+                return false;
+            }
+            let Some(pattern) = key_pattern(stroke) else {
+                return false;
+            };
+            if runtime.focused().is_some() && pattern.is_text_input() {
+                return false;
+            }
+            // a focused escape hatch owns its strokes: an editor's
+            // arrows, Enter and Tab are its own, and a copy hands the
+            // text back for the clipboard
+            let taken = runtime.key_stroke(&pattern);
+            if taken.handled {
+                if let Some(text) = taken.text {
+                    ffi::clipboard_write(&text);
+                }
+                blit(&runtime, &*root);
+                return true;
+            }
+            let Some(action) = runtime.match_key(&pattern) else {
+                return false;
+            };
+            if runtime.dispatch_action(action) {
+                blit(&runtime, &*root);
+                true
+            } else {
+                false
+            }
+        }
+    }));
+
     let handler_runtime = Rc::clone(&runtime);
     let handler_root = Rc::clone(&root);
     let handler_present = Rc::clone(&present);
@@ -126,7 +213,7 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
         let runtime = &handler_runtime;
         let root = &*handler_root;
         match event {
-            AppEvent::Redraw => blit(runtime, root),
+            AppEvent::Redraw | AppEvent::Wake => blit(runtime, root),
             AppEvent::ResignKey => {
                 // the user switched away: popovers close like the
                 // platform's own
@@ -161,6 +248,56 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
                     blit(runtime, root);
                 }
             }
+            AppEvent::Text(text) => {
+                // typing, paste of characters, and one day the IME
+                // commit — the same road for all of them
+                if !text.is_empty() && runtime.key(EditCommand::Insert(text)).applied {
+                    blit(runtime, root);
+                }
+            }
+            AppEvent::Key { vk, shift, command } => {
+                let edit = match vk {
+                    0x08 => Some(EditCommand::Backspace),
+                    0x2E => Some(EditCommand::Delete),
+                    0x25 => Some(EditCommand::Left(shift)),
+                    0x27 => Some(EditCommand::Right(shift)),
+                    0x24 => Some(EditCommand::Home(shift)),
+                    0x23 => Some(EditCommand::End(shift)),
+                    0x1B => {
+                        // esc releases focus
+                        if runtime.blur() {
+                            blit(runtime, root);
+                        }
+                        None
+                    }
+                    0x41 if command => Some(EditCommand::SelectAll), // Ctrl+A
+                    0x43 if command => {
+                        // Ctrl+C — the field's output goes to the system
+                        if let Some(text) = runtime.key(EditCommand::Copy).output {
+                            ffi::clipboard_write(&text);
+                        }
+                        None
+                    }
+                    0x58 if command => {
+                        // Ctrl+X
+                        let cut = runtime.key(EditCommand::Cut);
+                        if let Some(text) = &cut.output {
+                            ffi::clipboard_write(text);
+                        }
+                        if cut.output.is_some() {
+                            blit(runtime, root);
+                        }
+                        None
+                    }
+                    0x56 if command => ffi::clipboard_read().map(EditCommand::Insert), // Ctrl+V
+                    _ => None,
+                };
+                if let Some(edit) = edit
+                    && runtime.key(edit).applied
+                {
+                    blit(runtime, root);
+                }
+            }
             AppEvent::Blink => {
                 // an idle caret blinks; without focus the tick is
                 // silence — and the same slow clock ages the tooltip's
@@ -190,4 +327,69 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
     ffi::dispatch(AppEvent::Redraw);
     ffi::show_window(window);
     ffi::run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stroke(vk: u32, base: &str, shift: bool, control: bool, alt: bool) -> ffi::KeyStroke {
+        ffi::KeyStroke {
+            vk,
+            shift,
+            control,
+            alt,
+            chars_ignoring: base.to_string(),
+            types_text: false,
+        }
+    }
+
+    #[test]
+    fn named_keys_map_to_the_vocabulary() {
+        let pattern = key_pattern(&stroke(0x28, "", false, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::Down);
+        let pattern = key_pattern(&stroke(0x0D, "\r", false, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::Enter);
+        let pattern = key_pattern(&stroke(0x1B, "\u{1b}", false, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::Escape);
+    }
+
+    #[test]
+    fn ctrl_carries_command_the_accelerator() {
+        let pattern = key_pattern(&stroke(0x46, "f", false, true, false)).unwrap();
+        assert_eq!(pattern.key, Key::Char('f'));
+        assert!(pattern.command, "Ctrl is the accelerator");
+        assert!(!pattern.control, "the control flag stays with the system");
+        assert!(!pattern.is_text_input(), "a chord is never typing");
+    }
+
+    #[test]
+    fn a_bare_letter_is_text_input() {
+        let pattern = key_pattern(&stroke(0x41, "a", false, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::Char('a'));
+        assert!(pattern.is_text_input());
+    }
+
+    #[test]
+    fn shift_tab_matches_exactly() {
+        let pattern = key_pattern(&stroke(0x09, "\t", true, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::Tab);
+        assert!(pattern.shift);
+        assert!(!pattern.command && !pattern.option);
+    }
+
+    #[test]
+    fn a_lone_modifier_is_no_pattern() {
+        // VK_SHIFT alone: no named key, no base char
+        assert!(key_pattern(&stroke(0x10, "", true, false, false)).is_none());
+        // a control character as the base is not a Char either
+        assert!(key_pattern(&stroke(0x73, "", false, false, false)).is_none(), "F4 is silent");
+    }
+
+    #[test]
+    fn the_base_char_lowers_and_alt_rides_as_option() {
+        let pattern = key_pattern(&stroke(0x41, "A", true, false, true)).unwrap();
+        assert_eq!(pattern.key, Key::Char('a'), "shift does not change the key's identity");
+        assert!(pattern.option, "Alt rides as option");
+    }
 }

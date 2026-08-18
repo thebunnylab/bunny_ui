@@ -102,6 +102,21 @@ struct TrackMouseEventArgs {
 
 #[link(name = "user32", kind = "raw-dylib")]
 unsafe extern "system" {
+    fn GetKeyState(vk: i32) -> i16;
+    fn GetKeyboardState(state: *mut u8) -> i32;
+    fn ToUnicode(
+        vk: u32,
+        scan_code: u32,
+        state: *const u8,
+        buffer: *mut u16,
+        buffer_len: i32,
+        flags: u32,
+    ) -> i32;
+    fn OpenClipboard(hwnd: Hwnd) -> i32;
+    fn CloseClipboard() -> i32;
+    fn EmptyClipboard() -> i32;
+    fn GetClipboardData(format: u32) -> Handle;
+    fn SetClipboardData(format: u32, data: Handle) -> Handle;
     fn RegisterClassW(class: *const WndClassW) -> u16;
     fn CreateWindowExW(
         ex_style: u32,
@@ -206,6 +221,11 @@ unsafe extern "system" {
     fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
     fn QueryPerformanceCounter(count: *mut i64) -> i32;
     fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
+    fn GlobalAlloc(flags: u32, bytes: usize) -> Handle;
+    fn GlobalLock(handle: Handle) -> *mut c_void;
+    fn GlobalUnlock(handle: Handle) -> i32;
+    fn GlobalFree(handle: Handle) -> Handle;
+    fn Sleep(milliseconds: u32);
 }
 
 #[link(name = "dwmapi", kind = "raw-dylib")]
@@ -231,6 +251,11 @@ const WM_CLOSE: u32 = 0x0010;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_SETCURSOR: u32 = 0x0020;
 const WM_TIMER: u32 = 0x0113;
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_CHAR: u32 = 0x0102;
+const WM_SYSKEYDOWN: u32 = 0x0104;
+const WM_SYSCHAR: u32 = 0x0106;
+const WM_UNICHAR: u32 = 0x0109;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
@@ -241,6 +266,15 @@ const WM_EXITSIZEMOVE: u32 = 0x0232;
 const WM_DPICHANGED: u32 = 0x02E0;
 /// One frame-driver tick landed (posted by the driver thread).
 const WM_APP_FRAME: u32 = 0x8000 + 1;
+/// A task woke from another thread (posted by the wake hook).
+const WM_APP_WAKE: u32 = 0x8000 + 2;
+// virtual keys the shell reads directly
+const VK_SHIFT: i32 = 0x10;
+const VK_CONTROL: i32 = 0x11;
+const VK_MENU: i32 = 0x12;
+// clipboard
+const CF_UNICODETEXT: u32 = 13;
+const GMEM_MOVEABLE: u32 = 2;
 // WM_SIZE minimized
 const SIZE_MINIMIZED: usize = 1;
 // WM_ACTIVATE inactive
@@ -374,6 +408,13 @@ pub enum AppEvent {
     /// The pointer left the window — without this event the hover would
     /// stay stuck at the edge (the reason for TrackMouseEvent).
     MouseExited,
+    /// RAW editing key — only arrives when the keymap gate declined:
+    /// movement, deletion, and the Ctrl chords over a focused field.
+    /// `command` carries Ctrl, the platform's accelerator.
+    Key { vk: u32, shift: bool, command: bool },
+    /// The text road: typing, a paste of characters, `WM_CHAR` whole —
+    /// surrogate halves already joined at the boundary.
+    Text(String),
     /// Half-period of the caret blink (the shell's timer).
     Blink,
     /// One frame-driver tick: compose the next animated frame. `dt` is
@@ -384,6 +425,177 @@ pub enum AppEvent {
     /// The window deactivated (the user switched apps or windows) —
     /// open popovers close, the platform's own manner.
     ResignKey,
+    /// A task woke from somewhere else — a worker thread finished a
+    /// step. The frame the shell already knows how to draw drains the
+    /// queue on its way.
+    Wake,
+}
+
+// MARK: - Keyboard
+
+/// One key press, read at the boundary: the virtual key, the live
+/// modifiers, and the BASE character the key would type with a clean
+/// keyboard state — the `charactersIgnoringModifiers` twin, so `Char`
+/// patterns match independent of shift. `types_text` is the AltGr
+/// verdict: Ctrl+Alt that produces a character IS text on this
+/// platform, and the gate must let it through to the character road.
+pub struct KeyStroke {
+    pub vk: u32,
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+    pub chars_ignoring: String,
+    pub types_text: bool,
+}
+
+thread_local! {
+    static KEY_GATE: RefCell<Option<Box<dyn FnMut(&KeyStroke) -> bool>>> =
+        const { RefCell::new(None) };
+}
+
+/// Installs the keymap's first refusal. Returning `true` consumes the
+/// stroke whole — no character is ever born from it, because the pump
+/// only translates what the gate declined.
+pub fn set_key_gate(gate: Box<dyn FnMut(&KeyStroke) -> bool>) {
+    KEY_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+/// The base character a key would type with NO modifiers held. The
+/// no-mutation flag keeps the kernel's dead-key state untouched; a
+/// dead key answers nothing and can never be a `Char` binding — its
+/// composed text arrives later through the character road.
+fn base_char(vk: u32, scan_code: u32) -> String {
+    const DONT_CHANGE_STATE: u32 = 0x4;
+    let clean = [0u8; 256];
+    let mut buffer = [0u16; 8];
+    let count = unsafe {
+        ToUnicode(vk, scan_code, clean.as_ptr(), buffer.as_mut_ptr(), 8, DONT_CHANGE_STATE)
+    };
+    if count <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buffer[..count as usize])
+}
+
+/// Builds the stroke for one `WM_KEYDOWN`/`WM_SYSKEYDOWN`.
+fn key_stroke_of(wparam: usize, lparam: isize) -> KeyStroke {
+    let vk = wparam as u32;
+    let scan_code = ((lparam >> 16) & 0x1FF) as u32;
+    let shift = unsafe { GetKeyState(VK_SHIFT) } as u16 & 0x8000 != 0;
+    let control = unsafe { GetKeyState(VK_CONTROL) } as u16 & 0x8000 != 0;
+    let alt = unsafe { GetKeyState(VK_MENU) } as u16 & 0x8000 != 0;
+    // the AltGr verdict needs the REAL state: does this chord type?
+    let types_text = control && alt && {
+        const DONT_CHANGE_STATE: u32 = 0x4;
+        let mut state = [0u8; 256];
+        let mut buffer = [0u16; 8];
+        unsafe {
+            GetKeyboardState(state.as_mut_ptr());
+            ToUnicode(vk, scan_code, state.as_ptr(), buffer.as_mut_ptr(), 8, DONT_CHANGE_STATE)
+                > 0
+                && buffer[0] >= 0x20
+        }
+    };
+    KeyStroke { vk, shift, control, alt, chars_ignoring: base_char(vk, scan_code), types_text }
+}
+
+// MARK: - Clipboard
+
+/// The clipboard contends with managers on real machines: a short
+/// bounded retry, then give up in silence — an unbounded wait could
+/// hang the interface for a copy.
+fn open_clipboard_patiently() -> bool {
+    for attempt in 0..4 {
+        if unsafe { OpenClipboard(0) } != 0 {
+            return true;
+        }
+        if attempt < 3 {
+            unsafe {
+                Sleep(3);
+            }
+        }
+    }
+    false
+}
+
+/// Writes text to the system clipboard. On success the system owns
+/// the handle; it is freed only when the hand-off failed.
+pub fn clipboard_write(text: &str) {
+    if !open_clipboard_patiently() {
+        return;
+    }
+    unsafe {
+        EmptyClipboard();
+        let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes = utf16.len() * 2;
+        let handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if handle != 0 {
+            let memory = GlobalLock(handle);
+            if !memory.is_null() {
+                std::ptr::copy_nonoverlapping(utf16.as_ptr(), memory as *mut u16, utf16.len());
+                GlobalUnlock(handle);
+                if SetClipboardData(CF_UNICODETEXT, handle) == 0 {
+                    GlobalFree(handle);
+                }
+            } else {
+                GlobalFree(handle);
+            }
+        }
+        CloseClipboard();
+    }
+}
+
+/// Reads text from the system clipboard, to the first NUL.
+pub fn clipboard_read() -> Option<String> {
+    if !open_clipboard_patiently() {
+        return None;
+    }
+    let text = unsafe {
+        let handle = GetClipboardData(CF_UNICODETEXT);
+        if handle == 0 {
+            None
+        } else {
+            let memory = GlobalLock(handle) as *const u16;
+            if memory.is_null() {
+                None
+            } else {
+                let mut length = 0usize;
+                while *memory.add(length) != 0 {
+                    length += 1;
+                }
+                let text =
+                    String::from_utf16_lossy(std::slice::from_raw_parts(memory, length));
+                GlobalUnlock(handle);
+                Some(text)
+            }
+        }
+    };
+    unsafe {
+        CloseClipboard();
+    }
+    text
+}
+
+// MARK: - Cross-thread wake
+
+/// The main window every cross-thread knock lands on. An atomic (not
+/// a thread-local) because the signal comes from ANY thread —
+/// `PostMessageW` is the thread-safe half of the pump.
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// The wake hook for `Runtime::set_wake_hook`: a worker thread asks
+/// the pump for one more turn. Posted messages coalesce naturally in
+/// the queue; a signal raised during a frame lands on the next turn.
+pub fn wake_from_any_thread() {
+    post_wake_to(MAIN_HWND.load(Ordering::Acquire));
+}
+
+fn post_wake_to(hwnd: Hwnd) {
+    if hwnd != 0 {
+        unsafe {
+            PostMessageW(hwnd, WM_APP_WAKE, 0, 0);
+        }
+    }
 }
 
 thread_local! {
@@ -872,6 +1084,60 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             dispatch(AppEvent::RightMouseDown { x, y });
             0
         }
+        WM_KEYDOWN => {
+            // the gate already declined this stroke in the pump — what
+            // arrives here is the editing vocabulary and the Ctrl chords
+            let shift = unsafe { GetKeyState(VK_SHIFT) } as u16 & 0x8000 != 0;
+            let control = unsafe { GetKeyState(VK_CONTROL) } as u16 & 0x8000 != 0;
+            dispatch(AppEvent::Key { vk: wparam as u32, shift, command: control });
+            0
+        }
+        WM_CHAR => {
+            thread_local! {
+                /// The high half of a surrogate pair waits for its twin.
+                static PENDING_HIGH: Cell<Option<u16>> = const { Cell::new(None) };
+            }
+            let unit = wparam as u16;
+            match unit {
+                0xD800..=0xDBFF => {
+                    PENDING_HIGH.with(|cell| cell.set(Some(unit)));
+                }
+                0xDC00..=0xDFFF => {
+                    if let Some(high) = PENDING_HIGH.with(|cell| cell.take()) {
+                        let text = String::from_utf16_lossy(&[high, unit]);
+                        dispatch(AppEvent::Text(text));
+                    }
+                    // a lone low half drops — it spells nothing
+                }
+                _ => {
+                    PENDING_HIGH.with(|cell| cell.take());
+                    // control characters take the Key road, never this one
+                    if unit >= 0x20 && unit != 0x7F {
+                        dispatch(AppEvent::Text(
+                            char::from_u32(unit as u32).map(String::from).unwrap_or_default(),
+                        ));
+                    }
+                }
+            }
+            0
+        }
+        WM_UNICHAR => {
+            const UNICODE_NOCHAR: usize = 0xFFFF;
+            if wparam == UNICODE_NOCHAR {
+                // the probe: answer that the road exists
+                return 1;
+            }
+            if let Some(text) = char::from_u32(wparam as u32) {
+                if !text.is_control() {
+                    dispatch(AppEvent::Text(text.to_string()));
+                }
+            }
+            0
+        }
+        WM_SYSCHAR => {
+            // no menu bar to ring: a consumed Alt chord stays silent
+            0
+        }
         WM_TIMER => {
             if wparam == TIMER_BLINK {
                 dispatch(AppEvent::Blink);
@@ -890,6 +1156,10 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             driver().in_flight.store(false, Ordering::Release);
             let dt = frame_dt();
             dispatch(AppEvent::Frame { dt });
+            0
+        }
+        WM_APP_WAKE => {
+            dispatch(AppEvent::Wake);
             0
         }
         WM_ENTERSIZEMOVE => {
@@ -1040,6 +1310,7 @@ pub fn create_window(title: &str, width: f64, height: f64, _scene_chrome: bool) 
     }
     refresh_metrics(hwnd);
     driver().hwnd.store(hwnd, Ordering::Release);
+    MAIN_HWND.store(hwnd, Ordering::Release);
     WindowHandle { hwnd }
 }
 
@@ -1051,7 +1322,13 @@ pub fn show_window(window: WindowHandle) {
     }
 }
 
-/// Runs the message pump until the last window closes.
+/// Runs the message pump until the last window closes. The pump owns
+/// the keymap's first refusal: a key the gate consumes is never
+/// translated, so no character is ever born from it — the
+/// consumed-flag bug cannot exist by construction. `WM_SYSKEYDOWN`
+/// passes the gate too (every Alt chord is a system key), and the
+/// declined ones still reach `DefWindowProc` for the platform's own
+/// chords (Alt+F4 closes).
 pub fn run() {
     let mut msg = Msg {
         hwnd: 0,
@@ -1063,8 +1340,16 @@ pub fn run() {
     };
     unsafe {
         while GetMessageW(&mut msg, 0, 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            let gated = (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) && {
+                let stroke = key_stroke_of(msg.wparam, msg.lparam);
+                KEY_GATE.with(|slot| {
+                    slot.borrow_mut().as_mut().is_some_and(|gate| gate(&stroke))
+                })
+            };
+            if !gated {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
     }
 }
@@ -1209,6 +1494,43 @@ mod tests {
         assert!(window.scale() >= 1);
         unsafe {
             DestroyWindow(window.hwnd);
+        }
+    }
+
+    #[test]
+    fn the_clipboard_round_trips_and_gives_back() {
+        // this is a dev machine: save what the user had, restore after
+        let before = clipboard_read();
+        clipboard_write("bunny raro \u{1F407}");
+        assert_eq!(clipboard_read().as_deref(), Some("bunny raro \u{1F407}"));
+        if let Some(previous) = before {
+            clipboard_write(&previous);
+        }
+    }
+
+    #[test]
+    fn a_wake_crosses_threads_into_the_pump() {
+        let window = create_window("bunny wake", 80.0, 60.0, false);
+        let hwnd = window.hwnd;
+        let handle = std::thread::spawn(move || {
+            // the thread-safe half of the pump, from another thread
+            post_wake_to(hwnd);
+        });
+        handle.join().expect("the poster returns");
+        // one blocking read: the posted message IS the next message
+        let mut msg = Msg {
+            hwnd: 0,
+            message: 0,
+            wparam: 0,
+            lparam: 0,
+            time: 0,
+            pt: Point::default(),
+        };
+        let got = unsafe { GetMessageW(&mut msg, hwnd, WM_APP_WAKE, WM_APP_WAKE) };
+        assert!(got > 0, "the pump observed a message");
+        assert_eq!(msg.message, WM_APP_WAKE);
+        unsafe {
+            DestroyWindow(hwnd);
         }
     }
 
