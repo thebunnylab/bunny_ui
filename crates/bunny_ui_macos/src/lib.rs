@@ -26,8 +26,10 @@ pub use metal::OffscreenGpu;
 pub use text::CoreTextEngine;
 
 /// AppKit keyCode → the keymap vocabulary. Named keys come from the
-/// virtual-key table; the rest becomes `Char` through the base char
-/// (ignoring modifiers), lowercased. `None` = lone modifier/function key.
+/// virtual-key table; the rest becomes `Char` through the key's OWN
+/// character — what it types with no modifier applied, read from the
+/// user's layout — lowercased, because CapsLock is never a chord.
+/// `None` = lone modifier/function key.
 fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
     let named = match stroke.code {
         125 => Some(Key::Down),

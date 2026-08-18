@@ -245,7 +245,7 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 }
             }
             Event::KeyChar(character, mods) => {
-                if stroke(&runtime, pattern(bunny_ui::action::Key::Char(character), mods)) {
+                if stroke(&runtime, pattern(bunny_ui::action::Key::Char(character.to_ascii_lowercase()), mods)) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
@@ -390,7 +390,7 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
                 }
             }
             Event::KeyChar(character, mods) => {
-                if stroke(&runtime, pattern(bunny_ui::action::Key::Char(character), mods)) {
+                if stroke(&runtime, pattern(bunny_ui::action::Key::Char(character.to_ascii_lowercase()), mods)) {
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }

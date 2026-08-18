@@ -688,10 +688,16 @@ extern "C" fn bunny_do_command(_this: Id, _sel: Sel, command: Sel) {
 unsafe fn bare_characters(event: Id) -> String {
     unsafe {
         let selector = sel("charactersByApplyingModifiers:");
+        let fallback = || text_argument_to_string(msg_id(event, sel("charactersIgnoringModifiers")));
         if msg_bool_sel(class("NSEvent"), sel("instancesRespondToSelector:"), selector) == 0 {
-            return text_argument_to_string(msg_id(event, sel("charactersIgnoringModifiers")));
+            return fallback();
         }
-        text_argument_to_string(msg_id_u64(event, selector, 0))
+        let bare = text_argument_to_string(msg_id_u64(event, selector, 0));
+        // a dead key, a keypad key or a non-printing one can answer with
+        // nothing at all — then the shift-applied read is still better
+        // than no character, and the named-key table has already had
+        // its turn anyway
+        if bare.is_empty() { fallback() } else { bare }
     }
 }
 
