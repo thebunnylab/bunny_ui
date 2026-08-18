@@ -267,6 +267,12 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
       const [x, y] = point(event);
       wasm.bunny_pointer_down(x, y);
     });
+    canvas.addEventListener("contextmenu", (event) => {
+      // the scene offers its own menu — the browser's stays home
+      event.preventDefault();
+      const [x, y] = point(event);
+      wasm.bunny_context_click(x, y);
+    });
     canvas.addEventListener("pointerup", (event) => {
       const [x, y] = point(event);
       wasm.bunny_pointer_up(x, y);

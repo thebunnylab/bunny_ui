@@ -133,6 +133,11 @@ pub struct Runtime {
     last_overlays: RefCell<Vec<OverlayPlacement>>,
     /// The `.tooltip(…)` regions of the last layout, in paint order.
     last_tooltips: RefCell<Vec<crate::layout::TooltipRegion>>,
+    /// The `.context_menu(…)` regions of the last layout.
+    last_menus: RefCell<Vec<crate::layout::MenuRegion>>,
+    /// The open menu's ACTIONS, by row index — the stamp carries only
+    /// the labels; the closures stay here and fire on the pick.
+    menu_items: RefCell<Option<std::rc::Rc<[crate::views::MenuItem]>>>,
     /// The tooltip's whole life — the runtime owns it, the scene only
     /// declares. CLOCKLESS: the delay is the shell's tick seen twice,
     /// so no Instant crosses into wasm and the tests drive it by hand.
@@ -225,8 +230,8 @@ impl Runtime {
         for path in paths {
             closed |= reconciler::run_action(&format!("{path}/#dismiss"));
         }
-        // the app switched away: the explanation goes with it
-        closed | self.clear_tooltip()
+        // the app switched away: the explanation and the menu go too
+        closed | self.clear_tooltip() | self.close_menu()
     }
 
     /// One beat of the shell's slow clock (the caret-blink timer, a
@@ -265,6 +270,62 @@ impl Runtime {
         life.aged = false;
         drop(life);
         self.interaction.borrow_mut().tooltip.take().is_some()
+    }
+
+    /// A right press (a two-finger tap, a long press): the topmost
+    /// `.context_menu(…)` region under it opens its items at the
+    /// pointer. A press outside every region closes whatever is open.
+    /// `true` = repaint.
+    pub fn context_click(&self, x: Px, y: Px) -> bool {
+        let was_open = self.close_menu();
+        let cleared = self.clear_tooltip();
+        let region = self
+            .last_menus
+            .borrow()
+            .iter()
+            .rev()
+            .find(|region| region.rect.contains(x, y))
+            .cloned();
+        let Some(region) = region else {
+            return was_open || cleared;
+        };
+        let entries: Vec<Option<std::sync::Arc<str>>> = region
+            .items
+            .iter()
+            .map(|item| match item {
+                crate::views::MenuItem::Action { label, .. } => Some(label.clone()),
+                crate::views::MenuItem::Divider => None,
+            })
+            .collect();
+        *self.menu_items.borrow_mut() = Some(region.items);
+        self.interaction.borrow_mut().menu = Some(crate::layout::MenuOpen {
+            at: Point { x, y },
+            entries,
+            hovered: None,
+        });
+        true
+    }
+
+    /// Closes the open menu without firing anything. `true` = one was
+    /// open — repaint.
+    fn close_menu(&self) -> bool {
+        self.menu_items.borrow_mut().take();
+        self.interaction.borrow_mut().menu.take().is_some()
+    }
+
+    /// The row under a point of the OPEN menu — the same walk the
+    /// panel painted, shared in the layout module.
+    fn menu_row_at(&self, x: Px, y: Px) -> Option<(Option<usize>, bool)> {
+        let interaction = self.interaction.borrow();
+        let open = interaction.menu.as_ref()?;
+        let frame = self
+            .last_overlays
+            .borrow()
+            .iter()
+            .find(|overlay| overlay.path == crate::layout::MENU_PATH)
+            .map(|overlay| overlay.frame)?;
+        let inside = frame.contains(x, y);
+        Some((crate::layout::menu_row_at(frame, &open.entries, x, y), inside))
     }
 
     /// The topmost tooltip region under the pointer — paint order, so
@@ -354,6 +415,8 @@ impl Runtime {
             last_proposal: Cell::new(None),
             last_overlays: RefCell::new(Vec::new()),
             last_tooltips: RefCell::new(Vec::new()),
+            last_menus: RefCell::new(Vec::new()),
+            menu_items: RefCell::new(None),
             tooltip: RefCell::new(TooltipLife::default()),
             last_drag_regions: RefCell::new(Vec::new()),
             overlay_bounds: Cell::new(None),
@@ -492,6 +555,11 @@ impl Runtime {
             self.interaction.borrow_mut().element_grab = None;
             return false;
         }
+        // an open menu sits above the scene: a move inside it moves
+        // the row highlight and nothing underneath hears a thing
+        if let Some(repaint) = self.note_menu_hover(x, y) {
+            return repaint;
+        }
         let target = self.hover_target(x, y);
         let mut interaction = self.interaction.borrow_mut();
         let hovered = match &interaction.pressed {
@@ -517,6 +585,26 @@ impl Runtime {
         // never touches it — a region explains, it does not intercept
         let explained = self.note_tooltip_hover(x, y);
         changed || used || explained
+    }
+
+    /// The pointer over an OPEN menu: the row under it highlights and
+    /// the scene's own hover goes quiet — the panel is above it all.
+    /// `Some(repaint)` when the menu swallowed the move.
+    fn note_menu_hover(&self, x: Px, y: Px) -> Option<bool> {
+        let (row, inside) = self.menu_row_at(x, y)?;
+        let mut interaction = self.interaction.borrow_mut();
+        let open = interaction.menu.as_mut()?;
+        if !inside {
+            // outside the panel the scene hovers as ever (macOS keeps
+            // the menu up until a press) — only the row quiets
+            let changed = open.hovered.take().is_some();
+            return if changed { Some(true) } else { None };
+        }
+        let changed = open.hovered != row;
+        open.hovered = row;
+        let hovered_scene = interaction.hovered.take().is_some();
+        interaction.pointer = Some(Point { x, y });
+        Some(changed || hovered_scene)
     }
 
     /// One divider move: clamp the pointer into the split's lane range
@@ -614,6 +702,11 @@ impl Runtime {
     /// platform's clipboard; `handled: false` sends the stroke on to
     /// the app's bindings.
     pub fn key_stroke(&self, pattern: &KeyPattern) -> crate::custom::Response {
+        // an open menu takes Escape before anyone — its owner is the
+        // runtime, so no reconciler handler could
+        if *pattern == KeyPattern::key(crate::action::Key::Escape) && self.close_menu() {
+            return crate::custom::Response::handled();
+        }
         let Some(placement) = self.focused_custom() else {
             return crate::custom::Response::ignored();
         };
@@ -629,6 +722,29 @@ impl Runtime {
     /// action fires here (up-inside is button semantics). `true` =
     /// repaint.
     pub fn pointer_pressed(&self, x: Px, y: Px) -> bool {
+        // an open menu owns the press whole: a row fires ON THE DOWN
+        // (menu semantics, not button semantics) and a press outside
+        // closes and consumes — AppKit's own manners
+        if self.interaction.borrow().menu.is_some() {
+            let picked = self.menu_row_at(x, y).and_then(|(row, _)| row);
+            let action = picked.and_then(|index| {
+                self.menu_items.borrow().as_ref().and_then(|items| {
+                    match items.get(index) {
+                        Some(crate::views::MenuItem::Action { action, .. }) => {
+                            Some(action.clone())
+                        }
+                        _ => None,
+                    }
+                })
+            });
+            self.close_menu();
+            if let Some(action) = action {
+                // outside the borrows: the action writes state and the
+                // next layout sees a world without the menu
+                action();
+            }
+            return true;
+        }
         // a press ends any explanation, and never the other way round:
         // the tooltip is not a popover — it cannot eat a click
         let explained = self.clear_tooltip();
@@ -777,8 +893,9 @@ impl Runtime {
     /// (the shell repaints; no render: zero bodies).
     pub fn wheel(&self, x: Px, y: Px, dx: Px, dy: Px) -> bool {
         // the content is about to slide under a still pointer — the
-        // explanation dies rather than pointing at the wrong row
-        let explained = self.clear_tooltip();
+        // explanation dies and so does the menu, rather than pointing
+        // at the wrong row
+        let explained = self.clear_tooltip() | self.close_menu();
         let _ = explained; // folded into the returns below
         // the app's box gets the turn first: an editor scrolls itself.
         // What it ignores falls through to the region around it.
@@ -1637,6 +1754,7 @@ impl Runtime {
         *self.last_customs.borrow_mut() = result.customs.clone();
         *self.last_overlays.borrow_mut() = result.overlays.clone();
         *self.last_tooltips.borrow_mut() = result.tooltips.clone();
+        *self.last_menus.borrow_mut() = result.menus.clone();
         *self.last_drag_regions.borrow_mut() = result.drag_regions.clone();
         // an applied-target memory whose region left the scene goes
         // with it — live regions keep theirs (the wheel stays sovereign)

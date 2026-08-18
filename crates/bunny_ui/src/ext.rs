@@ -325,6 +325,24 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified { base: self, modifier: Modifier::Tooltip(text.into(), side) }
     }
 
+    /// `.context_menu(…)` — a right press (a two-finger tap, a long
+    /// press) inside this view offers these items at the pointer. The
+    /// runtime owns the menu: it opens, highlights, fires the picked
+    /// action and closes through the same doors a popover has — and on
+    /// the desktop the panel can leave the window.
+    ///
+    /// ```ignore
+    /// row.context_menu(vec![
+    ///     menu_item("Open", move || open(id)),
+    ///     menu_item("Rename…", move || rename(id)),
+    ///     menu_divider(),
+    ///     menu_item("Delete", move || delete(id)),
+    /// ])
+    /// ```
+    fn context_menu(self, items: Vec<crate::views::MenuItem>) -> Modified<Self> {
+        Modified { base: self, modifier: Modifier::ContextMenu(items.into()) }
+    }
+
     /// `.clipped()` — the subtree cannot paint outside this box, and
     /// the cut FOLLOWS `.corner_radius(…)` when there is one (a plain
     /// rectangle without it). The island that finally holds its

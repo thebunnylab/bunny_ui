@@ -202,7 +202,19 @@ impl Component for Finder {
                         } else {
                             selected.set(row);
                         }
-                    });
+                    })
+                    // the right press offers the row's own menu — the
+                    // runtime opens it at the pointer and closes it
+                    // through the popover's doors
+                    .context_menu(vec![
+                        menu_item("Open", move || {
+                            selected.set(row);
+                            details.set(true);
+                        }),
+                        menu_item("Select", move || selected.set(row)),
+                        menu_divider(),
+                        menu_item("Deselect", move || selected.set(0)),
+                    ]);
                     if on {
                         let name = name.clone();
                         let dir = dir.clone();

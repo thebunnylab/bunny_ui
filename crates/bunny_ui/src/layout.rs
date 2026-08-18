@@ -418,6 +418,11 @@ pub enum LayoutNode {
     /// itself rides the overlay machinery, so on the desktop it leaves
     /// the window like a popover does.
     Tooltip { text: Arc<str>, side: Side, child: Box<LayoutNode> },
+    /// `.context_menu(…)`: a right press inside the child offers these
+    /// items at the pointer. The RUNTIME owns the open menu (macOS has
+    /// no app state for menus and neither do we); the panel rides the
+    /// overlay machinery and leaves the window on the desktop.
+    ContextSource { items: std::rc::Rc<[crate::views::MenuItem]>, child: Box<LayoutNode> },
     /// The escape hatch (`custom(…)` / `canvas(…)`): a box the APP
     /// measures and paints, in the same command vocabulary the built-ins
     /// emit. `path` is its identity — the address of the events it
@@ -813,6 +818,8 @@ pub struct Interaction {
     /// layout like everything here (the delay is the shell's clock,
     /// never the scene's). The placement turns it into an overlay.
     pub tooltip: Option<(Arc<str>, Side, Rect)>,
+    /// The open context menu — the runtime's, resolved before layout.
+    pub menu: Option<MenuOpen>,
 }
 
 /// A draw command — the output of the placement pass, in paint order
@@ -991,6 +998,26 @@ pub struct TooltipRegion {
     pub rect: Rect,
 }
 
+/// One `.context_menu(…)` region of the placed scene — the items a
+/// right press inside `rect` offers.
+#[derive(Clone, Debug)]
+pub struct MenuRegion {
+    pub items: std::rc::Rc<[crate::views::MenuItem]>,
+    pub rect: Rect,
+}
+
+/// The open context menu as the STAMP carries it — data only, the
+/// actions stay with the runtime and fire by index.
+#[derive(Clone, PartialEq, Debug)]
+pub struct MenuOpen {
+    /// Where the right press landed — the panel hangs off this point.
+    pub at: Point,
+    /// The labels in order; `None` is a divider.
+    pub entries: Vec<Option<Arc<str>>>,
+    /// The row under the pointer — the runtime's, never CSS.
+    pub hovered: Option<usize>,
+}
+
 /// An overlay waiting for the deferred pass (the anchor placed, the
 /// popover not yet).
 #[derive(Debug)]
@@ -1082,6 +1109,9 @@ pub struct Placement {
     /// runtime's hover consults. Never a hit: a tooltip explains,
     /// it does not intercept.
     pub tooltips: Vec<TooltipRegion>,
+    /// Context-menu regions in paint order (last = topmost) — what a
+    /// right press consults.
+    pub menus: Vec<MenuRegion>,
     /// The Dom capture, when that mode is on ([`layout_dom`]) — the
     /// placement braços feed it the SEMANTIC scene while they walk.
     /// `None` costs one branch per hook and nothing else.
@@ -1204,6 +1234,9 @@ pub struct LayoutResult {
     /// runtime's hover consults. Never a hit: a tooltip explains,
     /// it does not intercept.
     pub tooltips: Vec<TooltipRegion>,
+    /// Context-menu regions in paint order (last = topmost) — what a
+    /// right press consults.
+    pub menus: Vec<MenuRegion>,
 }
 
 /// Runs both phases from the root with the default environment — the
@@ -1259,6 +1292,7 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         overlays: out.overlays,
         drag_regions: out.drag_regions,
         tooltips: out.tooltips,
+        menus: out.menus,
     }
 }
 
@@ -1295,6 +1329,7 @@ pub fn layout_dom(
             overlays: out.overlays,
             drag_regions: out.drag_regions,
             tooltips: out.tooltips,
+            menus: out.menus,
         },
         scene,
     )
@@ -1452,6 +1487,174 @@ fn anchored_frame(anchor: Rect, side: Side, size: Size, container: Rect) -> Rect
 /// never eats a click, hover-out is its whole life).
 pub const TOOLTIP_PATH: &str = "bunny.tooltip";
 
+/// The context menu's overlay path — pooled like a popover's panel,
+/// but the RUNTIME owns its doors, not the reconciler.
+pub const MENU_PATH: &str = "bunny.menu";
+
+/// The menu's shared geometry — the builder below and the runtime's
+/// row mapping must walk the SAME numbers, so they live in one place.
+pub(crate) const MENU_ROW_H: Px = 24.0;
+pub(crate) const MENU_DIVIDER_H: Px = 9.0;
+pub(crate) const MENU_PAD_V: Px = 5.0;
+pub(crate) const MENU_PAD_H: Px = 10.0;
+pub(crate) const MENU_MIN_W: Px = 160.0;
+
+/// The row index under a point inside an open menu's frame — `None`
+/// on padding, a divider, or outside. The runtime maps a press or a
+/// move through this; the panel painted THESE rows, so the two agree.
+pub(crate) fn menu_row_at(
+    frame: Rect,
+    entries: &[Option<Arc<str>>],
+    x: Px,
+    y: Px,
+) -> Option<usize> {
+    if !frame.contains(x, y) {
+        return None;
+    }
+    let mut top = frame.origin.y + MENU_PAD_V;
+    for (index, entry) in entries.iter().enumerate() {
+        let height = if entry.is_some() { MENU_ROW_H } else { MENU_DIVIDER_H };
+        if y >= top && y < top + height {
+            return entry.as_ref().map(|_| index);
+        }
+        top += height;
+    }
+    None
+}
+
+/// The menu panel: a themed card of rows. The hovered row is the
+/// STAMP's (the runtime tracks it, so the pixel modes highlight), and
+/// each row also declares its CSS hover — the element mode gets the
+/// same highlight with zero patches, its own way.
+fn menu_node(open: &MenuOpen, env: LayoutEnv) -> LayoutNode {
+    let theme = crate::theme::current();
+    let mut rows: Vec<LayoutNode> = Vec::with_capacity(open.entries.len());
+    for (index, entry) in open.entries.iter().enumerate() {
+        match entry {
+            Some(label) => {
+                let hovered = open.hovered == Some(index);
+                rows.push(LayoutNode::Styled {
+                    props: Box::new(VisualProps {
+                        background: hovered.then_some(theme.accent),
+                        background_hovered: Some(theme.accent),
+                        foreground: if hovered {
+                            Some(Color::WHITE)
+                        } else {
+                            Some(theme.fg)
+                        },
+                        foreground_hovered: Some(Color::WHITE),
+                        corner_radius: Some(4.0),
+                        ..VisualProps::default()
+                    }),
+                    child: Box::new(LayoutNode::Frame {
+                        width: None,
+                        height: Some(MENU_ROW_H),
+                        child: Box::new(LayoutNode::Stack {
+                            axis: Axis::Horizontal,
+                            spacing: 0.0,
+                            align: CrossAlign::Center,
+                            children: vec![
+                                LayoutNode::Padding {
+                                    edges: Edges {
+                                        top: 0.0,
+                                        bottom: 0.0,
+                                        leading: MENU_PAD_H,
+                                        trailing: MENU_PAD_H,
+                                    },
+                                    child: Box::new(LayoutNode::Text {
+                                        content: label.clone(),
+                                        highlights: None,
+                                        truncation: None,
+                                    }),
+                                },
+                                LayoutNode::Spacer,
+                            ],
+                        }),
+                    }),
+                });
+            }
+            None => {
+                // the quiet line between groups: a hairline, inset
+                rows.push(LayoutNode::Frame {
+                    width: None,
+                    height: Some(MENU_DIVIDER_H),
+                    child: Box::new(LayoutNode::Padding {
+                        edges: Edges {
+                            top: 4.0,
+                            bottom: 4.0,
+                            leading: MENU_PAD_H,
+                            trailing: MENU_PAD_H,
+                        },
+                        child: Box::new(LayoutNode::Styled {
+                            props: Box::new(VisualProps {
+                                background: Some(theme.border),
+                                ..VisualProps::default()
+                            }),
+                            child: Box::new(LayoutNode::Fill),
+                        }),
+                    }),
+                });
+            }
+        }
+    }
+    let _ = env;
+    LayoutNode::Styled {
+        props: Box::new(VisualProps {
+            background: Some(theme.panel),
+            border: Some((theme.border, 1.0)),
+            corner_radius: Some(7.0),
+            shadow: Some((18.0, Color { r: 0, g: 0, b: 0, a: 80 })),
+            clip: true,
+            font: FontPatch { size: Some(13.0), ..FontPatch::default() },
+            ..VisualProps::default()
+        }),
+        child: Box::new(LayoutNode::Padding {
+            edges: Edges {
+                top: MENU_PAD_V,
+                bottom: MENU_PAD_V,
+                leading: 0.0,
+                trailing: 0.0,
+            },
+            child: Box::new(LayoutNode::Stack {
+                axis: Axis::Vertical,
+                spacing: 0.0,
+                align: CrossAlign::Start,
+                children: rows,
+            }),
+        }),
+    }
+}
+
+/// The menu frame: the panel hangs down-right of the press, flips up
+/// or left when the container has no room, and clamps like everything
+/// anchored.
+fn menu_frame(at: Point, size: Size, container: Rect) -> Rect {
+    let mut x = at.x;
+    let mut y = at.y;
+    if y + size.height > container.origin.y + container.size.height {
+        y = at.y - size.height;
+    }
+    if x + size.width > container.origin.x + container.size.width {
+        x = at.x - size.width;
+    }
+    let clamp = |value: Px, low: Px, high: Px| value.min(high).max(low);
+    Rect {
+        origin: Point {
+            x: clamp(
+                x,
+                container.origin.x,
+                container.origin.x + (container.size.width - size.width).max(0.0),
+            ),
+            y: clamp(
+                y,
+                container.origin.y,
+                container.origin.y + (container.size.height - size.height).max(0.0),
+            ),
+        },
+        size,
+    }
+}
+
 /// The framework-drawn bubble: a small inverted label. The theme's
 /// ink becomes the ground and the canvas becomes the text — legible
 /// on both themes without a token of its own.
@@ -1498,6 +1701,36 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
             frame,
             display: (start, end),
             anchor_visible: queued.anchor_visible,
+        });
+    }
+    // the menu lands above every popover — the runtime opened it, the
+    // runtime will close it, and its rows highlight from the stamp
+    if let Some(open) = env.stamp.interaction.menu.clone() {
+        let node = menu_node(&open, env);
+        // natural width, floored at the house minimum; the height is
+        // the rows' own
+        let (natural, _) = node.measure(
+            Proposal { width: None, height: Some(container.size.height) },
+            env,
+        );
+        let size = Size {
+            width: natural.width.max(MENU_MIN_W).min(container.size.width),
+            height: natural.height.min(container.size.height),
+        };
+        let (_, fit) = node.measure(
+            Proposal { width: Some(size.width), height: Some(size.height) },
+            env,
+        );
+        let frame = menu_frame(open.at, size, container);
+        let start = out.display.len();
+        node.place(frame, fit, env, out);
+        let end = out.display.len();
+        out.overlays.push(OverlayPlacement {
+            path: MENU_PATH.to_string(),
+            anchor: Rect { origin: open.at, size: Size::default() },
+            frame,
+            display: (start, end),
+            anchor_visible: true,
         });
     }
     // the tooltip lands LAST — above every popover, outside every
@@ -1571,7 +1804,8 @@ impl LayoutNode {
             | LayoutNode::Island { child }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
-            | LayoutNode::Tooltip { child, .. } => child.is_flexible(axis),
+            | LayoutNode::Tooltip { child, .. }
+            | LayoutNode::ContextSource { child, .. } => child.is_flexible(axis),
             // a stack that HOLDS something flexible is itself flexible
             // (a panel with a scroll inside wants the leftover space —
             // nesting it must not freeze it at its natural extent)
@@ -1619,6 +1853,7 @@ impl LayoutNode {
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
             | LayoutNode::Tooltip { child, .. }
+            | LayoutNode::ContextSource { child, .. }
             | LayoutNode::Frame { child, .. } => child.first_baseline(env),
             // lane A leads the seam — its text sets the shared line
             LayoutNode::Split { children, .. } => {
@@ -1723,6 +1958,11 @@ impl LayoutNode {
             }
 
             LayoutNode::Tooltip { child, .. } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            LayoutNode::ContextSource { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -2260,6 +2500,17 @@ impl LayoutNode {
                 };
                 if let Some(rect) = region {
                     out.tooltips.push(TooltipRegion { text: text.clone(), side: *side, rect });
+                }
+            }
+
+            (LayoutNode::ContextSource { items, child }, Fit::Wrapped(_, fit)) => {
+                child.place(frame, *fit, env, out);
+                let region = match out.current_clip() {
+                    Some(clip) => frame.intersection(clip),
+                    None => Some(frame),
+                };
+                if let Some(rect) = region {
+                    out.menus.push(MenuRegion { items: items.clone(), rect });
                 }
             }
 

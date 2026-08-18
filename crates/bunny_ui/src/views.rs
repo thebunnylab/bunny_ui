@@ -480,6 +480,34 @@ impl View for Icon {
     }
 }
 
+/// One entry of a context menu: a labelled action, or the quiet line
+/// between groups.
+#[derive(Clone)]
+pub enum MenuItem {
+    Action { label: std::sync::Arc<str>, action: std::rc::Rc<dyn Fn()> },
+    Divider,
+}
+
+impl std::fmt::Debug for MenuItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MenuItem::Action { label, .. } => write!(f, "MenuItem({label})"),
+            MenuItem::Divider => f.write_str("MenuItem(—)"),
+        }
+    }
+}
+
+/// A labelled menu entry. The action runs when the row is picked —
+/// the menu closes first, so state written here lays out clean.
+pub fn menu_item(label: impl Into<std::sync::Arc<str>>, action: impl Fn() + 'static) -> MenuItem {
+    MenuItem::Action { label: label.into(), action: std::rc::Rc::new(action) }
+}
+
+/// The line between groups.
+pub fn menu_divider() -> MenuItem {
+    MenuItem::Divider
+}
+
 pub fn icon(symbol: crate::icon::Symbol) -> Icon {
     Icon(symbol)
 }

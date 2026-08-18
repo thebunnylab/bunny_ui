@@ -4103,4 +4103,126 @@ mod tests {
         .concat();
         assert_eq!(bytes, expected);
     }
+
+    #[test]
+    fn a_right_press_offers_the_menu_and_a_row_fires_on_the_down() {
+        use crate::layout::MENU_PATH;
+
+        #[derive(Clone)]
+        struct Row {
+            opened: State<usize>,
+        }
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                let opened = self.opened;
+                vstack!(
+                    text("file_0001.rs").context_menu(vec![
+                        menu_item("Open", move || opened.set(opened.get() + 1)),
+                        menu_divider(),
+                        menu_item("Delete", || {}),
+                    ]),
+                    text("below"),
+                )
+                .spacing(30.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Row { opened: State::new(0) };
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+
+        // a right press outside every region changes nothing
+        assert!(!runtime.context_click(200.0, 150.0));
+
+        // inside: the menu opens at the pointer
+        assert!(runtime.context_click(30.0, 8.0));
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let menu = result
+            .overlays
+            .iter()
+            .find(|overlay| overlay.path == MENU_PATH)
+            .expect("the menu is an overlay");
+        assert_eq!(menu.frame.origin.x, 30.0);
+        assert_eq!(menu.frame.origin.y, 8.0);
+        let labels: Vec<String> = result
+            .display
+            .iter()
+            .skip(menu.display.0)
+            .filter_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { content, .. } => {
+                    Some(content.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["Open".to_string(), "Delete".to_string()]);
+
+        // hovering the first row highlights it and quiets the scene
+        let row_y = menu.frame.origin.y + 5.0 + 12.0;
+        runtime.pointer_moved(menu.frame.origin.x + 20.0, row_y);
+        let stamped = runtime.interaction();
+        assert_eq!(stamped.menu.as_ref().and_then(|open| open.hovered), Some(0));
+        assert_eq!(stamped.hovered, None, "the scene under the menu goes quiet");
+
+        // the pick fires ON THE DOWN and the menu closes
+        assert!(runtime.pointer_pressed(menu.frame.origin.x + 20.0, row_y));
+        assert_eq!(view.opened.get(), 1, "the action ran");
+        assert!(runtime.interaction().menu.is_none(), "the menu closed");
+
+        // reopen, then a press OUTSIDE closes, consumes, and fires
+        // nothing — AppKit manners
+        runtime.context_click(30.0, 8.0);
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        assert!(runtime.pointer_pressed(250.0, 180.0));
+        assert_eq!(view.opened.get(), 1, "nothing underneath activated");
+        assert!(runtime.interaction().menu.is_none());
+
+        // reopen, Escape closes through the stroke gate
+        runtime.context_click(30.0, 8.0);
+        let handled = runtime
+            .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape));
+        assert!(handled.handled, "Escape closed the menu");
+        assert!(runtime.interaction().menu.is_none());
+
+        // reopen, a wheel closes (content would slide under it)
+        runtime.context_click(30.0, 8.0);
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        runtime.wheel(150.0, 100.0, 0.0, 5.0);
+        assert!(runtime.interaction().menu.is_none());
+    }
+
+    #[test]
+    fn a_divider_is_never_a_pick() {
+        #[derive(Clone)]
+        struct One {
+            fired: State<usize>,
+        }
+        impl Component for One {
+            fn body(self, _ctx: &Context) -> impl View {
+                let fired = self.fired;
+                text("target").context_menu(vec![
+                    menu_item("First", move || fired.set(fired.get() + 1)),
+                    menu_divider(),
+                    menu_item("Second", || {}),
+                ])
+            }
+        }
+        let runtime = Runtime::new();
+        let view = One { fired: State::new(0) };
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        runtime.context_click(20.0, 8.0);
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let menu = result
+            .overlays
+            .iter()
+            .find(|overlay| overlay.path == crate::layout::MENU_PATH)
+            .expect("open");
+        // the divider band: past the first row, inside the gap
+        let divider_y = menu.frame.origin.y + 5.0 + 24.0 + 4.0;
+        assert!(runtime.pointer_pressed(menu.frame.origin.x + 20.0, divider_y));
+        assert_eq!(view.fired.get(), 0, "a divider fires nothing");
+        assert!(runtime.interaction().menu.is_none(), "but the press still closes");
+    }
 }

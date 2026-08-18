@@ -242,6 +242,8 @@ pub(crate) unsafe fn sel(name: &str) -> Sel {
 /// already happened.
 pub enum AppEvent {
     MouseDown { x: f64, y: f64 },
+    /// The right button (or a two-finger tap): the context-menu press.
+    RightMouseDown { x: f64, y: f64 },
     MouseUp { x: f64, y: f64 },
     MouseMoved { x: f64, y: f64 },
     /// The pointer left the window — without this event the hover would
@@ -384,6 +386,11 @@ thread_local! {
 /// regions once, at boot.
 pub fn set_drag_gate(gate: Box<dyn Fn(f64, f64) -> bool>) {
     DRAG_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+extern "C" fn bunny_right_mouse_down(this: Id, _sel: Sel, event: Id) {
+    let (x, y) = unsafe { event_layout_point(this, event) };
+    dispatch(AppEvent::RightMouseDown { x, y });
 }
 
 extern "C" fn bunny_mouse_down(this: Id, _sel: Sel, event: Id) {
@@ -789,6 +796,12 @@ unsafe fn register_classes() {
             types.as_ptr(),
         );
         class_addMethod(view, sel("mouseUp:"), bunny_mouse_up as *const c_void, types.as_ptr());
+        class_addMethod(
+            view,
+            sel("rightMouseDown:"),
+            bunny_right_mouse_down as *const c_void,
+            types.as_ptr(),
+        );
         class_addMethod(
             view,
             sel("mouseMoved:"),

@@ -135,6 +135,8 @@ enum Event {
     Wake,
     /// The glue's slow clock beat once — the tooltip ages, then shows.
     TooltipTick,
+    /// A right press (the browser's contextmenu, default prevented).
+    ContextClick { x: f64, y: f64 },
     /// Dom mode: the browser's scroll observer — the element scrolled
     /// and the engine mirrors the offset (the dual ownership).
     DomScroll { id: u32, x: f64, y: f64 },
@@ -269,6 +271,11 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
+            Event::ContextClick { x, y } => {
+                if runtime.context_click(x, y) {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
+            }
             Event::ImageReady | Event::Wake => {
                 // the layout reflows around the fresh intrinsic size
                 // (or around what a task just wrote) and the paint asks
@@ -353,6 +360,11 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
+            Event::ContextClick { x, y } => {
+                if runtime.context_click(x, y) {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
             Event::ImageReady | Event::Wake => {
                 // geometry reflows around the fresh intrinsic size (or
                 // around what a task just wrote); the <img> elements
@@ -423,6 +435,12 @@ pub extern "C" fn bunny_pointer_move(x: f64, y: f64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_tooltip_tick() {
     dispatch(Event::TooltipTick);
+}
+
+/// The browser's contextmenu, default prevented by the glue.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_context_click(x: f64, y: f64) {
+    dispatch(Event::ContextClick { x, y });
 }
 
 #[unsafe(no_mangle)]

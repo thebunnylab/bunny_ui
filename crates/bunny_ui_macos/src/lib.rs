@@ -382,6 +382,13 @@ pub fn run_window_chrome(
                 blit(runtime, root);
             }
         }
+        AppEvent::RightMouseDown { x, y } => {
+            // the runtime opens (or closes) the context menu; the
+            // panel presents like any overlay — outside the window too
+            if runtime.context_click(x, y) {
+                blit(runtime, root);
+            }
+        }
         AppEvent::MouseDown { x, y } => {
             if runtime.pointer_pressed(x, y) {
                 blit(runtime, root);
