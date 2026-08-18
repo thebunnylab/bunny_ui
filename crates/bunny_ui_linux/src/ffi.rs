@@ -161,6 +161,8 @@ unsafe extern "C" {
     static wl_data_device_manager_interface: WlInterface;
     static wl_data_device_interface: WlInterface;
     static wl_data_source_interface: WlInterface;
+    static wl_subcompositor_interface: WlInterface;
+    static wl_subsurface_interface: WlInterface;
 }
 
 // MARK: - libwayland-cursor ABI (theme files arrive as ready wl_buffers)
@@ -272,11 +274,7 @@ pub(crate) struct Protocols {
     wm_base: &'static WlInterface,
     xdg_surface: &'static WlInterface,
     toplevel: &'static WlInterface,
-    // the tables cross-reference these through raw pointers the
-    // compiler cannot see; the overlays phase binds them by name
-    #[allow(dead_code)]
     popup: &'static WlInterface,
-    #[allow(dead_code)]
     positioner: &'static WlInterface,
 }
 
@@ -555,6 +553,11 @@ const TAG_DATA_DEVICE: usize = 13;
 const TAG_DATA_OFFER: usize = 14;
 const TAG_DATA_SOURCE: usize = 15;
 const OUTPUT_TAG_BASE: usize = 0x1000;
+/// Panel proxies encode index and role: base | (index << 2) | kind.
+const PANEL_TAG_BASE: usize = 0x1000_0000;
+const PANEL_KIND_SURFACE: usize = 0;
+const PANEL_KIND_XDG: usize = 1;
+const PANEL_KIND_POPUP: usize = 2;
 
 /// A decoded protocol event, queued for the loop. The dispatcher owns
 /// NOTHING but this queue — state and marshalling stay outside, so a
@@ -571,10 +574,13 @@ enum Ev {
     SurfaceLeave { output_ptr: usize },
     OutputScale { output_name: u32, scale: i32 },
     OutputDone { output_name: u32 },
-    PointerEnter { serial: u32, x: f64, y: f64 },
+    PointerEnter { serial: u32, surface_ptr: usize, x: f64, y: f64 },
     PointerLeave,
     PointerMotion { x: f64, y: f64 },
     PointerButton { serial: u32, time_ms: u32, button: u32, pressed: bool },
+    PointerAxis { axis: u32, value: f64 },
+    PointerAxisDiscrete { axis: u32, steps: i32 },
+    PointerFrame,
     BufferRelease,
     KeyboardKeymap { format: u32, fd: i32, size: u32 },
     KeyboardEnter,
@@ -587,6 +593,9 @@ enum Ev {
     Selection { offer_ptr: usize },
     SourceSend { mime: String, fd: i32 },
     SourceCancelled,
+    PanelConfigure { index: usize, serial: u32 },
+    PopupPosition { index: usize, x: i32, y: i32 },
+    PopupDone { index: usize },
 }
 
 thread_local! {
@@ -651,6 +660,7 @@ unsafe extern "C" fn dispatcher(
         TAG_POINTER => match opcode {
             0 => push_ev(Ev::PointerEnter {
                 serial: unsafe { arg(0).u },
+                surface_ptr: unsafe { arg(1).o } as usize,
                 x: fixed_to_f64(unsafe { arg(2).f }),
                 y: fixed_to_f64(unsafe { arg(3).f }),
             }),
@@ -665,7 +675,16 @@ unsafe extern "C" fn dispatcher(
                 button: unsafe { arg(2).u },
                 pressed: unsafe { arg(3).u } == 1,
             }),
-            _ => {} // axis family joins at the scroll phase; frame batches then
+            4 => push_ev(Ev::PointerAxis {
+                axis: unsafe { arg(1).u },
+                value: fixed_to_f64(unsafe { arg(2).f }),
+            }),
+            5 => push_ev(Ev::PointerFrame),
+            8 => push_ev(Ev::PointerAxisDiscrete {
+                axis: unsafe { arg(0).u },
+                steps: unsafe { arg(1).i },
+            }),
+            _ => {} // axis_source/stop and the v8+ refinements: unread
         },
         TAG_BUFFER => push_ev(Ev::BufferRelease),
         TAG_KEYBOARD => match opcode {
@@ -730,6 +749,26 @@ unsafe extern "C" fn dispatcher(
             _ => {} // target(0): a dnd-only hint
         },
         TAG_CURSOR_SURFACE => {}
+        tag if tag >= PANEL_TAG_BASE => {
+            let index = (tag - PANEL_TAG_BASE) >> 2;
+            match tag & 0x3 {
+                PANEL_KIND_XDG => {
+                    if opcode == 0 {
+                        push_ev(Ev::PanelConfigure { index, serial: unsafe { arg(0).u } });
+                    }
+                }
+                PANEL_KIND_POPUP => match opcode {
+                    0 => push_ev(Ev::PopupPosition {
+                        index,
+                        x: unsafe { arg(0).i },
+                        y: unsafe { arg(1).i },
+                    }),
+                    1 => push_ev(Ev::PopupDone { index }),
+                    _ => {}
+                },
+                _ => {} // the panel's wl_surface: enter/leave unread
+            }
+        }
         tag if tag >= OUTPUT_TAG_BASE => {
             let output_name = (tag - OUTPUT_TAG_BASE) as u32;
             match opcode {
@@ -819,6 +858,51 @@ impl ClickClock {
         self.count = if chained { self.count.saturating_add(1) } else { 1 };
         self.last = Some((time_ms, x, y));
         self.count
+    }
+}
+
+/// The wheel between pointer frames: continuous values in surface px,
+/// discrete detents when a real wheel turns. The flush prefers the
+/// detents (the ×16 line doctrine all platforms share) and flips the
+/// sign — wayland's positive is content-down, the engine's is up.
+#[derive(Default)]
+struct AxisAccumulator {
+    vertical: f64,
+    horizontal: f64,
+    vertical_steps: i32,
+    horizontal_steps: i32,
+}
+
+impl AxisAccumulator {
+    fn axis(&mut self, axis: u32, value: f64) {
+        match axis {
+            0 => self.vertical += value,
+            1 => self.horizontal += value,
+            _ => {}
+        }
+    }
+
+    fn discrete(&mut self, axis: u32, steps: i32) {
+        match axis {
+            0 => self.vertical_steps += steps,
+            1 => self.horizontal_steps += steps,
+            _ => {}
+        }
+    }
+
+    fn flush(&mut self) -> Option<(f64, f64)> {
+        let dy = if self.vertical_steps != 0 {
+            -(self.vertical_steps as f64) * 16.0
+        } else {
+            -self.vertical
+        };
+        let dx = if self.horizontal_steps != 0 {
+            -(self.horizontal_steps as f64) * 16.0
+        } else {
+            -self.horizontal
+        };
+        *self = AxisAccumulator::default();
+        (dx != 0.0 || dy != 0.0).then_some((dx, dy))
     }
 }
 
@@ -937,6 +1021,46 @@ struct SourceState {
     text: String,
 }
 
+/// One overlay panel. A popover/tooltip/menu is an xdg_popup (it may
+/// hang past the window's edge — the fidelity bar); the drag chip is a
+/// subsurface (a mouse-following popup would be a recreate storm).
+/// The protocol objects materialize at the first present, when the
+/// position is known.
+struct Panel {
+    chip: bool,
+    surface: *mut Proxy,
+    xdg: *mut Proxy,
+    popup: *mut Proxy,
+    subsurface: *mut Proxy,
+    backing: Option<Backing>,
+    /// Premultiplied BGRA waiting for the popup's first configure.
+    staged: Option<(usize, usize, Vec<u8>)>,
+    scene_origin: (f64, f64),
+    asked: (f64, f64),
+    /// configured − asked: the compositor's adjustment, folded into
+    /// event translation so hit-testing follows truth.
+    delta: (f64, f64),
+    configured: bool,
+}
+
+impl Panel {
+    fn new(chip: bool) -> Panel {
+        Panel {
+            chip,
+            surface: std::ptr::null_mut(),
+            xdg: std::ptr::null_mut(),
+            popup: std::ptr::null_mut(),
+            subsurface: std::ptr::null_mut(),
+            backing: None,
+            staged: None,
+            scene_origin: (0.0, 0.0),
+            asked: (f64::NAN, f64::NAN),
+            delta: (0.0, 0.0),
+            configured: false,
+        }
+    }
+}
+
 struct Client {
     display: *mut Display,
     registry: *mut Proxy,
@@ -962,6 +1086,11 @@ struct Client {
     selection: usize,
     source: Option<SourceState>,
     wake_read: c_int,
+    subcompositor: *mut Proxy,
+    panels: Vec<Option<Panel>>,
+    /// 0 = the main window; N = panel N−1 (event translation).
+    pointer_focus: usize,
+    axis: AxisAccumulator,
     /// Counts presenting commits — the configure road checks whether
     /// an ack was followed by one.
     presents: u64,
@@ -998,6 +1127,7 @@ pub enum AppEvent {
     Text(String),
     /// An editing key that passed the gate unconsumed.
     Key { sym: u32, shift: bool, command: bool },
+    Wheel { x: f64, y: f64, dx: f64, dy: f64 },
     Blink,
     Frame { dt: f64 },
 }
@@ -1106,6 +1236,8 @@ fn connect() {
         3,
         TAG_SYNC,
     );
+    let subcompositor =
+        bind(c"wl_subcompositor", &raw const wl_subcompositor_interface, 1, TAG_SYNC);
     let data_device = if data_manager.is_null() || seat.is_null() {
         std::ptr::null_mut()
     } else {
@@ -1181,6 +1313,10 @@ fn connect() {
             selection: 0,
             source: None,
             wake_read,
+            subcompositor,
+            panels: Vec::new(),
+            pointer_focus: 0,
+            axis: AxisAccumulator::default(),
             presents: 0,
             quit: false,
         })
@@ -1262,7 +1398,7 @@ pub fn create_window(title: &str, width: f64, height: f64, _scene_chrome: bool) 
             break;
         }
     }
-    WindowHandle
+    WindowHandle(0)
 }
 
 /// On wayland a window appears when its first buffer commits — the
@@ -1270,10 +1406,10 @@ pub fn create_window(title: &str, width: f64, height: f64, _scene_chrome: bool) 
 /// protocol design and this is a no-op kept for the twins' shape.
 pub fn show_window(_window: WindowHandle) {}
 
-/// The one window this phase; the handle is the twins' shape with the
-/// identity living in the client state.
+/// 0 is the main window; N is panel N−1. The identity lives in the
+/// client state, the handle is the twins' shape.
 #[derive(Clone, Copy)]
-pub struct WindowHandle;
+pub struct WindowHandle(usize);
 
 impl WindowHandle {
     /// Logical size of the content area (the layout viewport).
@@ -1312,6 +1448,297 @@ impl WindowHandle {
             apply_cursor();
         }
     }
+
+    /// Layout coordinates ARE this platform's positioning currency —
+    /// wayland knows no screen — so the twins' conversion is identity.
+    pub fn layout_rect_to_screen(&self, x: f64, y: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
+        (x, y, w, h)
+    }
+
+    /// The work area the placement math clamps against. Wayland has no
+    /// screen geometry, so the window's bounds inflate by a generous
+    /// margin: core places freely (popovers may hang past the edge —
+    /// the fidelity bar) and only pathological overflow is reined in.
+    pub fn screen_bounds_in_layout(&self) -> Option<(f64, f64, f64, f64)> {
+        const MARGIN: f64 = 512.0;
+        let (w, h) = self.content_size();
+        Some((-MARGIN, -MARGIN, w + 2.0 * MARGIN, h + 2.0 * MARGIN))
+    }
+
+    /// The panel's identity in the scene: the overlay's layout origin,
+    /// the base for translating its surface-local pointer events.
+    pub fn set_scene_origin(&self, x: f64, y: f64) {
+        if self.0 == 0 {
+            return;
+        }
+        with_client(|client| {
+            if let Some(Some(panel)) = client.panels.get_mut(self.0 - 1) {
+                panel.scene_origin = (x, y);
+            }
+        });
+    }
+
+    /// Position, size and pixels land together: the straight RGBA
+    /// slice premultiplies into ARGB8888 on the way in (the layered
+    /// twin's fused pass), the popup materializes lazily and re-homes
+    /// by recreation when the placement moved.
+    pub fn present_layered(
+        &self,
+        rect: (f64, f64, f64, f64),
+        width: usize,
+        height: usize,
+        rgba: &[u8],
+    ) {
+        if self.0 == 0 {
+            return;
+        }
+        panel_present(self.0 - 1, rect, width, height, rgba);
+    }
+
+    /// Hide and forget: the pool retires a panel whose overlay closed.
+    pub fn close_panel(&self) {
+        if self.0 == 0 {
+            return;
+        }
+        with_client(|client| {
+            let index = self.0 - 1;
+            if let Some(slot) = client.panels.get_mut(index) {
+                if let Some(panel) = slot.take() {
+                    unsafe { teardown_panel(panel) };
+                }
+            }
+            if client.pointer_focus == self.0 {
+                client.pointer_focus = 0;
+            }
+        });
+    }
+}
+
+/// The pool asks for a panel slot; the protocol objects wait for the
+/// first present, when the placement is known. `chip` picks the
+/// subsurface road (the mouse-following drag label).
+pub fn create_panel(_window: &WindowHandle, chip: bool) -> WindowHandle {
+    with_client(|client| {
+        client.panels.push(Some(Panel::new(chip)));
+        WindowHandle(client.panels.len())
+    })
+}
+
+/// Anchors: top-left of the anchor rect; gravity: down-right — the
+/// popup sits exactly where core placed it. Constraint adjustment is
+/// NONE on purpose: core is the placement authority and a popover may
+/// hang past every edge.
+const XDG_ANCHOR_TOP_LEFT: u32 = 5;
+const XDG_GRAVITY_BOTTOM_RIGHT: u32 = 8;
+
+unsafe fn teardown_panel(panel: Panel) {
+    unsafe {
+        if !panel.popup.is_null() {
+            destroy(panel.popup, 0);
+        }
+        if !panel.xdg.is_null() {
+            destroy(panel.xdg, 0);
+        }
+        if !panel.subsurface.is_null() {
+            destroy(panel.subsurface, 0);
+        }
+        if let Some(backing) = panel.backing {
+            destroy(backing.buffer, 0);
+            destroy(backing.pool, 1);
+            munmap(backing.map as *mut c_void, backing.len);
+            close(backing.fd);
+        }
+        if !panel.surface.is_null() {
+            destroy(panel.surface, 0);
+        }
+    }
+}
+
+fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height: usize, rgba: &[u8]) {
+    let (x, y, w, h) = rect;
+    with_client(|client| {
+        let (parent_surface, parent_xdg, parent_logical, scale) = match client.win.as_ref() {
+            Some(win) if win.map.can_attach() => {
+                (win.surface, win.xdg_surface, win.logical, win.scale)
+            }
+            _ => return,
+        };
+        let wm_base = client.wm_base;
+        let compositor = client.compositor;
+        let subcompositor = client.subcompositor;
+        let protocols = client.protocols;
+        let Some(Some(panel)) = client.panels.get_mut(index) else { return };
+        // a moved popup cannot re-anchor below reposition v3 — it is
+        // reborn at the new place (moves are rare: a reopened popover)
+        let moved = !panel.chip
+            && !panel.surface.is_null()
+            && ((panel.asked.0 - x).abs() > 0.5 || (panel.asked.1 - y).abs() > 0.5);
+        if moved {
+            let dead = std::mem::replace(panel, Panel::new(false));
+            unsafe { teardown_panel(dead) };
+        }
+        if panel.surface.is_null() {
+            unsafe {
+                let tag = PANEL_TAG_BASE + (index << 2);
+                let surface = construct(
+                    compositor,
+                    0,
+                    &raw const wl_surface_interface,
+                    &mut [arg_n()],
+                    tag + PANEL_KIND_SURFACE,
+                );
+                if panel.chip && !subcompositor.is_null() {
+                    let subsurface = construct(
+                        subcompositor,
+                        1, // get_subsurface(new, surface, parent)
+                        &raw const wl_subsurface_interface,
+                        &mut [arg_n(), arg_o(surface), arg_o(parent_surface)],
+                        TAG_SYNC,
+                    );
+                    request(subsurface, 5, &mut no_args()); // set_desync
+                    request(subsurface, 2, &mut [arg_o(parent_surface)]); // place_above
+                    request(
+                        subsurface,
+                        1,
+                        &mut [arg_i(x.round() as i32), arg_i(y.round() as i32)],
+                    );
+                    panel.subsurface = subsurface;
+                    panel.configured = true; // subsurfaces know no configure
+                } else {
+                    let xdg = construct(
+                        wm_base,
+                        2,
+                        protocols.xdg_surface as *const WlInterface,
+                        &mut [arg_n(), arg_o(surface)],
+                        tag + PANEL_KIND_XDG,
+                    );
+                    let positioner = construct(
+                        wm_base,
+                        1,
+                        protocols.positioner as *const WlInterface,
+                        &mut [arg_n()],
+                        TAG_SYNC,
+                    );
+                    request(
+                        positioner,
+                        1, // set_size
+                        &mut [arg_i(w.ceil().max(1.0) as i32), arg_i(h.ceil().max(1.0) as i32)],
+                    );
+                    // the anchor rect must sit INSIDE the parent's
+                    // geometry; the offset carries the true position
+                    let ax = x.clamp(0.0, (parent_logical.0 - 1.0).max(0.0));
+                    let ay = y.clamp(0.0, (parent_logical.1 - 1.0).max(0.0));
+                    request(
+                        positioner,
+                        2, // set_anchor_rect
+                        &mut [arg_i(ax as i32), arg_i(ay as i32), arg_i(1), arg_i(1)],
+                    );
+                    request(positioner, 3, &mut [arg_u(XDG_ANCHOR_TOP_LEFT)]);
+                    request(positioner, 4, &mut [arg_u(XDG_GRAVITY_BOTTOM_RIGHT)]);
+                    request(positioner, 5, &mut [arg_u(0)]); // no constraint adjustment
+                    request(
+                        positioner,
+                        6, // set_offset
+                        &mut [arg_i((x - ax).round() as i32), arg_i((y - ay).round() as i32)],
+                    );
+                    let popup = construct(
+                        xdg,
+                        2, // get_popup(new, parent, positioner)
+                        protocols.popup as *const WlInterface,
+                        &mut [arg_n(), arg_o(parent_xdg), arg_o(positioner)],
+                        tag + PANEL_KIND_POPUP,
+                    );
+                    destroy(positioner, 0);
+                    panel.xdg = xdg;
+                    panel.popup = popup;
+                    panel.configured = false;
+                    // the popup's map dance: an empty commit asks for
+                    // the first configure; the pixels wait staged
+                    request(surface, 6, &mut no_args());
+                }
+                panel.surface = surface;
+                panel.asked = (x, y);
+                panel.delta = (0.0, 0.0);
+            }
+        } else if panel.chip {
+            let position_moved =
+                (panel.asked.0 - x).abs() > 0.5 || (panel.asked.1 - y).abs() > 0.5;
+            if position_moved && !panel.subsurface.is_null() {
+                unsafe {
+                    request(
+                        panel.subsurface,
+                        1,
+                        &mut [arg_i(x.round() as i32), arg_i(y.round() as i32)],
+                    );
+                }
+                // double-buffered against the PARENT: the drag's own
+                // repaint of the main window applies it
+                panel.asked = (x, y);
+            }
+        }
+        // the fused pass: straight RGBA → premultiplied BGRA
+        let mut bytes = vec![0u8; width * height * 4];
+        for (source, target) in rgba.chunks_exact(4).zip(bytes.chunks_exact_mut(4)) {
+            let alpha = source[3] as u32;
+            target[0] = ((source[2] as u32 * alpha + 127) / 255) as u8;
+            target[1] = ((source[1] as u32 * alpha + 127) / 255) as u8;
+            target[2] = ((source[0] as u32 * alpha + 127) / 255) as u8;
+            target[3] = alpha as u8;
+        }
+        if !panel.configured {
+            panel.staged = Some((width, height, bytes));
+            unsafe { wl_display_flush(client.display) };
+            return;
+        }
+        unsafe {
+            flush_panel_pixels(client.shm, panel, width, height, &bytes, scale);
+            wl_display_flush(client.display);
+        }
+    });
+}
+
+/// Writes the premultiplied pixels into the panel's shm and commits.
+unsafe fn flush_panel_pixels(
+    shm: *mut Proxy,
+    panel: &mut Panel,
+    width: usize,
+    height: usize,
+    bytes: &[u8],
+    scale: usize,
+) {
+    unsafe {
+        let stale = panel
+            .backing
+            .as_ref()
+            .is_none_or(|backing| backing.width != width || backing.height != height);
+        if stale {
+            if let Some(old) = panel.backing.take() {
+                destroy(old.buffer, 0);
+                destroy(old.pool, 1);
+                munmap(old.map as *mut c_void, old.len);
+                close(old.fd);
+            }
+            const ARGB8888: u32 = 0;
+            panel.backing = make_backing(shm, width, height, ARGB8888, TAG_SYNC);
+        }
+        let Some(backing) = panel.backing.as_mut() else { return };
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), backing.map, bytes.len().min(backing.len));
+        let surface_version = wl_proxy_get_version(panel.surface);
+        if scale > 1 && surface_version >= 3 {
+            request(panel.surface, 8, &mut [arg_i(scale as i32)]);
+        }
+        request(panel.surface, 1, &mut [arg_o(backing.buffer), arg_i(0), arg_i(0)]);
+        if surface_version >= 4 {
+            request(
+                panel.surface,
+                9,
+                &mut [arg_i(0), arg_i(0), arg_i(width as i32), arg_i(height as i32)],
+            );
+        } else {
+            request(panel.surface, 2, &mut [arg_i(0), arg_i(0), arg_i(i32::MAX), arg_i(i32::MAX)]);
+        }
+        request(panel.surface, 6, &mut no_args());
+    }
 }
 
 // MARK: - the shm backing and the present
@@ -1332,9 +1759,24 @@ fn ensure_backing(client: &mut Client, width: usize, height: usize) -> bool {
             close(old.fd);
         }
     }
+    const XRGB8888: u32 = 1;
+    win.backing = make_backing(client.shm, width, height, XRGB8888, TAG_BUFFER);
+    win.backing.is_some()
+}
+
+/// One shm pool, one buffer: the whole backing story. The main window
+/// rides XRGB (opaque, release-tracked); panels ride ARGB
+/// (premultiplied, rewritten whole each present).
+fn make_backing(
+    shm: *mut Proxy,
+    width: usize,
+    height: usize,
+    format: u32,
+    buffer_tag: usize,
+) -> Option<Backing> {
     let len = width * height * 4;
     if len == 0 {
-        return false;
+        return None;
     }
     let fd = unsafe { memfd_create(c"bunny-shm".as_ptr(), MFD_CLOEXEC) };
     if fd < 0 || unsafe { ftruncate(fd, len as i64) } != 0 {
@@ -1342,28 +1784,23 @@ fn ensure_backing(client: &mut Client, width: usize, height: usize) -> bool {
             unsafe { close(fd) };
         }
         eprintln!("bunny_ui_linux: shm backing failed");
-        return false;
+        return None;
     }
-    let map = unsafe {
-        mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
-    };
+    let map = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) };
     if map as isize == -1 {
         unsafe { close(fd) };
         eprintln!("bunny_ui_linux: shm map failed");
-        return false;
+        return None;
     }
-    let pool = unsafe {
-        construct(
-            client.shm,
+    unsafe {
+        let pool = construct(
+            shm,
             0,
             &raw const wl_shm_pool_interface,
             &mut [arg_n(), arg_h(fd), arg_i(len as i32)],
             TAG_SYNC,
-        )
-    };
-    const XRGB8888: u32 = 1;
-    let buffer = unsafe {
-        construct(
+        );
+        let buffer = construct(
             pool,
             0,
             &raw const wl_buffer_interface,
@@ -1373,22 +1810,12 @@ fn ensure_backing(client: &mut Client, width: usize, height: usize) -> bool {
                 arg_i(width as i32),
                 arg_i(height as i32),
                 arg_i((width * 4) as i32),
-                arg_u(XRGB8888),
+                arg_u(format),
             ],
-            TAG_BUFFER,
-        )
-    };
-    win.backing = Some(Backing {
-        pool,
-        buffer,
-        map: map as *mut u8,
-        len,
-        width,
-        height,
-        fd,
-        released: true,
-    });
-    true
+            buffer_tag,
+        );
+        Some(Backing { pool, buffer, map: map as *mut u8, len, width, height, fd, released: true })
+    }
 }
 
 /// The single retained buffer: damage-only copies NEED last frame's
@@ -1962,10 +2389,21 @@ fn drain_protocol_events() {
                     dispatch(AppEvent::Frame { dt });
                 }
             }
-            Ev::PointerEnter { serial, x, y } => {
-                with_client(|client| {
+            Ev::PointerEnter { serial, surface_ptr, x, y } => {
+                let (x, y) = with_client(|client| {
                     client.serials.enter = serial;
+                    // which of our surfaces the pointer entered decides
+                    // the translation of everything that follows
+                    client.pointer_focus = client
+                        .panels
+                        .iter()
+                        .position(|panel| {
+                            panel.as_ref().is_some_and(|p| p.surface as usize == surface_ptr)
+                        })
+                        .map(|index| index + 1)
+                        .unwrap_or(0);
                     client.pointer_pos = (x, y);
+                    translate_pointer(client, x, y)
                 });
                 // a stale enter serial means an ignored set_cursor —
                 // re-assert, then let the scene see the entry as a move
@@ -1974,13 +2412,17 @@ fn drain_protocol_events() {
             }
             Ev::PointerLeave => dispatch(AppEvent::MouseExited),
             Ev::PointerMotion { x, y } => {
-                with_client(|client| client.pointer_pos = (x, y));
+                let (x, y) = with_client(|client| {
+                    client.pointer_pos = (x, y);
+                    translate_pointer(client, x, y)
+                });
                 dispatch(AppEvent::MouseMoved { x, y });
             }
             Ev::PointerButton { serial, time_ms, button, pressed } => {
                 let (x, y) = with_client(|client| {
                     client.serials.record_button(serial, pressed);
-                    client.pointer_pos
+                    let (x, y) = client.pointer_pos;
+                    translate_pointer(client, x, y)
                 });
                 const BTN_LEFT: u32 = 0x110;
                 const BTN_RIGHT: u32 = 0x111;
@@ -1995,6 +2437,55 @@ fn drain_protocol_events() {
                     _ => {}
                 }
             }
+            Ev::PointerAxis { axis, value } => {
+                with_client(|client| client.axis.axis(axis, value))
+            }
+            Ev::PointerAxisDiscrete { axis, steps } => {
+                with_client(|client| client.axis.discrete(axis, steps))
+            }
+            Ev::PointerFrame => {
+                let wheel = with_client(|client| {
+                    client.axis.flush().map(|(dx, dy)| {
+                        let (x, y) = client.pointer_pos;
+                        let (x, y) = translate_pointer(client, x, y);
+                        (x, y, dx, dy)
+                    })
+                });
+                if let Some((x, y, dx, dy)) = wheel {
+                    dispatch(AppEvent::Wheel { x, y, dx, dy });
+                }
+            }
+            Ev::PanelConfigure { index, serial } => with_client(|client| {
+                let shm = client.shm;
+                let scale = client.win.as_ref().map(|w| w.scale).unwrap_or(1);
+                if let Some(Some(panel)) = client.panels.get_mut(index) {
+                    unsafe { request(panel.xdg, 4, &mut [arg_u(serial)]) };
+                    panel.configured = true;
+                    if let Some((width, height, bytes)) = panel.staged.take() {
+                        unsafe {
+                            flush_panel_pixels(shm, panel, width, height, &bytes, scale);
+                            wl_display_flush(client.display);
+                        }
+                    }
+                }
+            }),
+            Ev::PopupPosition { index, x, y } => with_client(|client| {
+                if let Some(Some(panel)) = client.panels.get_mut(index) {
+                    // the compositor's answer is the truth hit-testing
+                    // follows; asked was our intention
+                    panel.delta = (x as f64 - panel.asked.0, y as f64 - panel.asked.1);
+                }
+            }),
+            Ev::PopupDone { index } => with_client(|client| {
+                // the compositor dismissed it (parent unmap, rare on
+                // this road); the pool recreates if core still wants it
+                if let Some(slot) = client.panels.get_mut(index) {
+                    if let Some(panel) = slot.take() {
+                        unsafe { teardown_panel(panel) };
+                    }
+                    *slot = Some(Panel::new(false));
+                }
+            }),
             Ev::SurfaceEnter { output_ptr } => {
                 if let Some(name) = resolve_output(output_ptr) {
                     update_scale(|win| win.entered.push(name));
@@ -2210,6 +2701,21 @@ fn drain_protocol_events() {
     }
 }
 
+/// Panel-surface events speak panel-local coordinates; the scene
+/// speaks the window's. The panel's origin plus the compositor's
+/// adjustment is the bridge.
+fn translate_pointer(client: &Client, x: f64, y: f64) -> (f64, f64) {
+    if client.pointer_focus == 0 {
+        return (x, y);
+    }
+    match client.panels.get(client.pointer_focus - 1) {
+        Some(Some(panel)) => {
+            (x + panel.scene_origin.0 + panel.delta.0, y + panel.scene_origin.1 + panel.delta.1)
+        }
+        _ => (x, y),
+    }
+}
+
 /// The census is keyed by registry name; enter/leave carried a proxy.
 fn resolve_output(output_ptr: usize) -> Option<u32> {
     with_client(|client| {
@@ -2347,6 +2853,12 @@ fn teardown() {
     CLIENT.with(|slot| {
         let Some(client) = slot.borrow_mut().take() else { return };
         unsafe {
+            // children before the parent — the protocol's teardown law
+            for slot in client.panels {
+                if let Some(panel) = slot {
+                    teardown_panel(panel);
+                }
+            }
             if let Some(win) = client.win {
                 destroy(win.toplevel, 0);
                 destroy(win.xdg_surface, 0);
@@ -2539,6 +3051,20 @@ mod tests {
         assert_eq!(resolve_scale(&[1, 2], &outputs), 2, "straddling takes the max");
         assert_eq!(resolve_scale(&[9], &outputs), 1, "an unknown output cannot vote");
         assert_eq!(resolve_scale(&[3], &[(3, 0)]), 1, "a zero scale clamps to one");
+    }
+
+    #[test]
+    fn the_wheel_prefers_detents_and_flips_the_sign() {
+        let mut axis = AxisAccumulator::default();
+        axis.axis(0, 10.0);
+        axis.discrete(0, 1);
+        assert_eq!(axis.flush(), Some((0.0, -16.0)), "a detent wins over its own px value");
+        axis.axis(0, -7.5);
+        assert_eq!(axis.flush(), Some((0.0, 7.5)), "trackpad px flip sign, keep magnitude");
+        axis.axis(1, 4.0);
+        axis.discrete(1, -2);
+        assert_eq!(axis.flush(), Some((32.0, 0.0)), "horizontal detents ride the same law");
+        assert_eq!(axis.flush(), None, "a flush drains the accumulator");
     }
 
     #[test]

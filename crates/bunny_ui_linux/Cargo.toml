@@ -21,3 +21,7 @@ countries-pure.workspace = true
 [[example]]
 name = "counter_window_linux"
 path = "examples/counter_window.rs"
+
+[[example]]
+name = "finder_window_linux"
+path = "examples/finder_window.rs"
