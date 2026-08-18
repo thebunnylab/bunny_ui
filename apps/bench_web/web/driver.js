@@ -12,7 +12,6 @@ const ROUNDS = 5;
 const COOLDOWN_MS = 2000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
 
 function interactive() {
   return [...document.querySelectorAll("#app [data-path]")];
@@ -101,6 +100,7 @@ async function all() {
       }
       prepare("filter 10 → 200"); // leave the full table behind
     }
+    window.__benchProgress = `round ${round + 1}/${ROUNDS}`;
     await sleep(COOLDOWN_MS);
   }
 
@@ -113,7 +113,8 @@ async function all() {
     clickOn(row);
     sustained += 1;
   }
-  await frame();
+  // no rAF here: a hidden pane never paints, and the numbers must
+  // not depend on the pane being watched
 
   const table = Object.fromEntries(
     Object.entries(results).map(([label, samples]) => [label, summarize(samples)]),

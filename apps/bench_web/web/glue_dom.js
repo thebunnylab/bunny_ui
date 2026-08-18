@@ -63,7 +63,42 @@ function sendText(text) {
   wasm.bunny_text(pointer, bytes.length);
 }
 const elements = new Map([[0, app]]);
-const rules = new Map();
+// Pseudo-STATE rules only (:hover, :active, :focus, ::placeholder),
+// one CSSRule object per declaration, keyed by element id. Everything
+// a resting element shows lives inline on the element — the style
+// placement law, shared with the server-side serializer. Pseudo rules
+// carry !important because an inline declaration outranks the sheet.
+const pseudoRules = new Map();
+
+function dropPseudo(id) {
+  const live = pseudoRules.get(id);
+  if (!live) return;
+  const styles = sheet.sheet;
+  for (const rule of live) {
+    const rules = styles.cssRules;
+    // reverse scan: recent elements die young and sit near the end
+    for (let i = rules.length - 1; i >= 0; i--) {
+      if (rules[i] === rule) {
+        styles.deleteRule(i);
+        break;
+      }
+    }
+  }
+  pseudoRules.delete(id);
+}
+
+function setPseudo(id, texts) {
+  dropPseudo(id);
+  if (!texts.length) return;
+  const styles = sheet.sheet;
+  const live = [];
+  for (const text of texts) {
+    const at = styles.cssRules.length;
+    styles.insertRule(text, at);
+    live.push(styles.cssRules[at]);
+  }
+  pseudoRules.set(id, live);
+}
 
 // Registered images by split key ("hi:lo"): a blob URL the <img>
 // elements load from, plus the decoded size once the probe lands
@@ -109,10 +144,6 @@ function rgba(packed) {
   const b = (packed >>> 8) & 0xff;
   const a = packed & 0xff;
   return `rgba(${r}, ${g}, ${b}, ${a / 255})`;
-}
-
-function flushRules() {
-  sheet.textContent = [...rules.values()].join("\n");
 }
 
 function createElementOf(kind) {
@@ -204,7 +235,6 @@ function applyPatches(view, length) {
   };
   const text = (count) => decoder.decode(bytes(count));
 
-  let rulesTouched = false;
   const count = u32();
   for (let i = 0; i < count; i++) {
     const op = u8();
@@ -223,10 +253,18 @@ function applyPatches(view, length) {
       elements.set(id, el);
     } else if (op === 2) {
       const el = elements.get(id);
-      el?.remove();
+      if (el) {
+        // ids are never reused, so a survivor here would leak the
+        // element AND its pseudo rules for the page's whole life
+        for (const child of el.querySelectorAll("[data-n]")) {
+          const n = Number(child.dataset.n);
+          elements.delete(n);
+          dropPseudo(n);
+        }
+        el.remove();
+      }
       elements.delete(id);
-      rules.delete(id);
-      rulesTouched = true;
+      dropPseudo(id);
     } else if (op === 3) {
       const el = elements.get(id);
       const x = f32();
@@ -252,29 +290,53 @@ function applyPatches(view, length) {
     } else if (op === 5) {
       const el = elements.get(id);
       const mask = u16();
-      const base = [];
-      let hover = null;
-      let pressed = null;
-      if (mask & 1) base.push(`background:${rgba(u32())}`);
-      if (mask & 2) hover = rgba(u32());
-      if (mask & 4) pressed = rgba(u32());
+      // full replace, the record's semantics: what the mask does not
+      // carry, the element does not keep
+      if (el) {
+        const style = el.style;
+        style.backgroundColor = "";
+        style.backgroundImage = "";
+        style.border = "";
+        style.borderRadius = "";
+        style.boxShadow = "";
+        style.transition = "";
+        style.color = "";
+        style.overflow = "";
+      }
+      const name = `[data-n="${id}"]`;
+      const pseudo = [];
+      if (mask & 1) {
+        const color = rgba(u32());
+        if (el) el.style.backgroundColor = color;
+      }
+      if (mask & 2) {
+        pseudo.push(`${name}:hover{background:${rgba(u32())} !important}`);
+      }
+      if (mask & 4) {
+        pseudo.push(`${name}:active{background:${rgba(u32())} !important}`);
+      }
       if (mask & 8) {
         const borderColor = u32();
         const borderWidth = f32();
-        base.push(`border:${borderWidth}px solid ${rgba(borderColor)}`);
+        if (el) el.style.border = `${borderWidth}px solid ${rgba(borderColor)}`;
       }
-      if (mask & 16) base.push(`border-radius:${f32()}px`);
+      if (mask & 16) {
+        const radius = f32();
+        if (el) el.style.borderRadius = `${radius}px`;
+      }
       if (mask & 32) {
         const radius = f32();
-        base.push(`box-shadow:0 0 ${radius}px ${rgba(u32())}`);
+        const color = rgba(u32());
+        if (el) el.style.boxShadow = `0 0 ${radius}px ${color}`;
       }
       if (mask & 64) {
         const response = f32();
         f32(); // damping — the CSS side keeps the duration
-        base.push(
-          `transition:background-color ${response}s ease-out,` +
-            ` transform ${response}s ease-out`,
-        );
+        if (el) {
+          el.style.transition =
+            `background-color ${response}s ease-out,` +
+            ` transform ${response}s ease-out`;
+        }
       }
       if (mask & 128) {
         const path = text(u16());
@@ -283,17 +345,27 @@ function applyPatches(view, length) {
           el.style.cursor = "default";
         }
       }
-      let focus = null;
-      let placeholder = null;
-      if (mask & 256) focus = rgba(u32());
-      if (mask & 512) placeholder = rgba(u32());
+      if (mask & 256) {
+        const focus = rgba(u32());
+        pseudo.push(
+          `${name}:focus{border-color:${focus} !important;caret-color:${focus}}`,
+        );
+      }
+      if (mask & 512) {
+        pseudo.push(`${name}::placeholder{color:${rgba(u32())}}`);
+      }
       // the ink the subtree INHERITS: the text below sets no color of
-      // its own, so these two rules flip the whole box at once
-      let hoverInk = null;
-      let pressedInk = null;
-      if (mask & 1024) base.push(`color:${rgba(u32())}`);
-      if (mask & 2048) hoverInk = rgba(u32());
-      if (mask & 4096) pressedInk = rgba(u32());
+      // its own, so the hover and active rules flip the box at once
+      if (mask & 1024) {
+        const ink = rgba(u32());
+        if (el) el.style.color = ink;
+      }
+      if (mask & 2048) {
+        pseudo.push(`${name}:hover{color:${rgba(u32())} !important}`);
+      }
+      if (mask & 4096) {
+        pseudo.push(`${name}:active{color:${rgba(u32())} !important}`);
+      }
       // a two-stop ramp: the geometry is the engine's, the pixels are
       // the browser's (background-image sits OVER the flat background)
       if (mask & 8192) {
@@ -301,39 +373,27 @@ function applyPatches(view, length) {
         const [a, b, c, d] = [f32(), f32(), f32(), f32()];
         const near = rgba(u32());
         const far = rgba(u32());
+        let image;
         if (kind === 0) {
           const reach = d < 0 ? "farthest-corner" : `${d}px`;
           const stop = d < 0 ? "100%" : `${d}px`;
-          base.push(
-            `background-image:radial-gradient(circle ${reach} at ` +
-              `${a * 100}% ${b * 100}%, ${near} ${c}px, ${far} ${stop})`,
-          );
+          image =
+            `radial-gradient(circle ${reach} at ` +
+            `${a * 100}% ${b * 100}%, ${near} ${c}px, ${far} ${stop})`;
         } else {
           // CSS runs its line through the centre: the angle carries the
           // direction (0deg points up, clockwise)
           const degrees = (Math.atan2(c - a, -(d - b)) * 180) / Math.PI;
-          base.push(
-            `background-image:linear-gradient(${degrees.toFixed(2)}deg, ${near}, ${far})`,
-          );
+          image = `linear-gradient(${degrees.toFixed(2)}deg, ${near}, ${far})`;
         }
+        if (el) el.style.backgroundImage = image;
       }
       if (mask & 16384) {
         // overflow + the radius already on the box: the browser clips
         // the subtree to the curve, natively, as a layer
-        base.push("overflow:hidden");
+        if (el) el.style.overflow = "hidden";
       }
-      const name = `[data-n="${id}"]`;
-      let rule = `${name}{${base.join(";")}}`;
-      if (hover) rule += `\n${name}:hover{background:${hover}}`;
-      if (pressed) rule += `\n${name}:active{background:${pressed}}`;
-      if (hoverInk) rule += `\n${name}:hover{color:${hoverInk}}`;
-      if (pressedInk) rule += `\n${name}:active{color:${pressedInk}}`;
-      if (focus) {
-        rule += `\n${name}:focus{border-color:${focus};caret-color:${focus}}`;
-      }
-      if (placeholder) rule += `\n${name}::placeholder{color:${placeholder}}`;
-      rules.set(id, rule);
-      rulesTouched = true;
+      setPseudo(id, pseudo);
     } else if (op === 6) {
       const el = elements.get(id);
       const color = rgba(u32());
@@ -450,9 +510,6 @@ function applyPatches(view, length) {
       }
     }
   }
-  // ONE stylesheet rebuild per batch — a window churn touches dozens
-  // of rules and must not pay the whole sheet for each
-  if (rulesTouched) flushRules();
 }
 
 function sendField(path, value, caret) {
@@ -621,6 +678,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
   ({ instance }) => {
     wasm = instance.exports;
     window.__bunny = wasm;
+    window.__bunnyDebug = { elements, pseudoRules };
     // the ABI gate: a missing export counts as version 0
     const abi = wasm.bunny_abi_version ? wasm.bunny_abi_version() >>> 0 : 0;
     if (abi !== EXPECTED_ABI) {
