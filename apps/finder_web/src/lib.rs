@@ -226,6 +226,9 @@ impl Component for Finder {
                 .radius(0.0, 260.0),
         )
         .corner_radius(12.0)
+        // the cut follows the radius: a selected row's own background
+        // dies at the curve instead of squaring the corner off
+        .clipped()
         .border(theme::border(), 1.0)
         .shadow(28.0))
         .padding_length(28.0)

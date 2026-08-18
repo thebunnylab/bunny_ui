@@ -304,6 +304,11 @@ function applyPatches(view, length) {
           );
         }
       }
+      if (mask & 16384) {
+        // overflow + the radius already on the box: the browser clips
+        // the subtree to the curve, natively, as a layer
+        base.push("overflow:hidden");
+      }
       const name = `[data-n="${id}"]`;
       let rule = `${name}{${base.join(";")}}`;
       if (hover) rule += `\n${name}:hover{background:${hover}}`;

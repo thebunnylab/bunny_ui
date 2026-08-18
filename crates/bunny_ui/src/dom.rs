@@ -132,6 +132,10 @@ pub struct DomStyle {
     pub focus_border: Option<Color>,
     /// A field's placeholder ink — the glue's `::placeholder` rule.
     pub placeholder_color: Option<Color>,
+    /// `.clipped()` — the glue's `overflow:hidden`, which pairs with
+    /// the radius already on the box: the browser cuts the subtree to
+    /// the curve as a LAYER, its own native rounded clip.
+    pub clip: bool,
 }
 
 impl DomStyle {
@@ -151,6 +155,7 @@ impl DomStyle {
             transition: None,
             focus_border: None,
             placeholder_color: None,
+            clip: props.clip,
         }
     }
 }
@@ -914,6 +919,8 @@ fn diff_children(
 ///                      start px, end px (negative = the box's reach);
 ///                      line: start x, start y, end x, end y (0..1) —
 ///                      then u32 near rgba, u32 far rgba
+///                   14 clip (no payload — the bit IS the value:
+///                      overflow:hidden beside the radius of bit 4)
 ///   6 set text      u32 rgba, u8 inherits ink (1 = no color of its
 ///                   own — the box above owns both states),
 ///                   f32 size, u8 weight, u8 mono,
@@ -1105,6 +1112,10 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     }
     if style.gradient.is_some() {
         mask |= 1 << 13;
+    }
+    if style.clip {
+        // the first payload-free bit of the format: the bit IS the value
+        mask |= 1 << 14;
     }
     push_u16(out, mask);
     if let Some(color) = style.background {
@@ -1985,6 +1996,26 @@ mod tests {
         ]
         .concat();
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn a_clipped_box_sets_the_overflow_bit_and_nothing_else() {
+        let bare = DomStyle {
+            background: Some(Color::hex(0x123456)),
+            corner_radius: Some(6.0),
+            ..DomStyle::default()
+        };
+        let cut = DomStyle { clip: true, ..bare.clone() };
+        let without = encode(&[DomPatch::SetStyle { id: 3, style: bare }]);
+        let with = encode(&[DomPatch::SetStyle { id: 3, style: cut }]);
+        // the first payload-free bit: the streams differ by ONE bit in
+        // the mask's high byte and nothing else
+        assert_eq!(with.len(), without.len(), "the bit carries no payload");
+        let mask = u16::from_le_bytes([with[9], with[10]]);
+        assert_eq!(mask & (1 << 14), 1 << 14, "bit 14 says the overflow hides");
+        let mut expected = without.clone();
+        expected[10] |= 0x40;
+        assert_eq!(with, expected);
     }
 
     const MARK_PATH: &[crate::icon::Verb] = &[
