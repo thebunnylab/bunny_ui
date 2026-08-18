@@ -347,6 +347,19 @@ impl<'a> Painter<'a> {
         self.display.push(DrawCommand::Image { rect: self.shift(rect), source });
     }
 
+    /// A two-stop ramp inside the rounded rect — the same value
+    /// `.background_gradient(…)` takes, resolved against THIS rect.
+    /// The declaration is proportional, so the ramp an app paints in
+    /// its box matches the one the framework paints on a background.
+    pub fn gradient(&mut self, rect: Rect, gradient: crate::layout::Gradient, corner_radius: Px) {
+        let shifted = self.shift(rect);
+        self.display.push(DrawCommand::Gradient {
+            rect: shifted,
+            paint: gradient.resolve(shifted),
+            corner_radius,
+        });
+    }
+
     /// One vector glyph, tinted, on the largest CENTRED square of
     /// `rect` — the same bytes the built-in `icon(…)` paints. Pass
     /// `painter.ink()` to take the inherited ink.
@@ -1230,5 +1243,94 @@ mod tests {
     /// Lays a node out at an exact proposal.
     fn layout_root(root: &LayoutNode, width: Px, height: Px) -> crate::layout::LayoutResult {
         crate::layout::layout(root, Proposal { width: Some(width), height: Some(height) })
+    }
+
+    /// The painter's ramp resolves against the SHIFTED rect: what an
+    /// app declares proportionally lands where the box actually is.
+    #[test]
+    fn the_painter_ramp_lands_in_layout_coords() {
+        struct Ramp;
+        impl CustomElement for Ramp {
+            fn paint(&self, ctx: &PaintCtx, painter: &mut Painter) {
+                painter.gradient(
+                    ctx.bounds(),
+                    crate::layout::Gradient::linear(Color::hex(0x000000), Color::hex(0xFFFFFF)),
+                    0.0,
+                );
+            }
+            fn name(&self) -> &str {
+                "ramp"
+            }
+        }
+        let result = crate::layout::layout(
+            &crate::layout::LayoutNode::Padding {
+                edges: crate::layout::Edges::uniform(10.0),
+                child: Box::new(node(Ramp)),
+            },
+            Proposal { width: Some(120.0), height: Some(60.0) },
+        );
+        let (rect, paint) = result
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Gradient { rect, paint, .. } => Some((*rect, *paint)),
+                _ => None,
+            })
+            .expect("the ramp painted");
+        assert_eq!(rect.origin.x, 10.0);
+        assert_eq!(rect.origin.y, 10.0);
+        // the line runs down the box: the resolved start sits on the
+        // box's top edge, in LAYOUT coordinates
+        match paint {
+            crate::layout::GradientPaint::Linear { start, end, .. } => {
+                assert_eq!(start.y, 10.0);
+                assert_eq!(end.y, 50.0);
+            }
+            other => panic!("a linear ramp, not {other:?}"),
+        }
+    }
+
+    /// The painter's glyph is the same bytes the built-in paints —
+    /// proven by the source key alone.
+    #[test]
+    fn the_painter_glyph_carries_the_tinted_key() {
+        const DOT_PATH: &[crate::icon::Verb] = &[
+            crate::icon::Verb::Move(4.0, 12.0),
+            crate::icon::Verb::Line(20.0, 12.0),
+        ];
+        const DOT_GLYPH: crate::icon::Glyph = crate::icon::Glyph {
+            draws: &[crate::icon::Draw {
+                paint: crate::icon::Paint::Stroke { width: 2.0 },
+                path: DOT_PATH,
+            }],
+        };
+        const DOT: crate::icon::Symbol = crate::icon::Symbol::new("test.dot", &DOT_GLYPH);
+        struct Badge;
+        impl CustomElement for Badge {
+            fn paint(&self, ctx: &PaintCtx, painter: &mut Painter) {
+                let ink = painter.ink();
+                painter.icon(ctx.bounds(), DOT, ink);
+            }
+            fn name(&self) -> &str {
+                "badge"
+            }
+        }
+        let result = crate::layout::layout(
+            &node(Badge),
+            Proposal { width: Some(40.0), height: Some(20.0) },
+        );
+        let source = result
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Image { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .expect("the glyph painted");
+        let ink = crate::theme::current().fg;
+        assert_eq!(
+            source.key(),
+            crate::image_engine::ImageSource::symbol(DOT, ink).key()
+        );
     }
 }
