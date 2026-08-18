@@ -217,6 +217,14 @@ impl Component for Finder {
         .alignment(HorizontalAlignment::Leading)
         .padding_edge(Edge::Bottom, 10.0)
         .background_color(theme::panel())
+        // a ramp behind the panel: the engine owns the geometry, each
+        // rendering paints it its own way (a CSS radial-gradient here,
+        // our own rasterizer on the canvas page)
+        .background_gradient(
+            Gradient::radial(theme::accent(), theme::accent().fade())
+                .center(UnitPoint::TOP_LEADING)
+                .radius(0.0, 260.0),
+        )
         .corner_radius(12.0)
         .border(theme::border(), 1.0)
         .shadow(28.0))

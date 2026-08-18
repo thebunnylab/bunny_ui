@@ -272,6 +272,29 @@ function applyPatches(view, length) {
       if (mask & 1024) base.push(`color:${rgba(u32())}`);
       if (mask & 2048) hoverInk = rgba(u32());
       if (mask & 4096) pressedInk = rgba(u32());
+      // a two-stop ramp: the geometry is the engine's, the pixels are
+      // the browser's (background-image sits OVER the flat background)
+      if (mask & 8192) {
+        const kind = u8();
+        const [a, b, c, d] = [f32(), f32(), f32(), f32()];
+        const near = rgba(u32());
+        const far = rgba(u32());
+        if (kind === 0) {
+          const reach = d < 0 ? "farthest-corner" : `${d}px`;
+          const stop = d < 0 ? "100%" : `${d}px`;
+          base.push(
+            `background-image:radial-gradient(circle ${reach} at ` +
+              `${a * 100}% ${b * 100}%, ${near} ${c}px, ${far} ${stop})`,
+          );
+        } else {
+          // CSS runs its line through the centre: the angle carries the
+          // direction (0deg points up, clockwise)
+          const degrees = (Math.atan2(c - a, -(d - b)) * 180) / Math.PI;
+          base.push(
+            `background-image:linear-gradient(${degrees.toFixed(2)}deg, ${near}, ${far})`,
+          );
+        }
+      }
       const name = `[data-n="${id}"]`;
       let rule = `${name}{${base.join(";")}}`;
       if (hover) rule += `\n${name}:hover{background:${hover}}`;

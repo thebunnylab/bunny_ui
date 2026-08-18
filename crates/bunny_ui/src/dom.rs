@@ -84,6 +84,11 @@ pub struct DomImage {
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct DomStyle {
     pub background: Option<Color>,
+    /// A two-stop ramp over the flat background — the browser's own
+    /// `radial-gradient`/`linear-gradient`. The geometry is ours (a
+    /// proportional centre, a direction); the pixels are the
+    /// browser's, like every other paint in this mode.
+    pub gradient: Option<crate::layout::Gradient>,
     pub hover_background: Option<Color>,
     pub pressed_background: Option<Color>,
     /// The ink this box hands DOWN. It only travels when a state below
@@ -112,6 +117,7 @@ impl DomStyle {
     fn from_props(props: &VisualProps) -> DomStyle {
         DomStyle {
             background: props.background,
+            gradient: props.gradient,
             hover_background: props.background_hovered,
             pressed_background: props.background_pressed,
             color: None,
@@ -866,6 +872,11 @@ fn diff_children(
 ///                   8 focus border u32 rgba   9 placeholder u32 rgba
 ///                   10 ink u32 rgba (what the subtree inherits)
 ///                   11 hover ink u32 rgba     12 pressed ink u32 rgba
+///                   13 gradient u8 kind (0 rings, 1 line),
+///                      f32 x4 — rings: centre x, centre y (0..1),
+///                      start px, end px (negative = the box's reach);
+///                      line: start x, start y, end x, end y (0..1) —
+///                      then u32 near rgba, u32 far rgba
 ///   6 set text      u32 rgba, u8 inherits ink (1 = no color of its
 ///                   own — the box above owns both states),
 ///                   f32 size, u8 weight, u8 mono,
@@ -1021,6 +1032,9 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     if style.pressed_color.is_some() {
         mask |= 1 << 12;
     }
+    if style.gradient.is_some() {
+        mask |= 1 << 13;
+    }
     push_u16(out, mask);
     if let Some(color) = style.background {
         push_u32(out, pack_color(color));
@@ -1063,6 +1077,30 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     }
     if let Some(color) = style.pressed_color {
         push_u32(out, pack_color(color));
+    }
+    if let Some(gradient) = style.gradient {
+        match gradient {
+            crate::layout::Gradient::Radial { center, start, end, inner, outer } => {
+                out.push(0);
+                push_f32(out, center.x);
+                push_f32(out, center.y);
+                push_f32(out, start);
+                // no reach given = the box's own farthest corner, which
+                // CSS spells `farthest-corner`
+                push_f32(out, end.unwrap_or(-1.0));
+                push_u32(out, pack_color(inner));
+                push_u32(out, pack_color(outer));
+            }
+            crate::layout::Gradient::Linear { start, end, from, to } => {
+                out.push(1);
+                push_f32(out, start.x);
+                push_f32(out, start.y);
+                push_f32(out, end.x);
+                push_f32(out, end.y);
+                push_u32(out, pack_color(from));
+                push_u32(out, pack_color(to));
+            }
+        }
     }
 }
 
@@ -1815,6 +1853,48 @@ mod tests {
             "closing is removal only: {patches:?}"
         );
         assert!(!patches.is_empty());
+    }
+
+    #[test]
+    fn a_gradient_reaches_the_browser_as_a_style() {
+        #[derive(Clone)]
+        struct Glow;
+        impl Component for Glow {
+            fn body(self, _ctx: &Context) -> impl View {
+                use crate::layout::{Gradient, UnitPoint};
+                let violet = Color::hex(0x8B5CF6);
+                spacer().frame(80.0, 40.0).background_color(Color::hex(0x101014)).background_gradient(
+                    Gradient::radial(violet, violet.fade())
+                        .center(UnitPoint::TOP)
+                        .radius(0.0, 120.0),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        let patches = runtime.dom_frame(&Glow, Size { width: 100.0, height: 60.0 });
+        let style = patches
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::SetStyle { style, .. } if style.gradient.is_some() => Some(style),
+                _ => None,
+            })
+            .expect("the ramp travels as style, not as pixels");
+        assert!(style.background.is_some(), "the flat color rides along under it");
+        match style.gradient.expect("a gradient") {
+            crate::layout::Gradient::Radial { center, start, end, .. } => {
+                assert_eq!(center.y, 0.0, "anchored to the top edge");
+                assert_eq!((start, end), (0.0, Some(120.0)));
+            }
+            other => panic!("{other:?}"),
+        }
+        // the mask bit and the payload are the wire contract
+        let bytes = encode(&[patches
+            .iter()
+            .find(|patch| matches!(patch, DomPatch::SetStyle { style, .. } if style.gradient.is_some()))
+            .cloned()
+            .expect("the style patch")]);
+        let mask = u16::from_le_bytes([bytes[9], bytes[10]]);
+        assert_eq!(mask & (1 << 13), 1 << 13, "bit 13 says a ramp follows");
     }
 
     #[test]
