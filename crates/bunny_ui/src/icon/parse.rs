@@ -125,6 +125,13 @@ struct Inherited {
     stroke_tint: Option<crate::layout::Color>,
     stroke_width: f32,
     even_odd: bool,
+    /// The composed affine of every ancestor — FLATTENED here at
+    /// convert time, so the runtime never meets a matrix. Cubics are
+    /// affine-safe, and every arc became a cubic before this applies.
+    transform: [f64; 6],
+    /// `stroke-dasharray`, resolved OFFLINE: the contour flattens and
+    /// the dashes become their own little strokes.
+    dash: Option<Vec<f32>>,
 }
 
 impl Default for Inherited {
@@ -137,8 +144,87 @@ impl Default for Inherited {
             stroke_tint: None,
             stroke_width: 1.0,
             even_odd: false,
+            transform: IDENTITY,
+            dash: None,
         }
     }
+}
+
+/// Column-major 2×3: `[a, b, c, d, e, f]` maps `(x, y)` to
+/// `(a·x + c·y + e, b·x + d·y + f)` — SVG's own matrix order.
+const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+fn compose(outer: [f64; 6], inner: [f64; 6]) -> [f64; 6] {
+    [
+        outer[0] * inner[0] + outer[2] * inner[1],
+        outer[1] * inner[0] + outer[3] * inner[1],
+        outer[0] * inner[2] + outer[2] * inner[3],
+        outer[1] * inner[2] + outer[3] * inner[3],
+        outer[0] * inner[4] + outer[2] * inner[5] + outer[4],
+        outer[1] * inner[4] + outer[3] * inner[5] + outer[5],
+    ]
+}
+
+fn apply(matrix: [f64; 6], x: f32, y: f32) -> (f32, f32) {
+    let (x, y) = (x as f64, y as f64);
+    (
+        (matrix[0] * x + matrix[2] * y + matrix[4]) as f32,
+        (matrix[1] * x + matrix[3] * y + matrix[5]) as f32,
+    )
+}
+
+/// `matrix(…)`, `translate(…)`, `scale(…)`, `rotate(deg [cx cy])` —
+/// a list of them composes left to right, SVG law.
+fn parse_transform(value: &str, line: usize) -> Result<[f64; 6], SvgError> {
+    let mut matrix = IDENTITY;
+    let mut rest = value.trim();
+    while !rest.is_empty() {
+        let open = rest.find('(').ok_or_else(|| SvgError {
+            line,
+            message: "The transform does not parse.".into(),
+        })?;
+        let close = rest.find(')').ok_or_else(|| SvgError {
+            line,
+            message: "The transform does not parse.".into(),
+        })?;
+        let name = rest[..open].trim();
+        let numbers: Vec<f64> = rest[open + 1..close]
+            .split([' ', ','])
+            .filter_map(|n| n.trim().parse().ok())
+            .collect();
+        let own = match (name, numbers.as_slice()) {
+            ("matrix", [a, b, c, d, e, f]) => [*a, *b, *c, *d, *e, *f],
+            ("translate", [x]) => [1.0, 0.0, 0.0, 1.0, *x, 0.0],
+            ("translate", [x, y]) => [1.0, 0.0, 0.0, 1.0, *x, *y],
+            ("scale", [s]) => [*s, 0.0, 0.0, *s, 0.0, 0.0],
+            ("scale", [x, y]) => [*x, 0.0, 0.0, *y, 0.0, 0.0],
+            ("rotate", [degrees]) => rotation(*degrees, 0.0, 0.0),
+            ("rotate", [degrees, cx, cy]) => rotation(*degrees, *cx, *cy),
+            _ => {
+                return Err(SvgError {
+                    line,
+                    message: format!("The transform {name} is not supported."),
+                });
+            }
+        };
+        matrix = compose(matrix, own);
+        rest = rest[close + 1..].trim_start_matches([' ', ',']).trim();
+    }
+    Ok(matrix)
+}
+
+fn rotation(degrees: f64, cx: f64, cy: f64) -> [f64; 6] {
+    let radians = degrees.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    // translate(cx cy) · rotate · translate(-cx -cy), composed flat
+    [
+        cos,
+        sin,
+        -sin,
+        cos,
+        cx - cos * cx + sin * cy,
+        cy - sin * cx - cos * cy,
+    ]
 }
 
 /// The measured refusals — each with its instruction.
@@ -201,23 +287,18 @@ pub fn parse(svg: &str) -> Result<ParsedGlyph, SvgError> {
                 return Err(SvgError { line, message: (*message).into() });
             }
         }
-        for (key, _) in &attributes {
-            if *key == "transform" {
-                return Err(SvgError {
-                    line,
-                    message: "The attribute transform is not supported. Apply it to the coordinates before you convert.".into(),
-                });
-            }
-            if *key == "stroke-dasharray" {
-                return Err(SvgError {
-                    line,
-                    message: "The attribute stroke-dasharray is not supported. The pen draws solid lines.".into(),
-                });
-            }
-        }
-
         let mut inherited = stack.last().expect("the root scope stays").clone();
         absorb_paint(&mut inherited, &attributes, &mut out.warnings);
+        if let Some(value) = attribute(&attributes, "transform") {
+            let own = parse_transform(value, line)?;
+            inherited.transform = compose(inherited.transform, own);
+        }
+        if let Some(value) = attribute(&attributes, "stroke-dasharray") {
+            let pattern: Vec<f32> =
+                value.split([' ', ',']).filter_map(|n| n.trim().parse().ok()).collect();
+            inherited.dash = (!pattern.is_empty() && pattern.iter().any(|d| *d > 0.0))
+                .then_some(pattern);
+        }
 
         match name {
             "svg" => {
@@ -484,6 +565,40 @@ fn push_draws(out: &mut ParsedGlyph, state: &Inherited, verbs: Vec<Verb>) {
     if verbs.is_empty() {
         return;
     }
+    // the ancestors' affine lands HERE, once — cubics carry an affine
+    // exactly, and every arc already became one
+    let verbs = if state.transform == IDENTITY {
+        verbs
+    } else {
+        verbs
+            .into_iter()
+            .map(|verb| {
+                let map = |x, y| apply(state.transform, x, y);
+                match verb {
+                    Verb::Move(x, y) => {
+                        let (x, y) = map(x, y);
+                        Verb::Move(x, y)
+                    }
+                    Verb::Line(x, y) => {
+                        let (x, y) = map(x, y);
+                        Verb::Line(x, y)
+                    }
+                    Verb::Quad(cx, cy, x, y) => {
+                        let (cx, cy) = map(cx, cy);
+                        let (x, y) = map(x, y);
+                        Verb::Quad(cx, cy, x, y)
+                    }
+                    Verb::Cubic(ax, ay, bx, by, x, y) => {
+                        let (ax, ay) = map(ax, ay);
+                        let (bx, by) = map(bx, by);
+                        let (x, y) = map(x, y);
+                        Verb::Cubic(ax, ay, bx, by, x, y)
+                    }
+                    Verb::Close => Verb::Close,
+                }
+            })
+            .collect()
+    };
     let fills = state.fill == Some(true);
     let strokes = state.stroke == Some(true);
     if fills {
@@ -491,8 +606,81 @@ fn push_draws(out: &mut ParsedGlyph, state: &Inherited, verbs: Vec<Verb>) {
         out.draws.push((Paint::Fill(rule), verbs.clone(), state.fill_tint));
     }
     if strokes {
-        out.draws.push((Paint::Stroke { width: state.stroke_width }, verbs, state.stroke_tint));
+        // a non-uniform scale bends the pen width; the root of the
+        // determinant is the honest average
+        let scale = (state.transform[0] * state.transform[3]
+            - state.transform[1] * state.transform[2])
+            .abs()
+            .sqrt() as f32;
+        let width = state.stroke_width * scale;
+        match &state.dash {
+            Some(pattern) => {
+                // the dashes resolve OFFLINE: flatten, walk, and every
+                // dash becomes its own little stroke — the runtime
+                // draws solid lines and never learns the word
+                let dashed = dash_verbs(&verbs, pattern);
+                if !dashed.is_empty() {
+                    out.draws.push((Paint::Stroke { width }, dashed, state.stroke_tint));
+                }
+            }
+            None => {
+                out.draws.push((Paint::Stroke { width }, verbs, state.stroke_tint));
+            }
+        }
     }
+}
+
+/// Walks the flattened contours emitting alternating on/off runs of
+/// the pattern as plain line verbs.
+fn dash_verbs(verbs: &[Verb], pattern: &[f32]) -> Vec<Verb> {
+    let flat = crate::icon::vector::flatten(
+        verbs,
+        crate::icon::vector::Placing { scale: 1.0, dx: 0.0, dy: 0.0 },
+    );
+    let cycle: f32 = pattern.iter().sum();
+    if cycle <= 0.0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (points, sealed) in flat.contours() {
+        let count = points.len();
+        let segments = if sealed { count } else { count.saturating_sub(1) };
+        // where we are inside the repeating pattern
+        let mut slot = 0usize;
+        let mut left = pattern[0];
+        let mut drawing = true;
+        let mut pen_down = false;
+        for i in 0..segments {
+            let (ax, ay) = points[i];
+            let (bx, by) = points[(i + 1) % count];
+            let length = ((bx - ax).hypot(by - ay)) as f32;
+            let mut travelled = 0.0f32;
+            while travelled < length {
+                let step = (length - travelled).min(left);
+                let t0 = (travelled / length) as f64;
+                let t1 = ((travelled + step) / length) as f64;
+                if drawing {
+                    let from = (ax + (bx - ax) * t0, ay + (by - ay) * t0);
+                    let to = (ax + (bx - ax) * t1, ay + (by - ay) * t1);
+                    if !pen_down {
+                        out.push(Verb::Move(from.0 as f32, from.1 as f32));
+                        pen_down = true;
+                    }
+                    out.push(Verb::Line(to.0 as f32, to.1 as f32));
+                }
+                travelled += step;
+                left -= step;
+                if left <= 0.0 {
+                    slot = (slot + 1) % pattern.len();
+                    left = pattern[slot];
+                    // an odd pattern doubles, SVG law: on/off alternates
+                    drawing = !drawing;
+                    pen_down = pen_down && drawing;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn ellipse_verbs(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<Verb> {
@@ -904,20 +1092,10 @@ mod tests {
 
     #[test]
     fn each_refusal_speaks_its_sentence() {
-        let cases = [
-            (
-                r#"<svg viewBox="0 0 24 24"><defs></defs></svg>"#,
-                "The element <defs> is not supported. Flatten the file before you convert it.",
-            ),
-            (
-                "<svg viewBox=\"0 0 24 24\">\n<g transform=\"rotate(90)\"/></svg>",
-                "The attribute transform is not supported. Apply it to the coordinates before you convert.",
-            ),
-            (
-                "<svg viewBox=\"0 0 16 16\">\n\n<circle cx=\"8\" cy=\"8\" r=\"6\" stroke-dasharray=\"21 40\"/></svg>",
-                "The attribute stroke-dasharray is not supported. The pen draws solid lines.",
-            ),
-        ];
+        let cases = [(
+            r#"<svg viewBox="0 0 24 24"><defs></defs></svg>"#,
+            "The element <defs> is not supported. Flatten the file before you convert it.",
+        )];
         for (svg, sentence) in cases {
             let error = parse(svg).unwrap_err();
             assert_eq!(error.message, sentence);
@@ -928,6 +1106,53 @@ mod tests {
         // T is refused at the path
         let error = parse_path_data("M0 0Q1 1 2 2T4 4", 7).unwrap_err();
         assert!(error.message.starts_with("The command T"));
+    }
+
+    /// The logo's shape: a rect with corners, rotated by transform —
+    /// the affine lands on the coordinates and the runtime never meets
+    /// a matrix.
+    #[test]
+    fn a_rotated_rect_converts_flat() {
+        let svg = r##"<svg viewBox="0 0 24 24" fill="#000"><rect x="8" y="8" width="8" height="8" transform="rotate(45 12 12)"/></svg>"##;
+        let parsed = parse(svg).unwrap();
+        assert_eq!(parsed.draws.len(), 1);
+        let path = &parsed.draws[0].1;
+        // the first corner (8,8) rotates about (12,12) to (12, 12-4√2)
+        match path[0] {
+            Verb::Move(x, y) => {
+                assert!((x - 12.0).abs() < 1e-3, "x {x}");
+                assert!((y - (12.0 - 5.656_854)).abs() < 1e-3, "y {y}");
+            }
+            other => panic!("a move, not {other:?}"),
+        }
+        // and a matrix on a group composes with the child
+        let grouped = r##"<svg viewBox="0 0 24 24" fill="#000"><g transform="translate(2 0)"><rect x="0" y="0" width="4" height="4" transform="scale(2)"/></g></svg>"##;
+        let parsed = parse(grouped).unwrap();
+        match parsed.draws[0].1[0] {
+            Verb::Move(x, y) => assert_eq!((x, y), (2.0, 0.0)),
+            other => panic!("{other:?}"),
+        }
+        match parsed.draws[0].1[1] {
+            Verb::Line(x, y) => assert_eq!((x, y), (10.0, 0.0), "scale then shift"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The status ring: a dashed circle — the dashes resolve offline
+    /// into little strokes, and the pen never learns the word.
+    #[test]
+    fn a_dashed_circle_becomes_little_strokes() {
+        let svg = r##"<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="#4b5" stroke-width="2" stroke-dasharray="21 40"/></svg>"##;
+        let parsed = parse(svg).unwrap();
+        assert_eq!(parsed.draws.len(), 1);
+        let (paint, path, tint) = &parsed.draws[0];
+        assert!(matches!(paint, Paint::Stroke { .. }));
+        assert!(tint.is_some(), "the color rides the draw");
+        // the ~56.5-length circle under on-21/off-40: one arc drawn
+        let moves = path.iter().filter(|v| matches!(v, Verb::Move(..))).count();
+        let lines = path.iter().filter(|v| matches!(v, Verb::Line(..))).count();
+        assert_eq!(moves, 1, "one dash on this ring: {path:?}");
+        assert!(lines > 4, "the dash keeps the arc's shape in little lines");
     }
 
     #[test]
