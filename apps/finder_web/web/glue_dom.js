@@ -20,6 +20,13 @@ const decoder = new TextDecoder();
 // wasm together.
 const EXPECTED_ABI = 1;
 
+// Which wasm this page boots: the page sets `window.BUNNY_WASM`
+// before this script loads; the finder's binary is the default.
+const WASM_URL = window.BUNNY_WASM || "finder_web.wasm";
+// `?stats` on the page URL: the glue accumulates its apply-side wall
+// time in `window.__bunnyApply` — the column the wasm cannot see.
+const STATS = location.search.includes("stats");
+
 // The engine's key table, mirrored (bunny_ui_web::named_key).
 const KEYS = {
   Backspace: 1,
@@ -518,7 +525,15 @@ const imports = {
     },
     js_apply_patches(pointer, length) {
       const view = new DataView(wasm.memory.buffer, pointer, length);
+      if (!STATS) {
+        applyPatches(view, length);
+        return;
+      }
+      const opened = performance.now();
       applyPatches(view, length);
+      const box = (window.__bunnyApply ||= { ms: 0, batches: 0 });
+      box.ms += performance.now() - opened;
+      box.batches += 1;
     },
     // fresh pixels for one canvas island, straight onto its element
     js_island(id, pointer, width, height) {
@@ -601,7 +616,8 @@ const imports = {
   },
 };
 
-WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
+const bootOpened = performance.now();
+WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
   ({ instance }) => {
     wasm = instance.exports;
     window.__bunny = wasm;
@@ -615,11 +631,16 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
         `Deploy the page and the wasm together, then reload.`;
       return;
     }
+    // the boot bill: fetch+instantiate, then the first frame inside
+    // start_dom — the two numbers a mount argument needs
+    window.__bunnyBoot = { instantiate: performance.now() - bootOpened };
+    const startOpened = performance.now();
     wasm.start_dom(
       app.clientWidth,
       app.clientHeight,
       window.devicePixelRatio || 1,
     );
+    window.__bunnyBoot.start = performance.now() - startOpened;
 
     const point = (event) => {
       const rect = app.getBoundingClientRect();

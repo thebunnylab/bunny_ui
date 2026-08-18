@@ -8,6 +8,7 @@ members = [
     "crates/countries_core",
     "apps/countries_pure",
     "apps/finder_web",
+    "apps/bench_web",
 ]
 
 [workspace.package]

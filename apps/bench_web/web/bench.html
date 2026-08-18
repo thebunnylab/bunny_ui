@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>bunny_ui — finder in the dom</title>
+    <title>bunny_ui — the bench table</title>
     <style>
       html,
       body {
@@ -23,6 +23,10 @@
   </head>
   <body>
     <div id="app"></div>
-    <script src="glue_dom.js?v=10"></script>
+    <script>
+      window.BUNNY_WASM = "bench_web.wasm";
+    </script>
+    <script src="glue_dom.js?v=1"></script>
+    <script src="driver.js?v=1"></script>
   </body>
 </html>

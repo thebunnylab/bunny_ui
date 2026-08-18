@@ -12,6 +12,10 @@ const context = canvas.getContext("2d");
 // pairing this mirror was not written for.
 const EXPECTED_ABI = 1;
 
+// Which wasm this page boots: the page sets `window.BUNNY_WASM`
+// before this script loads; the finder's binary is the default.
+const WASM_URL = window.BUNNY_WASM || "finder_web.wasm";
+
 let wasm = null;
 let frameArmed = false;
 let wakeArmed = false;
@@ -240,7 +244,7 @@ function modifiers(event) {
   );
 }
 
-WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
+WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
   ({ instance }) => {
     wasm = instance.exports;
     window.__bunny = wasm;
