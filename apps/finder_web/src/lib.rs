@@ -103,7 +103,7 @@ impl CustomElement for Scratch {
                 self.note.set(Arc::from(note));
                 Response::handled()
             }
-            ElementEvent::PointerMoved { at, .. } | ElementEvent::PointerDown { at } => {
+            ElementEvent::PointerMoved { at, .. } | ElementEvent::PointerDown { at, .. } => {
                 self.mark.set(at.x);
                 Response::handled()
             }

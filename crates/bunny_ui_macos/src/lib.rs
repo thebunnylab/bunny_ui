@@ -389,8 +389,8 @@ pub fn run_window_chrome(
                 blit(runtime, root);
             }
         }
-        AppEvent::MouseDown { x, y } => {
-            if runtime.pointer_pressed(x, y) {
+        AppEvent::MouseDown { x, y, clicks } => {
+            if runtime.pointer_clicked(x, y, clicks) {
                 blit(runtime, root);
             }
         }

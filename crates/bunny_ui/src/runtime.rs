@@ -806,6 +806,13 @@ impl Runtime {
     /// action fires here (up-inside is button semantics). `true` =
     /// repaint.
     pub fn pointer_pressed(&self, x: Px, y: Px) -> bool {
+        self.pointer_clicked(x, y, 1)
+    }
+
+    /// [`Self::pointer_pressed`] with the platform's click count — the
+    /// shells pass it through (AppKit and the browser both count; the
+    /// runtime never needs a clock). A box hears it in `PointerDown`.
+    pub fn pointer_clicked(&self, x: Px, y: Px, clicks: u8) -> bool {
         // an open menu owns the press whole: a row fires ON THE DOWN
         // (menu semantics, not button semantics) and a press outside
         // closes and consumes — AppKit's own manners
@@ -875,7 +882,10 @@ impl Runtime {
                 interaction.element_grab = Some(placement.path.clone());
             }
             let at = Self::local(&placement, x, y);
-            self.deliver(&placement, crate::custom::ElementEvent::PointerDown { at });
+            self.deliver(
+                &placement,
+                crate::custom::ElementEvent::PointerDown { at, clicks },
+            );
             return true;
         }
         // a press on a grip band starts the divider drag — nothing arms

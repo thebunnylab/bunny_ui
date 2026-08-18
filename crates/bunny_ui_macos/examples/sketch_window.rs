@@ -171,7 +171,7 @@ impl CustomElement for Sketch {
 
     fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
         match event {
-            ElementEvent::PointerDown { at } => {
+            ElementEvent::PointerDown { at, .. } => {
                 self.pointer.set(Some(*at));
                 self.extend(*at);
                 Response::handled()

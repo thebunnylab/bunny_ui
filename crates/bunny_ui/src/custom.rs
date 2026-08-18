@@ -414,7 +414,9 @@ pub enum ElementEvent {
     /// The pointer moved. `pressed` = the box owns the drag (the press
     /// started here), so the point can be outside the frame.
     PointerMoved { at: Point, pressed: bool },
-    PointerDown { at: Point },
+    /// `clicks` is the platform's own count — 2 selects a word, 3 a
+    /// line, and the box never needs a clock of its own.
+    PointerDown { at: Point, clicks: u8 },
     PointerUp { at: Point },
     /// The wheel turned over the box. Ignore it and the scroll region
     /// around the box takes the turn instead.
@@ -861,7 +863,7 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                ElementEvent::PointerDown { at: Point { x: 10.0, y: 10.0 } },
+                ElementEvent::PointerDown { at: Point { x: 10.0, y: 10.0 }, clicks: 1 },
                 ElementEvent::PointerMoved {
                     at: Point { x: 290.0, y: 290.0 },
                     pressed: true

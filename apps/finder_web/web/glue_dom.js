@@ -642,7 +642,7 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
     };
     app.addEventListener("pointerdown", (event) => {
       const [x, y] = point(event);
-      wasm.bunny_pointer_down(x, y);
+      wasm.bunny_pointer_down(x, y, event.detail || 1);
     });
     app.addEventListener("contextmenu", (event) => {
       // the scene offers its own menu — the browser's stays home

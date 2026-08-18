@@ -117,7 +117,7 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
 /// What the exports feed the shell — the web twin of the mac AppEvent.
 enum Event {
     PointerMove { x: f64, y: f64 },
-    PointerDown { x: f64, y: f64 },
+    PointerDown { x: f64, y: f64, clicks: u8 },
     PointerUp { x: f64, y: f64 },
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
     Text(String),
@@ -219,8 +219,8 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
-            Event::PointerDown { x, y } => {
-                if runtime.pointer_pressed(x, y) {
+            Event::PointerDown { x, y, clicks } => {
+                if runtime.pointer_clicked(x, y, clicks) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
@@ -330,8 +330,8 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
 
     let handle = Box::new(move |event: Event| {
         match event {
-            Event::PointerDown { x, y } => {
-                let _ = runtime.pointer_pressed(x, y);
+            Event::PointerDown { x, y, clicks } => {
+                let _ = runtime.pointer_clicked(x, y, clicks);
                 present(&runtime, runtime.dom_frame(&root, size), scale);
             }
             Event::PointerUp { x, y } => {
@@ -444,8 +444,9 @@ pub extern "C" fn bunny_context_click(x: f64, y: f64) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn bunny_pointer_down(x: f64, y: f64) {
-    dispatch(Event::PointerDown { x, y });
+pub extern "C" fn bunny_pointer_down(x: f64, y: f64, clicks: u32) {
+    // the browser already counts (UIEvent.detail)
+    dispatch(Event::PointerDown { x, y, clicks: clicks.min(255) as u8 });
 }
 
 #[unsafe(no_mangle)]

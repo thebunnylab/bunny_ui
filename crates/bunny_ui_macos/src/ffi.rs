@@ -241,7 +241,7 @@ pub(crate) unsafe fn sel(name: &str) -> Sel {
 /// coordinates (origin at top-left, logical points) — the AppKit flip
 /// already happened.
 pub enum AppEvent {
-    MouseDown { x: f64, y: f64 },
+    MouseDown { x: f64, y: f64, clicks: u8 },
     /// The right button (or a two-finger tap): the context-menu press.
     RightMouseDown { x: f64, y: f64 },
     MouseUp { x: f64, y: f64 },
@@ -407,7 +407,9 @@ extern "C" fn bunny_mouse_down(this: Id, _sel: Sel, event: Id) {
         }
         return;
     }
-    dispatch(AppEvent::MouseDown { x, y });
+    // AppKit already counts: 2 is the word, 3 is the line
+    let clicks = unsafe { msg_u64(event, sel("clickCount")).min(255) as u8 };
+    dispatch(AppEvent::MouseDown { x, y, clicks });
 }
 
 extern "C" fn bunny_mouse_up(this: Id, _sel: Sel, event: Id) {
