@@ -1,0 +1,23 @@
+[package]
+name = "bunny-ui-linux"
+version = "0.1.0"
+edition.workspace = true
+# every example is declared below with a platform-suffixed artifact
+# name; discovery would re-add the bare names and bring the collision
+# back
+autoexamples = false
+
+[dependencies]
+bunny-ui.workspace = true
+
+[dev-dependencies]
+countries-core.workspace = true
+countries-pure.workspace = true
+
+# the example FILES are deliberate twins of the other shells', but the
+# artifact names carry the platform: three crates emitting the same
+# `counter_window.exe` race the Windows linker's file lock (LNK1104)
+# on the host gate — the bench twins set the suffix precedent
+[[example]]
+name = "counter_window_linux"
+path = "examples/counter_window.rs"
