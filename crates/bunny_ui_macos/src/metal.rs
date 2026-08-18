@@ -307,8 +307,22 @@ vertex RectVary rect_vertex(uint vid [[vertex_id]],
     return out;
 }
 
+struct ClipRound {
+    float4 box;
+    float radius;
+};
+
+// the curve that softens the run's clip. radius 0 is the straight
+// rectangle the quad clamp already cut — and multiplying by 1.0 is
+// exact, so a scene without a rounded clip leaves both shaders
+// untouched, bit for bit
+static float clip_cov(float2 p, constant ClipRound& round) {
+    return round.radius > 0.0 ? rect_cov(p, round.box, round.radius) : 1.0;
+}
+
 fragment float4 rect_fragment(RectVary in [[stage_in]],
-                              device const RectInstance* rects [[buffer(0)]]) {
+                              device const RectInstance* rects [[buffer(0)]],
+                              constant ClipRound& round [[buffer(1)]]) {
     RectInstance rect = rects[in.id];
     float2 p = in.position.xy;
     float kind = rect.params.z;
@@ -358,10 +372,10 @@ fragment float4 rect_fragment(RectVary in [[stage_in]],
         float4 near = float4(rect.color);
         float4 far = float4(rect.color2);
         float4 mixed = floor(mix(near, far, t) + 0.5) / 255.0;
-        return float4(mixed.rgb, mixed.a * coverage);
+        return float4(mixed.rgb, mixed.a * coverage * clip_cov(p, round));
     }
     float4 color = float4(rect.color) / 255.0;
-    return float4(color.rgb, color.a * coverage);
+    return float4(color.rgb, color.a * coverage * clip_cov(p, round));
 }
 
 struct SpriteVary {
@@ -385,10 +399,14 @@ vertex SpriteVary sprite_vertex(uint vid [[vertex_id]],
 
 fragment float4 sprite_fragment(SpriteVary in [[stage_in]],
                                 device const SpriteInstance* sprites [[buffer(0)]],
+                                constant ClipRound& round [[buffer(1)]],
                                 texture2d<float, access::read> atlas [[texture(0)]]) {
     SpriteInstance sprite = sprites[in.id];
     float2 texel = sprite.tex.xy + (floor(in.position.xy) - floor(sprite.dest.xy));
-    return atlas.read(uint2(texel));
+    // straight alpha in, straight alpha out — only the coverage moves,
+    // and text under a rounded corner loses its square edge at last
+    float4 ink = atlas.read(uint2(texel));
+    return float4(ink.rgb, ink.a * clip_cov(in.position.xy, round));
 }
 "#;
 
@@ -419,6 +437,7 @@ struct Sels {
     set_vertex_buffer: Sel,
     set_fragment_buffer: Sel,
     set_vertex_bytes: Sel,
+    set_fragment_bytes: Sel,
     draw: Sel,
     set_fragment_texture: Sel,
     in_live_resize: Sel,
@@ -457,6 +476,7 @@ impl Sels {
                 set_vertex_buffer: sel("setVertexBuffer:offset:atIndex:"),
                 set_fragment_buffer: sel("setFragmentBuffer:offset:atIndex:"),
                 set_vertex_bytes: sel("setVertexBytes:length:atIndex:"),
+                set_fragment_bytes: sel("setFragmentBytes:length:atIndex:"),
                 draw: sel("drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:"),
                 set_fragment_texture: sel("setFragmentTexture:atIndex:"),
                 in_live_resize: sel("inLiveResize"),
@@ -579,6 +599,7 @@ impl MetalStack {
         instances: Id,
         sprite_offset: usize,
         runs: &[DrawRun],
+        rounds: &[RoundClip],
         atlas_texture: Id,
         textures: &[Id],
     ) -> Id {
@@ -616,7 +637,21 @@ impl MetalStack {
                     1,
                 );
                 let mut bound: Option<RunKind> = None;
+                let mut bound_round: Option<u32> = None;
                 for run in runs {
+                    // 32 bytes per SHAPE change — a frame with no
+                    // rounded clip binds slot zero once; bindings
+                    // persist across the pipeline swaps
+                    if bound_round != Some(run.round) {
+                        msg_void_ptr_u64_u64(
+                            encoder,
+                            self.sels.set_fragment_bytes,
+                            (&rounds[run.round as usize]) as *const RoundClip as *const c_void,
+                            32,
+                            1,
+                        );
+                        bound_round = Some(run.round);
+                    }
                     if bound != Some(run.kind) {
                         match run.kind {
                             RunKind::Rects => {
@@ -789,6 +824,33 @@ fn corner_clamp(scaled_radius: f64, snapped: Box4) -> f64 {
         .min((snapped.2 - snapped.0) as f64 / 2.0)
         .min((snapped.3 - snapped.1) as f64 / 2.0)
 }
+
+/// The curve a run is cut by, as the shaders see it — ONE per draw
+/// run, bound as 32 bytes of fragment constants, never per instance:
+/// the 64-byte rect wire and the 48-byte sprite wire stay untouched.
+/// `radius == 0` is the straight rectangle every clip has been until
+/// now — and multiplying coverage by 1.0 is exact, so a frame without
+/// a curve leaves both shaders bit for bit as they were.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq)]
+struct RoundClip {
+    /// The rounded clip's OWN snapped box in device px — the cut can
+    /// be smaller without the corner moving.
+    box4: [f32; 4],
+    radius: f32,
+    /// MSL rounds a float4-first struct to 32 bytes; these three say
+    /// so out loud on the Rust side.
+    pad: [f32; 3],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<RoundClip>() == 32);
+    assert!(std::mem::offset_of!(RoundClip, box4) == 0);
+    assert!(std::mem::offset_of!(RoundClip, radius) == 16);
+};
+
+/// Slot zero of every frame — the cut that never bends.
+const NO_ROUND: RoundClip = RoundClip { box4: [0.0; 4], radius: 0.0, pad: [0.0; 3] };
 
 const KIND_FILL: f32 = 0.0;
 const KIND_STROKE: f32 = 1.0;
@@ -1242,12 +1304,16 @@ struct DrawRun {
     kind: RunKind,
     base: u32,
     count: u32,
+    /// Index into the frame's interned curves — a `u32` compare keeps
+    /// run coalescing cheap, and the run only breaks when the SHAPE of
+    /// the cut changes, which no scene of today ever does.
+    round: u32,
 }
 
-fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, index: usize) {
+fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, round: u32, index: usize) {
     match runs.last_mut() {
-        Some(run) if run.kind == kind => run.count += 1,
-        _ => runs.push(DrawRun { kind, base: index as u32, count: 1 }),
+        Some(run) if run.kind == kind && run.round == round => run.count += 1,
+        _ => runs.push(DrawRun { kind, base: index as u32, count: 1, round }),
     }
 }
 
@@ -1258,6 +1324,9 @@ struct FrameBatches {
     rects: Vec<RectInstance>,
     sprites: Vec<SpriteInstance>,
     runs: Vec<DrawRun>,
+    /// The frame's interned curves — slot 0 is always [`NO_ROUND`], so
+    /// a frame with no rounded clip binds once and moves on.
+    rounds: Vec<RoundClip>,
     /// Dedicated textures this frame reads (borrowed from the atlas's
     /// cache — the atlas owns and releases them).
     textures: Vec<Id>,
@@ -1281,10 +1350,14 @@ fn build_frame(
     batches.sprites.clear();
     batches.runs.clear();
     batches.textures.clear();
+    batches.rounds.clear();
+    batches.rounds.push(NO_ROUND);
     let out = &mut batches.rects;
     let factor = scale as f64;
     let whole: Box4 = (0, 0, target.0 as i64, target.1 as i64);
-    let mut clips: Vec<Box4> = Vec::new();
+    // each entry: the hard cut, plus the index of the curve it lives
+    // under (the CPU's inheritance rule, spoken in indices)
+    let mut clips: Vec<(Box4, u32)> = Vec::new();
     for command in display.iter() {
         match command {
             DrawCommand::FillRect { rect, color, corner_radius } => {
@@ -1298,7 +1371,7 @@ fn build_frame(
                 }
                 let radius = corner_clamp(corner_radius * factor, snapped);
                 push_rect(out, snapped, clip, *color, radius, 0.0, KIND_FILL, 0.0);
-                note_run(&mut batches.runs, RunKind::Rects, out.len() - 1);
+                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
             }
             DrawCommand::Gradient { rect, paint, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -1347,7 +1420,7 @@ fn build_frame(
                         )
                     }
                 }
-                note_run(&mut batches.runs, RunKind::Rects, out.len() - 1);
+                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
             }
             DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -1363,7 +1436,7 @@ fn build_frame(
                 let thickness = (width * factor).max(1.0).round();
                 let radius = corner_clamp(corner_radius * factor, snapped);
                 push_rect(out, snapped, clip, *color, radius, thickness, KIND_STROKE, 0.0);
-                note_run(&mut batches.runs, RunKind::Rects, out.len() - 1);
+                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
             }
             DrawCommand::Shadow { rect, radius, color, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -1384,7 +1457,7 @@ fn build_frame(
                     continue;
                 }
                 push_rect(out, expanded, clip, *color, corner, reach, KIND_SHADOW, reach_px as f64);
-                note_run(&mut batches.runs, RunKind::Rects, out.len() - 1);
+                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
             }
             DrawCommand::TextLine { origin, content, range, color, font } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
@@ -1422,7 +1495,7 @@ fn build_frame(
                         ],
                         clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
                     });
-                    note_run(&mut batches.runs, RunKind::Sprites, batches.sprites.len() - 1);
+                    note_run(&mut batches.runs, RunKind::Sprites, round_of(&clips), batches.sprites.len() - 1);
                 }
             }
             DrawCommand::Image { rect, source } => {
@@ -1479,6 +1552,7 @@ fn build_frame(
                             note_run(
                                 &mut batches.runs,
                                 RunKind::Sprites,
+                                round_of(&clips),
                                 batches.sprites.len() - 1,
                             );
                         }
@@ -1505,19 +1579,44 @@ fn build_frame(
                         note_run(
                             &mut batches.runs,
                             RunKind::Texture(index as u16),
+                            round_of(&clips),
                             batches.sprites.len() - 1,
                         );
                     }
                 }
             }
-            DrawCommand::PushClip { rect, .. } => {
+            DrawCommand::PushClip { rect, corner_radius } => {
                 let snapped = snap_scaled(*rect, factor);
-                let top = match clips.last().copied() {
-                    Some(top) => box_intersect(snapped, top)
+                let cut = match clips.last().copied() {
+                    Some((top, _)) => box_intersect(snapped, top)
                         .unwrap_or((snapped.0, snapped.1, snapped.0, snapped.1)),
                     None => snapped,
                 };
-                clips.push(top);
+                // the same clamp and the same half-pixel door the CPU
+                // keeps — below it, the clip INHERITS the open curve
+                let radius = corner_clamp(corner_radius * factor, snapped);
+                let round = if radius >= 0.5 {
+                    let entry = RoundClip {
+                        box4: [
+                            snapped.0 as f32,
+                            snapped.1 as f32,
+                            snapped.2 as f32,
+                            snapped.3 as f32,
+                        ],
+                        radius: radius as f32,
+                        pad: [0.0; 3],
+                    };
+                    match batches.rounds.iter().position(|r| *r == entry) {
+                        Some(index) => index as u32,
+                        None => {
+                            batches.rounds.push(entry);
+                            (batches.rounds.len() - 1) as u32
+                        }
+                    }
+                } else {
+                    clips.last().map_or(0, |(_, round)| *round)
+                };
+                clips.push((cut, round));
             }
             DrawCommand::PopClip => {
                 clips.pop();
@@ -1530,11 +1629,16 @@ fn build_frame(
 /// The clip a primitive paints under: the stack top intersected with the
 /// target — `None` means nothing under it can paint (the CPU's clamped
 /// loops collapse to nothing there).
-fn effective_clip(clips: &[Box4], whole: Box4) -> Option<Box4> {
+fn effective_clip(clips: &[(Box4, u32)], whole: Box4) -> Option<Box4> {
     match clips.last().copied() {
-        Some(top) => box_intersect(top, whole),
+        Some((top, _)) => box_intersect(top, whole),
         None => Some(whole),
     }
+}
+
+/// The curve index the open clip lives under — slot 0 when none.
+fn round_of(clips: &[(Box4, u32)]) -> u32 {
+    clips.last().map_or(0, |(_, round)| *round)
 }
 
 // MARK: - Instance buffers (a fixed ring, recycled by polling)
@@ -1794,6 +1898,7 @@ impl MetalPresenter {
                 self.slots[index].buffer,
                 sprite_offset,
                 &self.batches.runs,
+                &self.batches.rounds,
                 self.atlas.texture,
                 &self.batches.textures,
             );
@@ -2034,6 +2139,7 @@ impl OffscreenGpu {
                 self.slots[index].buffer,
                 sprite_offset,
                 &self.batches.runs,
+                &self.batches.rounds,
                 self.atlas.texture,
                 &self.batches.textures,
             );
@@ -2186,6 +2292,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<RectInstance>(), 64);
         assert_eq!(std::mem::align_of::<RectInstance>(), 4);
         assert_eq!(std::mem::size_of::<SpriteInstance>(), 48);
+        assert_eq!(std::mem::size_of::<RoundClip>(), 32);
     }
 
     #[test]
@@ -2273,6 +2380,56 @@ mod tests {
             scene_bytes(&root, Size { width: 200.0, height: 120.0 }, 2, Color::CANVAS);
         let delta = max_channel_delta(&gpu, &cpu);
         assert!(delta <= 1, "clipped scene drifted by {delta} (allowed 1)");
+    }
+
+    /// The whole front on one screen: a bordered rounded island with
+    /// .clipped(), text crossing its corner, a child panel with its
+    /// own background, and a SCROLL nested inside — rects, sprites and
+    /// the inheritance rule all under the AA gate at once.
+    #[test]
+    fn a_rounded_clip_cuts_the_same_corner_on_both_backends() {
+        if !device_present() {
+            return;
+        }
+        let rows: Vec<usize> = (0..8).collect();
+        let root = vstack((
+            text("corner text").foreground_color(Color::hex(0x202531)),
+            empty().frame(150.0, 18.0).background_color(Color::hex(0xAA3322)),
+            list(rows, |row| row.to_string(), |row| {
+                let tint =
+                    if row % 2 == 0 { Color::hex(0x3B82F6) } else { Color::hex(0xDDE1E9) };
+                empty().frame(150.0, 16.0).background_color(tint)
+            })
+            .frame(160.0, 60.0),
+        ))
+        .background_color(Color::hex(0xF0F2F6))
+        .border(Color::hex(0x202531), 1.0)
+        .corner_radius(10.0)
+        .clipped()
+        .frame(170.0, 120.0);
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 190.0, height: 140.0 }, 2, Color::CANVAS);
+        assert_close(&gpu, &cpu, 2, "rounded clip");
+    }
+
+    /// Radius zero through the whole new plumbing: the strict tier
+    /// must not move — the curve is exactly nothing when absent.
+    #[test]
+    fn a_clipped_box_without_a_radius_stays_strict() {
+        if !device_present() {
+            return;
+        }
+        let root = vstack((
+            text("square").foreground_color(Color::hex(0x202531)),
+            empty().frame(120.0, 20.0).background_color(Color::hex(0x3B82F6)),
+        ))
+        .background_color(Color::hex(0xF0F2F6))
+        .clipped()
+        .frame(140.0, 34.0);
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 160.0, height: 60.0 }, 2, Color::CANVAS);
+        let delta = max_channel_delta(&gpu, &cpu);
+        assert!(delta <= 1, "the straight cut drifted by {delta} (allowed 1)");
     }
 
     #[test]
