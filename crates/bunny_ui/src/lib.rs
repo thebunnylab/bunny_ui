@@ -3358,6 +3358,52 @@ mod tests {
         );
     }
 
+    // MARK: - Window controls
+
+    #[test]
+    fn a_window_control_marks_the_button_and_wins_by_design() {
+        use crate::layout::WindowControl;
+        #[derive(Clone)]
+        struct Crowned;
+        impl Component for Crowned {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    hstack!(
+                        text("title"),
+                        spacer(),
+                        text("x")
+                            .frame(46.0, 40.0)
+                            .window_control(WindowControl::Close),
+                    )
+                    .frame(200.0, 40.0)
+                    .window_drag_region(),
+                    spacer().frame(200.0, 160.0),
+                )
+            }
+        }
+        let runtime = Runtime::new();
+        let result = runtime.layout(
+            &Crowned,
+            crate::layout::Proposal::exact(crate::layout::Size {
+                width: 200.0,
+                height: 200.0,
+            }),
+        );
+        assert_eq!(result.control_regions.len(), 1, "one button, one region");
+        let (control, region) = result.control_regions[0];
+        assert_eq!(control, WindowControl::Close);
+        assert_eq!((region.size.width, region.size.height), (46.0, 40.0));
+
+        // inside the button the control answers; outside it is silent;
+        // the bar around it still drags
+        let center =
+            (region.origin.x + region.size.width / 2.0, region.origin.y + region.size.height / 2.0);
+        assert_eq!(runtime.window_control_at(center.0, center.1), Some(WindowControl::Close));
+        assert_eq!(runtime.window_control_at(10.0, 20.0), None, "the bare bar is no button");
+        assert!(runtime.window_drag_at(10.0, 20.0), "the bar still drags around it");
+        assert_eq!(runtime.window_control_at(100.0, 120.0), None, "the body is no button");
+    }
+
     // MARK: - Window drag regions
 
     #[test]

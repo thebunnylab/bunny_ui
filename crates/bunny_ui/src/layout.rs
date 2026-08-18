@@ -127,6 +127,17 @@ pub enum Side {
     Trailing,
 }
 
+/// One of the window's own buttons, marked on a scene-drawn control
+/// so the platform treats it as the real thing (snap layouts hover
+/// the maximize button; the system closes on close). Shells without
+/// window chrome of their own ignore it honestly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowControl {
+    Close,
+    Minimize,
+    Maximize,
+}
+
 impl Side {
     fn opposite(self) -> Side {
         match self {
@@ -414,6 +425,10 @@ pub enum LayoutNode {
     /// title bar on a chrome-less window. Transparent to geometry;
     /// shells without windows ignore it honestly.
     DragRegion { child: Box<LayoutNode> },
+    /// `.window_control(…)`: the child IS one of the window's own
+    /// buttons on a scene-drawn title bar. The region wins by design —
+    /// the platform activates it, so a press never reaches the scene.
+    ControlRegion { control: WindowControl, child: Box<LayoutNode> },
     /// `.tooltip(…)`: hovering the child long enough shows a small
     /// framework-drawn label beside it. Transparent to geometry and to
     /// interaction — the region never steals a hover. The RUNTIME owns
@@ -1289,6 +1304,8 @@ pub struct Placement {
     /// Window-drag regions (clipped) — where a press with no
     /// interactive target drags the window on the desktop shell.
     pub drag_regions: Vec<Rect>,
+    /// The window's own buttons on a scene-drawn bar, in paint order.
+    pub control_regions: Vec<(WindowControl, Rect)>,
     /// Tooltip regions in paint order (last = topmost) — what the
     /// runtime's hover consults. Never a hit: a tooltip explains,
     /// it does not intercept.
@@ -1419,6 +1436,8 @@ pub struct LayoutResult {
     /// Window-drag regions — a press here with no interactive target
     /// drags the window on the desktop shell.
     pub drag_regions: Vec<Rect>,
+    /// The window's own buttons on a scene-drawn bar, in paint order.
+    pub control_regions: Vec<(WindowControl, Rect)>,
     /// Tooltip regions in paint order (last = topmost) — what the
     /// runtime's hover consults. Never a hit: a tooltip explains,
     /// it does not intercept.
@@ -1485,6 +1504,7 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         misses: out.misses,
         overlays: out.overlays,
         drag_regions: out.drag_regions,
+        control_regions: out.control_regions,
         tooltips: out.tooltips,
         menus: out.menus,
         drag_sources: out.drag_sources,
@@ -1524,6 +1544,7 @@ pub fn layout_dom(
             misses: out.misses,
             overlays: out.overlays,
             drag_regions: out.drag_regions,
+            control_regions: out.control_regions,
             tooltips: out.tooltips,
             menus: out.menus,
             drag_sources: out.drag_sources,
@@ -2046,6 +2067,7 @@ impl LayoutNode {
             | LayoutNode::Island { child }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
+            | LayoutNode::ControlRegion { child, .. }
             | LayoutNode::Tooltip { child, .. }
             | LayoutNode::ContextSource { child, .. }
             | LayoutNode::DragSource { child, .. }
@@ -2096,6 +2118,7 @@ impl LayoutNode {
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
+            | LayoutNode::ControlRegion { child, .. }
             | LayoutNode::Tooltip { child, .. }
             | LayoutNode::ContextSource { child, .. }
             | LayoutNode::DragSource { child, .. }
@@ -2199,6 +2222,11 @@ impl LayoutNode {
             }
 
             LayoutNode::DragRegion { child } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            LayoutNode::ControlRegion { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -2735,6 +2763,18 @@ impl LayoutNode {
                 };
                 if let Some(region) = region {
                     out.drag_regions.push(region);
+                }
+            }
+
+            (LayoutNode::ControlRegion { control, child }, Fit::Wrapped(_, fit)) => {
+                child.place(frame, *fit, env, out);
+                // clipped like a hit: what is not visible is no button
+                let region = match out.current_clip() {
+                    Some(clip) => frame.intersection(clip),
+                    None => Some(frame),
+                };
+                if let Some(region) = region {
+                    out.control_regions.push((*control, region));
                 }
             }
 

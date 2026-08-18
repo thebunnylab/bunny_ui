@@ -102,6 +102,7 @@ pub enum Modifier {
     /// Pressing this view (where no interactive target wins) drags the
     /// WINDOW — the scene's own title bar on a chrome-less window.
     WindowDragRegion,
+    WindowControl(crate::layout::WindowControl),
 
     // MARK: - Real interaction (a pointer target without chrome — the Button
     // without the outfit; the action fires on up-inside like the Button's)
@@ -226,6 +227,15 @@ impl Modifier {
             Modifier::Rendering(mode) => format!(" [.rendering(.{mode:?})]"),
             Modifier::KeyContext(name) => format!(" [.keyContext({name})]"),
             Modifier::WindowDragRegion => " [.windowDragRegion()]".into(),
+            Modifier::WindowControl(control) => format!(
+                " [.windowControl(.{})]",
+                match control {
+                    crate::layout::WindowControl::Close => "close",
+                    crate::layout::WindowControl::Minimize => "minimize",
+                    crate::layout::WindowControl::Maximize => "maximize",
+                }
+            )
+            .into(),
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
@@ -890,6 +900,13 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 // declaration, not paint: retained with the entry — the
                 // context deactivates when the view unmounts
                 crate::reconciler::attribute_context(name);
+            }
+            Modifier::WindowControl(control) => {
+                let control = *control;
+                out.wrap_last_layout(move |node| LayoutNode::ControlRegion {
+                    control,
+                    child: Box::new(node),
+                });
             }
             Modifier::WindowDragRegion => {
                 out.wrap_layout_from(mark, |node| LayoutNode::DragRegion {

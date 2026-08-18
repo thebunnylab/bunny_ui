@@ -159,6 +159,7 @@ pub struct Runtime {
     /// Window-drag regions of the last layout — the desktop shell's
     /// press gate consults them.
     last_drag_regions: RefCell<Vec<Rect>>,
+    last_control_regions: RefCell<Vec<(crate::layout::WindowControl, Rect)>>,
     /// Where popovers may live, in layout coordinates. `None` = the
     /// viewport; the desktop shell sets the SCREEN — overflow becomes
     /// plain geometry.
@@ -559,6 +560,18 @@ impl Runtime {
         self.last_drag_regions.borrow().iter().any(|region| region.contains(x, y))
     }
 
+    /// Which of the window's own buttons sits at this point, topmost
+    /// first. Unlike the drag handle, the control WINS by design: it
+    /// IS the button, and the platform (not the scene) activates it.
+    pub fn window_control_at(&self, x: Px, y: Px) -> Option<crate::layout::WindowControl> {
+        self.last_control_regions
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(_, region)| region.contains(x, y))
+            .map(|(control, _)| *control)
+    }
+
     fn with_parts(ctx: Context, text: Rc<dyn TextEngine>) -> Self {
         let runtime = Runtime {
             ctx,
@@ -594,6 +607,7 @@ impl Runtime {
             drag_preview: RefCell::new(None),
             tooltip: RefCell::new(TooltipLife::default()),
             last_drag_regions: RefCell::new(Vec::new()),
+            last_control_regions: RefCell::new(Vec::new()),
             overlay_bounds: Cell::new(None),
             dom: RefCell::new(crate::dom::DomLowering::default()),
             root_is_boundary: Cell::new(false),
@@ -2027,6 +2041,7 @@ impl Runtime {
         *self.last_drag_sources.borrow_mut() = result.drag_sources.clone();
         *self.last_drops.borrow_mut() = result.drops.clone();
         *self.last_drag_regions.borrow_mut() = result.drag_regions.clone();
+        *self.last_control_regions.borrow_mut() = result.control_regions.clone();
         // an applied-target memory whose region left the scene goes
         // with it — live regions keep theirs (the wheel stays sovereign)
         self.scroll_targets

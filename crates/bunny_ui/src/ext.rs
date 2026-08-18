@@ -742,6 +742,18 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// Marks THIS view as one of the window's own buttons on a
+    /// scene-drawn bar (`Chrome::Scene`). The platform activates it —
+    /// close closes, maximize offers the system's snap flyout — and
+    /// the press never reaches the scene. Shells with native chrome
+    /// ignore it honestly.
+    fn window_control(self, control: crate::layout::WindowControl) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::WindowControl(control),
+        }
+    }
+
     /// An anchored popover: THIS view is the anchor, `side` the
     /// preferred edge (flip-then-clamp when there is no room). Closes
     /// on Escape and on a press outside — the press is consumed, never
