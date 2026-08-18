@@ -5,6 +5,8 @@
 //! cargo run -p bunny-ui-macos --example table_window
 //! ```
 
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
 
@@ -53,6 +55,10 @@ impl Component for Sheet {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     bunny_ui_macos::run_window("bunny_ui — table", Size { width: 560.0, height: 480.0 }, Sheet);
 }
+
+#[cfg(not(target_os = "macos"))]
+fn main() {} // this example is macOS-only
