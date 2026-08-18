@@ -9,6 +9,7 @@
 //! The data is `const`-friendly on purpose: a shipped icon is a static
 //! table the compiler lays out, with zero startup cost and zero parse.
 
+pub mod house;
 pub(crate) mod vector;
 
 use std::cell::RefCell;

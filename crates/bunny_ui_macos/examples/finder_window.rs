@@ -181,7 +181,7 @@ impl Component for Finder {
         let selected_index = selected.get().min(count.saturating_sub(1));
 
         let header = hstack!(
-            text("›").font(Font::Headline).foreground_color(theme::accent()),
+            icon(symbol::CHEVRON_RIGHT).font(Font::Headline).foreground_color(theme::accent()),
             text_field("Search files by name…", self.query.binding()).monospaced().auto_focus(),
         )
         .spacing(10.0)
