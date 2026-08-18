@@ -531,6 +531,9 @@ pub enum AppEvent {
     /// The window deactivated (the user switched apps or windows) —
     /// open popovers close, the platform's own manner.
     ResignKey,
+    /// A system setting moved (theme, animation preference) — the
+    /// shell re-reads its mirrors.
+    SettingsChanged,
     /// A task woke from somewhere else — a worker thread finished a
     /// step. The frame the shell already knows how to draw drains the
     /// queue on its way.
@@ -682,6 +685,60 @@ pub fn clipboard_read() -> Option<String> {
     text
 }
 
+// MARK: - The season's mirrors (OS theme and reduced motion)
+
+#[link(name = "advapi32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn RegGetValueW(
+        key: isize,
+        subkey: *const u16,
+        value: *const u16,
+        flags: u32,
+        kind: *mut u32,
+        data: *mut c_void,
+        size: *mut u32,
+    ) -> i32;
+}
+
+/// Whether the user asked apps to wear light — the registry value the
+/// Settings toggle writes. `None` on a system without the setting.
+pub fn os_uses_light_theme() -> Option<bool> {
+    const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
+    const RRF_RT_REG_DWORD: u32 = 0x10;
+    let subkey = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+    let value = wide("AppsUseLightTheme");
+    let mut data: u32 = 0;
+    let mut size: u32 = 4;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            &mut data as *mut u32 as *mut c_void,
+            &mut size,
+        )
+    };
+    (status == 0).then_some(data != 0)
+}
+
+/// Whether the system animates — the accessibility setting's inverse
+/// is the engine's reduce-motion.
+pub fn animations_enabled() -> bool {
+    const SPI_GET_CLIENT_AREA_ANIMATION: u32 = 0x1042;
+    let mut enabled: i32 = 1;
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GET_CLIENT_AREA_ANIMATION,
+            0,
+            &mut enabled as *mut i32 as *mut c_void,
+            0,
+        );
+    }
+    enabled != 0
+}
+
 // MARK: - Scene chrome (the window draws its own crown)
 
 /// Which of the window's own buttons a point lands on — the shell's
@@ -800,6 +857,7 @@ const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
 const WM_IME_COMPOSITION: u32 = 0x010F;
 const WM_IME_SETCONTEXT: u32 = 0x0281;
 const WM_KILLFOCUS: u32 = 0x0008;
+const WM_SETTINGCHANGE: u32 = 0x001A;
 const GCS_COMPSTR: u32 = 0x0008;
 const GCS_CURSORPOS: u32 = 0x0080;
 const GCS_RESULTSTR: u32 = 0x0800;
@@ -1666,6 +1724,12 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // clearing would erase real input
             if ime_composing() {
                 dispatch(AppEvent::ImeUnmark);
+            }
+            0
+        }
+        WM_SETTINGCHANGE => {
+            if hwnd == MAIN_HWND.load(Ordering::Acquire) {
+                dispatch(AppEvent::SettingsChanged);
             }
             0
         }

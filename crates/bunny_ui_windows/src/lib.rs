@@ -106,6 +106,15 @@ pub fn run_window_chrome(
     root: impl View,
 ) {
     let window = ffi::create_window(title, size.width, size.height, chrome == Chrome::Scene);
+    // the season's mirrors: reduce-motion always follows the system
+    // (accessibility is never the app's to refuse); the theme follows
+    // ONLY while the app has not chosen one — an installed theme means
+    // the scene owns its colors and the shell stays out
+    let mirror_theme = bunny_ui::theme::version() == 0;
+    if mirror_theme && ffi::os_uses_light_theme() == Some(false) {
+        bunny_ui::theme::install(bunny_ui::theme::Theme::dark());
+    }
+    runtime.set_reduce_motion(!ffi::animations_enabled());
     // a task that lands on a worker thread asks the pump for one more
     // turn; the frame it takes drains the queue on its way
     runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
@@ -353,6 +362,22 @@ pub fn run_window_chrome(
         let root = &*handler_root;
         match event {
             AppEvent::Redraw | AppEvent::Wake => blit(runtime, root),
+            AppEvent::SettingsChanged => {
+                runtime.set_reduce_motion(!ffi::animations_enabled());
+                if mirror_theme {
+                    let wants_dark = ffi::os_uses_light_theme() == Some(false);
+                    let is_dark =
+                        bunny_ui::theme::current().canvas == bunny_ui::theme::Theme::dark().canvas;
+                    if wants_dark != is_dark {
+                        bunny_ui::theme::install(if wants_dark {
+                            bunny_ui::theme::Theme::dark()
+                        } else {
+                            bunny_ui::theme::Theme::light()
+                        });
+                    }
+                }
+                blit(runtime, root);
+            }
             AppEvent::ResignKey => {
                 // the user switched away: popovers close like the
                 // platform's own

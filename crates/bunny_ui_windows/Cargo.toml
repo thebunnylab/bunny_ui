@@ -6,3 +6,8 @@ description = "bunny-ui Windows shell — native window and bitmap blit, depende
 
 [dependencies]
 bunny-ui.workspace = true
+
+[dev-dependencies]
+# examples only (the real countries app in a native window)
+countries-core.workspace = true
+countries-pure.workspace = true
