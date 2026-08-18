@@ -96,6 +96,9 @@ pub enum Modifier {
     OnAppear(Rc<dyn Fn()>),
     OnTapGesture(Rc<dyn Fn()>),
 
+    /// `.id("name")` — the view takes a NAME in the identity.
+    Id(Rc<str>),
+
     // MARK: - Effects (onChange / onReceive / query — drained by the pump)
     Effect {
         name: &'static str,
@@ -174,6 +177,7 @@ impl Modifier {
             Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
             Modifier::CornerRadius(radius) => format!(" [.cornerRadius({radius})]"),
             Modifier::Monospaced => " [.monospaced()]".into(),
+            Modifier::Id(name) => format!(" [.id({name:?})]"),
             Modifier::FontSize(size) => format!(" [.font(.system(size: {size}))]"),
             Modifier::BackgroundHovered(color) => format!(" [.backgroundHovered({color})]"),
             Modifier::ForegroundHovered(color) => format!(" [.foregroundHovered({color})]"),
@@ -272,7 +276,7 @@ fn rewrite_scroll_node(
 /// same order-immunity as the text and scroll rewrites.
 fn rewrite_field_node(
     node: LayoutNode,
-    rewrite: &impl Fn(String, std::rc::Rc<str>, std::rc::Rc<str>) -> LayoutNode,
+    rewrite: &impl Fn(String, std::sync::Arc<str>, std::sync::Arc<str>) -> LayoutNode,
 ) -> LayoutNode {
     match node {
         LayoutNode::Field { path, content, placeholder, .. } => {
@@ -357,7 +361,7 @@ fn rewrite_image_node(
 fn rewrite_text_node(
     node: LayoutNode,
     rewrite: &impl Fn(
-        std::rc::Rc<str>,
+        std::sync::Arc<str>,
         Option<TextHighlight>,
         Option<Truncation>,
     ) -> LayoutNode,
@@ -431,6 +435,22 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             if let Some(node) = nodes.last_mut() {
                 node.line
                     .push_str(&format!(" [.modifier({})]", custom.name()));
+            }
+            out.extend(nodes);
+            return;
+        }
+
+        // `.id("name")` wraps the base's RENDER: the identity cursor
+        // must carry the name while the subtree declares its state,
+        // its animations and its hit paths.
+        if let Modifier::Id(name) = &self.modifier {
+            let mut nodes = NodeList::new();
+            {
+                let _frame = motor::identity::enter(format!("[{name}]"));
+                self.base.render_into(ctx, &mut nodes);
+            }
+            if let Some(node) = nodes.last_mut() {
+                node.line.push_str(&format!(" [.id({name:?})]"));
             }
             out.extend(nodes);
             return;

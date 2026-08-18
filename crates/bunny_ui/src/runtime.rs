@@ -1054,9 +1054,30 @@ impl Runtime {
         nodes
     }
 
+    /// Settle, then lay out — the headless twin of
+    /// [`Runtime::display_frame`], for a probe or a test that wants the
+    /// frames instead of the pixels.
+    ///
+    /// [`Runtime::layout`] alone does NOT run effects or tasks: it lays
+    /// out what the last pass built. A screen whose data arrives through
+    /// `.task` stays empty forever under a bare `layout` loop, which is
+    /// exactly what a headless probe writes first.
+    pub fn settled_layout(
+        &self,
+        root: &impl View,
+        proposal: crate::layout::Proposal,
+    ) -> crate::layout::LayoutResult {
+        self.settle(root);
+        self.layout(root, proposal)
+    }
+
     /// Layout of the current frame: runs one pass (incremental — stable
     /// tree = zero bodies), expands the retained layout tree, and
     /// answers the proposal with the frames by identity.
+    ///
+    /// It lays out; it does not settle. Effects and tasks belong to
+    /// [`Runtime::settle`] — see [`Runtime::settled_layout`] for the
+    /// pair a probe wants.
     pub fn layout(
         &self,
         root: &impl View,

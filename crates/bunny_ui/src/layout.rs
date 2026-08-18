@@ -30,6 +30,7 @@
 use motor::hash::FxHashMap as HashMap;
 use motor::views::ContentMode;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::image_engine::{ImageEngine, ImageSource, RawImages};
 use crate::text_engine::{FontPatch, FontSpec, MeasureCache, PixelFont, TextEngine};
@@ -260,7 +261,7 @@ pub enum LayoutNode {
     /// when truncation is on; highlight paints spans without touching the
     /// measure.
     Text {
-        content: Rc<str>,
+        content: Arc<str>,
         highlights: Option<TextHighlight>,
         truncation: Option<Truncation>,
     },
@@ -355,8 +356,8 @@ pub enum LayoutNode {
     /// never carries frame state.
     Field {
         path: String,
-        content: Rc<str>,
-        placeholder: Rc<str>,
+        content: Arc<str>,
+        placeholder: Arc<str>,
         /// `.auto_focus()`: the runtime focuses this field on its FIRST
         /// appearance — and never again (a user blur is final).
         auto_focus: bool,
@@ -584,7 +585,7 @@ pub enum DrawCommand {
     /// path).
     TextLine {
         origin: Point,
-        content: Rc<str>,
+        content: Arc<str>,
         range: (usize, usize),
         color: Color,
         font: FontSpec,
@@ -2552,7 +2553,7 @@ fn measure_stack(
 /// Paints a placed text: single line, word-wrapped, or truncated with an
 /// ellipsis — always through the SAME caches as measurement.
 fn place_text(
-    content: &Rc<str>,
+    content: &Arc<str>,
     highlights: Option<&TextHighlight>,
     truncation: Option<Truncation>,
     frame: Rect,
@@ -2573,7 +2574,7 @@ fn place_text(
     if let Some(mode) = truncation {
         // highlight does not survive the ellipsis (the original's ranges
         // do not map onto the composed text) — honest v1, noted
-        let composed: Rc<str> = Rc::from(truncate_to_width(content, mode, frame.size.width, env));
+        let composed: Arc<str> = Arc::from(truncate_to_width(content, mode, frame.size.width, env));
         let length = composed.len();
         out.display.push(DrawCommand::TextLine {
             origin: frame.origin,
@@ -2603,7 +2604,7 @@ fn place_text(
 /// prefix position (kerning between segments is approximate; real
 /// shaping by runs arrives with the attributed text system).
 fn emit_text_runs(
-    content: &Rc<str>,
+    content: &Arc<str>,
     line: (usize, usize),
     highlights: Option<&TextHighlight>,
     origin: Point,
@@ -2836,7 +2837,7 @@ mod tests {
     use super::*;
 
     fn text(chars: usize) -> LayoutNode {
-        LayoutNode::Text { content: Rc::from("x".repeat(chars)), highlights: None, truncation: None }
+        LayoutNode::Text { content: Arc::from("x".repeat(chars)), highlights: None, truncation: None }
     }
 
     fn boundary(path: &str, child: LayoutNode) -> LayoutNode {
@@ -2975,6 +2976,40 @@ mod tests {
         assert_eq!(low.frames.get("a").unwrap().size.width, 100.0);
         let high = layout(&split(9999.0), Proposal { width: Some(1200.0), height: Some(700.0) });
         assert_eq!(high.frames.get("a").unwrap().size.width, 1099.0);
+    }
+
+    #[test]
+    fn a_split_stacks_its_lanes_when_the_axis_says_so() {
+        // the same seam, turned: a panel with a list on top and a
+        // history below, and the grip drags up and down
+        let split = LayoutNode::Split {
+            path: "seam".into(),
+            axis: Axis::Vertical,
+            at: 300.0,
+            min_a: 80.0,
+            min_b: 80.0,
+            children: vec![
+                boundary("top", LayoutNode::Spacer),
+                LayoutNode::Frame {
+                    width: None,
+                    height: Some(1.0),
+                    child: Box::new(LayoutNode::Spacer),
+                },
+                boundary("bottom", LayoutNode::Spacer),
+            ],
+        };
+        let result = layout(&split, Proposal { width: Some(400.0), height: Some(700.0) });
+
+        assert_eq!(result.frames.get("top").unwrap().size.height, 300.0);
+        assert_eq!(result.frames.get("bottom").unwrap().size.height, 399.0);
+        assert_eq!(result.frames.get("bottom").unwrap().origin.y, 301.0);
+        // both lanes take the full width — the seam only cuts one axis
+        assert_eq!(result.frames.get("top").unwrap().size.width, 400.0);
+        // the grip band rides the seam horizontally now
+        let (path, grip) = result.hits.last().expect("the seam registers a grip").clone();
+        assert_eq!(path, "seam/#split");
+        assert_eq!(grip.size.height, SPLIT_GRIP);
+        assert!(grip.origin.y < 300.5 && 300.5 < grip.origin.y + grip.size.height);
     }
 
     #[test]
@@ -3131,7 +3166,7 @@ mod tests {
 
     #[test]
     fn words_wrap_at_spaces_never_mid_word() {
-        let node = LayoutNode::Text { content: Rc::from("aa bb cc"), highlights: None, truncation: None };
+        let node = LayoutNode::Text { content: Arc::from("aa bb cc"), highlights: None, truncation: None };
         let result = layout(&node, Proposal { width: Some(40.0), height: None });
 
         // "aa bb" (40px) fits; "cc" goes down whole — never an orphan "c"
@@ -3151,7 +3186,7 @@ mod tests {
     fn highlight_splits_the_line_into_colored_runs() {
         let hot = Color::hex(0xFF0000);
         let node = LayoutNode::Text {
-            content: Rc::from("abcdef"),
+            content: Arc::from("abcdef"),
             highlights: Some(TextHighlight { ranges: Rc::new(vec![(2, 4)]), color: hot }),
             truncation: None,
         };
@@ -3184,7 +3219,7 @@ mod tests {
         // "aa bb cc" at 40px breaks into "aa bb " + "cc"; the ranges
         // cover the "bb" (line 1) and the "cc" (line 2)
         let node = LayoutNode::Text {
-            content: Rc::from("aa bb cc"),
+            content: Arc::from("aa bb cc"),
             highlights: Some(TextHighlight {
                 ranges: Rc::new(vec![(3, 5), (6, 8)]),
                 color: hot,
@@ -3217,7 +3252,7 @@ mod tests {
     fn truncation_places_the_ellipsis_where_asked() {
         let truncated = |mode: Truncation| {
             let node = LayoutNode::Text {
-                content: Rc::from("abcdefgh"),
+                content: Arc::from("abcdefgh"),
                 highlights: None,
                 truncation: Some(mode),
             };
@@ -3240,7 +3275,7 @@ mod tests {
 
     #[test]
     fn a_word_longer_than_the_line_hard_breaks() {
-        let node = LayoutNode::Text { content: Rc::from("aaaaaaaaaa"), highlights: None, truncation: None };
+        let node = LayoutNode::Text { content: Arc::from("aaaaaaaaaa"), highlights: None, truncation: None };
         let result = layout(&node, Proposal { width: Some(40.0), height: None });
 
         // 10 chars of 8px in 40px: 5 per line

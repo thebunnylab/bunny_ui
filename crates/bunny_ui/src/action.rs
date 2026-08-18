@@ -75,6 +75,26 @@ impl KeyPattern {
         KeyPattern { key, shift: true, command: false, option: false, control: false }
     }
 
+    /// Cmd + Shift + key — a product's second shelf of shortcuts.
+    pub const fn command_shift(key: Key) -> KeyPattern {
+        KeyPattern { key, shift: true, command: true, option: false, control: false }
+    }
+
+    /// Control + key.
+    pub const fn control(key: Key) -> KeyPattern {
+        KeyPattern { key, shift: false, command: false, option: false, control: true }
+    }
+
+    /// Control + Shift + key.
+    pub const fn control_shift(key: Key) -> KeyPattern {
+        KeyPattern { key, shift: true, command: false, option: false, control: true }
+    }
+
+    /// Option (Alt) + key.
+    pub const fn option(key: Key) -> KeyPattern {
+        KeyPattern { key, shift: false, command: false, option: true, control: false }
+    }
+
     /// A bare Char (no cmd/ctrl) is TYPING: with a field focused, the
     /// gate lets it through to the text without consulting the map —
     /// bound or not. (Option counts as typing: option+a composes "å" on

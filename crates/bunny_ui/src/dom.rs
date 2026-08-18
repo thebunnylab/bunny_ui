@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::layout::{
     Color, DrawCommand, Point, Px, Rect, Size, Truncation, VisualProps,
@@ -131,7 +132,7 @@ impl DomStyle {
 /// with the SAME measures our layout used (the engine is its canvas).
 #[derive(Clone, Debug, PartialEq)]
 pub struct DomText {
-    pub content: Rc<str>,
+    pub content: Arc<str>,
     pub color: Color,
     /// Under a hover ink the element takes NO color of its own: the box
     /// above declares both states and CSS inheritance carries them
@@ -149,8 +150,8 @@ pub struct DomText {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DomField {
     pub path: String,
-    pub content: Rc<str>,
-    pub placeholder: Rc<str>,
+    pub content: Arc<str>,
+    pub placeholder: Arc<str>,
     pub font: FontSpec,
     pub color: Color,
 }

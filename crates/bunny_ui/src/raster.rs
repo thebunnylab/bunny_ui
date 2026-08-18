@@ -891,7 +891,7 @@ mod tests {
         let mut display = DisplayList::default();
         display.push(DrawCommand::TextLine {
             origin: Point { x: 0.0, y: 0.0 },
-            content: std::rc::Rc::from("1"),
+            content: std::sync::Arc::from("1"),
             range: (0, 1),
             color: Color::BLACK,
             font: crate::text_engine::FontSpec::DEFAULT,
@@ -1026,7 +1026,7 @@ mod tests {
     fn line(x: f64, y: f64, text: &str, color: Color) -> DrawCommand {
         DrawCommand::TextLine {
             origin: Point { x, y },
-            content: std::rc::Rc::from(text),
+            content: std::sync::Arc::from(text),
             range: (0, text.len()),
             color,
             font: crate::text_engine::FontSpec::DEFAULT,

@@ -1300,6 +1300,57 @@ mod tests {
     }
 
     #[test]
+    fn a_named_view_is_addressed_by_its_name_not_its_place() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Stripe {
+            extra: State<bool>,
+        }
+
+        impl Component for Stripe {
+            fn body(self, _ctx: &Context) -> impl View {
+                // a slot arrives above the named one; without the name
+                // the hit path of the git slot would shift with it
+                let head = if self.extra.get() {
+                    Either::First(text("search").on_click(|| {}))
+                } else {
+                    Either::Second(empty())
+                };
+                vstack((
+                    head,
+                    text("files").on_click(|| {}).id("explorer"),
+                    text("branch").on_click(|| {}).id("git"),
+                ))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Stripe { extra: State::new(false) };
+        let viewport = Proposal::exact(Size { width: 40.0, height: 200.0 });
+        let path_of = |result: &crate::layout::LayoutResult, name: &str| {
+            result
+                .hits
+                .iter()
+                .find(|(path, _)| path.contains(name))
+                .map(|(path, _)| path.clone())
+                .unwrap_or_default()
+        };
+
+        let before = runtime.layout(&view, viewport);
+        let git = path_of(&before, "[git]");
+        assert!(git.contains("[git]"), "the name is in the address: {git}");
+
+        view.extra.set(true);
+        let after = runtime.layout(&view, viewport);
+        assert_eq!(path_of(&after, "[git]"), git, "a new sibling above renames nothing");
+        assert!(
+            runtime.render_stable(&view).contains("[.id(\"git\")]"),
+            "the print says the name"
+        );
+    }
+
+    #[test]
     fn a_sleeping_task_wakes_on_the_engines_clock() {
         #[derive(Clone, Copy)]
         struct Debounced {

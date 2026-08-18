@@ -23,6 +23,7 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use motor::state::{Binding, Context};
 use motor::view::RenderNode;
@@ -52,7 +53,7 @@ pub(crate) fn wrap_layout(children: Vec<LayoutNode>) -> LayoutNode {
 
 /// `Text("…")` — `Rc<str>` for cheap clones (views are values).
 #[derive(Clone)]
-pub struct Text(pub Rc<str>);
+pub struct Text(pub Arc<str>);
 
 impl View for Text {
     type Arity = Single;
@@ -75,7 +76,7 @@ impl View for Text {
 /// `String` pay ONE allocation here, and an `Rc<str>` handed in (a row
 /// model that shares its strings) pays NOTHING — the body of a list
 /// clones pointers, not bytes.
-pub fn text(string: impl Into<Rc<str>>) -> Text {
+pub fn text(string: impl Into<Arc<str>>) -> Text {
     Text(string.into())
 }
 
@@ -174,7 +175,7 @@ where
 /// closure retained in the reconciler — a skipped view's field stays editable.
 #[derive(Clone)]
 pub struct TextField {
-    placeholder: Rc<str>,
+    placeholder: Arc<str>,
     text: Binding<String>,
 }
 
@@ -207,7 +208,7 @@ impl View for TextField {
                 );
                 out.push_layout(LayoutNode::Field {
                     path,
-                    content: Rc::from(value),
+                    content: Arc::from(value),
                     placeholder: self.placeholder.clone(),
                     auto_focus: false,
                 });
@@ -217,7 +218,7 @@ impl View for TextField {
                 content: if value.is_empty() {
                     self.placeholder.clone()
                 } else {
-                    Rc::from(value)
+                    Arc::from(value)
                 },
                 highlights: None,
                 truncation: None,
@@ -226,14 +227,15 @@ impl View for TextField {
     }
 }
 
-/// `HSplitView { a; b }`, with the seam as APP state: the binding's value
+/// A two-lane split with the seam as APP state: the binding's value
 /// renders in as lane A's width, a drag on the divider writes back —
 /// clamped between the lanes' floors. The framework owns the grip (a 6pt
 /// band over the 1pt hairline) and the drag loop; the app owns where the
 /// seam rests, so persisting or animating it is ordinary state.
 #[derive(Clone)]
-pub struct HSplit<A, B> {
+pub struct Split<A, B> {
     at: Binding<f64>,
+    axis: Axis,
     min_a: f64,
     min_b: f64,
     a: A,
@@ -241,16 +243,27 @@ pub struct HSplit<A, B> {
 }
 
 /// `hsplit(at, leading, trailing)` — the two-lane split. Floors default
-/// to 100pt each; tune them with [`HSplit::min_sizes`].
-pub fn hsplit<A, B>(at: Binding<f64>, a: A, b: B) -> HSplit<A, B>
+/// to 100pt each; tune them with [`Split::min_sizes`]. The vertical
+/// twin is [`vsplit`].
+pub fn hsplit<A, B>(at: Binding<f64>, a: A, b: B) -> Split<A, B>
 where
     A: View<Arity = Single>,
     B: View<Arity = Single>,
 {
-    HSplit { at, min_a: 100.0, min_b: 100.0, a, b }
+    Split { at, axis: Axis::Horizontal, min_a: 100.0, min_b: 100.0, a, b }
 }
 
-impl<A, B> HSplit<A, B> {
+/// `vsplit(at, top, bottom)` — the same seam, stacked. `at` is the TOP
+/// lane's height, and the grip drags up and down.
+pub fn vsplit<A, B>(at: Binding<f64>, a: A, b: B) -> Split<A, B>
+where
+    A: View<Arity = Single>,
+    B: View<Arity = Single>,
+{
+    Split { at, axis: Axis::Vertical, min_a: 100.0, min_b: 100.0, a, b }
+}
+
+impl<A, B> Split<A, B> {
     /// The lanes' floors, in points — the drag clamps against them.
     pub fn min_sizes(mut self, min_a: f64, min_b: f64) -> Self {
         self.min_a = min_a;
@@ -259,7 +272,7 @@ impl<A, B> HSplit<A, B> {
     }
 }
 
-impl<A, B> View for HSplit<A, B>
+impl<A, B> View for Split<A, B>
 where
     A: View<Arity = Single>,
     B: View<Arity = Single>,
@@ -271,15 +284,20 @@ where
         let mut nodes = NodeList::new();
         // the divider is an ORDINARY child (a themed 1pt strut): it
         // measures, paints and lowers like anything else on every target
-        let divider = crate::ext::ViewExt::background_color(
-            crate::ext::ViewExt::frame_width(spacer(), 1.0),
-            crate::theme::divider(),
-        );
+        let strut = match self.axis {
+            Axis::Horizontal => crate::ext::ViewExt::frame_width(spacer(), 1.0),
+            Axis::Vertical => crate::ext::ViewExt::frame_height(spacer(), 1.0),
+        };
+        let divider =
+            crate::ext::ViewExt::background_color(strut, crate::theme::divider());
         (self.a.clone(), divider, self.b.clone()).render_into(ctx, &mut nodes);
         let (prints, layouts) = nodes.into_parts();
         out.push(RenderNode::branch(
             if crate::view::print_enabled() {
-                format!("HSplitView(at: {at})")
+                match self.axis {
+                    Axis::Horizontal => format!("HSplitView(at: {at})"),
+                    Axis::Vertical => format!("VSplitView(at: {at})"),
+                }
             } else {
                 String::new()
             },
@@ -300,16 +318,16 @@ where
                 );
                 out.push_layout(LayoutNode::Split {
                     path,
-                    axis: Axis::Horizontal,
+                    axis: self.axis,
                     at,
                     min_a: self.min_a,
                     min_b: self.min_b,
                     children: layouts,
                 });
             }
-            // outside a pass (decorative use): the lanes become a row
+            // outside a pass (decorative use): the lanes become a stack
             None => out.push_layout(LayoutNode::Stack {
-                axis: Axis::Horizontal,
+                axis: self.axis,
                 spacing: 0.0,
                 align: CrossAlign::Start,
                 children: layouts,
@@ -319,7 +337,7 @@ where
 }
 
 pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> TextField {
-    TextField { placeholder: Rc::from(placeholder.into()), text }
+    TextField { placeholder: Arc::from(placeholder.into()), text }
 }
 
 /// `ProgressView()`

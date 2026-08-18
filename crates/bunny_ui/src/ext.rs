@@ -54,6 +54,20 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.id("source-control")` — the view takes a NAME in the identity.
+    ///
+    /// Without it a view is known by its POSITION among siblings
+    /// (`Stripe/#0/@First/#2`), so inserting a sibling above renames it:
+    /// its state, its animation scope and the path its clicks register
+    /// under all move. With it, the name is the address — which is also
+    /// how a test or a headless probe finds a control it did not build.
+    fn id(self, name: impl Into<std::rc::Rc<str>>) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Id(name.into()),
+        }
+    }
+
     /// `.bold()`
     fn bold(self) -> Modified<Self> {
         Modified {

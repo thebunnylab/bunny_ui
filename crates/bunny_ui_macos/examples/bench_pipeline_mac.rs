@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bunny_ui::layout::{Proposal, Size};
+use std::sync::Arc;
+
 use bunny_ui::prelude::*;
 use bunny_ui::raster::rasterize_with;
 use bunny_ui_macos::CoreTextEngine;
@@ -76,7 +78,7 @@ const SELECT_NEXT: ActionId = ActionId("bench.select_next");
 const CLEAR: Color = Color::rgba(0, 0, 0, 0);
 
 /// Subsequence match over `dir` then `name`, no allocation — the row
-/// model shares `Rc<str>`s, so a keystroke filters and rebuilds rows
+/// model shares `Arc<str>`s, so a keystroke filters and rebuilds rows
 /// without copying a byte of content.
 fn matches(dir: &str, name: &str, needle: &str) -> bool {
     let mut haystack = dir.chars().chain(name.chars()).map(|c| c.to_ascii_lowercase());
@@ -87,13 +89,13 @@ fn matches(dir: &str, name: &str, needle: &str) -> bool {
 struct Finder {
     query: State<String>,
     selected: State<usize>,
-    files: Rc<Vec<(Rc<str>, Rc<str>)>>,
+    files: Rc<Vec<(Arc<str>, Arc<str>)>>,
 }
 
 impl Component for Finder {
     fn body(self, _ctx: &Context) -> impl View {
         let query = self.query.get();
-        let items: Vec<(usize, Rc<str>, Rc<str>)> = self
+        let items: Vec<(usize, Arc<str>, Arc<str>)> = self
             .files
             .iter()
             .filter(|(name, dir)| query.is_empty() || matches(dir, name, &query))
@@ -161,13 +163,13 @@ impl Component for Finder {
 struct AnimatedFinder {
     query: State<String>,
     selected: State<usize>,
-    files: Rc<Vec<(Rc<str>, Rc<str>)>>,
+    files: Rc<Vec<(Arc<str>, Arc<str>)>>,
 }
 
 impl Component for AnimatedFinder {
     fn body(self, _ctx: &Context) -> impl View {
         let query = self.query.get();
-        let items: Vec<(usize, Rc<str>, Rc<str>)> = self
+        let items: Vec<(usize, Arc<str>, Arc<str>)> = self
             .files
             .iter()
             .filter(|(name, dir)| query.is_empty() || matches(dir, name, &query))
@@ -234,7 +236,7 @@ struct VirtualFinder {
     query: State<String>,
     selected: State<usize>,
     visible: State<Rc<Vec<usize>>>,
-    files: Rc<Vec<(Rc<str>, Rc<str>)>>,
+    files: Rc<Vec<(Arc<str>, Arc<str>)>>,
 }
 
 impl Component for VirtualFinder {
@@ -343,8 +345,8 @@ fn measure(label: &'static str, warmup: usize, frames: usize, mut step: impl FnM
 
 fn main() {
     let viewport = Proposal::exact(Size { width: 760.0, height: 640.0 });
-    let files: Rc<Vec<(Rc<str>, Rc<str>)>> = Rc::new(
-        FILES.iter().map(|(name, dir)| (Rc::from(*name), Rc::from(*dir))).collect(),
+    let files: Rc<Vec<(Arc<str>, Arc<str>)>> = Rc::new(
+        FILES.iter().map(|(name, dir)| (Arc::from(*name), Arc::from(*dir))).collect(),
     );
     let finder =
         Finder { query: State::new(String::new()), selected: State::new(0), files: Rc::clone(&files) };
@@ -511,12 +513,12 @@ fn main() {
 
     // ten thousand rows behind the virtual window — the scale story.
     // the fixture is generated ONCE, outside every step.
-    let big: Rc<Vec<(Rc<str>, Rc<str>)>> = Rc::new(
+    let big: Rc<Vec<(Arc<str>, Arc<str>)>> = Rc::new(
         (0..10_000)
             .map(|index| {
                 (
-                    Rc::from(format!("file_{index:04}.rs")),
-                    Rc::from(format!("src/mod_{:02}/", index % 100)),
+                    Arc::from(format!("file_{index:04}.rs")),
+                    Arc::from(format!("src/mod_{:02}/", index % 100)),
                 )
             })
             .collect(),

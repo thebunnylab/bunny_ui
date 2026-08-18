@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bunny_ui::prelude::*;
 
@@ -47,8 +48,8 @@ struct Finder {
     visible: State<Rc<Vec<usize>>>,
     /// What the page's own manifest says — fetched by a task, so the
     /// header shows the crossing landing.
-    manifest: State<Rc<str>>,
-    files: Rc<Vec<(Rc<str>, Rc<str>)>>,
+    manifest: State<Arc<str>>,
+    files: Rc<Vec<(Arc<str>, Arc<str>)>>,
     /// Built ONCE (hash + registration happen per identity, never per
     /// body) — the browser decodes it and reports back.
     logo: ImageSource,
@@ -170,7 +171,7 @@ impl Component for Finder {
                 if let Some(body) = reply.recv().await {
                     let line = body.lines().next().unwrap_or_default().trim();
                     if !line.is_empty() {
-                        manifest.set(Rc::from(line));
+                        manifest.set(Arc::from(line));
                     }
                 }
             }
@@ -182,7 +183,7 @@ const CLEAR: Color = Color { r: 0, g: 0, b: 0, a: 0 };
 
 /// The details popover — the same card chrome on every rendering (and
 /// on the mac, its own little window past the edge).
-fn details_card(name: Rc<str>, dir: Rc<str>) -> Erased {
+fn details_card(name: Arc<str>, dir: Arc<str>) -> Erased {
     erased(
         vstack!(
             text(name.clone()).bold(),
@@ -299,12 +300,12 @@ fn count_meter(count: usize) -> impl View {
 }
 
 fn finder() -> Finder {
-    let files: Rc<Vec<(Rc<str>, Rc<str>)>> = Rc::new(
+    let files: Rc<Vec<(Arc<str>, Arc<str>)>> = Rc::new(
         (0..10_000)
             .map(|index| {
                 (
-                    Rc::from(format!("file_{index:04}.rs")),
-                    Rc::from(format!("src/mod_{:02}/", index % 100)),
+                    Arc::from(format!("file_{index:04}.rs")),
+                    Arc::from(format!("src/mod_{:02}/", index % 100)),
                 )
             })
             .collect(),
@@ -314,7 +315,7 @@ fn finder() -> Finder {
         selected: State::new(0),
         details: State::new(false),
         visible: State::new(Rc::new((0..10_000).collect())),
-        manifest: State::new(Rc::from("reading the manifest…")),
+        manifest: State::new(Arc::from("reading the manifest…")),
         files,
         logo: logo(),
     }
