@@ -7,11 +7,17 @@
 //! flattens coarser at sixteen and finer at sixty-four, and the eye
 //! sees the same drawing at both.
 
-use super::Verb;
+use super::{Rule, Verb};
 
 /// How far the polyline may sit from the true curve, in device px.
 /// A tenth of a pixel disappears under the coverage anti-aliasing.
 const TOLERANCE: f64 = 0.1;
+
+/// Sub-scanlines per pixel row. The fill is EXACT along x (intervals,
+/// not samples) and quantized along y in steps of `1/ROWS` — at
+/// sixteen, the step hides under the same anti-aliasing the tolerance
+/// does. One power of two, so the partial coverages sum exactly.
+const ROWS: usize = 16;
 
 /// Wang's bound caps the segment count too — a degenerate table of
 /// verbs cannot ask for an unbounded fan.
@@ -233,6 +239,128 @@ fn cubic_points(
     })
 }
 
+/// A coverage mask: one `0..=1` per pixel. Draws of one glyph pile in
+/// by MAX — same ink, so overlap is union, and a translucent tint can
+/// never double-blend where a join or a second draw crosses itself.
+pub(crate) struct Mask {
+    width: usize,
+    height: usize,
+    values: Vec<f32>,
+}
+
+impl Mask {
+    pub fn new(width: usize, height: usize) -> Mask {
+        Mask { width, height, values: vec![0.0; width * height] }
+    }
+
+    pub fn clear(&mut self) {
+        self.values.fill(0.0);
+    }
+
+    pub fn at(&self, x: usize, y: usize) -> f32 {
+        self.values[y * self.width + x]
+    }
+
+    fn max_at(&mut self, x: usize, y: usize, coverage: f32) {
+        let value = &mut self.values[y * self.width + x];
+        *value = value.max(coverage);
+    }
+
+    /// Folds another draw's mask in.
+    pub fn merge_max(&mut self, other: &Mask) {
+        for (value, more) in self.values.iter_mut().zip(&other.values) {
+            *value = value.max(*more);
+        }
+    }
+}
+
+/// Fills the inside of `flat` into `mask` under `rule`. Every contour
+/// closes (SVG law — the seal only matters to a stroke). The walk is
+/// interval-exact in x: crossings on each sub-scanline sort, the rule
+/// picks the inside runs, and each run adds its exact overlap with
+/// each pixel. Sub-rows partition y, so the parts sum to true area
+/// with only the vertical quantization left.
+pub(crate) fn fill_into(mask: &mut Mask, flat: &Flattened, rule: Rule) {
+    let mut crossings: Vec<(f64, i32)> = Vec::new();
+    let mut row: Vec<f32> = vec![0.0; mask.width];
+    for y in 0..mask.height {
+        row.fill(0.0);
+        let mut touched = false;
+        for sub in 0..ROWS {
+            let sample = y as f64 + (sub as f64 + 0.5) / ROWS as f64;
+            crossings.clear();
+            for (points, _) in flat.contours() {
+                let count = points.len();
+                for i in 0..count {
+                    let (x0, y0) = points[i];
+                    let (x1, y1) = points[(i + 1) % count];
+                    // half-open in y: a vertex on the sample counts once
+                    let (dir, top, bottom, tx, bx) = if y1 > y0 {
+                        (1, y0, y1, x0, x1)
+                    } else if y0 > y1 {
+                        (-1, y1, y0, x1, x0)
+                    } else {
+                        continue; // horizontal — its neighbors cross
+                    };
+                    if sample >= top && sample < bottom {
+                        let t = (sample - top) / (bottom - top);
+                        crossings.push((tx + t * (bx - tx), dir));
+                    }
+                }
+            }
+            if crossings.is_empty() {
+                continue;
+            }
+            crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+            // walk the crossings; the rule decides where inside begins
+            let mut winding = 0;
+            let mut entered = 0.0;
+            for &(x, dir) in &crossings {
+                let was_inside = match rule {
+                    Rule::NonZero => winding != 0,
+                    Rule::EvenOdd => winding % 2 != 0,
+                };
+                winding += dir;
+                let is_inside = match rule {
+                    Rule::NonZero => winding != 0,
+                    Rule::EvenOdd => winding % 2 != 0,
+                };
+                if !was_inside && is_inside {
+                    entered = x;
+                } else if was_inside && !is_inside {
+                    touched |= add_run(&mut row, entered, x);
+                }
+            }
+        }
+        if touched {
+            for x in 0..mask.width {
+                if row[x] > 0.0 {
+                    mask.max_at(x, y, row[x].min(1.0));
+                }
+            }
+        }
+    }
+}
+
+/// Adds one inside run `[from, to]` of one sub-scanline into the row:
+/// each pixel takes its exact overlap, scaled by the sub-row's share.
+fn add_run(row: &mut [f32], from: f64, to: f64) -> bool {
+    let width = row.len() as f64;
+    let from = from.max(0.0);
+    let to = to.min(width);
+    if to <= from {
+        return false;
+    }
+    let share = 1.0 / ROWS as f64;
+    let first = from.floor() as usize;
+    let last = (to.ceil() as usize).min(row.len());
+    for x in first..last {
+        let cover = (to.min(x as f64 + 1.0) - from.max(x as f64)).max(0.0);
+        row[x] += (cover * share) as f32;
+    }
+    true
+}
+
 /// Distance from a point to one segment — the stroke's whole geometry,
 /// and the test bench's ruler.
 pub(crate) fn segment_distance(
@@ -423,5 +551,235 @@ mod tests {
         let flat = flatten(&[Verb::Move(0.0, 0.0), Verb::Line(24.0, 24.0)], placing);
         let all: Vec<_> = flat.contours().collect();
         assert_eq!(all[0].0, &[(10.0, 20.0), (58.0, 68.0)]);
+    }
+
+    fn filled(path: &[Verb], rule: Rule, side: usize) -> Mask {
+        let mut mask = Mask::new(side, side);
+        fill_into(&mut mask, &flatten(path, ONE), rule);
+        mask
+    }
+
+    #[test]
+    fn an_axis_rectangle_fills_exactly() {
+        // integer edges: x is interval-exact and the sixteen sub-rows
+        // sum to exactly one — full pixels read 1.0, not almost
+        let path = [
+            Verb::Move(3.0, 4.0),
+            Verb::Line(13.0, 4.0),
+            Verb::Line(13.0, 11.0),
+            Verb::Line(3.0, 11.0),
+            Verb::Close,
+        ];
+        let mask = filled(&path, Rule::NonZero, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                let inside = (3..13).contains(&x) && (4..11).contains(&y);
+                let want = if inside { 1.0 } else { 0.0 };
+                assert_eq!(mask.at(x, y), want, "pixel ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn an_open_contour_fills_closed() {
+        // no seal — the fill closes it anyway (SVG law)
+        let open = [
+            Verb::Move(2.0, 2.0),
+            Verb::Line(12.0, 2.0),
+            Verb::Line(12.0, 12.0),
+            Verb::Line(2.0, 12.0),
+        ];
+        let mask = filled(&open, Rule::NonZero, 14);
+        assert_eq!(mask.at(7, 7), 1.0);
+        assert_eq!(mask.at(3, 3), 1.0);
+    }
+
+    /// Two concentric rings wound the SAME way: even-odd cuts the
+    /// hole, non-zero paints it solid.
+    #[test]
+    fn a_donut_obeys_both_rules() {
+        let rings = [
+            Verb::Move(1.0, 1.0),
+            Verb::Line(15.0, 1.0),
+            Verb::Line(15.0, 15.0),
+            Verb::Line(1.0, 15.0),
+            Verb::Close,
+            Verb::Move(5.0, 5.0),
+            Verb::Line(11.0, 5.0),
+            Verb::Line(11.0, 11.0),
+            Verb::Line(5.0, 11.0),
+            Verb::Close,
+        ];
+        let even = filled(&rings, Rule::EvenOdd, 16);
+        assert_eq!(even.at(8, 8), 0.0, "even-odd cuts the hole");
+        assert_eq!(even.at(3, 8), 1.0, "the ring stays inked");
+        let solid = filled(&rings, Rule::NonZero, 16);
+        assert_eq!(solid.at(8, 8), 1.0, "non-zero fills through");
+    }
+
+    /// The inner ring wound the OTHER way: now non-zero cuts the hole
+    /// too — the winding direction is read, not assumed.
+    #[test]
+    fn a_reversed_inner_ring_holes_nonzero_too() {
+        let rings = [
+            Verb::Move(1.0, 1.0),
+            Verb::Line(15.0, 1.0),
+            Verb::Line(15.0, 15.0),
+            Verb::Line(1.0, 15.0),
+            Verb::Close,
+            Verb::Move(5.0, 5.0),
+            Verb::Line(5.0, 11.0),
+            Verb::Line(11.0, 11.0),
+            Verb::Line(11.0, 5.0),
+            Verb::Close,
+        ];
+        let mask = filled(&rings, Rule::NonZero, 16);
+        assert_eq!(mask.at(8, 8), 0.0);
+        assert_eq!(mask.at(3, 8), 1.0);
+    }
+
+    /// Where a contour overlaps itself the winding reaches two — the
+    /// coverage must still read ONE, never a double blend.
+    #[test]
+    fn a_self_overlap_never_exceeds_one() {
+        let bowtie = [
+            Verb::Move(2.0, 2.0),
+            Verb::Line(12.0, 2.0),
+            Verb::Line(12.0, 12.0),
+            Verb::Line(6.0, 12.0),
+            Verb::Line(6.0, 6.0),
+            Verb::Line(9.0, 6.0),
+            Verb::Line(9.0, 9.0),
+            Verb::Line(2.0, 9.0),
+            Verb::Close,
+        ];
+        let mask = filled(&bowtie, Rule::NonZero, 14);
+        // (7,7) sits inside both loops of the spiral: winding two
+        assert_eq!(mask.at(7, 7), 1.0);
+        for y in 0..14 {
+            for x in 0..14 {
+                assert!(mask.at(x, y) <= 1.0);
+            }
+        }
+    }
+
+    /// The independent referee: the textbook winding-number point test,
+    /// sharing NO code with the fill's crossing walk.
+    fn winding_at(point: (f64, f64), flat: &Flattened) -> i32 {
+        let (px, py) = point;
+        let mut winding = 0;
+        for (points, _) in flat.contours() {
+            let count = points.len();
+            for i in 0..count {
+                let (ax, ay) = points[i];
+                let (bx, by) = points[(i + 1) % count];
+                let cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+                if ay <= py {
+                    if by > py && cross > 0.0 {
+                        winding += 1;
+                    }
+                } else if by <= py && cross < 0.0 {
+                    winding -= 1;
+                }
+            }
+        }
+        winding
+    }
+
+    /// The oracle that catches what portraits cannot: for a bag of
+    /// shapes, the mask must agree with a brute-force 16×16 point count
+    /// per pixel. The gate is DERIVED, not shrugged: the fill is
+    /// interval-exact in x while the referee samples sixteen points, so
+    /// they may part by at most 1/16 per pixel — everything beyond is a
+    /// sign, an order or a parity gone wrong.
+    #[test]
+    fn the_coverage_matches_a_brute_force_count() {
+        const KAPPA: f32 = 0.552_284_75;
+        let diamond = vec![
+            Verb::Move(8.0, 0.5),
+            Verb::Line(15.5, 8.0),
+            Verb::Line(8.0, 15.5),
+            Verb::Line(0.5, 8.0),
+            Verb::Close,
+        ];
+        let triangle = vec![
+            Verb::Move(1.3, 14.2),
+            Verb::Line(14.8, 12.9),
+            Verb::Line(3.1, 1.6),
+            Verb::Close,
+        ];
+        let rings = vec![
+            Verb::Move(1.0, 1.0),
+            Verb::Line(15.0, 1.0),
+            Verb::Line(15.0, 15.0),
+            Verb::Line(1.0, 15.0),
+            Verb::Close,
+            Verb::Move(4.5, 4.5),
+            Verb::Line(11.5, 4.5),
+            Verb::Line(11.5, 11.5),
+            Verb::Line(4.5, 11.5),
+            Verb::Close,
+        ];
+        let circle = vec![
+            Verb::Move(15.0, 8.0),
+            Verb::Cubic(15.0, 8.0 + 7.0 * KAPPA, 8.0 + 7.0 * KAPPA, 15.0, 8.0, 15.0),
+            Verb::Cubic(8.0 - 7.0 * KAPPA, 15.0, 1.0, 8.0 + 7.0 * KAPPA, 1.0, 8.0),
+            Verb::Cubic(1.0, 8.0 - 7.0 * KAPPA, 8.0 - 7.0 * KAPPA, 1.0, 8.0, 1.0),
+            Verb::Cubic(8.0 + 7.0 * KAPPA, 1.0, 15.0, 8.0 - 7.0 * KAPPA, 15.0, 8.0),
+            Verb::Close,
+        ];
+        let cases: [(&str, &[Verb], Rule); 5] = [
+            ("diamond", &diamond, Rule::NonZero),
+            ("triangle", &triangle, Rule::NonZero),
+            ("rings even-odd", &rings, Rule::EvenOdd),
+            ("rings non-zero", &rings, Rule::NonZero),
+            ("circle", &circle, Rule::NonZero),
+        ];
+        for (label, path, rule) in cases {
+            let flat = flatten(path, ONE);
+            let mut mask = Mask::new(16, 16);
+            fill_into(&mut mask, &flat, rule);
+            for y in 0..16 {
+                for x in 0..16 {
+                    let mut hits = 0;
+                    for sy in 0..16 {
+                        for sx in 0..16 {
+                            let point = (
+                                x as f64 + (sx as f64 + 0.5) / 16.0,
+                                y as f64 + (sy as f64 + 0.5) / 16.0,
+                            );
+                            let winding = winding_at(point, &flat);
+                            let inside = match rule {
+                                Rule::NonZero => winding != 0,
+                                Rule::EvenOdd => winding % 2 != 0,
+                            };
+                            if inside {
+                                hits += 1;
+                            }
+                        }
+                    }
+                    let reference = hits as f32 / 256.0;
+                    let gap = (mask.at(x, y) - reference).abs();
+                    assert!(
+                        gap <= 1.0 / 16.0 + 1e-4,
+                        "{label} ({x},{y}): mask {} vs referee {reference}",
+                        mask.at(x, y),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merge_max_takes_the_union() {
+        let mut a = Mask::new(4, 1);
+        let mut b = Mask::new(4, 1);
+        a.max_at(0, 0, 0.8);
+        a.max_at(1, 0, 0.2);
+        b.max_at(1, 0, 0.9);
+        a.merge_max(&b);
+        assert_eq!(a.at(0, 0), 0.8);
+        assert_eq!(a.at(1, 0), 0.9);
+        assert_eq!(a.at(2, 0), 0.0);
     }
 }
