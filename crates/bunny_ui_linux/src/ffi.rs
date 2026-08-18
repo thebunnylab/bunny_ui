@@ -749,6 +749,9 @@ struct Client {
     clicks: ClickClock,
     pointer_pos: (f64, f64),
     cursor: CursorState,
+    /// Counts presenting commits — the configure road checks whether
+    /// an ack was followed by one.
+    presents: u64,
     quit: bool,
 }
 
@@ -895,6 +898,7 @@ fn connect() {
                 theme_scale: 0,
                 current: Cursor::Arrow,
             },
+            presents: 0,
             quit: false,
         })
     });
@@ -1226,6 +1230,7 @@ fn present_rows(width: usize, height: usize, rgba: &[u8], damage: &[(i64, i64, i
             wl_display_flush(client.display);
         }
         win.map.on_present();
+        client.presents += 1;
     });
 }
 
@@ -1333,22 +1338,40 @@ fn drain_protocol_events() {
                 }
             }),
             Ev::SurfaceConfigure { serial } => {
-                let resized = with_client(|client| {
-                    let Some(win) = client.win.as_mut() else { return false };
+                let (resized, mapped, before) = with_client(|client| {
+                    let presents = client.presents;
+                    let Some(win) = client.win.as_mut() else { return (false, false, presents) };
                     let staged = win.pending_size.take();
                     win.map.on_configure();
                     unsafe { request(win.xdg_surface, 4, &mut [arg_u(serial)]) };
+                    let mapped = win.map.mapped;
                     if let Some((w, h)) = staged {
                         let logical = (w as f64, h as f64);
                         if logical != win.logical {
                             win.logical = logical;
-                            return win.map.mapped;
+                            return (mapped, mapped, presents);
                         }
                     }
-                    false
+                    (false, mapped, presents)
                 });
                 if resized {
                     dispatch(AppEvent::Redraw);
+                }
+                // an ack only takes effect on the NEXT commit — a
+                // state-only configure on a parked app would otherwise
+                // never see one, and the shell may hold the window's
+                // very reveal on that cycle closing
+                if mapped {
+                    with_client(|client| {
+                        if client.presents == before
+                            && let Some(win) = client.win.as_ref()
+                        {
+                            unsafe {
+                                request(win.surface, 6, &mut no_args());
+                                wl_display_flush(client.display);
+                            }
+                        }
+                    });
                 }
             }
             Ev::ToplevelClose => with_client(|client| client.quit = true),

@@ -9,6 +9,7 @@
 #![cfg(target_os = "linux")]
 
 mod ffi;
+mod text;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -18,11 +19,14 @@ use bunny_ui::prelude::Runtime;
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
+pub use text::FreeTypeEngine;
 
 /// Opens the window and enters the live cycle. Returns when the app
 /// quits (closing the window quits).
 pub fn run_window(title: &str, size: Size, root: impl View) {
-    let runtime = Runtime::new();
+    // real text: the platform engine takes the place of the house
+    // default (the pictures follow at their phase)
+    let runtime = Runtime::new().text_engine(Rc::new(FreeTypeEngine::new()));
     run_window_with(title, size, runtime, root)
 }
 
