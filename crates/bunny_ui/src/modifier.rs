@@ -917,7 +917,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             }
             Modifier::WindowControl(control) => {
                 let control = *control;
-                out.wrap_last_layout(move |node| LayoutNode::ControlRegion {
+                out.wrap_layout_from(mark, move |node| LayoutNode::ControlRegion {
                     control,
                     child: Box::new(node),
                 });
