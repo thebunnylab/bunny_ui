@@ -4646,4 +4646,226 @@ mod tests {
         assert_eq!(name_x(&slid), before.0 - 60.0, "the header slid with its columns");
         assert_eq!(cell_x(&slid), before.1 - 60.0, "and the rows slid in step");
     }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    struct Tab {
+        index: usize,
+    }
+
+    /// The three questions pain 31 asks of one drop: WHERE it landed,
+    /// where the hand is WHILE it moves, and whether a target that is
+    /// half scrolled away still tells the truth.
+    #[test]
+    fn a_drop_says_where_it_landed() {
+        #[derive(Clone)]
+        struct Board {
+            landed: State<(usize, usize)>,
+            zone: State<Option<(usize, usize)>>,
+        }
+        impl Component for Board {
+            fn body(self, _ctx: &Context) -> impl View {
+                let landed = self.landed;
+                let zone = self.zone;
+                // a pane body: 200x100, dropped on by quadrant
+                vstack!(
+                    text("tab").on_drag(|| drag(Tab { index: 7 }, "tab 7")),
+                    empty()
+                        .frame(200.0, 100.0)
+                        .on_drop_at(move |_: &Tab, at| {
+                            let (x, y) = at.fraction();
+                            landed.set(((x * 100.0) as usize, (y * 100.0) as usize));
+                        })
+                        .preview(move |at| {
+                            zone.set(at.map(|at| {
+                                let (x, y) = at.fraction();
+                                ((x * 100.0) as usize, (y * 100.0) as usize)
+                            }))
+                        }),
+                )
+                .spacing(0.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Board { landed: State::new((0, 0)), zone: State::new(None) };
+        let size = Size { width: 220.0, height: 160.0 };
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let target = result.drops.first().expect("the body accepts").frame;
+        let source = result.drag_sources.first().expect("the tab lifts").rect;
+
+        // lift the tab, then travel to the target's own quarter point
+        runtime.pointer_pressed(
+            source.origin.x + source.size.width / 2.0,
+            source.origin.y + source.size.height / 2.0,
+        );
+        runtime.pointer_moved(source.origin.x + 30.0, source.origin.y + 30.0);
+        assert!(runtime.interaction().drag.is_some(), "the drag lifted");
+        let quarter = (
+            target.origin.x + target.size.width * 0.25,
+            target.origin.y + target.size.height * 0.75,
+        );
+        runtime.pointer_moved(quarter.0, quarter.1);
+        // the preview heard the place WHILE the drag moves — this is
+        // the whole of pain 31: the veil can be painted now
+        assert_eq!(view.zone.get(), Some((25, 75)), "the hand reports its quarter");
+
+        // the framework's ring stands down for a box that previews
+        let ringed = runtime
+            .layout(&view, crate::layout::Proposal::exact(size))
+            .display
+            .iter()
+            .any(|command| matches!(command,
+                crate::layout::DrawCommand::StrokeRect { color, width, .. }
+                    if *color == crate::theme::current().accent && *width == 2.0));
+        assert!(!ringed, "the app paints its own preview, so the ring keeps quiet");
+
+        // the release lands the value AND the place, and closes the
+        // preview before the action runs
+        runtime.pointer_released(quarter.0, quarter.1);
+        assert_eq!(view.landed.get(), (25, 75), "the drop knows its quadrant");
+        assert_eq!(view.zone.get(), None, "the preview closed with the gesture");
+    }
+
+    #[test]
+    fn a_preview_hears_the_leave_and_the_escape() {
+        #[derive(Clone)]
+        struct Board {
+            seen: State<Vec<String>>,
+        }
+        impl Component for Board {
+            fn body(self, _ctx: &Context) -> impl View {
+                let seen = self.seen;
+                vstack!(
+                    text("tab").on_drag(|| drag(Tab { index: 1 }, "tab")),
+                    empty().frame(80.0, 40.0).on_drop_at(|_: &Tab, _| {}).preview({
+                        let seen = seen;
+                        move |at| {
+                            let mut log = seen.get();
+                            log.push(match at {
+                                Some(_) => "over".to_string(),
+                                None => "left".to_string(),
+                            });
+                            seen.set(log);
+                        }
+                    }),
+                    empty().frame(80.0, 40.0),
+                )
+                .spacing(0.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Board { seen: State::new(Vec::new()) };
+        let size = Size { width: 120.0, height: 200.0 };
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let target = result.drops.first().expect("a target").frame;
+        let source = result.drag_sources.first().expect("the tab lifts").rect;
+        let inside = (
+            target.origin.x + target.size.width / 2.0,
+            target.origin.y + target.size.height / 2.0,
+        );
+
+        runtime.pointer_pressed(
+            source.origin.x + source.size.width / 2.0,
+            source.origin.y + source.size.height / 2.0,
+        );
+        // lift sideways, away from the target below
+        runtime.pointer_moved(source.origin.x + 40.0, source.origin.y);
+        runtime.pointer_moved(inside.0, inside.1);
+        assert_eq!(view.seen.get(), vec!["over".to_string()], "entering speaks once");
+
+        // moving WITHIN the same box does not re-enter, it just moves
+        runtime.pointer_moved(inside.0 + 4.0, inside.1 + 4.0);
+        assert_eq!(view.seen.get(), vec!["over".to_string(), "over".to_string()]);
+
+        // leaving the box: exactly ONE None, no matter how far it goes
+        runtime.pointer_moved(inside.0, target.origin.y + target.size.height + 30.0);
+        runtime.pointer_moved(inside.0, target.origin.y + target.size.height + 40.0);
+        let log = view.seen.get();
+        assert_eq!(log.last().map(String::as_str), Some("left"));
+        assert_eq!(
+            log.iter().filter(|entry| *entry == "left").count(),
+            1,
+            "leaving speaks once, not once per move: {log:?}"
+        );
+
+        // back in, then Escape — the preview must not be left hanging
+        runtime.pointer_moved(inside.0, inside.1);
+        assert_eq!(view.seen.get().last().map(String::as_str), Some("over"));
+        let handled =
+            runtime.key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape));
+        assert!(handled.handled, "escape cancelled the drag");
+        assert_eq!(view.seen.get().last().map(String::as_str), Some("left"),
+            "a cancelled drag closes the preview");
+    }
+
+    /// The trap: a target half scrolled out of view. The rect a drop
+    /// HITS is the visible slice; the box it reports against must be
+    /// the whole one, or every quadrant lies.
+    #[test]
+    fn a_scrolled_target_still_tells_the_truth() {
+        #[derive(Clone)]
+        struct Board {
+            at: State<Option<(i64, i64)>>,
+        }
+        impl Component for Board {
+            fn body(self, _ctx: &Context) -> impl View {
+                let at = self.at;
+                vstack!(
+                    text("tab").on_drag(|| drag(Tab { index: 0 }, "t")),
+                    scroll(vstack!(
+                        empty().frame(100.0, 60.0),
+                        empty()
+                            .frame(100.0, 100.0)
+                            .on_drop_at(move |_: &Tab, place| {
+                                at.set(Some((place.local.y as i64, place.size.height as i64)))
+                            }),
+                    )
+                    .spacing(0.0))
+                    .frame(100.0, 80.0),
+                )
+                .spacing(0.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Board { at: State::new(None) };
+        let size = Size { width: 120.0, height: 200.0 };
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        // scroll the target halfway up under its clip
+        let region = runtime
+            .layout(&view, crate::layout::Proposal::exact(size))
+            .scrolls
+            .first()
+            .map(|region| region.path.clone())
+            .expect("a region");
+        // all the way down: the target's top now sits ABOVE the clip,
+        // so its visible slice starts twenty points into its own box
+        runtime.set_scroll_offset(&region, crate::layout::Point { x: 0.0, y: 80.0 });
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        let target = result.drops.first().expect("the target is placed");
+        assert!(
+            target.rect.size.height < target.frame.size.height,
+            "the visible slice IS smaller: {:?} vs {:?}",
+            target.rect.size,
+            target.frame.size
+        );
+
+        // drop at the top edge of what is VISIBLE — which is 20pt down
+        // the target's own box, not zero
+        let source = result.drag_sources.first().expect("the tab lifts").rect;
+        runtime.pointer_pressed(
+            source.origin.x + source.size.width / 2.0,
+            source.origin.y + source.size.height / 2.0,
+        );
+        runtime.pointer_moved(source.origin.x + 30.0, source.origin.y + 20.0);
+        let visible_top = (target.rect.origin.x + 10.0, target.rect.origin.y + 1.0);
+        runtime.pointer_released(visible_top.0, visible_top.1);
+        let (local_y, height) = view.at.get().expect("it landed");
+        assert_eq!(height, 100, "the box it reports against is the WHOLE one");
+        assert!(
+            local_y >= 20 && local_y <= 22,
+            "the place is measured down the target's own box, not the slice: {local_y}"
+        );
+    }
 }

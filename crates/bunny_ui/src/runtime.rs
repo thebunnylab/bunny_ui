@@ -148,6 +148,10 @@ pub struct Runtime {
     /// The lifted drag's VALUE — the stamp carries only label and
     /// geometry; the typed value stays here and lands on the drop.
     drag_value: RefCell<Option<std::rc::Rc<dyn std::any::Any>>>,
+    /// The target that last heard a preview, and the closure to tell
+    /// when the drag leaves it. Exactly ONE box is ever previewing, so
+    /// the leaving `None` has one address and can never be lost.
+    drag_preview: RefCell<Option<(Rect, crate::layout::DragOverAction)>>,
     /// The tooltip's whole life — the runtime owns it, the scene only
     /// declares. CLOCKLESS: the delay is the shell's tick seen twice,
     /// so no Instant crosses into wasm and the tests drive it by hand.
@@ -339,6 +343,61 @@ impl Runtime {
             .cloned()
     }
 
+    /// Where a point sits inside a target's OWN box — never the
+    /// visible slice, so a half-scrolled target keeps honest quadrants.
+    fn drop_point(region: &crate::layout::DropRegion, x: Px, y: Px) -> crate::layout::DropPoint {
+        crate::layout::DropPoint {
+            local: Point { x: x - region.frame.origin.x, y: y - region.frame.origin.y },
+            size: region.frame.size,
+        }
+    }
+
+    /// Tells the box under the drag where the hand is, and the box the
+    /// drag just LEFT that it is over — one enter, one leave, in that
+    /// order, so an app that writes state from both never sees two
+    /// live previews. `true` = a closure ran (the state it wrote will
+    /// repaint on its own).
+    fn note_drag_preview(&self, region: Option<&crate::layout::DropRegion>, x: Px, y: Px) -> bool {
+        let entering = region.and_then(|region| {
+            region.over.as_ref().map(|over| (region.rect, over.clone()))
+        });
+        let leaving = {
+            let current = self.drag_preview.borrow();
+            match (&*current, &entering) {
+                // the same box, still under the hand: only the point moved
+                (Some((rect, _)), Some((next, _))) if rect == next => None,
+                (Some((_, over)), _) => Some(over.clone()),
+                (None, _) => None,
+            }
+        };
+        let mut ran = false;
+        if let Some(over) = leaving {
+            (over.0)(None);
+            ran = true;
+        }
+        if let Some((rect, over)) = entering {
+            let at = region.map(|region| Self::drop_point(region, x, y));
+            (over.0)(at);
+            *self.drag_preview.borrow_mut() = Some((rect, over));
+            ran = true;
+        } else {
+            *self.drag_preview.borrow_mut() = None;
+        }
+        ran
+    }
+
+    /// The drag ends: whoever was previewing hears `None`, once.
+    fn clear_drag_preview(&self) -> bool {
+        let previous = self.drag_preview.borrow_mut().take();
+        match previous {
+            Some((_, over)) => {
+                (over.0)(None);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// A live drag follows the pointer: the label chip moves, the
     /// compatible target under it rings, the scene's hover stays
     /// quiet. `Some(repaint)` when a drag owns the move.
@@ -353,7 +412,9 @@ impl Runtime {
         };
         if let Some(builder) = lift {
             let payload = (builder.0)();
-            let over = self.drop_at(x, y, &*payload.value).map(|region| region.rect);
+            let region = self.drop_at(x, y, &*payload.value);
+            let over = region.as_ref().map(|region| region.rect);
+            self.note_drag_preview(region.as_ref(), x, y);
             *self.drag_value.borrow_mut() = Some(payload.value);
             let mut interaction = self.interaction.borrow_mut();
             // the click dies at the lift: nothing fires on the release
@@ -370,21 +431,26 @@ impl Runtime {
             return Some(true);
         }
         let value = self.drag_value.borrow().clone()?;
-        let over = self.drop_at(x, y, &*value).map(|region| region.rect);
+        let region = self.drop_at(x, y, &*value);
+        let over = region.as_ref().map(|region| region.rect);
+        // the app hears the place first: the state it writes and the
+        // stamp below land in the SAME frame, never a step apart
+        let previewed = self.note_drag_preview(region.as_ref(), x, y);
         let mut interaction = self.interaction.borrow_mut();
         let live = interaction.drag.as_mut()?;
         let moved = live.at != (Point { x, y }) || live.over != over;
         live.at = Point { x, y };
         live.over = over;
         interaction.pointer = Some(Point { x, y });
-        Some(moved)
+        Some(moved || previewed)
     }
 
     /// Ends the drag without landing it. `true` = one was live.
     fn cancel_drag(&self) -> bool {
         self.drag_armed.borrow_mut().take();
         self.drag_value.borrow_mut().take();
-        self.interaction.borrow_mut().drag.take().is_some()
+        let previewed = self.clear_drag_preview();
+        self.interaction.borrow_mut().drag.take().is_some() || previewed
     }
 
     /// The row under a point of the OPEN menu — the same walk the
@@ -516,6 +582,7 @@ impl Runtime {
             last_drops: RefCell::new(Vec::new()),
             drag_armed: RefCell::new(None),
             drag_value: RefCell::new(None),
+            drag_preview: RefCell::new(None),
             tooltip: RefCell::new(TooltipLife::default()),
             last_drag_regions: RefCell::new(Vec::new()),
             overlay_bounds: Cell::new(None),
@@ -946,8 +1013,12 @@ impl Runtime {
         if let Some(value) = self.drag_value.borrow_mut().take() {
             let target = self.drop_at(x, y, &*value);
             self.interaction.borrow_mut().drag = None;
+            // the preview closes FIRST — the landing action writes its
+            // state into a world with no drag and no leftover preview
+            self.clear_drag_preview();
             if let Some(region) = target {
-                (region.action.0)(&*value);
+                let at = Self::drop_point(&region, x, y);
+                (region.action.0)(&*value, at);
             }
             return None;
         }

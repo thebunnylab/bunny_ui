@@ -435,7 +435,16 @@ pub enum LayoutNode {
     /// value. The runtime finds targets by GEOMETRY — a drop lands
     /// through any opaque hover gate, which is the transparent catcher
     /// the dock asked for.
-    DropTarget { accepts: std::any::TypeId, action: DropAction, child: Box<LayoutNode> },
+    DropTarget {
+        accepts: std::any::TypeId,
+        action: DropAction,
+        /// The app's own preview: called with the position while a
+        /// compatible drag moves over this box, and with `None` the
+        /// moment it leaves, lands or is cancelled. Declaring it makes
+        /// the framework's ring stand down — the box paints its own.
+        over: Option<DragOverAction>,
+        child: Box<LayoutNode>,
+    },
     /// The escape hatch (`custom(…)` / `canvas(…)`): a box the APP
     /// measures and paints, in the same command vocabulary the built-ins
     /// emit. `path` is its identity — the address of the events it
@@ -1085,11 +1094,23 @@ impl std::fmt::Debug for DragBuilder {
 
 /// The closure a drop lands in — same story.
 #[derive(Clone)]
-pub struct DropAction(pub std::rc::Rc<dyn Fn(&dyn std::any::Any)>);
+pub struct DropAction(pub std::rc::Rc<dyn Fn(&dyn std::any::Any, DropPoint)>);
 
 impl std::fmt::Debug for DropAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("on_drop")
+    }
+}
+
+/// The closure a live drag reports its position to — the app's own
+/// preview (a veil over the quadrant it would split into, a marker
+/// between two chips). `None` means the drag left, landed or died.
+#[derive(Clone)]
+pub struct DragOverAction(pub std::rc::Rc<dyn Fn(Option<DropPoint>)>);
+
+impl std::fmt::Debug for DragOverAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("preview")
     }
 }
 
@@ -1106,12 +1127,48 @@ impl std::fmt::Debug for DragSourceRegion {
     }
 }
 
+/// Where a drag sits inside a drop target — the answer to "the cursor
+/// is HERE over this box", which is what turns one drop into a move,
+/// a split toward an edge or an insertion before a chip.
+///
+/// The point is in the target's OWN coordinates (its top-left is zero)
+/// against its OWN size — never the visible slice. A target half
+/// scrolled out of view still answers honestly: its quadrants do not
+/// move because part of it is off screen.
+///
+/// Values outside the box are legal on purpose (a pointer dragged past
+/// an edge): every consumer clamps, so the type carries no invariant.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct DropPoint {
+    /// The pointer in the target's own coordinates.
+    pub local: Point,
+    /// The target's own box size — what the fraction divides by.
+    pub size: Size,
+}
+
+impl DropPoint {
+    /// The pointer as a FRACTION of the box: `0.0` at the origin edge,
+    /// `1.0` at the far edge, each axis on its own. A quadrant, a half
+    /// or an insertion index is decided from this and nothing else.
+    pub fn fraction(&self) -> (Px, Px) {
+        let axis = |value: Px, extent: Px| if extent > 0.0 { value / extent } else { 0.0 };
+        (axis(self.local.x, self.size.width), axis(self.local.y, self.size.height))
+    }
+}
+
 /// One `.on_drop(…)` region of the placed scene.
 #[derive(Clone)]
 pub struct DropRegion {
     pub accepts: std::any::TypeId,
     pub action: DropAction,
+    pub over: Option<DragOverAction>,
+    /// The VISIBLE slice — what a pointer must be inside to land here
+    /// (a target scrolled half away takes a drop only on the half you
+    /// can see, exactly like a hit).
     pub rect: Rect,
+    /// The target's OWN box, whole. The fraction divides by this, so a
+    /// clipped target never lies about where the hand is.
+    pub frame: Rect,
 }
 
 impl std::fmt::Debug for DropRegion {
@@ -2721,7 +2778,7 @@ impl LayoutNode {
                 }
             }
 
-            (LayoutNode::DropTarget { accepts, action, child }, Fit::Wrapped(_, fit)) => {
+            (LayoutNode::DropTarget { accepts, action, over, child }, Fit::Wrapped(_, fit)) => {
                 child.place(frame, *fit, env, out);
                 let region = match out.current_clip() {
                     Some(clip) => frame.intersection(clip),
@@ -2729,13 +2786,16 @@ impl LayoutNode {
                 };
                 if let Some(rect) = region {
                     // a compatible drag over THIS box: the framework
-                    // rings it — the drop focus every platform draws
-                    let ringed = env
-                        .stamp
-                        .interaction
-                        .drag
-                        .as_ref()
-                        .is_some_and(|live| live.over == Some(rect));
+                    // rings it — the drop focus every platform draws.
+                    // A box that paints its OWN preview gets no ring:
+                    // one affordance per target, and the app's wins.
+                    let ringed = over.is_none()
+                        && env
+                            .stamp
+                            .interaction
+                            .drag
+                            .as_ref()
+                            .is_some_and(|live| live.over == Some(rect));
                     if ringed {
                         out.display.push(DrawCommand::StrokeRect {
                             rect: frame,
@@ -2747,7 +2807,9 @@ impl LayoutNode {
                     out.drops.push(DropRegion {
                         accepts: *accepts,
                         action: action.clone(),
+                        over: over.clone(),
                         rect,
+                        frame,
                     });
                 }
             }

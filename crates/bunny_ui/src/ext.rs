@@ -26,7 +26,7 @@ use crate::action::ActionId;
 use crate::effects;
 use crate::erased::Erased;
 use crate::layout::Color;
-use crate::modifier::{Modified, Modifier};
+use crate::modifier::{DropTargetView, Modified, Modifier};
 use crate::view::{Single, View, render_line, short_type_name};
 use crate::views::Alignment;
 use motor::views::{ContentMode, Edge, Font, ListStyle, ProgressViewStyle, TextAlignment};
@@ -370,19 +370,36 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// ```ignore
     /// pane.on_drop(move |tab: &TabDrag| adopt(tab))
     /// ```
-    fn on_drop<T: 'static>(self, action: impl Fn(&T) + 'static) -> Modified<Self> {
-        let erased = move |any: &dyn std::any::Any| {
+    fn on_drop<T: 'static>(self, action: impl Fn(&T) + 'static) -> DropTargetView<Self> {
+        self.on_drop_at(move |value: &T, _| action(value))
+    }
+
+    /// [`Self::on_drop`] with the PLACE it landed — the pointer inside
+    /// this box, which is what turns one drop into a move, a split
+    /// toward the nearest edge or an insertion before a chip. The
+    /// position is against the target's OWN box, so a half-scrolled
+    /// target still answers honestly.
+    ///
+    /// ```ignore
+    /// pane.on_drop_at(move |tab: &TabDrag, at| {
+    ///     let (x, y) = at.fraction();
+    ///     shell.drop_on_pane(tab, pane, pane_drop_zone(x, y))
+    /// })
+    /// ```
+    fn on_drop_at<T: 'static>(
+        self,
+        action: impl Fn(&T, crate::layout::DropPoint) + 'static,
+    ) -> DropTargetView<Self> {
+        let erased = move |any: &dyn std::any::Any, at: crate::layout::DropPoint| {
             if let Some(value) = any.downcast_ref::<T>() {
-                action(value);
+                action(value, at);
             }
         };
-        Modified {
-            base: self,
-            modifier: Modifier::OnDrop {
-                accepts: std::any::TypeId::of::<T>(),
-                action: crate::layout::DropAction(std::rc::Rc::new(erased)),
-            },
-        }
+        DropTargetView::new(
+            self,
+            std::any::TypeId::of::<T>(),
+            crate::layout::DropAction(std::rc::Rc::new(erased)),
+        )
     }
 
     /// `.clipped()` — the subtree cannot paint outside this box, and

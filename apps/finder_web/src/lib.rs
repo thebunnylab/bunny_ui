@@ -121,6 +121,7 @@ fn matches(dir: &str, name: &str, needle: &str) -> bool {
 #[derive(Clone)]
 struct FileDrag {
     name: std::sync::Arc<str>,
+    dir: std::sync::Arc<str>,
 }
 
 #[derive(Clone)]
@@ -130,6 +131,10 @@ struct Finder {
     /// A second click on the selected row opens its details popover.
     details: State<bool>,
     visible: State<Rc<Vec<usize>>>,
+    /// Which half of the search field a dragged row is over — the
+    /// preview pain 31 asks for: the app paints the landing while the
+    /// hand is still moving.
+    drop_hint: State<Option<&'static str>>,
     /// What the page's own manifest says — fetched by a task, so the
     /// header shows the crossing landing.
     manifest: State<Arc<str>>,
@@ -161,13 +166,33 @@ impl Component for Finder {
                     .tooltip("The selected file opens here"),
                 {
                     let query = self.query;
+                    let hint = self.drop_hint;
                     text_field("Search ten thousand files…", self.query.binding())
                         .monospaced()
-                        // drop a row here: the search becomes the file
-                        .on_drop(move |file: &FileDrag| query.set(file.name.to_string()))
+                        // drop a row here: the search becomes the file,
+                        // and the LEFT half searches the name while the
+                        // right half searches its folder — the drop
+                        // says where it landed, so one target has two
+                        // meanings (pain 31)
+                        .on_drop_at(move |file: &FileDrag, at| {
+                            let (x, _) = at.fraction();
+                            query.set(if x < 0.5 {
+                                file.name.to_string()
+                            } else {
+                                file.dir.to_string()
+                            })
+                        })
+                        .preview(move |at| {
+                            hint.set(at.map(|at| {
+                                if at.fraction().0 < 0.5 { "name" } else { "folder" }
+                            }))
+                        })
                 },
                 count_meter(count),
-                text(self.manifest.get())
+                text(match self.drop_hint.get() {
+                    Some(half) => Arc::from(format!("drop to search by {half}")),
+                    None => self.manifest.get(),
+                })
                     .font_size(11.0)
                     .foreground_color(theme::fg_faint()),
             )
@@ -220,7 +245,13 @@ impl Component for Finder {
                     // through the popover's doors
                     .on_drag({
                         let name = name.clone();
-                        move || drag(FileDrag { name: name.clone() }, name.clone())
+                        let dir = dir.clone();
+                        move || {
+                            drag(
+                                FileDrag { name: name.clone(), dir: dir.clone() },
+                                name.clone(),
+                            )
+                        }
                     })
                     .context_menu(vec![
                         menu_item("Open", move || {
@@ -440,6 +471,7 @@ fn finder() -> Finder {
         selected: State::new(0),
         details: State::new(false),
         visible: State::new(Rc::new((0..10_000).collect())),
+        drop_hint: State::new(None),
         manifest: State::new(Arc::from("reading the manifest…")),
         files,
         logo: logo(),
