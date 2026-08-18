@@ -59,9 +59,31 @@ fn report(label: &str, frame: stats::FrameStats, patches: usize) {
         "{label:<16} bodies {:>5}  built {:>6}  visited {:>6}  reused {:>5}  patches {:>5}",
         frame.body_passes, frame.capture_nodes, frame.diff_visited, frame.diff_reused, patches
     );
+    // where the frame's milliseconds went — the stages, in order
+    use stats::Stage;
+    println!(
+        "{:<16} settle {:>6.3}  build {:>6.3}  diff {:>6.3}  encode {:>6.3}  = {:>6.3} ms",
+        "  stages",
+        frame.ms(Stage::Settle),
+        frame.ms(Stage::Capture),
+        frame.ms(Stage::Diff),
+        frame.ms(Stage::Encode),
+        frame.ms(Stage::Settle)
+            + frame.ms(Stage::Capture)
+            + frame.ms(Stage::Diff)
+            + frame.ms(Stage::Encode),
+    );
+}
+
+/// A clock for the stage timers — the engine takes a function, so the
+/// host decides what "now" means (the browser hands it `performance.now`).
+fn now_ms() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_secs_f64() * 1000.0
 }
 
 fn main() {
+    stats::set_clock(Some(now_ms));
     let runtime = Runtime::new();
     let app = App {
         rows: State::new(Rc::new(Vec::new())),
