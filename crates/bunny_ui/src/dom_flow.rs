@@ -160,6 +160,7 @@ impl Walk<'_> {
                     Axis::Horizontal => DomKind::FlexRow,
                 };
                 let mut container = node(kind);
+                container.children.reserve_exact(children.len());
                 // a container can be the pressed thing too (a bare
                 // stack hinted into an anchor): the pending action
                 // lands here the way it lands on a styled box
@@ -477,6 +478,7 @@ impl Walk<'_> {
                     return;
                 }
                 let mut group = node(DomKind::Group { path: std::rc::Rc::from(path.as_str()) });
+                group.children.reserve_exact(children.len());
                 let outer_pending = self.pending_boundary_class.take();
                 for child in children {
                     self.lower_into(child, &mut group.children);
