@@ -1079,26 +1079,53 @@ impl Runtime {
                 (region.content.height.round() - region.frame.size.height.round()).max(0.0);
             (max_x, max_y)
         };
-        let Some(region) = scrolls.iter().find(|region| {
-            region.frame.contains(x, y) && {
-                let (max_x, max_y) = travel(region);
-                (dx != 0.0 && max_x > 0.0) || (dy != 0.0 && max_y > 0.0)
-            }
-        }) else {
+        // each AXIS routes to the innermost region under the point
+        // that travels that way — a diagonal gesture over a table
+        // scrolls the rows AND slides the columns, instead of losing
+        // half of itself inside the inner list
+        let region_y = (dy != 0.0)
+            .then(|| {
+                scrolls.iter().find(|region| {
+                    region.frame.contains(x, y) && travel(region).1 > 0.0
+                })
+            })
+            .flatten();
+        let region_x = (dx != 0.0)
+            .then(|| {
+                scrolls.iter().find(|region| {
+                    region.frame.contains(x, y) && travel(region).0 > 0.0
+                })
+            })
+            .flatten();
+        if region_x.is_none() && region_y.is_none() {
             return false;
-        };
-        let (max_x, max_y) = travel(region);
-        // the wheel is sovereign: a reveal in flight dies on the spot
-        self.animator.borrow_mut().cancel_scroll(&region.path);
+        }
+        let mut moved = false;
         let mut offsets = self.scroll_offsets.borrow_mut();
-        let current = offsets.get(&region.path).copied().unwrap_or_default();
-        let next = Point {
-            x: (current.x - dx).clamp(0.0, max_x),
-            y: (current.y - dy).clamp(0.0, max_y),
+        let mut apply = |region: &ScrollRegion, dx: Px, dy: Px| {
+            let (max_x, max_y) = travel(region);
+            // the wheel is sovereign: a reveal in flight dies here
+            self.animator.borrow_mut().cancel_scroll(&region.path);
+            let current = offsets.get(&region.path).copied().unwrap_or_default();
+            let next = Point {
+                x: (current.x - dx).clamp(0.0, max_x),
+                y: (current.y - dy).clamp(0.0, max_y),
+            };
+            if next != current {
+                offsets.insert(region.path.clone(), next);
+                moved = true;
+            }
         };
-        let moved = next != current;
-        if moved {
-            offsets.insert(region.path.clone(), next);
+        match (region_x, region_y) {
+            (Some(rx), Some(ry)) if rx.path == ry.path => apply(rx, dx, dy),
+            (rx, ry) => {
+                if let Some(region) = ry {
+                    apply(region, 0.0, dy);
+                }
+                if let Some(region) = rx {
+                    apply(region, dx, 0.0);
+                }
+            }
         }
         moved
     }

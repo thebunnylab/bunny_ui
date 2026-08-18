@@ -480,6 +480,99 @@ impl View for Icon {
     }
 }
 
+use crate::ext::ViewExt as _;
+
+/// One column of a [`table`]: its header and its width in points.
+#[derive(Clone)]
+pub struct TableColumn {
+    pub title: Arc<str>,
+    pub width: f64,
+}
+
+/// A table column. Width is points; the header paints it bold over a
+/// hairline.
+pub fn column(title: impl Into<Arc<str>>, width: f64) -> TableColumn {
+    TableColumn { title: title.into(), width }
+}
+
+/// The row band of a [`table`] — one shared height keeps the virtual
+/// window honest and the sheet scannable.
+const TABLE_ROW_H: f64 = 26.0;
+const TABLE_CELL_PAD: f64 = 8.0;
+
+/// A table: fixed columns across, virtual rows down, and BOTH axes
+/// scroll — the header stays put vertically and slides with its
+/// columns horizontally, because it lives inside the sideways region
+/// and outside the vertical one. Rows come by INDEX (ten thousand
+/// exist, a screenful materializes); `cell(row, column)` builds one
+/// cell, clipped to its lane.
+///
+/// ```ignore
+/// table(
+///     vec![column("Name", 220.0), column("Kind", 90.0), column("Size", 80.0)],
+///     files.len(),
+///     |row| files[row].id.clone(),
+///     move |row, col| text(files[row].field(col)),
+/// )
+/// ```
+///
+/// What v1 leaves out, on purpose: the COLUMNS all materialize (the
+/// rows are the axis that reaches ten thousand; a sheet of very many
+/// columns can wait), and sorting is the app's — reorder your rows,
+/// the table draws what it is given.
+pub fn table<I, F, R>(
+    columns: Vec<TableColumn>,
+    count: usize,
+    id: I,
+    cell: F,
+) -> impl View<Arity = crate::view::Single>
+where
+    I: Fn(usize) -> String + Clone + 'static,
+    F: Fn(usize, usize) -> R + Clone + 'static,
+    R: View<Arity = crate::view::Single>,
+{
+    let theme = crate::theme::current();
+    let widths: Vec<f64> = columns.iter().map(|column| column.width).collect();
+    let header = for_each(
+        columns,
+        |column| column.title.to_string(),
+        |column| {
+            text(column.title.clone())
+                .bold()
+                .padding_edge(motor::views::Edge::Leading, TABLE_CELL_PAD)
+                .frame(column.width, TABLE_ROW_H)
+        },
+    )
+    .horizontal();
+    let body = {
+        let widths = widths.clone();
+        virtual_list(count, id, move |row| {
+            let cell = cell.clone();
+            let widths = widths.clone();
+            for_each(
+                widths.iter().copied().enumerate().collect::<Vec<_>>(),
+                |(col, _)| col.to_string(),
+                move |(col, width)| {
+                    cell(row, *col)
+                        .padding_edge(motor::views::Edge::Leading, TABLE_CELL_PAD)
+                        .frame(*width, TABLE_ROW_H)
+                        .clipped()
+                },
+            )
+            .horizontal()
+        })
+    };
+    scroll(
+        crate::vstack!(
+            header
+                .background_color(theme.panel)
+                .border(theme.border, 1.0),
+            body,
+        ),
+    )
+    .horizontal()
+}
+
 /// A scroll region of one's own — a vertical viewport by default. The
 /// lists already scroll themselves; this is for everything else that
 /// overflows: `.horizontal()` goes sideways (an editor without wrap, a

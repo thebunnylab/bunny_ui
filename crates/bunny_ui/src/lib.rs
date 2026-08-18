@@ -4520,4 +4520,130 @@ mod tests {
         assert!(!runtime.wheel(50.0, 12.0, 0.0, -5.0), "no vertical travel to take");
         assert!(runtime.wheel(50.0, 12.0, -5.0, 0.0), "sideways is the whole point");
     }
+
+    #[test]
+    fn a_table_stands_on_columns_and_windows_its_rows() {
+        #[derive(Clone, Copy)]
+        struct Sheet;
+        impl Component for Sheet {
+            fn body(self, _ctx: &Context) -> impl View {
+                table(
+                    vec![
+                        column("Name", 200.0),
+                        column("Kind", 90.0),
+                        column("Size", 80.0),
+                        column("Modified", 140.0),
+                    ],
+                    10_000,
+                    |row| row.to_string(),
+                    |row, col| text(format!("r{row}c{col}")),
+                )
+                .frame(260.0, 120.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 280.0, height: 140.0 };
+        let result = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
+
+        // two regions: the sideways sheet and the vertical rows
+        assert_eq!(result.scrolls.len(), 2, "{:?}", result.scrolls);
+        let across = result
+            .scrolls
+            .iter()
+            .find(|region| region.content.width > 400.0)
+            .expect("the sideways region spans the columns");
+        assert_eq!(across.content.width, 510.0, "the columns add up");
+        let down = result
+            .scrolls
+            .iter()
+            .find(|region| region.content.height > 1000.0)
+            .expect("the rows make the tall region");
+        assert!(down.content.height >= 10_000.0 * 26.0, "every row exists in geometry");
+
+        // ten thousand rows, a SCREENFUL of text painted
+        let cells = result
+            .display
+            .iter()
+            .filter(|command| {
+                matches!(command, crate::layout::DrawCommand::TextLine { content, .. }
+                    if content.starts_with('r'))
+            })
+            .count();
+        assert!(cells < 200, "the window stays a screenful: {cells}");
+        // the header paints its four titles
+        let headers = result
+            .display
+            .iter()
+            .filter(|command| {
+                matches!(command, crate::layout::DrawCommand::TextLine { content, .. }
+                    if ["Name", "Kind", "Size", "Modified"].contains(&&**content))
+            })
+            .count();
+        assert_eq!(headers, 4);
+
+        // a vertical wheel moves the rows and leaves the header put
+        assert!(runtime.wheel(100.0, 80.0, 0.0, -52.0));
+        let scrolled = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
+        let first_cell_y = scrolled
+            .display
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { origin, content, .. }
+                    if content.starts_with("r2c") =>
+                {
+                    Some(origin.y)
+                }
+                _ => None,
+            });
+        assert!(first_cell_y.is_some(), "row 2 rode into view");
+        let header_y = scrolled
+            .display
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { origin, content, .. }
+                    if &**content == "Name" =>
+                {
+                    Some(origin.y)
+                }
+                _ => None,
+            })
+            .expect("the header stays");
+        assert!(header_y < 26.0, "the header never scrolls away: {header_y}");
+
+        // a sideways wheel slides header AND rows together, in step
+        let name_x = |result: &crate::layout::LayoutResult| {
+            result
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { origin, content, .. }
+                        if &**content == "Name" =>
+                    {
+                        Some(origin.x)
+                    }
+                    _ => None,
+                })
+                .expect("the header is painted")
+        };
+        let cell_x = |result: &crate::layout::LayoutResult| {
+            result
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { origin, content, .. }
+                        if content.starts_with("r2c0") =>
+                    {
+                        Some(origin.x)
+                    }
+                    _ => None,
+                })
+                .expect("the cell is painted")
+        };
+        let before = (name_x(&scrolled), cell_x(&scrolled));
+        assert!(runtime.wheel(100.0, 80.0, -60.0, 0.0));
+        let slid = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
+        assert_eq!(name_x(&slid), before.0 - 60.0, "the header slid with its columns");
+        assert_eq!(cell_x(&slid), before.1 - 60.0, "and the rows slid in step");
+    }
 }
