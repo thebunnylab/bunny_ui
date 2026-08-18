@@ -102,6 +102,27 @@ becomes a CSS gradient — the geometry ours, the pixels the browser's.
 `Color::fade()` is the end of a glow: interpolation is straight, so a
 ramp that fades to a transparent black drags itself through grey.
 
+## Clipping
+
+`.clipped()` cuts the subtree to the box — and the cut follows the
+`.corner_radius(…)` already on it. There is no radius to repeat and no
+order to remember: the two fuse into one node.
+
+```rust
+vstack((toolbar(), panels()))
+    .background_color(surface)
+    .border(outline, 1.0)
+    .corner_radius(6.0)
+    .clipped()
+```
+
+A child that paints its own background dies at the curve; the border
+paints over the cut child. On the pixel backends one coverage multiply
+serves every primitive — fills, text, images, icons. In element mode
+the browser does it natively (`overflow:hidden` beside the radius).
+An inner clip with no radius of its own inherits the curve above it,
+so a scroll region inside a rounded card keeps the card's corners.
+
 ## Icons
 
 A glyph is a recipe, never pixels: verbs on a fixed 24 grid, plus the
