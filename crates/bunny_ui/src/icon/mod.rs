@@ -270,7 +270,7 @@ fn rasterize(glyph: &Glyph, color: Color, width: usize, height: usize) -> ImageR
     let mut union = vector::Mask::new(width, height);
     let mut scratch = vector::Mask::new(width, height);
     let mut run_color: Option<Color> = None;
-    let mut flush = |union: &mut vector::Mask, run_color: &mut Option<Color>, rgba: &mut Vec<u8>| {
+    let flush = |union: &mut vector::Mask, run_color: &mut Option<Color>, rgba: &mut Vec<u8>| {
         let Some(ink) = run_color.take() else { return };
         for y in 0..height {
             for x in 0..width {

@@ -354,6 +354,13 @@ impl Bitmap {
         if x0 >= cx1 || x1 <= cx0 || y0 >= cy1 || y1 <= cy0 {
             return;
         }
+        // the ellipse ignores the box's corner — the GPU's wire traded
+        // that slot for the aspect, and the two must drop it TOGETHER
+        // (a rounded wash clips through `.clipped()`)
+        let corner_radius = match paint {
+            GradientPaint::Radial { aspect, .. } if aspect != 1.0 => 0.0,
+            _ => corner_radius,
+        };
         let radius = corner_radius
             .max(0.0)
             .min((x1 - x0) as f64 / 2.0)

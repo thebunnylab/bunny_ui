@@ -938,10 +938,12 @@ fn diff_children(
 ///                   10 ink u32 rgba (what the subtree inherits)
 ///                   11 hover ink u32 rgba     12 pressed ink u32 rgba
 ///                   13 gradient u8 kind (0 rings, 1 line),
-///                      f32 x4 — rings: centre x, centre y (0..1),
-///                      start px, end px (negative = the box's reach);
-///                      line: start x, start y, end x, end y (0..1) —
-///                      then u32 near rgba, u32 far rgba
+///                      rings: f32 x5 — centre x, centre y (0..1),
+///                      start px, end px (negative = the box's reach),
+///                      aspect (1 = the circle; else the ellipse's
+///                      Y radius is end·aspect);
+///                      line: f32 x4 — start x, start y, end x, end y
+///                      (0..1) — then u32 near rgba, u32 far rgba
 ///                   14 clip (no payload — the bit IS the value:
 ///                      overflow:hidden beside the radius of bit 4)
 ///                   15 tooltip u16 len + utf8 — a data attribute; the
@@ -1200,7 +1202,7 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     }
     if let Some(gradient) = style.gradient {
         match gradient {
-            crate::layout::Gradient::Radial { center, start, end, inner, outer } => {
+            crate::layout::Gradient::Radial { center, start, end, aspect, inner, outer } => {
                 out.push(0);
                 push_f32(out, center.x);
                 push_f32(out, center.y);
@@ -1208,6 +1210,7 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
                 // no reach given = the box's own farthest corner, which
                 // CSS spells `farthest-corner`
                 push_f32(out, end.unwrap_or(-1.0));
+                push_f32(out, aspect);
                 push_u32(out, pack_color(inner));
                 push_u32(out, pack_color(outer));
             }

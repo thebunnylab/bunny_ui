@@ -302,9 +302,16 @@ function applyPatches(view, length) {
       if (mask & 8192) {
         const kind = u8();
         const [a, b, c, d] = [f32(), f32(), f32(), f32()];
+        const aspect = kind === 0 ? f32() : 1;
         const near = rgba(u32());
         const far = rgba(u32());
-        if (kind === 0) {
+        if (kind === 0 && aspect !== 1 && d > 0) {
+          // the ellipse: X radius on the wire, Y is X times the aspect
+          base.push(
+            `background-image:radial-gradient(ellipse ${d}px ${d * aspect}px at ` +
+              `${a * 100}% ${b * 100}%, ${near} ${((c / d) * 100).toFixed(2)}%, ${far} 100%)`,
+          );
+        } else if (kind === 0) {
           const reach = d < 0 ? "farthest-corner" : `${d}px`;
           const stop = d < 0 ? "100%" : `${d}px`;
           base.push(

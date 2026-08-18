@@ -588,10 +588,15 @@ impl UnitPoint {
 pub enum Gradient {
     /// Rings around `center`: `inner` at `start` px, `outer` at `end`
     /// px. `end: None` = the box's own reach — the farthest corner.
+    /// `aspect` scales the field's Y — `1.0` is the circle it always
+    /// was; `260.0 / 560.0` is the D89 wash, an ellipse whose radii
+    /// are `end` across and `end · aspect` down (the `start` fraction
+    /// rides both axes).
     Radial {
         center: UnitPoint,
         start: Px,
         end: Option<Px>,
+        aspect: f64,
         inner: Color,
         outer: Color,
     },
@@ -602,7 +607,14 @@ pub enum Gradient {
 impl Gradient {
     /// Rings from the centre, reaching the box's farthest corner.
     pub fn radial(inner: Color, outer: Color) -> Gradient {
-        Gradient::Radial { center: UnitPoint::CENTER, start: 0.0, end: None, inner, outer }
+        Gradient::Radial {
+            center: UnitPoint::CENTER,
+            start: 0.0,
+            end: None,
+            aspect: 1.0,
+            inner,
+            outer,
+        }
     }
 
     /// A ramp from the top edge to the bottom one.
@@ -613,8 +625,8 @@ impl Gradient {
     /// Moves a radial gradient's centre (a linear one keeps its line).
     pub fn center(self, center: UnitPoint) -> Gradient {
         match self {
-            Gradient::Radial { start, end, inner, outer, .. } => {
-                Gradient::Radial { center, start, end, inner, outer }
+            Gradient::Radial { start, end, aspect, inner, outer, .. } => {
+                Gradient::Radial { center, start, end, aspect, inner, outer }
             }
             other => other,
         }
@@ -623,8 +635,24 @@ impl Gradient {
     /// The two radii of a radial gradient, in px.
     pub fn radius(self, start: Px, end: Px) -> Gradient {
         match self {
-            Gradient::Radial { center, inner, outer, .. } => {
-                Gradient::Radial { center, start, end: Some(end), inner, outer }
+            Gradient::Radial { center, aspect, inner, outer, .. } => {
+                Gradient::Radial { center, start, end: Some(end), aspect, inner, outer }
+            }
+            other => other,
+        }
+    }
+
+    /// Squeezes a radial gradient into an ELLIPSE: the Y radius is the
+    /// X radius times `aspect`. A 560×260 wash is
+    /// `.radius(0.0, 560.0).aspect(260.0 / 560.0)` — and its 70% stop
+    /// is `.radius(392.0, 560.0)`, because `start` rides both axes.
+    /// One honest limit: an elliptical ramp ignores the box's corner
+    /// radius (the wire has no room for both) — a rounded wash clips
+    /// through `.clipped()`, which cuts every paint anyway.
+    pub fn aspect(self, aspect: f64) -> Gradient {
+        match self {
+            Gradient::Radial { center, start, end, inner, outer, .. } => {
+                Gradient::Radial { center, start, end, aspect, inner, outer }
             }
             other => other,
         }
@@ -644,13 +672,14 @@ impl Gradient {
     /// only evaluate).
     pub fn resolve(self, rect: Rect) -> GradientPaint {
         match self {
-            Gradient::Radial { center, start, end, inner, outer } => {
+            Gradient::Radial { center, start, end, aspect, inner, outer } => {
                 let center = center.resolve(rect);
                 let reach = end.unwrap_or_else(|| corner_reach(center, rect));
                 GradientPaint::Radial {
                     center,
                     start,
                     end: reach.max(start + 0.001),
+                    aspect: if aspect > 0.0 { aspect } else { 1.0 },
                     inner,
                     outer,
                 }
@@ -676,7 +705,7 @@ fn corner_reach(center: Point, rect: Rect) -> Px {
 /// carries.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum GradientPaint {
-    Radial { center: Point, start: Px, end: Px, inner: Color, outer: Color },
+    Radial { center: Point, start: Px, end: Px, aspect: f64, inner: Color, outer: Color },
     Linear { start: Point, end: Point, from: Color, to: Color },
 }
 
@@ -685,8 +714,11 @@ impl GradientPaint {
     /// shaders repeat.
     pub fn at(&self, point: Point) -> Color {
         match *self {
-            GradientPaint::Radial { center, start, end, inner, outer } => {
-                let distance = (point.x - center.x).hypot(point.y - center.y);
+            GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
+                // the ellipse is a circle in a Y-scaled space: at the
+                // point (0, end·aspect) the division lands on `end`
+                let distance =
+                    (point.x - center.x).hypot((point.y - center.y) / aspect);
                 mix(inner, outer, ((distance - start) / (end - start)).clamp(0.0, 1.0))
             }
             GradientPaint::Linear { start, end, from, to } => {
@@ -705,11 +737,12 @@ impl GradientPaint {
     pub fn scaled(self, factor: f64) -> GradientPaint {
         let scale = |point: Point| Point { x: point.x * factor, y: point.y * factor };
         match self {
-            GradientPaint::Radial { center, start, end, inner, outer } => {
+            GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
                 GradientPaint::Radial {
                     center: scale(center),
                     start: start * factor,
                     end: end * factor,
+                    aspect,
                     inner,
                     outer,
                 }
@@ -724,8 +757,8 @@ impl GradientPaint {
     pub(crate) fn shifted(self, dx: Px, dy: Px) -> GradientPaint {
         let shift = |point: Point| Point { x: point.x + dx, y: point.y + dy };
         match self {
-            GradientPaint::Radial { center, start, end, inner, outer } => {
-                GradientPaint::Radial { center: shift(center), start, end, inner, outer }
+            GradientPaint::Radial { center, start, end, aspect, inner, outer } => {
+                GradientPaint::Radial { center: shift(center), start, end, aspect, inner, outer }
             }
             GradientPaint::Linear { start, end, from, to } => {
                 GradientPaint::Linear { start: shift(start), end: shift(end), from, to }
@@ -4552,6 +4585,32 @@ mod tests {
             })
             .unwrap();
         assert_eq!(background, Color::hex(0x333333));
+    }
+
+    #[test]
+    fn an_elliptical_ramp_reaches_both_radii() {
+        let wash = Gradient::radial(Color::hex(0xFF0000), Color::hex(0x0000FF))
+            .radius(392.0, 560.0)
+            .aspect(260.0 / 560.0);
+        let frame = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size { width: 1120.0, height: 520.0 },
+        };
+        let paint = wash.resolve(frame);
+        // the far color lands at BOTH ends of the ellipse: 560 across,
+        // 260 down — and the 70% stop rides both axes
+        let far = Color::hex(0x0000FF);
+        assert_eq!(paint.at(Point { x: 560.0 + 560.0, y: 260.0 }), far);
+        assert_eq!(paint.at(Point { x: 560.0, y: 260.0 + 260.0 }), far);
+        let near = Color::hex(0xFF0000);
+        assert_eq!(paint.at(Point { x: 560.0 + 391.0, y: 260.0 }), near, "inside the stop");
+        assert_eq!(paint.at(Point { x: 560.0, y: 260.0 + 181.0 }), near, "70% of 260 is 182");
+        // aspect 1 is the circle it always was
+        let circle = Gradient::radial(near, far).radius(0.0, 100.0).resolve(frame);
+        match circle {
+            GradientPaint::Radial { aspect, .. } => assert_eq!(aspect, 1.0),
+            other => panic!("a radial, not {other:?}"),
+        }
     }
 
     const CHECK_PATH: &[crate::icon::Verb] = &[

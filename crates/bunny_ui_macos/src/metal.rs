@@ -361,6 +361,13 @@ fragment float4 rect_fragment(RectVary in [[stage_in]],
         if (kind == 3.0) {
             float distance = length(p - rect.point2);
             t = saturate((distance - rect.params.y) / (rect.params.w - rect.params.y));
+        } else if (kind == 5.0) {
+            // the ellipse is a circle in a Y-scaled space; its corner
+            // slot carries the aspect, so the cover is the plain box
+            coverage = rect_cov(p, rect.rect, 0.0);
+            float2 away = p - rect.point2;
+            float distance = length(float2(away.x, away.y / rect.params.x));
+            t = saturate((distance - rect.params.y) / (rect.params.w - rect.params.y));
         } else {
             float2 origin = float2(rect.params.y, rect.params.w);
             float2 axis = rect.point2 - origin;
@@ -857,6 +864,10 @@ const KIND_STROKE: f32 = 1.0;
 const KIND_SHADOW: f32 = 2.0;
 const KIND_RADIAL: f32 = 3.0;
 const KIND_LINEAR: f32 = 4.0;
+/// The elliptical rings: the ASPECT rides params.x (the corner slot —
+/// an elliptical ramp ignores the box corner; a rounded wash clips
+/// through `.clipped()`), start and end radii stay in params.y/.w.
+const KIND_ELLIPTIC: f32 = 5.0;
 
 // MARK: - The run atlas (text tiles, append-only shelves)
 
@@ -1388,20 +1399,31 @@ fn build_frame(
                         center,
                         start,
                         end,
+                        aspect,
                         inner,
                         outer,
-                    } => push_gradient(
-                        out,
-                        snapped,
-                        clip,
-                        inner,
-                        outer,
-                        radius,
-                        start,
-                        end,
-                        (center.x, center.y),
-                        KIND_RADIAL,
-                    ),
+                    } => {
+                        // the circle keeps its kind (and its corner)
+                        // byte for byte; the ellipse trades the corner
+                        // slot for the aspect
+                        let (kind, slot_x) = if aspect == 1.0 {
+                            (KIND_RADIAL, radius)
+                        } else {
+                            (KIND_ELLIPTIC, aspect)
+                        };
+                        push_gradient(
+                            out,
+                            snapped,
+                            clip,
+                            inner,
+                            outer,
+                            slot_x,
+                            start,
+                            end,
+                            (center.x, center.y),
+                            kind,
+                        )
+                    }
                     // the line's two ends fill the four numbers the
                     // struct still had: its start in the params, its
                     // end in the point — the quad stays the box
@@ -2501,6 +2523,25 @@ mod tests {
         let (gpu, cpu) =
             scene_bytes(&root, Size { width: 160.0, height: 180.0 }, 2, Color::CANVAS);
         assert_close(&gpu, &cpu, 2, "gradients");
+    }
+
+    #[test]
+    fn the_elliptical_wash_ramps_the_same_on_both_backends() {
+        if !device_present() {
+            return;
+        }
+        // the D89 numbers, scaled down: an elliptical wash across a
+        // wide bar — the aspect rides the corner slot, so the kinds
+        // diverge from the circle and the two rasterizers must agree
+        let root = empty().frame(280.0, 90.0).background_gradient(
+            Gradient::radial(Color::hex(0x7C5CFF), Color::hex(0x7C5CFF).fade())
+                .center(UnitPoint::TOP_LEADING)
+                .radius(98.0, 140.0)
+                .aspect(65.0 / 140.0),
+        );
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 300.0, height: 110.0 }, 2, Color::CANVAS);
+        assert_close(&gpu, &cpu, 2, "elliptical wash");
     }
 
     #[test]
