@@ -39,6 +39,7 @@
 
 pub mod action;
 pub mod anim;
+pub mod custom;
 pub mod dom;
 pub mod effects;
 pub mod erased;
@@ -102,6 +103,9 @@ pub mod task {
 pub mod prelude {
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::Spring;
+    pub use crate::custom::{
+        Custom, CustomElement, Metrics, PaintCtx, Painter, canvas, custom,
+    };
     pub use crate::erased::{CustomModifier, Erased, erased};
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;

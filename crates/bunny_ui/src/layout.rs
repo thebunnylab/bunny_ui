@@ -51,6 +51,11 @@ pub struct Point {
     pub y: Px,
 }
 
+impl Point {
+    /// The origin — where a box's own coordinates start.
+    pub const ZERO: Point = Point { x: 0.0, y: 0.0 };
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct Rect {
     pub origin: Point,
@@ -399,6 +404,12 @@ pub enum LayoutNode {
     /// title bar on a chrome-less window. Transparent to geometry;
     /// shells without windows ignore it honestly.
     DragRegion { child: Box<LayoutNode> },
+    /// The escape hatch (`custom(…)` / `canvas(…)`): a box the APP
+    /// measures and paints, in the same command vocabulary the built-ins
+    /// emit. `path` is its identity — the address of the events it
+    /// answers. On the element lowering it becomes a canvas island by
+    /// construction: what the app paints is PIXELS, never elements.
+    Custom { path: String, element: crate::custom::Custom },
 }
 
 /// Where a subtree renders when the scene lowers to elements. The v1
@@ -1218,6 +1229,9 @@ impl LayoutNode {
             LayoutNode::Boundary { children, .. } => {
                 children.len() == 1 && children[0].is_flexible(axis)
             }
+            // the app answers for its own box (the default is yes, the
+            // same answer a Rectangle gives)
+            LayoutNode::Custom { element, .. } => element.element().flexible(),
             // skipped boundary: the flexibility is the retained tree's
             LayoutNode::BoundaryRef { path } => crate::reconciler::with_retained_layout(
                 path,
@@ -1318,6 +1332,13 @@ impl LayoutNode {
             }
 
             LayoutNode::Leaf { size } => (*size, Fit::Leaf),
+
+            // the escape hatch measures itself, with the frame's text
+            // metrics in hand
+            LayoutNode::Custom { element, .. } => {
+                let metrics = crate::custom::Metrics::new(env.text, env.cache, env.font);
+                (element.element().measure(proposal, &metrics), Fit::Leaf)
+            }
 
             LayoutNode::Image { source, resizable, fit } => {
                 let size = match source {
@@ -1764,6 +1785,43 @@ impl LayoutNode {
                     width: 1.0,
                     corner_radius: 0.0,
                 });
+            }
+
+            (LayoutNode::Custom { element, .. }, Fit::Leaf) => {
+                // what the app paints is PIXELS: on the element lowering
+                // the box becomes a canvas island, and the island slices
+                // exactly the commands between here and the close
+                let start = out.display.len();
+                if let Some(dom) = out.dom.as_mut() {
+                    dom.open_canvas(frame, start);
+                }
+                // the box cannot paint outside itself — the clip is the
+                // framework's, never the app's promise
+                out.push_clip(frame);
+                let visible = out
+                    .current_clip()
+                    .and_then(|clip| clip.intersection(frame))
+                    .map_or(Rect { origin: Point::ZERO, size: Size::default() }, |clip| Rect {
+                        origin: Point {
+                            x: clip.origin.x - frame.origin.x,
+                            y: clip.origin.y - frame.origin.y,
+                        },
+                        size: clip.size,
+                    });
+                let ctx = crate::custom::PaintCtx {
+                    frame,
+                    visible,
+                    metrics: crate::custom::Metrics::new(env.text, env.cache, env.font),
+                };
+                let ink = out.foreground.last().copied().unwrap_or(Color::BLACK);
+                let mut painter =
+                    crate::custom::Painter::new(&mut out.display, frame.origin, env.font, ink);
+                element.element().paint(&ctx, &mut painter);
+                out.pop_clip();
+                let end = out.display.len();
+                if let Some(dom) = out.dom.as_mut() {
+                    dom.close_canvas(end);
+                }
             }
 
             (LayoutNode::Anchored { path, side, overlay, child }, Fit::Wrapped(_, fit)) => {
