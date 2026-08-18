@@ -154,15 +154,17 @@ impl Default for Runtime {
 impl Runtime {
     /// A runtime with the deterministic house font.
     ///
-    /// One runtime per thread is the contract: retention and identity
-    /// are thread state, so a SECOND runtime on the same thread adopts
-    /// the first one's retained bodies — and their recorded reads
-    /// point at the old state slots, which kills invalidation
-    /// silently. A harness that must boot again on one thread calls
-    /// [`Runtime::render_full`] first: the retention drops, every body
-    /// runs, and the reads bind to the states that are alive now.
-    /// (Every shell boots exactly one; tests each run on their own
-    /// thread.)
+    /// A runtime opens its own world: retention and identity are
+    /// thread state, and they reset when a runtime is born — a second
+    /// runtime on the same thread starts from nothing instead of
+    /// adopting the first one's retained bodies (whose recorded reads
+    /// would point at dead state slots and kill invalidation
+    /// silently). State declared OUTSIDE any pass — the app-scope
+    /// pattern every harness uses — has no owner and survives the
+    /// hand-over; state anchored inside the old world's bodies dies
+    /// with it, and so do its tasks. One runtime at a time per thread
+    /// is still the law: two runtimes ALTERNATING frames on one
+    /// thread would fight over one world.
     pub fn new() -> Self {
         Self::with_parts(Context::default(), Rc::new(PixelFont))
     }
@@ -236,6 +238,15 @@ impl Runtime {
     }
 
     fn with_parts(ctx: Context, text: Rc<dyn TextEngine>) -> Self {
+        // a runtime is born into its OWN world: whatever a previous
+        // runtime retained on this thread dies here — path identity
+        // means nothing across two runtimes, and stale reads pointing
+        // at old state slots would kill invalidation silently. App
+        // state declared outside any pass has no owner and survives.
+        crate::reconciler::reset_world();
+        crate::effects::reset();
+        crate::viewport::reset();
+        motor::identity::reset_world();
         let runtime = Runtime {
             ctx,
             last_root: RefCell::new(None),

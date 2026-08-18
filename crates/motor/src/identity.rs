@@ -406,6 +406,31 @@ fn current_scope(registry: &Registry) -> String {
     }
 }
 
+/// Opens a new world on this thread: everything the identity owns by
+/// PATH dies — the anchors, their state slots, the effect cells, the
+/// whole read graph. State declared outside any pass (app scope) has
+/// no owner and lives on untouched.
+///
+/// The runtime calls this when it is born. Path identity has no
+/// meaning across two runtimes: a world that outlived its runtime
+/// kept feeding the new one reads that pointed at the old state
+/// slots, and invalidation died silently. Dropping the effect cells
+/// also drops their task handles, so the old world's tasks cancel
+/// with it.
+pub fn reset_world() {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        let owners = std::mem::take(&mut registry.owners);
+        for (_, record) in owners {
+            for (type_id, index) in record.slots {
+                crate::state::free_slot(type_id, index);
+            }
+        }
+        let next_store_id = registry.next_store_id;
+        *registry = Registry { next_store_id, ..Registry::default() };
+    });
+}
+
 // MARK: - State anchors
 
 /// What `State::new` gets back when declaring state.

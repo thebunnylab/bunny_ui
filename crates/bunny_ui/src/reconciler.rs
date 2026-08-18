@@ -677,6 +677,21 @@ pub(crate) fn clear() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
 }
 
+/// The world-reset twin of [`clear`]: the retention AND every per-pass
+/// assembly falls. A newborn runtime starts from nothing — see
+/// `motor::identity::reset_world` for the other half of the contract.
+pub(crate) fn reset_world() {
+    RETAINED.with(|retained| retained.borrow_mut().clear());
+    PASS.with(|pass| *pass.borrow_mut() = PassState::default());
+    LAST_BODY_RUNS.with(|last| last.borrow_mut().clear());
+    ACTIVE_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
+    HANDLERS.with(|handlers| handlers.borrow_mut().clear());
+    ACTIONS.with(|actions| actions.borrow_mut().clear());
+    EDITORS.with(|editors| editors.borrow_mut().clear());
+    SPLITS.with(|splits| splits.borrow_mut().clear());
+    CUSTOMS.with(|customs| customs.borrow_mut().clear());
+}
+
 pub(crate) fn end_pass() {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();

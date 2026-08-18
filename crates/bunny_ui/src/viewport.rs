@@ -37,6 +37,12 @@ thread_local! {
         RefCell::new(FxHashMap::default());
 }
 
+/// Drops every retained region — part of the newborn runtime's world
+/// reset.
+pub(crate) fn reset() {
+    SNAPSHOT.with(|slot| slot.borrow_mut().clear());
+}
+
 /// Replaces the snapshot — the runtime calls this before each pass.
 pub(crate) fn publish(regions: impl Iterator<Item = (String, RegionSnapshot)>) {
     SNAPSHOT.with(|slot| {

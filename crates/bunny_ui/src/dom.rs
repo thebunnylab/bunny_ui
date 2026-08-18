@@ -2187,6 +2187,57 @@ mod tests {
         ));
     }
 
+    /// Two runtimes in sequence on ONE thread — every #[test] runs on
+    /// its own thread, so both must live in this body. The second
+    /// runtime opens its own world: its reads bind to the states that
+    /// are alive NOW, and invalidation works. Before the world reset
+    /// this pinned the opposite: the second runtime adopted the first
+    /// one's retention, every set landed on unread slots, and every
+    /// update diffed to nothing, forever.
+    #[test]
+    fn a_second_runtime_opens_its_own_world() {
+        #[derive(Clone, Copy)]
+        struct Lamp {
+            on: State<bool>,
+        }
+
+        impl Component for Lamp {
+            fn body(self, _ctx: &Context) -> impl View {
+                let lit = self.on.get();
+                text("lamp")
+                    .background_color(if lit {
+                        Color::hex(0xFFD75A)
+                    } else {
+                        Color::hex(0x30343A)
+                    })
+                    .on_click(|| {})
+            }
+        }
+
+        let size = Size { width: 120.0, height: 60.0 };
+
+        // world one, alive and invalidating
+        let first = Lamp { on: State::new(false) };
+        let elder = Runtime::new();
+        assert!(!elder.dom_frame(&first, size).is_empty(), "the first world mounts");
+        first.on.set(true);
+        assert!(
+            !elder.dom_frame(&first, size).is_empty(),
+            "the first world invalidates"
+        );
+
+        // world two: the same shape, new states, a new runtime
+        let second = Lamp { on: State::new(false) };
+        let newborn = Runtime::new();
+        assert!(!newborn.dom_frame(&second, size).is_empty(), "the second world mounts");
+        second.on.set(true);
+        let patches = newborn.dom_frame(&second, size);
+        assert!(
+            !patches.is_empty(),
+            "the second world invalidates — its reads bind to living states"
+        );
+    }
+
     // MARK: - The ABI handshake
 
     /// The glue mirrors this module by hand, so the two halves of the

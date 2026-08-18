@@ -128,12 +128,9 @@ fn fresh() -> (Table, Runtime) {
         filtered: State::new(false),
         toggles: Rc::new((0..ROWS).map(|_| State::new(false)).collect()),
     };
-    let runtime = Runtime::new();
-    // one runtime per thread is the contract; a harness that boots
-    // again claims the world first (see `Runtime::new`) so THIS
-    // table's reads bind to the states that are alive now
-    runtime.render_full(&table);
-    (table, runtime)
+    // a newborn runtime opens its own world (see `Runtime::new`), so
+    // this table's reads bind to the states that are alive now
+    (table, Runtime::new())
 }
 
 // MARK: - The clock
