@@ -174,11 +174,36 @@ impl Walk<'_> {
                 out.push(container);
             }
             LayoutNode::Padding { edges, child } => {
-                let mut container = node(DomKind::FlexColumn);
                 let Edges { top, leading, bottom, trailing } = *edges;
+                let mut lowered = Vec::new();
+                self.lower_into(child, &mut lowered);
+                // FOLD: a padding around one pure layout node becomes
+                // that node's own padding (nested edges sum). Styled
+                // boxes never fold — their background must stay tight
+                // to the child, and CSS padding would slide under it.
+                if let [only] = lowered.as_mut_slice()
+                    && only.style == DomStyle::default()
+                    && matches!(
+                        only.kind,
+                        DomKind::FlexColumn | DomKind::FlexRow | DomKind::Layers | DomKind::Box
+                    )
+                    && let Some(layout) = only.layout.as_mut()
+                {
+                    let (was_top, was_right, was_bottom, was_left) =
+                        layout.padding.unwrap_or((0.0, 0.0, 0.0, 0.0));
+                    layout.padding = Some((
+                        was_top + top,
+                        was_right + trailing,
+                        was_bottom + bottom,
+                        was_left + leading,
+                    ));
+                    out.append(&mut lowered);
+                    return;
+                }
+                let mut container = node(DomKind::FlexColumn);
                 container.layout.as_mut().expect("flow node").padding =
                     Some((top, trailing, bottom, leading));
-                self.lower_into(child, &mut container.children);
+                container.children = lowered;
                 out.push(container);
             }
             LayoutNode::Frame { width, height, child } => {

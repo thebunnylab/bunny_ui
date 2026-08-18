@@ -3058,6 +3058,42 @@ mod tests {
         assert_eq!(scrolled, Some(500.0 * 20.0), "the region jumps to the slot: {patches:?}");
     }
 
+    /// The LAW, pinned: a flow frame never asks the text engine for a
+    /// number. The browser wraps, measures and breaks — zero cache
+    /// calls, zero crossings, on the mount and on every update.
+    #[test]
+    fn a_flow_frame_never_measures_text() {
+        #[derive(Clone)]
+        struct Wordy {
+            flip: State<bool>,
+        }
+
+        impl Component for Wordy {
+            fn body(self, _ctx: &Context) -> impl View {
+                let on = self.flip.get();
+                crate::vstack!(
+                    text("a long paragraph that would have wrapped through the cache"),
+                    text(if on { "state one" } else { "state two" }),
+                    text("another line of prose beside a spacer"),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Wordy { flip: State::new(false) };
+        let size = Size { width: 120.0, height: 200.0 };
+        let _ = crate::stats::take();
+        let _ = runtime.dom_frame(&view, size);
+        let mount = crate::stats::take();
+        assert_eq!(mount.measure_misses, 0, "the mount never measured");
+        assert_eq!(mount.measure_hits, 0, "not even a warm hit");
+
+        view.flip.set(true);
+        let _ = runtime.dom_frame(&view, size);
+        let update = crate::stats::take();
+        assert_eq!(update.measure_misses + update.measure_hits, 0, "nor the update");
+    }
+
     // MARK: - The ABI handshake
 
     /// The glue mirrors this module by hand, so the two halves of the
