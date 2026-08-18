@@ -124,18 +124,35 @@ impl NodeList {
 
     /// Wraps the last layout node (the one from the Single view that just
     /// rendered) — the path of the layout modifiers (`.padding()`, frames).
-    /// A view with NO geometry of its own (`empty()`) still gets its
-    /// modifier: the wrap lands on a BOX OF NOTHING. That is what makes
-    /// `empty().frame(w, h).background_color(c)` a real painted box —
-    /// SwiftUI's own answer, where the frame IS a view and `EmptyView`
-    /// merely fills none of it. Bare `empty()` still contributes
-    /// nothing to a stack: only a modifier mints the box.
-    pub(crate) fn wrap_last_layout(
+    /// How many layout nodes are in hand — the MARK a modifier takes
+    /// before its base renders, so it can tell what the base added
+    /// from what a SIBLING left behind.
+    pub(crate) fn layout_mark(&self) -> usize {
+        self.layout.len()
+    }
+
+    /// Wraps what the base contributed since `mark`.
+    ///
+    /// The base is a Single view, so it left one node — or NONE at all
+    /// (`empty()` has no geometry). The old reading was "wrap the last
+    /// node", which in a stack reached PAST the base and stole the
+    /// previous sibling's box. Now: nothing added means the modifier
+    /// wraps a BOX OF NOTHING, which is how
+    /// `empty().frame(w, h).background_color(c)` becomes a real painted
+    /// box — SwiftUI's own answer, where the frame IS a view and
+    /// `EmptyView` merely fills none of it. Bare `empty()` still
+    /// contributes nothing to a stack: only a modifier mints the box.
+    pub(crate) fn wrap_layout_from(
         &mut self,
+        mark: usize,
         wrap: impl FnOnce(crate::layout::LayoutNode) -> crate::layout::LayoutNode,
     ) {
-        let last = self.layout.pop().unwrap_or_else(nothing_node);
-        self.layout.push(wrap(last));
+        let base = if self.layout.len() > mark {
+            self.layout.remove(mark)
+        } else {
+            nothing_node()
+        };
+        self.layout.insert(mark, wrap(base));
     }
 
     /// A retained boundary: enters as a reference (the marked line in the

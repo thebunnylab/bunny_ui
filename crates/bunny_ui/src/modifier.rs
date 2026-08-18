@@ -67,8 +67,13 @@ pub enum Modifier {
     ContextMenu(std::rc::Rc<[crate::views::MenuItem]>),
     /// `.on_drag(…)` — the view lifts into a typed drag.
     OnDrag(crate::layout::DragBuilder),
-    /// `.on_drop(…)` — the view takes a typed drag.
-    OnDrop { accepts: std::any::TypeId, action: crate::layout::DropAction },
+    /// `.on_drop(…)` — the view takes a typed drag, and may paint its
+    /// own preview while one hovers.
+    OnDrop {
+        accepts: std::any::TypeId,
+        action: crate::layout::DropAction,
+        over: Option<crate::layout::DragOverAction>,
+    },
     Monospaced,
     /// A size out of the preset scale — the rest of the font stays.
     FontSize(f64),
@@ -417,8 +422,8 @@ fn rewrite_text_node(
 /// `a` and then by `b` is shrinking it by `a + b`, so one node carries
 /// the sum and the chain of `.padding_edge(...)` calls stops paying one
 /// box per edge.
-fn wrap_padding(out: &mut NodeList, edges: Edges) {
-    out.wrap_last_layout(|node| match node {
+fn wrap_padding(out: &mut NodeList, mark: usize, edges: Edges) {
+    out.wrap_layout_from(mark, |node| match node {
         LayoutNode::Padding { edges: inner, child } => LayoutNode::Padding {
             edges: Edges {
                 top: inner.top + edges.top,
@@ -432,8 +437,8 @@ fn wrap_padding(out: &mut NodeList, edges: Edges) {
     });
 }
 
-fn wrap_styled(out: &mut NodeList, delta: VisualProps) {
-    out.wrap_last_layout(|node| match node {
+fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
+    out.wrap_layout_from(mark, |node| match node {
         LayoutNode::Styled { mut props, child } => {
             *props = (*props).or(delta);
             LayoutNode::Styled { props, child }
@@ -447,6 +452,69 @@ fn wrap_styled(out: &mut NodeList, delta: VisualProps) {
 pub struct Modified<C> {
     pub(crate) base: C,
     pub(crate) modifier: Modifier,
+}
+
+/// What `.on_drop(…)` answers: the view, taking a typed drag — and one
+/// method more, [`preview`](DropTargetView::preview), for the box that
+/// wants to paint the landing itself. The type is what keeps the two
+/// in order: a preview belongs to a drop, and it cannot be written
+/// anywhere else.
+#[derive(Clone)]
+pub struct DropTargetView<C> {
+    base: C,
+    accepts: std::any::TypeId,
+    action: crate::layout::DropAction,
+    over: Option<crate::layout::DragOverAction>,
+}
+
+impl<C> DropTargetView<C> {
+    pub(crate) fn new(
+        base: C,
+        accepts: std::any::TypeId,
+        action: crate::layout::DropAction,
+    ) -> DropTargetView<C> {
+        DropTargetView { base, accepts, action, over: None }
+    }
+
+    /// The app's own preview: called with the pointer's place inside
+    /// this box while a compatible drag moves over it, and with `None`
+    /// the moment it leaves, lands or is cancelled — so the closure is
+    /// the WHOLE story of the state it writes.
+    ///
+    /// Declaring it makes the framework's accent ring stand down: one
+    /// affordance per target, and the app's wins.
+    ///
+    /// ```ignore
+    /// pane.on_drop_at(move |tab: &TabDrag, at| adopt(tab, at.fraction()))
+    ///     .preview(move |at| zone.set(at.map(|at| pane_drop_zone(at.fraction()))))
+    /// ```
+    pub fn preview(mut self, action: impl Fn(Option<crate::layout::DropPoint>) + 'static) -> Self {
+        self.over = Some(crate::layout::DragOverAction(Rc::new(action)));
+        self
+    }
+}
+
+impl<C: View<Arity = Single>> View for DropTargetView<C> {
+    type Arity = Single;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        // the base renders in place — no identity frame of our own, so
+        // the box keeps the geometry and the scope it would have had
+        let mark = out.layout_mark();
+        self.base.render_into(ctx, out);
+        let accepts = self.accepts;
+        let action = self.action.clone();
+        let over = self.over.clone();
+        out.wrap_layout_from(mark, move |node| LayoutNode::DropTarget {
+            accepts,
+            action,
+            over,
+            child: Box::new(node),
+        });
+        if let Some(node) = out.last_mut() {
+            node.line.push_str(" [.onDrop()]");
+        }
+    }
 }
 
 impl<C: View<Arity = Single>> View for Modified<C> {
@@ -489,6 +557,9 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             set(&mut base_ctx.values);
         }
 
+        // the MARK: what the base adds is ours to wrap; anything
+        // already in hand belongs to a sibling and must not be touched
+        let mark = out.layout_mark();
         self.base.render_into(&base_ctx, out);
 
         match &self.modifier {
@@ -518,7 +589,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 }
                 // in layout, the sheet overlays the base — centered, the
                 // way a modal sits over what it covers
-                out.wrap_last_layout(|base| LayoutNode::Layered {
+                out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                     align: CrossAlign::Center,
                     children: vec![base, wrap_layout(sheet_layouts)],
                 });
@@ -571,7 +642,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     crate::reconciler::attribute_context(crate::action::OVERLAY_CONTEXT);
                 }
                 let side = *side;
-                out.wrap_last_layout(|base| LayoutNode::Anchored {
+                out.wrap_layout_from(mark, |base| LayoutNode::Anchored {
                     path: path.unwrap_or_default(),
                     side,
                     overlay: Rc::new(wrap_layout(popover_layouts)),
@@ -584,8 +655,8 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         // LAYOUT modifiers wrap the base's node — this is where the typed
         // chain becomes proposal/response structure
         match &self.modifier {
-            Modifier::Padding => wrap_padding(out, Edges::uniform(16.0)),
-            Modifier::PaddingLength(length) => wrap_padding(out, Edges::uniform(*length)),
+            Modifier::Padding => wrap_padding(out, mark, Edges::uniform(16.0)),
+            Modifier::PaddingLength(length) => wrap_padding(out, mark, Edges::uniform(*length)),
             Modifier::PaddingEdge(edge, length) => {
                 let mut edges = Edges::default();
                 match edge {
@@ -594,11 +665,11 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     Edge::Leading => edges.leading = *length,
                     Edge::Trailing => edges.trailing = *length,
                 }
-                wrap_padding(out, edges);
+                wrap_padding(out, mark, edges);
             }
             Modifier::FrameWH(width, height) => {
                 let (width, height) = (Some(*width), Some(*height));
-                out.wrap_last_layout(|node| LayoutNode::Frame {
+                out.wrap_layout_from(mark, |node| LayoutNode::Frame {
                     width,
                     height,
                     child: Box::new(node),
@@ -606,7 +677,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             }
             Modifier::FrameWidth(width) => {
                 let width = Some(*width);
-                out.wrap_last_layout(|node| LayoutNode::Frame {
+                out.wrap_layout_from(mark, |node| LayoutNode::Frame {
                     width,
                     height: None,
                     child: Box::new(node),
@@ -614,7 +685,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             }
             Modifier::FrameHeight(height) => {
                 let height = Some(*height);
-                out.wrap_last_layout(|node| LayoutNode::Frame {
+                out.wrap_layout_from(mark, |node| LayoutNode::Frame {
                     width: None,
                     height,
                     child: Box::new(node),
@@ -623,7 +694,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             Modifier::FrameMax(max_width, max_height, alignment) => {
                 let (max_width, max_height) = (*max_width, *max_height);
                 let align = crate::views::cross_align(*alignment);
-                out.wrap_last_layout(|node| LayoutNode::MaxFrame {
+                out.wrap_layout_from(mark, |node| LayoutNode::MaxFrame {
                     max_width,
                     max_height,
                     align,
@@ -632,48 +703,55 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             }
             Modifier::BackgroundColor(color) => wrap_styled(
                 out,
+                mark,
                 VisualProps { background: Some(*color), ..VisualProps::default() },
             ),
             Modifier::BackgroundGradient(gradient) => wrap_styled(
                 out,
+                mark,
                 VisualProps { gradient: Some(*gradient), ..VisualProps::default() },
             ),
             Modifier::Shadow(radius, color) => wrap_styled(
                 out,
+                mark,
                 VisualProps { shadow: Some((*radius, *color)), ..VisualProps::default() },
             ),
             Modifier::ForegroundColor(color) => wrap_styled(
                 out,
+                mark,
                 VisualProps { foreground: Some(*color), ..VisualProps::default() },
             ),
             Modifier::Border(color, width) => wrap_styled(
                 out,
+                mark,
                 VisualProps { border: Some((*color, *width)), ..VisualProps::default() },
             ),
             Modifier::CornerRadius(radius) => wrap_styled(
                 out,
+                mark,
                 VisualProps { corner_radius: Some(*radius), ..VisualProps::default() },
             ),
             Modifier::Clipped => {
-                wrap_styled(out, VisualProps { clip: true, ..VisualProps::default() })
+                wrap_styled(out, mark, VisualProps { clip: true, ..VisualProps::default() })
             }
-            Modifier::Tooltip(text, side) => out.wrap_last_layout(|node| {
+            Modifier::Tooltip(text, side) => out.wrap_layout_from(mark, |node| {
                 LayoutNode::Tooltip {
                     text: text.clone(),
                     side: *side,
                     child: Box::new(node),
                 }
             }),
-            Modifier::ContextMenu(items) => out.wrap_last_layout(|node| {
+            Modifier::ContextMenu(items) => out.wrap_layout_from(mark, |node| {
                 LayoutNode::ContextSource { items: items.clone(), child: Box::new(node) }
             }),
-            Modifier::OnDrag(payload) => out.wrap_last_layout(|node| {
+            Modifier::OnDrag(payload) => out.wrap_layout_from(mark, |node| {
                 LayoutNode::DragSource { payload: payload.clone(), child: Box::new(node) }
             }),
-            Modifier::OnDrop { accepts, action } => out.wrap_last_layout(|node| {
+            Modifier::OnDrop { accepts, action, over } => out.wrap_layout_from(mark, |node| {
                 LayoutNode::DropTarget {
                     accepts: *accepts,
                     action: action.clone(),
+                    over: over.clone(),
                     child: Box::new(node),
                 }
             }),
@@ -681,6 +759,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             // visuals carries the patch (measure applies it on top of the env)
             Modifier::Font(font) => wrap_styled(
                 out,
+                mark,
                 VisualProps {
                     font: FontPatch::full(FontSpec::resolve(*font)),
                     ..VisualProps::default()
@@ -688,6 +767,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             ),
             Modifier::Bold => wrap_styled(
                 out,
+                mark,
                 VisualProps {
                     font: FontPatch { weight: Some(Weight::Bold), ..FontPatch::default() },
                     ..VisualProps::default()
@@ -695,6 +775,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             ),
             Modifier::Monospaced => wrap_styled(
                 out,
+                mark,
                 VisualProps {
                     font: FontPatch { design: Some(FontDesign::Mono), ..FontPatch::default() },
                     ..VisualProps::default()
@@ -704,6 +785,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             // around it keeps its weight and its design
             Modifier::FontSize(size) => wrap_styled(
                 out,
+                mark,
                 VisualProps {
                     font: FontPatch { size: Some(*size), ..FontPatch::default() },
                     ..VisualProps::default()
@@ -711,39 +793,43 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             ),
             Modifier::BackgroundHovered(color) => wrap_styled(
                 out,
+                mark,
                 VisualProps { background_hovered: Some(*color), ..VisualProps::default() },
             ),
             Modifier::BackgroundPressed(color) => wrap_styled(
                 out,
+                mark,
                 VisualProps { background_pressed: Some(*color), ..VisualProps::default() },
             ),
             Modifier::ForegroundHovered(color) => wrap_styled(
                 out,
+                mark,
                 VisualProps { foreground_hovered: Some(*color), ..VisualProps::default() },
             ),
             Modifier::ForegroundPressed(color) => wrap_styled(
                 out,
+                mark,
                 VisualProps { foreground_pressed: Some(*color), ..VisualProps::default() },
             ),
             // the two below rewrite the TEXT NODE, descending through
             // `Styled` (`.font()`/`.foreground_color()` before or after, the
             // order does not matter) — on non-text they are no-ops on purpose
             // (SwiftUI parity: truncationMode outside text does nothing)
-            Modifier::Highlight(ranges, color) => out.wrap_last_layout(|node| {
+            Modifier::Highlight(ranges, color) => out.wrap_layout_from(mark, |node| {
                 rewrite_text_node(node, &|content, _, truncation| LayoutNode::Text {
                     content,
                     highlights: Some(TextHighlight { ranges: ranges.clone(), color: *color }),
                     truncation,
                 })
             }),
-            Modifier::TruncationMode(mode) => out.wrap_last_layout(|node| {
+            Modifier::TruncationMode(mode) => out.wrap_layout_from(mark, |node| {
                 rewrite_text_node(node, &|content, highlights, _| LayoutNode::Text {
                     content,
                     highlights,
                     truncation: Some(*mode),
                 })
             }),
-            Modifier::ScrollTarget(id) => out.wrap_last_layout(|node| {
+            Modifier::ScrollTarget(id) => out.wrap_layout_from(mark, |node| {
                 rewrite_scroll_node(node, &|path, axes, child| LayoutNode::Scroll {
                     path,
                     target: Some(id.clone()),
@@ -751,14 +837,14 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     child,
                 })
             }),
-            Modifier::Resizable => out.wrap_last_layout(|node| {
+            Modifier::Resizable => out.wrap_layout_from(mark, |node| {
                 rewrite_pixel_node(
                     node,
                     &|source, _, fit| LayoutNode::Image { source, resizable: true, fit },
                     &|symbol, _| LayoutNode::Icon { symbol, resizable: true },
                 )
             }),
-            Modifier::AspectRatio(mode) => out.wrap_last_layout(|node| {
+            Modifier::AspectRatio(mode) => out.wrap_layout_from(mark, |node| {
                 rewrite_pixel_node(
                     node,
                     &|source, resizable, _| LayoutNode::Image {
@@ -777,7 +863,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 // share the key and the outer spec wins (documented).
                 let key = motor::identity::cursor_scope().map(Rc::from);
                 let spec = *spec;
-                out.wrap_last_layout(|node| LayoutNode::Animated {
+                out.wrap_layout_from(mark, |node| LayoutNode::Animated {
                     key,
                     spec,
                     child: Box::new(node),
@@ -787,12 +873,12 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 // Auto is the table's business (v1: everything lowers
                 // to Dom); only an explicit Gpu claims an island node
                 if *mode == crate::layout::Rendering::Gpu {
-                    out.wrap_last_layout(|node| LayoutNode::Island {
+                    out.wrap_layout_from(mark, |node| LayoutNode::Island {
                         child: Box::new(node),
                     });
                 }
             }
-            Modifier::AutoFocus => out.wrap_last_layout(|node| {
+            Modifier::AutoFocus => out.wrap_layout_from(mark, |node| {
                 rewrite_field_node(node, &|path, content, placeholder| LayoutNode::Field {
                     path,
                     content,
@@ -806,7 +892,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 crate::reconciler::attribute_context(name);
             }
             Modifier::WindowDragRegion => {
-                out.wrap_last_layout(|node| LayoutNode::DragRegion {
+                out.wrap_layout_from(mark, |node| LayoutNode::DragRegion {
                     child: Box::new(node),
                 });
             }
@@ -815,7 +901,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 // reconciler, frame in the hit-test under the cursor identity
                 if let Some(path) = motor::identity::cursor_scope() {
                     crate::reconciler::attribute_action(path.clone(), action.clone());
-                    out.wrap_last_layout(|node| LayoutNode::Interactive {
+                    out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
                         path,
                         child: Box::new(node),
                     });
