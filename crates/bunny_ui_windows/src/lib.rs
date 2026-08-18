@@ -8,6 +8,7 @@
 
 #![cfg(target_os = "windows")]
 
+mod d3d;
 mod ffi;
 mod image;
 mod text;
@@ -21,6 +22,7 @@ use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
+pub use d3d::OffscreenD3d;
 pub use image::WicImageEngine;
 pub use text::DirectWriteEngine;
 
@@ -106,6 +108,10 @@ pub fn run_window_chrome(
     root: impl View,
 ) {
     let window = ffi::create_window(title, size.width, size.height, chrome == Chrome::Scene);
+    // the present backend, chosen ONCE: the GPU by default, the CPU
+    // raster on refusal — and the window has not shown yet, so the
+    // first frame (whichever road) lands before anyone looks
+    ffi::install_gpu(&window);
     // the season's mirrors: reduce-motion always follows the system
     // (accessibility is never the app's to refuse); the theme follows
     // ONLY while the app has not chosen one — an installed theme means
@@ -205,6 +211,19 @@ pub fn run_window_chrome(
                         &bitmap.to_rgba_bytes(),
                     );
                 }
+            }
+            if d3d::active() {
+                // GPU present: the same display list, no Surface in the
+                // path — the swapchain is the frame
+                d3d::present_window(
+                    &display,
+                    Size { width, height },
+                    scale,
+                    canvas,
+                    &*runtime.text(),
+                    &*runtime.images(),
+                );
+                return;
             }
             let mut slot = surface.borrow_mut();
             let stale = match &*slot {

@@ -1064,6 +1064,31 @@ fn metrics_of(hwnd: Hwnd) -> Metrics {
     METRICS.with(|slot| slot.borrow().get(&hwnd).copied().unwrap_or_default())
 }
 
+/// The client area in raw pixels — the GPU swapchain's size.
+pub(crate) fn client_px_of(hwnd: Hwnd) -> (u32, u32) {
+    metrics_of(hwnd).client_px
+}
+
+/// The logical size, for the GPU module's anti-flash first frame.
+pub(crate) fn logical_of(hwnd: Hwnd) -> (f64, f64) {
+    metrics_of(hwnd).logical
+}
+
+/// The integer raster scale, same as [`WindowHandle::scale`].
+pub(crate) fn int_scale_of(hwnd: Hwnd) -> usize {
+    metrics_of(hwnd).int_scale.max(1)
+}
+
+thread_local! {
+    /// True inside the modal size/move loop — the GPU present drops
+    /// vsync there so content and frame land in the same composition.
+    static IN_SIZE_MOVE: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn in_size_move() -> bool {
+    IN_SIZE_MOVE.with(|cell| cell.get())
+}
+
 // MARK: - The presentation backing (a DIB section per window)
 
 /// The ffi-owned presentation backing: `WM_PAINT` always reads from
@@ -1819,12 +1844,14 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_ENTERSIZEMOVE => {
+            IN_SIZE_MOVE.with(|cell| cell.set(true));
             unsafe {
                 SetTimer(hwnd, TIMER_RESIZE, 15, std::ptr::null());
             }
             0
         }
         WM_EXITSIZEMOVE => {
+            IN_SIZE_MOVE.with(|cell| cell.set(false));
             unsafe {
                 KillTimer(hwnd, TIMER_RESIZE);
             }
@@ -1852,6 +1879,8 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             LEAVE_ARMED.with(|armed| armed.borrow_mut().remove(&hwnd));
             // closing the MAIN window quits — a panel dies in silence
             if hwnd == MAIN_HWND.load(Ordering::Acquire) {
+                // the swapchain must not outlive its window
+                crate::d3d::teardown();
                 unsafe {
                     PostQuitMessage(0);
                 }
@@ -1994,6 +2023,18 @@ pub fn create_window(title: &str, width: f64, height: f64, scene_chrome: bool) -
     }
     refresh_metrics(hwnd);
     WindowHandle { hwnd }
+}
+
+/// Grafts the GPU present onto the main window — called by the shell
+/// assembler after [`create_window`] and BEFORE the first frame, so the
+/// swapchain presents its first clear frame in the dark and the CPU
+/// path never allocates a backing it will not use. A refusal
+/// (`BUNNY_PRESENT=cpu`, no device, no compiler) changes nothing —
+/// the DIB road, byte for byte. NOT part of `create_window` itself:
+/// the headless tests build windows on arbitrary test threads, where a
+/// swapchain would be dead weight wearing DXGI's cross-thread locks.
+pub fn install_gpu(window: &WindowHandle) {
+    let _ = crate::d3d::try_install(window.hwnd);
 }
 
 /// Shows the window after the first present (the anti-flash order).
