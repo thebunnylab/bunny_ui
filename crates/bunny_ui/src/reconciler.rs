@@ -80,7 +80,10 @@ pub(crate) struct Entry {
     pub splits: Vec<SplitEntry>,
     /// The paths of the app's own boxes (`custom(…)`) — the map that
     /// says a focused escape hatch is still on screen.
-    pub customs: Vec<String>,
+    /// `(path, does it take the keyboard)` — the second half is
+    /// what keeps a re-point from handing the keyboard to a box
+    /// that answers nothing.
+    pub customs: Vec<(String, bool)>,
     /// The body's named-action handlers — same retention.
     pub handlers: Vec<HandlerEntry>,
     /// Key contexts declared in the body (`.key_context(name)`) — a
@@ -97,7 +100,7 @@ struct BuildingFrame {
     actions: Vec<ActionEntry>,
     editors: Vec<EditorEntry>,
     splits: Vec<SplitEntry>,
-    customs: Vec<String>,
+    customs: Vec<(String, bool)>,
     handlers: Vec<HandlerEntry>,
     contexts: Vec<&'static str>,
 }
@@ -115,7 +118,7 @@ struct PassState {
     root_actions: Vec<ActionEntry>,
     root_editors: Vec<EditorEntry>,
     root_splits: Vec<SplitEntry>,
-    root_customs: Vec<String>,
+    root_customs: Vec<(String, bool)>,
     root_handlers: Vec<HandlerEntry>,
     root_contexts: Vec<&'static str>,
     /// Instrumentation: bodies that ran in this pass.
@@ -314,13 +317,13 @@ pub(crate) fn attribute_split(path: String, split: SplitFn) {
 /// The app's own box, registered during render — same attribution. The
 /// path alone is the record: it says the box is on screen this pass,
 /// which is how a focused escape hatch keeps the keyboard.
-pub(crate) fn attribute_custom(path: String) {
+pub(crate) fn attribute_custom(path: String, accepts_keys: bool) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         if let Some(frame) = pass.building.last_mut() {
-            frame.customs.push(path);
+            frame.customs.push((path, accepts_keys));
         } else {
-            pass.root_customs.push(path);
+            pass.root_customs.push((path, accepts_keys));
         }
     });
 }
@@ -545,6 +548,9 @@ thread_local! {
     static SPLITS: RefCell<HashMap<String, SplitFn>> = RefCell::new(HashMap::default());
     /// The app's boxes on screen this pass — paths only.
     static CUSTOMS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
+    /// The subset that answers `accepts_keys` — who may HOLD the
+    /// keyboard, as opposed to who is merely on screen.
+    static KEYED_CUSTOMS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
 }
 
 /// Reassembles the editor map from retention under the root + root region.
@@ -591,17 +597,29 @@ pub(crate) fn assemble_splits(root: &str) {
 /// for the boxes the app paints.
 pub(crate) fn assemble_customs(root: &str) {
     let mut set: HashSet<String> = HashSet::default();
+    let mut keyed: HashSet<String> = HashSet::default();
     RETAINED.with(|retained| {
         for (path, entry) in retained.borrow().iter() {
             if covers(root, path) {
-                set.extend(entry.customs.iter().cloned());
+                for (path, accepts_keys) in &entry.customs {
+                    set.insert(path.clone());
+                    if *accepts_keys {
+                        keyed.insert(path.clone());
+                    }
+                }
             }
         }
     });
     PASS.with(|pass| {
-        set.extend(std::mem::take(&mut pass.borrow_mut().root_customs));
+        for (path, accepts_keys) in std::mem::take(&mut pass.borrow_mut().root_customs) {
+            if accepts_keys {
+                keyed.insert(path.clone());
+            }
+            set.insert(path);
+        }
     });
     CUSTOMS.with(|customs| *customs.borrow_mut() = set);
+    KEYED_CUSTOMS.with(|keyed_customs| *keyed_customs.borrow_mut() = keyed);
 }
 
 /// Is the app's box at this path still on screen? (The focus of an
@@ -624,6 +642,37 @@ pub(crate) fn run_split(path: &str, at: crate::layout::Px) -> bool {
 }
 
 /// Is the target a text field? (decides if a click FOCUSES instead of acting)
+/// The ONE live input whose named chain is `chain` — a field's editor
+/// or a box that takes the keyboard. `None` when nothing answers, and
+/// `None` when TWO do: an ambiguous name must never hand the keyboard
+/// over on a guess.
+///
+/// `editors_only` narrows it to the fields, which is what a caret is
+/// allowed to follow — a caret belongs to an editor, and a box owns
+/// its own.
+pub(crate) fn input_by_chain(chain: &str, editors_only: bool) -> Option<String> {
+    if chain.is_empty() {
+        return None;
+    }
+    let mut found: Option<String> = None;
+    let mut walk = |path: &String| {
+        if motor::identity::named_chain(path) != chain {
+            return false;
+        }
+        match &found {
+            // two live inputs wear the same name: neither wins
+            Some(seen) if seen != path => return true,
+            Some(_) => {}
+            None => found = Some(path.clone()),
+        }
+        false
+    };
+    let ambiguous = EDITORS.with(|editors| editors.borrow().keys().any(&mut walk))
+        || (!editors_only
+            && KEYED_CUSTOMS.with(|customs| customs.borrow().iter().any(&mut walk)));
+    if ambiguous { None } else { found }
+}
+
 pub(crate) fn has_editor(path: &str) -> bool {
     EDITORS.with(|editors| editors.borrow().contains_key(path))
 }

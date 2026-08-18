@@ -316,6 +316,35 @@ pub fn cursor_scope() -> Option<String> {
     })
 }
 
+/// The NAMED projection of a path — the segments a person chose, in
+/// order, with everything positional dropped.
+///
+/// `Bench/#0/[pane-1]/Pane/@First/[code]` becomes `[pane-1]/[code]`.
+/// The kept segments are the ones an app spells: `.id(…)`, a row key,
+/// and the two overlay scopes (`sheet`, `popover`) — which stay so a
+/// name inside a sheet can never be confused with the same name on the
+/// page behind it. Dropped: the component's type name, `#n` tuple
+/// positions and `@Variant` branches, which all move when the tree
+/// above changes shape.
+///
+/// It is a PROJECTION, never a second identity: nothing is minted, the
+/// cursor is untouched, and the result is only as stable as the names
+/// the app chose. An empty answer means the thing has no name at all.
+pub fn named_chain(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for segment in path.split('/') {
+        let named = segment.starts_with('[') || segment == "sheet" || segment == "popover";
+        if !named {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(segment);
+    }
+    out
+}
+
 // MARK: - Cursor
 
 /// One step of the cursor — released on drop, so the path survives early
@@ -536,4 +565,36 @@ pub fn scoped_effect_slot<V: 'static>(site: impl Into<Site>) -> Rc<RefCell<Optio
         }
         cell
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::named_chain;
+
+    #[test]
+    fn the_projection_keeps_the_names_and_drops_the_positions() {
+        assert_eq!(
+            named_chain("Bench/#0/[pane-1]/Pane/@First/[code]"),
+            "[pane-1]/[code]"
+        );
+        // the shape of the tree above moved; the names did not
+        assert_eq!(
+            named_chain("Bench/@Second/[code]"),
+            named_chain("Bench/@First/#0/[code]")
+        );
+    }
+
+    #[test]
+    fn an_overlay_scope_stays_in_the_chain() {
+        // a name INSIDE a sheet is not the same name as the one on the
+        // page behind it — the scope is part of what a person wrote
+        assert_ne!(named_chain("App/popover/[query]"), named_chain("App/[query]"));
+        assert_eq!(named_chain("App/#3/sheet/[query]"), "sheet/[query]");
+    }
+
+    #[test]
+    fn a_path_with_no_name_projects_to_nothing() {
+        assert_eq!(named_chain("Bench/@First/#0"), "");
+        assert_eq!(named_chain(""), "");
+    }
 }

@@ -61,10 +61,23 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// its state, its animation scope and the path its clicks register
     /// under all move. With it, the name is the address — which is also
     /// how a test or a headless probe finds a control it did not build.
+    ///
+    /// A name is also what lets the KEYBOARD survive a change of shape
+    /// above: a focused box or field whose path shifts is found again
+    /// by its named chain, and takes its caret with it. Name the box
+    /// and the pane that holds it, and `⌘\` keeps the caret.
+    ///
+    /// The name must not contain `/`, `[` or `]` — the punctuation the
+    /// path itself is built from.
     fn id(self, name: impl Into<std::rc::Rc<str>>) -> Modified<Self> {
+        let name = name.into();
+        debug_assert!(
+            !name.contains(['/', '[', ']']),
+            "an id names a view; it must not spell the path's own punctuation: {name:?}"
+        );
         Modified {
             base: self,
-            modifier: Modifier::Id(name.into()),
+            modifier: Modifier::Id(name),
         }
     }
 

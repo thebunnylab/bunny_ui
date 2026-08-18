@@ -2637,6 +2637,281 @@ mod tests {
         assert!(plain.contains("[.onClick()]"), "and it is the click suffix: {plain}");
     }
 
+    /// The keyboard follows the NAME, not the position: wrapping a
+    /// pane in a split shifts every positional segment below it, and
+    /// the focused box must keep typing across the edit.
+    #[test]
+    fn the_keyboard_survives_a_split_above_it() {
+        use crate::layout::{Proposal, Size};
+        use std::cell::Cell;
+
+        struct Editor {
+            typed: Rc<Cell<usize>>,
+        }
+
+        impl CustomElement for Editor {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> crate::custom::Response {
+                if let ElementEvent::Text(text) = event {
+                    self.typed.set(self.typed.get() + text.len());
+                    return crate::custom::Response::handled();
+                }
+                crate::custom::Response::ignored()
+            }
+        }
+
+        #[derive(Clone)]
+        struct Bench {
+            split: State<bool>,
+            seam: State<f64>,
+            typed: Rc<Cell<usize>>,
+        }
+
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                let typed = Rc::clone(&self.typed);
+                let pane = custom(Editor { typed }).id("code");
+                if self.split.get() {
+                    Either::First(hsplit(self.seam.binding(), pane, text("other")))
+                } else {
+                    Either::Second(pane)
+                }
+            }
+        }
+
+        let bench = Bench {
+            split: State::new(false),
+            seam: State::new(200.0),
+            typed: Rc::new(Cell::new(0)),
+        };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
+        runtime.render_stable(&bench);
+        let result = runtime.layout(&bench, viewport);
+        let box_rect = result.customs.first().expect("the box is placed").frame;
+        runtime.pointer_pressed(box_rect.origin.x + 10.0, box_rect.origin.y + 10.0);
+        runtime.pointer_released(box_rect.origin.x + 10.0, box_rect.origin.y + 10.0);
+        assert!(runtime.focused().is_some(), "the click focused the box");
+        assert!(runtime.key(EditCommand::Insert("a".into())).applied, "and it types");
+
+        // the tree edit ABOVE: the pane gets wrapped in a split
+        bench.split.set(true);
+        runtime.render_stable(&bench);
+        runtime.layout(&bench, viewport);
+        assert!(
+            runtime.key(EditCommand::Insert("b".into())).applied,
+            "PAIN 23: the keyboard survives a tree edit above"
+        );
+    }
+
+    #[test]
+    fn a_moved_box_never_hears_that_it_lost_the_keyboard() {
+        use crate::layout::{Proposal, Size};
+        use std::cell::RefCell;
+
+        // the re-point must be SILENT: as far as the box knows it never
+        // lost the keyboard, which is the truth
+        struct Editor {
+            log: Rc<RefCell<Vec<bool>>>,
+        }
+
+        impl CustomElement for Editor {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> crate::custom::Response {
+                if let ElementEvent::Focused(on) = event {
+                    self.log.borrow_mut().push(*on);
+                }
+                crate::custom::Response::handled()
+            }
+        }
+
+        #[derive(Clone)]
+        struct Bench {
+            split: State<bool>,
+            seam: State<f64>,
+            log: Rc<RefCell<Vec<bool>>>,
+        }
+
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                let log = Rc::clone(&self.log);
+                let pane = custom(Editor { log }).id("code");
+                if self.split.get() {
+                    Either::First(hsplit(self.seam.binding(), pane, text("other")))
+                } else {
+                    Either::Second(pane)
+                }
+            }
+        }
+
+        let bench = Bench {
+            split: State::new(false),
+            seam: State::new(200.0),
+            log: Rc::new(RefCell::new(Vec::new())),
+        };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
+        runtime.render_stable(&bench);
+        let result = runtime.layout(&bench, viewport);
+        let rect = result.customs.first().expect("the box is placed").frame;
+        runtime.pointer_pressed(rect.origin.x + 10.0, rect.origin.y + 10.0);
+        runtime.pointer_released(rect.origin.x + 10.0, rect.origin.y + 10.0);
+        assert_eq!(*bench.log.borrow(), vec![true], "one focus, on the click");
+
+        bench.split.set(true);
+        runtime.render_stable(&bench);
+        runtime.layout(&bench, viewport);
+        assert_eq!(*bench.log.borrow(), vec![true], "and nothing at all on the split");
+    }
+
+    #[test]
+    fn a_name_that_two_boxes_share_hands_the_keyboard_to_neither() {
+        use crate::layout::{Proposal, Size};
+
+        // an ambiguous name must never hand the keyboard over on a
+        // guess: the honest answer is that the focus died
+        struct Editor;
+        impl CustomElement for Editor {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+        }
+
+        #[derive(Clone, Copy)]
+        struct Bench {
+            twin: State<bool>,
+            seam: State<f64>,
+        }
+
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                let one = custom(Editor).id("code");
+                if self.twin.get() {
+                    // the edit above AND a second box wearing the name
+                    Either::First(hsplit(self.seam.binding(), one, custom(Editor).id("code")))
+                } else {
+                    Either::Second(one)
+                }
+            }
+        }
+
+        let bench = Bench { twin: State::new(false), seam: State::new(200.0) };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
+        runtime.render_stable(&bench);
+        let result = runtime.layout(&bench, viewport);
+        let rect = result.customs.first().expect("a box").frame;
+        runtime.pointer_pressed(rect.origin.x + 10.0, rect.origin.y + 10.0);
+        runtime.pointer_released(rect.origin.x + 10.0, rect.origin.y + 10.0);
+        assert!(runtime.focused().is_some());
+
+        bench.twin.set(true);
+        runtime.render_stable(&bench);
+        runtime.layout(&bench, viewport);
+        assert_eq!(runtime.focused(), None, "two names, no winner");
+    }
+
+    #[test]
+    fn a_box_with_no_name_of_its_own_still_dies_honestly() {
+        use crate::layout::{Proposal, Size};
+
+        struct Editor;
+        impl CustomElement for Editor {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+        }
+
+        #[derive(Clone, Copy)]
+        struct Bench {
+            split: State<bool>,
+            seam: State<f64>,
+        }
+
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                if self.split.get() {
+                    Either::First(hsplit(self.seam.binding(), custom(Editor), text("other")))
+                } else {
+                    Either::Second(custom(Editor))
+                }
+            }
+        }
+
+        let bench = Bench { split: State::new(false), seam: State::new(200.0) };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
+        runtime.render_stable(&bench);
+        let result = runtime.layout(&bench, viewport);
+        let rect = result.customs.first().expect("a box").frame;
+        runtime.pointer_pressed(rect.origin.x + 10.0, rect.origin.y + 10.0);
+        runtime.pointer_released(rect.origin.x + 10.0, rect.origin.y + 10.0);
+        assert!(runtime.focused().is_some());
+
+        // no name, nothing to follow — the keyboard goes, honestly
+        bench.split.set(true);
+        runtime.render_stable(&bench);
+        runtime.layout(&bench, viewport);
+        assert_eq!(runtime.focused(), None);
+    }
+
+    #[test]
+    fn a_named_field_takes_its_caret_with_it() {
+        use crate::layout::{Proposal, Size};
+
+        // the caret column is the FIELD's memory, and it is keyed by
+        // path — so it has to move house with the field
+        #[derive(Clone, Copy)]
+        struct Bench {
+            split: State<bool>,
+            seam: State<f64>,
+            query: State<String>,
+        }
+
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                let field = text_field("search", self.query.binding()).id("query");
+                if self.split.get() {
+                    Either::First(hsplit(self.seam.binding(), field, text("other")))
+                } else {
+                    Either::Second(field)
+                }
+            }
+        }
+
+        let bench = Bench {
+            split: State::new(false),
+            seam: State::new(200.0),
+            query: State::new("hello".to_string()),
+        };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
+        runtime.render_stable(&bench);
+        let result = runtime.layout(&bench, viewport);
+        let field = result.fields.first().expect("the field is placed").clone();
+        runtime.focus(&field.path);
+        runtime.key(EditCommand::Insert("!".into()));
+        assert_eq!(bench.query.get(), "hello!");
+
+        // the tree above changes shape: the field keeps the keyboard
+        // AND the column, so the next keystroke lands where the last
+        // one did instead of at the start
+        bench.split.set(true);
+        runtime.render_stable(&bench);
+        runtime.layout(&bench, viewport);
+        assert!(runtime.focused().is_some(), "the keyboard followed the name");
+        runtime.key(EditCommand::Insert("?".into()));
+        assert_eq!(bench.query.get(), "hello!?", "and so did the caret");
+    }
+
     #[test]
     fn a_click_routes_through_hit_test_to_the_action_and_repaints() {
         use crate::layout::{Proposal, Size, hit_test};

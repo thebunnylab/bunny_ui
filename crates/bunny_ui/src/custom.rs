@@ -629,7 +629,10 @@ impl View for CustomView {
             // the registration says "this box is on screen": a focused
             // hatch keeps the keyboard while it is, and loses it the
             // pass it leaves (the same truth the fields live by)
-            crate::reconciler::attribute_custom(path.clone());
+            crate::reconciler::attribute_custom(
+                path.clone(),
+                self.element.element().accepts_keys(),
+            );
         }
         out.push_layout(LayoutNode::Custom { path, element: self.element.clone() });
     }

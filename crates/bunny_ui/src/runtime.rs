@@ -2153,6 +2153,10 @@ impl Runtime {
     /// component boundary.) A remounted field's `.auto_focus()` fires
     /// again: the identity is genuinely new, deliberately.
     fn release_dead_input(&self) {
+        // FIRST the migration, then the sweep: an input that moved must
+        // take its caret and its once-per-identity memory with it, and
+        // the retains below would have thrown both away
+        self.follow_named_inputs();
         self.carets.borrow_mut().retain(|path, _| reconciler::has_editor(path));
         self.auto_focused.borrow_mut().retain(|path| reconciler::has_editor(path));
         // the app's own box counts as a live input too: it registers
@@ -2164,6 +2168,72 @@ impl Runtime {
             .is_some_and(|path| !reconciler::has_editor(path) && !reconciler::has_custom(path));
         if focus_died {
             *self.focus.borrow_mut() = None;
+        }
+    }
+
+    /// An input whose PATH died but whose NAME is still on screen moves
+    /// house: the keyboard, the caret and the auto-focus memory follow
+    /// it to wherever the tree put it.
+    ///
+    /// This is what makes a caret survive `⌘\`. A path carries
+    /// positions — `#0`, `@First` — and wrapping a pane in a split
+    /// shifts every one of them below it; the names an app wrote with
+    /// `.id(…)` do not move. So when the held path is gone, the named
+    /// projection of it is asked for the ONE live input that still
+    /// wears that name, and the hold re-points there, in the same pass,
+    /// before the frame is stamped. The box hears no focus event: as
+    /// far as it knows it never lost the keyboard, which is the truth.
+    ///
+    /// What it cannot do, and no framework of this shape can: the
+    /// component's own `State` below a re-parented branch is FRESH.
+    /// Identity is the path, so a subtree that moves is a subtree that
+    /// re-mounts (the SwiftUI rule for an `if` that swaps branches).
+    /// Keep what must survive a re-parent ABOVE the branch that moves.
+    fn follow_named_inputs(&self) {
+        let held = self.focus.borrow().clone();
+        if let Some(path) = held {
+            let alive = reconciler::has_editor(&path) || reconciler::has_custom(&path);
+            if !alive {
+                let chain = motor::identity::named_chain(&path);
+                if let Some(moved) = reconciler::input_by_chain(&chain, false) {
+                    *self.focus.borrow_mut() = Some(moved.clone());
+                    self.follow_caret(&path, &moved);
+                }
+            }
+        }
+        // a field that moved keeps its caret even when it is not the
+        // one holding the keyboard — the column is the field's memory,
+        // not the focus's
+        let orphans: Vec<String> = self
+            .carets
+            .borrow()
+            .keys()
+            .filter(|path| !reconciler::has_editor(path))
+            .cloned()
+            .collect();
+        for path in orphans {
+            let chain = motor::identity::named_chain(&path);
+            if let Some(moved) = reconciler::input_by_chain(&chain, true) {
+                self.follow_caret(&path, &moved);
+            }
+        }
+    }
+
+    /// Moves one input's retained memory from a dead path to a live
+    /// one. The destination wins if it already has some: a field that
+    /// is really on screen is more truthful than a ghost.
+    fn follow_caret(&self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        let mut carets = self.carets.borrow_mut();
+        if let Some(state) = carets.remove(from) {
+            carets.entry(to.to_string()).or_insert(state);
+        }
+        drop(carets);
+        let mut seen = self.auto_focused.borrow_mut();
+        if seen.remove(from) {
+            seen.insert(to.to_string());
         }
     }
 
