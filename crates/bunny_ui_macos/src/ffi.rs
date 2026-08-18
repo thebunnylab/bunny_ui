@@ -774,12 +774,30 @@ thread_local! {
     /// Where the app asked for the native buttons, in points from the
     /// window's TOP-LEFT corner. `None` = wherever macOS puts them.
     static TRAFFIC_LIGHTS: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
+    /// The window that carries them, so the frame tick can put them
+    /// back without being handed anything.
+    static LIGHTS_WINDOW: Cell<Id> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// The app's answer to "where do the buttons sit", set once before the
 /// window is built.
 pub fn set_traffic_lights(at: Option<(f64, f64)>) {
     TRAFFIC_LIGHTS.with(|slot| slot.set(at));
+}
+
+/// Puts the buttons back if AppKit moved them — cheap enough to ask
+/// every frame, and silent when there is nothing to do.
+///
+/// It has to be asked that often. `setTitle:` re-lays the titlebar
+/// container, and so does a resize, a trip through full screen, and
+/// every other thing that touches the window's chrome; there is no
+/// notification for "the container laid out". Three frame reads and a
+/// comparison is cheaper than being wrong.
+pub fn keep_traffic_lights() {
+    let window = LIGHTS_WINDOW.with(|slot| slot.get());
+    if !window.is_null() {
+        place_traffic_lights(window);
+    }
 }
 
 /// The three standard buttons, in the order they sit.
@@ -845,7 +863,11 @@ pub fn place_traffic_lights(window: Id) {
                 Some(first) => frame.origin.x - first.x,
             };
             let placed = light_frame(bounds.size.height, frame, (x, y), shift);
-            msg_void_rect(button, sel("setFrame:"), placed);
+            // a no-op must cost nothing: setting the same frame every
+            // frame would dirty the titlebar for no reason
+            if placed.origin.x != frame.origin.x || placed.origin.y != frame.origin.y {
+                msg_void_rect(button, sel("setFrame:"), placed);
+            }
         }
     }
 }
@@ -855,6 +877,9 @@ extern "C" fn bunny_blink(_this: Id, _sel: Sel, _timer: Id) {
 }
 
 extern "C" fn bunny_frame(_this: Id, _sel: Sel, link: Id) {
+    // whatever re-laid the chrome since the last tick, the buttons go
+    // back — the check is three reads and it usually does nothing
+    keep_traffic_lights();
     let dt = unsafe {
         let last = msg_f64(link, sel("timestamp"));
         let next = msg_f64(link, sel("targetTimestamp"));
@@ -1368,7 +1393,6 @@ pub fn create_window(
             // NSWindowTitleHidden = 1 — the title still names the
             // window in Mission Control and the Dock
             msg_void_i64(window, sel("setTitleVisibility:"), 1);
-            place_traffic_lights(window);
         }
 
         let title = CString::new(title).expect("title without NUL");
@@ -1466,6 +1490,11 @@ pub fn create_window(
         // the keyboard is born pointing at the event view
         msg_void_id(window, sel("makeFirstResponder:"), view);
         msg_void_bool(app, sel("activateIgnoringOtherApps:"), 1);
+        // LAST: the traffic lights are placed after everything that
+        // touches the chrome. `setTitle:` alone puts them back where
+        // the system wants them, and it runs above.
+        LIGHTS_WINDOW.with(|slot| slot.set(window));
+        place_traffic_lights(window);
         objc_autoreleasePoolPop(pool);
 
         WindowHandle { window, view }
