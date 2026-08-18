@@ -247,9 +247,21 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
       const rect = canvas.getBoundingClientRect();
       return [event.clientX - rect.left, event.clientY - rect.top];
     };
+    // the tooltip's slow clock: two beats after the pointer settles —
+    // the first ages the wait, the second shows. The engine no-ops the
+    // strays, so the glue never has to know whether one is pending.
+    let tooltipBeats = [];
+    const armTooltip = () => {
+      tooltipBeats.forEach(clearTimeout);
+      tooltipBeats = [
+        setTimeout(() => wasm.bunny_tooltip_tick(), 360),
+        setTimeout(() => wasm.bunny_tooltip_tick(), 720),
+      ];
+    };
     canvas.addEventListener("pointermove", (event) => {
       const [x, y] = point(event);
       wasm.bunny_pointer_move(x, y);
+      armTooltip();
     });
     canvas.addEventListener("pointerdown", (event) => {
       const [x, y] = point(event);

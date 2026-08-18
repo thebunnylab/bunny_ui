@@ -302,6 +302,29 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.tooltip(…)` — hovering this view long enough shows a small
+    /// framework-drawn label under it. The runtime owns the wait and
+    /// the dismissal; on the desktop the bubble can leave the window,
+    /// like a popover. The region never steals a hover or a click.
+    ///
+    /// ```ignore
+    /// icon(symbol::SIDEBAR).tooltip("Toggle sidebar — \u{2318}B")
+    /// ```
+    fn tooltip(self, text: impl Into<std::sync::Arc<str>>) -> Modified<Self> {
+        self.tooltip_side(text, crate::layout::Side::Bottom)
+    }
+
+    /// [`Self::tooltip`] with the side the bubble prefers — a vertical
+    /// rail reads best with `Side::Trailing`. No room flips it, like
+    /// every anchored overlay.
+    fn tooltip_side(
+        self,
+        text: impl Into<std::sync::Arc<str>>,
+        side: crate::layout::Side,
+    ) -> Modified<Self> {
+        Modified { base: self, modifier: Modifier::Tooltip(text.into(), side) }
+    }
+
     /// `.clipped()` — the subtree cannot paint outside this box, and
     /// the cut FOLLOWS `.corner_radius(…)` when there is one (a plain
     /// rectangle without it). The island that finally holds its

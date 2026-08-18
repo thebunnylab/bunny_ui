@@ -10,6 +10,22 @@ app.dataset.n = "0";
 const sheet = document.createElement("style");
 document.head.appendChild(sheet);
 
+// the tooltip is the browser's in this mode, like the hover and the
+// inputs: a data attribute, a static rule, a transition-delay for the
+// wait — zero patches by construction. The bubble mirrors the engine's
+// (ink ground, canvas text, radius 5) without a wire round trip.
+const tooltipSheet = document.createElement("style");
+tooltipSheet.textContent = [
+  '[data-tip]::after{content:attr(data-tip);position:absolute;',
+  'left:50%;top:100%;transform:translate(-50%,6px);z-index:9;',
+  'background:rgba(32,37,49,0.95);color:#F5F6FA;padding:3px 7px;',
+  'border-radius:5px;font:11px -apple-system,system-ui,sans-serif;',
+  'white-space:nowrap;pointer-events:none;opacity:0;',
+  'box-shadow:0 2px 10px rgba(0,0,0,0.35)}',
+  '[data-tip]:hover::after{opacity:1;transition:opacity .1s linear .7s}',
+].join("");
+document.head.appendChild(tooltipSheet);
+
 let wasm = null;
 let wakeArmed = false;
 const decoder = new TextDecoder();
@@ -308,6 +324,12 @@ function applyPatches(view, length) {
         // overflow + the radius already on the box: the browser clips
         // the subtree to the curve, natively, as a layer
         base.push("overflow:hidden");
+      }
+      if (mask & 32768) {
+        const tip = text(u16());
+        if (el) el.dataset.tip = tip;
+      } else if (el && el.dataset.tip !== undefined) {
+        delete el.dataset.tip;
       }
       const name = `[data-n="${id}"]`;
       let rule = `${name}{${base.join(";")}}`;

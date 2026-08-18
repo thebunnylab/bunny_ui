@@ -150,7 +150,9 @@ impl Component for Finder {
         vstack!(vstack!(
             hstack!(
                 image(self.logo.clone()).resizable().frame(18.0, 18.0),
-                icon(symbol::CHEVRON_RIGHT).foreground_color(theme::accent()),
+                icon(symbol::CHEVRON_RIGHT)
+                    .foreground_color(theme::accent())
+                    .tooltip("The selected file opens here"),
                 text_field("Search ten thousand files…", self.query.binding()).monospaced(),
                 count_meter(count),
                 text(self.manifest.get())

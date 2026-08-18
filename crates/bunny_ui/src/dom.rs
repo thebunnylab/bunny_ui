@@ -136,6 +136,11 @@ pub struct DomStyle {
     /// the radius already on the box: the browser cuts the subtree to
     /// the curve as a LAYER, its own native rounded clip.
     pub clip: bool,
+    /// `.tooltip(…)` — in THIS mode the browser owns the wait and the
+    /// bubble (a CSS rule on a data attribute), the way it owns the
+    /// hover and the inputs: zero patches by construction. The pixel
+    /// modes run the engine's own bubble instead.
+    pub tooltip: Option<Arc<str>>,
 }
 
 impl DomStyle {
@@ -156,6 +161,7 @@ impl DomStyle {
             focus_border: None,
             placeholder_color: None,
             clip: props.clip,
+            tooltip: None,
         }
     }
 }
@@ -220,6 +226,9 @@ pub(crate) struct DomCapture {
     /// color a text inherits, never the hovered one the pointer
     /// resolved. This is what keeps the capture pointer-invariant.
     ink: Vec<Color>,
+    /// A `.tooltip(…)` waiting for the NEXT opened node — the wrapper
+    /// is transparent, so the text lands on its child's element.
+    armed_tooltip: Option<Arc<str>>,
     /// Stack depths where a box declared a hover/pressed ink. While one
     /// is open the text below inherits its color instead of setting it,
     /// which is what lets the browser flip the whole subtree.
@@ -255,6 +264,7 @@ impl DomCapture {
             // the scene's ink floor is the theme's, the same one the
             // place walk starts from
             ink: vec![crate::theme::current().fg],
+            armed_tooltip: None,
             ink_scopes: Vec::new(),
             island: 0,
             swallowed: 0,
@@ -280,6 +290,7 @@ impl DomCapture {
             style.interactive = self.pending_interactive.take();
         }
         style.transition = self.pending_transition.take();
+        style.tooltip = self.armed_tooltip.take();
         let node = DomNode {
             kind,
             x: frame.origin.x - parent_origin.x,
@@ -312,9 +323,13 @@ impl DomCapture {
         }
         let ink = self.current_ink();
         let (_, node) = self.stack.last_mut().expect("just opened");
+        // the rebuild must not drop what open() already stamped — a
+        // tooltip armed by the wrapper lands on THIS box
+        let tooltip = node.style.tooltip.take();
         node.style = DomStyle {
             interactive,
             transition,
+            tooltip,
             ..DomStyle::from_props(props)
         };
         if states || inheriting {
@@ -364,6 +379,14 @@ impl DomCapture {
     }
 
     /// A childless element — open and close in one move.
+    /// Arms a `.tooltip(…)` for the NEXT opened node — the placement
+    /// calls it just before the wrapped child places.
+    pub(crate) fn arm_tooltip(&mut self, text: Arc<str>) {
+        if self.island == 0 {
+            self.armed_tooltip = Some(text);
+        }
+    }
+
     pub(crate) fn leaf(&mut self, kind: DomKind, frame: Rect) {
         if self.island > 0 {
             return;
@@ -921,6 +944,9 @@ fn diff_children(
 ///                      then u32 near rgba, u32 far rgba
 ///                   14 clip (no payload — the bit IS the value:
 ///                      overflow:hidden beside the radius of bit 4)
+///                   15 tooltip u16 len + utf8 — a data attribute; the
+///                      browser owns the wait and the bubble (a static
+///                      CSS rule), the way it owns hover and inputs
 ///   6 set text      u32 rgba, u8 inherits ink (1 = no color of its
 ///                   own — the box above owns both states),
 ///                   f32 size, u8 weight, u8 mono,
@@ -1117,6 +1143,9 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
         // the first payload-free bit of the format: the bit IS the value
         mask |= 1 << 14;
     }
+    if style.tooltip.is_some() {
+        mask |= 1 << 15;
+    }
     push_u16(out, mask);
     if let Some(color) = style.background {
         push_u32(out, pack_color(color));
@@ -1183,6 +1212,9 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
                 push_u32(out, pack_color(to));
             }
         }
+    }
+    if let Some(tooltip) = &style.tooltip {
+        push_bytes_u16(out, tooltip.as_bytes());
     }
 }
 

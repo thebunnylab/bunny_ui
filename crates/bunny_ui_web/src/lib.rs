@@ -133,6 +133,8 @@ enum Event {
     ImageReady,
     /// A task has something to run: a fetch came back, a callback fired.
     Wake,
+    /// The glue's slow clock beat once — the tooltip ages, then shows.
+    TooltipTick,
     /// Dom mode: the browser's scroll observer — the element scrolled
     /// and the engine mirrors the offset (the dual ownership).
     DomScroll { id: u32, x: f64, y: f64 },
@@ -262,6 +264,11 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 scale = (ratio.round() as usize).max(1);
                 present(&runtime, &full, size, scale, &mut surface);
             }
+            Event::TooltipTick => {
+                if runtime.tooltip_tick() {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
+            }
             Event::ImageReady | Event::Wake => {
                 // the layout reflows around the fresh intrinsic size
                 // (or around what a task just wrote) and the paint asks
@@ -341,6 +348,11 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
                 size = Size { width, height };
                 present(&runtime, runtime.dom_frame(&root, size), scale);
             }
+            Event::TooltipTick => {
+                if runtime.tooltip_tick() {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
             Event::ImageReady | Event::Wake => {
                 // geometry reflows around the fresh intrinsic size (or
                 // around what a task just wrote); the <img> elements
@@ -403,6 +415,14 @@ pub extern "C" fn bunny_text(pointer: *mut u8, len: usize) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_pointer_move(x: f64, y: f64) {
     dispatch(Event::PointerMove { x, y });
+}
+
+/// One beat of the glue's slow clock: the tooltip ages, then shows.
+/// The glue arms two of these after a pointer settles — the runtime
+/// no-ops the strays.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_tooltip_tick() {
+    dispatch(Event::TooltipTick);
 }
 
 #[unsafe(no_mangle)]

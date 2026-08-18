@@ -3914,4 +3914,193 @@ mod tests {
         assert_eq!(bitmap.pixel(10, 20), Some(0xFF00_00FF), "inside the frame: red");
         assert_eq!(bitmap.pixel(30, 20), Some(0xFFFF_FFFF), "outside the frame: canvas");
     }
+
+    #[test]
+    fn a_tooltip_waits_two_beats_and_shows() {
+        use crate::layout::TOOLTIP_PATH;
+
+        #[derive(Clone, Copy)]
+        struct Rail;
+        impl Component for Rail {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text("gear").tooltip("Settings"),
+                    text("below"),
+                )
+                .spacing(20.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 120.0 };
+        let overlay_count = |runtime: &Runtime| {
+            runtime
+                .layout(&Rail, crate::layout::Proposal::exact(size))
+                .overlays
+                .iter()
+                .filter(|overlay| overlay.path == TOOLTIP_PATH)
+                .count()
+        };
+        // prime the retained geometry, then hover the labelled view
+        let _ = runtime.layout(&Rail, crate::layout::Proposal::exact(size));
+        runtime.pointer_moved(10.0, 8.0);
+        assert_eq!(overlay_count(&runtime), 0, "no bubble before the wait");
+        // the first beat only ages the wait
+        assert!(!runtime.tooltip_tick(), "one beat is not the delay");
+        assert_eq!(overlay_count(&runtime), 0);
+        // the second beat shows — and asks for a repaint
+        assert!(runtime.tooltip_tick(), "the second beat shows the bubble");
+        let result = runtime.layout(&Rail, crate::layout::Proposal::exact(size));
+        let bubble = result
+            .overlays
+            .iter()
+            .find(|overlay| overlay.path == TOOLTIP_PATH)
+            .expect("the bubble is an overlay");
+        // below the anchor, past the gap, painted at the very end
+        assert!(bubble.frame.origin.y > 8.0);
+        assert_eq!(bubble.display.1, result.display.len());
+        let says: Vec<String> = result
+            .display
+            .iter()
+            .skip(bubble.display.0)
+            .take(bubble.display.1 - bubble.display.0)
+            .filter_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { content, .. } => {
+                    Some(content.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(says, vec!["Settings".to_string()]);
+
+        // moving OFF the anchor takes the bubble with it
+        assert!(runtime.pointer_moved(10.0, 60.0), "leaving repaints");
+        assert_eq!(overlay_count(&runtime), 0, "the bubble left with the pointer");
+    }
+
+    #[test]
+    fn a_tooltip_never_eats_the_click() {
+        #[derive(Clone)]
+        struct Two {
+            count: State<usize>,
+        }
+        impl Component for Two {
+            fn body(self, _ctx: &Context) -> impl View {
+                let count = self.count;
+                vstack!(
+                    text("hover me").tooltip("An explanation"),
+                    text("press me").on_click(move || count.set(count.get() + 1)),
+                )
+                .spacing(30.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Two { count: State::new(0) };
+        let size = Size { width: 200.0, height: 120.0 };
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        // show the bubble over the first line
+        runtime.pointer_moved(10.0, 8.0);
+        runtime.tooltip_tick();
+        assert!(runtime.tooltip_tick(), "the bubble is up");
+        // pressing the OTHER line must still arm and fire — a popover
+        // would have eaten this press; the tooltip must not
+        let button = runtime
+            .layout(&view, crate::layout::Proposal::exact(size))
+            .hits
+            .last()
+            .map(|(_, rect)| {
+                (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)
+            })
+            .expect("the button is a target");
+        runtime.pointer_pressed(button.0, button.1);
+        runtime.pointer_released(button.0, button.1);
+        assert_eq!(view.count.get(), 1, "the press reached the button");
+    }
+
+    #[test]
+    fn a_press_or_a_wheel_ends_the_wait() {
+        #[derive(Clone, Copy)]
+        struct One;
+        impl Component for One {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("label").tooltip("Explains")
+            }
+        }
+        let runtime = Runtime::new();
+        let size = Size { width: 100.0, height: 40.0 };
+        let _ = runtime.layout(&One, crate::layout::Proposal::exact(size));
+        runtime.pointer_moved(10.0, 8.0);
+        runtime.pointer_pressed(10.0, 8.0);
+        assert!(!runtime.tooltip_tick(), "a press ends the wait");
+        assert!(!runtime.tooltip_tick());
+        runtime.pointer_released(10.0, 8.0);
+        runtime.pointer_moved(10.0, 8.0);
+        runtime.wheel(10.0, 8.0, 0.0, 3.0);
+        assert!(!runtime.tooltip_tick(), "a wheel ends the wait");
+        assert!(!runtime.tooltip_tick());
+    }
+
+    #[test]
+    fn a_tooltip_survives_the_modifier_stack() {
+        // the exact shape the demos write: paint modifiers BETWEEN the
+        // view and the tooltip — the attribute must still land
+        #[derive(Clone, Copy)]
+        struct Chevron;
+        impl Component for Chevron {
+            fn body(self, _ctx: &Context) -> impl View {
+                icon(symbol::CHEVRON_RIGHT)
+                    .foreground_color(Color::hex(0x3B82F6))
+                    .tooltip("The selected file opens here")
+            }
+        }
+        let runtime = Runtime::new();
+        let patches = runtime.dom_frame(&Chevron, Size { width: 100.0, height: 40.0 });
+        let landed = patches.iter().any(|patch| {
+            matches!(patch, crate::dom::DomPatch::SetStyle { style, .. } if style.tooltip.is_some())
+        });
+        assert!(landed, "the attribute lands under paint modifiers: {patches:#?}");
+    }
+
+    #[test]
+    fn in_element_mode_the_browser_owns_the_tooltip() {
+        #[derive(Clone, Copy)]
+        struct Labelled;
+        impl Component for Labelled {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("gear").tooltip("Settings")
+            }
+        }
+        let runtime = Runtime::new();
+        let size = Size { width: 100.0, height: 40.0 };
+        let patches = runtime.dom_frame(&Labelled, size);
+        let style = patches
+            .iter()
+            .find_map(|patch| match patch {
+                crate::dom::DomPatch::SetStyle { style, .. } if style.tooltip.is_some() => {
+                    Some(style.clone())
+                }
+                _ => None,
+            })
+            .expect("the text lands as a data attribute");
+        assert_eq!(style.tooltip.as_deref(), Some("Settings"));
+        // and the wire says so: bit 15, u16 len + utf8 at the tail
+        let bytes = crate::dom::encode(&[crate::dom::DomPatch::SetStyle {
+            id: 3,
+            style: crate::dom::DomStyle {
+                tooltip: Some(std::sync::Arc::from("Hi")),
+                ..crate::dom::DomStyle::default()
+            },
+        }]);
+        let expected: Vec<u8> = [
+            &1u32.to_le_bytes()[..],
+            &[5],
+            &3u32.to_le_bytes()[..],
+            &0x8000u16.to_le_bytes()[..],
+            &2u16.to_le_bytes()[..],
+            b"Hi",
+        ]
+        .concat();
+        assert_eq!(bytes, expected);
+    }
 }

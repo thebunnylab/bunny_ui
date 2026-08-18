@@ -21,6 +21,8 @@ fn tile(symbol: Symbol) -> impl View {
     .frame(96.0, 56.0)
     .background_hovered(theme::panel())
     .corner_radius(8.0)
+    // rest on a tile: the bubble waits, shows, and can leave the window
+    .tooltip(format!("Symbol::new({:?}, …)", symbol.name))
     .on_click(move || println!("{symbol:?}"))
 }
 

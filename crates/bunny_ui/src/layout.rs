@@ -411,6 +411,13 @@ pub enum LayoutNode {
     /// title bar on a chrome-less window. Transparent to geometry;
     /// shells without windows ignore it honestly.
     DragRegion { child: Box<LayoutNode> },
+    /// `.tooltip(…)`: hovering the child long enough shows a small
+    /// framework-drawn label beside it. Transparent to geometry and to
+    /// interaction — the region never steals a hover. The RUNTIME owns
+    /// when it shows (the scene stays pointer-invariant); the bubble
+    /// itself rides the overlay machinery, so on the desktop it leaves
+    /// the window like a popover does.
+    Tooltip { text: Arc<str>, side: Side, child: Box<LayoutNode> },
     /// The escape hatch (`custom(…)` / `canvas(…)`): a box the APP
     /// measures and paints, in the same command vocabulary the built-ins
     /// emit. `path` is its identity — the address of the events it
@@ -802,6 +809,10 @@ pub struct Interaction {
     /// every move until the release, even outside the frame (dragging
     /// a selection out of the box and back is one gesture).
     pub element_grab: Option<String>,
+    /// The tooltip the runtime decided to SHOW — resolved before
+    /// layout like everything here (the delay is the shell's clock,
+    /// never the scene's). The placement turns it into an overlay.
+    pub tooltip: Option<(Arc<str>, Side, Rect)>,
 }
 
 /// A draw command — the output of the placement pass, in paint order
@@ -971,6 +982,15 @@ pub struct OverlayPlacement {
     pub anchor_visible: bool,
 }
 
+/// One `.tooltip(…)` region of the placed scene — the anchor the
+/// runtime watches and the side the bubble prefers.
+#[derive(Clone, Debug)]
+pub struct TooltipRegion {
+    pub text: Arc<str>,
+    pub side: Side,
+    pub rect: Rect,
+}
+
 /// An overlay waiting for the deferred pass (the anchor placed, the
 /// popover not yet).
 #[derive(Debug)]
@@ -1058,6 +1078,10 @@ pub struct Placement {
     /// Window-drag regions (clipped) — where a press with no
     /// interactive target drags the window on the desktop shell.
     pub drag_regions: Vec<Rect>,
+    /// Tooltip regions in paint order (last = topmost) — what the
+    /// runtime's hover consults. Never a hit: a tooltip explains,
+    /// it does not intercept.
+    pub tooltips: Vec<TooltipRegion>,
     /// The Dom capture, when that mode is on ([`layout_dom`]) — the
     /// placement braços feed it the SEMANTIC scene while they walk.
     /// `None` costs one branch per hook and nothing else.
@@ -1176,6 +1200,10 @@ pub struct LayoutResult {
     /// Window-drag regions — a press here with no interactive target
     /// drags the window on the desktop shell.
     pub drag_regions: Vec<Rect>,
+    /// Tooltip regions in paint order (last = topmost) — what the
+    /// runtime's hover consults. Never a hit: a tooltip explains,
+    /// it does not intercept.
+    pub tooltips: Vec<TooltipRegion>,
 }
 
 /// Runs both phases from the root with the default environment — the
@@ -1230,6 +1258,7 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         misses: out.misses,
         overlays: out.overlays,
         drag_regions: out.drag_regions,
+        tooltips: out.tooltips,
     }
 }
 
@@ -1264,7 +1293,8 @@ pub fn layout_dom(
             customs: out.customs,
             misses: out.misses,
             overlays: out.overlays,
-        drag_regions: out.drag_regions,
+            drag_regions: out.drag_regions,
+            tooltips: out.tooltips,
         },
         scene,
     )
@@ -1417,6 +1447,36 @@ fn anchored_frame(anchor: Rect, side: Side, size: Size, container: Rect) -> Rect
 /// the still-open Dom root (the portal). A popover opened inside a
 /// popover queues during its parent's place and drains in the same
 /// loop.
+/// The path every shell recognizes as the tooltip's — the mac child
+/// panel pools by it; the dismissal doors leave it alone (a tooltip
+/// never eats a click, hover-out is its whole life).
+pub const TOOLTIP_PATH: &str = "bunny.tooltip";
+
+/// The framework-drawn bubble: a small inverted label. The theme's
+/// ink becomes the ground and the canvas becomes the text — legible
+/// on both themes without a token of its own.
+fn tooltip_node(text: Arc<str>) -> LayoutNode {
+    let theme = crate::theme::current();
+    LayoutNode::Styled {
+        props: Box::new(VisualProps {
+            background: Some(Color { a: 242, ..theme.fg }),
+            foreground: Some(theme.canvas),
+            corner_radius: Some(5.0),
+            shadow: Some((10.0, Color { r: 0, g: 0, b: 0, a: 90 })),
+            font: FontPatch { size: Some(11.0), ..FontPatch::default() },
+            ..VisualProps::default()
+        }),
+        child: Box::new(LayoutNode::Padding {
+            edges: Edges { top: 3.0, trailing: 7.0, bottom: 4.0, leading: 7.0 },
+            child: Box::new(LayoutNode::Text {
+                content: text,
+                highlights: None,
+                truncation: None,
+            }),
+        }),
+    }
+}
+
 fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
     let container = env.overlay_bounds.unwrap_or(viewport);
     let mut placed = 0;
@@ -1438,6 +1498,27 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
             frame,
             display: (start, end),
             anchor_visible: queued.anchor_visible,
+        });
+    }
+    // the tooltip lands LAST — above every popover, outside every
+    // clip, and on the desktop it leaves the window like they do
+    if let Some((text, side, anchor)) = env.stamp.interaction.tooltip.clone() {
+        let node = tooltip_node(text);
+        let proposal = Proposal {
+            width: Some(container.size.width),
+            height: Some(container.size.height),
+        };
+        let (size, fit) = node.measure(proposal, env);
+        let frame = anchored_frame(anchor, side, size, container);
+        let start = out.display.len();
+        node.place(frame, fit, env, out);
+        let end = out.display.len();
+        out.overlays.push(OverlayPlacement {
+            path: TOOLTIP_PATH.to_string(),
+            anchor,
+            frame,
+            display: (start, end),
+            anchor_visible: true,
         });
     }
 }
@@ -1489,7 +1570,8 @@ impl LayoutNode {
             | LayoutNode::Animated { child, .. }
             | LayoutNode::Island { child }
             | LayoutNode::Anchored { child, .. }
-            | LayoutNode::DragRegion { child } => child.is_flexible(axis),
+            | LayoutNode::DragRegion { child }
+            | LayoutNode::Tooltip { child, .. } => child.is_flexible(axis),
             // a stack that HOLDS something flexible is itself flexible
             // (a panel with a scroll inside wants the leftover space —
             // nesting it must not freeze it at its natural extent)
@@ -1536,6 +1618,7 @@ impl LayoutNode {
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
+            | LayoutNode::Tooltip { child, .. }
             | LayoutNode::Frame { child, .. } => child.first_baseline(env),
             // lane A leads the seam — its text sets the shared line
             LayoutNode::Split { children, .. } => {
@@ -1635,6 +1718,11 @@ impl LayoutNode {
             }
 
             LayoutNode::DragRegion { child } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            LayoutNode::Tooltip { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -2154,6 +2242,24 @@ impl LayoutNode {
                 };
                 if let Some(region) = region {
                     out.drag_regions.push(region);
+                }
+            }
+
+            (LayoutNode::Tooltip { text, side, child }, Fit::Wrapped(_, fit)) => {
+                if let Some(dom) = out.dom.as_mut() {
+                    // in element mode the browser owns the wait and the
+                    // bubble — the text lands as a data attribute on
+                    // the child's own element
+                    dom.arm_tooltip(text.clone());
+                }
+                child.place(frame, *fit, env, out);
+                // clipped like a hit: what is not visible explains nothing
+                let region = match out.current_clip() {
+                    Some(clip) => frame.intersection(clip),
+                    None => Some(frame),
+                };
+                if let Some(rect) = region {
+                    out.tooltips.push(TooltipRegion { text: text.clone(), side: *side, rect });
                 }
             }
 

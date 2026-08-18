@@ -49,6 +49,14 @@ pub struct ImeSnapshot {
     pub caret_rect: Rect,
 }
 
+/// The wait between a hover and its bubble — armed by the pointer,
+/// aged by one shell tick, shown on the next. No clock in sight.
+#[derive(Default)]
+struct TooltipLife {
+    pending: Option<crate::layout::TooltipRegion>,
+    aged: bool,
+}
+
 pub struct Runtime {
     ctx: Context,
     /// The root of the last pass — scopes `take_dirty` so it does not
@@ -123,6 +131,12 @@ pub struct Runtime {
     /// topmost) — the outside-press dismissal and the shells' second
     /// surfaces read from here.
     last_overlays: RefCell<Vec<OverlayPlacement>>,
+    /// The `.tooltip(…)` regions of the last layout, in paint order.
+    last_tooltips: RefCell<Vec<crate::layout::TooltipRegion>>,
+    /// The tooltip's whole life — the runtime owns it, the scene only
+    /// declares. CLOCKLESS: the delay is the shell's tick seen twice,
+    /// so no Instant crosses into wasm and the tests drive it by hand.
+    tooltip: RefCell<TooltipLife>,
     /// Window-drag regions of the last layout — the desktop shell's
     /// press gate consults them.
     last_drag_regions: RefCell<Vec<Rect>>,
@@ -211,7 +225,97 @@ impl Runtime {
         for path in paths {
             closed |= reconciler::run_action(&format!("{path}/#dismiss"));
         }
-        closed
+        // the app switched away: the explanation goes with it
+        closed | self.clear_tooltip()
+    }
+
+    /// One beat of the shell's slow clock (the caret-blink timer, a
+    /// browser timeout). The delay is this tick seen TWICE over an
+    /// unmoved hover: the first beat ages the wait, the second shows.
+    /// `true` = the bubble appeared — repaint.
+    pub fn tooltip_tick(&self) -> bool {
+        let mut life = self.tooltip.borrow_mut();
+        let Some(pending) = life.pending.clone() else {
+            return false;
+        };
+        if !life.aged {
+            life.aged = true;
+            return false;
+        }
+        life.pending = None;
+        life.aged = false;
+        drop(life);
+        self.interaction.borrow_mut().tooltip =
+            Some((pending.text, pending.side, pending.rect));
+        true
+    }
+
+    /// Is a tooltip waiting on the clock? The web glue asks after a
+    /// pointer event to arm its timeout chain; the mac shell rides the
+    /// blink timer and never asks.
+    pub fn tooltip_waiting(&self) -> bool {
+        self.tooltip.borrow().pending.is_some()
+    }
+
+    /// Drops the bubble and the wait. `true` = a bubble was showing —
+    /// repaint.
+    fn clear_tooltip(&self) -> bool {
+        let mut life = self.tooltip.borrow_mut();
+        life.pending = None;
+        life.aged = false;
+        drop(life);
+        self.interaction.borrow_mut().tooltip.take().is_some()
+    }
+
+    /// The topmost tooltip region under the pointer — paint order, so
+    /// the last one wins, mirroring the hits.
+    fn tooltip_at(&self, x: Px, y: Px) -> Option<crate::layout::TooltipRegion> {
+        self.last_tooltips
+            .borrow()
+            .iter()
+            .rev()
+            .find(|region| region.rect.contains(x, y))
+            .cloned()
+    }
+
+    /// Follows the hover: a region under the pointer arms the wait, a
+    /// bare stretch clears it, and the shown bubble lives exactly as
+    /// long as the pointer stays inside ITS anchor. `true` = repaint.
+    fn note_tooltip_hover(&self, x: Px, y: Px) -> bool {
+        let region = self.tooltip_at(x, y);
+        let mut interaction = self.interaction.borrow_mut();
+        if let Some((_, _, anchor)) = &interaction.tooltip {
+            match &region {
+                Some(hovered) if hovered.rect == *anchor => return false,
+                _ => {
+                    interaction.tooltip = None;
+                    let mut life = self.tooltip.borrow_mut();
+                    life.pending = region.filter(|_| interaction.pressed.is_none());
+                    life.aged = false;
+                    return true;
+                }
+            }
+        }
+        let pressed = interaction.pressed.is_some();
+        drop(interaction);
+        let mut life = self.tooltip.borrow_mut();
+        match region {
+            Some(region) if !pressed => {
+                let same = life
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.rect == region.rect);
+                if !same {
+                    life.pending = Some(region);
+                    life.aged = false;
+                }
+            }
+            _ => {
+                life.pending = None;
+                life.aged = false;
+            }
+        }
+        false
     }
 
     /// Should a press at this point drag the WINDOW? True inside a
@@ -249,6 +353,8 @@ impl Runtime {
             animator: RefCell::new(crate::anim::Animator::default()),
             last_proposal: Cell::new(None),
             last_overlays: RefCell::new(Vec::new()),
+            last_tooltips: RefCell::new(Vec::new()),
+            tooltip: RefCell::new(TooltipLife::default()),
             last_drag_regions: RefCell::new(Vec::new()),
             overlay_bounds: Cell::new(None),
             dom: RefCell::new(crate::dom::DomLowering::default()),
@@ -407,7 +513,10 @@ impl Runtime {
             }
             None => false,
         };
-        changed || used
+        // the tooltip's hover walks beside the interactive one and
+        // never touches it — a region explains, it does not intercept
+        let explained = self.note_tooltip_hover(x, y);
+        changed || used || explained
     }
 
     /// One divider move: clamp the pointer into the split's lane range
@@ -520,13 +629,18 @@ impl Runtime {
     /// action fires here (up-inside is button semantics). `true` =
     /// repaint.
     pub fn pointer_pressed(&self, x: Px, y: Px) -> bool {
+        // a press ends any explanation, and never the other way round:
+        // the tooltip is not a popover — it cannot eat a click
+        let explained = self.clear_tooltip();
         // an open popover eats the press outside its frame: the
         // TOPMOST one closes and nothing underneath arms (the press
         // is consumed — AppKit semantics, no accidental activation)
         let outside = {
             let overlays = self.last_overlays.borrow();
             overlays
-                .last()
+                .iter()
+                .rev()
+                .find(|top| top.path != crate::layout::TOOLTIP_PATH)
                 .filter(|top| !top.frame.contains(x, y))
                 .map(|top| top.path.clone())
         };
@@ -564,7 +678,7 @@ impl Runtime {
         let changed = interaction.pressed != target || interaction.hovered != target;
         interaction.hovered = target.clone();
         interaction.pressed = target;
-        changed
+        changed || explained
     }
 
     /// Button up: fires the action IF released inside the pressed
@@ -634,6 +748,8 @@ impl Runtime {
     /// The pointer left the window: clears hover (an in-flight press
     /// already had its visual dropped by the drag's `pointer_moved`).
     pub fn pointer_exited(&self) -> bool {
+        let explained = self.clear_tooltip();
+        let _ = explained;
         let hovered = {
             let mut interaction = self.interaction.borrow_mut();
             let hovered = interaction.hovered.take();
@@ -660,6 +776,10 @@ impl Runtime {
     /// reveals content above — the offset shrinks. `true` = it moved
     /// (the shell repaints; no render: zero bodies).
     pub fn wheel(&self, x: Px, y: Px, dx: Px, dy: Px) -> bool {
+        // the content is about to slide under a still pointer — the
+        // explanation dies rather than pointing at the wrong row
+        let explained = self.clear_tooltip();
+        let _ = explained; // folded into the returns below
         // the app's box gets the turn first: an editor scrolls itself.
         // What it ignores falls through to the region around it.
         let over = self
@@ -1516,6 +1636,7 @@ impl Runtime {
         *self.last_splits.borrow_mut() = result.splits.clone();
         *self.last_customs.borrow_mut() = result.customs.clone();
         *self.last_overlays.borrow_mut() = result.overlays.clone();
+        *self.last_tooltips.borrow_mut() = result.tooltips.clone();
         *self.last_drag_regions.borrow_mut() = result.drag_regions.clone();
         // an applied-target memory whose region left the scene goes
         // with it — live regions keep theirs (the wheel stays sovereign)

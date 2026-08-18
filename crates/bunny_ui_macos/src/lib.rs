@@ -453,8 +453,12 @@ pub fn run_window_chrome(
             }
         }
         AppEvent::Blink => {
-            // an idle caret blinks; without focus the tick is silence
-            if runtime.blink() {
+            // an idle caret blinks; without focus the tick is silence —
+            // and the same slow clock ages the tooltip's wait and then
+            // shows it: the delay is this tick seen twice
+            let blinked = runtime.blink();
+            let explained = runtime.tooltip_tick();
+            if blinked || explained {
                 blit(runtime, root);
             }
         }

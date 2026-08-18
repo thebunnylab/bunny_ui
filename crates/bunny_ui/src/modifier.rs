@@ -61,6 +61,8 @@ pub enum Modifier {
     CornerRadius(f64),
     /// `.clipped()` — the subtree is cut to the box (and its corner).
     Clipped,
+    /// `.tooltip(…)` — a hover explanation, shown by the runtime.
+    Tooltip(std::sync::Arc<str>, crate::layout::Side),
     Monospaced,
     /// A size out of the preset scale — the rest of the font stays.
     FontSize(f64),
@@ -188,6 +190,7 @@ impl Modifier {
             Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
             Modifier::CornerRadius(radius) => format!(" [.cornerRadius({radius})]"),
             Modifier::Clipped => " [.clipped()]".into(),
+            Modifier::Tooltip(text, _) => format!(" [.tooltip({text:?})]"),
             Modifier::Monospaced => " [.monospaced()]".into(),
             Modifier::Id(name) => format!(" [.id({name:?})]"),
             Modifier::FontSize(size) => format!(" [.font(.system(size: {size}))]"),
@@ -645,6 +648,13 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             Modifier::Clipped => {
                 wrap_styled(out, VisualProps { clip: true, ..VisualProps::default() })
             }
+            Modifier::Tooltip(text, side) => out.wrap_last_layout(|node| {
+                LayoutNode::Tooltip {
+                    text: text.clone(),
+                    side: *side,
+                    child: Box::new(node),
+                }
+            }),
             // font is an inherited scene property — the same Styled as the
             // visuals carries the patch (measure applies it on top of the env)
             Modifier::Font(font) => wrap_styled(
