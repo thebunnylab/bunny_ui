@@ -334,6 +334,9 @@ impl Tree {
                     element.style.insert("left", "0".into());
                     element.style.insert("right", "0".into());
                 }
+                if layout.stretch {
+                    element.style.insert("align-self", "stretch".into());
+                }
             }
             DomPatch::SetStyle { id, style } => {
                 let Some(element) = self.elements.get_mut(id) else {

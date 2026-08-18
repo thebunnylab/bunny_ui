@@ -80,6 +80,9 @@ pub struct Runtime {
     /// from a ResizeObserver) — the flow frame's window math reads
     /// them; the pixel targets never fill them.
     dom_viewports: RefCell<HashMap<String, (f64, f64)>>,
+    /// Browser-reported boxes by island path — a FLEXIBLE island
+    /// measures against its real box, not against a guess.
+    island_boxes: RefCell<HashMap<Rc<str>, (f64, f64)>>,
     /// The scroll regions of the last layout — the wheel map.
     last_scrolls: RefCell<Vec<ScrollRegion>>,
     /// The focused field (identity path) — owner of the keyboard.
@@ -261,6 +264,7 @@ impl Runtime {
             cache: MeasureCache::default(),
             scroll_offsets: RefCell::new(HashMap::default()),
             dom_viewports: RefCell::new(HashMap::default()),
+            island_boxes: RefCell::new(HashMap::default()),
             last_scrolls: RefCell::new(Vec::new()),
             focus: RefCell::new(None),
             carets: RefCell::new(HashMap::default()),
@@ -1259,16 +1263,20 @@ impl Runtime {
             anim: None,
             overlay_bounds: self.overlay_bounds.get(),
         };
+        let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
             scroll_offsets: &*offsets,
             size: (size.width, size.height),
             layout: Some(env),
             changed: &changed,
             retained_groups: &retained_groups,
+            island_boxes: &boxes,
         };
         let output = crate::stats::time(crate::stats::Stage::Capture, || {
             crate::dom_flow::lower(&tree, &flow)
         });
+        drop(boxes);
+        self.seed_island_boxes(&output.scene);
         drop(offsets);
         drop(carets);
         // the first field that asks for focus takes it — once
@@ -1349,14 +1357,18 @@ impl Runtime {
             overlay_bounds: self.overlay_bounds.get(),
         };
         let changed: Vec<String> = Vec::new();
+        let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
             scroll_offsets: &*offsets,
             size: (size.width, size.height),
             layout: Some(env),
             changed: &changed,
             retained_groups: &retained_groups,
+            island_boxes: &boxes,
         };
         let output = crate::dom_flow::lower(&tree, &flow);
+        drop(boxes);
+        self.seed_island_boxes(&output.scene);
         drop(offsets);
         drop(carets);
         self.dom.borrow_mut().adopt(&output.scene, &output.display);
@@ -1443,6 +1455,55 @@ impl Runtime {
             return;
         };
         self.dom_viewports.borrow_mut().insert(path, (width, height));
+    }
+
+    /// The browser reported a canvas island's box (its resize
+    /// observer fired). News re-runs the island's body so the next
+    /// frame measures against the REAL box; an echo of what the
+    /// engine already said returns false and costs nothing.
+    pub fn dom_island_box(&self, id: u32, width: f64, height: f64) -> bool {
+        let Some(path) = self.dom.borrow().island_path(id) else {
+            return false;
+        };
+        if let Some((w, h)) = self.island_boxes.borrow().get(path.as_ref()) {
+            if (w - width).abs() < 0.5 && (h - height).abs() < 0.5 {
+                return false;
+            }
+        }
+        self.island_boxes.borrow_mut().insert(Rc::clone(&path), (width, height));
+        // the island lives under a body — the fresh box re-runs it
+        // (nearest retained boundary up the path, the scroll's walk)
+        let mut probe: &str = path.as_ref();
+        loop {
+            if reconciler::is_retained(probe) {
+                motor::identity::invalidate(probe);
+                break;
+            }
+            match probe.rfind('/') {
+                Some(cut) => probe = &probe[..cut],
+                None => break,
+            }
+        }
+        true
+    }
+
+    /// Every island the scene holds seeds its measured box once — so
+    /// the observer's FIRST report (which only echoes the mount) does
+    /// not buy a frame. Later reports that disagree are real news.
+    fn seed_island_boxes(&self, scene: &crate::dom::DomNode) {
+        fn walk(node: &crate::dom::DomNode, boxes: &mut HashMap<Rc<str>, (f64, f64)>) {
+            if let crate::dom::DomKind::Canvas { path: Some(path), .. } = &node.kind {
+                if let Some(layout) = &node.layout {
+                    if let (Some(w), Some(h)) = (layout.width, layout.height) {
+                        boxes.entry(Rc::clone(path)).or_insert((w, h));
+                    }
+                }
+            }
+            for child in &node.children {
+                walk(child, boxes);
+            }
+        }
+        walk(scene, &mut self.island_boxes.borrow_mut());
     }
 
     /// The text engine of this runtime — the shell pairs it with its

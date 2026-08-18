@@ -271,7 +271,8 @@ fn rewrite_scroll_node(
             spec,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
-        LayoutNode::Island { child } => LayoutNode::Island {
+        LayoutNode::Island { path, child } => LayoutNode::Island {
+            path,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
         LayoutNode::Padding { edges, child } => LayoutNode::Padding {
@@ -312,7 +313,8 @@ fn rewrite_field_node(
             spec,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
-        LayoutNode::Island { child } => LayoutNode::Island {
+        LayoutNode::Island { path, child } => LayoutNode::Island {
+            path,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
         LayoutNode::Padding { edges, child } => LayoutNode::Padding {
@@ -360,7 +362,8 @@ fn rewrite_pixel_node(
             spec,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
-        LayoutNode::Island { child } => LayoutNode::Island {
+        LayoutNode::Island { path, child } => LayoutNode::Island {
+            path,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
         LayoutNode::Padding { edges, child } => LayoutNode::Padding {
@@ -403,7 +406,8 @@ fn rewrite_text_node(
             spec,
             child: Box::new(rewrite_text_node(*child, rewrite)),
         },
-        LayoutNode::Island { child } => LayoutNode::Island {
+        LayoutNode::Island { path, child } => LayoutNode::Island {
+            path,
             child: Box::new(rewrite_text_node(*child, rewrite)),
         },
         other => other,
@@ -763,7 +767,11 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 // Auto is the table's business (v1: everything lowers
                 // to Dom); only an explicit Gpu claims an island node
                 if *mode == crate::layout::Rendering::Gpu {
-                    out.wrap_last_layout(|node| LayoutNode::Island {
+                    // the island's identity: the flexible case keys
+                    // its browser-reported box by this path
+                    let path = motor::identity::cursor_scope();
+                    out.wrap_last_layout(move |node| LayoutNode::Island {
+                        path,
                         child: Box::new(node),
                     });
                 }

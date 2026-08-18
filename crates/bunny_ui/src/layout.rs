@@ -392,7 +392,7 @@ pub enum LayoutNode {
     /// CANVAS ISLAND — an element our layout positions, filled with the
     /// subtree's own draw commands. On pixel targets it dissolves:
     /// everything is the pixel pipeline there already.
-    Island { child: Box<LayoutNode> },
+    Island { path: Option<String>, child: Box<LayoutNode> },
     /// `.popover(...)`: the child is the ANCHOR; the overlay does not
     /// descend here. Placement queues it — the pass places every
     /// overlay AFTER the root, so the popover paints on top, its hits
@@ -1565,7 +1565,7 @@ impl LayoutNode {
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::Styled { child, .. }
             | LayoutNode::Animated { child, .. }
-            | LayoutNode::Island { child }
+            | LayoutNode::Island { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
             | LayoutNode::Hinted { child, .. } => child.is_flexible(axis),
@@ -1611,7 +1611,7 @@ impl LayoutNode {
                 child.first_baseline(env)
             }
             LayoutNode::Animated { child, .. }
-            | LayoutNode::Island { child }
+            | LayoutNode::Island { child, .. }
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
@@ -1902,7 +1902,7 @@ impl LayoutNode {
             }
 
             // the island claims a renderer, never a pixel of geometry
-            LayoutNode::Island { child } => {
+            LayoutNode::Island { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -2703,7 +2703,7 @@ impl LayoutNode {
                 }
             }
 
-            (LayoutNode::Island { child }, Fit::Wrapped(_, fit)) => {
+            (LayoutNode::Island { child, .. }, Fit::Wrapped(_, fit)) => {
                 // Dom mode: a canvas element in the flow, filled with
                 // the subtree's OWN draw commands (the display range
                 // between open and close). Pixel targets place through:

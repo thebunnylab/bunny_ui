@@ -68,7 +68,13 @@ pub enum DomKind {
     /// element; the subtree's draw commands fill it. `origin` is the
     /// island's ABSOLUTE frame origin (the commands translate by it)
     /// and `display` the `[start, end)` range into the pass's list.
-    Canvas { origin: (Px, Px), display: (usize, usize) },
+    Canvas {
+        origin: (Px, Px),
+        display: (usize, usize),
+        /// The island's identity — a flexible island's real box comes
+        /// back from the browser keyed by it.
+        path: Option<std::rc::Rc<str>>,
+    },
     /// An `<img>` — the browser fetches, decodes and paints it. The
     /// record carries the IDENTITY; the shell's registry maps it to a
     /// URL the browser can load.
@@ -474,6 +480,7 @@ impl DomCapture {
             DomKind::Canvas {
                 origin: (frame.origin.x, frame.origin.y),
                 display: (start, start),
+                path: None,
             },
             frame,
             frame.origin,
@@ -524,6 +531,9 @@ pub struct DomLayout {
     pub grow: bool,
     /// A virtual row's absolute offset inside its content box, px.
     pub slot_y: Option<f64>,
+    /// The child follows its container's cross size — `align-self:
+    /// stretch`, and no pinned size on the stretched axis.
+    pub stretch: bool,
 }
 
 /// Element hints only the Dom consumes — a real tag, a class, an id.
@@ -853,6 +863,22 @@ impl DomLowering {
             .collect()
     }
 
+    /// The island path behind a canvas element id — the glue's
+    /// resize observer reports by id, the runtime keys the box by
+    /// the island's path.
+    pub fn island_path(&self, id: u32) -> Option<std::rc::Rc<str>> {
+        fn walk(retained: &Retained, id: u32) -> Option<std::rc::Rc<str>> {
+            if retained.id == id {
+                return match &retained.node.kind {
+                    DomKind::Canvas { path, .. } => path.clone(),
+                    _ => None,
+                };
+            }
+            retained.children.iter().find_map(|child| walk(child, id))
+        }
+        self.root.as_ref().and_then(|root| walk(root, id))
+    }
+
     /// The scroll region path an element id belongs to — the glue's
     /// scroll observer reports by id, the runtime scrolls by path.
     pub fn scroll_path(&self, id: u32) -> Option<String> {
@@ -900,7 +926,7 @@ fn create_kind(kind: &DomKind) -> CreateKind {
 /// The island's slice of the pass's display list, moved to island-
 /// local coordinates (the raster surface starts at zero).
 fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
-    let DomKind::Canvas { origin, display } = &node.kind else {
+    let DomKind::Canvas { origin, display, .. } = &node.kind else {
         return Vec::new();
     };
     let slice = ctx
@@ -1469,7 +1495,7 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 ///
 /// A test pins the glue to this number: bump one side alone and the
 /// suite goes red before the browser ever gets the chance to.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -1531,7 +1557,8 @@ pub const ABI_VERSION: u32 = 2;
 ///                   2 end, 3 baseline),  2 padding f32 x4 (t r b l),
 ///                   3 width f32,  4 height f32,  5 max width f32,
 ///                   6 max height f32,  7 grow (flag, no payload),
-///                   8 slot y f32 (a virtual row's offset)
+///                   8 slot y f32 (a virtual row's offset),
+///                   9 stretch (flag, no payload)
 ///  12 move          u32 parent, u32 before (0 = to the end)
 ///  13 reveal        u32 target — the container scrolls it into view
 /// ```
@@ -1698,6 +1725,9 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 }
                 if layout.slot_y.is_some() {
                     mask |= 1 << 8;
+                }
+                if layout.stretch {
+                    mask |= 1 << 9;
                 }
                 push_u16(&mut out, mask);
                 if let Some(gap) = layout.gap {
@@ -2387,6 +2417,11 @@ mod tests {
 
         let islands = runtime.dom_islands(1);
         assert_eq!(islands.len(), 1);
+        assert_eq!(
+            (islands[0].width, islands[0].height),
+            (20, 10),
+            "the pixels match the island's box"
+        );
         assert!(
             islands[0].rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
             "the island has ink"
@@ -2406,6 +2441,128 @@ mod tests {
             "no structure churn on a redraw: {patches:?}"
         );
         assert_eq!(runtime.dom_islands(1).len(), 1, "fresh pixels follow the state");
+    }
+
+    /// A FLEXIBLE island guesses at mount, then the browser reports
+    /// the box it really gave the element — the island re-measures
+    /// against that box and the pixels agree with the element. The
+    /// observer's echo of what the engine already said buys nothing.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn a_flexible_island_takes_the_browsers_box() {
+        #[derive(Clone)]
+        struct WithFlexIsland;
+
+        impl Component for WithFlexIsland {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("above the island"),
+                    spacer()
+                        .background_color(Color::hex(0x3B82F6))
+                        .rendering(Rendering::Gpu)
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 120.0, height: 80.0 };
+        let mount = runtime.dom_frame(&WithFlexIsland, size);
+        let canvas_id = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Canvas, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the island mounted");
+        let _ = runtime.dom_islands(1);
+
+        // the browser gave the flexible element ITS box
+        assert!(
+            runtime.dom_island_box(canvas_id, 300.0, 40.0),
+            "a fresh box is news"
+        );
+        let patches = runtime.dom_frame(&WithFlexIsland, size);
+        assert!(
+            patches
+                .iter()
+                .all(|patch| !matches!(patch, DomPatch::Create { .. } | DomPatch::Remove { .. })),
+            "the element already belongs to the browser — only pixels move: {patches:?}"
+        );
+        let islands = runtime.dom_islands(1);
+        assert_eq!(islands.len(), 1, "fresh pixels at the reported size");
+        assert_eq!((islands[0].width, islands[0].height), (300, 40));
+
+        // the observer echoes what the engine now says — no frame
+        assert!(
+            !runtime.dom_island_box(canvas_id, 300.0, 40.0),
+            "an echo is not news"
+        );
+    }
+
+    /// The Scratch pattern: a custom element whose measure EATS the
+    /// width proposal. The island discovers that axis by probing two
+    /// proposals, leaves it to the browser (`align-self: stretch`, no
+    /// pinned width), and re-measures against the box the observer
+    /// reports — the pixels and the element converge in one round.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn a_hungry_island_stretches_and_takes_the_reported_box() {
+        struct EatsWidth;
+
+        impl crate::custom::CustomElement for EatsWidth {
+            fn name(&self) -> &str {
+                "eats-width"
+            }
+            fn measure(
+                &self,
+                proposal: crate::layout::Proposal,
+                _metrics: &crate::custom::Metrics,
+            ) -> Size {
+                Size { width: proposal.width.unwrap_or(24.0), height: 30.0 }
+            }
+            fn paint(&self, ctx: &crate::custom::PaintCtx, painter: &mut crate::custom::Painter) {
+                painter.fill(ctx.bounds(), Color::hex(0x3B82F6));
+            }
+        }
+
+        #[derive(Clone)]
+        struct WithHungryIsland;
+
+        impl Component for WithHungryIsland {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(text("above"), crate::custom::custom(EatsWidth))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 240.0, height: 120.0 };
+        let mount = runtime.dom_frame(&WithHungryIsland, size);
+        let canvas_id = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Canvas, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the island mounted");
+        let stretched = mount.iter().any(|patch| {
+            matches!(
+                patch,
+                DomPatch::SetLayout { id, layout }
+                    if *id == canvas_id
+                        && layout.stretch
+                        && layout.width.is_none()
+                        && layout.height == Some(30.0)
+            )
+        });
+        assert!(stretched, "width is the browser's, height is pinned: {mount:?}");
+        let _ = runtime.dom_islands(1);
+
+        // the browser stretched the element and the observer reported
+        assert!(runtime.dom_island_box(canvas_id, 500.0, 30.0));
+        let _ = runtime.dom_frame(&WithHungryIsland, size);
+        let islands = runtime.dom_islands(1);
+        assert_eq!(islands.len(), 1);
+        assert_eq!((islands[0].width, islands[0].height), (500, 30));
     }
 
     #[test]

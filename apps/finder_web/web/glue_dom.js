@@ -18,7 +18,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 2;
+const EXPECTED_ABI = 3;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -73,6 +73,17 @@ const viewportObserver = new ResizeObserver((entries) => {
     const id = Number(entry.target.dataset.n);
     const box = entry.contentRect;
     wasm.bunny_dom_viewport(id, box.width, box.height);
+  }
+});
+
+// Canvas island boxes, reported as they resize — a flexible island
+// re-measures against the box the browser really gave it.
+const islandObserver = new ResizeObserver((entries) => {
+  if (!wasm || !wasm.bunny_dom_box) return;
+  for (const entry of entries) {
+    const id = Number(entry.target.dataset.n);
+    const box = entry.contentRect;
+    wasm.bunny_dom_box(id, box.width, box.height);
   }
 });
 
@@ -345,6 +356,9 @@ function applyPatches(view, length) {
       if (domId) el.id = domId;
       if (kind === 4) {
         wireScroll(el, id);
+      }
+      if (kind === 6) {
+        islandObserver.observe(el);
       }
       const home = elements.get(parent);
       if (home) {
@@ -640,6 +654,7 @@ function applyPatches(view, length) {
         style.left = "";
         style.right = "";
         style.transform = "";
+        style.alignSelf = "";
       }
       const apply = el ? el.style : null;
       if (mask & 1) {
@@ -689,6 +704,11 @@ function applyPatches(view, length) {
           apply.left = "0";
           apply.right = "0";
         }
+      }
+      if (mask & 512 && apply) {
+        // the axis the child left to its container — a flexible
+        // island discovers its real box this way
+        apply.alignSelf = "stretch";
       }
     } else if (op === 12) {
       // one insertBefore, identity intact (0 = to the end)
@@ -979,6 +999,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         elements.set(id, el);
         if (el.tagName === "INPUT") wireInput(el);
         if (el.style.overflow === "auto") wireScroll(el, id);
+        if (el.tagName === "CANVAS") islandObserver.observe(el);
       }
     }
     // the boot bill: fetch+instantiate, then the first frame inside

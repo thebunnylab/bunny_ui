@@ -138,6 +138,7 @@ enum Event {
     /// and the engine mirrors the offset (the dual ownership).
     DomScroll { id: u32, x: f64, y: f64 },
     DomViewport { id: u32, width: f64, height: f64 },
+    DomBox { id: u32, width: f64, height: f64 },
     Action { path: String },
     /// Dom mode: the browser's input edited — value + selectionStart.
     Field { path: String, value: String, caret: usize },
@@ -275,6 +276,7 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
             // Dom-mode traffic — this shell rasterizes, nothing to do
             Event::DomScroll { .. }
             | Event::DomViewport { .. }
+            | Event::DomBox { .. }
             | Event::Action { .. }
             | Event::Field { .. } => {}
         }
@@ -366,6 +368,13 @@ fn start_dom_with(
             Event::DomViewport { id, width, height } => {
                 // stored for the next window math — no frame of its own
                 runtime.set_dom_viewport(id, width, height);
+            }
+            Event::DomBox { id, width, height } => {
+                // a flexible island's real box — news re-measures the
+                // island against it; an echo costs nothing
+                if runtime.dom_island_box(id, width, height) {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
             }
             Event::Action { path } => {
                 // the browser resolved the press; the engine runs the
@@ -524,6 +533,13 @@ pub extern "C" fn bunny_action(pointer: *mut u8, len: usize) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_dom_viewport(id: u32, width: f64, height: f64) {
     dispatch(Event::DomViewport { id, width, height });
+}
+
+/// Dom mode: a canvas island's resize observer fired — the box the
+/// browser really gave the element.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_dom_box(id: u32, width: f64, height: f64) {
+    dispatch(Event::DomBox { id, width, height });
 }
 
 /// The wire contract this binary encodes. The glue reads it before it

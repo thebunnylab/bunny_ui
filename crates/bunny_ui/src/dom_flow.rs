@@ -39,6 +39,10 @@ pub(crate) struct FlowEnv<'a> {
     /// The Groups the retained scene actually holds — a promise the
     /// diff cannot match would mount a hole, so the walk checks first.
     pub retained_groups: &'a std::collections::HashSet<std::rc::Rc<str>>,
+    /// Browser-reported boxes by island path — a FLEXIBLE island
+    /// measures against its real box, not against a guess.
+    #[cfg_attr(not(feature = "canvas"), allow(dead_code))]
+    pub island_boxes: &'a HashMap<std::rc::Rc<str>, (f64, f64)>,
 }
 
 /// What the walk hands back beside the scene.
@@ -226,6 +230,7 @@ impl Walk<'_> {
                 container.layout.as_mut().expect("flow node").padding =
                     Some((top, trailing, bottom, leading));
                 container.children = lowered;
+                Self::inherit_stretch(&mut container);
                 out.push(container);
             }
             LayoutNode::Frame { width, height, child } => {
@@ -551,12 +556,12 @@ impl Walk<'_> {
                 out.push(node(DomKind::Box));
             }
             #[cfg(feature = "canvas")]
-            LayoutNode::Island { child } => {
-                out.push(self.island(child));
+            LayoutNode::Island { path, child } => {
+                out.push(self.island(child, path.as_deref()));
             }
             #[cfg(feature = "canvas")]
-            LayoutNode::Custom { .. } => {
-                out.push(self.island(tree));
+            LayoutNode::Custom { path, .. } => {
+                out.push(self.island(tree, Some(path.as_str())));
             }
             // without the canvas feature the claiming APIs are gone,
             // so these arms are unreachable by construction — an
@@ -589,6 +594,21 @@ impl Walk<'_> {
                 // whole subtree, not a marker
                 self.lower_into(overlay, &mut popover.children);
                 self.overlays.push(popover);
+            }
+        }
+    }
+
+    /// A hungry interior keeps its hunger through a pure wrapper —
+    /// the stretch has to reach the flex line that can actually feed
+    /// it, or the wrapper sizes to its content and starves the child.
+    fn inherit_stretch(container: &mut DomNode) {
+        if container
+            .children
+            .iter()
+            .any(|child| child.layout.as_ref().is_some_and(|layout| layout.stretch))
+        {
+            if let Some(layout) = container.layout.as_mut() {
+                layout.stretch = true;
             }
         }
     }
@@ -633,15 +653,63 @@ impl Walk<'_> {
     }
 
     /// A canvas island: the engine measures and paints ITS OWN pixels,
+
     /// locally — the subtree places at its own origin, so the commands
     /// are island-local by construction and the element gets a fixed
     /// box the browser never argues with.
-    fn island(&mut self, subtree: &LayoutNode) -> DomNode {
+    fn island(&mut self, subtree: &LayoutNode, path: Option<&str>) -> DomNode {
+        let path: Option<std::rc::Rc<str>> = path.map(std::rc::Rc::from);
         let Some(env) = self.env.layout else {
-            return node(DomKind::Canvas { origin: (0.0, 0.0), display: (0, 0) });
+            return node(DomKind::Canvas { origin: (0.0, 0.0), display: (0, 0), path });
         };
-        let proposal = crate::layout::Proposal { width: self.slot.0, height: self.slot.1 };
-        let (size, fit) = subtree.measure(proposal, env);
+        // a flexible axis belongs to the browser: once it reported a
+        // box, the island measures against THAT — the pixels and the
+        // element agree after one round trip
+        let reported = path
+            .as_deref()
+            .and_then(|island| self.env.island_boxes.get(island))
+            .copied();
+        let flexible = (
+            subtree.is_flexible(Axis::Horizontal),
+            subtree.is_flexible(Axis::Vertical),
+        );
+        let proposal = crate::layout::Proposal {
+            width: match (flexible.0, reported) {
+                (true, Some((w, _))) => Some(w),
+                _ => self.slot.0,
+            },
+            height: match (flexible.1, reported) {
+                (true, Some((_, h))) => Some(h),
+                _ => self.slot.1,
+            },
+        };
+        let (measured, fit) = subtree.measure(proposal, env);
+        // which axes FOLLOW the proposal? offer a different box and
+        // watch what moves — a moved axis belongs to the browser:
+        // `align-self: stretch`, no pinned size, and every resize
+        // comes back through the observer
+        let shifted = crate::layout::Proposal {
+            width: Some(proposal.width.unwrap_or(measured.width) + 97.0),
+            height: Some(proposal.height.unwrap_or(measured.height) + 97.0),
+        };
+        let (moved, _) = subtree.measure(shifted, env);
+        let hungry = (
+            (moved.width - measured.width).abs() > 0.5,
+            (moved.height - measured.height).abs() > 0.5,
+        );
+        // a flexible subtree measures NATURAL even against an exact
+        // proposal — granting the slack is its container's job. The
+        // browser is that container here: the reported box wins.
+        let size = crate::layout::Size {
+            width: match (flexible.0, reported) {
+                (true, Some((w, _))) => w,
+                _ => measured.width,
+            },
+            height: match (flexible.1, reported) {
+                (true, Some((_, h))) => h,
+                _ => measured.height,
+            },
+        };
         let start = self.display.len();
         let mut placement = crate::layout::Placement::with_ink(self.current_ink());
         subtree.place(
@@ -654,12 +722,18 @@ impl Walk<'_> {
         let mut island = node(DomKind::Canvas {
             origin: (0.0, 0.0),
             display: (start, self.display.len()),
+            path,
         });
         {
             let layout = island.layout.as_mut().expect("flow node");
-            layout.width = Some(size.width);
-            layout.height = Some(size.height);
+            layout.width = (!hungry.0).then_some(size.width);
+            layout.height = (!hungry.1).then_some(size.height);
+            layout.stretch = hungry.0 || hungry.1;
         }
+        // the node's own box feeds the raster — the flow diff never
+        // reads it, but the island ledger sizes the pixels by it
+        island.width = size.width;
+        island.height = size.height;
         island
     }
 }
@@ -683,6 +757,7 @@ mod tests {
                 // tests never reuse: an empty retained set
                 Box::leak(Box::new(std::collections::HashSet::new()))
             },
+            island_boxes: Box::leak(Box::new(HashMap::default())),
         }
     }
 
