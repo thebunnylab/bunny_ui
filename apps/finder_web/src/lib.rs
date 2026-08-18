@@ -212,7 +212,10 @@ impl Component for Finder {
                     }
                 },
             )
-            .reveal(selected_index),
+            .reveal(selected_index)
+            // the flow page owns layout in the browser, so the row
+            // extent is DECLARED — the one number the window math needs
+            .row_height(29.0),
         )
         .alignment(HorizontalAlignment::Leading)
         .padding_edge(Edge::Bottom, 10.0)

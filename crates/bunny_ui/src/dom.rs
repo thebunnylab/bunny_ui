@@ -53,7 +53,14 @@ pub enum DomKind {
     /// A native `<input>` — the browser owns the editing.
     Field(DomField),
     /// A scroll viewport; `offset` is ours, the element mirrors it.
-    Scroll { path: Option<String>, offset: (Px, Px) },
+    Scroll {
+        path: Option<String>,
+        offset: (Px, Px),
+        /// The item id the region follows (`.scroll_target`/.reveal) —
+        /// the DIFF turns a CHANGE here into a Reveal (dense) or a
+        /// SetScroll at the row's slot (virtual).
+        target: Option<String>,
+    },
     /// The sized content inside a scroll — the extent the browser
     /// scrolls through (a virtual list sizes it to ALL rows).
     Content,
@@ -685,6 +692,25 @@ impl DomLowering {
         patches
     }
 
+    /// The browser reported a scroll: fold the offset into the
+    /// retained scene so the NEXT diff sees its own echo and stays
+    /// silent — the browser already moved, patching it back would
+    /// fight the wheel.
+    pub(crate) fn note_scroll(&mut self, id: u32, x: Px, y: Px) {
+        fn walk(retained: &mut Retained, id: u32, x: Px, y: Px) -> bool {
+            if retained.id == id {
+                if let DomKind::Scroll { offset, .. } = &mut retained.node.kind {
+                    *offset = (x, y);
+                }
+                return true;
+            }
+            retained.children.iter_mut().any(|child| walk(child, id, x, y))
+        }
+        if let Some(root) = self.root.as_mut() {
+            walk(root, id, x, y);
+        }
+    }
+
     /// Does the retained scene hold any canvas island? The runtime
     /// skips display-list collection when none is alive.
     pub(crate) fn has_islands(&self) -> bool {
@@ -1060,6 +1086,27 @@ fn diff_children_ordered(
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
+    // the ALIGNED fast path: same length, every child matching its
+    // old position (groups by path, the rest by kind) — the shape of
+    // almost every frame. One plain loop, zero allocation; the keyed
+    // machinery below only runs when something actually reordered,
+    // mounted or left.
+    let aligned = retained.children.len() == new.children.len()
+        && retained.children.iter().zip(&new.children).all(|(old, child)| {
+            match (&old.node.kind, &child.kind) {
+                (DomKind::Group { path: was }, DomKind::Group { path: now }) => was == now,
+                (old_kind, new_kind) => {
+                    std::mem::discriminant(old_kind) == std::mem::discriminant(new_kind)
+                }
+            }
+        });
+    if aligned {
+        for (old, child) in retained.children.iter_mut().zip(&new.children) {
+            diff_node(old, child, ctx, patches);
+        }
+        return;
+    }
+
     enum Plan<'a> {
         Survivor { old_position: usize, node: Retained },
         Fresh(&'a DomNode),
@@ -1834,25 +1881,38 @@ mod tests {
         view.gap.set(12.0);
         let patches = runtime.dom_frame(&view, size);
 
+        // under the flow the browser reflows: the padded node re-
+        // records its ONE layout, and the component beside it hears
+        // NOTHING — not even a transform
         let on_inner: Vec<_> =
             patches.iter().filter(|patch| patch_id(patch) >= inner_group).collect();
-        assert_eq!(on_inner.len(), 1, "the moved component: {patches:?}");
-        assert!(
-            matches!(on_inner[0], DomPatch::SetTransform { id, .. } if *id == inner_group),
-            "one transform on the boundary, interior byte-identical: {patches:?}"
-        );
+        assert!(on_inner.is_empty(), "the sibling never hears a padding: {patches:?}");
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        assert!(matches!(
+            &patches[0],
+            DomPatch::SetLayout { layout, .. } if layout.padding == Some((12.0, 12.0, 12.0, 12.0))
+        ));
     }
 
+    /// The browser owns the wheel in this mode: a scroll it reported
+    /// folds into the retained scene BEFORE the next diff, so the
+    /// frame meets its own echo and says nothing back.
     #[test]
-    fn a_wheel_is_one_scroll_patch() {
+    fn a_browser_scroll_echoes_to_silence() {
         let (runtime, view, size) = mini();
         view.count.set(30);
-        let _ = runtime.dom_frame(&view, size);
+        let mount = runtime.dom_frame(&view, size);
+        let scroll_id = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Scroll, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("a scroll region mounted");
 
-        assert!(runtime.wheel(100.0, 80.0, 0.0, -40.0), "the region moved");
+        runtime.dom_scrolled(scroll_id, 0.0, 40.0);
         let patches = runtime.dom_frame(&view, size);
-        assert_eq!(patches.len(), 1, "content never moves — the offset does: {patches:?}");
-        assert!(matches!(patches[0], DomPatch::SetScroll { .. }));
+        assert!(patches.is_empty(), "the echo stays silent: {patches:?}");
     }
 
     #[test]
@@ -1862,17 +1922,27 @@ mod tests {
 
         impl Component for Big {
             fn body(self, _ctx: &Context) -> impl View {
+                // the flow's one requirement: the app DECLARES the row
+                // extent (the browser owns layout; nothing measures)
                 virtual_list(10_000, |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
                 })
+                .row_height(20.0)
             }
         }
 
         let runtime = Runtime::new();
         let size = Size { width: 200.0, height: 150.0 };
-        let _ = runtime.dom_frame(&Big, size);
+        let mount = runtime.dom_frame(&Big, size);
+        let scroll_id = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Scroll, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the region mounted");
 
-        assert!(runtime.wheel(100.0, 80.0, 0.0, -50_000.0));
+        runtime.dom_scrolled(scroll_id, 0.0, 50_000.0);
         let patches = runtime.dom_frame(&Big, size);
 
         let created: Vec<u32> = patches
@@ -1889,10 +1959,16 @@ mod tests {
         // a slid window never drags an existing element around (the only
         // transforms dress the freshly created ones)
         let moved_survivor = patches.iter().any(|patch| {
-            matches!(patch, DomPatch::SetTransform { id, .. } if !created.contains(id))
+            matches!(patch, DomPatch::SetTransform { id, .. } | DomPatch::Move { id, .. }
+                if !created.contains(id))
         });
         assert!(!moved_survivor, "nothing moves in content coordinates: {patches:?}");
-        assert!(patches.iter().any(|p| matches!(p, DomPatch::SetScroll { .. })));
+        // the offset was the BROWSER's news — echoing it back would
+        // fight the wheel
+        assert!(
+            !patches.iter().any(|p| matches!(p, DomPatch::SetScroll { .. })),
+            "the reported offset never echoes: {patches:?}"
+        );
     }
 
     #[test]
@@ -2215,8 +2291,13 @@ mod tests {
         assert!(!patches.is_empty());
         for patch in &patches {
             assert!(
-                matches!(patch, DomPatch::SetSize { .. } | DomPatch::SetTransform { .. }),
-                "a resize is geometry only: {patch:?}"
+                matches!(
+                    patch,
+                    DomPatch::SetSize { .. }
+                        | DomPatch::SetTransform { .. }
+                        | DomPatch::SetLayout { .. }
+                ),
+                "a resize is geometry records only — the image never re-travels: {patch:?}"
             );
         }
     }
@@ -2252,16 +2333,23 @@ mod tests {
 
         view.image_on.set(false);
         let patches = runtime.dom_frame(&view, size);
+        // the swapped subtree leaves whole (one remove on its root
+        // covers the image inside) and the replacement mounts fresh —
+        // nothing ever mutates the old element in place
         assert!(
-            patches.iter().any(|patch| matches!(
-                patch,
-                DomPatch::Remove { id } if *id == image_id
-            )),
-            "a kind change never mutates in place: {patches:?}"
+            patches.iter().any(|patch| matches!(patch, DomPatch::Remove { .. })),
+            "the old subtree leaves: {patches:?}"
         );
         assert!(patches
             .iter()
             .any(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Box, .. })));
+        assert!(
+            !patches.iter().any(|patch| matches!(
+                patch,
+                DomPatch::SetImage { id, .. } if *id == image_id
+            )),
+            "the image element is never retargeted into something else: {patches:?}"
+        );
     }
 
     #[derive(Clone)]

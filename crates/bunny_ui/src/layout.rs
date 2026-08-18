@@ -865,6 +865,10 @@ impl DisplayList {
         self.commands.push(command);
     }
 
+    pub(crate) fn extend(&mut self, other: DisplayList) {
+        self.commands.extend(other.commands);
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &DrawCommand> {
         self.commands.iter()
     }
@@ -1072,6 +1076,12 @@ pub struct Placement {
 }
 
 impl Placement {
+    /// A placement seeded with an inherited ink — an island placed
+    /// LOCALLY still paints with the foreground its subtree sits in.
+    pub(crate) fn with_ink(ink: Color) -> Placement {
+        Placement { foreground: vec![ink], ..Placement::default() }
+    }
+
     /// A draw command joins the display list — unless this pass skips
     /// collection (a Dom frame with no live island: nothing consumes
     /// the list, so nothing pays for it).
@@ -2428,6 +2438,10 @@ impl LayoutNode {
                         crate::dom::DomKind::Scroll {
                             path: path.clone(),
                             offset: (offset.x, offset.y),
+                            // the ABSOLUTE capture keeps reveal in the
+                            // engine (SetScroll from measured frames) —
+                            // the record stays silent here
+                            target: None,
                         },
                         frame,
                         frame.origin,

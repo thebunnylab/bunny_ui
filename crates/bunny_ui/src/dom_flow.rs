@@ -15,7 +15,7 @@
 //! island's size (the engine measures its own pixels), and one day a
 //! `.layout(Exact)` interior. Everything else speaks records.
 
-use std::collections::HashMap;
+use motor::hash::FxHashMap as HashMap;
 
 use crate::dom::{DomHints, DomKind, DomLayout, DomNode, DomStyle, DomText};
 use crate::layout::{Axis, Color, CrossAlign, Edges, LayoutNode, Point, Px};
@@ -28,11 +28,26 @@ pub(crate) struct FlowEnv<'a> {
     pub scroll_offsets: &'a HashMap<String, Point>,
     /// The window box: the root's width and height.
     pub size: (Px, Px),
+    /// The island door: a canvas island still measures and paints
+    /// through the engine, LOCALLY — the one place a flow frame may
+    /// run measure and place, and only under an island's own root.
+    pub layout: Option<crate::layout::LayoutEnv<'a>>,
+}
+
+/// What the walk hands back beside the scene.
+pub(crate) struct FlowOutput {
+    pub scene: DomNode,
+    /// The islands' draw commands — every island's range indexes here,
+    /// already in island-local coordinates (each subtree placed at its
+    /// own origin).
+    pub display: crate::layout::DisplayList,
+    /// The fields on stage: `(path, wants the first focus)`.
+    pub fields: Vec<(String, bool)>,
 }
 
 /// Lowers the semantic tree to a flow scene. The root is the mount
 /// point (id 0): the theme's canvas, the window's box.
-pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> DomNode {
+pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
     let mut walk = Walk {
         env,
         ink: Vec::new(),
@@ -41,6 +56,9 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> DomNode {
         pending_interactive: None,
         pending_transition: None,
         overlays: Vec::new(),
+        display: crate::layout::DisplayList::default(),
+        fields: Vec::new(),
+        slot: (None, None),
     };
     let mut children = Vec::new();
     walk.lower_into(root, &mut children);
@@ -48,7 +66,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> DomNode {
     // construction, same contract as the absolute capture
     let overlays = std::mem::take(&mut walk.overlays);
     children.extend(overlays);
-    DomNode {
+    let scene = DomNode {
         kind: DomKind::Root,
         x: 0.0,
         y: 0.0,
@@ -58,10 +76,13 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> DomNode {
             background: Some(crate::theme::current().canvas),
             ..DomStyle::default()
         },
-        layout: Some(DomLayout::default()),
+        // the root is the one ABSOLUTE citizen of a flow scene: the
+        // window's box is real geometry, and a resize is its SetSize
+        layout: None,
         hints: DomHints::default(),
         children,
-    }
+    };
+    FlowOutput { scene, display: walk.display, fields: walk.fields }
 }
 
 struct Walk<'a> {
@@ -76,6 +97,12 @@ struct Walk<'a> {
     pending_interactive: Option<String>,
     pending_transition: Option<(f64, f64)>,
     overlays: Vec<DomNode>,
+    display: crate::layout::DisplayList,
+    fields: Vec<(String, bool)>,
+    /// The nearest ancestor Frame's declared box — the proposal an
+    /// island under it measures against (a flexible island learns its
+    /// real box from the browser, in the island round).
+    slot: (Option<Px>, Option<Px>),
 }
 
 /// A flow node with nothing to say yet.
@@ -155,6 +182,8 @@ impl Walk<'_> {
                 out.push(container);
             }
             LayoutNode::Frame { width, height, child } => {
+                let outer_slot = self.slot;
+                self.slot = (*width, *height);
                 let mut container = node(DomKind::FlexColumn);
                 {
                     let layout = container.layout.as_mut().expect("flow node");
@@ -167,6 +196,7 @@ impl Walk<'_> {
                     layout.align = Some(align_code(CrossAlign::Center));
                 }
                 self.lower_into(child, &mut container.children);
+                self.slot = outer_slot;
                 out.push(container);
             }
             LayoutNode::MaxFrame { max_width, max_height, align, child } => {
@@ -251,7 +281,8 @@ impl Walk<'_> {
                 text.style.interactive = self.pending_interactive.take();
                 out.push(text);
             }
-            LayoutNode::Field { path, content, placeholder, .. } => {
+            LayoutNode::Field { path, content, placeholder, auto_focus } => {
+                self.fields.push((path.clone(), *auto_focus));
                 let theme = crate::theme::current();
                 let mut field = node(DomKind::Field(crate::dom::DomField {
                     path: path.clone(),
@@ -294,7 +325,7 @@ impl Walk<'_> {
                     inherits_ink: !self.ink_scopes.is_empty(),
                 })));
             }
-            LayoutNode::Scroll { path, child, .. } => {
+            LayoutNode::Scroll { path, target, child } => {
                 let offset = self
                     .env
                     .scroll_offsets
@@ -304,6 +335,7 @@ impl Walk<'_> {
                 let mut scroll = node(DomKind::Scroll {
                     path: path.clone(),
                     offset: (offset.x, offset.y),
+                    target: target.clone(),
                 });
                 scroll.layout.as_mut().expect("flow node").grow = true;
                 let mut content = node(DomKind::Content);
@@ -402,10 +434,11 @@ impl Walk<'_> {
                 // a window drag region means nothing in a browser tab
                 self.lower_into(child, out);
             }
-            LayoutNode::Island { .. } | LayoutNode::Custom { .. } => {
-                // the island round gives these their local measure —
-                // until then the canvas mounts empty and sizeless
-                out.push(node(DomKind::Canvas { origin: (0.0, 0.0), display: (0, 0) }));
+            LayoutNode::Island { child } => {
+                out.push(self.island(child));
+            }
+            LayoutNode::Custom { .. } => {
+                out.push(self.island(tree));
             }
             LayoutNode::Anchored { path, child, .. } => {
                 self.lower_into(child, out);
@@ -417,13 +450,46 @@ impl Walk<'_> {
     }
 }
 
+impl Walk<'_> {
+    /// A canvas island: the engine measures and paints ITS OWN pixels,
+    /// locally — the subtree places at its own origin, so the commands
+    /// are island-local by construction and the element gets a fixed
+    /// box the browser never argues with.
+    fn island(&mut self, subtree: &LayoutNode) -> DomNode {
+        let Some(env) = self.env.layout else {
+            return node(DomKind::Canvas { origin: (0.0, 0.0), display: (0, 0) });
+        };
+        let proposal = crate::layout::Proposal { width: self.slot.0, height: self.slot.1 };
+        let (size, fit) = subtree.measure(proposal, env);
+        let start = self.display.len();
+        let mut placement = crate::layout::Placement::with_ink(self.current_ink());
+        subtree.place(
+            crate::layout::Rect { origin: Point::default(), size },
+            fit,
+            env,
+            &mut placement,
+        );
+        self.display.extend(placement.display);
+        let mut island = node(DomKind::Canvas {
+            origin: (0.0, 0.0),
+            display: (start, self.display.len()),
+        });
+        {
+            let layout = island.layout.as_mut().expect("flow node");
+            layout.width = Some(size.width);
+            layout.height = Some(size.height);
+        }
+        island
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
 
     fn env_fixture(offsets: &HashMap<String, Point>) -> FlowEnv<'_> {
-        FlowEnv { scroll_offsets: offsets, size: (400.0, 300.0) }
+        FlowEnv { scroll_offsets: offsets, size: (400.0, 300.0), layout: None }
     }
 
     fn text_node(content: &str) -> LayoutNode {
@@ -444,8 +510,8 @@ mod tests {
             align: CrossAlign::Start,
             children: vec![text_node("head"), LayoutNode::Spacer, text_node("foot")],
         };
-        let offsets = HashMap::new();
-        let scene = lower(&tree, &env_fixture(&offsets));
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
         let column = &scene.children[0];
         assert!(matches!(column.kind, DomKind::FlexColumn));
         let layout = column.layout.as_ref().expect("flow");
@@ -480,8 +546,8 @@ mod tests {
                 },
             ],
         };
-        let offsets = HashMap::new();
-        let scene = lower(&tree, &env_fixture(&offsets));
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
         fn walk(node: &DomNode) {
             assert!(node.layout.is_some(), "every flow node speaks records");
             assert_eq!((node.x, node.y, node.width, node.height).1, 0.0);
@@ -515,8 +581,8 @@ mod tests {
             ],
             heights: None,
         };
-        let offsets = HashMap::new();
-        let scene = lower(&tree, &env_fixture(&offsets));
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
         let content = &scene.children[0];
         assert!(matches!(content.kind, DomKind::Content));
         assert_eq!(
@@ -543,8 +609,8 @@ mod tests {
             props: Box::new(props),
             child: Box::new(text_node("flip me")),
         };
-        let offsets = HashMap::new();
-        let scene = lower(&tree, &env_fixture(&offsets));
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
         let boxed = &scene.children[0];
         assert_eq!(boxed.style.color, Some(Color::hex(0x888888)));
         let DomKind::Text(text) = &boxed.children[0].kind else {
@@ -567,8 +633,8 @@ mod tests {
                 child: Box::new(text_node("the row")),
             }],
         };
-        let offsets = HashMap::new();
-        let scene = lower(&tree, &env_fixture(&offsets));
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
         let last = scene.children.last().expect("the portal");
         assert!(matches!(&last.kind, DomKind::Popover { path } if path == "app/[row]"));
     }

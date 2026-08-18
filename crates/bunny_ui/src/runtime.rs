@@ -76,6 +76,10 @@ pub struct Runtime {
     /// by region SITES, never by rows. The other input maps (carets,
     /// targets, auto-focus) release on the sweep.
     scroll_offsets: RefCell<HashMap<String, Point>>,
+    /// Scroll viewports the BROWSER reported (`bunny_dom_viewport`,
+    /// from a ResizeObserver) — the flow frame's window math reads
+    /// them; the pixel targets never fill them.
+    dom_viewports: RefCell<HashMap<String, (f64, f64)>>,
     /// The scroll regions of the last layout — the wheel map.
     last_scrolls: RefCell<Vec<ScrollRegion>>,
     /// The focused field (identity path) — owner of the keyboard.
@@ -256,6 +260,7 @@ impl Runtime {
             images: Rc::new(RawImages::default()),
             cache: MeasureCache::default(),
             scroll_offsets: RefCell::new(HashMap::default()),
+            dom_viewports: RefCell::new(HashMap::default()),
             last_scrolls: RefCell::new(Vec::new()),
             focus: RefCell::new(None),
             carets: RefCell::new(HashMap::default()),
@@ -302,8 +307,30 @@ impl Runtime {
         {
             let offsets = self.scroll_offsets.borrow();
             let applied = self.scroll_targets.borrow();
-            crate::viewport::publish(self.last_scrolls.borrow().iter().filter_map(
-                |region| {
+            let last_scrolls = self.last_scrolls.borrow();
+            if last_scrolls.is_empty() {
+                // the FLOW frame never lays out, so no measured region
+                // exists — the browser's own reports stand in: offset
+                // from the scroll events, viewport from the observer,
+                // extents from the app (the window math's authority)
+                let viewports = self.dom_viewports.borrow();
+                crate::viewport::publish(offsets.keys().map(|path| {
+                    (
+                        path.clone(),
+                        crate::viewport::RegionSnapshot {
+                            offset_y: offsets.get(path).copied().unwrap_or_default().y,
+                            viewport: viewports
+                                .get(path)
+                                .map(|box_| box_.1)
+                                .unwrap_or(self.last_proposal.get().and_then(|p| p.height).unwrap_or(600.0)),
+                            row_extent: 0.0,
+                            offsets: None,
+                            applied: applied.get(path).cloned(),
+                        },
+                    )
+                }));
+            } else {
+                crate::viewport::publish(last_scrolls.iter().filter_map(|region| {
                     let row_extent = region.row_extent?;
                     Some((
                         region.path.clone(),
@@ -319,8 +346,8 @@ impl Runtime {
                             applied: applied.get(&region.path).cloned(),
                         },
                     ))
-                },
-            ));
+                }));
+            }
         }
         // new theme = stale retention (bodies baked old tokens into
         // the scene): rebuild once and continue incremental
@@ -1167,37 +1194,94 @@ impl Runtime {
         root: &impl View,
         size: crate::layout::Size,
     ) -> Vec<crate::dom::DomPatch> {
-        let proposal = crate::layout::Proposal::exact(size);
         self.settle(root);
-        // the display list only feeds canvas islands here — with none
-        // alive, nothing consumes it and nothing pays for it
-        let collect = self.dom.borrow().has_islands();
-        let (mut result, mut scene) = self.layout_once_with(root, proposal, true, collect);
-        // the follow-up loop of `layout`, capture riding: scroll
-        // targets, first auto-focus, window misses, orphaned popovers
-        // — capped, so a broken extent degrades and never hangs
-        for _ in 0..2 {
-            let moved = self.apply_scroll_targets(&result);
-            let focused = self.apply_auto_focus(&result);
-            let missed = if moved {
-                false
-            } else {
-                self.invalidate_window_misses(&result)
-            };
-            let orphaned = self.dismiss_orphaned_overlays(&result);
-            if !moved && !focused && !missed && !orphaned {
-                break;
+        // the tree, stable-root shortcut included — the flow twin of
+        // the pixel path's pass assembly
+        let stable_root = (self.root_is_boundary.get()
+            && crate::theme::version() == self.theme_version.get()
+            && !self.has_pending_dirty())
+        .then(|| self.last_root.borrow().clone())
+        .flatten()
+        .filter(|path| reconciler::is_retained(path));
+        let tree = match stable_root {
+            Some(path) => {
+                reconciler::note_stable_frame();
+                crate::layout::LayoutNode::BoundaryRef { path }
             }
-            (result, scene) = self.layout_once_with(root, proposal, true, collect);
+            None => {
+                let mut nodes = self.frame_pass(root);
+                let mut roots = nodes.take_layout();
+                self.root_is_boundary.set(matches!(
+                    roots.as_slice(),
+                    [crate::layout::LayoutNode::Boundary { .. }]
+                        | [crate::layout::LayoutNode::BoundaryRef { .. }]
+                ));
+                if roots.len() == 1 {
+                    roots.remove(0)
+                } else {
+                    crate::layout::LayoutNode::Stack {
+                        axis: crate::layout::Axis::Vertical,
+                        spacing: 0.0,
+                        align: crate::layout::CrossAlign::Start,
+                        children: roots,
+                    }
+                }
+            }
+        };
+        // the island door: only an island's own subtree may measure
+        // and place, locally — the flow walk itself never does
+        let interaction = self.interaction.borrow().clone();
+        let focus = self.focus.borrow().clone();
+        let carets = self.carets.borrow();
+        let stamp = crate::layout::FrameStamp {
+            interaction: &interaction,
+            focus: focus.as_deref(),
+            carets: &carets,
+            caret_visible: self.caret_visible.get(),
+        };
+        self.cache.begin_frame();
+        self.last_proposal.set(Some(crate::layout::Proposal::exact(size)));
+        let offsets = self.scroll_offsets.borrow();
+        let env = LayoutEnv {
+            text: &*self.text,
+            images: &*self.images,
+            cache: &self.cache,
+            scroll_offsets: &offsets,
+            font: FontSpec::DEFAULT,
+            stamp,
+            animator: Some(&self.animator),
+            anim: None,
+            overlay_bounds: self.overlay_bounds.get(),
+        };
+        let flow = crate::dom_flow::FlowEnv {
+            scroll_offsets: &*offsets,
+            size: (size.width, size.height),
+            layout: Some(env),
+        };
+        let output = crate::stats::time(crate::stats::Stage::Capture, || {
+            crate::dom_flow::lower(&tree, &flow)
+        });
+        drop(offsets);
+        drop(carets);
+        // the first field that asks for focus takes it — once
+        for (path, wants) in &output.fields {
+            if *wants
+                && !self.auto_focused.borrow().contains(path)
+            {
+                self.auto_focused.borrow_mut().insert(path.clone());
+                if self.focus.borrow().is_none() {
+                    self.focus(path);
+                }
+            }
         }
-        // an island born this frame needs the commands it slices — the
-        // skipped collection re-runs once, collected: the price of a
-        // birth, never of a steady frame
-        if result.saw_island && !collect {
-            (result, scene) = self.layout_once_with(root, proposal, true, true);
-        }
-        let scene = scene.expect("the capture rode the pass");
-        self.dom.borrow_mut().lower(&scene, &result.display)
+        self.dom.borrow_mut().lower(&output.scene, &output.display)
+    }
+
+    /// A click resolved by the BROWSER: the glue walked up from the
+    /// event target to the nearest `[data-path]` and hands the path
+    /// straight to the action door — no engine hit test, no geometry.
+    pub fn dom_action(&self, path: &str) -> bool {
+        reconciler::run_action(path)
     }
 
     /// The canvas islands whose pixels changed since the last call —
@@ -1240,6 +1324,39 @@ impl Runtime {
     /// scroll observer reports by id, the runtime scrolls by path.
     pub fn dom_scroll_path(&self, id: u32) -> Option<String> {
         self.dom.borrow().scroll_path(id)
+    }
+
+    /// The browser scrolled: the offset lands in the engine AND in
+    /// the retained scene, so the next diff meets its own echo and
+    /// emits nothing — the browser already moved.
+    pub fn dom_scrolled(&self, id: u32, x: f64, y: f64) {
+        let Some(path) = self.dom_scroll_path(id) else {
+            return;
+        };
+        self.set_scroll_offset(&path, crate::layout::Point { x, y });
+        self.dom.borrow_mut().note_scroll(id, x, y);
+        // the region's body IS the window function here — the fresh
+        // offset re-runs it (nearest retained boundary up the path)
+        let mut probe = path.as_str();
+        loop {
+            if reconciler::is_retained(probe) {
+                motor::identity::invalidate(probe);
+                break;
+            }
+            match probe.rfind('/') {
+                Some(cut) => probe = &probe[..cut],
+                None => break,
+            }
+        }
+    }
+
+    /// The browser reported a scroll element's box (a ResizeObserver
+    /// fired) — the flow frame's window math reads it next pass.
+    pub fn set_dom_viewport(&self, id: u32, width: f64, height: f64) {
+        let Some(path) = self.dom_scroll_path(id) else {
+            return;
+        };
+        self.dom_viewports.borrow_mut().insert(path, (width, height));
     }
 
     /// The text engine of this runtime — the shell pairs it with its

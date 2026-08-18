@@ -54,6 +54,26 @@ function modifiers(event) {
   );
 }
 
+// A click resolved by the BROWSER: the nearest [data-path] above the
+// event target IS the pressed thing — no coordinates cross the border.
+function sendAction(path) {
+  const bytes = new TextEncoder().encode(path);
+  const pointer = wasm.bunny_alloc(bytes.length);
+  new Uint8Array(wasm.memory.buffer, pointer, bytes.length).set(bytes);
+  wasm.bunny_action(pointer, bytes.length);
+}
+
+// Scroll boxes, reported as they resize — the flow frame's window
+// math reads them.
+const viewportObserver = new ResizeObserver((entries) => {
+  if (!wasm) return;
+  for (const entry of entries) {
+    const id = Number(entry.target.dataset.n);
+    const box = entry.contentRect;
+    wasm.bunny_dom_viewport(id, box.width, box.height);
+  }
+});
+
 // Text into the engine: one allocation, owned by the engine after the
 // call (the same door the canvas mode types through).
 function sendText(text) {
@@ -173,13 +193,15 @@ function createElementOf(kind, tag) {
   }
   if (kind === 6) {
     const canvas = document.createElement("canvas");
-    canvas.style.cssText = "position:absolute;left:0;top:0;";
+    // position rides the ops: absolute geometry sets it, flow leaves
+    // the element in the stream
+    canvas.style.cssText = "";
     return canvas;
   }
   if (kind === 7) {
     const img = document.createElement("img");
     // the box underneath owns the clicks; our geometry owns the frame
-    img.style.cssText = "position:absolute;left:0;top:0;pointer-events:none;";
+    img.style.cssText = "pointer-events:none;";
     img.draggable = false;
     return img;
   }
@@ -189,7 +211,7 @@ function createElementOf(kind, tag) {
     // preserveAspectRatio (xMidYMid meet) is the SAME centred square
     // the rasterizers paint
     svg.setAttribute("viewBox", "0 0 24 24");
-    svg.style.cssText = "position:absolute;left:0;top:0;pointer-events:none;";
+    svg.style.cssText = "pointer-events:none;";
     return svg;
   }
   if (kind === 3) {
@@ -199,8 +221,7 @@ function createElementOf(kind, tag) {
     // arrives through the patches — the theme owns the chrome, and no
     // inline border may outrank the stylesheet rule
     input.style.cssText =
-      "position:absolute;left:0;top:0;box-sizing:border-box;" +
-      "padding:5px 8px;outline:none;";
+      "box-sizing:border-box;padding:5px 8px;outline:none;";
     let composing = false;
     input.addEventListener("compositionstart", () => {
       composing = true;
@@ -220,14 +241,20 @@ function createElementOf(kind, tag) {
     return input;
   }
   const el = document.createElement(tag || "div");
-  el.style.cssText = "position:absolute;left:0;top:0;box-sizing:border-box;";
+  el.style.cssText = "box-sizing:border-box;min-width:0;min-height:0;";
   if (kind === 2) {
-    el.style.whiteSpace = "pre";
+    // the browser breaks the lines in this mode — pre-wrap keeps the
+    // engine's explicit newlines and wraps the rest
+    el.style.whiteSpace = "pre-wrap";
     el.style.cursor = "default";
   }
   if (kind === 4) {
     el.style.overflow = "auto";
     el.style.scrollBehavior = "smooth";
+  }
+  if (kind === 5) {
+    // content hosts virtual rows at absolute slots
+    el.style.position = "relative";
   }
   return el;
 }
@@ -276,6 +303,9 @@ function applyPatches(view, length) {
         el.addEventListener("scroll", () => {
           wasm.bunny_dom_scroll(id, el.scrollLeft, el.scrollTop);
         });
+        // the window math reads the region's real box — the browser
+        // owns layout here, so the browser reports it
+        viewportObserver.observe(el);
       }
       const home = elements.get(parent);
       const anchor = before ? elements.get(before) : null;
@@ -299,7 +329,13 @@ function applyPatches(view, length) {
       const el = elements.get(id);
       const x = f32();
       const y = f32();
-      if (el) el.style.transform = `translate(${x}px, ${y}px)`;
+      if (el) {
+        // absolute geometry: the op declares the regime
+        el.style.position = "absolute";
+        el.style.left = "0";
+        el.style.top = "0";
+        el.style.transform = `translate(${x}px, ${y}px)`;
+      }
     } else if (op === 4) {
       const el = elements.get(id);
       const width = f32();
@@ -552,12 +588,13 @@ function applyPatches(view, length) {
         style.maxWidth = "";
         style.maxHeight = "";
         style.flex = "";
-        style.minWidth = "";
-        style.minHeight = "";
+        style.minWidth = "0";
+        style.minHeight = "0";
         style.position = "";
         style.top = "";
         style.left = "";
         style.right = "";
+        style.transform = "";
       }
       const apply = el ? el.style : null;
       if (mask & 1) {
@@ -810,17 +847,16 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     );
     window.__bunnyBoot.start = performance.now() - startOpened;
 
-    const point = (event) => {
-      const rect = app.getBoundingClientRect();
-      return [event.clientX - rect.left, event.clientY - rect.top];
-    };
-    app.addEventListener("pointerdown", (event) => {
-      const [x, y] = point(event);
-      wasm.bunny_pointer_down(x, y);
-    });
+    // clicks resolve by DELEGATION: the browser already knows what
+    // was pressed — the engine never sees a coordinate in this mode
     app.addEventListener("pointerup", (event) => {
-      const [x, y] = point(event);
-      wasm.bunny_pointer_up(x, y);
+      const target =
+        event.target instanceof Element
+          ? event.target.closest("[data-path]")
+          : null;
+      if (target && target.dataset.path) {
+        sendAction(target.dataset.path);
+      }
     });
     // the browser owns the <input>s in this mode. What still belongs
     // to the engine: Escape (the keymap dismisses the popover) and

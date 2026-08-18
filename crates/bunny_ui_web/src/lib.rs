@@ -136,6 +136,8 @@ enum Event {
     /// Dom mode: the browser's scroll observer — the element scrolled
     /// and the engine mirrors the offset (the dual ownership).
     DomScroll { id: u32, x: f64, y: f64 },
+    DomViewport { id: u32, width: f64, height: f64 },
+    Action { path: String },
     /// Dom mode: the browser's input edited — value + selectionStart.
     Field { path: String, value: String, caret: usize },
 }
@@ -269,7 +271,10 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 present(&runtime, &full, size, scale, &mut surface);
             }
             // Dom-mode traffic — this shell rasterizes, nothing to do
-            Event::DomScroll { .. } | Event::Field { .. } => {}
+            Event::DomScroll { .. }
+            | Event::DomViewport { .. }
+            | Event::Action { .. }
+            | Event::Field { .. } => {}
         }
     });
     SHELL.with(|slot| {
@@ -325,12 +330,21 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
                 present(&runtime, runtime.dom_frame(&root, size), scale);
             }
             Event::DomScroll { id, x, y } => {
-                // the browser moved the element; the engine mirrors the
-                // offset so windows re-materialize and reveals compose
-                if let Some(path) = runtime.dom_scroll_path(id) {
-                    runtime.set_scroll_offset(&path, bunny_ui::layout::Point { x, y });
-                    present(&runtime, runtime.dom_frame(&root, size), scale);
-                }
+                // the browser moved: the offset folds into the engine
+                // AND the retained scene (the diff meets its own echo),
+                // and the region's window body re-runs
+                runtime.dom_scrolled(id, x, y);
+                present(&runtime, runtime.dom_frame(&root, size), scale);
+            }
+            Event::DomViewport { id, width, height } => {
+                // stored for the next window math — no frame of its own
+                runtime.set_dom_viewport(id, width, height);
+            }
+            Event::Action { path } => {
+                // the browser resolved the press; the engine runs the
+                // handler and the frame follows
+                runtime.dom_action(&path);
+                present(&runtime, runtime.dom_frame(&root, size), scale);
             }
             Event::Field { path, value, caret } => {
                 if runtime.sync_field(&path, &value, caret) {
@@ -468,6 +482,21 @@ pub extern "C" fn bunny_image_ready(_key_hi: u32, _key_lo: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_wake() {
     dispatch(Event::Wake);
+}
+
+/// Dom mode: the browser resolved a click to the nearest interactive
+/// path — no coordinates cross the border in this mode.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_action(pointer: *mut u8, len: usize) {
+    let path = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
+    dispatch(Event::Action { path });
+}
+
+/// Dom mode: a scroll box resized (the glue's ResizeObserver) — the
+/// window math reads the real box next frame.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_dom_viewport(id: u32, width: f64, height: f64) {
+    dispatch(Event::DomViewport { id, width, height });
 }
 
 /// The wire contract this binary encodes. The glue reads it before it
