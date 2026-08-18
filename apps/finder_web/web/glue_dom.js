@@ -704,7 +704,11 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
     };
     app.addEventListener("pointerdown", (event) => {
       const [x, y] = point(event);
-      wasm.bunny_pointer_down(x, y, event.detail || 1);
+      // `pointerdown` reports detail 0 — the browser only counts on
+      // `mousedown`, and this door stays on pointer events so touch
+      // and pen keep working. The shell counts, from the event's own
+      // timestamp and the button it came from.
+      wasm.bunny_pointer_down(x, y, event.timeStamp, event.button);
       if (wasm.bunny_drag_armed()) {
         // the browser's own text selection would fight the drag
         app.style.userSelect = "none";

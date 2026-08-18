@@ -252,13 +252,13 @@ impl Component for Finder {
                     // reaches the mark inside, and the mark stays lit
                     // when the pointer finally arrives on it
                     .hover_group()
-                    // first click selects; a second click on the
-                    // selected row opens its details popover
-                    .on_click(move || {
-                        if on {
+                    // one click selects; TWO open the details — the
+                    // count is the platform's, and the row never has to
+                    // hold a clock of its own
+                    .on_click_count(move |clicks| {
+                        selected.set(row);
+                        if clicks >= 2 {
                             details.set(true);
-                        } else {
-                            selected.set(row);
                         }
                     })
                     // the right press offers the row's own menu — the

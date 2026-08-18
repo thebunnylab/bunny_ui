@@ -153,6 +153,34 @@ thread_local! {
     /// Did the last press arm a drag? The element mode's glue reads it
     /// right after a press and opens its pointer-move door only then.
     static DRAG_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The running click count, `(when, x, y, count)`. The browser
+    /// counts on `mousedown` and NOT on `pointerdown` (which reports
+    /// `detail` zero), and the glue listens on `pointerdown` so touch
+    /// and pen keep working — so the shell counts, exactly like the
+    /// Windows one does over its own message stream.
+    static CLICK_STATE: std::cell::Cell<(f64, f64, f64, u8)> =
+        const { std::cell::Cell::new((f64::NEG_INFINITY, 0.0, 0.0, 0)) };
+}
+
+/// How long after a press a second one is still the SAME gesture. The
+/// browser exposes no system preference for it; a half second is what
+/// Win32 defaults to.
+const DOUBLE_CLICK_MS: f64 = 500.0;
+/// How far the pointer may travel and still count as the same spot.
+const CLICK_TRAVEL: f64 = 4.0;
+
+/// The platform's click count, counted here: 1, then 2 on a second
+/// press inside the window and the travel box, then 3. Pure over its
+/// state, so the rule is testable without a browser.
+fn count_click(state: (f64, f64, f64, u8), x: f64, y: f64, now_ms: f64) -> (f64, f64, f64, u8) {
+    let (last, last_x, last_y, count) = state;
+    let near = (x - last_x).abs() <= CLICK_TRAVEL && (y - last_y).abs() <= CLICK_TRAVEL;
+    let clicks = if now_ms - last <= DOUBLE_CLICK_MS && near {
+        count.saturating_add(1)
+    } else {
+        1
+    };
+    (now_ms, x, y, clicks)
 }
 
 fn dispatch(event: Event) {
@@ -468,9 +496,23 @@ pub extern "C" fn bunny_context_click(x: f64, y: f64) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn bunny_pointer_down(x: f64, y: f64, clicks: u32) {
-    // the browser already counts (UIEvent.detail)
-    dispatch(Event::PointerDown { x, y, clicks: clicks.min(255) as u8 });
+pub extern "C" fn bunny_pointer_down(x: f64, y: f64, time_ms: f64, button: u32) {
+    // the glue hands the event's own timestamp and which button it was;
+    // the count is the shell's to keep, because `pointerdown` carries
+    // no count of its own. Only the PRIMARY button counts, the way
+    // AppKit and Win32 count — a right press between two left ones must
+    // not turn the second into a double.
+    let clicks = if button == 0 {
+        let next = CLICK_STATE.with(|state| {
+            let next = count_click(state.get(), x, y, time_ms);
+            state.set(next);
+            next
+        });
+        next.3
+    } else {
+        1
+    };
+    dispatch(Event::PointerDown { x, y, clicks });
 }
 
 #[unsafe(no_mangle)]

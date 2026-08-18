@@ -2486,6 +2486,158 @@ mod tests {
     }
 
     #[test]
+    fn a_click_hands_the_platforms_own_count() {
+        use crate::layout::{Proposal, Size};
+        use std::cell::RefCell;
+
+        #[derive(Clone)]
+        struct Row {
+            seen: Rc<RefCell<Vec<u8>>>,
+        }
+
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                let seen = Rc::clone(&self.seen);
+                text("file.rs").on_click_count(move |clicks| seen.borrow_mut().push(clicks))
+            }
+        }
+
+        let row = Row { seen: Rc::new(RefCell::new(Vec::new())) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&row);
+        let result = runtime.layout(&row, Proposal::exact(Size { width: 200.0, height: 40.0 }));
+        let (_, rect) = result.hits.first().expect("the row is a target").clone();
+        let (x, y) = (rect.origin.x + 2.0, rect.origin.y + 2.0);
+
+        // a real double click is TWO press/release pairs, and the
+        // platform's count climbs across them
+        runtime.pointer_clicked(x, y, 1);
+        runtime.pointer_released(x, y);
+        runtime.pointer_clicked(x, y, 2);
+        runtime.pointer_released(x, y);
+        assert_eq!(*row.seen.borrow(), vec![1, 2]);
+    }
+
+    #[test]
+    fn the_old_click_door_fires_twice_on_a_double() {
+        use crate::layout::{Proposal, Size};
+        use std::cell::Cell;
+
+        // the semantics an app must be told about: `.on_click` knows
+        // nothing of counts, so a double click fires it TWICE
+        #[derive(Clone)]
+        struct Row {
+            plain: Rc<Cell<u32>>,
+            doubled: Rc<Cell<u32>>,
+        }
+
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                let plain = Rc::clone(&self.plain);
+                let doubled = Rc::clone(&self.doubled);
+                hstack((
+                    text("plain").on_click(move || plain.set(plain.get() + 1)),
+                    text("doubled").on_double_click(move || doubled.set(doubled.get() + 1)),
+                ))
+                .spacing(20.0)
+            }
+        }
+
+        let row = Row { plain: Rc::new(Cell::new(0)), doubled: Rc::new(Cell::new(0)) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&row);
+        let result = runtime.layout(&row, Proposal::exact(Size { width: 300.0, height: 40.0 }));
+        let targets: Vec<_> = result.hits.iter().map(|(_, rect)| *rect).collect();
+        let double_click = |rect: crate::layout::Rect| {
+            let (x, y) = (rect.origin.x + 2.0, rect.origin.y + 2.0);
+            for clicks in [1, 2] {
+                runtime.pointer_clicked(x, y, clicks);
+                runtime.pointer_released(x, y);
+            }
+        };
+
+        double_click(targets[0]);
+        assert_eq!(row.plain.get(), 2, "the plain door hears both presses");
+        double_click(targets[1]);
+        assert_eq!(row.doubled.get(), 1, "the double door hears only the second");
+
+        // and a TRIPLE does not fire the double door again: 1, 2, 3 and
+        // only the 2 lands
+        let rect = targets[1];
+        let (x, y) = (rect.origin.x + 2.0, rect.origin.y + 2.0);
+        for clicks in [1, 2, 3] {
+            runtime.pointer_clicked(x, y, clicks);
+            runtime.pointer_released(x, y);
+        }
+        assert_eq!(row.doubled.get(), 2, "one more double inside the triple, not two");
+    }
+
+    #[test]
+    fn a_count_never_leaks_to_the_next_target() {
+        use crate::layout::{Proposal, Size};
+        use std::cell::RefCell;
+
+        #[derive(Clone)]
+        struct Board {
+            seen: Rc<RefCell<Vec<(char, u8)>>>,
+        }
+
+        impl Component for Board {
+            fn body(self, _ctx: &Context) -> impl View {
+                let left = Rc::clone(&self.seen);
+                let right = Rc::clone(&self.seen);
+                hstack((
+                    text("left").on_click_count(move |clicks| left.borrow_mut().push(('l', clicks))),
+                    text("right")
+                        .on_click_count(move |clicks| right.borrow_mut().push(('r', clicks))),
+                ))
+                .spacing(20.0)
+            }
+        }
+
+        let board = Board { seen: Rc::new(RefCell::new(Vec::new())) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&board);
+        let result = runtime.layout(&board, Proposal::exact(Size { width: 300.0, height: 40.0 }));
+        let targets: Vec<_> = result.hits.iter().map(|(_, rect)| *rect).collect();
+        let click = |rect: crate::layout::Rect, clicks: u8| {
+            let (x, y) = (rect.origin.x + 2.0, rect.origin.y + 2.0);
+            runtime.pointer_clicked(x, y, clicks);
+            runtime.pointer_released(x, y);
+        };
+
+        click(targets[0], 1);
+        click(targets[0], 2);
+        // the hand moves to the other target and starts over
+        click(targets[1], 1);
+        assert_eq!(*board.seen.borrow(), vec![('l', 1), ('l', 2), ('r', 1)]);
+    }
+
+    #[test]
+    fn both_click_doors_print_the_same() {
+        // the two doors are ONE registration, and the printed tree must
+        // not tell them apart — this is what buys the goldens
+        #[derive(Clone, Copy)]
+        struct Plain;
+        impl Component for Plain {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("a").on_click(|| {})
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Counted;
+        impl Component for Counted {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("a").on_click_count(|_| {})
+            }
+        }
+        let plain = Runtime::new().render_stable(&Plain).replace("Plain", "X");
+        let counted = Runtime::new().render_stable(&Counted).replace("Counted", "X");
+        assert_eq!(plain, counted);
+        assert!(plain.contains("[.onClick()]"), "and it is the click suffix: {plain}");
+    }
+
+    #[test]
     fn a_click_routes_through_hit_test_to_the_action_and_repaints() {
         use crate::layout::{Proposal, Size, hit_test};
 

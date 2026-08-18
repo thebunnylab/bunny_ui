@@ -139,7 +139,7 @@ where
         match motor::identity::cursor_scope() {
             Some(path) => {
                 let action = self.action.clone();
-                crate::reconciler::attribute_action(path.clone(), Rc::new(move || action()));
+                crate::reconciler::attribute_action(path.clone(), Rc::new(move |_| action()));
                 out.push_layout(LayoutNode::Interactive {
                     path,
                     child: Box::new(chrome),

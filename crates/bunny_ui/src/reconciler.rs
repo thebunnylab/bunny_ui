@@ -38,7 +38,12 @@ use crate::text_input::{CaretState, EditCommand};
 
 /// An interactive action registered during render: (target path, what
 /// the click fires).
-pub(crate) type ActionEntry = (String, Rc<dyn Fn()>);
+/// What a click hands the app: the platform's own count for the press
+/// that armed it — 1, then 2 on the double, 3 on the triple. The
+/// framework holds no clock; it carries what the shell counted.
+pub(crate) type ClickAction = Rc<dyn Fn(u8)>;
+
+pub(crate) type ActionEntry = (String, ClickAction);
 
 /// A text field's editor: applies a command to the (binding, caret)
 /// pair and returns the output of `Read`/`Copy`/`Cut`. Retained like
@@ -270,7 +275,7 @@ pub(crate) fn attribute_effect(effect: EffectFn) {
 }
 
 /// An interactive action registered during render — same attribution.
-pub(crate) fn attribute_action(path: String, action: Rc<dyn Fn()>) {
+pub(crate) fn attribute_action(path: String, action: ClickAction) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         if let Some(frame) = pass.building.last_mut() {
@@ -492,15 +497,16 @@ pub(crate) fn assemble_effects(root: &str) -> Vec<EffectFn> {
 }
 
 thread_local! {
-    /// The live click map: target path → action. Reassembled on every
-    /// pass, like the effect queue.
-    static ACTIONS: RefCell<HashMap<String, Rc<dyn Fn()>>> = RefCell::new(HashMap::default());
+    /// The live click map: target path → action, which takes the
+    /// platform's click count. Reassembled on every pass, like the
+    /// effect queue.
+    static ACTIONS: RefCell<HashMap<String, ClickAction>> = RefCell::new(HashMap::default());
 }
 
 /// Reassembles the click map from the retention under the root (a
 /// skipped view's button stays clickable) + the root region.
 pub(crate) fn assemble_actions(root: &str) {
-    let mut map: HashMap<String, Rc<dyn Fn()>> = HashMap::default();
+    let mut map: HashMap<String, ClickAction> = HashMap::default();
     RETAINED.with(|retained| {
         for (path, entry) in retained.borrow().iter() {
             if covers(root, path) {
@@ -521,11 +527,11 @@ pub(crate) fn assemble_actions(root: &str) {
 /// Fires the target's action (the key comes from the hit-test).
 /// `false` = target not registered (the identity died between frame and
 /// click — harmless).
-pub(crate) fn run_action(path: &str) -> bool {
+pub(crate) fn run_action(path: &str, clicks: u8) -> bool {
     let action = ACTIONS.with(|actions| actions.borrow().get(path).cloned());
     match action {
         Some(action) => {
-            action();
+            action(clicks);
             true
         }
         None => false,

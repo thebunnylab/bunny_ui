@@ -519,10 +519,48 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// `Button` chrome: same action retention, same up-inside. It is the
     /// clickable list row.
     fn on_click(self, action: impl Fn() + 'static) -> Modified<Self> {
+        self.on_click_count(move |_| action())
+    }
+
+    /// The same target, told HOW MANY clicks the press carried: 1, then
+    /// 2 on the double, 3 on the triple. The count is the PLATFORM's —
+    /// the framework holds no clock — and it is the same number the
+    /// app's own box reads from `ElementEvent::PointerDown`.
+    ///
+    /// ```ignore
+    /// row.on_click_count(move |clicks| match clicks {
+    ///     1 => preview(path),        // one click looks
+    ///     _ => open_permanent(path), // two open for good
+    /// })
+    /// ```
+    ///
+    /// A double click fires this TWICE — once with 1, once with 2 —
+    /// because each press and release is a click of its own. Whoever
+    /// wants only the second one wants [`ViewExt::on_double_click`].
+    ///
+    /// This and `.on_click` are the SAME registration: the last one in
+    /// a chain is the one that fires.
+    fn on_click_count(self, action: impl Fn(u8) + 'static) -> Modified<Self> {
         Modified {
             base: self,
             modifier: Modifier::OnClick(Rc::new(action)),
         }
+    }
+
+    /// Only the SECOND click of a double — the explorer row that opens
+    /// a file for good, the tab that stops being a preview. The count
+    /// is the platform's, so a triple does not fire it again: three
+    /// presses are 1, 2, 3 and only the 2 lands here.
+    ///
+    /// It sits on [`ViewExt::on_click_count`], the way `.on_drop` sits
+    /// on `.on_drop_at` — the same one registration, so a view takes
+    /// this OR a click door, never both.
+    fn on_double_click(self, action: impl Fn() + 'static) -> Modified<Self> {
+        self.on_click_count(move |clicks| {
+            if clicks == 2 {
+                action();
+            }
+        })
     }
 
     /// `.on_action(SELECT_NEXT, move || …)` — registers the named

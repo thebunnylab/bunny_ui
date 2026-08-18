@@ -113,7 +113,7 @@ pub enum Modifier {
 
     // MARK: - Real interaction (a pointer target without chrome — the Button
     // without the outfit; the action fires on up-inside like the Button's)
-    OnClick(Rc<dyn Fn()>),
+    OnClick(crate::reconciler::ClickAction),
     OnAction(crate::action::ActionId, Rc<dyn Fn()>),
 
     // MARK: - Interaction (the action fires at render, as in the headless engine)
@@ -653,10 +653,12 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                             }
                         })
                     };
-                    crate::reconciler::attribute_action(
-                        format!("{path}/#dismiss"),
-                        close.clone(),
-                    );
+                    crate::reconciler::attribute_action(format!("{path}/#dismiss"), {
+                        // a dismiss has no count to hear: the same
+                        // closure the keyboard's Escape handler holds
+                        let close = close.clone();
+                        Rc::new(move |_| close())
+                    });
                     crate::reconciler::attribute_handler(
                         path.clone(),
                         crate::action::OVERLAY_DISMISS,

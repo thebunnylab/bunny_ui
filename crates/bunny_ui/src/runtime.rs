@@ -148,6 +148,12 @@ pub struct Runtime {
     /// The pressed-but-not-lifted drag: its builder and where the
     /// press landed. Past the threshold it becomes the live value.
     drag_armed: RefCell<Option<(crate::layout::DragBuilder, Point)>>,
+    /// The click count of the press that ARMED the pressed target. The
+    /// platform counts (AppKit's `clickCount`, the Win32 counter, the
+    /// web shell's) — the framework holds no clock. One press arms at a
+    /// time, so the number needs no key: it belongs to whatever
+    /// `interaction.pressed` names, and the release takes it.
+    pressed_clicks: Cell<u8>,
     /// The lifted drag's VALUE — the stamp carries only label and
     /// geometry; the typed value stays here and lands on the drop.
     drag_value: RefCell<Option<std::rc::Rc<dyn std::any::Any>>>,
@@ -246,7 +252,7 @@ impl Runtime {
             .collect();
         let mut closed = false;
         for path in paths {
-            closed |= reconciler::run_action(&format!("{path}/#dismiss"));
+            closed |= reconciler::run_action(&format!("{path}/#dismiss"), 1);
         }
         // the app switched away: the explanation and the menu go too
         closed | self.clear_tooltip() | self.close_menu()
@@ -607,6 +613,7 @@ impl Runtime {
             last_drag_sources: RefCell::new(Vec::new()),
             last_drops: RefCell::new(Vec::new()),
             drag_armed: RefCell::new(None),
+            pressed_clicks: Cell::new(1),
             drag_value: RefCell::new(None),
             drag_preview: RefCell::new(None),
             tooltip: RefCell::new(TooltipLife::default()),
@@ -711,7 +718,14 @@ impl Runtime {
     /// hit-test over `LayoutResult::hits`). `false` = target not
     /// registered.
     pub fn activate(&self, path: &str) -> bool {
-        reconciler::run_action(path)
+        self.activate_clicks(path, 1)
+    }
+
+    /// The same fire, carrying the platform's click count — what a
+    /// press that arrived through [`Runtime::pointer_clicked`] hands
+    /// the app.
+    pub fn activate_clicks(&self, path: &str, clicks: u8) -> bool {
+        reconciler::run_action(path, clicks)
     }
 
     // MARK: - Pointer (resolved BEFORE layout — the LAW)
@@ -1029,8 +1043,12 @@ impl Runtime {
     }
 
     /// [`Self::pointer_pressed`] with the platform's click count — the
-    /// shells pass it through (AppKit and the browser both count; the
-    /// runtime never needs a clock). A box hears it in `PointerDown`.
+    /// shells pass it through and the runtime never needs a clock.
+    /// AppKit counts (`clickCount`); Win32 hands a message kind and its
+    /// shell counts; the browser counts on `mousedown` and NOT on
+    /// `pointerdown`, which reports `detail` zero, so the web shell
+    /// counts too. A box hears the number in `PointerDown`, and a view
+    /// through `.on_click_count`.
     pub fn pointer_clicked(&self, x: Px, y: Px, clicks: u8) -> bool {
         // an open menu owns the press whole: a row fires ON THE DOWN
         // (menu semantics, not button semantics) and a press outside
@@ -1085,9 +1103,13 @@ impl Runtime {
                 .map(|top| top.path.clone())
         };
         if let Some(path) = outside {
-            reconciler::run_action(&format!("{path}/#dismiss"));
+            reconciler::run_action(&format!("{path}/#dismiss"), 1);
             return true;
         }
+        // ONE write, above every branch that can arm a target — the
+        // risen press of a box, the thumb, the seam and the ordinary
+        // tail all take their count from here, and the release takes it
+        self.pressed_clicks.set(clicks);
         let target = self.hover_target(x, y);
         // a press inside the app's box hands it the pointer: nothing
         // arms by default (a box has no up-inside action to mis-fire)
@@ -1147,6 +1169,10 @@ impl Runtime {
     /// click). Returns the fired/focused path; the pressed visual
     /// always clears.
     pub fn pointer_released(&self, x: Px, y: Px) -> Option<String> {
+        // taken at the TOP so it cannot leak: every release resets it,
+        // including the ones that end a drag, a grab, a seam or a thumb
+        // and fire no action at all, so the next gesture starts at one
+        let clicks = self.pressed_clicks.replace(1);
         // a live drag ends here: over a compatible target the value
         // lands (the drag clears FIRST — the action writes state into
         // a world without it); anywhere else it just goes home
@@ -1194,7 +1220,7 @@ impl Runtime {
                     .borrow()
                     .iter()
                     .any(|(path, rect)| *path == above && rect.contains(x, y));
-                if inside && self.activate(&above) {
+                if inside && self.activate_clicks(&above, clicks) {
                     return Some(above);
                 }
             }
@@ -1228,7 +1254,7 @@ impl Runtime {
                 self.focus_at(&path, x);
                 Some(path)
             }
-            Some(path) if self.activate(&path) => {
+            Some(path) if self.activate_clicks(&path, clicks) => {
                 self.blur();
                 Some(path)
             }
@@ -2090,7 +2116,7 @@ impl Runtime {
         let mut closed = false;
         for overlay in &result.overlays {
             if !overlay.anchor_visible {
-                closed |= reconciler::run_action(&format!("{}/#dismiss", overlay.path));
+                closed |= reconciler::run_action(&format!("{}/#dismiss", overlay.path), 1);
             }
         }
         closed
