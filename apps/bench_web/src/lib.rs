@@ -176,6 +176,57 @@ pub mod keyed {
         )
     }
 
+    /// One row: the component wears the `<tr>` (its identity group IS
+    /// the element), and its body is the cells — DIRECT children, the
+    /// exact nesting the harness pierces.
+    #[derive(Clone)]
+    struct KeyedRow {
+        id: usize,
+        label: String,
+        selected_now: bool,
+        rows: State<Rc<Vec<(usize, String)>>>,
+        selected: State<Option<usize>>,
+    }
+
+    impl Component for KeyedRow {
+        fn body(self, _ctx: &Context) -> impl View {
+            let id = self.id;
+            let rows = self.rows;
+            let selected = self.selected;
+            (
+                text(self.id.to_string())
+                    .foreground_color(theme::fg())
+                    .element("td")
+                    .css_class("col-md-1"),
+                hstack!(
+                    text(self.label.clone())
+                        .foreground_color(theme::fg())
+                        .element("a")
+                        .on_click(move || selected.set(Some(id)))
+                )
+                .element("td")
+                .css_class("col-md-4"),
+                hstack!(
+                    hstack!(
+                        text("x")
+                            .foreground_color(theme::fg_secondary())
+                            .element("span")
+                            .css_class("glyphicon glyphicon-remove")
+                    )
+                    .element("a")
+                    .on_click(move || {
+                        let mut kept = (*rows.get()).clone();
+                        kept.retain(|(kept_id, _)| *kept_id != id);
+                        rows.set(Rc::new(kept));
+                    })
+                )
+                .element("td")
+                .css_class("col-md-1"),
+                hstack!(text(String::new())).element("td").css_class("col-md-6"),
+            )
+        }
+    }
+
     #[derive(Clone)]
     pub struct App {
         pub rows: State<Rc<Vec<(usize, String)>>>,
@@ -252,41 +303,18 @@ pub mod keyed {
             .spacing(6.0)
             .padding_length(8.0);
 
-            let table = list(
+            let table = for_each(
                 (*data).clone(),
                 |(id, _)| id.to_string(),
                 move |(id, label)| {
-                    let id = *id;
-                    let is_selected = selected.get() == Some(id);
-                    hstack!(
-                        text(id.to_string())
-                            .foreground_color(theme::fg())
-                            .element("td")
-                            .css_class("col-md-1"),
-                        text(label.clone())
-                            .foreground_color(theme::fg())
-                            .element("a")
-                            .on_click(move || selected.set(Some(id)))
-                            .element("td")
-                            .css_class("col-md-4"),
-                        text("x")
-                            .foreground_color(theme::fg_secondary())
-                            .element("a")
-                            .on_click(move || {
-                                let mut kept = (*rows.get()).clone();
-                                kept.retain(|(kept_id, _)| *kept_id != id);
-                                rows.set(Rc::new(kept));
-                            })
-                            .element("td")
-                            .css_class("col-md-1"),
-                        spacer(),
-                    )
-                    .spacing(8.0)
-                    .background_color(if is_selected {
-                        theme::selection()
-                    } else {
-                        CLEAR
-                    })
+                    let is_selected = selected.get() == Some(*id);
+                    KeyedRow {
+                        id: *id,
+                        label: label.clone(),
+                        selected_now: is_selected,
+                        rows,
+                        selected,
+                    }
                     .element("tr")
                     .css_class(if is_selected { "danger" } else { "" })
                 },
@@ -294,7 +322,9 @@ pub mod keyed {
 
             vstack!(
                 controls,
-                table.element("tbody").css_class("test-data"),
+                hstack!(table.element("tbody"))
+                    .element("table")
+                    .css_class("table table-hover table-striped test-data"),
             )
             .alignment(HorizontalAlignment::Leading)
             .frame(900.0, 800.0)
