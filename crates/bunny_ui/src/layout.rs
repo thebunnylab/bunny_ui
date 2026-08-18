@@ -420,9 +420,9 @@ pub enum LayoutNode {
     /// id. Transparent everywhere else, like `.rendering()`: a pixel
     /// target never knows the child was ever going to be a `<tr>`.
     Hinted {
-        tag: Option<String>,
-        class: Option<String>,
-        dom_id: Option<String>,
+        tag: Option<std::rc::Rc<str>>,
+        class: Option<std::rc::Rc<str>>,
+        dom_id: Option<std::rc::Rc<str>>,
         child: Box<LayoutNode>,
     },
     /// The escape hatch (`custom(…)` / `canvas(…)`): a box the APP

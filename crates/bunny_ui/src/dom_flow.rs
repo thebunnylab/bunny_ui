@@ -484,7 +484,8 @@ impl Walk<'_> {
                 if let Some(class) = self.pending_boundary_class.take() {
                     // the body spoke about its own element: an empty
                     // class clears, anything else attributes
-                    group.hints.class = (!class.is_empty()).then_some(class);
+                    group.hints.class =
+                        (!class.is_empty()).then(|| std::rc::Rc::from(class.as_str()));
                 }
                 self.pending_boundary_class = outer_pending;
                 out.push(group);

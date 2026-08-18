@@ -531,9 +531,9 @@ pub struct DomLayout {
 /// pixel target. Empty on everything the engine makes by itself.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DomHints {
-    pub tag: Option<String>,
-    pub class: Option<String>,
-    pub dom_id: Option<String>,
+    pub tag: Option<std::rc::Rc<str>>,
+    pub class: Option<std::rc::Rc<str>>,
+    pub dom_id: Option<std::rc::Rc<str>>,
 }
 
 impl DomHints {
@@ -610,7 +610,7 @@ pub enum DomPatch {
     SetAnchor { id: u32, anchor: u32, side: u8, path: String },
     /// The element's LIVE hints changed — class and id re-attribute in
     /// place (the tag never changes without a recreation).
-    SetHints { id: u32, class: Option<String>, dom_id: Option<String> },
+    SetHints { id: u32, class: Option<std::rc::Rc<str>>, dom_id: Option<std::rc::Rc<str>> },
 }
 
 // MARK: - Lowering (retained scene + diff)

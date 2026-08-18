@@ -267,7 +267,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     fn element(self, tag: impl Into<String>) -> Modified<Self> {
         Modified {
             base: self,
-            modifier: Modifier::ElementHint(Some(tag.into()), None, None),
+            modifier: Modifier::ElementHint(Some(std::rc::Rc::from(tag.into().as_str())), None, None),
         }
     }
 
@@ -276,7 +276,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     fn css_class(self, class: impl Into<String>) -> Modified<Self> {
         Modified {
             base: self,
-            modifier: Modifier::ElementHint(None, Some(class.into()), None),
+            modifier: Modifier::ElementHint(None, Some(std::rc::Rc::from(class.into().as_str())), None),
         }
     }
 
@@ -284,7 +284,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     fn element_id(self, id: impl Into<String>) -> Modified<Self> {
         Modified {
             base: self,
-            modifier: Modifier::ElementHint(None, None, Some(id.into())),
+            modifier: Modifier::ElementHint(None, None, Some(std::rc::Rc::from(id.into().as_str())),),
         }
     }
 

@@ -219,10 +219,10 @@ impl Tree {
             }
         }
         if let Some(class) = &hints.class {
-            element.attrs.insert("class", class.clone());
+            element.attrs.insert("class", class.to_string());
         }
         if let Some(dom_id) = &hints.dom_id {
-            element.attrs.insert("id", dom_id.clone());
+            element.attrs.insert("id", dom_id.to_string());
         }
         self.elements.insert(id, element);
     }
@@ -473,11 +473,11 @@ impl Tree {
             DomPatch::SetHints { id, class, dom_id } => {
                 if let Some(element) = self.elements.get_mut(id) {
                     match class {
-                        Some(class) => element.attrs.insert("class", class.clone()),
+                        Some(class) => element.attrs.insert("class", class.to_string()),
                         None => element.attrs.remove("class"),
                     };
                     match dom_id {
-                        Some(dom_id) => element.attrs.insert("id", dom_id.clone()),
+                        Some(dom_id) => element.attrs.insert("id", dom_id.to_string()),
                         None => element.attrs.remove("id"),
                     };
                 }

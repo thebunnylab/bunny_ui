@@ -91,7 +91,7 @@ pub enum Modifier {
     WindowDragRegion,
     /// Dom hints: `(tag, class, id)` — only the element lowering
     /// consumes them; everything else passes through.
-    ElementHint(Option<String>, Option<String>, Option<String>),
+    ElementHint(Option<std::rc::Rc<str>>, Option<std::rc::Rc<str>>, Option<std::rc::Rc<str>>),
 
     // MARK: - Real interaction (a pointer target without chrome — the Button
     // without the outfit; the action fires on up-inside like the Button's)
