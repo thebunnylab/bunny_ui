@@ -29,6 +29,10 @@ motor = { path = "crates/motor" }
 [profile.web]
 inherits = "release"
 opt-level = "z"
+# one unit for the whole binary: fat LTO already merges them, but the
+# split still costs duplicated helpers. Measured, not assumed —
+# `opt-level = "s"` was tried here too and came out 100 KB WORSE
+codegen-units = 1
 lto = true
 # the name table is 17% of the download and nothing but a debugger's
 # comfort: the glue never reads it, and a stack trace from a shipped
