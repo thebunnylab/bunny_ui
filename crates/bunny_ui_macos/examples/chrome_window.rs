@@ -14,9 +14,12 @@ use std::rc::Rc;
 use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
 #[cfg(target_os = "macos")]
-use bunny_ui_macos::Chrome;
+use bunny_ui_macos::{Chrome, Lights};
 
 const BAR_H: f64 = 44.0;
+/// The diameter of one traffic light. macOS draws them at fourteen;
+/// this bar wears them a little smaller.
+const LIGHT: f64 = 12.0;
 /// Room for the native traffic lights at the top-left corner.
 const LIGHTS_W: f64 = 78.0;
 
@@ -125,7 +128,7 @@ fn main() {
         Size { width: 860.0, height: 560.0 },
         // the bar is 44 points, so the lights are placed by hand: the
         // system would centre them in a bar of 28 and leave them high
-        Chrome::SceneAt { x: 16.0, y: (BAR_H - 14.0) / 2.0 },
+        Chrome::SceneAt(Lights::at(16.0, (BAR_H - LIGHT) / 2.0).sized(LIGHT)),
         runtime,
         App { tab: State::new(0) },
     );

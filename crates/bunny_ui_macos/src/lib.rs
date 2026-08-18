@@ -103,24 +103,53 @@ pub enum Chrome {
     ///
     /// ```ignore
     /// // a bar of forty points wants its lights at (16, 14)
-    /// run_window_chrome(title, size, Chrome::SceneAt { x: 16.0, y: 14.0 }, runtime, root)
+    /// run_window_chrome(title, size, Chrome::SceneAt(Lights::at(16.0, 14.0)), runtime, root)
     /// ```
     ///
     /// The spacing BETWEEN the three stays the system's own: the group
     /// moves, the buttons keep their manners.
-    SceneAt { x: f64, y: f64 },
+    SceneAt(Lights),
+}
+
+/// Where the native window buttons sit, and how big they are.
+///
+/// ```ignore
+/// Lights::at(16.0, 15.0)              // the system's own size
+/// Lights::at(16.0, 15.0).sized(12.0)  // smaller, gaps and all
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Lights {
+    x: f64,
+    y: f64,
+    size: Option<f64>,
+}
+
+impl Lights {
+    /// Points from the window's TOP-LEFT corner, the way a designer
+    /// counts. The buttons keep the size macOS draws them at.
+    pub fn at(x: f64, y: f64) -> Lights {
+        Lights { x, y, size: None }
+    }
+
+    /// The diameter of one light, in points — macOS draws them at
+    /// fourteen. The circle IS the button's box, so this is exactly
+    /// what lands on the glass, and the distance between the three
+    /// scales with it: the group shrinks whole, gaps and all.
+    pub fn sized(self, size: f64) -> Lights {
+        Lights { size: Some(size), ..self }
+    }
 }
 
 impl Chrome {
     /// Does the scene draw the bar?
     fn scene(self) -> bool {
-        matches!(self, Chrome::Scene | Chrome::SceneAt { .. })
+        matches!(self, Chrome::Scene | Chrome::SceneAt(_))
     }
 
     /// Where the app wants the native buttons, if it said.
-    fn lights(self) -> Option<(f64, f64)> {
+    fn lights(self) -> Option<(f64, f64, Option<f64>)> {
         match self {
-            Chrome::SceneAt { x, y } => Some((x, y)),
+            Chrome::SceneAt(lights) => Some((lights.x, lights.y, lights.size)),
             _ => None,
         }
     }

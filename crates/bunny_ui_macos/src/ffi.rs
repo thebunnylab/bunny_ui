@@ -773,7 +773,7 @@ extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, note: Id) {
 thread_local! {
     /// Where the app asked for the native buttons, in points from the
     /// window's TOP-LEFT corner. `None` = wherever macOS puts them.
-    static TRAFFIC_LIGHTS: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
+    static TRAFFIC_LIGHTS: Cell<Option<(f64, f64, Option<f64>)>> = const { Cell::new(None) };
     /// The window that carries them, so the frame tick can put them
     /// back without being handed anything.
     static LIGHTS_WINDOW: Cell<Id> = const { Cell::new(std::ptr::null_mut()) };
@@ -781,7 +781,7 @@ thread_local! {
 
 /// The app's answer to "where do the buttons sit", set once before the
 /// window is built.
-pub fn set_traffic_lights(at: Option<(f64, f64)>) {
+pub fn set_traffic_lights(at: Option<(f64, f64, Option<f64>)>) {
     TRAFFIC_LIGHTS.with(|slot| slot.set(at));
 }
 
@@ -803,6 +803,30 @@ pub fn keep_traffic_lights() {
 /// The three standard buttons, in the order they sit.
 const WINDOW_BUTTONS: [u64; 3] = [0, 1, 2]; // close, miniaturize, zoom
 
+thread_local! {
+    /// The buttons as macOS made them — `(x, width, height)` each,
+    /// read the FIRST time we see them and never again. Every
+    /// placement measures from this, because reading a frame we
+    /// already moved would compound the scale on every tick.
+    static NATURAL_LIGHTS: RefCell<Vec<(f64, f64, f64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The system's own frame for one button, remembered.
+fn natural_light(index: usize, seen: CGRect) -> CGRect {
+    NATURAL_LIGHTS.with(|slot| {
+        let mut natural = slot.borrow_mut();
+        if natural.len() <= index {
+            natural.resize(index + 1, (0.0, 0.0, 0.0));
+            natural[index] = (seen.origin.x, seen.size.width, seen.size.height);
+        }
+        let (x, width, height) = natural[index];
+        CGRect {
+            origin: CGPoint { x, y: seen.origin.y },
+            size: CGSize { width, height },
+        }
+    })
+}
+
 /// One button's frame, moved. The container counts from the BOTTOM,
 /// like every AppKit view, and the app counts from the top, like every
 /// designer: the flip lives here, alone, where a test can reach it
@@ -810,14 +834,31 @@ const WINDOW_BUTTONS: [u64; 3] = [0, 1, 2]; // close, miniaturize, zoom
 ///
 /// `shift` is how far this button sits from the first one — the
 /// system's own spacing, which the placement never touches.
-fn light_frame(container_height: f64, frame: CGRect, at: (f64, f64), shift: f64) -> CGRect {
+fn light_frame(
+    container_height: f64,
+    frame: CGRect,
+    at: (f64, f64),
+    shift: f64,
+    size: Option<f64>,
+) -> CGRect {
     let (x, y) = at;
+    // the circle IS the button's box — a smaller frame draws a smaller
+    // light — so one number scales the button AND the distance to the
+    // one before it: the group shrinks whole, gaps and all
+    let scale = match (size, frame.size.height) {
+        (Some(size), height) if height > 0.0 => size / height,
+        _ => 1.0,
+    };
+    let side = CGSize {
+        width: frame.size.width * scale,
+        height: frame.size.height * scale,
+    };
     CGRect {
         origin: CGPoint {
-            x: x + shift,
-            y: container_height - y - frame.size.height,
+            x: x + shift * scale,
+            y: container_height - y - side.height,
         },
-        size: frame.size,
+        size: side,
     }
 }
 
@@ -834,15 +875,14 @@ fn light_frame(container_height: f64, frame: CGRect, at: (f64, f64), shift: f64)
 /// here, once. The horizontal spacing between the three is the
 /// system's own — only the group moves.
 pub fn place_traffic_lights(window: Id) {
-    let Some((x, y)) = TRAFFIC_LIGHTS.with(|slot| slot.get()) else {
+    let Some((x, y, size)) = TRAFFIC_LIGHTS.with(|slot| slot.get()) else {
         return;
     };
     if window.is_null() {
         return;
     }
     unsafe {
-        let mut first_origin: Option<CGPoint> = None;
-        for kind in WINDOW_BUTTONS {
+        for (index, kind) in WINDOW_BUTTONS.into_iter().enumerate() {
             let button = msg_id_u64(window, sel("standardWindowButton:"), kind);
             if button.is_null() {
                 continue;
@@ -853,19 +893,18 @@ pub fn place_traffic_lights(window: Id) {
                 continue;
             }
             let bounds = msg_rect(container, sel("bounds"));
-            // the group keeps the system's own spacing: only the first
-            // button is placed, and the rest follow by their offset
-            let shift = match first_origin {
-                None => {
-                    first_origin = Some(frame.origin);
-                    0.0
-                }
-                Some(first) => frame.origin.x - first.x,
-            };
-            let placed = light_frame(bounds.size.height, frame, (x, y), shift);
+            // measured from the SYSTEM's own geometry, remembered the
+            // first time we saw it: reading the current frame would
+            // compound the scale a little more on every tick
+            let natural = natural_light(index, frame);
+            let shift = natural.origin.x - natural_light(0, frame).origin.x;
+            let placed = light_frame(bounds.size.height, natural, (x, y), shift, size);
             // a no-op must cost nothing: setting the same frame every
             // frame would dirty the titlebar for no reason
-            if placed.origin.x != frame.origin.x || placed.origin.y != frame.origin.y {
+            if placed.origin.x != frame.origin.x
+                || placed.origin.y != frame.origin.y
+                || placed.size.width != frame.size.width
+            {
                 msg_void_rect(button, sel("setFrame:"), placed);
             }
         }
@@ -1682,7 +1721,7 @@ mod tests {
             origin: CGPoint { x: 7.0, y: 6.0 },
             size: CGSize { width: 14.0, height: 14.0 },
         };
-        let placed = light_frame(40.0, button, (16.0, 14.0), 0.0);
+        let placed = light_frame(40.0, button, (16.0, 14.0), 0.0, None);
         assert_eq!(placed.origin.x, 16.0, "sixteen from the leading edge");
         // AppKit counts up from the bottom: 40 - 14 - 14
         assert_eq!(placed.origin.y, 12.0, "and fourteen from the top, flipped");
@@ -1701,10 +1740,29 @@ mod tests {
         };
         // the second and third buttons carry their distance from the
         // first: only the GROUP moves
-        let first = light_frame(40.0, button, (16.0, 14.0), 0.0);
-        let second = light_frame(40.0, button, (16.0, 14.0), 20.0);
+        let first = light_frame(40.0, button, (16.0, 14.0), 0.0, None);
+        let second = light_frame(40.0, button, (16.0, 14.0), 20.0, None);
         assert_eq!(second.origin.x - first.origin.x, 20.0);
         assert_eq!(second.origin.y, first.origin.y, "and they stay on one line");
+    }
+
+    #[test]
+    fn a_smaller_light_takes_its_gap_with_it() {
+        // the circle IS the button's box, so one number is the whole
+        // look: the button shrinks and so does the distance to the one
+        // before it — the group stays a group
+        let button = CGRect {
+            origin: CGPoint { x: 7.0, y: 6.0 },
+            size: CGSize { width: 14.0, height: 14.0 },
+        };
+        let first = light_frame(40.0, button, (16.0, 14.0), 0.0, Some(7.0));
+        let second = light_frame(40.0, button, (16.0, 14.0), 20.0, Some(7.0));
+        assert_eq!(first.size.width, 7.0, "half the diameter");
+        assert_eq!(first.size.height, 7.0);
+        assert_eq!(second.origin.x - first.origin.x, 10.0, "and half the gap");
+        // the top edge is still where the app asked: what changes is
+        // the size, never the anchor
+        assert_eq!(first.origin.y, 40.0 - 14.0 - 7.0);
     }
 
     #[test]
