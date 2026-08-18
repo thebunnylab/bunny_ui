@@ -2797,12 +2797,27 @@ impl LayoutNode {
                             .as_ref()
                             .is_some_and(|live| live.over == Some(rect));
                     if ringed {
+                        let accent = crate::theme::current().accent;
                         out.display.push(DrawCommand::StrokeRect {
                             rect: frame,
-                            color: crate::theme::current().accent,
+                            color: accent,
                             width: 2.0,
                             corner_radius: 6.0,
                         });
+                        // element mode never reads the draw list, so the
+                        // ring must be an ELEMENT there — a box with a
+                        // border, born with the drag and dying with it
+                        if let Some(dom) = out.dom.as_mut() {
+                            dom.leaf_styled(
+                                crate::dom::DomKind::Box,
+                                frame,
+                                crate::dom::DomStyle {
+                                    border: Some((accent, 2.0)),
+                                    corner_radius: Some(6.0),
+                                    ..crate::dom::DomStyle::default()
+                                },
+                            );
+                        }
                     }
                     out.drops.push(DropRegion {
                         accepts: *accepts,

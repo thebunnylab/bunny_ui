@@ -640,10 +640,30 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
       const rect = app.getBoundingClientRect();
       return [event.clientX - rect.left, event.clientY - rect.top];
     };
+    // The move door: this mode hears NO pointer moves — the browser
+    // owns the hover, and that is why a hover here costs zero patches.
+    // A drag is the one gesture that needs them, so the door opens only
+    // when a press landed on a drag source and shuts on the release: a
+    // hover with no button down can never reach the engine.
+    const onDragMove = (event) => {
+      const [x, y] = point(event);
+      wasm.bunny_pointer_move(x, y);
+    };
+    const closeDragDoor = () => {
+      app.removeEventListener("pointermove", onDragMove);
+      app.style.userSelect = "";
+    };
     app.addEventListener("pointerdown", (event) => {
       const [x, y] = point(event);
       wasm.bunny_pointer_down(x, y, event.detail || 1);
+      if (wasm.bunny_drag_armed()) {
+        // the browser's own text selection would fight the drag
+        app.style.userSelect = "none";
+        app.addEventListener("pointermove", onDragMove);
+      }
     });
+    // a pointer that leaves the window mid-drag ends the gesture too
+    app.addEventListener("pointercancel", closeDragDoor);
     app.addEventListener("contextmenu", (event) => {
       // the scene offers its own menu — the browser's stays home
       event.preventDefault();
@@ -651,6 +671,7 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
       wasm.bunny_context_click(x, y);
     });
     app.addEventListener("pointerup", (event) => {
+      closeDragDoor();
       const [x, y] = point(event);
       wasm.bunny_pointer_up(x, y);
     });

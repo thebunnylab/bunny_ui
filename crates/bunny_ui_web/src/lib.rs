@@ -150,6 +150,9 @@ struct Shell {
 
 thread_local! {
     static SHELL: RefCell<Option<Shell>> = const { RefCell::new(None) };
+    /// Did the last press arm a drag? The element mode's glue reads it
+    /// right after a press and opens its pointer-move door only then.
+    static DRAG_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn dispatch(event: Event) {
@@ -332,10 +335,14 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
         match event {
             Event::PointerDown { x, y, clicks } => {
                 let _ = runtime.pointer_clicked(x, y, clicks);
+                // the glue asks this next: a press on a drag source is
+                // the ONLY thing that opens the move door in this mode
+                DRAG_ARMED.with(|armed| armed.set(runtime.drag_armed()));
                 present(&runtime, runtime.dom_frame(&root, size), scale);
             }
             Event::PointerUp { x, y } => {
                 let _ = runtime.pointer_released(x, y);
+                DRAG_ARMED.with(|armed| armed.set(false));
                 present(&runtime, runtime.dom_frame(&root, size), scale);
             }
             Event::DomScroll { id, x, y } => {
@@ -395,6 +402,16 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
+            // a pointer MOVE reaches us in this mode only between a
+            // press that armed a drag and its release (the glue opens
+            // the door and closes it) — so a drag works here too and
+            // the zero-patch hover stays untouched, by construction
+            Event::PointerMove { x, y } => {
+                if runtime.pointer_moved(x, y) {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+                DRAG_ARMED.with(|armed| armed.set(runtime.drag_armed()));
+            }
             // hover, wheel and ticks belong to the browser in this
             // mode — nothing to do on our side of the border
             _ => {}
@@ -435,6 +452,13 @@ pub extern "C" fn bunny_pointer_move(x: f64, y: f64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_tooltip_tick() {
     dispatch(Event::TooltipTick);
+}
+
+/// Did the last press arm a drag? The element mode's glue asks this
+/// to decide whether to listen for moves at all.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_drag_armed() -> u32 {
+    DRAG_ARMED.with(|armed| armed.get() as u32)
 }
 
 /// The browser's contextmenu, default prevented by the glue.

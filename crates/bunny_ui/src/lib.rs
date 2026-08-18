@@ -4868,4 +4868,67 @@ mod tests {
             "the place is measured down the target's own box, not the slice: {local_y}"
         );
     }
+
+    /// Element mode never reads the draw list, so the drop ring had to
+    /// become an ELEMENT there — and a drag has to be possible in that
+    /// mode at all, which needs the pointer-move door the glue opens
+    /// only for an armed press.
+    #[test]
+    fn in_element_mode_the_ring_is_a_box_and_the_drag_still_lifts() {
+        #[derive(Clone, Copy)]
+        struct Board;
+        impl Component for Board {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text("tab").on_drag(|| drag(Tab { index: 3 }, "tab 3")),
+                    // NO preview declared: this one wears the
+                    // framework's ring, and must wear it in the browser
+                    text("pane").frame(80.0, 40.0).on_drop(|_: &Tab| {}),
+                )
+                .spacing(0.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 120.0, height: 120.0 };
+        let mount = runtime.dom_frame(&Board, size);
+        let accent = crate::theme::current().accent;
+        let ringed = |patches: &[crate::dom::DomPatch]| {
+            patches.iter().any(|patch| matches!(patch,
+                crate::dom::DomPatch::SetStyle { style, .. }
+                    if style.border == Some((accent, 2.0))))
+        };
+        assert!(!ringed(&mount), "no drag, no ring");
+
+        // the drag lifts through the very door the element mode opens
+        let geometry = runtime.layout(&Board, crate::layout::Proposal::exact(size));
+        let source = geometry.drag_sources.first().expect("the tab lifts").rect;
+        let target = geometry.drops.first().expect("the pane accepts").rect;
+        runtime.pointer_pressed(
+            source.origin.x + source.size.width / 2.0,
+            source.origin.y + source.size.height / 2.0,
+        );
+        assert!(runtime.drag_armed(), "the press armed it — this is what the glue asks");
+        runtime.pointer_moved(source.origin.x + 40.0, source.origin.y);
+        runtime.pointer_moved(
+            target.origin.x + target.size.width / 2.0,
+            target.origin.y + target.size.height / 2.0,
+        );
+        assert!(runtime.interaction().drag.is_some(), "the drag is live in this mode too");
+
+        // the ring reached the browser as a bordered box
+        let over = runtime.dom_frame(&Board, size);
+        assert!(ringed(&over), "the ring is an element: {over:#?}");
+
+        // and it leaves with the gesture
+        runtime.pointer_released(
+            target.origin.x + target.size.width / 2.0,
+            target.origin.y + target.size.height / 2.0,
+        );
+        let after = runtime.dom_frame(&Board, size);
+        assert!(
+            after.iter().any(|patch| matches!(patch, crate::dom::DomPatch::Remove { .. })),
+            "the ring element dies with the drag: {after:#?}"
+        );
+    }
 }

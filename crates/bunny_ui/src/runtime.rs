@@ -445,6 +445,15 @@ impl Runtime {
         Some(moved || previewed)
     }
 
+    /// Did the last press land on a drag source? The web's element
+    /// mode asks right after a press, and opens its pointer-move door
+    /// ONLY when the answer is yes — a hover with no button down can
+    /// never reach the engine there, which is how that mode keeps its
+    /// zero-patch hover by construction instead of by policy.
+    pub fn drag_armed(&self) -> bool {
+        self.drag_armed.borrow().is_some() || self.drag_value.borrow().is_some()
+    }
+
     /// Ends the drag without landing it. `true` = one was live.
     fn cancel_drag(&self) -> bool {
         self.drag_armed.borrow_mut().take();
