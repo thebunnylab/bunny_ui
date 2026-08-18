@@ -30,3 +30,6 @@ motor = { path = "crates/motor" }
 inherits = "release"
 opt-level = "z"
 lto = true
+panic = "abort"
+strip = true
+codegen-units = 1
