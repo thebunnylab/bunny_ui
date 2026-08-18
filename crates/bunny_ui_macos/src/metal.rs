@@ -2579,6 +2579,84 @@ mod tests {
         assert_eq!(first, gpu.atlas_footprint(), "a warm frame re-uploads nothing");
     }
 
+    // MARK: - Icons
+
+    const MARK_PATH: &[bunny_ui::icon::Verb] = &[
+        bunny_ui::icon::Verb::Move(4.0, 12.0),
+        bunny_ui::icon::Verb::Line(10.0, 18.0),
+        bunny_ui::icon::Verb::Line(20.0, 6.0),
+    ];
+    const DISC_PATH: &[bunny_ui::icon::Verb] = &[
+        bunny_ui::icon::Verb::Move(12.0, 2.0),
+        bunny_ui::icon::Verb::Cubic(17.5, 2.0, 22.0, 6.5, 22.0, 12.0),
+        bunny_ui::icon::Verb::Cubic(22.0, 17.5, 17.5, 22.0, 12.0, 22.0),
+        bunny_ui::icon::Verb::Cubic(6.5, 22.0, 2.0, 17.5, 2.0, 12.0),
+        bunny_ui::icon::Verb::Cubic(2.0, 6.5, 6.5, 2.0, 12.0, 2.0),
+        bunny_ui::icon::Verb::Close,
+    ];
+    const MARK_GLYPH: bunny_ui::icon::Glyph = bunny_ui::icon::Glyph {
+        draws: &[bunny_ui::icon::Draw {
+            paint: bunny_ui::icon::Paint::Stroke { width: 2.0 },
+            path: MARK_PATH,
+        }],
+    };
+    const DISC_GLYPH: bunny_ui::icon::Glyph = bunny_ui::icon::Glyph {
+        draws: &[bunny_ui::icon::Draw {
+            paint: bunny_ui::icon::Paint::Fill(bunny_ui::icon::Rule::NonZero),
+            path: DISC_PATH,
+        }],
+    };
+    const MARK: bunny_ui::icon::Symbol = bunny_ui::icon::Symbol::new("test.mark", &MARK_GLYPH);
+    const DISC: bunny_ui::icon::Symbol = bunny_ui::icon::Symbol::new("test.disc", &DISC_GLYPH);
+
+    fn icon_scene() -> impl View {
+        // two glyphs, three tints, two sizes — natural beside text,
+        // exact through the frame idiom
+        vstack((
+            icon(MARK),
+            icon(MARK).foreground_color(Color::hex(0x3366AA)),
+            icon(DISC).foreground_color(Color::hex(0xAA3322)),
+            icon(DISC).resizable().frame(32.0, 32.0),
+            text("beside").foreground_color(Color::hex(0x222222)),
+        ))
+        .spacing(4.0)
+    }
+
+    #[test]
+    fn icons_match_the_cpu_byte_for_byte() {
+        if !device_present() {
+            return;
+        }
+        // the FIRST primitive with exact parity: the house rasterizes
+        // the glyph once and both pipelines blit those same bytes — a
+        // 1:1 texel read on the GPU, a straight blit on the CPU. Not
+        // assert_close: assert_eq.
+        let (gpu, cpu) =
+            scene_bytes(&icon_scene(), Size { width: 120.0, height: 160.0 }, 2, Color::CANVAS);
+        assert!(
+            gpu == cpu,
+            "icon scene diverged (max channel delta {})",
+            max_channel_delta(&gpu, &cpu)
+        );
+    }
+
+    #[test]
+    fn a_warm_icon_frame_reuses_every_upload() {
+        if !device_present() {
+            return;
+        }
+        let runtime = Runtime::new();
+        let root = icon_scene();
+        let display = runtime.display_frame(&root, Size { width: 120.0, height: 160.0 });
+        let engine = RawImages::default();
+        let mut gpu = OffscreenGpu::new(240, 320).expect("offscreen gpu");
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        let first = gpu.atlas_footprint();
+        assert!(first.0 >= 4, "four tinted tiles at least: {first:?}");
+        gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
+        assert_eq!(first, gpu.atlas_footprint(), "the tinted keys cache, never thrash");
+    }
+
     #[test]
     fn an_ultra_wide_image_never_touches_the_shelf() {
         if !device_present() {
