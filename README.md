@@ -62,7 +62,7 @@ canvas(|ctx, p| p.fill_rounded(ctx.bounds(), ink, 6.0))
 
 // the full one: it measures, paints, and answers the pointer,
 // the keyboard and the input system
-custom(CodeSurface { document, state })
+custom(SketchPad { strokes, caption })
 ```
 
 The box paints in its own coordinates and cannot escape them — the
@@ -119,10 +119,11 @@ cargo test
 cargo run -p bunny-ui --example counter_headless
 cargo run -p bunny-ui-macos --example counter_window
 cargo run -p bunny-ui-macos --example git_window
+cargo run -p bunny-ui-macos --example sketch_window
 cargo run -p countries-pure
 ```
 
-The first demo prints a small interface to the terminal. The second opens a native macOS window. The third reads this repository's own `git log` from a worker thread and fills the window while it scrolls. The fourth prints a full sample application.
+The first demo prints a small interface to the terminal. The second opens a native macOS window. The third reads this repository's own `git log` from a worker thread and fills the window while it scrolls. The fourth is one box the application owns: it draws its own ink with the pointer, sizes its brush with the wheel, and types into a caption of its own — composition included. The fifth prints a full sample application.
 
 ## Design rules
 
