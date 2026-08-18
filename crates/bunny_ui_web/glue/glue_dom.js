@@ -166,6 +166,35 @@ function rgba(packed) {
   return `rgba(${r}, ${g}, ${b}, ${a / 255})`;
 }
 
+// The input's editing dance — shared by creation and hydration.
+function wireInput(input) {
+  let composing = false;
+  const report = () => {
+    const path = input.dataset.path ?? "";
+    sendField(path, input.value, input.selectionStart ?? input.value.length);
+  };
+  input.addEventListener("compositionstart", () => {
+    composing = true;
+  });
+  input.addEventListener("compositionend", () => {
+    composing = false;
+    report();
+  });
+  input.addEventListener("input", () => {
+    // NEVER during a live composition — the browser owns that dance
+    if (!composing) report();
+  });
+}
+
+// A scroll box's reporting — shared by creation and hydration.
+function wireScroll(el, id) {
+  el.addEventListener("scroll", () => {
+    wasm.bunny_dom_scroll(id, el.scrollLeft, el.scrollTop);
+    repositionPopovers();
+  });
+  viewportObserver.observe(el);
+}
+
 function createElementOf(kind, tag) {
   // 0 group, 1 box, 2 text, 3 field, 4 scroll, 5 content, 6 canvas,
   // 7 image, 8 icon, 9 flex column, 10 flex row, 11 layers, 12 popover
@@ -222,22 +251,7 @@ function createElementOf(kind, tag) {
     // inline border may outrank the stylesheet rule
     input.style.cssText =
       "box-sizing:border-box;padding:5px 8px;outline:none;";
-    let composing = false;
-    input.addEventListener("compositionstart", () => {
-      composing = true;
-    });
-    input.addEventListener("compositionend", () => {
-      composing = false;
-      report(input);
-    });
-    input.addEventListener("input", () => {
-      // NEVER during a live composition — the browser owns that dance
-      if (!composing) report(input);
-    });
-    function report(input) {
-      const path = input.dataset.path ?? "";
-      sendField(path, input.value, input.selectionStart ?? input.value.length);
-    }
+    wireInput(input);
     return input;
   }
   const el = document.createElement(tag || "div");
@@ -300,13 +314,7 @@ function applyPatches(view, length) {
       if (cls) el.className = cls;
       if (domId) el.id = domId;
       if (kind === 4) {
-        el.addEventListener("scroll", () => {
-          wasm.bunny_dom_scroll(id, el.scrollLeft, el.scrollTop);
-          repositionPopovers();
-        });
-        // the window math reads the region's real box — the browser
-        // owns layout here, so the browser reports it
-        viewportObserver.observe(el);
+        wireScroll(el, id);
       }
       const home = elements.get(parent);
       const anchor = before ? elements.get(before) : null;
@@ -899,6 +907,17 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         `Deploy the page and the wasm together, then reload.`;
       return;
     }
+    // a page the BUILD painted: adopt its elements before the wasm
+    // takes over — ids are the data-n the serializer stamped
+    const hydrated = app.dataset.hydrate === "1";
+    if (hydrated) {
+      for (const el of app.querySelectorAll("[data-n]")) {
+        const id = Number(el.dataset.n);
+        elements.set(id, el);
+        if (el.tagName === "INPUT") wireInput(el);
+        if (el.style.overflow === "auto") wireScroll(el, id);
+      }
+    }
     // the boot bill: fetch+instantiate, then the first frame inside
     // start_dom — the two numbers a mount argument needs
     window.__bunnyBoot = { instantiate: performance.now() - bootOpened };
@@ -907,6 +926,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       app.clientWidth,
       app.clientHeight,
       window.devicePixelRatio || 1,
+      hydrated ? 1 : 0,
     );
     window.__bunnyBoot.start = performance.now() - startOpened;
 

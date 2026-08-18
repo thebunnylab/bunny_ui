@@ -430,8 +430,13 @@ pub extern "C" fn start(width: f64, height: f64, scale: f64) {
 }
 
 /// The Dom page calls this one — the SAME scene, rendered at home.
-/// `scale` rasters the canvas islands at the device's density.
+/// `scale` rasters the canvas islands at the device's density;
+/// `hydrate` says the page shipped painted and the boot adopts it.
 #[unsafe(no_mangle)]
-pub extern "C" fn start_dom(width: f64, height: f64, scale: f64) {
-    bunny_ui_web::start_dom(width, height, scale, finder());
+pub extern "C" fn start_dom(width: f64, height: f64, scale: f64, hydrate: u32) {
+    if hydrate != 0 {
+        bunny_ui_web::start_dom_hydrated(width, height, scale, finder());
+    } else {
+        bunny_ui_web::start_dom(width, height, scale, finder());
+    }
 }

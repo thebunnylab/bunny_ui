@@ -290,6 +290,23 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
 /// and programmatic scrolls ride `scroll-behavior`, so the browser
 /// animates while the engine stays event-driven.
 pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static) {
+    start_dom_with(width, height, scale, false, root)
+}
+
+/// [`start_dom`] over a page the BUILD already painted: the runtime
+/// adopts the served elements as its retained truth, and the first
+/// frame says nothing — only the islands blit their first pixels.
+pub fn start_dom_hydrated(width: f64, height: f64, scale: f64, root: impl View + 'static) {
+    start_dom_with(width, height, scale, true, root)
+}
+
+fn start_dom_with(
+    width: f64,
+    height: f64,
+    scale: f64,
+    hydrate: bool,
+    root: impl View + 'static,
+) {
     let runtime = Runtime::new()
         .text_engine(Rc::new(CanvasTextEngine::new()))
         .image_engine(Rc::new(CanvasImageEngine::new()));
@@ -299,6 +316,11 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
     runtime.set_reduce_motion(true);
     let mut size = Size { width, height };
     let scale = (scale.round() as usize).max(1);
+    if hydrate {
+        // the page shipped painted: adopt it, and let the first frame
+        // agree in silence
+        runtime.dom_adopt(&root, size);
+    }
 
     // patches first, then any island whose pixels changed — the
     // element exists before its bitmap arrives

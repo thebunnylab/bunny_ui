@@ -53,6 +53,7 @@ pub mod one_of;
 pub mod raster;
 mod reconciler;
 pub mod runtime;
+pub mod ssr;
 pub mod state_ext;
 pub mod stats;
 pub mod text_engine;

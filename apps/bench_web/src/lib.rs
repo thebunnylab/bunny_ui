@@ -5,7 +5,9 @@
 //! one chip filters the table down to ten rows and back. The driver
 //! page (`web/driver.js`) dispatches real pointer events and times
 //! the full input → state → patches → elements path.
-#![cfg(target_arch = "wasm32")]
+// The VIEW compiles on every target: the build renders the page
+// natively (see examples/render.rs) and the wasm hydrates on top —
+// only the FFI exports below stay web-gated.
 
 use std::rc::Rc;
 
@@ -68,7 +70,7 @@ impl Component for Row {
 }
 
 #[derive(Clone)]
-struct Bench {
+pub struct Bench {
     filtered: State<bool>,
     toggles: Rc<Vec<State<bool>>>,
 }
@@ -126,12 +128,22 @@ impl Component for Bench {
     }
 }
 
-/// The bench page calls this once, with the box geometry.
-#[unsafe(no_mangle)]
-pub extern "C" fn start_dom(width: f64, height: f64, scale: f64) {
-    let bench = Bench {
+/// The scene, shared by the wasm boot and the native page builder.
+pub fn bench() -> Bench {
+    Bench {
         filtered: State::new(false),
         toggles: Rc::new((0..ROWS).map(|_| State::new(false)).collect()),
-    };
-    bunny_ui_web::start_dom(width, height, scale, bench);
+    }
+}
+
+/// The bench page calls this once, with the box geometry. `hydrate`
+/// says the page shipped painted: adopt instead of mounting.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn start_dom(width: f64, height: f64, scale: f64, hydrate: u32) {
+    if hydrate != 0 {
+        bunny_ui_web::start_dom_hydrated(width, height, scale, bench());
+    } else {
+        bunny_ui_web::start_dom(width, height, scale, bench());
+    }
 }

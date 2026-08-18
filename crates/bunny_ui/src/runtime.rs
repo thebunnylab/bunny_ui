@@ -1284,6 +1284,83 @@ impl Runtime {
         self.dom.borrow_mut().lower(&output.scene, &output.display)
     }
 
+    /// Hydration's engine half: run the same frame the build ran and
+    /// ADOPT its scene as the retained truth — the browser already
+    /// holds these elements, ids assigned by the same pre-order. The
+    /// next [`Runtime::dom_frame`] diffs against a page that is
+    /// already true and says nothing.
+    pub fn dom_adopt(&self, root: &impl View, size: crate::layout::Size) {
+        self.settle(root);
+        let _ = reconciler::take_frame_runs();
+        let retained_groups = self.dom.borrow().group_paths();
+        let stable_root = (self.root_is_boundary.get()
+            && crate::theme::version() == self.theme_version.get()
+            && !self.has_pending_dirty())
+        .then(|| self.last_root.borrow().clone())
+        .flatten()
+        .filter(|path| reconciler::is_retained(path));
+        let tree = match stable_root {
+            Some(path) => {
+                reconciler::note_stable_frame();
+                crate::layout::LayoutNode::BoundaryRef { path }
+            }
+            None => {
+                let mut nodes = self.frame_pass(root);
+                let mut roots = nodes.take_layout();
+                self.root_is_boundary.set(matches!(
+                    roots.as_slice(),
+                    [crate::layout::LayoutNode::Boundary { .. }]
+                        | [crate::layout::LayoutNode::BoundaryRef { .. }]
+                ));
+                if roots.len() == 1 {
+                    roots.remove(0)
+                } else {
+                    crate::layout::LayoutNode::Stack {
+                        axis: crate::layout::Axis::Vertical,
+                        spacing: 0.0,
+                        align: crate::layout::CrossAlign::Start,
+                        children: roots,
+                    }
+                }
+            }
+        };
+        let interaction = self.interaction.borrow().clone();
+        let focus = self.focus.borrow().clone();
+        let carets = self.carets.borrow();
+        let stamp = crate::layout::FrameStamp {
+            interaction: &interaction,
+            focus: focus.as_deref(),
+            carets: &carets,
+            caret_visible: self.caret_visible.get(),
+        };
+        self.cache.begin_frame();
+        self.last_proposal.set(Some(crate::layout::Proposal::exact(size)));
+        let offsets = self.scroll_offsets.borrow();
+        let env = LayoutEnv {
+            text: &*self.text,
+            images: &*self.images,
+            cache: &self.cache,
+            scroll_offsets: &offsets,
+            font: FontSpec::DEFAULT,
+            stamp,
+            animator: Some(&self.animator),
+            anim: None,
+            overlay_bounds: self.overlay_bounds.get(),
+        };
+        let changed: Vec<String> = Vec::new();
+        let flow = crate::dom_flow::FlowEnv {
+            scroll_offsets: &*offsets,
+            size: (size.width, size.height),
+            layout: Some(env),
+            changed: &changed,
+            retained_groups: &retained_groups,
+        };
+        let output = crate::dom_flow::lower(&tree, &flow);
+        drop(offsets);
+        drop(carets);
+        self.dom.borrow_mut().adopt(&output.scene, &output.display);
+    }
+
     /// A click resolved by the BROWSER: the glue walked up from the
     /// event target to the nearest `[data-path]` and hands the path
     /// straight to the action door — no engine hit test, no geometry.

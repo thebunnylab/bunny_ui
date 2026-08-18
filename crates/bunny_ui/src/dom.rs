@@ -782,6 +782,48 @@ impl DomLowering {
         }
     }
 
+    /// Hydration: the served page already holds the mount, so the
+    /// lowering ADOPTS the scene as its retained truth — ids assigned
+    /// in the exact pre-order the mount stream used, groups and
+    /// islands registered, zero patches emitted. Islands stay dirty:
+    /// a built page ships their boxes empty, and the first blit after
+    /// boot fills them.
+    pub(crate) fn adopt(&mut self, scene: &DomNode, display: &crate::layout::DisplayList) {
+        fn adopt_node(node: &DomNode, ctx: &mut LowerCtx) -> Retained {
+            let id = *ctx.next_id;
+            *ctx.next_id += 1;
+            if let DomKind::Group { path } = &node.kind {
+                ctx.group_paths.insert(path.clone());
+            }
+            let mut retained = Retained {
+                id,
+                node: shallow(node),
+                children: Vec::new(),
+            };
+            if matches!(node.kind, DomKind::Canvas { .. }) {
+                note_island(id, node, ctx);
+            }
+            retained.children =
+                node.children.iter().map(|child| adopt_node(child, ctx)).collect();
+            retained
+        }
+        self.next_id = 1;
+        self.group_paths.clear();
+        self.islands.clear();
+        self.anchors_sent.clear();
+        let mut next_id = self.next_id;
+        let mut ctx = LowerCtx {
+            next_id: &mut next_id,
+            display: display.as_slice(),
+            islands: &mut self.islands,
+            group_paths: &mut self.group_paths,
+        };
+        let mut root = Retained { id: 0, node: shallow(scene), children: Vec::new() };
+        root.children = scene.children.iter().map(|child| adopt_node(child, &mut ctx)).collect();
+        self.next_id = next_id;
+        self.root = Some(root);
+    }
+
     /// The retained Groups' identity paths — the flow walk consults
     /// them before promising a reuse.
     pub(crate) fn group_paths(&self) -> std::collections::HashSet<String> {
