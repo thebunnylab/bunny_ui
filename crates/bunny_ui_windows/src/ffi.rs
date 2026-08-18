@@ -171,6 +171,45 @@ unsafe extern "system" {
     fn ReleaseCapture() -> i32;
     fn GetDoubleClickTime() -> u32;
     fn SetProcessDPIAware() -> i32;
+    fn ScreenToClient(hwnd: Hwnd, point: *mut Point) -> i32;
+    fn ClientToScreen(hwnd: Hwnd, point: *mut Point) -> i32;
+    fn MonitorFromWindow(hwnd: Hwnd, flags: u32) -> Handle;
+    fn GetMonitorInfoW(monitor: Handle, info: *mut MonitorInfo) -> i32;
+    fn SystemParametersInfoW(action: u32, param: u32, out: *mut c_void, update: u32) -> i32;
+    fn UpdateLayeredWindow(
+        hwnd: Hwnd,
+        dest_dc: Hdc,
+        dest_point: *const Point,
+        size: *const SizePx,
+        source_dc: Hdc,
+        source_point: *const Point,
+        color_key: u32,
+        blend: *const BlendFunction,
+        flags: u32,
+    ) -> i32;
+    fn IsWindowVisible(hwnd: Hwnd) -> i32;
+}
+
+#[repr(C)]
+struct MonitorInfo {
+    size: u32,
+    monitor: Rect,
+    work: Rect,
+    flags: u32,
+}
+
+#[repr(C)]
+struct SizePx {
+    cx: i32,
+    cy: i32,
+}
+
+#[repr(C)]
+struct BlendFunction {
+    op: u8,
+    flags: u8,
+    source_constant_alpha: u8,
+    alpha_format: u8,
 }
 
 #[link(name = "gdi32", kind = "raw-dylib")]
@@ -256,11 +295,30 @@ const WM_CHAR: u32 = 0x0102;
 const WM_SYSKEYDOWN: u32 = 0x0104;
 const WM_SYSCHAR: u32 = 0x0106;
 const WM_UNICHAR: u32 = 0x0109;
+const WM_MOVE: u32 = 0x0003;
+const WM_MOUSEACTIVATE: u32 = 0x0021;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
 const WM_RBUTTONDOWN: u32 = 0x0204;
+const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_MOUSEHWHEEL: u32 = 0x020E;
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// The never-activate answer to a click on a panel.
+const MA_NOACTIVATE: isize = 3;
+/// `SPI_GETWHEELSCROLLLINES`.
+const SPI_WHEEL_LINES: u32 = 0x68;
+// panel window styles
+const WS_POPUP: u32 = 0x8000_0000;
+const WS_EX_LAYERED: u32 = 0x0008_0000;
+const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+const SW_SHOWNOACTIVATE: i32 = 4;
+const SW_HIDE: i32 = 0;
+const ULW_ALPHA: u32 = 2;
+const AC_SRC_OVER: u8 = 0;
+const AC_SRC_ALPHA: u8 = 1;
+const MONITOR_DEFAULT_TO_NEAREST: u32 = 2;
 const WM_ENTERSIZEMOVE: u32 = 0x0231;
 const WM_EXITSIZEMOVE: u32 = 0x0232;
 const WM_DPICHANGED: u32 = 0x02E0;
@@ -408,6 +466,9 @@ pub enum AppEvent {
     /// The pointer left the window — without this event the hover would
     /// stay stuck at the edge (the reason for TrackMouseEvent).
     MouseExited,
+    /// Scrolling: deltas in logical points, the engine's sign
+    /// (positive reveals content above). Notches convert at arrival.
+    Wheel { x: f64, y: f64, dx: f64, dy: f64 },
     /// RAW editing key — only arrives when the keymap gate declined:
     /// movement, deletion, and the Ctrl chords over a focused field.
     /// `command` carries Ctrl, the platform's accelerator.
@@ -928,24 +989,62 @@ fn count_click(x: i32, y: i32) -> u8 {
 // MARK: - The window procedure
 
 thread_local! {
-    /// Whether the leave message is armed — TrackMouseEvent is one-shot
-    /// and re-arms on the first move after each leave.
-    static LEAVE_ARMED: Cell<bool> = const { Cell::new(false) };
+    /// The windows whose leave message is armed — TrackMouseEvent is
+    /// one-shot per window and re-arms on the first move after a leave.
+    static LEAVE_ARMED: RefCell<std::collections::HashSet<Hwnd>> =
+        RefCell::new(std::collections::HashSet::new());
+    /// Where each panel's slice sits in SCENE coordinates — the
+    /// translation that lets a panel's pointer events look identical
+    /// to the window's, so the runtime never learns which surface the
+    /// pointer touched.
+    static PANEL_ORIGINS: RefCell<HashMap<Hwnd, (f64, f64)>> = RefCell::new(HashMap::new());
+}
+
+/// The scale every surface shares — panels ride the OWNER's metrics.
+fn shared_factor() -> f64 {
+    let main = MAIN_HWND.load(Ordering::Acquire);
+    let factor = metrics_of(main).factor;
+    if factor > 0.0 { factor } else { 1.0 }
+}
+
+fn scene_origin(hwnd: Hwnd) -> (f64, f64) {
+    PANEL_ORIGINS.with(|origins| origins.borrow().get(&hwnd).copied().unwrap_or((0.0, 0.0)))
 }
 
 fn layout_point(hwnd: Hwnd, lparam: isize) -> (f64, f64) {
     let x = (lparam & 0xFFFF) as u16 as i16 as i32;
     let y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
-    let metrics = metrics_of(hwnd);
-    let factor = if metrics.factor > 0.0 { metrics.factor } else { 1.0 };
-    (x as f64 / factor, y as f64 / factor)
+    let factor = shared_factor();
+    let (dx, dy) = scene_origin(hwnd);
+    (x as f64 / factor + dx, y as f64 / factor + dy)
+}
+
+/// Wheel notches → logical points. `delta` is the raw wheel value
+/// (±120 per notch, fractional on precision touchpads); a notch moves
+/// the system's scroll-lines setting worth of ~16-point lines — the
+/// same conversion the mac applies to its legacy line-tick wheels.
+fn wheel_px(delta: f64, lines: f64) -> f64 {
+    delta / 120.0 * lines * 16.0
+}
+
+fn wheel_lines() -> f64 {
+    let mut lines: u32 = 3;
+    unsafe {
+        SystemParametersInfoW(SPI_WHEEL_LINES, 0, &mut lines as *mut u32 as *mut c_void, 0);
+    }
+    // WHEEL_PAGESCROLL (u32::MAX) means "a page": keep the default
+    if lines == 0 || lines == u32::MAX { 3.0 } else { lines as f64 }
 }
 
 unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize {
     match msg {
         WM_CREATE => 0,
         WM_SIZE => {
-            if wparam == SIZE_MINIMIZED {
+            // ONLY the main window has a size of its own: a panel is
+            // sized by the present that created it, and its birth
+            // arrives here SYNCHRONOUSLY from inside that present — a
+            // dispatch would re-enter the handler mid-frame
+            if hwnd != MAIN_HWND.load(Ordering::Acquire) || wparam == SIZE_MINIMIZED {
                 return 0;
             }
             refresh_metrics(hwnd);
@@ -956,6 +1055,11 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_DPICHANGED => {
+            if hwnd != MAIN_HWND.load(Ordering::Acquire) {
+                // layered panels are raw screen pixels — the owner's
+                // funnel rescales them on its next present
+                return 0;
+            }
             // honor the suggested rect verbatim — it is what makes a
             // mixed-DPI monitor drag land at the right physical size
             let suggested = lparam as *const Rect;
@@ -1038,7 +1142,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             }
         }
         WM_MOUSEMOVE => {
-            if !LEAVE_ARMED.with(|cell| cell.get()) {
+            if LEAVE_ARMED.with(|armed| armed.borrow_mut().insert(hwnd)) {
                 let mut track = TrackMouseEventArgs {
                     size: std::mem::size_of::<TrackMouseEventArgs>() as u32,
                     flags: TME_LEAVE,
@@ -1048,15 +1152,54 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 unsafe {
                     TrackMouseEvent(&mut track);
                 }
-                LEAVE_ARMED.with(|cell| cell.set(true));
             }
             let (x, y) = layout_point(hwnd, lparam);
             dispatch(AppEvent::MouseMoved { x, y });
             0
         }
         WM_MOUSELEAVE => {
-            LEAVE_ARMED.with(|cell| cell.set(false));
+            LEAVE_ARMED.with(|armed| armed.borrow_mut().remove(&hwnd));
             dispatch(AppEvent::MouseExited);
+            0
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            // wheel positions arrive in SCREEN pixels, unlike every
+            // other mouse message
+            let mut point = Point {
+                x: (lparam & 0xFFFF) as u16 as i16 as i32,
+                y: ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32,
+            };
+            unsafe {
+                ScreenToClient(hwnd, &mut point);
+            }
+            let factor = shared_factor();
+            let (ox, oy) = scene_origin(hwnd);
+            let x = point.x as f64 / factor + ox;
+            let y = point.y as f64 / factor + oy;
+            let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16 as f64;
+            let px = wheel_px(delta, wheel_lines());
+            // vertical matches the engine's sign (positive reveals
+            // content above); the tilt wheel flips, like the web's dx
+            let (dx, dy) =
+                if msg == WM_MOUSEWHEEL { (0.0, px) } else { (-px, 0.0) };
+            dispatch(AppEvent::Wheel { x, y, dx, dy });
+            0
+        }
+        WM_MOUSEACTIVATE => {
+            if hwnd != MAIN_HWND.load(Ordering::Acquire) {
+                // a panel never takes the keyboard — the second belt
+                // beside WS_EX_NOACTIVATE
+                return MA_NOACTIVATE;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_MOVE => {
+            if hwnd == MAIN_HWND.load(Ordering::Acquire) {
+                // owned panels do not ride the owner on their own —
+                // the present repositions them, so a caption drag asks
+                // for one
+                dispatch(AppEvent::Redraw);
+            }
             0
         }
         WM_LBUTTONDOWN => {
@@ -1192,9 +1335,13 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                     backing.release();
                 }
             });
-            // closing the window quits — the mac shell's manner
-            unsafe {
-                PostQuitMessage(0);
+            PANEL_ORIGINS.with(|origins| origins.borrow_mut().remove(&hwnd));
+            LEAVE_ARMED.with(|armed| armed.borrow_mut().remove(&hwnd));
+            // closing the MAIN window quits — a panel dies in silence
+            if hwnd == MAIN_HWND.load(Ordering::Acquire) {
+                unsafe {
+                    PostQuitMessage(0);
+                }
             }
             0
         }
@@ -1450,6 +1597,145 @@ impl WindowHandle {
             apply_cursor(cursor);
         }
     }
+
+    /// A rect in LAYOUT coordinates converted to SCREEN pixels — where
+    /// a panel (and one day the IME candidate window) lands.
+    pub fn layout_rect_to_screen(&self, x: f64, y: f64, width: f64, height: f64) -> Rect {
+        let factor = shared_factor();
+        let mut origin = Point { x: 0, y: 0 };
+        unsafe {
+            ClientToScreen(self.hwnd, &mut origin);
+        }
+        let left = origin.x + (x * factor).round() as i32;
+        let top = origin.y + (y * factor).round() as i32;
+        Rect {
+            left,
+            top,
+            right: left + (width * factor).round() as i32,
+            bottom: top + (height * factor).round() as i32,
+        }
+    }
+
+    /// The monitor's WORK area (the taskbar excluded) in this window's
+    /// layout coordinates — left of or above the window comes out
+    /// negative. What popovers clamp against.
+    pub fn screen_bounds_in_layout(&self) -> Option<(f64, f64, f64, f64)> {
+        let factor = shared_factor();
+        unsafe {
+            let monitor = MonitorFromWindow(self.hwnd, MONITOR_DEFAULT_TO_NEAREST);
+            if monitor == 0 {
+                return None;
+            }
+            let mut info = MonitorInfo {
+                size: std::mem::size_of::<MonitorInfo>() as u32,
+                monitor: Rect::default(),
+                work: Rect::default(),
+                flags: 0,
+            };
+            if GetMonitorInfoW(monitor, &mut info) == 0 {
+                return None;
+            }
+            let mut origin = Point { x: 0, y: 0 };
+            ClientToScreen(self.hwnd, &mut origin);
+            Some((
+                (info.work.left - origin.x) as f64 / factor,
+                (info.work.top - origin.y) as f64 / factor,
+                (info.work.right - info.work.left) as f64 / factor,
+                (info.work.bottom - info.work.top) as f64 / factor,
+            ))
+        }
+    }
+
+    /// Registers where this panel's slice sits in the scene, so its
+    /// pointer events translate back on arrival.
+    pub fn set_scene_origin(&self, x: f64, y: f64) {
+        PANEL_ORIGINS.with(|origins| {
+            origins.borrow_mut().insert(self.hwnd, (x, y));
+        });
+    }
+
+    /// Presents a panel whole: position, size and pixels land in ONE
+    /// atomic call. Takes the scene's STRAIGHT rgba and premultiplies
+    /// into BGRA during the copy — the platform's per-pixel-alpha
+    /// window wants exactly that.
+    pub fn present_layered(&self, screen: Rect, width: usize, height: usize, rgba: &[u8]) {
+        if width == 0 || height == 0 || !ensure_backing(self.hwnd, width, height) {
+            return;
+        }
+        BACKING.with(|stores| {
+            let mut stores = stores.borrow_mut();
+            let backing = stores.get_mut(&self.hwnd).expect("backing for the panel");
+            let bytes =
+                unsafe { std::slice::from_raw_parts_mut(backing.bits, width * height * 4) };
+            for (source, dest) in rgba.chunks_exact(4).zip(bytes.chunks_exact_mut(4)) {
+                let alpha = source[3] as u32;
+                dest[0] = (source[2] as u32 * alpha / 255) as u8;
+                dest[1] = (source[1] as u32 * alpha / 255) as u8;
+                dest[2] = (source[0] as u32 * alpha / 255) as u8;
+                dest[3] = source[3];
+            }
+            let position = Point { x: screen.left, y: screen.top };
+            let size = SizePx { cx: width as i32, cy: height as i32 };
+            let source = Point { x: 0, y: 0 };
+            let blend = BlendFunction {
+                op: AC_SRC_OVER,
+                flags: 0,
+                source_constant_alpha: 255,
+                alpha_format: AC_SRC_ALPHA,
+            };
+            unsafe {
+                UpdateLayeredWindow(
+                    self.hwnd,
+                    0,
+                    &position,
+                    &size,
+                    backing.dc,
+                    &source,
+                    0,
+                    &blend,
+                    ULW_ALPHA,
+                );
+                if IsWindowVisible(self.hwnd) == 0 {
+                    ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                }
+            }
+        });
+    }
+
+    /// Retires a panel: hidden, forgotten, destroyed.
+    pub fn close_panel(&self) {
+        unsafe {
+            ShowWindow(self.hwnd, SW_HIDE);
+            DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// A borderless never-activate panel owned by the window — the surface
+/// a popover, tooltip, menu or drag chip leaves the window on. Shares
+/// the window class (and so the pointer road); takes no timer, no
+/// driver, no keyboard — the parent drives every frame.
+pub fn create_panel(owner: &WindowHandle) -> WindowHandle {
+    let class_name = register_class();
+    let title = wide("");
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            class_name.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            owner.hwnd,
+            0,
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null(),
+        )
+    };
+    assert!(hwnd != 0, "the platform refused the panel");
+    WindowHandle { hwnd }
 }
 
 #[cfg(test)]
@@ -1492,6 +1778,75 @@ mod tests {
         let (width, height) = window.content_size();
         assert!(width > 0.0 && height > 0.0);
         assert!(window.scale() >= 1);
+        unsafe {
+            DestroyWindow(window.hwnd);
+        }
+    }
+
+    #[test]
+    fn wheel_notches_become_scroll_lines_in_points() {
+        // one notch, three lines of ~16 points — the platform default
+        assert_eq!(wheel_px(120.0, 3.0), 48.0);
+        assert_eq!(wheel_px(-120.0, 3.0), -48.0);
+        // precision touchpads send fractions of a notch
+        assert_eq!(wheel_px(30.0, 3.0), 12.0);
+        // a taller system setting scrolls farther
+        assert_eq!(wheel_px(120.0, 5.0), 80.0);
+    }
+
+    #[test]
+    fn a_layout_rect_lands_on_screen_and_comes_back() {
+        let window = create_window("bunny screen", 200.0, 150.0, false);
+        MAIN_HWND.store(window.hwnd, Ordering::Release);
+        let factor = shared_factor();
+        let rect = window.layout_rect_to_screen(10.0, 20.0, 30.0, 40.0);
+        assert_eq!(rect.right - rect.left, (30.0 * factor).round() as i32);
+        assert_eq!(rect.bottom - rect.top, (40.0 * factor).round() as i32);
+        // the work area exists and holds a positive size
+        let (_, _, work_w, work_h) = window.screen_bounds_in_layout().expect("a monitor");
+        assert!(work_w > 100.0 && work_h > 100.0);
+        unsafe {
+            DestroyWindow(window.hwnd);
+        }
+    }
+
+    #[test]
+    fn a_panel_translates_its_events_into_the_scene() {
+        let window = create_window("bunny panel", 100.0, 80.0, false);
+        MAIN_HWND.store(window.hwnd, Ordering::Release);
+        let panel = create_panel(&window);
+        panel.set_scene_origin(300.0, -20.0);
+        let factor = shared_factor();
+        // a client point on the panel reads as scene coordinates
+        let lparam = ((10.0 * factor) as isize) | (((8.0 * factor) as isize) << 16);
+        let (x, y) = layout_point(panel.hwnd, lparam);
+        assert!((x - 310.0).abs() < 1.0, "x lands in the scene: {x}");
+        assert!((y - (-12.0)).abs() < 1.0, "y lands in the scene: {y}");
+        panel.close_panel();
+        unsafe {
+            DestroyWindow(window.hwnd);
+        }
+    }
+
+    #[test]
+    fn the_layered_copy_premultiplies_into_bgra() {
+        let window = create_window("bunny layered", 60.0, 40.0, false);
+        let panel = create_panel(&window);
+        // one half-transparent red pixel: premultiplied BGRA
+        panel.present_layered(
+            Rect { left: 0, top: 0, right: 2, bottom: 1 },
+            2,
+            1,
+            &[255, 0, 0, 128, 0, 255, 0, 255],
+        );
+        BACKING.with(|stores| {
+            let stores = stores.borrow();
+            let backing = stores.get(&panel.hwnd).expect("panel backing");
+            let bytes = unsafe { std::slice::from_raw_parts(backing.bits, 8) };
+            assert_eq!(&bytes[0..4], &[0, 0, 128, 128], "premultiplied red, BGRA order");
+            assert_eq!(&bytes[4..8], &[0, 255, 0, 255], "opaque green stays whole");
+        });
+        panel.close_panel();
         unsafe {
             DestroyWindow(window.hwnd);
         }
