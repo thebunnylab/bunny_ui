@@ -454,10 +454,34 @@ impl<C: View<Arity = Single>> View for Modified<C> {
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        // the thin generic shim: every distinct modifier chain in the
+        // app instantiates ONLY these two doors — the engine below is
+        // compiled once for all of them
+        render_modified(
+            ctx,
+            out,
+            &self.modifier,
+            &|ctx, out| self.base.render_into(ctx, out),
+            &|| crate::erased::erased(self.base.clone()),
+        );
+    }
+}
+
+/// The engine behind every `Modified<C>`, compiled ONCE. The wrapper
+/// hands over two doors to its base — rendering it, and an erased
+/// clone for the custom-modifier path — and a thousand distinct
+/// chains share this body in the binary instead of repeating it.
+fn render_modified(
+    ctx: &Context,
+    out: &mut NodeList,
+    modifier: &Modifier,
+    render_base: &dyn Fn(&Context, &mut NodeList),
+    erase_base: &dyn Fn() -> crate::erased::Erased,
+) {
         // `.modifier(…)` re-renders through the custom modifier's own
         // body(content:), and marks the node — the recomputable blur path.
-        if let Modifier::Custom(custom) = &self.modifier {
-            let applied = custom.apply(ctx, crate::erased::erased(self.base.clone()));
+        if let Modifier::Custom(custom) = modifier {
+            let applied = custom.apply(ctx, erase_base());
             let mut nodes = NodeList::new();
             applied.render_into(ctx, &mut nodes);
             if let Some(node) = nodes.last_mut() {
@@ -471,11 +495,11 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         // `.id("name")` wraps the base's RENDER: the identity cursor
         // must carry the name while the subtree declares its state,
         // its animations and its hit paths.
-        if let Modifier::Id(name) = &self.modifier {
+        if let Modifier::Id(name) = modifier {
             let mut nodes = NodeList::new();
             {
                 let _frame = motor::identity::enter(format!("[{name}]"));
-                self.base.render_into(ctx, &mut nodes);
+                render_base(ctx, &mut nodes);
             }
             if let Some(node) = nodes.last_mut() {
                 node.line.push_str(&format!(" [.id({name:?})]"));
@@ -486,13 +510,13 @@ impl<C: View<Arity = Single>> View for Modified<C> {
 
         // `.inject()` / `.modelContainer()` water the subtree.
         let mut base_ctx = ctx.clone();
-        if let Modifier::EnvSet { set, .. } = &self.modifier {
+        if let Modifier::EnvSet { set, .. } = modifier {
             set(&mut base_ctx.values);
         }
 
-        self.base.render_into(&base_ctx, out);
+        render_base(&base_ctx, out);
 
-        match &self.modifier {
+        match modifier {
             Modifier::OnAppear(action) | Modifier::OnTapGesture(action) => action(),
             Modifier::Effect { effect, .. } => {
                 // The effect sees the subtree's environment — the pump only
@@ -584,7 +608,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
 
         // LAYOUT modifiers wrap the base's node — this is where the typed
         // chain becomes proposal/response structure
-        match &self.modifier {
+        match modifier {
             Modifier::Padding => wrap_padding(out, Edges::uniform(16.0)),
             Modifier::PaddingLength(length) => wrap_padding(out, Edges::uniform(*length)),
             Modifier::PaddingEdge(edge, length) => {
@@ -834,8 +858,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         if let Some(node) = out.last_mut() {
             // frame does not print: the suffix is not even formatted
             if crate::view::print_enabled() {
-                node.line.push_str(&self.modifier.suffix());
+                node.line.push_str(&modifier.suffix());
             }
         }
-    }
 }
