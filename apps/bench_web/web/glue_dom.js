@@ -21,8 +21,10 @@ const decoder = new TextDecoder();
 const EXPECTED_ABI = 2;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
-// before this script loads; the finder's binary is the default.
+// before this script loads; the finder's binary is the default. The
+// entry export follows the same door (`window.BUNNY_START`).
 const WASM_URL = window.BUNNY_WASM || "finder_web.wasm";
+const START_EXPORT = window.BUNNY_START || "start_dom";
 // `?stats` on the page URL: the glue accumulates its apply-side wall
 // time in `window.__bunnyApply` — the column the wasm cannot see.
 const STATS = location.search.includes("stats");
@@ -922,7 +924,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     // start_dom — the two numbers a mount argument needs
     window.__bunnyBoot = { instantiate: performance.now() - bootOpened };
     const startOpened = performance.now();
-    wasm.start_dom(
+    wasm[START_EXPORT](
       app.clientWidth,
       app.clientHeight,
       window.devicePixelRatio || 1,

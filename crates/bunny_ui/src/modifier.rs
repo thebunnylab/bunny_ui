@@ -89,6 +89,9 @@ pub enum Modifier {
     /// Pressing this view (where no interactive target wins) drags the
     /// WINDOW — the scene's own title bar on a chrome-less window.
     WindowDragRegion,
+    /// Dom hints: `(tag, class, id)` — only the element lowering
+    /// consumes them; everything else passes through.
+    ElementHint(Option<String>, Option<String>, Option<String>),
 
     // MARK: - Real interaction (a pointer target without chrome — the Button
     // without the outfit; the action fires on up-inside like the Button's)
@@ -209,6 +212,9 @@ impl Modifier {
             Modifier::Rendering(mode) => format!(" [.rendering(.{mode:?})]"),
             Modifier::KeyContext(name) => format!(" [.keyContext({name})]"),
             Modifier::WindowDragRegion => " [.windowDragRegion()]".into(),
+            Modifier::ElementHint(tag, class, dom_id) => {
+                format!(" [.element({tag:?}, {class:?}, {dom_id:?})]")
+            }
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
@@ -774,6 +780,15 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             }
             Modifier::WindowDragRegion => {
                 out.wrap_last_layout(|node| LayoutNode::DragRegion {
+                    child: Box::new(node),
+                });
+            }
+            Modifier::ElementHint(tag, class, dom_id) => {
+                let (tag, class, dom_id) = (tag.clone(), class.clone(), dom_id.clone());
+                out.wrap_last_layout(move |node| LayoutNode::Hinted {
+                    tag,
+                    class,
+                    dom_id,
                     child: Box::new(node),
                 });
             }

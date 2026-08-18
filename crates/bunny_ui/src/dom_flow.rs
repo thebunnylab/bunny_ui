@@ -503,6 +503,23 @@ impl Walk<'_> {
                 // a window drag region means nothing in a browser tab
                 self.lower_into(child, out);
             }
+            LayoutNode::Hinted { tag, class, dom_id, child } => {
+                // the hint stamps whatever the child lowered to — one
+                // node in practice (a hinted stack, text, or box)
+                let opened = out.len();
+                self.lower_into(child, out);
+                for hinted in &mut out[opened..] {
+                    if tag.is_some() {
+                        hinted.hints.tag = tag.clone();
+                    }
+                    if class.is_some() {
+                        hinted.hints.class = class.clone();
+                    }
+                    if dom_id.is_some() {
+                        hinted.hints.dom_id = dom_id.clone();
+                    }
+                }
+            }
             #[cfg(feature = "canvas")]
             LayoutNode::Island { child } => {
                 out.push(self.island(child));

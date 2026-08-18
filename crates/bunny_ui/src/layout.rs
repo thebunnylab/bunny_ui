@@ -411,6 +411,15 @@ pub enum LayoutNode {
     /// title bar on a chrome-less window. Transparent to geometry;
     /// shells without windows ignore it honestly.
     DragRegion { child: Box<LayoutNode> },
+    /// Element hints for the Dom lowering — a real tag, a class, an
+    /// id. Transparent everywhere else, like `.rendering()`: a pixel
+    /// target never knows the child was ever going to be a `<tr>`.
+    Hinted {
+        tag: Option<String>,
+        class: Option<String>,
+        dom_id: Option<String>,
+        child: Box<LayoutNode>,
+    },
     /// The escape hatch (`custom(…)` / `canvas(…)`): a box the APP
     /// measures and paints, in the same command vocabulary the built-ins
     /// emit. `path` is its identity — the address of the events it
@@ -1523,7 +1532,8 @@ impl LayoutNode {
             | LayoutNode::Animated { child, .. }
             | LayoutNode::Island { child }
             | LayoutNode::Anchored { child, .. }
-            | LayoutNode::DragRegion { child } => child.is_flexible(axis),
+            | LayoutNode::DragRegion { child }
+            | LayoutNode::Hinted { child, .. } => child.is_flexible(axis),
             // a stack that HOLDS something flexible is itself flexible
             // (a panel with a scroll inside wants the leftover space —
             // nesting it must not freeze it at its natural extent)
@@ -1570,6 +1580,7 @@ impl LayoutNode {
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
+            | LayoutNode::Hinted { child, .. }
             | LayoutNode::Frame { child, .. } => child.first_baseline(env),
             // lane A leads the seam — its text sets the shared line
             LayoutNode::Split { children, .. } => {
@@ -1669,6 +1680,11 @@ impl LayoutNode {
             }
 
             LayoutNode::DragRegion { child } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            LayoutNode::Hinted { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -2178,6 +2194,10 @@ impl LayoutNode {
                     anchor,
                     anchor_visible,
                 });
+            }
+
+            (LayoutNode::Hinted { child, .. }, Fit::Wrapped(_, fit)) => {
+                child.place(frame, *fit, env, out);
             }
 
             (LayoutNode::DragRegion { child }, Fit::Wrapped(_, fit)) => {
