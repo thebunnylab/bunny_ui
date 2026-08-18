@@ -197,7 +197,22 @@ function wireScroll(el, id) {
   viewportObserver.observe(el);
 }
 
+// The table family lays itself out — a hinted <tr> must BE a table
+// row, not a flex box wearing its name. For these tags the browser's
+// own display wins and our flex steps aside.
+const TABLE_TAGS = new Set(["table", "thead", "tbody", "tfoot", "tr", "td", "th"]);
+
 function createElementOf(kind, tag) {
+  const el = createElementRaw(kind, tag);
+  if (tag && TABLE_TAGS.has(tag)) {
+    el.style.display = "";
+    el.style.minWidth = "";
+    el.style.minHeight = "";
+  }
+  return el;
+}
+
+function createElementRaw(kind, tag) {
   // 0 group, 1 box, 2 text, 3 field, 4 scroll, 5 content, 6 canvas,
   // 7 image, 8 icon, 9 flex column, 10 flex row, 11 layers, 12 popover
   if (kind === 9 || kind === 10) {
@@ -662,6 +677,19 @@ function applyPatches(view, length) {
       // the browser computes the offset — dense lists only
       const target = elements.get(u32());
       if (target) target.scrollIntoView({ block: "nearest" });
+    } else if (op === 15) {
+      // live hints: class and id re-attribute in place
+      const cls = text(u8());
+      const domId = text(u8());
+      const el = elements.get(id);
+      if (el) {
+        el.className = cls;
+        if (domId) {
+          el.id = domId;
+        } else {
+          el.removeAttribute("id");
+        }
+      }
     } else if (op === 14) {
       // the popover's anchor relation — position now, and again
       // whenever anything scrolls or the window resizes

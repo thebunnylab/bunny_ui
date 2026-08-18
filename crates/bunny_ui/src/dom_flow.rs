@@ -156,6 +156,11 @@ impl Walk<'_> {
                     Axis::Horizontal => DomKind::FlexRow,
                 };
                 let mut container = node(kind);
+                // a container can be the pressed thing too (a bare
+                // stack hinted into an anchor): the pending action
+                // lands here the way it lands on a styled box
+                container.style.interactive = self.pending_interactive.take();
+                container.style.transition = self.pending_transition.take();
                 let layout = container.layout.as_mut().expect("flow node");
                 if *spacing != 0.0 {
                     layout.gap = Some(*spacing);

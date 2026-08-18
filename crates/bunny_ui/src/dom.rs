@@ -608,6 +608,9 @@ pub enum DomPatch {
     /// element `anchor`'s real box on `side`, repositioning while
     /// either of them moves. `path` keys the dismissal doors.
     SetAnchor { id: u32, anchor: u32, side: u8, path: String },
+    /// The element's LIVE hints changed — class and id re-attribute in
+    /// place (the tag never changes without a recreation).
+    SetHints { id: u32, class: Option<String>, dom_id: Option<String> },
 }
 
 // MARK: - Lowering (retained scene + diff)
@@ -1122,6 +1125,15 @@ fn diff_node(
     }
     if old.style != new.style {
         patches.push(DomPatch::SetStyle { id, style: new.style.clone() });
+    }
+    if old.hints != new.hints {
+        // class and id re-attribute live; a TAG change would need a
+        // recreation and the walk never changes one on a kept identity
+        patches.push(DomPatch::SetHints {
+            id,
+            class: new.hints.class.clone(),
+            dom_id: new.hints.dom_id.clone(),
+        });
     }
     match (&old.kind, &new.kind) {
         (DomKind::Text(before), DomKind::Text(after)) if before != after => {
@@ -1734,6 +1746,12 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 out.push(*side);
                 push_bytes_u16(&mut out, path.as_bytes());
             }
+            DomPatch::SetHints { id, class, dom_id } => {
+                out.push(15);
+                push_u32(&mut out, *id);
+                push_hint(&mut out, class.as_deref());
+                push_hint(&mut out, dom_id.as_deref());
+            }
         }
     }
     out
@@ -1927,7 +1945,8 @@ mod tests {
             | DomPatch::SetLayout { id, .. }
             | DomPatch::Move { id, .. }
             | DomPatch::Reveal { id, .. }
-            | DomPatch::SetAnchor { id, .. } => *id,
+            | DomPatch::SetAnchor { id, .. }
+            | DomPatch::SetHints { id, .. } => *id,
         }
     }
 

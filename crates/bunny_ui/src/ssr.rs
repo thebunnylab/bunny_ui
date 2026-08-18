@@ -459,6 +459,18 @@ impl Tree {
                 element.attrs.insert("placeholder", field.placeholder.to_string());
                 element.attrs.insert("data-path", field.path.clone());
             }
+            DomPatch::SetHints { id, class, dom_id } => {
+                if let Some(element) = self.elements.get_mut(id) {
+                    match class {
+                        Some(class) => element.attrs.insert("class", class.clone()),
+                        None => element.attrs.remove("class"),
+                    };
+                    match dom_id {
+                        Some(dom_id) => element.attrs.insert("id", dom_id.clone()),
+                        None => element.attrs.remove("id"),
+                    };
+                }
+            }
             DomPatch::SetScroll { .. }
             | DomPatch::SetImage { .. }
             | DomPatch::SetIcon { .. }
