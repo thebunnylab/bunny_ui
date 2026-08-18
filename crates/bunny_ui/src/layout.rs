@@ -569,6 +569,10 @@ pub struct Interaction {
     /// The split whose divider is being dragged — moves route to its
     /// retained position writer instead of hover until the release.
     pub split_drag: Option<String>,
+    /// The app's box that owns the pointer: a press inside it keeps
+    /// every move until the release, even outside the frame (dragging
+    /// a selection out of the box and back is one gesture).
+    pub element_grab: Option<String>,
 }
 
 /// A draw command — the output of the placement pass, in paint order
@@ -760,6 +764,19 @@ pub struct SplitPlacement {
     pub min_b: Px,
 }
 
+/// A placed escape hatch — what the runtime needs to route an event
+/// into the app's own coordinates (mirror of [`FieldPlacement`]). The
+/// element rides along: a skipped subtree keeps answering, because the
+/// retained tree kept it.
+#[derive(Clone, Debug)]
+pub struct CustomPlacement {
+    pub path: String,
+    pub frame: Rect,
+    /// The font the box inherited — the metrics an event resolves with.
+    pub font: FontSpec,
+    pub element: crate::custom::Custom,
+}
+
 /// The grip band's thickness over a split divider, in points.
 pub const SPLIT_GRIP: Px = 6.0;
 
@@ -771,6 +788,9 @@ pub struct Placement {
     pub scrolls: Vec<ScrollRegion>,
     pub fields: Vec<FieldPlacement>,
     pub splits: Vec<SplitPlacement>,
+    /// The app's own boxes, in paint order — where an event goes when
+    /// the hit-test lands on one.
+    pub customs: Vec<CustomPlacement>,
     /// Stack of the inherited foreground — the top colors the text.
     foreground: Vec<Color>,
     /// Stack of the nearest `Interactive`'s `(hovered, pressed)` — the
@@ -899,6 +919,8 @@ pub struct LayoutResult {
     pub scrolls: Vec<ScrollRegion>,
     pub fields: Vec<FieldPlacement>,
     pub splits: Vec<SplitPlacement>,
+    /// The app's own boxes — the addresses an event resolves against.
+    pub customs: Vec<CustomPlacement>,
     /// Virtual windows that failed to cover the visible band this
     /// frame — the runtime re-materializes them in a follow-up pass.
     pub misses: Vec<String>,
@@ -958,6 +980,7 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         scrolls: out.scrolls,
         fields: out.fields,
         splits: out.splits,
+        customs: out.customs,
         misses: out.misses,
         overlays: out.overlays,
         drag_regions: out.drag_regions,
@@ -992,6 +1015,7 @@ pub fn layout_dom(
             scrolls: out.scrolls,
             fields: out.fields,
             splits: out.splits,
+            customs: out.customs,
             misses: out.misses,
             overlays: out.overlays,
         drag_regions: out.drag_regions,
@@ -1787,7 +1811,24 @@ impl LayoutNode {
                 });
             }
 
-            (LayoutNode::Custom { element, .. }, Fit::Leaf) => {
+            (LayoutNode::Custom { path, element }, Fit::Leaf) => {
+                // the box answers for the whole frame: a hit here never
+                // falls through to what is painted underneath, and the
+                // event finds the element by this path
+                if !path.is_empty() {
+                    let visible = out.current_clip().map_or(Some(frame), |clip| {
+                        frame.intersection(clip)
+                    });
+                    if let Some(visible) = visible {
+                        out.hits.push((path.clone(), visible));
+                        out.customs.push(CustomPlacement {
+                            path: path.clone(),
+                            frame,
+                            font: env.font,
+                            element: element.clone(),
+                        });
+                    }
+                }
                 // what the app paints is PIXELS: on the element lowering
                 // the box becomes a canvas island, and the island slices
                 // exactly the commands between here and the close

@@ -93,6 +93,9 @@ pub struct Runtime {
     /// The splits of the last layout — a divider drag maps the pointer
     /// back to a lane extent through this geometry.
     last_splits: RefCell<Vec<crate::layout::SplitPlacement>>,
+    /// The app's own boxes from the last layout — an event resolves its
+    /// element and its local coordinates through here.
+    last_customs: RefCell<Vec<crate::layout::CustomPlacement>>,
     /// The theme version the last pass saw — switching themes rebuilds
     /// the retention ONCE (tokens read in a body are baked into the
     /// scene).
@@ -237,6 +240,7 @@ impl Runtime {
             caret_visible: Cell::new(true),
             last_fields: RefCell::new(Vec::new()),
             last_splits: RefCell::new(Vec::new()),
+            last_customs: RefCell::new(Vec::new()),
             theme_version: Cell::new(crate::theme::version()),
             keymap: RefCell::new(HashMap::default()),
             scoped_keymap: RefCell::new(HashMap::default()),
@@ -367,6 +371,20 @@ impl Runtime {
             self.interaction.borrow_mut().pointer = Some(Point { x, y });
             return self.drag_split(&path, x, y);
         }
+        // a box that took the press owns every move until the release —
+        // dragging a selection past the frame is one gesture, not two
+        let grabbed = self.interaction.borrow().element_grab.clone();
+        if let Some(path) = grabbed {
+            self.interaction.borrow_mut().pointer = Some(Point { x, y });
+            if let Some(placement) = self.custom_at(&path) {
+                let at = Self::local(&placement, x, y);
+                let event = crate::custom::ElementEvent::PointerMoved { at, pressed: true };
+                return self.deliver(&placement, event).handled;
+            }
+            // the box left the scene mid-drag: the gesture ends with it
+            self.interaction.borrow_mut().element_grab = None;
+            return false;
+        }
         let target = self.hover_target(x, y);
         let mut interaction = self.interaction.borrow_mut();
         let hovered = match &interaction.pressed {
@@ -375,8 +393,20 @@ impl Runtime {
         };
         let changed = interaction.hovered != hovered;
         interaction.pointer = Some(Point { x, y });
-        interaction.hovered = hovered;
-        changed
+        interaction.hovered = hovered.clone();
+        drop(interaction);
+        // a free move over a box still reaches it: a cursor over code
+        // wants the column under it
+        let over = hovered.as_deref().and_then(|path| self.custom_at(path));
+        let used = match over {
+            Some(placement) => {
+                let at = Self::local(&placement, x, y);
+                let event = crate::custom::ElementEvent::PointerMoved { at, pressed: false };
+                self.deliver(&placement, event).handled
+            }
+            None => false,
+        };
+        changed || used
     }
 
     /// One divider move: clamp the pointer into the split's lane range
@@ -406,6 +436,37 @@ impl Runtime {
         reconciler::run_split(path, at)
     }
 
+    // MARK: - The app's own boxes (the escape hatch)
+
+    /// The app's box registered at `path` in the last layout.
+    fn custom_at(&self, path: &str) -> Option<crate::layout::CustomPlacement> {
+        self.last_customs
+            .borrow()
+            .iter()
+            .find(|placement| placement.path == path)
+            .cloned()
+    }
+
+    /// Hands one event to the app's box — the point arrives in the
+    /// box's OWN coordinates, and the answer says whether the scene
+    /// still gets a turn.
+    fn deliver(
+        &self,
+        placement: &crate::layout::CustomPlacement,
+        event: crate::custom::ElementEvent,
+    ) -> crate::custom::Response {
+        let ctx = crate::custom::EventCtx {
+            frame: placement.frame,
+            metrics: crate::custom::Metrics::new(&*self.text, &self.cache, placement.font),
+        };
+        placement.element.element().event(&event, &ctx)
+    }
+
+    /// A point in the box's own coordinates.
+    fn local(placement: &crate::layout::CustomPlacement, x: Px, y: Px) -> Point {
+        Point { x: x - placement.frame.origin.x, y: y - placement.frame.origin.y }
+    }
+
     /// Button down: ARMS pressed on the target under the point — no
     /// action fires here (up-inside is button semantics). `true` =
     /// repaint.
@@ -425,6 +486,21 @@ impl Runtime {
             return true;
         }
         let target = self.hover_target(x, y);
+        // a press inside the app's box hands it the pointer: nothing
+        // arms (a box has no up-inside action to mis-fire) and the
+        // moves keep coming until the release
+        if let Some(placement) = target.as_deref().and_then(|path| self.custom_at(path)) {
+            {
+                let mut interaction = self.interaction.borrow_mut();
+                interaction.pointer = Some(Point { x, y });
+                interaction.hovered = Some(placement.path.clone());
+                interaction.pressed = None;
+                interaction.element_grab = Some(placement.path.clone());
+            }
+            let at = Self::local(&placement, x, y);
+            self.deliver(&placement, crate::custom::ElementEvent::PointerDown { at });
+            return true;
+        }
         // a press on a grip band starts the divider drag — nothing arms
         // (a divider has no up-inside action to mis-fire)
         if let Some(grip) = target.as_deref().and_then(|t| t.strip_suffix("/#split")) {
@@ -448,6 +524,21 @@ impl Runtime {
     /// click). Returns the fired/focused path; the pressed visual
     /// always clears.
     pub fn pointer_released(&self, x: Px, y: Px) -> Option<String> {
+        // the box that owns the pointer hears the release and the
+        // gesture ends there: no action fires under it
+        let grabbed = self.interaction.borrow().element_grab.clone();
+        if let Some(path) = grabbed {
+            {
+                let mut interaction = self.interaction.borrow_mut();
+                interaction.element_grab = None;
+                interaction.pointer = Some(Point { x, y });
+            }
+            if let Some(placement) = self.custom_at(&path) {
+                let at = Self::local(&placement, x, y);
+                self.deliver(&placement, crate::custom::ElementEvent::PointerUp { at });
+            }
+            return None;
+        }
         // a divider drag ends on release — no action fires, no focus moves
         if self.interaction.borrow().split_drag.is_some() {
             let mut interaction = self.interaction.borrow_mut();
@@ -486,11 +577,18 @@ impl Runtime {
     /// The pointer left the window: clears hover (an in-flight press
     /// already had its visual dropped by the drag's `pointer_moved`).
     pub fn pointer_exited(&self) -> bool {
-        let mut interaction = self.interaction.borrow_mut();
-        let changed = interaction.hovered.is_some();
-        interaction.hovered = None;
-        interaction.pointer = None;
-        changed
+        let hovered = {
+            let mut interaction = self.interaction.borrow_mut();
+            let hovered = interaction.hovered.take();
+            interaction.pointer = None;
+            hovered
+        };
+        // the box under the pointer hears it leave (a hovered column,
+        // a hovered row of the app's own drawing, goes quiet)
+        if let Some(placement) = hovered.as_deref().and_then(|path| self.custom_at(path)) {
+            self.deliver(&placement, crate::custom::ElementEvent::PointerExited);
+        }
+        hovered.is_some()
     }
 
     /// Snapshot of the pointer state — the shell cursor and the asserts.
@@ -505,6 +603,18 @@ impl Runtime {
     /// reveals content above — the offset shrinks. `true` = it moved
     /// (the shell repaints; no render: zero bodies).
     pub fn wheel(&self, x: Px, y: Px, dx: Px, dy: Px) -> bool {
+        // the app's box gets the turn first: an editor scrolls itself.
+        // What it ignores falls through to the region around it.
+        let over = self
+            .hover_target(x, y)
+            .and_then(|path| self.custom_at(&path));
+        if let Some(placement) = over {
+            let at = Self::local(&placement, x, y);
+            let event = crate::custom::ElementEvent::Wheel { at, dx, dy };
+            if self.deliver(&placement, event).handled {
+                return true;
+            }
+        }
         let scrolls = self.last_scrolls.borrow();
         let travel = |region: &ScrollRegion| {
             let max_x =
@@ -1285,6 +1395,7 @@ impl Runtime {
         *self.last_scrolls.borrow_mut() = result.scrolls.clone();
         *self.last_fields.borrow_mut() = result.fields.clone();
         *self.last_splits.borrow_mut() = result.splits.clone();
+        *self.last_customs.borrow_mut() = result.customs.clone();
         *self.last_overlays.borrow_mut() = result.overlays.clone();
         *self.last_drag_regions.borrow_mut() = result.drag_regions.clone();
         // an applied-target memory whose region left the scene goes

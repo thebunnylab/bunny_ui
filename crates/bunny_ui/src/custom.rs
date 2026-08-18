@@ -67,6 +67,19 @@ pub trait CustomElement: 'static {
         }
     }
 
+    /// One event, in LOCAL coordinates. The default ignores everything:
+    /// a box that only paints answers nothing, and what it ignores goes
+    /// back to the scene (an ignored wheel scrolls the region around
+    /// it).
+    ///
+    /// A press on the box takes the POINTER until the release: the
+    /// moves keep arriving even when the pointer leaves the frame,
+    /// which is what dragging a selection needs.
+    fn event(&self, event: &ElementEvent, ctx: &EventCtx) -> Response {
+        let _ = (event, ctx);
+        Response::ignored()
+    }
+
     /// Does the box want the leftover space of the stack that holds it?
     /// The default is yes — the same answer a `Rectangle` gives. A
     /// `.frame(…)` around it always wins.
@@ -301,6 +314,70 @@ impl<'a> Painter<'a> {
         self.display.push(DrawCommand::PushClip { rect: self.shift(rect) });
         body(self);
         self.display.push(DrawCommand::PopClip);
+    }
+}
+
+// MARK: - What reaches the box
+
+/// One event for the app's box, in LOCAL coordinates: the origin is the
+/// box's own top-left corner.
+///
+/// The list grows as the shells learn to say more — match with a `_`
+/// arm.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum ElementEvent {
+    /// The pointer moved. `pressed` = the box owns the drag (the press
+    /// started here), so the point can be outside the frame.
+    PointerMoved { at: Point, pressed: bool },
+    PointerDown { at: Point },
+    PointerUp { at: Point },
+    /// The wheel turned over the box. Ignore it and the scroll region
+    /// around the box takes the turn instead.
+    Wheel { at: Point, dx: Px, dy: Px },
+    /// The pointer left the box (or the window).
+    PointerExited,
+}
+
+/// What the app answers.
+///
+/// `handled` decides whether the event stops here; `text` is what a
+/// copy or a cut hands back to the platform's clipboard.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Response {
+    pub handled: bool,
+    pub text: Option<String>,
+}
+
+impl Response {
+    /// The box used the event: it stops here.
+    pub fn handled() -> Response {
+        Response { handled: true, text: None }
+    }
+
+    /// The box did not use it: the scene takes over.
+    pub fn ignored() -> Response {
+        Response::default()
+    }
+
+    /// Handled, with text for the clipboard.
+    pub fn text(text: impl Into<String>) -> Response {
+        Response { handled: true, text: Some(text.into()) }
+    }
+}
+
+/// What the app reads while it answers an event.
+pub struct EventCtx<'a> {
+    /// The box, in LAYOUT coordinates — its size is what measure
+    /// answered.
+    pub frame: Rect,
+    /// Text measurement, cached: how a click becomes a column.
+    pub metrics: Metrics<'a>,
+}
+
+impl EventCtx<'_> {
+    pub fn size(&self) -> Size {
+        self.frame.size
     }
 }
 
@@ -599,6 +676,162 @@ mod tests {
         // a second frame with nothing changed asks for no pixels
         assert!(runtime.dom_frame(&Screen, size).is_empty());
         assert!(runtime.dom_islands(1).is_empty(), "unchanged pixels never re-raster");
+    }
+
+    /// A surface that writes down every event it is told about.
+    struct Recorder {
+        log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
+        takes_wheel: Rc<Cell<bool>>,
+    }
+
+    impl Recorder {
+        fn new(log: &Rc<std::cell::RefCell<Vec<ElementEvent>>>) -> Recorder {
+            Recorder { log: Rc::clone(log), takes_wheel: Rc::new(Cell::new(false)) }
+        }
+    }
+
+    impl CustomElement for Recorder {
+        fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+
+        fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
+            self.log.borrow_mut().push(event.clone());
+            match event {
+                ElementEvent::Wheel { .. } if !self.takes_wheel.get() => Response::ignored(),
+                _ => Response::handled(),
+            }
+        }
+    }
+
+    #[test]
+    fn a_press_hands_the_box_the_pointer_until_the_release() {
+        // the drag leaves the frame and keeps arriving: selecting text
+        // past the edge is ONE gesture
+        #[derive(Clone)]
+        struct Screen {
+            log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
+        }
+        impl Component for Screen {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                use crate::ext::ViewExt;
+                custom(Recorder::new(&self.log))
+                    .frame(80.0, 40.0)
+                    .padding_length(10.0)
+            }
+        }
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let runtime = Runtime::new();
+        let view = Screen { log: Rc::clone(&log) };
+        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(100.0) });
+
+        assert!(runtime.pointer_pressed(20.0, 20.0), "the press lands in the box");
+        runtime.pointer_moved(300.0, 300.0);
+        assert_eq!(runtime.pointer_released(300.0, 300.0), None, "no action fires under it");
+        let seen = log.borrow().clone();
+        assert_eq!(
+            seen,
+            vec![
+                ElementEvent::PointerDown { at: Point { x: 10.0, y: 10.0 } },
+                ElementEvent::PointerMoved {
+                    at: Point { x: 290.0, y: 290.0 },
+                    pressed: true
+                },
+                ElementEvent::PointerUp { at: Point { x: 290.0, y: 290.0 } },
+            ],
+            "local coordinates, and the drag survives leaving the box"
+        );
+    }
+
+    #[test]
+    fn a_press_on_the_box_never_reaches_what_is_under_it() {
+        #[derive(Clone)]
+        struct Screen {
+            fired: Rc<Cell<bool>>,
+        }
+        impl Component for Screen {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                let fired = Rc::clone(&self.fired);
+                crate::zstack!(
+                    crate::views::button(crate::views::text("under"), move || fired.set(true)),
+                    canvas(|ctx, painter| painter.fill(ctx.bounds(), Color::FILL)),
+                )
+            }
+        }
+        let fired = Rc::new(Cell::new(false));
+        let runtime = Runtime::new();
+        let view = Screen { fired: Rc::clone(&fired) };
+        runtime.layout(&view, Proposal { width: Some(120.0), height: Some(60.0) });
+        runtime.pointer_pressed(60.0, 30.0);
+        runtime.pointer_released(60.0, 30.0);
+        assert!(!fired.get(), "the box owns its own frame");
+    }
+
+    #[test]
+    fn an_ignored_wheel_falls_through_to_the_region() {
+        #[derive(Clone)]
+        struct Scrolled {
+            log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
+            takes_wheel: Rc<Cell<bool>>,
+        }
+        impl Component for Scrolled {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                use crate::ext::ViewExt;
+                let (log, takes_wheel) = (self.log, self.takes_wheel);
+                crate::views::list(
+                    vec![0usize],
+                    |row| row.to_string(),
+                    move |_| {
+                        custom(Recorder {
+                            log: Rc::clone(&log),
+                            takes_wheel: Rc::clone(&takes_wheel),
+                        })
+                        .frame(60.0, 400.0)
+                    },
+                )
+            }
+        }
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let takes_wheel = Rc::new(Cell::new(false));
+        let runtime = Runtime::new();
+        let view = Scrolled { log: Rc::clone(&log), takes_wheel: Rc::clone(&takes_wheel) };
+        runtime.layout(&view, Proposal { width: Some(60.0), height: Some(80.0) });
+
+        // the box ignores the wheel: the list around it scrolls
+        assert!(runtime.wheel(30.0, 40.0, 0.0, -20.0), "the region took the turn");
+        assert!(matches!(log.borrow().last(), Some(ElementEvent::Wheel { .. })));
+        assert_eq!(runtime.scroll_offset("Scrolled").y, 20.0);
+
+        // the box that takes it stops it there
+        takes_wheel.set(true);
+        assert!(runtime.wheel(30.0, 40.0, 0.0, -20.0));
+        assert_eq!(
+            runtime.scroll_offset("Scrolled").y,
+            20.0,
+            "what the box takes never reaches the region"
+        );
+    }
+
+    #[test]
+    fn a_free_move_reaches_the_box_unpressed() {
+        #[derive(Clone)]
+        struct Screen {
+            log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
+        }
+        impl Component for Screen {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                custom(Recorder::new(&self.log))
+            }
+        }
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let runtime = Runtime::new();
+        let view = Screen { log: Rc::clone(&log) };
+        runtime.layout(&view, Proposal { width: Some(40.0), height: Some(40.0) });
+        runtime.pointer_moved(12.0, 8.0);
+        assert_eq!(
+            log.borrow().last(),
+            Some(&ElementEvent::PointerMoved { at: Point { x: 12.0, y: 8.0 }, pressed: false })
+        );
+        runtime.pointer_exited();
+        assert_eq!(log.borrow().last(), Some(&ElementEvent::PointerExited));
     }
 
     /// Lays a node out at an exact proposal.

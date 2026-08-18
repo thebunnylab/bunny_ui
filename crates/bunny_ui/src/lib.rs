@@ -104,7 +104,8 @@ pub mod prelude {
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::Spring;
     pub use crate::custom::{
-        Custom, CustomElement, Metrics, PaintCtx, Painter, canvas, custom,
+        Custom, CustomElement, ElementEvent, EventCtx, Metrics, PaintCtx, Painter, Response,
+        canvas, custom,
     };
     pub use crate::erased::{CustomModifier, Erased, erased};
     pub use crate::{hstack, text, vstack, zstack};
