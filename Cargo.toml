@@ -33,3 +33,15 @@ lto = true
 panic = "abort"
 strip = true
 codegen-units = 1
+
+# The SPEED twin: what a benchmark ships. Baseline-tier wasm runs the
+# size-optimized code several times slower, and a harness presses the
+# button before the optimizer catches up — a scoreboard binary pays
+# bytes for first-second speed.
+[profile.webspeed]
+inherits = "release"
+opt-level = 3
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1
