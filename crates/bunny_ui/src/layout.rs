@@ -2199,6 +2199,18 @@ impl LayoutNode {
                     .last()
                     .copied()
                     .unwrap_or_else(|| crate::theme::current().fg);
+                if let Some(dom) = out.dom.as_mut() {
+                    // the capture re-stamps the ink from its own stack
+                    dom.leaf(
+                        crate::dom::DomKind::Icon(crate::dom::DomIcon {
+                            key: symbol.key,
+                            symbol: *symbol,
+                            color,
+                            inherits_ink: false,
+                        }),
+                        frame,
+                    );
+                }
                 let side = frame.size.width.min(frame.size.height);
                 if side > 0.0 {
                     let rect = Rect {

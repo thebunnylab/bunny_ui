@@ -66,6 +66,11 @@ pub enum DomKind {
     /// record carries the IDENTITY; the shell's registry maps it to a
     /// URL the browser can load.
     Image(DomImage),
+    /// An `<svg>` — a vector glyph rendered AT HOME: the browser
+    /// scales the drawing, and the tint is `currentColor`, so hover
+    /// and press flip through the box above with no patch of their
+    /// own.
+    Icon(DomIcon),
 }
 
 /// One image element. `key` is the source identity ([`crate::
@@ -76,6 +81,22 @@ pub enum DomKind {
 pub struct DomImage {
     pub key: u64,
     pub cover: bool,
+}
+
+/// One vector glyph element. `key` is the SYMBOL's identity — never
+/// the tinted one: a re-tint moves the style and leaves the geometry
+/// alone. The drawing rides as the `Symbol` (Copy, two words); the
+/// encoder reads its verbs only when a patch mounts or changes, so a
+/// warm frame never touches them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DomIcon {
+    pub key: u64,
+    pub symbol: crate::icon::Symbol,
+    /// The inherited ink — the record of what the element shows.
+    pub color: Color,
+    /// Under a hover ink the element takes NO color of its own: the
+    /// box above declares both states and CSS carries them down.
+    pub inherits_ink: bool,
 }
 
 /// The visual record of a node — everything CSS will say about it.
@@ -350,6 +371,11 @@ impl DomCapture {
             text.color = self.current_ink();
             text.inherits_ink = !self.ink_scopes.is_empty();
         }
+        if let DomKind::Icon(icon) = &mut kind {
+            // the glyph fills with currentColor — same law as the text
+            icon.color = self.current_ink();
+            icon.inherits_ink = !self.ink_scopes.is_empty();
+        }
         self.open(kind, frame, frame.origin);
         self.close();
     }
@@ -441,6 +467,7 @@ pub enum CreateKind {
     Content,
     Canvas,
     Image,
+    Icon,
 }
 
 /// One island's fresh pixels — the shell blits them into the island's
@@ -471,6 +498,7 @@ pub enum DomPatch {
     SetField { id: u32, field: DomField },
     SetScroll { id: u32, x: f64, y: f64 },
     SetImage { id: u32, image: DomImage },
+    SetIcon { id: u32, icon: DomIcon },
 }
 
 // MARK: - Lowering (retained scene + diff)
@@ -610,6 +638,7 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::Content => CreateKind::Content,
         DomKind::Canvas { .. } => CreateKind::Canvas,
         DomKind::Image(_) => CreateKind::Image,
+        DomKind::Icon(_) => CreateKind::Icon,
     }
 }
 
@@ -714,6 +743,9 @@ fn create_subtree(
         DomKind::Image(image) => {
             patches.push(DomPatch::SetImage { id, image: *image });
         }
+        DomKind::Icon(icon) => {
+            patches.push(DomPatch::SetIcon { id, icon: *icon });
+        }
         _ => {}
     }
     let children = create_children(node, id, ctx, patches);
@@ -781,6 +813,9 @@ fn diff_node(
         (_, DomKind::Canvas { .. }) => note_island(id, new, ctx),
         (DomKind::Image(before), DomKind::Image(after)) if before != after => {
             patches.push(DomPatch::SetImage { id, image: *after });
+        }
+        (DomKind::Icon(before), DomKind::Icon(after)) if before != after => {
+            patches.push(DomPatch::SetIcon { id, icon: *after });
         }
         _ => {}
     }
@@ -859,7 +894,7 @@ fn diff_children(
 /// per patch: u8 op, u32 id, payload
 ///   1 create        u32 parent, u8 kind (0 group, 1 box, 2 text,
 ///                                        3 field, 4 scroll, 5 content,
-///                                        6 canvas, 7 image)
+///                                        6 canvas, 7 image, 8 icon)
 ///   2 remove        —
 ///   3 set transform f32 x, f32 y
 ///   4 set size      f32 w, f32 h
@@ -889,6 +924,19 @@ fn diff_children(
 ///   8 set scroll    f32 x, f32 y
 ///   9 set image     u32 key hi, u32 key lo, u8 cover — identity as a
 ///                   NUMBER (the shell's registry maps key → URL)
+///  10 set icon      u32 key hi, u32 key lo (the SYMBOL identity, for
+///                   the debugger's eyes), u32 ink rgba, u8 inherits
+///                   ink (1 = no color of its own — the box above owns
+///                   both states), u8 draw count, then per draw:
+///                   u8 paint (0 fill, 1 fill even-odd, 2 stroke),
+///                   f32 pen width (grid units; 0 for fills),
+///                   u32 len + utf8 `d` on the house 24 grid — the
+///                   glue's viewBox mirrors that constant, and the
+///                   default preserveAspectRatio is the SAME centred
+///                   square the rasterizers paint. The tint never
+///                   rides the geometry: the `<svg>` draws with
+///                   `currentColor`, so hover and press flip through
+///                   the box above with no patch of their own
 /// ```
 pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
     let mut out = Vec::with_capacity(patches.len() * 16 + 4);
@@ -908,6 +956,7 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
                     CreateKind::Content => 5,
                     CreateKind::Canvas => 6,
                     CreateKind::Image => 7,
+                    CreateKind::Icon => 8,
                 });
             }
             DomPatch::Remove { id } => {
@@ -985,6 +1034,26 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
                 push_u32(&mut out, (image.key >> 32) as u32);
                 push_u32(&mut out, image.key as u32);
                 out.push(image.cover as u8);
+            }
+            DomPatch::SetIcon { id, icon } => {
+                out.push(10);
+                push_u32(&mut out, *id);
+                push_u32(&mut out, (icon.key >> 32) as u32);
+                push_u32(&mut out, icon.key as u32);
+                push_u32(&mut out, pack_color(icon.color));
+                out.push(icon.inherits_ink as u8);
+                let draws = icon.symbol.glyph.draws;
+                out.push(draws.len() as u8);
+                for draw in draws {
+                    let (paint, width) = match draw.paint {
+                        crate::icon::Paint::Fill(crate::icon::Rule::NonZero) => (0u8, 0.0f32),
+                        crate::icon::Paint::Fill(crate::icon::Rule::EvenOdd) => (1, 0.0),
+                        crate::icon::Paint::Stroke { width } => (2, width),
+                    };
+                    out.push(paint);
+                    push_f32(&mut out, width as f64);
+                    push_bytes_u32(&mut out, crate::icon::to_svg_path(draw.path).as_bytes());
+                }
             }
         }
     }
@@ -1156,6 +1225,7 @@ mod tests {
             | DomPatch::SetText { id, .. }
             | DomPatch::SetField { id, .. }
             | DomPatch::SetImage { id, .. }
+            | DomPatch::SetIcon { id, .. }
             | DomPatch::SetScroll { id, .. } => *id,
         }
     }
@@ -1913,5 +1983,135 @@ mod tests {
         ]
         .concat();
         assert_eq!(bytes, expected);
+    }
+
+    const MARK_PATH: &[crate::icon::Verb] = &[
+        crate::icon::Verb::Move(4.0, 12.0),
+        crate::icon::Verb::Line(10.0, 18.0),
+        crate::icon::Verb::Line(20.0, 6.0),
+    ];
+    const MARK_GLYPH: crate::icon::Glyph = crate::icon::Glyph {
+        draws: &[crate::icon::Draw {
+            paint: crate::icon::Paint::Stroke { width: 2.0 },
+            path: MARK_PATH,
+        }],
+    };
+    const MARK: crate::icon::Symbol = crate::icon::Symbol::new("test.mark", &MARK_GLYPH);
+
+    #[test]
+    fn the_icon_encoding_is_byte_stable() {
+        let icon = DomIcon {
+            key: MARK.key,
+            symbol: MARK,
+            color: Color::hex(0x8A94A6),
+            inherits_ink: false,
+        };
+        let bytes = encode(&[DomPatch::SetIcon { id: 7, icon }]);
+        let expected: Vec<u8> = [
+            &1u32.to_le_bytes()[..],
+            &[10],
+            &7u32.to_le_bytes()[..],
+            &((MARK.key >> 32) as u32).to_le_bytes()[..],
+            &(MARK.key as u32).to_le_bytes()[..],
+            &0x8A94_A6FFu32.to_le_bytes()[..],
+            &[0],
+            &[1],
+            &[2],
+            &2.0f32.to_le_bytes()[..],
+            &16u32.to_le_bytes()[..],
+            b"M4 12L10 18L20 6",
+        ]
+        .concat();
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn an_icon_under_a_hover_ink_takes_no_color_of_its_own() {
+        const FAINT: Color = Color::hex(0x8A8A8A);
+        const BRIGHT: Color = Color::hex(0xF5F5F5);
+
+        #[derive(Clone, Copy)]
+        struct CloseButton;
+
+        impl Component for CloseButton {
+            fn body(self, _ctx: &Context) -> impl View {
+                icon(MARK)
+                    .foreground_color(FAINT)
+                    .foreground_hovered(BRIGHT)
+                    .on_click(|| {})
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 100.0, height: 50.0 };
+        let patches = runtime.dom_frame(&CloseButton, size);
+
+        // the box declares both inks; the browser owns the swap
+        let ink = patches
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::SetStyle { style, .. } if style.hover_color.is_some() => {
+                    Some((style.color, style.hover_color))
+                }
+                _ => None,
+            })
+            .expect("the box declares the ink it hands down");
+        assert_eq!(ink, (Some(FAINT), Some(BRIGHT)));
+        // and the glyph takes NO color of its own — currentColor
+        // inherits through, exactly the law the text keeps
+        let inherits = patches.iter().any(|patch| {
+            matches!(patch, DomPatch::SetIcon { icon, .. } if icon.inherits_ink)
+        });
+        assert!(inherits, "the glyph inherits its ink: {patches:#?}");
+
+        // the LAW still holds: hovering patches nothing
+        let target = runtime
+            .layout(&CloseButton, crate::layout::Proposal::exact(size))
+            .hits
+            .last()
+            .map(|(_, rect)| {
+                (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)
+            })
+            .expect("the glyph is a target");
+        assert!(runtime.pointer_moved(target.0, target.1), "the hover state flipped");
+        assert_eq!(runtime.dom_frame(&CloseButton, size), vec![], "hover is the browser's");
+    }
+
+    #[test]
+    fn a_new_tint_is_one_icon_patch() {
+        #[derive(Clone)]
+        struct Tinted {
+            ink: State<Color>,
+        }
+
+        impl Component for Tinted {
+            fn body(self, _ctx: &Context) -> impl View {
+                icon(MARK).foreground_color(self.ink.get())
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Tinted { ink: State::new(Color::hex(0x333333)) };
+        let size = Size { width: 60.0, height: 40.0 };
+        let mount = runtime.dom_frame(&view, size);
+        let creates = mount
+            .iter()
+            .filter(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Icon, .. }))
+            .count();
+        assert_eq!(creates, 1, "one element for one glyph: {mount:?}");
+
+        // the same scene again: nothing moves
+        assert_eq!(runtime.dom_frame(&view, size), vec![]);
+
+        // a re-tint is ONE icon patch — the geometry never re-travels
+        // in a style, and no other element hears about it
+        view.ink.set(Color::hex(0xAA2211));
+        let patches = runtime.dom_frame(&view, size);
+        assert_eq!(patches.len(), 1, "{patches:#?}");
+        assert!(matches!(
+            &patches[0],
+            DomPatch::SetIcon { icon, .. }
+                if icon.color == Color::hex(0xAA2211) && !icon.inherits_ink
+        ));
     }
 }

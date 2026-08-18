@@ -154,6 +154,52 @@ const fn fnv1a(tag: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+/// The `d` of one verb table on the house grid — what the Dom wire
+/// carries and the glue hands the browser. ONE encoder, byte-tested,
+/// so the geometry contract lives in exactly one place.
+pub(crate) fn to_svg_path(path: &[Verb]) -> String {
+    use std::fmt::Write;
+    // whole grid points print whole — the wire stays short and stable
+    fn number(out: &mut String, value: f32) {
+        if value == value.trunc() {
+            let _ = write!(out, "{}", value as i64);
+        } else {
+            let _ = write!(out, "{value}");
+        }
+    }
+    fn numbers(out: &mut String, values: &[f32]) {
+        for (i, value) in values.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            number(out, *value);
+        }
+    }
+    let mut out = String::new();
+    for verb in path {
+        match *verb {
+            Verb::Move(x, y) => {
+                out.push('M');
+                numbers(&mut out, &[x, y]);
+            }
+            Verb::Line(x, y) => {
+                out.push('L');
+                numbers(&mut out, &[x, y]);
+            }
+            Verb::Quad(cx, cy, x, y) => {
+                out.push('Q');
+                numbers(&mut out, &[cx, cy, x, y]);
+            }
+            Verb::Cubic(ax, ay, bx, by, x, y) => {
+                out.push('C');
+                numbers(&mut out, &[ax, ay, bx, by, x, y]);
+            }
+            Verb::Close => out.push('Z'),
+        }
+    }
+    out
+}
+
 // MARK: - The house rasterizer
 
 /// How many tinted rasters stay warm before the cache drops them all —

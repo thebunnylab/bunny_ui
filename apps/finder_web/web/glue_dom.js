@@ -117,6 +117,15 @@ function createElementOf(kind) {
     img.draggable = false;
     return img;
   }
+  if (kind === 8) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    // the viewBox mirrors the engine's ICON_GRID; the default
+    // preserveAspectRatio (xMidYMid meet) is the SAME centred square
+    // the rasterizers paint
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.style.cssText = "position:absolute;left:0;top:0;pointer-events:none;";
+    return svg;
+  }
   if (kind === 3) {
     const input = document.createElement("input");
     input.type = "text";
@@ -388,6 +397,38 @@ function applyPatches(view, length) {
         // false: our frame IS the rect (contain and stretch resolve in
         // the engine's geometry) — the element just fills it
         el.style.objectFit = cover ? "cover" : "fill";
+      }
+    } else if (op === 10) {
+      u32(); // the symbol identity rides for the debugger's eyes
+      u32();
+      const color = rgba(u32());
+      const inheritsInk = u8();
+      const count = u8();
+      const el = elements.get(id);
+      if (el) {
+        // an inherited ink takes NO inline color — the box above owns
+        // both states, the same law the text keeps
+        el.style.color = inheritsInk ? "" : color;
+        el.textContent = "";
+      }
+      for (let d = 0; d < count; d++) {
+        const paint = u8();
+        const width = f32();
+        const data = text(u32());
+        if (!el) continue;
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.setAttribute("d", data);
+        if (paint === 2) {
+          path.setAttribute("fill", "none");
+          path.setAttribute("stroke", "currentColor");
+          path.setAttribute("stroke-width", width);
+          path.setAttribute("stroke-linecap", "round");
+          path.setAttribute("stroke-linejoin", "round");
+        } else {
+          path.setAttribute("fill", "currentColor");
+          if (paint === 1) path.setAttribute("fill-rule", "evenodd");
+        }
+        el.appendChild(path);
       }
     }
   }
