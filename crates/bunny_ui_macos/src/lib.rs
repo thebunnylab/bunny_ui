@@ -315,6 +315,17 @@ pub fn run_window_chrome(
             if runtime.focused().is_some() && pattern.is_text_input() {
                 return false;
             }
+            // a focused escape hatch owns its strokes: an editor's
+            // arrows, Enter and Tab are its own, and a copy hands the
+            // text back for the pasteboard
+            let taken = runtime.key_stroke(&pattern);
+            if taken.handled {
+                if let Some(text) = taken.text {
+                    ffi::clipboard_write(&text);
+                }
+                blit(&runtime, &*root);
+                return true;
+            }
             let Some(action) = runtime.match_key(&pattern) else {
                 return false;
             };

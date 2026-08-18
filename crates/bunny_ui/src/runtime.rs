@@ -848,7 +848,9 @@ impl Runtime {
         // the app's box answers for itself; only the caret rect
         // changes hands, from the box's coordinates into the scene's
         if let Some(placement) = self.custom_at(&path) {
-            let context = placement.element.element().ime()?;
+            let metrics =
+                crate::custom::Metrics::new(&*self.text, &self.cache, placement.font);
+            let context = placement.element.element().ime(&metrics)?;
             return Some(ImeSnapshot {
                 text: context.text,
                 selected: context.selected,
@@ -896,7 +898,9 @@ impl Runtime {
                 return None;
             }
             let local = Self::local(&placement, x, y);
-            return placement.element.element().ime_index_at(local);
+            let metrics =
+                crate::custom::Metrics::new(&*self.text, &self.cache, placement.font);
+            return placement.element.element().ime_index_at(local, &metrics);
         }
         let field = self
             .last_fields
@@ -921,7 +925,9 @@ impl Runtime {
     pub fn ime_rect_for(&self, utf16: usize) -> Option<Rect> {
         let path = self.focus.borrow().clone()?;
         if let Some(placement) = self.custom_at(&path) {
-            let rect = placement.element.element().ime_rect_for(utf16)?;
+            let metrics =
+                crate::custom::Metrics::new(&*self.text, &self.cache, placement.font);
+            let rect = placement.element.element().ime_rect_for(utf16, &metrics)?;
             return Some(Self::to_layout(&placement, rect));
         }
         let field = self

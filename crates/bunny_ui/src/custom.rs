@@ -102,21 +102,22 @@ pub trait CustomElement: 'static {
     /// A document answers with the CONTEXT it wants the input system to
     /// know, not with its whole content: the current line is a good
     /// answer, as long as the indices below agree with it.
-    fn ime(&self) -> Option<ImeContext> {
+    fn ime(&self, metrics: &Metrics) -> Option<ImeContext> {
+        let _ = metrics;
         None
     }
 
     /// The UTF-16 index under a LOCAL point — the input system asks
     /// this to look a word up under the mouse.
-    fn ime_index_at(&self, local: Point) -> Option<usize> {
-        let _ = local;
+    fn ime_index_at(&self, local: Point, metrics: &Metrics) -> Option<usize> {
+        let _ = (local, metrics);
         None
     }
 
     /// The caret-shaped rect at a UTF-16 index of [`CustomElement::ime`],
     /// in LOCAL coordinates — where the candidate window lands.
-    fn ime_rect_for(&self, utf16: usize) -> Option<Rect> {
-        let _ = utf16;
+    fn ime_rect_for(&self, utf16: usize, metrics: &Metrics) -> Option<Rect> {
+        let _ = (utf16, metrics);
         None
     }
 
@@ -972,7 +973,7 @@ mod tests {
             }
         }
 
-        fn ime(&self) -> Option<ImeContext> {
+        fn ime(&self, _metrics: &Metrics) -> Option<ImeContext> {
             let text = self.text.borrow().clone();
             let caret = text.chars().count();
             Some(ImeContext {
@@ -986,11 +987,11 @@ mod tests {
             })
         }
 
-        fn ime_index_at(&self, local: Point) -> Option<usize> {
+        fn ime_index_at(&self, local: Point, _metrics: &Metrics) -> Option<usize> {
             Some((local.x / COLUMN).round().max(0.0) as usize)
         }
 
-        fn ime_rect_for(&self, utf16: usize) -> Option<Rect> {
+        fn ime_rect_for(&self, utf16: usize, _metrics: &Metrics) -> Option<Rect> {
             Some(Rect {
                 origin: Point { x: utf16 as Px * COLUMN, y: 0.0 },
                 size: Size { width: 1.5, height: 16.0 },
