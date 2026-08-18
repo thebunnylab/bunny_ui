@@ -152,6 +152,17 @@ impl Default for Runtime {
 }
 
 impl Runtime {
+    /// A runtime with the deterministic house font.
+    ///
+    /// One runtime per thread is the contract: retention and identity
+    /// are thread state, so a SECOND runtime on the same thread adopts
+    /// the first one's retained bodies — and their recorded reads
+    /// point at the old state slots, which kills invalidation
+    /// silently. A harness that must boot again on one thread calls
+    /// [`Runtime::render_full`] first: the retention drops, every body
+    /// runs, and the reads bind to the states that are alive now.
+    /// (Every shell boots exactly one; tests each run on their own
+    /// thread.)
     pub fn new() -> Self {
         Self::with_parts(Context::default(), Rc::new(PixelFont))
     }
@@ -1274,6 +1285,7 @@ impl Runtime {
     /// tree's lines are not even formatted (printing is for people;
     /// frames are for pixels).
     fn frame_pass(&self, root: &impl View) -> NodeList {
+        crate::stats::note_body_pass();
         crate::view::set_print(false);
         self.printless.set(true);
         let nodes = self.render_pass(root);
@@ -1429,6 +1441,9 @@ impl Runtime {
         proposal: crate::layout::Proposal,
         dom: bool,
     ) -> (crate::layout::LayoutResult, Option<crate::dom::DomNode>) {
+        // every call walks measure+place (the stable-root shortcut
+        // skips BODIES, not geometry) — so every call counts
+        crate::stats::note_layout_pass();
         // STABLE boundary-root frame (hover, wheel, blink, the
         // post-settle layout): nothing dirty, same theme, retained
         // root — the walk would be all-skip and emit exactly ONE
@@ -1502,12 +1517,20 @@ impl Runtime {
             anim: None,
             overlay_bounds: self.overlay_bounds.get(),
         };
-        let (result, scene) = if dom {
-            let (result, scene) = crate::layout::layout_dom(&tree, proposal, env);
-            (result, Some(scene))
+        let stage = if dom {
+            crate::stats::Stage::Capture
         } else {
-            (crate::layout::layout_with(&tree, proposal, env), None)
+            crate::stats::Stage::Layout
         };
+        let (result, scene) = crate::stats::time(stage, || {
+            if dom {
+                let (result, scene) = crate::layout::layout_dom(&tree, proposal, env);
+                (result, Some(scene))
+            } else {
+                (crate::layout::layout_with(&tree, proposal, env), None)
+            }
+        });
+        crate::stats::note_display(result.display.len());
         drop(offsets);
         drop(carets);
         *self.last_hits.borrow_mut() = result.hits.clone();
@@ -1647,17 +1670,19 @@ impl Runtime {
     /// for no confirmation (a pass with no new dirt produced a
     /// consistent tree by definition; the next pass would be all-skip).
     pub fn settle(&self, root: &impl View) {
-        for _ in 0..8 {
-            // the same order as the print path: a task that resolved
-            // writes its state, then the pass reads it
-            self.poll_tasks();
-            self.frame_pass(root);
-            let observed_change = self.pump();
-            effects::sweep_tasks();
-            if !observed_change && !self.has_pending_dirty() && !motor::task::has_ready() {
-                return;
+        crate::stats::time(crate::stats::Stage::Settle, || {
+            for _ in 0..8 {
+                // the same order as the print path: a task that resolved
+                // writes its state, then the pass reads it
+                self.poll_tasks();
+                self.frame_pass(root);
+                let observed_change = self.pump();
+                effects::sweep_tasks();
+                if !observed_change && !self.has_pending_dirty() && !motor::task::has_ready() {
+                    return;
+                }
             }
-        }
+        })
     }
 
     fn has_pending_dirty(&self) -> bool {

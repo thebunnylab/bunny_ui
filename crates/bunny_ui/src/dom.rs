@@ -271,6 +271,7 @@ impl DomCapture {
             self.swallowed += 1;
             return;
         }
+        crate::stats::note_capture_node();
         let parent_origin = self.stack.last().map(|(origin, _)| *origin).unwrap_or_default();
         let mut style = match &kind {
             DomKind::Box => DomStyle::default(),
@@ -556,6 +557,14 @@ impl DomLowering {
         scene: &DomNode,
         display: &crate::layout::DisplayList,
     ) -> Vec<DomPatch> {
+        crate::stats::time(crate::stats::Stage::Diff, || self.lower_timed(scene, display))
+    }
+
+    fn lower_timed(
+        &mut self,
+        scene: &DomNode,
+        display: &crate::layout::DisplayList,
+    ) -> Vec<DomPatch> {
         let mut patches = Vec::new();
         match self.root.as_mut() {
             None => {
@@ -793,6 +802,7 @@ fn diff_node(
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
+    crate::stats::note_diff_visit();
     let id = retained.id;
     let old = &retained.node;
     if (old.x, old.y) != (new.x, new.y) {
@@ -969,6 +979,14 @@ pub const ABI_VERSION: u32 = 1;
 ///                   the box above with no patch of their own
 /// ```
 pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
+    crate::stats::time(crate::stats::Stage::Encode, || {
+        let out = encode_unclocked(patches);
+        crate::stats::note_encode(patches.len(), out.len());
+        out
+    })
+}
+
+fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
     let mut out = Vec::with_capacity(patches.len() * 16 + 4);
     push_u32(&mut out, patches.len() as u32);
     for patch in patches {
