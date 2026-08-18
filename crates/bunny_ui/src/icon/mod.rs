@@ -10,6 +10,8 @@
 //! table the compiler lays out, with zero startup cost and zero parse.
 
 pub mod house;
+#[cfg(feature = "svg")]
+pub mod parse;
 pub(crate) mod vector;
 
 use std::cell::RefCell;

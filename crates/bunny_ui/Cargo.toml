@@ -4,5 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 description = "Declarative UI in Rust with a SwiftUI spirit — monomorphic typed tree, state with structural identity, incremental reconciliation"
 
+[features]
+# The SVG door: the subset parser behind `Symbol::from_svg` and the
+# svg2icon converter. Off by default — the shipped binary carries no
+# parser. Its tests need it too: `cargo test --features svg`.
+svg = []
+
 [dependencies]
 motor.workspace = true
