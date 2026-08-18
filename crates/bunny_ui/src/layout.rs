@@ -398,6 +398,12 @@ pub enum LayoutNode {
     /// consults the env's [`FrameStamp`] by `path` (pointer state never
     /// sticks to a tree).
     Interactive { path: String, child: Box<LayoutNode> },
+    /// `.hover_group()` — the subtree can paint by THIS box's pointer
+    /// state instead of by its own nearest target. The group is hovered
+    /// while the hovered target is the group's path or anything under
+    /// it, which is what makes the mark inside a chip stay lit when the
+    /// pointer finally reaches it (the rule CSS keeps for `:hover`).
+    HoverGroup { path: String, child: Box<LayoutNode> },
     /// Reference to a retained boundary (skipped by the reconciler);
     /// measure and place resolve ON-THE-FLY against the retention — the
     /// frame's tree is never stitched into a copy.
@@ -845,6 +851,25 @@ pub struct VisualProps {
     /// the cut FOLLOWS `.corner_radius(…)` when there is one. Paint
     /// only, like everything here: the measure never hears about it.
     pub clip: bool,
+    /// `.opacity(…)` — everything the subtree paints fades by this
+    /// factor, `0..1`. Paint only, like the rest: a box at zero still
+    /// measures, still lays out and still clicks.
+    ///
+    /// In the pixel pipelines the fade lands on each COMMAND, not on a
+    /// layer: two children of one faded box that overlap show through
+    /// each other. That is the price of a compositor with no offscreen
+    /// pass, and it is invisible in the case the modifier exists for —
+    /// a crossfade between two glyphs that share a slot.
+    pub opacity: Option<f64>,
+    /// The same fade under hover and pressed, so a mark can appear
+    /// under the pointer without the scene changing what it CONTAINS
+    /// (the LAW: hover swaps paint, never content).
+    pub opacity_hovered: Option<f64>,
+    pub opacity_pressed: Option<f64>,
+    /// `.group_hovered()` — this box's hover and pressed paint follows
+    /// the nearest `.hover_group()` above it, not the interactive
+    /// target it belongs to.
+    pub from_group: bool,
 }
 
 impl VisualProps {
@@ -865,6 +890,10 @@ impl VisualProps {
             foreground_pressed: self.foreground_pressed.or(outer.foreground_pressed),
             font: self.font.or(outer.font),
             shadow: self.shadow.or(outer.shadow),
+            opacity: self.opacity.or(outer.opacity),
+            opacity_hovered: self.opacity_hovered.or(outer.opacity_hovered),
+            opacity_pressed: self.opacity_pressed.or(outer.opacity_pressed),
+            from_group: self.from_group || outer.from_group,
         }
     }
 }
@@ -970,6 +999,36 @@ impl DisplayList {
 
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
+    }
+
+    /// Fades everything pushed since `from` — what `.opacity(…)`
+    /// leaves behind in the pixel pipelines. The multiply lands on the
+    /// ALPHA of each command's own paint (an image takes a veil over
+    /// its source), so a nested fade multiplies, exactly as a stack of
+    /// layers would.
+    pub(crate) fn fade_from(&mut self, from: usize, opacity: f64) {
+        let scale = |alpha: u8| ((alpha as f64) * opacity).round().clamp(0.0, 255.0) as u8;
+        let fade = |color: &mut Color| color.a = scale(color.a);
+        for command in &mut self.commands[from..] {
+            match command {
+                DrawCommand::FillRect { color, .. }
+                | DrawCommand::StrokeRect { color, .. }
+                | DrawCommand::Shadow { color, .. }
+                | DrawCommand::TextLine { color, .. } => fade(color),
+                DrawCommand::Gradient { paint, .. } => match paint {
+                    GradientPaint::Radial { inner, outer, .. } => {
+                        fade(inner);
+                        fade(outer);
+                    }
+                    GradientPaint::Linear { from, to, .. } => {
+                        fade(from);
+                        fade(to);
+                    }
+                },
+                DrawCommand::Image { source, .. } => *source = source.faded(opacity),
+                DrawCommand::PushClip { .. } | DrawCommand::PopClip => {}
+            }
+        }
     }
 
     /// A translated copy of `commands[range]` — what a second surface
@@ -1320,6 +1379,11 @@ pub struct Placement {
     /// Stack of the nearest `Interactive`'s `(hovered, pressed)` — the
     /// `Styled` picks its background by it.
     pointer: Vec<(bool, bool)>,
+    /// The same, but only for targets that DECLARED themselves a group
+    /// (`.hover_group()`): a descendant marked `.group_hovered()` reads
+    /// this stack instead, so the pointer over a chip can light the
+    /// mark inside it.
+    groups: Vec<(bool, bool)>,
     /// Stack of the current clip (intersections in logical coordinates) —
     /// whoever records a hit consults it; the raster redoes the cut in
     /// physical px.
@@ -2099,6 +2163,7 @@ impl LayoutNode {
             },
             LayoutNode::Padding { child, .. }
             | LayoutNode::Interactive { child, .. }
+            | LayoutNode::HoverGroup { child, .. }
             | LayoutNode::Styled { child, .. }
             | LayoutNode::Animated { child, .. }
             | LayoutNode::Island { child }
@@ -2153,6 +2218,7 @@ impl LayoutNode {
             LayoutNode::Animated { child, .. }
             | LayoutNode::Island { child }
             | LayoutNode::Interactive { child, .. }
+            | LayoutNode::HoverGroup { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
             | LayoutNode::ControlRegion { child, .. }
@@ -2436,7 +2502,8 @@ impl LayoutNode {
                 measure_split(*axis, *unit, *at, *min_a, *min_b, children, proposal, env)
             }
 
-            LayoutNode::Interactive { child, .. } => {
+            LayoutNode::Interactive { child, .. }
+            | LayoutNode::HoverGroup { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -3232,6 +3299,10 @@ impl LayoutNode {
                     // (the capture keeps the base ink of its own)
                     dom.open_styled(props, frame);
                 }
+                // what the fade covers starts HERE: the box's own halo,
+                // background and border fade with the subtree, the way
+                // a layer would take them all at once
+                let fade_from = out.display.len();
                 // the halo goes first — everything else paints over it
                 if let Some((radius, color)) = props.shadow {
                     out.display.push(DrawCommand::Shadow {
@@ -3241,7 +3312,11 @@ impl LayoutNode {
                         corner_radius: props.corner_radius.unwrap_or(0.0),
                     });
                 }
-                let (hovered, pressed) = out.pointer.last().copied().unwrap_or((false, false));
+                // a box that follows a GROUP paints by the ancestor's
+                // pointer, not by the target it belongs to — the mark
+                // inside a chip lights when the CHIP is hovered
+                let stack = if props.from_group { &out.groups } else { &out.pointer };
+                let (hovered, pressed) = stack.last().copied().unwrap_or((false, false));
                 // pressed > hovered > normal; a state without its own
                 // background falls back to the base one — a button with
                 // no hover defined does not flicker
@@ -3302,6 +3377,22 @@ impl LayoutNode {
                         width,
                         corner_radius: props.corner_radius.unwrap_or(0.0),
                     });
+                }
+                // the veil closes the box. In ELEMENT mode the browser
+                // owns it (a real layer, on the element itself), so the
+                // commands stay untouched — an island under a faded box
+                // must not fade twice
+                if out.dom.is_none() {
+                    let opacity = if pressed {
+                        props.opacity_pressed.or(props.opacity)
+                    } else if hovered {
+                        props.opacity_hovered.or(props.opacity)
+                    } else {
+                        props.opacity
+                    };
+                    if let Some(opacity) = opacity.filter(|value| *value < 1.0) {
+                        out.display.fade_from(fade_from, opacity.max(0.0));
+                    }
                 }
                 if let Some(dom) = out.dom.as_mut() {
                     dom.close();
@@ -3374,6 +3465,34 @@ impl LayoutNode {
                 } else {
                     child.place(frame, *fit, env, out);
                 }
+            }
+
+            (LayoutNode::HoverGroup { path, child }, Fit::Wrapped(_, fit)) => {
+                // a descendant's path CONTAINS the group's, so the walk
+                // is a prefix test — and the state survives the pointer
+                // moving onto a target inside the group
+                let under = |target: &Option<String>| {
+                    target.as_deref().is_some_and(|target| {
+                        target == path
+                            || target.strip_prefix(path.as_str()).is_some_and(|rest| {
+                                rest.starts_with('/')
+                            })
+                    })
+                };
+                let hovered = under(&env.stamp.interaction.hovered);
+                let pressed = hovered && under(&env.stamp.interaction.pressed);
+                out.groups.push((hovered, pressed));
+                if let Some(dom) = out.dom.as_mut() {
+                    // element mode gets a box of its OWN: the glue hangs
+                    // the descendants' state rules off its selector, and
+                    // an ancestor is the one thing a selector can name
+                    dom.open_group(group_key(path), frame);
+                }
+                child.place(frame, *fit, env, out);
+                if let Some(dom) = out.dom.as_mut() {
+                    dom.close_group();
+                }
+                out.groups.pop();
             }
 
             (LayoutNode::Interactive { path, child }, Fit::Wrapped(size, fit)) => {
@@ -3549,6 +3668,15 @@ impl LayoutNode {
 /// thickness, lane A gets `at` clamped between the minimums, lane B the
 /// rest. Unbounded on the main axis (a natural pass) the lanes answer
 /// their naturals — the clamp only means something against a real offer.
+/// A hover group's anchor for the element lowering: the path, hashed.
+/// The browser needs a name to hang a selector on, never the path
+/// itself — the same reason an image identity crosses as a number.
+pub(crate) fn group_key(path: &str) -> u64 {
+    let mut hasher = motor::hash::FxHasher::default();
+    std::hash::Hasher::write(&mut hasher, path.as_bytes());
+    std::hash::Hasher::finish(&hasher)
+}
+
 /// Lane A's extent in POINTS, whatever unit the seam speaks. `room` is
 /// what the two lanes share — the frame's main extent minus the
 /// divider — so a fraction of one half is exactly the other half, and

@@ -371,7 +371,9 @@ impl WicImageEngine {
             ImageSource::FileIcon { .. } => None,
             // what the house draws never reaches an engine — the door
             // intercepts glyphs and traced paths alike
-            ImageSource::Symbol { .. } | ImageSource::Path { .. } => None,
+            ImageSource::Symbol { .. }
+            | ImageSource::Path { .. }
+            | ImageSource::Faded { .. } => None,
         };
         let answer = decoded.as_ref().map(read);
         self.decoded.borrow_mut().insert(key, decoded);
@@ -533,7 +535,9 @@ impl ImageEngine for WicImageEngine {
                 self.with_decoded(source, |decoded| self.resample(decoded, width, height))??
             }
             ImageSource::FileIcon { path, .. } => icon_rgba(path, width, height)?,
-            ImageSource::Symbol { .. } | ImageSource::Path { .. } => {
+            ImageSource::Symbol { .. }
+            | ImageSource::Path { .. }
+            | ImageSource::Faded { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
                 return None;
             }

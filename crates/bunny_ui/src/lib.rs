@@ -2171,6 +2171,132 @@ mod tests {
     }
 
     #[test]
+    fn a_fade_covers_the_paint_and_never_the_layout() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Card {
+            fade: State<f64>,
+        }
+
+        impl Component for Card {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("half")
+                    .foreground_color(Color { r: 10, g: 20, b: 30, a: 200 })
+                    .background_color(Color { r: 0, g: 0, b: 0, a: 100 })
+                    .opacity(self.fade.get())
+            }
+        }
+
+        let viewport = Proposal::exact(Size { width: 200.0, height: 60.0 });
+        let card = Card { fade: State::new(1.0) };
+        let runtime = Runtime::new();
+        let read = || {
+            runtime.render_stable(&card);
+            let result = runtime.layout(&card, viewport);
+            let alphas: Vec<u8> = result
+                .display
+                .iter()
+                .filter_map(|command| match command {
+                    DrawCommand::FillRect { color, .. }
+                    | DrawCommand::TextLine { color, .. } => Some(color.a),
+                    _ => None,
+                })
+                .collect();
+            (alphas, result.hits.clone())
+        };
+
+        let (solid, solid_hits) = read();
+        card.fade.set(0.5);
+        let (half, half_hits) = read();
+        assert_eq!(solid, vec![100, 200], "untouched, the paint keeps its own alpha");
+        assert_eq!(half, vec![50, 100], "the veil multiplies the background AND the ink");
+        // the LAW: paint only. a box at half fade lays out — and hits —
+        // exactly like a box at none
+        assert_eq!(solid_hits, half_hits);
+    }
+
+    #[test]
+    fn a_mark_lights_by_the_hover_of_its_group() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+
+        // the product's tab chip: a slot holds a mark that is a target
+        // of its OWN (it closes the tab), and what reveals it is the
+        // pointer over the CHIP — never over the mark
+        #[derive(Clone, Copy)]
+        struct Chip {
+            follows: State<bool>,
+        }
+
+        impl Component for Chip {
+            fn body(self, _ctx: &Context) -> impl View {
+                let mark = text("x")
+                    .foreground_color(Color { r: 200, g: 200, b: 200, a: 255 })
+                    .opacity(0.0)
+                    .opacity_hovered(1.0);
+                let mark = if self.follows.get() {
+                    Either::First(mark.group_hovered())
+                } else {
+                    Either::Second(mark)
+                };
+                hstack((text("file.rs"), mark.on_click(|| {})))
+                    .on_click(|| {})
+                    .hover_group()
+            }
+        }
+
+        let viewport = Proposal::exact(Size { width: 300.0, height: 40.0 });
+        let chip = Chip { follows: State::new(false) };
+        let runtime = Runtime::new();
+        let mark_alpha = || {
+            runtime.render_stable(&chip);
+            // the pointer sits over the label, well clear of the mark
+            runtime.pointer_moved(6.0, 8.0);
+            let result = runtime.layout(&chip, viewport);
+            result
+                .display
+                .iter()
+                .filter_map(|command| match command {
+                    DrawCommand::TextLine { content, color, .. } if &**content == "x" => {
+                        Some(color.a)
+                    }
+                    _ => None,
+                })
+                .next()
+                .expect("the mark paints, faded or not")
+        };
+
+        assert_eq!(mark_alpha(), 0, "on its own the mark waits for its OWN hover");
+        chip.follows.set(true);
+        assert_eq!(mark_alpha(), 255, "following the group, the chip's hover reveals it");
+
+        // and the pointer can REACH it: a group is hovered while the
+        // hovered target is the group or anything under it, so the mark
+        // does not blink out from under the pointer on its way there
+        runtime.render_stable(&chip);
+        let result = runtime.layout(&chip, viewport);
+        let mark_rect = result
+            .hits
+            .iter()
+            .filter(|(_, rect)| rect.size.width < 100.0)
+            .map(|(_, rect)| *rect)
+            .next_back()
+            .expect("the mark is a target of its own");
+        runtime.pointer_moved(mark_rect.origin.x + 2.0, mark_rect.origin.y + 2.0);
+        let over = runtime.layout(&chip, viewport);
+        let alpha = over
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::TextLine { content, color, .. } if &**content == "x" => Some(color.a),
+                _ => None,
+            })
+            .next()
+            .expect("the mark paints");
+        assert_eq!(alpha, 255, "the mark stays lit under the pointer that reached it");
+    }
+
+    #[test]
     fn a_click_routes_through_hit_test_to_the_action_and_repaints() {
         use crate::layout::{Proposal, Size, hit_test};
 
@@ -4217,6 +4343,56 @@ mod tests {
     }
 
     #[test]
+    fn in_element_mode_the_browser_owns_the_fade_and_the_group() {
+        #[derive(Clone, Copy)]
+        struct Chip;
+        impl Component for Chip {
+            fn body(self, _ctx: &Context) -> impl View {
+                hstack((
+                    text("file.rs"),
+                    text("x").opacity(0.0).opacity_hovered(1.0).group_hovered().on_click(|| {}),
+                ))
+                .on_click(|| {})
+                .hover_group()
+            }
+        }
+        let runtime = Runtime::new();
+        let size = Size { width: 300.0, height: 40.0 };
+        let patches = runtime.dom_frame(&Chip, size);
+        let faded = patches
+            .iter()
+            .find_map(|patch| match patch {
+                crate::dom::DomPatch::SetStyle { style, .. } if style.opacity.is_some() => {
+                    Some(style.clone())
+                }
+                _ => None,
+            })
+            .expect("the fade reaches the element");
+        assert_eq!(faded.opacity, Some(0.0));
+        assert_eq!(faded.hover_opacity, Some(1.0));
+        // the mark names the ancestor whose :hover drives it — and that
+        // ancestor is a real box in the scene, which is the one thing a
+        // selector can name
+        let group = faded.group.expect("the mark carries its group");
+        let owner = patches.iter().any(|patch| {
+            matches!(patch, crate::dom::DomPatch::SetStyle { style, .. }
+                if style.group_owner == Some(group))
+        });
+        assert!(owner, "the group owns a box of its own: {patches:#?}");
+
+        // and the LAW holds: hovering the chip moves nothing — the
+        // browser flips the rules on its own
+        let hit = runtime
+            .layout(&Chip, crate::layout::Proposal::exact(size))
+            .hits
+            .first()
+            .expect("the chip is a target")
+            .1;
+        assert!(runtime.pointer_moved(hit.origin.x + 2.0, hit.origin.y + 2.0));
+        assert_eq!(runtime.dom_frame(&Chip, size), vec![], "a group hover is zero patches");
+    }
+
+    #[test]
     fn in_element_mode_the_browser_owns_the_tooltip() {
         #[derive(Clone, Copy)]
         struct Labelled;
@@ -4250,7 +4426,7 @@ mod tests {
             &1u32.to_le_bytes()[..],
             &[5],
             &3u32.to_le_bytes()[..],
-            &0x8000u16.to_le_bytes()[..],
+            &0x8000u32.to_le_bytes()[..],
             &2u16.to_le_bytes()[..],
             b"Hi",
         ]

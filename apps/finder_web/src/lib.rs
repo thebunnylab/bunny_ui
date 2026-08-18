@@ -228,6 +228,14 @@ impl Component for Finder {
                         },
                         text(dir.clone()).monospaced(),
                         spacer(),
+                        // the mark the row REVEALS: it waits at zero
+                        // opacity and the pointer over the ROW lights
+                        // it, so the scene never swaps what it holds
+                        icon(symbol::CLOSE)
+                            .opacity(0.0)
+                            .opacity_hovered(1.0)
+                            .group_hovered()
+                            .on_click(move || selected.set(row)),
                     )
                     .spacing(8.0)
                     .alignment(VerticalAlignment::Center)
@@ -240,6 +248,10 @@ impl Component for Finder {
                     .foreground_color(theme::fg_secondary())
                     .foreground_hovered(theme::fg())
                     .animated(Spring::snappy())
+                    // the row is the GROUP: what the pointer does to it
+                    // reaches the mark inside, and the mark stays lit
+                    // when the pointer finally arrives on it
+                    .hover_group()
                     // first click selects; a second click on the
                     // selected row opens its details popover
                     .on_click(move || {

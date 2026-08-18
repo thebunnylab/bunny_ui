@@ -49,6 +49,12 @@ pub enum ImageSource {
         color: crate::layout::Color,
         box_size: (f32, f32),
     },
+    /// Any source, seen through a VEIL — what `.opacity(…)` leaves for
+    /// the pixel pipelines, where there is no offscreen layer to fade.
+    /// The fade rides the identity, so the compositor, the GPU atlas
+    /// and the damage diff need to learn nothing: a faded image is
+    /// simply another image.
+    Faded { key: u64, inner: Rc<ImageSource>, alpha: u8 },
 }
 
 /// Domain tags folded into the key so the two variants never share an
@@ -56,6 +62,7 @@ pub enum ImageSource {
 const BYTES_TAG: u64 = 0x62_6e_79_5f_62_79_74_65; // "bny_byte"
 const ICON_TAG: u64 = 0x62_6e_79_5f_69_63_6f_6e; // "bny_icon"
 const PATH_TAG: u64 = 0x62_6e_79_5f_70_61_74_68; // "bny_path"
+const FADE_TAG: u64 = 0x62_6e_79_5f_66_61_64_65; // "bny_fade"
 
 fn fx_hash(tag: u64, bytes: &[u8]) -> u64 {
     let mut hasher = motor::hash::FxHasher::default();
@@ -160,13 +167,38 @@ impl ImageSource {
         ImageSource::Path { key: hasher.finish(), verbs, paint, color, box_size }
     }
 
+    /// The same source behind a veil. `1.0` gives the source back
+    /// untouched — a fade that changes nothing must not cost an
+    /// identity, or every cache would hold the picture twice.
+    pub fn faded(&self, opacity: f64) -> ImageSource {
+        let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        if alpha == 255 {
+            return self.clone();
+        }
+        // a veil over a veil multiplies, and only the OUTER one stays:
+        // the identity of a stack of fades is one number
+        let (inner, alpha) = match self {
+            ImageSource::Faded { inner, alpha: under, .. } => (
+                Rc::clone(inner),
+                ((*under as u32 * alpha as u32 + 127) / 255) as u8,
+            ),
+            other => (Rc::new(other.clone()), alpha),
+        };
+        let mut hasher = motor::hash::FxHasher::default();
+        hasher.write_u64(FADE_TAG);
+        hasher.write_u64(inner.key());
+        hasher.write_u8(alpha);
+        ImageSource::Faded { key: hasher.finish(), inner, alpha }
+    }
+
     /// The cheap identity — what diffs, caches and the wire carry.
     pub fn key(&self) -> u64 {
         match self {
             ImageSource::Bytes { key, .. }
             | ImageSource::FileIcon { key, .. }
             | ImageSource::Symbol { key, .. }
-            | ImageSource::Path { key, .. } => *key,
+            | ImageSource::Path { key, .. }
+            | ImageSource::Faded { key, .. } => *key,
         }
     }
 }
@@ -200,6 +232,10 @@ impl PartialEq for ImageSource {
             | (
                 ImageSource::Path { key, .. },
                 ImageSource::Path { key: other_key, .. },
+            )
+            | (
+                ImageSource::Faded { key, .. },
+                ImageSource::Faded { key: other_key, .. },
             ) => key == other_key,
             _ => false,
         }
@@ -222,6 +258,9 @@ impl fmt::Debug for ImageSource {
             ),
             ImageSource::Path { key, verbs, .. } => {
                 write!(f, "path(0x{key:016x}, {} verbs)", verbs.len())
+            }
+            ImageSource::Faded { inner, alpha, .. } => {
+                write!(f, "faded({inner:?}, {alpha})")
             }
         }
     }
@@ -280,6 +319,9 @@ pub fn raster_source(
         ImageSource::Path { key, verbs, paint, color, box_size } => {
             crate::icon::raster_trace(*key, verbs, *paint, *color, *box_size, width, height)
         }
+        ImageSource::Faded { key, inner, alpha } => {
+            fade_raster(*key, engine, inner, *alpha, width, height)
+        }
         _ => engine.raster(source, width, height),
     }
 }
@@ -299,8 +341,50 @@ pub fn intrinsic_of(engine: &dyn ImageEngine, source: &ImageSource) -> Option<(u
         ImageSource::Path { box_size, .. } => {
             Some((box_size.0.round() as u32, box_size.1.round() as u32))
         }
+        // a veil never changes a size
+        ImageSource::Faded { inner, .. } => intrinsic_of(engine, inner),
         _ => engine.intrinsic(source),
     }
+}
+
+/// How many faded copies stay warm. A veil is a rare thing on a
+/// picture — the crossfade the modifier exists for lands on glyphs,
+/// which are small.
+const FADE_KEEP: usize = 64;
+
+thread_local! {
+    static FADED: RefCell<HashMap<(u64, usize, usize), Rc<ImageRaster>>> =
+        RefCell::new(HashMap::default());
+}
+
+/// The source's own pixels with the veil multiplied in — straight
+/// alpha, so the fade is one multiply per pixel and the chroma never
+/// moves.
+fn fade_raster(
+    key: u64,
+    engine: &dyn ImageEngine,
+    inner: &ImageSource,
+    alpha: u8,
+    width: usize,
+    height: usize,
+) -> Option<Rc<ImageRaster>> {
+    if let Some(hit) = FADED.with(|cache| cache.borrow().get(&(key, width, height)).cloned()) {
+        return Some(hit);
+    }
+    let source = raster_source(engine, inner, width, height)?;
+    let mut rgba = source.rgba.clone();
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel[3] = ((pixel[3] as u32 * alpha as u32 + 127) / 255) as u8;
+    }
+    let faded = Rc::new(ImageRaster { width: source.width, height: source.height, rgba });
+    FADED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= FADE_KEEP {
+            cache.clear();
+        }
+        cache.insert((key, width, height), Rc::clone(&faded));
+    });
+    Some(faded)
 }
 
 // MARK: - RawImages, the default engine
@@ -410,7 +494,9 @@ impl ImageEngine for RawImages {
         match source {
             ImageSource::Bytes { bytes, .. } => RawImages::decode_header(bytes),
             ImageSource::FileIcon { .. } => Some((FILE_ICON_SIZE, FILE_ICON_SIZE)),
-            ImageSource::Symbol { .. } | ImageSource::Path { .. } => {
+            ImageSource::Symbol { .. }
+            | ImageSource::Path { .. }
+            | ImageSource::Faded { .. } => {
                 // the door intercepts what the house draws before any
                 // engine — a regression at a call site should be LOUD
                 debug_assert!(false, "a house drawing never reaches an engine");
@@ -438,7 +524,9 @@ impl ImageEngine for RawImages {
                 RawImages::resample(bytes, dimensions, width, height)
             }
             ImageSource::FileIcon { key, .. } => RawImages::checker(*key, width, height),
-            ImageSource::Symbol { .. } | ImageSource::Path { .. } => {
+            ImageSource::Symbol { .. }
+            | ImageSource::Path { .. }
+            | ImageSource::Faded { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
                 return None;
             }
@@ -521,5 +609,48 @@ mod tests {
     fn the_keyed_exit_skips_hashing() {
         let keyed = ImageSource::bytes_keyed(7, RawImages::encode(1, 1, &[1, 2, 3, 4]));
         assert_eq!(keyed.key(), 7);
+    }
+
+    // MARK: - The veil (dor 25)
+
+    #[test]
+    fn a_veil_multiplies_the_pixels_and_moves_the_identity() {
+        use crate::icon::house;
+        use crate::layout::Color;
+
+        let engine = RawImages::default();
+        let ink = Color { r: 255, g: 255, b: 255, a: 255 };
+        let solid = ImageSource::symbol(house::CLOSE, ink);
+        let half = solid.faded(0.5);
+        assert_ne!(solid.key(), half.key(), "a fade is a new identity");
+        assert_eq!(solid.faded(1.0).key(), solid.key(), "and no fade is no cost");
+
+        let full = raster_source(&engine, &solid, 24, 24).expect("the glyph rasterizes");
+        let faded = raster_source(&engine, &half, 24, 24).expect("so does the veil over it");
+        assert_eq!(full.width, faded.width);
+        let alphas = |raster: &ImageRaster| -> Vec<u8> {
+            raster.rgba.chunks_exact(4).map(|pixel| pixel[3]).collect()
+        };
+        let (before, after) = (alphas(&full), alphas(&faded));
+        assert!(before.iter().any(|alpha| *alpha > 200), "the mark is there to fade");
+        for (solid, faded) in before.iter().zip(&after) {
+            assert_eq!(*faded, ((*solid as u32 * 128 + 127) / 255) as u8);
+        }
+    }
+
+    #[test]
+    fn a_veil_over_a_veil_is_one_veil() {
+        use crate::icon::house;
+        use crate::layout::Color;
+
+        let source = ImageSource::symbol(house::CHECK, Color::BLACK);
+        let twice = source.faded(0.5).faded(0.5);
+        match &twice {
+            ImageSource::Faded { inner, alpha, .. } => {
+                assert_eq!(inner.key(), source.key(), "the stack never grows");
+                assert_eq!(*alpha, 64, "the fades multiply");
+            }
+            other => panic!("a fade must stay a fade: {other:?}"),
+        }
     }
 }

@@ -245,7 +245,9 @@ impl CoreGraphicsImageEngine {
             ImageSource::FileIcon { .. } => std::ptr::null_mut(),
             // what the house draws never reaches an engine — the door
             // intercepts glyphs and traced paths alike
-            ImageSource::Symbol { .. } | ImageSource::Path { .. } => std::ptr::null_mut(),
+            ImageSource::Symbol { .. }
+            | ImageSource::Path { .. }
+            | ImageSource::Faded { .. } => std::ptr::null_mut(),
         };
         let entry = (!image.is_null()).then(|| OwnedImage(image));
         self.decoded.borrow_mut().insert(key, entry);
@@ -295,7 +297,9 @@ impl ImageEngine for CoreGraphicsImageEngine {
                 unsafe { draw_image(image, width, height) }?
             }
             ImageSource::FileIcon { path, .. } => unsafe { icon_rgba(path, width, height) }?,
-            ImageSource::Symbol { .. } | ImageSource::Path { .. } => {
+            ImageSource::Symbol { .. }
+            | ImageSource::Path { .. }
+            | ImageSource::Faded { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
                 return None;
             }

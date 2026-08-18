@@ -80,6 +80,11 @@ pub enum Modifier {
     /// A size out of the preset scale — the rest of the font stays.
     FontSize(f64),
     BackgroundHovered(Color),
+    Opacity(f64),
+    OpacityHovered(f64),
+    OpacityPressed(f64),
+    HoverGroup,
+    GroupHovered,
     BackgroundPressed(Color),
     ForegroundHovered(Color),
     ForegroundPressed(Color),
@@ -213,6 +218,11 @@ impl Modifier {
             Modifier::Id(name) => format!(" [.id({name:?})]"),
             Modifier::FontSize(size) => format!(" [.font(.system(size: {size}))]"),
             Modifier::BackgroundHovered(color) => format!(" [.backgroundHovered({color})]"),
+            Modifier::Opacity(value) => format!(" [.opacity({value})]"),
+            Modifier::OpacityHovered(value) => format!(" [.opacityHovered({value})]"),
+            Modifier::OpacityPressed(value) => format!(" [.opacityPressed({value})]"),
+            Modifier::HoverGroup => " [.hoverGroup()]".into(),
+            Modifier::GroupHovered => " [.groupHovered()]".into(),
             Modifier::ForegroundHovered(color) => format!(" [.foregroundHovered({color})]"),
             Modifier::ForegroundPressed(color) => format!(" [.foregroundPressed({color})]"),
             Modifier::BackgroundPressed(color) => format!(" [.backgroundPressed({color})]"),
@@ -835,6 +845,34 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 mark,
                 VisualProps { foreground_pressed: Some(*color), ..VisualProps::default() },
             ),
+            Modifier::Opacity(value) => wrap_styled(
+                out,
+                mark,
+                VisualProps { opacity: Some(*value), ..VisualProps::default() },
+            ),
+            Modifier::OpacityHovered(value) => wrap_styled(
+                out,
+                mark,
+                VisualProps { opacity_hovered: Some(*value), ..VisualProps::default() },
+            ),
+            Modifier::OpacityPressed(value) => wrap_styled(
+                out,
+                mark,
+                VisualProps { opacity_pressed: Some(*value), ..VisualProps::default() },
+            ),
+            Modifier::GroupHovered => wrap_styled(
+                out,
+                mark,
+                VisualProps { from_group: true, ..VisualProps::default() },
+            ),
+            Modifier::HoverGroup => {
+                if let Some(path) = motor::identity::cursor_scope() {
+                    out.wrap_layout_from(mark, |node| LayoutNode::HoverGroup {
+                        path,
+                        child: Box::new(node),
+                    });
+                }
+            }
             // the two below rewrite the TEXT NODE, descending through
             // `Styled` (`.font()`/`.foreground_color()` before or after, the
             // order does not matter) — on non-text they are no-ops on purpose

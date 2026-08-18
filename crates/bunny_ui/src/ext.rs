@@ -472,6 +472,49 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.opacity(…)` — everything the subtree paints fades by this
+    /// factor, `0..1`. Paint only, like every visual modifier: a view
+    /// at zero still measures, still lays out and still clicks.
+    ///
+    /// Two stacked children with opposite fades are how a mark
+    /// REPLACES another without the scene changing what it contains —
+    /// the modified dot that becomes a close mark under the pointer.
+    fn opacity(self, value: f64) -> Modified<Self> {
+        Modified { base: self, modifier: Modifier::Opacity(value) }
+    }
+
+    /// The fade under the nearest interactive target's hover — or
+    /// under the GROUP's, with [`ViewExt::group_hovered`].
+    fn opacity_hovered(self, value: f64) -> Modified<Self> {
+        Modified { base: self, modifier: Modifier::OpacityHovered(value) }
+    }
+
+    /// The fade under pressed — the pair of
+    /// [`ViewExt::opacity_hovered`].
+    fn opacity_pressed(self, value: f64) -> Modified<Self> {
+        Modified { base: self, modifier: Modifier::OpacityPressed(value) }
+    }
+
+    /// `.hover_group()` — this view PUBLISHES its pointer state to
+    /// everything below it, so a descendant can paint by the hover of
+    /// an ancestor instead of its own nearest target.
+    ///
+    /// The flag lands on the interactive target in the chain, wherever
+    /// it sits, so the order of the modifiers stays irrelevant. A view
+    /// with no target of its own becomes one — a card that is only
+    /// hovered still lights what is inside it.
+    fn hover_group(self) -> Modified<Self> {
+        Modified { base: self, modifier: Modifier::HoverGroup }
+    }
+
+    /// `.group_hovered()` — this view's hover and pressed paint follows
+    /// the nearest [`ViewExt::hover_group`] above it instead of the
+    /// target it belongs to. It retargets every state this view
+    /// declares at once: background, ink and fade.
+    fn group_hovered(self) -> Modified<Self> {
+        Modified { base: self, modifier: Modifier::GroupHovered }
+    }
+
     /// `.onClick { … }` — the view becomes a pointer target WITHOUT the
     /// `Button` chrome: same action retention, same up-inside. It is the
     /// clickable list row.

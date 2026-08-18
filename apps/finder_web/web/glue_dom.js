@@ -275,7 +275,7 @@ function applyPatches(view, length) {
       }
     } else if (op === 5) {
       const el = elements.get(id);
-      const mask = u16();
+      const mask = u32();
       const base = [];
       let hover = null;
       let pressed = null;
@@ -359,12 +359,37 @@ function applyPatches(view, length) {
       } else if (el && el.dataset.tip !== undefined) {
         delete el.dataset.tip;
       }
+      // the fade is a real LAYER here: the browser composites the
+      // subtree once, which the per-command multiply of the pixel
+      // pipelines only approximates
+      let hoverFade = null;
+      let pressedFade = null;
+      if (mask & 65536) base.push(`opacity:${f32()}`);
+      if (mask & 131072) hoverFade = f32();
+      if (mask & 262144) pressedFade = f32();
+      // a box that follows a GROUP takes its states from an ANCESTOR's
+      // pointer: the same rules, hung off the group's selector, so the
+      // browser still owns the hover and a group frame costs no patch
+      // the group crosses as a NUMBER: the browser needs an anchor to
+      // hang a selector on, never the path a person reads
+      let group = null;
+      if (mask & 524288) group = imageKey(u32(), u32());
+      if (mask & 1048576) {
+        const owner = imageKey(u32(), u32());
+        if (el) el.dataset.g = owner;
+      } else if (el && el.dataset.g !== undefined) {
+        delete el.dataset.g;
+      }
       const name = `[data-n="${id}"]`;
+      const from = group ? `[data-g="${group}"]` : name;
+      const on = (state) => (group ? `${from}:${state} ${name}` : `${name}:${state}`);
       let rule = `${name}{${base.join(";")}}`;
-      if (hover) rule += `\n${name}:hover{background:${hover}}`;
-      if (pressed) rule += `\n${name}:active{background:${pressed}}`;
-      if (hoverInk) rule += `\n${name}:hover{color:${hoverInk}}`;
-      if (pressedInk) rule += `\n${name}:active{color:${pressedInk}}`;
+      if (hover) rule += `\n${on("hover")}{background:${hover}}`;
+      if (pressed) rule += `\n${on("active")}{background:${pressed}}`;
+      if (hoverInk) rule += `\n${on("hover")}{color:${hoverInk}}`;
+      if (pressedInk) rule += `\n${on("active")}{color:${pressedInk}}`;
+      if (hoverFade !== null) rule += `\n${on("hover")}{opacity:${hoverFade}}`;
+      if (pressedFade !== null) rule += `\n${on("active")}{opacity:${pressedFade}}`;
       if (focus) {
         rule += `\n${name}:focus{border-color:${focus};caret-color:${focus}}`;
       }

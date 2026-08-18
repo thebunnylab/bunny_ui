@@ -141,6 +141,23 @@ pub struct DomStyle {
     /// hover and the inputs: zero patches by construction. The pixel
     /// modes run the engine's own bubble instead.
     pub tooltip: Option<Arc<str>>,
+    /// `.opacity(…)` and its two states. In THIS mode the fade is a
+    /// real LAYER — the browser composites the subtree once — which is
+    /// strictly better than the per-command multiply the pixel
+    /// pipelines do, and costs the scene nothing.
+    pub opacity: Option<f64>,
+    pub hover_opacity: Option<f64>,
+    pub pressed_opacity: Option<f64>,
+    /// `.group_hovered()` — the ancestor whose `:hover` drives this
+    /// box's state paint, as a NUMBER (the same reason images cross as
+    /// keys: a path is for people, and the browser only needs an
+    /// anchor). The glue turns it into a descendant selector, so the
+    /// browser keeps owning the hover and a group frame still costs
+    /// zero patches.
+    pub group: Option<u64>,
+    /// The box a `.hover_group()` owns names itself here — the anchor
+    /// every follower's selector points at.
+    pub group_owner: Option<u64>,
 }
 
 impl DomStyle {
@@ -162,6 +179,11 @@ impl DomStyle {
             placeholder_color: None,
             clip: props.clip,
             tooltip: None,
+            opacity: props.opacity,
+            hover_opacity: props.opacity_hovered,
+            pressed_opacity: props.opacity_pressed,
+            group: None,
+            group_owner: None,
         }
     }
 }
@@ -222,6 +244,8 @@ pub(crate) struct DomCapture {
     pending_transition: Option<(f64, f64)>,
     /// Armed by an `Interactive`; the next opened box takes it.
     pending_interactive: Option<String>,
+    /// The ancestors that declared themselves hover groups.
+    groups: Vec<u64>,
     /// The BASE ink of every open node, in step with `stack` — the
     /// color a text inherits, never the hovered one the pointer
     /// resolved. This is what keeps the capture pointer-invariant.
@@ -261,6 +285,7 @@ impl DomCapture {
             stack: vec![(Point { x: 0.0, y: 0.0 }, root)],
             pending_transition: None,
             pending_interactive: None,
+            groups: Vec::new(),
             // the scene's ink floor is the theme's, the same one the
             // place walk starts from
             ink: vec![crate::theme::current().fg],
@@ -313,6 +338,7 @@ impl DomCapture {
         }
         let interactive = self.pending_interactive.take();
         let transition = self.pending_transition.take();
+        let group = self.current_group();
         let states = props.foreground_hovered.is_some() || props.foreground_pressed.is_some();
         // inside a hover ink the text inherits, so a box that changes
         // the ink must SAY so — otherwise the inheritance walks past it
@@ -330,6 +356,7 @@ impl DomCapture {
             interactive,
             transition,
             tooltip,
+            group: props.from_group.then(|| group).flatten(),
             ..DomStyle::from_props(props)
         };
         if states || inheriting {
@@ -435,11 +462,35 @@ impl DomCapture {
         self.pending_interactive = Some(path.to_string());
     }
 
+    /// Opens the box a hover group owns. It exists only in this mode
+    /// and only for the selector: a descendant's state rules hang off
+    /// an ANCESTOR, and an ancestor is the one thing CSS can name.
+    pub(crate) fn open_group(&mut self, key: u64, frame: Rect) {
+        self.groups.push(key);
+        if self.island > 0 {
+            self.swallowed += 1;
+            return;
+        }
+        self.open(DomKind::Box, frame, frame.origin);
+        let (_, node) = self.stack.last_mut().expect("just opened");
+        node.style.group_owner = Some(key);
+    }
+
+    pub(crate) fn close_group(&mut self) {
+        self.groups.pop();
+        self.close();
+    }
+
     /// The scope that armed a pending attribute closes: whatever no box
     /// consumed must not leak to a later sibling.
     pub(crate) fn disarm(&mut self) {
         self.pending_transition = None;
         self.pending_interactive = None;
+    }
+
+    /// The nearest ancestor that declared itself a hover group.
+    fn current_group(&self) -> Option<u64> {
+        self.groups.last().copied()
     }
 
     /// Opens a canvas island at `frame`; `start` is where the island's
@@ -928,7 +979,7 @@ fn diff_children(
 ///   2 remove        —
 ///   3 set transform f32 x, f32 y
 ///   4 set size      f32 w, f32 h
-///   5 set style     u16 mask, fields in bit order:
+///   5 set style     u32 mask, fields in bit order:
 ///                   0 background u32 rgba   1 hover u32   2 pressed u32
 ///                   3 border u32 rgba + f32 width          4 radius f32
 ///                   5 shadow f32 radius + u32 rgba
@@ -949,6 +1000,15 @@ fn diff_children(
 ///                   15 tooltip u16 len + utf8 — a data attribute; the
 ///                      browser owns the wait and the bubble (a static
 ///                      CSS rule), the way it owns hover and inputs
+///                   16 opacity f32   17 hover opacity   18 pressed
+///                   19 group u32 key hi, u32 key lo — the ancestor
+///                      whose `:hover` drives bits 1, 2, 11, 12, 17
+///                      and 18 of THIS box, as a descendant selector.
+///                      The browser still owns the hover, so a group
+///                      frame is zero patches
+///                   20 group owner u32 hi, u32 lo — the box a
+///                      `.hover_group()` owns names itself, and the
+///                      followers below point their selectors at it
 ///   6 set text      u32 rgba, u8 inherits ink (1 = no color of its
 ///                   own — the box above owns both states),
 ///                   f32 size, u8 weight, u8 mono, u8 italic,
@@ -1110,7 +1170,7 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
 }
 
 fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
-    let mut mask: u16 = 0;
+    let mut mask: u32 = 0;
     if style.background.is_some() {
         mask |= 1;
     }
@@ -1160,7 +1220,22 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     if style.tooltip.is_some() {
         mask |= 1 << 15;
     }
-    push_u16(out, mask);
+    if style.opacity.is_some() {
+        mask |= 1 << 16;
+    }
+    if style.hover_opacity.is_some() {
+        mask |= 1 << 17;
+    }
+    if style.pressed_opacity.is_some() {
+        mask |= 1 << 18;
+    }
+    if style.group.is_some() {
+        mask |= 1 << 19;
+    }
+    if style.group_owner.is_some() {
+        mask |= 1 << 20;
+    }
+    push_u32(out, mask);
     if let Some(color) = style.background {
         push_u32(out, pack_color(color));
     }
@@ -1230,6 +1305,23 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     }
     if let Some(tooltip) = &style.tooltip {
         push_bytes_u16(out, tooltip.as_bytes());
+    }
+    if let Some(opacity) = style.opacity {
+        push_f32(out, opacity);
+    }
+    if let Some(opacity) = style.hover_opacity {
+        push_f32(out, opacity);
+    }
+    if let Some(opacity) = style.pressed_opacity {
+        push_f32(out, opacity);
+    }
+    if let Some(group) = style.group {
+        push_u32(out, (group >> 32) as u32);
+        push_u32(out, group as u32);
+    }
+    if let Some(owner) = style.group_owner {
+        push_u32(out, (owner >> 32) as u32);
+        push_u32(out, owner as u32);
     }
 }
 
@@ -1746,7 +1838,7 @@ mod tests {
             &20f32.to_le_bytes()[..],
             &[5],
             &7u32.to_le_bytes()[..],
-            &(1u16 | 1 << 7).to_le_bytes()[..],
+            &(1u32 | 1 << 7).to_le_bytes()[..],
             &0x112233FFu32.to_le_bytes()[..],
             &2u16.to_le_bytes()[..],
             b"go",
