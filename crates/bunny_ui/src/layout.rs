@@ -3259,7 +3259,7 @@ impl LayoutNode {
                 // the same two calls do the whole job there too — and
                 // the layer scope tells the glue that what it paints
                 // lets the pointer through
-                let mut paint_layer = |out: &mut Placement| {
+                let paint_layer = |out: &mut Placement| {
                     if let Some(dom) = out.dom.as_mut() {
                         dom.enter_layer();
                     }
