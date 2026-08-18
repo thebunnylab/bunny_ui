@@ -758,6 +758,10 @@ pub struct VisualProps {
     /// corner radius — including the notch behind a rounded corner,
     /// which belongs to the shadow, not to the backdrop.
     pub shadow: Option<(Px, Color)>,
+    /// `.clipped()` — the subtree cannot paint outside this box, and
+    /// the cut FOLLOWS `.corner_radius(…)` when there is one. Paint
+    /// only, like everything here: the measure never hears about it.
+    pub clip: bool,
 }
 
 impl VisualProps {
@@ -768,6 +772,7 @@ impl VisualProps {
         VisualProps {
             background: self.background.or(outer.background),
             gradient: self.gradient.or(outer.gradient),
+            clip: self.clip || outer.clip,
             foreground: self.foreground.or(outer.foreground),
             border: self.border.or(outer.border),
             corner_radius: self.corner_radius.or(outer.corner_radius),
@@ -2517,7 +2522,16 @@ impl LayoutNode {
                     let color = animated(crate::anim::Channel::Foreground, color);
                     out.foreground.push(color);
                 }
+                // the background IS the shape, so it paints before the
+                // cut; the border paints after, over the cut child — a
+                // ring blended once, never twice
+                if props.clip {
+                    out.push_clip(frame, props.corner_radius.unwrap_or(0.0));
+                }
                 child.place(frame, *fit, env, out);
+                if props.clip {
+                    out.pop_clip();
+                }
                 if ink.is_some() {
                     out.foreground.pop();
                 }
@@ -4110,5 +4124,80 @@ mod tests {
                 size: Size { width: 20.0, height: 20.0 }
             }
         );
+    }
+
+    #[test]
+    fn clipped_reads_the_radius_already_on_the_box() {
+        // .corner_radius + .clipped fuse into ONE node — the cut takes
+        // the radius without being handed it, in either order
+        let dressed = styled(
+            VisualProps { clip: true, corner_radius: Some(6.0), ..VisualProps::default() },
+            text(3),
+        );
+        let result = layout(&dressed, Proposal::unspecified());
+        let cut = result
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::PushClip { rect, corner_radius } => Some((*rect, *corner_radius)),
+                _ => None,
+            })
+            .expect("the cut is pushed");
+        assert_eq!(cut.1, 6.0);
+        let pops = result
+            .display
+            .iter()
+            .filter(|command| matches!(command, DrawCommand::PopClip))
+            .count();
+        assert_eq!(pops, 1, "balanced by construction");
+        // without a radius: the plain rect cut of always
+        let plain = styled(VisualProps { clip: true, ..VisualProps::default() }, text(3));
+        let result = layout(&plain, Proposal::unspecified());
+        assert!(result.display.iter().any(|command| matches!(
+            command,
+            DrawCommand::PushClip { corner_radius, .. } if *corner_radius == 0.0
+        )));
+    }
+
+    /// The pain the front came to kill, end to end: a bordered rounded
+    /// island whose child paints its own background — the child's
+    /// corner dies at the curve, the border paints OVER the cut child.
+    #[test]
+    fn a_box_finally_holds_its_children() {
+        let island = styled(
+            VisualProps {
+                background: Some(Color::hex(0xF0F0F0)),
+                border: Some((Color::BLACK, 1.0)),
+                corner_radius: Some(6.0),
+                clip: true,
+                ..VisualProps::default()
+            },
+            styled(
+                VisualProps { background: Some(Color::hex(0xAA2211)), ..VisualProps::default() },
+                text(3),
+            ),
+        );
+        let result = layout(&island, Proposal { width: Some(40.0), height: Some(24.0) });
+        // paint order: island fill, PUSH, child fill, POP, border
+        let kinds: Vec<&str> = result
+            .display
+            .iter()
+            .map(|command| match command {
+                DrawCommand::FillRect { .. } => "fill",
+                DrawCommand::PushClip { .. } => "push",
+                DrawCommand::PopClip => "pop",
+                DrawCommand::StrokeRect { .. } => "stroke",
+                _ => "other",
+            })
+            .filter(|kind| *kind != "other")
+            .collect();
+        assert_eq!(kinds, vec!["fill", "push", "fill", "pop", "stroke"]);
+        // and the pixels agree: the child corner is CUT, the island
+        // border survives on top
+        let bitmap = crate::raster::rasterize(&result.display, 40, 24, Color::WHITE);
+        let white = 0xFFFF_FFFF_u32;
+        assert_eq!(bitmap.pixel(0, 0), Some(white), "the notch stays canvas");
+        let child = 0xAA22_11FF_u32;
+        assert_eq!(bitmap.pixel(20, 12), Some(child), "the child body paints");
     }
 }

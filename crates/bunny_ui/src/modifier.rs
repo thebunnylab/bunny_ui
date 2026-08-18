@@ -59,6 +59,8 @@ pub enum Modifier {
     ForegroundColor(Color),
     Border(Color, f64),
     CornerRadius(f64),
+    /// `.clipped()` — the subtree is cut to the box (and its corner).
+    Clipped,
     Monospaced,
     /// A size out of the preset scale — the rest of the font stays.
     FontSize(f64),
@@ -185,6 +187,7 @@ impl Modifier {
             Modifier::ForegroundColor(color) => format!(" [.foregroundColor({color})]"),
             Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
             Modifier::CornerRadius(radius) => format!(" [.cornerRadius({radius})]"),
+            Modifier::Clipped => " [.clipped()]".into(),
             Modifier::Monospaced => " [.monospaced()]".into(),
             Modifier::Id(name) => format!(" [.id({name:?})]"),
             Modifier::FontSize(size) => format!(" [.font(.system(size: {size}))]"),
@@ -639,6 +642,9 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 out,
                 VisualProps { corner_radius: Some(*radius), ..VisualProps::default() },
             ),
+            Modifier::Clipped => {
+                wrap_styled(out, VisualProps { clip: true, ..VisualProps::default() })
+            }
             // font is an inherited scene property — the same Styled as the
             // visuals carries the patch (measure applies it on top of the env)
             Modifier::Font(font) => wrap_styled(

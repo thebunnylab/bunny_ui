@@ -2381,12 +2381,14 @@ mod tests {
                 .background_color(Color::hex(0xAA69FB))
                 .foreground_color(Color::hex(0x070510))
                 .border(Color::hex(0x2A1B3F), 1.0)
-                .corner_radius(6.0),
+                .corner_radius(6.0)
+                .clipped(),
         );
         assert!(printed.contains("[.background(#AA69FB)]"), "{printed}");
         assert!(printed.contains("[.foregroundColor(#070510)]"), "{printed}");
         assert!(printed.contains("[.border(#2A1B3F, width: 1)]"), "{printed}");
         assert!(printed.contains("[.cornerRadius(6)]"), "{printed}");
+        assert!(printed.contains("[.clipped()]"), "{printed}");
     }
 
     #[test]

@@ -302,6 +302,16 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.clipped()` — the subtree cannot paint outside this box, and
+    /// the cut FOLLOWS `.corner_radius(…)` when there is one (a plain
+    /// rectangle without it). The island that finally holds its
+    /// children in: panels with backgrounds of their own stop leaking
+    /// over the curve. Put it anywhere in the chain — it fuses into
+    /// the same node the radius rides, so the order never matters.
+    fn clipped(self) -> Modified<Self> {
+        Modified { base: self, modifier: Modifier::Clipped }
+    }
+
     /// `.monospaced()` — swaps the inherited font's design (grids).
     fn monospaced(self) -> Modified<Self> {
         Modified {
