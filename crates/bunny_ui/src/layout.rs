@@ -313,6 +313,27 @@ pub enum LayoutNode {
     /// `align` is the HORIZONTAL edge each child sits on; the vertical
     /// one stays centered, exactly what SwiftUI's `.leading` means.
     Layered { align: CrossAlign, children: Vec<LayoutNode> },
+    /// `.overlay(at, view)` — a layer painted OVER the box (or UNDER
+    /// it, with `behind`), taking the box's size and giving it NOTHING
+    /// back.
+    ///
+    /// The base measures alone and its answer IS this node's answer;
+    /// the layer only ever negotiates against that resolved box. So a
+    /// rule wide enough to cross a box that HUGS its content never asks
+    /// the parent for room — which is the whole difference from
+    /// [`LayoutNode::Layered`], where every child enters the max and a
+    /// flexible one makes the stack above it flexible too.
+    ///
+    /// `at` places the layer the way a [`UnitPoint`] places anything: a
+    /// point of the layer meets the same point of the box, so
+    /// `UnitPoint::BOTTOM` hangs a rule on the bottom edge and
+    /// `TOP_TRAILING` parks a badge in the corner.
+    Overlay {
+        at: UnitPoint,
+        behind: bool,
+        layer: Box<LayoutNode>,
+        child: Box<LayoutNode>,
+    },
     Padding { edges: Edges, child: Box<LayoutNode> },
     /// `.frame(width:height:)` — `Some` axes override proposal and answer.
     Frame { width: Option<Px>, height: Option<Px>, child: Box<LayoutNode> },
@@ -2200,6 +2221,9 @@ impl LayoutNode {
                 Axis::Horizontal => width.is_none() && child.is_flexible(axis),
                 Axis::Vertical => height.is_none() && child.is_flexible(axis),
             },
+            // the layer is invisible to the question: a rule wide
+            // enough to cross the box must never make the box flexible
+            LayoutNode::Overlay { child, .. } => child.is_flexible(axis),
             LayoutNode::Padding { child, .. }
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::HoverGroup { child, .. }
@@ -2254,6 +2278,7 @@ impl LayoutNode {
                 let env = LayoutEnv { font: props.font.apply_over(env.font), ..env };
                 child.first_baseline(env)
             }
+            LayoutNode::Overlay { child, .. } => child.first_baseline(env),
             LayoutNode::Animated { child, .. }
             | LayoutNode::Island { child }
             | LayoutNode::Interactive { child, .. }
@@ -2447,6 +2472,15 @@ impl LayoutNode {
                         )
                     }
                 }
+            }
+
+            LayoutNode::Overlay { layer, child, .. } => {
+                // the base answers ALONE — the layer never enters a max
+                let (size, base_fit) = child.measure(proposal, env);
+                // and the layer negotiates against the RESOLVED box, so
+                // a `Fill` inside it takes exactly what the base took
+                let (layer_size, layer_fit) = layer.measure(Proposal::exact(size), env);
+                (size, Fit::Children(vec![(size, base_fit), (layer_size, layer_fit)]))
             }
 
             LayoutNode::Layered { children, .. } => {
@@ -3198,6 +3232,49 @@ impl LayoutNode {
                     min_a: *min_a,
                     min_b: *min_b,
                 });
+            }
+
+            (LayoutNode::Overlay { at, behind, layer, child }, Fit::Children(fits)) => {
+                let mut fits = fits;
+                let (base_size, base_fit) = fits.remove(0);
+                let (layer_size, layer_fit) = fits.remove(0);
+                // a layer that FILLED the measured box follows the real
+                // frame instead: the parent may have handed the base
+                // more room than it asked for, and a rule that crossed
+                // the box must still cross it
+                let stretch = |axis_layer: Px, axis_base: Px, axis_frame: Px| {
+                    if axis_layer >= axis_base { axis_frame } else { axis_layer }
+                };
+                let size = Size {
+                    width: stretch(layer_size.width, base_size.width, frame.size.width),
+                    height: stretch(layer_size.height, base_size.height, frame.size.height),
+                };
+                let origin = Point {
+                    x: frame.origin.x + (frame.size.width - size.width) * at.x,
+                    y: frame.origin.y + (frame.size.height - size.height) * at.y,
+                };
+                let layer_frame = Rect { origin, size };
+                // paint order IS the declaration: behind goes first.
+                // In element mode the tree order is the paint order, so
+                // the same two calls do the whole job there too — and
+                // the layer scope tells the glue that what it paints
+                // lets the pointer through
+                let mut paint_layer = |out: &mut Placement| {
+                    if let Some(dom) = out.dom.as_mut() {
+                        dom.enter_layer();
+                    }
+                    layer.place(layer_frame, layer_fit, env, out);
+                    if let Some(dom) = out.dom.as_mut() {
+                        dom.leave_layer();
+                    }
+                };
+                if *behind {
+                    paint_layer(out);
+                    child.place(frame, base_fit, env, out);
+                } else {
+                    child.place(frame, base_fit, env, out);
+                    paint_layer(out);
+                }
             }
 
             (LayoutNode::Layered { align, children }, Fit::Children(fits)) => {
@@ -4406,6 +4483,32 @@ mod tests {
         assert_eq!(result.frames.get("line").unwrap().size.width, 1.0);
         assert_eq!(result.frames.get("editor").unwrap().size.width, 939.0);
         assert_eq!(result.frames.get("editor").unwrap().origin.x, 261.0);
+    }
+
+    #[test]
+    fn a_layer_is_invisible_to_flexibility() {
+        // the same tree twice: as a Layered, a flexible child makes the
+        // whole thing flexible; as an Overlay, the layer is not asked
+        let rule = LayoutNode::Spacer;
+        let chip = LayoutNode::Leaf { size: Size { width: 60.0, height: 20.0 } };
+        let layered = LayoutNode::Layered {
+            align: CrossAlign::Center,
+            children: vec![chip.clone(), rule.clone()],
+        };
+        assert!(
+            layered.is_flexible(Axis::Horizontal),
+            "a layered pile takes its children's flexibility"
+        );
+        let overlaid = LayoutNode::Overlay {
+            at: UnitPoint::BOTTOM,
+            behind: false,
+            layer: Box::new(rule),
+            child: Box::new(chip),
+        };
+        assert!(
+            !overlaid.is_flexible(Axis::Horizontal),
+            "an overlay answers for the BASE alone — the whole cure of the pain"
+        );
     }
 
     #[test]

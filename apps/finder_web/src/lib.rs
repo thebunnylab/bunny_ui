@@ -243,6 +243,19 @@ impl Component for Finder {
                     .padding_edge(Edge::Trailing, 12.0)
                     .padding_edge(Edge::Top, 6.0)
                     .padding_edge(Edge::Bottom, 6.0)
+                    // the selected row wears a 2pt accent rule on its
+                    // leading edge — a LAYER, so the row keeps hugging
+                    // its content and a border would tint every side
+                    .overlay(
+                        UnitPoint::LEADING,
+                        if on {
+                            Either::First(
+                                spacer().frame_width(2.0).background_color(theme::accent()),
+                            )
+                        } else {
+                            Either::Second(empty())
+                        },
+                    )
                     .background_color(if on { theme::row_pressed() } else { CLEAR })
                     .background_hovered(theme::row_hover())
                     .foreground_color(theme::fg_secondary())

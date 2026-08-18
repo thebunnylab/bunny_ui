@@ -2913,6 +2913,269 @@ mod tests {
     }
 
     #[test]
+    fn a_layer_takes_the_box_and_gives_it_nothing() {
+        use crate::layout::{DrawCommand, Proposal, Size, UnitPoint};
+
+        // the pain itself: a rule wide enough to CROSS a chip must not
+        // make the chip flexible, or every tab eats half the strip
+        #[derive(Clone, Copy)]
+        struct Strip {
+            ruled: State<bool>,
+        }
+
+        impl Component for Strip {
+            fn body(self, _ctx: &Context) -> impl View {
+                let chip = text("file.rs").padding_length(8.0);
+                let one = if self.ruled.get() {
+                    Either::First(chip.overlay(
+                        UnitPoint::BOTTOM,
+                        spacer().frame_height(2.0).background_color(Color::hex(0x3B82F6)),
+                    ))
+                } else {
+                    Either::Second(chip)
+                };
+                hstack((one, text("other"), spacer())).spacing(4.0)
+            }
+        }
+
+        let strip = Strip { ruled: State::new(false) };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 400.0, height: 40.0 });
+        // where the SIBLING starts is where the chip ends
+        let sibling_x = |ruled: bool| {
+            strip.ruled.set(ruled);
+            runtime.render_stable(&strip);
+            runtime
+                .layout(&strip, viewport)
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::TextLine { content, origin, .. } if &**content == "other" => {
+                        Some(origin.x)
+                    }
+                    _ => None,
+                })
+                .expect("the sibling is drawn")
+        };
+
+        let plain = sibling_x(false);
+        let ruled = sibling_x(true);
+        assert_eq!(ruled, plain, "the rule never moved the sibling: the chip still hugs");
+        assert!(plain < 100.0, "and the chip really is hugging: {plain}");
+    }
+
+    #[test]
+    fn a_layer_hangs_where_the_unit_point_says() {
+        use crate::layout::{DrawCommand, Proposal, Size, UnitPoint};
+
+        // ONE runtime: two of them on a thread share the retention, so
+        // the second body would never run and the badge would never move
+        #[derive(Clone, Copy)]
+        struct Card {
+            at: State<UnitPoint>,
+        }
+
+        impl Component for Card {
+            fn body(self, _ctx: &Context) -> impl View {
+                rectangle()
+                    .frame(200.0, 100.0)
+                    .background_color(Color::hex(0x111111))
+                    .overlay(
+                        self.at.get(),
+                        spacer().frame(20.0, 10.0).background_color(Color::hex(0xFF0000)),
+                    )
+            }
+        }
+
+        let card = Card { at: State::new(UnitPoint::TOP_LEADING) };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 200.0, height: 100.0 });
+        let badge = |at: UnitPoint| {
+            card.at.set(at);
+            runtime.render_stable(&card);
+            runtime
+                .layout(&card, viewport)
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::FillRect { rect, color, .. }
+                        if color.r == 255 && color.g == 0 =>
+                    {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+                .expect("the badge paints")
+        };
+
+        assert_eq!(badge(UnitPoint::TOP_LEADING).origin, Point { x: 0.0, y: 0.0 });
+        assert_eq!(
+            badge(UnitPoint::BOTTOM_TRAILING).origin,
+            Point { x: 180.0, y: 90.0 },
+            "the badge's corner meets the box's corner"
+        );
+        assert_eq!(badge(UnitPoint::CENTER).origin, Point { x: 90.0, y: 45.0 });
+        assert_eq!(badge(UnitPoint::BOTTOM).origin, Point { x: 90.0, y: 90.0 });
+    }
+
+    #[test]
+    fn a_layer_that_fills_an_axis_crosses_the_whole_box() {
+        use crate::layout::{DrawCommand, Proposal, Size, UnitPoint};
+
+        // the 2pt bar of the active tab: it must cross the box the
+        // PARENT finally handed it, not the one measure guessed
+        #[derive(Clone, Copy)]
+        struct Bar;
+        impl Component for Bar {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("tab")
+                    .frame(300.0, 40.0)
+                    .overlay(
+                        UnitPoint::BOTTOM,
+                        spacer().frame_height(2.0).background_color(Color::hex(0x00FF00)),
+                    )
+            }
+        }
+
+        let runtime = Runtime::new();
+        runtime.render_stable(&Bar);
+        let result = runtime.layout(&Bar, Proposal::exact(Size { width: 400.0, height: 60.0 }));
+        let rule = result
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::FillRect { rect, color, .. } if color.g == 255 => Some(*rect),
+                _ => None,
+            })
+            .expect("the rule paints");
+        assert_eq!(rule.size, Size { width: 300.0, height: 2.0 });
+        assert_eq!(rule.origin.y, 38.0, "and it hangs on the bottom edge");
+    }
+
+    #[test]
+    fn a_layer_paints_over_and_a_background_paints_under() {
+        use crate::layout::{DrawCommand, Proposal, Size, UnitPoint};
+
+        #[derive(Clone, Copy)]
+        struct Both;
+        impl Component for Both {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("middle")
+                    .background(
+                        UnitPoint::CENTER,
+                        spacer().background_color(Color::hex(0x0000FF)),
+                    )
+                    .overlay(
+                        UnitPoint::CENTER,
+                        spacer().background_color(Color::hex(0xFF0000)),
+                    )
+            }
+        }
+
+        let runtime = Runtime::new();
+        runtime.render_stable(&Both);
+        let result =
+            runtime.layout(&Both, Proposal::exact(Size { width: 200.0, height: 40.0 }));
+        let index = |red: bool| {
+            result
+                .display
+                .iter()
+                .position(|command| match command {
+                    DrawCommand::FillRect { color, .. } => {
+                        if red { color.r == 255 } else { color.b == 255 }
+                    }
+                    _ => false,
+                })
+                .expect("both layers paint")
+        };
+        let label = result
+            .display
+            .iter()
+            .position(|command| matches!(command, DrawCommand::TextLine { .. }))
+            .expect("the label paints");
+        assert!(index(false) < label, "the background is under the box");
+        assert!(index(true) > label, "and the overlay is over it");
+    }
+
+    #[test]
+    fn in_element_mode_a_decorative_layer_lets_the_click_through() {
+        use crate::layout::UnitPoint;
+
+        // the browser routes by ELEMENT there, so a rule covering a row
+        // would eat the row's click unless it says it must not
+        #[derive(Clone, Copy)]
+        struct Row;
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("row")
+                    .background_color(Color::hex(0x202020))
+                    .on_click(|| {})
+                    .overlay(
+                        UnitPoint::BOTTOM,
+                        spacer().frame_height(2.0).background_color(Color::hex(0x3B82F6)),
+                    )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let patches = runtime.dom_frame(&Row, Size { width: 200.0, height: 40.0 });
+        let styles: Vec<crate::dom::DomStyle> = patches
+            .iter()
+            .filter_map(|patch| match patch {
+                crate::dom::DomPatch::SetStyle { style, .. } => Some(style.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            styles.iter().any(|style| style.pass_through),
+            "the rule lets the pointer through: {styles:#?}"
+        );
+        assert!(
+            styles.iter().any(|style| style.interactive.is_some() && !style.pass_through),
+            "and the row keeps its own click"
+        );
+    }
+
+    #[test]
+    fn a_layer_never_hides_a_rewrite_from_the_base() {
+        use crate::layout::UnitPoint;
+
+        // modifier order stays irrelevant: `.scroll_target` descends to
+        // the Scroll node through the wrappers, and the overlay is one
+        #[derive(Clone, Copy)]
+        struct Panel;
+        impl Component for Panel {
+            fn body(self, _ctx: &Context) -> impl View {
+                let rows: Vec<usize> = (0..30).collect();
+                scroll(for_each(
+                    rows,
+                    |row| format!("row{row}"),
+                    |row| text(format!("row {row}")).frame_height(20.0),
+                ))
+                    .overlay(
+                        UnitPoint::TOP,
+                        spacer().frame_height(2.0).background_color(Color::hex(0x3B82F6)),
+                    )
+                    .scroll_target("row20")
+                    .id("panel")
+            }
+        }
+
+        let runtime = Runtime::new();
+        runtime.render_stable(&Panel);
+        let result = runtime.layout(
+            &Panel,
+            crate::layout::Proposal::exact(Size { width: 200.0, height: 100.0 }),
+        );
+        let region = result.scrolls.first().expect("the region survived the layer");
+        assert_eq!(
+            region.target.as_deref(),
+            Some("row20"),
+            "the rewrite reached the Scroll through the overlay"
+        );
+    }
+
+    #[test]
     fn a_click_routes_through_hit_test_to_the_action_and_repaints() {
         use crate::layout::{Proposal, Size, hit_test};
 

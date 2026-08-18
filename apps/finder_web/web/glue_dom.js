@@ -380,6 +380,11 @@ function applyPatches(view, length) {
       } else if (el && el.dataset.g !== undefined) {
         delete el.dataset.g;
       }
+      if (mask & 2097152) {
+        // a layer that asks for nothing: the click belongs to whatever
+        // it covers
+        base.push("pointer-events:none");
+      }
       const name = `[data-n="${id}"]`;
       const from = group ? `[data-g="${group}"]` : name;
       const on = (state) => (group ? `${from}:${state} ${name}` : `${name}:${state}`);

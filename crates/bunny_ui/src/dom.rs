@@ -158,6 +158,12 @@ pub struct DomStyle {
     /// The box a `.hover_group()` owns names itself here — the anchor
     /// every follower's selector points at.
     pub group_owner: Option<u64>,
+    /// Inside a `.overlay(…)`/`.background(…)` layer that asks for
+    /// nothing: the box lets the pointer THROUGH to what it covers. A
+    /// rule or an insertion marker must not eat the click that belongs
+    /// to the row underneath, and in this mode the browser routes by
+    /// element and not by our hit list.
+    pub pass_through: bool,
 }
 
 impl DomStyle {
@@ -184,6 +190,7 @@ impl DomStyle {
             pressed_opacity: props.opacity_pressed,
             group: None,
             group_owner: None,
+            pass_through: false,
         }
     }
 }
@@ -246,6 +253,10 @@ pub(crate) struct DomCapture {
     pending_interactive: Option<String>,
     /// The ancestors that declared themselves hover groups.
     groups: Vec<u64>,
+    /// How many overlay layers are open around here. What a layer
+    /// paints lets the pointer THROUGH unless it asks for a target of
+    /// its own — a rule must not eat the click of the row it crosses.
+    overlay_depth: usize,
     /// The BASE ink of every open node, in step with `stack` — the
     /// color a text inherits, never the hovered one the pointer
     /// resolved. This is what keeps the capture pointer-invariant.
@@ -286,6 +297,7 @@ impl DomCapture {
             pending_transition: None,
             pending_interactive: None,
             groups: Vec::new(),
+            overlay_depth: 0,
             // the scene's ink floor is the theme's, the same one the
             // place walk starts from
             ink: vec![crate::theme::current().fg],
@@ -314,6 +326,9 @@ impl DomCapture {
         if let DomKind::Box = kind {
             style.interactive = self.pending_interactive.take();
         }
+        // inside a layer, a box that asks for nothing lets the pointer
+        // through to what it covers
+        style.pass_through = self.overlay_depth > 0 && style.interactive.is_none();
         style.transition = self.pending_transition.take();
         style.tooltip = self.armed_tooltip.take();
         let node = DomNode {
@@ -353,6 +368,8 @@ impl DomCapture {
         // tooltip armed by the wrapper lands on THIS box
         let tooltip = node.style.tooltip.take();
         node.style = DomStyle {
+            // the rebuild must not drop what the layer scope decided
+            pass_through: self.overlay_depth > 0 && interactive.is_none(),
             interactive,
             transition,
             tooltip,
@@ -449,8 +466,9 @@ impl DomCapture {
             field.color = self.current_ink();
         }
         self.open(kind, frame, frame.origin);
+        let pass_through = self.overlay_depth > 0 && style.interactive.is_none();
         let (_, node) = self.stack.last_mut().expect("just opened");
-        node.style = style;
+        node.style = DomStyle { pass_through, ..style };
         self.close();
     }
 
@@ -474,6 +492,16 @@ impl DomCapture {
         self.open(DomKind::Box, frame, frame.origin);
         let (_, node) = self.stack.last_mut().expect("just opened");
         node.style.group_owner = Some(key);
+    }
+
+    /// Opens/closes an overlay LAYER scope: what it paints inside is
+    /// decoration until something in it asks to be a target.
+    pub(crate) fn enter_layer(&mut self) {
+        self.overlay_depth += 1;
+    }
+
+    pub(crate) fn leave_layer(&mut self) {
+        self.overlay_depth = self.overlay_depth.saturating_sub(1);
     }
 
     pub(crate) fn close_group(&mut self) {
@@ -1009,6 +1037,10 @@ fn diff_children(
 ///                   20 group owner u32 hi, u32 lo — the box a
 ///                      `.hover_group()` owns names itself, and the
 ///                      followers below point their selectors at it
+///                   21 pass through (no payload — the bit IS the
+///                      value): `pointer-events:none`, for a layer
+///                      that covers a box and must not take its
+///                      clicks
 ///   6 set text      u32 rgba, u8 inherits ink (1 = no color of its
 ///                   own — the box above owns both states),
 ///                   f32 size, u8 weight, u8 mono, u8 italic,
@@ -1234,6 +1266,10 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     }
     if style.group_owner.is_some() {
         mask |= 1 << 20;
+    }
+    if style.pass_through {
+        // payload-free, like the clip bit: the bit IS the value
+        mask |= 1 << 21;
     }
     push_u32(out, mask);
     if let Some(color) = style.background {

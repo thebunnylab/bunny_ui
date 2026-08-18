@@ -51,7 +51,6 @@ pub enum Modifier {
     MultilineTextAlignment(TextAlignment),
     Blur(f64),
     IgnoresSafeArea,
-    Background(String),
     Hidden,
     Equatable,
 
@@ -194,7 +193,6 @@ impl Modifier {
             Modifier::Resizable => " [.resizable()]".into(),
             Modifier::Blur(radius) => format!(" [.blur(radius: {radius})]"),
             Modifier::IgnoresSafeArea => " [.ignoresSafeArea()]".into(),
-            Modifier::Background(line) => format!(" [.background {{ {line} }}]"),
             Modifier::Hidden => " [.hidden()]".into(),
             Modifier::Equatable => " [.equatable()]".into(),
             Modifier::BackgroundColor(color) => format!(" [.background({color})]"),
@@ -305,6 +303,14 @@ fn rewrite_scroll_node(
         LayoutNode::Island { child } => LayoutNode::Island {
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
+        // the base is what a rewrite looks for; the LAYER is a separate
+        // view and must never be descended into
+        LayoutNode::Overlay { at, behind, layer, child } => LayoutNode::Overlay {
+            at,
+            behind,
+            layer,
+            child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
         LayoutNode::Padding { edges, child } => LayoutNode::Padding {
             edges,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
@@ -344,6 +350,14 @@ fn rewrite_field_node(
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
         LayoutNode::Island { child } => LayoutNode::Island {
+            child: Box::new(rewrite_field_node(*child, rewrite)),
+        },
+        // the base is what a rewrite looks for; the LAYER is a separate
+        // view and must never be descended into
+        LayoutNode::Overlay { at, behind, layer, child } => LayoutNode::Overlay {
+            at,
+            behind,
+            layer,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
         LayoutNode::Padding { edges, child } => LayoutNode::Padding {
@@ -394,6 +408,14 @@ fn rewrite_pixel_node(
         LayoutNode::Island { child } => LayoutNode::Island {
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
+        // the base is what a rewrite looks for; the LAYER is a separate
+        // view and must never be descended into
+        LayoutNode::Overlay { at, behind, layer, child } => LayoutNode::Overlay {
+            at,
+            behind,
+            layer,
+            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
+        },
         LayoutNode::Padding { edges, child } => LayoutNode::Padding {
             edges,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
@@ -435,6 +457,14 @@ fn rewrite_text_node(
             child: Box::new(rewrite_text_node(*child, rewrite)),
         },
         LayoutNode::Island { child } => LayoutNode::Island {
+            child: Box::new(rewrite_text_node(*child, rewrite)),
+        },
+        // the base is what a rewrite looks for; the LAYER is a separate
+        // view and must never be descended into
+        LayoutNode::Overlay { at, behind, layer, child } => LayoutNode::Overlay {
+            at,
+            behind,
+            layer,
             child: Box::new(rewrite_text_node(*child, rewrite)),
         },
         other => other,
@@ -536,6 +566,71 @@ impl<C: View<Arity = Single>> View for DropTargetView<C> {
         });
         if let Some(node) = out.last_mut() {
             node.line.push_str(" [.onDrop()]");
+        }
+    }
+}
+
+/// What `.overlay(…)` and `.background(…)` answer: the view with a
+/// LAYER over it (or under it), typed all the way down — the layer is
+/// an ordinary view, monomorphic like everything else, and no erasure
+/// boundary is opened for it.
+#[derive(Clone)]
+pub struct OverlayView<C, L> {
+    base: C,
+    layer: L,
+    at: crate::layout::UnitPoint,
+    behind: bool,
+}
+
+impl<C, L> OverlayView<C, L> {
+    pub(crate) fn new(
+        base: C,
+        layer: L,
+        at: crate::layout::UnitPoint,
+        behind: bool,
+    ) -> OverlayView<C, L> {
+        OverlayView { base, layer, at, behind }
+    }
+}
+
+impl<C, L> View for OverlayView<C, L>
+where
+    C: View<Arity = Single>,
+    L: View<Arity = Single>,
+{
+    type Arity = Single;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        // the base renders in place, keeping the geometry and the scope
+        // it would have had; the layer renders under an identity frame
+        // of its OWN, so its state and its tasks have an address that
+        // does not move when the base's children do
+        let mark = out.layout_mark();
+        self.base.render_into(ctx, out);
+        let mut layer_nodes = NodeList::new();
+        {
+            let _frame = motor::identity::enter(if self.behind {
+                "background".to_string()
+            } else {
+                "overlay".to_string()
+            });
+            self.layer.render_into(ctx, &mut layer_nodes);
+        }
+        let (layer_prints, layer_layouts) = layer_nodes.into_parts();
+        let layer = wrap_layout(layer_layouts);
+        let (at, behind) = (self.at, self.behind);
+        out.wrap_layout_from(mark, move |node| LayoutNode::Overlay {
+            at,
+            behind,
+            layer: Box::new(layer),
+            child: Box::new(node),
+        });
+        if let Some(node) = out.last_mut() {
+            if crate::view::print_enabled() {
+                node.line
+                    .push_str(if behind { " [.background()]" } else { " [.overlay()]" });
+                node.children.extend(layer_prints);
+            }
         }
     }
 }

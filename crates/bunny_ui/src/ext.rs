@@ -27,7 +27,7 @@ use crate::effects;
 use crate::erased::Erased;
 use crate::layout::Color;
 use crate::modifier::{DropTargetView, Modified, Modifier};
-use crate::view::{Single, View, render_line, short_type_name};
+use crate::view::{Single, View, short_type_name};
 use crate::views::Alignment;
 use motor::views::{ContentMode, Edge, Font, ListStyle, ProgressViewStyle, TextAlignment};
 
@@ -234,12 +234,56 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.background { … }` — describes the content without mounting it.
-    fn background<C: View<Arity = Single>>(self, content: C) -> Modified<Self> {
-        Modified {
-            base: self,
-            modifier: Modifier::Background(render_line(&content)),
-        }
+    /// `.background(UnitPoint::CENTER, view)` — the twin of
+    /// [`ViewExt::overlay`], painted UNDER instead of over. Same
+    /// contract: the layer takes the box's size and gives it nothing.
+    ///
+    /// For a flat color or a ramp reach for `.background_color(…)` and
+    /// `.background_gradient(…)` — those are properties of the box and
+    /// cost no node at all. This one is for a VIEW.
+    fn background<C: View<Arity = Single>>(
+        self,
+        at: crate::layout::UnitPoint,
+        content: C,
+    ) -> crate::modifier::OverlayView<Self, C> {
+        crate::modifier::OverlayView::new(self, content, at, true)
+    }
+
+    /// `.overlay(UnitPoint::BOTTOM, rule)` — a layer painted OVER this
+    /// view. It takes the view's SIZE and gives it nothing back: a rule
+    /// wide enough to cross a box that hugs its content leaves the hug
+    /// alone, and the box never grows to hold it.
+    ///
+    /// ```ignore
+    /// tab.overlay(
+    ///     UnitPoint::BOTTOM,
+    ///     spacer().frame_height(2.0).background_color(theme::accent()),
+    /// )
+    /// ```
+    ///
+    /// A `spacer()` and not a `rectangle()`: the rectangle paints a
+    /// fill of its OWN, which would cover the colour behind it. The
+    /// framework's own divider is written the same way.
+    ///
+    /// The [`UnitPoint`] places the layer the way it places anything: a
+    /// point of the layer meets the same point of the box, so `BOTTOM`
+    /// hangs a rule on the bottom edge and `TOP_TRAILING` parks a badge
+    /// in a corner. A layer that fills an axis follows the box on that
+    /// axis, whatever room the parent finally handed it.
+    ///
+    /// The layer is a SIBLING of what it covers, so it does not inherit
+    /// the box's hover ink: write `.overlay(…)` BEFORE `.on_click(…)`
+    /// for a layer that must light up with the box. It takes no clicks
+    /// of its own unless its own subtree asks for them — a marker or a
+    /// rule lets the press through to what is underneath.
+    ///
+    /// [`UnitPoint`]: crate::layout::UnitPoint
+    fn overlay<C: View<Arity = Single>>(
+        self,
+        at: crate::layout::UnitPoint,
+        content: C,
+    ) -> crate::modifier::OverlayView<Self, C> {
+        crate::modifier::OverlayView::new(self, content, at, false)
     }
 
     /// `.hidden()`
