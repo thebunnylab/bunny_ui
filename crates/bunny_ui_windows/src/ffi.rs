@@ -473,9 +473,13 @@ pub enum AppEvent {
     /// movement, deletion, and the Ctrl chords over a focused field.
     /// `command` carries Ctrl, the platform's accelerator.
     Key { vk: u32, shift: bool, command: bool },
-    /// The text road: typing, a paste of characters, `WM_CHAR` whole —
-    /// surrogate halves already joined at the boundary.
+    /// The text road: typing, a paste of characters, the IME's final
+    /// commit — surrogate halves already joined at the boundary.
     Text(String),
+    /// Live composition: the marked text + the caret INSIDE it (UTF-16).
+    ImeMark { text: String, caret: usize },
+    /// The composition ended with what was marked still standing.
+    ImeUnmark,
     /// Half-period of the caret blink (the shell's timer).
     Blink,
     /// One frame-driver tick: compose the next animated frame. `dt` is
@@ -635,6 +639,150 @@ pub fn clipboard_read() -> Option<String> {
         CloseClipboard();
     }
     text
+}
+
+// MARK: - IME (IMM32 — the three doors and the mirror)
+
+#[link(name = "imm32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn ImmGetContext(hwnd: Hwnd) -> isize;
+    fn ImmReleaseContext(hwnd: Hwnd, himc: isize) -> i32;
+    fn ImmGetCompositionStringW(himc: isize, index: u32, buffer: *mut c_void, length: u32)
+        -> i32;
+    fn ImmSetCandidateWindow(himc: isize, form: *const CandidateForm) -> i32;
+    fn ImmAssociateContext(hwnd: Hwnd, himc: isize) -> isize;
+    fn ImmNotifyIME(himc: isize, action: u32, index: u32, value: u32) -> i32;
+}
+
+#[repr(C)]
+struct CandidateForm {
+    index: u32,
+    style: u32,
+    point: Point,
+    area: Rect,
+}
+
+const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
+const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
+const WM_IME_COMPOSITION: u32 = 0x010F;
+const WM_IME_SETCONTEXT: u32 = 0x0281;
+const WM_KILLFOCUS: u32 = 0x0008;
+const GCS_COMPSTR: u32 = 0x0008;
+const GCS_CURSORPOS: u32 = 0x0080;
+const GCS_RESULTSTR: u32 = 0x0800;
+/// "Never cover this rect" — the correct semantic for a caret.
+const CFS_EXCLUDE: u32 = 0x0080;
+const ISC_SHOWUICOMPOSITIONWINDOW: isize = 0x8000_0000u32 as i32 as isize;
+const NI_COMPOSITIONSTR: u32 = 0x0015;
+const CPS_COMPLETE: u32 = 0x0001;
+/// The IME consumed this keystroke — never the keymap's business.
+const VK_PROCESSKEY: u32 = 0xE5;
+
+/// What the shell knows about the focused field, synced per blit —
+/// the mirror the doors read without asking the runtime mid-message.
+#[derive(Default, Clone, Copy)]
+struct ImeMirror {
+    /// A field (or an escape hatch with ime) is focused.
+    enabled: bool,
+    /// A composition is live in the runtime.
+    marked: bool,
+    /// Where the composition starts, in UTF-16 — the candidate anchor.
+    marked_start: usize,
+    /// The caret rect in LAYOUT points, the fallback anchor.
+    caret: (f64, f64, f64, f64),
+}
+
+thread_local! {
+    static IME: Cell<ImeMirror> = Cell::new(ImeMirror::default());
+    /// The context the window was born with, kept while disabled.
+    static ORIGINAL_HIMC: Cell<Option<isize>> = const { Cell::new(None) };
+    /// The composition-start rect resolver — answered live by the
+    /// runtime, in layout points.
+    static IME_RECT: RefCell<Option<Box<dyn Fn(usize) -> Option<(f64, f64, f64, f64)>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Installs the runtime's rect-at-index resolver (candidate placement).
+pub fn set_ime_rect_resolver(
+    resolver: Box<dyn Fn(usize) -> Option<(f64, f64, f64, f64)>>,
+) {
+    IME_RECT.with(|slot| *slot.borrow_mut() = Some(resolver));
+}
+
+/// Syncs the mirror after a blit, and keeps the window's input
+/// context association honest: no field focused = the IME detached,
+/// keys arrive as clean strokes for the keymap.
+pub fn sync_ime(state: Option<(bool, usize, (f64, f64, f64, f64))>) {
+    let hwnd = MAIN_HWND.load(Ordering::Acquire);
+    let mirror = match state {
+        Some((marked, marked_start, caret)) => {
+            ImeMirror { enabled: true, marked, marked_start, caret }
+        }
+        None => ImeMirror::default(),
+    };
+    let was = IME.with(|cell| cell.replace(mirror));
+    if hwnd == 0 || was.enabled == mirror.enabled {
+        return;
+    }
+    if mirror.enabled {
+        // give the context back
+        if let Some(original) = ORIGINAL_HIMC.with(|cell| cell.take()) {
+            unsafe {
+                ImmAssociateContext(hwnd, original);
+            }
+        }
+    } else {
+        // detach, remembering what the window was born with
+        let original = unsafe { ImmAssociateContext(hwnd, 0) };
+        ORIGINAL_HIMC.with(|cell| cell.set(Some(original)));
+    }
+}
+
+/// Whether a composition is live — the gate's first question.
+fn ime_composing() -> bool {
+    IME.with(|cell| cell.get().marked)
+}
+
+/// Places the candidate window at the composition's start (or the
+/// caret), excluding the rect so the list never covers what it spells.
+fn place_candidate_window(himc: isize) {
+    let mirror = IME.with(|cell| cell.get());
+    let rect = IME_RECT
+        .with(|slot| slot.borrow().as_ref().and_then(|resolve| resolve(mirror.marked_start)))
+        .unwrap_or(mirror.caret);
+    let factor = shared_factor();
+    let (x, y, w, h) = rect;
+    let area = Rect {
+        left: (x * factor).round() as i32,
+        top: (y * factor).round() as i32,
+        right: ((x + w) * factor).round() as i32,
+        bottom: ((y + h) * factor).round() as i32,
+    };
+    let form = CandidateForm {
+        index: 0,
+        style: CFS_EXCLUDE,
+        point: Point { x: area.left, y: area.bottom },
+        area,
+    };
+    unsafe {
+        ImmSetCandidateWindow(himc, &form);
+    }
+}
+
+/// Reads one composition string (`GCS_COMPSTR`/`GCS_RESULTSTR`).
+fn composition_string(himc: isize, kind: u32) -> Option<String> {
+    unsafe {
+        let bytes = ImmGetCompositionStringW(himc, kind, std::ptr::null_mut(), 0);
+        if bytes < 0 {
+            return None;
+        }
+        let units = bytes as usize / 2;
+        let mut buffer = vec![0u16; units];
+        if units > 0 {
+            ImmGetCompositionStringW(himc, kind, buffer.as_mut_ptr() as *mut c_void, bytes as u32);
+        }
+        Some(String::from_utf16_lossy(&buffer))
+    }
 }
 
 // MARK: - Cross-thread wake
@@ -1228,11 +1376,86 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_KEYDOWN => {
+            if wparam as u32 == VK_PROCESSKEY {
+                // the IME owns this stroke — its message machinery
+                // needs the default road
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
             // the gate already declined this stroke in the pump — what
             // arrives here is the editing vocabulary and the Ctrl chords
             let shift = unsafe { GetKeyState(VK_SHIFT) } as u16 & 0x8000 != 0;
             let control = unsafe { GetKeyState(VK_CONTROL) } as u16 & 0x8000 != 0;
             dispatch(AppEvent::Key { vk: wparam as u32, shift, command: control });
+            0
+        }
+        WM_IME_SETCONTEXT => {
+            // the belt: the IME draws no composition window of its own
+            let lparam = lparam & !ISC_SHOWUICOMPOSITIONWINDOW;
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_IME_STARTCOMPOSITION => {
+            // the suspenders: Def would create the default composition
+            // window — the scene draws marked text inline instead
+            let himc = unsafe { ImmGetContext(hwnd) };
+            if himc != 0 {
+                place_candidate_window(himc);
+                unsafe {
+                    ImmReleaseContext(hwnd, himc);
+                }
+            }
+            0
+        }
+        WM_IME_COMPOSITION => {
+            let himc = unsafe { ImmGetContext(hwnd) };
+            if himc == 0 {
+                return 0;
+            }
+            // the order rule: RESULT first, then the fresh composition —
+            // a commit and the next syllable ride one message in
+            // Japanese and Korean
+            if (lparam as u32) & GCS_RESULTSTR != 0 {
+                if let Some(text) = composition_string(himc, GCS_RESULTSTR) {
+                    if !text.is_empty() {
+                        dispatch(AppEvent::Text(text));
+                    }
+                }
+            }
+            if (lparam as u32) & GCS_COMPSTR != 0 {
+                if let Some(text) = composition_string(himc, GCS_COMPSTR) {
+                    let caret =
+                        unsafe { ImmGetCompositionStringW(himc, GCS_CURSORPOS, std::ptr::null_mut(), 0) };
+                    dispatch(AppEvent::ImeMark { text, caret: caret.max(0) as usize });
+                    place_candidate_window(himc);
+                }
+            }
+            unsafe {
+                ImmReleaseContext(hwnd, himc);
+            }
+            // never Def: it would synthesize WM_IME_CHAR duplicates
+            0
+        }
+        WM_IME_ENDCOMPOSITION => {
+            // unmark ONLY if the runtime still holds marked text: after
+            // a commit the result already cleared it, and a second
+            // clearing would erase real input
+            if ime_composing() {
+                dispatch(AppEvent::ImeUnmark);
+            }
+            0
+        }
+        WM_KILLFOCUS => {
+            // the platform's manner: focus leaving mid-composition
+            // commits what stands — the commit flows back through the
+            // composition door as a result
+            if ime_composing() {
+                let himc = unsafe { ImmGetContext(hwnd) };
+                if himc != 0 {
+                    unsafe {
+                        ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_COMPLETE, 0);
+                        ImmReleaseContext(hwnd, himc);
+                    }
+                }
+            }
             0
         }
         WM_CHAR => {
@@ -1487,12 +1710,18 @@ pub fn run() {
     };
     unsafe {
         while GetMessageW(&mut msg, 0, 0, 0) > 0 {
-            let gated = (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) && {
-                let stroke = key_stroke_of(msg.wparam, msg.lparam);
-                KEY_GATE.with(|slot| {
-                    slot.borrow_mut().as_mut().is_some_and(|gate| gate(&stroke))
-                })
-            };
+            let gated = (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN)
+                // a live composition owns its keys (Esc closes the
+                // candidates, arrows walk the clauses), and a stroke
+                // the IME consumed was never the keymap's to take
+                && msg.wparam as u32 != VK_PROCESSKEY
+                && !ime_composing()
+                && {
+                    let stroke = key_stroke_of(msg.wparam, msg.lparam);
+                    KEY_GATE.with(|slot| {
+                        slot.borrow_mut().as_mut().is_some_and(|gate| gate(&stroke))
+                    })
+                };
             if !gated {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);

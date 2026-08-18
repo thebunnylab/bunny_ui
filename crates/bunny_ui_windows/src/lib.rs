@@ -227,11 +227,32 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
             } else {
                 ffi::Cursor::Arrow
             });
+            // the input system's mirror: the doors answer from this
+            // without asking the runtime mid-message
+            ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
+                let rect = snapshot.caret_rect;
+                (
+                    snapshot.marked.is_some(),
+                    snapshot.marked.map(|(start, _)| start).unwrap_or(0),
+                    (rect.origin.x, rect.origin.y, rect.size.width, rect.size.height),
+                )
+            }));
             // wake or park the frame driver — the event may have
             // started (or finished) an animation
             ffi::set_frame_driver_paused(!runtime.wants_frame());
         }
     };
+
+    // the candidate window's anchor: the rect at the composition's
+    // start, answered live by the runtime in layout points
+    ffi::set_ime_rect_resolver(Box::new({
+        let runtime = Rc::clone(&runtime);
+        move |utf16| {
+            runtime.ime_rect_for(utf16).map(|rect| {
+                (rect.origin.x, rect.origin.y, rect.size.width, rect.size.height)
+            })
+        }
+    }));
 
     // the gate: keymap BEFORE the input system — bare chars with a
     // focused field pass straight through (typing is never stolen); a
@@ -325,9 +346,20 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
                 }
             }
             AppEvent::Text(text) => {
-                // typing, paste of characters, and one day the IME
-                // commit — the same road for all of them
+                // typing, paste of characters, and the IME's commit —
+                // the same road for all of them
                 if !text.is_empty() && runtime.key(EditCommand::Insert(text)).applied {
+                    blit(runtime, root);
+                }
+            }
+            AppEvent::ImeMark { text, caret } => {
+                let command = EditCommand::SetMarked { text, caret_utf16: (caret, 0) };
+                if runtime.key(command).applied {
+                    blit(runtime, root);
+                }
+            }
+            AppEvent::ImeUnmark => {
+                if runtime.key(EditCommand::Unmark).applied {
                     blit(runtime, root);
                 }
             }
