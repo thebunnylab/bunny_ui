@@ -36,7 +36,7 @@ const SCENARIOS = {
       // the row's label cell, by its action path — resilient to how
       // deep the markup nests it
       const label = [...document.querySelectorAll("#app tr [data-path]")].find(
-        (el) => !el.dataset.path.includes("#"),
+        (el) => !el.dataset.path.endsWith("#dismiss"),
       );
       const rect = label.getBoundingClientRect();
       label.dispatchEvent(
