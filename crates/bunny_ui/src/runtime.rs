@@ -1195,6 +1195,11 @@ impl Runtime {
         size: crate::layout::Size,
     ) -> Vec<crate::dom::DomPatch> {
         self.settle(root);
+        // everything that ran while settling — the reuse decision's
+        // whole evidence (a theme change already cleared retention,
+        // which re-runs every body and empties no promise wrongly)
+        let changed = reconciler::take_frame_runs();
+        let retained_groups = self.dom.borrow().group_paths();
         // the tree, stable-root shortcut included — the flow twin of
         // the pixel path's pass assembly
         let stable_root = (self.root_is_boundary.get()
@@ -1257,6 +1262,8 @@ impl Runtime {
             scroll_offsets: &*offsets,
             size: (size.width, size.height),
             layout: Some(env),
+            changed: &changed,
+            retained_groups: &retained_groups,
         };
         let output = crate::stats::time(crate::stats::Stage::Capture, || {
             crate::dom_flow::lower(&tree, &flow)

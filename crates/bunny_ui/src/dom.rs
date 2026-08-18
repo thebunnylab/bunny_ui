@@ -86,6 +86,11 @@ pub enum DomKind {
     FlexRow,
     /// Layered children: `display:grid`, everyone in the same cell.
     Layers,
+    /// A CLEAN boundary, by promise: no body under this path ran this
+    /// frame, so the retained subtree still holds — the diff keeps it
+    /// wholesale and never descends. Internal to the walk and the
+    /// diff; the wire never carries it.
+    Reuse { path: String },
     /// A popover under the root (the portal). The glue positions it
     /// from the anchor's real box — the identity is the overlay path.
     Popover {
@@ -632,6 +637,7 @@ struct LowerCtx<'a> {
     next_id: &'a mut u32,
     display: &'a [DrawCommand],
     islands: &'a mut HashMap<u32, Island>,
+    group_paths: &'a mut std::collections::HashSet<String>,
 }
 
 /// The retained side of the Dom mode: last frame's scene with ids.
@@ -646,6 +652,10 @@ pub struct DomLowering {
     /// Anchor relations already shipped: popover element id → anchor
     /// element id. A relation re-ships when the anchor recreates.
     anchors_sent: HashMap<u32, u32>,
+    /// Every retained Group's identity path — the walk consults this
+    /// before promising a reuse (a promise the diff cannot keep would
+    /// mount a hole).
+    group_paths: std::collections::HashSet<String>,
 }
 
 impl DomLowering {
@@ -688,6 +698,7 @@ impl DomLowering {
                     next_id: &mut next_id,
                     display: display.as_slice(),
                     islands: &mut self.islands,
+                    group_paths: &mut self.group_paths,
                 };
                 root.children = create_children(scene, 0, &mut ctx, &mut patches);
                 self.next_id = next_id;
@@ -699,6 +710,7 @@ impl DomLowering {
                     next_id: &mut next_id,
                     display: display.as_slice(),
                     islands: &mut self.islands,
+                    group_paths: &mut self.group_paths,
                 };
                 diff_node(root, scene, &mut ctx, &mut patches);
                 self.next_id = next_id;
@@ -770,6 +782,12 @@ impl DomLowering {
         }
     }
 
+    /// The retained Groups' identity paths — the flow walk consults
+    /// them before promising a reuse.
+    pub(crate) fn group_paths(&self) -> std::collections::HashSet<String> {
+        self.group_paths.clone()
+    }
+
     /// Does the retained scene hold any canvas island? The runtime
     /// skips display-list collection when none is alive.
     pub(crate) fn has_islands(&self) -> bool {
@@ -827,6 +845,10 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::FlexRow => CreateKind::FlexRow,
         DomKind::Layers => CreateKind::Layers,
         DomKind::Popover { .. } => CreateKind::Popover,
+        // a reuse only exists where a retained group matched; reaching
+        // creation means the promise broke — mount an empty anchor and
+        // let the next frame heal it
+        DomKind::Reuse { .. } => CreateKind::Group,
     }
 }
 
@@ -940,6 +962,9 @@ fn create_subtree(
         kind: create_kind(&node.kind),
         hints: node.hints.clone(),
     });
+    if let DomKind::Group { path } = &node.kind {
+        ctx.group_paths.insert(path.clone());
+    }
     match &node.layout {
         // a flow node speaks semantics; its geometry fields are silent
         Some(layout) => {
@@ -1003,6 +1028,18 @@ fn remove_subtree(retained: &Retained, ctx: &mut LowerCtx, patches: &mut Vec<Dom
         }
     }
     forget_islands(retained, ctx.islands);
+    fn forget_groups(
+        retained: &Retained,
+        groups: &mut std::collections::HashSet<String>,
+    ) {
+        if let DomKind::Group { path } = &retained.node.kind {
+            groups.remove(path);
+        }
+        for child in &retained.children {
+            forget_groups(child, groups);
+        }
+    }
+    forget_groups(retained, ctx.group_paths);
 }
 
 /// Diffs one matched pair: geometry, style, kind payload, children.
@@ -1012,6 +1049,12 @@ fn diff_node(
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
+    // the promise, honored: the walk never descended, the diff never
+    // traverses — the retained subtree IS the frame's truth here
+    if let DomKind::Reuse { .. } = &new.kind {
+        crate::stats::note_diff_reuse();
+        return;
+    }
     crate::stats::note_diff_visit();
     let id = retained.id;
     let old = &retained.node;
@@ -1159,7 +1202,7 @@ fn diff_children(
     let mut next: Vec<Retained> = Vec::with_capacity(new.children.len());
     for (index, child) in new.children.iter().enumerate() {
         let matched = match &child.kind {
-            DomKind::Group { path } => by_path.remove(path),
+            DomKind::Group { path } | DomKind::Reuse { path } => by_path.remove(path),
             // a kind change at the same index is remove+create — the
             // mismatched retained goes BACK to its slot so the leftover
             // sweep emits its remove (taking and filtering would drop
@@ -1218,6 +1261,8 @@ fn diff_children_ordered(
         && retained.children.iter().zip(&new.children).all(|(old, child)| {
             match (&old.node.kind, &child.kind) {
                 (DomKind::Group { path: was }, DomKind::Group { path: now }) => was == now,
+                // a reuse promise aligns with the group it promised
+                (DomKind::Group { path: was }, DomKind::Reuse { path: now }) => was == now,
                 (old_kind, new_kind) => {
                     std::mem::discriminant(old_kind) == std::mem::discriminant(new_kind)
                 }
@@ -1251,7 +1296,7 @@ fn diff_children_ordered(
     let mut plan: Vec<Plan> = Vec::with_capacity(new.children.len());
     for (index, child) in new.children.iter().enumerate() {
         let matched = match &child.kind {
-            DomKind::Group { path } => by_path.remove(path),
+            DomKind::Group { path } | DomKind::Reuse { path } => by_path.remove(path),
             kind => by_index.get_mut(index).and_then(|slot| match slot.take() {
                 Some(old)
                     if std::mem::discriminant(&old.node.kind)
@@ -3092,6 +3137,74 @@ mod tests {
         let _ = runtime.dom_frame(&view, size);
         let update = crate::stats::take();
         assert_eq!(update.measure_misses + update.measure_hits, 0, "nor the update");
+    }
+
+    /// The O(change) proof, pinned by NUMBER: an untouched component
+    /// is not even traversed. One row flips among fifty; the diff
+    /// visits a handful of nodes and reuses every clean sibling.
+    #[test]
+    fn an_untouched_subtree_is_not_even_traversed() {
+        #[derive(Clone, Copy)]
+        struct Cell {
+            on: State<bool>,
+        }
+
+        impl Component for Cell {
+            fn body(self, _ctx: &Context) -> impl View {
+                let on = self.on.get();
+                let toggle = self.on;
+                text(if on { "on" } else { "off" })
+                    .background_color(if on {
+                        Color::hex(0x3B82F6)
+                    } else {
+                        Color::rgba(0, 0, 0, 0)
+                    })
+                    .on_click(move || toggle.set(!toggle.get()))
+            }
+        }
+
+        #[derive(Clone)]
+        struct Grid {
+            cells: std::rc::Rc<Vec<State<bool>>>,
+        }
+
+        impl Component for Grid {
+            fn body(self, _ctx: &Context) -> impl View {
+                let cells = self.cells.clone();
+                crate::vstack!(list(
+                    (0..50).collect::<Vec<_>>(),
+                    |i| i.to_string(),
+                    move |i| Cell { on: cells[*i] },
+                ))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Grid { cells: std::rc::Rc::new((0..50).map(|_| State::new(false)).collect()) };
+        let size = Size { width: 200.0, height: 400.0 };
+        let _ = runtime.dom_frame(&view, size);
+
+        let _ = crate::stats::take();
+        view.cells[7].set(true);
+        let patches = runtime.dom_frame(&view, size);
+        let stats = crate::stats::take();
+
+        assert_eq!(patches.len(), 2, "the flip is two style records: {patches:?}");
+        assert!(
+            stats.diff_visited < 20,
+            "the diff visited {} nodes for one flipped cell",
+            stats.diff_visited
+        );
+        assert!(
+            stats.diff_reused >= 49,
+            "every clean sibling reused wholesale, got {}",
+            stats.diff_reused
+        );
+        assert!(
+            stats.capture_nodes < 30,
+            "the walk never descended the clean rows, built {}",
+            stats.capture_nodes
+        );
     }
 
     // MARK: - The ABI handshake

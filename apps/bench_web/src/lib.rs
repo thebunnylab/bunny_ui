@@ -27,6 +27,46 @@ fn value_of(index: usize) -> String {
     format!("${}.{}M", 90 + index % 20, index % 10)
 }
 
+/// One row, one component: the toggle read lives in THIS body, so a
+/// flip dirties this row alone — the reuse promise covers the rest.
+/// The same shape a signals framework uses for its O(change) story.
+#[derive(Clone, Copy)]
+struct Row {
+    index: usize,
+    on: State<bool>,
+}
+
+impl Component for Row {
+    fn body(self, _ctx: &Context) -> impl View {
+        let on = self.on.get();
+        let toggle = self.on;
+        hstack!(
+            text(name_of(self.index)).foreground_color(theme::fg()),
+            text(tools_of(self.index))
+                .font(Font::Subheadline)
+                .monospaced()
+                .foreground_color(theme::fg_secondary()),
+            spacer(),
+            text(value_of(self.index))
+                .font(Font::Subheadline)
+                .monospaced()
+                .foreground_color(theme::fg_secondary()),
+            rectangle()
+                .frame(12.0, 12.0)
+                .background_color(if on { theme::accent() } else { theme::border() })
+                .corner_radius(3.0),
+        )
+        .spacing(8.0)
+        .alignment(VerticalAlignment::Center)
+        .padding_edge(Edge::Leading, 12.0)
+        .padding_edge(Edge::Trailing, 12.0)
+        .padding_edge(Edge::Top, 5.0)
+        .padding_edge(Edge::Bottom, 5.0)
+        .background_color(if on { theme::row_pressed() } else { CLEAR })
+        .on_click(move || toggle.set(!toggle.get()))
+    }
+}
+
 #[derive(Clone)]
 struct Bench {
     filtered: State<bool>,
@@ -67,34 +107,7 @@ impl Component for Bench {
         let rows = list(
             items,
             |index| index.to_string(),
-            move |index| {
-                let toggle = toggles[*index];
-                let on = toggle.get();
-                hstack!(
-                    text(name_of(*index)).foreground_color(theme::fg()),
-                    text(tools_of(*index))
-                        .font(Font::Subheadline)
-                        .monospaced()
-                        .foreground_color(theme::fg_secondary()),
-                    spacer(),
-                    text(value_of(*index))
-                        .font(Font::Subheadline)
-                        .monospaced()
-                        .foreground_color(theme::fg_secondary()),
-                    rectangle()
-                        .frame(12.0, 12.0)
-                        .background_color(if on { theme::accent() } else { theme::border() })
-                        .corner_radius(3.0),
-                )
-                .spacing(8.0)
-                .alignment(VerticalAlignment::Center)
-                .padding_edge(Edge::Leading, 12.0)
-                .padding_edge(Edge::Trailing, 12.0)
-                .padding_edge(Edge::Top, 5.0)
-                .padding_edge(Edge::Bottom, 5.0)
-                .background_color(if on { theme::row_pressed() } else { CLEAR })
-                .on_click(move || toggle.set(!toggle.get()))
-            },
+            move |index| Row { index: *index, on: toggles[*index] },
         );
 
         vstack!(

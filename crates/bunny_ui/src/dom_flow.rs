@@ -32,6 +32,13 @@ pub(crate) struct FlowEnv<'a> {
     /// through the engine, LOCALLY — the one place a flow frame may
     /// run measure and place, and only under an island's own root.
     pub layout: Option<crate::layout::LayoutEnv<'a>>,
+    /// Every body that ran this frame — a boundary with none of them
+    /// under it is CLEAN, and the walk promises its reuse instead of
+    /// descending.
+    pub changed: &'a [String],
+    /// The Groups the retained scene actually holds — a promise the
+    /// diff cannot match would mount a hole, so the walk checks first.
+    pub retained_groups: &'a std::collections::HashSet<String>,
 }
 
 /// What the walk hands back beside the scene.
@@ -107,6 +114,11 @@ struct Walk<'a> {
 
 /// A flow node with nothing to say yet.
 fn node(kind: DomKind) -> DomNode {
+    // a reuse marker is a promise, not a built node — the counter
+    // tracks real construction
+    if !matches!(kind, DomKind::Reuse { .. }) {
+        crate::stats::note_capture_node();
+    }
     DomNode {
         kind,
         x: 0.0,
@@ -434,6 +446,27 @@ impl Walk<'_> {
                 out.push(container);
             }
             LayoutNode::Boundary { path, children } => {
+                // a CLEAN boundary is a promise, not a walk: no body
+                // under it ran, the retained group still holds, and
+                // the diff keeps it wholesale — O(change), by absence
+                if self.env.retained_groups.contains(path)
+                    && !self.env.changed.iter().any(|run| {
+                        // related in EITHER direction dirties: a run
+                        // below me changed my interior; a run above me
+                        // re-rendered me inline (inline renders never
+                        // reach the body-run ledger on their own)
+                        let related = |a: &str, b: &str| {
+                            a == b
+                                || (a.len() > b.len()
+                                    && a.as_bytes().starts_with(b.as_bytes())
+                                    && a.as_bytes()[b.len()] == b'/')
+                        };
+                        related(run, path) || related(path, run)
+                    })
+                {
+                    out.push(node(DomKind::Reuse { path: path.clone() }));
+                    return;
+                }
                 let mut group = node(DomKind::Group { path: path.clone() });
                 for child in children {
                     self.lower_into(child, &mut group.children);
@@ -544,7 +577,20 @@ mod tests {
     use std::sync::Arc;
 
     fn env_fixture(offsets: &HashMap<String, Point>) -> FlowEnv<'_> {
-        FlowEnv { scroll_offsets: offsets, size: (400.0, 300.0), layout: None }
+        FlowEnv {
+            scroll_offsets: offsets,
+            size: (400.0, 300.0),
+            layout: None,
+            changed: &[],
+            retained_groups: {
+                thread_local! {
+                    static EMPTY: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                }
+                // tests never reuse: an empty retained set
+                Box::leak(Box::new(std::collections::HashSet::new()))
+            },
+        }
     }
 
     fn text_node(content: &str) -> LayoutNode {

@@ -124,6 +124,7 @@ thread_local! {
     static RETAINED: RefCell<BTreeMap<String, Entry>> = const { RefCell::new(BTreeMap::new()) };
     static PASS: RefCell<PassState> = RefCell::new(PassState::default());
     static LAST_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static FRAME_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A boundary's retained layout tree, borrowed in place — measure and
@@ -688,6 +689,7 @@ pub(crate) fn reset_world() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
     PASS.with(|pass| *pass.borrow_mut() = PassState::default());
     LAST_BODY_RUNS.with(|last| last.borrow_mut().clear());
+    FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().clear());
     ACTIVE_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     HANDLERS.with(|handlers| handlers.borrow_mut().clear());
     ACTIONS.with(|actions| actions.borrow_mut().clear());
@@ -701,8 +703,16 @@ pub(crate) fn end_pass() {
         let mut pass = pass.borrow_mut();
         pass.active = false;
         let runs = std::mem::take(&mut pass.body_runs);
+        FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().extend(runs.iter().cloned()));
         LAST_BODY_RUNS.with(|last| *last.borrow_mut() = runs);
     });
+}
+
+/// Every body that ran since the last drain — a FRAME may settle over
+/// several passes, and the reuse decision needs all of them. The Dom
+/// frame drains this once per event.
+pub(crate) fn take_frame_runs() -> Vec<String> {
+    FRAME_BODY_RUNS.with(|frame| std::mem::take(&mut *frame.borrow_mut()))
 }
 
 /// Instrumentation: the bodies that ran in the last pass (identity
