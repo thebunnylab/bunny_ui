@@ -10,7 +10,7 @@ function press(id) {
   const el = document.getElementById(id);
   const rect = el.getBoundingClientRect();
   el.dispatchEvent(
-    new PointerEvent("pointerup", {
+    new MouseEvent("click", {
       bubbles: true,
       clientX: rect.left + 4,
       clientY: rect.top + 4,
@@ -40,7 +40,7 @@ const SCENARIOS = {
       );
       const rect = label.getBoundingClientRect();
       label.dispatchEvent(
-        new PointerEvent("pointerup", {
+        new MouseEvent("click", {
           bubbles: true,
           clientX: rect.left + 3,
           clientY: rect.top + 3,

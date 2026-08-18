@@ -204,8 +204,19 @@ impl Tree {
             element.style.insert(name, (*value).to_string());
         }
         if let Some(tag_hint) = &hints.tag {
-            // a hinted tag replaces the div; the styles stay
             element.tag = leak_tag(tag_hint);
+            // the table family lays itself out — the browser's own
+            // display wins and our flex steps aside (the glue's rule,
+            // mirrored: a serialized page must agree with a mounted one)
+            if matches!(
+                element.tag,
+                "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
+            ) {
+                element.style.remove("display");
+                element.style.remove("flex-direction");
+                element.style.remove("min-width");
+                element.style.remove("min-height");
+            }
         }
         if let Some(class) = &hints.class {
             element.attrs.insert("class", class.clone());

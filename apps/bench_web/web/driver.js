@@ -41,7 +41,7 @@ function clickOn(el) {
     clientY: rect.top + rect.height / 2,
   };
   el.dispatchEvent(new PointerEvent("pointerdown", options));
-  el.dispatchEvent(new PointerEvent("pointerup", options));
+  el.dispatchEvent(new MouseEvent("click", options));
 }
 
 // The update path applies patches synchronously, so the bracket

@@ -969,7 +969,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
 
     // clicks resolve by DELEGATION: the browser already knows what
     // was pressed — the engine never sees a coordinate in this mode
-    app.addEventListener("pointerup", (event) => {
+    app.addEventListener("click", (event) => {
       const source = event.target instanceof Element ? event.target : null;
       // a press OUTSIDE the topmost popover dismisses it and is
       // CONSUMED — the engine's own outside-press contract
