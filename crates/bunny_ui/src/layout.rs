@@ -411,6 +411,11 @@ pub enum LayoutNode {
     /// title bar on a chrome-less window. Transparent to geometry;
     /// shells without windows ignore it honestly.
     DragRegion { child: Box<LayoutNode> },
+    /// `.layout(Exact)`: this subtree keeps the ENGINE's layout on
+    /// the element lowering — measured, placed and captured with the
+    /// absolute machinery, pixel-partner to the canvas. Transparent on
+    /// every pixel target (they are exact already, by construction).
+    ExactLayout { child: Box<LayoutNode> },
     /// A class for the ENCLOSING boundary's element, declared from
     /// inside its body — the door a row uses to flip its own `<tr>`
     /// class without its parent hearing. Invisible everywhere: zero
@@ -431,6 +436,15 @@ pub enum LayoutNode {
     /// answers. On the element lowering it becomes a canvas island by
     /// construction: what the app paints is PIXELS, never elements.
     Custom { path: String, element: crate::custom::Custom },
+}
+
+/// How the element lowering lays a subtree out: the browser's flow
+/// (the default), or the engine's own numbers (`Exact` — pixel parity
+/// with the canvas, at the price of our layout running for it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutMode {
+    Flow,
+    Exact,
 }
 
 /// Where a subtree renders when the scene lowers to elements. The v1
@@ -1096,6 +1110,22 @@ impl Placement {
         Placement { foreground: vec![ink], ..Placement::default() }
     }
 
+    /// [`Placement::with_ink`] with the Dom capture riding — the
+    /// `.layout(Exact)` door: a LOCAL absolute lowering of one
+    /// subtree, spliced back into the flow by the caller.
+    pub(crate) fn with_capture(size: Size, ink: Color) -> Placement {
+        Placement {
+            foreground: vec![ink],
+            dom: Some(crate::dom::DomCapture::new(size)),
+            ..Placement::default()
+        }
+    }
+
+    /// Takes the capture out — the caller splices its scene.
+    pub(crate) fn take_capture(&mut self) -> crate::dom::DomCapture {
+        self.dom.take().expect("the capture was riding")
+    }
+
     /// A draw command joins the display list — unless this pass skips
     /// collection (a Dom frame with no live island: nothing consumes
     /// the list, so nothing pays for it).
@@ -1696,6 +1726,11 @@ impl LayoutNode {
 
             LayoutNode::BoundaryHint { .. } => (Size::default(), Fit::Leaf),
 
+            LayoutNode::ExactLayout { child } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
             LayoutNode::Stack { axis, spacing, children, .. } => {
                 measure_stack(*axis, *spacing, children, proposal, env)
             }
@@ -2208,6 +2243,10 @@ impl LayoutNode {
             }
 
             (LayoutNode::BoundaryHint { .. }, Fit::Leaf) => {}
+
+            (LayoutNode::ExactLayout { child }, Fit::Wrapped(_, fit)) => {
+                child.place(frame, *fit, env, out);
+            }
 
             (LayoutNode::DragRegion { child }, Fit::Wrapped(_, fit)) => {
                 child.place(frame, *fit, env, out);

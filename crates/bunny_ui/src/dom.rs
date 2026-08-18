@@ -3273,6 +3273,53 @@ mod tests {
         );
     }
 
+    /// `.layout(Exact)`: the subtree keeps the engine's numbers on
+    /// the element lowering — absolute geometry inside a relative box
+    /// the flow carries. The interior positions are the SAME ones the
+    /// pixel targets compute: parity by construction, pinned here.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn an_exact_subtree_keeps_the_engines_numbers() {
+        use crate::layout::LayoutMode;
+
+        #[derive(Clone, Copy)]
+        struct Mixed;
+
+        impl Component for Mixed {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("flow above"),
+                    crate::vstack!(text("pinned"), text("exact"))
+                        .frame(120.0, 60.0)
+                        .layout(LayoutMode::Exact),
+                    text("flow below"),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 200.0 };
+        let patches = runtime.dom_frame(&Mixed, size);
+
+        // the exact interior speaks geometry: transforms and sizes
+        let transforms =
+            patches.iter().filter(|p| matches!(p, DomPatch::SetTransform { .. })).count();
+        assert!(
+            transforms >= 2,
+            "the exact interior is positioned by our numbers: {patches:#?}"
+        );
+        // and the flow around it never is (the wrapper itself carries
+        // a layout record, not a transform)
+        let flow_texts = patches
+            .iter()
+            .filter(|p| matches!(p, DomPatch::SetText { .. }))
+            .count();
+        assert_eq!(flow_texts, 4, "{patches:#?}");
+        // a second frame with nothing changed is silent — the exact
+        // subtree diffs like everything else
+        assert!(runtime.dom_frame(&Mixed, size).is_empty());
+    }
+
     // MARK: - The ABI handshake
 
     /// The glue mirrors this module by hand, so the two halves of the

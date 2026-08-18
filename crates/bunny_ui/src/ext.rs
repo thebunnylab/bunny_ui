@@ -288,6 +288,18 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// The element lowering keeps the ENGINE's layout for this
+    /// subtree: measured, placed and positioned by our numbers —
+    /// pixel parity with the canvas where the design demands it.
+    /// The flow around it never notices.
+    #[cfg(feature = "canvas")]
+    fn layout(self, mode: crate::layout::LayoutMode) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::LayoutMode(mode),
+        }
+    }
+
     #[cfg(feature = "canvas")]
     fn rendering(self, mode: crate::layout::Rendering) -> Modified<Self> {
         Modified {

@@ -543,6 +543,14 @@ impl Walk<'_> {
                 }
             }
             #[cfg(feature = "canvas")]
+            LayoutNode::ExactLayout { child } => {
+                out.push(self.exact(child));
+            }
+            #[cfg(not(feature = "canvas"))]
+            LayoutNode::ExactLayout { .. } => {
+                out.push(node(DomKind::Box));
+            }
+            #[cfg(feature = "canvas")]
             LayoutNode::Island { child } => {
                 out.push(self.island(child));
             }
@@ -588,6 +596,42 @@ impl Walk<'_> {
 
 #[cfg(feature = "canvas")]
 impl Walk<'_> {
+    /// `.layout(Exact)`: the subtree keeps the ENGINE's numbers. It
+    /// measures at its slot, places with the ABSOLUTE capture — the
+    /// machinery the whole mode once ran on — and splices the result
+    /// under a relative box the flow sizes and carries. Pixel parity
+    /// with the canvas, by construction: same measure, same place.
+    fn exact(&mut self, subtree: &LayoutNode) -> DomNode {
+        let Some(env) = self.env.layout else {
+            return node(DomKind::Box);
+        };
+        let proposal = crate::layout::Proposal {
+            width: self.slot.0,
+            height: self.slot.1,
+        };
+        let (size, fit) = subtree.measure(proposal, env);
+        let mut placement = crate::layout::Placement::with_capture(size, self.current_ink());
+        subtree.place(
+            crate::layout::Rect { origin: Point::default(), size },
+            fit,
+            env,
+            &mut placement,
+        );
+        // the interior arrives ABSOLUTE (geometry on every node); the
+        // wrapper is a Content box — position:relative by creation —
+        // sized by our answer, carried by the flow like any other box
+        let captured = placement.take_capture().finish();
+        let mut wrapper = node(DomKind::Content);
+        {
+            let layout = wrapper.layout.as_mut().expect("flow node");
+            layout.width = Some(size.width);
+            layout.height = Some(size.height);
+        }
+        wrapper.children = captured.children;
+        self.display.extend(placement.display);
+        wrapper
+    }
+
     /// A canvas island: the engine measures and paints ITS OWN pixels,
     /// locally — the subtree places at its own origin, so the commands
     /// are island-local by construction and the element gets a fixed

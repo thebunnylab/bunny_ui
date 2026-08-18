@@ -92,6 +92,8 @@ pub enum Modifier {
     /// Dom hints: `(tag, class, id)` — only the element lowering
     /// consumes them; everything else passes through.
     ElementHint(Option<std::rc::Rc<str>>, Option<std::rc::Rc<str>>, Option<std::rc::Rc<str>>),
+    /// `.layout(Exact)` — the element lowering keeps our numbers here.
+    LayoutMode(crate::layout::LayoutMode),
 
     // MARK: - Real interaction (a pointer target without chrome — the Button
     // without the outfit; the action fires on up-inside like the Button's)
@@ -215,6 +217,7 @@ impl Modifier {
             Modifier::ElementHint(tag, class, dom_id) => {
                 format!(" [.element({tag:?}, {class:?}, {dom_id:?})]")
             }
+            Modifier::LayoutMode(mode) => format!(" [.layout({mode:?})]"),
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
@@ -791,6 +794,13 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                     dom_id,
                     child: Box::new(node),
                 });
+            }
+            Modifier::LayoutMode(mode) => {
+                if *mode == crate::layout::LayoutMode::Exact {
+                    out.wrap_last_layout(|node| LayoutNode::ExactLayout {
+                        child: Box::new(node),
+                    });
+                }
             }
             Modifier::OnClick(action) => {
                 // the same registration as the Button: action retained in the
