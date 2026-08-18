@@ -36,12 +36,26 @@ pub enum ImageSource {
     /// the text atlas has kept since day one). No engine ever sees this
     /// variant: [`raster_source`] intercepts it first.
     Symbol { key: u64, symbol: crate::icon::Symbol, color: crate::layout::Color },
+    /// A path the app TRACED while the frame ran — the runtime twin of
+    /// the glyph: the verbs come from data (a squiggle under a word, a
+    /// lane of a commit graph, a sparkline), so nothing about it can be
+    /// a `const` table. `verbs` already sit inside their own box, whose
+    /// point size is `box_size`, and the key folds geometry, paint and
+    /// ink together. No engine ever sees this variant either.
+    Path {
+        key: u64,
+        verbs: Rc<[crate::icon::Verb]>,
+        paint: crate::icon::Paint,
+        color: crate::layout::Color,
+        box_size: (f32, f32),
+    },
 }
 
 /// Domain tags folded into the key so the two variants never share an
 /// identity by accident.
 const BYTES_TAG: u64 = 0x62_6e_79_5f_62_79_74_65; // "bny_byte"
 const ICON_TAG: u64 = 0x62_6e_79_5f_69_63_6f_6e; // "bny_icon"
+const PATH_TAG: u64 = 0x62_6e_79_5f_70_61_74_68; // "bny_path"
 
 fn fx_hash(tag: u64, bytes: &[u8]) -> u64 {
     let mut hasher = motor::hash::FxHasher::default();
@@ -80,12 +94,79 @@ impl ImageSource {
         ImageSource::Symbol { key, symbol, color }
     }
 
+    /// A traced path — built at PAINT, where the geometry is known.
+    /// The hash walks the table ONCE per call: a few dozen numbers,
+    /// which is the price of an identity for something that has no
+    /// name. Keep the tables short and the frame never notices.
+    pub fn path(
+        verbs: impl Into<Rc<[crate::icon::Verb]>>,
+        paint: crate::icon::Paint,
+        color: crate::layout::Color,
+        box_size: (f32, f32),
+    ) -> ImageSource {
+        use crate::icon::{Paint, Verb};
+        let verbs = verbs.into();
+        let mut hasher = motor::hash::FxHasher::default();
+        hasher.write_u64(PATH_TAG);
+        hasher.write_usize(verbs.len());
+        let number = |hasher: &mut motor::hash::FxHasher, value: f32| {
+            hasher.write_u32(value.to_bits())
+        };
+        for verb in verbs.iter() {
+            match *verb {
+                Verb::Move(x, y) => {
+                    hasher.write_u8(0);
+                    number(&mut hasher, x);
+                    number(&mut hasher, y);
+                }
+                Verb::Line(x, y) => {
+                    hasher.write_u8(1);
+                    number(&mut hasher, x);
+                    number(&mut hasher, y);
+                }
+                Verb::Quad(cx, cy, x, y) => {
+                    hasher.write_u8(2);
+                    for value in [cx, cy, x, y] {
+                        number(&mut hasher, value);
+                    }
+                }
+                Verb::Cubic(ax, ay, bx, by, x, y) => {
+                    hasher.write_u8(3);
+                    for value in [ax, ay, bx, by, x, y] {
+                        number(&mut hasher, value);
+                    }
+                }
+                Verb::Close => hasher.write_u8(4),
+            }
+        }
+        match paint {
+            Paint::Fill(rule) => {
+                hasher.write_u8(5);
+                hasher.write_u8(rule as u8);
+            }
+            Paint::Stroke { width } => {
+                hasher.write_u8(6);
+                number(&mut hasher, width);
+            }
+        }
+        hasher.write_u32(
+            (color.r as u32) << 24
+                | (color.g as u32) << 16
+                | (color.b as u32) << 8
+                | color.a as u32,
+        );
+        number(&mut hasher, box_size.0);
+        number(&mut hasher, box_size.1);
+        ImageSource::Path { key: hasher.finish(), verbs, paint, color, box_size }
+    }
+
     /// The cheap identity — what diffs, caches and the wire carry.
     pub fn key(&self) -> u64 {
         match self {
             ImageSource::Bytes { key, .. }
             | ImageSource::FileIcon { key, .. }
-            | ImageSource::Symbol { key, .. } => *key,
+            | ImageSource::Symbol { key, .. }
+            | ImageSource::Path { key, .. } => *key,
         }
     }
 }
@@ -115,6 +196,10 @@ impl PartialEq for ImageSource {
             (
                 ImageSource::Symbol { key, .. },
                 ImageSource::Symbol { key: other_key, .. },
+            )
+            | (
+                ImageSource::Path { key, .. },
+                ImageSource::Path { key: other_key, .. },
             ) => key == other_key,
             _ => false,
         }
@@ -135,6 +220,9 @@ impl fmt::Debug for ImageSource {
                 "symbol({}, #{:02x}{:02x}{:02x}{:02x})",
                 symbol.name, color.r, color.g, color.b, color.a
             ),
+            ImageSource::Path { key, verbs, .. } => {
+                write!(f, "path(0x{key:016x}, {} verbs)", verbs.len())
+            }
         }
     }
 }
@@ -189,6 +277,9 @@ pub fn raster_source(
         ImageSource::Symbol { key, symbol, color } => {
             crate::icon::raster(*key, symbol, *color, width, height)
         }
+        ImageSource::Path { key, verbs, paint, color, box_size } => {
+            crate::icon::raster_trace(*key, verbs, *paint, *color, *box_size, width, height)
+        }
         _ => engine.raster(source, width, height),
     }
 }
@@ -202,6 +293,11 @@ pub fn intrinsic_of(engine: &dyn ImageEngine, source: &ImageSource) -> Option<(u
         ImageSource::Symbol { .. } => {
             let grid = crate::icon::ICON_GRID as u32;
             Some((grid, grid))
+        }
+        // a traced path IS its box — the painter sized it from the
+        // geometry, so there is nothing to resample against
+        ImageSource::Path { box_size, .. } => {
+            Some((box_size.0.round() as u32, box_size.1.round() as u32))
         }
         _ => engine.intrinsic(source),
     }
@@ -314,10 +410,10 @@ impl ImageEngine for RawImages {
         match source {
             ImageSource::Bytes { bytes, .. } => RawImages::decode_header(bytes),
             ImageSource::FileIcon { .. } => Some((FILE_ICON_SIZE, FILE_ICON_SIZE)),
-            ImageSource::Symbol { .. } => {
-                // the door intercepts symbols before any engine — a
-                // regression at a call site should be LOUD
-                debug_assert!(false, "a symbol never reaches an engine");
+            ImageSource::Symbol { .. } | ImageSource::Path { .. } => {
+                // the door intercepts what the house draws before any
+                // engine — a regression at a call site should be LOUD
+                debug_assert!(false, "a house drawing never reaches an engine");
                 None
             }
         }
@@ -342,8 +438,8 @@ impl ImageEngine for RawImages {
                 RawImages::resample(bytes, dimensions, width, height)
             }
             ImageSource::FileIcon { key, .. } => RawImages::checker(*key, width, height),
-            ImageSource::Symbol { .. } => {
-                debug_assert!(false, "a symbol never reaches an engine");
+            ImageSource::Symbol { .. } | ImageSource::Path { .. } => {
+                debug_assert!(false, "a house drawing never reaches an engine");
                 return None;
             }
         };

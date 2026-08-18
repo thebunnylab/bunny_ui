@@ -249,30 +249,60 @@ pub(crate) struct Mask {
     width: usize,
     height: usize,
     values: Vec<f32>,
+    /// The half-open box of pixels that were ever written, `(x0, y0,
+    /// x1, y1)`. A traced path's box is the whole drawing while its
+    /// ink is a thread through it — the ink is what the blend must
+    /// walk, never the box.
+    dirty: Option<(usize, usize, usize, usize)>,
 }
 
 impl Mask {
     pub fn new(width: usize, height: usize) -> Mask {
-        Mask { width, height, values: vec![0.0; width * height] }
+        Mask { width, height, values: vec![0.0; width * height], dirty: None }
     }
 
     pub fn clear(&mut self) {
         self.values.fill(0.0);
+        self.dirty = None;
     }
 
     pub fn at(&self, x: usize, y: usize) -> f32 {
         self.values[y * self.width + x]
     }
 
+    /// What was touched — `None` when nothing was.
+    pub fn dirty(&self) -> Option<(usize, usize, usize, usize)> {
+        self.dirty
+    }
+
+    fn touch(&mut self, x: usize, y: usize) {
+        match &mut self.dirty {
+            None => self.dirty = Some((x, y, x + 1, y + 1)),
+            Some((x0, y0, x1, y1)) => {
+                *x0 = (*x0).min(x);
+                *y0 = (*y0).min(y);
+                *x1 = (*x1).max(x + 1);
+                *y1 = (*y1).max(y + 1);
+            }
+        }
+    }
+
     fn max_at(&mut self, x: usize, y: usize, coverage: f32) {
         let value = &mut self.values[y * self.width + x];
         *value = value.max(coverage);
+        self.touch(x, y);
     }
 
     /// Folds another draw's mask in.
     pub fn merge_max(&mut self, other: &Mask) {
-        for (value, more) in self.values.iter_mut().zip(&other.values) {
-            *value = value.max(*more);
+        let Some((x0, y0, x1, y1)) = other.dirty else { return };
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let more = other.values[y * other.width + x];
+                if more > 0.0 {
+                    self.max_at(x, y, more);
+                }
+            }
         }
     }
 }

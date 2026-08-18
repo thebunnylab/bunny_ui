@@ -243,8 +243,9 @@ impl CoreGraphicsImageEngine {
             ImageSource::Bytes { bytes, .. } => unsafe { decode(bytes) },
             // icons resolve per size through the workspace, never here
             ImageSource::FileIcon { .. } => std::ptr::null_mut(),
-            // symbols never reach an engine — the door intercepts them
-            ImageSource::Symbol { .. } => std::ptr::null_mut(),
+            // what the house draws never reaches an engine — the door
+            // intercepts glyphs and traced paths alike
+            ImageSource::Symbol { .. } | ImageSource::Path { .. } => std::ptr::null_mut(),
         };
         let entry = (!image.is_null()).then(|| OwnedImage(image));
         self.decoded.borrow_mut().insert(key, entry);
@@ -294,8 +295,8 @@ impl ImageEngine for CoreGraphicsImageEngine {
                 unsafe { draw_image(image, width, height) }?
             }
             ImageSource::FileIcon { path, .. } => unsafe { icon_rgba(path, width, height) }?,
-            ImageSource::Symbol { .. } => {
-                debug_assert!(false, "a symbol never reaches an engine");
+            ImageSource::Symbol { .. } | ImageSource::Path { .. } => {
+                debug_assert!(false, "a house drawing never reaches an engine");
                 return None;
             }
         };

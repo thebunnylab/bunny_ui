@@ -14,10 +14,11 @@
 //! ```
 //!
 //! The app paints with the SAME vocabulary the built-ins emit — rects,
-//! text lines, images, clips — so nothing forks: the desktop rasterizes
-//! it on the GPU, the web canvas mode rasterizes it on the CPU, the web
-//! element mode turns the box into a canvas island, and the damage diff
-//! keeps working because the commands compare by value.
+//! text lines, images, ramps, glyphs, paths and clips — so nothing
+//! forks: the desktop rasterizes it on the GPU, the web canvas mode
+//! rasterizes it on the CPU, the web element mode turns the box into a
+//! canvas island, and the damage diff keeps working because the
+//! commands compare by value.
 //!
 //! **When NOT to use it.** The hatch is for content outside the
 //! vocabulary, never a shortcut around a missing modifier. A rounded
@@ -379,6 +380,52 @@ impl<'a> Painter<'a> {
             rect: self.shift(square),
             source: ImageSource::symbol(symbol, color),
         });
+    }
+
+    /// A path the app builds THIS frame, in LOCAL points — the door
+    /// for geometry that comes from data and can never be a table: the
+    /// squiggle under a misspelled word, the curved lane of a commit
+    /// graph, the connector of a diagram, the line of a sparkline.
+    ///
+    /// The verbs are the ones a glyph carries ([`Verb::Move`],
+    /// `Line`, `Quad`, `Cubic`, `Close`) and the paint is the same
+    /// [`Paint`]: a fill under one of the two winding rules, or a pen
+    /// of a given width with ROUND caps and joins. The house
+    /// rasterizes it, so the CPU compositor, the GPU atlas and the
+    /// browser canvas consume literally the same pixels.
+    ///
+    /// The cost is a raster: a table that changes every frame pays one
+    /// every frame (and, on the GPU, one upload). Build paths from
+    /// data that moves at human speed, and a warm cache answers.
+    ///
+    /// [`Verb::Move`]: crate::icon::Verb::Move
+    /// [`Paint`]: crate::icon::Paint
+    pub fn path(&mut self, verbs: &[crate::icon::Verb], paint: crate::icon::Paint, color: Color) {
+        let Some((min_x, min_y, max_x, max_y)) = crate::icon::bounds(verbs) else {
+            return;
+        };
+        // the box grows by half a pen (the ink rides OUTSIDE the
+        // contour) plus one point for the anti-aliased edge
+        let pad = match paint {
+            crate::icon::Paint::Stroke { width } => width as f64 / 2.0 + 1.0,
+            crate::icon::Paint::Fill(_) => 1.0,
+        };
+        let origin = Point { x: min_x - pad, y: min_y - pad };
+        let size = Size {
+            width: (max_x - min_x) + 2.0 * pad,
+            height: (max_y - min_y) + 2.0 * pad,
+        };
+        if size.width <= 0.0 || size.height <= 0.0 {
+            return;
+        }
+        let local = crate::icon::shifted(verbs, -origin.x as f32, -origin.y as f32);
+        let source = ImageSource::path(
+            local,
+            paint,
+            color,
+            (size.width as f32, size.height as f32),
+        );
+        self.display.push(DrawCommand::Image { rect: self.shift(Rect { origin, size }), source });
     }
 
     /// Everything `body` paints is cut to `rect` — balanced by
@@ -1358,5 +1405,69 @@ mod tests {
             source.key(),
             crate::image_engine::ImageSource::symbol(DOT, ink).key()
         );
+    }
+
+    // MARK: - The traced path (dor 28)
+
+    /// A box that draws ONE curve the app assembled.
+    struct Squiggle {
+        verbs: Vec<crate::icon::Verb>,
+        paint: crate::icon::Paint,
+    }
+
+    impl CustomElement for Squiggle {
+        fn paint(&self, _ctx: &PaintCtx, painter: &mut Painter) {
+            painter.path(&self.verbs, self.paint, Color::BLACK);
+        }
+    }
+
+    fn images(display: &crate::layout::DisplayList) -> Vec<(Rect, crate::image_engine::ImageSource)> {
+        display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Image { rect, source } => Some((*rect, source.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_traced_path_lands_in_the_boxs_own_coordinates() {
+        use crate::icon::{Paint, Verb};
+        // a pen of 2 across a line from (10,20) to (60,20): the box is
+        // the geometry plus half a pen plus the anti-aliased point
+        let element = Squiggle {
+            verbs: vec![Verb::Move(10.0, 20.0), Verb::Line(60.0, 20.0)],
+            paint: Paint::Stroke { width: 2.0 },
+        };
+        let result = layout_root(&node(element), 200.0, 90.0);
+        let drawn = images(&result.display);
+        assert_eq!(drawn.len(), 1);
+        let (rect, _) = drawn[0];
+        assert_eq!(rect.origin, Point { x: 8.0, y: 18.0 });
+        assert_eq!(rect.size, Size { width: 54.0, height: 4.0 });
+    }
+
+    #[test]
+    fn an_empty_table_paints_nothing() {
+        use crate::icon::{Paint, Rule};
+        let element = Squiggle { verbs: Vec::new(), paint: Paint::Fill(Rule::NonZero) };
+        let result = layout_root(&node(element), 60.0, 40.0);
+        assert!(images(&result.display).is_empty());
+    }
+
+    #[test]
+    fn a_traced_path_survives_the_damage_diff() {
+        use crate::icon::{Paint, Verb};
+        // the identity compares by VALUE: the same table twice is the
+        // same image, one moved point is a different one
+        let table = |y: f32| vec![Verb::Move(4.0, y), Verb::Quad(20.0, 0.0, 36.0, y)];
+        let pen = Paint::Stroke { width: 1.5 };
+        let draw = |y: f32| {
+            let element = Squiggle { verbs: table(y), paint: pen };
+            images(&layout_root(&node(element), 60.0, 40.0).display)
+        };
+        assert_eq!(draw(20.0), draw(20.0));
+        assert_ne!(draw(20.0), draw(21.0));
     }
 }

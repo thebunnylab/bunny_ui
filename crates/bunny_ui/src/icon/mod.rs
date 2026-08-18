@@ -250,6 +250,131 @@ pub(crate) fn raster(
     })
 }
 
+/// How many traced paths stay warm. Their own map, away from the
+/// glyphs: a diagram that rebuilds its curves every frame must never
+/// evict the toolbar's icons.
+const TRACE_KEEP: usize = 128;
+
+thread_local! {
+    /// Traced paths by `(key, physical width, physical height)`. The
+    /// key already folds the geometry, the paint and the ink — the
+    /// same contract the glyph rasters keep.
+    static TRACES: RefCell<HashMap<(u64, usize, usize), Rc<ImageRaster>>> =
+        RefCell::new(HashMap::default());
+}
+
+/// The box a verb table needs, in its own coordinates — the CONTROL
+/// hull, which a curve never leaves (the Bezier property). A hull is a
+/// few transparent pixels wider than the ink on a bent curve, and it
+/// costs one pass over the table instead of a flattening.
+pub(crate) fn bounds(path: &[Verb]) -> Option<(f64, f64, f64, f64)> {
+    let mut box_ = None;
+    let mut eat = |x: f32, y: f32| {
+        let (x, y) = (x as f64, y as f64);
+        match &mut box_ {
+            None => box_ = Some((x, y, x, y)),
+            Some((min_x, min_y, max_x, max_y)) => {
+                *min_x = min_x.min(x);
+                *min_y = min_y.min(y);
+                *max_x = max_x.max(x);
+                *max_y = max_y.max(y);
+            }
+        }
+    };
+    for verb in path {
+        match *verb {
+            Verb::Move(x, y) | Verb::Line(x, y) => eat(x, y),
+            Verb::Quad(cx, cy, x, y) => {
+                eat(cx, cy);
+                eat(x, y);
+            }
+            Verb::Cubic(ax, ay, bx, by, x, y) => {
+                eat(ax, ay);
+                eat(bx, by);
+                eat(x, y);
+            }
+            Verb::Close => {}
+        }
+    }
+    box_
+}
+
+/// Moves a whole table into its own box — what the painter does once,
+/// so the raster below always starts at the origin.
+pub(crate) fn shifted(path: &[Verb], dx: f32, dy: f32) -> Vec<Verb> {
+    path.iter()
+        .map(|verb| match *verb {
+            Verb::Move(x, y) => Verb::Move(x + dx, y + dy),
+            Verb::Line(x, y) => Verb::Line(x + dx, y + dy),
+            Verb::Quad(cx, cy, x, y) => Verb::Quad(cx + dx, cy + dy, x + dx, y + dy),
+            Verb::Cubic(ax, ay, bx, by, x, y) => {
+                Verb::Cubic(ax + dx, ay + dy, bx + dx, by + dy, x + dx, y + dy)
+            }
+            Verb::Close => Verb::Close,
+        })
+        .collect()
+}
+
+/// The door `image_engine::raster_source` opens for a traced path —
+/// the glyph door's twin, for geometry the app builds while the frame
+/// runs.
+pub(crate) fn raster_trace(
+    key: u64,
+    path: &[Verb],
+    paint: Paint,
+    color: Color,
+    box_size: (f32, f32),
+    width: usize,
+    height: usize,
+) -> Option<Rc<ImageRaster>> {
+    if width == 0 || height == 0 || box_size.0 <= 0.0 || box_size.1 <= 0.0 {
+        return None;
+    }
+    TRACES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(raster) = cache.get(&(key, width, height)) {
+            return Some(Rc::clone(raster));
+        }
+        if cache.len() >= TRACE_KEEP {
+            cache.clear();
+        }
+        let raster = Rc::new(rasterize_trace(path, paint, color, box_size, width, height));
+        cache.insert((key, width, height), Rc::clone(&raster));
+        Some(raster)
+    })
+}
+
+/// One traced path, rasterized. The scale comes from the LONGER side
+/// of the box: rounding the short side to whole pixels then cannot
+/// stretch the drawing, which is what a tall thin sparkline would
+/// show first.
+fn rasterize_trace(
+    path: &[Verb],
+    paint: Paint,
+    color: Color,
+    box_size: (f32, f32),
+    width: usize,
+    height: usize,
+) -> ImageRaster {
+    let scale = if box_size.0 >= box_size.1 {
+        width as f64 / box_size.0 as f64
+    } else {
+        height as f64 / box_size.1 as f64
+    };
+    let placing = vector::Placing { scale, dx: 0.0, dy: 0.0 };
+    let mut mask = vector::Mask::new(width, height);
+    let flat = vector::flatten(path, placing);
+    match paint {
+        Paint::Fill(rule) => vector::fill_into(&mut mask, &flat, rule),
+        Paint::Stroke { width: pen } => {
+            vector::stroke_into(&mut mask, &flat, pen as f64 * scale)
+        }
+    }
+    let mut rgba = vec![0u8; width * height * 4];
+    paint_mask(&mask, color, &mut rgba, width, height);
+    ImageRaster { width, height, rgba }
+}
+
 /// One glyph, rasterized: the [`ICON_GRID`] square scales onto the
 /// largest CENTRED square of the destination, every draw piles its
 /// coverage in by MAX, and the tint lands once at the end — straight
@@ -272,21 +397,7 @@ fn rasterize(glyph: &Glyph, color: Color, width: usize, height: usize) -> ImageR
     let mut run_color: Option<Color> = None;
     let flush = |union: &mut vector::Mask, run_color: &mut Option<Color>, rgba: &mut Vec<u8>| {
         let Some(ink) = run_color.take() else { return };
-        for y in 0..height {
-            for x in 0..width {
-                let coverage = union.at(x, y);
-                if coverage <= 0.0 {
-                    continue;
-                }
-                // the same rounding `set_covered` applies on the way in
-                let alpha = (ink.a as f64 * coverage as f64).round() as u32;
-                if alpha == 0 {
-                    continue;
-                }
-                let to = (y * width + x) * 4;
-                blend_straight(&mut rgba[to..to + 4], ink, alpha);
-            }
-        }
+        paint_mask(union, ink, rgba, width, height);
         union.clear();
     };
     for draw in glyph.draws {
@@ -307,6 +418,28 @@ fn rasterize(glyph: &Glyph, color: Color, width: usize, height: usize) -> ImageR
     }
     flush(&mut union, &mut run_color, &mut rgba);
     ImageRaster { width, height, rgba }
+}
+
+/// Lays one ink over a finished coverage mask. The rounding is the
+/// one `set_covered` applies on the way in, so a glyph rasterized here
+/// and a rect painted by the compositor agree on the same edge.
+fn paint_mask(mask: &vector::Mask, ink: Color, rgba: &mut [u8], width: usize, height: usize) {
+    let Some((x0, y0, x1, y1)) = mask.dirty() else { return };
+    debug_assert!(x1 <= width && y1 <= height);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let coverage = mask.at(x, y);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let alpha = (ink.a as f64 * coverage as f64).round() as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let to = (y * width + x) * 4;
+            blend_straight(&mut rgba[to..to + 4], ink, alpha);
+        }
+    }
 }
 
 /// Source-over of a straight-alpha ink onto a straight-alpha pixel —
@@ -487,5 +620,94 @@ mod tests {
         }
         let share = beyond_two as f64 / (side * side) as f64;
         assert!(share < 0.08, "{share} of pixels beyond two steps");
+    }
+
+    // MARK: - The traced path (what the app builds while the frame runs)
+
+    #[test]
+    fn one_rasterizer_answers_the_table_and_the_trace() {
+        // the glyph door and the runtime door share the same stone: a
+        // 24 unit square drawn as a const glyph and the SAME verbs
+        // traced into a 24 point box must land byte for byte
+        let glyph = rasterize(&SQUARE_GLYPH, INK, 24, 24);
+        let trace = rasterize_trace(
+            SQUARE_PATH,
+            Paint::Fill(Rule::NonZero),
+            INK,
+            (ICON_GRID as f32, ICON_GRID as f32),
+            24,
+            24,
+        );
+        assert_eq!(glyph.rgba, trace.rgba);
+    }
+
+    #[test]
+    fn a_traced_pen_rides_the_line_it_was_given() {
+        // a horizontal pen of 4 units across a 40x12 box: the band is
+        // ink, a row well above it is not
+        const LINE: &[Verb] = &[Verb::Move(2.0, 6.0), Verb::Line(38.0, 6.0)];
+        let raster =
+            rasterize_trace(LINE, Paint::Stroke { width: 4.0 }, INK, (40.0, 12.0), 40, 12);
+        let alpha = |x: usize, y: usize| raster.rgba[(y * 40 + x) * 4 + 3];
+        assert_eq!(alpha(20, 6), 255, "the middle of the band is solid");
+        assert_eq!(alpha(20, 0), 0, "three units above it, nothing");
+        assert_eq!(alpha(20, 11), 0, "and nothing below it either");
+        // the round cap rides PAST the first point by half a pen — which
+        // is exactly why the painter pads the box before it rasterizes
+        assert!((1..255).contains(&alpha(0, 6)), "the cap softens at the edge");
+    }
+
+    #[test]
+    fn a_traced_identity_folds_geometry_paint_and_ink() {
+        use crate::image_engine::ImageSource;
+        const A: &[Verb] = &[Verb::Move(0.0, 0.0), Verb::Line(10.0, 10.0)];
+        const B: &[Verb] = &[Verb::Move(0.0, 0.0), Verb::Line(10.0, 9.0)];
+        let pen = Paint::Stroke { width: 2.0 };
+        let box_ = (12.0, 12.0);
+        let key = |verbs: &'static [Verb], paint, color| {
+            ImageSource::path(verbs.to_vec(), paint, color, box_).key()
+        };
+        assert_eq!(key(A, pen, INK), key(A, pen, INK), "the same drawing, the same key");
+        assert_ne!(key(A, pen, INK), key(B, pen, INK), "one moved point moves it");
+        assert_ne!(
+            key(A, pen, INK),
+            key(A, Paint::Fill(Rule::NonZero), INK),
+            "the paint rides the identity"
+        );
+        assert_ne!(
+            key(A, pen, INK),
+            key(A, pen, Color { r: 200, g: 10, b: 10, a: 255 }),
+            "and so does the ink"
+        );
+    }
+
+    #[test]
+    fn the_control_hull_holds_every_curve() {
+        // a cubic that bulges up: the hull answers the CONTROLS, which
+        // the curve never leaves
+        const ARC: &[Verb] =
+            &[Verb::Move(0.0, 10.0), Verb::Cubic(0.0, 0.0, 20.0, 0.0, 20.0, 10.0)];
+        assert_eq!(bounds(ARC), Some((0.0, 0.0, 20.0, 10.0)));
+        assert_eq!(bounds(&[]), None, "an empty table has no box");
+    }
+
+    #[test]
+    fn a_shifted_table_moves_whole() {
+        const CURVE: &[Verb] = &[
+            Verb::Move(1.0, 2.0),
+            Verb::Quad(3.0, 4.0, 5.0, 6.0),
+            Verb::Cubic(7.0, 8.0, 9.0, 10.0, 11.0, 12.0),
+            Verb::Close,
+        ];
+        let moved = shifted(CURVE, -1.0, -2.0);
+        assert_eq!(
+            moved,
+            vec![
+                Verb::Move(0.0, 0.0),
+                Verb::Quad(2.0, 2.0, 4.0, 4.0),
+                Verb::Cubic(6.0, 6.0, 8.0, 8.0, 10.0, 10.0),
+                Verb::Close,
+            ]
+        );
     }
 }

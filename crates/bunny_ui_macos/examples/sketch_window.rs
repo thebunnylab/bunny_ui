@@ -19,6 +19,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
+use bunny_ui::icon::{Paint, Verb};
 use bunny_ui::layout::{Color, Point, Px, Rect, Size};
 use bunny_ui::prelude::*;
 #[cfg(target_os = "macos")]
@@ -104,17 +105,41 @@ impl CustomElement for Sketch {
 
         let brush = self.brush.get();
         let mut ink = |stroke: &Stroke, color: Color| {
-            // the framework has no path primitive yet, so the app draws
-            // its own ink with what exists: a rounded dab per step
-            for point in stroke {
-                painter.fill_rounded(
+            match stroke.len() {
+                0 => {}
+                // a single tap has no direction: it is a dab
+                1 => painter.fill_rounded(
                     Rect {
-                        origin: Point { x: point.x - brush / 2.0, y: point.y - brush / 2.0 },
+                        origin: Point {
+                            x: stroke[0].x - brush / 2.0,
+                            y: stroke[0].y - brush / 2.0,
+                        },
                         size: Size { width: brush, height: brush },
                     },
                     color,
                     brush / 2.0,
-                );
+                ),
+                // the ink is ONE path the app assembles from the points
+                // the pointer passed through — every sample becomes the
+                // control of a quadratic and the midpoints become the
+                // anchors, which is how a hand-drawn line stops looking
+                // like a chain of segments
+                _ => {
+                    let mut verbs = Vec::with_capacity(stroke.len() + 1);
+                    verbs.push(Verb::Move(stroke[0].x as f32, stroke[0].y as f32));
+                    for pair in stroke.windows(2) {
+                        let (from, to) = (pair[0], pair[1]);
+                        verbs.push(Verb::Quad(
+                            from.x as f32,
+                            from.y as f32,
+                            ((from.x + to.x) / 2.0) as f32,
+                            ((from.y + to.y) / 2.0) as f32,
+                        ));
+                    }
+                    let last = stroke[stroke.len() - 1];
+                    verbs.push(Verb::Line(last.x as f32, last.y as f32));
+                    painter.path(&verbs, Paint::Stroke { width: brush as f32 }, color);
+                }
             }
         };
         for stroke in self.strokes.get().iter() {
