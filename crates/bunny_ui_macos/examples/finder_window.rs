@@ -10,6 +10,8 @@
 //! with hover and click without button chrome, scrolling with clip and
 //! thumb. The footer shows what the click "opened".
 
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
 
@@ -366,6 +368,7 @@ impl Component for Finder {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     let runtime = Runtime::new()
         .text_engine(Rc::new(bunny_ui_macos::CoreTextEngine::new()))
@@ -392,3 +395,6 @@ fn main() {
         },
     );
 }
+
+#[cfg(not(target_os = "macos"))]
+fn main() {} // this example is macOS-only

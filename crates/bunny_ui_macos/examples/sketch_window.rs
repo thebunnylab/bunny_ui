@@ -14,11 +14,14 @@
 //! cargo run -p bunny-ui-macos --example sketch_window
 //! ```
 
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use std::rc::Rc;
 use std::sync::Arc;
 
 use bunny_ui::layout::{Color, Point, Px, Rect, Size};
 use bunny_ui::prelude::*;
+#[cfg(target_os = "macos")]
 use bunny_ui_macos::Chrome;
 
 const BAR_H: f64 = 44.0;
@@ -278,6 +281,7 @@ impl Component for App {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     theme::install(Theme::dark());
     let runtime = Runtime::new()
@@ -299,3 +303,6 @@ fn main() {
         },
     );
 }
+
+#[cfg(not(target_os = "macos"))]
+fn main() {} // this example is macOS-only

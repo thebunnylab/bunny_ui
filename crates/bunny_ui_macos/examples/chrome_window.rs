@@ -7,10 +7,13 @@
 //! cargo run -p bunny-ui-macos --example chrome_window
 //! ```
 
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use std::rc::Rc;
 
 use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
+#[cfg(target_os = "macos")]
 use bunny_ui_macos::Chrome;
 
 const BAR_H: f64 = 44.0;
@@ -111,6 +114,7 @@ impl Component for App {
 
 const CLEAR: Color = Color { r: 0, g: 0, b: 0, a: 0 };
 
+#[cfg(target_os = "macos")]
 fn main() {
     theme::install(Theme::dark());
     let runtime = Runtime::new()
@@ -124,3 +128,6 @@ fn main() {
         App { tab: State::new(0) },
     );
 }
+
+#[cfg(not(target_os = "macos"))]
+fn main() {} // this example is macOS-only

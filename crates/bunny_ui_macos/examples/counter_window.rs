@@ -4,6 +4,8 @@
 //! cargo run -p bunny-ui-macos --example counter_window
 //! ```
 
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
 
@@ -24,6 +26,7 @@ impl Component for Counter {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     let counter = Counter { count: State::new(0) };
     bunny_ui_macos::run_window(
@@ -32,3 +35,6 @@ fn main() {
         counter,
     );
 }
+
+#[cfg(not(target_os = "macos"))]
+fn main() {} // this example is macOS-only

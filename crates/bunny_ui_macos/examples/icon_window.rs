@@ -5,6 +5,8 @@
 //! cargo run -p bunny-ui-macos --example icon_window
 //! ```
 
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use bunny_ui::icon::Symbol;
 use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
@@ -26,6 +28,7 @@ fn tile(symbol: Symbol) -> impl View {
     .on_click(move || println!("{symbol:?}"))
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     let rows: Vec<Vec<Symbol>> =
         symbol::ALL.chunks(4).map(|chunk| chunk.to_vec()).collect();
@@ -73,3 +76,6 @@ fn main() {
         .padding_length(18.0),
     );
 }
+
+#[cfg(not(target_os = "macos"))]
+fn main() {} // this example is macOS-only

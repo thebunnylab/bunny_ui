@@ -6,6 +6,8 @@
 //! cargo run --release -p bunny-ui-macos --example bench_pipeline_mac
 //! ```
 
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -15,6 +17,7 @@ use std::sync::Arc;
 
 use bunny_ui::prelude::*;
 use bunny_ui::raster::rasterize_with;
+#[cfg(target_os = "macos")]
 use bunny_ui_macos::CoreTextEngine;
 
 struct CountingAllocator;
@@ -343,6 +346,7 @@ fn measure(label: &'static str, warmup: usize, frames: usize, mut step: impl FnM
     }
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     let viewport = Proposal::exact(Size { width: 760.0, height: 640.0 });
     let files: Rc<Vec<(Arc<str>, Arc<str>)>> = Rc::new(
@@ -610,3 +614,6 @@ fn main() {
     );
 }
 
+
+#[cfg(not(target_os = "macos"))]
+fn main() {} // this example is macOS-only

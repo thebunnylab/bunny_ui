@@ -7,6 +7,8 @@
 //! cargo run -p bunny-ui-macos --example image_window
 //! ```
 
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
 
@@ -67,6 +69,7 @@ fn png(width: u32, height: u32, pixel: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> 
     out
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     // a 64×40 "sunset": sky gradient over a dark ground band
     let hero = ImageSource::from_bytes(png(64, 40, |x, y| {
@@ -141,3 +144,6 @@ fn main() {
         .padding_length(24.0),
     );
 }
+
+#[cfg(not(target_os = "macos"))]
+fn main() {} // this example is macOS-only
