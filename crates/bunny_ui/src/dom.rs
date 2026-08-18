@@ -606,6 +606,12 @@ impl DomLowering {
         patches
     }
 
+    /// Does the retained scene hold any canvas island? The runtime
+    /// skips display-list collection when none is alive.
+    pub(crate) fn has_islands(&self) -> bool {
+        !self.islands.is_empty()
+    }
+
     /// The islands whose pixels no longer match, cleared of their flag.
     /// Each returns `(id, logical width, logical height, commands)` —
     /// the caller rasterizes and blits.

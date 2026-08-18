@@ -186,7 +186,11 @@ fn protected_by_skip(registry: &Registry, owner: &str) -> bool {
     let mut best_len = 0usize;
     let mut best_is_skip = false;
     let covers = |candidate: &str| {
-        owner == candidate || owner.starts_with(&format!("{candidate}/"))
+        // byte compare, no allocation — this closure runs per skipped
+        // and re-run boundary for every owner the sweep audits
+        owner.len() >= candidate.len()
+            && owner.as_bytes().starts_with(candidate.as_bytes())
+            && (owner.len() == candidate.len() || owner.as_bytes()[candidate.len()] == b'/')
     };
     for skip in &registry.skipped {
         if covers(skip) && skip.len() > best_len {

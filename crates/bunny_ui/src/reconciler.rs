@@ -473,7 +473,11 @@ pub(crate) fn run_isolated(root: &str) {
 }
 
 fn covers(ancestor: &str, path: &str) -> bool {
-    path == ancestor || path.starts_with(&format!("{ancestor}/"))
+    // byte compare, no allocation: this runs once per retained entry
+    // per assembly walk — a format! here taxed every pass
+    path.len() >= ancestor.len()
+        && path.as_bytes().starts_with(ancestor.as_bytes())
+        && (path.len() == ancestor.len() || path.as_bytes()[ancestor.len()] == b'/')
 }
 
 /// The pass's effect queue: the root region + the whole retention under

@@ -1025,6 +1025,13 @@ pub const SPLIT_GRIP: Px = 6.0;
 pub struct Placement {
     pub frames: Frames,
     pub display: DisplayList,
+    /// A Dom frame with no live island skips the display list — the
+    /// clip stack still runs, only the command collection sleeps.
+    skip_display: bool,
+    /// A canvas island placed this pass. When collection was OFF, the
+    /// runtime re-runs the pass collected — an island's birth costs
+    /// one extra walk; a steady frame costs none.
+    saw_island: bool,
     pub hits: Vec<(String, Rect)>,
     pub scrolls: Vec<ScrollRegion>,
     pub fields: Vec<FieldPlacement>,
@@ -1065,6 +1072,16 @@ pub struct Placement {
 }
 
 impl Placement {
+    /// A draw command joins the display list — unless this pass skips
+    /// collection (a Dom frame with no live island: nothing consumes
+    /// the list, so nothing pays for it).
+    #[inline]
+    fn draw(&mut self, command: DrawCommand) {
+        if !self.skip_display {
+            self.display.push(command);
+        }
+    }
+
     /// The command carries this node's OWN box; the stack keeps the
     /// intersection, because a hit consults the stack. Snapping and
     /// intersecting commute (round is monotone), so the consumers'
@@ -1077,12 +1094,12 @@ impl Placement {
                 .unwrap_or(Rect { origin: rect.origin, size: Size::default() }),
             None => rect,
         };
-        self.display.push(DrawCommand::PushClip { rect, corner_radius });
+        self.draw(DrawCommand::PushClip { rect, corner_radius });
         self.clip.push(clipped);
     }
 
     fn pop_clip(&mut self) {
-        self.display.push(DrawCommand::PopClip);
+        self.draw(DrawCommand::PopClip);
         self.clip.pop();
     }
 
@@ -1170,6 +1187,9 @@ pub struct LayoutResult {
     /// Virtual windows that failed to cover the visible band this
     /// frame — the runtime re-materializes them in a follow-up pass.
     pub misses: Vec<String>,
+    /// A canvas island placed while display collection was off — the
+    /// runtime re-runs the pass collected.
+    pub(crate) saw_island: bool,
     /// The placed popovers, in paint order (last = topmost) — each one
     /// a suffix slice of `display`.
     pub overlays: Vec<OverlayPlacement>,
@@ -1228,6 +1248,7 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         splits: out.splits,
         customs: out.customs,
         misses: out.misses,
+        saw_island: out.saw_island,
         overlays: out.overlays,
         drag_regions: out.drag_regions,
     }
@@ -1240,10 +1261,12 @@ pub fn layout_dom(
     root: &LayoutNode,
     proposal: Proposal,
     env: LayoutEnv,
+    collect_display: bool,
 ) -> (LayoutResult, crate::dom::DomNode) {
     let (size, fit) = root.measure(proposal, env);
     let mut out = Placement {
         dom: Some(crate::dom::DomCapture::new(size)),
+        skip_display: !collect_display,
         ..Placement::default()
     };
     root.place(Rect { origin: Point::default(), size }, fit, env, &mut out);
@@ -1263,8 +1286,9 @@ pub fn layout_dom(
             splits: out.splits,
             customs: out.customs,
             misses: out.misses,
+            saw_island: out.saw_island,
             overlays: out.overlays,
-        drag_regions: out.drag_regions,
+            drag_regions: out.drag_regions,
         },
         scene,
     )
@@ -1884,7 +1908,7 @@ impl LayoutNode {
                     dom.set_background(Color::FILL);
                     dom.close();
                 }
-                out.display.push(DrawCommand::FillRect {
+                out.draw(DrawCommand::FillRect {
                     rect: frame,
                     color: Color::FILL,
                     corner_radius: 0.0,
@@ -1946,7 +1970,7 @@ impl LayoutNode {
                 // field chrome: tokens read at PLACEMENT — a retheme
                 // repaints without re-running a single body
                 let theme = crate::theme::current();
-                out.display.push(DrawCommand::FillRect {
+                out.draw(DrawCommand::FillRect {
                     rect: frame,
                     color: theme.field,
                     corner_radius: FIELD_RADIUS,
@@ -1967,7 +1991,7 @@ impl LayoutNode {
                 if let Some((start, end)) = selection {
                     let x0 = text_origin.x + prefix_width(start);
                     let x1 = text_origin.x + prefix_width(end);
-                    out.display.push(DrawCommand::FillRect {
+                    out.draw(DrawCommand::FillRect {
                         rect: Rect {
                             origin: Point { x: x0, y: text_origin.y },
                             size: Size { width: x1 - x0, height: metrics.height() },
@@ -1981,7 +2005,7 @@ impl LayoutNode {
                         // the placeholder walks the SAME path as the real
                         // text: same origin, same font, only the color
                         // drops
-                        out.display.push(DrawCommand::TextLine {
+                        out.draw(DrawCommand::TextLine {
                             origin: text_origin,
                             content: placeholder.clone(),
                             range: (0, placeholder.len()),
@@ -1991,7 +2015,7 @@ impl LayoutNode {
                     }
                 } else {
                     let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
-                    out.display.push(DrawCommand::TextLine {
+                    out.draw(DrawCommand::TextLine {
                         origin: text_origin,
                         content: content.clone(),
                         range: (0, content.len()),
@@ -2004,7 +2028,7 @@ impl LayoutNode {
                 if let Some((start, end)) = marked {
                     let x0 = text_origin.x + prefix_width(start);
                     let x1 = text_origin.x + prefix_width(end);
-                    out.display.push(DrawCommand::FillRect {
+                    out.draw(DrawCommand::FillRect {
                         rect: Rect {
                             origin: Point { x: x0, y: text_origin.y + metrics.height() - 1.0 },
                             size: Size { width: x1 - x0, height: 1.0 },
@@ -2016,7 +2040,7 @@ impl LayoutNode {
                 // caret on top (the blink alternates via the stamp)
                 if let Some(caret) = caret {
                     let x = text_origin.x + prefix_width(caret);
-                    out.display.push(DrawCommand::FillRect {
+                    out.draw(DrawCommand::FillRect {
                         rect: Rect {
                             origin: Point { x, y: text_origin.y },
                             size: Size { width: FIELD_CARET_W, height: metrics.height() },
@@ -2025,7 +2049,7 @@ impl LayoutNode {
                         corner_radius: FIELD_CARET_W / 2.0,
                     });
                 }
-                out.display.push(DrawCommand::StrokeRect {
+                out.draw(DrawCommand::StrokeRect {
                     rect: frame,
                     color: if focused { theme.focus } else { theme.field_border },
                     width: 1.0,
@@ -2055,7 +2079,7 @@ impl LayoutNode {
                     dom.set_border(Color::OUTLINE, 1.0);
                     dom.close();
                 }
-                out.display.push(DrawCommand::StrokeRect {
+                out.draw(DrawCommand::StrokeRect {
                     rect: frame,
                     color: Color::OUTLINE,
                     width: 1.0,
@@ -2085,6 +2109,7 @@ impl LayoutNode {
                 // the box becomes a canvas island, and the island slices
                 // exactly the commands between here and the close
                 let start = out.display.len();
+                out.saw_island = true;
                 if let Some(dom) = out.dom.as_mut() {
                     dom.open_canvas(frame, start);
                 }
@@ -2166,7 +2191,7 @@ impl LayoutNode {
                         dom.set_border(Color::OUTLINE, 1.0);
                         dom.close();
                     }
-                    out.display.push(DrawCommand::StrokeRect {
+                    out.draw(DrawCommand::StrokeRect {
                         rect: frame,
                         color: Color::OUTLINE,
                         width: 1.0,
@@ -2189,14 +2214,14 @@ impl LayoutNode {
                         // clip is built in, never a separate modifier
                         if let Some(rect) = cover_rect(frame, intrinsic_of(&*env.images, source)) {
                             out.push_clip(frame, 0.0);
-                            out.display.push(DrawCommand::Image {
+                            out.draw(DrawCommand::Image {
                                 rect,
                                 source: source.clone(),
                             });
                             out.pop_clip();
                         }
                     } else if frame.size.width > 0.0 && frame.size.height > 0.0 {
-                        out.display.push(DrawCommand::Image {
+                        out.draw(DrawCommand::Image {
                             rect: frame,
                             source: source.clone(),
                         });
@@ -2234,7 +2259,7 @@ impl LayoutNode {
                         },
                         size: Size { width: side, height: side },
                     };
-                    out.display.push(DrawCommand::Image {
+                    out.draw(DrawCommand::Image {
                         rect,
                         source: ImageSource::symbol(*symbol, color),
                     });
@@ -2474,7 +2499,7 @@ impl LayoutNode {
                 }
                 // the halo goes first — everything else paints over it
                 if let Some((radius, color)) = props.shadow {
-                    out.display.push(DrawCommand::Shadow {
+                    out.draw(DrawCommand::Shadow {
                         rect: frame,
                         radius,
                         color: animated(crate::anim::Channel::Shadow, color),
@@ -2493,7 +2518,7 @@ impl LayoutNode {
                     props.background
                 };
                 if let Some(color) = background {
-                    out.display.push(DrawCommand::FillRect {
+                    out.draw(DrawCommand::FillRect {
                         rect: frame,
                         color: animated(crate::anim::Channel::Background, color),
                         corner_radius: props.corner_radius.unwrap_or(0.0),
@@ -2503,7 +2528,7 @@ impl LayoutNode {
                 // child: the two compose, and the geometry resolves to
                 // px here — the shaders only evaluate
                 if let Some(gradient) = props.gradient {
-                    out.display.push(DrawCommand::Gradient {
+                    out.draw(DrawCommand::Gradient {
                         rect: frame,
                         paint: gradient.resolve(frame),
                         corner_radius: props.corner_radius.unwrap_or(0.0),
@@ -2536,7 +2561,7 @@ impl LayoutNode {
                     out.foreground.pop();
                 }
                 if let Some((color, width)) = props.border {
-                    out.display.push(DrawCommand::StrokeRect {
+                    out.draw(DrawCommand::StrokeRect {
                         rect: frame,
                         color: animated(crate::anim::Channel::Border, color),
                         width,
@@ -2602,6 +2627,7 @@ impl LayoutNode {
                 // between open and close). Pixel targets place through:
                 // everything is the pixel pipeline there already.
                 if out.dom.is_some() {
+                    out.saw_island = true;
                     let start = out.display.len();
                     if let Some(dom) = out.dom.as_mut() {
                         dom.open_canvas(frame, start);
@@ -2986,7 +3012,7 @@ fn place_text(
         // do not map onto the composed text) — honest v1, noted
         let composed: Arc<str> = Arc::from(truncate_to_width(content, mode, frame.size.width, env));
         let length = composed.len();
-        out.display.push(DrawCommand::TextLine {
+        out.draw(DrawCommand::TextLine {
             origin: frame.origin,
             content: composed,
             range: (0, length),
@@ -3031,7 +3057,7 @@ fn emit_text_runs(
         font: env.font,
     };
     let Some(highlight) = highlights else {
-        out.display.push(whole());
+        out.draw(whole());
         return;
     };
 
@@ -3055,7 +3081,7 @@ fn emit_text_runs(
         segments.push((cursor, line_end, false));
     }
     if segments.len() == 1 && !segments[0].2 {
-        out.display.push(whole());
+        out.draw(whole());
         return;
     }
 
@@ -3065,7 +3091,7 @@ fn emit_text_runs(
         } else {
             env.cache.get_or_measure(&content[line_start..start], &env.font, env.text).width
         };
-        out.display.push(DrawCommand::TextLine {
+        out.draw(DrawCommand::TextLine {
             origin: Point { x: origin.x + offset, y: origin.y },
             content: content.clone(),
             range: (start, end),
@@ -3167,7 +3193,7 @@ fn draw_scrollbar(frame: Rect, content_h: Px, offset_y: Px, max_y: Px, out: &mut
     let thumb_h = ((frame.size.height / content_h) * track).max(SCROLLBAR_MIN).min(track);
     let travel = track - thumb_h;
     let thumb_y = frame.origin.y + SCROLLBAR_INSET + travel * (offset_y / max_y);
-    out.display.push(DrawCommand::FillRect {
+    out.draw(DrawCommand::FillRect {
         rect: Rect {
             origin: Point {
                 x: frame.origin.x + frame.size.width - SCROLLBAR_INSET - SCROLLBAR_W,

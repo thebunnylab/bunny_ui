@@ -358,7 +358,7 @@ fn main() {
 
     println!(
         "\n{:<16} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7} {:>7} {:>8} {:>8}",
-        "per frame", "settle", "layout", "capture", "diff", "encode", "bodies", "walks", "nodes", "visited", "miss"
+        "per frame", "settle", "layout", "capture", "diff", "encode", "bodies", "walks", "nodes", "visited", "draw"
     );
     println!("{}", "─".repeat(104));
     for row in &stage_rows {
@@ -376,7 +376,7 @@ fn main() {
             per(row.stats.layout_passes),
             per(row.stats.capture_nodes),
             per(row.stats.diff_visited),
-            per(row.stats.measure_misses),
+            per(row.stats.display_commands),
         );
     }
 

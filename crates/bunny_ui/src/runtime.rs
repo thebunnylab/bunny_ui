@@ -1149,27 +1149,53 @@ impl Runtime {
         result.display
     }
 
-    /// The frame in DOM mode: the same settle + layout machinery as
-    /// [`Runtime::display_frame`], then ONE capture pass over the now-
-    /// stable tree and the diff against the retained scene. The result
-    /// is the patch list that brings the element tree up to date —
-    /// empty when nothing observable changed (a hover, a caret blink).
+    /// The frame in DOM mode: settle, then the same convergence loop
+    /// as [`Runtime::layout`] — with the capture riding EVERY round,
+    /// so the settled round's scene is the one lowered and no second
+    /// walk ever runs. The result is the patch list that brings the
+    /// element tree up to date — empty when nothing observable
+    /// changed (a caret blink).
     ///
-    /// The engine never ticks springs here: animation specs lower into
-    /// the patches as CSS transitions and the browser animates.
+    /// Two idle costs of the pixel path stay out on purpose: the
+    /// engine never ticks springs here (animation specs lower into
+    /// the patches as CSS transitions and the browser animates), and
+    /// hover never re-resolves (the glue sends no pointer moves —
+    /// `:hover` belongs to the browser, and the scene is pointer-
+    /// invariant by construction).
     pub fn dom_frame(
         &self,
         root: &impl View,
         size: crate::layout::Size,
     ) -> Vec<crate::dom::DomPatch> {
-        // the pass settles state, applies scroll targets and heals
-        // virtual windows; its display list feeds the canvas islands
-        let _ = self.display_frame(root, size);
-        let (result, scene) = self.layout_once_with(
-            root,
-            crate::layout::Proposal::exact(size),
-            true,
-        );
+        let proposal = crate::layout::Proposal::exact(size);
+        self.settle(root);
+        // the display list only feeds canvas islands here — with none
+        // alive, nothing consumes it and nothing pays for it
+        let collect = self.dom.borrow().has_islands();
+        let (mut result, mut scene) = self.layout_once_with(root, proposal, true, collect);
+        // the follow-up loop of `layout`, capture riding: scroll
+        // targets, first auto-focus, window misses, orphaned popovers
+        // — capped, so a broken extent degrades and never hangs
+        for _ in 0..2 {
+            let moved = self.apply_scroll_targets(&result);
+            let focused = self.apply_auto_focus(&result);
+            let missed = if moved {
+                false
+            } else {
+                self.invalidate_window_misses(&result)
+            };
+            let orphaned = self.dismiss_orphaned_overlays(&result);
+            if !moved && !focused && !missed && !orphaned {
+                break;
+            }
+            (result, scene) = self.layout_once_with(root, proposal, true, collect);
+        }
+        // an island born this frame needs the commands it slices — the
+        // skipped collection re-runs once, collected: the price of a
+        // birth, never of a steady frame
+        if result.saw_island && !collect {
+            (result, scene) = self.layout_once_with(root, proposal, true, true);
+        }
         let scene = scene.expect("the capture rode the pass");
         self.dom.borrow_mut().lower(&scene, &result.display)
     }
@@ -1442,7 +1468,7 @@ impl Runtime {
         root: &impl View,
         proposal: crate::layout::Proposal,
     ) -> crate::layout::LayoutResult {
-        self.layout_once_with(root, proposal, false).0
+        self.layout_once_with(root, proposal, false, true).0
     }
 
     /// One layout pass, optionally with the Dom capture riding it.
@@ -1451,6 +1477,7 @@ impl Runtime {
         root: &impl View,
         proposal: crate::layout::Proposal,
         dom: bool,
+        collect_display: bool,
     ) -> (crate::layout::LayoutResult, Option<crate::dom::DomNode>) {
         // every call walks measure+place (the stable-root shortcut
         // skips BODIES, not geometry) — so every call counts
@@ -1535,7 +1562,8 @@ impl Runtime {
         };
         let (result, scene) = crate::stats::time(stage, || {
             if dom {
-                let (result, scene) = crate::layout::layout_dom(&tree, proposal, env);
+                let (result, scene) =
+                    crate::layout::layout_dom(&tree, proposal, env, collect_display);
                 (result, Some(scene))
             } else {
                 (crate::layout::layout_with(&tree, proposal, env), None)
