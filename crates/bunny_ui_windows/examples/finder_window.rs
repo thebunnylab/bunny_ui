@@ -370,9 +370,9 @@ impl Component for Finder {
 
 #[cfg(target_os = "windows")]
 fn main() {
-    // the image engine joins in its own phase — icons stay quiet
-    let runtime =
-        Runtime::new().text_engine(Rc::new(bunny_ui_windows::DirectWriteEngine::new()));
+    let runtime = Runtime::new()
+        .text_engine(Rc::new(bunny_ui_windows::DirectWriteEngine::new()))
+        .image_engine(Rc::new(bunny_ui_windows::WicImageEngine::new()));
     // the app keymap: key → intent (the handlers live in the screen)
     runtime.bind_in("finder", KeyPattern::key(Key::Down), SELECT_NEXT);
     runtime.bind_in("finder", KeyPattern::key(Key::Up), SELECT_PREV);
