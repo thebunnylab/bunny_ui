@@ -288,6 +288,13 @@ pub enum LayoutNode {
         resizable: bool,
         fit: Option<ContentMode>,
     },
+    /// A vector glyph. Rigid by nature — the natural size follows the
+    /// INHERITED font (a glyph beside text scales with the text), and
+    /// `.resizable()` hands the axes to the proposal, the file-icon
+    /// idiom. It paints the largest CENTRED square of its frame, which
+    /// is also what the browser's default `preserveAspectRatio` does —
+    /// the pixel pipelines and the Dom agree without an attribute.
+    Icon { symbol: crate::icon::Symbol, resizable: bool },
     /// Fills whatever the proposal gives (Rectangle).
     Fill,
     Stack { axis: Axis, spacing: Px, align: CrossAlign, children: Vec<LayoutNode> },
@@ -1600,6 +1607,12 @@ impl LayoutNode {
                 (size, Fit::Leaf)
             }
 
+            LayoutNode::Icon { resizable, .. } => {
+                // a synchronous square — no decode, no reflow, ever
+                let side = crate::icon::natural_size(&env.font) as u32;
+                (image_size(Some((side, side)), *resizable, None, proposal), Fit::Leaf)
+            }
+
             // the anchor's geometry IS the node's — the overlay never
             // participates in the measure
             LayoutNode::Anchored { child, .. } => {
@@ -2176,6 +2189,31 @@ impl LayoutNode {
                     }
                 }
             },
+
+            (LayoutNode::Icon { symbol, .. }, Fit::Leaf) => {
+                // the ink is the INHERITED one, the same line Text
+                // reads — .foreground_color and the hover/press inks
+                // reach a glyph with zero new API
+                let color = out
+                    .foreground
+                    .last()
+                    .copied()
+                    .unwrap_or_else(|| crate::theme::current().fg);
+                let side = frame.size.width.min(frame.size.height);
+                if side > 0.0 {
+                    let rect = Rect {
+                        origin: Point {
+                            x: frame.origin.x + (frame.size.width - side) / 2.0,
+                            y: frame.origin.y + (frame.size.height - side) / 2.0,
+                        },
+                        size: Size { width: side, height: side },
+                    };
+                    out.display.push(DrawCommand::Image {
+                        rect,
+                        source: ImageSource::symbol(*symbol, color),
+                    });
+                }
+            }
 
             (LayoutNode::Stack { axis, spacing, align, children }, Fit::Children(fits)) => {
                 place_stack(*axis, *spacing, *align, children, frame, fits, env, out);
@@ -3943,5 +3981,113 @@ mod tests {
             })
             .unwrap();
         assert_eq!(background, Color::hex(0x333333));
+    }
+
+    const CHECK_PATH: &[crate::icon::Verb] = &[
+        crate::icon::Verb::Move(4.0, 12.0),
+        crate::icon::Verb::Line(10.0, 18.0),
+        crate::icon::Verb::Line(20.0, 6.0),
+    ];
+    const CHECK_GLYPH: crate::icon::Glyph = crate::icon::Glyph {
+        draws: &[crate::icon::Draw {
+            paint: crate::icon::Paint::Stroke { width: 2.0 },
+            path: CHECK_PATH,
+        }],
+    };
+    const CHECK: crate::icon::Symbol = crate::icon::Symbol::new("test.check", &CHECK_GLYPH);
+
+    fn icon_node(resizable: bool) -> LayoutNode {
+        LayoutNode::Icon { symbol: CHECK, resizable }
+    }
+
+    #[test]
+    fn an_icon_measures_off_the_inherited_font() {
+        // 13pt body × 1.25, rounded to the whole point: sixteen — the
+        // number the house wrote by hand before the symbol existed
+        assert_eq!(
+            layout(&icon_node(false), Proposal::unspecified()).size,
+            Size { width: 16.0, height: 16.0 }
+        );
+        // a font patch on the way down moves it, like a character
+        let big = styled(
+            VisualProps {
+                font: FontPatch { size: Some(20.0), ..FontPatch::default() },
+                ..VisualProps::default()
+            },
+            icon_node(false),
+        );
+        assert_eq!(
+            layout(&big, Proposal::unspecified()).size,
+            Size { width: 25.0, height: 25.0 }
+        );
+        // rigid: a proposal cannot squeeze a glyph
+        let squeezed = layout(
+            &icon_node(false),
+            Proposal { width: Some(100.0), height: Some(100.0) },
+        );
+        assert_eq!(squeezed.size, Size { width: 16.0, height: 16.0 });
+    }
+
+    #[test]
+    fn a_resizable_icon_answers_the_frame() {
+        // the file-icon idiom: .resizable().frame(w, h) is an exact box
+        let node = LayoutNode::Frame {
+            width: Some(24.0),
+            height: Some(24.0),
+            child: Box::new(icon_node(true)),
+        };
+        assert_eq!(
+            layout(&node, Proposal::unspecified()).size,
+            Size { width: 24.0, height: 24.0 }
+        );
+    }
+
+    #[test]
+    fn an_icon_takes_the_inherited_ink_in_its_key() {
+        let ink = Color::hex(0x336699);
+        let root = styled(
+            VisualProps { foreground: Some(ink), ..VisualProps::default() },
+            icon_node(false),
+        );
+        let result = layout(&root, Proposal::unspecified());
+        let sources: Vec<ImageSource> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Image { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources.len(), 1);
+        // the tint rides the identity — the damage diff sees an ink
+        // flip without ever looking at pixels
+        assert_eq!(sources[0].key(), ImageSource::symbol(CHECK, ink).key());
+        assert_ne!(sources[0].key(), ImageSource::symbol(CHECK, Color::hex(0x000000)).key());
+    }
+
+    #[test]
+    fn an_icon_paints_the_largest_centred_square() {
+        let node = LayoutNode::Frame {
+            width: Some(40.0),
+            height: Some(20.0),
+            child: Box::new(icon_node(true)),
+        };
+        let result = layout(&node, Proposal::unspecified());
+        let rect = result
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("the glyph paints");
+        // the browser's centred meet, in our own paint
+        assert_eq!(
+            rect,
+            Rect {
+                origin: Point { x: 10.0, y: 0.0 },
+                size: Size { width: 20.0, height: 20.0 }
+            }
+        );
     }
 }

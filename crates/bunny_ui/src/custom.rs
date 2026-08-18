@@ -347,6 +347,27 @@ impl<'a> Painter<'a> {
         self.display.push(DrawCommand::Image { rect: self.shift(rect), source });
     }
 
+    /// One vector glyph, tinted, on the largest CENTRED square of
+    /// `rect` — the same bytes the built-in `icon(…)` paints. Pass
+    /// `painter.ink()` to take the inherited ink.
+    pub fn icon(&mut self, rect: Rect, symbol: crate::icon::Symbol, color: Color) {
+        let side = rect.size.width.min(rect.size.height);
+        if side <= 0.0 {
+            return;
+        }
+        let square = Rect {
+            origin: Point {
+                x: rect.origin.x + (rect.size.width - side) / 2.0,
+                y: rect.origin.y + (rect.size.height - side) / 2.0,
+            },
+            size: Size { width: side, height: side },
+        };
+        self.display.push(DrawCommand::Image {
+            rect: self.shift(square),
+            source: ImageSource::symbol(symbol, color),
+        });
+    }
+
     /// Everything `body` paints is cut to `rect` — balanced by
     /// construction, so a clip can never leak out of the box.
     pub fn clipped(&mut self, rect: Rect, body: impl FnOnce(&mut Painter)) {

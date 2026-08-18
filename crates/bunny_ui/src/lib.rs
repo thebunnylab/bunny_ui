@@ -111,6 +111,7 @@ pub mod prelude {
     pub use crate::erased::{CustomModifier, Erased, erased};
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
+    pub use crate::icon::{ICON_GRID, Symbol};
     pub use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, RawImages, file_icon};
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)

@@ -458,6 +458,32 @@ pub fn image(source: crate::image_engine::ImageSource) -> Image {
     Image(source)
 }
 
+/// A vector glyph. Sizes with the INHERITED font, the way a character
+/// would, and takes the inherited ink — `.foreground_color` and the
+/// hover/press inks reach it with no icon-specific API. For an exact
+/// box, the file-icon idiom: `.resizable().frame(w, h)`.
+///
+/// ```ignore
+/// icon(symbol::CHEVRON_RIGHT)
+/// icon(symbol::SEARCH).font(Font::Title)
+/// icon(symbol::FOLDER).resizable().frame(24.0, 24.0)
+/// ```
+#[derive(Clone)]
+pub struct Icon(pub crate::icon::Symbol);
+
+impl View for Icon {
+    type Arity = Single;
+
+    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
+        out.push(RenderNode::leaf(format!("Icon ({})", self.0.name)));
+        out.push_layout(LayoutNode::Icon { symbol: self.0, resizable: false });
+    }
+}
+
+pub fn icon(symbol: crate::icon::Symbol) -> Icon {
+    Icon(symbol)
+}
+
 // MARK: - Containers
 
 pub use motor::views::Alignment;

@@ -24,6 +24,19 @@ use motor::hash::FxHashMap as HashMap;
 /// writes it as the `viewBox`. One constant, three renderers.
 pub const ICON_GRID: Px = 24.0;
 
+/// A glyph beside 13pt body text wants SIXTEEN points — the number the
+/// house wrote by hand for file icons before the symbol existed. Every
+/// other font follows the same ratio.
+const ICON_RATIO: Px = 1.25;
+
+/// The natural side of an icon under a font, in points. Derived from
+/// `FontSpec::size` — pure data, identical on every target — never
+/// from engine metrics, and rounded to a whole point so a stem lands
+/// on a pixel edge at one and at two scale.
+pub fn natural_size(font: &crate::text_engine::FontSpec) -> Px {
+    (font.size * ICON_RATIO).round()
+}
+
 /// One drawing instruction, in grid units. Coordinates are `f32`: the
 /// grid is small, the table is `const`, and half the bytes reach twice
 /// as many glyphs into a cache line.

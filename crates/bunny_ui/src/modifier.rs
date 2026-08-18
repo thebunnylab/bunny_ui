@@ -322,46 +322,49 @@ fn rewrite_field_node(
     }
 }
 
-/// Descends through wrappers to the `Image` node and rewrites it —
-/// `.resizable()`/`.aspect_ratio()` work before or after the visual
-/// modifiers; on anything that is not an image they are no-ops on
-/// purpose (SwiftUI parity, like truncationMode outside text).
-fn rewrite_image_node(
+/// Descends through wrappers to the pixel leaf — an `Image` or an
+/// `Icon` — and rewrites it: `.resizable()`/`.aspect_ratio()` work
+/// before or after the visual modifiers; on anything else they are
+/// no-ops on purpose (SwiftUI parity, like truncationMode outside
+/// text). Two closures because the two leaves carry different state.
+fn rewrite_pixel_node(
     node: LayoutNode,
     rewrite: &impl Fn(
         Option<crate::image_engine::ImageSource>,
         bool,
         Option<ContentMode>,
     ) -> LayoutNode,
+    icon: &impl Fn(crate::icon::Symbol, bool) -> LayoutNode,
 ) -> LayoutNode {
     match node {
         LayoutNode::Image { source, resizable, fit } => rewrite(source, resizable, fit),
+        LayoutNode::Icon { symbol, resizable } => icon(symbol, resizable),
         LayoutNode::Styled { props, child } => LayoutNode::Styled {
             props,
-            child: Box::new(rewrite_image_node(*child, rewrite)),
+            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
             spec,
-            child: Box::new(rewrite_image_node(*child, rewrite)),
+            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
         LayoutNode::Island { child } => LayoutNode::Island {
-            child: Box::new(rewrite_image_node(*child, rewrite)),
+            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
         LayoutNode::Padding { edges, child } => LayoutNode::Padding {
             edges,
-            child: Box::new(rewrite_image_node(*child, rewrite)),
+            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
         LayoutNode::Frame { width, height, child } => LayoutNode::Frame {
             width,
             height,
-            child: Box::new(rewrite_image_node(*child, rewrite)),
+            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
         LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
             max_width,
             max_height,
             align,
-            child: Box::new(rewrite_image_node(*child, rewrite)),
+            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
         other => other,
     }
@@ -710,18 +713,23 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 })
             }),
             Modifier::Resizable => out.wrap_last_layout(|node| {
-                rewrite_image_node(node, &|source, _, fit| LayoutNode::Image {
-                    source,
-                    resizable: true,
-                    fit,
-                })
+                rewrite_pixel_node(
+                    node,
+                    &|source, _, fit| LayoutNode::Image { source, resizable: true, fit },
+                    &|symbol, _| LayoutNode::Icon { symbol, resizable: true },
+                )
             }),
             Modifier::AspectRatio(mode) => out.wrap_last_layout(|node| {
-                rewrite_image_node(node, &|source, resizable, _| LayoutNode::Image {
-                    source,
-                    resizable,
-                    fit: Some(*mode),
-                })
+                rewrite_pixel_node(
+                    node,
+                    &|source, resizable, _| LayoutNode::Image {
+                        source,
+                        resizable,
+                        fit: Some(*mode),
+                    },
+                    // a glyph is a square — it has its one ratio already
+                    &|symbol, resizable| LayoutNode::Icon { symbol, resizable },
+                )
             }),
             Modifier::Animated(spec) => {
                 // the key is captured NOW, at render — the cursor is
