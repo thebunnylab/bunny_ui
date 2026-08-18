@@ -361,6 +361,42 @@ fn add_run(row: &mut [f32], from: f64, to: f64) -> bool {
     true
 }
 
+/// Strokes `flat` into `mask` with a pen `width` wide (device px).
+/// The whole geometry is DISTANCE: a pixel's coverage is the house
+/// kernel `(width/2 − distance + 0.5).clamp(0, 1)` against the nearest
+/// segment — which hands out round caps and round joins for free (the
+/// near-end of a segment IS a disc), and the MAX accumulation makes
+/// self-overlap union, never a double blend. A sealed contour strokes
+/// its closing segment; an open one wears its caps.
+pub(crate) fn stroke_into(mask: &mut Mask, flat: &Flattened, width: f64) {
+    let half = width / 2.0;
+    // pixels whose CENTER sits within the kernel's reach of the
+    // segment — one pixel of slack keeps the cut clearly outside
+    let reach = half + 1.5;
+    for (points, sealed) in flat.contours() {
+        let count = points.len();
+        let segments = if sealed { count } else { count - 1 };
+        for i in 0..segments {
+            let a = points[i];
+            let b = points[(i + 1) % count];
+            let x0 = ((a.0.min(b.0) - reach).floor().max(0.0)) as usize;
+            let y0 = ((a.1.min(b.1) - reach).floor().max(0.0)) as usize;
+            let x1 = ((a.0.max(b.0) + reach).ceil().max(0.0) as usize).min(mask.width);
+            let y1 = ((a.1.max(b.1) + reach).ceil().max(0.0) as usize).min(mask.height);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let center = (x as f64 + 0.5, y as f64 + 0.5);
+                    let distance = segment_distance(center, a, b);
+                    let coverage = (half - distance + 0.5).clamp(0.0, 1.0);
+                    if coverage > 0.0 {
+                        mask.max_at(x, y, coverage as f32);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Distance from a point to one segment — the stroke's whole geometry,
 /// and the test bench's ruler.
 pub(crate) fn segment_distance(
@@ -768,6 +804,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn stroked(path: &[Verb], width: f64, side: usize) -> Mask {
+        let mut mask = Mask::new(side, side);
+        stroke_into(&mut mask, &flatten(path, ONE), width);
+        mask
+    }
+
+    /// The stroke's oracle is its own definition: for every pixel, the
+    /// kernel of the brute-force MIN distance over every segment. The
+    /// bounding boxes in `stroke_into` may skip pixels — never drop
+    /// ink — so the two must agree to the LAST BIT.
+    #[test]
+    fn the_stroke_matches_the_field_it_claims() {
+        let path = [
+            Verb::Move(2.5, 3.1),
+            Verb::Line(12.7, 2.4),
+            Verb::Line(13.9, 12.2),
+            Verb::Line(4.1, 13.6),
+            Verb::Line(2.2, 7.7),
+        ];
+        let width = 2.6;
+        let flat = flatten(&path, ONE);
+        let mask = stroked(&path, width, 16);
+        let points: Vec<_> = flat.contours().next().unwrap().0.to_vec();
+        for y in 0..16 {
+            for x in 0..16 {
+                let center = (x as f64 + 0.5, y as f64 + 0.5);
+                let nearest = points
+                    .windows(2)
+                    .map(|pair| segment_distance(center, pair[0], pair[1]))
+                    .fold(f64::INFINITY, f64::min);
+                let want = (width / 2.0 - nearest + 0.5).clamp(0.0, 1.0) as f32;
+                assert_eq!(mask.at(x, y), want, "pixel ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_stroked_line_wears_round_caps() {
+        let path = [Verb::Move(4.0, 8.0), Verb::Line(12.0, 8.0)];
+        let mask = stroked(&path, 3.0, 16);
+        // past the endpoint along the axis: still under the cap's disc
+        assert!(mask.at(12, 8) > 0.9, "the cap reaches past the end");
+        // past the disc: bare
+        assert_eq!(mask.at(14, 8), 0.0);
+        // the cap is ROUND: on the axis the shoulder fades…
+        let shoulder = mask.at(13, 8);
+        assert!(
+            shoulder > 0.0 && shoulder < 1.0,
+            "the shoulder anti-aliases, read {shoulder}"
+        );
+        // …and the diagonal corner a SQUARE cap would ink stays bare
+        assert_eq!(mask.at(13, 9), 0.0);
+    }
+
+    #[test]
+    fn a_sealed_triangle_strokes_its_closing_edge() {
+        let open = [
+            Verb::Move(2.0, 2.0),
+            Verb::Line(14.0, 2.0),
+            Verb::Line(8.0, 13.0),
+        ];
+        let sealed = [
+            Verb::Move(2.0, 2.0),
+            Verb::Line(14.0, 2.0),
+            Verb::Line(8.0, 13.0),
+            Verb::Close,
+        ];
+        // midpoint of the closing edge (2,2)-(8,13)
+        let probe = (5, 7);
+        let bare = stroked(&open, 2.0, 16);
+        let inked = stroked(&sealed, 2.0, 16);
+        assert_eq!(bare.at(probe.0, probe.1), 0.0, "no seal, no closing edge");
+        assert!(inked.at(probe.0, probe.1) > 0.9, "the seal draws it");
+    }
+
+    #[test]
+    fn a_sharp_join_stays_at_one() {
+        // a hairpin — the join region is covered by both segments
+        let path = [
+            Verb::Move(3.0, 3.0),
+            Verb::Line(13.0, 3.0),
+            Verb::Line(3.0, 5.0),
+        ];
+        let mask = stroked(&path, 2.5, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                assert!(mask.at(x, y) <= 1.0, "({x},{y}) overflowed the union");
+            }
+        }
+        // the elbow itself is solid
+        assert_eq!(mask.at(12, 3), 1.0);
     }
 
     #[test]
