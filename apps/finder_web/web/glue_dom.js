@@ -300,6 +300,7 @@ function applyPatches(view, length) {
   };
   const text = (count) => decoder.decode(bytes(count));
 
+  let removedAny = false;
   const count = u32();
   for (let i = 0; i < count; i++) {
     const op = u8();
@@ -324,18 +325,13 @@ function applyPatches(view, length) {
       elements.set(id, el);
     } else if (op === 2) {
       const el = elements.get(id);
-      if (el) {
-        // ids are never reused, so a survivor here would leak the
-        // element AND its pseudo rules for the page's whole life
-        for (const child of el.querySelectorAll("[data-n]")) {
-          const n = Number(child.dataset.n);
-          elements.delete(n);
-          dropPseudo(n);
-        }
-        el.remove();
-      }
+      if (el) el.remove();
       elements.delete(id);
       dropPseudo(id);
+      // the SUBTREE's registrations die in one sweep at the end of
+      // the batch — a thousand row removals must not pay a thousand
+      // subtree queries
+      removedAny = true;
     } else if (op === 3) {
       const el = elements.get(id);
       const x = f32();
@@ -678,6 +674,17 @@ function applyPatches(view, length) {
         el.dataset.anchor = anchor;
         el.dataset.side = side;
         placePopover(el);
+      }
+    }
+  }
+  if (removedAny) {
+    // one pass over the registry: whatever a removal detached loses
+    // its entry and its pseudo rules — ids are never reused, so a
+    // survivor here would leak for the page's whole life
+    for (const [id, el] of elements) {
+      if (id !== 0 && !el.isConnected) {
+        elements.delete(id);
+        dropPseudo(id);
       }
     }
   }
