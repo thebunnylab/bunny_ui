@@ -38,6 +38,27 @@ function cssFont(size, weight, mono, italic) {
   return `${italic ? "italic " : ""}${weight} ${size}px ${family}`;
 }
 
+// The engine names a key by what it types with NO modifier — so a
+// chord on shifted punctuation is spellable at all. `event.key` has the
+// shift APPLIED (shift and backslash arrives as a pipe), so the chord
+// road asks the keyboard layout instead.
+//
+// getLayoutMap reads the USER'S OWN layout, which is the only correct
+// answer: a table of US pairs would be wrong on a Brazilian keyboard.
+// Where the browser has no such map the base falls back to the typed
+// character — today's behaviour, and never a crash.
+let layoutMap = null;
+if (navigator.keyboard && navigator.keyboard.getLayoutMap) {
+  navigator.keyboard.getLayoutMap().then((map) => {
+    layoutMap = map;
+  });
+}
+
+function baseChar(event) {
+  const base = layoutMap && event.code ? layoutMap.get(event.code) : undefined;
+  return base && base.length === 1 ? base : event.key;
+}
+
 function requestFrame() {
   if (frameArmed) return;
   frameArmed = true;
@@ -302,7 +323,7 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
       // a command stroke is a stroke; a bare character is TEXT, so
       // typing takes the same road a paste and a composition take
       if (event.metaKey || event.ctrlKey) {
-        wasm.bunny_key_char(event.key.codePointAt(0), mods);
+        wasm.bunny_key_char(baseChar(event).codePointAt(0), mods);
       } else {
         sendText(event.key);
       }

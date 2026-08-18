@@ -10,6 +10,25 @@ app.dataset.n = "0";
 const sheet = document.createElement("style");
 document.head.appendChild(sheet);
 
+// The engine names a key by what it types with NO modifier, so a chord
+// on shifted punctuation is spellable at all. `event.key` has the shift
+// APPLIED (shift and backslash arrives as a pipe), so the chord road
+// asks the keyboard layout — the USER'S own, never a table of US pairs,
+// which would be wrong on a Brazilian keyboard. Where the browser has
+// no such map the base falls back to the typed character: today's
+// behaviour, and never a crash.
+let layoutMap = null;
+if (navigator.keyboard && navigator.keyboard.getLayoutMap) {
+  navigator.keyboard.getLayoutMap().then((map) => {
+    layoutMap = map;
+  });
+}
+
+function baseChar(event) {
+  const base = layoutMap && event.code ? layoutMap.get(event.code) : undefined;
+  return base && base.length === 1 ? base : event.key;
+}
+
 // the tooltip is the browser's in this mode, like the hover and the
 // inputs: a data attribute, a static rule, a transition-delay for the
 // wait — zero patches by construction. The bubble mirrors the engine's
@@ -696,7 +715,7 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
       }
       if (event.key.length !== 1) return;
       if (event.metaKey || event.ctrlKey) {
-        wasm.bunny_key_char(event.key.codePointAt(0), mods);
+        wasm.bunny_key_char(baseChar(event).codePointAt(0), mods);
         return;
       }
       if (typing) return;

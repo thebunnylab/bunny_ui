@@ -117,6 +117,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_id_arg(obj: Id, sel: Sel, a: Id) -> Id;
     #[link_name = "objc_msgSend"]
+    fn msg_id_u64(obj: Id, sel: Sel, a: u64) -> Id;
+    #[link_name = "objc_msgSend"]
     fn msg_bool_id_id(obj: Id, sel: Sel, a: Id, b: Id) -> i8;
     #[link_name = "objc_msgSend"]
     fn msg_timer(
@@ -442,9 +444,14 @@ pub struct KeyStroke {
     pub option: bool,
     pub command: bool,
     pub chars: String,
-    /// `charactersIgnoringModifiers` — the BASE char: `Char` patterns
-    /// match through here (shift/option do not change the key's identity).
+    /// `charactersIgnoringModifiers` — which ignores command and option
+    /// and APPLIES shift, so it is the typing char, not the key's name.
     pub chars_ignoring: String,
+    /// The key's OWN character, with no modifier applied at all
+    /// (`charactersByApplyingModifiers:0`) — what a `Char` pattern must
+    /// match, and read through the USER'S LAYOUT, so the Brazilian
+    /// keyboard this is written on needs no table of US pairs.
+    pub chars_bare: String,
 }
 
 thread_local! {
@@ -669,6 +676,25 @@ extern "C" fn bunny_do_command(_this: Id, _sel: Sel, command: Sel) {
     dispatch(AppEvent::Command { selector });
 }
 
+/// The key's characters with NO modifier applied — AppKit reads the
+/// user's own layout, which is why this beats any table: on a Brazilian
+/// ABNT2 keyboard the physical key that types `|` under shift answers
+/// its own base character here, whatever that is.
+///
+/// The selector arrived in macOS 10.15 (a test in this file pins that it
+/// is here). Should it ever be missing, the base falls back to
+/// `charactersIgnoringModifiers` — the old, shift-applied answer, which
+/// is exactly today's behaviour and never a crash.
+unsafe fn bare_characters(event: Id) -> String {
+    unsafe {
+        let selector = sel("charactersByApplyingModifiers:");
+        if msg_bool_sel(class("NSEvent"), sel("instancesRespondToSelector:"), selector) == 0 {
+            return text_argument_to_string(msg_id(event, sel("charactersIgnoringModifiers")));
+        }
+        text_argument_to_string(msg_id_u64(event, selector, 0))
+    }
+}
+
 extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
     unsafe {
         let code = msg_u16(event, sel("keyCode"));
@@ -683,6 +709,7 @@ extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
             chars_ignoring: text_argument_to_string(
                 msg_id(event, sel("charactersIgnoringModifiers")),
             ),
+            chars_bare: bare_characters(event),
         };
 
         // live IME composition: the keys belong to the IME (Esc closes
@@ -1507,5 +1534,33 @@ pub fn clipboard_read() -> Option<String> {
             return None;
         }
         Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The selector pain 34's fix stands on. `charactersIgnoringModifiers`
+    /// only ignores command and option — it APPLIES shift, so a chord on
+    /// shifted punctuation arrives as the shifted character and never
+    /// matches its spec. `charactersByApplyingModifiers:` asks for the
+    /// characters under a chosen set of modifiers, so ZERO gives the
+    /// key's own base character IN THE USER'S LAYOUT — no table of US
+    /// pairs, which would be wrong on the Brazilian keyboard this is
+    /// written on.
+    ///
+    /// It arrived in macOS 10.15. This test is the proof that it is
+    /// here, and the alarm if a build target ever predates it.
+    #[test]
+    fn appkit_can_report_a_key_without_its_modifiers() {
+        unsafe {
+            let responds = msg_bool_sel(
+                class("NSEvent"),
+                sel("instancesRespondToSelector:"),
+                sel("charactersByApplyingModifiers:"),
+            );
+            assert_ne!(responds, 0, "NSEvent has no charactersByApplyingModifiers:");
+        }
     }
 }

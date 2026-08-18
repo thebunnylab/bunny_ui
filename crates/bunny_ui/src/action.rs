@@ -45,6 +45,22 @@ pub enum Key {
     Delete,
     Home,
     End,
+    /// A printable key, named by THE CHARACTER IT TYPES WITH NO
+    /// MODIFIER APPLIED, lowercased.
+    ///
+    /// This is the contract every shell owes, and it is what makes a
+    /// chord spellable: `command_shift(Char('\\'))` is "the backslash
+    /// key, with shift", not "the pipe character". A shell that reports
+    /// the SHIFTED character instead makes every chord on shifted
+    /// punctuation unmatchable — the letters survive by accident,
+    /// because lowercasing repairs them, and the punctuation does not.
+    ///
+    /// Each platform has the right question to ask: `ToUnicode` with a
+    /// clean keyboard state on Windows, `charactersByApplyingModifiers:0`
+    /// on macOS, the keyboard layout map in a browser that has one. All
+    /// three read the USER'S OWN LAYOUT, which is why none of them is a
+    /// table of US pairs — a table would be wrong on the Brazilian
+    /// keyboard this framework is written on.
     Char(char),
 }
 

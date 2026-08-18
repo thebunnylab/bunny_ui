@@ -46,7 +46,13 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
         _ => None,
     };
     let key = named.or_else(|| {
-        let base = stroke.chars_ignoring.chars().next()?;
+        // the KEY's own character, not the one it would type: AppKit's
+        // charactersIgnoringModifiers applies shift, so a chord on
+        // shifted punctuation used to arrive as its shifted twin and
+        // never matched its spec (command_shift(Char('\\')) came in as
+        // '|'). Reading the bare character asks the user's own layout
+        // instead of assuming a US keyboard.
+        let base = stroke.chars_bare.chars().next()?;
         // PUA F700–F8FF: AppKit function keys — never text
         (!base.is_control() && !('\u{F700}'..='\u{F8FF}').contains(&base))
             .then(|| Key::Char(base.to_ascii_lowercase()))

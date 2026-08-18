@@ -5067,4 +5067,39 @@ mod tests {
         // and it rides right after the mono flag
         assert_eq!(bytes[at - 1], 0, "mono sits before it");
     }
+
+    /// The contract pain 34 was missing: `Key::Char` names the key by
+    /// what it types with NO modifier, so a chord on shifted
+    /// punctuation is spellable at all. The engine cannot press a real
+    /// key — what it CAN pin is that the vocabulary is unambiguous and
+    /// that a shell reporting the shifted twin produces a pattern that
+    /// does not match, which is exactly the bug the port hit.
+    #[test]
+    fn a_chord_names_the_key_not_the_character_it_types() {
+        use crate::action::{Key, KeyPattern};
+
+        let spec = KeyPattern::command_shift(Key::Char('\\'));
+        // what a shell that reports the SHIFTED character would build
+        let shifted_twin = KeyPattern::command_shift(Key::Char('|'));
+        assert_ne!(spec, shifted_twin, "the twin is a DIFFERENT pattern — hence the dead chord");
+
+        // the keymap matches on the pattern whole, so the spec answers
+        // only for the spec
+        let runtime = Runtime::new();
+        let split = crate::action::ActionId("test.split");
+        runtime.bind(spec, split);
+        assert_eq!(runtime.match_key(&spec), Some(split));
+        assert_eq!(
+            runtime.match_key(&shifted_twin),
+            None,
+            "a shell that hands over the shifted char finds nothing bound"
+        );
+
+        // and the letters that survived by accident: lowercasing is why
+        // command-shift-G lives, and it says nothing about punctuation
+        assert_eq!(
+            KeyPattern::command_shift(Key::Char('g')),
+            KeyPattern::command_shift(Key::Char('G'.to_ascii_lowercase()))
+        );
+    }
 }
