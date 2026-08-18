@@ -193,12 +193,19 @@ pub struct DomField {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DomNode {
     pub kind: DomKind,
-    /// Offset from the parent NODE's origin (logical px).
+    /// Offset from the parent NODE's origin (logical px). Owned by
+    /// the ABSOLUTE lowering; a flow node leaves all four at zero and
+    /// speaks through `layout`.
     pub x: Px,
     pub y: Px,
     pub width: Px,
     pub height: Px,
     pub style: DomStyle,
+    /// `Some` = this node lives in the FLOW: the browser lays it out
+    /// from these semantics and the geometry fields above stay silent.
+    pub layout: Option<DomLayout>,
+    /// Real-element hints (tag, class, id) — the Dom's alone.
+    pub hints: DomHints,
     pub children: Vec<DomNode>,
 }
 
@@ -246,6 +253,8 @@ impl DomCapture {
                 background: Some(crate::theme::current().canvas),
                 ..DomStyle::default()
             },
+            layout: None,
+            hints: DomHints::default(),
             children: Vec::new(),
         };
         DomCapture {
@@ -288,6 +297,8 @@ impl DomCapture {
             width: frame.size.width,
             height: frame.size.height,
             style,
+            layout: None,
+            hints: DomHints::default(),
             children: Vec::new(),
         };
         // the node inherits the ink until a `Styled` says otherwise
@@ -459,6 +470,47 @@ impl DomCapture {
     }
 }
 
+// MARK: - The flow records
+
+/// The FLOW record: what a flow node tells the browser about layout —
+/// semantics, never coordinates. `None` on a node means the absolute
+/// lowering owns its geometry (today's whole scene; tomorrow only a
+/// `.layout(Exact)` interior). The wire twin of [`DomStyle`]: a full
+/// replace, one write per changed node.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DomLayout {
+    /// Gap between a flex container's children, px.
+    pub gap: Option<f64>,
+    /// Cross-axis alignment: 0 start, 1 center, 2 end, 3 baseline.
+    pub align: Option<u8>,
+    /// Padding `(top, right, bottom, left)`, px.
+    pub padding: Option<(f64, f64, f64, f64)>,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+    pub max_width: Option<f64>,
+    pub max_height: Option<f64>,
+    /// The flexible child: `flex:1 1 0` and a zeroed min-size.
+    pub grow: bool,
+    /// A virtual row's absolute offset inside its content box, px.
+    pub slot_y: Option<f64>,
+}
+
+/// Element hints only the Dom consumes — a real tag, a class, an id.
+/// Every other lowering ignores them, like `.rendering(Gpu)` on a
+/// pixel target. Empty on everything the engine makes by itself.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DomHints {
+    pub tag: Option<String>,
+    pub class: Option<String>,
+    pub dom_id: Option<String>,
+}
+
+impl DomHints {
+    pub fn is_empty(&self) -> bool {
+        self.tag.is_none() && self.class.is_none() && self.dom_id.is_none()
+    }
+}
+
 // MARK: - Patches
 
 /// The element kind a `Create` patch carries — what the glue
@@ -490,9 +542,10 @@ pub struct IslandFrame {
 /// the Dom up to date.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DomPatch {
-    /// A new element under `parent`, appended (positions are absolute
-    /// within the parent, so sibling order only decides paint stacking).
-    Create { id: u32, parent: u32, kind: CreateKind },
+    /// A new element under `parent`, placed before sibling `before`
+    /// (0 = appended). Under the absolute lowering order only decides
+    /// paint stacking; under the flow it IS the layout.
+    Create { id: u32, parent: u32, before: u32, kind: CreateKind, hints: DomHints },
     /// Removes the element AND its subtree.
     Remove { id: u32 },
     SetTransform { id: u32, x: f64, y: f64 },
@@ -505,6 +558,17 @@ pub enum DomPatch {
     SetScroll { id: u32, x: f64, y: f64 },
     SetImage { id: u32, image: DomImage },
     SetIcon { id: u32, icon: DomIcon },
+    /// The FULL flow record — the glue resets and applies, the exact
+    /// twin of `SetStyle` for the other half of an element's truth.
+    SetLayout { id: u32, layout: DomLayout },
+    /// The element moves before sibling `before` (0 = to the end)
+    /// under `parent` — one `insertBefore`, identity intact. Emitted
+    /// for flow parents only: absolute children never need it.
+    Move { id: u32, parent: u32, before: u32 },
+    /// Scroll container `id` brings `target` into view — the browser
+    /// computes the offset (dense lists only; a virtual list's rows
+    /// may not exist, so its reveal stays an engine `SetScroll`).
+    Reveal { id: u32, target: u32 },
 }
 
 // MARK: - Lowering (retained scene + diff)
@@ -737,6 +801,26 @@ fn note_island(id: u32, node: &DomNode, ctx: &mut LowerCtx) {
 
 /// Emits the patches that build `node` (already positioned) under
 /// `parent` and returns its retained mirror.
+/// [`create_subtree`] with a real position: the root lands `before`
+/// its next sibling (0 = append). The interior appends in order — a
+/// fresh subtree has nothing to dodge.
+fn create_subtree_before(
+    node: &DomNode,
+    parent: u32,
+    before: u32,
+    ctx: &mut LowerCtx,
+    patches: &mut Vec<DomPatch>,
+) -> Retained {
+    let opened = patches.len();
+    let created = create_subtree(node, parent, ctx, patches);
+    if before != 0
+        && let DomPatch::Create { before: slot, .. } = &mut patches[opened]
+    {
+        *slot = before;
+    }
+    created
+}
+
 fn create_subtree(
     node: &DomNode,
     parent: u32,
@@ -745,9 +829,25 @@ fn create_subtree(
 ) -> Retained {
     let id = *ctx.next_id;
     *ctx.next_id += 1;
-    patches.push(DomPatch::Create { id, parent, kind: create_kind(&node.kind) });
-    patches.push(DomPatch::SetTransform { id, x: node.x, y: node.y });
-    patches.push(DomPatch::SetSize { id, width: node.width, height: node.height });
+    patches.push(DomPatch::Create {
+        id,
+        parent,
+        before: 0,
+        kind: create_kind(&node.kind),
+        hints: node.hints.clone(),
+    });
+    match &node.layout {
+        // a flow node speaks semantics; its geometry fields are silent
+        Some(layout) => {
+            if *layout != DomLayout::default() {
+                patches.push(DomPatch::SetLayout { id, layout: layout.clone() });
+            }
+        }
+        None => {
+            patches.push(DomPatch::SetTransform { id, x: node.x, y: node.y });
+            patches.push(DomPatch::SetSize { id, width: node.width, height: node.height });
+        }
+    }
     if node.style != DomStyle::default() {
         patches.push(DomPatch::SetStyle { id, style: node.style.clone() });
     }
@@ -811,11 +911,25 @@ fn diff_node(
     crate::stats::note_diff_visit();
     let id = retained.id;
     let old = &retained.node;
-    if (old.x, old.y) != (new.x, new.y) {
-        patches.push(DomPatch::SetTransform { id, x: new.x, y: new.y });
-    }
-    if (old.width, old.height) != (new.width, new.height) {
-        patches.push(DomPatch::SetSize { id, width: new.width, height: new.height });
+    match &new.layout {
+        // a flow node speaks semantics — its geometry fields are silent
+        Some(layout) => {
+            if old.layout.as_ref() != Some(layout) {
+                patches.push(DomPatch::SetLayout { id, layout: layout.clone() });
+            }
+        }
+        None => {
+            // an absolute node that WAS flow clears its record first
+            if old.layout.is_some() {
+                patches.push(DomPatch::SetLayout { id, layout: DomLayout::default() });
+            }
+            if (old.x, old.y) != (new.x, new.y) {
+                patches.push(DomPatch::SetTransform { id, x: new.x, y: new.y });
+            }
+            if (old.width, old.height) != (new.width, new.height) {
+                patches.push(DomPatch::SetSize { id, width: new.width, height: new.height });
+            }
+        }
     }
     if old.style != new.style {
         patches.push(DomPatch::SetStyle { id, style: new.style.clone() });
@@ -855,6 +969,13 @@ fn diff_children(
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
+    // under a FLOW parent sibling order IS the layout, so the matching
+    // must also reconcile positions; under an absolute parent order
+    // only decides paint stacking and the old path stays byte-for-byte
+    if new.layout.is_some() {
+        diff_children_ordered(retained, new, ctx, patches);
+        return;
+    }
     let old_children = std::mem::take(&mut retained.children);
     let mut by_path: HashMap<String, Retained> = HashMap::new();
     let mut by_index: Vec<Option<Retained>> = Vec::with_capacity(old_children.len());
@@ -907,6 +1028,138 @@ fn diff_children(
     retained.children = next;
 }
 
+/// The keyed, ORDERED reconciliation a flow parent needs. Groups match
+/// by identity path, everything else by old position and kind — and
+/// then position itself reconciles: fresh children are created back to
+/// front, each placed `before` its already-real next sibling (an
+/// insert costs zero moves), while surviving children off the longest
+/// increasing subsequence of their old order move with one `Move`
+/// each — a swap of two rows is exactly two patches.
+fn diff_children_ordered(
+    retained: &mut Retained,
+    new: &DomNode,
+    ctx: &mut LowerCtx,
+    patches: &mut Vec<DomPatch>,
+) {
+    enum Plan<'a> {
+        Survivor { old_position: usize, node: Retained },
+        Fresh(&'a DomNode),
+    }
+
+    let old_children = std::mem::take(&mut retained.children);
+    let mut by_path: HashMap<String, (usize, Retained)> = HashMap::new();
+    let mut by_index: Vec<Option<Retained>> = Vec::with_capacity(old_children.len());
+    for (position, old) in old_children.into_iter().enumerate() {
+        if let DomKind::Group { path } = &old.node.kind {
+            by_path.insert(path.clone(), (position, old));
+            by_index.push(None);
+        } else {
+            by_index.push(Some(old));
+        }
+    }
+
+    // match first — creation waits for the placement walk below
+    let mut plan: Vec<Plan> = Vec::with_capacity(new.children.len());
+    for (index, child) in new.children.iter().enumerate() {
+        let matched = match &child.kind {
+            DomKind::Group { path } => by_path.remove(path),
+            kind => by_index.get_mut(index).and_then(|slot| match slot.take() {
+                Some(old)
+                    if std::mem::discriminant(&old.node.kind)
+                        == std::mem::discriminant(kind) =>
+                {
+                    Some((index, old))
+                }
+                Some(old) => {
+                    *slot = Some(old);
+                    None
+                }
+                None => None,
+            }),
+        };
+        match matched {
+            Some((old_position, mut old)) => {
+                diff_node(&mut old, child, ctx, patches);
+                plan.push(Plan::Survivor { old_position, node: old });
+            }
+            None => plan.push(Plan::Fresh(child)),
+        }
+    }
+
+    // removals go out before placements: an anchor is never a corpse
+    for (_, (_, leftover)) in by_path {
+        remove_subtree(&leftover, ctx, patches);
+    }
+    for leftover in by_index.into_iter().flatten() {
+        remove_subtree(&leftover, ctx, patches);
+    }
+
+    // the stable spine: survivors whose old order already reads in
+    // increasing sequence stay put; everything else moves or mounts
+    let survivor_positions: Vec<(usize, usize)> = plan
+        .iter()
+        .enumerate()
+        .filter_map(|(at, entry)| match entry {
+            Plan::Survivor { old_position, .. } => Some((at, *old_position)),
+            Plan::Fresh(_) => None,
+        })
+        .collect();
+    let stable: std::collections::HashSet<usize> =
+        longest_increasing(&survivor_positions).into_iter().collect();
+
+    // back to front: the anchor below is always already real
+    let parent = retained.id;
+    let mut anchor = 0u32;
+    let mut next: Vec<Option<Retained>> = plan
+        .iter()
+        .map(|_| None)
+        .collect();
+    for at in (0..plan.len()).rev() {
+        match plan.pop().expect("walking the plan") {
+            Plan::Survivor { node, .. } => {
+                if !stable.contains(&at) {
+                    patches.push(DomPatch::Move { id: node.id, parent, before: anchor });
+                }
+                anchor = node.id;
+                next[at] = Some(node);
+            }
+            Plan::Fresh(child) => {
+                let created = create_subtree_before(child, parent, anchor, ctx, patches);
+                anchor = created.id;
+                next[at] = Some(created);
+            }
+        }
+    }
+    retained.children = next.into_iter().map(|slot| slot.expect("planned")).collect();
+}
+
+/// The `at` indices of the longest increasing run of `old_position`s —
+/// the survivors that need no move. O(n log n), std only.
+fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
+    let mut tails: Vec<usize> = Vec::new(); // indices into `pairs`
+    let mut parents: Vec<Option<usize>> = vec![None; pairs.len()];
+    for (index, &(_, old_position)) in pairs.iter().enumerate() {
+        let place = tails
+            .partition_point(|&tail| pairs[tail].1 < old_position);
+        if place > 0 {
+            parents[index] = Some(tails[place - 1]);
+        }
+        if place == tails.len() {
+            tails.push(index);
+        } else {
+            tails[place] = index;
+        }
+    }
+    let mut run = Vec::with_capacity(tails.len());
+    let mut cursor = tails.last().copied();
+    while let Some(index) = cursor {
+        run.push(pairs[index].0);
+        cursor = parents[index];
+    }
+    run.reverse();
+    run
+}
+
 // MARK: - The wire encoding
 
 /// The version of the wire contract between [`encode`] and the glue.
@@ -928,7 +1181,7 @@ fn diff_children(
 ///
 /// A test pins the glue to this number: bump one side alone and the
 /// suite goes red before the browser ever gets the chance to.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -936,9 +1189,11 @@ pub const ABI_VERSION: u32 = 1;
 /// ```text
 /// u32 count
 /// per patch: u8 op, u32 id, payload
-///   1 create        u32 parent, u8 kind (0 group, 1 box, 2 text,
-///                                        3 field, 4 scroll, 5 content,
-///                                        6 canvas, 7 image, 8 icon)
+///   1 create        u32 parent, u32 before (0 = append), three hint
+///                   strings (u8 len + utf8 each: tag, class, id),
+///                   u8 kind (0 group, 1 box, 2 text, 3 field,
+///                            4 scroll, 5 content, 6 canvas, 7 image,
+///                            8 icon)
 ///   2 remove        —
 ///   3 set transform f32 x, f32 y
 ///   4 set size      f32 w, f32 h
@@ -983,6 +1238,14 @@ pub const ABI_VERSION: u32 = 1;
 ///                   rides the geometry: the `<svg>` draws with
 ///                   `currentColor`, so hover and press flip through
 ///                   the box above with no patch of their own
+///  11 set layout    u16 mask, fields in bit order:
+///                   0 gap f32,  1 align u8 (0 start, 1 center,
+///                   2 end, 3 baseline),  2 padding f32 x4 (t r b l),
+///                   3 width f32,  4 height f32,  5 max width f32,
+///                   6 max height f32,  7 grow (flag, no payload),
+///                   8 slot y f32 (a virtual row's offset)
+///  12 move          u32 parent, u32 before (0 = to the end)
+///  13 reveal        u32 target — the container scrolls it into view
 /// ```
 pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
     crate::stats::time(crate::stats::Stage::Encode, || {
@@ -997,10 +1260,14 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
     push_u32(&mut out, patches.len() as u32);
     for patch in patches {
         match patch {
-            DomPatch::Create { id, parent, kind } => {
+            DomPatch::Create { id, parent, before, kind, hints } => {
                 out.push(1);
                 push_u32(&mut out, *id);
                 push_u32(&mut out, *parent);
+                push_u32(&mut out, *before);
+                push_hint(&mut out, hints.tag.as_deref());
+                push_hint(&mut out, hints.class.as_deref());
+                push_hint(&mut out, hints.dom_id.as_deref());
                 out.push(match kind {
                     CreateKind::Group => 0,
                     CreateKind::Box => 1,
@@ -1108,6 +1375,77 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                     push_f32(&mut out, width as f64);
                     push_bytes_u32(&mut out, crate::icon::to_svg_path(draw.path).as_bytes());
                 }
+            }
+            DomPatch::SetLayout { id, layout } => {
+                out.push(11);
+                push_u32(&mut out, *id);
+                let mut mask = 0u16;
+                if layout.gap.is_some() {
+                    mask |= 1;
+                }
+                if layout.align.is_some() {
+                    mask |= 1 << 1;
+                }
+                if layout.padding.is_some() {
+                    mask |= 1 << 2;
+                }
+                if layout.width.is_some() {
+                    mask |= 1 << 3;
+                }
+                if layout.height.is_some() {
+                    mask |= 1 << 4;
+                }
+                if layout.max_width.is_some() {
+                    mask |= 1 << 5;
+                }
+                if layout.max_height.is_some() {
+                    mask |= 1 << 6;
+                }
+                if layout.grow {
+                    mask |= 1 << 7;
+                }
+                if layout.slot_y.is_some() {
+                    mask |= 1 << 8;
+                }
+                push_u16(&mut out, mask);
+                if let Some(gap) = layout.gap {
+                    push_f32(&mut out, gap);
+                }
+                if let Some(align) = layout.align {
+                    out.push(align);
+                }
+                if let Some((top, right, bottom, left)) = layout.padding {
+                    push_f32(&mut out, top);
+                    push_f32(&mut out, right);
+                    push_f32(&mut out, bottom);
+                    push_f32(&mut out, left);
+                }
+                if let Some(width) = layout.width {
+                    push_f32(&mut out, width);
+                }
+                if let Some(height) = layout.height {
+                    push_f32(&mut out, height);
+                }
+                if let Some(max_width) = layout.max_width {
+                    push_f32(&mut out, max_width);
+                }
+                if let Some(max_height) = layout.max_height {
+                    push_f32(&mut out, max_height);
+                }
+                if let Some(slot_y) = layout.slot_y {
+                    push_f32(&mut out, slot_y);
+                }
+            }
+            DomPatch::Move { id, parent, before } => {
+                out.push(12);
+                push_u32(&mut out, *id);
+                push_u32(&mut out, *parent);
+                push_u32(&mut out, *before);
+            }
+            DomPatch::Reveal { id, target } => {
+                out.push(13);
+                push_u32(&mut out, *id);
+                push_u32(&mut out, *target);
             }
         }
     }
@@ -1252,6 +1590,20 @@ fn push_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+/// One hint string: `u8` length + utf8 (0 = none). Hints are short by
+/// construction — a tag or a class list, never content.
+fn push_hint(out: &mut Vec<u8>, hint: Option<&str>) {
+    match hint {
+        Some(value) => {
+            let bytes = value.as_bytes();
+            let len = bytes.len().min(u8::MAX as usize);
+            out.push(len as u8);
+            out.extend_from_slice(&bytes[..len]);
+        }
+        None => out.push(0),
+    }
+}
+
 fn push_f32(out: &mut Vec<u8>, value: f64) {
     out.extend_from_slice(&(value as f32).to_le_bytes());
 }
@@ -1284,7 +1636,10 @@ mod tests {
             | DomPatch::SetField { id, .. }
             | DomPatch::SetImage { id, .. }
             | DomPatch::SetIcon { id, .. }
-            | DomPatch::SetScroll { id, .. } => *id,
+            | DomPatch::SetScroll { id, .. }
+            | DomPatch::SetLayout { id, .. }
+            | DomPatch::Move { id, .. }
+            | DomPatch::Reveal { id, .. } => *id,
         }
     }
 
@@ -1336,7 +1691,7 @@ mod tests {
         let creates: Vec<_> = patches
             .iter()
             .filter_map(|patch| match patch {
-                DomPatch::Create { id, parent, kind } => Some((*id, *parent, *kind)),
+                DomPatch::Create { id, parent, kind, .. } => Some((*id, *parent, *kind)),
                 _ => None,
             })
             .collect();
@@ -1719,7 +2074,13 @@ mod tests {
     #[test]
     fn the_encoding_is_byte_stable() {
         let patches = vec![
-            DomPatch::Create { id: 7, parent: 0, kind: CreateKind::Box },
+            DomPatch::Create {
+                id: 7,
+                parent: 0,
+                before: 0,
+                kind: CreateKind::Box,
+                hints: DomHints::default(),
+            },
             DomPatch::SetTransform { id: 7, x: 10.0, y: 20.0 },
             DomPatch::SetStyle {
                 id: 7,
@@ -1737,6 +2098,8 @@ mod tests {
             &[1],
             &7u32.to_le_bytes()[..],
             &0u32.to_le_bytes()[..],
+            &0u32.to_le_bytes()[..],
+            &[0, 0, 0],
             &[1],
             &[3],
             &7u32.to_le_bytes()[..],
@@ -2242,6 +2605,159 @@ mod tests {
             !patches.is_empty(),
             "the second world invalidates — its reads bind to living states"
         );
+    }
+
+    // MARK: - The flow vocabulary (the wire half; the capture rides
+    // in the next round)
+
+    fn flow_row(path: &str) -> DomNode {
+        DomNode {
+            kind: DomKind::Group { path: path.to_string() },
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+            style: DomStyle::default(),
+            layout: Some(DomLayout::default()),
+            hints: DomHints::default(),
+            children: Vec::new(),
+        }
+    }
+
+    fn flow_root(children: Vec<DomNode>) -> DomNode {
+        DomNode {
+            kind: DomKind::Root,
+            x: 0.0,
+            y: 0.0,
+            width: 400.0,
+            height: 300.0,
+            style: DomStyle::default(),
+            layout: Some(DomLayout { gap: Some(8.0), ..DomLayout::default() }),
+            hints: DomHints::default(),
+            children,
+        }
+    }
+
+    /// The reorder contract: two rows trade places in a five-row flow
+    /// list, and the wire carries exactly two `Move`s — the stable
+    /// spine never travels.
+    #[test]
+    fn a_swap_under_flow_is_two_moves() {
+        let mut lowering = DomLowering::default();
+        let display = crate::layout::DisplayList::default();
+        let rows = |order: &[&str]| flow_root(order.iter().map(|p| flow_row(p)).collect());
+
+        let mount = lowering.lower(&rows(&["a", "b", "c", "d", "e"]), &display);
+        assert_eq!(
+            mount.iter().filter(|p| matches!(p, DomPatch::Create { .. })).count(),
+            5,
+            "{mount:#?}"
+        );
+
+        let swapped = lowering.lower(&rows(&["a", "d", "c", "b", "e"]), &display);
+        let moves: Vec<_> =
+            swapped.iter().filter(|p| matches!(p, DomPatch::Move { .. })).collect();
+        assert_eq!(moves.len(), 2, "a swap is two moves: {swapped:#?}");
+        assert!(
+            !swapped.iter().any(|p| matches!(
+                p,
+                DomPatch::Create { .. } | DomPatch::Remove { .. } | DomPatch::SetTransform { .. }
+            )),
+            "nothing mounts, nothing leaves, nothing is positioned by hand: {swapped:#?}"
+        );
+    }
+
+    /// A mid-list insert lands `before` its real next sibling — zero
+    /// moves, and the survivors stay silent.
+    #[test]
+    fn an_insert_under_flow_is_one_positioned_create() {
+        let mut lowering = DomLowering::default();
+        let display = crate::layout::DisplayList::default();
+        let rows = |order: &[&str]| flow_root(order.iter().map(|p| flow_row(p)).collect());
+
+        let mount = lowering.lower(&rows(&["a", "b", "c"]), &display);
+        let ids: Vec<u32> = mount
+            .iter()
+            .filter_map(|p| match p {
+                DomPatch::Create { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+
+        let grown = lowering.lower(&rows(&["a", "new", "b", "c"]), &display);
+        let creates: Vec<_> = grown
+            .iter()
+            .filter_map(|p| match p {
+                DomPatch::Create { id, before, .. } => Some((*id, *before)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(creates.len(), 1, "{grown:#?}");
+        assert_eq!(
+            creates[0].1, ids[1],
+            "the fresh row lands before what was row b: {grown:#?}"
+        );
+        assert!(
+            !grown.iter().any(|p| matches!(p, DomPatch::Move { .. })),
+            "an insert never moves a survivor: {grown:#?}"
+        );
+    }
+
+    /// A flow node's layout travels as ONE record — and its geometry
+    /// fields never do.
+    #[test]
+    fn a_flow_layout_change_is_one_setlayout() {
+        let mut lowering = DomLowering::default();
+        let display = crate::layout::DisplayList::default();
+        let with_gap = |gap: f64| {
+            let mut root = flow_root(vec![flow_row("a")]);
+            root.layout = Some(DomLayout { gap: Some(gap), ..DomLayout::default() });
+            root
+        };
+
+        let _ = lowering.lower(&with_gap(8.0), &display);
+        let regapped = lowering.lower(&with_gap(12.0), &display);
+        assert_eq!(regapped.len(), 1, "{regapped:#?}");
+        assert!(matches!(
+            &regapped[0],
+            DomPatch::SetLayout { id: 0, layout } if layout.gap == Some(12.0)
+        ));
+    }
+
+    /// The three new encodings, pinned byte for byte.
+    #[test]
+    fn the_flow_encoding_is_byte_stable() {
+        let patches = vec![
+            DomPatch::SetLayout {
+                id: 5,
+                layout: DomLayout {
+                    gap: Some(8.0),
+                    grow: true,
+                    slot_y: Some(120.0),
+                    ..DomLayout::default()
+                },
+            },
+            DomPatch::Move { id: 5, parent: 1, before: 9 },
+            DomPatch::Reveal { id: 3, target: 44 },
+        ];
+        let bytes = encode(&patches);
+        let expected: Vec<u8> = [
+            &3u32.to_le_bytes()[..],
+            &[11],
+            &5u32.to_le_bytes()[..],
+            &(1u16 | 1 << 7 | 1 << 8).to_le_bytes()[..],
+            &8f32.to_le_bytes()[..],
+            &120f32.to_le_bytes()[..],
+            &[12],
+            &5u32.to_le_bytes()[..],
+            &1u32.to_le_bytes()[..],
+            &9u32.to_le_bytes()[..],
+            &[13],
+            &3u32.to_le_bytes()[..],
+            &44u32.to_le_bytes()[..],
+        ]
+        .concat();
+        assert_eq!(bytes, expected);
     }
 
     // MARK: - The ABI handshake

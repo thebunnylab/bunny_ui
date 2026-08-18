@@ -18,7 +18,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 1;
+const EXPECTED_ABI = 2;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default.
@@ -146,7 +146,7 @@ function rgba(packed) {
   return `rgba(${r}, ${g}, ${b}, ${a / 255})`;
 }
 
-function createElementOf(kind) {
+function createElementOf(kind, tag) {
   // 0 group, 1 box, 2 text, 3 field, 4 scroll, 5 content, 6 canvas,
   // 7 image
   if (kind === 6) {
@@ -197,7 +197,7 @@ function createElementOf(kind) {
     }
     return input;
   }
-  const el = document.createElement("div");
+  const el = document.createElement(tag || "div");
   el.style.cssText = "position:absolute;left:0;top:0;box-sizing:border-box;";
   if (kind === 2) {
     el.style.whiteSpace = "pre";
@@ -241,15 +241,23 @@ function applyPatches(view, length) {
     const id = u32();
     if (op === 1) {
       const parent = u32();
+      const before = u32();
+      const tag = text(u8());
+      const cls = text(u8());
+      const domId = text(u8());
       const kind = u8();
-      const el = createElementOf(kind);
+      const el = createElementOf(kind, tag);
       el.dataset.n = id;
+      if (cls) el.className = cls;
+      if (domId) el.id = domId;
       if (kind === 4) {
         el.addEventListener("scroll", () => {
           wasm.bunny_dom_scroll(id, el.scrollLeft, el.scrollTop);
         });
       }
-      elements.get(parent)?.appendChild(el);
+      const home = elements.get(parent);
+      const anchor = before ? elements.get(before) : null;
+      home?.insertBefore(el, anchor ?? null);
       elements.set(id, el);
     } else if (op === 2) {
       const el = elements.get(id);
@@ -508,6 +516,86 @@ function applyPatches(view, length) {
         }
         el.appendChild(path);
       }
+    } else if (op === 11) {
+      // the FULL flow record — reset, then apply what the mask carries
+      const el = elements.get(id);
+      const mask = u16();
+      if (el) {
+        const style = el.style;
+        style.gap = "";
+        style.alignItems = "";
+        style.padding = "";
+        style.width = "";
+        style.height = "";
+        style.maxWidth = "";
+        style.maxHeight = "";
+        style.flex = "";
+        style.minWidth = "";
+        style.minHeight = "";
+        style.position = "";
+        style.top = "";
+        style.left = "";
+        style.right = "";
+      }
+      const apply = el ? el.style : null;
+      if (mask & 1) {
+        const gap = f32();
+        if (apply) apply.gap = `${gap}px`;
+      }
+      if (mask & 2) {
+        const align = u8();
+        if (apply) {
+          apply.alignItems =
+            align === 1 ? "center" : align === 2 ? "flex-end" : align === 3 ? "baseline" : "flex-start";
+        }
+      }
+      if (mask & 4) {
+        const [top, right, bottom, left] = [f32(), f32(), f32(), f32()];
+        if (apply) apply.padding = `${top}px ${right}px ${bottom}px ${left}px`;
+      }
+      if (mask & 8) {
+        const width = f32();
+        if (apply) apply.width = `${width}px`;
+      }
+      if (mask & 16) {
+        const height = f32();
+        if (apply) apply.height = `${height}px`;
+      }
+      if (mask & 32) {
+        const max = f32();
+        if (apply) apply.maxWidth = `${max}px`;
+      }
+      if (mask & 64) {
+        const max = f32();
+        if (apply) apply.maxHeight = `${max}px`;
+      }
+      if (mask & 128 && apply) {
+        // the flexible child — and the classic flex footgun: a zeroed
+        // min-size, or content refuses to shrink
+        apply.flex = "1 1 0";
+        apply.minWidth = "0";
+        apply.minHeight = "0";
+      }
+      if (mask & 256) {
+        const slotY = f32();
+        if (apply) {
+          // a virtual row: absolute inside its relative content box
+          apply.position = "absolute";
+          apply.top = `${slotY}px`;
+          apply.left = "0";
+          apply.right = "0";
+        }
+      }
+    } else if (op === 12) {
+      // one insertBefore, identity intact (0 = to the end)
+      const el = elements.get(id);
+      const parent = elements.get(u32());
+      const before = u32();
+      if (el && parent) parent.insertBefore(el, before ? (elements.get(before) ?? null) : null);
+    } else if (op === 13) {
+      // the browser computes the offset — dense lists only
+      const target = elements.get(u32());
+      if (target) target.scrollIntoView({ block: "nearest" });
     }
   }
 }
