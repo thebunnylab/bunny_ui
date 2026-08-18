@@ -318,6 +318,9 @@ pub enum LayoutNode {
         /// scrolls just enough to reveal the row — the wheel stays
         /// sovereign in between (`.scroll_target(id)`).
         target: Option<String>,
+        /// Which way the region travels. A list is vertical; an editor
+        /// without wrap, a terminal and a spreadsheet go sideways too.
+        axes: ScrollAxes,
         child: Box<LayoutNode>,
     },
     /// A two-lane split with a user-draggable divider. The position is
@@ -999,6 +1002,24 @@ impl DisplayList {
 /// The outputs of the placement pass: frames by identity (tests), the
 /// draw list (rasterizer/backends) and the interaction targets (in paint
 /// order — hit-testing scans back to front, the top one wins).
+/// The directions a scroll region travels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScrollAxes {
+    Vertical,
+    Horizontal,
+    Both,
+}
+
+impl ScrollAxes {
+    pub fn vertical(self) -> bool {
+        matches!(self, ScrollAxes::Vertical | ScrollAxes::Both)
+    }
+
+    pub fn horizontal(self) -> bool {
+        matches!(self, ScrollAxes::Horizontal | ScrollAxes::Both)
+    }
+}
+
 /// A placed scroll region — the wheel's map. Regions enter
 /// child-before-parent: the innermost one under the point decides first.
 #[derive(Clone, Debug)]
@@ -1947,7 +1968,10 @@ impl LayoutNode {
             // a split FILLS the offer on both axes — its whole job is
             // dividing the room it was given
             LayoutNode::Split { .. } => true,
-            LayoutNode::Scroll { .. } => axis == Axis::Vertical,
+            LayoutNode::Scroll { axes, .. } => match axis {
+                Axis::Vertical => axes.vertical(),
+                Axis::Horizontal => axes.horizontal(),
+            },
             // a field takes the offered width (like the real TextField)
             LayoutNode::Field { .. } => axis == Axis::Horizontal,
             LayoutNode::MaxFrame { max_width, max_height, child, .. } => match axis {
@@ -2269,11 +2293,13 @@ impl LayoutNode {
                 (size, Fit::Wrapped(child_size, Box::new(fit)))
             }
 
-            LayoutNode::Scroll { child, .. } => {
+            LayoutNode::Scroll { axes, child, .. } => {
+                // the scrolling axes stay OPEN — the content takes its
+                // natural extent there and the region travels through it
                 let (content, fit) = child.measure(
                     Proposal {
-                        width: proposal.width,
-                        height: None,
+                        width: if axes.horizontal() { None } else { proposal.width },
+                        height: if axes.vertical() { None } else { proposal.height },
                     },
                     env,
                 );
@@ -2929,7 +2955,10 @@ impl LayoutNode {
                 child.place(Rect { origin: Point { x, y }, size: child_size }, *fit, env, out);
             }
 
-            (LayoutNode::Scroll { path, target, child }, Fit::ScrollContent(content, fit)) => {
+            (
+                LayoutNode::Scroll { path, target, axes, child },
+                Fit::ScrollContent(content, fit),
+            ) => {
                 // per-axis travel over SNAPPED values: "scrollable by
                 // 0.000001px" does not exist here by construction
                 let max_x = (content.width.round() - frame.size.width.round()).max(0.0);
@@ -2996,8 +3025,11 @@ impl LayoutNode {
                     out.region_stack.pop();
                 }
                 out.anchors.pop();
-                if max_y > 0.0 {
+                if max_y > 0.0 && axes.vertical() {
                     draw_scrollbar(frame, content.height, offset.y, max_y, out);
+                }
+                if max_x > 0.0 && axes.horizontal() {
+                    draw_scrollbar_h(frame, content.width, offset.x, max_x, out);
                 }
                 out.pop_clip();
                 if let Some(path) = path {
@@ -3749,6 +3781,28 @@ fn draw_scrollbar(frame: Rect, content_h: Px, offset_y: Px, max_y: Px, out: &mut
     });
 }
 
+/// The vertical thumb, turned on its side.
+fn draw_scrollbar_h(frame: Rect, content_w: Px, offset_x: Px, max_x: Px, out: &mut Placement) {
+    let track = frame.size.width - 2.0 * SCROLLBAR_INSET;
+    if track <= 0.0 {
+        return;
+    }
+    let thumb_w = ((frame.size.width / content_w) * track).max(SCROLLBAR_MIN).min(track);
+    let travel = track - thumb_w;
+    let thumb_x = frame.origin.x + SCROLLBAR_INSET + travel * (offset_x / max_x);
+    out.display.push(DrawCommand::FillRect {
+        rect: Rect {
+            origin: Point {
+                x: thumb_x,
+                y: frame.origin.y + frame.size.height - SCROLLBAR_INSET - SCROLLBAR_W,
+            },
+            size: Size { width: thumb_w, height: SCROLLBAR_W },
+        },
+        color: crate::theme::current().scrollbar,
+        corner_radius: SCROLLBAR_W / 2.0,
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn place_stack(
     axis: Axis,
@@ -4022,6 +4076,7 @@ mod tests {
                 boundary(
                     "region",
                     LayoutNode::Scroll {
+                        axes: crate::layout::ScrollAxes::Vertical,
                         path: None,
                         target: None,
                         child: Box::new(boundary("content", text(1000))),
@@ -4344,6 +4399,7 @@ mod tests {
         };
 
         let root = LayoutNode::Scroll {
+            axes: crate::layout::ScrollAxes::Vertical,
             path: Some("list".to_string()),
             target: None,
             child: Box::new(rows(10)),
@@ -4377,6 +4433,7 @@ mod tests {
             child: Box::new(text(4)),
         };
         let root = LayoutNode::Scroll {
+            axes: crate::layout::ScrollAxes::Vertical,
             path: Some("list".to_string()),
             target: None,
             child: Box::new(LayoutNode::Stack {
@@ -4409,6 +4466,7 @@ mod tests {
     #[test]
     fn scrollbar_appears_only_with_overflow() {
         let scroll = |count: usize| LayoutNode::Scroll {
+            axes: crate::layout::ScrollAxes::Vertical,
             path: Some("list".to_string()),
             target: None,
             child: Box::new(rows(count)),

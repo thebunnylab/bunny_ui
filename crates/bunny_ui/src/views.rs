@@ -480,6 +480,54 @@ impl View for Icon {
     }
 }
 
+/// A scroll region of one's own — a vertical viewport by default. The
+/// lists already scroll themselves; this is for everything else that
+/// overflows: `.horizontal()` goes sideways (an editor without wrap, a
+/// terminal line), `.both_axes()` travels freely (a spreadsheet).
+#[derive(Clone)]
+pub struct ScrollView<C> {
+    content: C,
+    axes: crate::layout::ScrollAxes,
+}
+
+impl<C> ScrollView<C> {
+    /// Sideways only.
+    pub fn horizontal(mut self) -> Self {
+        self.axes = crate::layout::ScrollAxes::Horizontal;
+        self
+    }
+
+    /// Both ways.
+    pub fn both_axes(mut self) -> Self {
+        self.axes = crate::layout::ScrollAxes::Both;
+        self
+    }
+}
+
+impl<C: View> View for ScrollView<C> {
+    type Arity = Single;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let mut inner = NodeList::new();
+        self.content.render_into(ctx, &mut inner);
+        let (prints, layouts) = inner.into_parts();
+        out.push(RenderNode::branch(
+            if crate::view::print_enabled() { "ScrollView".to_string() } else { String::new() },
+            prints,
+        ));
+        out.push_layout(LayoutNode::Scroll {
+            path: motor::identity::cursor_scope(),
+            target: None,
+            axes: self.axes,
+            child: Box::new(wrap_layout(layouts)),
+        });
+    }
+}
+
+pub fn scroll<C: View>(content: C) -> ScrollView<C> {
+    ScrollView { content, axes: crate::layout::ScrollAxes::Vertical }
+}
+
 /// What a drag carries: the typed value, erased for the wire between
 /// source and target, and the label the cursor wears on the way.
 #[derive(Clone)]
@@ -915,6 +963,7 @@ where
         // retained offset (a remounted list restores the position)
         out.push_layout(LayoutNode::Scroll {
             target: None,
+            axes: crate::layout::ScrollAxes::Vertical,
             path: motor::identity::cursor_scope(),
             child: Box::new(LayoutNode::Stack {
                 axis: Axis::Vertical,
@@ -1143,6 +1192,7 @@ where
         ));
         out.push_layout(LayoutNode::Scroll {
             target: reveal_id,
+            axes: crate::layout::ScrollAxes::Vertical,
             path: motor::identity::cursor_scope(),
             child: Box::new(LayoutNode::VirtualStack {
                 row_extent: snapshot.map(|snap| snap.row_extent).unwrap_or(0.0),
@@ -1309,6 +1359,7 @@ impl<H: View, C: View> View for Section<H, C> {
         out.push_layout(if self.kind == "List" {
             LayoutNode::Scroll {
                 target: None,
+                axes: crate::layout::ScrollAxes::Vertical,
                 path: motor::identity::cursor_scope(),
                 child: Box::new(stacked),
             }

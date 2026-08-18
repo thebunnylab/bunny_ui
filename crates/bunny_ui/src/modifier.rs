@@ -261,10 +261,10 @@ impl Modifier {
 /// after visual modifiers). Without a scroll region it is a no-op.
 fn rewrite_scroll_node(
     node: LayoutNode,
-    rewrite: &impl Fn(Option<String>, Box<LayoutNode>) -> LayoutNode,
+    rewrite: &impl Fn(Option<String>, crate::layout::ScrollAxes, Box<LayoutNode>) -> LayoutNode,
 ) -> LayoutNode {
     match node {
-        LayoutNode::Scroll { path, child, .. } => rewrite(path, child),
+        LayoutNode::Scroll { path, axes, child, .. } => rewrite(path, axes, child),
         LayoutNode::Styled { props, child } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
@@ -744,9 +744,10 @@ impl<C: View<Arity = Single>> View for Modified<C> {
                 })
             }),
             Modifier::ScrollTarget(id) => out.wrap_last_layout(|node| {
-                rewrite_scroll_node(node, &|path, child| LayoutNode::Scroll {
+                rewrite_scroll_node(node, &|path, axes, child| LayoutNode::Scroll {
                     path,
                     target: Some(id.clone()),
+                    axes,
                     child,
                 })
             }),

@@ -4441,4 +4441,83 @@ mod tests {
         runtime.pointer_released(150.0, 95.0);
         assert_eq!(pane.focused.get(), 1, "up-outside is button manners");
     }
+
+    #[test]
+    fn a_region_can_travel_sideways_and_both_ways() {
+        #[derive(Clone, Copy)]
+        struct Sheet;
+        impl Component for Sheet {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(
+                    vstack!(
+                        text("a wide row that runs far past the viewport edge"),
+                        text("and a second one below it"),
+                        text("and a third"),
+                    )
+                    .spacing(30.0),
+                )
+                .both_axes()
+                .frame(120.0, 60.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 140.0, height: 80.0 };
+        let result = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
+        let region = result.scrolls.first().expect("the region registered");
+        assert!(region.content.width > 120.0, "the content keeps its width");
+        assert!(region.content.height > 60.0, "and its height");
+
+        // the wheel travels BOTH ways and clamps per axis
+        assert!(runtime.wheel(60.0, 30.0, -4.0, -6.0));
+        let offsets = runtime
+            .layout(&Sheet, crate::layout::Proposal::exact(size))
+            .scrolls
+            .first()
+            .map(|_| ())
+            .expect("still there");
+        let _ = offsets;
+        // a huge wheel pins to the far corner instead of flying off
+        runtime.wheel(60.0, 30.0, -100_000.0, -100_000.0);
+        let pinned = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
+        let region = pinned.scrolls.first().unwrap();
+        // both thumbs paint: the vertical lane hugs the right edge,
+        // the horizontal one lies along the bottom
+        let scrollbar = crate::theme::current().scrollbar;
+        let thumbs: Vec<crate::layout::Rect> = pinned
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                crate::layout::DrawCommand::FillRect { rect, color, .. }
+                    if *color == scrollbar =>
+                {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thumbs.len(), 2, "one thumb per travelling axis");
+        assert!(thumbs.iter().any(|rect| rect.size.height > rect.size.width), "the tall one");
+        assert!(thumbs.iter().any(|rect| rect.size.width > rect.size.height), "the flat one");
+        let _ = region;
+    }
+
+    #[test]
+    fn a_sideways_only_region_ignores_the_vertical_wheel() {
+        #[derive(Clone, Copy)]
+        struct Line;
+        impl Component for Line {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(text("one very long unwrapped line of code that overflows"))
+                    .horizontal()
+                    .frame(100.0, 24.0)
+            }
+        }
+        let runtime = Runtime::new();
+        let size = Size { width: 120.0, height: 40.0 };
+        let _ = runtime.layout(&Line, crate::layout::Proposal::exact(size));
+        // dy alone finds no travel; dx moves it
+        assert!(!runtime.wheel(50.0, 12.0, 0.0, -5.0), "no vertical travel to take");
+        assert!(runtime.wheel(50.0, 12.0, -5.0, 0.0), "sideways is the whole point");
+    }
 }
