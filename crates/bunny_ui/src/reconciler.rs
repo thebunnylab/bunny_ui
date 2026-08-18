@@ -73,6 +73,9 @@ pub(crate) struct Entry {
     pub editors: Vec<EditorEntry>,
     /// The body's split-position writers — same retention.
     pub splits: Vec<SplitEntry>,
+    /// The paths of the app's own boxes (`custom(…)`) — the map that
+    /// says a focused escape hatch is still on screen.
+    pub customs: Vec<String>,
     /// The body's named-action handlers — same retention.
     pub handlers: Vec<HandlerEntry>,
     /// Key contexts declared in the body (`.key_context(name)`) — a
@@ -89,6 +92,7 @@ struct BuildingFrame {
     actions: Vec<ActionEntry>,
     editors: Vec<EditorEntry>,
     splits: Vec<SplitEntry>,
+    customs: Vec<String>,
     handlers: Vec<HandlerEntry>,
     contexts: Vec<&'static str>,
 }
@@ -106,6 +110,7 @@ struct PassState {
     root_actions: Vec<ActionEntry>,
     root_editors: Vec<EditorEntry>,
     root_splits: Vec<SplitEntry>,
+    root_customs: Vec<String>,
     root_handlers: Vec<HandlerEntry>,
     root_contexts: Vec<&'static str>,
     /// Instrumentation: bodies that ran in this pass.
@@ -200,7 +205,7 @@ pub(crate) fn finish_entry(
     node: RenderNode,
     layout: LayoutNode,
 ) {
-    let (effects, actions, editors, splits, handlers, contexts) = PASS.with(|pass| {
+    let (effects, actions, editors, splits, customs, handlers, contexts) = PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         match pass.building.pop() {
             Some(frame) => {
@@ -210,11 +215,13 @@ pub(crate) fn finish_entry(
                     frame.actions,
                     frame.editors,
                     frame.splits,
+                    frame.customs,
                     frame.handlers,
                     frame.contexts,
                 )
             }
             None => (
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -240,6 +247,7 @@ pub(crate) fn finish_entry(
                 actions,
                 editors,
                 splits,
+                customs,
                 handlers,
                 contexts,
                 parent_segments,
@@ -294,6 +302,20 @@ pub(crate) fn attribute_split(path: String, split: SplitFn) {
             frame.splits.push((path, split));
         } else {
             pass.root_splits.push((path, split));
+        }
+    });
+}
+
+/// The app's own box, registered during render — same attribution. The
+/// path alone is the record: it says the box is on screen this pass,
+/// which is how a focused escape hatch keeps the keyboard.
+pub(crate) fn attribute_custom(path: String) {
+    PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        if let Some(frame) = pass.building.last_mut() {
+            frame.customs.push(path);
+        } else {
+            pass.root_customs.push(path);
         }
     });
 }
@@ -515,6 +537,8 @@ thread_local! {
     /// actions.
     static EDITORS: RefCell<HashMap<String, EditorFn>> = RefCell::new(HashMap::default());
     static SPLITS: RefCell<HashMap<String, SplitFn>> = RefCell::new(HashMap::default());
+    /// The app's boxes on screen this pass — paths only.
+    static CUSTOMS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
 }
 
 /// Reassembles the editor map from retention under the root + root region.
@@ -555,6 +579,29 @@ pub(crate) fn assemble_splits(root: &str) {
         }
     });
     SPLITS.with(|splits| *splits.borrow_mut() = map);
+}
+
+/// Reassembles the escape-hatch map from retention — the editors' twin
+/// for the boxes the app paints.
+pub(crate) fn assemble_customs(root: &str) {
+    let mut set: HashSet<String> = HashSet::default();
+    RETAINED.with(|retained| {
+        for (path, entry) in retained.borrow().iter() {
+            if covers(root, path) {
+                set.extend(entry.customs.iter().cloned());
+            }
+        }
+    });
+    PASS.with(|pass| {
+        set.extend(std::mem::take(&mut pass.borrow_mut().root_customs));
+    });
+    CUSTOMS.with(|customs| *customs.borrow_mut() = set);
+}
+
+/// Is the app's box at this path still on screen? (The focus of an
+/// escape hatch lives or dies by this answer.)
+pub(crate) fn has_custom(path: &str) -> bool {
+    CUSTOMS.with(|customs| customs.borrow().contains(path))
 }
 
 /// Hands a dragged divider position to the split's retained writer.

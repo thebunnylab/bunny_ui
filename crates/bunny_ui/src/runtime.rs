@@ -332,6 +332,7 @@ impl Runtime {
             reconciler::assemble_actions(pass_root);
             reconciler::assemble_editors(pass_root);
             reconciler::assemble_splits(pass_root);
+            reconciler::assemble_customs(pass_root);
             reconciler::assemble_handlers(pass_root);
             reconciler::assemble_contexts(pass_root);
             // with the editors of THIS pass assembled, dead fields
@@ -1385,11 +1386,13 @@ impl Runtime {
     fn release_dead_input(&self) {
         self.carets.borrow_mut().retain(|path, _| reconciler::has_editor(path));
         self.auto_focused.borrow_mut().retain(|path| reconciler::has_editor(path));
+        // the app's own box counts as a live input too: it registers
+        // itself every pass it renders, exactly like a field's editor
         let focus_died = self
             .focus
             .borrow()
             .as_deref()
-            .is_some_and(|path| !reconciler::has_editor(path));
+            .is_some_and(|path| !reconciler::has_editor(path) && !reconciler::has_custom(path));
         if focus_died {
             *self.focus.borrow_mut() = None;
         }

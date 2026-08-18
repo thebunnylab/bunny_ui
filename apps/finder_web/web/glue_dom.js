@@ -13,6 +13,42 @@ document.head.appendChild(sheet);
 let wasm = null;
 let wakeArmed = false;
 const decoder = new TextDecoder();
+
+// The engine's key table, mirrored (bunny_ui_web::named_key).
+const KEYS = {
+  Backspace: 1,
+  Delete: 2,
+  ArrowLeft: 3,
+  ArrowRight: 4,
+  Home: 5,
+  End: 6,
+  Escape: 7,
+  ArrowUp: 8,
+  ArrowDown: 9,
+  Enter: 10,
+  Tab: 11,
+  PageUp: 12,
+  PageDown: 13,
+};
+
+// 1 shift, 2 command, 4 option, 8 control — the engine's bits.
+function modifiers(event) {
+  return (
+    (event.shiftKey ? 1 : 0) |
+    (event.metaKey ? 2 : 0) |
+    (event.altKey ? 4 : 0) |
+    (event.ctrlKey ? 8 : 0)
+  );
+}
+
+// Text into the engine: one allocation, owned by the engine after the
+// call (the same door the canvas mode types through).
+function sendText(text) {
+  const bytes = new TextEncoder().encode(text);
+  const pointer = wasm.bunny_alloc(bytes.length);
+  new Uint8Array(wasm.memory.buffer, pointer, bytes.length).set(bytes);
+  wasm.bunny_text(pointer, bytes.length);
+}
 const elements = new Map([[0, app]]);
 const rules = new Map();
 
@@ -512,10 +548,28 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
       const [x, y] = point(event);
       wasm.bunny_pointer_up(x, y);
     });
-    // the browser owns typing in this mode; Escape is the engine's —
-    // it dismisses the open popover through the keymap
+    // the browser owns the <input>s in this mode. What still belongs
+    // to the engine: Escape (the keymap dismisses the popover) and
+    // every stroke a focused canvas island wants — a box the app
+    // paints has no element to type into.
     window.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") wasm.bunny_key(7, 0);
+      const typing = event.target && event.target.tagName === "INPUT";
+      const mods = modifiers(event);
+      const code = KEYS[event.key];
+      if (code !== undefined) {
+        if (typing && code !== 7) return;
+        if (code !== 7) event.preventDefault();
+        wasm.bunny_key(code, mods);
+        return;
+      }
+      if (event.key.length !== 1) return;
+      if (event.metaKey || event.ctrlKey) {
+        wasm.bunny_key_char(event.key.codePointAt(0), mods);
+        return;
+      }
+      if (typing) return;
+      event.preventDefault();
+      sendText(event.key);
     });
   },
 );

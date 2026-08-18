@@ -48,6 +48,72 @@ unsafe extern "C" {
     fn js_island(id: u32, pointer: *const u8, width: u32, height: u32);
 }
 
+/// The glue's key table, mirrored: one number per named key.
+fn named_key(code: u32) -> Option<bunny_ui::action::Key> {
+    use bunny_ui::action::Key;
+    Some(match code {
+        1 => Key::Backspace,
+        2 => Key::Delete,
+        3 => Key::Left,
+        4 => Key::Right,
+        5 => Key::Home,
+        6 => Key::End,
+        7 => Key::Escape,
+        8 => Key::Up,
+        9 => Key::Down,
+        10 => Key::Enter,
+        11 => Key::Tab,
+        12 => Key::PageUp,
+        13 => Key::PageDown,
+        _ => return None,
+    })
+}
+
+/// The modifier bits the glue sends: 1 shift, 2 command, 4 option, 8
+/// control.
+fn pattern(key: bunny_ui::action::Key, mods: u32) -> KeyPattern {
+    KeyPattern {
+        key,
+        shift: mods & 1 != 0,
+        command: mods & 2 != 0,
+        option: mods & 4 != 0,
+        control: mods & 8 != 0,
+    }
+}
+
+/// One stroke, in the desktop gate's order: the focused escape hatch
+/// first, then the keymap, then the field's editing vocabulary. `true`
+/// = something changed and the frame is worth presenting.
+fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
+    use bunny_ui::action::Key;
+    if runtime.key_stroke(&pattern).handled {
+        return true;
+    }
+    // typing with a focused field is never stolen by a binding
+    let typing = runtime.focused().is_some() && pattern.is_text_input();
+    if !typing
+        && let Some(action) = runtime.match_key(&pattern)
+        && runtime.dispatch_action(action)
+    {
+        return true;
+    }
+    let edit = match pattern.key {
+        Key::Backspace => Some(EditCommand::Backspace),
+        Key::Delete => Some(EditCommand::Delete),
+        Key::Left => Some(EditCommand::Left(pattern.shift)),
+        Key::Right => Some(EditCommand::Right(pattern.shift)),
+        Key::Home => Some(EditCommand::Home(pattern.shift)),
+        Key::End => Some(EditCommand::End(pattern.shift)),
+        Key::Char('a') if pattern.command => Some(EditCommand::SelectAll),
+        Key::Escape => return runtime.blur(),
+        _ => None,
+    };
+    match edit {
+        Some(edit) => runtime.key(edit).applied,
+        None => false,
+    }
+}
+
 /// What the exports feed the shell — the web twin of the mac AppEvent.
 enum Event {
     PointerMove { x: f64, y: f64 },
@@ -55,7 +121,11 @@ enum Event {
     PointerUp { x: f64, y: f64 },
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
     Text(String),
-    Key(u32, bool),
+    /// A named key from the glue's table, with the modifier bits.
+    Key(u32, u32),
+    /// A character stroke (the modifiers decide whether it types or
+    /// commands).
+    KeyChar(char, u32),
     Frame { dt: f64 },
     Resize { width: f64, height: f64, scale: f64 },
     /// The browser finished decoding a registered image — measure and
@@ -167,35 +237,16 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
-            Event::Key(code, shift) => {
-                // the keymap first — the mac gate's order: Escape with
-                // a popover open dismisses; without one it blurs below
-                if code == 7
-                    && let Some(action) =
-                        runtime.match_key(&KeyPattern::key(bunny_ui::action::Key::Escape))
-                    && runtime.dispatch_action(action)
-                {
+            Event::KeyChar(character, mods) => {
+                if stroke(&runtime, pattern(bunny_ui::action::Key::Char(character), mods)) {
                     present(&runtime, &full, size, scale, &mut surface);
-                    return;
                 }
-                let edit = match code {
-                    1 => Some(EditCommand::Backspace),
-                    2 => Some(EditCommand::Delete),
-                    3 => Some(EditCommand::Left(shift)),
-                    4 => Some(EditCommand::Right(shift)),
-                    5 => Some(EditCommand::Home(shift)),
-                    6 => Some(EditCommand::End(shift)),
-                    7 => {
-                        if runtime.blur() {
-                            present(&runtime, &full, size, scale, &mut surface);
-                        }
-                        None
-                    }
-                    _ => None,
+            }
+            Event::Key(code, mods) => {
+                let Some(key) = named_key(code) else {
+                    return;
                 };
-                if let Some(edit) = edit
-                    && runtime.key(edit).applied
-                {
+                if stroke(&runtime, pattern(key, mods)) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
@@ -296,18 +347,32 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
                 // themselves paint on their own
                 present(&runtime, runtime.dom_frame(&root, size), scale);
             }
-            Event::Key(7, _) => {
-                // the browser owns editing here; Escape is the
-                // keymap's business — a popover dismisses through it
-                if let Some(action) =
-                    runtime.match_key(&KeyPattern::key(bunny_ui::action::Key::Escape))
-                    && runtime.dispatch_action(action)
-                {
+            Event::Key(code, mods) => {
+                // the browser owns the <input>s here; the strokes that
+                // matter to US are the focused island's and the
+                // keymap's (Escape dismisses a popover through it)
+                let Some(key) = named_key(code) else {
+                    return;
+                };
+                if stroke(&runtime, pattern(key, mods)) {
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
-            // hover, wheel, other keys and ticks belong to the browser
-            // in this mode — nothing to do on our side of the border
+            Event::KeyChar(character, mods) => {
+                if stroke(&runtime, pattern(bunny_ui::action::Key::Char(character), mods)) {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
+            Event::Text(text) => {
+                // a focused island types through the same door the
+                // desktop uses; a field's text never comes this way
+                // (the <input> owns it and syncs through bunny_field)
+                if runtime.key(EditCommand::Insert(text)).applied {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
+            // hover, wheel and ticks belong to the browser in this
+            // mode — nothing to do on our side of the border
             _ => {}
         }
     });
@@ -355,9 +420,22 @@ pub extern "C" fn bunny_wheel(x: f64, y: f64, dx: f64, dy: f64) {
     dispatch(Event::Wheel { x, y, dx, dy });
 }
 
+/// One named key: `code` from the glue's table (mirrored in
+/// [`named_key`]), `mods` as the bit flags 1 shift, 2 command, 4
+/// option, 8 control.
 #[unsafe(no_mangle)]
-pub extern "C" fn bunny_key(code: u32, shift: u32) {
-    dispatch(Event::Key(code, shift != 0));
+pub extern "C" fn bunny_key(code: u32, mods: u32) {
+    dispatch(Event::Key(code, mods));
+}
+
+/// One character stroke — the code point plus the same modifier bits.
+/// Plain typing does NOT come through here: it is text (`bunny_text`),
+/// so a composition and a paste take the same road.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_key_char(code_point: u32, mods: u32) {
+    if let Some(character) = char::from_u32(code_point) {
+        dispatch(Event::KeyChar(character, mods));
+    }
 }
 
 #[unsafe(no_mangle)]

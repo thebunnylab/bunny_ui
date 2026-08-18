@@ -111,7 +111,11 @@ pub mod prelude {
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
     pub use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, RawImages, file_icon};
-    pub use crate::layout::{Color, Rendering, Side, Truncation, VisualProps};
+    // geometry is app vocabulary the moment the app paints a box of
+    // its own (`custom(…)` / `canvas(…)`)
+    pub use crate::layout::{
+        Color, Point, Proposal, Px, Rect, Rendering, Side, Size, Truncation, VisualProps,
+    };
     pub use crate::theme::{self, Theme};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
     pub use crate::text_input::{CaretState, EditCommand};

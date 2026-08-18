@@ -207,6 +207,7 @@ function sendText(text) {
   wasm.bunny_text(pointer, bytes.length);
 }
 
+// The engine's key table, mirrored (bunny_ui_web::named_key).
 const KEYS = {
   Backspace: 1,
   Delete: 2,
@@ -215,7 +216,23 @@ const KEYS = {
   Home: 5,
   End: 6,
   Escape: 7,
+  ArrowUp: 8,
+  ArrowDown: 9,
+  Enter: 10,
+  Tab: 11,
+  PageUp: 12,
+  PageDown: 13,
 };
+
+// 1 shift, 2 command, 4 option, 8 control — the engine's bits.
+function modifiers(event) {
+  return (
+    (event.shiftKey ? 1 : 0) |
+    (event.metaKey ? 2 : 0) |
+    (event.altKey ? 4 : 0) |
+    (event.ctrlKey ? 8 : 0)
+  );
+}
 
 WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
   ({ instance }) => {
@@ -252,14 +269,20 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
       { passive: false },
     );
     window.addEventListener("keydown", (event) => {
+      const mods = modifiers(event);
       const code = KEYS[event.key];
       if (code !== undefined) {
         event.preventDefault();
-        wasm.bunny_key(code, event.shiftKey ? 1 : 0);
+        wasm.bunny_key(code, mods);
         return;
       }
-      if (event.key.length === 1 && !event.metaKey && !event.ctrlKey) {
-        event.preventDefault();
+      if (event.key.length !== 1) return;
+      event.preventDefault();
+      // a command stroke is a stroke; a bare character is TEXT, so
+      // typing takes the same road a paste and a composition take
+      if (event.metaKey || event.ctrlKey) {
+        wasm.bunny_key_char(event.key.codePointAt(0), mods);
+      } else {
         sendText(event.key);
       }
     });

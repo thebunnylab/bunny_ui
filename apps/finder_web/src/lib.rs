@@ -34,6 +34,84 @@ pub extern "C" fn finder_fetched(pointer: *mut u8, len: usize) {
     }
 }
 
+// MARK: - The escape hatch, in a browser tab
+
+/// A box the APP paints: it takes the keyboard on a click, types, and
+/// follows the pointer with a hairline. On the canvas page it is more
+/// commands in the same frame; on the element page it becomes a canvas
+/// island - the app's pixels inside a tree of real elements.
+#[derive(Clone, Copy)]
+struct Scratch {
+    note: State<Arc<str>>,
+    /// Where the pointer last was, in the box's own coordinates.
+    mark: State<f64>,
+}
+
+impl Scratch {
+    const HEIGHT: f64 = 46.0;
+}
+
+impl CustomElement for Scratch {
+    fn name(&self) -> &str {
+        "scratch"
+    }
+
+    fn accepts_keys(&self) -> bool {
+        true
+    }
+
+    fn measure(&self, proposal: bunny_ui::layout::Proposal, _metrics: &Metrics) -> Size {
+        Size { width: proposal.width.unwrap_or(0.0), height: Self::HEIGHT }
+    }
+
+    fn paint(&self, ctx: &PaintCtx, painter: &mut Painter) {
+        let note = self.note.get();
+        painter.fill_rounded(ctx.bounds(), theme::row_hover(), 8.0);
+        let ink = if ctx.focused { theme::fg() } else { theme::fg_faint() };
+        let origin = Point { x: 12.0, y: 14.0 };
+        painter.text(origin, note.clone(), ink);
+        // the caret is the app's: the runtime only hands over the phase
+        if ctx.caret_visible {
+            let width = ctx.metrics.width(&note);
+            painter.fill(
+                Rect {
+                    origin: Point { x: origin.x + width + 1.0, y: origin.y },
+                    size: Size { width: 1.5, height: ctx.metrics.line_height() },
+                },
+                theme::accent(),
+            );
+        }
+        // a hairline under the pointer — proof the moves arrive
+        painter.fill(
+            Rect {
+                origin: Point { x: self.mark.get(), y: Self::HEIGHT - 6.0 },
+                size: Size { width: 2.0, height: 3.0 },
+            },
+            theme::accent(),
+        );
+    }
+
+    fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
+        match event {
+            ElementEvent::Text(text) => {
+                self.note.set(Arc::from(format!("{}{text}", self.note.get())));
+                Response::handled()
+            }
+            ElementEvent::Key(pattern) if pattern.key == Key::Backspace => {
+                let mut note = self.note.get().to_string();
+                note.pop();
+                self.note.set(Arc::from(note));
+                Response::handled()
+            }
+            ElementEvent::PointerMoved { at, .. } | ElementEvent::PointerDown { at } => {
+                self.mark.set(at.x);
+                Response::handled()
+            }
+            _ => Response::ignored(),
+        }
+    }
+}
+
 fn matches(dir: &str, name: &str, needle: &str) -> bool {
     let mut haystack = dir.chars().chain(name.chars()).map(|c| c.to_ascii_lowercase());
     needle.chars().map(|c| c.to_ascii_lowercase()).all(|wanted| haystack.any(|c| c == wanted))
@@ -53,6 +131,8 @@ struct Finder {
     /// Built ONCE (hash + registration happen per identity, never per
     /// body) — the browser decodes it and reports back.
     logo: ImageSource,
+    /// The app-painted box under the header.
+    scratch: Scratch,
 }
 
 impl Component for Finder {
@@ -80,6 +160,10 @@ impl Component for Finder {
             .spacing(10.0)
             .alignment(VerticalAlignment::Center)
             .padding_length(10.0),
+            custom(self.scratch)
+                .padding_edge(Edge::Leading, 10.0)
+                .padding_edge(Edge::Trailing, 10.0)
+                .padding_edge(Edge::Bottom, 8.0),
             virtual_list(
                 count,
                 move |row| {
@@ -318,6 +402,10 @@ fn finder() -> Finder {
         manifest: State::new(Arc::from("reading the manifest…")),
         files,
         logo: logo(),
+        scratch: Scratch {
+            note: State::new(Arc::from("click here and type — the app paints this box")),
+            mark: State::new(12.0),
+        },
     }
 }
 

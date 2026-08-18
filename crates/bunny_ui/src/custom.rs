@@ -478,6 +478,12 @@ impl View for CustomView {
         // outside a pass (a decorative render) there is no identity to
         // key events on — the box still paints, it just answers nothing
         let path = motor::identity::cursor_scope().unwrap_or_default();
+        if !path.is_empty() {
+            // the registration says "this box is on screen": a focused
+            // hatch keeps the keyboard while it is, and loses it the
+            // pass it leaves (the same truth the fields live by)
+            crate::reconciler::attribute_custom(path.clone());
+        }
         out.push_layout(LayoutNode::Custom { path, element: self.element.clone() });
     }
 }
@@ -527,7 +533,9 @@ mod tests {
     use crate::layout::{Axis, CrossAlign, DrawCommand, LayoutNode, Proposal};
     use crate::runtime::Runtime;
     use crate::text_input::EditCommand;
-    use crate::view::Component;
+    use crate::state_ext::StateExt;
+    use crate::view::{Component, Either};
+    use motor::state::State;
     use motor::state::Context as ViewContext;
 
     /// A surface that fills itself and remembers what it was told.
@@ -1151,6 +1159,51 @@ mod tests {
                 .handled,
             "no focus, no keys"
         );
+    }
+
+    #[test]
+    fn the_keyboard_survives_the_frames_that_follow_the_click() {
+        // the shells settle after every event, and the settle releases
+        // the input of whatever left the scene. A box the app paints
+        // registers no field editor, so the sweep used to take its
+        // keyboard on the very next frame — it now says it is here.
+        let (runtime, editor) = focused_editor();
+        let view = Editing { editor: editor.clone() };
+        runtime.settle(&view);
+        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(80.0) });
+        assert_eq!(runtime.focused().as_deref(), Some("Editing/#1"));
+        assert!(runtime.key(EditCommand::Insert("still here".into())).applied);
+        assert_eq!(&*editor.text.borrow(), "still here");
+    }
+
+    #[test]
+    fn a_box_that_leaves_the_scene_gives_the_keyboard_back() {
+        #[derive(Clone)]
+        struct Screen {
+            editor: MiniEditor,
+            gone: State<bool>,
+        }
+        impl Component for Screen {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                use crate::ext::ViewExt;
+                if self.gone.get() {
+                    Either::Second(crate::views::text("the box left"))
+                } else {
+                    Either::First(custom(self.editor).frame(200.0, 40.0))
+                }
+            }
+        }
+        let runtime = Runtime::new();
+        let view = Screen { editor: MiniEditor::default(), gone: State::new(false) };
+        let proposal = Proposal { width: Some(200.0), height: Some(80.0) };
+        runtime.layout(&view, proposal);
+        runtime.pointer_pressed(10.0, 10.0);
+        runtime.pointer_released(10.0, 10.0);
+        assert!(runtime.focused().is_some());
+
+        view.gone.set(true);
+        runtime.settle(&view);
+        assert_eq!(runtime.focused(), None, "the keyboard goes with the box");
     }
 
     /// Lays a node out at an exact proposal.
