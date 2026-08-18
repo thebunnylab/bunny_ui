@@ -88,7 +88,15 @@ pub enum DomKind {
     Layers,
     /// A popover under the root (the portal). The glue positions it
     /// from the anchor's real box — the identity is the overlay path.
-    Popover { path: String },
+    Popover {
+        path: String,
+        /// The anchor's identity: a Group the walk wraps around the
+        /// anchored child (`{path}/#anchor`). The diff resolves it to
+        /// an element id and ships the relation as one patch.
+        anchor: String,
+        /// 0 top, 1 bottom, 2 leading, 3 trailing.
+        side: u8,
+    },
 }
 
 /// One image element. `key` is the source identity ([`crate::
@@ -591,6 +599,10 @@ pub enum DomPatch {
     /// computes the offset (dense lists only; a virtual list's rows
     /// may not exist, so its reveal stays an engine `SetScroll`).
     Reveal { id: u32, target: u32 },
+    /// The popover's anchor relation: the glue positions `id` from
+    /// element `anchor`'s real box on `side`, repositioning while
+    /// either of them moves. `path` keys the dismissal doors.
+    SetAnchor { id: u32, anchor: u32, side: u8, path: String },
 }
 
 // MARK: - Lowering (retained scene + diff)
@@ -631,6 +643,9 @@ pub struct DomLowering {
     root: Option<Retained>,
     next_id: u32,
     islands: HashMap<u32, Island>,
+    /// Anchor relations already shipped: popover element id → anchor
+    /// element id. A relation re-ships when the anchor recreates.
+    anchors_sent: HashMap<u32, u32>,
 }
 
 impl DomLowering {
@@ -687,6 +702,50 @@ impl DomLowering {
                 };
                 diff_node(root, scene, &mut ctx, &mut patches);
                 self.next_id = next_id;
+            }
+        }
+        // popovers: resolve each portal's anchor to a real element and
+        // ship the relation when it changed — the walk only runs while
+        // a popover exists (or just left)
+        if !self.anchors_sent.is_empty()
+            || patches
+                .iter()
+                .any(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Popover, .. }))
+        {
+            let mut relations: Vec<(u32, u32, u8, String)> = Vec::new();
+            if let Some(root) = self.root.as_ref() {
+                fn group_id(node: &Retained, path: &str) -> Option<u32> {
+                    if let DomKind::Group { path: here } = &node.node.kind
+                        && here == path
+                    {
+                        return Some(node.id);
+                    }
+                    node.children.iter().find_map(|child| group_id(child, path))
+                }
+                fn collect(
+                    node: &Retained,
+                    root: &Retained,
+                    out: &mut Vec<(u32, u32, u8, String)>,
+                ) {
+                    if let DomKind::Popover { path, anchor, side } = &node.node.kind
+                        && let Some(anchor_id) = group_id(root, anchor)
+                    {
+                        out.push((node.id, anchor_id, *side, path.clone()));
+                    }
+                    for child in &node.children {
+                        collect(child, root, out);
+                    }
+                }
+                collect(root, root, &mut relations);
+            }
+            let live: std::collections::HashSet<u32> =
+                relations.iter().map(|(id, ..)| *id).collect();
+            self.anchors_sent.retain(|id, _| live.contains(id));
+            for (id, anchor, side, path) in relations {
+                if self.anchors_sent.get(&id) != Some(&anchor) {
+                    self.anchors_sent.insert(id, anchor);
+                    patches.push(DomPatch::SetAnchor { id, anchor, side, path });
+                }
             }
         }
         patches
@@ -1001,8 +1060,72 @@ fn diff_node(
         }
         _ => {}
     }
+    let previous_target = old_kind_for_reveal(retained);
     retained.node = shallow(new);
+    let followed = match (&previous_target, &new.kind) {
+        // the region follows an item: a CHANGED target reveals it —
+        // virtual rows by their slot (they may not exist yet), dense
+        // rows by the browser's own scrollIntoView
+        (
+            Some(before),
+            DomKind::Scroll { target: Some(after), .. },
+        ) if before.as_deref() != Some(after.as_str()) => Some(after.clone()),
+        (None, DomKind::Scroll { target: Some(after), .. }) => Some(after.clone()),
+        _ => None,
+    };
     diff_children(retained, new, ctx, patches);
+    if let Some(target) = followed {
+        reveal_target(retained, new, &target, patches);
+    }
+}
+
+/// The retained Scroll's PREVIOUS target (before `shallow` runs, the
+/// caller captures it) — `None` when the node is not a scroll region.
+fn old_kind_for_reveal(retained: &Retained) -> Option<Option<String>> {
+    match &retained.node.kind {
+        DomKind::Scroll { target, .. } => Some(target.clone()),
+        _ => None,
+    }
+}
+
+/// Emits the reveal for `target` under an already-diffed scroll node:
+/// a virtual row scrolls to its slot, a dense row asks the browser.
+fn reveal_target(
+    retained: &Retained,
+    new: &DomNode,
+    target: &str,
+    patches: &mut Vec<DomPatch>,
+) {
+    let suffix = format!("[{target}]");
+    // the scene knows the slot; the retention knows the element
+    let slot = new
+        .children
+        .first()
+        .into_iter()
+        .flat_map(|content| content.children.iter())
+        .find_map(|row| match &row.kind {
+            DomKind::Group { path } if path.ends_with(&suffix) => {
+                row.layout.as_ref().and_then(|layout| layout.slot_y)
+            }
+            _ => None,
+        });
+    match slot {
+        Some(y) => patches.push(DomPatch::SetScroll { id: retained.id, x: 0.0, y }),
+        None => {
+            let row_id = retained
+                .children
+                .first()
+                .into_iter()
+                .flat_map(|content| content.children.iter())
+                .find_map(|row| match &row.node.kind {
+                    DomKind::Group { path } if path.ends_with(&suffix) => Some(row.id),
+                    _ => None,
+                });
+            if let Some(row) = row_id {
+                patches.push(DomPatch::Reveal { id: retained.id, target: row });
+            }
+        }
+    }
 }
 
 /// Matches the children lists: groups by identity path (a slid window
@@ -1517,6 +1640,13 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_u32(&mut out, *id);
                 push_u32(&mut out, *target);
             }
+            DomPatch::SetAnchor { id, anchor, side, path } => {
+                out.push(14);
+                push_u32(&mut out, *id);
+                push_u32(&mut out, *anchor);
+                out.push(*side);
+                push_bytes_u16(&mut out, path.as_bytes());
+            }
         }
     }
     out
@@ -1709,7 +1839,8 @@ mod tests {
             | DomPatch::SetScroll { id, .. }
             | DomPatch::SetLayout { id, .. }
             | DomPatch::Move { id, .. }
-            | DomPatch::Reveal { id, .. } => *id,
+            | DomPatch::Reveal { id, .. }
+            | DomPatch::SetAnchor { id, .. } => *id,
         }
     }
 
@@ -2436,25 +2567,46 @@ mod tests {
             })
             .collect();
         assert!(!top_level.is_empty(), "the popover mounted: {patches:?}");
-        assert_eq!(top_level[0].1, 0, "the first created node hangs off the root");
+        // the PORTAL: the popover hangs off the root, and its anchor
+        // relation travels as one patch. Opening re-wraps the anchored
+        // child in its anchor group (bounded churn, that subtree only)
+        // — every OTHER sibling stays silent.
+        assert!(
+            top_level.iter().any(|(_, parent)| *parent == 0),
+            "the popover hangs off the root: {patches:?}"
+        );
+        assert!(
+            patches.iter().any(|patch| matches!(patch, DomPatch::SetAnchor { .. })),
+            "the anchor relation travels: {patches:?}"
+        );
         let fresh: Vec<u32> = top_level.iter().map(|(id, _)| *id).collect();
+        let anchored: Vec<u32> = patches
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Remove { id } => Some(*id),
+                _ => None,
+            })
+            .collect();
         for patch in &patches {
+            let id = patch_id(patch);
             assert!(
-                !mounted.contains(&patch_id(patch)) || fresh.contains(&patch_id(patch)),
-                "an old sibling moved on open: {patch:?}"
+                !mounted.contains(&id) || fresh.contains(&id) || anchored.contains(&id),
+                "an untouched sibling moved on open: {patch:?}"
             );
         }
 
-        // closing removes the subtree and, again, nothing else
+        // closing removes the portal and unwraps the anchor — nothing
+        // beyond those two subtrees moves
         view.open.set(false);
         let patches = runtime.dom_frame(&view, size);
-        assert!(
-            patches
-                .iter()
-                .all(|patch| matches!(patch, DomPatch::Remove { id } if fresh.contains(id))),
-            "closing is removal only: {patches:?}"
-        );
         assert!(!patches.is_empty());
+        assert!(
+            patches.iter().any(|patch| matches!(
+                patch,
+                DomPatch::Remove { id } if fresh.contains(id)
+            )),
+            "the popover left: {patches:?}"
+        );
     }
 
     #[test]
@@ -2869,6 +3021,41 @@ mod tests {
         ]
         .concat();
         assert_eq!(bytes, expected);
+    }
+
+    /// The keyboard's reveal under flow: the region follows its item,
+    /// and a CHANGED target scrolls to the row's slot — the engine
+    /// commands once, the browser's echo comes back silent.
+    #[test]
+    fn a_reveal_scrolls_to_the_slot() {
+        #[derive(Clone)]
+        struct Follows {
+            selected: State<usize>,
+        }
+
+        impl Component for Follows {
+            fn body(self, _ctx: &Context) -> impl View {
+                let selected = self.selected.get();
+                virtual_list(1_000, |row| format!("r{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+                .row_height(20.0)
+                .reveal(selected)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Follows { selected: State::new(0) };
+        let size = Size { width: 200.0, height: 100.0 };
+        let _ = runtime.dom_frame(&view, size);
+
+        view.selected.set(500);
+        let patches = runtime.dom_frame(&view, size);
+        let scrolled = patches.iter().find_map(|patch| match patch {
+            DomPatch::SetScroll { y, .. } => Some(*y),
+            _ => None,
+        });
+        assert_eq!(scrolled, Some(500.0 * 20.0), "the region jumps to the slot: {patches:?}");
     }
 
     // MARK: - The ABI handshake

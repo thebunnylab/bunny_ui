@@ -338,9 +338,20 @@ impl Walk<'_> {
                     target: target.clone(),
                 });
                 scroll.layout.as_mut().expect("flow node").grow = true;
-                let mut content = node(DomKind::Content);
-                self.lower_into(child, &mut content.children);
-                scroll.children.push(content);
+                let mut lowered = Vec::new();
+                self.lower_into(child, &mut lowered);
+                match lowered.as_slice() {
+                    // a virtual stack IS the content already — no
+                    // second skin, or the rows hide one box too deep
+                    [only] if matches!(only.kind, DomKind::Content) => {
+                        scroll.children = lowered;
+                    }
+                    _ => {
+                        let mut content = node(DomKind::Content);
+                        content.children = lowered;
+                        scroll.children.push(content);
+                    }
+                }
                 out.push(scroll);
             }
             LayoutNode::VirtualStack { row_extent, count, children, heights } => {
@@ -440,10 +451,29 @@ impl Walk<'_> {
             LayoutNode::Custom { .. } => {
                 out.push(self.island(tree));
             }
-            LayoutNode::Anchored { path, child, .. } => {
-                self.lower_into(child, out);
-                let mut popover = node(DomKind::Popover { path: path.clone() });
-                popover.style.background = Some(crate::theme::current().panel);
+            LayoutNode::Anchored { path, side, overlay, child } => {
+                // the anchor gets an IDENTITY the glue can find: a
+                // group wrapped around the child, keyed off the
+                // popover's own path
+                let anchor_path = format!("{path}/#anchor");
+                let mut anchor = node(DomKind::Group { path: anchor_path.clone() });
+                self.lower_into(child, &mut anchor.children);
+                out.push(anchor);
+
+                let side = match side {
+                    crate::layout::Side::Top => 0u8,
+                    crate::layout::Side::Bottom => 1,
+                    crate::layout::Side::Leading => 2,
+                    crate::layout::Side::Trailing => 3,
+                };
+                let mut popover = node(DomKind::Popover {
+                    path: path.clone(),
+                    anchor: anchor_path,
+                    side,
+                });
+                // the CARD lowers under the portal — the overlay is a
+                // whole subtree, not a marker
+                self.lower_into(overlay, &mut popover.children);
                 self.overlays.push(popover);
             }
         }
@@ -636,6 +666,11 @@ mod tests {
         let offsets = HashMap::default();
         let scene = lower(&tree, &env_fixture(&offsets)).scene;
         let last = scene.children.last().expect("the portal");
-        assert!(matches!(&last.kind, DomKind::Popover { path } if path == "app/[row]"));
+        assert!(matches!(
+            &last.kind,
+            DomKind::Popover { path, anchor, side: 1 }
+                if path == "app/[row]" && anchor == "app/[row]/#anchor"
+        ));
+        assert!(!last.children.is_empty(), "the card lowered under the portal");
     }
 }

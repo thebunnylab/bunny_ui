@@ -302,6 +302,7 @@ function applyPatches(view, length) {
       if (kind === 4) {
         el.addEventListener("scroll", () => {
           wasm.bunny_dom_scroll(id, el.scrollLeft, el.scrollTop);
+          repositionPopovers();
         });
         // the window math reads the region's real box — the browser
         // owns layout here, so the browser reports it
@@ -655,7 +656,69 @@ function applyPatches(view, length) {
       // the browser computes the offset — dense lists only
       const target = elements.get(u32());
       if (target) target.scrollIntoView({ block: "nearest" });
+    } else if (op === 14) {
+      // the popover's anchor relation — position now, and again
+      // whenever anything scrolls or the window resizes
+      const anchor = u32();
+      const side = u8();
+      const path = text(u16());
+      const el = elements.get(id);
+      if (el) {
+        el.dataset.popover = path;
+        el.dataset.anchor = anchor;
+        el.dataset.side = side;
+        placePopover(el);
+      }
     }
+  }
+}
+
+// The popover placement: the browser owns the boxes, so the browser
+// positions the card — preferred side, flip when it does not fit,
+// then a two-axis clamp into the root. The engine's flip-then-clamp
+// policy, in the coordinate system that owns it here.
+const POPOVER_GAP = 6;
+
+function placePopover(el) {
+  const anchorEl = elements.get(Number(el.dataset.anchor));
+  if (!anchorEl || !anchorEl.isConnected) {
+    // the anchor left (a filter, a window slide): the popover follows
+    sendAction(`${el.dataset.popover}/#dismiss`);
+    return;
+  }
+  const appBox = app.getBoundingClientRect();
+  const box = anchorEl.getBoundingClientRect();
+  el.style.position = "absolute";
+  const width = el.offsetWidth;
+  const height = el.offsetHeight;
+  const ax = box.left - appBox.left;
+  const ay = box.top - appBox.top;
+  const side = Number(el.dataset.side);
+  const origin = (s) =>
+    s === 0
+      ? [ax + (box.width - width) / 2, ay - height - POPOVER_GAP]
+      : s === 1
+        ? [ax + (box.width - width) / 2, ay + box.height + POPOVER_GAP]
+        : s === 2
+          ? [ax - width - POPOVER_GAP, ay + (box.height - height) / 2]
+          : [ax + box.width + POPOVER_GAP, ay + (box.height - height) / 2];
+  const fits = ([x, y]) =>
+    x >= 0 && y >= 0 && x + width <= appBox.width && y + height <= appBox.height;
+  let [x, y] = origin(side);
+  if (!fits([x, y])) {
+    const flipped = origin({ 0: 1, 1: 0, 2: 3, 3: 2 }[side]);
+    if (fits(flipped)) [x, y] = flipped;
+  }
+  x = Math.min(Math.max(x, 0), Math.max(appBox.width - width, 0));
+  y = Math.min(Math.max(y, 0), Math.max(appBox.height - height, 0));
+  el.style.left = "0";
+  el.style.top = "0";
+  el.style.transform = `translate(${x}px, ${y}px)`;
+}
+
+function repositionPopovers() {
+  for (const el of app.querySelectorAll("[data-popover]")) {
+    placePopover(el);
   }
 }
 
@@ -850,14 +913,24 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     // clicks resolve by DELEGATION: the browser already knows what
     // was pressed — the engine never sees a coordinate in this mode
     app.addEventListener("pointerup", (event) => {
-      const target =
-        event.target instanceof Element
-          ? event.target.closest("[data-path]")
-          : null;
+      const source = event.target instanceof Element ? event.target : null;
+      // a press OUTSIDE the topmost popover dismisses it and is
+      // CONSUMED — the engine's own outside-press contract
+      const popovers = [...app.querySelectorAll("[data-popover]")];
+      if (popovers.length && source) {
+        const inside = popovers.some((popover) => popover.contains(source));
+        if (!inside) {
+          const topmost = popovers[popovers.length - 1];
+          sendAction(`${topmost.dataset.popover}/#dismiss`);
+          return;
+        }
+      }
+      const target = source ? source.closest("[data-path]") : null;
       if (target && target.dataset.path) {
         sendAction(target.dataset.path);
       }
     });
+    window.addEventListener("resize", repositionPopovers);
     // the browser owns the <input>s in this mode. What still belongs
     // to the engine: Escape (the keymap dismisses the popover) and
     // every stroke a focused canvas island wants — a box the app
