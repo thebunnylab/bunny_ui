@@ -9,6 +9,7 @@
 #![cfg(target_os = "windows")]
 
 mod ffi;
+mod text;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -18,14 +19,15 @@ use bunny_ui::prelude::Runtime;
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
+pub use text::DirectWriteEngine;
 
 /// Opens the window and enters the live cycle. Returns when the app
 /// quits (closing the window quits).
-///
-/// The engines are the house defaults for now — the platform text and
-/// image engines take their place in their own phases.
 pub fn run_window(title: &str, size: Size, root: impl View) {
-    run_window_with(title, size, Runtime::new(), root)
+    // real text: the platform engine takes the place of the house
+    // default (the image engine follows in its own phase)
+    let runtime = Runtime::new().text_engine(Rc::new(DirectWriteEngine::new()));
+    run_window_with(title, size, runtime, root)
 }
 
 /// Like [`run_window`], but with the `Runtime` assembled by the caller —

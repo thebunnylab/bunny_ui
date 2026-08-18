@@ -261,8 +261,104 @@ const IDC_ARROW: usize = 32512;
 const IDC_HAND: usize = 32649;
 const IDC_SIZEWE: usize = 32644;
 
-fn wide(text: &str) -> Vec<u16> {
+pub(crate) fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// MARK: - COM plumbing (shared by every COM consumer in the shell)
+//
+// The house pattern, translated from the mac's objc_msgSend discipline:
+// per interface a `#[repr(C)]` vtable struct in header order with the
+// slot indexes cited, unused runs compressed to `_pad` arrays; calls
+// are plain `((*(*p).vtbl).method)(p, …)` inside small safe wrappers.
+// One prohibition, learned from the platform's ABI: NEVER call a COM
+// method that returns a struct by value — every method used here
+// answers HRESULT or void through out-pointers.
+
+pub(crate) type Hresult = i32;
+
+pub(crate) fn com_ok(hr: Hresult) -> bool {
+    hr >= 0
+}
+
+/// A COM identity, written literally with a comment naming it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Guid {
+    pub d1: u32,
+    pub d2: u16,
+    pub d3: u16,
+    pub d4: [u8; 8],
+}
+
+/// The three slots every vtable starts with.
+#[repr(C)]
+pub(crate) struct UnknownVtbl {
+    pub query_interface:
+        unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> Hresult,
+    pub add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub release: unsafe extern "system" fn(*mut c_void) -> u32,
+}
+
+#[repr(C)]
+struct Unknown {
+    vtbl: *const UnknownVtbl,
+}
+
+/// A retained COM interface — released on Drop through the IUnknown
+/// prefix (the owner pattern, the mac's `OwnedFont` translated).
+pub(crate) struct Com<T>(std::ptr::NonNull<T>);
+
+impl<T> Com<T> {
+    pub fn from_raw(pointer: *mut T) -> Option<Com<T>> {
+        std::ptr::NonNull::new(pointer).map(Com)
+    }
+
+    pub fn as_ptr(&self) -> *mut T {
+        self.0.as_ptr()
+    }
+}
+
+impl<T> Drop for Com<T> {
+    fn drop(&mut self) {
+        unsafe {
+            let unknown = self.0.as_ptr() as *mut Unknown;
+            (((*unknown).vtbl).read().release)(unknown as *mut c_void);
+        }
+    }
+}
+
+#[link(name = "ole32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn CoInitializeEx(reserved: *const c_void, model: u32) -> Hresult;
+    pub(crate) fn CoCreateInstance(
+        clsid: *const Guid,
+        aggregate: *mut c_void,
+        context: u32,
+        iid: *const Guid,
+        out: *mut *mut c_void,
+    ) -> Hresult;
+}
+
+/// `CLSCTX_INPROC_SERVER`.
+pub(crate) const CLSCTX_INPROC_SERVER: u32 = 1;
+
+/// Joins the apartment — once per THREAD, the unit CoInitializeEx
+/// works in (the shell is one thread; the tests are many). `S_FALSE`
+/// (already in) and `RPC_E_CHANGED_MODE` (someone chose the other
+/// model first — in-proc servers still work) both count as joined.
+pub(crate) fn com_init() {
+    thread_local! {
+        static JOINED: Cell<bool> = const { Cell::new(false) };
+    }
+    JOINED.with(|joined| {
+        if !joined.replace(true) {
+            const COINIT_APARTMENTTHREADED: u32 = 0x2;
+            unsafe {
+                CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED);
+            }
+        }
+    });
 }
 
 // MARK: - Events
