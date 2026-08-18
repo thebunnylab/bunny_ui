@@ -54,6 +54,9 @@ pub(crate) struct FlowOutput {
     pub display: crate::layout::DisplayList,
     /// The fields on stage: `(path, wants the first focus)`.
     pub fields: Vec<(String, bool)>,
+    /// The app's boxes inside each island, with ISLAND-LOCAL frames —
+    /// exactly the coordinates the browser reports on the canvas.
+    pub customs: Vec<(std::rc::Rc<str>, crate::layout::CustomPlacement)>,
 }
 
 /// Lowers the semantic tree to a flow scene. The root is the mount
@@ -71,6 +74,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         fields: Vec::new(),
         slot: (None, None),
         pending_boundary_class: None,
+        customs: Vec::new(),
     };
     let mut children = Vec::new();
     walk.lower_into(root, &mut children);
@@ -97,7 +101,12 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         hints: DomHints::default(),
         children,
     };
-    FlowOutput { scene, display: walk.display, fields: walk.fields }
+    FlowOutput {
+        scene,
+        display: walk.display,
+        fields: walk.fields,
+        customs: walk.customs,
+    }
 }
 
 struct Walk<'a> {
@@ -121,6 +130,7 @@ struct Walk<'a> {
     /// island under it measures against (a flexible island learns its
     /// real box from the browser, in the island round).
     slot: (Option<Px>, Option<Px>),
+    customs: Vec<(std::rc::Rc<str>, crate::layout::CustomPlacement)>,
 }
 
 /// A flow node with nothing to say yet.
@@ -766,6 +776,13 @@ impl Walk<'_> {
             &mut placement,
         );
         self.display.extend(placement.display);
+        // the boxes inside this island keep their LOCAL frames — the
+        // pointer door routes the browser's canvas coordinates by them
+        if let Some(island) = &path {
+            for custom in placement.customs {
+                self.customs.push((std::rc::Rc::clone(island), custom));
+            }
+        }
         let mut island = node(DomKind::Canvas {
             origin: (0.0, 0.0),
             display: (start, self.display.len()),

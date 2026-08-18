@@ -83,6 +83,9 @@ pub struct Runtime {
     /// Browser-reported boxes by island path — a FLEXIBLE island
     /// measures against its real box, not against a guess.
     island_boxes: RefCell<HashMap<Rc<str>, (f64, f64)>>,
+    /// The app's boxes inside each island, frames ISLAND-LOCAL — the
+    /// canvas pointer door routes the browser's coordinates by them.
+    dom_customs: RefCell<Vec<(Rc<str>, crate::layout::CustomPlacement)>>,
     /// The scroll regions of the last layout — the wheel map.
     last_scrolls: RefCell<Vec<ScrollRegion>>,
     /// The focused field (identity path) — owner of the keyboard.
@@ -265,6 +268,7 @@ impl Runtime {
             scroll_offsets: RefCell::new(HashMap::default()),
             dom_viewports: RefCell::new(HashMap::default()),
             island_boxes: RefCell::new(HashMap::default()),
+            dom_customs: RefCell::new(Vec::new()),
             last_scrolls: RefCell::new(Vec::new()),
             focus: RefCell::new(None),
             carets: RefCell::new(HashMap::default()),
@@ -492,13 +496,23 @@ impl Runtime {
 
     // MARK: - The app's own boxes (the escape hatch)
 
-    /// The app's box registered at `path` in the last layout.
+    /// The app's box registered at `path` in the last layout — the
+    /// pixel pass's ledger first, then the flow's (island-local
+    /// frames; keys and text carry no point, and the box's own world
+    /// is exactly what the ctx should say).
     fn custom_at(&self, path: &str) -> Option<crate::layout::CustomPlacement> {
         self.last_customs
             .borrow()
             .iter()
             .find(|placement| placement.path == path)
             .cloned()
+            .or_else(|| {
+                self.dom_customs
+                    .borrow()
+                    .iter()
+                    .find(|(_, placement)| placement.path == path)
+                    .map(|(_, placement)| placement.clone())
+            })
     }
 
     /// Hands one event to the app's box — the point arrives in the
@@ -549,6 +563,7 @@ impl Runtime {
         *self.focus.borrow_mut() = Some(path.to_string());
         if let Some(placement) = self.custom_at(path) {
             self.deliver(&placement, crate::custom::ElementEvent::Focused(true));
+            self.dirty_island_of(&placement.path);
         }
     }
 
@@ -565,6 +580,7 @@ impl Runtime {
             self.deliver(&placement, crate::custom::ElementEvent::Key(*pattern));
         if response.handled {
             self.caret_visible.set(true);
+            self.dirty_island_of(&placement.path);
         }
         response
     }
@@ -877,6 +893,7 @@ impl Runtime {
         // means something while focused goes quiet
         if let Some(placement) = dropped.as_deref().and_then(|path| self.custom_at(path)) {
             self.deliver(&placement, crate::custom::ElementEvent::Focused(false));
+            self.dirty_island_of(&placement.path);
         }
         dropped.is_some()
     }
@@ -1062,6 +1079,7 @@ impl Runtime {
             let response = self.deliver(&placement, event);
             if response.handled {
                 self.caret_visible.set(true);
+                self.dirty_island_of(&placement.path);
             }
             return Edited { applied: response.handled, output: response.text };
         }
@@ -1277,6 +1295,7 @@ impl Runtime {
         });
         drop(boxes);
         self.seed_island_boxes(&output.scene);
+        *self.dom_customs.borrow_mut() = output.customs.clone();
         drop(offsets);
         drop(carets);
         // the first field that asks for focus takes it — once
@@ -1369,6 +1388,7 @@ impl Runtime {
         let output = crate::dom_flow::lower(&tree, &flow);
         drop(boxes);
         self.seed_island_boxes(&output.scene);
+        *self.dom_customs.borrow_mut() = output.customs.clone();
         drop(offsets);
         drop(carets);
         self.dom.borrow_mut().adopt(&output.scene, &output.display);
@@ -1485,6 +1505,99 @@ impl Runtime {
             }
         }
         true
+    }
+
+    /// A pointer event ON a canvas island, in the canvas's own
+    /// coordinates (`kind`: 0 down, 1 move, 2 up). The box under the
+    /// point hears it; a press GRABS the box until the release, the
+    /// way the desktop's pointer does; the release hands the keyboard
+    /// to a box that takes keys — first responder follows the click.
+    pub fn dom_island_pointer(&self, id: u32, kind: u32, x: f64, y: f64) -> bool {
+        let Some(island) = self.dom.borrow().island_path(id) else {
+            return false;
+        };
+        let grabbed = self.interaction.borrow().element_grab.clone();
+        let placement = match (kind, grabbed) {
+            // the grabbed box hears every move and the release,
+            // wherever the pointer went — dragging needs it
+            (1 | 2, Some(path)) => self
+                .dom_customs
+                .borrow()
+                .iter()
+                .find(|(_, custom)| custom.path == path)
+                .map(|(_, custom)| custom.clone()),
+            _ => self
+                .dom_customs
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(home, custom)| {
+                    home.as_ref() == island.as_ref() && custom.frame.contains(x, y)
+                })
+                .map(|(_, custom)| custom.clone()),
+        };
+        let Some(placement) = placement else {
+            return false;
+        };
+        let at = Self::local(&placement, x, y);
+        match kind {
+            0 => {
+                self.interaction.borrow_mut().element_grab =
+                    Some(placement.path.clone());
+                self.deliver(
+                    &placement,
+                    crate::custom::ElementEvent::PointerDown { at },
+                );
+            }
+            1 => {
+                let pressed = self.interaction.borrow().element_grab.is_some();
+                self.deliver(
+                    &placement,
+                    crate::custom::ElementEvent::PointerMoved { at, pressed },
+                );
+            }
+            2 => {
+                self.interaction.borrow_mut().element_grab = None;
+                self.deliver(&placement, crate::custom::ElementEvent::PointerUp { at });
+                if placement.element.element().accepts_keys() {
+                    self.focus_element(&placement.path);
+                } else {
+                    self.blur();
+                }
+            }
+            _ => return false,
+        }
+        self.dirty_island_of(&placement.path);
+        true
+    }
+
+    /// The paint of an app's box reads state OUTSIDE any body — no
+    /// boundary hears its changes. After an event reaches a box that
+    /// lives in an island, the island's body re-runs so the pixels
+    /// can follow; identical paint output still blits nothing (the
+    /// island ledger compares commands). A box from the pixel pass
+    /// is not in this ledger — the call is a no-op there.
+    fn dirty_island_of(&self, custom_path: &str) {
+        let island = self
+            .dom_customs
+            .borrow()
+            .iter()
+            .find(|(_, custom)| custom.path == custom_path)
+            .map(|(island, _)| Rc::clone(island));
+        let Some(island) = island else {
+            return;
+        };
+        let mut probe: &str = island.as_ref();
+        loop {
+            if reconciler::is_retained(probe) {
+                motor::identity::invalidate(probe);
+                break;
+            }
+            match probe.rfind('/') {
+                Some(cut) => probe = &probe[..cut],
+                None => break,
+            }
+        }
     }
 
     /// Every island the scene holds seeds its measured box once — so

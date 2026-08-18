@@ -139,6 +139,7 @@ enum Event {
     DomScroll { id: u32, x: f64, y: f64 },
     DomViewport { id: u32, width: f64, height: f64 },
     DomBox { id: u32, width: f64, height: f64 },
+    IslandPointer { id: u32, kind: u32, x: f64, y: f64 },
     Action { path: String },
     /// Dom mode: the browser's input edited — value + selectionStart.
     Field { path: String, value: String, caret: usize },
@@ -277,6 +278,7 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
             Event::DomScroll { .. }
             | Event::DomViewport { .. }
             | Event::DomBox { .. }
+            | Event::IslandPointer { .. }
             | Event::Action { .. }
             | Event::Field { .. } => {}
         }
@@ -373,6 +375,13 @@ fn start_dom_with(
                 // a flexible island's real box — news re-measures the
                 // island against it; an echo costs nothing
                 if runtime.dom_island_box(id, width, height) {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
+            Event::IslandPointer { id, kind, x, y } => {
+                // the canvas's own coordinates, routed to the app's
+                // box under the point — the pixels follow its answer
+                if runtime.dom_island_pointer(id, kind, x, y) {
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
@@ -540,6 +549,13 @@ pub extern "C" fn bunny_dom_viewport(id: u32, width: f64, height: f64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_dom_box(id: u32, width: f64, height: f64) {
     dispatch(Event::DomBox { id, width, height });
+}
+
+/// Dom mode: a pointer event on a canvas island, in the canvas's own
+/// coordinates (`kind`: 0 down, 1 move, 2 up).
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_island_pointer(id: u32, kind: u32, x: f64, y: f64) {
+    dispatch(Event::IslandPointer { id, kind, x, y });
 }
 
 /// The wire contract this binary encodes. The glue reads it before it

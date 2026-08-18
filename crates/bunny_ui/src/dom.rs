@@ -2686,6 +2686,112 @@ mod tests {
         assert_eq!((islands[0].width, islands[0].height), (682, 46));
     }
 
+    /// The Scratch demo's whole life under flow: a click on the
+    /// canvas reaches the app's box in the box's OWN coordinates,
+    /// the release hands it the keyboard, and typing lands as text —
+    /// the same doors the desktop and the canvas mode use.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn a_click_on_an_island_reaches_the_apps_box() {
+        #[derive(Clone)]
+        struct Pad {
+            mark: State<f64>,
+            note: State<std::sync::Arc<str>>,
+        }
+
+        impl crate::custom::CustomElement for Pad {
+            fn name(&self) -> &str {
+                "pad"
+            }
+            fn flexible(&self) -> bool {
+                false
+            }
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn measure(
+                &self,
+                proposal: crate::layout::Proposal,
+                _metrics: &crate::custom::Metrics,
+            ) -> Size {
+                Size { width: proposal.width.unwrap_or(200.0), height: 40.0 }
+            }
+            fn paint(&self, ctx: &crate::custom::PaintCtx, painter: &mut crate::custom::Painter) {
+                painter.fill(ctx.bounds(), Color::hex(0x3B82F6));
+                painter.fill(
+                    Rect {
+                        origin: Point { x: self.mark.get(), y: 0.0 },
+                        size: Size { width: 2.0, height: 4.0 },
+                    },
+                    Color::hex(0xFFFFFF),
+                );
+            }
+            fn event(
+                &self,
+                event: &crate::custom::ElementEvent,
+                _ctx: &crate::custom::EventCtx,
+            ) -> crate::custom::Response {
+                match event {
+                    crate::custom::ElementEvent::PointerDown { at } => {
+                        self.mark.set(at.x);
+                        crate::custom::Response::handled()
+                    }
+                    crate::custom::ElementEvent::Text(text) => {
+                        self.note
+                            .set(std::sync::Arc::from(format!("{}{text}", self.note.get())));
+                        crate::custom::Response::handled()
+                    }
+                    _ => crate::custom::Response::ignored(),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct WithPad {
+            mark: State<f64>,
+            note: State<std::sync::Arc<str>>,
+        }
+
+        impl Component for WithPad {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("above"),
+                    crate::custom::custom(Pad { mark: self.mark, note: self.note })
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 400.0, height: 200.0 };
+        let view = WithPad {
+            mark: State::new(0.0),
+            note: State::new(std::sync::Arc::from("")),
+        };
+        let mount = runtime.dom_frame(&view, size);
+        let canvas_id = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Canvas, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the island mounted");
+        let _ = runtime.dom_islands(1);
+
+        // the press lands in the box's own coordinates
+        assert!(runtime.dom_island_pointer(canvas_id, 0, 25.0, 10.0));
+        assert_eq!(view.mark.get(), 25.0, "the box heard the press where it happened");
+        assert!(runtime.dom_island_pointer(canvas_id, 2, 25.0, 10.0));
+
+        // the release handed it the keyboard: typing reaches the box
+        let answer = runtime.key(EditCommand::Insert("hi".into()));
+        assert!(answer.applied, "the focused box types");
+        assert_eq!(view.note.get().as_ref(), "hi");
+
+        // and the pixels follow the state
+        let _ = runtime.dom_frame(&view, size);
+        assert_eq!(runtime.dom_islands(1).len(), 1, "fresh pixels follow the press");
+    }
+
     #[test]
     fn the_encoding_is_byte_stable() {
         let patches = vec![

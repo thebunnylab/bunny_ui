@@ -87,6 +87,30 @@ const islandObserver = new ResizeObserver((entries) => {
   }
 });
 
+// A canvas island's wiring: its box reported as it resizes, and the
+// pointer handed over in the canvas's OWN coordinates — a press
+// captures the pointer so the moves keep arriving until the release,
+// the way dragging inside an app-painted box needs.
+function wireIsland(el, id) {
+  islandObserver.observe(el);
+  el.addEventListener("pointerdown", (event) => {
+    try {
+      el.setPointerCapture(event.pointerId);
+    } catch {
+      // a pointer that already lifted cannot be captured — the press
+      // still counts
+    }
+    event.preventDefault();
+    wasm.bunny_island_pointer(id, 0, event.offsetX, event.offsetY);
+  });
+  el.addEventListener("pointermove", (event) => {
+    wasm.bunny_island_pointer(id, 1, event.offsetX, event.offsetY);
+  });
+  el.addEventListener("pointerup", (event) => {
+    wasm.bunny_island_pointer(id, 2, event.offsetX, event.offsetY);
+  });
+}
+
 // Text into the engine: one allocation, owned by the engine after the
 // call (the same door the canvas mode types through).
 function sendText(text) {
@@ -369,7 +393,7 @@ function applyPatches(view, length) {
         wireScroll(el, id);
       }
       if (kind === 6) {
-        islandObserver.observe(el);
+        wireIsland(el, id);
       }
       const home = elements.get(parent);
       if (home) {
@@ -1019,7 +1043,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         elements.set(id, el);
         if (el.tagName === "INPUT") wireInput(el);
         if (el.style.overflow === "auto") wireScroll(el, id);
-        if (el.tagName === "CANVAS") islandObserver.observe(el);
+        if (el.tagName === "CANVAS") wireIsland(el, id);
         if (el.style.position === "relative") el.__pos = "relative";
       }
     }
