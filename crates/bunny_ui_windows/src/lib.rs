@@ -74,11 +74,38 @@ pub fn run_window(title: &str, size: Size, root: impl View) {
     run_window_with(title, size, runtime, root)
 }
 
+/// Who draws the window's top edge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Chrome {
+    /// The system title bar.
+    Native,
+    /// The SCENE draws the bar: no system frame, resize borders kept.
+    /// Mark the bar with [`ViewExt::window_drag_region`] so the window
+    /// drags by it, and mark the scene's own buttons with
+    /// [`ViewExt::window_control`] — the platform activates them, and
+    /// the maximize button offers the system's snap flyout.
+    ///
+    /// [`ViewExt::window_drag_region`]: bunny_ui::ext::ViewExt::window_drag_region
+    /// [`ViewExt::window_control`]: bunny_ui::ext::ViewExt::window_control
+    Scene,
+}
+
 /// Like [`run_window`], but with the `Runtime` assembled by the caller —
 /// the path for apps with their own environment (the text engine is
 /// still the assembler's responsibility).
 pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl View) {
-    let window = ffi::create_window(title, size.width, size.height, false);
+    run_window_chrome(title, size, Chrome::Native, runtime, root)
+}
+
+/// Like [`run_window_with`], choosing who draws the window's top edge.
+pub fn run_window_chrome(
+    title: &str,
+    size: Size,
+    chrome: Chrome,
+    runtime: Runtime,
+    root: impl View,
+) {
+    let window = ffi::create_window(title, size.width, size.height, chrome == Chrome::Scene);
     // a task that lands on a worker thread asks the pump for one more
     // turn; the frame it takes drains the queue on its way
     runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
@@ -242,6 +269,27 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
             ffi::set_frame_driver_paused(!runtime.wants_frame());
         }
     };
+
+    // the frame conversation: a press on a `.window_drag_region()`
+    // (with no interactive target above) moves the window; a
+    // `.window_control(…)` answers as the window's own button — the
+    // platform closes, minimizes, maximizes and offers its snap flyout
+    ffi::set_chrome_gates(
+        Box::new({
+            let runtime = Rc::clone(&runtime);
+            move |x, y| runtime.window_drag_at(x, y)
+        }),
+        Box::new({
+            let runtime = Rc::clone(&runtime);
+            move |x, y| {
+                runtime.window_control_at(x, y).map(|control| match control {
+                    bunny_ui::layout::WindowControl::Close => ffi::ControlHit::Close,
+                    bunny_ui::layout::WindowControl::Minimize => ffi::ControlHit::Minimize,
+                    bunny_ui::layout::WindowControl::Maximize => ffi::ControlHit::Maximize,
+                })
+            }
+        }),
+    );
 
     // the candidate window's anchor: the rect at the composition's
     // start, answered live by the runtime in layout points

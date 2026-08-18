@@ -173,6 +173,9 @@ unsafe extern "system" {
     fn SetProcessDPIAware() -> i32;
     fn ScreenToClient(hwnd: Hwnd, point: *mut Point) -> i32;
     fn ClientToScreen(hwnd: Hwnd, point: *mut Point) -> i32;
+    fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
+    fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32;
+    fn IsZoomed(hwnd: Hwnd) -> i32;
     fn MonitorFromWindow(hwnd: Hwnd, flags: u32) -> Handle;
     fn GetMonitorInfoW(monitor: Handle, info: *mut MonitorInfo) -> i32;
     fn SystemParametersInfoW(action: u32, param: u32, out: *mut c_void, update: u32) -> i32;
@@ -270,7 +273,18 @@ unsafe extern "system" {
 #[link(name = "dwmapi", kind = "raw-dylib")]
 unsafe extern "system" {
     fn DwmFlush() -> i32;
+    fn DwmSetWindowAttribute(
+        hwnd: Hwnd,
+        attribute: u32,
+        value: *const c_void,
+        size: u32,
+    ) -> i32;
 }
+
+/// `DWMWA_WINDOW_CORNER_PREFERENCE` / `DWMWCP_ROUND` — the system's
+/// own rounded corners, the same radius its apps wear.
+const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+const DWMWCP_ROUND: u32 = 2;
 
 // window styles
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
@@ -306,6 +320,33 @@ const WM_MOUSEHWHEEL: u32 = 0x020E;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 /// The never-activate answer to a click on a panel.
 const MA_NOACTIVATE: isize = 3;
+// scene chrome: the non-client conversation
+const WM_NCCALCSIZE: u32 = 0x0083;
+const WM_NCHITTEST: u32 = 0x0084;
+const WM_NCMOUSEMOVE: u32 = 0x00A0;
+const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+const WM_NCLBUTTONUP: u32 = 0x00A2;
+const WM_NCMOUSELEAVE: u32 = 0x02A2;
+const WM_SYSCOMMAND: u32 = 0x0112;
+const SC_MINIMIZE: usize = 0xF020;
+const SC_MAXIMIZE: usize = 0xF030;
+const SC_CLOSE: usize = 0xF060;
+const SC_RESTORE: usize = 0xF120;
+const HTCAPTION: isize = 2;
+const HTMINBUTTON: isize = 8;
+const HTMAXBUTTON: isize = 9;
+const HTLEFT: isize = 10;
+const HTRIGHT: isize = 11;
+const HTTOP: isize = 12;
+const HTTOPLEFT: isize = 13;
+const HTTOPRIGHT: isize = 14;
+const HTBOTTOM: isize = 15;
+const HTBOTTOMLEFT: isize = 16;
+const HTBOTTOMRIGHT: isize = 17;
+const HTCLOSE: isize = 20;
+/// `SM_CXFRAME` + `SM_CXPADDEDBORDER` — the resize band's two halves.
+const SM_CXFRAME: i32 = 32;
+const SM_CXPADDEDBORDER: i32 = 92;
 /// `SPI_GETWHEELSCROLLLINES`.
 const SPI_WHEEL_LINES: u32 = 0x68;
 // panel window styles
@@ -639,6 +680,98 @@ pub fn clipboard_read() -> Option<String> {
         CloseClipboard();
     }
     text
+}
+
+// MARK: - Scene chrome (the window draws its own crown)
+
+/// Which of the window's own buttons a point lands on — the shell's
+/// copy of the core's `WindowControl`, kept at the boundary.
+#[derive(Clone, Copy)]
+pub enum ControlHit {
+    Close,
+    Minimize,
+    Maximize,
+}
+
+thread_local! {
+    /// Whether the MAIN window wears scene chrome.
+    static SCENE_CHROME: Cell<bool> = const { Cell::new(false) };
+    /// Which caption button the press went down on — the release only
+    /// fires over the same one.
+    static PRESSED_CONTROL: Cell<isize> = const { Cell::new(0) };
+    /// "Does a press at this layout point drag the window?"
+    static DRAG_GATE: RefCell<Option<Box<dyn Fn(f64, f64) -> bool>>> =
+        const { RefCell::new(None) };
+    /// "Which window button sits at this layout point?"
+    static CONTROL_GATE: RefCell<Option<Box<dyn Fn(f64, f64) -> Option<ControlHit>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Installs the scene's answers for the platform's hit-test.
+pub fn set_chrome_gates(
+    drag: Box<dyn Fn(f64, f64) -> bool>,
+    control: Box<dyn Fn(f64, f64) -> Option<ControlHit>>,
+) {
+    DRAG_GATE.with(|slot| *slot.borrow_mut() = Some(drag));
+    CONTROL_GATE.with(|slot| *slot.borrow_mut() = Some(control));
+}
+
+/// The resize band, in physical pixels at this window's dpi.
+fn resize_band(hwnd: Hwnd) -> i32 {
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    unsafe {
+        GetSystemMetricsForDpi(SM_CXFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+    }
+}
+
+/// The scene window's hit-test: resize borders first (skipped when
+/// maximized), then the scene's own buttons, then the drag handle,
+/// then plain client. The platform does the rest — snap layouts hover
+/// the maximize answer, close closes, a caption drag moves and a
+/// caption double-click maximizes.
+fn scene_hit_test(hwnd: Hwnd, screen_x: i32, screen_y: i32) -> isize {
+    let mut window = Rect::default();
+    unsafe {
+        GetWindowRect(hwnd, &mut window);
+    }
+    if unsafe { IsZoomed(hwnd) } == 0 {
+        let band = resize_band(hwnd);
+        let left = screen_x < window.left + band;
+        let right = screen_x >= window.right - band;
+        let top = screen_y < window.top + band;
+        let bottom = screen_y >= window.bottom - band;
+        let edge = match (left, right, top, bottom) {
+            (true, _, true, _) => HTTOPLEFT,
+            (_, true, true, _) => HTTOPRIGHT,
+            (true, _, _, true) => HTBOTTOMLEFT,
+            (_, true, _, true) => HTBOTTOMRIGHT,
+            (true, ..) => HTLEFT,
+            (_, true, ..) => HTRIGHT,
+            (_, _, true, _) => HTTOP,
+            (_, _, _, true) => HTBOTTOM,
+            _ => 0,
+        };
+        if edge != 0 {
+            return edge;
+        }
+    }
+    let mut point = Point { x: screen_x, y: screen_y };
+    unsafe {
+        ScreenToClient(hwnd, &mut point);
+    }
+    let factor = shared_factor();
+    let (x, y) = (point.x as f64 / factor, point.y as f64 / factor);
+    let control = CONTROL_GATE
+        .with(|slot| slot.borrow().as_ref().and_then(|gate| gate(x, y)));
+    if let Some(control) = control {
+        return match control {
+            ControlHit::Close => HTCLOSE,
+            ControlHit::Minimize => HTMINBUTTON,
+            ControlHit::Maximize => HTMAXBUTTON,
+        };
+    }
+    let drags = DRAG_GATE.with(|slot| slot.borrow().as_ref().is_some_and(|gate| gate(x, y)));
+    if drags { HTCAPTION } else { HTCLIENT }
 }
 
 // MARK: - IME (IMM32 — the three doors and the mirror)
@@ -1280,6 +1413,99 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             }
             0
         }
+        WM_NCCALCSIZE => {
+            let main = hwnd == MAIN_HWND.load(Ordering::Acquire);
+            if !main || !SCENE_CHROME.with(|cell| cell.get()) || wparam == 0 {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            // the scene eats the frame: the client rect IS the window
+            // rect — except maximized, where the window hangs past the
+            // monitor by its (now invisible) frame and the client must
+            // step back inside
+            if unsafe { IsZoomed(hwnd) } != 0 {
+                let band = resize_band(hwnd);
+                let rects = lparam as *mut Rect; // NCCALCSIZE_PARAMS starts with rgrc[0]
+                unsafe {
+                    (*rects).left += band;
+                    (*rects).top += band;
+                    (*rects).right -= band;
+                    (*rects).bottom -= band;
+                }
+            }
+            0
+        }
+        WM_NCHITTEST => {
+            let main = hwnd == MAIN_HWND.load(Ordering::Acquire);
+            if !main || !SCENE_CHROME.with(|cell| cell.get()) {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            let x = (lparam & 0xFFFF) as u16 as i16 as i32;
+            let y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+            scene_hit_test(hwnd, x, y)
+        }
+        WM_NCMOUSEMOVE => {
+            // the bar lives in non-client territory now — its hover
+            // still belongs to the scene
+            if hwnd == MAIN_HWND.load(Ordering::Acquire) && SCENE_CHROME.with(|cell| cell.get())
+            {
+                let mut point = Point {
+                    x: (lparam & 0xFFFF) as u16 as i16 as i32,
+                    y: ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32,
+                };
+                unsafe {
+                    ScreenToClient(hwnd, &mut point);
+                }
+                let factor = shared_factor();
+                dispatch(AppEvent::MouseMoved {
+                    x: point.x as f64 / factor,
+                    y: point.y as f64 / factor,
+                });
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_NCMOUSELEAVE => {
+            // the pointer left through the bar: the hover unsticks the
+            // same way it does from the client side
+            dispatch(AppEvent::MouseExited);
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_NCLBUTTONDOWN => {
+            // the scene's own buttons: consumed HERE, or the default
+            // road paints the platform's LEGACY caption button over the
+            // scene — a museum piece flashing through the bar
+            match wparam as isize {
+                HTCLOSE | HTMINBUTTON | HTMAXBUTTON => {
+                    PRESSED_CONTROL.with(|cell| cell.set(wparam as isize));
+                    0
+                }
+                _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+            }
+        }
+        WM_NCLBUTTONUP => {
+            // release over the same button fires it — the platform's
+            // own manner, action on the up
+            let pressed = PRESSED_CONTROL.with(|cell| cell.take());
+            let hit = wparam as isize;
+            if pressed == hit {
+                let command = match hit {
+                    HTCLOSE => Some(SC_CLOSE),
+                    HTMINBUTTON => Some(SC_MINIMIZE),
+                    HTMAXBUTTON => Some(if unsafe { IsZoomed(hwnd) } != 0 {
+                        SC_RESTORE
+                    } else {
+                        SC_MAXIMIZE
+                    }),
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    unsafe {
+                        PostMessageW(hwnd, WM_SYSCOMMAND, command, 0);
+                    }
+                    return 0;
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_ERASEBKGND => 1,
         WM_SETCURSOR => {
             if (lparam & 0xFFFF) == HTCLIENT {
@@ -1629,10 +1855,12 @@ fn register_class() -> Vec<u16> {
 
 /// Creates the window HIDDEN at the requested logical content size.
 /// The caller presents the first frame and then shows it — the window
-/// never flashes unpainted. `_scene_chrome` is accepted for signature
-/// parity with the mac shell; the scene-drawn chrome is a later phase.
-pub fn create_window(title: &str, width: f64, height: f64, _scene_chrome: bool) -> WindowHandle {
+/// never flashes unpainted. With `scene_chrome`, the frame belongs to
+/// the scene: the non-client conversation answers with the scene's
+/// own drag handle and buttons, and resize borders survive.
+pub fn create_window(title: &str, width: f64, height: f64, scene_chrome: bool) -> WindowHandle {
     install_dpi_awareness();
+    SCENE_CHROME.with(|cell| cell.set(scene_chrome));
     let class_name = register_class();
     let title = wide(title);
     let style = WS_OVERLAPPEDWINDOW;
@@ -1654,8 +1882,27 @@ pub fn create_window(title: &str, width: f64, height: f64, _scene_chrome: bool) 
         )
     };
     assert!(hwnd != 0, "the platform refused the window");
+    // the frame conversation needs to know who the main window is
+    // BEFORE the resize below re-runs it
+    driver().hwnd.store(hwnd, Ordering::Release);
+    MAIN_HWND.store(hwnd, Ordering::Release);
+    if scene_chrome {
+        // a frameless window keeps the system's rounded corners — the
+        // compositor cuts and antialiases them, the platform's own
+        // radius. An older system answers with an error and square
+        // corners, honestly.
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &DWMWCP_ROUND as *const u32 as *const c_void,
+                4,
+            );
+        }
+    }
     // now the window knows its monitor: size the CLIENT area to the
-    // requested logical points at the true DPI
+    // requested logical points at the true DPI. Under scene chrome the
+    // client IS the window, so the outer size needs no adjusting.
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let (_, factor) = scale_of(dpi);
     let mut rect = Rect {
@@ -1665,7 +1912,10 @@ pub fn create_window(title: &str, width: f64, height: f64, _scene_chrome: bool) 
         bottom: (height * factor).round() as i32,
     };
     unsafe {
-        AdjustWindowRectExForDpi(&mut rect, style, 0, 0, dpi);
+        if !scene_chrome {
+            AdjustWindowRectExForDpi(&mut rect, style, 0, 0, dpi);
+        }
+        const SWP_FRAMECHANGED: u32 = 0x0020;
         SetWindowPos(
             hwnd,
             0,
@@ -1673,14 +1923,12 @@ pub fn create_window(title: &str, width: f64, height: f64, _scene_chrome: bool) 
             0,
             rect.right - rect.left,
             rect.bottom - rect.top,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_FRAMECHANGED,
         );
         // the slow clock: caret blink and the tooltip's wait
         SetTimer(hwnd, TIMER_BLINK, 500, std::ptr::null());
     }
     refresh_metrics(hwnd);
-    driver().hwnd.store(hwnd, Ordering::Release);
-    MAIN_HWND.store(hwnd, Ordering::Release);
     WindowHandle { hwnd }
 }
 
