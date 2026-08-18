@@ -1,8 +1,10 @@
-// The keyed operations, timed the house way: real clicks on the ids
-// the official harness uses, interleaved rounds, a cooldown between
-// them. Run `await __keyed.all()` from the console.
+// The keyed operations, measured the OFFICIAL way: every sample runs
+// on a freshly loaded page — the harness this mirrors reloads between
+// benchmarks, and so does this driver, carrying its progress in
+// sessionStorage. Kick it with `__keyed.suite()`; read the table in
+// `__keyedResults` when the page stops reloading.
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const ITERATIONS = 5;
 
 function press(id) {
   const el = document.getElementById(id);
@@ -16,67 +18,94 @@ function press(id) {
   );
 }
 
-function rowCount() {
-  return document.querySelectorAll("#app tr").length;
-}
-
 function timed(action) {
   const opened = performance.now();
   action();
   return performance.now() - opened;
 }
 
-async function all() {
-  const results = {};
-  const measure = (label, action, samples = 10) => {
-    const bucket = (results[label] ||= []);
-    for (let i = 0; i < samples; i++) {
-      bucket.push(timed(action));
+// Each scenario: `prep` runs untimed on the fresh page, `run` is the
+// one measured action — the official harness's own shape.
+const SCENARIOS = {
+  "create 1k": { prep: () => {}, run: () => press("run") },
+  "replace 1k": { prep: () => press("run"), run: () => press("run") },
+  "update every 10th": { prep: () => press("run"), run: () => press("update") },
+  "select row": {
+    prep: () => press("run"),
+    run: () => {
+      const label = document.querySelectorAll("#app tr a")[10];
+      const rect = label.getBoundingClientRect();
+      label.dispatchEvent(
+        new PointerEvent("pointerup", {
+          bubbles: true,
+          clientX: rect.left + 3,
+          clientY: rect.top + 3,
+        }),
+      );
+    },
+  },
+  "swap rows": { prep: () => press("run"), run: () => press("swaprows") },
+  "append 1k": { prep: () => press("run"), run: () => press("add") },
+  "clear 1k": { prep: () => press("run"), run: () => press("clear") },
+  "create 10k": { prep: () => {}, run: () => press("runlots") },
+};
+
+function schedule() {
+  const labels = Object.keys(SCENARIOS);
+  const plan = [];
+  for (const label of labels) {
+    for (let i = 0; i < ITERATIONS; i++) {
+      plan.push(label);
     }
-  };
-
-  for (let round = 0; round < 3; round++) {
-    press("clear");
-    measure("create 1k", () => press("run"), 5);
-    measure("update 10th", () => press("update"), 10);
-    measure("select", () => {
-      const label = document.querySelectorAll("#app tr a")[6];
-      if (label) {
-        const rect = label.getBoundingClientRect();
-        label.dispatchEvent(
-          new PointerEvent("pointerup", {
-            bubbles: true,
-            clientX: rect.left + 3,
-            clientY: rect.top + 3,
-          }),
-        );
-      }
-    }, 10);
-    measure("swap", () => press("swaprows"), 10);
-    measure("append 1k", () => press("add"), 3);
-    measure("clear", () => press("clear"), 3);
-    press("runlots");
-    measure("create 10k (once)", () => {}, 1);
-    results["create 10k rows"] ||= [];
-    press("clear");
-    measure("create 10k rows", () => press("runlots"), 2);
-    press("clear");
-    await sleep(2000);
   }
-
-  const table = {};
-  for (const [label, samples] of Object.entries(results)) {
-    const sorted = [...samples].sort((a, b) => a - b);
-    table[label] = {
-      p50: +sorted[Math.floor(sorted.length / 2)].toFixed(2),
-      max: +sorted[sorted.length - 1].toFixed(2),
-      samples: sorted.length,
-    };
-  }
-  table.rows = { p50: rowCount() };
-  window.__keyedResults = table;
-  console.table(table);
-  return table;
+  return plan;
 }
 
-window.__keyed = { all, press, rowCount };
+async function ready() {
+  while (!window.__bunny || !document.getElementById("run")) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function step() {
+  const state = JSON.parse(sessionStorage.getItem("keyedSuite") || "null");
+  if (!state) return;
+  if (state.at >= state.plan.length) {
+    sessionStorage.removeItem("keyedSuite");
+    const table = {};
+    for (const [label, samples] of Object.entries(state.results)) {
+      const sorted = [...samples].sort((a, b) => a - b);
+      table[label] = {
+        p50: +sorted[Math.floor(sorted.length / 2)].toFixed(1),
+        max: +sorted[sorted.length - 1].toFixed(1),
+        samples: sorted.length,
+      };
+    }
+    window.__keyedResults = table;
+    document.title = "keyed DONE";
+    console.table(table);
+    return;
+  }
+  await ready();
+  const label = state.plan[state.at];
+  const scenario = SCENARIOS[label];
+  scenario.prep();
+  // one macrotask so the prep's layout settles before the sample
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const sample = timed(scenario.run);
+  (state.results[label] ||= []).push(sample);
+  state.at += 1;
+  sessionStorage.setItem("keyedSuite", JSON.stringify(state));
+  location.reload();
+}
+
+function suite() {
+  sessionStorage.setItem(
+    "keyedSuite",
+    JSON.stringify({ at: 0, plan: schedule(), results: {} }),
+  );
+  location.reload();
+}
+
+window.__keyed = { suite, press };
+step();
