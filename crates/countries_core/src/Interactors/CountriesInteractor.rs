@@ -98,6 +98,8 @@ use std::rc::Rc;
 /// Port of `UnitTests/Mocks/{Mock,MockedWebRepositories,MockedDBRepositories}.swift`
 /// + `UnitTests/Mocks/Interactors/CountriesInteractorTests.swift`.
 #[cfg(test)]
+// the mock actions keep Swift's case names, as the file keeps Swift's names
+#[allow(non_camel_case_types)]
 mod tests {
     use super::*;
     use crate::Repositories::Database::CountriesDBRepository::CountriesDBRepository;
