@@ -14,12 +14,52 @@ mod text;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use bunny_ui::action::{Key, KeyPattern};
 use bunny_ui::layout::Size;
-use bunny_ui::prelude::Runtime;
+use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
 pub use text::FreeTypeEngine;
+
+/// XKB keysym → the keymap vocabulary. Named keys come from the sym
+/// table; the rest becomes `Char` through the base char (a clean
+/// keyboard state), lowercased. `None` = lone modifier/function key.
+///
+/// The modifier mapping is the platform's: Ctrl is the accelerator,
+/// so Ctrl carries `command`; Alt (Mod1) carries `option`; the
+/// `control` flag stays false (Super belongs to the system). An AltGr
+/// chord that types (`types_text`) never reaches this table — the
+/// gate lets it through to the character road first.
+fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
+    let named = match stroke.sym {
+        0xff54 => Some(Key::Down),
+        0xff52 => Some(Key::Up),
+        0xff51 => Some(Key::Left),
+        0xff53 => Some(Key::Right),
+        0xff0d | 0xff8d => Some(Key::Enter), // Return and the keypad Enter share it
+        0xff1b => Some(Key::Escape),
+        0xff09 | 0xfe20 => Some(Key::Tab), // shift turns Tab into ISO_Left_Tab
+        0xff55 => Some(Key::PageUp),
+        0xff56 => Some(Key::PageDown),
+        0xff08 => Some(Key::Backspace),
+        0xffff => Some(Key::Delete),
+        0xff50 => Some(Key::Home),
+        0xff57 => Some(Key::End),
+        _ => None,
+    };
+    let key = named.or_else(|| {
+        let base = stroke.chars_ignoring.chars().next()?;
+        (!base.is_control()).then(|| Key::Char(base.to_ascii_lowercase()))
+    })?;
+    Some(KeyPattern {
+        key,
+        shift: stroke.shift,
+        command: stroke.control,
+        option: stroke.alt,
+        control: false,
+    })
+}
 
 /// Opens the window and enters the live cycle. Returns when the app
 /// quits (closing the window quits).
@@ -56,6 +96,10 @@ pub fn run_window_chrome(
     root: impl View,
 ) {
     let window = ffi::create_window(title, size.width, size.height, chrome == Chrome::Scene);
+    // a task that lands on a worker thread asks the pump for one more
+    // turn; the frame it takes drains the queue on its way
+    runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
+    // two owners: the keyboard gate and the event handler
     let runtime = Rc::new(runtime);
     let root = Rc::new(root);
 
@@ -150,6 +194,48 @@ pub fn run_window_chrome(
         }
     };
 
+    // the gate: keymap BEFORE the input system — bare chars with a
+    // focused field pass straight through (typing is never stolen); a
+    // binding with no handler mounted does not consume; an AltGr chord
+    // that types IS text and never enters. The composition-first step
+    // arrives with the IME phase.
+    ffi::set_key_gate(Box::new({
+        let runtime = Rc::clone(&runtime);
+        let root = Rc::clone(&root);
+        let blit = blit.clone();
+        move |stroke: &ffi::KeyStroke| {
+            if stroke.types_text {
+                return false;
+            }
+            let Some(pattern) = key_pattern(stroke) else {
+                return false;
+            };
+            if runtime.focused().is_some() && pattern.is_text_input() {
+                return false;
+            }
+            // a focused escape hatch owns its strokes: an editor's
+            // arrows, Enter and Tab are its own, and a copy hands the
+            // text back for the clipboard
+            let taken = runtime.key_stroke(&pattern);
+            if taken.handled {
+                if let Some(text) = taken.text {
+                    ffi::clipboard_write(&text);
+                }
+                blit(&runtime, &*root);
+                return true;
+            }
+            let Some(action) = runtime.match_key(&pattern) else {
+                return false;
+            };
+            if runtime.dispatch_action(action) {
+                blit(&runtime, &*root);
+                true
+            } else {
+                false
+            }
+        }
+    }));
+
     let handler_runtime = Rc::clone(&runtime);
     let handler_root = Rc::clone(&root);
     let handler_present = Rc::clone(&present);
@@ -157,7 +243,64 @@ pub fn run_window_chrome(
         let runtime = &handler_runtime;
         let root = &*handler_root;
         match event {
-            AppEvent::Redraw => blit(runtime, root),
+            AppEvent::Redraw | AppEvent::Wake => blit(runtime, root),
+            AppEvent::ResignKey => {
+                // the user switched away: popovers close like the
+                // platform's own
+                if runtime.dismiss_all_overlays() {
+                    blit(runtime, root);
+                }
+            }
+            AppEvent::Text(text) => {
+                // typing, paste of characters, and the composed
+                // dead-key result — the same road for all of them
+                if !text.is_empty() && runtime.key(EditCommand::Insert(text)).applied {
+                    blit(runtime, root);
+                }
+            }
+            AppEvent::Key { sym, shift, command } => {
+                let edit = match sym {
+                    0xff08 => Some(EditCommand::Backspace),
+                    0xffff => Some(EditCommand::Delete),
+                    0xff51 => Some(EditCommand::Left(shift)),
+                    0xff53 => Some(EditCommand::Right(shift)),
+                    0xff50 => Some(EditCommand::Home(shift)),
+                    0xff57 => Some(EditCommand::End(shift)),
+                    0xff1b => {
+                        // esc releases focus
+                        if runtime.blur() {
+                            blit(runtime, root);
+                        }
+                        None
+                    }
+                    0x61 if command => Some(EditCommand::SelectAll), // Ctrl+A
+                    0x63 if command => {
+                        // Ctrl+C — the field's output goes to the system
+                        if let Some(text) = runtime.key(EditCommand::Copy).output {
+                            ffi::clipboard_write(&text);
+                        }
+                        None
+                    }
+                    0x78 if command => {
+                        // Ctrl+X
+                        let cut = runtime.key(EditCommand::Cut);
+                        if let Some(text) = &cut.output {
+                            ffi::clipboard_write(text);
+                        }
+                        if cut.output.is_some() {
+                            blit(runtime, root);
+                        }
+                        None
+                    }
+                    0x76 if command => ffi::clipboard_read().map(EditCommand::Insert), // Ctrl+V
+                    _ => None,
+                };
+                if let Some(edit) = edit
+                    && runtime.key(edit).applied
+                {
+                    blit(runtime, root);
+                }
+            }
             AppEvent::MouseMoved { x, y } => {
                 if runtime.pointer_moved(x, y) {
                     blit(runtime, root);
@@ -215,4 +358,70 @@ pub fn run_window_chrome(
     ffi::dispatch(AppEvent::Redraw);
     ffi::show_window(window);
     ffi::run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stroke(sym: u32, base: &str, shift: bool, control: bool, alt: bool) -> ffi::KeyStroke {
+        ffi::KeyStroke {
+            sym,
+            shift,
+            control,
+            alt,
+            chars_ignoring: base.to_string(),
+            types_text: false,
+        }
+    }
+
+    #[test]
+    fn named_keys_map_to_the_vocabulary() {
+        let pattern = key_pattern(&stroke(0xff54, "", false, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::Down);
+        let pattern = key_pattern(&stroke(0xff0d, "\r", false, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::Enter);
+        let pattern = key_pattern(&stroke(0xff1b, "\u{1b}", false, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::Escape);
+    }
+
+    #[test]
+    fn ctrl_carries_command_the_accelerator() {
+        let pattern = key_pattern(&stroke(0x66, "f", false, true, false)).unwrap();
+        assert_eq!(pattern.key, Key::Char('f'));
+        assert!(pattern.command, "Ctrl is the accelerator");
+        assert!(!pattern.control, "the control flag stays with the system");
+        assert!(!pattern.is_text_input(), "a chord is never typing");
+    }
+
+    #[test]
+    fn a_bare_letter_is_text_input() {
+        let pattern = key_pattern(&stroke(0x61, "a", false, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::Char('a'));
+        assert!(pattern.is_text_input());
+    }
+
+    #[test]
+    fn shift_tab_matches_exactly() {
+        // shift turns Tab into ISO_Left_Tab — the table folds it back
+        let pattern = key_pattern(&stroke(0xfe20, "\t", true, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::Tab);
+        assert!(pattern.shift);
+        assert!(!pattern.command && !pattern.option);
+    }
+
+    #[test]
+    fn a_lone_modifier_is_no_pattern() {
+        // Shift_L alone: no named key, no base char
+        assert!(key_pattern(&stroke(0xffe1, "", true, false, false)).is_none());
+        // a function key has no base char either
+        assert!(key_pattern(&stroke(0xffc1, "", false, false, false)).is_none(), "F4 is silent");
+    }
+
+    #[test]
+    fn the_base_char_lowers_and_alt_rides_as_option() {
+        let pattern = key_pattern(&stroke(0x41, "A", true, false, true)).unwrap();
+        assert_eq!(pattern.key, Key::Char('a'), "shift does not change the key's identity");
+        assert!(pattern.option, "Alt rides as option");
+    }
 }

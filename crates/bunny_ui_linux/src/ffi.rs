@@ -22,8 +22,8 @@
 //! reader in the GPU era.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
-use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
+use std::collections::{HashMap, VecDeque};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::time::Instant;
 
 // MARK: - libc floor (the only raw syscalls the shell needs)
@@ -41,6 +41,10 @@ const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x1;
 
+const O_CLOEXEC: c_int = 0o2000000;
+const O_NONBLOCK: c_int = 0o4000;
+const MAP_PRIVATE: c_int = 0x2;
+
 unsafe extern "C" {
     fn memfd_create(name: *const c_char, flags: c_uint) -> c_int;
     fn ftruncate(fd: c_int, length: i64) -> c_int;
@@ -55,6 +59,10 @@ unsafe extern "C" {
     fn munmap(addr: *mut c_void, length: usize) -> c_int;
     fn poll(fds: *mut PollFd, count: u64, timeout_ms: c_int) -> c_int;
     fn close(fd: c_int) -> c_int;
+    fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
+    fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
+    fn write(fd: c_int, buffer: *const c_void, count: usize) -> isize;
+    fn getpid() -> c_int;
 }
 
 // MARK: - libwayland-client ABI (the library owns the wire; we own the tables)
@@ -149,6 +157,10 @@ unsafe extern "C" {
     static wl_output_interface: WlInterface;
     static wl_seat_interface: WlInterface;
     static wl_pointer_interface: WlInterface;
+    static wl_keyboard_interface: WlInterface;
+    static wl_data_device_manager_interface: WlInterface;
+    static wl_data_device_interface: WlInterface;
+    static wl_data_source_interface: WlInterface;
 }
 
 // MARK: - libwayland-cursor ABI (theme files arrive as ready wl_buffers)
@@ -175,6 +187,63 @@ unsafe extern "C" {
     fn wl_cursor_theme_destroy(theme: *mut c_void);
     fn wl_cursor_theme_get_cursor(theme: *mut c_void, name: *const c_char) -> *mut WlCursor;
     fn wl_cursor_image_get_buffer(image: *mut WlCursorImage) -> *mut Proxy;
+}
+
+// MARK: - libxkbcommon ABI (the keymap authority — NEVER parsed by hand)
+
+const XKB_KEYMAP_FORMAT_TEXT_V1: c_int = 1;
+const XKB_STATE_MODS_EFFECTIVE: c_int = 8;
+const XKB_COMPOSE_COMPOSING: c_int = 1;
+const XKB_COMPOSE_COMPOSED: c_int = 2;
+const XKB_COMPOSE_CANCELLED: c_int = 3;
+
+#[link(name = "xkbcommon")]
+unsafe extern "C" {
+    fn xkb_context_new(flags: c_int) -> *mut c_void;
+    fn xkb_context_unref(context: *mut c_void);
+    fn xkb_keymap_new_from_string(
+        context: *mut c_void,
+        text: *const c_char,
+        format: c_int,
+        flags: c_int,
+    ) -> *mut c_void;
+    fn xkb_keymap_unref(keymap: *mut c_void);
+    fn xkb_keymap_key_repeats(keymap: *mut c_void, keycode: u32) -> c_int;
+    fn xkb_state_new(keymap: *mut c_void) -> *mut c_void;
+    fn xkb_state_unref(state: *mut c_void);
+    fn xkb_state_update_mask(
+        state: *mut c_void,
+        depressed: u32,
+        latched: u32,
+        locked: u32,
+        layout_depressed: u32,
+        layout_latched: u32,
+        layout_locked: u32,
+    ) -> c_int;
+    fn xkb_state_key_get_one_sym(state: *mut c_void, keycode: u32) -> u32;
+    fn xkb_state_key_get_utf8(
+        state: *mut c_void,
+        keycode: u32,
+        buffer: *mut c_char,
+        size: usize,
+    ) -> c_int;
+    fn xkb_state_mod_name_is_active(
+        state: *mut c_void,
+        name: *const c_char,
+        kind: c_int,
+    ) -> c_int;
+    fn xkb_compose_table_new_from_locale(
+        context: *mut c_void,
+        locale: *const c_char,
+        flags: c_int,
+    ) -> *mut c_void;
+    fn xkb_compose_table_unref(table: *mut c_void);
+    fn xkb_compose_state_new(table: *mut c_void, flags: c_int) -> *mut c_void;
+    fn xkb_compose_state_unref(state: *mut c_void);
+    fn xkb_compose_state_feed(state: *mut c_void, sym: u32) -> c_int;
+    fn xkb_compose_state_get_status(state: *mut c_void) -> c_int;
+    fn xkb_compose_state_get_utf8(state: *mut c_void, buffer: *mut c_char, size: usize) -> c_int;
+    fn xkb_compose_state_reset(state: *mut c_void);
 }
 
 // MARK: - the xdg-shell tables (hand-written, opcode order is law)
@@ -482,6 +551,9 @@ const TAG_POINTER: usize = 9;
 const TAG_BUFFER: usize = 10;
 const TAG_CURSOR_SURFACE: usize = 11;
 const TAG_KEYBOARD: usize = 12;
+const TAG_DATA_DEVICE: usize = 13;
+const TAG_DATA_OFFER: usize = 14;
+const TAG_DATA_SOURCE: usize = 15;
 const OUTPUT_TAG_BASE: usize = 0x1000;
 
 /// A decoded protocol event, queued for the loop. The dispatcher owns
@@ -504,6 +576,17 @@ enum Ev {
     PointerMotion { x: f64, y: f64 },
     PointerButton { serial: u32, time_ms: u32, button: u32, pressed: bool },
     BufferRelease,
+    KeyboardKeymap { format: u32, fd: i32, size: u32 },
+    KeyboardEnter,
+    KeyboardLeave,
+    KeyboardKey { serial: u32, key: u32, pressed: bool },
+    KeyboardMods { depressed: u32, latched: u32, locked: u32, group: u32 },
+    RepeatInfo { rate: i32, delay: i32 },
+    NewOffer { offer_ptr: usize },
+    OfferMime { offer_ptr: usize, mime: String },
+    Selection { offer_ptr: usize },
+    SourceSend { mime: String, fd: i32 },
+    SourceCancelled,
 }
 
 thread_local! {
@@ -585,7 +668,68 @@ unsafe extern "C" fn dispatcher(
             _ => {} // axis family joins at the scroll phase; frame batches then
         },
         TAG_BUFFER => push_ev(Ev::BufferRelease),
-        TAG_CURSOR_SURFACE | TAG_KEYBOARD => {}
+        TAG_KEYBOARD => match opcode {
+            0 => push_ev(Ev::KeyboardKeymap {
+                format: unsafe { arg(0).u },
+                fd: unsafe { arg(1).h },
+                size: unsafe { arg(2).u },
+            }),
+            1 => push_ev(Ev::KeyboardEnter),
+            2 => push_ev(Ev::KeyboardLeave),
+            3 => push_ev(Ev::KeyboardKey {
+                serial: unsafe { arg(0).u },
+                key: unsafe { arg(2).u },
+                pressed: unsafe { arg(3).u } == 1,
+            }),
+            4 => push_ev(Ev::KeyboardMods {
+                depressed: unsafe { arg(1).u },
+                latched: unsafe { arg(2).u },
+                locked: unsafe { arg(3).u },
+                group: unsafe { arg(4).u },
+            }),
+            5 => push_ev(Ev::RepeatInfo {
+                rate: unsafe { arg(0).i },
+                delay: unsafe { arg(1).i },
+            }),
+            _ => {}
+        },
+        TAG_DATA_DEVICE => match opcode {
+            0 => {
+                // the offer proxy is SERVER-created; wire its
+                // dispatcher before any of its events can land
+                let offer = unsafe { arg(0).o };
+                if !offer.is_null() {
+                    unsafe {
+                        wl_proxy_add_dispatcher(
+                            offer,
+                            dispatcher,
+                            TAG_DATA_OFFER as *const c_void,
+                            std::ptr::null_mut(),
+                        );
+                    }
+                    push_ev(Ev::NewOffer { offer_ptr: offer as usize });
+                }
+            }
+            5 => push_ev(Ev::Selection { offer_ptr: unsafe { arg(0).o } as usize }),
+            _ => {} // drag-and-drop events: out of this war's scope
+        },
+        TAG_DATA_OFFER => {
+            if opcode == 0 {
+                let mime =
+                    unsafe { CStr::from_ptr(arg(0).s) }.to_string_lossy().into_owned();
+                push_ev(Ev::OfferMime { offer_ptr: _proxy as usize, mime });
+            }
+        }
+        TAG_DATA_SOURCE => match opcode {
+            1 => {
+                let mime =
+                    unsafe { CStr::from_ptr(arg(0).s) }.to_string_lossy().into_owned();
+                push_ev(Ev::SourceSend { mime, fd: unsafe { arg(1).h } });
+            }
+            2 => push_ev(Ev::SourceCancelled),
+            _ => {} // target(0): a dnd-only hint
+        },
+        TAG_CURSOR_SURFACE => {}
         tag if tag >= OUTPUT_TAG_BASE => {
             let output_name = (tag - OUTPUT_TAG_BASE) as u32;
             match opcode {
@@ -628,12 +772,14 @@ impl MapState {
     }
 }
 
-/// The serial slots the protocol demands back. Buttons record on PRESS
-/// only — compositors decline moves and grabs quoting release serials.
+/// The serial slots the protocol demands back. Buttons and keys record
+/// on PRESS only — compositors decline moves and grabs quoting release
+/// serials.
 #[derive(Default)]
 struct Serials {
     enter: u32,
     press: u32,
+    key_press: u32,
 }
 
 impl Serials {
@@ -641,6 +787,18 @@ impl Serials {
         if pressed {
             self.press = serial;
         }
+    }
+
+    fn record_key(&mut self, serial: u32, pressed: bool) {
+        if pressed {
+            self.key_press = serial;
+        }
+    }
+
+    /// Compositor serials rise monotonically; a selection claim wants
+    /// the freshest of ANY kind — a stale kind is silently rejected.
+    fn latest(&self) -> u32 {
+        self.enter.max(self.press).max(self.key_press)
     }
 }
 
@@ -734,12 +892,60 @@ struct CursorState {
     current: Cursor,
 }
 
+/// The keyboard: the compositor sends the keymap as text, xkbcommon
+/// compiles it, and the shell asks the state questions. `scratch` is a
+/// second state that never learns the modifiers — the chars-ignoring
+/// road (the ToUnicode-zeroed twin).
+struct Keyboard {
+    context: *mut c_void,
+    keymap: *mut c_void,
+    state: *mut c_void,
+    scratch: *mut c_void,
+    compose: *mut c_void,
+    repeat_rate: i32,
+    repeat_delay: i32,
+    /// The held repeating keycode and its generation — a bumped
+    /// generation orphans any timer already scheduled (the
+    /// ghost-repeat cure).
+    held: Option<(u32, u64)>,
+    generation: u64,
+    /// A second press of the held keycode without a release means the
+    /// compositor repeats for us — our timer stands down for the hold.
+    compositor_repeats: bool,
+}
+
+impl Keyboard {
+    fn new() -> Keyboard {
+        Keyboard {
+            context: std::ptr::null_mut(),
+            keymap: std::ptr::null_mut(),
+            state: std::ptr::null_mut(),
+            scratch: std::ptr::null_mut(),
+            compose: std::ptr::null_mut(),
+            repeat_rate: 16,
+            repeat_delay: 500,
+            held: None,
+            generation: 0,
+            compositor_repeats: false,
+        }
+    }
+}
+
+/// Our claim on the selection: the source proxy and the text it serves.
+struct SourceState {
+    proxy: *mut Proxy,
+    text: String,
+}
+
 struct Client {
     display: *mut Display,
     registry: *mut Proxy,
     compositor: *mut Proxy,
     shm: *mut Proxy,
     pointer: *mut Proxy,
+    keyboard_proxy: *mut Proxy,
+    data_device: *mut Proxy,
+    data_manager: *mut Proxy,
     wm_base: *mut Proxy,
     protocols: &'static Protocols,
     outputs: Vec<OutputInfo>,
@@ -749,6 +955,13 @@ struct Client {
     clicks: ClickClock,
     pointer_pos: (f64, f64),
     cursor: CursorState,
+    keyboard: Keyboard,
+    /// Live offers and their advertised mimes, keyed by proxy address.
+    offers: HashMap<usize, Vec<String>>,
+    /// The current selection's offer (0 = cleared).
+    selection: usize,
+    source: Option<SourceState>,
+    wake_read: c_int,
     /// Counts presenting commits — the configure road checks whether
     /// an ack was followed by one.
     presents: u64,
@@ -759,6 +972,7 @@ thread_local! {
     static CLIENT: RefCell<Option<Client>> = const { RefCell::new(None) };
     static HANDLER: RefCell<Option<Box<dyn FnMut(AppEvent)>>> = const { RefCell::new(None) };
     static NEXT_BLINK: Cell<Option<Instant>> = const { Cell::new(None) };
+    static NEXT_REPEAT: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 fn with_client<R>(body: impl FnOnce(&mut Client) -> R) -> R {
@@ -772,11 +986,18 @@ fn with_client<R>(body: impl FnOnce(&mut Client) -> R) -> R {
 
 pub enum AppEvent {
     Redraw,
+    Wake,
+    ResignKey,
     MouseMoved { x: f64, y: f64 },
     MouseDown { x: f64, y: f64, clicks: u8 },
     MouseUp { x: f64, y: f64 },
     RightMouseDown { x: f64, y: f64 },
     MouseExited,
+    /// Typing, paste of characters, and the composed dead-key result —
+    /// the same road for all of them.
+    Text(String),
+    /// An editing key that passed the gate unconsumed.
+    Key { sym: u32, shift: bool, command: bool },
     Blink,
     Frame { dt: f64 },
 }
@@ -866,16 +1087,70 @@ fn connect() {
         }
     }
 
-    // the pointer: capability events are racy at bind, the census is
-    // not — WSLg and every desktop advertise the pointer up front
-    let pointer = if seat.is_null() {
+    // the devices: capability events are racy at bind, the census is
+    // not — WSLg and every desktop advertise pointer+keyboard up front
+    let (pointer, keyboard_proxy) = if seat.is_null() {
+        (std::ptr::null_mut(), std::ptr::null_mut())
+    } else {
+        unsafe {
+            (
+                construct(seat, 0, &raw const wl_pointer_interface, &mut [arg_n()], TAG_POINTER),
+                construct(seat, 1, &raw const wl_keyboard_interface, &mut [arg_n()], TAG_KEYBOARD),
+            )
+        }
+    };
+
+    let data_manager = bind(
+        c"wl_data_device_manager",
+        &raw const wl_data_device_manager_interface,
+        3,
+        TAG_SYNC,
+    );
+    let data_device = if data_manager.is_null() || seat.is_null() {
         std::ptr::null_mut()
     } else {
-        unsafe { construct(seat, 0, &raw const wl_pointer_interface, &mut [arg_n()], TAG_POINTER) }
+        unsafe {
+            construct(
+                data_manager,
+                1, // get_data_device(new id, seat)
+                &raw const wl_data_device_interface,
+                &mut [arg_n(), arg_o(seat)],
+                TAG_DATA_DEVICE,
+            )
+        }
     };
 
     let cursor_surface =
         unsafe { construct(compositor, 0, &raw const wl_surface_interface, &mut [arg_n()], TAG_CURSOR_SURFACE) };
+
+    // the wake pipe: any thread writes a byte, the poll loop turns it
+    // into one more frame of the pump
+    let mut pipe_fds = [0 as c_int; 2];
+    let wake_read = if unsafe { pipe2(pipe_fds.as_mut_ptr(), O_CLOEXEC | O_NONBLOCK) } == 0 {
+        WAKE_WRITE_FD.store(pipe_fds[1], std::sync::atomic::Ordering::Release);
+        pipe_fds[0]
+    } else {
+        -1
+    };
+
+    let mut keyboard = Keyboard::new();
+    unsafe {
+        keyboard.context = xkb_context_new(0);
+        if !keyboard.context.is_null() {
+            // the locale drives the dead-key table; empty falls to C
+            let locale = std::env::var("LC_ALL")
+                .or_else(|_| std::env::var("LC_CTYPE"))
+                .or_else(|_| std::env::var("LANG"))
+                .unwrap_or_else(|_| "C".into());
+            if let Ok(locale_c) = CString::new(locale) {
+                let table = xkb_compose_table_new_from_locale(keyboard.context, locale_c.as_ptr(), 0);
+                if !table.is_null() {
+                    keyboard.compose = xkb_compose_state_new(table, 0);
+                    xkb_compose_table_unref(table);
+                }
+            }
+        }
+    }
 
     CLIENT.with(|slot| {
         *slot.borrow_mut() = Some(Client {
@@ -884,6 +1159,9 @@ fn connect() {
             compositor,
             shm,
             pointer,
+            keyboard_proxy,
+            data_device,
+            data_manager,
             wm_base,
             protocols,
             outputs,
@@ -898,6 +1176,11 @@ fn connect() {
                 theme_scale: 0,
                 current: Cursor::Arrow,
             },
+            keyboard,
+            offers: HashMap::new(),
+            selection: 0,
+            source: None,
+            wake_read,
             presents: 0,
             quit: false,
         })
@@ -1304,6 +1587,289 @@ fn apply_cursor() {
     });
 }
 
+// MARK: - the keyboard road (gate → edit keys → text)
+
+/// What one key press looks like at the gate. `control` carries Ctrl
+/// (the accelerator — it maps to `command` in the keymap vocabulary),
+/// `alt` carries Mod1. `chars_ignoring` is the base character from a
+/// modifier-clean state; `types_text` marks an AltGr chord that TYPES
+/// (level-3 text is never a binding).
+pub struct KeyStroke {
+    pub sym: u32,
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+    pub chars_ignoring: String,
+    pub types_text: bool,
+}
+
+thread_local! {
+    static KEY_GATE: RefCell<Option<Box<dyn FnMut(&KeyStroke) -> bool>>> =
+        const { RefCell::new(None) };
+}
+
+pub fn set_key_gate(gate: Box<dyn FnMut(&KeyStroke) -> bool>) {
+    KEY_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+/// What one press resolved to, computed under the client borrow and
+/// acted on outside it.
+enum KeyRoad {
+    Silence,
+    Composed(String),
+    Stroke(KeyStroke, String),
+}
+
+/// The xkb walk for one PRESSED key: compose first (dead keys), then
+/// the stroke with both texts. `keycode` is already evdev+8.
+fn key_road(keyboard: &mut Keyboard, keycode: u32) -> KeyRoad {
+    if keyboard.state.is_null() {
+        return KeyRoad::Silence;
+    }
+    unsafe {
+        let sym = xkb_state_key_get_one_sym(keyboard.state, keycode);
+        if !keyboard.compose.is_null() && xkb_compose_state_feed(keyboard.compose, sym) == 1 {
+            match xkb_compose_state_get_status(keyboard.compose) {
+                XKB_COMPOSE_COMPOSING => return KeyRoad::Silence,
+                XKB_COMPOSE_COMPOSED => {
+                    let mut buffer = [0 as c_char; 64];
+                    let n = xkb_compose_state_get_utf8(
+                        keyboard.compose,
+                        buffer.as_mut_ptr(),
+                        buffer.len(),
+                    );
+                    xkb_compose_state_reset(keyboard.compose);
+                    let text = utf8_of(&buffer, n);
+                    return if text.is_empty() { KeyRoad::Silence } else { KeyRoad::Composed(text) };
+                }
+                XKB_COMPOSE_CANCELLED => {
+                    xkb_compose_state_reset(keyboard.compose);
+                    return KeyRoad::Silence;
+                }
+                _ => {}
+            }
+        }
+        let mut buffer = [0 as c_char; 64];
+        let n = xkb_state_key_get_utf8(keyboard.state, keycode, buffer.as_mut_ptr(), buffer.len());
+        let text = utf8_of(&buffer, n);
+        let mut ignoring = [0 as c_char; 64];
+        let n = xkb_state_key_get_utf8(
+            keyboard.scratch,
+            keycode,
+            ignoring.as_mut_ptr(),
+            ignoring.len(),
+        );
+        let chars_ignoring = utf8_of(&ignoring, n);
+        let active = |name: &CStr| {
+            xkb_state_mod_name_is_active(keyboard.state, name.as_ptr(), XKB_STATE_MODS_EFFECTIVE)
+                == 1
+        };
+        let printable = !text.is_empty() && !text.chars().any(|ch| ch.is_control());
+        // the AltGr rule: a level-3 chord that types IS text — it
+        // skips the gate so the binding never steals the character
+        let types_text = printable && active(c"Mod5");
+        KeyRoad::Stroke(
+            KeyStroke {
+                sym,
+                shift: active(c"Shift"),
+                control: active(c"Control"),
+                alt: active(c"Mod1"),
+                chars_ignoring,
+                types_text,
+            },
+            text,
+        )
+    }
+}
+
+fn utf8_of(buffer: &[c_char], written: c_int) -> String {
+    if written <= 0 {
+        return String::new();
+    }
+    let bytes: Vec<u8> =
+        buffer[..(written as usize).min(buffer.len())].iter().map(|&c| c as u8).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The editing keys the shell forwards when the gate declines: the
+/// EditCommand set plus the Ctrl accelerator quartet.
+fn is_edit_key(stroke: &KeyStroke) -> bool {
+    matches!(stroke.sym, 0xff08 | 0xffff | 0xff51 | 0xff53 | 0xff50 | 0xff57 | 0xff1b)
+        || (stroke.control && matches!(stroke.sym, 0x61 | 0x63 | 0x78 | 0x76))
+}
+
+/// One pressed (or repeated) key walks the whole road: gate first,
+/// then the editing keys, then the character road. Runs OUTSIDE the
+/// client borrow.
+fn deliver_key(road: KeyRoad) {
+    match road {
+        KeyRoad::Silence => {}
+        KeyRoad::Composed(text) => dispatch(AppEvent::Text(text)),
+        KeyRoad::Stroke(stroke, text) => {
+            let consumed = KEY_GATE.with(|slot| {
+                slot.borrow_mut().as_mut().is_some_and(|gate| gate(&stroke))
+            });
+            if consumed {
+                return;
+            }
+            if is_edit_key(&stroke) {
+                dispatch(AppEvent::Key {
+                    sym: stroke.sym,
+                    shift: stroke.shift,
+                    command: stroke.control,
+                });
+            } else if !text.is_empty()
+                && !text.chars().any(|ch| ch.is_control())
+                && (stroke.types_text || (!stroke.control && !stroke.alt))
+            {
+                dispatch(AppEvent::Text(text));
+            }
+        }
+    }
+}
+
+// MARK: - clipboard (the selection, both directions, never blocking)
+
+const SELF_MIME_PREFIX: &str = "pid/";
+const TEXT_MIMES: [&CStr; 3] = [c"text/plain;charset=utf-8", c"UTF8_STRING", c"text/plain"];
+
+/// Claims the selection with a fresh data source serving `text`.
+pub fn clipboard_write(text: &str) {
+    with_client(|client| {
+        if client.data_manager.is_null() || client.data_device.is_null() {
+            return;
+        }
+        unsafe {
+            if let Some(old) = client.source.take() {
+                destroy(old.proxy, 1); // wl_data_source.destroy
+            }
+            let source = construct(
+                client.data_manager,
+                0, // create_data_source
+                &raw const wl_data_source_interface,
+                &mut [arg_n()],
+                TAG_DATA_SOURCE,
+            );
+            if source.is_null() {
+                return;
+            }
+            for mime in TEXT_MIMES {
+                request(source, 0, &mut [arg_s(mime)]);
+            }
+            // the self-mime: paste-from-self never touches a pipe
+            let own = CString::new(format!("{}{}", SELF_MIME_PREFIX, getpid())).unwrap_or_default();
+            request(source, 0, &mut [WlArgument { s: own.as_ptr() }]);
+            // a stale serial KIND is silently rejected — take the max
+            request(
+                client.data_device,
+                1, // set_selection(source, serial)
+                &mut [arg_o(source), arg_u(client.serials.latest())],
+            );
+            wl_display_flush(client.display);
+            client.source = Some(SourceState { proxy: source, text: text.to_string() });
+        }
+    });
+}
+
+/// Reads the selection. Our own claim answers from memory; a peer's
+/// answers through a pipe under a hard deadline — a hung peer must
+/// never hang the UI thread.
+pub fn clipboard_read() -> Option<String> {
+    // the self short-circuit
+    let own = with_client(|client| {
+        let mimes = client.offers.get(&client.selection)?;
+        mimes
+            .iter()
+            .any(|mime| mime.starts_with(SELF_MIME_PREFIX))
+            .then(|| client.source.as_ref().map(|source| source.text.clone()))
+            .flatten()
+    });
+    if own.is_some() {
+        return own;
+    }
+    let (display, offer, mime) = with_client(|client| {
+        let mimes = client.offers.get(&client.selection)?;
+        let mime = pick_text_mime(mimes)?;
+        Some((client.display, client.selection as *mut Proxy, mime))
+    })?;
+    let mut fds = [0 as c_int; 2];
+    if unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
+        return None;
+    }
+    unsafe {
+        // receive(mime, write_fd) is opcode 1 (accept is 0) — and
+        // FLUSH before reading: the request otherwise sits in our
+        // buffer while we block on a pipe nobody will ever write
+        request(offer, 1, &mut [arg_s(mime), arg_h(fds[1])]);
+        wl_display_flush(display);
+        close(fds[1]);
+    }
+    let mut bytes = Vec::new();
+    let deadline = Instant::now() + std::time::Duration::from_secs(4);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut poll_fds = [PollFd { fd: fds[0], events: POLLIN, revents: 0 }];
+        let ready = unsafe { poll(poll_fds.as_mut_ptr(), 1, remaining.as_millis() as c_int) };
+        if ready <= 0 {
+            break;
+        }
+        let mut chunk = [0u8; 4096];
+        let got = unsafe { read(fds[0], chunk.as_mut_ptr().cast(), chunk.len()) };
+        if got <= 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..got as usize]);
+    }
+    unsafe { close(fds[0]) };
+    let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+    (!text.is_empty()).then_some(text)
+}
+
+/// The mime negotiation, in preference order: utf-8 first, the legacy
+/// names after — the offer's advertised list decides.
+fn pick_text_mime(mimes: &[String]) -> Option<&'static CStr> {
+    TEXT_MIMES
+        .iter()
+        .find(|wanted| mimes.iter().any(|have| have == &wanted.to_string_lossy()))
+        .copied()
+}
+
+/// Serves our claimed selection to a peer, chunked and poll-gated —
+/// a reader that never drains must not wedge us either.
+fn serve_selection(text: String, fd: c_int) {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    let deadline = Instant::now() + std::time::Duration::from_secs(4);
+    while at < bytes.len() && Instant::now() < deadline {
+        const POLLOUT: i16 = 0x4;
+        let mut poll_fds = [PollFd { fd, events: POLLOUT, revents: 0 }];
+        if unsafe { poll(poll_fds.as_mut_ptr(), 1, 100) } <= 0 {
+            continue;
+        }
+        let wrote = unsafe { write(fd, bytes[at..].as_ptr().cast(), bytes.len() - at) };
+        if wrote <= 0 {
+            break;
+        }
+        at += wrote as usize;
+    }
+    unsafe { close(fd) };
+}
+
+// MARK: - wake (any thread asks the pump for one more turn)
+
+static WAKE_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+pub fn wake_from_any_thread() {
+    let fd = WAKE_WRITE_FD.load(std::sync::atomic::Ordering::Acquire);
+    if fd >= 0 {
+        let byte = 1u8;
+        unsafe { write(fd, (&raw const byte).cast(), 1) };
+    }
+}
+
 // MARK: - IME mirror (the door opens at its phase; the slot keeps the twins' order)
 
 pub fn sync_ime(_state: Option<(bool, usize, (f64, f64, f64, f64))>) {}
@@ -1484,6 +2050,162 @@ fn drain_protocol_events() {
                     backing.released = true;
                 }
             }),
+            Ev::KeyboardKeymap { format, fd, size } => {
+                with_client(|client| unsafe {
+                    // format 1 is xkb text v1 — the only one we compile
+                    if format == 1 && fd >= 0 && size > 0 && !client.keyboard.context.is_null() {
+                        let map = mmap(
+                            std::ptr::null_mut(),
+                            size as usize,
+                            PROT_READ,
+                            MAP_PRIVATE,
+                            fd,
+                            0,
+                        );
+                        if map as isize != -1 {
+                            let keymap = xkb_keymap_new_from_string(
+                                client.keyboard.context,
+                                map.cast(),
+                                XKB_KEYMAP_FORMAT_TEXT_V1,
+                                0,
+                            );
+                            munmap(map, size as usize);
+                            if !keymap.is_null() {
+                                let kb = &mut client.keyboard;
+                                if !kb.state.is_null() {
+                                    xkb_state_unref(kb.state);
+                                }
+                                if !kb.scratch.is_null() {
+                                    xkb_state_unref(kb.scratch);
+                                }
+                                if !kb.keymap.is_null() {
+                                    xkb_keymap_unref(kb.keymap);
+                                }
+                                kb.keymap = keymap;
+                                kb.state = xkb_state_new(keymap);
+                                // the scratch state never learns the
+                                // modifiers — the chars-ignoring road
+                                kb.scratch = xkb_state_new(keymap);
+                            }
+                        }
+                    }
+                    if fd >= 0 {
+                        close(fd);
+                    }
+                });
+            }
+            Ev::KeyboardEnter => {}
+            Ev::KeyboardLeave => {
+                with_client(|client| {
+                    let kb = &mut client.keyboard;
+                    kb.generation += 1;
+                    kb.held = None;
+                    kb.compositor_repeats = false;
+                    if !kb.compose.is_null() {
+                        unsafe { xkb_compose_state_reset(kb.compose) };
+                    }
+                });
+                NEXT_REPEAT.with(|cell| cell.set(None));
+                // focus left: popovers close like the platform's own
+                dispatch(AppEvent::ResignKey);
+            }
+            Ev::KeyboardMods { depressed, latched, locked, group } => with_client(|client| {
+                if !client.keyboard.state.is_null() {
+                    unsafe {
+                        xkb_state_update_mask(
+                            client.keyboard.state,
+                            depressed,
+                            latched,
+                            locked,
+                            0,
+                            0,
+                            group,
+                        );
+                    }
+                }
+            }),
+            Ev::RepeatInfo { rate, delay } => with_client(|client| {
+                client.keyboard.repeat_rate = rate;
+                client.keyboard.repeat_delay = delay;
+            }),
+            Ev::KeyboardKey { serial, key, pressed } => {
+                let road = with_client(|client| {
+                    client.serials.record_key(serial, pressed);
+                    let keycode = key + 8; // the evdev offset
+                    let kb = &mut client.keyboard;
+                    if pressed {
+                        // a second press of the held key without a
+                        // release: the compositor repeats for us —
+                        // our timer stands down for this hold
+                        if kb.held.as_ref().is_some_and(|&(held, _)| held == keycode) {
+                            kb.compositor_repeats = true;
+                            kb.held = None;
+                            NEXT_REPEAT.with(|cell| cell.set(None));
+                        } else if !kb.compositor_repeats
+                            && kb.repeat_rate > 0
+                            && !kb.keymap.is_null()
+                            && unsafe { xkb_keymap_key_repeats(kb.keymap, keycode) } == 1
+                        {
+                            kb.generation += 1;
+                            kb.held = Some((keycode, kb.generation));
+                            NEXT_REPEAT.with(|cell| {
+                                cell.set(Some(
+                                    Instant::now()
+                                        + std::time::Duration::from_millis(
+                                            kb.repeat_delay.max(0) as u64,
+                                        ),
+                                ))
+                            });
+                        }
+                        key_road(kb, keycode)
+                    } else {
+                        if kb.held.as_ref().is_some_and(|&(held, _)| held == keycode) {
+                            kb.held = None;
+                            kb.generation += 1;
+                            NEXT_REPEAT.with(|cell| cell.set(None));
+                        }
+                        kb.compositor_repeats = false;
+                        KeyRoad::Silence
+                    }
+                });
+                deliver_key(road);
+            }
+            Ev::NewOffer { offer_ptr } => with_client(|client| {
+                client.offers.insert(offer_ptr, Vec::new());
+            }),
+            Ev::OfferMime { offer_ptr, mime } => with_client(|client| {
+                client.offers.entry(offer_ptr).or_default().push(mime);
+            }),
+            Ev::Selection { offer_ptr } => with_client(|client| {
+                // at most the current offer stays alive
+                let stale: Vec<usize> =
+                    client.offers.keys().copied().filter(|&ptr| ptr != offer_ptr).collect();
+                for ptr in stale {
+                    client.offers.remove(&ptr);
+                    if ptr != 0 {
+                        unsafe { destroy(ptr as *mut Proxy, 2) }; // wl_data_offer.destroy
+                    }
+                }
+                client.selection = offer_ptr;
+            }),
+            Ev::SourceSend { mime, fd } => {
+                let text = with_client(|client| {
+                    let serves = TEXT_MIMES.iter().any(|t| t.to_string_lossy() == mime)
+                        || mime.starts_with(SELF_MIME_PREFIX);
+                    (serves).then(|| client.source.as_ref().map(|s| s.text.clone())).flatten()
+                });
+                match text {
+                    Some(text) => serve_selection(text, fd),
+                    None => unsafe {
+                        close(fd);
+                    },
+                }
+            }
+            Ev::SourceCancelled => with_client(|client| {
+                if let Some(source) = client.source.take() {
+                    unsafe { destroy(source.proxy, 1) };
+                }
+            }),
         }
     }
 }
@@ -1526,29 +2248,40 @@ fn update_scale(edit: impl FnOnce(&mut Window)) {
 pub fn run() {
     NEXT_BLINK.with(|cell| cell.set(Some(Instant::now() + BLINK_INTERVAL)));
     loop {
-        let (display, quit) = with_client(|client| (client.display, client.quit));
+        let (display, wake_fd, quit) =
+            with_client(|client| (client.display, client.wake_read, client.quit));
         if quit {
             break;
         }
+        let wake_woke;
         unsafe {
             while wl_display_prepare_read(display) != 0 {
                 wl_display_dispatch_pending(display);
             }
             wl_display_flush(display);
-            let timeout = NEXT_BLINK.with(|cell| {
-                cell.get()
-                    .map(|at| {
-                        at.saturating_duration_since(Instant::now()).as_millis().min(1000) as c_int
-                    })
-                    .unwrap_or(1000)
-            });
-            let mut fds =
-                [PollFd { fd: wl_display_get_fd(display), events: POLLIN, revents: 0 }];
-            let ready = poll(fds.as_mut_ptr(), 1, timeout.max(0));
+            // the deadline heap, two entries tall: blink and repeat
+            let timeout = [NEXT_BLINK.with(Cell::get), NEXT_REPEAT.with(Cell::get)]
+                .into_iter()
+                .flatten()
+                .map(|at| at.saturating_duration_since(Instant::now()).as_millis() as c_int)
+                .min()
+                .unwrap_or(1000)
+                .clamp(0, 1000);
+            let mut fds = [
+                PollFd { fd: wl_display_get_fd(display), events: POLLIN, revents: 0 },
+                PollFd { fd: wake_fd, events: POLLIN, revents: 0 },
+            ];
+            let count = if wake_fd >= 0 { 2 } else { 1 };
+            let ready = poll(fds.as_mut_ptr(), count, timeout);
             if ready > 0 && fds[0].revents & POLLIN != 0 {
                 wl_display_read_events(display);
             } else {
                 wl_display_cancel_read(display);
+            }
+            wake_woke = count == 2 && ready > 0 && fds[1].revents & POLLIN != 0;
+            if wake_woke {
+                let mut drain = [0u8; 64];
+                while read(wake_fd, drain.as_mut_ptr().cast(), drain.len()) > 0 {}
             }
             wl_display_dispatch_pending(display);
             if wl_display_get_error(display) != 0 {
@@ -1557,6 +2290,19 @@ pub fn run() {
             }
         }
         drain_protocol_events();
+        if wake_woke {
+            dispatch(AppEvent::Wake);
+        }
+        let repeat_due = NEXT_REPEAT.with(|cell| {
+            let due = cell.get().is_some_and(|at| Instant::now() >= at);
+            if due {
+                cell.set(None); // fire_repeat re-arms while the key holds
+            }
+            due
+        });
+        if repeat_due {
+            fire_repeat();
+        }
         let blink_due = NEXT_BLINK.with(|cell| {
             let due = cell.get().is_some_and(|at| Instant::now() >= at);
             if due {
@@ -1569,6 +2315,28 @@ pub fn run() {
         }
     }
     teardown();
+}
+
+/// The repeat timer fired: if the key still holds under the same
+/// generation, the whole road runs again (gate first — the platforms'
+/// own repeat semantics) and the clock re-arms at the rate.
+fn fire_repeat() {
+    let road = with_client(|client| {
+        let kb = &mut client.keyboard;
+        let Some((keycode, generation)) = kb.held else {
+            return KeyRoad::Silence;
+        };
+        if generation != kb.generation {
+            // a bumped generation orphans the timer — the ghost cure
+            kb.held = None;
+            return KeyRoad::Silence;
+        }
+        let interval = (1000 / kb.repeat_rate.max(1)).max(1) as u64;
+        NEXT_REPEAT
+            .with(|cell| cell.set(Some(Instant::now() + std::time::Duration::from_millis(interval))));
+        key_road(kb, keycode)
+    });
+    deliver_key(road);
 }
 
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -1599,6 +2367,46 @@ fn teardown() {
                     destroy(client.pointer, 1); // release
                 } else {
                     wl_proxy_destroy(client.pointer);
+                }
+            }
+            if !client.keyboard_proxy.is_null() {
+                if wl_proxy_get_version(client.keyboard_proxy) >= 3 {
+                    destroy(client.keyboard_proxy, 0); // release
+                } else {
+                    wl_proxy_destroy(client.keyboard_proxy);
+                }
+            }
+            if let Some(source) = &client.source {
+                destroy(source.proxy, 1);
+            }
+            if !client.data_device.is_null() {
+                if wl_proxy_get_version(client.data_device) >= 2 {
+                    destroy(client.data_device, 2); // release
+                } else {
+                    wl_proxy_destroy(client.data_device);
+                }
+            }
+            let kb = &client.keyboard;
+            if !kb.compose.is_null() {
+                xkb_compose_state_unref(kb.compose);
+            }
+            if !kb.state.is_null() {
+                xkb_state_unref(kb.state);
+            }
+            if !kb.scratch.is_null() {
+                xkb_state_unref(kb.scratch);
+            }
+            if !kb.keymap.is_null() {
+                xkb_keymap_unref(kb.keymap);
+            }
+            if !kb.context.is_null() {
+                xkb_context_unref(kb.context);
+            }
+            if client.wake_read >= 0 {
+                close(client.wake_read);
+                let wake_write = WAKE_WRITE_FD.swap(-1, std::sync::atomic::Ordering::AcqRel);
+                if wake_write >= 0 {
+                    close(wake_write);
                 }
             }
             for output in &client.outputs {
@@ -1731,6 +2539,37 @@ mod tests {
         assert_eq!(resolve_scale(&[1, 2], &outputs), 2, "straddling takes the max");
         assert_eq!(resolve_scale(&[9], &outputs), 1, "an unknown output cannot vote");
         assert_eq!(resolve_scale(&[3], &[(3, 0)]), 1, "a zero scale clamps to one");
+    }
+
+    #[test]
+    fn the_mime_negotiation_prefers_utf8() {
+        let offered = vec!["text/plain".to_string(), "text/plain;charset=utf-8".to_string()];
+        assert_eq!(
+            pick_text_mime(&offered).map(|m| m.to_string_lossy().into_owned()),
+            Some("text/plain;charset=utf-8".to_string())
+        );
+        let legacy = vec!["TEXT".to_string(), "text/plain".to_string()];
+        assert_eq!(
+            pick_text_mime(&legacy).map(|m| m.to_string_lossy().into_owned()),
+            Some("text/plain".to_string())
+        );
+        assert!(pick_text_mime(&["image/png".to_string()]).is_none());
+    }
+
+    #[test]
+    fn the_wake_crosses_threads() {
+        let mut fds = [0 as c_int; 2];
+        assert_eq!(unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) }, 0);
+        WAKE_WRITE_FD.store(fds[1], std::sync::atomic::Ordering::Release);
+        std::thread::spawn(wake_from_any_thread).join().expect("the waker thread lands");
+        let mut byte = [0u8; 1];
+        let got = unsafe { read(fds[0], byte.as_mut_ptr().cast(), 1) };
+        assert_eq!(got, 1, "one byte crossed the pipe from another thread");
+        WAKE_WRITE_FD.store(-1, std::sync::atomic::Ordering::Release);
+        unsafe {
+            close(fds[0]);
+            close(fds[1]);
+        }
     }
 
     /// The one test that talks to a compositor — and skips in silence
