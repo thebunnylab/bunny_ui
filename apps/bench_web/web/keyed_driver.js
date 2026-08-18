@@ -33,7 +33,11 @@ const SCENARIOS = {
   "select row": {
     prep: () => press("run"),
     run: () => {
-      const label = document.querySelectorAll("#app tr a")[10];
+      // the row's label cell, by its action path — resilient to how
+      // deep the markup nests it
+      const label = [...document.querySelectorAll("#app tr [data-path]")].find(
+        (el) => !el.dataset.path.includes("#"),
+      );
       const rect = label.getBoundingClientRect();
       label.dispatchEvent(
         new PointerEvent("pointerup", {
@@ -92,7 +96,13 @@ async function step() {
   scenario.prep();
   // one macrotask so the prep's layout settles before the sample
   await new Promise((resolve) => setTimeout(resolve, 50));
-  const sample = timed(scenario.run);
+  let sample;
+  try {
+    sample = timed(scenario.run);
+  } catch (error) {
+    console.error(label, error);
+    sample = -1;
+  }
   (state.results[label] ||= []).push(sample);
   state.at += 1;
   sessionStorage.setItem("keyedSuite", JSON.stringify(state));
