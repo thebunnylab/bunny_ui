@@ -910,6 +910,11 @@ pub struct Interaction {
     /// The split whose divider is being dragged — moves route to its
     /// retained position writer instead of hover until the release.
     pub split_drag: Option<String>,
+    /// The scrollbar thumb being dragged: the region's path, whether it
+    /// is the horizontal one, and WHERE inside the thumb the press
+    /// landed — without that offset the thumb jumps to the pointer on
+    /// the first move.
+    pub thumb_drag: Option<ThumbDrag>,
     /// The app's box that owns the pointer: a press inside it keeps
     /// every move until the release, even outside the frame (dragging
     /// a selection out of the box and back is one gesture).
@@ -922,6 +927,15 @@ pub struct Interaction {
     pub menu: Option<MenuOpen>,
     /// The live drag — the runtime's, resolved before layout.
     pub drag: Option<DragLive>,
+}
+
+/// A scrollbar thumb under the pointer, mid-drag.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThumbDrag {
+    pub path: String,
+    pub horizontal: bool,
+    /// Distance from the thumb's leading edge to the press.
+    pub grab: Px,
 }
 
 /// A draw command — the output of the placement pass, in paint order
@@ -1355,6 +1369,13 @@ pub struct SplitPlacement {
 pub struct CustomPlacement {
     pub path: String,
     pub frame: Rect,
+    /// What the clip stack lets through, in the box's LOCAL
+    /// coordinates — the viewport a box reads to page, and the same
+    /// rect its paint was given.
+    pub visible: Rect,
+    /// The scroll region the box sits inside, if any: where a reveal
+    /// the box asks for is spent.
+    pub region: Option<String>,
     /// The font the box inherited — the metrics an event resolves with.
     pub font: FontSpec,
     pub element: crate::custom::Custom,
@@ -2777,6 +2798,22 @@ impl LayoutNode {
             }
 
             (LayoutNode::Custom { path, element }, Fit::Leaf) => {
+                // what the clip lets through, in the box's own
+                // coordinates — the paint and the events read the SAME
+                // window, and a box inside a scroll learns its viewport
+                // from it
+                let window = out
+                    .current_clip()
+                    .and_then(|clip| clip.intersection(frame))
+                    .map_or(Rect { origin: Point::ZERO, size: Size::default() }, |clip| {
+                        Rect {
+                            origin: Point {
+                                x: clip.origin.x - frame.origin.x,
+                                y: clip.origin.y - frame.origin.y,
+                            },
+                            size: clip.size,
+                        }
+                    });
                 // the box answers for the whole frame: a hit here never
                 // falls through to what is painted underneath, and the
                 // event finds the element by this path
@@ -2789,6 +2826,8 @@ impl LayoutNode {
                         out.customs.push(CustomPlacement {
                             path: path.clone(),
                             frame,
+                            visible: window,
+                            region: out.region_stack.last().cloned(),
                             font: env.font,
                             element: element.clone(),
                         });
@@ -2799,25 +2838,28 @@ impl LayoutNode {
                 // exactly the commands between here and the close
                 let start = out.display.len();
                 if let Some(dom) = out.dom.as_mut() {
-                    dom.open_canvas(frame, start);
+                    // the island covers what is VISIBLE, never the whole
+                    // box: a box that declared four thousand points of
+                    // content would otherwise mint a canvas that tall,
+                    // and the paint inside it is one screen anyway
+                    dom.open_canvas(
+                        Rect {
+                            origin: Point {
+                                x: frame.origin.x + window.origin.x,
+                                y: frame.origin.y + window.origin.y,
+                            },
+                            size: window.size,
+                        },
+                        start,
+                    );
                 }
                 // the box cannot paint outside itself — the clip is the
                 // framework's, never the app's promise
                 out.push_clip(frame, 0.0);
-                let visible = out
-                    .current_clip()
-                    .and_then(|clip| clip.intersection(frame))
-                    .map_or(Rect { origin: Point::ZERO, size: Size::default() }, |clip| Rect {
-                        origin: Point {
-                            x: clip.origin.x - frame.origin.x,
-                            y: clip.origin.y - frame.origin.y,
-                        },
-                        size: clip.size,
-                    });
                 let focused = env.stamp.focus == Some(path.as_str()) && !path.is_empty();
                 let ctx = crate::custom::PaintCtx {
                     frame,
-                    visible,
+                    visible: window,
                     metrics: crate::custom::Metrics::new(env.text, env.cache, env.font),
                     focused,
                     caret_visible: focused && env.stamp.caret_visible,
@@ -3252,10 +3294,24 @@ impl LayoutNode {
                 }
                 out.anchors.pop();
                 if max_y > 0.0 && axes.vertical() {
-                    draw_scrollbar(frame, content.height, offset.y, max_y, out);
+                    draw_scrollbar(
+                        path.as_deref(),
+                        frame,
+                        content.height,
+                        offset.y,
+                        max_y,
+                        out,
+                    );
                 }
                 if max_x > 0.0 && axes.horizontal() {
-                    draw_scrollbar_h(frame, content.width, offset.x, max_x, out);
+                    draw_scrollbar_h(
+                        path.as_deref(),
+                        frame,
+                        content.width,
+                        offset.x,
+                        max_x,
+                        out,
+                    );
                 }
                 out.pop_clip();
                 if let Some(path) = path {
@@ -4054,8 +4110,15 @@ fn truncate_to_width(content: &str, mode: Truncation, width: Px, env: LayoutEnv)
 }
 
 const SCROLLBAR_W: Px = 4.0;
-const SCROLLBAR_INSET: Px = 6.0;
-const SCROLLBAR_MIN: Px = 24.0;
+/// How far the thumb sits from the region's edges — and, with the
+/// length below, the whole geometry of the track the runtime reads
+/// back when a hand drags the thumb.
+pub(crate) const SCROLLBAR_INSET: Px = 6.0;
+pub(crate) const SCROLLBAR_MIN: Px = 24.0;
+/// The band the pointer grabs the thumb by. The painted thumb is four
+/// points wide — too thin to aim at — so the target is wider than the
+/// paint, the same trick the split's grip plays over its hairline.
+pub const SCROLLBAR_GRAB: Px = 12.0;
 
 const FIELD_PAD_H: Px = 8.0;
 const FIELD_PAD_V: Px = 5.0;
@@ -4066,7 +4129,14 @@ const FIELD_CARET_W: Px = 1.5;
 /// pointer capture): 4px wide at 6px from the right edge, track with
 /// inset 6, floor of 24, proportional to the viewport — and it only
 /// exists when there is overflow (short content never gets a bar).
-fn draw_scrollbar(frame: Rect, content_h: Px, offset_y: Px, max_y: Px, out: &mut Placement) {
+fn draw_scrollbar(
+    path: Option<&str>,
+    frame: Rect,
+    content_h: Px,
+    offset_y: Px,
+    max_y: Px,
+    out: &mut Placement,
+) {
     let track = frame.size.height - 2.0 * SCROLLBAR_INSET;
     if track <= 0.0 {
         return;
@@ -4074,21 +4144,50 @@ fn draw_scrollbar(frame: Rect, content_h: Px, offset_y: Px, max_y: Px, out: &mut
     let thumb_h = ((frame.size.height / content_h) * track).max(SCROLLBAR_MIN).min(track);
     let travel = track - thumb_h;
     let thumb_y = frame.origin.y + SCROLLBAR_INSET + travel * (offset_y / max_y);
+    let thumb_x = frame.origin.x + frame.size.width - SCROLLBAR_INSET - SCROLLBAR_W;
     out.display.push(DrawCommand::FillRect {
         rect: Rect {
-            origin: Point {
-                x: frame.origin.x + frame.size.width - SCROLLBAR_INSET - SCROLLBAR_W,
-                y: thumb_y,
-            },
+            origin: Point { x: thumb_x, y: thumb_y },
             size: Size { width: SCROLLBAR_W, height: thumb_h },
         },
         color: crate::theme::current().scrollbar,
         corner_radius: SCROLLBAR_W / 2.0,
     });
+    // the grab band, over the paint and pushed AFTER the content: the
+    // reverse hit walk finds it first, and the thumb is draggable
+    // wherever the pointer can plausibly aim at it
+    if let Some(path) = path {
+        let band = Rect {
+            origin: Point {
+                x: (thumb_x + SCROLLBAR_W / 2.0 - SCROLLBAR_GRAB / 2.0).max(frame.origin.x),
+                y: thumb_y,
+            },
+            size: Size { width: SCROLLBAR_GRAB, height: thumb_h },
+        };
+        if let Some(visible) = clip_of(out, band) {
+            out.hits.push((format!("{path}/#thumb-v"), visible));
+        }
+    }
+}
+
+/// What the current clip lets through of a rect — the door every hit
+/// goes through (an off-screen thumb cannot be grabbed).
+fn clip_of(out: &Placement, rect: Rect) -> Option<Rect> {
+    match out.current_clip() {
+        Some(clip) => rect.intersection(clip),
+        None => Some(rect),
+    }
 }
 
 /// The vertical thumb, turned on its side.
-fn draw_scrollbar_h(frame: Rect, content_w: Px, offset_x: Px, max_x: Px, out: &mut Placement) {
+fn draw_scrollbar_h(
+    path: Option<&str>,
+    frame: Rect,
+    content_w: Px,
+    offset_x: Px,
+    max_x: Px,
+    out: &mut Placement,
+) {
     let track = frame.size.width - 2.0 * SCROLLBAR_INSET;
     if track <= 0.0 {
         return;
@@ -4096,17 +4195,27 @@ fn draw_scrollbar_h(frame: Rect, content_w: Px, offset_x: Px, max_x: Px, out: &m
     let thumb_w = ((frame.size.width / content_w) * track).max(SCROLLBAR_MIN).min(track);
     let travel = track - thumb_w;
     let thumb_x = frame.origin.x + SCROLLBAR_INSET + travel * (offset_x / max_x);
+    let thumb_y = frame.origin.y + frame.size.height - SCROLLBAR_INSET - SCROLLBAR_W;
     out.display.push(DrawCommand::FillRect {
         rect: Rect {
-            origin: Point {
-                x: thumb_x,
-                y: frame.origin.y + frame.size.height - SCROLLBAR_INSET - SCROLLBAR_W,
-            },
+            origin: Point { x: thumb_x, y: thumb_y },
             size: Size { width: thumb_w, height: SCROLLBAR_W },
         },
         color: crate::theme::current().scrollbar,
         corner_radius: SCROLLBAR_W / 2.0,
     });
+    if let Some(path) = path {
+        let band = Rect {
+            origin: Point {
+                x: thumb_x,
+                y: (thumb_y + SCROLLBAR_W / 2.0 - SCROLLBAR_GRAB / 2.0).max(frame.origin.y),
+            },
+            size: Size { width: thumb_w, height: SCROLLBAR_GRAB },
+        };
+        if let Some(visible) = clip_of(out, band) {
+            out.hits.push((format!("{path}/#thumb-h"), visible));
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

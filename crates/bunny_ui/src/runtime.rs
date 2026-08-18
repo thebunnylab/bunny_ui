@@ -117,6 +117,9 @@ pub struct Runtime {
     /// The last APPLIED `.scroll_target` per region — the follow fires
     /// only when the target changes; in between, the wheel is sovereign.
     scroll_targets: RefCell<HashMap<String, String>>,
+    /// The last APPLIED reveal per app box — the same "only on change"
+    /// door the targets above keep, so the wheel is never fought.
+    element_reveals: RefCell<HashMap<String, crate::layout::Rect>>,
     /// Fields whose `.auto_focus()` already fired — first appearance
     /// only; a user blur is final.
     auto_focused: RefCell<std::collections::HashSet<String>>,
@@ -593,6 +596,7 @@ impl Runtime {
             keymap: RefCell::new(HashMap::default()),
             scoped_keymap: RefCell::new(HashMap::default()),
             scroll_targets: RefCell::new(HashMap::default()),
+            element_reveals: RefCell::new(HashMap::default()),
             auto_focused: RefCell::new(std::collections::HashSet::default()),
             animator: RefCell::new(crate::anim::Animator::default()),
             last_proposal: Cell::new(None),
@@ -730,6 +734,12 @@ impl Runtime {
             self.interaction.borrow_mut().pointer = Some(Point { x, y });
             return self.drag_split(&path, x, y);
         }
+        // a thumb under the hand owns the pointer the same way
+        let thumb = self.interaction.borrow().thumb_drag.clone();
+        if let Some(thumb) = thumb {
+            self.interaction.borrow_mut().pointer = Some(Point { x, y });
+            return self.drag_thumb(&thumb, x, y);
+        }
         // a box that took the press owns every move until the release —
         // dragging a selection past the frame is one gesture, not two
         let grabbed = self.interaction.borrow().element_grab.clone();
@@ -836,6 +846,94 @@ impl Runtime {
         reconciler::run_split(path, at)
     }
 
+    /// The thumb's geometry, in the axis it travels: `(track start,
+    /// track length, thumb length, travel, max offset)`. The mirror of
+    /// `draw_scrollbar` — one formula, written twice on purpose would
+    /// be a bug waiting, so this reads the SAME constants.
+    fn thumb_geometry(
+        region: &crate::layout::ScrollRegion,
+        horizontal: bool,
+    ) -> Option<(Px, Px, Px, Px)> {
+        let (extent, content) = match horizontal {
+            true => (region.frame.size.width, region.content.width),
+            false => (region.frame.size.height, region.content.height),
+        };
+        let max = (content.round() - extent.round()).max(0.0);
+        if max <= 0.0 {
+            return None;
+        }
+        let track = extent - 2.0 * crate::layout::SCROLLBAR_INSET;
+        if track <= 0.0 {
+            return None;
+        }
+        let thumb = ((extent / content) * track)
+            .max(crate::layout::SCROLLBAR_MIN)
+            .min(track);
+        let start = match horizontal {
+            true => region.frame.origin.x,
+            false => region.frame.origin.y,
+        } + crate::layout::SCROLLBAR_INSET;
+        Some((start, thumb, (track - thumb).max(0.0), max))
+    }
+
+    fn region_at(&self, path: &str) -> Option<crate::layout::ScrollRegion> {
+        self.last_scrolls.borrow().iter().find(|region| region.path == path).cloned()
+    }
+
+    /// A press on a thumb's grab band: which region, which axis, and
+    /// how far into the thumb the pointer landed.
+    fn grab_thumb(&self, target: &str, x: Px, y: Px) -> Option<crate::layout::ThumbDrag> {
+        let (path, horizontal) = match target.strip_suffix("/#thumb-v") {
+            Some(path) => (path, false),
+            None => (target.strip_suffix("/#thumb-h")?, true),
+        };
+        let region = self.region_at(path)?;
+        let (start, thumb, travel, max) = Self::thumb_geometry(&region, horizontal)?;
+        let offset = self.scroll_offset(path);
+        let along = match horizontal {
+            true => offset.x,
+            false => offset.y,
+        };
+        let head = start + travel * (along / max);
+        let pointer = if horizontal { x } else { y };
+        Some(crate::layout::ThumbDrag {
+            path: path.to_string(),
+            horizontal,
+            grab: (pointer - head).clamp(0.0, thumb),
+        })
+    }
+
+    /// The thumb travels with the hand: the band's head follows the
+    /// pointer minus where it was grabbed, and the region's offset is
+    /// that head read back through the track.
+    fn drag_thumb(&self, drag: &crate::layout::ThumbDrag, x: Px, y: Px) -> bool {
+        let Some(region) = self.region_at(&drag.path) else {
+            return false;
+        };
+        let Some((start, _, travel, max)) = Self::thumb_geometry(&region, drag.horizontal)
+        else {
+            return false;
+        };
+        if travel <= 0.0 {
+            return false;
+        }
+        let pointer = if drag.horizontal { x } else { y };
+        let along = (((pointer - drag.grab) - start) / travel * max).clamp(0.0, max);
+        let current = self.scroll_offset(&drag.path);
+        let next = match drag.horizontal {
+            true => Point { x: along, y: current.y },
+            false => Point { x: current.x, y: along },
+        };
+        if next == current {
+            return false;
+        }
+        // the wheel's own door: an offset written by hand cancels a
+        // reveal in flight, or the spring would fight the hand
+        self.animator.borrow_mut().cancel_scroll(&drag.path);
+        self.set_scroll_offset(&drag.path, next);
+        true
+    }
+
     // MARK: - The app's own boxes (the escape hatch)
 
     /// The app's box registered at `path` in the last layout.
@@ -857,6 +955,7 @@ impl Runtime {
     ) -> crate::custom::Response {
         let ctx = crate::custom::EventCtx {
             frame: placement.frame,
+            visible: placement.visible,
             metrics: crate::custom::Metrics::new(&*self.text, &self.cache, placement.font),
         };
         placement.element.element().event(&event, &ctx)
@@ -1015,6 +1114,16 @@ impl Runtime {
             }
             return true;
         }
+        // a press on a thumb takes the pointer until the release: the
+        // region travels with the hand, and nothing arms (a thumb has
+        // no up-inside action to mis-fire)
+        if let Some(drag) = target.as_deref().and_then(|t| self.grab_thumb(t, x, y)) {
+            let mut interaction = self.interaction.borrow_mut();
+            interaction.pointer = Some(Point { x, y });
+            interaction.thumb_drag = Some(drag);
+            interaction.pressed = None;
+            return true;
+        }
         // a press on a grip band starts the divider drag — nothing arms
         // (a divider has no up-inside action to mis-fire)
         if let Some(grip) = target.as_deref().and_then(|t| t.strip_suffix("/#split")) {
@@ -1091,10 +1200,14 @@ impl Runtime {
             }
             return None;
         }
-        // a divider drag ends on release — no action fires, no focus moves
-        if self.interaction.borrow().split_drag.is_some() {
+        // a divider or a thumb ends its drag on release — no action
+        // fires, no focus moves
+        if self.interaction.borrow().split_drag.is_some()
+            || self.interaction.borrow().thumb_drag.is_some()
+        {
             let mut interaction = self.interaction.borrow_mut();
             interaction.split_drag = None;
+            interaction.thumb_drag = None;
             interaction.pointer = Some(Point { x, y });
             return None;
         }
@@ -1744,6 +1857,107 @@ impl Runtime {
             .collect()
     }
 
+    /// Applies the reveals the app's own boxes ask for: a box inside a
+    /// region answers a LOCAL rect and the region travels the shortest
+    /// distance that shows it — the same arithmetic `.scroll_target`
+    /// runs for a row, on both axes.
+    ///
+    /// Only a CHANGED answer moves anything: a caret that stayed put
+    /// while the hand turned the wheel must not be dragged back.
+    fn apply_element_reveals(&self, result: &crate::layout::LayoutResult) -> bool {
+        let mut moved = false;
+        for placement in &result.customs {
+            let Some(path) = &placement.region else { continue };
+            let Some(local) = placement.element.element().reveal() else { continue };
+            // the memory is the LOCAL rect: the box's frame travels
+            // with the region, so a layout rect would look new after
+            // every wheel turn and the reveal would fight the hand
+            if self.element_reveals.borrow().get(&placement.path) == Some(&local) {
+                continue;
+            }
+            self.element_reveals.borrow_mut().insert(placement.path.clone(), local);
+            let wanted = crate::layout::Rect {
+                origin: Point {
+                    x: placement.frame.origin.x + local.origin.x,
+                    y: placement.frame.origin.y + local.origin.y,
+                },
+                size: local.size,
+            };
+            let Some(region) = result.scrolls.iter().find(|region| &region.path == path)
+            else {
+                continue;
+            };
+            moved |= self.reveal_in(region, wanted);
+        }
+        moved
+    }
+
+    /// Moves ONE region the shortest way that shows `wanted`, on both
+    /// axes. `true` = an offset changed on the spot (an animated region
+    /// flies there instead, and answers `false`).
+    fn reveal_in(
+        &self,
+        region: &crate::layout::ScrollRegion,
+        wanted: crate::layout::Rect,
+    ) -> bool {
+        // the shortest travel that shows an edge: nothing when it
+        // already fits, the near edge when it sits before the window,
+        // the far edge when it sits after
+        let shift = |low: Px, high: Px, window_low: Px, window_high: Px| -> Px {
+            if low < window_low {
+                low - window_low
+            } else if high > window_high {
+                (high - window_high).min(low - window_low)
+            } else {
+                0.0
+            }
+        };
+        let dx = shift(
+            wanted.origin.x,
+            wanted.origin.x + wanted.size.width,
+            region.frame.origin.x,
+            region.frame.origin.x + region.frame.size.width,
+        );
+        let dy = shift(
+            wanted.origin.y,
+            wanted.origin.y + wanted.size.height,
+            region.frame.origin.y,
+            region.frame.origin.y + region.frame.size.height,
+        );
+        if dx == 0.0 && dy == 0.0 {
+            return false;
+        }
+        let current = self.scroll_offset(&region.path);
+        let travel_x =
+            (region.content.width.round() - region.frame.size.width.round()).max(0.0);
+        let travel_y =
+            (region.content.height.round() - region.frame.size.height.round()).max(0.0);
+        let next = Point {
+            x: (current.x + dx).clamp(0.0, travel_x),
+            y: (current.y + dy).clamp(0.0, travel_y),
+        };
+        if next == current {
+            return false;
+        }
+        let mut animator = self.animator.borrow_mut();
+        match region.anim.filter(|_| !animator.reduce_motion()) {
+            Some(spring) => {
+                animator.animate_scroll(
+                    &region.path,
+                    (current.x, current.y),
+                    (next.x, next.y),
+                    spring,
+                );
+                false
+            }
+            None => {
+                drop(animator);
+                self.set_scroll_offset(&region.path, next);
+                true
+            }
+        }
+    }
+
     /// Applies `.scroll_target(id)` requests: for each region whose
     /// declared target CHANGED since the last application, scrolls just
     /// enough to reveal the row (top-aligns when above, bottom-aligns
@@ -1848,7 +2062,7 @@ impl Runtime {
         // strip for a frame, never a hang. The wheel and a user blur
         // are never fought.
         for _ in 0..2 {
-            let moved = self.apply_scroll_targets(&result);
+            let moved = self.apply_scroll_targets(&result) | self.apply_element_reveals(&result);
             let focused = self.apply_auto_focus(&result);
             // a miss measured on the round a target just moved is
             // spurious — it audited the PRE-jump offset; the relayout

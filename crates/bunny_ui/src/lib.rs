@@ -2297,6 +2297,195 @@ mod tests {
     }
 
     #[test]
+    fn a_box_that_declares_its_content_rides_the_region() {
+        use crate::layout::{Proposal, Size};
+
+        // the contract of dor 21: on an OPEN axis the box answers the
+        // extent of its CONTENT, and the framework's region owns the
+        // rest — thumb, wheel, travel and reveal
+        #[derive(Clone, Copy)]
+        struct Ledger {
+            caret: State<f64>,
+        }
+
+        struct Surface {
+            caret: f64,
+        }
+
+        impl CustomElement for Surface {
+            fn measure(&self, proposal: Proposal, _metrics: &Metrics) -> Size {
+                Size {
+                    width: proposal.width.unwrap_or(0.0),
+                    // 200 rows of 20pt: four thousand points of content
+                    height: proposal.height.unwrap_or(4000.0),
+                }
+            }
+
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+
+            fn reveal(&self) -> Option<Rect> {
+                Some(Rect {
+                    origin: Point { x: 0.0, y: self.caret * 20.0 },
+                    size: Size { width: 2.0, height: 20.0 },
+                })
+            }
+        }
+
+        impl Component for Ledger {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(custom(Surface { caret: self.caret.get() })).id("region")
+            }
+        }
+
+        let ledger = Ledger { caret: State::new(0.0) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&ledger);
+        let viewport = Proposal::exact(Size { width: 300.0, height: 200.0 });
+        let result = runtime.layout(&ledger, viewport);
+
+        let region = result.scrolls.first().expect("the box sits in a region").clone();
+        assert_eq!(region.content.height, 4000.0, "the region sees the CONTENT extent");
+        let thumb = result
+            .hits
+            .iter()
+            .find(|(path, _)| path.ends_with("/#thumb-v"))
+            .expect("the thumb is a target")
+            .1;
+
+        // the wheel travels, because the geometry is honest
+        assert!(runtime.wheel(150.0, 100.0, 0.0, -120.0));
+        assert!(runtime.scroll_offset(&region.path).y > 0.0);
+        runtime.set_scroll_offset(&region.path, Point::ZERO);
+
+        // the thumb travels WITH the hand: the press remembers where
+        // inside the band it landed, so nothing jumps on the first move
+        let grab_y = thumb.origin.y + 4.0;
+        assert!(runtime.pointer_pressed(thumb.origin.x + 2.0, grab_y));
+        assert!(runtime.pointer_moved(thumb.origin.x + 2.0, grab_y + 1.0));
+        let after_one = runtime.scroll_offset(&region.path).y;
+        assert!(after_one > 0.0 && after_one < 100.0, "one point of thumb is a small step: {after_one}");
+        assert!(runtime.pointer_moved(thumb.origin.x + 2.0, 10_000.0));
+        assert_eq!(
+            runtime.scroll_offset(&region.path).y,
+            3800.0,
+            "and the far end is the far end"
+        );
+        assert_eq!(runtime.pointer_released(thumb.origin.x + 2.0, 10_000.0), None);
+        // after the release the pointer is free again
+        runtime.pointer_moved(150.0, 100.0);
+        assert_eq!(runtime.scroll_offset(&region.path).y, 3800.0);
+    }
+
+    #[test]
+    fn a_box_asks_the_region_to_reveal_what_it_holds() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Ledger {
+            caret: State<f64>,
+        }
+
+        struct Surface {
+            caret: f64,
+        }
+
+        impl CustomElement for Surface {
+            fn measure(&self, proposal: Proposal, _metrics: &Metrics) -> Size {
+                Size { width: proposal.width.unwrap_or(0.0), height: 4000.0 }
+            }
+
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+
+            fn reveal(&self) -> Option<Rect> {
+                Some(Rect {
+                    origin: Point { x: 0.0, y: self.caret * 20.0 },
+                    size: Size { width: 2.0, height: 20.0 },
+                })
+            }
+        }
+
+        impl Component for Ledger {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(custom(Surface { caret: self.caret.get() })).id("region")
+            }
+        }
+
+        let ledger = Ledger { caret: State::new(0.0) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&ledger);
+        let viewport = Proposal::exact(Size { width: 300.0, height: 200.0 });
+        let result = runtime.layout(&ledger, viewport);
+        let path = result.scrolls.first().expect("a region").path.clone();
+        assert_eq!(runtime.scroll_offset(&path).y, 0.0, "row zero already shows");
+
+        // the caret walks off the bottom: the region travels the
+        // SHORTEST way that shows it
+        ledger.caret.set(80.0);
+        runtime.render_stable(&ledger);
+        runtime.layout(&ledger, viewport);
+        assert_eq!(runtime.scroll_offset(&path).y, 1420.0, "bottom-aligned, not centred");
+
+        // the hand turns the wheel with the caret where it was: a
+        // reveal that did not CHANGE never fights the wheel
+        runtime.wheel(150.0, 100.0, 0.0, 120.0);
+        let after_wheel = runtime.scroll_offset(&path).y;
+        assert!(after_wheel < 1420.0, "the wheel moved: {after_wheel}");
+        runtime.render_stable(&ledger);
+        runtime.layout(&ledger, viewport);
+        assert_eq!(runtime.scroll_offset(&path).y, after_wheel, "and it stayed moved");
+    }
+
+    #[test]
+    fn the_island_of_a_tall_box_is_only_a_screen() {
+        // element mode: the box becomes a canvas, and a box that
+        // declared four thousand points of content must not mint a
+        // canvas four thousand points tall
+        struct Surface;
+        impl CustomElement for Surface {
+            fn measure(
+                &self,
+                proposal: crate::layout::Proposal,
+                _metrics: &Metrics,
+            ) -> Size {
+                Size { width: proposal.width.unwrap_or(0.0), height: 4000.0 }
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+        }
+
+        #[derive(Clone, Copy)]
+        struct Ledger;
+        impl Component for Ledger {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(custom(Surface))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let patches = runtime.dom_frame(&Ledger, Size { width: 300.0, height: 200.0 });
+        let canvas = patches
+            .iter()
+            .find_map(|patch| match patch {
+                crate::dom::DomPatch::Create { id, kind, .. }
+                    if *kind == crate::dom::CreateKind::Canvas =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .expect("the box lowers to an island");
+        let size = patches
+            .iter()
+            .find_map(|patch| match patch {
+                crate::dom::DomPatch::SetSize { id, width, height } if *id == canvas => {
+                    Some((*width, *height))
+                }
+                _ => None,
+            })
+            .expect("the island is sized");
+        assert_eq!(size, (300.0, 200.0), "the island is the window, not the content");
+    }
+
+    #[test]
     fn a_click_routes_through_hit_test_to_the_action_and_repaints() {
         use crate::layout::{Proposal, Size, hit_test};
 

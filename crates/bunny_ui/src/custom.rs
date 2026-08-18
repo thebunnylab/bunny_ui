@@ -60,6 +60,25 @@ pub trait CustomElement: 'static {
 
     /// The answer to the parent's proposal. The default takes what was
     /// proposed (and zero on an axis the parent left open).
+    ///
+    /// An axis the parent left OPEN is a question: *how much do you
+    /// hold?* Inside a scroll region, both are the same question — and
+    /// a box that answers the extent of its CONTENT gets the whole
+    /// region for free: the thumb (draggable), the wheel, the travel,
+    /// the clamps, and [`CustomElement::reveal`]. It never has to paint
+    /// more than a screen, because `ctx.visible` says which screen; on
+    /// the element lowering the island is that screen too, never the
+    /// content.
+    ///
+    /// ```ignore
+    /// fn measure(&self, proposal: Proposal, metrics: &Metrics) -> Size {
+    ///     Size {
+    ///         width: proposal.width.unwrap_or(0.0),
+    ///         // the document, not the window
+    ///         height: self.lines as f64 * metrics.line_height(),
+    ///     }
+    /// }
+    /// ```
     fn measure(&self, proposal: Proposal, metrics: &Metrics) -> Size {
         let _ = metrics;
         Size {
@@ -119,6 +138,22 @@ pub trait CustomElement: 'static {
     /// in LOCAL coordinates — where the candidate window lands.
     fn ime_rect_for(&self, utf16: usize, metrics: &Metrics) -> Option<Rect> {
         let _ = (utf16, metrics);
+        None
+    }
+
+    /// A rect, in LOCAL coordinates, that the box wants BROUGHT INTO
+    /// VIEW — the caret of a document, the selected cell of a grid.
+    /// The enclosing scroll region travels the shortest distance that
+    /// shows it, exactly as `.scroll_target(id)` does for a row, and
+    /// only when the answer CHANGES: the wheel is never fought.
+    ///
+    /// It is the other half of the contract a scrolling box signs. On
+    /// an OPEN axis, [`CustomElement::measure`] answers the extent of
+    /// the CONTENT (not of the window), and the framework's region then
+    /// owns the whole affair — the thumb, the wheel, the travel, and
+    /// this. The box keeps painting one screen: `ctx.visible` says
+    /// which one.
+    fn reveal(&self) -> Option<Rect> {
         None
     }
 
@@ -554,6 +589,12 @@ pub struct EventCtx<'a> {
     /// The box, in LAYOUT coordinates — its size is what measure
     /// answered.
     pub frame: Rect,
+    /// What the clip stack lets through, in LOCAL coordinates — the
+    /// SAME window the paint was given. A box that declared its
+    /// content extent reads its viewport here: the origin is how far
+    /// the region has travelled, the size is what fits, and a page key
+    /// needs nothing else.
+    pub visible: Rect,
     /// Text measurement, cached: how a click becomes a column.
     pub metrics: Metrics<'a>,
 }
