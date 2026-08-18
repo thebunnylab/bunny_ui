@@ -102,6 +102,38 @@ becomes a CSS gradient — the geometry ours, the pixels the browser's.
 `Color::fade()` is the end of a glow: interpolation is straight, so a
 ramp that fades to a transparent black drags itself through grey.
 
+## Icons
+
+A glyph is a recipe, never pixels: verbs on a fixed 24 grid, plus the
+paint that turns contours into ink. The house rasterizes the recipe at
+the exact physical size a frame asks for — crisp at sixteen, crisp at
+sixty-four.
+
+```rust
+icon(symbol::CHEVRON_RIGHT)                          // sizes with the font, takes the ink
+icon(symbol::SEARCH).font(Font::Title)               // a symbol scales like a character
+icon(symbol::FOLDER).resizable().frame(24.0, 24.0)   // the exact-box idiom
+icon(acme::LOGO)                                     // an app's own glyph: the same type
+```
+
+One glyph, four renderings. The CPU rasterizes it once — a scanline
+fill and a distance-field pen with round caps. The desktop GPU blits
+those same bytes from the sprite atlas, so the two pipelines agree
+byte for byte. The web canvas mode is the CPU rasterizer. The web
+element mode emits a real `<svg>` that draws with `currentColor`, so a
+hover re-tints with zero patches.
+
+Sixteen symbols ship with the framework (`bunny_ui::symbol`). An app
+converts its own icon files offline:
+
+```bash
+cargo run -p bunny-ui --features svg --example svg2icon -- icons/*.svg
+```
+
+The tool prints Rust const data to paste into the app — the default
+build carries no parser. The same parser opens at runtime behind the
+`svg` feature (`Symbol::from_svg`) for the app that accepts the cost.
+
 ## Status
 
 Early development. The API is not stable.
@@ -111,6 +143,7 @@ Early development. The API is not stable.
 ```bash
 cargo build
 cargo test
+cargo test --features svg   # the icon converter's parser rides the flag
 ```
 
 ## Demos
@@ -120,10 +153,11 @@ cargo run -p bunny-ui --example counter_headless
 cargo run -p bunny-ui-macos --example counter_window
 cargo run -p bunny-ui-macos --example git_window
 cargo run -p bunny-ui-macos --example sketch_window
+cargo run -p bunny-ui-macos --example icon_window
 cargo run -p countries-pure
 ```
 
-The first demo prints a small interface to the terminal. The second opens a native macOS window. The third reads this repository's own `git log` from a worker thread and fills the window while it scrolls. The fourth is one box the application owns: it draws its own ink with the pointer, sizes its brush with the wheel, and types into a caption of its own — composition included. The fifth prints a full sample application.
+The first demo prints a small interface to the terminal. The second opens a native macOS window. The third reads this repository's own `git log` from a worker thread and fills the window while it scrolls. The fourth is one box the application owns: it draws its own ink with the pointer, sizes its brush with the wheel, and types into a caption of its own — composition included. The fifth shows the sixteen house glyphs across fonts and inks. The sixth prints a full sample application.
 
 ## Design rules
 
