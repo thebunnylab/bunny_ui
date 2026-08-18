@@ -60,6 +60,13 @@ impl CustomElement for Scratch {
         true
     }
 
+    // the box wants the row's width, never the column's leftover —
+    // the measure below pins the height and this keeps the stacks
+    // from offering more
+    fn flexible(&self) -> bool {
+        false
+    }
+
     fn measure(&self, proposal: bunny_ui::layout::Proposal, _metrics: &Metrics) -> Size {
         Size { width: proposal.width.unwrap_or(0.0), height: Self::HEIGHT }
     }

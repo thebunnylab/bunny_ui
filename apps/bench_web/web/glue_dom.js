@@ -283,6 +283,15 @@ function createElementRaw(kind, tag) {
     return input;
   }
   const el = document.createElement(tag || "div");
+  if (kind === 0 || kind === 1) {
+    // a wrapper is a COLUMN, not a block: the engine proposes its box
+    // to the child, and only a flex line can hand the offer down
+    // (width by the stretch default, height by the fill flag)
+    el.style.cssText =
+      "display:flex;flex-direction:column;box-sizing:border-box;" +
+      "min-width:0;min-height:0;";
+    return el;
+  }
   el.style.cssText = "box-sizing:border-box;min-width:0;min-height:0;";
   if (kind === 2) {
     // the browser breaks the lines in this mode — pre-wrap keeps the
@@ -295,8 +304,10 @@ function createElementRaw(kind, tag) {
     el.style.scrollBehavior = "smooth";
   }
   if (kind === 5) {
-    // content hosts virtual rows at absolute slots
+    // content hosts virtual rows at absolute slots — the element OWNS
+    // this position: the layout reset restores it, never erases it
     el.style.position = "relative";
+    el.__pos = "relative";
   }
   return el;
 }
@@ -649,7 +660,7 @@ function applyPatches(view, length) {
         style.flex = "";
         style.minWidth = "0";
         style.minHeight = "0";
-        style.position = "";
+        style.position = el.__pos || "";
         style.top = "";
         style.left = "";
         style.right = "";
@@ -709,6 +720,12 @@ function applyPatches(view, length) {
         // the axis the child left to its container — a flexible
         // island discovers its real box this way
         apply.alignSelf = "stretch";
+      }
+      if (mask & 1024 && apply) {
+        // take the offer, keep the content floor
+        apply.flex = "1 1 auto";
+        apply.minWidth = "0";
+        apply.minHeight = "0";
       }
     } else if (op === 12) {
       // one insertBefore, identity intact (0 = to the end)
@@ -990,6 +1007,9 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         `Deploy the page and the wasm together, then reload.`;
       return;
     }
+    // the window is a one-slot column: its child can take the box
+    app.style.display = "flex";
+    app.style.flexDirection = "column";
     // a page the BUILD painted: adopt its elements before the wasm
     // takes over — ids are the data-n the serializer stamped
     const hydrated = app.dataset.hydrate === "1";
@@ -1000,6 +1020,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         if (el.tagName === "INPUT") wireInput(el);
         if (el.style.overflow === "auto") wireScroll(el, id);
         if (el.tagName === "CANVAS") islandObserver.observe(el);
+        if (el.style.position === "relative") el.__pos = "relative";
       }
     }
     // the boot bill: fetch+instantiate, then the first frame inside

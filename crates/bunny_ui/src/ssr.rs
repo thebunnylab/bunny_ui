@@ -100,6 +100,9 @@ impl Tree {
         };
         root.attrs.insert("id", "app".to_string());
         root.attrs.insert("data-hydrate", "1".to_string());
+        // the window is a one-slot column: its child can take the box
+        root.style.insert("display", "flex".into());
+        root.style.insert("flex-direction", "column".into());
         let _ = size;
         let mut elements = BTreeMap::new();
         elements.insert(0, root);
@@ -187,9 +190,19 @@ impl Tree {
                     ("position", "relative"),
                 ],
             ),
+            // a wrapper is a COLUMN, not a block: the engine proposes
+            // its box to the child, and only a flex line can hand the
+            // offer down (width by the stretch default, height by the
+            // fill flag)
             CreateKind::Group | CreateKind::Box => (
                 "div",
-                &[("box-sizing", "border-box"), ("min-width", "0"), ("min-height", "0")],
+                &[
+                    ("display", "flex"),
+                    ("flex-direction", "column"),
+                    ("box-sizing", "border-box"),
+                    ("min-width", "0"),
+                    ("min-height", "0"),
+                ],
             ),
         };
         let mut element = Element {
@@ -336,6 +349,9 @@ impl Tree {
                 }
                 if layout.stretch {
                     element.style.insert("align-self", "stretch".into());
+                }
+                if layout.fill {
+                    element.style.insert("flex", "1 1 auto".into());
                 }
             }
             DomPatch::SetStyle { id, style } => {

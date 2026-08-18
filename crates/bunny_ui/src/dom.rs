@@ -534,6 +534,11 @@ pub struct DomLayout {
     /// The child follows its container's cross size — `align-self:
     /// stretch`, and no pinned size on the stretched axis.
     pub stretch: bool,
+    /// The child takes the container's OFFER and keeps its content
+    /// floor — `flex: 1 1 auto`. A wrapper's proposal semantics: the
+    /// interior fills a definite box, and an auto box still sizes to
+    /// the content instead of collapsing to a zero basis.
+    pub fill: bool,
 }
 
 /// Element hints only the Dom consumes — a real tag, a class, an id.
@@ -1558,7 +1563,8 @@ pub const ABI_VERSION: u32 = 3;
 ///                   3 width f32,  4 height f32,  5 max width f32,
 ///                   6 max height f32,  7 grow (flag, no payload),
 ///                   8 slot y f32 (a virtual row's offset),
-///                   9 stretch (flag, no payload)
+///                   9 stretch (flag, no payload),
+///                   10 fill (flag, no payload)
 ///  12 move          u32 parent, u32 before (0 = to the end)
 ///  13 reveal        u32 target — the container scrolls it into view
 /// ```
@@ -1728,6 +1734,9 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 }
                 if layout.stretch {
                     mask |= 1 << 9;
+                }
+                if layout.fill {
+                    mask |= 1 << 10;
                 }
                 push_u16(&mut out, mask);
                 if let Some(gap) = layout.gap {
@@ -2563,6 +2572,118 @@ mod tests {
         let islands = runtime.dom_islands(1);
         assert_eq!(islands.len(), 1);
         assert_eq!((islands[0].width, islands[0].height), (500, 30));
+    }
+
+    /// The window's box FLOWS DOWN: the mount point is a one-slot
+    /// column, and a vertically flexible app takes the offer through
+    /// every wrapper on the way (`fill`, `flex: 1 1 auto`) — the
+    /// finder's padded panel reaches the bottom of the window, like
+    /// the engine that proposes its box has always guaranteed.
+    #[test]
+    fn the_windows_box_flows_down_to_a_padded_panel() {
+        #[derive(Clone)]
+        struct Paned;
+
+        impl Component for Paned {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("toolbar"),
+                    virtual_list(100, |row| format!("r{row}"), |row| {
+                        text(format!("row {row}"))
+                    })
+                )
+                .padding_length(28.0)
+                .background_color(Color::hex(0x10141B))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&Paned, Size { width: 400.0, height: 300.0 });
+        // the first element under the root carries the offer
+        let first = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, parent: 0, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the app mounted");
+        let takes = |wanted: u32| {
+            mount.iter().any(|patch| {
+                matches!(
+                    patch,
+                    DomPatch::SetLayout { id, layout } if *id == wanted && layout.fill
+                )
+            })
+        };
+        assert!(takes(first), "the root child takes the window: {mount:?}");
+    }
+
+    /// The finder's exact shape, kept honest: a width-hungry custom
+    /// under padding wrappers, between a toolbar and a virtual list.
+    /// The browser's report must reach it through the whole chain.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn a_report_reaches_an_island_behind_wrappers() {
+        struct EatsRow;
+
+        impl crate::custom::CustomElement for EatsRow {
+            fn name(&self) -> &str {
+                "eats-row"
+            }
+            fn flexible(&self) -> bool {
+                false
+            }
+            fn measure(
+                &self,
+                proposal: crate::layout::Proposal,
+                _metrics: &crate::custom::Metrics,
+            ) -> Size {
+                Size { width: proposal.width.unwrap_or(0.0), height: 46.0 }
+            }
+            fn paint(&self, ctx: &crate::custom::PaintCtx, painter: &mut crate::custom::Painter) {
+                painter.fill(ctx.bounds(), Color::hex(0x3B82F6));
+            }
+        }
+
+        #[derive(Clone)]
+        struct Pane;
+
+        impl Component for Pane {
+            fn body(self, _ctx: &Context) -> impl View {
+                use motor::views::Edge;
+                crate::vstack!(crate::vstack!(
+                    crate::hstack!(text("toolbar")),
+                    crate::custom::custom(EatsRow)
+                        .padding_edge(Edge::Leading, 10.0)
+                        .padding_edge(Edge::Trailing, 10.0)
+                        .padding_edge(Edge::Bottom, 8.0),
+                    virtual_list(1_000, |row| format!("r{row}"), |row| {
+                        text(format!("row {row}"))
+                    })
+                ))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 760.0, height: 640.0 };
+        let mount = runtime.dom_frame(&Pane, size);
+        let canvas_id = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Canvas, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the island mounted");
+        let _ = runtime.dom_islands(1);
+
+        assert!(
+            runtime.dom_island_box(canvas_id, 682.0, 46.0),
+            "the report is news"
+        );
+        let _ = runtime.dom_frame(&Pane, size);
+        let islands = runtime.dom_islands(1);
+        assert_eq!(islands.len(), 1, "the report re-rastered the island");
+        assert_eq!((islands[0].width, islands[0].height), (682, 46));
     }
 
     #[test]

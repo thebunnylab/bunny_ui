@@ -74,6 +74,9 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
     };
     let mut children = Vec::new();
     walk.lower_into(root, &mut children);
+    // the mount point is a one-slot column and the window's box is
+    // the offer — a flexible app takes it
+    Walk::stamp_fill(root, &mut children);
     // popovers mount as the root's LAST children — the portal, by
     // construction, same contract as the absolute capture
     let overlays = std::mem::take(&mut walk.overlays);
@@ -187,7 +190,22 @@ impl Walk<'_> {
                             }
                         }
                     }
+                    // and the CROSS axis is the stack's own extent:
+                    // a child flexible across it takes the line
+                    // (align-self beats the container's align-items)
+                    let cross = match axis {
+                        Axis::Vertical => Axis::Horizontal,
+                        Axis::Horizontal => Axis::Vertical,
+                    };
+                    if child.is_flexible(cross) {
+                        for stretched in &mut container.children[opened..] {
+                            if let Some(layout) = stretched.layout.as_mut() {
+                                layout.stretch = true;
+                            }
+                        }
+                    }
                 }
+                Self::inherit_stretch(&mut container);
                 out.push(container);
             }
             LayoutNode::Layered { align, children } => {
@@ -230,6 +248,7 @@ impl Walk<'_> {
                 container.layout.as_mut().expect("flow node").padding =
                     Some((top, trailing, bottom, leading));
                 container.children = lowered;
+                Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(&mut container);
                 out.push(container);
             }
@@ -249,6 +268,8 @@ impl Walk<'_> {
                 }
                 self.lower_into(child, &mut container.children);
                 self.slot = outer_slot;
+                Self::stamp_fill(child, &mut container.children);
+                Self::inherit_stretch(&mut container);
                 out.push(container);
             }
             LayoutNode::MaxFrame { max_width, max_height, align, child } => {
@@ -266,6 +287,8 @@ impl Walk<'_> {
                     layout.align = Some(align_code(*align));
                 }
                 self.lower_into(child, &mut container.children);
+                Self::stamp_fill(child, &mut container.children);
+                Self::inherit_stretch(&mut container);
                 out.push(container);
             }
             LayoutNode::Spacer => {
@@ -317,6 +340,8 @@ impl Walk<'_> {
                 }
                 self.ink.pop();
                 self.font = outer_font;
+                Self::stamp_fill(child, &mut boxed.children);
+                Self::inherit_stretch(&mut boxed);
                 out.push(boxed);
             }
             LayoutNode::Text { content, highlights, truncation } => {
@@ -389,7 +414,14 @@ impl Walk<'_> {
                     offset: (offset.x, offset.y),
                     target: target.clone(),
                 });
-                scroll.layout.as_mut().expect("flow node").grow = true;
+                {
+                    let layout = scroll.layout.as_mut().expect("flow node");
+                    // the leftover length is the scroller's, and the
+                    // offered CROSS size too — a pixel scroller takes
+                    // the proposal's width, this one stretches to it
+                    layout.grow = true;
+                    layout.stretch = true;
+                }
                 let mut lowered = Vec::new();
                 self.lower_into(child, &mut lowered);
                 match lowered.as_slice() {
@@ -486,8 +518,11 @@ impl Walk<'_> {
                 group.children.reserve_exact(children.len());
                 let outer_pending = self.pending_boundary_class.take();
                 for child in children {
+                    let opened = group.children.len();
                     self.lower_into(child, &mut group.children);
+                    Self::stamp_fill(child, &mut group.children[opened..]);
                 }
+                Self::inherit_stretch(&mut group);
                 if let Some(class) = self.pending_boundary_class.take() {
                     // the body spoke about its own element: an empty
                     // class clears, anything else attributes
@@ -598,6 +633,21 @@ impl Walk<'_> {
         }
     }
 
+    /// The engine PROPOSES a wrapper's box to its interior; a block
+    /// element proposes nothing. Every wrapper is a column instead,
+    /// and a vertically flexible interior takes the offer through
+    /// `flex: 1 1 auto` — full when the box is definite, content-
+    /// sized when it is not (a zero basis would collapse it).
+    fn stamp_fill(child: &LayoutNode, lowered: &mut [DomNode]) {
+        if child.is_flexible(Axis::Vertical) {
+            for node in lowered {
+                if let Some(layout) = node.layout.as_mut() {
+                    layout.fill = true;
+                }
+            }
+        }
+    }
+
     /// A hungry interior keeps its hunger through a pure wrapper —
     /// the stretch has to reach the flex line that can actually feed
     /// it, or the wrapper sizes to its content and starves the child.
@@ -673,15 +723,12 @@ impl Walk<'_> {
             subtree.is_flexible(Axis::Horizontal),
             subtree.is_flexible(Axis::Vertical),
         );
+        // the reported box IS the container's offer — a pixel stack
+        // proposes its extent to every child, flexible or not, and
+        // the child answers with what it wants
         let proposal = crate::layout::Proposal {
-            width: match (flexible.0, reported) {
-                (true, Some((w, _))) => Some(w),
-                _ => self.slot.0,
-            },
-            height: match (flexible.1, reported) {
-                (true, Some((_, h))) => Some(h),
-                _ => self.slot.1,
-            },
+            width: reported.map(|(w, _)| w).or(self.slot.0),
+            height: reported.map(|(_, h)| h).or(self.slot.1),
         };
         let (measured, fit) = subtree.measure(proposal, env);
         // which axes FOLLOW the proposal? offer a different box and
