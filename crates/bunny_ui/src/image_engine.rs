@@ -30,6 +30,12 @@ pub enum ImageSource {
     Bytes { key: u64, bytes: Rc<[u8]> },
     /// The platform's icon for a file path (macOS: the workspace icon).
     FileIcon { key: u64, path: Rc<str> },
+    /// A vector glyph the HOUSE draws, already tinted. `key` folds the
+    /// symbol AND the ink — a re-tint IS a new identity, so the caches,
+    /// the GPU atlas and the damage diff work untouched (the contract
+    /// the text atlas has kept since day one). No engine ever sees this
+    /// variant: [`raster_source`] intercepts it first.
+    Symbol { key: u64, symbol: crate::icon::Symbol, color: crate::layout::Color },
 }
 
 /// Domain tags folded into the key so the two variants never share an
@@ -60,10 +66,26 @@ impl ImageSource {
         ImageSource::Bytes { key, bytes: bytes.into() }
     }
 
+    /// A tinted glyph — built at PLACEMENT, where the ink is known.
+    /// One 64-bit mix per icon per frame: the symbol's key is already
+    /// well spread, the tint only has to move it somewhere unique.
+    pub fn symbol(symbol: crate::icon::Symbol, color: crate::layout::Color) -> ImageSource {
+        let packed = ((color.r as u64) << 24)
+            | ((color.g as u64) << 16)
+            | ((color.b as u64) << 8)
+            | color.a as u64;
+        let mut key = symbol.key ^ packed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        key = key.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        key ^= key >> 33;
+        ImageSource::Symbol { key, symbol, color }
+    }
+
     /// The cheap identity — what diffs, caches and the wire carry.
     pub fn key(&self) -> u64 {
         match self {
-            ImageSource::Bytes { key, .. } | ImageSource::FileIcon { key, .. } => *key,
+            ImageSource::Bytes { key, .. }
+            | ImageSource::FileIcon { key, .. }
+            | ImageSource::Symbol { key, .. } => *key,
         }
     }
 }
@@ -90,6 +112,10 @@ impl PartialEq for ImageSource {
                 ImageSource::FileIcon { path, .. },
                 ImageSource::FileIcon { path: other_path, .. },
             ) => path == other_path,
+            (
+                ImageSource::Symbol { key, .. },
+                ImageSource::Symbol { key: other_key, .. },
+            ) => key == other_key,
             _ => false,
         }
     }
@@ -104,6 +130,11 @@ impl fmt::Debug for ImageSource {
                 write!(f, "bytes(0x{key:016x}, {}b)", bytes.len())
             }
             ImageSource::FileIcon { path, .. } => write!(f, "file-icon({path})"),
+            ImageSource::Symbol { symbol, color, .. } => write!(
+                f,
+                "symbol({}, #{:02x}{:02x}{:02x}{:02x})",
+                symbol.name, color.r, color.g, color.b, color.a
+            ),
         }
     }
 }
@@ -141,6 +172,39 @@ pub trait ImageEngine {
         width: usize,
         height: usize,
     ) -> Option<Rc<ImageRaster>>;
+}
+
+/// The ONE door every pipeline asks for pixels through. A vector glyph
+/// never reaches the platform: the house rasterizes it, so the CPU
+/// compositor, the GPU atlas and the browser canvas consume literally
+/// the same bytes — parity by construction, not by agreement. Anything
+/// else is the platform's to decode.
+pub fn raster_source(
+    engine: &dyn ImageEngine,
+    source: &ImageSource,
+    width: usize,
+    height: usize,
+) -> Option<Rc<ImageRaster>> {
+    match source {
+        ImageSource::Symbol { key, symbol, color } => {
+            crate::icon::raster(*key, symbol, *color, width, height)
+        }
+        _ => engine.raster(source, width, height),
+    }
+}
+
+/// The intrinsic twin. A glyph has no natural pixel size — the grid
+/// square stands in, the way [`FILE_ICON_SIZE`] stands in for the
+/// workspace icons; the normal use is the icon view, which sizes off
+/// the FONT and never asks.
+pub fn intrinsic_of(engine: &dyn ImageEngine, source: &ImageSource) -> Option<(u32, u32)> {
+    match source {
+        ImageSource::Symbol { .. } => {
+            let grid = crate::icon::ICON_GRID as u32;
+            Some((grid, grid))
+        }
+        _ => engine.intrinsic(source),
+    }
 }
 
 // MARK: - RawImages, the default engine
@@ -250,6 +314,12 @@ impl ImageEngine for RawImages {
         match source {
             ImageSource::Bytes { bytes, .. } => RawImages::decode_header(bytes),
             ImageSource::FileIcon { .. } => Some((FILE_ICON_SIZE, FILE_ICON_SIZE)),
+            ImageSource::Symbol { .. } => {
+                // the door intercepts symbols before any engine — a
+                // regression at a call site should be LOUD
+                debug_assert!(false, "a symbol never reaches an engine");
+                None
+            }
         }
     }
 
@@ -272,6 +342,10 @@ impl ImageEngine for RawImages {
                 RawImages::resample(bytes, dimensions, width, height)
             }
             ImageSource::FileIcon { key, .. } => RawImages::checker(*key, width, height),
+            ImageSource::Symbol { .. } => {
+                debug_assert!(false, "a symbol never reaches an engine");
+                return None;
+            }
         };
         let raster = Rc::new(ImageRaster { width, height, rgba });
         let mut rasters = self.rasters.borrow_mut();

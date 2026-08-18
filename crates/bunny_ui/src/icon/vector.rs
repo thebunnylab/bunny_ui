@@ -10,8 +10,10 @@
 use super::{Rule, Verb};
 
 /// How far the polyline may sit from the true curve, in device px.
-/// A tenth of a pixel disappears under the coverage anti-aliasing.
-const TOLERANCE: f64 = 0.1;
+/// The error is SYSTEMATIC — a chord always sits inside its arc — so
+/// the bound is tight: three hundredths keep the thinnest pen (a two
+/// unit stroke on a sixteen pixel icon) within two percent of true.
+const TOLERANCE: f64 = 0.03;
 
 /// Sub-scanlines per pixel row. The fill is EXACT along x (intervals,
 /// not samples) and quantized along y in steps of `1/ROWS` — at
@@ -20,8 +22,9 @@ const TOLERANCE: f64 = 0.1;
 const ROWS: usize = 16;
 
 /// Wang's bound caps the segment count too — a degenerate table of
-/// verbs cannot ask for an unbounded fan.
-const MAX_SEGMENTS: usize = 64;
+/// verbs cannot ask for an unbounded fan. High enough that no real
+/// curve at icon sizes ever meets it (the clamp would BREAK the bound).
+const MAX_SEGMENTS: usize = 128;
 
 /// The grid→device placing: a uniform scale and a shift. Icons never
 /// rotate, so the whole transform is three numbers — and the flattening
@@ -562,12 +565,12 @@ mod tests {
     fn the_segment_count_is_derived_not_guessed() {
         let small = cubic_segments((16.0, 0.0), (16.0, 8.8), (8.8, 16.0), (0.0, 16.0));
         assert!(
-            (4..=12).contains(&small),
+            (8..=20).contains(&small),
             "a 16px quarter circle wants a handful, took {small}"
         );
         let big = cubic_segments((320.0, 0.0), (320.0, 176.0), (176.0, 320.0), (0.0, 320.0));
         assert!(
-            (16..=MAX_SEGMENTS).contains(&big),
+            (32..MAX_SEGMENTS).contains(&big),
             "a 320px quarter circle wants real segments, took {big}"
         );
         assert!(big > small, "the count follows the size");

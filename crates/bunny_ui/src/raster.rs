@@ -17,7 +17,7 @@
 //! house pixel font and for the Mac's CoreText (and for the web's
 //! canvas, one day).
 
-use crate::image_engine::{ImageEngine, RawImages};
+use crate::image_engine::{ImageEngine, RawImages, raster_source};
 use crate::layout::{Color, DisplayList, DrawCommand, GradientPaint, Point, Rect};
 use crate::text_engine::{PixelFont, TextEngine, TextRaster};
 
@@ -560,7 +560,7 @@ pub fn rasterize_with(
             DrawCommand::Image { rect, source } => {
                 let width = physical_extent(rect.size.width, scale);
                 let height = physical_extent(rect.size.height, scale);
-                if let Some(raster) = images.raster(source, width, height) {
+                if let Some(raster) = raster_source(images, source, width, height) {
                     bitmap.composite_rgba(
                         rect.origin.x,
                         rect.origin.y,
@@ -877,7 +877,7 @@ impl Surface {
                     DrawCommand::Image { rect: image_rect, source } => {
                         let width = physical_extent(image_rect.size.width, self.scale);
                         let height = physical_extent(image_rect.size.height, self.scale);
-                        if let Some(raster) = images.raster(source, width, height) {
+                        if let Some(raster) = raster_source(images, source, width, height) {
                             self.bitmap.composite_rgba(
                                 image_rect.origin.x,
                                 image_rect.origin.y,

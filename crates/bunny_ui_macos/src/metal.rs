@@ -37,7 +37,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::hash::{Hash, Hasher};
 use std::ptr::null_mut;
 
-use bunny_ui::image_engine::{ImageEngine, ImageSource};
+use bunny_ui::image_engine::{ImageEngine, ImageSource, raster_source};
 use bunny_ui::layout::{Color, DisplayList, DrawCommand, Rect, Size};
 use bunny_ui::raster::physical_extent;
 use bunny_ui::text_engine::{FontKey, FontSpec, TextEngine};
@@ -1094,7 +1094,7 @@ impl RunAtlas {
         }
         let shared = height <= DEDICATED_HEIGHT && width * height <= DEDICATED_AREA;
         if shared && !self.images.contains_key(&cache_key) {
-            let Some(raster) = engine.raster(source, width as usize, height as usize) else {
+            let Some(raster) = raster_source(engine, source, width as usize, height as usize) else {
                 return Ok(None);
             };
             unsafe {
@@ -1143,7 +1143,7 @@ impl RunAtlas {
         if self.dedicated.len() >= DEDICATED_KEEP {
             return Err(AtlasFull);
         }
-        let Some(raster) = engine.raster(source, width as usize, height as usize) else {
+        let Some(raster) = raster_source(engine, source, width as usize, height as usize) else {
             return Ok(None);
         };
         let texture = unsafe {

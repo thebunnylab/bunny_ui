@@ -32,7 +32,7 @@ use motor::views::ContentMode;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::image_engine::{ImageEngine, ImageSource, RawImages};
+use crate::image_engine::{ImageEngine, ImageSource, RawImages, intrinsic_of};
 use crate::text_engine::{FontPatch, FontSpec, MeasureCache, PixelFont, TextEngine};
 
 /// Logical pixels. Snapping to device pixels is the real backend's
@@ -1594,7 +1594,7 @@ impl LayoutNode {
                     // the print-parity stub keeps the old rigid box
                     None => Size { width: 40.0, height: 40.0 },
                     Some(source) => {
-                        image_size(env.images.intrinsic(source), *resizable, *fit, proposal)
+                        image_size(intrinsic_of(&*env.images, source), *resizable, *fit, proposal)
                     }
                 };
                 (size, Fit::Leaf)
@@ -2160,7 +2160,7 @@ impl LayoutNode {
                     if cover {
                         // Fill spills over the frame on one axis — the
                         // clip is built in, never a separate modifier
-                        if let Some(rect) = cover_rect(frame, env.images.intrinsic(source)) {
+                        if let Some(rect) = cover_rect(frame, intrinsic_of(&*env.images, source)) {
                             out.push_clip(frame);
                             out.display.push(DrawCommand::Image {
                                 rect,
