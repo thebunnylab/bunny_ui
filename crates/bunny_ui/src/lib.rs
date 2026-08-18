@@ -41,6 +41,7 @@ pub mod action;
 pub mod anim;
 pub mod custom;
 pub mod dom;
+mod dom_flow;
 pub mod effects;
 pub mod erased;
 pub mod ext;

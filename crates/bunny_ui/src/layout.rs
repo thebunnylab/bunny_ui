@@ -1490,7 +1490,7 @@ impl LayoutNode {
     /// Flexible = wants the leftover space on the axis (the basis of
     /// stack distribution). Explicit priority, never a side effect of
     /// overflow.
-    fn is_flexible(&self, axis: Axis) -> bool {
+    pub(crate) fn is_flexible(&self, axis: Axis) -> bool {
         match self {
             LayoutNode::Spacer | LayoutNode::Fill => true,
             // a split FILLS the offer on both axes — its whole job is
@@ -3178,7 +3178,7 @@ const SCROLLBAR_MIN: Px = 24.0;
 
 const FIELD_PAD_H: Px = 8.0;
 const FIELD_PAD_V: Px = 5.0;
-const FIELD_RADIUS: Px = 5.0;
+pub(crate) const FIELD_RADIUS: Px = 5.0;
 const FIELD_CARET_W: Px = 1.5;
 
 /// The region's thumb — draw-only at this stage (drag arrives with

@@ -71,6 +71,17 @@ pub enum DomKind {
     /// and press flip through the box above with no patch of their
     /// own.
     Icon(DomIcon),
+    /// A flow container: `display:flex; flex-direction:column`. Two
+    /// variants instead of a payload so the keyed match's discriminant
+    /// tells the axes apart — an axis change recreates the element.
+    FlexColumn,
+    /// The row twin: `display:flex; flex-direction:row`.
+    FlexRow,
+    /// Layered children: `display:grid`, everyone in the same cell.
+    Layers,
+    /// A popover under the root (the portal). The glue positions it
+    /// from the anchor's real box — the identity is the overlay path.
+    Popover { path: String },
 }
 
 /// One image element. `key` is the source identity ([`crate::
@@ -139,7 +150,7 @@ pub struct DomStyle {
 }
 
 impl DomStyle {
-    fn from_props(props: &VisualProps) -> DomStyle {
+    pub(crate) fn from_props(props: &VisualProps) -> DomStyle {
         DomStyle {
             background: props.background,
             gradient: props.gradient,
@@ -526,6 +537,10 @@ pub enum CreateKind {
     Canvas,
     Image,
     Icon,
+    FlexColumn,
+    FlexRow,
+    Layers,
+    Popover,
 }
 
 /// One island's fresh pixels — the shell blits them into the island's
@@ -723,6 +738,10 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::Canvas { .. } => CreateKind::Canvas,
         DomKind::Image(_) => CreateKind::Image,
         DomKind::Icon(_) => CreateKind::Icon,
+        DomKind::FlexColumn => CreateKind::FlexColumn,
+        DomKind::FlexRow => CreateKind::FlexRow,
+        DomKind::Layers => CreateKind::Layers,
+        DomKind::Popover { .. } => CreateKind::Popover,
     }
 }
 
@@ -1278,6 +1297,10 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                     CreateKind::Canvas => 6,
                     CreateKind::Image => 7,
                     CreateKind::Icon => 8,
+                    CreateKind::FlexColumn => 9,
+                    CreateKind::FlexRow => 10,
+                    CreateKind::Layers => 11,
+                    CreateKind::Popover => 12,
                 });
             }
             DomPatch::Remove { id } => {

@@ -148,7 +148,29 @@ function rgba(packed) {
 
 function createElementOf(kind, tag) {
   // 0 group, 1 box, 2 text, 3 field, 4 scroll, 5 content, 6 canvas,
-  // 7 image
+  // 7 image, 8 icon, 9 flex column, 10 flex row, 11 layers, 12 popover
+  if (kind === 9 || kind === 10) {
+    // a FLOW container: static, the browser lays its children out
+    const el = document.createElement(tag || "div");
+    el.style.cssText =
+      `display:flex;flex-direction:${kind === 9 ? "column" : "row"};` +
+      "box-sizing:border-box;min-width:0;min-height:0;";
+    return el;
+  }
+  if (kind === 11) {
+    // layered children: one grid cell, everyone in it
+    const el = document.createElement(tag || "div");
+    el.style.cssText =
+      "display:grid;box-sizing:border-box;min-width:0;min-height:0;";
+    return el;
+  }
+  if (kind === 12) {
+    // a popover: absolute under the root; the glue positions it from
+    // the anchor's real box once the placement round lands
+    const el = document.createElement(tag || "div");
+    el.style.cssText = "position:absolute;left:0;top:0;box-sizing:border-box;";
+    return el;
+  }
   if (kind === 6) {
     const canvas = document.createElement("canvas");
     canvas.style.cssText = "position:absolute;left:0;top:0;";
