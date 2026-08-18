@@ -2805,7 +2805,7 @@ impl LayoutNode {
                     // measure from the same origin, so a flight above
                     // never bends the captured interior
                     dom.open(
-                        crate::dom::DomKind::Group { path: path.clone() },
+                        crate::dom::DomKind::Group { path: std::rc::Rc::from(path.as_str()) },
                         real,
                         real.origin,
                     );

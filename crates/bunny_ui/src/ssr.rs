@@ -385,7 +385,7 @@ impl Tree {
                     );
                 }
                 if let Some(path) = &style.interactive {
-                    element.attrs.insert("data-path", path.clone());
+                    element.attrs.insert("data-path", path.to_string());
                     element.style.insert("cursor", "default".into());
                 }
                 if let Some(focus) = style.focus_border {

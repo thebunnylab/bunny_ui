@@ -45,7 +45,7 @@ pub enum DomKind {
     /// The mount point — id 0, never created or removed.
     Root,
     /// A component boundary: the diff matches it by identity path.
-    Group { path: String },
+    Group { path: std::rc::Rc<str> },
     /// A styled box (background, border, radius, shadow, interaction).
     Box,
     /// One run of text — the browser renders and selects it natively.
@@ -90,7 +90,7 @@ pub enum DomKind {
     /// frame, so the retained subtree still holds — the diff keeps it
     /// wholesale and never descends. Internal to the walk and the
     /// diff; the wire never carries it.
-    Reuse { path: String },
+    Reuse { path: std::rc::Rc<str> },
     /// A popover under the root (the portal). The glue positions it
     /// from the anchor's real box — the identity is the overlay path.
     Popover {
@@ -154,7 +154,7 @@ pub struct DomStyle {
     pub shadow: Option<(Px, Color)>,
     /// The action path of the enclosing `Interactive` — the glue posts
     /// clicks back with it, and `:hover`/`:active` scope to it.
-    pub interactive: Option<String>,
+    pub interactive: Option<std::rc::Rc<str>>,
     /// `(response, damping)` of the enclosing animation scope — the
     /// glue lowers it to a CSS transition; the engine never ticks here.
     pub transition: Option<(f64, f64)>,
@@ -253,7 +253,7 @@ pub(crate) struct DomCapture {
     /// Armed by an `Animated` scope; the next opened node takes it.
     pending_transition: Option<(f64, f64)>,
     /// Armed by an `Interactive`; the next opened box takes it.
-    pending_interactive: Option<String>,
+    pending_interactive: Option<std::rc::Rc<str>>,
     /// The BASE ink of every open node, in step with `stack` — the
     /// color a text inherits, never the hovered one the pointer
     /// resolved. This is what keeps the capture pointer-invariant.
@@ -452,7 +452,7 @@ impl DomCapture {
     }
 
     pub(crate) fn arm_interactive(&mut self, path: &str) {
-        self.pending_interactive = Some(path.to_string());
+        self.pending_interactive = Some(std::rc::Rc::from(path));
     }
 
     /// The scope that armed a pending attribute closes: whatever no box
@@ -640,7 +640,7 @@ struct LowerCtx<'a> {
     next_id: &'a mut u32,
     display: &'a [DrawCommand],
     islands: &'a mut HashMap<u32, Island>,
-    group_paths: &'a mut std::collections::HashSet<String>,
+    group_paths: &'a mut std::collections::HashSet<std::rc::Rc<str>>,
 }
 
 /// The retained side of the Dom mode: last frame's scene with ids.
@@ -658,7 +658,7 @@ pub struct DomLowering {
     /// Every retained Group's identity path — the walk consults this
     /// before promising a reuse (a promise the diff cannot keep would
     /// mount a hole).
-    group_paths: std::collections::HashSet<String>,
+    group_paths: std::collections::HashSet<std::rc::Rc<str>>,
 }
 
 impl DomLowering {
@@ -731,7 +731,7 @@ impl DomLowering {
             if let Some(root) = self.root.as_ref() {
                 fn group_id(node: &Retained, path: &str) -> Option<u32> {
                     if let DomKind::Group { path: here } = &node.node.kind
-                        && here == path
+                        && **here == *path
                     {
                         return Some(node.id);
                     }
@@ -829,7 +829,7 @@ impl DomLowering {
 
     /// The retained Groups' identity paths — the flow walk consults
     /// them before promising a reuse.
-    pub(crate) fn group_paths(&self) -> std::collections::HashSet<String> {
+    pub(crate) fn group_paths(&self) -> std::collections::HashSet<std::rc::Rc<str>> {
         self.group_paths.clone()
     }
 
@@ -1075,7 +1075,7 @@ fn remove_subtree(retained: &Retained, ctx: &mut LowerCtx, patches: &mut Vec<Dom
     forget_islands(retained, ctx.islands);
     fn forget_groups(
         retained: &Retained,
-        groups: &mut std::collections::HashSet<String>,
+        groups: &mut std::collections::HashSet<std::rc::Rc<str>>,
     ) {
         if let DomKind::Group { path } = &retained.node.kind {
             groups.remove(path);
@@ -1242,7 +1242,7 @@ fn diff_children(
         return;
     }
     let old_children = std::mem::take(&mut retained.children);
-    let mut by_path: HashMap<String, Retained> = HashMap::new();
+    let mut by_path: HashMap<std::rc::Rc<str>, Retained> = HashMap::new();
     let mut by_index: Vec<Option<Retained>> = Vec::with_capacity(old_children.len());
     for old in old_children {
         if let DomKind::Group { path } = &old.node.kind {
@@ -1335,7 +1335,7 @@ fn diff_children_ordered(
     }
 
     let old_children = std::mem::take(&mut retained.children);
-    let mut by_path: HashMap<String, (usize, Retained)> = HashMap::new();
+    let mut by_path: HashMap<std::rc::Rc<str>, (usize, Retained)> = HashMap::new();
     let mut by_index: Vec<Option<Retained>> = Vec::with_capacity(old_children.len());
     for (position, old) in old_children.into_iter().enumerate() {
         if let DomKind::Group { path } = &old.node.kind {
@@ -2423,7 +2423,7 @@ mod tests {
                 id: 7,
                 style: DomStyle {
                     background: Some(Color::hex(0x112233)),
-                    interactive: Some("go".to_string()),
+                    interactive: Some(std::rc::Rc::from("go")),
                     ..DomStyle::default()
                 },
             },
@@ -2986,7 +2986,7 @@ mod tests {
 
     fn flow_row(path: &str) -> DomNode {
         DomNode {
-            kind: DomKind::Group { path: path.to_string() },
+            kind: DomKind::Group { path: std::rc::Rc::from(path) },
             x: 0.0,
             y: 0.0,
             width: 0.0,

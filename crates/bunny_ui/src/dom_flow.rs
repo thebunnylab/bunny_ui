@@ -38,7 +38,7 @@ pub(crate) struct FlowEnv<'a> {
     pub changed: &'a [String],
     /// The Groups the retained scene actually holds — a promise the
     /// diff cannot match would mount a hole, so the walk checks first.
-    pub retained_groups: &'a std::collections::HashSet<String>,
+    pub retained_groups: &'a std::collections::HashSet<std::rc::Rc<str>>,
 }
 
 /// What the walk hands back beside the scene.
@@ -102,7 +102,7 @@ struct Walk<'a> {
     /// inherits instead of painting its own color.
     ink_scopes: Vec<usize>,
     font: FontSpec,
-    pending_interactive: Option<String>,
+    pending_interactive: Option<std::rc::Rc<str>>,
     pending_transition: Option<(f64, f64)>,
     overlays: Vec<DomNode>,
     display: crate::layout::DisplayList,
@@ -458,7 +458,7 @@ impl Walk<'_> {
                 // a CLEAN boundary is a promise, not a walk: no body
                 // under it ran, the retained group still holds, and
                 // the diff keeps it wholesale — O(change), by absence
-                if self.env.retained_groups.contains(path)
+                if self.env.retained_groups.contains(path.as_str())
                     && !self.env.changed.iter().any(|run| {
                         // related in EITHER direction dirties: a run
                         // below me changed my interior; a run above me
@@ -473,10 +473,10 @@ impl Walk<'_> {
                         related(run, path) || related(path, run)
                     })
                 {
-                    out.push(node(DomKind::Reuse { path: path.clone() }));
+                    out.push(node(DomKind::Reuse { path: std::rc::Rc::from(path.as_str()) }));
                     return;
                 }
-                let mut group = node(DomKind::Group { path: path.clone() });
+                let mut group = node(DomKind::Group { path: std::rc::Rc::from(path.as_str()) });
                 let outer_pending = self.pending_boundary_class.take();
                 for child in children {
                     self.lower_into(child, &mut group.children);
@@ -503,11 +503,11 @@ impl Walk<'_> {
                 });
                 match lowered {
                     Some(nodes) => out.extend(nodes),
-                    None => out.push(node(DomKind::Group { path: path.clone() })),
+                    None => out.push(node(DomKind::Group { path: std::rc::Rc::from(path.as_str()) })),
                 }
             }
             LayoutNode::Interactive { path, child } => {
-                self.pending_interactive = Some(path.clone());
+                self.pending_interactive = Some(std::rc::Rc::from(path.as_str()));
                 self.lower_into(child, out);
                 self.pending_interactive = None;
             }
@@ -560,7 +560,7 @@ impl Walk<'_> {
                 // group wrapped around the child, keyed off the
                 // popover's own path
                 let anchor_path = format!("{path}/#anchor");
-                let mut anchor = node(DomKind::Group { path: anchor_path.clone() });
+                let mut anchor = node(DomKind::Group { path: std::rc::Rc::from(anchor_path.as_str()) });
                 self.lower_into(child, &mut anchor.children);
                 out.push(anchor);
 
