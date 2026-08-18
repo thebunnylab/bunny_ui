@@ -17,7 +17,7 @@ edition = "2024"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bunny-ui = { path = "crates/bunny_ui" }
+bunny-ui = { path = "crates/bunny_ui", default-features = false }
 countries-core = { path = "crates/countries_core" }
 
 countries-pure = { path = "apps/countries_pure" }

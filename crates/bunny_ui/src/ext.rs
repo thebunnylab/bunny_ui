@@ -260,6 +260,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// Everywhere else the modifier dissolves (pixel targets already
     /// are the pixel pipeline). `Rendering::Auto` is the default table:
     /// v1 lowers everything to elements.
+    #[cfg(feature = "canvas")]
     fn rendering(self, mode: crate::layout::Rendering) -> Modified<Self> {
         Modified {
             base: self,

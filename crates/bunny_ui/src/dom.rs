@@ -2327,6 +2327,7 @@ mod tests {
         assert_eq!(runtime.dom_frame(&CloseGlyph, size), vec![], "hover is the browser's");
     }
 
+    #[cfg(feature = "canvas")]
     #[test]
     fn an_island_mounts_as_one_canvas_and_redraws_only_on_change() {
         #[derive(Clone)]
@@ -2535,6 +2536,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "canvas")]
     #[test]
     fn a_kind_swap_recreates_the_element() {
         let runtime = Runtime::new();
@@ -2570,9 +2572,11 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "canvas")]
     #[derive(Clone)]
     struct Isle;
 
+    #[cfg(feature = "canvas")]
     impl Component for Isle {
         fn body(self, _ctx: &Context) -> impl View {
             image(tiny_image(200))
@@ -2582,6 +2586,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "canvas")]
     #[test]
     fn an_image_inside_an_island_stays_pixels() {
         let runtime = Runtime::new();

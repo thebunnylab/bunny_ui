@@ -503,11 +503,20 @@ impl Walk<'_> {
                 // a window drag region means nothing in a browser tab
                 self.lower_into(child, out);
             }
+            #[cfg(feature = "canvas")]
             LayoutNode::Island { child } => {
                 out.push(self.island(child));
             }
+            #[cfg(feature = "canvas")]
             LayoutNode::Custom { .. } => {
                 out.push(self.island(tree));
+            }
+            // without the canvas feature the claiming APIs are gone,
+            // so these arms are unreachable by construction — an
+            // empty box keeps the match total
+            #[cfg(not(feature = "canvas"))]
+            LayoutNode::Island { .. } | LayoutNode::Custom { .. } => {
+                out.push(node(DomKind::Box));
             }
             LayoutNode::Anchored { path, side, overlay, child } => {
                 // the anchor gets an IDENTITY the glue can find: a
@@ -538,6 +547,7 @@ impl Walk<'_> {
     }
 }
 
+#[cfg(feature = "canvas")]
 impl Walk<'_> {
     /// A canvas island: the engine measures and paints ITS OWN pixels,
     /// locally — the subtree places at its own origin, so the commands

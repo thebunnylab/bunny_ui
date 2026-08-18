@@ -50,6 +50,7 @@ pub mod image_engine;
 pub mod layout;
 pub mod modifier;
 pub mod one_of;
+#[cfg(feature = "canvas")]
 pub mod raster;
 mod reconciler;
 pub mod runtime;
@@ -109,8 +110,10 @@ pub mod prelude {
     pub use crate::anim::Spring;
     pub use crate::custom::{
         Custom, CustomElement, ElementEvent, EventCtx, ImeContext, Metrics, PaintCtx, Painter,
-        Response, canvas, custom,
+        Response,
     };
+    #[cfg(feature = "canvas")]
+    pub use crate::custom::{canvas, custom};
     pub use crate::erased::{CustomModifier, Erased, erased};
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
@@ -3040,6 +3043,7 @@ mod tests {
         assert_eq!(fonts, vec![(9.0, Weight::Bold), (26.0, Weight::Regular)]);
     }
 
+    #[cfg(feature = "canvas")]
     #[test]
     fn paint_puts_ink_where_the_layout_put_the_text() {
         use crate::layout::Size;
@@ -3303,6 +3307,7 @@ mod tests {
         theme::install(Theme::light());
     }
 
+    #[cfg(feature = "canvas")]
     #[test]
     fn a_surface_repaints_a_real_hover_incrementally() {
         use crate::layout::{Proposal, Size};
@@ -3883,6 +3888,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "canvas")]
     #[test]
     fn a_fill_image_covers_and_clips_inside_its_frame() {
         use crate::layout::{DrawCommand, LayoutNode, Proposal, layout};

@@ -5,6 +5,13 @@ edition.workspace = true
 description = "Declarative UI in Rust with a SwiftUI spirit — monomorphic typed tree, state with structural identity, incremental reconciliation"
 
 [features]
+default = ["canvas"]
+# The pixel half: the CPU rasterizer, canvas islands, and the APIs
+# that claim them. A web page that never paints a pixel of its own
+# opts out (`default-features = false`) and the whole path — raster,
+# measure, place — compiles away. The gated APIs then fail LOUDLY at
+# compile time, never silently at runtime.
+canvas = []
 # The SVG door: the subset parser behind `Symbol::from_svg` and the
 # svg2icon converter. Off by default — the shipped binary carries no
 # parser. Its tests need it too: `cargo test --features svg`.
@@ -12,3 +19,11 @@ svg = []
 
 [dependencies]
 motor.workspace = true
+
+[[example]]
+name = "bench_pipeline"
+required-features = ["canvas"]
+
+[[example]]
+name = "counter_headless"
+required-features = ["canvas"]

@@ -21,6 +21,7 @@ use std::rc::Rc;
 
 use bunny_ui::layout::{Color, Size};
 use bunny_ui::prelude::*;
+#[cfg(feature = "canvas")]
 use bunny_ui::raster::Surface;
 use bunny_ui::runtime::Runtime;
 use bunny_ui::text_input::EditCommand;
@@ -160,6 +161,7 @@ fn dispatch(event: Event) {
 
 /// Boots the shell with the app's root view. The demo crate calls this
 /// from its exported `start`; everything after travels through events.
+#[cfg(feature = "canvas")]
 pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
     let runtime = Runtime::new()
         .text_engine(Rc::new(CanvasTextEngine::new()))
@@ -329,6 +331,7 @@ fn start_dom_with(
             let bytes = bunny_ui::dom::encode(&patches);
             unsafe { js_apply_patches(bytes.as_ptr(), bytes.len()) };
         }
+        #[cfg(feature = "canvas")]
         for island in runtime.dom_islands(scale) {
             unsafe {
                 js_island(
@@ -339,6 +342,8 @@ fn start_dom_with(
                 );
             }
         }
+        #[cfg(not(feature = "canvas"))]
+        let _ = scale;
     }
 
     let handle = Box::new(move |event: Event| {

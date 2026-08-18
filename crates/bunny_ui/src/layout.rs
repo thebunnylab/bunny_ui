@@ -4202,6 +4202,7 @@ mod tests {
     /// The pain the front came to kill, end to end: a bordered rounded
     /// island whose child paints its own background — the child's
     /// corner dies at the curve, the border paints OVER the cut child.
+    #[cfg(feature = "canvas")]
     #[test]
     fn a_box_finally_holds_its_children() {
         let island = styled(

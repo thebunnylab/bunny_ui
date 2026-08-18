@@ -1079,6 +1079,7 @@ impl Runtime {
     /// content moved under a still pointer (an action inserted/removed),
     /// hover re-resolves against the new hits and runs ONE extra pass —
     /// interaction always resolved BEFORE the pass that paints it.
+    #[cfg(feature = "canvas")]
     pub fn frame(
         &self,
         root: &impl View,
@@ -1371,6 +1372,7 @@ impl Runtime {
     /// The canvas islands whose pixels changed since the last call —
     /// rasterized at `scale` and ready to blit. Empty when the scene
     /// has no islands or nothing inside one moved.
+    #[cfg(feature = "canvas")]
     pub fn dom_islands(&self, scale: usize) -> Vec<crate::dom::IslandFrame> {
         self.dom
             .borrow_mut()
@@ -1799,12 +1801,14 @@ impl Runtime {
     /// A full frame down to the bitmap: layout at the viewport's exact
     /// proposal and rasterization of the display list — what the
     /// platform backend blits to the window.
+    #[cfg(feature = "canvas")]
     pub fn paint(&self, root: &impl View, size: crate::layout::Size) -> crate::raster::Bitmap {
         self.paint_at_scale(root, size, 1)
     }
 
     /// [`Runtime::paint`] at retina: layout in logical points, bitmap
     /// in physical pixels (`size × scale`).
+    #[cfg(feature = "canvas")]
     pub fn paint_at_scale(
         &self,
         root: &impl View,
