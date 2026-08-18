@@ -384,7 +384,18 @@ impl<'a> Painter<'a> {
     /// Everything `body` paints is cut to `rect` — balanced by
     /// construction, so a clip can never leak out of the box.
     pub fn clipped(&mut self, rect: Rect, body: impl FnOnce(&mut Painter)) {
-        self.display.push(DrawCommand::PushClip { rect: self.shift(rect) });
+        self.clipped_rounded(rect, 0.0, body);
+    }
+
+    /// [`Painter::clipped`] with a corner — the same cut `.clipped()`
+    /// gives a box, for an app that draws its own.
+    pub fn clipped_rounded(
+        &mut self,
+        rect: Rect,
+        corner_radius: Px,
+        body: impl FnOnce(&mut Painter),
+    ) {
+        self.display.push(DrawCommand::PushClip { rect: self.shift(rect), corner_radius });
         body(self);
         self.display.push(DrawCommand::PopClip);
     }
@@ -684,7 +695,7 @@ mod tests {
         assert!(
             matches!(
                 commands.first(),
-                Some(DrawCommand::PushClip { rect }) if *rect == Rect {
+                Some(DrawCommand::PushClip { rect, .. }) if *rect == Rect {
                     origin: Point::ZERO,
                     size: Size { width: 80.0, height: 40.0 },
                 }

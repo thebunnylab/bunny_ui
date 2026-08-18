@@ -838,10 +838,14 @@ pub enum DrawCommand {
     /// command carries identity, never pixels (equality is the source
     /// key — cheap for the damage diff).
     Image { rect: Rect, source: ImageSource },
-    /// From here to the paired [`DrawCommand::PopClip`], every draw
-    /// intersects this rect (the rect arrives already intersected with
-    /// the outer clip).
-    PushClip { rect: Rect },
+    /// From here to the paired [`DrawCommand::PopClip`], every draw is
+    /// cut to this box — the rect INTERSECTS whatever clip is already
+    /// open (each consumer keeps that stack), and `corner_radius` bends
+    /// the cut around the corners (`0.0` = the straight rectangle this
+    /// command was born as). The rect arrives in the pushing node's OWN
+    /// coordinates: a curve has no corner left after somebody else's
+    /// intersection, so the composition lives where the stacks live.
+    PushClip { rect: Rect, corner_radius: Px },
     PopClip,
 }
 
@@ -914,8 +918,8 @@ impl DisplayList {
                 DrawCommand::Image { rect, source } => {
                     DrawCommand::Image { rect: shift_rect(rect), source }
                 }
-                DrawCommand::PushClip { rect } => {
-                    DrawCommand::PushClip { rect: shift_rect(rect) }
+                DrawCommand::PushClip { rect, corner_radius } => {
+                    DrawCommand::PushClip { rect: shift_rect(rect), corner_radius: corner_radius }
                 }
                 DrawCommand::PopClip => DrawCommand::PopClip,
             })
@@ -1056,14 +1060,19 @@ pub struct Placement {
 }
 
 impl Placement {
-    fn push_clip(&mut self, rect: Rect) {
+    /// The command carries this node's OWN box; the stack keeps the
+    /// intersection, because a hit consults the stack. Snapping and
+    /// intersecting commute (round is monotone), so the consumers'
+    /// own stacks land on the same integers the old pre-intersected
+    /// command did — byte for byte.
+    fn push_clip(&mut self, rect: Rect, corner_radius: Px) {
         let clipped = match self.clip.last() {
             Some(top) => rect
                 .intersection(*top)
                 .unwrap_or(Rect { origin: rect.origin, size: Size::default() }),
             None => rect,
         };
-        self.display.push(DrawCommand::PushClip { rect: clipped });
+        self.display.push(DrawCommand::PushClip { rect, corner_radius });
         self.clip.push(clipped);
     }
 
@@ -2076,7 +2085,7 @@ impl LayoutNode {
                 }
                 // the box cannot paint outside itself — the clip is the
                 // framework's, never the app's promise
-                out.push_clip(frame);
+                out.push_clip(frame, 0.0);
                 let visible = out
                     .current_clip()
                     .and_then(|clip| clip.intersection(frame))
@@ -2174,7 +2183,7 @@ impl LayoutNode {
                         // Fill spills over the frame on one axis — the
                         // clip is built in, never a separate modifier
                         if let Some(rect) = cover_rect(frame, intrinsic_of(&*env.images, source)) {
-                            out.push_clip(frame);
+                            out.push_clip(frame, 0.0);
                             out.display.push(DrawCommand::Image {
                                 rect,
                                 source: source.clone(),
@@ -2360,7 +2369,7 @@ impl LayoutNode {
                 // offset never leaves the region in no man's land
                 let offset =
                     Point { x: raw.x.clamp(0.0, max_x), y: raw.y.clamp(0.0, max_y) };
-                out.push_clip(frame);
+                out.push_clip(frame, 0.0);
                 let content_origin = Point {
                     x: frame.origin.x - offset.x,
                     y: frame.origin.y - offset.y,
@@ -3772,7 +3781,7 @@ mod tests {
         assert!(
             result.display.iter().any(|command| matches!(
                 command,
-                DrawCommand::PushClip { rect } if rect.size.height == 100.0
+                DrawCommand::PushClip { rect, .. } if rect.size.height == 100.0
             )),
             "the region clips at its own frame"
         );

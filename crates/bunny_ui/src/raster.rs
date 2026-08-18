@@ -571,7 +571,7 @@ pub fn rasterize_with(
                     );
                 }
             }
-            DrawCommand::PushClip { rect } => bitmap.push_clip(scale_rect(*rect, factor)),
+            DrawCommand::PushClip { rect, .. } => bitmap.push_clip(scale_rect(*rect, factor)),
             DrawCommand::PopClip => bitmap.pop_clip(),
         }
     }
@@ -713,7 +713,7 @@ impl Surface {
         for (index, command) in commands[..upto].iter().enumerate() {
             visit(index, stack.last().copied());
             match command {
-                DrawCommand::PushClip { rect } => {
+                DrawCommand::PushClip { rect, .. } => {
                     let snapped = Bitmap::snap(scale_rect(*rect, factor));
                     let top = match stack.last().copied() {
                         Some(top) => {
@@ -827,7 +827,7 @@ impl Surface {
             self.bitmap.push_clip_physical(rect);
             for (index, command) in new.iter().enumerate() {
                 match command {
-                    DrawCommand::PushClip { rect } => {
+                    DrawCommand::PushClip { rect, .. } => {
                         self.bitmap.push_clip(scale_rect(*rect, factor));
                         continue;
                     }
@@ -1263,6 +1263,7 @@ mod tests {
                             origin: Point { x: 0.0, y: 16.0 },
                             size: Size { width: 120.0, height: 48.0 },
                         },
+                        corner_radius: 0.0,
                     },
                     line(8.0, 18.0, "one", Color::BLACK),
                     line(8.0, 40.0, "two", Color::BLACK),
@@ -1275,6 +1276,7 @@ mod tests {
                             origin: Point { x: 0.0, y: 16.0 },
                             size: Size { width: 120.0, height: 48.0 },
                         },
+                        corner_radius: 0.0,
                     },
                     line(8.0, 8.0, "one", Color::BLACK),
                     line(8.0, 30.0, "two", Color::BLACK),

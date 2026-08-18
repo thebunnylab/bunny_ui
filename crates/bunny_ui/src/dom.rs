@@ -687,7 +687,9 @@ fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
             DrawCommand::Image { rect, source } => {
                 DrawCommand::Image { rect: shift(rect), source }
             }
-            DrawCommand::PushClip { rect } => DrawCommand::PushClip { rect: shift(rect) },
+            DrawCommand::PushClip { rect, corner_radius } => {
+                DrawCommand::PushClip { rect: shift(rect), corner_radius: corner_radius }
+            }
             DrawCommand::PopClip => DrawCommand::PopClip,
         })
         .collect()

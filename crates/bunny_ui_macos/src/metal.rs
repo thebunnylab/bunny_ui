@@ -1510,7 +1510,7 @@ fn build_frame(
                     }
                 }
             }
-            DrawCommand::PushClip { rect } => {
+            DrawCommand::PushClip { rect, .. } => {
                 let snapped = snap_scaled(*rect, factor);
                 let top = match clips.last().copied() {
                     Some(top) => box_intersect(snapped, top)
