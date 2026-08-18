@@ -29,7 +29,90 @@ pub struct Bitmap {
     pixels: Vec<u32>,
     /// Clip stack in physical px (intersections already resolved) — `set`
     /// checks the top; fill, stroke and text respect it for free.
-    clip: Vec<(i64, i64, i64, i64)>,
+    clip: Vec<ClipEntry>,
+    /// The stack top, MIRRORED flat: `set` runs per pixel and must not
+    /// pay a `Vec` deref there. An empty stack mirrors as the open
+    /// sentinel, so the hot path is four integer compares, always.
+    top_cut: (i64, i64, i64, i64),
+    top_round: Option<ClipRound>,
+}
+
+/// The cut of an empty clip stack — everything passes.
+const OPEN_CUT: (i64, i64, i64, i64) = (i64::MIN, i64::MIN, i64::MAX, i64::MAX);
+
+/// One open clip: the hard rectangular cut every clip has always been,
+/// and the curve that softens it — kept in its OWN box, because an
+/// outer rect can trim the cut without moving the corner it rounds.
+#[derive(Clone, Copy)]
+struct ClipEntry {
+    cut: (i64, i64, i64, i64),
+    round: Option<ClipRound>,
+}
+
+/// The curve of a rounded clip, in physical px. The radius is clamped
+/// the way `fill_rect` clamps it — the background and the cut that
+/// follows it must ramp the SAME arc, or a seam is born between a box
+/// and its own corner.
+#[derive(Clone, Copy)]
+struct ClipRound {
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+    radius: f64,
+    /// `radius.ceil()` — the width of the four corner squares, the
+    /// only pixels in the whole surface that pay anything.
+    reach: i64,
+}
+
+impl ClipRound {
+    /// `None` below half a pixel — the same door `fill_rect` keeps, so
+    /// a hair of a radius stays the straight clip byte for byte.
+    fn new((x0, y0, x1, y1): (i64, i64, i64, i64), corner_radius: f64) -> Option<ClipRound> {
+        let radius = corner_radius
+            .max(0.0)
+            .min((x1 - x0) as f64 / 2.0)
+            .min((y1 - y0) as f64 / 2.0);
+        (radius >= 0.5).then_some(ClipRound {
+            x0,
+            y0,
+            x1,
+            y1,
+            radius,
+            reach: radius.ceil() as i64,
+        })
+    }
+
+    /// The columns of this row the curve leaves whole — a span fills
+    /// between them in one go and blends only the two ends.
+    fn straight(&self, y: i64) -> (i64, i64) {
+        if y < self.y0 + self.reach || y >= self.y1 - self.reach {
+            (self.x0 + self.reach, self.x1 - self.reach)
+        } else {
+            (i64::MIN, i64::MAX)
+        }
+    }
+
+    /// `fill_rect`'s corner kernel, word for word.
+    #[inline]
+    fn coverage(&self, x: i64, y: i64) -> f64 {
+        let in_top = y < self.y0 + self.reach;
+        let in_bottom = y >= self.y1 - self.reach;
+        if !(in_top || in_bottom) {
+            return 1.0;
+        }
+        let left = x < self.x0 + self.reach;
+        let right = x >= self.x1 - self.reach;
+        if !(left || right) {
+            return 1.0;
+        }
+        let center_x =
+            if left { self.x0 as f64 + self.radius } else { self.x1 as f64 - self.radius };
+        let center_y =
+            if in_top { self.y0 as f64 + self.radius } else { self.y1 as f64 - self.radius };
+        let distance = (x as f64 + 0.5 - center_x).hypot(y as f64 + 0.5 - center_y);
+        (self.radius - distance + 0.5).clamp(0.0, 1.0)
+    }
 }
 
 fn pack(color: Color) -> u32 {
@@ -66,7 +149,14 @@ fn blend_px(src: u32, dst: u32) -> u32 {
 
 impl Bitmap {
     pub fn new(width: usize, height: usize, background: Color) -> Self {
-        Bitmap { width, height, pixels: vec![pack(background); width * height], clip: Vec::new() }
+        Bitmap {
+            width,
+            height,
+            pixels: vec![pack(background); width * height],
+            clip: Vec::new(),
+            top_cut: OPEN_CUT,
+            top_round: None,
+        }
     }
 
     pub fn width(&self) -> usize {
@@ -99,43 +189,90 @@ impl Bitmap {
         bytes
     }
 
+    #[inline(always)]
     fn set(&mut self, x: i64, y: i64, color: u32) {
         if x < 0 || y < 0 || (x as usize) >= self.width || (y as usize) >= self.height {
             return;
         }
-        if let Some((cx0, cy0, cx1, cy1)) = self.clip.last().copied()
-            && (x < cx0 || y < cy0 || x >= cx1 || y >= cy1)
-        {
+        let (cx0, cy0, cx1, cy1) = self.top_cut;
+        if x < cx0 || y < cy0 || x >= cx1 || y >= cy1 {
             return;
+        }
+        let mut color = color;
+        // the curve bites four small corner squares and nothing else —
+        // everywhere else this is one predicted branch on a hot field
+        if let Some(round) = &self.top_round {
+            let coverage = round.coverage(x, y);
+            if coverage < 1.0 {
+                let alpha = ((color & 0xFF) as f64 * coverage).round() as u32;
+                if alpha == 0 {
+                    return;
+                }
+                color = (color & !0xFF) | alpha;
+            }
         }
         let index = y as usize * self.width + x as usize;
         self.pixels[index] = blend_px(color, self.pixels[index]);
     }
 
-    /// Pushes the snapped clip, already intersected with the current top.
-    fn push_clip(&mut self, rect: Rect) {
-        let (x0, y0, x1, y1) = Self::snap(rect);
-        let clipped = match self.clip.last().copied() {
-            Some((cx0, cy0, cx1, cy1)) => (x0.max(cx0), y0.max(cy0), x1.min(cx1), y1.min(cy1)),
-            None => (x0, y0, x1, y1),
+    /// Refreshes the flat mirror after a push or a pop.
+    fn sync_top(&mut self) {
+        match self.clip.last() {
+            Some(entry) => {
+                self.top_cut = entry.cut;
+                self.top_round = entry.round;
+            }
+            None => {
+                self.top_cut = OPEN_CUT;
+                self.top_round = None;
+            }
+        }
+    }
+
+    /// Pushes a clip: the RECT intersects the open cut (exact integer
+    /// boxes, as always) and the CURVE is the innermost one declared —
+    /// a clip with no radius of its own INHERITS the curve already
+    /// cutting, so a scroll region inside a rounded island keeps the
+    /// island's corners.
+    fn push_clip(&mut self, rect: Rect, corner_radius: f64) {
+        let snapped = Self::snap(rect);
+        let round = ClipRound::new(snapped, corner_radius);
+        let (x0, y0, x1, y1) = snapped;
+        let entry = match self.clip.last().copied() {
+            Some(top) => {
+                let (cx0, cy0, cx1, cy1) = top.cut;
+                ClipEntry {
+                    cut: (x0.max(cx0), y0.max(cy0), x1.min(cx1), y1.min(cy1)),
+                    round: round.or(top.round),
+                }
+            }
+            None => ClipEntry { cut: snapped, round },
         };
-        self.clip.push(clipped);
+        self.clip.push(entry);
+        self.sync_top();
     }
 
     fn pop_clip(&mut self) {
         self.clip.pop();
+        self.sync_top();
     }
 
     /// Pushes an ALREADY-physical clip (the damage replay) — same stack,
     /// no snapping, intersected with the current top like any clip.
     fn push_clip_physical(&mut self, rect: DamageRect) {
-        let clipped = match self.clip.last().copied() {
-            Some((cx0, cy0, cx1, cy1)) => {
-                (rect.0.max(cx0), rect.1.max(cy0), rect.2.min(cx1), rect.3.min(cy1))
+        let entry = match self.clip.last().copied() {
+            Some(top) => {
+                let (cx0, cy0, cx1, cy1) = top.cut;
+                ClipEntry {
+                    cut: (rect.0.max(cx0), rect.1.max(cy0), rect.2.min(cx1), rect.3.min(cy1)),
+                    // a damage rect never bends — it inherits the curve
+                    round: top.round,
+                }
             }
-            None => rect,
+            None => ClipEntry { cut: rect, round: None },
         };
-        self.clip.push(clipped);
+        self.clip.push(entry);
+        self.sync_top();
     }
 
     /// Overwrites the rect with `color` — a CLEAR, not a wash: alpha is
@@ -267,12 +404,10 @@ impl Bitmap {
     fn clip_box(&self) -> (i64, i64, i64, i64) {
         let surface = (0, 0, self.width as i64, self.height as i64);
         match self.clip.last().copied() {
-            Some((x0, y0, x1, y1)) => (
-                x0.max(surface.0),
-                y0.max(surface.1),
-                x1.min(surface.2),
-                y1.min(surface.3),
-            ),
+            Some(entry) => {
+                let (x0, y0, x1, y1) = entry.cut;
+                (x0.max(surface.0), y0.max(surface.1), x1.min(surface.2), y1.min(surface.3))
+            }
             None => surface,
         }
     }
@@ -290,8 +425,22 @@ impl Bitmap {
             return;
         }
         if color.a == 255 {
+            // a row crossing no corner keeps the one-shot fill; a row
+            // that does keeps it for its MIDDLE and blends the two ends
+            let (straight_from, straight_to) = match &self.top_round {
+                Some(round) => round.straight(y),
+                None => (i64::MIN, i64::MAX),
+            };
+            let middle_from = from.max(straight_from).min(to);
+            let middle_to = to.min(straight_to).max(middle_from);
+            for x in from..middle_from {
+                self.set(x, y, packed);
+            }
             let row = y as usize * self.width;
-            self.pixels[row + from as usize..row + to as usize].fill(packed);
+            self.pixels[row + middle_from as usize..row + middle_to as usize].fill(packed);
+            for x in middle_to..to {
+                self.set(x, y, packed);
+            }
         } else {
             for x in from..to {
                 self.set(x, y, packed);
@@ -571,7 +720,9 @@ pub fn rasterize_with(
                     );
                 }
             }
-            DrawCommand::PushClip { rect, .. } => bitmap.push_clip(scale_rect(*rect, factor)),
+            DrawCommand::PushClip { rect, corner_radius } => {
+                bitmap.push_clip(scale_rect(*rect, factor), corner_radius * factor)
+            }
             DrawCommand::PopClip => bitmap.pop_clip(),
         }
     }
@@ -691,7 +842,12 @@ impl Surface {
             }
             // the destination rect is the whole truth — no slack needed
             DrawCommand::Image { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
-            DrawCommand::PushClip { .. } | DrawCommand::PopClip => return None,
+            // a clip that CHANGES must damage everything it governs —
+            // its own box is the safe superset (the curve and the
+            // nested cuts only ever REMOVE coverage). Identical clips
+            // in the prefix and suffix contribute nothing, as ever.
+            DrawCommand::PushClip { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
+            DrawCommand::PopClip => return None,
         };
         let clipped = match clip {
             Some(clip) => intersect(raw, clip)?,
@@ -827,8 +983,8 @@ impl Surface {
             self.bitmap.push_clip_physical(rect);
             for (index, command) in new.iter().enumerate() {
                 match command {
-                    DrawCommand::PushClip { rect, .. } => {
-                        self.bitmap.push_clip(scale_rect(*rect, factor));
+                    DrawCommand::PushClip { rect, corner_radius } => {
+                        self.bitmap.push_clip(scale_rect(*rect, factor), corner_radius * factor);
                         continue;
                     }
                     DrawCommand::PopClip => {
@@ -1468,5 +1624,201 @@ mod tests {
         assert_eq!(damage, vec![(10, 10, 26, 26)], "only the image rect repaints");
         // and the pixels landed: the new seed shows at the center
         assert_eq!(surface.bitmap().pixel(18, 18), Some(0xC8C8_C8FF), "seed 200 everywhere");
+    }
+
+    fn clip(x: f64, y: f64, w: f64, h: f64, radius: f64) -> DrawCommand {
+        DrawCommand::PushClip {
+            rect: Rect {
+                origin: Point { x, y },
+                size: Size { width: w, height: h },
+            },
+            corner_radius: radius,
+        }
+    }
+
+    /// The frozen degenerate: a radius-zero clip must leave EXACTLY
+    /// the picture the straight clip always left.
+    #[test]
+    fn a_clip_without_a_radius_is_the_clip_it_always_was() {
+        let display = list(vec![
+            clip(2.0, 2.0, 8.0, 8.0, 0.0),
+            fill(0.0, 0.0, 12.0, 12.0, Color::BLACK),
+            DrawCommand::PopClip,
+        ]);
+        let bitmap = rasterize(&display, 12, 12, Color::WHITE);
+        let picture = portrait(&bitmap, 0, 0, 12, 12, super::pack(Color::BLACK));
+        assert_eq!(
+            picture,
+            "\
+............
+............
+..########..
+..########..
+..########..
+..########..
+..########..
+..########..
+..########..
+..########..
+............
+............
+"
+        );
+    }
+
+    /// The pain the front came to kill: a child that paints its own
+    /// background under a rounded clip loses its corner to the curve.
+    #[test]
+    fn a_rounded_clip_eats_the_child_corner() {
+        let display = list(vec![
+            clip(1.0, 1.0, 14.0, 14.0, 5.0),
+            fill(1.0, 1.0, 14.0, 14.0, Color::BLACK),
+            DrawCommand::PopClip,
+        ]);
+        let bitmap = rasterize(&display, 16, 16, Color::WHITE);
+        let black = super::pack(Color::BLACK);
+        let white = super::pack(Color::WHITE);
+        // the dead corner is untouched canvas
+        assert_eq!(bitmap.pixel(1, 1), Some(white), "the notch stays canvas");
+        // the straight edges hold their ink
+        assert_eq!(bitmap.pixel(8, 1), Some(black));
+        assert_eq!(bitmap.pixel(1, 8), Some(black));
+        assert_eq!(bitmap.pixel(8, 8), Some(black));
+        // and the pixel ON the arc (coverage 0.55 by the kernel) is
+        // neither empty nor full — real anti-aliasing, not a threshold
+        let arc = bitmap.pixel(2, 2).unwrap();
+        let alpha_like = arc != black && arc != white;
+        assert!(alpha_like, "the arc blends: 0x{arc:08x}");
+    }
+
+    /// Text funnels through the same door — a glyph crossing the
+    /// corner is cut smoothly, no square survivor.
+    #[test]
+    fn text_under_a_rounded_clip_loses_its_corner() {
+        let radius = 6.0;
+        let display = list(vec![
+            clip(0.0, 0.0, 24.0, 24.0, radius),
+            fill(0.0, 0.0, 24.0, 24.0, Color::FILL),
+            line(0.0, 0.0, "88", Color::BLACK),
+            DrawCommand::PopClip,
+        ]);
+        let bitmap = rasterize(&display, 24, 24, Color::WHITE);
+        let white = super::pack(Color::WHITE);
+        // the notch (outside the arc) shows canvas even where the
+        // glyph would have inked; one pixel in, the arc already blends
+        assert_eq!(bitmap.pixel(0, 0), Some(white));
+        assert_ne!(bitmap.pixel(1, 1), Some(white), "the arc blends at (1,1)");
+        // inside the curve the glyph paints
+        let inked = (4..20)
+            .flat_map(|y| (4..20).map(move |x| (x, y)))
+            .any(|(x, y)| bitmap.pixel(x, y) == Some(super::pack(Color::BLACK)));
+        assert!(inked, "the glyph body survives inside the curve");
+    }
+
+    /// An image blit funnels through the same door too.
+    #[test]
+    fn an_image_under_a_rounded_clip_is_cut_smoothly() {
+        let source = crate::image_engine::ImageSource::from_bytes(RawImages::encode(4, 4, &[0x40u8; 64]));
+        let display = list(vec![
+            clip(0.0, 0.0, 12.0, 12.0, 4.0),
+            DrawCommand::Image {
+                rect: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size { width: 12.0, height: 12.0 },
+                },
+                source,
+            },
+            DrawCommand::PopClip,
+        ]);
+        let bitmap = rasterize(&display, 12, 12, Color::WHITE);
+        let white = super::pack(Color::WHITE);
+        assert_eq!(bitmap.pixel(0, 0), Some(white), "the notch stays canvas");
+        assert_ne!(bitmap.pixel(6, 6), Some(white), "the body lands");
+        // the corner pixel on the arc is a BLEND of image over canvas
+        let arc = bitmap.pixel(1, 1).unwrap();
+        assert_ne!(arc, white, "the arc took some image");
+        assert_ne!(arc & 0xFF, 0x00);
+    }
+
+    /// The composition rule: rects intersect all the way down, the
+    /// innermost curve wins, and a rect-only clip INHERITS the curve
+    /// already cutting (the scroll-inside-a-card case).
+    #[test]
+    fn the_innermost_curve_wins_and_the_rects_still_cut() {
+        // a rounded island, then a straight inner clip: the inner cut
+        // trims the right half away, but the island's curve still eats
+        // the top-left corner of what remains
+        let display = list(vec![
+            clip(0.0, 0.0, 16.0, 16.0, 5.0),
+            clip(0.0, 0.0, 8.0, 16.0, 0.0),
+            fill(0.0, 0.0, 16.0, 16.0, Color::BLACK),
+            DrawCommand::PopClip,
+            DrawCommand::PopClip,
+        ]);
+        let bitmap = rasterize(&display, 16, 16, Color::WHITE);
+        let black = super::pack(Color::BLACK);
+        let white = super::pack(Color::WHITE);
+        assert_eq!(bitmap.pixel(0, 0), Some(white), "the island curve holds");
+        assert_eq!(bitmap.pixel(4, 4), Some(black), "inside both cuts");
+        assert_eq!(bitmap.pixel(9, 4), Some(white), "the straight cut trims the right");
+        // a deeper ROUNDED clip replaces the curve: its own corner
+        // bends, the outer's corner has no say inside it
+        let nested = list(vec![
+            clip(0.0, 0.0, 16.0, 16.0, 7.0),
+            clip(4.0, 4.0, 12.0, 12.0, 3.0),
+            fill(0.0, 0.0, 16.0, 16.0, Color::BLACK),
+            DrawCommand::PopClip,
+            DrawCommand::PopClip,
+        ]);
+        let bitmap = rasterize(&nested, 16, 16, Color::WHITE);
+        assert_eq!(bitmap.pixel(4, 4), Some(white), "the inner curve bends its own corner");
+        assert_eq!(bitmap.pixel(10, 10), Some(black));
+    }
+
+    /// The oracle covers the curve: an incremental frame under a
+    /// rounded clip stays byte-identical to the one-shot raster —
+    /// including the replay plumbing that must pass the radius.
+    #[test]
+    fn the_rounded_clip_survives_the_incremental_oracle() {
+        let frames = vec![
+            list(vec![
+                fill(0.0, 0.0, 40.0, 40.0, Color::WHITE),
+                clip(4.0, 4.0, 32.0, 32.0, 8.0),
+                fill(4.0, 4.0, 32.0, 32.0, Color::BLACK),
+                DrawCommand::PopClip,
+            ]),
+            // the content re-tints under the same curve
+            list(vec![
+                fill(0.0, 0.0, 40.0, 40.0, Color::WHITE),
+                clip(4.0, 4.0, 32.0, 32.0, 8.0),
+                fill(4.0, 4.0, 32.0, 32.0, Color::FILL),
+                DrawCommand::PopClip,
+            ]),
+            // the RADIUS itself changes: the clip lands in the middle
+            // and must damage everything it governs
+            list(vec![
+                fill(0.0, 0.0, 40.0, 40.0, Color::WHITE),
+                clip(4.0, 4.0, 32.0, 32.0, 2.0),
+                fill(4.0, 4.0, 32.0, 32.0, Color::FILL),
+                DrawCommand::PopClip,
+            ]),
+            // and collapses back to the straight cut
+            list(vec![
+                fill(0.0, 0.0, 40.0, 40.0, Color::WHITE),
+                clip(4.0, 4.0, 32.0, 32.0, 0.0),
+                fill(4.0, 4.0, 32.0, 32.0, Color::FILL),
+                DrawCommand::PopClip,
+            ]),
+        ];
+        let mut surface = Surface::new(40, 40, 1, Color::CANVAS);
+        for frame in frames {
+            let oracle = rasterize(&frame, 40, 40, Color::CANVAS);
+            surface.frame(frame, &PixelFont, &RawImages::default());
+            assert_eq!(
+                surface.bitmap().pixels(),
+                oracle.pixels(),
+                "golden: incremental == full under the curve"
+            );
+        }
     }
 }
