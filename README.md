@@ -50,6 +50,58 @@ reader dies, and the next `send` answers `Err` — the sign for the
 worker to stop. `.task_id(id)` restarts the work when the id moves, so
 a details panel that switches files cancels the read in flight.
 
+## A box the application owns
+
+Some content has no interface vocabulary: a code editor, a terminal
+grid, a waveform. It gets a box of its own, painted with the same
+commands every built-in view emits.
+
+```rust
+// the short door: a box that only draws
+canvas(|ctx, p| p.fill_rounded(ctx.bounds(), ink, 6.0))
+
+// the full one: it measures, paints, and answers the pointer,
+// the keyboard and the input system
+custom(CodeSurface { document, state })
+```
+
+The box paints in its own coordinates and cannot escape them — the
+clip around it is the framework's. It hears how much of it the clip
+lets through, so a long document costs one screen, and it inherits the
+ink and the font of the scope above it.
+
+Nothing forks: the desktop composites the box on the GPU, the web
+canvas mode on the CPU, and the element mode turns it into a canvas
+island. A box that asks for the keyboard takes it on a click; the
+strokes reach it before the key bindings, text arrives as text
+(typing, a paste, the commit of a composition), and on the desktop the
+input system asks it directly where the caret is.
+
+Use it for content that has no views. A rounded corner, a hover state
+or a gradient belongs in the framework.
+
+## Gradients
+
+A two-stop ramp is a property of a view, declared in the box's own
+proportions so it survives every resize.
+
+```rust
+panel.background_gradient(
+    Gradient::radial(violet, violet.fade())
+        .center(UnitPoint::TOP)
+        .radius(0.0, 420.0),
+)
+bar.background_gradient(Gradient::linear(top_ink, bottom_ink))
+```
+
+The placement resolves it to pixels once; the rasterizers only
+evaluate. On the desktop the ramp rides the same GPU instance a fill
+does, and the CPU oracle agrees with it. On the element lowering it
+becomes a CSS gradient — the geometry ours, the pixels the browser's.
+
+`Color::fade()` is the end of a glow: interpolation is straight, so a
+ramp that fades to a transparent black drags itself through grey.
+
 ## Status
 
 Early development. The API is not stable.

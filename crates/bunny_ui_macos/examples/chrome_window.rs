@@ -90,11 +90,22 @@ impl Component for App {
         )
         .spacing(8.0);
 
-        vstack!(
-            bar,
-            spacer().frame(1.0, 1.0).background_color(theme::divider()),
-            zstack!(spacer().background_color(theme::canvas()), body),
-        )
+        // the well carries a glow: a ramp declared in the box's own
+        // proportions, so it follows every resize without a number
+        // changing — and every rendering paints it (our rasterizer on
+        // the desktop, a CSS gradient on the element lowering)
+        let well = zstack!(
+            spacer()
+                .background_color(theme::canvas())
+                .background_gradient(
+                    Gradient::radial(theme::accent(), theme::accent().fade())
+                        .center(UnitPoint::TOP)
+                        .radius(0.0, 520.0),
+                ),
+            body,
+        );
+
+        vstack!(bar, spacer().frame(1.0, 1.0).background_color(theme::divider()), well)
     }
 }
 
