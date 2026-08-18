@@ -112,13 +112,13 @@ pub mod prelude {
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
     pub use crate::icon::house as symbol;
-    pub use crate::icon::{ICON_GRID, Symbol};
+    pub use crate::icon::{ICON_GRID, Paint, Rule, Symbol, Verb};
     pub use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, RawImages, file_icon};
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
-        Color, Gradient, Point, Proposal, Px, Rect, Rendering, Side, Size, Truncation, UnitPoint,
-        VisualProps,
+        Color, Fraction, Gradient, Point, Proposal, Px, Rect, Rendering, Side, Size, Truncation,
+        UnitPoint, VisualProps,
     };
     pub use crate::theme::{self, Theme};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
@@ -2060,6 +2060,114 @@ mod tests {
         runtime.pointer_moved(700.0, 300.0);
         assert_eq!(bench.seam.get(), 120.0);
         let _ = grip_path;
+    }
+
+    #[test]
+    fn a_fractional_seam_keeps_its_share_when_the_window_moves() {
+        use crate::layout::{Fraction, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Panes {
+            share: State<Fraction>,
+        }
+
+        impl Component for Panes {
+            fn body(self, _ctx: &Context) -> impl View {
+                hsplit(self.share.binding(), text("left"), text("right"))
+            }
+        }
+
+        let panes = Panes { share: State::new(Fraction(0.25)) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&panes);
+        // the divider is one point, so the lanes share what is left —
+        // and the grip sits on its middle, half a point past the lane
+        let lane = |width: f64| {
+            let result =
+                runtime.layout(&panes, Proposal::exact(Size { width, height: 400.0 }));
+            let grip = result
+                .hits
+                .iter()
+                .find(|(path, _)| path.ends_with("/#split"))
+                .expect("the seam registers a grip")
+                .1;
+            grip.origin.x + grip.size.width / 2.0 - 0.5
+        };
+        assert_eq!(lane(801.0), 200.0, "a quarter of eight hundred");
+        assert_eq!(lane(401.0), 100.0, "still a quarter when the window halves");
+
+        // the same seam in POINTS does the opposite, on purpose: lane A
+        // is a number and lane B eats every point the window gains
+        #[derive(Clone, Copy)]
+        struct Pinned {
+            seam: State<f64>,
+        }
+
+        impl Component for Pinned {
+            fn body(self, _ctx: &Context) -> impl View {
+                hsplit(self.seam.binding(), text("left"), text("right"))
+                    .min_sizes(50.0, 50.0)
+            }
+        }
+
+        let pinned = Pinned { seam: State::new(200.0) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&pinned);
+        let pinned_lane = |width: f64| {
+            let result =
+                runtime.layout(&pinned, Proposal::exact(Size { width, height: 400.0 }));
+            let grip = result
+                .hits
+                .iter()
+                .find(|(path, _)| path.ends_with("/#split"))
+                .expect("the seam registers a grip")
+                .1;
+            grip.origin.x + grip.size.width / 2.0 - 0.5
+        };
+        assert_eq!(pinned_lane(801.0), 200.0);
+        assert_eq!(pinned_lane(401.0), 200.0);
+    }
+
+    #[test]
+    fn a_fractional_drag_writes_a_share_and_stops_at_a_tenth() {
+        use crate::layout::{Fraction, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Panes {
+            share: State<Fraction>,
+        }
+
+        impl Component for Panes {
+            fn body(self, _ctx: &Context) -> impl View {
+                hsplit(self.share.binding(), text("left"), text("right"))
+            }
+        }
+
+        let panes = Panes { share: State::new(Fraction(0.5)) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&panes);
+        let viewport = Proposal::exact(Size { width: 1001.0, height: 700.0 });
+        let result = runtime.layout(&panes, viewport);
+        let grip = result
+            .hits
+            .iter()
+            .find(|(path, _)| path.ends_with("/#split"))
+            .expect("the seam registers a grip")
+            .1;
+        let grip_center_x = grip.origin.x + grip.size.width / 2.0;
+
+        assert!(runtime.pointer_pressed(grip_center_x, 300.0));
+        // the pointer names points; what lands in the binding is a share
+        assert!(runtime.pointer_moved(250.0, 300.0));
+        assert_eq!(panes.share.get(), Fraction(0.25));
+
+        // the floor is RELATIVE — a tenth of the pair, not a number of
+        // points, so it holds at every window size
+        runtime.pointer_moved(1.0, 300.0);
+        assert_eq!(panes.share.get(), Fraction(0.1));
+        runtime.pointer_moved(2000.0, 300.0);
+        assert_eq!(panes.share.get(), Fraction(0.9));
+        assert_eq!(runtime.pointer_released(2000.0, 300.0), None);
     }
 
     #[test]

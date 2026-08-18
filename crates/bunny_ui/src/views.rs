@@ -29,7 +29,9 @@ use motor::state::{Binding, Context};
 use motor::view::RenderNode;
 use motor::views::NavigationPath;
 
-use crate::layout::{Axis, CrossAlign, Edges, LayoutNode, Size as LayoutSize, VisualProps};
+use crate::layout::{
+    Axis, CrossAlign, Edges, Fraction, LayoutNode, SeamUnit, Size as LayoutSize, VisualProps,
+};
 use crate::state_ext::BindingExt;
 use crate::view::{NodeList, Single, View, render_line};
 
@@ -227,14 +229,67 @@ impl View for TextField {
     }
 }
 
+/// What a seam can be measured in. The unit rides the BINDING's type,
+/// so a seam and its floors can never disagree: `Binding<f64>` is
+/// points, `Binding<Fraction>` is a share of the container.
+///
+/// The trait is closed in practice — the two implementations below are
+/// the two units the framework knows.
+pub trait SeamValue: Clone + 'static {
+    /// Which arithmetic the layout runs.
+    const UNIT: SeamUnit;
+    /// The floor each lane gets when the app names none: a hundred
+    /// points, or a tenth of the pair.
+    const FLOOR: f64;
+    /// The number, for the layout node and the printed tree.
+    fn amount(&self) -> f64;
+    /// The number, on its way back from a drag.
+    fn of(amount: f64) -> Self;
+}
+
+impl SeamValue for f64 {
+    const UNIT: SeamUnit = SeamUnit::Points;
+    const FLOOR: f64 = 100.0;
+
+    fn amount(&self) -> f64 {
+        *self
+    }
+
+    fn of(amount: f64) -> f64 {
+        amount
+    }
+}
+
+impl SeamValue for Fraction {
+    const UNIT: SeamUnit = SeamUnit::Fraction;
+    const FLOOR: f64 = 0.1;
+
+    fn amount(&self) -> f64 {
+        self.0
+    }
+
+    fn of(amount: f64) -> Fraction {
+        Fraction(amount)
+    }
+}
+
 /// A two-lane split with the seam as APP state: the binding's value
-/// renders in as lane A's width, a drag on the divider writes back —
+/// renders in as lane A's extent, a drag on the divider writes back —
 /// clamped between the lanes' floors. The framework owns the grip (a 6pt
 /// band over the 1pt hairline) and the drag loop; the app owns where the
 /// seam rests, so persisting or animating it is ordinary state.
+///
+/// A `Binding<f64>` puts the seam in POINTS: lane A is exactly that
+/// wide and everything the window gains goes to lane B. A
+/// [`Binding<Fraction>`] puts it in SHARES: both lanes keep their
+/// slice through a resize, and the floors become shares too — which is
+/// what a tree of panes needs, where a boundary is a proportion and
+/// not a pixel.
+///
+/// [`Binding<Fraction>`]: Fraction
 #[derive(Clone)]
-pub struct Split<A, B> {
-    at: Binding<f64>,
+pub struct Split<T: 'static, A, B> {
+    at: Binding<T>,
     axis: Axis,
     min_a: f64,
     min_b: f64,
@@ -243,28 +298,33 @@ pub struct Split<A, B> {
 }
 
 /// `hsplit(at, leading, trailing)` — the two-lane split. Floors default
-/// to 100pt each; tune them with [`Split::min_sizes`]. The vertical
-/// twin is [`vsplit`].
-pub fn hsplit<A, B>(at: Binding<f64>, a: A, b: B) -> Split<A, B>
+/// to a hundred points each (a tenth of the pair, for a fractional
+/// seam); tune them with [`Split::min_sizes`]. The vertical twin is
+/// [`vsplit`].
+pub fn hsplit<T, A, B>(at: Binding<T>, a: A, b: B) -> Split<T, A, B>
 where
+    T: SeamValue,
     A: View<Arity = Single>,
     B: View<Arity = Single>,
 {
-    Split { at, axis: Axis::Horizontal, min_a: 100.0, min_b: 100.0, a, b }
+    Split { at, axis: Axis::Horizontal, min_a: T::FLOOR, min_b: T::FLOOR, a, b }
 }
 
 /// `vsplit(at, top, bottom)` — the same seam, stacked. `at` is the TOP
 /// lane's height, and the grip drags up and down.
-pub fn vsplit<A, B>(at: Binding<f64>, a: A, b: B) -> Split<A, B>
+pub fn vsplit<T, A, B>(at: Binding<T>, a: A, b: B) -> Split<T, A, B>
 where
+    T: SeamValue,
     A: View<Arity = Single>,
     B: View<Arity = Single>,
 {
-    Split { at, axis: Axis::Vertical, min_a: 100.0, min_b: 100.0, a, b }
+    Split { at, axis: Axis::Vertical, min_a: T::FLOOR, min_b: T::FLOOR, a, b }
 }
 
-impl<A, B> Split<A, B> {
-    /// The lanes' floors, in points — the drag clamps against them.
+impl<T, A, B> Split<T, A, B> {
+    /// The lanes' floors, in the SEAM's own unit — points for a
+    /// `f64` seam, shares for a `Fraction` one. The drag clamps
+    /// against them, and so does every measure.
     pub fn min_sizes(mut self, min_a: f64, min_b: f64) -> Self {
         self.min_a = min_a;
         self.min_b = min_b;
@@ -272,15 +332,16 @@ impl<A, B> Split<A, B> {
     }
 }
 
-impl<A, B> View for Split<A, B>
+impl<T, A, B> View for Split<T, A, B>
 where
+    T: SeamValue,
     A: View<Arity = Single>,
     B: View<Arity = Single>,
 {
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
-        let at = self.at.wrappedValue();
+        let at = self.at.wrappedValue().amount();
         let mut nodes = NodeList::new();
         // the divider is an ORDINARY child (a themed 1pt strut): it
         // measures, paints and lowers like anything else on every target
@@ -294,9 +355,15 @@ where
         let (prints, layouts) = nodes.into_parts();
         out.push(RenderNode::branch(
             if crate::view::print_enabled() {
+                // the printed tree says which unit the seam speaks, so
+                // a snapshot can never read a share as a number of points
+                let seam = match T::UNIT {
+                    SeamUnit::Points => format!("at: {at}"),
+                    SeamUnit::Fraction => format!("share: {at}"),
+                };
                 match self.axis {
-                    Axis::Horizontal => format!("HSplitView(at: {at})"),
-                    Axis::Vertical => format!("VSplitView(at: {at})"),
+                    Axis::Horizontal => format!("HSplitView({seam})"),
+                    Axis::Vertical => format!("VSplitView({seam})"),
                 }
             } else {
                 String::new()
@@ -311,14 +378,15 @@ where
                     Rc::new(move |new_at| {
                         // the clamp can pin the seam: a repeated value
                         // must not dirty the world
-                        if binding.wrappedValue() != new_at {
-                            binding.set(new_at);
+                        if binding.wrappedValue().amount() != new_at {
+                            binding.set(T::of(new_at));
                         }
                     }),
                 );
                 out.push_layout(LayoutNode::Split {
                     path,
                     axis: self.axis,
+                    unit: T::UNIT,
                     at,
                     min_a: self.min_a,
                     min_b: self.min_b,

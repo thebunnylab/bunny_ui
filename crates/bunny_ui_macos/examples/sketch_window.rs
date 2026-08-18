@@ -19,7 +19,6 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use bunny_ui::icon::{Paint, Verb};
 use bunny_ui::layout::{Color, Point, Px, Rect, Size};
 use bunny_ui::prelude::*;
 #[cfg(target_os = "macos")]

@@ -814,16 +814,25 @@ impl Runtime {
         let Some(split) = placement else {
             return false;
         };
-        let (pointer_main, origin_main, total) = match split.axis {
-            crate::layout::Axis::Horizontal => {
-                (x, split.frame.origin.x, split.frame.size.width)
-            }
-            crate::layout::Axis::Vertical => {
-                (y, split.frame.origin.y, split.frame.size.height)
+        let (pointer_main, origin_main) = match split.axis {
+            crate::layout::Axis::Horizontal => (x, split.frame.origin.x),
+            crate::layout::Axis::Vertical => (y, split.frame.origin.y),
+        };
+        // the pointer names lane A's extent in POINTS; what the binding
+        // holds is whatever unit the seam speaks, so the clamp runs in
+        // that unit and the write-back is already in it
+        let reached = pointer_main - origin_main;
+        let at = match split.unit {
+            crate::layout::SeamUnit::Points => reached
+                .clamp(split.min_a, (split.room - split.min_b).max(split.min_a)),
+            crate::layout::SeamUnit::Fraction => {
+                if split.room <= 0.0 {
+                    return false;
+                }
+                (reached / split.room)
+                    .clamp(split.min_a, (1.0 - split.min_b).max(split.min_a))
             }
         };
-        let at = (pointer_main - origin_main)
-            .clamp(split.min_a, (total - split.min_b).max(split.min_a));
         reconciler::run_split(path, at)
     }
 

@@ -346,6 +346,7 @@ pub enum LayoutNode {
     Split {
         path: String,
         axis: Axis,
+        unit: SeamUnit,
         at: Px,
         min_a: Px,
         min_b: Px,
@@ -1023,6 +1024,38 @@ impl DisplayList {
     }
 }
 
+/// How a split's seam and its floors are measured.
+///
+/// The unit rides the BINDING's type, never a builder call: a
+/// `Binding<f64>` is points and a [`Binding<Fraction>`] is a share, so
+/// a seam and its floors can never disagree about what they mean.
+///
+/// [`Binding<Fraction>`]: Fraction
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SeamUnit {
+    /// Points: lane A is exactly `at` wide, and everything the window
+    /// gains goes to lane B.
+    Points,
+    /// A share of the room the two lanes have, `0..1`: both keep their
+    /// SLICE when the window changes size, which is what a tree of
+    /// panes wants.
+    Fraction,
+}
+
+/// A seam measured as a share of its container, `0..1`.
+///
+/// `hsplit(state.share.binding(), a, b)` with a `State<Fraction>` is
+/// the whole ceremony: the floors become shares too (a tenth of the
+/// pair by default), and a resize moves both lanes together.
+#[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Default)]
+pub struct Fraction(pub f64);
+
+impl Fraction {
+    pub fn amount(self) -> f64 {
+        self.0
+    }
+}
+
 /// The outputs of the placement pass: frames by identity (tests), the
 /// draw list (rasterizer/backends) and the interaction targets (in paint
 /// order — hit-testing scans back to front, the top one wins).
@@ -1247,6 +1280,10 @@ pub struct SplitPlacement {
     pub path: String,
     pub frame: Rect,
     pub axis: Axis,
+    pub unit: SeamUnit,
+    /// What the two lanes share — the frame's main extent minus the
+    /// divider. A fractional drag divides by THIS, never by the frame.
+    pub room: Px,
     pub min_a: Px,
     pub min_b: Px,
 }
@@ -2395,8 +2432,8 @@ impl LayoutNode {
                 (size, Fit::ScrollContent(content, Box::new(fit)))
             }
 
-            LayoutNode::Split { axis, at, min_a, min_b, children, .. } => {
-                measure_split(*axis, *at, *min_a, *min_b, children, proposal, env)
+            LayoutNode::Split { axis, unit, at, min_a, min_b, children, .. } => {
+                measure_split(*axis, *unit, *at, *min_a, *min_b, children, proposal, env)
             }
 
             LayoutNode::Interactive { child, .. } => {
@@ -2958,7 +2995,7 @@ impl LayoutNode {
             }
 
             (
-                LayoutNode::Split { path, axis, min_a, min_b, children, .. },
+                LayoutNode::Split { path, axis, unit, min_a, min_b, children, .. },
                 Fit::Children(fits),
             ) => {
                 // the seam's metrics, read before the fits move into
@@ -2970,6 +3007,9 @@ impl LayoutNode {
                     })
                 };
                 let seam_center = lane_main(0) + lane_main(1) / 2.0;
+                // what the lanes share: a fractional drag divides by
+                // THIS, never by the frame (the divider is not room)
+                let room = (lane_main(0) + lane_main(2)).max(0.0);
                 // lanes in measure order: A, divider, B — each filling
                 // the frame's cross extent
                 let mut cursor = 0.0;
@@ -3023,6 +3063,8 @@ impl LayoutNode {
                     path: path.clone(),
                     frame,
                     axis: *axis,
+                    unit: *unit,
+                    room,
                     min_a: *min_a,
                     min_b: *min_b,
                 });
@@ -3507,8 +3549,27 @@ impl LayoutNode {
 /// thickness, lane A gets `at` clamped between the minimums, lane B the
 /// rest. Unbounded on the main axis (a natural pass) the lanes answer
 /// their naturals — the clamp only means something against a real offer.
+/// Lane A's extent in POINTS, whatever unit the seam speaks. `room` is
+/// what the two lanes share — the frame's main extent minus the
+/// divider — so a fraction of one half is exactly the other half, and
+/// nested splits add up.
+///
+/// The clamp is the seam's ONLY guard: a binding may hold anything
+/// (a restored window, a hand-typed number, a drag in flight), and
+/// what reaches the lanes always fits between the floors.
+pub(crate) fn resolve_seam(unit: SeamUnit, at: Px, min_a: Px, min_b: Px, room: Px) -> Px {
+    let room = room.max(0.0);
+    let (want, floor, ceiling) = match unit {
+        SeamUnit::Points => (at, min_a, room - min_b),
+        SeamUnit::Fraction => (at * room, min_a * room, room - min_b * room),
+    };
+    want.clamp(floor, ceiling.max(floor))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn measure_split(
     axis: Axis,
+    unit: SeamUnit,
     at: Px,
     min_a: Px,
     min_b: Px,
@@ -3538,7 +3599,7 @@ fn measure_split(
 
     let (a_main, b_main) = match proposed_main {
         Some(total) => {
-            let a = at.clamp(min_a, (total - thickness - min_b).max(min_a));
+            let a = resolve_seam(unit, at, min_a, min_b, total - thickness);
             (Some(a), Some((total - a - thickness).max(0.0)))
         }
         None => (None, None),
@@ -4093,6 +4154,7 @@ mod tests {
         let split = |at: f64| LayoutNode::Split {
             path: "seam".into(),
             axis: Axis::Horizontal,
+            unit: SeamUnit::Points,
             at,
             min_a: 100.0,
             min_b: 100.0,
@@ -4135,6 +4197,7 @@ mod tests {
         let split = LayoutNode::Split {
             path: "seam".into(),
             axis: Axis::Vertical,
+            unit: SeamUnit::Points,
             at: 300.0,
             min_a: 80.0,
             min_b: 80.0,
