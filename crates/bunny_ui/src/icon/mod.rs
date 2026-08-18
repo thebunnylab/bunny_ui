@@ -85,6 +85,11 @@ pub enum Paint {
 pub struct Draw {
     pub paint: Paint,
     pub path: &'static [Verb],
+    /// This draw's OWN color. `None` takes the symbol ink — the whole
+    /// glyph re-tints with the text around it. `Some` is the drawing's
+    /// palette (a crab that is orange in any theme): it rides the
+    /// glyph's identity, so the caches never learn a new key.
+    pub tint: Option<Color>,
 }
 
 /// A whole drawing on the [`ICON_GRID`]. This is the type an app's
@@ -257,9 +262,39 @@ fn rasterize(glyph: &Glyph, color: Color, width: usize, height: usize) -> ImageR
         dx: (width as f64 - side) / 2.0,
         dy: (height as f64 - side) / 2.0,
     };
+    // consecutive draws of ONE color pile into a union mask and blend
+    // ONCE — a monochrome glyph stays byte for byte what it always
+    // was, and a translucent ink never double-blends at a join. A
+    // tint change flushes and paints over, in draw order (SVG law).
+    let mut rgba = vec![0u8; width * height * 4];
     let mut union = vector::Mask::new(width, height);
     let mut scratch = vector::Mask::new(width, height);
+    let mut run_color: Option<Color> = None;
+    let mut flush = |union: &mut vector::Mask, run_color: &mut Option<Color>, rgba: &mut Vec<u8>| {
+        let Some(ink) = run_color.take() else { return };
+        for y in 0..height {
+            for x in 0..width {
+                let coverage = union.at(x, y);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                // the same rounding `set_covered` applies on the way in
+                let alpha = (ink.a as f64 * coverage as f64).round() as u32;
+                if alpha == 0 {
+                    continue;
+                }
+                let to = (y * width + x) * 4;
+                blend_straight(&mut rgba[to..to + 4], ink, alpha);
+            }
+        }
+        union.clear();
+    };
     for draw in glyph.draws {
+        let ink = draw.tint.unwrap_or(color);
+        if run_color.is_some() && run_color != Some(ink) {
+            flush(&mut union, &mut run_color, &mut rgba);
+        }
+        run_color = Some(ink);
         scratch.clear();
         let flat = vector::flatten(draw.path, placing);
         match draw.paint {
@@ -270,26 +305,33 @@ fn rasterize(glyph: &Glyph, color: Color, width: usize, height: usize) -> ImageR
         }
         union.merge_max(&scratch);
     }
-    let mut rgba = vec![0u8; width * height * 4];
-    for y in 0..height {
-        for x in 0..width {
-            let coverage = union.at(x, y);
-            if coverage <= 0.0 {
-                continue;
-            }
-            // the same rounding `set_covered` applies on the way in
-            let alpha = (color.a as f64 * coverage as f64).round() as u8;
-            if alpha == 0 {
-                continue;
-            }
-            let to = (y * width + x) * 4;
-            rgba[to] = color.r;
-            rgba[to + 1] = color.g;
-            rgba[to + 2] = color.b;
-            rgba[to + 3] = alpha;
-        }
-    }
+    flush(&mut union, &mut run_color, &mut rgba);
     ImageRaster { width, height, rgba }
+}
+
+/// Source-over of a straight-alpha ink onto a straight-alpha pixel —
+/// the destination may be TRANSPARENT here (the raster's own ground),
+/// unlike the bitmap compositor's always-opaque canvas. Over nothing
+/// this writes the ink exactly, which is what keeps a monochrome glyph
+/// byte-identical to the single-pass raster it always had.
+fn blend_straight(pixel: &mut [u8], ink: Color, alpha: u32) {
+    let da = pixel[3] as u32;
+    if da == 0 {
+        pixel[0] = ink.r;
+        pixel[1] = ink.g;
+        pixel[2] = ink.b;
+        pixel[3] = alpha as u8;
+        return;
+    }
+    let keep = da * (255 - alpha) / 255;
+    let out_a = alpha + keep;
+    let mix = |source: u8, dest: u8| -> u8 {
+        ((source as u32 * alpha + dest as u32 * keep + out_a / 2) / out_a) as u8
+    };
+    pixel[0] = mix(ink.r, pixel[0]);
+    pixel[1] = mix(ink.g, pixel[1]);
+    pixel[2] = mix(ink.b, pixel[2]);
+    pixel[3] = out_a as u8;
 }
 
 #[cfg(test)]
@@ -304,7 +346,7 @@ mod tests {
         Verb::Close,
     ];
     const SQUARE_GLYPH: Glyph =
-        Glyph { draws: &[Draw { paint: Paint::Fill(Rule::NonZero), path: SQUARE_PATH }] };
+        Glyph { draws: &[Draw { paint: Paint::Fill(Rule::NonZero), path: SQUARE_PATH, tint: None }] };
     const SQUARE: Symbol = Symbol::new("test.square", &SQUARE_GLYPH);
 
     const INK: Color = Color { r: 20, g: 40, b: 60, a: 255 };
@@ -367,6 +409,42 @@ mod tests {
         }
     }
 
+    /// A tinted draw keeps its own palette in ANY ink; an untinted
+    /// one re-tints with the symbol — the two live in one glyph.
+    #[test]
+    fn a_tinted_draw_keeps_its_palette() {
+        const ORANGE: Color = Color { r: 0xF7, g: 0x8C, b: 0x3C, a: 255 };
+        const LEFT: &[Verb] = &[
+            Verb::Move(2.0, 2.0),
+            Verb::Line(11.0, 2.0),
+            Verb::Line(11.0, 22.0),
+            Verb::Line(2.0, 22.0),
+            Verb::Close,
+        ];
+        const RIGHT: &[Verb] = &[
+            Verb::Move(13.0, 2.0),
+            Verb::Line(22.0, 2.0),
+            Verb::Line(22.0, 22.0),
+            Verb::Line(13.0, 22.0),
+            Verb::Close,
+        ];
+        const TWO_TONE: Glyph = Glyph {
+            draws: &[
+                Draw { paint: Paint::Fill(Rule::NonZero), path: LEFT, tint: Some(ORANGE) },
+                Draw { paint: Paint::Fill(Rule::NonZero), path: RIGHT, tint: None },
+            ],
+        };
+        let ink = Color { r: 20, g: 40, b: 60, a: 255 };
+        let raster = rasterize(&TWO_TONE, ink, 24, 24);
+        let pixel = |x: usize, y: usize| {
+            let at = (y * 24 + x) * 4;
+            [raster.rgba[at], raster.rgba[at + 1], raster.rgba[at + 2], raster.rgba[at + 3]]
+        };
+        assert_eq!(pixel(5, 12), [ORANGE.r, ORANGE.g, ORANGE.b, 255], "the crab stays orange");
+        assert_eq!(pixel(18, 12), [ink.r, ink.g, ink.b, 255], "the plain half takes the ink");
+        assert_eq!(pixel(12, 12)[3], 0, "the gap stays air");
+    }
+
     /// A circle of four cubics against the house pill — the corner
     /// kernel of `fill_rect` at radius = half the box. The two ramps
     /// are cousins, not twins — analytic area against distance offset,
@@ -387,7 +465,7 @@ mod tests {
             Verb::Close,
         ];
         const CIRCLE: Glyph =
-            Glyph { draws: &[Draw { paint: Paint::Fill(Rule::NonZero), path: CIRCLE_PATH }] };
+            Glyph { draws: &[Draw { paint: Paint::Fill(Rule::NonZero), path: CIRCLE_PATH, tint: None }] };
         let side = 48;
         let raster = rasterize(&CIRCLE, INK, side, side);
         let radius = side as f64 / 2.0;

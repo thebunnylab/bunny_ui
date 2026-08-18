@@ -2754,13 +2754,13 @@ mod tests {
     const MARK_GLYPH: bunny_ui::icon::Glyph = bunny_ui::icon::Glyph {
         draws: &[bunny_ui::icon::Draw {
             paint: bunny_ui::icon::Paint::Stroke { width: 2.0 },
-            path: MARK_PATH,
+            path: MARK_PATH, tint: None,
         }],
     };
     const DISC_GLYPH: bunny_ui::icon::Glyph = bunny_ui::icon::Glyph {
         draws: &[bunny_ui::icon::Draw {
             paint: bunny_ui::icon::Paint::Fill(bunny_ui::icon::Rule::NonZero),
-            path: DISC_PATH,
+            path: DISC_PATH, tint: None,
         }],
     };
     const MARK: bunny_ui::icon::Symbol = bunny_ui::icon::Symbol::new("test.mark", &MARK_GLYPH);

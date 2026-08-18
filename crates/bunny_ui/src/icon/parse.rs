@@ -35,7 +35,7 @@ impl std::error::Error for SvgError {}
 /// leaks it into a [`Symbol`].
 #[derive(Debug)]
 pub struct ParsedGlyph {
-    pub draws: Vec<(Paint, Vec<Verb>)>,
+    pub draws: Vec<(Paint, Vec<Verb>, Option<crate::layout::Color>)>,
     /// Non-fatal notes: a hardcoded color collapsed to the ink, a cap
     /// style replaced by round. The converter prints them; a clean
     /// file has none.
@@ -51,7 +51,11 @@ impl Symbol {
         let draws: Vec<Draw> = parsed
             .draws
             .into_iter()
-            .map(|(paint, path)| Draw { paint, path: &*Box::leak(path.into_boxed_slice()) })
+            .map(|(paint, path, tint)| Draw {
+                paint,
+                path: &*Box::leak(path.into_boxed_slice()),
+                tint,
+            })
             .collect();
         let glyph: &'static Glyph =
             Box::leak(Box::new(Glyph { draws: &*Box::leak(draws.into_boxed_slice()) }));
@@ -69,14 +73,22 @@ pub fn to_rust_const(const_name: &str, name: &str, parsed: &ParsedGlyph) -> Stri
     }
     let _ = writeln!(out, "const {const_name}_GLYPH: Glyph = Glyph {{");
     let _ = writeln!(out, "    draws: &[");
-    for (paint, path) in &parsed.draws {
+    for (paint, path, tint) in &parsed.draws {
         let paint_source = match paint {
             Paint::Fill(Rule::NonZero) => "Paint::Fill(Rule::NonZero)".to_string(),
             Paint::Fill(Rule::EvenOdd) => "Paint::Fill(Rule::EvenOdd)".to_string(),
             Paint::Stroke { width } => format!("Paint::Stroke {{ width: {width:?} }}"),
         };
+        let tint_source = match tint {
+            Some(color) => format!(
+                "Some(Color {{ r: {}, g: {}, b: {}, a: {} }})",
+                color.r, color.g, color.b, color.a
+            ),
+            None => "None".to_string(),
+        };
         let _ = writeln!(out, "        Draw {{");
         let _ = writeln!(out, "            paint: {paint_source},");
+        let _ = writeln!(out, "            tint: {tint_source},");
         let _ = writeln!(out, "            path: &[");
         for verb in path {
             let verb_source = match verb {
@@ -106,6 +118,11 @@ pub fn to_rust_const(const_name: &str, name: &str, parsed: &ParsedGlyph) -> Stri
 struct Inherited {
     fill: Option<bool>,   // Some(true) = paint, Some(false) = none
     stroke: Option<bool>, // same
+    /// A HARDCODED color becomes the draw's own tint — the crab stays
+    /// orange in any theme. The ink placeholders (currentColor, black)
+    /// stay `None` and re-tint with the symbol.
+    fill_tint: Option<crate::layout::Color>,
+    stroke_tint: Option<crate::layout::Color>,
     stroke_width: f32,
     even_odd: bool,
 }
@@ -113,7 +130,14 @@ struct Inherited {
 impl Default for Inherited {
     fn default() -> Self {
         // SVG law: fill black, stroke none — until somebody says
-        Inherited { fill: Some(true), stroke: Some(false), stroke_width: 1.0, even_odd: false }
+        Inherited {
+            fill: Some(true),
+            stroke: Some(false),
+            fill_tint: None,
+            stroke_tint: None,
+            stroke_width: 1.0,
+            even_odd: false,
+        }
     }
 }
 
@@ -287,7 +311,7 @@ pub fn parse(svg: &str) -> Result<ParsedGlyph, SvgError> {
     let dx = (super::ICON_GRID as f32 - width * scale) / 2.0 - min_x * scale;
     let dy = (super::ICON_GRID as f32 - height * scale) / 2.0 - min_y * scale;
     let place = |x: f32, y: f32| (x * scale + dx, y * scale + dy);
-    for (paint, path) in &mut out.draws {
+    for (paint, path, _) in &mut out.draws {
         if let Paint::Stroke { width } = paint {
             *width *= scale;
         }
@@ -373,11 +397,11 @@ fn parse_attributes<'a>(rest: &'a str, line: usize) -> Result<Vec<(&'a str, &'a 
 fn absorb_paint(state: &mut Inherited, attributes: &[(&str, &str)], warnings: &mut Vec<String>) {
     if let Some(value) = attribute(attributes, "fill") {
         state.fill = Some(value != "none");
-        note_color(value, "fill", warnings);
+        state.fill_tint = tint_of(value, "fill", warnings);
     }
     if let Some(value) = attribute(attributes, "stroke") {
         state.stroke = Some(value != "none");
-        note_color(value, "stroke", warnings);
+        state.stroke_tint = tint_of(value, "stroke", warnings);
     }
     if let Some(value) = attribute(attributes, "stroke-width") {
         if let Ok(width) = value.trim().parse() {
@@ -398,12 +422,59 @@ fn absorb_paint(state: &mut Inherited, attributes: &[(&str, &str)], warnings: &m
     }
 }
 
-fn note_color(value: &str, of: &str, warnings: &mut Vec<String>) {
-    // black is the corpus's ink PLACEHOLDER (sixty-five files write
-    // stroke="#000" meaning "the ink") — only a real color earns a note
+/// A real color becomes the draw's own tint; the ink placeholders
+/// (currentColor, black — sixty-five corpus files write `#000` meaning
+/// "the ink") stay `None`. A color this parser cannot read earns a
+/// note and falls back to the ink.
+fn tint_of(
+    value: &str,
+    of: &str,
+    warnings: &mut Vec<String>,
+) -> Option<crate::layout::Color> {
     let quiet = ["none", "currentColor", "", "black", "#000", "#000000"];
-    if !quiet.contains(&value) {
-        warnings.push(format!("{of}=\"{value}\" becomes the symbol ink — a glyph is monochrome."));
+    if quiet.contains(&value) {
+        return None;
+    }
+    match hex_color(value) {
+        Some(color) => Some(color),
+        None => {
+            warnings.push(format!(
+                "{of}=\"{value}\" is not a hex color — the draw takes the symbol ink."
+            ));
+            None
+        }
+    }
+}
+
+/// `#rgb` and `#rrggbb` — the two forms icon sets write.
+fn hex_color(value: &str) -> Option<crate::layout::Color> {
+    let digits = value.strip_prefix('#')?;
+    let nibble = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let bytes = digits.as_bytes();
+    match bytes.len() {
+        3 => {
+            let mut out = [0u8; 3];
+            for (i, byte) in bytes.iter().enumerate() {
+                let value = nibble(*byte)?;
+                out[i] = value << 4 | value;
+            }
+            Some(crate::layout::Color { r: out[0], g: out[1], b: out[2], a: 255 })
+        }
+        6 => {
+            let mut out = [0u8; 3];
+            for i in 0..3 {
+                out[i] = nibble(bytes[i * 2])? << 4 | nibble(bytes[i * 2 + 1])?;
+            }
+            Some(crate::layout::Color { r: out[0], g: out[1], b: out[2], a: 255 })
+        }
+        _ => None,
     }
 }
 
@@ -417,10 +488,10 @@ fn push_draws(out: &mut ParsedGlyph, state: &Inherited, verbs: Vec<Verb>) {
     let strokes = state.stroke == Some(true);
     if fills {
         let rule = if state.even_odd { Rule::EvenOdd } else { Rule::NonZero };
-        out.draws.push((Paint::Fill(rule), verbs.clone()));
+        out.draws.push((Paint::Fill(rule), verbs.clone(), state.fill_tint));
     }
     if strokes {
-        out.draws.push((Paint::Stroke { width: state.stroke_width }, verbs));
+        out.draws.push((Paint::Stroke { width: state.stroke_width }, verbs, state.stroke_tint));
     }
 }
 
@@ -866,7 +937,7 @@ mod tests {
         let svg = r##"<svg xmlns="x" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="2"><path d="M2 2h12v12H2z"/></svg>"##;
         let parsed = parse(svg).unwrap();
         assert_eq!(parsed.draws.len(), 1);
-        let (paint, path) = &parsed.draws[0];
+        let (paint, path, _) = &parsed.draws[0];
         assert_eq!(*paint, Paint::Stroke { width: 3.0 });
         assert_eq!(path[0], Verb::Move(3.0, 3.0));
         assert_eq!(path[1], Verb::Line(21.0, 3.0));
@@ -882,11 +953,20 @@ mod tests {
     }
 
     #[test]
-    fn hardcoded_colors_collapse_with_a_note() {
+    fn a_hardcoded_color_becomes_the_draws_own_tint() {
         let svg = r##"<svg viewBox="0 0 24 24" fill="#89b4fa"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>"##;
         let parsed = parse(svg).unwrap();
         assert_eq!(parsed.draws.len(), 1);
-        assert!(parsed.warnings.iter().any(|w| w.contains("monochrome")), "{:?}", parsed.warnings);
+        assert_eq!(
+            parsed.draws[0].2,
+            Some(crate::layout::Color { r: 0x89, g: 0xb4, b: 0xfa, a: 255 }),
+            "the palette rides the draw"
+        );
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        // the short form reads too, and the ink placeholder stays None
+        assert_eq!(hex_color("#fa0"), Some(crate::layout::Color { r: 0xff, g: 0xaa, b: 0x00, a: 255 }));
+        let plain = parse(r##"<svg viewBox="0 0 24 24" fill="#000"><rect x="4" y="4" width="16" height="16"/></svg>"##).unwrap();
+        assert_eq!(plain.draws[0].2, None, "black is the ink placeholder");
     }
 
     #[test]
@@ -897,9 +977,10 @@ mod tests {
         let symbol = Symbol::from_svg("test.search", svg).unwrap();
         let parsed = parse(svg).unwrap();
         assert_eq!(symbol.glyph.draws.len(), parsed.draws.len());
-        for (leaked, (paint, path)) in symbol.glyph.draws.iter().zip(&parsed.draws) {
+        for (leaked, (paint, path, tint)) in symbol.glyph.draws.iter().zip(&parsed.draws) {
             assert_eq!(leaked.paint, *paint);
             assert_eq!(leaked.path, &path[..]);
+            assert_eq!(leaked.tint, *tint);
         }
         // and the printed const carries the same counts
         let source = to_rust_const("SEARCH", "search", &parsed);

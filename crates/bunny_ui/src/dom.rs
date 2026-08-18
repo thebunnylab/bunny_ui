@@ -965,6 +965,8 @@ fn diff_children(
 ///                   both states), u8 draw count, then per draw:
 ///                   u8 paint (0 fill, 1 fill even-odd, 2 stroke),
 ///                   f32 pen width (grid units; 0 for fills),
+///                   u8 tinted + u32 rgba when 1 (the draw's OWN
+///                   palette — a crab stays orange in any theme),
 ///                   u32 len + utf8 `d` on the house 24 grid — the
 ///                   glue's viewBox mirrors that constant, and the
 ///                   default preserveAspectRatio is the SAME centred
@@ -1087,6 +1089,13 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
                     };
                     out.push(paint);
                     push_f32(&mut out, width as f64);
+                    match draw.tint {
+                        Some(tint) => {
+                            out.push(1);
+                            push_u32(&mut out, pack_color(tint));
+                        }
+                        None => out.push(0),
+                    }
                     push_bytes_u32(&mut out, crate::icon::to_svg_path(draw.path).as_bytes());
                 }
             }
@@ -2058,7 +2067,7 @@ mod tests {
     const MARK_GLYPH: crate::icon::Glyph = crate::icon::Glyph {
         draws: &[crate::icon::Draw {
             paint: crate::icon::Paint::Stroke { width: 2.0 },
-            path: MARK_PATH,
+            path: MARK_PATH, tint: None,
         }],
     };
     const MARK: crate::icon::Symbol = crate::icon::Symbol::new("test.mark", &MARK_GLYPH);
@@ -2083,6 +2092,7 @@ mod tests {
             &[1],
             &[2],
             &2.0f32.to_le_bytes()[..],
+            &[0],
             &16u32.to_le_bytes()[..],
             b"M4 12L10 18L20 6",
         ]

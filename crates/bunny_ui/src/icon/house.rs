@@ -17,25 +17,25 @@ const FILL: Paint = Paint::Fill(Rule::NonZero);
 // MARK: - Chevrons
 
 const CHEVRON_RIGHT_GLYPH: Glyph = Glyph {
-    draws: &[Draw { paint: STROKE, path: &[Move(9.0, 6.0), Line(15.0, 12.0), Line(9.0, 18.0)] }],
+    draws: &[Draw { paint: STROKE, path: &[Move(9.0, 6.0), Line(15.0, 12.0), Line(9.0, 18.0)], tint: None }],
 };
 /// `›` — disclosure, breadcrumbs, "go".
 pub const CHEVRON_RIGHT: Symbol = Symbol::new("chevron.right", &CHEVRON_RIGHT_GLYPH);
 
 const CHEVRON_LEFT_GLYPH: Glyph = Glyph {
-    draws: &[Draw { paint: STROKE, path: &[Move(15.0, 6.0), Line(9.0, 12.0), Line(15.0, 18.0)] }],
+    draws: &[Draw { paint: STROKE, path: &[Move(15.0, 6.0), Line(9.0, 12.0), Line(15.0, 18.0)], tint: None }],
 };
 /// `‹` — back.
 pub const CHEVRON_LEFT: Symbol = Symbol::new("chevron.left", &CHEVRON_LEFT_GLYPH);
 
 const CHEVRON_DOWN_GLYPH: Glyph = Glyph {
-    draws: &[Draw { paint: STROKE, path: &[Move(6.0, 9.0), Line(12.0, 15.0), Line(18.0, 9.0)] }],
+    draws: &[Draw { paint: STROKE, path: &[Move(6.0, 9.0), Line(12.0, 15.0), Line(18.0, 9.0)], tint: None }],
 };
 /// `▾` — an open disclosure, a dropdown.
 pub const CHEVRON_DOWN: Symbol = Symbol::new("chevron.down", &CHEVRON_DOWN_GLYPH);
 
 const CHEVRON_UP_GLYPH: Glyph = Glyph {
-    draws: &[Draw { paint: STROKE, path: &[Move(6.0, 15.0), Line(12.0, 9.0), Line(18.0, 15.0)] }],
+    draws: &[Draw { paint: STROKE, path: &[Move(6.0, 15.0), Line(12.0, 9.0), Line(18.0, 15.0)], tint: None }],
 };
 /// `▴` — collapse.
 pub const CHEVRON_UP: Symbol = Symbol::new("chevron.up", &CHEVRON_UP_GLYPH);
@@ -43,7 +43,7 @@ pub const CHEVRON_UP: Symbol = Symbol::new("chevron.up", &CHEVRON_UP_GLYPH);
 // MARK: - Marks
 
 const CHECK_GLYPH: Glyph = Glyph {
-    draws: &[Draw { paint: STROKE, path: &[Move(5.0, 12.5), Line(10.0, 17.5), Line(19.0, 7.0)] }],
+    draws: &[Draw { paint: STROKE, path: &[Move(5.0, 12.5), Line(10.0, 17.5), Line(19.0, 7.0)], tint: None }],
 };
 /// Done, selected, on.
 pub const CHECK: Symbol = Symbol::new("check", &CHECK_GLYPH);
@@ -51,7 +51,7 @@ pub const CHECK: Symbol = Symbol::new("check", &CHECK_GLYPH);
 const CLOSE_GLYPH: Glyph = Glyph {
     draws: &[Draw {
         paint: STROKE,
-        path: &[Move(6.0, 6.0), Line(18.0, 18.0), Move(18.0, 6.0), Line(6.0, 18.0)],
+        path: &[Move(6.0, 6.0), Line(18.0, 18.0), Move(18.0, 6.0), Line(6.0, 18.0)], tint: None,
     }],
 };
 /// `✕` — dismiss, the tab's corner.
@@ -60,14 +60,14 @@ pub const CLOSE: Symbol = Symbol::new("close", &CLOSE_GLYPH);
 const PLUS_GLYPH: Glyph = Glyph {
     draws: &[Draw {
         paint: STROKE,
-        path: &[Move(12.0, 5.0), Line(12.0, 19.0), Move(5.0, 12.0), Line(19.0, 12.0)],
+        path: &[Move(12.0, 5.0), Line(12.0, 19.0), Move(5.0, 12.0), Line(19.0, 12.0)], tint: None,
     }],
 };
 /// Add.
 pub const PLUS: Symbol = Symbol::new("plus", &PLUS_GLYPH);
 
 const MINUS_GLYPH: Glyph =
-    Glyph { draws: &[Draw { paint: STROKE, path: &[Move(5.0, 12.0), Line(19.0, 12.0)] }] };
+    Glyph { draws: &[Draw { paint: STROKE, path: &[Move(5.0, 12.0), Line(19.0, 12.0)], tint: None }] };
 /// Remove, collapse.
 pub const MINUS: Symbol = Symbol::new("minus", &MINUS_GLYPH);
 
@@ -87,7 +87,7 @@ const SEARCH_GLYPH: Glyph = Glyph {
             // …and its handle
             Move(15.8, 15.8),
             Line(20.0, 20.0),
-        ],
+        ], tint: None,
     }],
 };
 /// `⌕` — find.
@@ -109,7 +109,7 @@ const FOLDER_GLYPH: Glyph = Glyph {
             Line(5.0, 19.0),
             Cubic(3.9, 19.0, 3.0, 18.1, 3.0, 17.0),
             Close,
-        ],
+        ], tint: None,
     }],
 };
 /// The explorer's noun.
@@ -133,7 +133,7 @@ const DOCUMENT_GLYPH: Glyph = Glyph {
             Move(14.0, 3.0),
             Line(14.0, 8.0),
             Line(19.0, 8.0),
-        ],
+        ], tint: None,
     }],
 };
 /// A file, a page.
@@ -157,7 +157,7 @@ const SIDEBAR_GLYPH: Glyph = Glyph {
             // …and the rail
             Move(9.5, 5.0),
             Line(9.5, 19.0),
-        ],
+        ], tint: None,
     }],
 };
 /// `▤` — the panel toggle.
@@ -198,7 +198,7 @@ const GEAR_GLYPH: Glyph = Glyph {
             Line(12.0, 4.0),
             Move(15.89, 8.11),
             Line(17.66, 6.34),
-        ],
+        ], tint: None,
     }],
 };
 /// `⚙` — settings.
@@ -219,7 +219,7 @@ const INFO_GLYPH: Glyph = Glyph {
                 // the stem
                 Move(12.0, 11.0),
                 Line(12.0, 16.5),
-            ],
+            ], tint: None,
         },
         // the dot is a FILLED disc — the second draw of one glyph
         Draw {
@@ -231,7 +231,7 @@ const INFO_GLYPH: Glyph = Glyph {
                 Cubic(10.8, 6.94, 11.34, 6.4, 12.0, 6.4),
                 Cubic(12.66, 6.4, 13.2, 6.94, 13.2, 7.6),
                 Close,
-            ],
+            ], tint: None,
         },
     ],
 };
@@ -250,7 +250,7 @@ const WARNING_GLYPH: Glyph = Glyph {
                 Close,
                 Move(12.0, 10.0),
                 Line(12.0, 14.5),
-            ],
+            ], tint: None,
         },
         Draw {
             paint: FILL,
@@ -261,7 +261,7 @@ const WARNING_GLYPH: Glyph = Glyph {
                 Cubic(10.8, 16.54, 11.34, 16.0, 12.0, 16.0),
                 Cubic(12.66, 16.0, 13.2, 16.54, 13.2, 17.2),
                 Close,
-            ],
+            ], tint: None,
         },
     ],
 };
@@ -291,7 +291,7 @@ const ELLIPSIS_GLYPH: Glyph = Glyph {
             Cubic(17.4, 11.12, 18.12, 10.4, 19.0, 10.4),
             Cubic(19.88, 10.4, 20.6, 11.12, 20.6, 12.0),
             Close,
-        ],
+        ], tint: None,
     }],
 };
 /// `…` — more.

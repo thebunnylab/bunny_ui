@@ -4562,7 +4562,7 @@ mod tests {
     const CHECK_GLYPH: crate::icon::Glyph = crate::icon::Glyph {
         draws: &[crate::icon::Draw {
             paint: crate::icon::Paint::Stroke { width: 2.0 },
-            path: CHECK_PATH,
+            path: CHECK_PATH, tint: None,
         }],
     };
     const CHECK: crate::icon::Symbol = crate::icon::Symbol::new("test.check", &CHECK_GLYPH);

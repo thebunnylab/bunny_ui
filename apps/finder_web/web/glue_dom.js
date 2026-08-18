@@ -441,18 +441,20 @@ function applyPatches(view, length) {
       for (let d = 0; d < count; d++) {
         const paint = u8();
         const width = f32();
+        // the draw's own palette, or currentColor to ride the ink
+        const ink = u8() === 1 ? rgba(u32()) : "currentColor";
         const data = text(u32());
         if (!el) continue;
         const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
         path.setAttribute("d", data);
         if (paint === 2) {
           path.setAttribute("fill", "none");
-          path.setAttribute("stroke", "currentColor");
+          path.setAttribute("stroke", ink);
           path.setAttribute("stroke-width", width);
           path.setAttribute("stroke-linecap", "round");
           path.setAttribute("stroke-linejoin", "round");
         } else {
-          path.setAttribute("fill", "currentColor");
+          path.setAttribute("fill", ink);
           if (paint === 1) path.setAttribute("fill-rule", "evenodd");
         }
         el.appendChild(path);

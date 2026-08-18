@@ -1312,7 +1312,7 @@ mod tests {
         const DOT_GLYPH: crate::icon::Glyph = crate::icon::Glyph {
             draws: &[crate::icon::Draw {
                 paint: crate::icon::Paint::Stroke { width: 2.0 },
-                path: DOT_PATH,
+                path: DOT_PATH, tint: None,
             }],
         };
         const DOT: crate::icon::Symbol = crate::icon::Symbol::new("test.dot", &DOT_GLYPH);
