@@ -44,6 +44,7 @@ pub mod dom;
 pub mod effects;
 pub mod erased;
 pub mod ext;
+pub mod icon;
 pub mod image_engine;
 pub mod layout;
 pub mod modifier;
