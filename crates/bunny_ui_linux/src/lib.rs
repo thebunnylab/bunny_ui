@@ -405,6 +405,17 @@ pub fn run_window_chrome(
                     blit(runtime, root);
                 }
             }
+            AppEvent::ImeMark { text, caret } => {
+                let command = EditCommand::SetMarked { text, caret_utf16: (caret, 0) };
+                if runtime.key(command).applied {
+                    blit(runtime, root);
+                }
+            }
+            AppEvent::ImeUnmark => {
+                if runtime.key(EditCommand::Unmark).applied {
+                    blit(runtime, root);
+                }
+            }
             AppEvent::Blink => {
                 // an idle caret blinks; without focus the tick is
                 // silence — and the same slow clock ages the tooltip's

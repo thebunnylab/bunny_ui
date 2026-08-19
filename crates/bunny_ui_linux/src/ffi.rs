@@ -263,6 +263,7 @@ enum Iface {
     XdgSurface,
     Toplevel,
     Popup,
+    TextInput,
     CoreSurface,
     CoreSeat,
     CoreOutput,
@@ -276,6 +277,8 @@ pub(crate) struct Protocols {
     toplevel: &'static WlInterface,
     popup: &'static WlInterface,
     positioner: &'static WlInterface,
+    ti_manager: &'static WlInterface,
+    text_input: &'static WlInterface,
 }
 
 /// The xdg-shell message rows, transcribed from the installed
@@ -367,13 +370,53 @@ fn xdg_spec() -> [(&'static CStr, u32, Vec<Msg>, Vec<Msg>); 5] {
     ]
 }
 
+/// text-input v3, transcribed from the unstable XML in opcode order —
+/// its own spec because its own file verifies it.
+fn text_input_spec() -> [(&'static CStr, u32, Vec<Msg>, Vec<Msg>); 2] {
+    use Iface::*;
+    [
+        (
+            c"zwp_text_input_manager_v3",
+            1,
+            vec![
+                Msg(c"destroy", c"", &[]),
+                Msg(c"get_text_input", c"no", &[Some(TextInput), Some(CoreSeat)]),
+            ],
+            vec![],
+        ),
+        (
+            c"zwp_text_input_v3",
+            1,
+            vec![
+                Msg(c"destroy", c"", &[]),
+                Msg(c"enable", c"", &[]),
+                Msg(c"disable", c"", &[]),
+                Msg(c"set_surrounding_text", c"sii", &[None, None, None]),
+                Msg(c"set_text_change_cause", c"u", &[None]),
+                Msg(c"set_content_type", c"uu", &[None, None]),
+                Msg(c"set_cursor_rectangle", c"iiii", &[None, None, None, None]),
+                Msg(c"commit", c"", &[]),
+            ],
+            vec![
+                Msg(c"enter", c"o", &[Some(CoreSurface)]),
+                Msg(c"leave", c"o", &[Some(CoreSurface)]),
+                Msg(c"preedit_string", c"?sii", &[None, None, None]),
+                Msg(c"commit_string", c"?s", &[None]),
+                Msg(c"delete_surrounding_text", c"uu", &[None, None]),
+                Msg(c"done", c"u", &[None]),
+            ],
+        ),
+    ]
+}
+
 /// Builds the five `WlInterface` tables and leaks them. Two passes:
 /// the interfaces are allocated first so the message rows can point at
 /// each other (popup → positioner, xdg_surface → toplevel, …).
 fn build_protocols() -> Protocols {
-    let spec = xdg_spec();
+    let spec: Vec<(&'static CStr, u32, Vec<Msg>, Vec<Msg>)> =
+        xdg_spec().into_iter().chain(text_input_spec()).collect();
     // pass 1: stable homes, filled with placeholders
-    let slots: &'static mut [WlInterface; 5] = Box::leak(Box::new(std::array::from_fn(|_| {
+    let slots: &'static mut [WlInterface; 7] = Box::leak(Box::new(std::array::from_fn(|_| {
         WlInterface {
             name: c"".as_ptr(),
             version: 0,
@@ -390,6 +433,7 @@ fn build_protocols() -> Protocols {
             Iface::XdgSurface => unsafe { base.add(2) },
             Iface::Toplevel => unsafe { base.add(3) },
             Iface::Popup => unsafe { base.add(4) },
+            Iface::TextInput => unsafe { base.add(6) },
             Iface::CoreSurface => &raw const wl_surface_interface,
             Iface::CoreSeat => &raw const wl_seat_interface,
             Iface::CoreOutput => &raw const wl_output_interface,
@@ -432,6 +476,8 @@ fn build_protocols() -> Protocols {
         xdg_surface: &slots[2],
         toplevel: &slots[3],
         popup: &slots[4],
+        ti_manager: &slots[5],
+        text_input: &slots[6],
     }
 }
 
@@ -552,6 +598,7 @@ const TAG_KEYBOARD: usize = 12;
 const TAG_DATA_DEVICE: usize = 13;
 const TAG_DATA_OFFER: usize = 14;
 const TAG_DATA_SOURCE: usize = 15;
+const TAG_TEXT_INPUT: usize = 16;
 const OUTPUT_TAG_BASE: usize = 0x1000;
 /// Panel proxies encode index and role: base | (index << 2) | kind.
 const PANEL_TAG_BASE: usize = 0x1000_0000;
@@ -596,6 +643,10 @@ enum Ev {
     PanelConfigure { index: usize, serial: u32 },
     PopupPosition { index: usize, x: i32, y: i32 },
     PopupDone { index: usize },
+    ImePreedit { text: String, cursor_begin: i32 },
+    ImeCommit { text: String },
+    ImeDone { serial: u32 },
+    ImeLeave,
 }
 
 thread_local! {
@@ -749,6 +800,29 @@ unsafe extern "C" fn dispatcher(
             _ => {} // target(0): a dnd-only hint
         },
         TAG_CURSOR_SURFACE => {}
+        TAG_TEXT_INPUT => match opcode {
+            1 => push_ev(Ev::ImeLeave),
+            2 => {
+                let s = unsafe { arg(0).s };
+                let text = if s.is_null() {
+                    String::new()
+                } else {
+                    unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned()
+                };
+                push_ev(Ev::ImePreedit { text, cursor_begin: unsafe { arg(1).i } });
+            }
+            3 => {
+                let s = unsafe { arg(0).s };
+                let text = if s.is_null() {
+                    String::new()
+                } else {
+                    unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned()
+                };
+                push_ev(Ev::ImeCommit { text });
+            }
+            5 => push_ev(Ev::ImeDone { serial: unsafe { arg(0).u } }),
+            _ => {} // enter(0): the focus follows sync_ime; delete_surrounding(4): documented gap
+        },
         tag if tag >= PANEL_TAG_BASE => {
             let index = (tag - PANEL_TAG_BASE) >> 2;
             match tag & 0x3 {
@@ -1021,6 +1095,67 @@ struct SourceState {
     text: String,
 }
 
+/// The v3 composition cycle: events stage, `done` applies atomically.
+/// The result lands BEFORE the fresh preedit — the order every
+/// platform's IME phase learned the hard way.
+#[derive(Default)]
+struct ImeCycle {
+    preedit: Option<(String, i32)>,
+    commit: Option<String>,
+}
+
+enum ImeOp {
+    Insert(String),
+    Mark { text: String, caret_utf16: usize },
+    Unmark,
+}
+
+impl ImeCycle {
+    /// `marked` = a composition was live before this done.
+    fn finish(&mut self, marked: bool) -> (Vec<ImeOp>, bool) {
+        let mut ops = Vec::new();
+        if let Some(text) = self.commit.take()
+            && !text.is_empty()
+        {
+            ops.push(ImeOp::Insert(text));
+        }
+        match self.preedit.take() {
+            Some((text, begin)) if !text.is_empty() => {
+                let caret = utf16_index_at(&text, begin.max(0) as usize);
+                ops.push(ImeOp::Mark { text, caret_utf16: caret });
+                (ops, true)
+            }
+            _ => {
+                // a done without a fresh preedit ends the marked run —
+                // but only if one was live (post-commit must not fire)
+                if marked {
+                    ops.push(ImeOp::Unmark);
+                }
+                (ops, false)
+            }
+        }
+    }
+}
+
+/// v3 speaks BYTE offsets into utf-8; the core resolvers speak utf-16.
+fn utf16_index_at(text: &str, byte_offset: usize) -> usize {
+    text.get(..byte_offset.min(text.len()))
+        .map(|prefix| prefix.encode_utf16().count())
+        .unwrap_or_else(|| text.encode_utf16().count())
+}
+
+struct ImeState {
+    text_input: *mut Proxy,
+    enabled: bool,
+    marked: bool,
+    cycle: ImeCycle,
+    /// Our commit count vs the compositor's `done` echo — extra
+    /// commits only flow while they agree (the loop breaker).
+    commits: u32,
+    done_serial: u32,
+    last_rect: (i32, i32, i32, i32),
+}
+
 /// One overlay panel. A popover/tooltip/menu is an xdg_popup (it may
 /// hang past the window's edge — the fidelity bar); the drag chip is a
 /// subsurface (a mouse-following popup would be a recreate storm).
@@ -1087,6 +1222,7 @@ struct Client {
     source: Option<SourceState>,
     wake_read: c_int,
     subcompositor: *mut Proxy,
+    ime: ImeState,
     panels: Vec<Option<Panel>>,
     /// 0 = the main window; N = panel N−1 (event translation).
     pointer_focus: usize,
@@ -1128,6 +1264,8 @@ pub enum AppEvent {
     /// An editing key that passed the gate unconsumed.
     Key { sym: u32, shift: bool, command: bool },
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
+    ImeMark { text: String, caret: usize },
+    ImeUnmark,
     Blink,
     Frame { dt: f64 },
 }
@@ -1238,6 +1376,23 @@ fn connect() {
     );
     let subcompositor =
         bind(c"wl_subcompositor", &raw const wl_subcompositor_interface, 1, TAG_SYNC);
+    // text-input v3 where the compositor speaks it (WSLg's does not —
+    // the road stays inert and typing flows untouched)
+    let ti_manager =
+        bind(c"zwp_text_input_manager_v3", protocols.ti_manager as *const WlInterface, 1, TAG_SYNC);
+    let text_input = if ti_manager.is_null() || seat.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe {
+            construct(
+                ti_manager,
+                1, // get_text_input(new, seat)
+                protocols.text_input as *const WlInterface,
+                &mut [arg_n(), arg_o(seat)],
+                TAG_TEXT_INPUT,
+            )
+        }
+    };
     let data_device = if data_manager.is_null() || seat.is_null() {
         std::ptr::null_mut()
     } else {
@@ -1314,6 +1469,15 @@ fn connect() {
             source: None,
             wake_read,
             subcompositor,
+            ime: ImeState {
+                text_input,
+                enabled: false,
+                marked: false,
+                cycle: ImeCycle::default(),
+                commits: 0,
+                done_serial: 0,
+                last_rect: (0, 0, 0, 0),
+            },
             panels: Vec::new(),
             pointer_focus: 0,
             axis: AxisAccumulator::default(),
@@ -2129,6 +2293,10 @@ fn is_edit_key(stroke: &KeyStroke) -> bool {
 /// then the editing keys, then the character road. Runs OUTSIDE the
 /// client borrow.
 fn deliver_key(road: KeyRoad) {
+    // step one of the gate: a live composition wins outright
+    if ime_marked() {
+        return;
+    }
     match road {
         KeyRoad::Silence => {}
         KeyRoad::Composed(text) => dispatch(AppEvent::Text(text)),
@@ -2297,9 +2465,67 @@ pub fn wake_from_any_thread() {
     }
 }
 
-// MARK: - IME mirror (the door opens at its phase; the slot keeps the twins' order)
+// MARK: - IME mirror (synced per blit — the v3 door)
 
-pub fn sync_ime(_state: Option<(bool, usize, (f64, f64, f64, f64))>) {}
+/// The per-blit mirror: a focused field enables the text input and
+/// feeds the caret rectangle; blur disables it. Every state change is
+/// double-buffered behind `commit`, and extra commits only flow while
+/// the compositor's `done` echo agrees with our count.
+pub fn sync_ime(state: Option<(bool, usize, (f64, f64, f64, f64))>) {
+    with_client(|client| {
+        let text_input = client.ime.text_input;
+        if text_input.is_null() {
+            return;
+        }
+        unsafe {
+            match state {
+                Some((_marked, _start, rect)) => {
+                    let rect = (
+                        rect.0.round() as i32,
+                        rect.1.round() as i32,
+                        rect.2.round().max(1.0) as i32,
+                        rect.3.round().max(1.0) as i32,
+                    );
+                    let mut dirty = false;
+                    if !client.ime.enabled {
+                        request(text_input, 1, &mut no_args()); // enable
+                        request(text_input, 5, &mut [arg_u(0), arg_u(0)]); // content: none/normal
+                        client.ime.enabled = true;
+                        dirty = true;
+                    }
+                    if client.ime.last_rect != rect {
+                        request(
+                            text_input,
+                            6,
+                            &mut [arg_i(rect.0), arg_i(rect.1), arg_i(rect.2), arg_i(rect.3)],
+                        );
+                        client.ime.last_rect = rect;
+                        dirty = true;
+                    }
+                    if dirty && client.ime.commits == client.ime.done_serial {
+                        request(text_input, 7, &mut no_args()); // commit
+                        client.ime.commits += 1;
+                    }
+                }
+                None => {
+                    if client.ime.enabled {
+                        request(text_input, 2, &mut no_args()); // disable
+                        request(text_input, 7, &mut no_args());
+                        client.ime.enabled = false;
+                        client.ime.marked = false;
+                        client.ime.commits += 1;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// The gate's composition-first step: while a composition is live the
+/// IME owns the key stream.
+fn ime_marked() -> bool {
+    with_client(|client| client.ime.marked)
+}
 
 // MARK: - the frame driver (no thread: the compositor's callback is the clock)
 
@@ -2476,6 +2702,40 @@ fn drain_protocol_events() {
                     panel.delta = (x as f64 - panel.asked.0, y as f64 - panel.asked.1);
                 }
             }),
+            Ev::ImePreedit { text, cursor_begin } => with_client(|client| {
+                client.ime.cycle.preedit = Some((text, cursor_begin));
+            }),
+            Ev::ImeCommit { text } => with_client(|client| {
+                client.ime.cycle.commit = Some(text);
+            }),
+            Ev::ImeDone { serial } => {
+                let ops = with_client(|client| {
+                    client.ime.done_serial = serial;
+                    let (ops, marked) = client.ime.cycle.finish(client.ime.marked);
+                    client.ime.marked = marked;
+                    ops
+                });
+                for op in ops {
+                    match op {
+                        ImeOp::Insert(text) => dispatch(AppEvent::Text(text)),
+                        ImeOp::Mark { text, caret_utf16 } => {
+                            dispatch(AppEvent::ImeMark { text, caret: caret_utf16 })
+                        }
+                        ImeOp::Unmark => dispatch(AppEvent::ImeUnmark),
+                    }
+                }
+            }
+            Ev::ImeLeave => {
+                let was_marked = with_client(|client| {
+                    let was = client.ime.marked;
+                    client.ime.marked = false;
+                    client.ime.cycle = ImeCycle::default();
+                    was
+                });
+                if was_marked {
+                    dispatch(AppEvent::ImeUnmark);
+                }
+            }
             Ev::PopupDone { index } => with_client(|client| {
                 // the compositor dismissed it (parent unmap, rare on
                 // this road); the pool recreates if core still wants it
@@ -3051,6 +3311,70 @@ mod tests {
         assert_eq!(resolve_scale(&[1, 2], &outputs), 2, "straddling takes the max");
         assert_eq!(resolve_scale(&[9], &outputs), 1, "an unknown output cannot vote");
         assert_eq!(resolve_scale(&[3], &[(3, 0)]), 1, "a zero scale clamps to one");
+    }
+
+    #[test]
+    fn the_text_input_tables_match_their_xml() {
+        let path =
+            "/usr/share/wayland-protocols/unstable/text-input/text-input-unstable-v3.xml";
+        let Ok(xml) = std::fs::read_to_string(path) else { return };
+        for (name, _, methods, events) in text_input_spec() {
+            let open = format!("<interface name=\"{}\"", name.to_string_lossy());
+            let start = xml.find(&open).expect("interface present in the XML");
+            let block = &xml[start..];
+            let end = block.find("</interface>").expect("interface block closes");
+            let block = &block[..end];
+            let mut cursor = 0;
+            for Msg(msg, _, _) in &methods {
+                let needle = format!("<request name=\"{}\"", msg.to_string_lossy());
+                let at = block[cursor..]
+                    .find(&needle)
+                    .unwrap_or_else(|| panic!("{needle} in opcode order"));
+                cursor += at + needle.len();
+            }
+            let mut cursor = 0;
+            for Msg(msg, _, _) in &events {
+                let needle = format!("<event name=\"{}\"", msg.to_string_lossy());
+                let at = block[cursor..]
+                    .find(&needle)
+                    .unwrap_or_else(|| panic!("{needle} in opcode order"));
+                cursor += at + needle.len();
+            }
+        }
+    }
+
+    #[test]
+    fn the_ime_cycle_lands_the_result_before_the_fresh_preedit() {
+        let mut cycle = ImeCycle::default();
+        cycle.commit = Some("水".into());
+        cycle.preedit = Some(("すい".into(), 3));
+        let (ops, marked) = cycle.finish(true);
+        assert!(marked);
+        assert!(matches!(&ops[0], ImeOp::Insert(text) if text == "水"), "result first");
+        assert!(
+            matches!(&ops[1], ImeOp::Mark { text, caret_utf16 } if text == "すい" && *caret_utf16 == 1),
+            "then the composition, caret in utf-16"
+        );
+    }
+
+    #[test]
+    fn a_done_without_preedit_unmarks_only_a_live_composition() {
+        let mut cycle = ImeCycle::default();
+        let (ops, marked) = cycle.finish(true);
+        assert!(!marked);
+        assert!(matches!(ops.as_slice(), [ImeOp::Unmark]), "a live run ends");
+        let (ops, marked) = cycle.finish(false);
+        assert!(!marked);
+        assert!(ops.is_empty(), "post-commit silence: nothing was live, nothing fires");
+    }
+
+    #[test]
+    fn utf16_indexes_walk_surrogates() {
+        assert_eq!(utf16_index_at("aé水", 0), 0);
+        assert_eq!(utf16_index_at("aé水", 1), 1);
+        assert_eq!(utf16_index_at("aé水", 3), 2, "é is two bytes, one unit");
+        assert_eq!(utf16_index_at("🐰b", 4), 2, "the emoji is four bytes, two units");
+        assert_eq!(utf16_index_at("ab", 99), 2, "past the end clamps");
     }
 
     #[test]
