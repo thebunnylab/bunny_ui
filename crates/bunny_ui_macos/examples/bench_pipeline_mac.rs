@@ -163,6 +163,43 @@ impl Component for Finder {
 /// region reveals through a spring. A SEPARATE component so the plain
 /// rows above stay byte-identical to the certified table.
 #[derive(Clone)]
+/// The finder with a LIVE 26pt mark in a bar above it — the fixture of
+/// the loop path: the scene rests, the mark steps at 5fps, and the
+/// price of a step is the mark's own pixels and nothing else.
+struct LiveMark {
+    files: Rc<Vec<(Arc<str>, Arc<str>)>>,
+}
+
+impl Component for LiveMark {
+    fn body(self, _ctx: &Context) -> impl View {
+        use bunny_ui::custom::canvas;
+        let mark = canvas(|ctx, painter| {
+            let size = ctx.size();
+            let breathe = 1.0 + 0.10 * (ctx.phase * std::f64::consts::TAU).sin();
+            let diameter = size.width.min(size.height) * 0.68 * breathe;
+            let ring = Rect {
+                origin: Point {
+                    x: (size.width - diameter) / 2.0,
+                    y: (size.height - diameter) / 2.0,
+                },
+                size: Size { width: diameter, height: diameter },
+            };
+            painter.stroke(ring, painter.ink(), 2.5, diameter / 2.0);
+        })
+        .looping(Loop::secs(9.6).fps(5.0))
+        .frame(26.0, 26.0);
+        vstack!(
+            hstack!(mark, spacer()).frame_height(36.0),
+            Finder {
+                query: State::new(String::new()),
+                selected: State::new(0),
+                files: self.files,
+            }
+        )
+    }
+}
+
+#[derive(Clone)]
 struct AnimatedFinder {
     query: State<String>,
     selected: State<usize>,
@@ -424,6 +461,18 @@ fn main() {
         ticks += 1;
         anim_runtime.tick(1.0 / 120.0);
         std::hint::black_box(anim_runtime.animation_frame(&animated, window).len());
+    }));
+
+    // the loop path: a live decoration steps at 5fps while the app
+    // rests — tick + repaint of ONE 26pt box, no layout, no scene.
+    // this is the whole per-step price of an animated mark in the bar.
+    let marked = LiveMark { files: Rc::clone(&files) };
+    let mark_runtime = Runtime::new().text_engine(engine.clone());
+    let _ = mark_runtime.display_frame(&marked, window);
+    reports.push(measure("live mark step (tick+island raster)", 5, 200, || {
+        // one slow beat: exactly one 5fps step of a 9.6s loop
+        mark_runtime.tick(0.2);
+        std::hint::black_box(mark_runtime.live_islands(2).len());
     }));
 
     let laid_out = runtime.layout(&finder, viewport);
