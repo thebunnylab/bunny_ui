@@ -2923,6 +2923,114 @@ mod tests {
         assert!(plain.contains("[.onClick()]"), "and it is the click suffix: {plain}");
     }
 
+    /// A modal box declines text while its command mode is on, and the
+    /// bare stroke reaches the keymap — the whole of a vim layer is
+    /// bare keys, and none of them would arrive otherwise.
+    #[test]
+    fn a_modal_box_declines_text_and_the_bare_stroke_reaches_the_map() {
+        use crate::action::{ActionId, Key, KeyPattern};
+        use crate::layout::{Proposal, Size};
+        use std::cell::Cell;
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mode {
+            Insert,
+            Command,
+        }
+
+        struct Modal {
+            mode: Rc<Cell<Mode>>,
+            typed: Rc<Cell<usize>>,
+        }
+
+        impl CustomElement for Modal {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+
+            // the whole pain: only the box knows that `d` is a command
+            // right now and not a letter
+            fn takes_text(&self) -> bool {
+                self.mode.get() == Mode::Insert
+            }
+
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> crate::custom::Response {
+                if let ElementEvent::Text(text) = event {
+                    self.typed.set(self.typed.get() + text.len());
+                    return crate::custom::Response::handled();
+                }
+                // a stroke the box does not want goes back to the scene
+                crate::custom::Response::ignored()
+            }
+        }
+
+        const DELETE_LINE: ActionId = ActionId("vim.delete_line");
+
+        #[derive(Clone)]
+        struct Bench {
+            mode: Rc<Cell<Mode>>,
+            typed: Rc<Cell<usize>>,
+            deleted: Rc<Cell<usize>>,
+        }
+
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                let deleted = Rc::clone(&self.deleted);
+                custom(Modal { mode: Rc::clone(&self.mode), typed: Rc::clone(&self.typed) })
+                    .id("editor")
+                    .on_action(DELETE_LINE, move || deleted.set(deleted.get() + 1))
+            }
+        }
+
+        let bench = Bench {
+            mode: Rc::new(Cell::new(Mode::Insert)),
+            typed: Rc::new(Cell::new(0)),
+            deleted: Rc::new(Cell::new(0)),
+        };
+        let deleted = Rc::clone(&bench.deleted);
+        let runtime = Runtime::new();
+        runtime.bind(KeyPattern::key(Key::Char('d')), DELETE_LINE);
+
+        let viewport = Proposal::exact(Size { width: 400.0, height: 200.0 });
+        runtime.render_stable(&bench);
+        let result = runtime.layout(&bench, viewport);
+        let box_rect = result.customs.first().expect("the box is placed").frame;
+        runtime.pointer_pressed(box_rect.origin.x + 5.0, box_rect.origin.y + 5.0);
+        runtime.pointer_released(box_rect.origin.x + 5.0, box_rect.origin.y + 5.0);
+        assert!(runtime.focused().is_some(), "the click focused the box");
+
+        // INSERT: the box is typing, so the gate hands `d` to it and
+        // the binding never hears the stroke
+        assert!(runtime.focus_takes_text(), "an inserting box types");
+
+        // COMMAND: the same box, the same focus, the same key — and now
+        // the gate steps aside
+        bench.mode.set(Mode::Command);
+        assert!(!runtime.focus_takes_text(), "a commanding box declines text");
+        // the shells' gate is `focus_takes_text() && is_text_input()`;
+        // with the box declining, the stroke walks the ordinary road
+        let pattern = KeyPattern::key(Key::Char('d'));
+        assert!(pattern.is_text_input(), "`d` is a bare character");
+        assert!(
+            !runtime.key_stroke(&pattern).handled,
+            "the box ignores it, so the keymap gets its turn",
+        );
+        let action = match runtime.chord(&pattern) {
+            crate::action::KeyMatch::Action(action) => action,
+            other => panic!("the map answers the bare key, got {other:?}"),
+        };
+        assert!(runtime.dispatch_action(action), "and the binding runs");
+        assert_eq!(deleted.get(), 1);
+        assert_eq!(bench.typed.get(), 0, "nothing was typed in command mode");
+
+        // nothing focused is nobody typing — the gate never fires on an
+        // empty keyboard
+        runtime.blur();
+        assert!(!runtime.focus_takes_text());
+    }
+
     /// The keyboard follows the NAME, not the position: wrapping a
     /// pane in a split shifts every positional segment below it, and
     /// the focused box must keep typing across the edit.

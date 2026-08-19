@@ -1772,6 +1772,27 @@ impl Runtime {
         self.focus.borrow().clone()
     }
 
+    /// Is the keyboard's owner taking TEXT right now? The key gate of
+    /// every shell asks this before it lets a bare character through
+    /// as typing: `false` and the stroke walks on to the box, then to
+    /// the keymap.
+    ///
+    /// Nothing focused answers `false` — there is no one to type. A
+    /// field always answers `true`. A box the app owns answers for
+    /// itself through [`crate::custom::CustomElement::takes_text`],
+    /// which is how a modal editor keeps its command mode.
+    pub fn focus_takes_text(&self) -> bool {
+        let Some(path) = self.focused() else {
+            return false;
+        };
+        match self.custom_at(&path) {
+            Some(placement) => placement.element.element().takes_text(),
+            // a field types, always — the box that is not the app's is
+            // the framework's own, and it has no mode
+            None => true,
+        }
+    }
+
     /// Focuses a field. The caret goes to the END the first time (the
     /// stamp's clamp resolves the `usize::MAX`); refocusing restores
     /// the retained position.

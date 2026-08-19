@@ -116,6 +116,32 @@ pub trait CustomElement: 'static {
         false
     }
 
+    /// Is the box taking TEXT right now? The default is yes — the
+    /// answer a field gives, and the one a box that types wants.
+    ///
+    /// A bare character reaching a box that holds the keyboard is
+    /// TYPING, and typing is never stolen by a binding: the key gate
+    /// hands it straight to the box without consulting the keymap. For
+    /// a box that types, that rule is the whole point.
+    ///
+    /// A MODAL box is the exception, and it is the only one that knows:
+    /// in a command mode `d` is a command, not a letter. Answer `false`
+    /// while the mode is on and the bare stroke walks the ordinary road
+    /// — the box's own `event` first, then the keymap — so a binding
+    /// can name it and a person can rebind it.
+    ///
+    /// ```ignore
+    /// fn takes_text(&self) -> bool {
+    ///     self.mode.get() == Mode::Insert
+    /// }
+    /// ```
+    ///
+    /// The answer is read per stroke, so it can change with the mode
+    /// without anything being re-focused.
+    fn takes_text(&self) -> bool {
+        true
+    }
+
     /// What the platform's input system sees while the box is focused —
     /// the text around the caret, the selection, the live composition
     /// and the caret rect in LOCAL coordinates. `None` = no composition

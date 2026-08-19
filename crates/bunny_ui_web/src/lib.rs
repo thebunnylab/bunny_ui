@@ -107,10 +107,11 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
     {
         return true;
     }
-    // typing with a focused field is never stolen by a binding — but
-    // MID-CHORD the keyboard belongs to the keymap: the stroke that
-    // finishes `cmd-k s` is not typing
-    let typing = !mid_chord && runtime.focused().is_some() && pattern.is_text_input();
+    // typing is never stolen by a binding — but only whoever holds the
+    // keyboard AND is taking text is typing (a modal box in command
+    // mode declines), and MID-CHORD the keyboard belongs to the
+    // keymap: the stroke that finishes `cmd-k s` is not typing
+    let typing = !mid_chord && runtime.focus_takes_text() && pattern.is_text_input();
     if !typing {
         match runtime.chord(&pattern) {
             KeyMatch::Action(action) if runtime.dispatch_action(action) => return true,

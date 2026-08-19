@@ -428,9 +428,11 @@ pub fn run_window_chrome(
         move |x, y| runtime.window_drag_at(x, y)
     }));
 
-    // the gate: keymap BEFORE the input system — bare chars with a focused
-    // field pass straight through (typing is never stolen); a binding with
-    // no handler mounted does not consume (the palette-less screen types fine)
+    // the gate: keymap BEFORE the input system — bare chars pass straight
+    // through to whoever holds the keyboard AND is taking text (typing is
+    // never stolen; a modal box in command mode declines and the stroke
+    // walks on); a binding with no handler mounted does not consume (the
+    // palette-less screen types fine)
     ffi::set_key_gate(Box::new({
         let runtime = Rc::clone(&runtime);
         let root = Rc::clone(&root);
@@ -443,7 +445,7 @@ pub fn run_window_chrome(
             // that finishes `cmd-k s` is not typing, and it is not the
             // focused box's either
             let mid_chord = !runtime.pending_chord().is_empty();
-            if !mid_chord && runtime.focused().is_some() && pattern.is_text_input() {
+            if !mid_chord && runtime.focus_takes_text() && pattern.is_text_input() {
                 return false;
             }
             // a focused escape hatch owns its strokes: an editor's
