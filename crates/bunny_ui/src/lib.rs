@@ -1872,6 +1872,47 @@ mod tests {
         assert!(runtime.live_islands_all(2).is_empty());
     }
 
+    /// A mark anchored to the TOP does not move when the window grows
+    /// taller — its layout position is the same number before and
+    /// after. Whatever a shell does with its surface has to preserve
+    /// that: a world where the mark's position depends on the window's
+    /// height is a world where a placement that has not happened yet is
+    /// already wrong, and the error grows with the drag.
+    #[test]
+    fn a_top_anchored_live_box_does_not_move_when_the_window_grows() {
+        use crate::anim::Loop;
+        use crate::custom::canvas;
+
+        #[derive(Clone, Copy)]
+        struct Bar;
+        impl Component for Bar {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    canvas(|ctx, p| {
+                        p.fill(ctx.bounds(), crate::layout::Color::BLACK);
+                    })
+                    .looping(Loop::secs(4.8).fps(5.0))
+                    .frame(24.0, 24.0),
+                    spacer(),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let short = runtime.display_frame(&Bar, crate::layout::Size { width: 400.0, height: 300.0 });
+        let _ = short;
+        let before = runtime.live_frames();
+        assert_eq!(before.len(), 1);
+
+        let _ = runtime.display_frame(&Bar, crate::layout::Size { width: 400.0, height: 900.0 });
+        let after = runtime.live_frames();
+        assert_eq!(
+            after[0].1.origin, before[0].1.origin,
+            "three hundred points of window later, the mark is where it was",
+        );
+        assert_eq!(after[0].1.size, before[0].1.size);
+    }
+
     /// A shell that dissolves a live box's surface (a window mid-resize
     /// draws the box into the scene instead) has to say so, or the
     /// ledger keeps answering for a surface that holds nothing and the

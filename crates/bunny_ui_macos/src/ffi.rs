@@ -89,6 +89,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_void_f64(obj: Id, sel: Sel, a: f64);
     #[link_name = "objc_msgSend"]
+    fn msg_void_u32(obj: Id, sel: Sel, a: u32);
+    #[link_name = "objc_msgSend"]
     fn msg_f64(obj: Id, sel: Sel) -> f64;
     #[link_name = "objc_msgSend"]
     fn msg_bool_i64(obj: Id, sel: Sel, a: i64) -> i8;
@@ -1293,6 +1295,14 @@ impl WindowHandle {
         unsafe { msg_f64(self.window, sel("backingScaleFactor")).round().max(1.0) as usize }
     }
 
+    /// The layer keeps its distance to the BOTTOM flexible, which in
+    /// AppKit's world means it hangs from the TOP edge.
+    const LAYER_MIN_Y_MARGIN: u32 = 1 << 3;
+    /// And its distance to the RIGHT flexible, so it hangs from the
+    /// LEFT edge — together, the top-left corner the layout counts
+    /// from.
+    const LAYER_MAX_X_MARGIN: u32 = 1 << 2;
+
     /// Presents one live box on its own sublayer: the window behind it
     /// never redraws. `x`/`y` are the box's LAYOUT origin (top-left,
     /// points) and `view_height` is the height of the layout that
@@ -1329,6 +1339,24 @@ impl WindowHandle {
                     // the sublayer composites over the drawable — where
                     // the scene left the box's hole
                     msg_void_id(root, sel("addSublayer:"), layer);
+                    // The two worlds disagree: layout counts from the
+                    // TOP-left, a layer from the bottom-left. So a box
+                    // that never moved in the layout still needs a new
+                    // layer origin every time the window's HEIGHT
+                    // changes — and until we place it, the old origin is
+                    // wrong by exactly how far the drag has gone.
+                    //
+                    // The mask makes CoreAnimation keep the distance to
+                    // the TOP and to the LEFT instead, in the
+                    // superlayer's own resize. A box that did not move
+                    // is then already right before we say anything, and
+                    // one that did is corrected by the next placement,
+                    // as before.
+                    msg_void_u32(
+                        layer,
+                        sel("setAutoresizingMask:"),
+                        Self::LAYER_MIN_Y_MARGIN | Self::LAYER_MAX_X_MARGIN,
+                    );
                     LiveLayer { layer, buffers: [Vec::new(), Vec::new()], flip: false }
                 });
                 // premultiply into the spare backing
