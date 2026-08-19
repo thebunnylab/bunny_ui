@@ -334,11 +334,11 @@ fn rewrite_scroll_node(
 /// same order-immunity as the text and scroll rewrites.
 fn rewrite_field_node(
     node: LayoutNode,
-    rewrite: &impl Fn(String, std::sync::Arc<str>, std::sync::Arc<str>) -> LayoutNode,
+    rewrite: &impl Fn(String, std::sync::Arc<str>, std::sync::Arc<str>, bool) -> LayoutNode,
 ) -> LayoutNode {
     match node {
-        LayoutNode::Field { path, content, placeholder, .. } => {
-            rewrite(path, content, placeholder)
+        LayoutNode::Field { path, content, placeholder, multiline, .. } => {
+            rewrite(path, content, placeholder, multiline)
         }
         LayoutNode::Styled { props, child } => LayoutNode::Styled {
             props,
@@ -1085,11 +1085,8 @@ fn apply(
             }
         }
         Modifier::AutoFocus => out.wrap_layout_from(mark, |node| {
-            rewrite_field_node(node, &|path, content, placeholder| LayoutNode::Field {
-                path,
-                content,
-                placeholder,
-                auto_focus: true,
+            rewrite_field_node(node, &|path, content, placeholder, multiline| {
+                LayoutNode::Field { path, content, placeholder, multiline, auto_focus: true }
             })
         }),
         Modifier::KeyContext(name) => {

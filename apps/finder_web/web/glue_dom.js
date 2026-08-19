@@ -141,7 +141,7 @@ function flushRules() {
 
 function createElementOf(kind) {
   // 0 group, 1 box, 2 text, 3 field, 4 scroll, 5 content, 6 canvas,
-  // 7 image
+  // 7 image, 8 icon, 9 editor
   if (kind === 6) {
     const canvas = document.createElement("canvas");
     canvas.style.cssText = "position:absolute;left:0;top:0;";
@@ -163,15 +163,25 @@ function createElementOf(kind) {
     svg.style.cssText = "position:absolute;left:0;top:0;pointer-events:none;";
     return svg;
   }
-  if (kind === 3) {
-    const input = document.createElement("input");
-    input.type = "text";
+  if (kind === 3 || kind === 9) {
+    // 9 is the field of MANY lines: a textarea, so the browser wraps,
+    // breaks and scrolls it at home — the same record fills both
+    const input =
+      kind === 9
+        ? document.createElement("textarea")
+        : document.createElement("input");
+    if (kind === 9) {
+      input.rows = 1;
+    } else {
+      input.type = "text";
+    }
     // padding mirrors the engine's FIELD_PAD; every color and border
     // arrives through the patches — the theme owns the chrome, and no
     // inline border may outrank the stylesheet rule
     input.style.cssText =
       "position:absolute;left:0;top:0;box-sizing:border-box;" +
-      "padding:5px 8px;outline:none;";
+      "padding:5px 8px;outline:none;" +
+      (kind === 9 ? "resize:none;font:inherit;" : "");
     let composing = false;
     input.addEventListener("compositionstart", () => {
       composing = true;

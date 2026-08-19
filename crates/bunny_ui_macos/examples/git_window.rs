@@ -7,6 +7,12 @@
 //! the result. Closing the window (or reloading) cancels the task, the
 //! reader dies, and the next `send` tells the worker to stop.
 //!
+//! The foot is the other half of a source-control panel: a commit box
+//! of MANY lines. It takes the height the pane gives it, wraps by word
+//! inside that width, and scrolls down when the message outgrows the
+//! box — Enter breaks the line, and `\u{2318}\u{21a9}` still commits,
+//! because a chord belongs to the app.
+//!
 //! ```sh
 //! cargo run -p bunny-ui-macos --example git_window
 //! ```
@@ -26,6 +32,10 @@ use bunny_ui_macos::Chrome;
 const BAR_H: f64 = 44.0;
 const LIGHTS_W: f64 = 78.0;
 const ROW_H: f64 = 30.0;
+/// The commit box, in the product's own number.
+const MESSAGE_H: f64 = 72.0;
+/// `\u{2318}\u{21a9}` writes the commit — a chord the FIELD never sees.
+const COMMIT: ActionId = ActionId("git.commit");
 /// The demo paces the stream so the crossing is VISIBLE. A real panel
 /// sends as fast as the process writes.
 const PACE: Duration = Duration::from_millis(6);
@@ -42,6 +52,8 @@ struct App {
     commits: State<Rc<Vec<Commit>>>,
     reloads: State<usize>,
     reading: State<bool>,
+    message: State<String>,
+    wrote: State<usize>,
 }
 
 impl Component for App {
@@ -110,11 +122,49 @@ impl Component for App {
             },
         );
 
+        // the commit box: many lines, the height of the pane's choosing,
+        // and the message stays the APP's string the whole way
+        let message = self.message;
+        let wrote = self.wrote;
+        let written = message.get();
+        let ready = !written.trim().is_empty();
+        let foot = vstack!(
+            text_editor("Message (\u{2318}\u{21a9} to commit)", message.binding())
+                .frame_height(MESSAGE_H),
+            hstack!(
+                text(match wrote.get() {
+                    0 => "nothing written yet".to_string(),
+                    1 => "1 message written".to_string(),
+                    written => format!("{written} messages written"),
+                })
+                .font_size(11.0)
+                .foreground_color(theme::fg_faint()),
+                spacer(),
+                text("Commit")
+                    .font_size(11.0)
+                    .foreground_color(if ready { Color::WHITE } else { theme::fg_faint() })
+                    .padding_edge(Edge::Leading, 10.0)
+                    .padding_edge(Edge::Trailing, 10.0)
+                    .padding_edge(Edge::Top, 4.0)
+                    .padding_edge(Edge::Bottom, 4.0)
+                    .background_color(if ready { theme::accent() } else { theme::row_hover() })
+                    .corner_radius(6.0)
+                    .on_click(move || commit(message, wrote)),
+            )
+            .alignment(VerticalAlignment::Center),
+        )
+        .spacing(8.0)
+        .padding_length(8.0)
+        .background_color(theme::panel());
+
         vstack!(
             title,
             spacer().frame(1.0, 1.0).background_color(theme::divider()),
             zstack!(spacer().background_color(theme::canvas()), list),
+            spacer().frame(1.0, 1.0).background_color(theme::divider()),
+            foot,
         )
+        .on_action(COMMIT, move || commit(message, wrote))
         // the id is the reload count: pressing reload cancels the read
         // in flight and starts a fresh one
         .task_id(reloads.get(), move || async move {
@@ -131,6 +181,16 @@ impl Component for App {
             reading.set(false);
         })
     }
+}
+
+/// Writes the message — the demo's whole idea of a commit. An empty
+/// one is not a commit, and the box empties when it lands.
+fn commit(message: State<String>, wrote: State<usize>) {
+    if message.get().trim().is_empty() {
+        return;
+    }
+    message.set(String::new());
+    wrote.set(wrote.get() + 1);
 }
 
 /// Runs `git log` and sends one commit per line. An `Err` from send
@@ -165,6 +225,9 @@ fn main() {
     let runtime = Runtime::new()
         .text_engine(Rc::new(bunny_ui_macos::CoreTextEngine::new()))
         .image_engine(Rc::new(bunny_ui_macos::CoreGraphicsImageEngine::new()));
+    // the chord reaches the app even with the box focused; a bare Enter
+    // never gets this far — the many-line field takes it as a break
+    runtime.bind(KeyPattern::command(Key::Enter), COMMIT);
     bunny_ui_macos::run_window_chrome(
         "bunny — git log",
         Size { width: 900.0, height: 620.0 },
@@ -174,6 +237,8 @@ fn main() {
             commits: State::new(Rc::new(Vec::new())),
             reloads: State::new(0),
             reading: State::new(false),
+            message: State::new(String::new()),
+            wrote: State::new(0),
         },
     );
 }

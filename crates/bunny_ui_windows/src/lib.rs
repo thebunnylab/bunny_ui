@@ -361,6 +361,22 @@ pub fn run_window_chrome(
                 blit(&runtime, &*root);
                 return true;
             }
+            // a field of MANY lines owns the bare break and the bare
+            // vertical arrows, before any binding — and only it: a
+            // one-line field declines and the stroke walks on, so the
+            // app keeps its Enter and a list keeps its arrows
+            if pattern.is_plain()
+                && let Some(command) = match pattern.key {
+                    Key::Enter => Some(EditCommand::Newline),
+                    Key::Up => Some(EditCommand::Up(pattern.shift)),
+                    Key::Down => Some(EditCommand::Down(pattern.shift)),
+                    _ => None,
+                }
+                && runtime.key(command).applied
+            {
+                blit(&runtime, &*root);
+                return true;
+            }
             let Some(action) = runtime.match_key(&pattern) else {
                 return false;
             };

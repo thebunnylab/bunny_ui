@@ -221,6 +221,9 @@ pub struct DomField {
     pub placeholder: Arc<str>,
     pub font: FontSpec,
     pub color: Color,
+    /// Many lines: the glue builds a `<textarea>` instead of an
+    /// `<input>`, and the browser wraps and scrolls it at home.
+    pub multiline: bool,
 }
 
 /// A captured scene node: kind + parent-relative frame + style +
@@ -575,6 +578,10 @@ pub enum CreateKind {
     Canvas,
     Image,
     Icon,
+    /// A `<textarea>`: the field of many lines. A separate kind because
+    /// the ELEMENT differs — a field that changes shape is recreated,
+    /// which is the only way an input becomes a textarea.
+    Editor,
 }
 
 /// One island's fresh pixels — the shell blits them into the island's
@@ -740,7 +747,13 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::Group { .. } => CreateKind::Group,
         DomKind::Box => CreateKind::Box,
         DomKind::Text(_) => CreateKind::Text,
-        DomKind::Field(_) => CreateKind::Field,
+        DomKind::Field(field) => {
+            if field.multiline {
+                CreateKind::Editor
+            } else {
+                CreateKind::Field
+            }
+        }
         DomKind::Scroll { .. } => CreateKind::Scroll,
         DomKind::Content => CreateKind::Content,
         DomKind::Canvas { .. } => CreateKind::Canvas,
@@ -1003,7 +1016,9 @@ fn diff_children(
 /// per patch: u8 op, u32 id, payload
 ///   1 create        u32 parent, u8 kind (0 group, 1 box, 2 text,
 ///                                        3 field, 4 scroll, 5 content,
-///                                        6 canvas, 7 image, 8 icon)
+///                                        6 canvas, 7 image, 8 icon,
+///                                        9 editor — the field of many
+///                                        lines, a `<textarea>`)
 ///   2 remove        —
 ///   3 set transform f32 x, f32 y
 ///   4 set size      f32 w, f32 h
@@ -1089,6 +1104,7 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
                     CreateKind::Canvas => 6,
                     CreateKind::Image => 7,
                     CreateKind::Icon => 8,
+                    CreateKind::Editor => 9,
                 });
             }
             DomPatch::Remove { id } => {
@@ -1679,6 +1695,60 @@ mod tests {
             DomPatch::SetField { field, .. } => assert_eq!(field.content.as_ref(), "x"),
             other => panic!("a field patch, not {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_many_line_field_mounts_as_a_textarea() {
+        // two components, so the two trees never share an identity —
+        // and neither does anything the reconciler retains under it
+        #[derive(Clone)]
+        struct Note {
+            text: State<String>,
+        }
+        #[derive(Clone)]
+        struct Name {
+            text: State<String>,
+        }
+
+        impl Component for Note {
+            fn body(self, _ctx: &Context) -> impl View {
+                text_editor("note", self.text.binding())
+            }
+        }
+        impl Component for Name {
+            fn body(self, _ctx: &Context) -> impl View {
+                text_field("note", self.text.binding())
+            }
+        }
+
+        let size = Size { width: 200.0, height: 80.0 };
+        fn kind_of(root: &impl View, size: Size) -> CreateKind {
+            let runtime = Runtime::new();
+            runtime
+                .dom_frame(root, size)
+                .into_iter()
+                .find_map(|patch| match patch {
+                    DomPatch::Create { kind, .. } if kind != CreateKind::Group => Some(kind),
+                    _ => None,
+                })
+                .expect("the field mounts")
+        }
+        // the ELEMENT differs, so the kind does: an input cannot become
+        // a textarea in place, and a swapped kind recreates the element
+        assert_eq!(kind_of(&Note { text: State::new(String::new()) }, size), CreateKind::Editor);
+        assert_eq!(kind_of(&Name { text: State::new(String::new()) }, size), CreateKind::Field);
+
+        // the wire says 9, beside the eight that came before it
+        let runtime = Runtime::new();
+        let view = Note { text: State::new(String::new()) };
+        let bytes = encode(&runtime.dom_frame(&view, size));
+        let creates: Vec<u8> = bytes
+            .windows(2)
+            .filter(|pair| pair[0] == 1)
+            .map(|pair| pair[1])
+            .collect();
+        assert!(!creates.is_empty(), "the stream carries at least one create");
+        assert!(bytes.contains(&9), "the editor kind rides the stream: {creates:?}");
     }
 
     #[test]

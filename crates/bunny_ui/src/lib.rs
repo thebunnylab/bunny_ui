@@ -3917,6 +3917,250 @@ mod tests {
     }
 
     #[test]
+    fn a_many_line_field_takes_the_box_and_wraps_inside_it() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+        use crate::text_input::EditCommand;
+
+        #[derive(Clone, Copy)]
+        struct Panel {
+            note: State<String>,
+            name: State<String>,
+        }
+
+        impl Component for Panel {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack((
+                    text_editor("write a note", self.note.binding()).frame(120.0, 72.0),
+                    text_field("name", self.name.binding()).frame_width(120.0),
+                ))
+            }
+        }
+
+        // 120 wide is thirteen cells of run; the line is sixteen tall
+        const NOTE: &str = "one two three four five six";
+        let panel = Panel {
+            note: State::new(NOTE.to_string()),
+            name: State::new(String::new()),
+        };
+        let runtime = Runtime::new();
+        runtime.render_stable(&panel);
+        let viewport = Proposal::exact(Size { width: 240.0, height: 200.0 });
+        let result = runtime.layout(&panel, viewport);
+
+        let box_of = |result: &crate::layout::LayoutResult, tall: bool| {
+            result
+                .hits
+                .iter()
+                .find(|(_, rect)| (rect.size.height > 40.0) == tall)
+                .cloned()
+                .expect("both fields are targets")
+        };
+        let (note_path, note_frame) = box_of(&result, true);
+        let (name_path, _) = box_of(&result, false);
+
+        // the height the parent gave IS the box — not a hole with one
+        // line centred in it
+        assert_eq!(note_frame.size.height, 72.0);
+        assert_eq!(note_frame.size.width, 120.0, "and a long line never widened it");
+
+        // the note wraps by word: two runs, one line apart
+        let runs = |result: &crate::layout::LayoutResult| {
+            result
+                .display
+                .iter()
+                .filter_map(|command| match command {
+                    DrawCommand::TextLine { origin, content, range, .. }
+                        if content.starts_with("one two") =>
+                    {
+                        Some((origin.y, content[range.0..range.1].to_string()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let wrapped = runs(&result);
+        assert_eq!(wrapped.len(), 2, "{wrapped:?}");
+        assert_eq!(wrapped[0].1, "one two three ");
+        assert_eq!(wrapped[1].1, "four five six");
+        assert_eq!(wrapped[1].0 - wrapped[0].0, 16.0, "one line apart");
+
+        // a press picks the line by its Y — the second run, not the first
+        let second = note_frame.origin.y + 5.0 + 20.0;
+        assert!(runtime.pointer_clicked(note_frame.origin.x + 8.0, second, 1, false));
+        assert_eq!(runtime.focused(), Some(note_path.clone()));
+        assert_eq!(
+            runtime.ime_snapshot().expect("focused").selected,
+            (14, 0),
+            "the caret landed at the start of the second line",
+        );
+
+        // and a third click takes THAT line, not the whole note
+        runtime.pointer_clicked(note_frame.origin.x + 8.0, second, 3, false);
+        runtime.pointer_released(note_frame.origin.x + 8.0, second);
+        assert_eq!(runtime.ime_snapshot().expect("focused").selected, (14, 13));
+
+        // more text does not grow the box: it rolls inside it
+        assert!(runtime.key(EditCommand::SelectAll).applied);
+        assert!(runtime.key(EditCommand::Insert(
+            "alpha bravo charlie delta echo foxtrot golf hotel india".into()
+        )).applied);
+        let grown = runtime.layout(&panel, viewport);
+        assert_eq!(box_of(&grown, true).1.size.height, 72.0, "the box held");
+        assert!(
+            runtime.scroll_offset(&note_path).y > 0.0,
+            "the caret at the tail rolled the note under the box",
+        );
+        // and the rolled offset is a whole number of lines' worth, never
+        // past the end of the text
+        let offset = runtime.scroll_offset(&note_path).y;
+        assert!(runtime.key(EditCommand::Home(false)).applied);
+        assert_eq!(runtime.scroll_offset(&note_path).y, 0.0, "Home brought it back");
+        assert!(offset > 0.0);
+
+        // the one-line field beside it kept its own natural height
+        let (_, name_frame) = box_of(&runtime.layout(&panel, viewport), false);
+        assert_eq!(name_frame.size.height, 26.0);
+        assert_eq!(name_path, name_path);
+    }
+
+    #[test]
+    fn a_many_line_field_fills_the_height_the_stack_offers() {
+        use crate::layout::{Proposal, Size};
+
+        // two components, so the two trees never share an identity —
+        // and neither does anything the reconciler retains under it
+        #[derive(Clone, Copy)]
+        struct Note {
+            text: State<String>,
+        }
+        #[derive(Clone, Copy)]
+        struct Name {
+            text: State<String>,
+        }
+
+        impl Component for Note {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack((text("head"), text_editor("note", self.text.binding())))
+            }
+        }
+        impl Component for Name {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack((text("head"), text_field("note", self.text.binding())))
+            }
+        }
+
+        let viewport = Proposal::exact(Size { width: 240.0, height: 200.0 });
+        fn box_of(root: &impl View, viewport: Proposal) -> crate::layout::Rect {
+            let runtime = Runtime::new();
+            runtime.render_stable(root);
+            runtime.layout(root, viewport).hits.last().expect("the field is a target").1
+        }
+
+        // the many-line field is the only flexible one in the stack, so
+        // the leftover is all its own — it reaches the bottom
+        let many = box_of(&Note { text: State::new(String::new()) }, viewport);
+        assert!(many.size.height > 100.0, "took the leftover: {}", many.size.height);
+        assert_eq!(many.origin.y + many.size.height, 200.0, "down to the last point");
+
+        // the one-line field in the same place keeps its natural height:
+        // flexible is a DECLARATION, never a side effect of the room
+        assert_eq!(box_of(&Name { text: State::new(String::new()) }, viewport).size.height, 26.0);
+    }
+
+    #[test]
+    fn the_many_line_field_owns_the_break_and_the_vertical_arrows() {
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::EditCommand;
+
+        #[derive(Clone, Copy)]
+        struct Panel {
+            note: State<String>,
+            name: State<String>,
+        }
+
+        impl Component for Panel {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack((
+                    text_editor("write a note", self.note.binding()).frame(120.0, 72.0),
+                    text_field("name", self.name.binding()).frame_width(120.0),
+                ))
+            }
+        }
+
+        let panel = Panel {
+            note: State::new(String::new()),
+            name: State::new("deco".to_string()),
+        };
+        let runtime = Runtime::new();
+        runtime.render_stable(&panel);
+        let viewport = Proposal::exact(Size { width: 240.0, height: 200.0 });
+        let result = runtime.layout(&panel, viewport);
+        let box_of = |result: &crate::layout::LayoutResult, tall: bool| {
+            result
+                .hits
+                .iter()
+                .find(|(_, rect)| (rect.size.height > 40.0) == tall)
+                .cloned()
+                .expect("both fields are targets")
+        };
+        let (_, note_frame) = box_of(&result, true);
+        let (_, name_frame) = box_of(&result, false);
+        let into = |frame: crate::layout::Rect| {
+            (frame.origin.x + 8.0, frame.origin.y + frame.size.height / 2.0)
+        };
+
+        // the break belongs to the many-line field
+        let (x, y) = into(note_frame);
+        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_released(x, y);
+        assert!(runtime.key(EditCommand::Insert("ab".into())).applied);
+        assert!(runtime.key(EditCommand::Newline).applied, "the note takes a break");
+        assert!(runtime.key(EditCommand::Insert("cd".into())).applied);
+        assert_eq!(panel.note.get(), "ab\ncd", "the break landed in the app's own string");
+
+        // and NOT to the one-line one: it declines, so the app's binding
+        // hears the stroke and `\u{2318}\u{21a9}` keeps meaning commit
+        let (x, y) = into(name_frame);
+        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_released(x, y);
+        assert!(!runtime.key(EditCommand::Newline).applied, "a one-line field declines");
+        assert!(!runtime.key(EditCommand::Up(false)).applied, "and the arrows too");
+        assert_eq!(panel.name.get(), "deco", "untouched");
+
+        // a paste of many lines into the one-line field arrives flat
+        assert!(runtime.key(EditCommand::SelectAll).applied);
+        assert!(runtime.key(EditCommand::Insert("two\nlines".into())).applied);
+        assert_eq!(panel.name.get(), "two lines");
+
+        // the vertical arrows walk the note's visual lines and KEEP the
+        // column across a short one
+        let (x, y) = into(note_frame);
+        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_released(x, y);
+        // three lines of twelve, one and twelve cells — none of them
+        // wide enough to wrap inside the box
+        assert!(runtime.key(EditCommand::SelectAll).applied);
+        assert!(runtime.key(EditCommand::Insert("first line x\ny\nthird line z".into())).applied);
+        let selected = || runtime.ime_snapshot().expect("focused").selected;
+        assert_eq!(selected(), (27, 0), "at the tail of the third line, column twelve");
+        assert!(runtime.key(EditCommand::Up(false)).applied);
+        assert_eq!(selected(), (14, 0), "the short line has no column twelve — its end");
+        assert!(runtime.key(EditCommand::Up(false)).applied);
+        assert_eq!(selected(), (12, 0), "and the column came back on the long one");
+        assert!(runtime.key(EditCommand::Down(true)).applied);
+        assert_eq!(selected(), (12, 2), "shift extends the walk");
+
+        // off the top is the start of the note; off the bottom, the end
+        assert!(runtime.key(EditCommand::Up(false)).applied);
+        assert!(runtime.key(EditCommand::Up(false)).applied);
+        assert_eq!(selected(), (0, 0));
+        for _ in 0..4 {
+            assert!(runtime.key(EditCommand::Down(false)).applied);
+        }
+        assert_eq!(selected(), (27, 0));
+    }
+
+    #[test]
     fn actions_register_dispatch_and_the_innermost_wins() {
         const PING: ActionId = ActionId("test.ping");
 

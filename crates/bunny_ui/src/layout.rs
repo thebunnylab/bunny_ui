@@ -397,15 +397,19 @@ pub enum LayoutNode {
     /// render (`key` is `None` outside a pass — the scope is inert).
     /// Transparent to geometry; in Dom it lowers to a CSS transition.
     Animated { key: Option<Rc<str>>, spec: crate::anim::Spring, child: Box<LayoutNode> },
-    /// ONE-line text field — semantic end to end (in Dom it becomes an
-    /// `<input>`; in Gpu, chrome + text + caret + selection from here).
-    /// Focus, caret, selection and IME composition do NOT live here:
-    /// placement consults the env's [`FrameStamp`] by `path` — the tree
-    /// never carries frame state.
+    /// Text field — semantic end to end (in Dom it becomes an `<input>`
+    /// or a `<textarea>`; in Gpu, chrome + text + caret + selection
+    /// from here). Focus, caret, selection and IME composition do NOT
+    /// live here: placement consults the env's [`FrameStamp`] by
+    /// `path` — the tree never carries frame state.
     Field {
         path: String,
         content: Arc<str>,
         placeholder: Arc<str>,
+        /// One line, or many. A one-line field is rigid in height and
+        /// scrolls sideways; a many-line one takes the height the
+        /// parent offers, wraps inside it, and scrolls down.
+        multiline: bool,
         /// `.auto_focus()`: the runtime focuses this field on its FIRST
         /// appearance — and never again (a user blur is final).
         auto_focus: bool,
@@ -1369,6 +1373,12 @@ struct QueuedOverlay {
 pub struct FieldPlacement {
     pub path: String,
     pub frame: Rect,
+    /// One line, or many — the runtime asks before it hands the field
+    /// a break or a vertical arrow.
+    pub multiline: bool,
+    /// One visual line's height: the step between wrapped lines, and
+    /// what a vertical arrow travels.
+    pub line_height: Px,
     /// The box the run may occupy — the frame minus the field's own
     /// padding. The runtime keeps the caret inside THIS; the padding
     /// itself stays layout's business.
@@ -1377,6 +1387,16 @@ pub struct FieldPlacement {
     pub font: FontSpec,
     /// The field asked for focus on first appearance.
     pub auto_focus: bool,
+}
+
+/// Which visual line owns a byte: the FIRST whose end reaches it, so a
+/// caret at a break belongs to the line it was typed on and not to the
+/// one after. Never empty — a field always has at least one line.
+pub fn line_of(lines: &[(usize, usize)], byte: usize) -> usize {
+    lines
+        .iter()
+        .position(|&(_, end)| byte <= end)
+        .unwrap_or(lines.len().saturating_sub(1))
 }
 
 /// A placed split — the geometry the runtime needs to route a divider
@@ -2219,8 +2239,10 @@ impl LayoutNode {
                 Axis::Vertical => axes.vertical(),
                 Axis::Horizontal => axes.horizontal(),
             },
-            // a field takes the offered width (like the real TextField)
-            LayoutNode::Field { .. } => axis == Axis::Horizontal,
+            // a field takes the offered width (like the real TextField),
+            // and a many-line one takes the offered HEIGHT: `.frame_height`
+            // then sizes the BOX, instead of centring one line in a hole
+            LayoutNode::Field { multiline, .. } => axis == Axis::Horizontal || *multiline,
             LayoutNode::MaxFrame { max_width, max_height, child, .. } => match axis {
                 Axis::Horizontal => max_width.is_infinite() || child.is_flexible(axis),
                 Axis::Vertical => max_height.is_infinite() || child.is_flexible(axis),
@@ -2352,15 +2374,23 @@ impl LayoutNode {
                 (size, Fit::Leaf)
             }
 
-            LayoutNode::Field { content, placeholder, .. } => {
+            LayoutNode::Field { content, placeholder, multiline, .. } => {
                 let sample: &str = if content.is_empty() { placeholder } else { content };
                 let metrics = env.cache.get_or_measure(sample, &env.font, env.text);
                 let natural = metrics.width + 2.0 * FIELD_PAD_H;
-                let size = Size {
-                    width: proposal.width.unwrap_or(natural),
-                    height: metrics.height() + 2.0 * FIELD_PAD_V,
+                let width = proposal.width.unwrap_or(natural);
+                let height = match multiline {
+                    // the box the parent gives, and the text wraps
+                    // INSIDE it: a long line never widens the column,
+                    // and a tall text never grows the box — it scrolls
+                    true => proposal.height.unwrap_or_else(|| {
+                        let inner = (width - 2.0 * FIELD_PAD_H).max(1.0);
+                        let lines = env.cache.get_or_break(sample, &env.font, inner, env.text);
+                        lines.len() as Px * metrics.height() + 2.0 * FIELD_PAD_V
+                    }),
+                    false => metrics.height() + 2.0 * FIELD_PAD_V,
                 };
-                (size, Fit::Leaf)
+                (Size { width, height }, Fit::Leaf)
             }
 
             LayoutNode::Leaf { size } => (*size, Fit::Leaf),
@@ -2685,7 +2715,11 @@ impl LayoutNode {
                 });
             }
 
-            (LayoutNode::Field { path, content, placeholder, auto_focus }, Fit::Leaf) => {
+            (
+                LayoutNode::Field { path, content, placeholder, multiline, auto_focus },
+                Fit::Leaf,
+            ) => {
+                let multiline = *multiline;
                 if out.dom.is_some() {
                     // the browser's input owns focus, caret and
                     // composition — the record carries what to SHOW,
@@ -2705,6 +2739,7 @@ impl LayoutNode {
                                 placeholder: placeholder.clone(),
                                 font: env.font,
                                 color,
+                                multiline,
                             }),
                             frame,
                             crate::dom::DomStyle {
@@ -2745,93 +2780,134 @@ impl LayoutNode {
                     color: theme.field,
                     corner_radius: FIELD_RADIUS,
                 });
+                // the placeholder walks the SAME path as the real text:
+                // same origin, same font, same breaks — only the ink drops
+                let sample: &Arc<str> = if content.is_empty() { placeholder } else { content };
+                // a many-line field asks a PROBE for the line height
+                // instead of measuring a whole note as one line; a
+                // one-line field measures what it draws, as it always did
                 let metrics = env.cache.get_or_measure(
-                    if content.is_empty() { placeholder } else { content },
+                    if multiline { "0" } else { sample },
                     &env.font,
                     env.text,
                 );
+                let line_h = metrics.height();
+                let inner = (frame.size.width - 2.0 * FIELD_PAD_H).max(0.0);
+                let inner_h = (frame.size.height - 2.0 * FIELD_PAD_V).max(0.0);
+                // one shape, one loop: the one-line field is the field
+                // whose list of lines has one entry
+                let single = [(0usize, sample.len())];
+                let broken;
+                let lines: &[(usize, usize)] = if multiline {
+                    broken = env.cache.get_or_break(sample, &env.font, inner, env.text);
+                    &broken
+                } else {
+                    &single
+                };
                 // the run scrolls UNDER the box to keep the caret in
                 // sight. The offset is engine state written by the
                 // runtime from the caret — the same map a scroll box
                 // reads, keyed by the field's own path — and it clamps
                 // against THIS frame: a field that widens never leaves
-                // a gap after the last glyph.
-                let inner = (frame.size.width - 2.0 * FIELD_PAD_H).max(0.0);
-                let overflow = (metrics.width - inner).max(0.0);
-                let offset = env
-                    .scroll_offsets
-                    .get(path)
-                    .map(|point| point.x)
-                    .unwrap_or(0.0)
-                    .clamp(0.0, overflow);
+                // a gap after the last glyph. A wrapped field has
+                // nothing to give sideways, so it only ever rolls down
+                let overflow_x =
+                    if multiline { 0.0 } else { (metrics.width - inner).max(0.0) };
+                let overflow_y = (lines.len() as Px * line_h - inner_h).max(0.0);
+                let scroll = env.scroll_offsets.get(path).copied().unwrap_or_default();
+                let offset = Point {
+                    x: scroll.x.clamp(0.0, overflow_x),
+                    y: scroll.y.clamp(0.0, overflow_y),
+                };
                 let text_origin = Point {
-                    x: frame.origin.x + FIELD_PAD_H - offset,
-                    y: frame.origin.y + FIELD_PAD_V,
+                    x: frame.origin.x + FIELD_PAD_H - offset.x,
+                    y: frame.origin.y + FIELD_PAD_V - offset.y,
                 };
                 // everything the field writes is cut by its own box:
                 // a string longer than the field stops at the border
                 // instead of painting over the neighbour
                 out.push_clip(frame, FIELD_RADIUS);
-                let prefix_width = |end: usize| {
-                    env.cache.get_or_measure(&content[..end], &env.font, env.text).width
+                let width_of = |from: usize, to: usize| {
+                    env.cache.get_or_measure(&sample[from..to], &env.font, env.text).width
                 };
-                // selection behind the text
-                if let Some((start, end)) = selection {
-                    let x0 = text_origin.x + prefix_width(start);
-                    let x1 = text_origin.x + prefix_width(end);
-                    out.display.push(DrawCommand::FillRect {
-                        rect: Rect {
-                            origin: Point { x: x0, y: text_origin.y },
-                            size: Size { width: x1 - x0, height: metrics.height() },
-                        },
-                        color: theme.selection,
-                        corner_radius: 0.0,
-                    });
-                }
-                if content.is_empty() {
-                    if !placeholder.is_empty() {
-                        // the placeholder walks the SAME path as the real
-                        // text: same origin, same font, only the color
-                        // drops
+                let color = if content.is_empty() {
+                    theme.placeholder
+                } else {
+                    out.foreground.last().copied().unwrap_or(theme.fg)
+                };
+                for (index, &(start, end)) in lines.iter().enumerate() {
+                    let y = text_origin.y + index as Px * line_h;
+                    // a note of a thousand lines pays for the ones that
+                    // show — the same discipline the row window keeps
+                    if y + line_h <= frame.origin.y
+                        || y >= frame.origin.y + frame.size.height
+                    {
+                        continue;
+                    }
+                    // selection behind the text
+                    if let Some((from, to)) = selection {
+                        let head = from.clamp(start, end);
+                        let tail = to.clamp(start, end);
+                        // a break INSIDE the selection reads as a sliver
+                        // at the end of its line — without it a selected
+                        // empty line would show nothing at all
+                        let over = to > end && from <= end;
+                        if head < tail || over {
+                            let x0 = text_origin.x + width_of(start, head);
+                            let x1 = text_origin.x
+                                + width_of(start, tail)
+                                + if over { line_h / 2.0 } else { 0.0 };
+                            out.display.push(DrawCommand::FillRect {
+                                rect: Rect {
+                                    origin: Point { x: x0, y },
+                                    size: Size { width: x1 - x0, height: line_h },
+                                },
+                                color: theme.selection,
+                                corner_radius: 0.0,
+                            });
+                        }
+                    }
+                    if start < end {
                         out.display.push(DrawCommand::TextLine {
-                            origin: text_origin,
-                            content: placeholder.clone(),
-                            range: (0, placeholder.len()),
-                            color: theme.placeholder,
+                            origin: Point { x: text_origin.x, y },
+                            content: sample.clone(),
+                            range: (start, end),
+                            color,
                             font: env.font,
                         });
                     }
-                } else {
-                    let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
-                    out.display.push(DrawCommand::TextLine {
-                        origin: text_origin,
-                        content: content.clone(),
-                        range: (0, content.len()),
-                        color,
-                        font: env.font,
-                    });
+                    // the live composition gets the IME underline (the
+                    // caret's ink — the composition's visual pair)
+                    if let Some((from, to)) = marked {
+                        let head = from.clamp(start, end);
+                        let tail = to.clamp(start, end);
+                        if head < tail {
+                            let x0 = text_origin.x + width_of(start, head);
+                            let x1 = text_origin.x + width_of(start, tail);
+                            out.display.push(DrawCommand::FillRect {
+                                rect: Rect {
+                                    origin: Point { x: x0, y: y + line_h - 1.0 },
+                                    size: Size { width: x1 - x0, height: 1.0 },
+                                },
+                                color: theme.caret,
+                                corner_radius: 0.0,
+                            });
+                        }
+                    }
                 }
-                // the live composition gets the IME underline (the
-                // caret's ink — the composition's visual pair)
-                if let Some((start, end)) = marked {
-                    let x0 = text_origin.x + prefix_width(start);
-                    let x1 = text_origin.x + prefix_width(end);
-                    out.display.push(DrawCommand::FillRect {
-                        rect: Rect {
-                            origin: Point { x: x0, y: text_origin.y + metrics.height() - 1.0 },
-                            size: Size { width: x1 - x0, height: 1.0 },
-                        },
-                        color: theme.caret,
-                        corner_radius: 0.0,
-                    });
-                }
-                // caret on top (the blink alternates via the stamp)
+                // caret on top (the blink alternates via the stamp).
+                // It belongs to the EARLIER line at a break, so End on a
+                // wrapped line shows it where the typing is
                 if let Some(caret) = caret {
-                    let x = text_origin.x + prefix_width(caret);
+                    let index = line_of(lines, caret);
+                    let (start, _) = lines[index];
                     out.display.push(DrawCommand::FillRect {
                         rect: Rect {
-                            origin: Point { x, y: text_origin.y },
-                            size: Size { width: FIELD_CARET_W, height: metrics.height() },
+                            origin: Point {
+                                x: text_origin.x + width_of(start, caret.max(start)),
+                                y: text_origin.y + index as Px * line_h,
+                            },
+                            size: Size { width: FIELD_CARET_W, height: line_h },
                         },
                         color: theme.caret,
                         corner_radius: FIELD_CARET_W / 2.0,
@@ -2861,10 +2937,12 @@ impl LayoutNode {
                             x: frame.origin.x + FIELD_PAD_H,
                             y: frame.origin.y + FIELD_PAD_V,
                         },
-                        size: Size { width: inner, height: metrics.height() },
+                        size: Size { width: inner, height: inner_h },
                     },
                     text_origin,
                     font: env.font,
+                    line_height: line_h,
+                    multiline,
                     auto_focus: *auto_focus,
                 });
             }

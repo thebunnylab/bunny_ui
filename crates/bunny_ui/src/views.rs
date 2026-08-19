@@ -171,14 +171,16 @@ where
     Button { label, action }
 }
 
-/// `TextField("Placeholder", text: $binding)` — a ONE-line field. The app
-/// owns the STRING (the binding); the framework owns caret, selection and
-/// focus (by structural identity, like scroll). Editing arrives through a
-/// closure retained in the reconciler — a skipped view's field stays editable.
+/// `TextField("Placeholder", text: $binding)` — a field of one line, or
+/// of many. The app owns the STRING (the binding); the framework owns
+/// caret, selection and focus (by structural identity, like scroll).
+/// Editing arrives through a closure retained in the reconciler — a
+/// skipped view's field stays editable.
 #[derive(Clone)]
 pub struct TextField {
     placeholder: Arc<str>,
     text: Binding<String>,
+    multiline: bool,
 }
 
 impl View for TextField {
@@ -194,9 +196,23 @@ impl View for TextField {
         match motor::identity::cursor_scope() {
             Some(path) => {
                 let binding = self.text.clone();
+                let multiline = self.multiline;
                 crate::reconciler::attribute_editor(
                     path.clone(),
                     Rc::new(move |command, state| {
+                        // a ONE-line field cannot hold a break: a paste
+                        // of several lines arrives flattened, the way
+                        // every one-line field on every platform takes it
+                        let command = match command {
+                            crate::text_input::EditCommand::Insert(text)
+                                if !multiline && text.contains('\n') =>
+                            {
+                                crate::text_input::EditCommand::Insert(
+                                    text.replace('\n', " "),
+                                )
+                            }
+                            command => command,
+                        };
                         let mut value = binding.wrappedValue();
                         let original = value.clone();
                         let output = crate::text_input::apply(&mut value, state, command);
@@ -212,6 +228,7 @@ impl View for TextField {
                     path,
                     content: Arc::from(value),
                     placeholder: self.placeholder.clone(),
+                    multiline: self.multiline,
                     auto_focus: false,
                 });
             }
@@ -405,7 +422,20 @@ where
 }
 
 pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> TextField {
-    TextField { placeholder: Arc::from(placeholder.into()), text }
+    TextField { placeholder: Arc::from(placeholder.into()), text, multiline: false }
+}
+
+/// `TextEditor("Placeholder", text: $binding)` — the same field, of
+/// MANY lines. It takes the height the parent gives it (`.frame_height`
+/// then sizes the BOX), wraps by word inside that width so a long line
+/// never widens the column, and scrolls down when the text outgrows the
+/// box — the height never chases the content.
+///
+/// Enter inserts a break here, and only here: a one-line field lets the
+/// stroke through to the app's bindings, so a chord like `⌘↵` keeps
+/// meaning what the app says it means.
+pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> TextField {
+    TextField { placeholder: Arc::from(placeholder.into()), text, multiline: true }
 }
 
 /// `ProgressView()`

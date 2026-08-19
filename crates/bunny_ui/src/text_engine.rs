@@ -358,11 +358,42 @@ pub fn break_lines(
     cache: &MeasureCache,
 ) -> Vec<(usize, usize)> {
     let mut lines = Vec::new();
-    let mut line_start = 0usize;
-    let mut cursor = 0usize;
+    let mut paragraph = 0usize;
+    loop {
+        // a hard break ends a paragraph whatever the width says, and
+        // the break itself belongs to NO line: the caret sits at the
+        // end of one and at the start of the next
+        let stop = text[paragraph..]
+            .find('\n')
+            .map(|offset| paragraph + offset)
+            .unwrap_or(text.len());
+        wrap_paragraph(text, paragraph, stop, font, max_width, engine, cache, &mut lines);
+        if stop == text.len() {
+            return lines;
+        }
+        paragraph = stop + 1;
+    }
+}
 
-    while cursor < text.len() {
-        let rest = &text[cursor..];
+/// One paragraph's soft breaks, pushed in order. Always pushes at
+/// least one line — an empty paragraph is an empty visual line, which
+/// is where a caret goes after a lone break.
+#[allow(clippy::too_many_arguments)]
+fn wrap_paragraph(
+    text: &str,
+    start: usize,
+    stop: usize,
+    font: &FontSpec,
+    max_width: Px,
+    engine: &dyn TextEngine,
+    cache: &MeasureCache,
+    lines: &mut Vec<(usize, usize)>,
+) {
+    let mut line_start = start;
+    let mut cursor = start;
+
+    while cursor < stop {
+        let rest = &text[cursor..stop];
         let is_space = rest.starts_with(' ');
         let token_len = if is_space {
             rest.find(|c| c != ' ').unwrap_or(rest.len())
@@ -402,8 +433,7 @@ pub fn break_lines(
         }
         cursor = token_end;
     }
-    lines.push((line_start, text.len()));
-    lines
+    lines.push((line_start, stop));
 }
 
 // MARK: - Measurement cache

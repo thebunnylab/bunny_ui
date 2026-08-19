@@ -96,6 +96,10 @@ pub struct Runtime {
     /// typing or focusing returns it to solid (an idle caret blinks,
     /// an active one does not).
     caret_visible: Cell<bool>,
+    /// The column a vertical walk keeps while it crosses short lines.
+    /// Any other caret move clears it — the walk starts fresh from
+    /// wherever the caret now stands.
+    goal_column: Cell<Option<Px>>,
     /// The fields of the last layout (geometry + effective font) —
     /// click-to-position and IME sync measure through here.
     last_fields: RefCell<Vec<FieldPlacement>>,
@@ -606,6 +610,7 @@ impl Runtime {
             focus: RefCell::new(None),
             carets: RefCell::new(HashMap::default()),
             caret_visible: Cell::new(true),
+            goal_column: Cell::new(None),
             last_fields: RefCell::new(Vec::new()),
             last_splits: RefCell::new(Vec::new()),
             last_customs: RefCell::new(Vec::new()),
@@ -774,7 +779,7 @@ impl Runtime {
         let swept = self.interaction.borrow().field_drag.clone();
         if let Some(path) = swept {
             self.interaction.borrow_mut().pointer = Some(Point { x, y });
-            return self.sweep_to(&path, x);
+            return self.sweep_to(&path, x, y);
         }
         // a box that took the press owns every move until the release —
         // dragging a selection past the frame is one gesture, not two
@@ -1190,7 +1195,7 @@ impl Runtime {
         // release, so a sweep that leaves the box stays one gesture
         if let Some(path) = target.as_deref().filter(|path| reconciler::has_editor(path)) {
             let path = path.to_string();
-            self.select_at(&path, x, clicks, shift);
+            self.select_at(&path, x, y, clicks, shift);
             let mut interaction = self.interaction.borrow_mut();
             interaction.pointer = Some(Point { x, y });
             interaction.hovered = Some(path.clone());
@@ -1514,11 +1519,12 @@ impl Runtime {
     /// clicks take the word under the pointer, three take the line. And
     /// `shift` keeps the anchor where it already was, which is the
     /// keyboard's own extend done with the mouse.
-    fn select_at(&self, path: &str, x: Px, clicks: u8, shift: bool) {
+    fn select_at(&self, path: &str, x: Px, y: Px, clicks: u8, shift: bool) {
         self.caret_visible.set(true);
+        self.goal_column.set(None);
         let held = self.focus.borrow().as_deref() == Some(path);
         *self.focus.borrow_mut() = Some(path.to_string());
-        let Some((text, caret)) = self.caret_under(path, x) else {
+        let Some((text, caret, line)) = self.caret_under(path, x, y) else {
             self.carets
                 .borrow_mut()
                 .entry(path.to_string())
@@ -1527,9 +1533,9 @@ impl Runtime {
         };
         let previous = self.carets.borrow().get(path).copied().unwrap_or_default();
         let state = match clicks {
-            // the third click takes the line — and a one-line field IS
-            // the line
-            3.. => CaretState { caret: text.len(), anchor: Some(0), marked: None },
+            // the third click takes the line under the hand — and a
+            // one-line field IS the line
+            3.. => CaretState { caret: line.1, anchor: Some(line.0), marked: None },
             2 => {
                 let (start, end) = word_around(&text, caret);
                 CaretState { caret: end, anchor: Some(start), marked: None }
@@ -1552,8 +1558,9 @@ impl Runtime {
     /// A move with the button down: the caret walks to the pointer and
     /// the anchor stays put. `true` = the selection moved and the frame
     /// must repaint.
-    fn sweep_to(&self, path: &str, x: Px) -> bool {
-        let Some((_, caret)) = self.caret_under(path, x) else { return false };
+    fn sweep_to(&self, path: &str, x: Px, y: Px) -> bool {
+        self.goal_column.set(None);
+        let Some((_, caret, _)) = self.caret_under(path, x, y) else { return false };
         let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
         if state.caret == caret {
             return false;
@@ -1568,26 +1575,60 @@ impl Runtime {
         true
     }
 
-    /// The field's text and the byte the pointer's X names in it —
-    /// `None` when the path holds no editor.
-    fn caret_under(&self, path: &str, x: Px) -> Option<(String, usize)> {
+    /// What the pointer names inside a field: its text, the byte under
+    /// the point, and the VISUAL LINE the point landed on — `None` when
+    /// the path holds no editor. In a many-line field the Y picks the
+    /// line and the X the byte inside it; a one-line field is one line,
+    /// and the Y is nothing at all.
+    ///
+    /// The line comes from the pointer, never from the byte: a caret
+    /// sitting exactly on a break belongs to the line it was typed on,
+    /// and a third click there must still take the line under the hand.
+    fn caret_under(&self, path: &str, x: Px, y: Px) -> Option<(String, usize, (usize, usize))> {
         let mut probe = CaretState::default();
         let text = reconciler::run_editor(path, EditCommand::Read, &mut probe)??;
-        let placement = self
-            .last_fields
-            .borrow()
-            .iter()
-            .find(|field| field.path == path)
-            .cloned();
-        let caret = match placement {
-            Some(field) => {
-                caret_from_x(&text, x - field.text_origin.x, &field.font, &*self.text, &self.cache)
+        let whole = (0, text.len());
+        let placement = self.field_at(path);
+        let (caret, line) = match placement {
+            Some(field) if field.multiline => {
+                let lines = self.wrap(&text, &field);
+                let row = ((y - field.text_origin.y) / field.line_height).floor();
+                let row = (row.max(0.0) as usize).min(lines.len().saturating_sub(1));
+                let (start, end) = lines[row];
+                let caret = start
+                    + caret_from_x(
+                        &text[start..end],
+                        x - field.text_origin.x,
+                        &field.font,
+                        &*self.text,
+                        &self.cache,
+                    );
+                (caret, (start, end))
             }
+            Some(field) => (
+                caret_from_x(&text, x - field.text_origin.x, &field.font, &*self.text, &self.cache),
+                whole,
+            ),
             // before the first layout there is no run to measure
             // against: the caret goes to the end, as it always did
-            None => text.len(),
+            None => (text.len(), whole),
         };
-        Some((text, caret))
+        Some((text, caret, line))
+    }
+
+    /// The geometry the last layout recorded for a field.
+    fn field_at(&self, path: &str) -> Option<crate::layout::FieldPlacement> {
+        self.last_fields.borrow().iter().find(|field| field.path == path).cloned()
+    }
+
+    /// The field's visual lines — the SAME break the placement drew,
+    /// because it is the same call against the same cache.
+    fn wrap(
+        &self,
+        text: &str,
+        field: &crate::layout::FieldPlacement,
+    ) -> std::rc::Rc<Vec<(usize, usize)>> {
+        self.cache.get_or_break(text, &field.font, field.run.size.width, &*self.text)
     }
 
     /// The run follows the caret: the field scrolls its own text so the
@@ -1595,15 +1636,12 @@ impl Runtime {
     /// the caret, the string, and the geometry of the last layout — and
     /// it lands where a scroll box keeps its own, under the field's
     /// path. The app writes nothing and reads nothing.
+    ///
+    /// A one-line field rolls sideways; a wrapped one has nothing to
+    /// give sideways and rolls DOWN, one visual line at a time.
     fn reveal_caret(&self, path: &str) {
-        let field = self
-            .last_fields
-            .borrow()
-            .iter()
-            .find(|field| field.path == path)
-            .cloned();
         // before the first layout there is no box to scroll inside
-        let Some(field) = field else { return };
+        let Some(field) = self.field_at(path) else { return };
         let mut probe = CaretState::default();
         let Some(Some(text)) = reconciler::run_editor(path, EditCommand::Read, &mut probe)
         else {
@@ -1611,27 +1649,118 @@ impl Runtime {
         };
         let caret = self.carets.borrow().get(path).map(|state| state.caret).unwrap_or(0);
         let caret = crate::text_input::clamp_index(&text, caret);
-        let caret_x = self.cache.get_or_measure(&text[..caret], &field.font, &*self.text).width;
-        let full = self.cache.get_or_measure(&text, &field.font, &*self.text).width;
-        let inner = field.run.size.width;
         let mut offset =
-            self.scroll_offsets.borrow().get(path).map(|point| point.x).unwrap_or(0.0);
-        // the caret leaving through the left edge pulls the run back;
-        // through the right edge it pushes — with the caret's own width
-        // of room, so the bar itself is never half eaten by the border
-        if caret_x < offset {
-            offset = caret_x;
-        } else if caret_x + Self::CARET_ROOM > offset + inner {
-            offset = caret_x + Self::CARET_ROOM - inner;
+            self.scroll_offsets.borrow().get(path).copied().unwrap_or_default();
+        // the caret leaving through one edge pulls the run back; through
+        // the other it pushes — with the caret's own width of room, so
+        // the bar itself is never half eaten by the border. And it never
+        // rolls past the text: deleting the tail brings the run home
+        // instead of leaving a gap after the last glyph
+        let follow = |at: Px, extent: Px, room: Px, box_extent: Px, full: Px| {
+            let mut at_offset = extent;
+            if at < at_offset {
+                at_offset = at;
+            } else if at + room > at_offset + box_extent {
+                at_offset = at + room - box_extent;
+            }
+            at_offset.clamp(0.0, (full - box_extent).max(0.0))
+        };
+        if field.multiline {
+            let lines = self.wrap(&text, &field);
+            let row = crate::layout::line_of(&lines, caret);
+            offset.x = 0.0;
+            offset.y = follow(
+                row as Px * field.line_height,
+                offset.y,
+                field.line_height,
+                field.run.size.height,
+                lines.len() as Px * field.line_height,
+            );
+        } else {
+            let caret_x =
+                self.cache.get_or_measure(&text[..caret], &field.font, &*self.text).width;
+            let full = self.cache.get_or_measure(&text, &field.font, &*self.text).width;
+            offset.x = follow(
+                caret_x,
+                offset.x,
+                Self::CARET_ROOM,
+                field.run.size.width,
+                full,
+            );
         }
-        // and it never scrolls past the text: deleting the tail brings
-        // the run home instead of leaving a gap after the last glyph
-        let offset = offset.clamp(0.0, (full - inner).max(0.0));
-        self.scroll_offsets
-            .borrow_mut()
-            .entry(path.to_string())
-            .or_default()
-            .x = offset;
+        self.scroll_offsets.borrow_mut().insert(path.to_string(), offset);
+    }
+
+    /// Enter, offered to the focused field. A many-line field takes it
+    /// as a break; a one-line one declines, and the stroke goes on to
+    /// the app's bindings — which is why `⌘↵` still commits.
+    fn insert_break(&self, path: &str) -> Edited {
+        match self.field_at(path).is_some_and(|field| field.multiline) {
+            true => self.key(EditCommand::Insert("\n".into())),
+            false => Edited { applied: false, output: None },
+        }
+    }
+
+    /// A vertical arrow, offered to the focused field. The caret walks
+    /// ONE visual line and keeps the column it started from — off the
+    /// top it goes home, off the bottom to the end, the way a text view
+    /// does everywhere. A one-line field declines, so a list under a
+    /// search box still navigates with the arrows.
+    fn walk_line(&self, path: &str, down: bool, select: bool) -> Edited {
+        let declined = Edited { applied: false, output: None };
+        let Some(field) = self.field_at(path).filter(|field| field.multiline) else {
+            return declined;
+        };
+        let mut probe = CaretState::default();
+        let Some(Some(text)) = reconciler::run_editor(path, EditCommand::Read, &mut probe)
+        else {
+            return declined;
+        };
+        let lines = self.wrap(&text, &field);
+        let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
+        let caret = crate::text_input::clamp_index(&text, state.caret);
+        let row = crate::layout::line_of(&lines, caret);
+        // the column the walk keeps: taken from where the caret stands
+        // and RETAINED, so crossing a short line does not lose it
+        let column = self.goal_column.get().unwrap_or_else(|| {
+            self.cache
+                .get_or_measure(&text[lines[row].0..caret], &field.font, &*self.text)
+                .width
+        });
+        let target = match (down, row) {
+            (true, row) => row + 1,
+            (false, 0) => usize::MAX,
+            (false, row) => row - 1,
+        };
+        let landed = match lines.get(target) {
+            Some(&(start, end)) => {
+                start
+                    + caret_from_x(
+                        &text[start..end],
+                        column,
+                        &field.font,
+                        &*self.text,
+                        &self.cache,
+                    )
+            }
+            // off the top or the bottom: the ends of the text
+            None if down => text.len(),
+            None => 0,
+        };
+        // the same rule the arrows already follow: shift arms the anchor
+        // and keeps it, a bare walk drops the selection
+        if select {
+            state.anchor = Some(state.anchor.unwrap_or(caret));
+        } else {
+            state.anchor = None;
+        }
+        state.caret = landed;
+        state.marked = None;
+        self.carets.borrow_mut().insert(path.to_string(), state);
+        self.caret_visible.set(true);
+        self.reveal_caret(path);
+        self.goal_column.set(Some(column));
+        Edited { applied: true, output: None }
     }
 
     pub fn blur(&self) -> bool {
@@ -1802,6 +1931,17 @@ impl Runtime {
         let Some(path) = self.focus.borrow().clone() else {
             return Edited { applied: false, output: None };
         };
+        // three commands a headless model cannot answer: they need the
+        // wrap, and the wrap is geometry. A field that declines lets
+        // the stroke through to the app, which is the whole point of
+        // Enter and of the vertical arrows
+        match command {
+            EditCommand::Newline => return self.insert_break(&path),
+            EditCommand::Up(select) => return self.walk_line(&path, false, select),
+            EditCommand::Down(select) => return self.walk_line(&path, true, select),
+            // any other command is a fresh start for the walk's column
+            _ => self.goal_column.set(None),
+        }
         // the app's box speaks its own vocabulary: what the shell means
         // by "insert this text" or "this is the marked text" arrives as
         // an event, and the box owns the rest (a document's caret is

@@ -42,6 +42,15 @@ pub enum EditCommand {
     Home(bool),
     End(bool),
     SelectAll,
+    /// The break key. Only a MANY-line field takes it; a one-line one
+    /// declines and the app's bindings hear the stroke, so `⌘↵` keeps
+    /// meaning what the app says.
+    ///
+    /// This one and the two below are resolved by the RUNTIME, not
+    /// here: a visual line is geometry, and this model is headless.
+    Newline,
+    Up(bool),
+    Down(bool),
     /// Reads the whole text without mutating (IME synchronization uses it).
     Read,
     /// Returns the selection without mutating (`None` = collapsed).
@@ -286,6 +295,9 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
             state.anchor = Some(0);
             state.caret = text.len();
         }
+        // the runtime answered these before the command got here: they
+        // need the wrap, and the wrap is not in this file
+        EditCommand::Newline | EditCommand::Up(_) | EditCommand::Down(_) => {}
     }
     None
 }

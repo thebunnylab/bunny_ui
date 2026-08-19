@@ -118,6 +118,13 @@ impl KeyPattern {
     pub fn is_text_input(&self) -> bool {
         matches!(self.key, Key::Char(_)) && !self.command && !self.control
     }
+
+    /// No accelerator held. Shift does not count — it types, it does
+    /// not command. This is the shape a focused field may claim: a bare
+    /// Enter is a break, `⌘↵` belongs to the app.
+    pub fn is_plain(&self) -> bool {
+        !self.command && !self.control && !self.option
+    }
 }
 
 #[cfg(test)]
@@ -131,5 +138,13 @@ mod tests {
         assert!(!KeyPattern::key(Key::Down).is_text_input());
         let option_a = KeyPattern { option: true, ..KeyPattern::key(Key::Char('a')) };
         assert!(option_a.is_text_input(), "option composes text on macOS");
+    }
+
+    #[test]
+    fn a_plain_stroke_holds_no_accelerator() {
+        assert!(KeyPattern::key(Key::Enter).is_plain());
+        let shifted = KeyPattern { shift: true, ..KeyPattern::key(Key::Enter) };
+        assert!(shifted.is_plain(), "shift types, it does not command");
+        assert!(!KeyPattern::command(Key::Enter).is_plain(), "the app owns the chord");
     }
 }

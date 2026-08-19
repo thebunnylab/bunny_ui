@@ -14,7 +14,9 @@ text border.
 **Dom mode** (`dom.html` + `glue_dom.js`): the engine lowers the scene
 to element patches — a fixed little-endian stream the glue walks with
 one `DataView`. Text selects natively, scroll carries real momentum,
-the input owns the editing. Hover and pressed states are `:hover` and
+the input owns the editing — a field of many lines mounts as a
+`<textarea>`, so the browser wraps, breaks and scrolls it at home.
+Hover and pressed states are `:hover` and
 `:active` rules — including the INK a subtree inherits, so the row's
 path text brightens under the pointer without one patch crossing;
 animation specs become CSS transitions. The browser renders at home;
@@ -37,7 +39,7 @@ python3 -m http.server 8871 --directory web
 Then open http://localhost:8871 (canvas) or
 http://localhost:8871/dom.html (dom + island).
 
-One binary carries both shells (~478 KB through the `web` profile —
+One binary carries both shells (~488 KB through the `web` profile —
 `opt-level = "z"`, one codegen unit, lto, and the name table stripped). Ten thousand rows
 stay virtualized in both modes: the scroll geometry is honest to the
 full extent, and only the visible window exists.

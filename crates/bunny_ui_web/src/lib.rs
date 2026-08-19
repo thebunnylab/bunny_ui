@@ -89,6 +89,21 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
     if runtime.key_stroke(&pattern).handled {
         return true;
     }
+    // a field of MANY lines owns the bare break and the bare vertical
+    // arrows, before any binding — and only it: a one-line field
+    // declines and the stroke walks on, so the app keeps its Enter and
+    // a list keeps its arrows
+    if pattern.is_plain()
+        && let Some(command) = match pattern.key {
+            Key::Enter => Some(EditCommand::Newline),
+            Key::Up => Some(EditCommand::Up(pattern.shift)),
+            Key::Down => Some(EditCommand::Down(pattern.shift)),
+            _ => None,
+        }
+        && runtime.key(command).applied
+    {
+        return true;
+    }
     // typing with a focused field is never stolen by a binding
     let typing = runtime.focused().is_some() && pattern.is_text_input();
     if !typing
