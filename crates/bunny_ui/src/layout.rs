@@ -197,6 +197,9 @@ pub struct LayoutEnv<'a> {
     pub animator: Option<&'a std::cell::RefCell<crate::anim::Animator>>,
     /// The animation scope opened by the nearest `Animated` ancestor.
     pub anim: Option<AnimScope<'a>>,
+    /// The loop opened by the nearest `.looping(...)` ancestor — the
+    /// custom boxes below paint by its phase.
+    pub live: Option<crate::anim::Loop>,
     /// Where overlays may live. `None` = the pass's viewport (web,
     /// headless); the mac shell sets the SCREEN in layout coordinates —
     /// a popover then overflows the window by plain geometry, and the
@@ -439,6 +442,11 @@ pub enum LayoutNode {
     /// subtree's own draw commands. On pixel targets it dissolves:
     /// everything is the pixel pipeline there already.
     Island { child: Box<LayoutNode> },
+    /// `.looping(...)`: the boxes below paint by a repeating clock.
+    /// Transparent to geometry — the phase reaches the paint and
+    /// nothing else, so a step of the loop repaints the box and the
+    /// scene stays byte-identical.
+    Live { spec: crate::anim::Loop, child: Box<LayoutNode> },
     /// `.popover(...)`: the child is the ANCHOR; the overlay does not
     /// descend here. Placement queues it — the pass places every
     /// overlay AFTER the root, so the popover paints on top, its hits
@@ -1431,7 +1439,17 @@ pub struct CustomPlacement {
     pub region: Option<String>,
     /// The font the box inherited — the metrics an event resolves with.
     pub font: FontSpec,
+    /// The foreground the box inherited — a live repaint hands the
+    /// paint the same ink the place did.
+    pub ink: Color,
     pub element: crate::custom::Custom,
+    /// The loop the box paints by, when a `.looping(...)` holds it —
+    /// the runtime repaints this box alone on each step of the clock.
+    pub live: Option<crate::anim::Loop>,
+    /// The box's own commands in the frame's display list
+    /// (`start..end`) — what a live repaint replaces, and what the GPU
+    /// presenter routes to the box's own layer.
+    pub slice: (usize, usize),
 }
 
 /// The grip band's thickness over a split divider, in points.
@@ -1666,6 +1684,7 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
+            live: None,
             overlay_bounds: None,
         },
     )
@@ -2260,6 +2279,7 @@ impl LayoutNode {
             | LayoutNode::Styled { child, .. }
             | LayoutNode::Animated { child, .. }
             | LayoutNode::Island { child }
+            | LayoutNode::Live { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
             | LayoutNode::ControlRegion { child, .. }
@@ -2311,6 +2331,7 @@ impl LayoutNode {
             LayoutNode::Overlay { child, .. } => child.first_baseline(env),
             LayoutNode::Animated { child, .. }
             | LayoutNode::Island { child }
+            | LayoutNode::Live { child, .. }
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::HoverGroup { child, .. }
             | LayoutNode::Anchored { child, .. }
@@ -2635,6 +2656,13 @@ impl LayoutNode {
 
             // the island claims a renderer, never a pixel of geometry
             LayoutNode::Island { child } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            // the loop claims a clock, never a pixel of geometry — the
+            // measure of a looping box is phase-blind by contract
+            LayoutNode::Live { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -2965,27 +2993,47 @@ impl LayoutNode {
                 // what the clip lets through, in the box's own
                 // coordinates — the paint and the events read the SAME
                 // window, and a box inside a scroll learns its viewport
-                // from it
-                let window = out
-                    .current_clip()
-                    .and_then(|clip| clip.intersection(frame))
-                    .map_or(Rect { origin: Point::ZERO, size: Size::default() }, |clip| {
-                        Rect {
-                            origin: Point {
-                                x: clip.origin.x - frame.origin.x,
-                                y: clip.origin.y - frame.origin.y,
+                // from it. No clip above means all of the box shows;
+                // a clip that misses the box means none of it does.
+                let window = out.current_clip().map_or(
+                    Rect { origin: Point::ZERO, size: frame.size },
+                    |clip| {
+                        clip.intersection(frame).map_or(
+                            Rect { origin: Point::ZERO, size: Size::default() },
+                            |clip| Rect {
+                                origin: Point {
+                                    x: clip.origin.x - frame.origin.x,
+                                    y: clip.origin.y - frame.origin.y,
+                                },
+                                size: clip.size,
                             },
-                            size: clip.size,
+                        )
+                    },
+                );
+                // the phase the paint reads: the loop the nearest
+                // `.looping(...)` opened, resolved against the box's
+                // own clock. A box outside a loop paints phase zero; a
+                // box without identity holds the still frame.
+                let phase = match env.live {
+                    Some(spec) if !path.is_empty() => match env.animator {
+                        Some(animator) => {
+                            animator.borrow_mut().resolve_phase(path, spec)
                         }
-                    });
+                        None => spec.quantise(spec.still),
+                    },
+                    Some(spec) => spec.quantise(spec.still),
+                    None => 0.0,
+                };
                 // the box answers for the whole frame: a hit here never
                 // falls through to what is painted underneath, and the
                 // event finds the element by this path
-                if !path.is_empty() {
+                let placed = if path.is_empty() {
+                    None
+                } else {
                     let visible = out.current_clip().map_or(Some(frame), |clip| {
                         frame.intersection(clip)
                     });
-                    if let Some(visible) = visible {
+                    visible.map(|visible| {
                         out.hits.push((path.clone(), visible));
                         out.customs.push(CustomPlacement {
                             path: path.clone(),
@@ -2993,10 +3041,14 @@ impl LayoutNode {
                             visible: window,
                             region: out.region_stack.last().cloned(),
                             font: env.font,
+                            ink: out.foreground.last().copied().unwrap_or(Color::BLACK),
                             element: element.clone(),
+                            live: env.live,
+                            slice: (0, 0),
                         });
-                    }
-                }
+                        out.customs.len() - 1
+                    })
+                };
                 // what the app paints is PIXELS: on the element lowering
                 // the box becomes a canvas island, and the island slices
                 // exactly the commands between here and the close
@@ -3027,6 +3079,7 @@ impl LayoutNode {
                     metrics: crate::custom::Metrics::new(env.text, env.cache, env.font),
                     focused,
                     caret_visible: focused && env.stamp.caret_visible,
+                    phase,
                 };
                 let ink = out.foreground.last().copied().unwrap_or(Color::BLACK);
                 let mut painter =
@@ -3036,6 +3089,11 @@ impl LayoutNode {
                 let end = out.display.len();
                 if let Some(dom) = out.dom.as_mut() {
                     dom.close_canvas(end);
+                }
+                // the retained placement remembers which commands are
+                // the box's — a live box repaints exactly this slice
+                if let Some(index) = placed {
+                    out.customs[index].slice = (start, end);
                 }
             }
 
@@ -3711,6 +3769,13 @@ impl LayoutNode {
                 if let Some(dom) = out.dom.as_mut() {
                     dom.disarm();
                 }
+            }
+
+            (LayoutNode::Live { spec, child }, Fit::Wrapped(_, fit)) => {
+                // the clock opens for the subtree: the custom boxes
+                // below resolve their phase against it at paint time
+                let env = LayoutEnv { live: Some(*spec), ..env };
+                child.place(frame, *fit, env, out);
             }
 
             (LayoutNode::Island { child }, Fit::Wrapped(_, fit)) => {
@@ -4832,6 +4897,7 @@ mod tests {
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
+            live: None,
             overlay_bounds: None,
         };
         node.measure(proposal, env).0
@@ -4861,6 +4927,7 @@ mod tests {
                 stamp: FrameStamp::idle(interaction, &carets),
                 animator: None,
                 anim: None,
+                live: None,
                 overlay_bounds: None,
             },
         )
@@ -5049,6 +5116,7 @@ mod tests {
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
+            live: None,
             overlay_bounds: None,
         };
 

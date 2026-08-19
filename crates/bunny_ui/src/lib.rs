@@ -103,7 +103,7 @@ pub mod task {
 
 pub mod prelude {
     pub use crate::action::{ActionId, Key, KeyPattern};
-    pub use crate::anim::Spring;
+    pub use crate::anim::{FramePace, Loop, Spring, Ticked};
     pub use crate::custom::{
         Custom, CustomElement, ElementEvent, EventCtx, ImeContext, Metrics, PaintCtx, Painter,
         Response, canvas, custom,
@@ -124,7 +124,7 @@ pub mod prelude {
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
     pub use crate::text_input::{CaretState, EditCommand};
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
-    pub use crate::runtime::{Edited, ImeSnapshot, Runtime};
+    pub use crate::runtime::{Edited, ImeSnapshot, LiveBlit, Runtime};
     pub use crate::state_ext::{BindingExt, StateExt};
     pub use crate::task;
     pub use crate::view::{Component, Either, Many, Single, UnaryView, View};
@@ -494,7 +494,7 @@ mod tests {
         assert!(runtime.wants_frame(), "the spring is armed");
 
         // one tick: the color is in flight, strictly between the ends
-        assert!(runtime.tick(1.0 / 120.0));
+        assert!(runtime.tick(1.0 / 120.0).scene);
         let moving = fill_of(&runtime.animation_frame(&chip, size));
         assert_ne!(moving, OFF);
         assert_ne!(moving, ON);
@@ -1633,6 +1633,138 @@ mod tests {
     }
 
     #[test]
+    fn a_looping_box_reads_the_phase_and_a_step_repaints_it_alone() {
+        use crate::anim::Loop;
+        use crate::custom::canvas;
+
+        // a box whose picture IS the phase: the red channel counts it
+        #[derive(Clone, Copy)]
+        struct Mark;
+        impl Component for Mark {
+            fn body(self, _ctx: &Context) -> impl View {
+                canvas(|ctx, p| {
+                    let red = (ctx.phase * 255.0).round() as u8;
+                    p.fill(ctx.bounds(), crate::layout::Color::rgba(red, 0, 0, 255));
+                })
+                .looping(Loop::secs(1.0).fps(4.0))
+                .frame(20.0, 20.0)
+            }
+        }
+
+        let red_of = |display: &crate::layout::DisplayList| {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::FillRect { color, .. } => Some(color.r),
+                    _ => None,
+                })
+                .expect("the box paints its fill")
+        };
+
+        let size = crate::layout::Size { width: 20.0, height: 20.0 };
+        let runtime = Runtime::new();
+        let mounted = runtime.display_frame(&Mark, size);
+        assert_eq!(red_of(&mounted), 0, "the clock seeds on the still frame");
+        assert!(runtime.wants_frame(), "a live loop keeps frames coming");
+        assert_eq!(
+            runtime.frame_pace(),
+            crate::anim::FramePace::Slow(0.25),
+            "loops alone ask one frame per step"
+        );
+
+        // inside the first step: nothing anywhere
+        assert!(!runtime.tick(0.1).any());
+        assert!(runtime.live_islands(1).is_empty());
+
+        // crossing a step: the island repaints, the scene never asked
+        let moved = runtime.tick(0.16);
+        assert!(moved.islands && !moved.scene, "a loop never asks for layout");
+        let blits = runtime.live_islands(1);
+        assert_eq!(blits.len(), 1);
+        let first = &blits[0];
+        assert_eq!((first.width, first.height), (20, 20));
+        assert_eq!(first.frame.size.width, 20.0);
+        assert_eq!(first.rgba[0], 64, "the pixels carry the quarter phase");
+        assert!(runtime.live_islands(1).is_empty(), "the step was drained");
+
+        // the next step paints a DIFFERENT picture
+        assert!(runtime.tick(0.25).islands);
+        let second = runtime.live_islands(1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(second[0].rgba[0], first.rgba[0]);
+
+        // an ordinary scene frame paints the CURRENT phase — the box
+        // never jumps back when the app changes around it
+        let scene = runtime.animation_frame(&Mark, size);
+        assert_eq!(red_of(&scene), second[0].rgba[0]);
+    }
+
+    #[test]
+    fn a_step_that_paints_the_same_picture_blits_nothing() {
+        use crate::anim::Loop;
+        use crate::custom::canvas;
+
+        // alive, but blind to the phase: steps arrive, pixels never move
+        #[derive(Clone, Copy)]
+        struct Steady;
+        impl Component for Steady {
+            fn body(self, _ctx: &Context) -> impl View {
+                canvas(|ctx, p| {
+                    p.fill(ctx.bounds(), crate::layout::Color::rgba(9, 9, 9, 255));
+                })
+                .looping(Loop::secs(1.0).fps(10.0))
+                .frame(8.0, 8.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = crate::layout::Size { width: 8.0, height: 8.0 };
+        let _ = runtime.display_frame(&Steady, size);
+        assert!(runtime.tick(0.15).islands);
+        assert_eq!(runtime.live_islands(1).len(), 1, "the first step seeds the ledger");
+        assert!(runtime.tick(0.1).islands);
+        assert!(
+            runtime.live_islands(1).is_empty(),
+            "the ledger drops a step that paints the same picture"
+        );
+    }
+
+    #[test]
+    fn reduce_motion_holds_a_looping_box_on_its_resting_frame() {
+        use crate::anim::Loop;
+        use crate::custom::canvas;
+
+        #[derive(Clone, Copy)]
+        struct Mark;
+        impl Component for Mark {
+            fn body(self, _ctx: &Context) -> impl View {
+                canvas(|ctx, p| {
+                    let red = (ctx.phase * 255.0).round() as u8;
+                    p.fill(ctx.bounds(), crate::layout::Color::rgba(red, 0, 0, 255));
+                })
+                .looping(Loop::secs(1.0).fps(4.0).still_at(0.5))
+                .frame(20.0, 20.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        runtime.set_reduce_motion(true);
+        let size = crate::layout::Size { width: 20.0, height: 20.0 };
+        let mounted = runtime.display_frame(&Mark, size);
+        let red = mounted
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::FillRect { color, .. } => Some(color.r),
+                _ => None,
+            })
+            .expect("the box paints its fill");
+        assert_eq!(red, 128, "the resting frame, not the start of the loop");
+        assert!(!runtime.wants_frame(), "no clock runs for a reduced-motion user");
+        assert!(!runtime.tick(1.0).any());
+        assert_eq!(runtime.frame_pace(), crate::anim::FramePace::Idle);
+    }
+
+    #[test]
     fn scrolling_never_bends_an_animated_row() {
         use crate::anim::Spring;
 
@@ -1848,7 +1980,7 @@ mod tests {
             .expect("the chip paints a background");
         assert_eq!(fill, ON, "reduce motion jumps to the target");
         assert!(!runtime.wants_frame());
-        assert!(!runtime.tick(1.0 / 120.0));
+        assert!(!runtime.tick(1.0 / 120.0).any());
     }
 
     #[test]
@@ -1857,7 +1989,7 @@ mod tests {
         // animation reports no repaint and no wish for a next frame —
         // the shell parks the display link on this answer
         let runtime = Runtime::new();
-        assert!(!runtime.tick(1.0 / 120.0));
+        assert!(!runtime.tick(1.0 / 120.0).any());
         assert!(!runtime.wants_frame());
     }
 

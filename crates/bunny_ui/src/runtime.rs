@@ -49,6 +49,23 @@ pub struct ImeSnapshot {
     pub caret_rect: Rect,
 }
 
+/// One live box whose picture changed on a clock step: where it sits
+/// and the fresh pixels. The shell presents it on the box's OWN
+/// surface — the window behind it never redraws.
+pub struct LiveBlit {
+    /// The box's identity — stable across steps; a shell keys the
+    /// box's layer on it.
+    pub path: String,
+    /// The rect the pixels cover, in LAYOUT coordinates (the visible
+    /// window of the box).
+    pub frame: Rect,
+    /// Physical pixel size of `rgba`.
+    pub width: usize,
+    pub height: usize,
+    /// Straight (not premultiplied) RGBA rows, top-down.
+    pub rgba: Vec<u8>,
+}
+
 /// The wait between a hover and its bubble — armed by the pointer,
 /// aged by one shell tick, shown on the next. No clock in sight.
 #[derive(Default)]
@@ -109,6 +126,10 @@ pub struct Runtime {
     /// The app's own boxes from the last layout — an event resolves its
     /// element and its local coordinates through here.
     last_customs: RefCell<Vec<crate::layout::CustomPlacement>>,
+    /// What each live box painted on its last step, in LOCAL
+    /// coordinates — a step that paints the same picture blits
+    /// nothing. Swept against the live boxes still placed.
+    live_ledger: RefCell<motor::hash::FxHashMap<Rc<str>, Vec<crate::layout::DrawCommand>>>,
     /// The theme version the last pass saw — switching themes rebuilds
     /// the retention ONCE (tokens read in a body are baked into the
     /// scene).
@@ -614,6 +635,7 @@ impl Runtime {
             last_fields: RefCell::new(Vec::new()),
             last_splits: RefCell::new(Vec::new()),
             last_customs: RefCell::new(Vec::new()),
+            live_ledger: RefCell::new(motor::hash::FxHashMap::default()),
             theme_version: Cell::new(crate::theme::version()),
             keymap: RefCell::new(HashMap::default()),
             scoped_keymap: RefCell::new(HashMap::default()),
@@ -2028,11 +2050,11 @@ impl Runtime {
         result.display
     }
 
-    /// Advances the retained animations by `dt` seconds. `true` = a
-    /// value moved and the frame must repaint. With nothing animating
-    /// the call is free — the shell pauses its frame driver while this
-    /// stays false.
-    pub fn tick(&self, dt: f64) -> bool {
+    /// Advances the retained animations by `dt` seconds and says what
+    /// moved: `scene` asks for a layout frame, `islands` only repaints
+    /// the looping boxes. With nothing animating the call is free — the
+    /// shell pauses its frame driver while both stay false.
+    pub fn tick(&self, dt: f64) -> crate::anim::Ticked {
         // the engine's clock moves with the frames: a sleeping task
         // wakes here, and its waker asks the shell for a settled turn
         // (this path only repaints, and a task needs the bodies)
@@ -2055,6 +2077,26 @@ impl Runtime {
         // a sleeping task needs the clock to keep moving, and the
         // clock is the frame tick — the shell's driver stays awake
         self.animator.borrow().wants_frame() || motor::task::has_timers()
+    }
+
+    /// The frame rate the moment deserves. A shell with a slow timer
+    /// serves a loop-only scene with one frame per step instead of a
+    /// display-rate driver — the difference between a decoration and a
+    /// busy app. Tasks in flight keep the display pace: their wakers
+    /// ride the frame clock.
+    pub fn frame_pace(&self) -> crate::anim::FramePace {
+        let pace = self.animator.borrow().pace();
+        if motor::task::has_timers() && pace != crate::anim::FramePace::Display {
+            return crate::anim::FramePace::Display;
+        }
+        pace
+    }
+
+    /// Freezes (or resumes) the loop clocks — the shell calls it when
+    /// the window leaves or reaches the front. A decoration animates
+    /// for eyes that are on it; springs keep flying either way.
+    pub fn set_loops_paused(&self, paused: bool) {
+        self.animator.borrow_mut().set_loops_paused(paused);
     }
 
     /// Accessibility: on, every animation completes instantly. The
@@ -2149,6 +2191,97 @@ impl Runtime {
     /// scroll observer reports by id, the runtime scrolls by path.
     pub fn dom_scroll_path(&self, id: u32) -> Option<String> {
         self.dom.borrow().scroll_path(id)
+    }
+
+    /// The live boxes whose picture changed on the latest clock steps —
+    /// repainted at their new phase and rasterized at `scale`, ready to
+    /// blit. The scene is NEVER touched: no body runs, no layout runs,
+    /// the retained display list stays byte-identical. A step whose
+    /// paint lands on the same commands is dropped by the ledger.
+    ///
+    /// The shell calls this when a tick reports `islands` and presents
+    /// each blit on the box's own surface (a layer on macOS, the
+    /// island canvas on the web) — the window behind it never redraws.
+    pub fn live_islands(&self, scale: usize) -> Vec<LiveBlit> {
+        let dirty = self.animator.borrow_mut().take_dirty_loops();
+        if dirty.is_empty() {
+            return Vec::new();
+        }
+        let customs = self.last_customs.borrow();
+        let mut ledger = self.live_ledger.borrow_mut();
+        // the ledger lives exactly as long as the placed live boxes
+        ledger.retain(|path, _| {
+            customs
+                .iter()
+                .any(|placement| placement.live.is_some() && *placement.path == **path)
+        });
+        let focus = self.focus.borrow().clone();
+        let mut blits = Vec::new();
+        for path in dirty {
+            let Some(placement) = customs
+                .iter()
+                .find(|placement| placement.live.is_some() && *placement.path == *path)
+            else {
+                continue;
+            };
+            let spec = placement.live.expect("filtered on live above");
+            let phase = self.animator.borrow_mut().resolve_phase(&placement.path, spec);
+            // repaint in LOCAL coordinates: the painter's origin undoes
+            // the visible window, so the pixels cover exactly what the
+            // screen shows of the box
+            let mut display = crate::layout::DisplayList::default();
+            let focused = focus.as_deref() == Some(placement.path.as_str());
+            let ctx = crate::custom::PaintCtx {
+                frame: placement.frame,
+                visible: placement.visible,
+                metrics: crate::custom::Metrics::new(&*self.text, &self.cache, placement.font),
+                focused,
+                caret_visible: focused && self.caret_visible.get(),
+                phase,
+            };
+            let origin = crate::layout::Point {
+                x: -placement.visible.origin.x,
+                y: -placement.visible.origin.y,
+            };
+            let mut painter = crate::custom::Painter::new(
+                &mut display,
+                origin,
+                placement.font,
+                placement.ink,
+            );
+            placement.element.element().paint(&ctx, &mut painter);
+            if ledger.get(&path).is_some_and(|last| last == display.as_slice()) {
+                continue;
+            }
+            ledger.insert(Rc::clone(&path), display.as_slice().to_vec());
+            let physical = (
+                ((placement.visible.size.width.round() as usize) * scale).max(1),
+                ((placement.visible.size.height.round() as usize) * scale).max(1),
+            );
+            let bitmap = crate::raster::rasterize_with(
+                &display,
+                physical.0,
+                physical.1,
+                scale,
+                crate::layout::Color::rgba(0, 0, 0, 0),
+                &*self.text,
+                &*self.images,
+            );
+            blits.push(LiveBlit {
+                path: placement.path.clone(),
+                frame: crate::layout::Rect {
+                    origin: crate::layout::Point {
+                        x: placement.frame.origin.x + placement.visible.origin.x,
+                        y: placement.frame.origin.y + placement.visible.origin.y,
+                    },
+                    size: placement.visible.size,
+                },
+                width: physical.0,
+                height: physical.1,
+                rgba: bitmap.to_rgba_bytes(),
+            });
+        }
+        blits
     }
 
     /// The text engine of this runtime — the shell pairs it with its
@@ -2628,6 +2761,7 @@ impl Runtime {
             stamp,
             animator: Some(&self.animator),
             anim: None,
+            live: None,
             overlay_bounds: self.overlay_bounds.get(),
         };
         let (result, scene) = if dom {

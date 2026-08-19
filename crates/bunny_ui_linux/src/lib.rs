@@ -462,7 +462,7 @@ pub fn run_window_chrome(
                 // the tick path: springs advance, then layout only —
                 // zero bodies on a stable tree; settle and effects
                 // belong to the real-event path
-                if runtime.tick(dt) {
+                if runtime.tick(dt).any() {
                     let (width, height) = window.content_size();
                     let display = runtime.animation_frame(root, Size { width, height });
                     handler_present(runtime, display);

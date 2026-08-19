@@ -301,7 +301,7 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 }
             }
             Event::Frame { dt } => {
-                if runtime.tick(dt) {
+                if runtime.tick(dt).any() {
                     present(&runtime, &tick, size, scale, &mut surface);
                 } else if runtime.wants_frame() {
                     unsafe { js_request_frame() };

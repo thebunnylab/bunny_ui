@@ -101,6 +101,8 @@ pub enum Modifier {
     AspectRatio(ContentMode),
     /// Colors under this view move through a spring when they change.
     Animated(crate::anim::Spring),
+    /// The custom boxes under this view paint by a repeating clock.
+    Looping(crate::anim::Loop),
     /// Where this subtree renders when the scene lowers to elements.
     Rendering(crate::layout::Rendering),
     /// Declares a key context active while this view is mounted.
@@ -235,6 +237,10 @@ impl Modifier {
                 " [.animated(response: {}, damping: {})]",
                 spec.response, spec.damping
             ),
+            Modifier::Looping(spec) => format!(
+                " [.looping(period: {}, fps: {})]",
+                spec.period, spec.fps
+            ),
             Modifier::Rendering(mode) => format!(" [.rendering(.{mode:?})]"),
             Modifier::KeyContext(name) => format!(" [.keyContext({name})]"),
             Modifier::WindowDragRegion => " [.windowDragRegion()]".into(),
@@ -303,6 +309,10 @@ fn rewrite_scroll_node(
         LayoutNode::Island { child } => LayoutNode::Island {
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
+        LayoutNode::Live { spec, child } => LayoutNode::Live {
+            spec,
+            child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
         // the base is what a rewrite looks for; the LAYER is a separate
         // view and must never be descended into
         LayoutNode::Overlay { at, behind, layer, child } => LayoutNode::Overlay {
@@ -350,6 +360,10 @@ fn rewrite_field_node(
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
         LayoutNode::Island { child } => LayoutNode::Island {
+            child: Box::new(rewrite_field_node(*child, rewrite)),
+        },
+        LayoutNode::Live { spec, child } => LayoutNode::Live {
+            spec,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
         // the base is what a rewrite looks for; the LAYER is a separate
@@ -408,6 +422,10 @@ fn rewrite_pixel_node(
         LayoutNode::Island { child } => LayoutNode::Island {
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
+        LayoutNode::Live { spec, child } => LayoutNode::Live {
+            spec,
+            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
+        },
         // the base is what a rewrite looks for; the LAYER is a separate
         // view and must never be descended into
         LayoutNode::Overlay { at, behind, layer, child } => LayoutNode::Overlay {
@@ -457,6 +475,10 @@ fn rewrite_text_node(
             child: Box::new(rewrite_text_node(*child, rewrite)),
         },
         LayoutNode::Island { child } => LayoutNode::Island {
+            child: Box::new(rewrite_text_node(*child, rewrite)),
+        },
+        LayoutNode::Live { spec, child } => LayoutNode::Live {
+            spec,
             child: Box::new(rewrite_text_node(*child, rewrite)),
         },
         // the base is what a rewrite looks for; the LAYER is a separate
@@ -1083,6 +1105,13 @@ fn apply(
                     child: Box::new(node),
                 });
             }
+        }
+        Modifier::Looping(spec) => {
+            let spec = *spec;
+            out.wrap_layout_from(mark, move |node| LayoutNode::Live {
+                spec,
+                child: Box::new(node),
+            });
         }
         Modifier::AutoFocus => out.wrap_layout_from(mark, |node| {
             rewrite_field_node(node, &|path, content, placeholder, multiline| {

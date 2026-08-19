@@ -243,6 +243,11 @@ pub struct PaintCtx<'a> {
     /// The blink phase the caret follows — the box paints its own
     /// caret, the runtime only says when it shows.
     pub caret_visible: bool,
+    /// Where the enclosing `.looping(...)` clock is in its cycle
+    /// (0..1), snapped onto the loop's step grid. Zero outside a loop.
+    /// The paint must be a pure function of it — the geometry the
+    /// measure answered never depends on the phase.
+    pub phase: f64,
 }
 
 impl PaintCtx<'_> {

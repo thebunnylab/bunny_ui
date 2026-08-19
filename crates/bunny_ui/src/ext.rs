@@ -338,6 +338,25 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.looping(9.6)` — the custom boxes below paint by a repeating
+    /// clock: `ctx.phase` walks 0..1 over the period and wraps. The
+    /// paint must be a pure function of the phase; the geometry never
+    /// is. The runtime repaints ONLY the looping box on each step of
+    /// the clock — the scene around it stays untouched, so a small
+    /// decoration costs its own pixels and nothing else.
+    ///
+    /// `Loop::secs(9.6).fps(5.0).still_at(0.25)` picks the frame rate
+    /// and the resting frame. A slow loop reads smoothly at a low
+    /// rate — the eye sees the travel per step, not the rate. Reduced
+    /// motion shows the resting frame and never starts the clock; a
+    /// window out front freezes it.
+    fn looping(self, spec: impl Into<crate::anim::Loop>) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Looping(spec.into()),
+        }
+    }
+
     /// `.animated(Spring::smooth())` — colors under this view move
     /// through the spring when they change (state, hover) instead of
     /// jumping. Put it AFTER the props it animates; the nearest styled
