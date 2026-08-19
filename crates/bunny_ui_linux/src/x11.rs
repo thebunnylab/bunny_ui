@@ -33,7 +33,8 @@ use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::time::Instant;
 
 use crate::ffi::{
-    close, dispatch, pipe2, poll, read, AppEvent, PollFd, O_CLOEXEC, O_NONBLOCK, POLLIN,
+    close, deliver_key, dispatch, key_road, pipe2, poll, read, AppEvent, ClickClock, Cursor,
+    Keyboard, PollFd, O_CLOEXEC, O_NONBLOCK, POLLIN,
 };
 
 // MARK: - libc floor additions (SysV shared memory + free — the
@@ -169,7 +170,132 @@ unsafe extern "C" {
         value_mask: u32,
         value_list: *const u32,
     ) -> Cookie;
+    fn xcb_open_font(
+        connection: *mut Connection,
+        font: u32,
+        name_length: u16,
+        name: *const c_char,
+    ) -> Cookie;
+    /// The core glyph cursor: source and mask glyphs from one font,
+    /// black ink on white ground (the universal fallback tier).
+    #[allow(clippy::too_many_arguments)]
+    fn xcb_create_glyph_cursor(
+        connection: *mut Connection,
+        cursor: u32,
+        source_font: u32,
+        mask_font: u32,
+        source_char: u16,
+        mask_char: u16,
+        fore_red: u16,
+        fore_green: u16,
+        fore_blue: u16,
+        back_red: u16,
+        back_green: u16,
+        back_blue: u16,
+    ) -> Cookie;
+    fn xcb_change_window_attributes(
+        connection: *mut Connection,
+        window: u32,
+        value_mask: u32,
+        value_list: *const u32,
+    ) -> Cookie;
 }
+
+#[link(name = "xkbcommon-x11")]
+unsafe extern "C" {
+    fn xkb_x11_setup_xkb_extension(
+        connection: *mut Connection,
+        major: u16,
+        minor: u16,
+        flags: c_int,
+        major_out: *mut u16,
+        minor_out: *mut u16,
+        base_event_out: *mut u8,
+        base_error_out: *mut u8,
+    ) -> c_int;
+    fn xkb_x11_get_core_keyboard_device_id(connection: *mut Connection) -> i32;
+    fn xkb_x11_keymap_new_from_device(
+        context: *mut c_void,
+        connection: *mut Connection,
+        device: i32,
+        flags: c_int,
+    ) -> *mut c_void;
+    fn xkb_x11_state_new_from_device(
+        keymap: *mut c_void,
+        connection: *mut Connection,
+        device: i32,
+    ) -> *mut c_void;
+}
+
+#[link(name = "xcb-xkb")]
+unsafe extern "C" {
+    /// PerClientFlags — the detectable-autorepeat switch (XKB 1.0).
+    #[allow(clippy::too_many_arguments)]
+    fn xcb_xkb_per_client_flags(
+        connection: *mut Connection,
+        device_spec: u16,
+        change: u32,
+        value: u32,
+        controls_to_change: u32,
+        auto_controls: u32,
+        auto_controls_values: u32,
+    ) -> Cookie;
+    fn xcb_xkb_per_client_flags_reply(
+        connection: *mut Connection,
+        cookie: Cookie,
+        error: *mut *mut GenericEvent,
+    ) -> *mut c_void;
+    /// SelectEvents, the simple affect/select form (details NULL).
+    #[allow(clippy::too_many_arguments)]
+    fn xcb_xkb_select_events(
+        connection: *mut Connection,
+        device_spec: u16,
+        affect_which: u16,
+        clear: u16,
+        select_all: u16,
+        affect_map: u16,
+        map: u16,
+        details: *const c_void,
+    ) -> Cookie;
+}
+
+const XKB_ID_USE_CORE_KBD: u16 = 256;
+const XKB_PER_CLIENT_FLAG_DETECTABLE_AUTO_REPEAT: u32 = 1;
+const XKB_EVENT_TYPE_STATE_NOTIFY: u16 = 4;
+
+/// `xcb_xkb_state_notify_event_t` head — verified against xkb.h; only
+/// the mod/group fields are read (update_mask wants exactly those).
+#[repr(C)]
+struct XkbStateNotifyEvent {
+    response_type: u8,
+    xkb_type: u8,
+    sequence: u16,
+    time: u32,
+    device_id: u8,
+    mods: u8,
+    base_mods: u8,
+    latched_mods: u8,
+    locked_mods: u8,
+    group: u8,
+    base_group: i16,
+    latched_group: i16,
+    locked_group: u8,
+    compat_state: u8,
+    grab_mods: u8,
+    compat_grab_mods: u8,
+    lookup_mods: u8,
+    compat_lookup_mods: u8,
+    ptr_btn_state: u16,
+    changed: u16,
+    keycode: u8,
+    event_type: u8,
+}
+
+const _: () = {
+    assert!(std::mem::offset_of!(XkbStateNotifyEvent, base_mods) == 10);
+    assert!(std::mem::offset_of!(XkbStateNotifyEvent, base_group) == 14);
+    assert!(std::mem::offset_of!(XkbStateNotifyEvent, locked_group) == 18);
+};
 
 #[link(name = "xcb-shm")]
 unsafe extern "C" {
@@ -509,6 +635,19 @@ pub(crate) struct XClient {
     pointer_pos: (f64, f64),
     quit: bool,
     presents: u64,
+    /// The shared xkb walk (states + compose); the keymap here comes
+    /// from the device, and the SERVER repeats — the repeat fields
+    /// inside stay idle on this door.
+    keyboard: Keyboard,
+    /// The xkb extension's event code — StateNotify arrives there.
+    xkb_base_event: u8,
+    /// The core cursor font and one lazily-made cursor per style.
+    cursor_font: u32,
+    cursors: [u32; 6],
+    cursor_current: Option<Cursor>,
+    /// Client-side double click — X sends plain buttons, the shell
+    /// counts (the same 400 ms / 4 px window every platform keeps).
+    clicks: ClickClock,
 }
 
 thread_local! {
@@ -561,6 +700,7 @@ pub(crate) fn connect() {
             -1
         }
     };
+    let (keyboard, xkb_base_event) = setup_keyboard(display);
     X_CLIENT.with(|slot| {
         *slot.borrow_mut() = Some(XClient {
             connection: display,
@@ -573,7 +713,173 @@ pub(crate) fn connect() {
             pointer_pos: (0.0, 0.0),
             quit: false,
             presents: 0,
+            keyboard,
+            xkb_base_event,
+            cursor_font: 0,
+            cursors: [0; 6],
+            cursor_current: None,
+            clicks: ClickClock::default(),
         })
+    });
+}
+
+// MARK: - Keyboard (xkbcommon-x11: the device keymap, server repeat)
+
+/// Builds the whole xkb walk off the server's core keyboard: keymap
+/// and state from the device, the mods-blind scratch, the locale
+/// compose table — and flips detectable autorepeat so a HELD key
+/// arrives as repeated presses with no releases between (the server
+/// repeats; the client machinery of the first door stands down).
+fn setup_keyboard(connection: *mut Connection) -> (Keyboard, u8) {
+    let mut keyboard = Keyboard::new();
+    let mut base_event = 0u8;
+    unsafe {
+        let (mut major, mut minor, mut base_error) = (0u16, 0u16, 0u8);
+        if xkb_x11_setup_xkb_extension(
+            connection,
+            1,
+            0,
+            0,
+            &mut major,
+            &mut minor,
+            &mut base_event,
+            &mut base_error,
+        ) == 0
+        {
+            eprintln!("bunny_ui x11: no XKB extension — keys stay silent");
+            return (keyboard, 0);
+        }
+        keyboard.context = crate::ffi::xkb_context_new(0);
+        if keyboard.context.is_null() {
+            return (keyboard, base_event);
+        }
+        let device = xkb_x11_get_core_keyboard_device_id(connection);
+        if device >= 0 {
+            keyboard.keymap =
+                xkb_x11_keymap_new_from_device(keyboard.context, connection, device, 0);
+        }
+        if !keyboard.keymap.is_null() {
+            keyboard.state = xkb_x11_state_new_from_device(keyboard.keymap, connection, device);
+            // the mods-blind twin state — the chars_ignoring road
+            keyboard.scratch = crate::ffi::xkb_state_new(keyboard.keymap);
+        }
+        // the locale drives the dead-key table; empty falls to C
+        let locale = std::env::var("LC_ALL")
+            .or_else(|_| std::env::var("LC_CTYPE"))
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_else(|_| "C".into());
+        if let Ok(locale_c) = std::ffi::CString::new(locale) {
+            let table = crate::ffi::xkb_compose_table_new_from_locale(
+                keyboard.context,
+                locale_c.as_ptr(),
+                0,
+            );
+            if !table.is_null() {
+                keyboard.compose = crate::ffi::xkb_compose_state_new(table, 0);
+                crate::ffi::xkb_compose_table_unref(table);
+            }
+        }
+        // server-side repeat, made visible: presses repeat, releases
+        // only land when the finger truly lifts
+        let cookie = xcb_xkb_per_client_flags(
+            connection,
+            XKB_ID_USE_CORE_KBD,
+            XKB_PER_CLIENT_FLAG_DETECTABLE_AUTO_REPEAT,
+            XKB_PER_CLIENT_FLAG_DETECTABLE_AUTO_REPEAT,
+            0,
+            0,
+            0,
+        );
+        let reply =
+            xcb_xkb_per_client_flags_reply(connection, cookie, std::ptr::null_mut());
+        if !reply.is_null() {
+            free(reply);
+        }
+        // modifier truth flows through StateNotify, not per-key guesses
+        xcb_xkb_select_events(
+            connection,
+            XKB_ID_USE_CORE_KBD,
+            XKB_EVENT_TYPE_STATE_NOTIFY,
+            0,
+            XKB_EVENT_TYPE_STATE_NOTIFY,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        xcb_flush(connection);
+    }
+    (keyboard, base_event)
+}
+
+// MARK: - Cursor (the core font tier: universal, theme-blind)
+
+/// The glyph each style wears in the core `cursor` font (source; the
+/// mask is always glyph+1).
+fn glyph_of(cursor: Cursor) -> u16 {
+    match cursor {
+        Cursor::Arrow => 68,            // left_ptr
+        Cursor::Pointing => 60,         // hand2
+        Cursor::ResizeLeftRight => 108, // sb_h_double_arrow
+        Cursor::ResizeUpDown => 116,    // sb_v_double_arrow
+        Cursor::ResizeNwSe => 134,      // top_left_corner
+        Cursor::ResizeNeSw => 136,      // top_right_corner
+    }
+}
+
+fn cursor_slot(cursor: Cursor) -> usize {
+    match cursor {
+        Cursor::Arrow => 0,
+        Cursor::Pointing => 1,
+        Cursor::ResizeLeftRight => 2,
+        Cursor::ResizeUpDown => 3,
+        Cursor::ResizeNwSe => 4,
+        Cursor::ResizeNeSw => 5,
+    }
+}
+
+pub(crate) fn set_cursor(cursor: Cursor) {
+    with_x(|client| {
+        if client.cursor_current == Some(cursor) {
+            return;
+        }
+        client.cursor_current = Some(cursor);
+        let Some(win) = client.win.as_ref() else { return };
+        unsafe {
+            if client.cursor_font == 0 {
+                client.cursor_font = xcb_generate_id(client.connection);
+                let name = c"cursor";
+                xcb_open_font(
+                    client.connection,
+                    client.cursor_font,
+                    name.to_bytes().len() as u16,
+                    name.as_ptr(),
+                );
+            }
+            let slot = cursor_slot(cursor);
+            if client.cursors[slot] == 0 {
+                let id = xcb_generate_id(client.connection);
+                let glyph = glyph_of(cursor);
+                xcb_create_glyph_cursor(
+                    client.connection,
+                    id,
+                    client.cursor_font,
+                    client.cursor_font,
+                    glyph,
+                    glyph + 1,
+                    0,
+                    0,
+                    0,
+                    u16::MAX,
+                    u16::MAX,
+                    u16::MAX,
+                );
+                client.cursors[slot] = id;
+            }
+            const CW_CURSOR: u32 = 0x4000;
+            let values = [client.cursors[slot]];
+            xcb_change_window_attributes(client.connection, win.id, CW_CURSOR, values.as_ptr());
+            xcb_flush(client.connection);
+        }
     });
 }
 
@@ -998,31 +1304,95 @@ fn interpret(event: *mut GenericEvent) -> Step {
         }
         XCB_BUTTON_PRESS | XCB_BUTTON_RELEASE => {
             let button = event as *mut InputEvent;
-            let (detail, x, y, state) = unsafe {
-                ((*button).detail, (*button).event_x, (*button).event_y, (*button).state)
+            let (detail, x, y, state, time) = unsafe {
+                (
+                    (*button).detail,
+                    (*button).event_x,
+                    (*button).event_y,
+                    (*button).state,
+                    (*button).time,
+                )
             };
             let scale = with_x(|client| client.win.as_ref().map(|w| w.scale).unwrap_or(1));
             let (x, y) = (x as f64 / scale as f64, y as f64 / scale as f64);
             match (kind, detail) {
-                // wheel buttons arrive in Q1 with the accumulator
-                (XCB_BUTTON_PRESS, 1) => Step::Deliver(AppEvent::MouseDown {
-                    x,
-                    y,
-                    clicks: 1,
-                    shift: state & 0x1 != 0,
-                }),
+                (XCB_BUTTON_PRESS, 1) => {
+                    let clicks = with_x(|client| client.clicks.click(time, x, y));
+                    Step::Deliver(AppEvent::MouseDown {
+                        x,
+                        y,
+                        clicks,
+                        shift: state & 0x1 != 0,
+                    })
+                }
                 (XCB_BUTTON_RELEASE, 1) => Step::Deliver(AppEvent::MouseUp { x, y }),
                 (XCB_BUTTON_PRESS, 3) => Step::Deliver(AppEvent::RightMouseDown { x, y }),
+                // the wheel speaks buttons: one press per detent, the
+                // ×16 line doctrine, up positive toward the engine
+                (XCB_BUTTON_PRESS, 4) => {
+                    Step::Deliver(AppEvent::Wheel { x, y, dx: 0.0, dy: 16.0 })
+                }
+                (XCB_BUTTON_PRESS, 5) => {
+                    Step::Deliver(AppEvent::Wheel { x, y, dx: 0.0, dy: -16.0 })
+                }
+                (XCB_BUTTON_PRESS, 6) => {
+                    Step::Deliver(AppEvent::Wheel { x, y, dx: 16.0, dy: 0.0 })
+                }
+                (XCB_BUTTON_PRESS, 7) => {
+                    Step::Deliver(AppEvent::Wheel { x, y, dx: -16.0, dy: 0.0 })
+                }
                 _ => Step::Silence,
             }
         }
+        XCB_KEY_PRESS => {
+            // detectable autorepeat holds: a held key arrives as
+            // repeated presses — each walks the same road the first
+            // door's timer used to walk
+            let keycode = unsafe { (*(event as *mut InputEvent)).detail };
+            let road = with_x(|client| key_road(&mut client.keyboard, keycode as u32));
+            deliver_key(road);
+            Step::Silence
+        }
+        XCB_KEY_RELEASE => Step::Silence,
+        XCB_ENTER_NOTIFY => {
+            let crossing = event as *mut CrossingEvent;
+            let (x, y) = unsafe { ((*crossing).event_x, (*crossing).event_y) };
+            let scale = with_x(|client| {
+                client.pointer_pos = (x as f64, y as f64);
+                client.win.as_ref().map(|w| w.scale).unwrap_or(1)
+            });
+            Step::Deliver(AppEvent::MouseMoved {
+                x: x as f64 / scale as f64,
+                y: y as f64 / scale as f64,
+            })
+        }
         XCB_LEAVE_NOTIFY => Step::Deliver(AppEvent::MouseExited),
         XCB_FOCUS_OUT => Step::Deliver(AppEvent::ResignKey),
-        // keys arrive in Q1 with xkbcommon-x11; enter/focus-in and
-        // property notify have no engine mirror yet
-        XCB_KEY_PRESS | XCB_KEY_RELEASE | XCB_ENTER_NOTIFY | XCB_FOCUS_IN
-        | XCB_PROPERTY_NOTIFY => Step::Silence,
-        _ => Step::Silence,
+        XCB_FOCUS_IN | XCB_PROPERTY_NOTIFY => Step::Silence,
+        _ => {
+            // the xkb extension's own events ride above the core range;
+            // StateNotify feeds the modifier truth into the state
+            let base = with_x(|client| client.xkb_base_event);
+            if base != 0 && kind == base {
+                let notify = event as *mut XkbStateNotifyEvent;
+                if unsafe { (*notify).xkb_type } == XKB_EVENT_TYPE_STATE_NOTIFY as u8 {
+                    with_x(|client| unsafe {
+                        if !client.keyboard.state.is_null() {
+                            crate::ffi::xkb_state_update_mask(
+                                client.keyboard.state,
+                                (*notify).base_mods as u32,
+                                (*notify).latched_mods as u32,
+                                (*notify).locked_mods as u32,
+                                (*notify).base_group as u32,
+                                (*notify).latched_group as u32,
+                                (*notify).locked_group as u32,
+                            );
+                        }
+                    });
+                }
+            }
+            Step::Silence
+        }
     }
 }
 
@@ -1120,6 +1490,22 @@ fn teardown() {
                 }
                 xcb_destroy_window(client.connection, win.id);
             }
+            let kb = &client.keyboard;
+            if !kb.compose.is_null() {
+                crate::ffi::xkb_compose_state_unref(kb.compose);
+            }
+            if !kb.state.is_null() {
+                crate::ffi::xkb_state_unref(kb.state);
+            }
+            if !kb.scratch.is_null() {
+                crate::ffi::xkb_state_unref(kb.scratch);
+            }
+            if !kb.keymap.is_null() {
+                crate::ffi::xkb_keymap_unref(kb.keymap);
+            }
+            if !kb.context.is_null() {
+                crate::ffi::xkb_context_unref(kb.context);
+            }
             xcb_flush(client.connection);
             xcb_disconnect(client.connection);
             if client.wake_read >= 0 {
@@ -1160,6 +1546,36 @@ mod tests {
         assert_eq!(scale_from_resources("Xcursor.size: 24\n*background: #000\n"), 1);
         assert_eq!(scale_from_resources(""), 1);
         assert_eq!(scale_from_resources("Xft.dpi: garbage"), 1);
+    }
+
+    #[test]
+    fn every_cursor_style_wears_a_core_glyph() {
+        // sources are even (mask = glyph+1 pairs with it), all six
+        // styles resolve, and no two share a face
+        let all = [
+            Cursor::Arrow,
+            Cursor::Pointing,
+            Cursor::ResizeLeftRight,
+            Cursor::ResizeUpDown,
+            Cursor::ResizeNwSe,
+            Cursor::ResizeNeSw,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for cursor in all {
+            let glyph = glyph_of(cursor);
+            assert_eq!(glyph % 2, 0, "cursor-font sources sit on even codes");
+            assert!(seen.insert(glyph), "two styles share glyph {glyph}");
+            assert!(cursor_slot(cursor) < 6);
+        }
+        assert_eq!(seen.len(), 6);
+    }
+
+    #[test]
+    fn the_xkb_state_notify_layout_holds() {
+        assert_eq!(std::mem::offset_of!(XkbStateNotifyEvent, base_mods), 10);
+        assert_eq!(std::mem::offset_of!(XkbStateNotifyEvent, base_group), 14);
+        assert_eq!(std::mem::offset_of!(XkbStateNotifyEvent, locked_group), 18);
+        assert_eq!(std::mem::offset_of!(XkbStateNotifyEvent, keycode), 28);
     }
 
     #[test]

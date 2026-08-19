@@ -201,21 +201,23 @@ const XKB_COMPOSE_COMPOSING: c_int = 1;
 const XKB_COMPOSE_COMPOSED: c_int = 2;
 const XKB_COMPOSE_CANCELLED: c_int = 3;
 
+// the x11 door shares this whole family (its keymap comes from the
+// device instead of a string, but the states and compose are one)
 #[link(name = "xkbcommon")]
 unsafe extern "C" {
-    fn xkb_context_new(flags: c_int) -> *mut c_void;
-    fn xkb_context_unref(context: *mut c_void);
+    pub(crate) fn xkb_context_new(flags: c_int) -> *mut c_void;
+    pub(crate) fn xkb_context_unref(context: *mut c_void);
     fn xkb_keymap_new_from_string(
         context: *mut c_void,
         text: *const c_char,
         format: c_int,
         flags: c_int,
     ) -> *mut c_void;
-    fn xkb_keymap_unref(keymap: *mut c_void);
+    pub(crate) fn xkb_keymap_unref(keymap: *mut c_void);
     fn xkb_keymap_key_repeats(keymap: *mut c_void, keycode: u32) -> c_int;
-    fn xkb_state_new(keymap: *mut c_void) -> *mut c_void;
-    fn xkb_state_unref(state: *mut c_void);
-    fn xkb_state_update_mask(
+    pub(crate) fn xkb_state_new(keymap: *mut c_void) -> *mut c_void;
+    pub(crate) fn xkb_state_unref(state: *mut c_void);
+    pub(crate) fn xkb_state_update_mask(
         state: *mut c_void,
         depressed: u32,
         latched: u32,
@@ -236,14 +238,14 @@ unsafe extern "C" {
         name: *const c_char,
         kind: c_int,
     ) -> c_int;
-    fn xkb_compose_table_new_from_locale(
+    pub(crate) fn xkb_compose_table_new_from_locale(
         context: *mut c_void,
         locale: *const c_char,
         flags: c_int,
     ) -> *mut c_void;
-    fn xkb_compose_table_unref(table: *mut c_void);
-    fn xkb_compose_state_new(table: *mut c_void, flags: c_int) -> *mut c_void;
-    fn xkb_compose_state_unref(state: *mut c_void);
+    pub(crate) fn xkb_compose_table_unref(table: *mut c_void);
+    pub(crate) fn xkb_compose_state_new(table: *mut c_void, flags: c_int) -> *mut c_void;
+    pub(crate) fn xkb_compose_state_unref(state: *mut c_void);
     fn xkb_compose_state_feed(state: *mut c_void, sym: u32) -> c_int;
     fn xkb_compose_state_get_status(state: *mut c_void) -> c_int;
     fn xkb_compose_state_get_utf8(state: *mut c_void, buffer: *mut c_char, size: usize) -> c_int;
@@ -940,13 +942,13 @@ impl Serials {
 /// shell counts. Same window the platforms use: 400 ms and a 4 px
 /// wander budget.
 #[derive(Default)]
-struct ClickClock {
+pub(crate) struct ClickClock {
     last: Option<(u32, f64, f64)>,
     count: u8,
 }
 
 impl ClickClock {
-    fn click(&mut self, time_ms: u32, x: f64, y: f64) -> u8 {
+    pub(crate) fn click(&mut self, time_ms: u32, x: f64, y: f64) -> u8 {
         let chained = self.last.is_some_and(|(t, lx, ly)| {
             time_ms.wrapping_sub(t) <= 400 && (x - lx).abs() <= 4.0 && (y - ly).abs() <= 4.0
         });
@@ -1078,12 +1080,12 @@ struct CursorState {
 /// compiles it, and the shell asks the state questions. `scratch` is a
 /// second state that never learns the modifiers — the chars-ignoring
 /// road (the ToUnicode-zeroed twin).
-struct Keyboard {
-    context: *mut c_void,
-    keymap: *mut c_void,
-    state: *mut c_void,
-    scratch: *mut c_void,
-    compose: *mut c_void,
+pub(crate) struct Keyboard {
+    pub(crate) context: *mut c_void,
+    pub(crate) keymap: *mut c_void,
+    pub(crate) state: *mut c_void,
+    pub(crate) scratch: *mut c_void,
+    pub(crate) compose: *mut c_void,
     repeat_rate: i32,
     repeat_delay: i32,
     /// The held repeating keycode and its generation — a bumped
@@ -1097,7 +1099,7 @@ struct Keyboard {
 }
 
 impl Keyboard {
-    fn new() -> Keyboard {
+    pub(crate) fn new() -> Keyboard {
         Keyboard {
             context: std::ptr::null_mut(),
             keymap: std::ptr::null_mut(),
@@ -1654,8 +1656,7 @@ impl WindowHandle {
 
     pub fn set_cursor(&self, cursor: Cursor) {
         if is_x11() {
-            // the cursor speaks in Q1 (core font glyphs)
-            return;
+            return crate::x11::set_cursor(cursor);
         }
         let changed = with_client(|client| {
             let previous = client.cursor.current;
@@ -2332,7 +2333,7 @@ pub fn set_key_gate(gate: Box<dyn FnMut(&KeyStroke) -> bool>) {
 
 /// What one press resolved to, computed under the client borrow and
 /// acted on outside it.
-enum KeyRoad {
+pub(crate) enum KeyRoad {
     Silence,
     Composed(String),
     Stroke(KeyStroke, String),
@@ -2351,8 +2352,9 @@ fn shift_held(keyboard: &Keyboard) -> bool {
     }
 }
 
-/// the stroke with both texts. `keycode` is already evdev+8.
-fn key_road(keyboard: &mut Keyboard, keycode: u32) -> KeyRoad {
+/// the stroke with both texts. `keycode` is already evdev+8 (the x11
+/// server's own keycodes live on the same lattice).
+pub(crate) fn key_road(keyboard: &mut Keyboard, keycode: u32) -> KeyRoad {
     if keyboard.state.is_null() {
         return KeyRoad::Silence;
     }
@@ -2431,7 +2433,7 @@ fn is_edit_key(stroke: &KeyStroke) -> bool {
 /// One pressed (or repeated) key walks the whole road: gate first,
 /// then the editing keys, then the character road. Runs OUTSIDE the
 /// client borrow.
-fn deliver_key(road: KeyRoad) {
+pub(crate) fn deliver_key(road: KeyRoad) {
     // step one of the gate: a live composition wins outright
     if ime_marked() {
         return;
@@ -2998,6 +3000,10 @@ pub fn sync_ime(state: Option<(bool, usize, (f64, f64, f64, f64))>) {
 /// The gate's composition-first step: while a composition is live the
 /// IME owns the key stream.
 fn ime_marked() -> bool {
+    if is_x11() {
+        // no composition road on the second door
+        return false;
+    }
     with_client(|client| client.ime.marked)
 }
 
