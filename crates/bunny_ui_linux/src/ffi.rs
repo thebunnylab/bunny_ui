@@ -29,22 +29,24 @@ use std::time::Instant;
 // MARK: - libc floor (the only raw syscalls the shell needs)
 
 #[repr(C)]
-struct PollFd {
-    fd: c_int,
-    events: i16,
-    revents: i16,
+pub(crate) struct PollFd {
+    pub(crate) fd: c_int,
+    pub(crate) events: i16,
+    pub(crate) revents: i16,
 }
 
-const POLLIN: i16 = 0x1;
+pub(crate) const POLLIN: i16 = 0x1;
 const MFD_CLOEXEC: c_uint = 0x1;
 const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x1;
 
-const O_CLOEXEC: c_int = 0o2000000;
-const O_NONBLOCK: c_int = 0o4000;
+pub(crate) const O_CLOEXEC: c_int = 0o2000000;
+pub(crate) const O_NONBLOCK: c_int = 0o4000;
 const MAP_PRIVATE: c_int = 0x2;
 
+// the libc floor is one — the x11 door borrows these instead of
+// redeclaring (a diverging redeclaration is a compile error)
 unsafe extern "C" {
     fn memfd_create(name: *const c_char, flags: c_uint) -> c_int;
     fn ftruncate(fd: c_int, length: i64) -> c_int;
@@ -57,10 +59,10 @@ unsafe extern "C" {
         offset: i64,
     ) -> *mut c_void;
     fn munmap(addr: *mut c_void, length: usize) -> c_int;
-    fn poll(fds: *mut PollFd, count: u64, timeout_ms: c_int) -> c_int;
-    fn close(fd: c_int) -> c_int;
-    fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
-    fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
+    pub(crate) fn poll(fds: *mut PollFd, count: u64, timeout_ms: c_int) -> c_int;
+    pub(crate) fn close(fd: c_int) -> c_int;
+    pub(crate) fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
+    pub(crate) fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
     fn write(fd: c_int, buffer: *const c_void, count: usize) -> isize;
     fn getpid() -> c_int;
 }
@@ -1525,6 +1527,10 @@ fn connect() {
 /// dance and BLOCKS until the compositor's first configure — from here
 /// on, attaching is legal and the first present maps the window.
 pub fn create_window(title: &str, width: f64, height: f64, scene_chrome: bool) -> WindowHandle {
+    if is_x11() {
+        crate::x11::create_window(title, width, height, scene_chrome);
+        return WindowHandle(0);
+    }
     if CLIENT.with(|slot| slot.borrow().is_none()) {
         connect();
     }
@@ -1597,8 +1603,13 @@ pub fn create_window(title: &str, width: f64, height: f64, scene_chrome: bool) -
 
 /// On wayland a window appears when its first buffer commits — the
 /// first present IS the reveal, so the anti-flash order holds by
-/// protocol design and this is a no-op kept for the twins' shape.
-pub fn show_window(_window: WindowHandle) {}
+/// protocol design and this is a no-op on that door. The x11 door
+/// maps here, AFTER the first present landed in the backing.
+pub fn show_window(_window: WindowHandle) {
+    if is_x11() {
+        crate::x11::show_window();
+    }
+}
 
 /// 0 is the main window; N is panel N−1. The identity lives in the
 /// client state, the handle is the twins' shape.
@@ -1608,11 +1619,17 @@ pub struct WindowHandle(usize);
 impl WindowHandle {
     /// Logical size of the content area (the layout viewport).
     pub fn content_size(&self) -> (f64, f64) {
+        if is_x11() {
+            return crate::x11::content_size();
+        }
         with_client(|client| client.win.as_ref().map(|w| w.logical).unwrap_or((0.0, 0.0)))
     }
 
     /// The integer raster scale the engine sees.
     pub fn scale(&self) -> usize {
+        if is_x11() {
+            return crate::x11::scale();
+        }
         with_client(|client| client.win.as_ref().map(|w| w.scale).unwrap_or(1))
     }
 
@@ -1629,10 +1646,17 @@ impl WindowHandle {
         if damage.is_empty() {
             return;
         }
+        if is_x11() {
+            return crate::x11::present_rows(width, height, rgba, damage);
+        }
         present_rows(width, height, rgba, damage);
     }
 
     pub fn set_cursor(&self, cursor: Cursor) {
+        if is_x11() {
+            // the cursor speaks in Q1 (core font glyphs)
+            return;
+        }
         let changed = with_client(|client| {
             let previous = client.cursor.current;
             client.cursor.current = cursor;
@@ -1712,6 +1736,11 @@ impl WindowHandle {
 /// first present, when the placement is known. `chip` picks the
 /// subsurface road (the mouse-following drag label).
 pub fn create_panel(_window: &WindowHandle, chip: bool) -> WindowHandle {
+    if is_x11() {
+        // overlays cross this door in Q3 — a dead handle keeps the
+        // pool's shape and every present on it is a quiet no-op
+        return WindowHandle(0);
+    }
     with_client(|client| {
         client.panels.push(Some(Panel::new(chip)));
         WindowHandle(client.panels.len())
@@ -2703,6 +2732,11 @@ const TEXT_MIMES: [&CStr; 3] = [c"text/plain;charset=utf-8", c"UTF8_STRING", c"t
 
 /// Claims the selection with a fresh data source serving `text`.
 pub fn clipboard_write(text: &str) {
+    if is_x11() {
+        // the selections dance arrives in Q2
+        let _ = text;
+        return;
+    }
     with_client(|client| {
         if client.data_manager.is_null() || client.data_device.is_null() {
             return;
@@ -2743,6 +2777,10 @@ pub fn clipboard_write(text: &str) {
 /// answers through a pipe under a hard deadline — a hung peer must
 /// never hang the UI thread.
 pub fn clipboard_read() -> Option<String> {
+    if is_x11() {
+        // the selections dance arrives in Q2
+        return None;
+    }
     // the self short-circuit
     let own = with_client(|client| {
         let mimes = client.offers.get(&client.selection)?;
@@ -2830,6 +2868,64 @@ fn serve_selection(text: String, fd: c_int) {
 
 static WAKE_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// The x11 door stores its own pipe's write end here — the waker is
+/// one static either way, so any thread pokes the right loop.
+pub(crate) fn set_wake_write_fd(fd: c_int) {
+    WAKE_WRITE_FD.store(fd, std::sync::atomic::Ordering::Release);
+}
+
+// MARK: - the backend pick (the facade's one decision)
+
+/// Which protocol border this process speaks — decided ONCE, at the
+/// first window, and never again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Backend {
+    Wayland,
+    X11,
+}
+
+/// The pure resolver: an explicit `BUNNY_BACKEND` wins, then the
+/// wayland display, then the x11 display — and a box with neither
+/// has no shell to offer.
+fn resolve_backend(
+    forced: Option<&str>,
+    wayland_display: bool,
+    x11_display: bool,
+) -> Option<Backend> {
+    match forced {
+        Some("wayland") => return Some(Backend::Wayland),
+        Some("x11") => return Some(Backend::X11),
+        Some(other) => {
+            eprintln!("bunny_ui: unknown BUNNY_BACKEND `{other}` — picking by display");
+        }
+        None => {}
+    }
+    if wayland_display {
+        Some(Backend::Wayland)
+    } else if x11_display {
+        Some(Backend::X11)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn backend() -> Backend {
+    static BACKEND: std::sync::OnceLock<Backend> = std::sync::OnceLock::new();
+    *BACKEND.get_or_init(|| {
+        let forced = std::env::var("BUNNY_BACKEND").ok();
+        resolve_backend(
+            forced.as_deref(),
+            std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()),
+            std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty()),
+        )
+        .expect("no wayland or x11 display — is this a graphical session?")
+    })
+}
+
+fn is_x11() -> bool {
+    backend() == Backend::X11
+}
+
 pub fn wake_from_any_thread() {
     let fd = WAKE_WRITE_FD.load(std::sync::atomic::Ordering::Acquire);
     if fd >= 0 {
@@ -2845,6 +2941,11 @@ pub fn wake_from_any_thread() {
 /// double-buffered behind `commit`, and extra commits only flow while
 /// the compositor's `done` echo agrees with our count.
 pub fn sync_ime(state: Option<(bool, usize, (f64, f64, f64, f64))>) {
+    if is_x11() {
+        // no composition road on this door (XIM is a fossil); dead
+        // keys still compose client-side
+        return;
+    }
     with_client(|client| {
         let text_input = client.ime.text_input;
         if text_input.is_null() {
@@ -2903,6 +3004,9 @@ fn ime_marked() -> bool {
 // MARK: - the frame driver (no thread: the compositor's callback is the clock)
 
 pub fn set_frame_driver_paused(paused: bool) {
+    if is_x11() {
+        return crate::x11::set_frame_driver_paused(paused);
+    }
     with_client(|client| {
         if let Some(win) = client.win.as_mut() {
             win.paused = paused;
@@ -2920,6 +3024,10 @@ pub fn set_frame_driver_paused(paused: bool) {
 /// that does not compile) changes nothing — the shm road, byte for
 /// byte.
 pub fn install_gpu(_window: &WindowHandle) {
+    if is_x11() {
+        // the gpu crosses this door in Q5/Q6 — CPU presents until then
+        return;
+    }
     let _ = crate::gl::try_install();
 }
 
@@ -3541,6 +3649,9 @@ fn update_scale(edit: impl FnOnce(&mut Window)) {
 /// timeout scheduler (blink today; repeat and more join later). Runs
 /// until the window closes.
 pub fn run() {
+    if is_x11() {
+        return crate::x11::run();
+    }
     NEXT_BLINK.with(|cell| cell.set(Some(Instant::now() + BLINK_INTERVAL)));
     loop {
         let (display, wake_fd, quit) =
@@ -3728,6 +3839,22 @@ fn teardown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_backend_pick_honors_force_then_displays() {
+        use Backend::{Wayland, X11};
+        // the explicit word wins over any display
+        assert_eq!(resolve_backend(Some("x11"), true, true), Some(X11));
+        assert_eq!(resolve_backend(Some("wayland"), false, true), Some(Wayland));
+        // an unknown word degrades to the display walk, loudly
+        assert_eq!(resolve_backend(Some("cocoa"), true, false), Some(Wayland));
+        // wayland outranks x11 when both offer
+        assert_eq!(resolve_backend(None, true, true), Some(Wayland));
+        assert_eq!(resolve_backend(None, false, true), Some(X11));
+        assert_eq!(resolve_backend(None, true, false), Some(Wayland));
+        // a box with neither has no shell to offer
+        assert_eq!(resolve_backend(None, false, false), None);
+    }
 
     /// Argument count a signature promises (digits are since-versions,
     /// `?` is nullability — neither is an argument).

@@ -12,6 +12,7 @@ mod ffi;
 mod gl;
 mod image;
 mod text;
+mod x11;
 
 use std::cell::RefCell;
 use std::rc::Rc;
