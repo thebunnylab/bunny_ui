@@ -3099,6 +3099,91 @@ mod tests {
         assert!(plain.contains("[.onClick()]"), "and it is the click suffix: {plain}");
     }
 
+    /// The split that makes a TWIN: after it, two live boxes wear the
+    /// same name and the projection cannot choose. The hold must not
+    /// stay pointing at the box that died — an app that is told `None`
+    /// can focus again, and one that is told a ghost cannot even find
+    /// out. This is the second of the two answers the port asked for,
+    /// and the case the first one declines.
+    #[test]
+    fn an_ambiguous_name_after_a_split_kills_the_hold_honestly() {
+        use crate::layout::{Proposal, Size};
+        use std::cell::Cell;
+
+        struct Pane {
+            typed: Rc<Cell<usize>>,
+        }
+
+        impl CustomElement for Pane {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> crate::custom::Response {
+                if let ElementEvent::Text(text) = event {
+                    self.typed.set(self.typed.get() + text.len());
+                    return crate::custom::Response::handled();
+                }
+                crate::custom::Response::ignored()
+            }
+        }
+
+        #[derive(Clone)]
+        struct Bench {
+            split: State<bool>,
+            seam: State<f64>,
+            typed: Rc<Cell<usize>>,
+        }
+
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                let one = custom(Pane { typed: Rc::clone(&self.typed) }).id("code");
+                if self.split.get() {
+                    // the split duplicates the pane — and its name with
+                    // it, which is what makes the projection ambiguous
+                    let two = custom(Pane { typed: Rc::clone(&self.typed) }).id("code");
+                    Either::First(hsplit(self.seam.binding(), one, two))
+                } else {
+                    Either::Second(one)
+                }
+            }
+        }
+
+        let bench = Bench {
+            split: State::new(false),
+            seam: State::new(300.0),
+            typed: Rc::new(Cell::new(0)),
+        };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
+        runtime.render_stable(&bench);
+        let result = runtime.layout(&bench, viewport);
+        let pane = result.customs.first().expect("the box is placed").frame;
+        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        let held = runtime.focused().expect("the click focused the pane");
+
+        bench.split.set(true);
+        runtime.render_stable(&bench);
+        runtime.layout(&bench, viewport);
+
+        // two twins wear the name, so nobody inherits the keyboard —
+        // and the hold does NOT stay on the box that is gone
+        assert_eq!(
+            runtime.focused(),
+            None,
+            "an ambiguous name is answered with silence, never with a ghost",
+        );
+        assert_ne!(runtime.focused().as_deref(), Some(held.as_str()));
+
+        // and the app can act on that: focusing again lands for real
+        let split = runtime.layout(&bench, viewport);
+        let left = split.customs.first().expect("the panes are placed").frame;
+        runtime.pointer_pressed(left.origin.x + 10.0, left.origin.y + 10.0);
+        runtime.pointer_released(left.origin.x + 10.0, left.origin.y + 10.0);
+        assert!(runtime.focused().is_some(), "a fresh click still focuses");
+    }
+
     /// A modal box declines text while its command mode is on, and the
     /// bare stroke reaches the keymap — the whole of a vim layer is
     /// bare keys, and none of them would arrive otherwise.
