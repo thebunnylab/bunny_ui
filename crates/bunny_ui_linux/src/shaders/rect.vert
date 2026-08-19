@@ -7,9 +7,8 @@
 layout(push_constant) uniform Push {
     vec4 round_box;
     vec4 quad;
+    vec4 round_radii;
     vec2 viewport;
-    float round_radius;
-    float pad;
 } pc;
 
 layout(location = 0) in vec4 a_rect;
@@ -18,12 +17,14 @@ layout(location = 2) in vec4 a_params;
 layout(location = 3) in vec4 a_color;
 layout(location = 4) in vec4 a_color2;
 layout(location = 5) in vec2 a_point2;
+layout(location = 6) in vec4 a_radii;
 
 layout(location = 0) flat out vec4 v_rect;
 layout(location = 1) flat out vec4 v_params;
 layout(location = 2) flat out vec4 v_color;
 layout(location = 3) flat out vec4 v_color2;
 layout(location = 4) flat out vec2 v_point2;
+layout(location = 5) flat out vec4 v_radii;
 
 vec2 unit_corners[6] = vec2[6](
     vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
@@ -42,4 +43,5 @@ void main() {
     v_color = a_color;
     v_color2 = a_color2;
     v_point2 = a_point2;
+    v_radii = a_radii;
 }

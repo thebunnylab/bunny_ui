@@ -51,23 +51,25 @@ const SPRITE_FRAG_SPV: &[u8] = include_bytes!("shaders/sprite.frag.spv");
 const MASK_VERT_SPV: &[u8] = include_bytes!("shaders/mask.vert.spv");
 const MASK_FRAG_SPV: &[u8] = include_bytes!("shaders/mask.frag.spv");
 
-/// The 48-byte push range every pipeline shares — layout mirrored in
+/// The 56-byte push range every pipeline shares — layout mirrored in
 /// each shader's `Push` block, asserts are the defense against drift.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Push {
     round_box: [f32; 4],
     quad: [f32; 4],
+    /// The cut's four corners. A `vec4` wants a 16-byte slot, so it
+    /// sits before the viewport and the range grows by eight bytes —
+    /// far under the 128 every device promises.
+    round_radii: [f32; 4],
     viewport: [f32; 2],
-    round_radius: f32,
-    pad: f32,
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<Push>() == 48);
+    assert!(std::mem::size_of::<Push>() == 56);
     assert!(std::mem::offset_of!(Push, quad) == 16);
-    assert!(std::mem::offset_of!(Push, viewport) == 32);
-    assert!(std::mem::offset_of!(Push, round_radius) == 40);
+    assert!(std::mem::offset_of!(Push, round_radii) == 32);
+    assert!(std::mem::offset_of!(Push, viewport) == 48);
 };
 
 // MARK: - FFI border (dlopen the door, GetInstanceProcAddr the hallway)
@@ -1452,7 +1454,7 @@ impl VkStack {
 
             // fixed state: the nearest sampler (texelFetch never uses
             // it, completeness demands it), one sampler-set layout,
-            // the shared 48-byte push range, the command pool
+            // the shared 56-byte push range, the command pool
             let sampler_info = SamplerCreateInfo {
                 s_type: ST_SAMPLER_CREATE,
                 p_next: std::ptr::null(),
@@ -1837,6 +1839,7 @@ impl VkStack {
             VertexInputAttribute { location: 3, binding: 0, format: FORMAT_R8G8B8A8_UNORM_ATTR, offset: 48 },
             VertexInputAttribute { location: 4, binding: 0, format: FORMAT_R8G8B8A8_UNORM_ATTR, offset: 52 },
             VertexInputAttribute { location: 5, binding: 0, format: FORMAT_R32G32_SFLOAT, offset: 56 },
+            VertexInputAttribute { location: 6, binding: 0, format: FORMAT_R32G32B32A32_SFLOAT, offset: 64 },
         ];
         let sprite_binding = VertexInputBinding {
             binding: 0,
@@ -2571,9 +2574,8 @@ fn record_frame(
         let mut push = Push {
             round_box: [0.0; 4],
             quad: [0.0; 4],
+            round_radii: [0.0; 4],
             viewport: [extent.0 as f32, extent.1 as f32],
-            round_radius: 0.0,
-            pad: 0.0,
         };
         let push_all = |command: CommandBuffer, push: &Push| {
             (fns.cmd_push_constants)(
@@ -2599,7 +2601,7 @@ fn record_frame(
             if bound_round != run.round {
                 let round: &RoundClip = &batches.rounds[run.round as usize];
                 push.round_box = round.box4;
-                push.round_radius = round.radius;
+                push.round_radii = round.radii;
                 push_all(command, &push);
                 bound_round = run.round;
             }
@@ -2660,7 +2662,7 @@ fn record_frame(
             let r = radius as f32;
             (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, stack.mask_pipeline);
             push.round_box = [0.0, 0.0, w, h];
-            push.round_radius = r;
+            push.round_radii = [r; 4];
             for quad in [
                 [0.0, 0.0, r, r],
                 [w - r, 0.0, w, r],
@@ -4173,10 +4175,10 @@ mod tests {
 
     #[test]
     fn the_push_range_holds_its_layout() {
-        assert_eq!(std::mem::size_of::<Push>(), 48);
+        assert_eq!(std::mem::size_of::<Push>(), 56);
         assert_eq!(std::mem::offset_of!(Push, quad), 16);
-        assert_eq!(std::mem::offset_of!(Push, viewport), 32);
-        assert_eq!(std::mem::offset_of!(Push, round_radius), 40);
+        assert_eq!(std::mem::offset_of!(Push, round_radii), 32);
+        assert_eq!(std::mem::offset_of!(Push, viewport), 48);
     }
 }
 

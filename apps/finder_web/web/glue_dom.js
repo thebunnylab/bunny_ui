@@ -297,6 +297,8 @@ function applyPatches(view, length) {
         const borderWidth = f32();
         base.push(`border:${borderWidth}px solid ${rgba(borderColor)}`);
       }
+      // bit 4 is the one radius every corner shares; bit 22 below is
+      // the four, and a box sends one or the other, never both
       if (mask & 16) base.push(`border-radius:${f32()}px`);
       if (mask & 32) {
         const radius = f32();
@@ -394,6 +396,14 @@ function applyPatches(view, length) {
         // a layer that asks for nothing: the click belongs to whatever
         // it covers
         base.push("pointer-events:none");
+      }
+      if (mask & 4194304) {
+        // four corners, clockwise from the top left — the CSS order
+        const tl = f32();
+        const tr = f32();
+        const br = f32();
+        const bl = f32();
+        base.push(`border-radius:${tl}px ${tr}px ${br}px ${bl}px`);
       }
       const name = `[data-n="${id}"]`;
       const from = group ? `[data-g="${group}"]` : name;

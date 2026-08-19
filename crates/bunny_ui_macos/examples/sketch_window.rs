@@ -24,7 +24,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use bunny_ui::layout::{Point, Px, Rect, Size};
+use bunny_ui::layout::{Color, Corners, Point, Px, Rect, Size};
 use bunny_ui::prelude::*;
 #[cfg(target_os = "macos")]
 use bunny_ui_macos::Chrome;
@@ -307,8 +307,39 @@ struct App {
     sketch: Sketch,
 }
 
+impl App {
+    /// One cell of the brush picker. The picker is ONE figure cut into
+    /// three, so the cells that end it round outward and the middle
+    /// one stays square — four corners, not one.
+    fn cell(&self, label: &str, width: Px, corners: Corners) -> impl View + use<> {
+        let brush = self.sketch.brush;
+        let chosen = (brush.get() - width).abs() < 0.01;
+        text(label)
+            .font_size(11.0)
+            .foreground_color(if chosen { Color::WHITE } else { theme::fg_secondary() })
+            .foreground_hovered(Color::WHITE)
+            .padding_edge(Edge::Leading, 9.0)
+            .padding_edge(Edge::Trailing, 9.0)
+            .padding_edge(Edge::Top, 5.0)
+            .padding_edge(Edge::Bottom, 5.0)
+            .background_color(if chosen { theme::accent() } else { theme::control() })
+            .background_hovered(theme::row_hover())
+            .corner_radius(corners)
+            .on_click(move || brush.set(width))
+    }
+}
+
 impl Component for App {
     fn body(self, _ctx: &Context) -> impl View {
+        // the picker: the first cell rounds its LEFT, the last its
+        // RIGHT, and the one between them rounds nothing
+        let picker = hstack!(
+            self.cell("fine", 2.0, Corners::left(7.0)),
+            self.cell("medium", 6.0, Corners::ZERO),
+            self.cell("broad", 14.0, Corners::right(7.0)),
+        )
+        .spacing(1.0);
+
         let bar = hstack!(
             spacer().frame(LIGHTS_W, 1.0),
             text("sketch").bold(),
@@ -316,6 +347,7 @@ impl Component for App {
                 .font_size(11.0)
                 .foreground_color(theme::fg_faint()),
             spacer(),
+            picker,
             text(format!("{} strokes", self.sketch.strokes.get().len()))
                 .font_size(11.0)
                 .foreground_color(theme::fg_secondary()),

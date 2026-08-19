@@ -62,6 +62,130 @@ pub struct Rect {
     pub size: Size,
 }
 
+/// The four corners of a box, clockwise from the top left.
+///
+/// One number spreads to all four, so everything that has a single
+/// radius stays what it was: `.corner_radius(8.0)` and
+/// `Corners::all(8.0)` are the same value.
+///
+/// The shape that needs four is a figure made of BANDS — a selection
+/// over three lines rounds the top of the first, nothing on the
+/// middle, and the bottom of the last:
+///
+/// ```ignore
+/// painter.fill_rounded(first,  tint, Corners::top(4.0));
+/// painter.fill_rounded(middle, tint, Corners::ZERO);
+/// painter.fill_rounded(last,   tint, Corners::bottom(4.0));
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Corners {
+    pub top_left: Px,
+    pub top_right: Px,
+    pub bottom_right: Px,
+    pub bottom_left: Px,
+}
+
+impl Corners {
+    /// Four square corners — the plain rectangle.
+    pub const ZERO: Corners =
+        Corners { top_left: 0.0, top_right: 0.0, bottom_right: 0.0, bottom_left: 0.0 };
+
+    /// The same radius on all four.
+    pub const fn all(radius: Px) -> Corners {
+        Corners {
+            top_left: radius,
+            top_right: radius,
+            bottom_right: radius,
+            bottom_left: radius,
+        }
+    }
+
+    /// Rounds the two TOP corners and leaves the bottom square — the
+    /// first band of a stack.
+    pub const fn top(radius: Px) -> Corners {
+        Corners { top_left: radius, top_right: radius, ..Corners::ZERO }
+    }
+
+    /// Rounds the two BOTTOM corners — the last band of a stack.
+    pub const fn bottom(radius: Px) -> Corners {
+        Corners { bottom_right: radius, bottom_left: radius, ..Corners::ZERO }
+    }
+
+    /// Rounds the two LEFT corners — the first cell of a row.
+    pub const fn left(radius: Px) -> Corners {
+        Corners { top_left: radius, bottom_left: radius, ..Corners::ZERO }
+    }
+
+    /// Rounds the two RIGHT corners — the last cell of a row.
+    pub const fn right(radius: Px) -> Corners {
+        Corners { top_right: radius, bottom_right: radius, ..Corners::ZERO }
+    }
+
+    /// Are all four square? The straight rectangle takes the short path
+    /// in every pipeline.
+    pub fn is_zero(&self) -> bool {
+        self.max() <= 0.0
+    }
+
+    /// The one radius all four share, if they do — what a consumer with
+    /// room for a single number asks before it spends four.
+    pub fn uniform(&self) -> Option<Px> {
+        (self.top_left == self.top_right
+            && self.top_left == self.bottom_right
+            && self.top_left == self.bottom_left)
+            .then_some(self.top_left)
+    }
+
+    /// The largest of the four — the reach a corner loop must cover.
+    pub fn max(&self) -> Px {
+        self.top_left.max(self.top_right).max(self.bottom_right).max(self.bottom_left)
+    }
+
+    /// Each corner cut to the box it rounds: never negative, never more
+    /// than half a side. A radius under half a pixel becomes square —
+    /// the straight rectangle it already painted as.
+    pub fn clamped(&self, width: Px, height: Px) -> Corners {
+        let cut = |radius: Px| {
+            let radius = radius.max(0.0).min(width / 2.0).min(height / 2.0);
+            if radius < 0.5 { 0.0 } else { radius }
+        };
+        Corners {
+            top_left: cut(self.top_left),
+            top_right: cut(self.top_right),
+            bottom_right: cut(self.bottom_right),
+            bottom_left: cut(self.bottom_left),
+        }
+    }
+}
+
+impl From<Px> for Corners {
+    fn from(radius: Px) -> Corners {
+        Corners::all(radius)
+    }
+}
+
+impl std::ops::Mul<Px> for &Corners {
+    type Output = Corners;
+
+    fn mul(self, factor: Px) -> Corners {
+        *self * factor
+    }
+}
+
+impl std::ops::Mul<Px> for Corners {
+    type Output = Corners;
+
+    /// The device-pixel scale reaches all four at once.
+    fn mul(self, factor: Px) -> Corners {
+        Corners {
+            top_left: self.top_left * factor,
+            top_right: self.top_right * factor,
+            bottom_right: self.bottom_right * factor,
+            bottom_left: self.bottom_left * factor,
+        }
+    }
+}
+
 /// The parent's proposal. `None` on an axis = "answer your ideal size".
 ///
 /// Deliberately **no `Default`**: a forgotten value cannot silently
@@ -867,7 +991,7 @@ pub struct VisualProps {
     /// Inherited downward: the text below paints with the current foreground.
     pub foreground: Option<Color>,
     pub border: Option<(Color, Px)>,
-    pub corner_radius: Option<Px>,
+    pub corner_radius: Option<Corners>,
     /// Alternate background under hover/pressed of the ancestor
     /// `Interactive` — in Dom, `:hover`/`:active`. (Generalizing the
     /// state to the whole `VisualProps` waits for the theme port.)
@@ -988,21 +1112,23 @@ pub struct ThumbDrag {
 /// It is the rasterizer's interface and, later on, any backend's.
 #[derive(Clone, PartialEq, Debug)]
 pub enum DrawCommand {
-    /// `corner_radius: 0.0` = plain rectangle (the usual straight path).
-    FillRect { rect: Rect, color: Color, corner_radius: Px },
+    /// `corner_radius: Corners::ZERO` = plain rectangle (the usual
+    /// straight path). Four numbers, so a band of a bigger figure can
+    /// round only the corners that end it.
+    FillRect { rect: Rect, color: Color, corner_radius: Corners },
     /// A two-stop ramp inside the rounded rect — the same shape a
     /// `FillRect` covers, with the color resolved per pixel.
-    Gradient { rect: Rect, paint: GradientPaint, corner_radius: Px },
+    Gradient { rect: Rect, paint: GradientPaint, corner_radius: Corners },
     /// A soft halo OUTSIDE the rounded rect: alpha falls off
     /// quadratically from the edge over `radius` px. `corner_radius`
     /// makes the halo follow the corners — including the little notch
     /// BEHIND a rounded corner, which belongs to the shadow, not to the
     /// backdrop.
-    Shadow { rect: Rect, radius: Px, color: Color, corner_radius: Px },
+    Shadow { rect: Rect, radius: Px, color: Color, corner_radius: Corners },
     /// A border painted INWARD from the edge, `width` logical px —
     /// it follows `corner_radius` around the corners (an anti-aliased
     /// ring; `0.0` = the four straight bars).
-    StrokeRect { rect: Rect, color: Color, width: Px, corner_radius: Px },
+    StrokeRect { rect: Rect, color: Color, width: Px, corner_radius: Corners },
     /// One already-wrapped line of text. `origin` is the TOP-left of the
     /// line box (the engine converts to baseline internally); `font` is
     /// the effective inherited font. The painted span is
@@ -1029,7 +1155,7 @@ pub enum DrawCommand {
     /// command was born as). The rect arrives in the pushing node's OWN
     /// coordinates: a curve has no corner left after somebody else's
     /// intersection, so the composition lives where the stacks live.
-    PushClip { rect: Rect, corner_radius: Px },
+    PushClip { rect: Rect, corner_radius: Corners },
     PopClip,
 }
 
@@ -1555,14 +1681,14 @@ impl Placement {
     /// intersecting commute (round is monotone), so the consumers'
     /// own stacks land on the same integers the old pre-intersected
     /// command did — byte for byte.
-    fn push_clip(&mut self, rect: Rect, corner_radius: Px) {
+    fn push_clip(&mut self, rect: Rect, corner_radius: impl Into<Corners>) {
         let clipped = match self.clip.last() {
             Some(top) => rect
                 .intersection(*top)
                 .unwrap_or(Rect { origin: rect.origin, size: Size::default() }),
             None => rect,
         };
-        self.display.push(DrawCommand::PushClip { rect, corner_radius });
+        self.display.push(DrawCommand::PushClip { rect, corner_radius: corner_radius.into() });
         self.clip.push(clipped);
     }
 
@@ -1999,7 +2125,7 @@ fn menu_node(open: &MenuOpen, env: LayoutEnv) -> LayoutNode {
                             Some(theme.fg)
                         },
                         foreground_hovered: Some(Color::WHITE),
-                        corner_radius: Some(4.0),
+                        corner_radius: Some(Corners::all(4.0)),
                         ..VisualProps::default()
                     }),
                     child: Box::new(LayoutNode::Frame {
@@ -2058,7 +2184,7 @@ fn menu_node(open: &MenuOpen, env: LayoutEnv) -> LayoutNode {
         props: Box::new(VisualProps {
             background: Some(theme.panel),
             border: Some((theme.border, 1.0)),
-            corner_radius: Some(7.0),
+            corner_radius: Some(Corners::all(7.0)),
             shadow: Some((18.0, Color { r: 0, g: 0, b: 0, a: 80 })),
             clip: true,
             font: FontPatch { size: Some(13.0), ..FontPatch::default() },
@@ -2120,7 +2246,7 @@ fn tooltip_node(text: Arc<str>) -> LayoutNode {
         props: Box::new(VisualProps {
             background: Some(Color { a: 242, ..theme.fg }),
             foreground: Some(theme.canvas),
-            corner_radius: Some(5.0),
+            corner_radius: Some(Corners::all(5.0)),
             shadow: Some((10.0, Color { r: 0, g: 0, b: 0, a: 90 })),
             font: FontPatch { size: Some(11.0), ..FontPatch::default() },
             ..VisualProps::default()
@@ -2765,7 +2891,7 @@ impl LayoutNode {
                 out.display.push(DrawCommand::FillRect {
                     rect: frame,
                     color: Color::FILL,
-                    corner_radius: 0.0,
+                    corner_radius: Corners::ZERO,
                 });
             }
 
@@ -2799,7 +2925,7 @@ impl LayoutNode {
                             crate::dom::DomStyle {
                                 background: Some(theme.field),
                                 border: Some((theme.field_border, 1.0)),
-                                corner_radius: Some(FIELD_RADIUS),
+                                corner_radius: Some(Corners::all(FIELD_RADIUS)),
                                 focus_border: Some(theme.focus),
                                 placeholder_color: Some(theme.placeholder),
                                 ..crate::dom::DomStyle::default()
@@ -2832,7 +2958,7 @@ impl LayoutNode {
                 out.display.push(DrawCommand::FillRect {
                     rect: frame,
                     color: theme.field,
-                    corner_radius: FIELD_RADIUS,
+                    corner_radius: Corners::all(FIELD_RADIUS),
                 });
                 // the placeholder walks the SAME path as the real text:
                 // same origin, same font, same breaks — only the ink drops
@@ -2917,7 +3043,7 @@ impl LayoutNode {
                                     size: Size { width: x1 - x0, height: line_h },
                                 },
                                 color: theme.selection,
-                                corner_radius: 0.0,
+                                corner_radius: Corners::ZERO,
                             });
                         }
                     }
@@ -2944,7 +3070,7 @@ impl LayoutNode {
                                     size: Size { width: x1 - x0, height: 1.0 },
                                 },
                                 color: theme.caret,
-                                corner_radius: 0.0,
+                                corner_radius: Corners::ZERO,
                             });
                         }
                     }
@@ -2964,7 +3090,7 @@ impl LayoutNode {
                             size: Size { width: FIELD_CARET_W, height: line_h },
                         },
                         color: theme.caret,
-                        corner_radius: FIELD_CARET_W / 2.0,
+                        corner_radius: Corners::all(FIELD_CARET_W / 2.0),
                     });
                 }
                 out.pop_clip();
@@ -2972,7 +3098,7 @@ impl LayoutNode {
                     rect: frame,
                     color: if focused { theme.focus } else { theme.field_border },
                     width: 1.0,
-                    corner_radius: FIELD_RADIUS,
+                    corner_radius: Corners::all(FIELD_RADIUS),
                 });
                 // the field is a pointer target (clicking focuses) —
                 // clipped like any hit
@@ -3011,7 +3137,7 @@ impl LayoutNode {
                     rect: frame,
                     color: Color::OUTLINE,
                     width: 1.0,
-                    corner_radius: 0.0,
+                    corner_radius: Corners::ZERO,
                 });
             }
 
@@ -3247,7 +3373,7 @@ impl LayoutNode {
                             rect: frame,
                             color: accent,
                             width: 2.0,
-                            corner_radius: 6.0,
+                            corner_radius: Corners::all(6.0),
                         });
                         // element mode never reads the draw list, so the
                         // ring must be an ELEMENT there — a box with a
@@ -3258,7 +3384,7 @@ impl LayoutNode {
                                 frame,
                                 crate::dom::DomStyle {
                                     border: Some((accent, 2.0)),
-                                    corner_radius: Some(6.0),
+                                    corner_radius: Some(Corners::all(6.0)),
                                     ..crate::dom::DomStyle::default()
                                 },
                             );
@@ -3280,7 +3406,7 @@ impl LayoutNode {
                         rect: frame,
                         color: Color::OUTLINE,
                         width: 1.0,
-                        corner_radius: 0.0,
+                        corner_radius: Corners::ZERO,
                     });
                 }
                 Some(source) => {
@@ -3660,7 +3786,7 @@ impl LayoutNode {
                         rect: frame,
                         radius,
                         color: animated(crate::anim::Channel::Shadow, color),
-                        corner_radius: props.corner_radius.unwrap_or(0.0),
+                        corner_radius: props.corner_radius.unwrap_or_default(),
                     });
                 }
                 // a box that follows a GROUP paints by the ancestor's
@@ -3682,7 +3808,7 @@ impl LayoutNode {
                     out.display.push(DrawCommand::FillRect {
                         rect: frame,
                         color: animated(crate::anim::Channel::Background, color),
-                        corner_radius: props.corner_radius.unwrap_or(0.0),
+                        corner_radius: props.corner_radius.unwrap_or_default(),
                     });
                 }
                 // the ramp paints OVER the flat color and under the
@@ -3692,7 +3818,7 @@ impl LayoutNode {
                     out.display.push(DrawCommand::Gradient {
                         rect: frame,
                         paint: gradient.resolve(frame),
-                        corner_radius: props.corner_radius.unwrap_or(0.0),
+                        corner_radius: props.corner_radius.unwrap_or_default(),
                     });
                 }
                 // the ink walks the same ladder as the background: a
@@ -3712,7 +3838,7 @@ impl LayoutNode {
                 // cut; the border paints after, over the cut child — a
                 // ring blended once, never twice
                 if props.clip {
-                    out.push_clip(frame, props.corner_radius.unwrap_or(0.0));
+                    out.push_clip(frame, props.corner_radius.unwrap_or_default());
                 }
                 child.place(frame, *fit, env, out);
                 if props.clip {
@@ -3726,7 +3852,7 @@ impl LayoutNode {
                         rect: frame,
                         color: animated(crate::anim::Channel::Border, color),
                         width,
-                        corner_radius: props.corner_radius.unwrap_or(0.0),
+                        corner_radius: props.corner_radius.unwrap_or_default(),
                     });
                 }
                 // the veil closes the box. In ELEMENT mode the browser
@@ -4453,7 +4579,7 @@ fn draw_scrollbar(
             size: Size { width: SCROLLBAR_W, height: thumb_h },
         },
         color: crate::theme::current().scrollbar,
-        corner_radius: SCROLLBAR_W / 2.0,
+        corner_radius: Corners::all(SCROLLBAR_W / 2.0),
     });
     // the grab band, over the paint and pushed AFTER the content: the
     // reverse hit walk finds it first, and the thumb is draggable
@@ -4505,7 +4631,7 @@ fn draw_scrollbar_h(
             size: Size { width: thumb_w, height: SCROLLBAR_W },
         },
         color: crate::theme::current().scrollbar,
-        corner_radius: SCROLLBAR_W / 2.0,
+        corner_radius: Corners::all(SCROLLBAR_W / 2.0),
     });
     if let Some(path) = path {
         let band = Rect {
@@ -5250,7 +5376,7 @@ mod tests {
             VisualProps {
                 background: Some(Color::hex(0x112233)),
                 border: Some((Color::hex(0x445566), 2.0)),
-                corner_radius: Some(4.0),
+                corner_radius: Some(Corners::all(4.0)),
                 ..VisualProps::default()
             },
             text(3),
@@ -5262,7 +5388,7 @@ mod tests {
         assert!(matches!(
             commands[0],
             DrawCommand::FillRect { color, corner_radius, .. }
-                if *color == Color::hex(0x112233) && *corner_radius == 4.0
+                if *color == Color::hex(0x112233) && *corner_radius == Corners::all(4.0)
         ));
         assert!(matches!(commands[1], DrawCommand::TextLine { .. }));
         assert!(matches!(
@@ -5281,7 +5407,7 @@ mod tests {
                 VisualProps {
                     background: Some(Color::BLACK),
                     border: Some((Color::WHITE, 3.0)),
-                    corner_radius: Some(8.0),
+                    corner_radius: Some(Corners::all(8.0)),
                     ..VisualProps::default()
                 },
                 text(7),
@@ -5536,7 +5662,7 @@ mod tests {
         // .corner_radius + .clipped fuse into ONE node — the cut takes
         // the radius without being handed it, in either order
         let dressed = styled(
-            VisualProps { clip: true, corner_radius: Some(6.0), ..VisualProps::default() },
+            VisualProps { clip: true, corner_radius: Some(Corners::all(6.0)), ..VisualProps::default() },
             text(3),
         );
         let result = layout(&dressed, Proposal::unspecified());
@@ -5548,7 +5674,7 @@ mod tests {
                 _ => None,
             })
             .expect("the cut is pushed");
-        assert_eq!(cut.1, 6.0);
+        assert_eq!(cut.1, Corners::all(6.0));
         let pops = result
             .display
             .iter()
@@ -5560,7 +5686,7 @@ mod tests {
         let result = layout(&plain, Proposal::unspecified());
         assert!(result.display.iter().any(|command| matches!(
             command,
-            DrawCommand::PushClip { corner_radius, .. } if *corner_radius == 0.0
+            DrawCommand::PushClip { corner_radius, .. } if corner_radius.is_zero()
         )));
     }
 
@@ -5573,7 +5699,7 @@ mod tests {
             VisualProps {
                 background: Some(Color::hex(0xF0F0F0)),
                 border: Some((Color::BLACK, 1.0)),
-                corner_radius: Some(6.0),
+                corner_radius: Some(Corners::all(6.0)),
                 clip: true,
                 ..VisualProps::default()
             },

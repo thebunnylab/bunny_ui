@@ -419,18 +419,29 @@ layout(std140) uniform Frame {
 };
 layout(std140) uniform Round {
     vec4 round_box;
-    float round_radius;
+    vec4 round_radii;
 };
 
-float rect_sdf(vec2 p, vec4 rect, float radius) {
+// which of the four a pixel answers to: the box's own midpoint splits
+// it in quarters, and a pixel far from every corner reads the same
+// coverage whichever radius it picked — a straight edge does not
+// depend on it
+float corner_at(vec2 p, vec4 rect, vec4 radii) {
+    vec2 mid = (rect.xy + rect.zw) * 0.5;
+    return p.x < mid.x ? (p.y < mid.y ? radii.x : radii.w)
+                       : (p.y < mid.y ? radii.y : radii.z);
+}
+
+float rect_sdf(vec2 p, vec4 rect, vec4 radii) {
+    float radius = corner_at(p, rect, radii);
     vec2 shifted = max(rect.xy + radius - p, p - (rect.zw - radius));
     float outside = length(max(shifted, vec2(0.0)));
     float inside = min(max(shifted.x, shifted.y), 0.0);
     return outside + inside - radius;
 }
 
-float rect_cov(vec2 p, vec4 rect, float radius) {
-    return clamp(0.5 - rect_sdf(p, rect, radius), 0.0, 1.0);
+float rect_cov(vec2 p, vec4 rect, vec4 radii) {
+    return clamp(0.5 - rect_sdf(p, rect, radii), 0.0, 1.0);
 }
 
 // the curve that softens the run's clip. radius 0 is the straight
@@ -438,7 +449,9 @@ float rect_cov(vec2 p, vec4 rect, float radius) {
 // exact, so a scene without a rounded clip leaves both shaders
 // untouched, bit for bit
 float clip_cov(vec2 p) {
-    return round_radius > 0.0 ? rect_cov(p, round_box, round_radius) : 1.0;
+    return any(greaterThan(round_radii, vec4(0.0)))
+        ? rect_cov(p, round_box, round_radii)
+        : 1.0;
 }
 
 // gl_FragCoord counts from the bottom-left; the raster counts from the
@@ -459,12 +472,14 @@ in vec4 a_params;
 in vec4 a_color;
 in vec4 a_color2;
 in vec2 a_point2;
+in vec4 a_radii;
 
 flat out vec4 v_rect;
 flat out vec4 v_params;
 flat out vec4 v_color;
 flat out vec4 v_color2;
 flat out vec2 v_point2;
+flat out vec4 v_radii;
 
 const vec2 unit_corners[6] = vec2[6](
     vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
@@ -485,6 +500,7 @@ void main() {
     v_color = a_color;
     v_color2 = a_color2;
     v_point2 = a_point2;
+    v_radii = a_radii;
 }
 "#;
 
@@ -494,6 +510,7 @@ flat in vec4 v_params;
 flat in vec4 v_color;
 flat in vec4 v_color2;
 flat in vec2 v_point2;
+flat in vec4 v_radii;
 out vec4 out_color;
 
 void main() {
@@ -502,23 +519,23 @@ void main() {
     float coverage;
     if (kind == 0.0) {
         // fill: the cpu corner ramp, clamp(radius - d + 0.5, 0, 1)
-        coverage = rect_cov(p, v_rect, v_params.x);
+        coverage = rect_cov(p, v_rect, v_radii);
     } else if (kind == 1.0) {
         // stroke: outer coverage minus the inner rect's — the inset
         // keeps the same corner center as the cpu ring, and integer
         // edges keep the straight bars exact and never double-blended
         float thickness = v_params.y;
         vec4 inner = vec4(v_rect.xy + thickness, v_rect.zw - thickness);
-        float inner_radius = max(v_params.x - thickness, 0.0);
+        vec4 inner_radii = max(v_radii - thickness, vec4(0.0));
         coverage = clamp(
-            rect_cov(p, v_rect, v_params.x) - rect_cov(p, inner, inner_radius),
+            rect_cov(p, v_rect, v_radii) - rect_cov(p, inner, inner_radii),
             0.0, 1.0);
     } else if (kind == 2.0) {
         // shadow: quadratic falloff outside the rounded core — the quad
         // arrives pre-expanded, params.w undoes the expansion
         float expansion = v_params.w;
         vec4 base = vec4(v_rect.xy + expansion, v_rect.zw - expansion);
-        float corner = v_params.x;
+        float corner = corner_at(p, base, v_radii);
         float reach = v_params.y;
         vec2 delta = p - clamp(p, base.xy + corner, base.zw - corner);
         float dist = length(delta) - corner;
@@ -529,7 +546,7 @@ void main() {
         // pixel: rings from point2 (params.y and .w are the radii), or
         // a ramp from params to point2. The cpu resolved every number
         // in f64 — this only mixes.
-        coverage = rect_cov(p, v_rect, v_params.x);
+        coverage = rect_cov(p, v_rect, v_radii);
         float t;
         if (kind == 3.0) {
             float dist = length(p - v_point2);
@@ -537,7 +554,7 @@ void main() {
         } else if (kind == 5.0) {
             // the ellipse is a circle in a Y-scaled space; its corner
             // slot carries the aspect, so the cover is the plain box
-            coverage = rect_cov(p, v_rect, 0.0);
+            coverage = rect_cov(p, v_rect, vec4(0.0));
             vec2 away = p - v_point2;
             float dist = length(vec2(away.x, away.y / v_params.x));
             t = clamp((dist - v_params.y) / (v_params.w - v_params.y), 0.0, 1.0);
@@ -630,7 +647,7 @@ out vec4 out_color;
 
 void main() {
     // the window's own rounded box rides the Round block
-    out_color = vec4(0.0, 0.0, 0.0, rect_cov(raster_p(), round_box, round_radius));
+    out_color = vec4(0.0, 0.0, 0.0, rect_cov(raster_p(), round_box, round_radii));
 }
 "#;
 
@@ -911,7 +928,15 @@ impl GlStack {
                 gl,
                 &[SHADER_PRELUDE, RECT_VERT],
                 &[SHADER_PRELUDE, SHARED_FRAG, RECT_FRAG_BODY],
-                &[c"a_rect", c"a_clip", c"a_params", c"a_color", c"a_color2", c"a_point2"],
+                &[
+                c"a_rect",
+                c"a_clip",
+                c"a_params",
+                c"a_color",
+                c"a_color2",
+                c"a_point2",
+                c"a_radii",
+            ],
             )
             .map_err(|log| format!("rect pipeline refused: {}", log.trim()))?;
             self.sprite_program = build_program(
@@ -1092,7 +1117,7 @@ impl GlStack {
         let r = radius as f32;
         let (w, h) = viewport;
         unsafe {
-            let round = RoundClip { box4: [0.0, 0.0, w, h], radius: r, pad: [0.0; 3] };
+            let round = RoundClip { box4: [0.0, 0.0, w, h], radii: [r; 4] };
             (gl.bind_buffer)(GL_UNIFORM_BUFFER, self.round_ubo);
             (gl.buffer_data)(
                 GL_UNIFORM_BUFFER,
@@ -1149,6 +1174,7 @@ unsafe fn rect_attribs(gl: &GlFns, base: usize) {
             (3, 48, 4, GL_UNSIGNED_BYTE, 1),
             (4, 52, 4, GL_UNSIGNED_BYTE, 1),
             (5, 56, 2, GL_FLOAT, 0),
+            (6, 64, 4, GL_FLOAT, 0),
         ] {
             (gl.enable_vertex_attrib_array)(index);
             (gl.vertex_attrib_pointer)(

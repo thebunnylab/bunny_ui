@@ -4,9 +4,8 @@
 layout(push_constant) uniform Push {
     vec4 round_box;
     vec4 quad;
+    vec4 round_radii;
     vec2 viewport;
-    float round_radius;
-    float pad;
 } pc;
 
 layout(location = 0) in vec4 a_dest;

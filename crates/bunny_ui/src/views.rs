@@ -30,7 +30,8 @@ use motor::view::RenderNode;
 use motor::views::NavigationPath;
 
 use crate::layout::{
-    Axis, CrossAlign, Edges, Fraction, LayoutNode, SeamUnit, Size as LayoutSize, VisualProps,
+    Axis, Corners, CrossAlign, Edges, Fraction, LayoutNode, SeamUnit, Size as LayoutSize,
+    VisualProps,
 };
 use crate::state_ext::BindingExt;
 use crate::view::{NodeList, Single, View, render_line};
@@ -119,7 +120,7 @@ where
                 background: Some(theme.control),
                 background_hovered: Some(theme.control_hovered),
                 background_pressed: Some(theme.control_pressed),
-                corner_radius: Some(BUTTON_RADIUS),
+                corner_radius: Some(Corners::all(BUTTON_RADIUS)),
                 ..VisualProps::default()
             }),
             child: Box::new(LayoutNode::Padding {

@@ -385,10 +385,14 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     }
 
     /// `.cornerRadius(8)` — rounds THIS node's background.
-    fn corner_radius(self, radius: f64) -> Modified<Self> {
+    ///
+    /// One number rounds all four corners. A [`crate::layout::Corners`]
+    /// rounds only the ones it names, for a box that continues into its
+    /// neighbour: `.corner_radius(Corners::top(6.0))`.
+    fn corner_radius(self, radius: impl Into<crate::layout::Corners>) -> Modified<Self> {
         Modified {
             base: self,
-            modifier: Modifier::CornerRadius(radius),
+            modifier: Modifier::CornerRadius(radius.into()),
         }
     }
 

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use bunny_ui::image_engine::{ImageEngine, ImageSource, raster_source};
-use bunny_ui::layout::{Color, DisplayList, DrawCommand, Rect};
+use bunny_ui::layout::{Color, Corners, DisplayList, DrawCommand, Rect};
 use bunny_ui::raster::physical_extent;
 use bunny_ui::text_engine::{FontKey, FontSpec, TextEngine};
 
@@ -39,11 +39,14 @@ pub(crate) const ATLAS_MAX_SIZE: u32 = 4096;
 pub(crate) struct RectInstance {
     pub(crate) rect: [f32; 4],   // x0, y0, x1, y1 (the shadow ships EXPANDED)
     pub(crate) clip: [f32; 4],   // the snapped clip-stack top
-    pub(crate) params: [f32; 4], // corner, thickness/reach/first, kind, expansion/second
+    pub(crate) params: [f32; 4], // aspect (the ellipse only), thickness/reach/first, kind, expansion/second
     pub(crate) color: [u8; 4],   // straight RGBA (a normalized attribute)
     /// A gradient's second half rides here: the far color plus one
     /// point (centre for the rings, end for the line).
     pub(crate) pad: [u8; 12],
+    /// The four corners, clockwise from the top left, CLAMPED in
+    /// device px — the shader only picks the one its quadrant owns.
+    pub(crate) radii: [f32; 4],
 }
 
 /// One text run (or chunk of one): a rectangle of atlas texels copied
@@ -58,12 +61,13 @@ pub(crate) struct SpriteInstance {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<RectInstance>() == 64);
+    assert!(std::mem::size_of::<RectInstance>() == 80);
     assert!(std::mem::offset_of!(RectInstance, rect) == 0);
     assert!(std::mem::offset_of!(RectInstance, clip) == 16);
     assert!(std::mem::offset_of!(RectInstance, params) == 32);
     assert!(std::mem::offset_of!(RectInstance, color) == 48);
     assert!(std::mem::offset_of!(RectInstance, pad) == 52);
+    assert!(std::mem::offset_of!(RectInstance, radii) == 64);
     assert!(std::mem::size_of::<SpriteInstance>() == 48);
     assert!(std::mem::offset_of!(SpriteInstance, dest) == 0);
     assert!(std::mem::offset_of!(SpriteInstance, tex) == 16);
@@ -98,40 +102,47 @@ pub(crate) fn snap_scaled(rect: Rect, factor: f64) -> Box4 {
     )
 }
 
-/// The CPU's radius clamp, verbatim: never negative via `max`, then
-/// halved against the SNAPPED extent (which can drive it negative on a
-/// degenerate rect — the raster accepts that, so the port does too).
-pub(crate) fn corner_clamp(scaled_radius: f64, snapped: Box4) -> f64 {
-    scaled_radius
-        .max(0.0)
-        .min((snapped.2 - snapped.0) as f64 / 2.0)
-        .min((snapped.3 - snapped.1) as f64 / 2.0)
+/// The CPU's radius clamp, verbatim — the same `Corners::clamped` the
+/// raster runs, against the SNAPPED extent.
+pub(crate) fn corner_clamp(scaled: Corners, snapped: Box4) -> Corners {
+    scaled.clamped((snapped.2 - snapped.0) as f64, (snapped.3 - snapped.1) as f64)
+}
+
+/// The four corners as a shader reads them, clockwise from the top
+/// left — the ONE place the field order is spoken.
+pub(crate) fn wire_radii(radii: Corners) -> [f32; 4] {
+    [
+        radii.top_left as f32,
+        radii.top_right as f32,
+        radii.bottom_right as f32,
+        radii.bottom_left as f32,
+    ]
 }
 
 /// The curve a run is cut by, as the shaders see it — ONE per draw
 /// run, bound as 32 bytes of per-run constants, never per instance.
-/// `radius == 0` is the straight rectangle every clip has been until
-/// now — and multiplying coverage by 1.0 is exact.
+/// Four zero radii are the straight rectangle every clip has been
+/// until now — and multiplying coverage by 1.0 is exact.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) struct RoundClip {
     /// The rounded clip's OWN snapped box in device px — the cut can
     /// be smaller without the corner moving.
     pub(crate) box4: [f32; 4],
-    pub(crate) radius: f32,
-    /// Constant blocks round to 16-byte registers; these three say so
-    /// out loud on the Rust side.
-    pub(crate) pad: [f32; 3],
+    /// The four corners. They fit the second 16-byte register the
+    /// constant block was already padding out to, so the cut carries
+    /// four for the price of one.
+    pub(crate) radii: [f32; 4],
 }
 
 const _: () = {
     assert!(std::mem::size_of::<RoundClip>() == 32);
     assert!(std::mem::offset_of!(RoundClip, box4) == 0);
-    assert!(std::mem::offset_of!(RoundClip, radius) == 16);
+    assert!(std::mem::offset_of!(RoundClip, radii) == 16);
 };
 
 /// Slot zero of every frame — the cut that never bends.
-pub(crate) const NO_ROUND: RoundClip = RoundClip { box4: [0.0; 4], radius: 0.0, pad: [0.0; 3] };
+pub(crate) const NO_ROUND: RoundClip = RoundClip { box4: [0.0; 4], radii: [0.0; 4] };
 
 pub(crate) const KIND_FILL: f32 = 0.0;
 pub(crate) const KIND_STROKE: f32 = 1.0;
@@ -472,12 +483,13 @@ impl RunAtlas {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_rect(
     out: &mut Vec<RectInstance>,
     quad: Box4,
     clip: Box4,
     color: Color,
-    radius: f64,
+    radii: Corners,
     extra: f64,
     kind: f32,
     expansion: f64,
@@ -485,9 +497,10 @@ fn push_rect(
     out.push(RectInstance {
         rect: [quad.0 as f32, quad.1 as f32, quad.2 as f32, quad.3 as f32],
         clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
-        params: [radius as f32, extra as f32, kind, expansion as f32],
+        params: [0.0, extra as f32, kind, expansion as f32],
         color: [color.r, color.g, color.b, color.a],
         pad: [0; 12],
+        radii: wire_radii(radii),
     });
 }
 
@@ -500,7 +513,8 @@ fn push_gradient(
     clip: Box4,
     near: Color,
     far: Color,
-    radius: f64,
+    radii: Corners,
+    aspect: f64,
     first: f64,
     second: f64,
     point: (f64, f64),
@@ -513,9 +527,10 @@ fn push_gradient(
     out.push(RectInstance {
         rect: [quad.0 as f32, quad.1 as f32, quad.2 as f32, quad.3 as f32],
         clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
-        params: [radius as f32, first as f32, kind, second as f32],
+        params: [aspect as f32, first as f32, kind, second as f32],
         color: [near.r, near.g, near.b, near.a],
         pad,
+        radii: wire_radii(radii),
     });
 }
 
@@ -601,8 +616,8 @@ pub(crate) fn build_frame(
                 if box_intersect(snapped, clip).is_none() {
                     continue;
                 }
-                let radius = corner_clamp(corner_radius * factor, snapped);
-                push_rect(out, snapped, clip, *color, radius, 0.0, KIND_FILL, 0.0);
+                let radii = corner_clamp(corner_radius * factor, snapped);
+                push_rect(out, snapped, clip, *color, radii, 0.0, KIND_FILL, 0.0);
                 note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
             }
             DrawCommand::Gradient { rect, paint, corner_radius } => {
@@ -614,7 +629,7 @@ pub(crate) fn build_frame(
                 if box_intersect(snapped, clip).is_none() {
                     continue;
                 }
-                let radius = corner_clamp(corner_radius * factor, snapped);
+                let radii = corner_clamp(corner_radius * factor, snapped);
                 match paint.scaled(factor) {
                     bunny_ui::layout::GradientPaint::Radial {
                         center,
@@ -627,10 +642,10 @@ pub(crate) fn build_frame(
                         // the circle keeps its kind (and its corner)
                         // byte for byte; the ellipse trades the corner
                         // slot for the aspect
-                        let (kind, slot_x) = if aspect == 1.0 {
-                            (KIND_RADIAL, radius)
+                        let (kind, corners) = if aspect == 1.0 {
+                            (KIND_RADIAL, radii)
                         } else {
-                            (KIND_ELLIPTIC, aspect)
+                            (KIND_ELLIPTIC, Corners::ZERO)
                         };
                         push_gradient(
                             out,
@@ -638,7 +653,8 @@ pub(crate) fn build_frame(
                             clip,
                             inner,
                             outer,
-                            slot_x,
+                            corners,
+                            aspect,
                             start,
                             end,
                             (center.x, center.y),
@@ -655,7 +671,8 @@ pub(crate) fn build_frame(
                             clip,
                             from,
                             to,
-                            radius,
+                            radii,
+                            0.0,
                             start.x,
                             start.y,
                             (end.x, end.y),
@@ -677,8 +694,8 @@ pub(crate) fn build_frame(
                 // the cpu's integer thickness, resolved here: at least
                 // one device pixel, rounded once
                 let thickness = (width * factor).max(1.0).round();
-                let radius = corner_clamp(corner_radius * factor, snapped);
-                push_rect(out, snapped, clip, *color, radius, thickness, KIND_STROKE, 0.0);
+                let radii = corner_clamp(corner_radius * factor, snapped);
+                push_rect(out, snapped, clip, *color, radii, thickness, KIND_STROKE, 0.0);
                 note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
             }
             DrawCommand::Shadow { rect, radius, color, corner_radius } => {
@@ -837,8 +854,8 @@ pub(crate) fn build_frame(
                 };
                 // the same clamp and the same half-pixel door the CPU
                 // keeps — below it, the clip INHERITS the open curve
-                let radius = corner_clamp(corner_radius * factor, snapped);
-                let round = if radius >= 0.5 {
+                let radii = corner_clamp(corner_radius * factor, snapped);
+                let round = if !radii.is_zero() {
                     let entry = RoundClip {
                         box4: [
                             snapped.0 as f32,
@@ -846,8 +863,7 @@ pub(crate) fn build_frame(
                             snapped.2 as f32,
                             snapped.3 as f32,
                         ],
-                        radius: radius as f32,
-                        pad: [0.0; 3],
+                        radii: wire_radii(radii),
                     };
                     match batches.rounds.iter().position(|r| *r == entry) {
                         Some(index) => index as u32,

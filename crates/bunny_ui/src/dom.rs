@@ -31,7 +31,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::layout::{
-    Color, DrawCommand, Point, Px, Rect, Size, Truncation, VisualProps,
+    Color, Corners, DrawCommand, Point, Px, Rect, Size, Truncation, VisualProps,
 };
 use crate::text_engine::{FontDesign, FontSpec, Weight};
 
@@ -119,7 +119,7 @@ pub struct DomStyle {
     pub hover_color: Option<Color>,
     pub pressed_color: Option<Color>,
     pub border: Option<(Color, Px)>,
-    pub corner_radius: Option<Px>,
+    pub corner_radius: Option<Corners>,
     pub shadow: Option<(Px, Color)>,
     /// The action path of the enclosing `Interactive` — the glue posts
     /// clicks back with it, and `:hover`/`:active` scope to it.
@@ -1024,7 +1024,8 @@ fn diff_children(
 ///   4 set size      f32 w, f32 h
 ///   5 set style     u32 mask, fields in bit order:
 ///                   0 background u32 rgba   1 hover u32   2 pressed u32
-///                   3 border u32 rgba + f32 width          4 radius f32
+///                   3 border u32 rgba + f32 width
+///                   4 radius f32 (all four corners the same)
 ///                   5 shadow f32 radius + u32 rgba
 ///                   6 transition f32 response + f32 damping
 ///                   7 interactive u16 len + utf8
@@ -1056,6 +1057,11 @@ fn diff_children(
 ///                      value): `pointer-events:none`, for a layer
 ///                      that covers a box and must not take its
 ///                      clicks
+///                   22 radii f32 x4 — top left, top right, bottom
+///                      right, bottom left. It REPLACES bit 4: a box
+///                      sends one number or four, never both, and a
+///                      box that rounds all four the same never pays
+///                      the three extra floats
 ///   6 set text      u32 rgba, u8 inherits ink (1 = no color of its
 ///                   own — the box above owns both states),
 ///                   f32 size, u8 weight, u8 mono, u8 italic,
@@ -1231,8 +1237,13 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     if style.border.is_some() {
         mask |= 1 << 3;
     }
-    if style.corner_radius.is_some() {
-        mask |= 1 << 4;
+    // one radius keeps bit 4 and its single float — the wire a box
+    // that rounds all four corners has always sent. Four different
+    // ones take bit 22 instead, and only they pay for it
+    match style.corner_radius.map(|radii| radii.uniform()) {
+        Some(Some(_)) => mask |= 1 << 4,
+        Some(None) => mask |= 1 << 22,
+        None => {}
     }
     if style.shadow.is_some() {
         mask |= 1 << 5;
@@ -1301,7 +1312,7 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
         push_u32(out, pack_color(color));
         push_f32(out, width);
     }
-    if let Some(radius) = style.corner_radius {
+    if let Some(radius) = style.corner_radius.and_then(|radii| radii.uniform()) {
         push_f32(out, radius);
     }
     if let Some((radius, color)) = style.shadow {
@@ -1374,6 +1385,12 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     if let Some(owner) = style.group_owner {
         push_u32(out, (owner >> 32) as u32);
         push_u32(out, owner as u32);
+    }
+    if let Some(radii) = style.corner_radius.filter(|radii| radii.uniform().is_none()) {
+        push_f32(out, radii.top_left);
+        push_f32(out, radii.top_right);
+        push_f32(out, radii.bottom_right);
+        push_f32(out, radii.bottom_left);
     }
 }
 
@@ -1775,7 +1792,7 @@ mod tests {
                 _ => None,
             })
             .expect("the panel chrome reached the patches");
-        assert_eq!(style.corner_radius, Some(12.0));
+        assert_eq!(style.corner_radius, Some(Corners::all(12.0)));
         assert_eq!(style.border, Some((Color::hex(0xDDDDE2), 1.0)));
         assert_eq!(style.shadow, Some((24.0, Color::hex_a(0x0000_0040))));
     }
@@ -2247,7 +2264,7 @@ mod tests {
     fn a_clipped_box_sets_the_overflow_bit_and_nothing_else() {
         let bare = DomStyle {
             background: Some(Color::hex(0x123456)),
-            corner_radius: Some(6.0),
+            corner_radius: Some(Corners::all(6.0)),
             ..DomStyle::default()
         };
         let cut = DomStyle { clip: true, ..bare.clone() };
@@ -2261,6 +2278,40 @@ mod tests {
         let mut expected = without.clone();
         expected[10] |= 0x40;
         assert_eq!(with, expected);
+    }
+
+    #[test]
+    fn four_corners_take_their_own_bit_and_leave_the_one_radius_alone() {
+        // one radius keeps bit 4 and its single float — the wire a box
+        // that rounds all four has always sent
+        let one = DomStyle {
+            corner_radius: Some(Corners::all(6.0)),
+            ..DomStyle::default()
+        };
+        let bytes = encode(&[DomPatch::SetStyle { id: 3, style: one }]);
+        let mask = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
+        assert_eq!(mask, 1 << 4, "the one radius is bit 4, alone");
+        assert_eq!(bytes.len(), 13 + 4, "and it costs one float");
+
+        // four different ones take bit 22 INSTEAD, with the four in
+        // CSS order behind it
+        let four = DomStyle {
+            corner_radius: Some(Corners {
+                top_left: 1.0,
+                top_right: 2.0,
+                bottom_right: 3.0,
+                bottom_left: 4.0,
+            }),
+            ..DomStyle::default()
+        };
+        let bytes = encode(&[DomPatch::SetStyle { id: 3, style: four }]);
+        let mask = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
+        assert_eq!(mask, 1 << 22, "four radii take bit 22, and bit 4 stays clear");
+        let radii: Vec<f32> = bytes[13..]
+            .chunks_exact(4)
+            .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect();
+        assert_eq!(radii, vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     const MARK_PATH: &[crate::icon::Verb] = &[

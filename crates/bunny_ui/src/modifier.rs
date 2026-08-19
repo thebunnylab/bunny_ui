@@ -59,7 +59,7 @@ pub enum Modifier {
     BackgroundGradient(crate::layout::Gradient),
     ForegroundColor(Color),
     Border(Color, f64),
-    CornerRadius(f64),
+    CornerRadius(crate::layout::Corners),
     /// `.clipped()` — the subtree is cut to the box (and its corner).
     Clipped,
     /// `.tooltip(…)` — a hover explanation, shown by the runtime.
@@ -208,7 +208,15 @@ impl Modifier {
             },
             Modifier::ForegroundColor(color) => format!(" [.foregroundColor({color})]"),
             Modifier::Border(color, width) => format!(" [.border({color}, width: {width})]"),
-            Modifier::CornerRadius(radius) => format!(" [.cornerRadius({radius})]"),
+            // one radius prints as one number — the print of a box
+            // that rounds all four never changed
+            Modifier::CornerRadius(radii) => match radii.uniform() {
+                Some(radius) => format!(" [.cornerRadius({radius})]"),
+                None => format!(
+                    " [.cornerRadius({} {} {} {})]",
+                    radii.top_left, radii.top_right, radii.bottom_right, radii.bottom_left
+                ),
+            },
             Modifier::Clipped => " [.clipped()]".into(),
             Modifier::Tooltip(text, _) => format!(" [.tooltip({text:?})]"),
             Modifier::ContextMenu(items) => format!(" [.contextMenu({} items)]", items.len()),
@@ -915,10 +923,10 @@ fn apply(
             mark,
             VisualProps { border: Some((*color, *width)), ..VisualProps::default() },
         ),
-        Modifier::CornerRadius(radius) => wrap_styled(
+        Modifier::CornerRadius(radii) => wrap_styled(
             out,
             mark,
-            VisualProps { corner_radius: Some(*radius), ..VisualProps::default() },
+            VisualProps { corner_radius: Some(*radii), ..VisualProps::default() },
         ),
         Modifier::Clipped => {
             wrap_styled(out, mark, VisualProps { clip: true, ..VisualProps::default() })

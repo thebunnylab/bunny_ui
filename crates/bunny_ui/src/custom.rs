@@ -35,7 +35,9 @@ use motor::state::Context;
 use motor::view::RenderNode;
 
 use crate::image_engine::ImageSource;
-use crate::layout::{Color, DisplayList, DrawCommand, LayoutNode, Point, Proposal, Px, Rect, Size};
+use crate::layout::{
+    Color, Corners, DisplayList, DrawCommand, LayoutNode, Point, Proposal, Px, Rect, Size,
+};
 use crate::text_engine::{FontSpec, LineMetrics, MeasureCache, TextEngine};
 use crate::view::{NodeList, Single, View};
 
@@ -349,32 +351,53 @@ impl<'a> Painter<'a> {
 
     /// A rectangle with rounded corners (anti-aliased, like every
     /// background in the framework).
-    pub fn fill_rounded(&mut self, rect: Rect, color: Color, corner_radius: Px) {
+    ///
+    /// One number rounds all four; a [`Corners`] rounds the ones it
+    /// names — `Corners::top(4.0)` for the first band of a figure that
+    /// continues below.
+    pub fn fill_rounded(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        corner_radius: impl Into<Corners>,
+    ) {
         self.display.push(DrawCommand::FillRect {
             rect: self.shift(rect),
             color,
-            corner_radius,
+            corner_radius: corner_radius.into(),
         });
     }
 
     /// A border painted INWARD from the edge.
-    pub fn stroke(&mut self, rect: Rect, color: Color, width: Px, corner_radius: Px) {
+    pub fn stroke(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        width: Px,
+        corner_radius: impl Into<Corners>,
+    ) {
         self.display.push(DrawCommand::StrokeRect {
             rect: self.shift(rect),
             color,
             width,
-            corner_radius,
+            corner_radius: corner_radius.into(),
         });
     }
 
     /// A soft halo outside the rect — the quadratic falloff of
     /// `.shadow()`.
-    pub fn shadow(&mut self, rect: Rect, radius: Px, color: Color, corner_radius: Px) {
+    pub fn shadow(
+        &mut self,
+        rect: Rect,
+        radius: Px,
+        color: Color,
+        corner_radius: impl Into<Corners>,
+    ) {
         self.display.push(DrawCommand::Shadow {
             rect: self.shift(rect),
             radius,
             color,
-            corner_radius,
+            corner_radius: corner_radius.into(),
         });
     }
 
@@ -431,12 +454,12 @@ impl<'a> Painter<'a> {
     /// `.background_gradient(…)` takes, resolved against THIS rect.
     /// The declaration is proportional, so the ramp an app paints in
     /// its box matches the one the framework paints on a background.
-    pub fn gradient(&mut self, rect: Rect, gradient: crate::layout::Gradient, corner_radius: Px) {
+    pub fn gradient(&mut self, rect: Rect, gradient: crate::layout::Gradient, corner_radius: impl Into<Corners>) {
         let shifted = self.shift(rect);
         self.display.push(DrawCommand::Gradient {
             rect: shifted,
             paint: gradient.resolve(shifted),
-            corner_radius,
+            corner_radius: corner_radius.into(),
         });
     }
 
@@ -542,10 +565,13 @@ impl<'a> Painter<'a> {
     pub fn clipped_rounded(
         &mut self,
         rect: Rect,
-        corner_radius: Px,
+        corner_radius: impl Into<Corners>,
         body: impl FnOnce(&mut Painter),
     ) {
-        self.display.push(DrawCommand::PushClip { rect: self.shift(rect), corner_radius });
+        self.display.push(DrawCommand::PushClip {
+            rect: self.shift(rect),
+            corner_radius: corner_radius.into(),
+        });
         body(self);
         self.display.push(DrawCommand::PopClip);
     }

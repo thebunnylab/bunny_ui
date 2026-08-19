@@ -38,7 +38,7 @@ use std::hash::{Hash, Hasher};
 use std::ptr::null_mut;
 
 use bunny_ui::image_engine::{ImageEngine, ImageSource, raster_source};
-use bunny_ui::layout::{Color, DisplayList, DrawCommand, Rect, Size};
+use bunny_ui::layout::{Color, Corners, DisplayList, DrawCommand, Rect, Size};
 use bunny_ui::raster::physical_extent;
 use bunny_ui::text_engine::{FontKey, FontSpec, TextEngine};
 
@@ -201,12 +201,15 @@ struct MTLRegion {
 struct RectInstance {
     rect: [f32; 4],   // x0, y0, x1, y1 (the shadow ships its EXPANDED box)
     clip: [f32; 4],   // the snapped clip-stack top
-    params: [f32; 4], // corner_radius, thickness/reach/first, kind, expansion/second
+    params: [f32; 4], // aspect (the ellipse only), thickness/reach/first, kind, expansion/second
     color: [u8; 4],   // straight RGBA
     // A gradient's second half rides here: the far color plus one
-    // point (centre for the rings, end for the line). The struct does
-    // not grow — the ramp fits the twelve bytes that were padding.
+    // point (centre for the rings, end for the line). The ramp fits
+    // the twelve bytes that were padding.
     pad: [u8; 12],
+    // The four corners, clockwise from the top left, CLAMPED in device
+    // px — the shader only picks the one its quadrant owns.
+    radii: [f32; 4],
 }
 
 /// One text run (or chunk of one): a rectangle of atlas texels copied
@@ -221,12 +224,13 @@ struct SpriteInstance {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<RectInstance>() == 64);
+    assert!(std::mem::size_of::<RectInstance>() == 80);
     assert!(std::mem::offset_of!(RectInstance, rect) == 0);
     assert!(std::mem::offset_of!(RectInstance, clip) == 16);
     assert!(std::mem::offset_of!(RectInstance, params) == 32);
     assert!(std::mem::offset_of!(RectInstance, color) == 48);
     assert!(std::mem::offset_of!(RectInstance, pad) == 52);
+    assert!(std::mem::offset_of!(RectInstance, radii) == 64);
     assert!(std::mem::size_of::<SpriteInstance>() == 48);
     assert!(std::mem::offset_of!(SpriteInstance, dest) == 0);
     assert!(std::mem::offset_of!(SpriteInstance, tex) == 16);
@@ -256,6 +260,7 @@ struct RectInstance {
     uchar4 color;
     uchar4 color2;   // a gradient's far color (padding otherwise)
     float2 point2;   // rings: the centre; line: its end (padding otherwise)
+    float4 radii;    // top left, top right, bottom right, bottom left
 };
 
 struct SpriteInstance {
@@ -274,15 +279,26 @@ static float4 to_ndc(float2 position, float2 viewport) {
     return float4(unit.x * 2.0 - 1.0, 1.0 - unit.y * 2.0, 0.0, 1.0);
 }
 
-static float rect_sdf(float2 p, float4 rect, float radius) {
+// which of the four a pixel answers to: the box's own midpoint splits
+// it in quarters, and a pixel far from every corner reads the same
+// coverage whichever radius it picked — a straight edge does not
+// depend on it
+static float corner_at(float2 p, float4 rect, float4 radii) {
+    float2 mid = (rect.xy + rect.zw) * 0.5;
+    return p.x < mid.x ? (p.y < mid.y ? radii.x : radii.w)
+                       : (p.y < mid.y ? radii.y : radii.z);
+}
+
+static float rect_sdf(float2 p, float4 rect, float4 radii) {
+    float radius = corner_at(p, rect, radii);
     float2 shifted = max(rect.xy + radius - p, p - (rect.zw - radius));
     float outside = length(max(shifted, 0.0));
     float inside = min(max(shifted.x, shifted.y), 0.0);
     return outside + inside - radius;
 }
 
-static float rect_cov(float2 p, float4 rect, float radius) {
-    return clamp(0.5 - rect_sdf(p, rect, radius), 0.0, 1.0);
+static float rect_cov(float2 p, float4 rect, float4 radii) {
+    return clamp(0.5 - rect_sdf(p, rect, radii), 0.0, 1.0);
 }
 
 struct RectVary {
@@ -309,7 +325,7 @@ vertex RectVary rect_vertex(uint vid [[vertex_id]],
 
 struct ClipRound {
     float4 box;
-    float radius;
+    float4 radii;
 };
 
 // the curve that softens the run's clip. radius 0 is the straight
@@ -317,7 +333,7 @@ struct ClipRound {
 // exact, so a scene without a rounded clip leaves both shaders
 // untouched, bit for bit
 static float clip_cov(float2 p, constant ClipRound& round) {
-    return round.radius > 0.0 ? rect_cov(p, round.box, round.radius) : 1.0;
+    return any(round.radii > 0.0) ? rect_cov(p, round.box, round.radii) : 1.0;
 }
 
 fragment float4 rect_fragment(RectVary in [[stage_in]],
@@ -329,23 +345,23 @@ fragment float4 rect_fragment(RectVary in [[stage_in]],
     float coverage;
     if (kind == 0.0) {
         // fill: the cpu corner ramp, clamp(radius - d + 0.5, 0, 1)
-        coverage = rect_cov(p, rect.rect, rect.params.x);
+        coverage = rect_cov(p, rect.rect, rect.radii);
     } else if (kind == 1.0) {
         // stroke: outer coverage minus the inner rect's — the inset
         // keeps the same corner center as the cpu ring, and integer
         // edges keep the straight bars exact and never double-blended
         float thickness = rect.params.y;
         float4 inner = float4(rect.rect.xy + thickness, rect.rect.zw - thickness);
-        float inner_radius = max(rect.params.x - thickness, 0.0);
+        float4 inner_radii = max(rect.radii - thickness, 0.0);
         coverage = clamp(
-            rect_cov(p, rect.rect, rect.params.x) - rect_cov(p, inner, inner_radius),
+            rect_cov(p, rect.rect, rect.radii) - rect_cov(p, inner, inner_radii),
             0.0, 1.0);
     } else if (kind == 2.0) {
         // shadow: quadratic falloff outside the rounded core — the quad
         // arrives pre-expanded, params.w undoes the expansion
         float expansion = rect.params.w;
         float4 base = float4(rect.rect.xy + expansion, rect.rect.zw - expansion);
-        float corner = rect.params.x;
+        float corner = corner_at(p, base, rect.radii);
         float reach = rect.params.y;
         float2 delta = p - clamp(p, base.xy + corner, base.zw - corner);
         float distance = length(delta) - corner;
@@ -356,15 +372,15 @@ fragment float4 rect_fragment(RectVary in [[stage_in]],
         // pixel: rings from point2 (params.y and .w are the radii), or
         // a ramp from rect.xy to point2. The cpu resolved every number
         // in f64 — this only mixes.
-        coverage = rect_cov(p, rect.rect, rect.params.x);
+        coverage = rect_cov(p, rect.rect, rect.radii);
         float t;
         if (kind == 3.0) {
             float distance = length(p - rect.point2);
             t = saturate((distance - rect.params.y) / (rect.params.w - rect.params.y));
         } else if (kind == 5.0) {
-            // the ellipse is a circle in a Y-scaled space; its corner
-            // slot carries the aspect, so the cover is the plain box
-            coverage = rect_cov(p, rect.rect, 0.0);
+            // the ellipse is a circle in a Y-scaled space; params.x
+            // carries the aspect, so the cover is the plain box
+            coverage = rect_cov(p, rect.rect, float4(0.0));
             float2 away = p - rect.point2;
             float distance = length(float2(away.x, away.y / rect.params.x));
             t = saturate((distance - rect.params.y) / (rect.params.w - rect.params.y));
@@ -822,14 +838,10 @@ fn snap_scaled(rect: Rect, factor: f64) -> Box4 {
     )
 }
 
-/// The CPU's radius clamp, verbatim: never negative via `max`, then
-/// halved against the SNAPPED extent (which can drive it negative on a
-/// degenerate rect — the raster accepts that, so the port does too).
-fn corner_clamp(scaled_radius: f64, snapped: Box4) -> f64 {
-    scaled_radius
-        .max(0.0)
-        .min((snapped.2 - snapped.0) as f64 / 2.0)
-        .min((snapped.3 - snapped.1) as f64 / 2.0)
+/// The CPU's radius clamp, verbatim — the same `Corners::clamped` the
+/// raster runs, against the SNAPPED extent.
+fn corner_clamp(scaled: Corners, snapped: Box4) -> Corners {
+    scaled.clamped((snapped.2 - snapped.0) as f64, (snapped.3 - snapped.1) as f64)
 }
 
 /// The curve a run is cut by, as the shaders see it — ONE per draw
@@ -844,20 +856,20 @@ struct RoundClip {
     /// The rounded clip's OWN snapped box in device px — the cut can
     /// be smaller without the corner moving.
     box4: [f32; 4],
-    radius: f32,
-    /// MSL rounds a float4-first struct to 32 bytes; these three say
-    /// so out loud on the Rust side.
-    pad: [f32; 3],
+    /// The four corners. They fit the three floats MSL was already
+    /// padding this struct out to, so the cut carries four for the
+    /// price of one.
+    radii: [f32; 4],
 }
 
 const _: () = {
     assert!(std::mem::size_of::<RoundClip>() == 32);
     assert!(std::mem::offset_of!(RoundClip, box4) == 0);
-    assert!(std::mem::offset_of!(RoundClip, radius) == 16);
+    assert!(std::mem::offset_of!(RoundClip, radii) == 16);
 };
 
 /// Slot zero of every frame — the cut that never bends.
-const NO_ROUND: RoundClip = RoundClip { box4: [0.0; 4], radius: 0.0, pad: [0.0; 3] };
+const NO_ROUND: RoundClip = RoundClip { box4: [0.0; 4], radii: [0.0; 4] };
 
 const KIND_FILL: f32 = 0.0;
 const KIND_STROKE: f32 = 1.0;
@@ -1252,12 +1264,13 @@ impl RunAtlas {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_rect(
     out: &mut Vec<RectInstance>,
     quad: Box4,
     clip: Box4,
     color: Color,
-    radius: f64,
+    radii: Corners,
     extra: f64,
     kind: f32,
     expansion: f64,
@@ -1265,10 +1278,22 @@ fn push_rect(
     out.push(RectInstance {
         rect: [quad.0 as f32, quad.1 as f32, quad.2 as f32, quad.3 as f32],
         clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
-        params: [radius as f32, extra as f32, kind, expansion as f32],
+        params: [0.0, extra as f32, kind, expansion as f32],
         color: [color.r, color.g, color.b, color.a],
         pad: [0; 12],
+        radii: wire_radii(radii),
     });
+}
+
+/// The four corners as the shader reads them, clockwise from the top
+/// left — the ONE place the field order is spoken.
+fn wire_radii(radii: Corners) -> [f32; 4] {
+    [
+        radii.top_left as f32,
+        radii.top_right as f32,
+        radii.bottom_right as f32,
+        radii.bottom_left as f32,
+    ]
 }
 
 /// One gradient instance: the fill's quad and corner, plus the second
@@ -1280,7 +1305,8 @@ fn push_gradient(
     clip: Box4,
     near: Color,
     far: Color,
-    radius: f64,
+    radii: Corners,
+    aspect: f64,
     first: f64,
     second: f64,
     point: (f64, f64),
@@ -1293,9 +1319,10 @@ fn push_gradient(
     out.push(RectInstance {
         rect: [quad.0 as f32, quad.1 as f32, quad.2 as f32, quad.3 as f32],
         clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
-        params: [radius as f32, first as f32, kind, second as f32],
+        params: [aspect as f32, first as f32, kind, second as f32],
         color: [near.r, near.g, near.b, near.a],
         pad,
+        radii: wire_radii(radii),
     });
 }
 
@@ -1380,8 +1407,8 @@ fn build_frame(
                 if box_intersect(snapped, clip).is_none() {
                     continue;
                 }
-                let radius = corner_clamp(corner_radius * factor, snapped);
-                push_rect(out, snapped, clip, *color, radius, 0.0, KIND_FILL, 0.0);
+                let radii = corner_clamp(corner_radius * factor, snapped);
+                push_rect(out, snapped, clip, *color, radii, 0.0, KIND_FILL, 0.0);
                 note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
             }
             DrawCommand::Gradient { rect, paint, corner_radius } => {
@@ -1393,7 +1420,7 @@ fn build_frame(
                 if box_intersect(snapped, clip).is_none() {
                     continue;
                 }
-                let radius = corner_clamp(corner_radius * factor, snapped);
+                let radii = corner_clamp(corner_radius * factor, snapped);
                 match paint.scaled(factor) {
                     bunny_ui::layout::GradientPaint::Radial {
                         center,
@@ -1403,13 +1430,13 @@ fn build_frame(
                         inner,
                         outer,
                     } => {
-                        // the circle keeps its kind (and its corner)
-                        // byte for byte; the ellipse trades the corner
-                        // slot for the aspect
-                        let (kind, slot_x) = if aspect == 1.0 {
-                            (KIND_RADIAL, radius)
+                        // the circle keeps its kind (and its corners)
+                        // byte for byte; the ellipse drops the corners
+                        // and takes the aspect slot instead
+                        let (kind, corners) = if aspect == 1.0 {
+                            (KIND_RADIAL, radii)
                         } else {
-                            (KIND_ELLIPTIC, aspect)
+                            (KIND_ELLIPTIC, Corners::ZERO)
                         };
                         push_gradient(
                             out,
@@ -1417,7 +1444,8 @@ fn build_frame(
                             clip,
                             inner,
                             outer,
-                            slot_x,
+                            corners,
+                            aspect,
                             start,
                             end,
                             (center.x, center.y),
@@ -1434,7 +1462,8 @@ fn build_frame(
                             clip,
                             from,
                             to,
-                            radius,
+                            radii,
+                            0.0,
                             start.x,
                             start.y,
                             (end.x, end.y),
@@ -1456,8 +1485,8 @@ fn build_frame(
                 // the cpu's integer thickness, resolved here: at least
                 // one device pixel, rounded once
                 let thickness = (width * factor).max(1.0).round();
-                let radius = corner_clamp(corner_radius * factor, snapped);
-                push_rect(out, snapped, clip, *color, radius, thickness, KIND_STROKE, 0.0);
+                let radii = corner_clamp(corner_radius * factor, snapped);
+                push_rect(out, snapped, clip, *color, radii, thickness, KIND_STROKE, 0.0);
                 note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
             }
             DrawCommand::Shadow { rect, radius, color, corner_radius } => {
@@ -1616,8 +1645,8 @@ fn build_frame(
                 };
                 // the same clamp and the same half-pixel door the CPU
                 // keeps — below it, the clip INHERITS the open curve
-                let radius = corner_clamp(corner_radius * factor, snapped);
-                let round = if radius >= 0.5 {
+                let radii = corner_clamp(corner_radius * factor, snapped);
+                let round = if !radii.is_zero() {
                     let entry = RoundClip {
                         box4: [
                             snapped.0 as f32,
@@ -1625,8 +1654,7 @@ fn build_frame(
                             snapped.2 as f32,
                             snapped.3 as f32,
                         ],
-                        radius: radius as f32,
-                        pad: [0.0; 3],
+                        radii: wire_radii(radii),
                     };
                     match batches.rounds.iter().position(|r| *r == entry) {
                         Some(index) => index as u32,
@@ -2311,7 +2339,9 @@ mod tests {
     fn the_wire_structs_hold_their_layout() {
         // the const asserts already gate the build; this pins the numbers
         // in a place a failing CI can point at
-        assert_eq!(std::mem::size_of::<RectInstance>(), 64);
+        // 80 since the four corners: the sixteen bytes buy every
+        // pipeline a band that rounds only the corners that end it
+        assert_eq!(std::mem::size_of::<RectInstance>(), 80);
         assert_eq!(std::mem::align_of::<RectInstance>(), 4);
         assert_eq!(std::mem::size_of::<SpriteInstance>(), 48);
         assert_eq!(std::mem::size_of::<RoundClip>(), 32);
@@ -2364,6 +2394,56 @@ mod tests {
             "flat opaque scene diverged (max channel delta {})",
             max_channel_delta(&gpu, &cpu)
         );
+    }
+
+    #[test]
+    fn a_band_with_four_different_corners_matches_the_raster() {
+        if !device_present() {
+            return;
+        }
+        // the figure the four corners exist for: a selection over three
+        // lines. The first band rounds its top, the middle is square,
+        // the last rounds its bottom — and the sides that MEET carry a
+        // square corner beside a rounded one, which no single radius
+        // can ask for
+        use bunny_ui::layout::Corners;
+        let tint = Color::rgba(59, 130, 246, 120);
+        let root = vstack((
+            empty().frame(90.0, 20.0).background_color(tint).corner_radius(Corners::top(6.0)),
+            empty().frame(120.0, 20.0).background_color(tint),
+            empty().frame(70.0, 20.0).background_color(tint).corner_radius(Corners::bottom(6.0)),
+            // and four radii that share nothing, to pin the order
+            empty().frame(80.0, 40.0).background_color(Color::hex(0x18181D)).corner_radius(
+                Corners { top_left: 2.0, top_right: 10.0, bottom_right: 4.0, bottom_left: 16.0 },
+            ),
+        ))
+        .padding_length(8.0);
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 160.0, height: 140.0 }, 2, Color::CANVAS);
+        let delta = max_channel_delta(&gpu, &cpu);
+        assert!(delta <= 1, "the four corners drifted by {delta} (allowed 1)");
+    }
+
+    #[test]
+    fn a_cut_with_four_corners_matches_the_raster() {
+        if !device_present() {
+            return;
+        }
+        // the same four on a CLIP: the curve rides the per-run uniform,
+        // which had room for them all along
+        use bunny_ui::layout::Corners;
+        let root = vstack((
+            empty().frame(200.0, 30.0).background_color(Color::hex(0x3B82F6)),
+            empty().frame(200.0, 30.0).background_color(Color::hex(0xF59E0B)),
+        ))
+        .frame(110.0, 50.0)
+        .corner_radius(Corners { top_left: 14.0, top_right: 0.0, bottom_right: 14.0, bottom_left: 0.0 })
+        .clipped()
+        .padding_length(10.0);
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 140.0, height: 80.0 }, 2, Color::CANVAS);
+        let delta = max_channel_delta(&gpu, &cpu);
+        assert!(delta <= 1, "the four-cornered cut drifted by {delta} (allowed 1)");
     }
 
     #[test]

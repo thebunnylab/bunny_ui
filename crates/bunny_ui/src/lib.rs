@@ -3784,7 +3784,7 @@ mod tests {
         let view = text("ab").corner_radius(5.0).background_color(Color::hex(0x123456));
         let result = runtime.layout(&view, Proposal::unspecified());
 
-        let fills: Vec<(Color, f64)> = result
+        let fills: Vec<(Color, crate::layout::Corners)> = result
             .display
             .iter()
             .filter_map(|command| match command {
@@ -3796,7 +3796,7 @@ mod tests {
             .collect();
         assert_eq!(
             fills,
-            vec![(Color::hex(0x123456), 5.0)],
+            vec![(Color::hex(0x123456), crate::layout::Corners::all(5.0))],
             "a single Styled — the radius rounds THIS background"
         );
     }
@@ -3898,7 +3898,7 @@ mod tests {
         for command in result.display.iter() {
             match command {
                 DrawCommand::FillRect { corner_radius, .. } if !saw_text => {
-                    assert_eq!(*corner_radius, 6.0);
+                    assert_eq!(*corner_radius, crate::layout::Corners::all(6.0));
                     fill_before_text = true;
                 }
                 DrawCommand::TextLine { .. } => saw_text = true,
@@ -4107,7 +4107,7 @@ mod tests {
             })
             .expect("the field pushes a clip");
         assert_eq!(clip.0, frame, "the cut IS the box");
-        assert_eq!(clip.1, 5.0, "and it follows the corner");
+        assert_eq!(clip.1, crate::layout::Corners::all(5.0), "and it follows the corner");
 
         // the border is drawn OUTSIDE the cut — a clipped stroke would
         // eat its own outer half
@@ -4154,7 +4154,7 @@ mod tests {
             .iter()
             .filter_map(|command| match command {
                 DrawCommand::FillRect { rect, corner_radius, .. }
-                    if rect.size.width < 2.0 && *corner_radius > 0.0 =>
+                    if rect.size.width < 2.0 && !corner_radius.is_zero() =>
                 {
                     Some(rect.origin.x)
                 }
@@ -4978,6 +4978,56 @@ mod tests {
             })
             .collect();
         assert_eq!(fonts, vec![(9.0, Weight::Bold), (26.0, Weight::Regular)]);
+    }
+
+    #[test]
+    fn a_box_rounds_only_the_corners_it_names() {
+        use crate::layout::{Color, Corners, DrawCommand, Proposal, Size};
+
+        // one number still spreads to four — every call that had a
+        // radius means exactly what it meant
+        assert_eq!(Corners::from(8.0), Corners::all(8.0));
+        assert_eq!(Corners::all(8.0).uniform(), Some(8.0));
+        assert_eq!(Corners::top(6.0).uniform(), None);
+
+        let runtime = Runtime::new();
+        let view = vstack((
+            empty().frame(40.0, 20.0).background_color(Color::hex(0x112233))
+                .corner_radius(Corners::top(6.0)),
+            empty().frame(40.0, 20.0).background_color(Color::hex(0x112233)),
+            empty().frame(40.0, 20.0).background_color(Color::hex(0x112233))
+                .corner_radius(Corners::bottom(6.0)),
+        ));
+        let result = runtime.layout(&view, Proposal::unspecified());
+        let radii: Vec<Corners> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::FillRect { corner_radius, .. } => Some(*corner_radius),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            radii,
+            vec![Corners::top(6.0), Corners::ZERO, Corners::bottom(6.0)],
+            "the band carries the corners that END it, and no others",
+        );
+
+        // and the pixels agree: the first band's TOP corner is bitten
+        // out while its BOTTOM one is square, so the two bands meet on
+        // a full edge
+        let sheet = Corners { top_left: 6.0, top_right: 6.0, bottom_right: 0.0, bottom_left: 0.0 };
+        let band = empty()
+            .frame(40.0, 20.0)
+            .background_color(Color::BLACK)
+            .corner_radius(sheet)
+            .padding_length(4.0);
+        let bitmap = runtime.paint(&band, Size { width: 48.0, height: 28.0 });
+        let ink = |x: usize, y: usize| bitmap.pixel(x, y) != bitmap.pixel(47, 27);
+        assert!(!ink(4, 4), "the top left corner is cut away");
+        assert!(!ink(43, 4), "so is the top right");
+        assert!(ink(4, 23), "the bottom left is SQUARE — the band continues below");
+        assert!(ink(43, 23), "and so is the bottom right");
     }
 
     #[test]
