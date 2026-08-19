@@ -44,6 +44,7 @@ pub mod dom;
 pub mod effects;
 pub mod erased;
 pub mod ext;
+pub mod glass;
 pub mod icon;
 pub mod image_engine;
 pub mod layout;
@@ -117,8 +118,8 @@ pub mod prelude {
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
-        Color, Fraction, Gradient, Point, Proposal, Px, Rect, Rendering, Side, Size, Truncation,
-        UnitPoint, VisualProps,
+        Color, Fraction, Glass, Gradient, Point, Proposal, Px, Rect, Rendering, Side, Size,
+        Truncation, UnitPoint, VisualProps,
     };
     pub use crate::theme::{self, Theme};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};

@@ -18,7 +18,10 @@
 //! canvas, one day).
 
 use crate::image_engine::{ImageEngine, RawImages, raster_source};
-use crate::layout::{Color, Corners, DisplayList, DrawCommand, GradientPaint, Point, Rect};
+use crate::glass::{Lens, Pyramid};
+use crate::layout::{
+    Color, Corners, DisplayList, DrawCommand, GlassPaint, GradientPaint, Point, Rect,
+};
 use crate::text_engine::{PixelFont, TextEngine, TextRaster};
 
 /// An RGBA buffer (one `0xRRGGBBAA` `u32` per pixel, rows top to
@@ -360,6 +363,40 @@ impl Bitmap {
                     }
                     let strength = 1.0 - distance / reach;
                     self.set_covered(x, y, color, strength * strength);
+                }
+            }
+        }
+    }
+
+    /// The liquid-glass pane: it READS the pixels already in this
+    /// bitmap, blurs them through the pyramid, bends them at the rim
+    /// and writes the result back over the same box.
+    ///
+    /// The only paint that samples its own target, which is why the
+    /// pyramid is built from a copy of the neighbourhood: the write of
+    /// one pixel must never move the blur of the next.
+    fn glass_pane(&mut self, rect: Rect, glass: GlassPaint, corner_radius: Corners) {
+        let (x0, y0, x1, y1) = Self::snap(rect);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (cx0, cy0, cx1, cy1) = self.clip_box();
+        if x0 >= cx1 || x1 <= cx0 || y0 >= cy1 || y1 <= cy0 {
+            return;
+        }
+        let radii = corner_radius.clamped((x1 - x0) as f64, (y1 - y0) as f64);
+        let lens = Lens {
+            rect: (x0 as f64, y0 as f64, x1 as f64, y1 as f64),
+            radii,
+            glass,
+            viewport: (self.width as f64, self.height as f64),
+        };
+        let pyramid =
+            Pyramid::build(&self.pixels, self.width, self.height, lens.area(), lens.levels());
+        for y in y0.max(cy0)..y1.min(cy1) {
+            for x in x0.max(cx0)..x1.min(cx1) {
+                if let Some((color, coverage)) = lens.shade(&pyramid, x, y) {
+                    self.set_covered(x, y, color, coverage);
                 }
             }
         }
@@ -721,6 +758,11 @@ pub fn rasterize_with(
                 paint.scaled(factor),
                 corner_radius * factor,
             ),
+            DrawCommand::Backdrop { rect, glass, corner_radius } => bitmap.glass_pane(
+                scale_rect(*rect, factor),
+                glass.scaled(factor),
+                corner_radius * factor,
+            ),
             DrawCommand::StrokeRect { rect, color, width, corner_radius } => bitmap
                 .stroke_rect(
                     scale_rect(*rect, factor),
@@ -855,6 +897,7 @@ impl Surface {
         let raw = match command {
             DrawCommand::FillRect { rect, .. }
             | DrawCommand::StrokeRect { rect, .. }
+            | DrawCommand::Backdrop { rect, .. }
             | DrawCommand::Gradient { rect, .. } => Bitmap::snap(scale_rect(*rect, factor)),
             DrawCommand::Shadow { rect, radius, .. } => {
                 let (x0, y0, x1, y1) = Bitmap::snap(scale_rect(*rect, factor));
@@ -969,6 +1012,32 @@ impl Surface {
         candidates.extend(self.bounds[prefix..self.bounds.len() - suffix].iter().flatten());
         candidates.extend(new_bounds[prefix..new.len() - suffix].iter().flatten());
 
+        // a pane of glass READS what is under it: a change anywhere in
+        // its reach changes the pane, even when the pane's own command
+        // did not move. Panes that answer for each other settle by
+        // repeating the sweep — stacked glass is one pane over another
+        let mut panes: Vec<usize> = Vec::new();
+        loop {
+            let mut grew = false;
+            for (index, command) in new.iter().enumerate() {
+                let DrawCommand::Backdrop { glass, .. } = command else { continue };
+                let (Some(bounds), false) = (new_bounds[index], panes.contains(&index)) else {
+                    continue;
+                };
+                let reach = (glass.reach() * self.scale as f64).ceil() as i64;
+                let watch =
+                    (bounds.0 - reach, bounds.1 - reach, bounds.2 + reach, bounds.3 + reach);
+                if candidates.iter().any(|rect| touches(watch, *rect)) {
+                    candidates.push(bounds);
+                    panes.push(index);
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
         // greedy merge of touching rects; too many leftovers collapse
         // into one box (clears beat bookkeeping at that point)
         let mut damage: Vec<DamageRect> = Vec::new();
@@ -1039,6 +1108,13 @@ impl Surface {
                         self.bitmap.fill_gradient(
                             scale_rect(*rect, factor),
                             paint.scaled(factor),
+                            corner_radius * factor,
+                        )
+                    }
+                    DrawCommand::Backdrop { rect, glass, corner_radius } => {
+                        self.bitmap.glass_pane(
+                            scale_rect(*rect, factor),
+                            glass.scaled(factor),
                             corner_radius * factor,
                         )
                     }
@@ -1121,7 +1197,7 @@ impl Surface {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{DrawCommand, Point};
+    use crate::layout::{DrawCommand, Glass, Point};
 
     /// Draws the ascii portrait of a bitmap patch — a readable golden.
     fn portrait(bitmap: &Bitmap, x: usize, y: usize, w: usize, h: usize, ink: u32) -> String {
@@ -1854,5 +1930,247 @@ mod tests {
                 "golden: incremental == full under the curve"
             );
         }
+    }
+
+    // MARK: - Liquid glass
+
+    fn size(width: f64, height: f64) -> crate::layout::Size {
+        crate::layout::Size { width, height }
+    }
+
+    fn box_at(x: f64, y: f64, width: f64, height: f64) -> Rect {
+        Rect { origin: Point { x, y }, size: size(width, height) }
+    }
+
+    /// A scene of vertical stripes — the pattern a blur flattens and a
+    /// lens bends.
+    fn stripes(width: usize, height: usize, step: usize) -> DisplayList {
+        let mut display = DisplayList::default();
+        for column in (0..width).step_by(step) {
+            display.push(DrawCommand::FillRect {
+                rect: box_at(column as f64, 0.0, (step / 2) as f64, height as f64),
+                color: Color::BLACK,
+                corner_radius: Corners::ZERO,
+            });
+        }
+        display
+    }
+
+    fn luma(pixel: u32) -> f64 {
+        let (r, g, b) = ((pixel >> 24) & 0xFF, (pixel >> 16) & 0xFF, (pixel >> 8) & 0xFF);
+        0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64
+    }
+
+    fn pane(rect: Rect, glass: crate::layout::Glass, radius: f64) -> DrawCommand {
+        DrawCommand::Backdrop {
+            rect,
+            glass: glass.resolve(rect),
+            corner_radius: Corners::all(radius),
+        }
+    }
+
+    #[test]
+    fn a_pane_flattens_the_stripes_under_it_and_leaves_the_rest_alone() {
+        let mut display = stripes(120, 80, 8);
+        display.push(pane(box_at(30.0, 20.0, 60.0, 40.0), Glass::frosted(), 0.0));
+        let bitmap = rasterize(&display, 120, 80, Color::WHITE);
+
+        // outside the pane the stripes keep their full contrast
+        let outside: Vec<f64> = (0..16).map(|x| luma(bitmap.pixel(x, 4).expect("pixel"))).collect();
+        let outside_range = outside.iter().cloned().fold(f64::MIN, f64::max)
+            - outside.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(outside_range > 200.0, "the raw stripes are black on white: {outside_range}");
+
+        // under it they are one wash
+        let inside: Vec<f64> = (40..80).map(|x| luma(bitmap.pixel(x, 40).expect("pixel"))).collect();
+        let inside_range = inside.iter().cloned().fold(f64::MIN, f64::max)
+            - inside.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(
+            inside_range < outside_range / 4.0,
+            "a heavy blur must kill the stripes: {inside_range} vs {outside_range}"
+        );
+    }
+
+    #[test]
+    fn the_lens_magnifies_it_never_pinches() {
+        // a scene that is dark up to x=40 and bright after it. The
+        // pane's left rim sits in the dark, and the rim samples
+        // INWARD: it must show the bright side and come out BRIGHTER.
+        // Sampling outward pinches, and a pinch is the loudest tell of
+        // a fake lens.
+        //
+        // The two panes differ ONLY in the amount, so the blur and the
+        // rim sharpening are the same on both sides of the assertion.
+        let lens = Glass::regular()
+            .tint(Color::rgba(0, 0, 0, 0))
+            .highlight(Color::WHITE, 0.0, 0.0)
+            .saturation(1.0);
+        let scene = |glass: Glass| {
+            let mut display = DisplayList::default();
+            display.push(DrawCommand::FillRect {
+                rect: box_at(0.0, 0.0, 40.0, 80.0),
+                color: Color::BLACK,
+                corner_radius: Corners::ZERO,
+            });
+            display.push(pane(box_at(30.0, 20.0, 80.0, 40.0), glass, 0.0));
+            rasterize(&display, 160, 80, Color::WHITE)
+        };
+        let still = scene(lens.refraction(24.0, 0.0));
+        let bent = scene(lens.refraction(24.0, 20.0));
+
+        let (x, y) = (33, 40);
+        assert!(
+            luma(bent.pixel(x, y).expect("pixel")) > luma(still.pixel(x, y).expect("pixel")) + 8.0,
+            "the rim must pull the bright side in, not push it away"
+        );
+    }
+
+    #[test]
+    fn a_flat_pane_bends_nothing() {
+        let scene = |glass: Glass| {
+            let mut display = stripes(160, 80, 10);
+            display.push(pane(box_at(20.0, 20.0, 120.0, 100.0), glass, 0.0));
+            rasterize(&display, 160, 140, Color::WHITE)
+        };
+        let base = Glass::regular().tint(Color::rgba(0, 0, 0, 0)).highlight(Color::WHITE, 0.0, 0.0);
+        // the same BAND on both, so the two only disagree about the
+        // amount — the band also drives how the blur backs off, and a
+        // pane shorter than its band is all rim
+        let flat = scene(base.refraction(24.0, 0.0));
+        let bent = scene(base.refraction(24.0, 30.0));
+
+        // the centre is more than one band inward from every rim, so
+        // both panes must agree there
+        assert_eq!(flat.pixel(80, 70), bent.pixel(80, 70), "the face of the pane never bends");
+        // and the rim must NOT agree
+        let differs = (22..40).any(|x| flat.pixel(x, 70) != bent.pixel(x, 70));
+        assert!(differs, "an amount of 30 has to move the rim");
+    }
+
+    #[test]
+    fn the_rim_lights_along_both_diagonals() {
+        // the dual lobe: the edge facing the light and the edge facing
+        // directly away both light up; the perpendicular diagonal goes
+        // quiet. One lobe alone reads as a shine painted on a corner.
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::FillRect {
+            rect: box_at(0.0, 0.0, 120.0, 120.0),
+            color: Color::hex(0x404060),
+            corner_radius: Corners::ZERO,
+        });
+        display.push(pane(
+            box_at(20.0, 20.0, 80.0, 80.0),
+            Glass::regular().refraction(0.0, 0.0).highlight(Color::WHITE, 6.0, 1.0),
+            24.0,
+        ));
+        let bitmap = rasterize(&display, 120, 120, Color::WHITE);
+
+        // three points at the same depth (about 3px in) on three
+        // corners of the arc — the band is 6, so a deeper sample would
+        // read no rim at all
+        let corner = |x: usize, y: usize| luma(bitmap.pixel(x, y).expect("pixel"));
+        let top_left = corner(29, 29);
+        let bottom_right = corner(90, 90);
+        let top_right = corner(90, 29);
+        assert!(top_left > top_right + 4.0, "the lit diagonal: {top_left} vs {top_right}");
+        assert!(
+            bottom_right > top_right + 4.0,
+            "and its opposite lobe: {bottom_right} vs {top_right}"
+        );
+    }
+
+    #[test]
+    fn a_pane_keeps_its_own_corner() {
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::FillRect {
+            rect: box_at(0.0, 0.0, 80.0, 80.0),
+            color: Color::BLACK,
+            corner_radius: Corners::ZERO,
+        });
+        let plain = rasterize(&display, 80, 80, Color::WHITE);
+        display.push(pane(box_at(10.0, 10.0, 60.0, 60.0), Glass::regular(), 20.0));
+        let rounded = rasterize(&display, 80, 80, Color::WHITE);
+
+        // the box's own corner, outside the arc: the pane never got there
+        assert_eq!(rounded.pixel(11, 11), plain.pixel(11, 11), "outside the arc");
+        assert_ne!(rounded.pixel(40, 40), plain.pixel(40, 40), "and inside it, glass");
+    }
+
+    #[test]
+    fn the_touch_lights_add_and_default_to_nothing() {
+        let scene = |glass: Glass| {
+            let mut display = DisplayList::default();
+            display.push(DrawCommand::FillRect {
+                rect: box_at(0.0, 0.0, 80.0, 80.0),
+                color: Color::hex(0x203040),
+                corner_radius: Corners::ZERO,
+            });
+            display.push(pane(box_at(10.0, 10.0, 60.0, 60.0), glass, 0.0));
+            rasterize(&display, 80, 80, Color::WHITE)
+        };
+        let quiet = scene(Glass::regular());
+        let sheened = scene(Glass::regular().sheen(0.25));
+        let spotted = scene(Glass::regular().spot(crate::layout::UnitPoint::CENTER, 0.5, 0.5));
+
+        let at = |bitmap: &Bitmap, x: usize, y: usize| luma(bitmap.pixel(x, y).expect("pixel"));
+        assert!(at(&sheened, 40, 40) > at(&quiet, 40, 40) + 20.0, "a sheen adds light");
+        assert!(at(&spotted, 40, 40) > at(&quiet, 40, 40) + 20.0, "and so does the spot");
+        // the spot is a POOL: it reaches zero at its radius
+        assert_eq!(at(&spotted, 12, 12), at(&quiet, 12, 12), "the corner is outside the pool");
+    }
+
+    #[test]
+    fn a_pane_repaints_when_the_scene_under_it_moves() {
+        // the pane's own command never changes here — what changes is a
+        // box behind it. The damage must still cover the pane, because
+        // glass reads what is under it.
+        let pane_box = box_at(20.0, 20.0, 60.0, 40.0);
+        let frame = |mark: Color| {
+            let mut display = DisplayList::default();
+            display.push(DrawCommand::FillRect {
+                rect: box_at(24.0, 24.0, 10.0, 10.0),
+                color: mark,
+                corner_radius: Corners::ZERO,
+            });
+            display.push(pane(pane_box, Glass::regular(), 0.0));
+            display
+        };
+        let mut surface = Surface::new(120, 80, 1, Color::WHITE);
+        let images = crate::image_engine::RawImages::default();
+        surface.frame(frame(Color::BLACK), &PixelFont, &images);
+        let damage = surface.frame(frame(Color::hex(0x3B82F6)), &PixelFont, &images);
+
+        assert!(!damage.is_empty(), "a changed box under glass is not a silent frame");
+        let covered = damage.iter().any(|rect| {
+            rect.0 <= 20 && rect.1 <= 20 && rect.2 >= 80 && rect.3 >= 60
+        });
+        assert!(covered, "the whole pane repaints, not just the box that moved: {damage:?}");
+    }
+
+    #[test]
+    fn the_material_merges_knob_by_knob() {
+        // `.liquid_glass().backdrop_blur(16)` is ONE material: the
+        // chain's blur wins and every other knob keeps the tuned value
+        let inner = Glass::regular();
+        let outer = Glass::regular().blur(16.0);
+        let merged = inner.or(outer).resolve(box_at(0.0, 0.0, 100.0, 100.0));
+        assert_eq!(merged.blur, 16.0);
+        assert_eq!(merged.tint, Glass::TUNED_TINT);
+        assert_eq!(merged.saturation, Glass::TUNED_SATURATION);
+
+        // and the one CLOSEST to the view wins the knobs it named
+        let pinned = Glass::regular().blur(2.0).or(Glass::regular().blur(16.0));
+        assert_eq!(pinned.blur, Some(2.0));
+    }
+
+    #[test]
+    fn the_blur_floor_is_the_first_level_of_the_pyramid() {
+        // every blur below the pyramid's own level 0 renders as level 0:
+        // the minimum glass is light glass, never clear glass
+        assert_eq!(crate::glass::level_for(0.0), 0.0);
+        assert_eq!(crate::glass::level_for(crate::glass::SIGMA_L0), 0.0);
+        assert_eq!(crate::glass::level_for(crate::glass::SIGMA_L0 * 2.0), 1.0);
+        // and it never climbs past the top of the pyramid
+        assert_eq!(crate::glass::level_for(10_000.0), crate::glass::MAX_LEVEL as f64);
     }
 }

@@ -790,6 +790,11 @@ fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
             DrawCommand::Shadow { rect, radius, color, corner_radius } => {
                 DrawCommand::Shadow { rect: shift(rect), radius, color, corner_radius }
             }
+            DrawCommand::Backdrop { rect, glass, corner_radius } => DrawCommand::Backdrop {
+                rect: shift(rect),
+                glass: glass.shifted(dx, dy),
+                corner_radius,
+            },
             DrawCommand::TextLine { origin, content, range, color, font } => {
                 DrawCommand::TextLine {
                     origin: Point { x: origin.x + dx, y: origin.y + dy },

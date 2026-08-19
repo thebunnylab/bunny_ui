@@ -977,6 +977,298 @@ fn mix(from: Color, to: Color, t: f64) -> Color {
     }
 }
 
+/// The liquid-glass material: a pane that reads what is painted behind
+/// it, blurs that, bends it through a rounded lens and lays a tint over
+/// the result.
+///
+/// Every knob is optional and an unset knob takes the tuned value, so
+/// two glass modifiers on one view MERGE knob by knob (the one closest
+/// to the view wins). `.liquid_glass().backdrop_blur(16.0)` is one
+/// material with one changed number, not two materials.
+///
+/// The pane samples the draw list ALREADY BEHIND IT. Three consequences
+/// are part of the contract:
+///
+/// - The box's own background, border, text and children paint AFTER,
+///   and stay sharp. That is what makes glass usable.
+/// - The box's own halo is captured INTO the glass: the shadow paints
+///   first and it overlaps. Blurred and tinted it reads as depth. To
+///   keep a halo out of the pane, hang it on a wrapper box.
+/// - A pane over nothing shows nothing. Glass is a material, not a
+///   color: it needs something behind it to bend.
+///
+/// Declared in the box's own proportions (a [`UnitPoint`] for the
+/// spot), the same as [`Gradient`], so it survives a resize.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Glass {
+    /// Gaussian sigma of the backdrop blur, in logical px. The floor is
+    /// the material's own: a value below the first level of the blur
+    /// pyramid renders as that level. The minimum glass is light
+    /// glass, never clear glass.
+    pub blur: Option<Px>,
+    /// Composited OVER the blurred backdrop.
+    pub tint: Option<Color>,
+    /// `(band, amount)`: how far inward the rim bends the backdrop, and
+    /// the peak displacement at the very edge, both in logical px. An
+    /// amount of zero makes a flat pane — blur and tint only, which is
+    /// what a nested panel and text-heavy glass want.
+    pub refraction: Option<(Px, Px)>,
+    /// Per-channel spread of the rim displacement. `0.0`, the tuned
+    /// value, has no fringe at all.
+    pub chromatic: Option<f64>,
+    /// `(color, band, intensity)` of the specular rim.
+    pub highlight: Option<(Color, Px, f64)>,
+    /// `1.0` leaves the backdrop as it is. Above that keeps color alive
+    /// through a heavy blur.
+    pub saturation: Option<f64>,
+    /// `1.0` leaves the backdrop as it is.
+    pub brightness: Option<f64>,
+    /// Flat additive white over the whole pane, `0..1` — the uniform
+    /// half of a touch sheen.
+    pub sheen: Option<f64>,
+    /// `(centre, radius, alpha)` of a radial additive white spot: where
+    /// it sits in the pane, its radius as a fraction of the pane's
+    /// SMALLER side, and its peak white.
+    pub spot: Option<(UnitPoint, f64, f64)>,
+}
+
+impl Glass {
+    /// The tuned material. The numbers are a lens, not a frost: a small
+    /// blur over nearly-legible content, a displacement about one and a
+    /// half times its band, saturation above one, and no fringe.
+    pub const TUNED_BLUR: Px = 8.0;
+    pub const TUNED_TINT: Color = Color { r: 255, g: 255, b: 255, a: 51 };
+    pub const TUNED_REFRACTION: (Px, Px) = (16.0, 24.0);
+    pub const TUNED_HIGHLIGHT: (Color, Px, f64) = (Color::WHITE, 2.0, 0.9);
+    pub const TUNED_SATURATION: f64 = 1.5;
+
+    /// The tuned material, with nothing pinned — an outer
+    /// `.backdrop_*()` can still move any knob.
+    pub const fn regular() -> Glass {
+        Glass {
+            blur: None,
+            tint: None,
+            refraction: None,
+            chromatic: None,
+            highlight: None,
+            saturation: None,
+            brightness: None,
+            sheen: None,
+            spot: None,
+        }
+    }
+
+    /// Barely there: a thin tint and a stronger lens. What a control
+    /// over a photograph wants.
+    pub const fn clear() -> Glass {
+        Glass {
+            blur: Some(4.0),
+            tint: Some(Color { r: 255, g: 255, b: 255, a: 26 }),
+            refraction: Some((12.0, 28.0)),
+            ..Glass::regular()
+        }
+    }
+
+    /// A flat frosted pane: a heavy blur and NO lens. What a panel
+    /// full of text wants — a bent rim under a paragraph is noise.
+    pub const fn frosted() -> Glass {
+        Glass {
+            blur: Some(24.0),
+            tint: Some(Color { r: 255, g: 255, b: 255, a: 61 }),
+            refraction: Some((0.0, 0.0)),
+            ..Glass::regular()
+        }
+    }
+
+    pub const fn blur(mut self, sigma: Px) -> Glass {
+        self.blur = Some(sigma);
+        self
+    }
+
+    pub const fn tint(mut self, color: Color) -> Glass {
+        self.tint = Some(color);
+        self
+    }
+
+    /// How far inward the rim bends the backdrop, and by how much.
+    pub const fn refraction(mut self, band: Px, amount: Px) -> Glass {
+        self.refraction = Some((band, amount));
+        self
+    }
+
+    /// The per-channel spread of the rim displacement. `0.0` has no
+    /// fringe.
+    pub const fn chromatic(mut self, amount: f64) -> Glass {
+        self.chromatic = Some(amount);
+        self
+    }
+
+    pub const fn highlight(mut self, color: Color, band: Px, intensity: f64) -> Glass {
+        self.highlight = Some((color, band, intensity));
+        self
+    }
+
+    pub const fn saturation(mut self, saturation: f64) -> Glass {
+        self.saturation = Some(saturation);
+        self
+    }
+
+    pub const fn brightness(mut self, brightness: f64) -> Glass {
+        self.brightness = Some(brightness);
+        self
+    }
+
+    pub const fn sheen(mut self, sheen: f64) -> Glass {
+        self.sheen = Some(sheen);
+        self
+    }
+
+    /// A pool of light in the pane: where, how wide as a fraction of
+    /// the pane's smaller side, and how bright.
+    pub const fn spot(mut self, center: UnitPoint, radius: f64, alpha: f64) -> Glass {
+        self.spot = Some((center, radius, alpha));
+        self
+    }
+
+    /// Merge of two glass modifiers on the same view: the knob already
+    /// set (CLOSEST to the view) wins, and the outer one only fills
+    /// what is missing — the same rule [`VisualProps::or`] follows.
+    pub fn or(self, outer: Glass) -> Glass {
+        Glass {
+            blur: self.blur.or(outer.blur),
+            tint: self.tint.or(outer.tint),
+            refraction: self.refraction.or(outer.refraction),
+            chromatic: self.chromatic.or(outer.chromatic),
+            highlight: self.highlight.or(outer.highlight),
+            saturation: self.saturation.or(outer.saturation),
+            brightness: self.brightness.or(outer.brightness),
+            sheen: self.sheen.or(outer.sheen),
+            spot: self.spot.or(outer.spot),
+        }
+    }
+
+    /// The knobs this material actually named, in a fixed order — what
+    /// the scene print shows. A view that only asked for the material
+    /// names nothing.
+    pub fn knobs(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(blur) = self.blur {
+            parts.push(format!("blur: {blur}"));
+        }
+        if let Some(tint) = self.tint {
+            parts.push(format!("tint: {tint}"));
+        }
+        if let Some((band, amount)) = self.refraction {
+            parts.push(format!("refraction: {band}/{amount}"));
+        }
+        if let Some(chromatic) = self.chromatic {
+            parts.push(format!("chromatic: {chromatic}"));
+        }
+        if let Some((color, band, intensity)) = self.highlight {
+            parts.push(format!("highlight: {color} {band}/{intensity}"));
+        }
+        if let Some(saturation) = self.saturation {
+            parts.push(format!("saturation: {saturation}"));
+        }
+        if let Some(brightness) = self.brightness {
+            parts.push(format!("brightness: {brightness}"));
+        }
+        if let Some(sheen) = self.sheen {
+            parts.push(format!("sheen: {sheen}"));
+        }
+        if let Some((center, radius, alpha)) = self.spot {
+            parts.push(format!("spot: {} {} {radius}/{alpha}", center.x, center.y));
+        }
+        parts.join(", ")
+    }
+
+    /// The material in px against the box that carries it — the form
+    /// every rasterizer consumes (the CPU resolves in f64; the shaders
+    /// only evaluate).
+    pub fn resolve(self, rect: Rect) -> GlassPaint {
+        let (refraction_band, refraction_amount) = self.refraction.unwrap_or(Glass::TUNED_REFRACTION);
+        let (highlight, highlight_band, highlight_intensity) =
+            self.highlight.unwrap_or(Glass::TUNED_HIGHLIGHT);
+        let smaller = rect.size.width.min(rect.size.height);
+        let (spot_center, spot_radius, spot_alpha) = match self.spot {
+            Some((center, radius, alpha)) => (center.resolve(rect), radius * smaller, alpha),
+            None => (rect.origin, 0.0, 0.0),
+        };
+        GlassPaint {
+            blur: self.blur.unwrap_or(Glass::TUNED_BLUR).max(0.0),
+            tint: self.tint.unwrap_or(Glass::TUNED_TINT),
+            refraction_band: refraction_band.max(0.0),
+            refraction_amount,
+            chromatic: self.chromatic.unwrap_or(0.0).max(0.0),
+            highlight,
+            highlight_band: highlight_band.max(0.0),
+            highlight_intensity: highlight_intensity.max(0.0),
+            saturation: self.saturation.unwrap_or(Glass::TUNED_SATURATION).max(0.0),
+            brightness: self.brightness.unwrap_or(1.0).max(0.0),
+            sheen: self.sheen.unwrap_or(0.0).clamp(0.0, 1.0),
+            spot_center,
+            spot_radius,
+            spot_alpha: spot_alpha.clamp(0.0, 1.0),
+        }
+    }
+}
+
+/// A [`Glass`] with every number resolved in logical px — what a draw
+/// command carries.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct GlassPaint {
+    pub blur: Px,
+    pub tint: Color,
+    pub refraction_band: Px,
+    pub refraction_amount: Px,
+    pub chromatic: f64,
+    pub highlight: Color,
+    pub highlight_band: Px,
+    pub highlight_intensity: f64,
+    pub saturation: f64,
+    pub brightness: f64,
+    pub sheen: f64,
+    pub spot_center: Point,
+    pub spot_radius: Px,
+    pub spot_alpha: f64,
+}
+
+impl GlassPaint {
+    /// The same material in device pixels — the rasterizers work there.
+    pub fn scaled(self, factor: f64) -> GlassPaint {
+        GlassPaint {
+            blur: self.blur * factor,
+            refraction_band: self.refraction_band * factor,
+            refraction_amount: self.refraction_amount * factor,
+            highlight_band: self.highlight_band * factor,
+            spot_center: Point {
+                x: self.spot_center.x * factor,
+                y: self.spot_center.y * factor,
+            },
+            spot_radius: self.spot_radius * factor,
+            ..self
+        }
+    }
+
+    /// Shifted into another surface's coordinates.
+    pub(crate) fn shifted(self, dx: Px, dy: Px) -> GlassPaint {
+        GlassPaint {
+            spot_center: Point { x: self.spot_center.x + dx, y: self.spot_center.y + dy },
+            ..self
+        }
+    }
+
+    /// How far outside the pane the material reads, in the same units
+    /// as its own numbers — a SUPERSET, which is what a damage rect
+    /// always wants. The lens pulls from `refraction_amount` away and
+    /// the fringe spreads that; the blur reaches about four sigma, and
+    /// never less than the pyramid's own floor.
+    pub fn reach(&self) -> Px {
+        let fringe = self.refraction_amount.abs() * (1.0 + self.chromatic.max(0.0));
+        self.blur.max(3.0) * 4.0 + fringe
+    }
+}
+
 /// VISUAL properties of a scene node — paint only, by construction: no
 /// field here changes measure (the "hover does not touch layout" LAW,
 /// guaranteed by the type). In Dom mode this becomes the element's CSS;
@@ -988,6 +1280,11 @@ pub struct VisualProps {
     /// A ramp painted OVER the flat background and under the child —
     /// the two compose (`.background_color(base).background_gradient(…)`).
     pub gradient: Option<Gradient>,
+    /// The liquid-glass material behind the box: it reads what is
+    /// already painted, blurs it, bends it at the rim and lays a tint
+    /// over the result. Paint only, like everything here — a pane
+    /// measures exactly like the box it dresses.
+    pub glass: Option<Glass>,
     /// Inherited downward: the text below paints with the current foreground.
     pub foreground: Option<Color>,
     pub border: Option<(Color, Px)>,
@@ -1045,6 +1342,12 @@ impl VisualProps {
         VisualProps {
             background: self.background.or(outer.background),
             gradient: self.gradient.or(outer.gradient),
+            // knob by knob, so a chain of `.backdrop_*()` builds ONE
+            // material instead of the innermost one winning whole
+            glass: match (self.glass, outer.glass) {
+                (Some(inner), Some(outer)) => Some(inner.or(outer)),
+                (inner, outer) => inner.or(outer),
+            },
             clip: self.clip || outer.clip,
             foreground: self.foreground.or(outer.foreground),
             border: self.border.or(outer.border),
@@ -1119,6 +1422,13 @@ pub enum DrawCommand {
     /// A two-stop ramp inside the rounded rect — the same shape a
     /// `FillRect` covers, with the color resolved per pixel.
     Gradient { rect: Rect, paint: GradientPaint, corner_radius: Corners },
+    /// The liquid-glass pane: it READS the pixels the commands before
+    /// it left behind, blurs them, bends them through the rounded lens
+    /// and lays the tint over the result. The only command that reads
+    /// what it paints on, which is why it must keep its place in paint
+    /// order — a pane moved earlier shows a scene that did not exist
+    /// yet.
+    Backdrop { rect: Rect, glass: GlassPaint, corner_radius: Corners },
     /// A soft halo OUTSIDE the rounded rect: alpha falls off
     /// quadratically from the edge over `radius` px. `corner_radius`
     /// makes the halo follow the corners — including the little notch
@@ -1200,6 +1510,14 @@ impl DisplayList {
                 | DrawCommand::StrokeRect { color, .. }
                 | DrawCommand::Shadow { color, .. }
                 | DrawCommand::TextLine { color, .. } => fade(color),
+                // the pane fades by its TINT and its lights: what it
+                // samples is the scene, and the scene is already there
+                DrawCommand::Backdrop { glass, .. } => {
+                    fade(&mut glass.tint);
+                    fade(&mut glass.highlight);
+                    glass.sheen *= opacity;
+                    glass.spot_alpha *= opacity;
+                }
                 DrawCommand::Gradient { paint, .. } => match paint {
                     GradientPaint::Radial { inner, outer, .. } => {
                         fade(inner);
@@ -1238,6 +1556,11 @@ impl DisplayList {
                 DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
                     DrawCommand::StrokeRect { rect: shift_rect(rect), color, width, corner_radius }
                 }
+                DrawCommand::Backdrop { rect, glass, corner_radius } => DrawCommand::Backdrop {
+                    rect: shift_rect(rect),
+                    glass: glass.shifted(dx, dy),
+                    corner_radius,
+                },
                 DrawCommand::Gradient { rect, paint, corner_radius } => DrawCommand::Gradient {
                     rect: shift_rect(rect),
                     paint: paint.shifted(dx, dy),
@@ -3786,6 +4109,18 @@ impl LayoutNode {
                         rect: frame,
                         radius,
                         color: animated(crate::anim::Channel::Shadow, color),
+                        corner_radius: props.corner_radius.unwrap_or_default(),
+                    });
+                }
+                // the pane comes after the halo and before everything
+                // else: it reads the scene BEHIND the box, and the
+                // box's own paint must stay sharp on top of it. The
+                // halo is under it and therefore inside it — hang the
+                // halo on a wrapper to keep it out
+                if let Some(glass) = props.glass {
+                    out.display.push(DrawCommand::Backdrop {
+                        rect: frame,
+                        glass: glass.resolve(frame),
                         corner_radius: props.corner_radius.unwrap_or_default(),
                     });
                 }

@@ -95,6 +95,9 @@ pub enum Modifier {
     AutoFocus,
     /// A soft halo behind the view: (radius, color).
     Shadow(f64, Color),
+    /// The liquid-glass material behind the view. Every knob is
+    /// optional, so a chain of them MERGES into one material.
+    Glass(crate::layout::Glass),
     /// The image below negotiates size with the proposal.
     Resizable,
     /// How a resizable image maps into its box: contain or cover.
@@ -241,6 +244,9 @@ impl Modifier {
             Modifier::ScrollTarget(id) => format!(" [.scrollTarget({id:?})]"),
             Modifier::AutoFocus => " [.autoFocus()]".into(),
             Modifier::Shadow(radius, color) => format!(" [.shadow(radius: {radius}, {color})]"),
+            // the knobs a chain named, in a fixed order — the print of
+            // a view that only asked for the material stays ` [.glass()]`
+            Modifier::Glass(glass) => format!(" [.glass({})]", glass.knobs()),
             Modifier::Animated(spec) => format!(
                 " [.animated(response: {}, damping: {})]",
                 spec.response, spec.damping
@@ -912,6 +918,11 @@ fn apply(
             out,
             mark,
             VisualProps { shadow: Some((*radius, *color)), ..VisualProps::default() },
+        ),
+        Modifier::Glass(glass) => wrap_styled(
+            out,
+            mark,
+            VisualProps { glass: Some(*glass), ..VisualProps::default() },
         ),
         Modifier::ForegroundColor(color) => wrap_styled(
             out,

@@ -620,6 +620,8 @@ pub(crate) fn build_frame(
                 push_rect(out, snapped, clip, *color, radii, 0.0, KIND_FILL, 0.0);
                 note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
             }
+            // the pane answers in a tier commit of its own
+            DrawCommand::Backdrop { .. } => continue,
             DrawCommand::Gradient { rect, paint, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
                 let snapped = snap_scaled(*rect, factor);

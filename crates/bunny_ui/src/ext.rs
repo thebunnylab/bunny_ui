@@ -717,6 +717,104 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+
+    /// Turns this view into a pane of liquid glass: it blurs, bends and
+    /// tints whatever is painted behind it.
+    ///
+    /// ```ignore
+    /// vstack((title, body))
+    ///     .padding(16.0)
+    ///     .corner_radius(22.0)
+    ///     .glass(Glass::regular())
+    /// ```
+    ///
+    /// Combine it with a corner radius — the lens follows the corners,
+    /// and a square pane is a rare thing. The material needs something
+    /// BEHIND it: glass over nothing shows nothing.
+    ///
+    /// The view's own halo goes INTO the pane, because a halo paints
+    /// first and it overlaps. To keep a halo out, hang it on a wrapper
+    /// view.
+    fn glass(self, glass: crate::layout::Glass) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Glass(glass),
+        }
+    }
+
+    /// [`ViewExt::glass`] with the tuned material — the short way to
+    /// ask for glass and refine it with the `backdrop_*` family.
+    ///
+    /// ```ignore
+    /// panel.corner_radius(28.0).liquid_glass().backdrop_blur(16.0)
+    /// ```
+    fn liquid_glass(self) -> Modified<Self> {
+        self.glass(crate::layout::Glass::regular())
+    }
+
+    /// The blur radius of this view's backdrop. It turns the material
+    /// on if it is not on already, like every `backdrop_*` method.
+    fn backdrop_blur(self, sigma: f64) -> Modified<Self> {
+        self.glass(crate::layout::Glass::regular().blur(sigma))
+    }
+
+    /// The tint composited over the blurred backdrop.
+    fn backdrop_tint(self, color: crate::layout::Color) -> Modified<Self> {
+        self.glass(crate::layout::Glass::regular().tint(color))
+    }
+
+    /// How far inward the rim bends the backdrop, and by how much. An
+    /// `amount` of zero makes a flat pane — blur and tint only, which
+    /// is what a nested panel and text-heavy glass want.
+    fn backdrop_refraction(self, band: f64, amount: f64) -> Modified<Self> {
+        self.glass(crate::layout::Glass::regular().refraction(band, amount))
+    }
+
+    /// The per-channel spread of the rim displacement. `0.0`, the tuned
+    /// value, has no fringe.
+    fn backdrop_chromatic_aberration(self, amount: f64) -> Modified<Self> {
+        self.glass(crate::layout::Glass::regular().chromatic(amount))
+    }
+
+    /// The specular rim: its colour, its band and its strength.
+    fn backdrop_highlight(
+        self,
+        color: crate::layout::Color,
+        band: f64,
+        intensity: f64,
+    ) -> Modified<Self> {
+        self.glass(crate::layout::Glass::regular().highlight(color, band, intensity))
+    }
+
+    /// The saturation of this view's backdrop. `1.0` leaves it as it
+    /// is; above that keeps colour alive through a heavy blur.
+    fn backdrop_saturation(self, saturation: f64) -> Modified<Self> {
+        self.glass(crate::layout::Glass::regular().saturation(saturation))
+    }
+
+    /// The brightness of this view's backdrop. `1.0` leaves it as it
+    /// is.
+    fn backdrop_brightness(self, brightness: f64) -> Modified<Self> {
+        self.glass(crate::layout::Glass::regular().brightness(brightness))
+    }
+
+    /// A flat additive white over the whole pane — the uniform half of
+    /// a touch sheen. `0.0`, the default, adds nothing.
+    fn backdrop_sheen(self, sheen: f64) -> Modified<Self> {
+        self.glass(crate::layout::Glass::regular().sheen(sheen))
+    }
+
+    /// A pool of light in the pane: where it sits, its radius as a
+    /// fraction of the pane's smaller side, and its peak white.
+    fn backdrop_spot(
+        self,
+        center: crate::layout::UnitPoint,
+        radius: f64,
+        alpha: f64,
+    ) -> Modified<Self> {
+        self.glass(crate::layout::Glass::regular().spot(center, radius, alpha))
+    }
+
     /// Declares a key context ACTIVE while this view is mounted —
     /// `Runtime::bind_in(context, …)` bindings answer only then. The
     /// palette closes, its keys go quiet.
