@@ -429,13 +429,37 @@ impl<'a> Painter<'a> {
     /// rasterizes it, so the CPU compositor, the GPU atlas and the
     /// browser canvas consume literally the same pixels.
     ///
+    /// The ink is a `Color` or a [`Gradient`] — the same ramp a box
+    /// paints behind itself, declared in the PATH's own proportions, so
+    /// it survives every size the mark is drawn at. The house resolves
+    /// and samples it while it rasterizes, which is why a ramped path
+    /// asks nothing new of any rendering:
+    ///
+    /// ```ignore
+    /// painter.path(&verbs, Paint::Stroke { width: 3.0 }, Color::WHITE);
+    /// painter.path(
+    ///     &verbs,
+    ///     Paint::Fill(Rule::NonZero),
+    ///     Gradient::linear(dawn, dusk)
+    ///         .direction(UnitPoint::TOP_LEADING, UnitPoint::BOTTOM_TRAILING),
+    /// );
+    /// ```
+    ///
     /// The cost is a raster: a table that changes every frame pays one
-    /// every frame (and, on the GPU, one upload). Build paths from
-    /// data that moves at human speed, and a warm cache answers.
+    /// every frame (and, on the GPU, one upload). The ink is part of
+    /// the identity, so a mark repainted through another ramp is
+    /// another tile. Build paths from data that moves at human speed,
+    /// and a warm cache answers.
     ///
     /// [`Verb::Move`]: crate::icon::Verb::Move
     /// [`Paint`]: crate::icon::Paint
-    pub fn path(&mut self, verbs: &[crate::icon::Verb], paint: crate::icon::Paint, color: Color) {
+    /// [`Gradient`]: crate::layout::Gradient
+    pub fn path(
+        &mut self,
+        verbs: &[crate::icon::Verb],
+        paint: crate::icon::Paint,
+        ink: impl Into<crate::icon::Ink>,
+    ) {
         let Some((min_x, min_y, max_x, max_y)) = crate::icon::bounds(verbs) else {
             return;
         };
@@ -457,7 +481,7 @@ impl<'a> Painter<'a> {
         let source = ImageSource::path(
             local,
             paint,
-            color,
+            ink.into(),
             (size.width as f32, size.height as f32),
         );
         self.display.push(DrawCommand::Image { rect: self.shift(Rect { origin, size }), source });

@@ -46,7 +46,7 @@ pub enum ImageSource {
         key: u64,
         verbs: Rc<[crate::icon::Verb]>,
         paint: crate::icon::Paint,
-        color: crate::layout::Color,
+        ink: crate::icon::Ink,
         box_size: (f32, f32),
     },
     /// Any source, seen through a VEIL — what `.opacity(…)` leaves for
@@ -108,10 +108,10 @@ impl ImageSource {
     pub fn path(
         verbs: impl Into<Rc<[crate::icon::Verb]>>,
         paint: crate::icon::Paint,
-        color: crate::layout::Color,
+        ink: crate::icon::Ink,
         box_size: (f32, f32),
     ) -> ImageSource {
-        use crate::icon::{Paint, Verb};
+        use crate::icon::{Ink, Paint, Verb};
         let verbs = verbs.into();
         let mut hasher = motor::hash::FxHasher::default();
         hasher.write_u64(PATH_TAG);
@@ -156,15 +156,55 @@ impl ImageSource {
                 number(&mut hasher, width);
             }
         }
-        hasher.write_u32(
-            (color.r as u32) << 24
-                | (color.g as u32) << 16
-                | (color.b as u32) << 8
-                | color.a as u32,
-        );
+        // the ink is part of the identity, exactly like a symbol's
+        // tint: a path repainted through another ramp is another tile
+        let colour = |hasher: &mut motor::hash::FxHasher, color: crate::layout::Color| {
+            hasher.write_u32(
+                (color.r as u32) << 24
+                    | (color.g as u32) << 16
+                    | (color.b as u32) << 8
+                    | color.a as u32,
+            );
+        };
+        match ink {
+            Ink::Solid(color) => {
+                hasher.write_u8(7);
+                colour(&mut hasher, color);
+            }
+            Ink::Ramp(ramp) => {
+                hasher.write_u8(8);
+                match ramp {
+                    crate::layout::Gradient::Linear { start, end, from, to } => {
+                        hasher.write_u8(0);
+                        for value in [start.x, start.y, end.x, end.y] {
+                            hasher.write_u64(value.to_bits());
+                        }
+                        colour(&mut hasher, from);
+                        colour(&mut hasher, to);
+                    }
+                    crate::layout::Gradient::Radial {
+                        center,
+                        start,
+                        end,
+                        aspect,
+                        inner,
+                        outer,
+                    } => {
+                        hasher.write_u8(1);
+                        for value in
+                            [center.x, center.y, start, end.unwrap_or(f64::NAN), aspect]
+                        {
+                            hasher.write_u64(value.to_bits());
+                        }
+                        colour(&mut hasher, inner);
+                        colour(&mut hasher, outer);
+                    }
+                }
+            }
+        }
         number(&mut hasher, box_size.0);
         number(&mut hasher, box_size.1);
-        ImageSource::Path { key: hasher.finish(), verbs, paint, color, box_size }
+        ImageSource::Path { key: hasher.finish(), verbs, paint, ink, box_size }
     }
 
     /// The same source behind a veil. `1.0` gives the source back
@@ -316,8 +356,8 @@ pub fn raster_source(
         ImageSource::Symbol { key, symbol, color } => {
             crate::icon::raster(*key, symbol, *color, width, height)
         }
-        ImageSource::Path { key, verbs, paint, color, box_size } => {
-            crate::icon::raster_trace(*key, verbs, *paint, *color, *box_size, width, height)
+        ImageSource::Path { key, verbs, paint, ink, box_size } => {
+            crate::icon::raster_trace(*key, verbs, *paint, *ink, *box_size, width, height)
         }
         ImageSource::Faded { key, inner, alpha } => {
             fade_raster(*key, engine, inner, *alpha, width, height)

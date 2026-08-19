@@ -78,6 +78,31 @@ pub enum Paint {
     Stroke { width: f32 },
 }
 
+/// What the ink of a traced path IS: one colour, or a ramp. The ramp is
+/// declared in the path's OWN box (the same [`Gradient`] a box paints
+/// behind itself), so it survives every size the path is drawn at — and
+/// because a path is pixels in every rendering, all four get the same
+/// bytes without one of them learning a new trick.
+///
+/// [`Gradient`]: crate::layout::Gradient
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Ink {
+    Solid(crate::layout::Color),
+    Ramp(crate::layout::Gradient),
+}
+
+impl From<crate::layout::Color> for Ink {
+    fn from(color: crate::layout::Color) -> Ink {
+        Ink::Solid(color)
+    }
+}
+
+impl From<crate::layout::Gradient> for Ink {
+    fn from(ramp: crate::layout::Gradient) -> Ink {
+        Ink::Ramp(ramp)
+    }
+}
+
 /// One paint over one path. A glyph is a short stack of these, painted
 /// in order — most icons are a single stroked path; a badge may fill a
 /// disc first and stroke a mark on top.
@@ -322,7 +347,7 @@ pub(crate) fn raster_trace(
     key: u64,
     path: &[Verb],
     paint: Paint,
-    color: Color,
+    ink: Ink,
     box_size: (f32, f32),
     width: usize,
     height: usize,
@@ -338,7 +363,7 @@ pub(crate) fn raster_trace(
         if cache.len() >= TRACE_KEEP {
             cache.clear();
         }
-        let raster = Rc::new(rasterize_trace(path, paint, color, box_size, width, height));
+        let raster = Rc::new(rasterize_trace(path, paint, ink, box_size, width, height));
         cache.insert((key, width, height), Rc::clone(&raster));
         Some(raster)
     })
@@ -351,7 +376,7 @@ pub(crate) fn raster_trace(
 fn rasterize_trace(
     path: &[Verb],
     paint: Paint,
-    color: Color,
+    ink: Ink,
     box_size: (f32, f32),
     width: usize,
     height: usize,
@@ -371,7 +396,23 @@ fn rasterize_trace(
         }
     }
     let mut rgba = vec![0u8; width * height * 4];
-    paint_mask(&mask, color, &mut rgba, width, height);
+    match ink {
+        Ink::Solid(color) => paint_mask(&mask, color, &mut rgba, width, height),
+        Ink::Ramp(ramp) => {
+            // the ramp is resolved against the path's LOGICAL box, so a
+            // radius written in points stays that many points at any
+            // scale — and the pixel centre is read back through the
+            // same scale the coverage was measured at
+            let paint = ramp.resolve(crate::layout::Rect {
+                origin: crate::layout::Point { x: 0.0, y: 0.0 },
+                size: crate::layout::Size {
+                    width: box_size.0 as f64,
+                    height: box_size.1 as f64,
+                },
+            });
+            paint_ramp(&mask, paint, scale, &mut rgba, width, height);
+        }
+    }
     ImageRaster { width, height, rgba }
 }
 
@@ -424,6 +465,38 @@ fn rasterize(glyph: &Glyph, color: Color, width: usize, height: usize) -> ImageR
 /// one `set_covered` applies on the way in, so a glyph rasterized here
 /// and a rect painted by the compositor agree on the same edge.
 fn paint_mask(mask: &vector::Mask, ink: Color, rgba: &mut [u8], width: usize, height: usize) {
+    paint_covered(mask, rgba, width, height, |_, _| ink);
+}
+
+/// The same pass with the ink read from a ramp, pixel by pixel. The
+/// centre of the pixel is divided back by the raster's scale, so the
+/// ramp is sampled in the coordinates it was declared in.
+fn paint_ramp(
+    mask: &vector::Mask,
+    paint: crate::layout::GradientPaint,
+    scale: f64,
+    rgba: &mut [u8],
+    width: usize,
+    height: usize,
+) {
+    paint_covered(mask, rgba, width, height, |x, y| {
+        paint.at(crate::layout::Point {
+            x: (x as f64 + 0.5) / scale,
+            y: (y as f64 + 0.5) / scale,
+        })
+    });
+}
+
+/// Every covered pixel takes the ink the caller names for it. One
+/// blend per pixel, never two — the mask already unioned the overlaps.
+#[inline]
+fn paint_covered(
+    mask: &vector::Mask,
+    rgba: &mut [u8],
+    width: usize,
+    height: usize,
+    ink: impl Fn(usize, usize) -> Color,
+) {
     let Some((x0, y0, x1, y1)) = mask.dirty() else { return };
     debug_assert!(x1 <= width && y1 <= height);
     for y in y0..y1 {
@@ -432,6 +505,7 @@ fn paint_mask(mask: &vector::Mask, ink: Color, rgba: &mut [u8], width: usize, he
             if coverage <= 0.0 {
                 continue;
             }
+            let ink = ink(x, y);
             let alpha = (ink.a as f64 * coverage as f64).round() as u32;
             if alpha == 0 {
                 continue;
@@ -633,7 +707,7 @@ mod tests {
         let trace = rasterize_trace(
             SQUARE_PATH,
             Paint::Fill(Rule::NonZero),
-            INK,
+            Ink::Solid(INK),
             (ICON_GRID as f32, ICON_GRID as f32),
             24,
             24,
@@ -647,7 +721,7 @@ mod tests {
         // ink, a row well above it is not
         const LINE: &[Verb] = &[Verb::Move(2.0, 6.0), Verb::Line(38.0, 6.0)];
         let raster =
-            rasterize_trace(LINE, Paint::Stroke { width: 4.0 }, INK, (40.0, 12.0), 40, 12);
+            rasterize_trace(LINE, Paint::Stroke { width: 4.0 }, Ink::Solid(INK), (40.0, 12.0), 40, 12);
         let alpha = |x: usize, y: usize| raster.rgba[(y * 40 + x) * 4 + 3];
         assert_eq!(alpha(20, 6), 255, "the middle of the band is solid");
         assert_eq!(alpha(20, 0), 0, "three units above it, nothing");
@@ -658,26 +732,137 @@ mod tests {
     }
 
     #[test]
+    fn a_traced_path_fills_with_a_ramp_that_survives_the_scale() {
+        use crate::layout::{Gradient, Point, Rect, Size, UnitPoint};
+
+        // a filled band across a 40x12 box, red at the leading edge and
+        // blue at the trailing one
+        const BAND: &[Verb] = &[
+            Verb::Move(0.0, 0.0),
+            Verb::Line(40.0, 0.0),
+            Verb::Line(40.0, 12.0),
+            Verb::Line(0.0, 12.0),
+            Verb::Close,
+        ];
+        const RED: Color = Color { r: 220, g: 30, b: 30, a: 255 };
+        const BLUE: Color = Color { r: 30, g: 30, b: 220, a: 255 };
+        let ramp = Gradient::linear(RED, BLUE)
+            .direction(UnitPoint::LEADING, UnitPoint::TRAILING);
+        let fill = Paint::Fill(Rule::NonZero);
+        let box_ = (40.0f32, 12.0f32);
+
+        let traced = |scale: usize| {
+            rasterize_trace(BAND, fill, Ink::Ramp(ramp), box_, 40 * scale, 12 * scale)
+        };
+        let at = |raster: &ImageRaster, x: usize, y: usize| {
+            let to = (y * raster.width + x) * 4;
+            Color {
+                r: raster.rgba[to],
+                g: raster.rgba[to + 1],
+                b: raster.rgba[to + 2],
+                a: raster.rgba[to + 3],
+            }
+        };
+
+        let one = traced(1);
+        // the ramp runs: red on the left, blue on the right, and the
+        // middle belongs to neither
+        let left = at(&one, 1, 6);
+        let right = at(&one, 38, 6);
+        let middle = at(&one, 20, 6);
+        assert!(left.r > left.b, "the leading edge is red: {left:?}");
+        assert!(right.b > right.r, "the trailing edge is blue: {right:?}");
+        assert!(middle.r < left.r && middle.b < right.b, "and the middle mixes: {middle:?}");
+
+        // the ORACLE is the ramp's own formula — the one the shaders
+        // repeat — read in the coordinates the path was declared in
+        let paint = ramp.resolve(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size { width: 40.0, height: 12.0 },
+        });
+        for x in [1usize, 9, 20, 31, 38] {
+            let want = paint.at(Point { x: x as f64 + 0.5, y: 6.5 });
+            let got = at(&one, x, 6);
+            assert_eq!((got.r, got.g, got.b), (want.r, want.g, want.b), "at x={x}");
+        }
+
+        // and it survives the scale: the ramp is declared in the box's
+        // OWN proportions, so twice the pixels is the same picture —
+        // which is why every rendering gets the same bytes for free
+        let two = traced(2);
+        assert_eq!(two.width, 80);
+        for x in [1usize, 9, 20, 31, 38] {
+            let want = paint.at(Point { x: x as f64 + 0.5, y: 6.5 });
+            // the physical pixel whose CENTRE is nearest that logical
+            // point: 2x + 0 has centre (2x + 0.5) / 2 = x + 0.25
+            let got = at(&two, x * 2, 12);
+            let near = |a: u8, b: u8| a.abs_diff(b) <= 4;
+            assert!(
+                near(got.r, want.r) && near(got.g, want.g) && near(got.b, want.b),
+                "at x={x}: {got:?} against {want:?}",
+            );
+        }
+
+        // a flat ink is untouched: the same path through the old door
+        // is byte for byte the raster it always was
+        let flat = rasterize_trace(BAND, fill, Ink::Solid(RED), box_, 40, 12);
+        assert!(flat.rgba.chunks(4).all(|pixel| pixel[3] == 0
+            || (pixel[0], pixel[1], pixel[2]) == (RED.r, RED.g, RED.b)));
+        assert_ne!(flat.rgba, one.rgba, "and a ramp is not a flat fill");
+    }
+
+    #[test]
+    fn a_pen_put_down_and_lifted_at_one_point_is_a_dot() {
+        // the dab a sketch draws: a segment of no length at all. The
+        // distance field answers the POINT, so the round cap is the
+        // whole mark — and the box the painter pads around it holds it
+        const DAB: &[Verb] = &[Verb::Move(6.0, 6.0), Verb::Line(6.0, 6.0)];
+        let raster =
+            rasterize_trace(DAB, Paint::Stroke { width: 8.0 }, Ink::Solid(INK), (12.0, 12.0), 12, 12);
+        let alpha = |x: usize, y: usize| raster.rgba[(y * 12 + x) * 4 + 3];
+        assert_eq!(alpha(6, 6), 255, "the middle is solid");
+        assert_eq!(alpha(0, 0), 0, "the corner is outside the disc");
+        assert!((1..255).contains(&alpha(6, 2)), "and the rim softens");
+    }
+
+    #[test]
     fn a_traced_identity_folds_geometry_paint_and_ink() {
         use crate::image_engine::ImageSource;
         const A: &[Verb] = &[Verb::Move(0.0, 0.0), Verb::Line(10.0, 10.0)];
         const B: &[Verb] = &[Verb::Move(0.0, 0.0), Verb::Line(10.0, 9.0)];
         let pen = Paint::Stroke { width: 2.0 };
         let box_ = (12.0, 12.0);
-        let key = |verbs: &'static [Verb], paint, color| {
-            ImageSource::path(verbs.to_vec(), paint, color, box_).key()
+        let key = |verbs: &'static [Verb], paint, ink: Ink| {
+            ImageSource::path(verbs.to_vec(), paint, ink, box_).key()
         };
-        assert_eq!(key(A, pen, INK), key(A, pen, INK), "the same drawing, the same key");
-        assert_ne!(key(A, pen, INK), key(B, pen, INK), "one moved point moves it");
+        let ink = Ink::Solid(INK);
+        assert_eq!(key(A, pen, ink), key(A, pen, ink), "the same drawing, the same key");
+        assert_ne!(key(A, pen, ink), key(B, pen, ink), "one moved point moves it");
         assert_ne!(
-            key(A, pen, INK),
-            key(A, Paint::Fill(Rule::NonZero), INK),
+            key(A, pen, ink),
+            key(A, Paint::Fill(Rule::NonZero), ink),
             "the paint rides the identity"
         );
         assert_ne!(
-            key(A, pen, INK),
-            key(A, pen, Color { r: 200, g: 10, b: 10, a: 255 }),
+            key(A, pen, ink),
+            key(A, pen, Ink::Solid(Color { r: 200, g: 10, b: 10, a: 255 })),
             "and so does the ink"
+        );
+        // and a ramp is a different tile from either of its ends, and
+        // from another ramp with the same ends pointing elsewhere
+        let ramp = crate::layout::Gradient::linear(INK, Color { r: 200, g: 10, b: 10, a: 255 });
+        assert_ne!(key(A, pen, ink), key(A, pen, Ink::Ramp(ramp)));
+        assert_ne!(
+            key(A, pen, Ink::Ramp(ramp)),
+            key(
+                A,
+                pen,
+                Ink::Ramp(ramp.direction(
+                    crate::layout::UnitPoint::LEADING,
+                    crate::layout::UnitPoint::TRAILING,
+                )),
+            ),
+            "the ramp's own geometry rides it too"
         );
     }
 

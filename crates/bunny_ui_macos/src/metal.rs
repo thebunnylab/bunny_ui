@@ -2820,6 +2820,58 @@ mod tests {
         .spacing(4.0)
     }
 
+    /// A box that draws ONE ramped path — the escape hatch's road to
+    /// the sprite atlas, with the ink read per pixel instead of once.
+    struct RampedMark;
+
+    impl bunny_ui::prelude::CustomElement for RampedMark {
+        fn paint(
+            &self,
+            ctx: &bunny_ui::prelude::PaintCtx,
+            painter: &mut bunny_ui::prelude::Painter,
+        ) {
+            use bunny_ui::icon::{Paint, Rule, Verb};
+            let (w, h) = (ctx.size().width as f32, ctx.size().height as f32);
+            let verbs = [
+                Verb::Move(2.0, 2.0),
+                Verb::Line(w - 2.0, 2.0),
+                Verb::Line(w - 2.0, h - 2.0),
+                Verb::Line(2.0, h - 2.0),
+                Verb::Close,
+            ];
+            painter.path(
+                &verbs,
+                Paint::Fill(Rule::NonZero),
+                bunny_ui::layout::Gradient::linear(
+                    Color::hex(0xDD2233),
+                    Color::hex(0x2233DD),
+                )
+                .direction(
+                    bunny_ui::layout::UnitPoint::TOP_LEADING,
+                    bunny_ui::layout::UnitPoint::BOTTOM_TRAILING,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn a_ramped_path_matches_the_cpu_byte_for_byte() {
+        if !device_present() {
+            return;
+        }
+        // the ramp is resolved and sampled ONCE, by the house, into the
+        // tile both pipelines then blit — so a gradient inside a traced
+        // path needs no shader on either side, and parity stays exact
+        let root = bunny_ui::prelude::custom(RampedMark).frame(80.0, 48.0);
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 100.0, height: 60.0 }, 2, Color::CANVAS);
+        assert!(
+            gpu == cpu,
+            "ramped path diverged (max channel delta {})",
+            max_channel_delta(&gpu, &cpu)
+        );
+    }
+
     #[test]
     fn icons_match_the_cpu_byte_for_byte() {
         if !device_present() {

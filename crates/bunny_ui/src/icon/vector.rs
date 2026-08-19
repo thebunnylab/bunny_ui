@@ -75,16 +75,19 @@ pub(crate) fn flatten(path: &[Verb], placing: Placing) -> Flattened {
     // so `Close` can seal and a verb after it can reopen at the seam.
     let mut start: Option<(usize, (f64, f64))> = None;
     let mut current: Option<(f64, f64)> = None;
+    // did a drawing verb touch the OPEN contour? SVG strokes a subpath
+    // that was drawn to, never a lone `Move`
+    let mut drawn = false;
 
     for verb in path {
         match *verb {
             Verb::Move(x, y) => {
                 let point = placing.apply(x, y);
-                begin(&mut out, &mut start, point);
+                begin(&mut out, &mut start, &mut drawn, point);
                 current = Some(point);
             }
             Verb::Line(x, y) => {
-                let Some(from) = reopen(&mut out, &mut start, &mut current) else {
+                let Some(from) = reopen(&mut out, &mut start, &mut drawn, &mut current) else {
                     continue;
                 };
                 let to = placing.apply(x, y);
@@ -92,7 +95,7 @@ pub(crate) fn flatten(path: &[Verb], placing: Placing) -> Flattened {
                 current = Some(to);
             }
             Verb::Quad(cx, cy, x, y) => {
-                let Some(from) = reopen(&mut out, &mut start, &mut current) else {
+                let Some(from) = reopen(&mut out, &mut start, &mut drawn, &mut current) else {
                     continue;
                 };
                 let control = placing.apply(cx, cy);
@@ -105,7 +108,7 @@ pub(crate) fn flatten(path: &[Verb], placing: Placing) -> Flattened {
                 current = Some(to);
             }
             Verb::Cubic(ax, ay, bx, by, x, y) => {
-                let Some(from) = reopen(&mut out, &mut start, &mut current) else {
+                let Some(from) = reopen(&mut out, &mut start, &mut drawn, &mut current) else {
                     continue;
                 };
                 let a = placing.apply(ax, ay);
@@ -131,14 +134,20 @@ pub(crate) fn flatten(path: &[Verb], placing: Placing) -> Flattened {
         }
     }
     // a contour that never grew past its Move carries no ink
-    prune_empty(&mut out);
+    prune_empty(&mut out, drawn);
     out
 }
 
 /// Opens a contour at `point`. A `Move` lands here — and so does the
 /// first verb after a `Close`, through [`reopen`].
-fn begin(out: &mut Flattened, start: &mut Option<(usize, (f64, f64))>, point: (f64, f64)) {
-    prune_empty(out);
+fn begin(
+    out: &mut Flattened,
+    start: &mut Option<(usize, (f64, f64))>,
+    drawn: &mut bool,
+    point: (f64, f64),
+) {
+    prune_empty(out, *drawn);
+    *drawn = false;
     *start = Some((out.points.len(), point));
     out.contours.push((out.points.len(), false));
     out.points.push(point);
@@ -150,14 +159,17 @@ fn begin(out: &mut Flattened, start: &mut Option<(usize, (f64, f64))>, point: (f
 fn reopen(
     out: &mut Flattened,
     start: &mut Option<(usize, (f64, f64))>,
+    drawn: &mut bool,
     current: &mut Option<(f64, f64)>,
 ) -> Option<(f64, f64)> {
     let point = (*current)?;
     if start.is_none() {
         // after a Close the next subpath opens AT the seam
-        begin(out, start, point);
+        begin(out, start, drawn, point);
     }
     debug_assert!(current.is_some(), "a path begins with Move");
+    // whatever verb asked for the current point is about to draw
+    *drawn = true;
     Some(point)
 }
 
@@ -168,8 +180,16 @@ fn push(out: &mut Flattened, from: (f64, f64), to: (f64, f64)) {
     }
 }
 
-/// Drops an open contour that holds only its `Move`.
-fn prune_empty(out: &mut Flattened) {
+/// Drops a contour that holds only its `Move` and was never DRAWN to.
+/// One that WAS drawn to — a pen put down and lifted at the same
+/// point — survives as a single point, and the round cap makes it a
+/// dot. That is the rule SVG names in so many words: a subpath of a
+/// lone `moveto` is not stroked; a `moveto` and a line back to the
+/// same place is.
+fn prune_empty(out: &mut Flattened, drawn: bool) {
+    if drawn {
+        return;
+    }
     if let Some(&(first, _)) = out.contours.last() {
         if out.points.len() - first < 2 {
             out.points.truncate(first);
@@ -408,7 +428,12 @@ pub(crate) fn stroke_into(mask: &mut Mask, flat: &Flattened, width: f64) {
     let reach = half + 1.5;
     for (points, sealed) in flat.contours() {
         let count = points.len();
-        let segments = if sealed { count } else { count - 1 };
+        let segments = match (sealed, count) {
+            // a contour that is only a point: the round cap IS the mark
+            (_, 1) => 1,
+            (true, _) => count,
+            (false, _) => count - 1,
+        };
         for i in 0..segments {
             let a = points[i];
             let b = points[(i + 1) % count];
@@ -539,6 +564,18 @@ mod tests {
         );
         let all: Vec<_> = flat.contours().collect();
         assert_eq!(all[0].0.len(), 2);
+    }
+
+    #[test]
+    fn a_subpath_drawn_back_to_its_own_start_survives_as_a_point() {
+        // SVG's own rule, both halves: a lone `Move` is not stroked...
+        let stray = flatten(&[Verb::Move(3.0, 3.0), Verb::Line(9.0, 3.0), Verb::Move(1.0, 1.0)], ONE);
+        assert_eq!(stray.contours().count(), 1, "the trailing Move drew nothing");
+        // ...and a `Move` with a line back to the same place IS
+        let dab = flatten(&[Verb::Move(3.0, 3.0), Verb::Line(3.0, 3.0)], ONE);
+        let all: Vec<_> = dab.contours().collect();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, &[(3.0, 3.0)], "one point, and the cap makes it a dot");
     }
 
     /// A quarter circle as the standard cubic (kappa control points),

@@ -6,6 +6,11 @@
 //! the caret. Nothing here is a built-in view — and nothing here needs
 //! a new one.
 //!
+//! The ink is a RAMP, not a colour: `Painter::path` takes the same
+//! `Gradient` a box paints behind itself, declared in the mark's own
+//! proportions — so a stroke shows where it began and where it went,
+//! at any size, and every rendering gets the same pixels.
+//!
 //! Drag to draw. The wheel changes the brush. Click the caption strip
 //! and type (composition included); Backspace erases, Escape drops the
 //! keyboard, and the ink clears with Delete.
@@ -19,7 +24,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use bunny_ui::layout::{Color, Point, Px, Rect, Size};
+use bunny_ui::layout::{Point, Px, Rect, Size};
 use bunny_ui::prelude::*;
 #[cfg(target_os = "macos")]
 use bunny_ui_macos::Chrome;
@@ -103,20 +108,21 @@ impl CustomElement for Sketch {
         }
 
         let brush = self.brush.get();
-        let mut ink = |stroke: &Stroke, color: Color| {
+        // the ink is a RAMP, not a colour: declared in the stroke's own
+        // box, so it holds whatever the hand draws, at whatever size
+        let mut ink = |stroke: &Stroke, color: Gradient| {
             match stroke.len() {
                 0 => {}
-                // a single tap has no direction: it is a dab
-                1 => painter.fill_rounded(
-                    Rect {
-                        origin: Point {
-                            x: stroke[0].x - brush / 2.0,
-                            y: stroke[0].y - brush / 2.0,
-                        },
-                        size: Size { width: brush, height: brush },
-                    },
+                // a single tap has no direction: it is a dab — a pen
+                // put down and lifted at the same point, so it wears
+                // the ramp like every other mark
+                1 => painter.path(
+                    &[
+                        Verb::Move(stroke[0].x as f32, stroke[0].y as f32),
+                        Verb::Line(stroke[0].x as f32, stroke[0].y as f32),
+                    ],
+                    Paint::Stroke { width: brush as f32 },
                     color,
-                    brush / 2.0,
                 ),
                 // the ink is ONE path the app assembles from the points
                 // the pointer passed through — every sample becomes the
@@ -142,9 +148,9 @@ impl CustomElement for Sketch {
             }
         };
         for stroke in self.strokes.get().iter() {
-            ink(stroke, palette::INK);
+            ink(stroke, palette::ink());
         }
-        ink(&self.live.get(), palette::LIVE);
+        ink(&self.live.get(), palette::live());
 
         // the crosshair follows the pointer — proof the moves arrive
         if let Some(at) = self.pointer.get() {
@@ -267,7 +273,26 @@ mod palette {
     pub const WELL: Color = Color::hex(0x121319);
     pub const GRID: Color = Color::hex(0x23262F);
     pub const INK: Color = Color::hex(0x7FD1C8);
+    pub const INK_END: Color = Color::hex(0x4C7BE8);
     pub const LIVE: Color = Color::hex(0xE879F9);
+    pub const LIVE_END: Color = Color::hex(0xFBBF24);
+
+    /// The settled ink: a ramp along the mark it draws, so a long
+    /// stroke shows where it started and where it went.
+    pub fn ink() -> bunny_ui::layout::Gradient {
+        ramp(INK, INK_END)
+    }
+
+    /// The stroke under the hand, in its own two colours.
+    pub fn live() -> bunny_ui::layout::Gradient {
+        ramp(LIVE, LIVE_END)
+    }
+
+    fn ramp(from: Color, to: Color) -> bunny_ui::layout::Gradient {
+        use bunny_ui::layout::UnitPoint;
+        bunny_ui::layout::Gradient::linear(from, to)
+            .direction(UnitPoint::TOP_LEADING, UnitPoint::BOTTOM_TRAILING)
+    }
     pub const CROSS: Color = Color::hex(0x3B4252);
     pub const STRIP: Color = Color::hex(0x191B22);
     pub const FG: Color = Color::hex(0xD5DAE4);

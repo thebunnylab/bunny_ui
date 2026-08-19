@@ -39,7 +39,7 @@ python3 -m http.server 8871 --directory web
 Then open http://localhost:8871 (canvas) or
 http://localhost:8871/dom.html (dom + island).
 
-One binary carries both shells (~488 KB through the `web` profile —
+One binary carries both shells (~490 KB through the `web` profile —
 `opt-level = "z"`, one codegen unit, lto, and the name table stripped). Ten thousand rows
 stay virtualized in both modes: the scroll geometry is honest to the
 full extent, and only the visible window exists.
