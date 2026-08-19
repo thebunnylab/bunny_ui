@@ -158,6 +158,23 @@ pub struct DomStyle {
     /// The box a `.hover_group()` owns names itself here — the anchor
     /// every follower's selector points at.
     pub group_owner: Option<u64>,
+    /// The liquid-glass material, as much of it as a browser owns:
+    /// `backdrop-filter` gives the blur, the saturation and the
+    /// brightness natively, and the rim goes on as two inset shadows
+    /// along the lit diagonals.
+    ///
+    /// Two parts of the material stay behind in this mode: the LENS
+    /// (the rim's refraction, and the fringe with it) and the touch
+    /// lights. CSS has no displacement map, and the promise of the
+    /// element lowering was never pixels — it is the geometry, with
+    /// native text and native controls. A subtree that needs the whole
+    /// material asks for `.rendering(Gpu)` and gets it exactly.
+    ///
+    /// The TINT does not travel here: it is composited into
+    /// `background` at capture time, where both colours are known,
+    /// because an element has one background colour and the tint sits
+    /// directly under whatever the box paints itself.
+    pub glass: Option<GlassFilter>,
     /// Inside a `.overlay(…)`/`.background(…)` layer that asks for
     /// nothing: the box lets the pointer THROUGH to what it covers. A
     /// rule or an insertion marker must not eat the click that belongs
@@ -190,8 +207,63 @@ impl DomStyle {
             pressed_opacity: props.opacity_pressed,
             group: None,
             group_owner: None,
+            glass: props.glass.map(GlassFilter::of),
             pass_through: false,
         }
+    }
+}
+
+/// What a browser can carry of a pane of glass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlassFilter {
+    /// The `backdrop-filter` blur, in logical px. CSS takes a standard
+    /// deviation here, which is the same number the material means.
+    pub blur: Px,
+    pub saturation: f64,
+    pub brightness: f64,
+    /// The specular rim: its colour and its band.
+    pub rim: Color,
+    pub rim_band: Px,
+}
+
+impl GlassFilter {
+    fn of(glass: crate::layout::Glass) -> GlassFilter {
+        // the box is not known here and the filter needs none of it —
+        // only the spot resolves against a frame, and the spot is one
+        // of the two things this mode leaves behind
+        let resolved = glass.resolve(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: crate::layout::Size { width: 0.0, height: 0.0 },
+        });
+        GlassFilter {
+            blur: resolved.blur,
+            saturation: resolved.saturation,
+            brightness: resolved.brightness,
+            rim: Color {
+                a: (resolved.highlight.a as f64 * resolved.highlight_intensity.clamp(0.0, 1.0))
+                    .round() as u8,
+                ..resolved.highlight
+            },
+            rim_band: resolved.highlight_band,
+        }
+    }
+
+    /// The colour an element paints, once the tint is folded in: the
+    /// tint sits under the box's own background, so the background wins
+    /// where it is opaque and the tint shows through where it is not.
+    fn under(tint: Color, background: Option<Color>) -> Option<Color> {
+        let Some(background) = background else { return Some(tint) };
+        let over = background.a as f64 / 255.0;
+        let channel = |top: u8, under: u8| {
+            (top as f64 * over + under as f64 * (1.0 - over)).round() as u8
+        };
+        let alpha = over + (tint.a as f64 / 255.0) * (1.0 - over);
+        Some(Color {
+            r: channel(background.r, tint.r),
+            g: channel(background.g, tint.g),
+            b: channel(background.b, tint.b),
+            a: (alpha * 255.0).round() as u8,
+        })
     }
 }
 
@@ -379,6 +451,19 @@ impl DomCapture {
             group: props.from_group.then(|| group).flatten(),
             ..DomStyle::from_props(props)
         };
+        // the tint has no layer of its own in a browser: it folds into
+        // the background, where it belongs — under whatever the box
+        // paints itself and over the blurred backdrop
+        if let Some(glass) = props.glass {
+            let tint = glass.resolve(frame).tint;
+            node.style.background = GlassFilter::under(tint, node.style.background);
+            node.style.hover_background =
+                node.style.hover_background.and_then(|color| GlassFilter::under(tint, Some(color)));
+            node.style.pressed_background = node
+                .style
+                .pressed_background
+                .and_then(|color| GlassFilter::under(tint, Some(color)));
+        }
         if states || inheriting {
             node.style.color = Some(ink);
         }
@@ -1067,6 +1152,13 @@ fn diff_children(
 ///                      sends one number or four, never both, and a
 ///                      box that rounds all four the same never pays
 ///                      the three extra floats
+///                   23 glass f32 blur, f32 saturation, f32 brightness,
+///                      u32 rim rgba, f32 rim band — the half of the
+///                      liquid-glass material a browser owns natively.
+///                      The TINT is not here: it folds into bit 0 at
+///                      capture time, because an element has one
+///                      background colour and the tint sits under
+///                      whatever the box paints itself
 ///   6 set text      u32 rgba, u8 inherits ink (1 = no color of its
 ///                   own — the box above owns both states),
 ///                   f32 size, u8 weight, u8 mono, u8 italic,
@@ -1303,6 +1395,9 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
         // payload-free, like the clip bit: the bit IS the value
         mask |= 1 << 21;
     }
+    if style.glass.is_some() {
+        mask |= 1 << 23;
+    }
     push_u32(out, mask);
     if let Some(color) = style.background {
         push_u32(out, pack_color(color));
@@ -1396,6 +1491,13 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
         push_f32(out, radii.top_right);
         push_f32(out, radii.bottom_right);
         push_f32(out, radii.bottom_left);
+    }
+    if let Some(glass) = style.glass {
+        push_f32(out, glass.blur);
+        push_f32(out, glass.saturation);
+        push_f32(out, glass.brightness);
+        push_u32(out, pack_color(glass.rim));
+        push_f32(out, glass.rim_band);
     }
 }
 
@@ -2448,5 +2550,65 @@ mod tests {
             DomPatch::SetIcon { icon, .. }
                 if icon.color == Color::hex(0xAA2211) && !icon.inherits_ink
         ));
+    }
+
+    #[test]
+    fn a_pane_of_glass_becomes_a_native_backdrop_filter() {
+        #[derive(Clone, Copy)]
+        struct Panel;
+        impl Component for Panel {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("hello")
+                    .padding_length(10.0)
+                    .corner_radius(16.0)
+                    .glass(crate::layout::Glass::regular())
+            }
+        }
+
+        let runtime = Runtime::new();
+        let patches = runtime.dom_frame(&Panel, Size { width: 200.0, height: 80.0 });
+        let glass = patches
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::SetStyle { style, .. } => style.glass,
+                _ => None,
+            })
+            .expect("the pane carries a filter");
+        assert_eq!(glass.blur, crate::layout::Glass::TUNED_BLUR);
+        assert_eq!(glass.saturation, crate::layout::Glass::TUNED_SATURATION);
+        assert_eq!(glass.brightness, 1.0);
+        assert!(glass.rim_band > 0.0, "the rim rides along as an inset shadow");
+
+        // the TINT is not on the wire: an element has one background
+        // colour, and the tint sits under whatever the box paints
+        let background = patches
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::SetStyle { style, .. } if style.glass.is_some() => style.background,
+                _ => None,
+            })
+            .expect("the tint became the background");
+        assert_eq!(background, crate::layout::Glass::TUNED_TINT);
+
+        // and the bit reaches the stream where the glue reads it
+        let bytes = encode(&patches);
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn a_background_under_glass_paints_over_the_tint() {
+        // the tint is UNDER the box's own paint: an opaque background
+        // hides it, a translucent one lets it through
+        let tint = Color { r: 255, g: 255, b: 255, a: 51 };
+        let opaque = Color::hex(0x203040);
+        assert_eq!(
+            GlassFilter::under(tint, Some(opaque)),
+            Some(opaque),
+            "an opaque background wins outright"
+        );
+        let veil = Color { r: 0, g: 0, b: 0, a: 128 };
+        let folded = GlassFilter::under(tint, Some(veil)).expect("a colour");
+        assert!(folded.r > 0 && folded.r < 255, "a veil mixes with the tint: {folded:?}");
+        assert!(folded.a > veil.a, "and the two alphas compose: {folded:?}");
     }
 }

@@ -300,9 +300,12 @@ function applyPatches(view, length) {
       // bit 4 is the one radius every corner shares; bit 22 below is
       // the four, and a box sends one or the other, never both
       if (mask & 16) base.push(`border-radius:${f32()}px`);
+      // the halo and the glass rim share one property: collect both
+      // and write a single declaration at the end
+      const shadows = [];
       if (mask & 32) {
         const radius = f32();
-        base.push(`box-shadow:0 0 ${radius}px ${rgba(u32())}`);
+        shadows.push(`0 0 ${radius}px ${rgba(u32())}`);
       }
       if (mask & 64) {
         const response = f32();
@@ -405,6 +408,31 @@ function applyPatches(view, length) {
         const bl = f32();
         base.push(`border-radius:${tl}px ${tr}px ${br}px ${bl}px`);
       }
+      // liquid glass, the half a browser owns: the blur, the
+      // saturation and the brightness are one native filter over what
+      // is BEHIND the element, and the rim goes on as two inset
+      // shadows along the lit diagonals — the dual lobe the material
+      // is known by. The tint already arrived folded into the
+      // background. The lens and the touch lights stay with the pixel
+      // modes: CSS has no displacement map, and this mode promises the
+      // geometry with native text, never the pixels
+      if (mask & 8388608) {
+        const blur = f32();
+        const saturation = f32();
+        const brightness = f32();
+        const rim = rgba(u32());
+        const band = f32();
+        const filter =
+          `blur(${blur}px) saturate(${saturation}) brightness(${brightness})`;
+        base.push(`backdrop-filter:${filter}`);
+        base.push(`-webkit-backdrop-filter:${filter}`);
+        if (band > 0) {
+          const spread = Math.max(1, band);
+          shadows.push(`inset ${spread}px ${spread}px ${spread * 1.5}px ${-spread}px ${rim}`);
+          shadows.push(`inset ${-spread}px ${-spread}px ${spread * 1.5}px ${-spread}px ${rim}`);
+        }
+      }
+      if (shadows.length) base.push(`box-shadow:${shadows.join(",")}`);
       const name = `[data-n="${id}"]`;
       const from = group ? `[data-g="${group}"]` : name;
       const on = (state) => (group ? `${from}:${state} ${name}` : `${name}:${state}`);
