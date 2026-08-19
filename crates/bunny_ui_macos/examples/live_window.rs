@@ -16,8 +16,12 @@
 //!   exactly there when the window is key again;
 //! - with reduce motion on, the ring holds its resting frame forever.
 
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use bunny_ui::prelude::*;
+#[cfg(target_os = "macos")]
 use bunny_ui_macos::CoreTextEngine;
+#[cfg(target_os = "macos")]
 use std::rc::Rc;
 
 const BAR_H: f64 = 44.0;
@@ -70,6 +74,7 @@ impl Component for LiveDemo {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     theme::install(Theme::dark());
     let runtime = Runtime::new().text_engine(Rc::new(CoreTextEngine::new()));
@@ -80,3 +85,6 @@ fn main() {
         LiveDemo,
     );
 }
+
+#[cfg(not(target_os = "macos"))]
+fn main() {} // this example is macOS-only
