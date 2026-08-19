@@ -484,6 +484,18 @@ fn main() {
         std::hint::black_box(bitmap.to_rgba_bytes().len());
     }));
 
+    // the ladder's front: the SAME display list presented by VULKAN —
+    // walk + staging + record + submit + the GPU itself, WAITED.
+    use bunny_ui_linux::OffscreenVk;
+    if let Some(mut gpu) = OffscreenVk::new(1520, 1280) {
+        gpu.present_wait(&laid_out.display, 2, Color::CANVAS, &*engine, &RawImages::default());
+        reports.push(measure("present VK 1520×1280 (full)", 3, 200, || {
+            gpu.present_wait(&laid_out.display, 2, Color::CANVAS, &*engine, &RawImages::default());
+        }));
+        reports.push(measure("present VK (record, no wait)", 3, 200, || {
+            gpu.present_nowait(&laid_out.display, 2, Color::CANVAS, &*engine, &RawImages::default());
+        }));
+    }
     // the second backend: the SAME display list presented by GL —
     // walk + upload + encode + submit + the GPU itself, WAITED, so the
     // number hides nothing. the twin of the cpu paint row above.
@@ -586,6 +598,12 @@ fn main() {
     if let Some(mut gpu) = OffscreenGl::new(6048, 3928) {
         gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine, &RawImages::default());
         reports.push(measure("present GPU 6048×3928 (full)", 3, 100, || {
+            gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine, &RawImages::default());
+        }));
+    }
+    if let Some(mut gpu) = OffscreenVk::new(6048, 3928) {
+        gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine, &RawImages::default());
+        reports.push(measure("present VK 6048×3928 (full)", 3, 100, || {
             gpu.present_wait(&editor_layout.display, 2, Color::CANVAS, &*engine, &RawImages::default());
         }));
     }
