@@ -9,6 +9,7 @@
 #![cfg(target_os = "linux")]
 
 mod ffi;
+mod gl;
 mod image;
 mod text;
 
@@ -21,6 +22,7 @@ use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
+pub use gl::OffscreenGl;
 pub use image::LinuxImageEngine;
 pub use text::FreeTypeEngine;
 
@@ -100,6 +102,10 @@ pub fn run_window_chrome(
     root: impl View,
 ) {
     let window = ffi::create_window(title, size.width, size.height, chrome == Chrome::Scene);
+    // the present backend, chosen ONCE: the GPU by default, the CPU
+    // raster on refusal — and the window is still unmapped, so the
+    // first frame (whichever road) IS the reveal
+    ffi::install_gpu(&window);
     // the season's mirrors: reduce-motion always follows the system
     // (accessibility is never the app's to refuse); the theme follows
     // ONLY while the app has not chosen one — an installed theme means
@@ -201,6 +207,19 @@ pub fn run_window_chrome(
                         &bitmap.to_rgba_bytes(),
                     );
                 }
+            }
+            if gl::active() {
+                // GPU present: the same display list, no Surface in
+                // the path — the swap is the frame
+                gl::present_window(
+                    &display,
+                    Size { width, height },
+                    scale,
+                    canvas,
+                    &*runtime.text(),
+                    &*runtime.images(),
+                );
+                return;
             }
             let mut slot = surface.borrow_mut();
             let stale = match &*slot {

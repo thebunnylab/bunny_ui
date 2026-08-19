@@ -2910,6 +2910,101 @@ pub fn set_frame_driver_paused(paused: bool) {
     });
 }
 
+// MARK: - the gpu graft (the shell side of gl.rs)
+
+/// Grafts the GPU present onto the main window — called by the shell
+/// assembler after [`create_window`] and BEFORE the first frame, so the
+/// first presenting commit (the reveal, by protocol design) already
+/// walks the GPU road and the CPU path never allocates a backing it
+/// will not use. A refusal (`BUNNY_PRESENT=cpu`, no libEGL, a shader
+/// that does not compile) changes nothing — the shm road, byte for
+/// byte.
+pub fn install_gpu(_window: &WindowHandle) {
+    let _ = crate::gl::try_install();
+}
+
+/// What the EGL surface wraps: the connection, the main surface and
+/// whether the scene draws its own corners.
+pub(crate) fn gpu_targets() -> Option<(*mut c_void, *mut c_void, bool)> {
+    with_client(|client| {
+        client
+            .win
+            .as_ref()
+            .map(|win| (client.display as *mut c_void, win.surface as *mut c_void, win.scene))
+    })
+}
+
+/// The buffer size the EGL window is born with, in device pixels.
+pub(crate) fn gpu_buffer_size() -> (usize, usize) {
+    with_client(|client| {
+        client.win.as_ref().map_or((1, 1), |win| {
+            let scale = win.scale.max(1) as f64;
+            (
+                (win.logical.0 * scale).round().max(1.0) as usize,
+                (win.logical.1 * scale).round().max(1.0) as usize,
+            )
+        })
+    })
+}
+
+/// The surface state a GPU present rides in front of the swap: the
+/// buffer scale and the frame callback — the same envelope the CPU
+/// commit wears, minus attach and damage (the swap carries those).
+/// `false` = the window is not configured yet; committing is illegal
+/// and the caller keeps its frame for the next redraw.
+pub(crate) fn gpu_pre_present(scale: usize) -> bool {
+    with_client(|client| {
+        let Some(win) = client.win.as_mut() else { return false };
+        if !win.map.can_attach() {
+            return false;
+        }
+        unsafe {
+            if scale > 1 && wl_proxy_get_version(win.surface) >= 3 {
+                request(win.surface, 8, &mut [arg_i(scale as i32)]);
+            }
+            // every presenting commit carries a frame callback; `done`
+            // is gated by the paused flag, so a parked app simply lets
+            // it fall — and no bare commit ever follows a present
+            if !win.frame_inflight {
+                let callback = construct(
+                    win.surface,
+                    3,
+                    &raw const wl_callback_interface,
+                    &mut [arg_n()],
+                    TAG_FRAME,
+                );
+                win.frame_inflight = !callback.is_null();
+            }
+        }
+        true
+    })
+}
+
+/// The swap went through: the surface is mapped and the ack road sees
+/// a presenting commit — the CPU present's bookkeeping, verbatim.
+pub(crate) fn gpu_note_present() {
+    with_client(|client| {
+        if let Some(win) = client.win.as_mut() {
+            win.map.on_present();
+        }
+        client.presents += 1;
+    });
+}
+
+/// The compositor must never resize the window past what the GPU can
+/// render — the texture ceiling, spoken as the toplevel's max size in
+/// logical units.
+pub(crate) fn gpu_limit_size(max_px: usize) {
+    with_client(|client| {
+        let Some(win) = client.win.as_ref() else { return };
+        let logical = (max_px / win.scale.max(1)) as i32;
+        unsafe {
+            request(win.toplevel, 7, &mut [arg_i(logical), arg_i(logical)]);
+            wl_display_flush(client.display);
+        }
+    });
+}
+
 // MARK: - the loop
 
 /// Interprets the queued protocol events. Runs only from the loop and
@@ -2956,16 +3051,24 @@ fn drain_protocol_events() {
                 // never see one, and the shell may hold the window's
                 // very reveal on that cycle closing
                 if mapped {
-                    with_client(|client| {
-                        if client.presents == before
-                            && let Some(win) = client.win.as_ref()
-                        {
-                            unsafe {
-                                request(win.surface, 6, &mut no_args());
-                                wl_display_flush(client.display);
+                    let owed = with_client(|client| client.presents == before);
+                    if owed && crate::gl::active() {
+                        // an EGL surface never takes a bare commit (the
+                        // recorded old-compositor corruption) — the ack
+                        // rides a REAL present instead, and the skip
+                        // key forgets so the swap cannot decline
+                        crate::gl::invalidate();
+                        dispatch(AppEvent::Redraw);
+                    } else if owed {
+                        with_client(|client| {
+                            if let Some(win) = client.win.as_ref() {
+                                unsafe {
+                                    request(win.surface, 6, &mut no_args());
+                                    wl_display_flush(client.display);
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                 }
             }
             Ev::ToplevelClose => with_client(|client| client.quit = true),
@@ -3534,8 +3637,11 @@ fn fire_repeat() {
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Protocol teardown order is law: role → xdg_surface → wl_surface
-/// last, devices released, then the connection.
+/// last, devices released, then the connection. The GPU goes first of
+/// all — its EGL surface and `wl_egl_window` must die before the
+/// wayland surface they wrap.
 fn teardown() {
+    crate::gl::teardown();
     CLIENT.with(|slot| {
         let Some(client) = slot.borrow_mut().take() else { return };
         unsafe {
