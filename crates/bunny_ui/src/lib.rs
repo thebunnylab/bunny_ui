@@ -3702,6 +3702,117 @@ mod tests {
     }
 
     #[test]
+    fn the_field_cuts_its_text_and_the_run_follows_the_caret() {
+        use crate::layout::{DrawCommand, Point, Proposal, Size};
+        use crate::text_input::EditCommand;
+
+        #[derive(Clone, Copy)]
+        struct Form {
+            name: State<String>,
+        }
+
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                text_field("name", self.name.binding()).frame_width(120.0)
+            }
+        }
+
+        // 120 wide, 8 of padding each side: thirteen cells of run
+        let form = Form { name: State::new(String::new()) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&form);
+        let viewport = Proposal::exact(Size { width: 240.0, height: 60.0 });
+        let result = runtime.layout(&form, viewport);
+
+        // the box cuts what it holds: a clip with the field's own
+        // corner, around the field's own frame
+        let (field_path, frame) = result.hits.last().expect("the field is a target").clone();
+        let clip = result
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::PushClip { rect, corner_radius } => Some((*rect, *corner_radius)),
+                _ => None,
+            })
+            .expect("the field pushes a clip");
+        assert_eq!(clip.0, frame, "the cut IS the box");
+        assert_eq!(clip.1, 5.0, "and it follows the corner");
+
+        // the border is drawn OUTSIDE the cut — a clipped stroke would
+        // eat its own outer half
+        let order: Vec<&str> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::PushClip { .. } => Some("push"),
+                DrawCommand::PopClip => Some("pop"),
+                DrawCommand::StrokeRect { .. } => Some("border"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["push", "pop", "border"]);
+
+        let text_x = |result: &crate::layout::LayoutResult| {
+            result
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::TextLine { origin, .. } => Some(origin.x),
+                    _ => None,
+                })
+                .expect("the field paints its run")
+        };
+        let home = text_x(&result);
+
+        // a string that fits leaves the run at home
+        runtime.pointer_pressed(frame.origin.x + 4.0, frame.origin.y + 4.0);
+        runtime.pointer_released(frame.origin.x + 4.0, frame.origin.y + 4.0);
+        assert_eq!(runtime.focused(), Some(field_path.clone()));
+        assert!(runtime.key(EditCommand::Insert("short".into())).applied);
+        assert_eq!(text_x(&runtime.layout(&form, viewport)), home, "five cells fit");
+
+        // past the right edge the run walks left, and the caret stays
+        // inside the box that holds it
+        assert!(runtime.key(EditCommand::Insert(" and then some more".into())).applied);
+        let scrolled = runtime.layout(&form, viewport);
+        let offset = runtime.scroll_offset(&field_path).x;
+        assert!(offset > 0.0, "the run moved: {offset}");
+        assert_eq!(text_x(&scrolled), home - offset);
+        let caret_x = scrolled
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::FillRect { rect, corner_radius, .. }
+                    if rect.size.width < 2.0 && *corner_radius > 0.0 =>
+                {
+                    Some(rect.origin.x)
+                }
+                _ => None,
+            })
+            .last()
+            .expect("a focused field paints its caret");
+        assert!(
+            caret_x >= frame.origin.x && caret_x <= frame.origin.x + frame.size.width,
+            "the caret stayed in sight at {caret_x}",
+        );
+
+        // Home walks the caret back and the run comes home with it
+        assert!(runtime.key(EditCommand::Home(false)).applied);
+        assert_eq!(runtime.scroll_offset(&field_path).x, 0.0);
+        assert_eq!(text_x(&runtime.layout(&form, viewport)), home);
+
+        // and a run scrolled to the end never leaves a gap when the
+        // text shrinks under it: the clamp is the placement's, so it
+        // holds even for an offset written against an older string
+        assert!(runtime.key(EditCommand::End(false)).applied);
+        let end = runtime.scroll_offset(&field_path).x;
+        assert!(end > 0.0);
+        runtime.set_scroll_offset(&field_path, Point { x: end + 500.0, y: 0.0 });
+        let clamped = runtime.layout(&form, viewport);
+        assert_eq!(text_x(&clamped), home - end, "the clamp is the box's, not the caret's");
+    }
+
+    #[test]
     fn actions_register_dispatch_and_the_innermost_wins() {
         const PING: ActionId = ActionId("test.ping");
 

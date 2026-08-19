@@ -342,6 +342,10 @@ impl Runtime {
     /// lift — under it, a click stays a click.
     const DRAG_THRESHOLD: Px = 4.0;
 
+    /// The room the run keeps after the caret when it scrolls to the
+    /// right edge — the caret's own width, so the bar stays whole.
+    const CARET_ROOM: Px = 2.0;
+
     /// The compatible drop region under a point — the INNERMOST of the
     /// topmost, by GEOMETRY: a drag lands through every opaque hover
     /// gate, which is the transparent catcher the dock wanted.
@@ -1491,6 +1495,51 @@ impl Runtime {
         self.carets
             .borrow_mut()
             .insert(path.to_string(), CaretState { caret, anchor: None, marked: None });
+        self.reveal_caret(path);
+    }
+
+    /// The run follows the caret: the field scrolls its own text so the
+    /// caret never hides behind a border. The offset is DERIVED — from
+    /// the caret, the string, and the geometry of the last layout — and
+    /// it lands where a scroll box keeps its own, under the field's
+    /// path. The app writes nothing and reads nothing.
+    fn reveal_caret(&self, path: &str) {
+        let field = self
+            .last_fields
+            .borrow()
+            .iter()
+            .find(|field| field.path == path)
+            .cloned();
+        // before the first layout there is no box to scroll inside
+        let Some(field) = field else { return };
+        let mut probe = CaretState::default();
+        let Some(Some(text)) = reconciler::run_editor(path, EditCommand::Read, &mut probe)
+        else {
+            return;
+        };
+        let caret = self.carets.borrow().get(path).map(|state| state.caret).unwrap_or(0);
+        let caret = crate::text_input::clamp_index(&text, caret);
+        let caret_x = self.cache.get_or_measure(&text[..caret], &field.font, &*self.text).width;
+        let full = self.cache.get_or_measure(&text, &field.font, &*self.text).width;
+        let inner = field.run.size.width;
+        let mut offset =
+            self.scroll_offsets.borrow().get(path).map(|point| point.x).unwrap_or(0.0);
+        // the caret leaving through the left edge pulls the run back;
+        // through the right edge it pushes — with the caret's own width
+        // of room, so the bar itself is never half eaten by the border
+        if caret_x < offset {
+            offset = caret_x;
+        } else if caret_x + Self::CARET_ROOM > offset + inner {
+            offset = caret_x + Self::CARET_ROOM - inner;
+        }
+        // and it never scrolls past the text: deleting the tail brings
+        // the run home instead of leaving a gap after the last glyph
+        let offset = offset.clamp(0.0, (full - inner).max(0.0));
+        self.scroll_offsets
+            .borrow_mut()
+            .entry(path.to_string())
+            .or_default()
+            .x = offset;
     }
 
     pub fn blur(&self) -> bool {
@@ -1692,8 +1741,9 @@ impl Runtime {
         // can re-enter the runtime
         match reconciler::run_editor(&path, command, &mut state) {
             Some(output) => {
-                self.carets.borrow_mut().insert(path, state);
+                self.carets.borrow_mut().insert(path.clone(), state);
                 self.caret_visible.set(true);
+                self.reveal_caret(&path);
                 Edited { applied: true, output }
             }
             None => Edited { applied: false, output: None },

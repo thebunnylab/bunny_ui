@@ -1365,6 +1365,10 @@ struct QueuedOverlay {
 pub struct FieldPlacement {
     pub path: String,
     pub frame: Rect,
+    /// The box the run may occupy — the frame minus the field's own
+    /// padding. The runtime keeps the caret inside THIS; the padding
+    /// itself stays layout's business.
+    pub run: Rect,
     pub text_origin: Point,
     pub font: FontSpec,
     /// The field asked for focus on first appearance.
@@ -2737,15 +2741,33 @@ impl LayoutNode {
                     color: theme.field,
                     corner_radius: FIELD_RADIUS,
                 });
-                let text_origin = Point {
-                    x: frame.origin.x + FIELD_PAD_H,
-                    y: frame.origin.y + FIELD_PAD_V,
-                };
                 let metrics = env.cache.get_or_measure(
                     if content.is_empty() { placeholder } else { content },
                     &env.font,
                     env.text,
                 );
+                // the run scrolls UNDER the box to keep the caret in
+                // sight. The offset is engine state written by the
+                // runtime from the caret — the same map a scroll box
+                // reads, keyed by the field's own path — and it clamps
+                // against THIS frame: a field that widens never leaves
+                // a gap after the last glyph.
+                let inner = (frame.size.width - 2.0 * FIELD_PAD_H).max(0.0);
+                let overflow = (metrics.width - inner).max(0.0);
+                let offset = env
+                    .scroll_offsets
+                    .get(path)
+                    .map(|point| point.x)
+                    .unwrap_or(0.0)
+                    .clamp(0.0, overflow);
+                let text_origin = Point {
+                    x: frame.origin.x + FIELD_PAD_H - offset,
+                    y: frame.origin.y + FIELD_PAD_V,
+                };
+                // everything the field writes is cut by its own box:
+                // a string longer than the field stops at the border
+                // instead of painting over the neighbour
+                out.push_clip(frame, FIELD_RADIUS);
                 let prefix_width = |end: usize| {
                     env.cache.get_or_measure(&content[..end], &env.font, env.text).width
                 };
@@ -2811,6 +2833,7 @@ impl LayoutNode {
                         corner_radius: FIELD_CARET_W / 2.0,
                     });
                 }
+                out.pop_clip();
                 out.display.push(DrawCommand::StrokeRect {
                     rect: frame,
                     color: if focused { theme.focus } else { theme.field_border },
@@ -2829,6 +2852,13 @@ impl LayoutNode {
                 out.fields.push(FieldPlacement {
                     path: path.clone(),
                     frame,
+                    run: Rect {
+                        origin: Point {
+                            x: frame.origin.x + FIELD_PAD_H,
+                            y: frame.origin.y + FIELD_PAD_V,
+                        },
+                        size: Size { width: inner, height: metrics.height() },
+                    },
                     text_origin,
                     font: env.font,
                     auto_focus: *auto_focus,
