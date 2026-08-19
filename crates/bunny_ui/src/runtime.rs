@@ -1510,6 +1510,38 @@ impl Runtime {
             .insert(pattern, action);
     }
 
+    /// Empties the app's key table, so a cascade can be RE-INSTALLED
+    /// instead of piled onto. Overwriting a pattern is not enough: a
+    /// binding the user DELETED from their keymap has nothing to
+    /// overwrite it, and would outlive the edit that removed it.
+    ///
+    /// The house's own contexts stand — [`RESERVED_PREFIX`] is not the
+    /// app's to empty, and a popover that could no longer be dismissed
+    /// with Escape would be a strange price for reloading a keymap.
+    ///
+    /// [`RESERVED_PREFIX`]: crate::action::RESERVED_PREFIX
+    pub fn clear_bindings(&self) {
+        self.keymap.borrow_mut().clear();
+        self.scoped_keymap
+            .borrow_mut()
+            .retain(|context, _| context.starts_with(crate::action::RESERVED_PREFIX));
+    }
+
+    /// Empties ONE context — the layer-sized twin, for a cascade that
+    /// re-stacks a single scope. A reserved context is not the app's to
+    /// empty and the call does nothing.
+    pub fn clear_bindings_in(&self, context: &str) {
+        debug_assert!(
+            !context.starts_with(crate::action::RESERVED_PREFIX),
+            "the `{}` prefix is the framework's own",
+            crate::action::RESERVED_PREFIX,
+        );
+        if context.starts_with(crate::action::RESERVED_PREFIX) {
+            return;
+        }
+        self.scoped_keymap.borrow_mut().remove(context);
+    }
+
     /// The binding for the pattern: ACTIVE scoped contexts first (a
     /// mounted `.key_context` turns its bindings on), the global map as
     /// the fallback.

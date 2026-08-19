@@ -5104,6 +5104,66 @@ mod tests {
     }
 
     #[test]
+    fn the_key_table_can_be_emptied_so_a_cascade_re_installs() {
+        use crate::layout::{Proposal, Size};
+
+        const SAVE: ActionId = ActionId("app.save");
+        const OLD: ActionId = ActionId("app.removed_by_the_user");
+
+        #[derive(Clone, Copy)]
+        struct App {
+            card: State<bool>,
+        }
+        impl Component for App {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("editor").key_context("editor").popover(
+                    self.card.binding(),
+                    crate::layout::Side::Trailing,
+                    |_| erased(text("card")),
+                )
+            }
+        }
+
+        let viewport = Proposal::exact(Size { width: 200.0, height: 100.0 });
+        let app = App { card: State::new(true) };
+        let runtime = Runtime::new();
+        runtime.settle(&app);
+        runtime.layout(&app, viewport);
+
+        // a cascade goes in: one global layer and one scoped
+        let save = KeyPattern::command(Key::Char('s'));
+        let old = KeyPattern::command(Key::Char('j'));
+        runtime.bind(save, SAVE);
+        runtime.bind(old, OLD);
+        runtime.bind_in("editor", old, OLD);
+        assert_eq!(runtime.match_key(&save), Some(SAVE));
+        assert_eq!(runtime.match_key(&old), Some(OLD));
+
+        // the user edits the keymap and the host re-installs it. The
+        // binding the edit REMOVED has nothing to overwrite it, so
+        // only an empty table can make it go
+        runtime.clear_bindings();
+        runtime.bind(save, SAVE);
+        assert_eq!(runtime.match_key(&save), Some(SAVE), "the layer went back in");
+        assert_eq!(runtime.match_key(&old), None, "and what the edit dropped is gone");
+
+        // the house's own context stood through it: a popover is still
+        // dismissible, which is not the app's to take away
+        assert_eq!(
+            runtime.match_key(&KeyPattern::key(Key::Escape)),
+            Some(crate::action::OVERLAY_DISMISS),
+            "the reserved context survives an app's clear",
+        );
+
+        // and one layer can be re-stacked on its own
+        runtime.bind_in("editor", old, OLD);
+        assert_eq!(runtime.match_key(&old), Some(OLD));
+        runtime.clear_bindings_in("editor");
+        assert_eq!(runtime.match_key(&old), None);
+        assert_eq!(runtime.match_key(&save), Some(SAVE), "the other layers stayed");
+    }
+
+    #[test]
     fn one_click_swaps_the_theme_scene_and_one_click_swaps_it_back() {
         use crate::layout::{DrawCommand, Proposal, Size};
 

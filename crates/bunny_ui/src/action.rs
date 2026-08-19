@@ -23,6 +23,11 @@ pub const OVERLAY_DISMISS: ActionId = ActionId("bunny.popover.dismiss");
 /// reserved for the framework's own contexts.
 pub const OVERLAY_CONTEXT: &str = "bunny.popover";
 
+/// The prefix the framework keeps for itself. A key context under it
+/// belongs to the house: an app never declares one, and emptying the
+/// key table leaves them standing.
+pub const RESERVED_PREFIX: &str = "bunny.";
+
 impl std::fmt::Display for ActionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.0)
