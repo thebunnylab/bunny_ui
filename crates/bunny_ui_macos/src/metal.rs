@@ -94,6 +94,8 @@ unsafe extern "C" {
     fn msg_void_ptr_u64_u64(obj: Id, sel: Sel, a: *const c_void, b: u64, c: u64);
     #[link_name = "objc_msgSend"]
     fn msg_void_u64x5(obj: Id, sel: Sel, a: u64, b: u64, c: u64, d: u64, e: u64);
+    #[link_name = "objc_msgSend"]
+    fn msg_void_u64x3(obj: Id, sel: Sel, a: u64, b: u64, c: u64);
     // `CGSize` is a 2-double HFA — it travels in registers.
     #[link_name = "objc_msgSend"]
     fn msg_void_size(obj: Id, sel: Sel, a: CGSize);
@@ -135,12 +137,20 @@ unsafe extern "C" {
 
 const PIXEL_FORMAT_RGBA8: u64 = 70; // MTLPixelFormatRGBA8Unorm — the mirror's byte order
 const PIXEL_FORMAT_BGRA8: u64 = 80; // MTLPixelFormatBGRA8Unorm — the only format a layer takes
+// MTLPixelFormatRGBA8Unorm_sRGB — the blur pyramid. An sRGB texture
+// decodes on sample and encodes on write, so the whole chain averages
+// in LINEAR light for free, which is the difference between glass and
+// a grey halo.
+const PIXEL_FORMAT_RGBA8_SRGB: u64 = 71;
+const LOAD_ACTION_DONT_CARE: u64 = 0;
+const LOAD_ACTION_LOAD: u64 = 1;
 const LOAD_ACTION_CLEAR: u64 = 2;
 const STORE_ACTION_STORE: u64 = 1;
 const BLEND_ONE: u64 = 1;
 const BLEND_SOURCE_ALPHA: u64 = 4;
 const BLEND_ONE_MINUS_SOURCE_ALPHA: u64 = 5;
 const STORAGE_MODE_SHARED: u64 = 0;
+const STORAGE_MODE_PRIVATE: u64 = 2;
 const TEXTURE_USAGE_SHADER_READ: u64 = 1;
 const TEXTURE_USAGE_RENDER_TARGET: u64 = 4;
 // CPUCacheModeWriteCombined | StorageModeShared — the CPU only writes
@@ -223,7 +233,51 @@ struct SpriteInstance {
     clip: [f32; 4],
 }
 
+/// One pane of liquid glass. Everything is snapped device pixels
+/// resolved on the CPU in f64, like every other instance here — the
+/// shader only evaluates the material.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // written whole, read by the GPU — never field by field
+struct GlassInstance {
+    rect: [f32; 4],   // x0, y0, x1, y1
+    clip: [f32; 4],   // the snapped clip-stack top
+    radii: [f32; 4],  // the four corners, clamped
+    lens: [f32; 4],   // blur, refraction band, refraction amount, chromatic
+    finish: [f32; 4], // highlight band, highlight intensity, saturation, brightness
+    touch: [f32; 4],  // sheen, spot x, spot y, spot radius
+    tint: [u8; 4],    // straight RGBA
+    highlight: [u8; 4],
+    spot_alpha: f32,
+    pad: f32,
+}
+
 const _: () = {
+    assert!(std::mem::size_of::<GlassInstance>() == 112);
+    assert!(std::mem::offset_of!(GlassInstance, rect) == 0);
+    assert!(std::mem::offset_of!(GlassInstance, clip) == 16);
+    assert!(std::mem::offset_of!(GlassInstance, radii) == 32);
+    assert!(std::mem::offset_of!(GlassInstance, lens) == 48);
+    assert!(std::mem::offset_of!(GlassInstance, finish) == 64);
+    assert!(std::mem::offset_of!(GlassInstance, touch) == 80);
+    assert!(std::mem::offset_of!(GlassInstance, tint) == 96);
+    assert!(std::mem::offset_of!(GlassInstance, highlight) == 100);
+    assert!(std::mem::offset_of!(GlassInstance, spot_alpha) == 104);
+};
+
+/// What one blur pass needs — the twin of `BlurParams` in the shader.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BlurParams {
+    inv_dst: [f32; 2],
+    direction: [f32; 2],
+    source_level: f32,
+    decode: f32,
+    pad: [f32; 2],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<BlurParams>() == 32);
     assert!(std::mem::size_of::<RectInstance>() == 80);
     assert!(std::mem::offset_of!(RectInstance, rect) == 0);
     assert!(std::mem::offset_of!(RectInstance, clip) == 16);
@@ -431,6 +485,257 @@ fragment float4 sprite_fragment(SpriteVary in [[stage_in]],
     float4 ink = atlas.read(uint2(texel));
     return float4(ink.rgb, ink.a * clip_cov(in.position.xy, round));
 }
+
+// MARK: - Liquid glass
+//
+// The material of `glass.rs`, textually. Every constant below is that
+// module's, and the parity tests hold the two answers together.
+//
+// A pane READS the scene, and a drawable cannot be read
+// (`framebufferOnly` stays YES — turning it off costs lossless
+// compression and the direct-to-display path on EVERY frame, glass or
+// not). So a frame that carries glass renders into an offscreen colour
+// texture and is blitted over at the end. A frame without glass never
+// pays a byte of this.
+
+struct BlurParams {
+    float2 inv_dst;     // 1 / destination size in px
+    float2 direction;   // (1,0) horizontal, (0,1) vertical
+    float source_level; // the mip this pass reads
+    float decode;       // 1 when the source is raw scene colour
+    float2 pad;
+};
+
+struct FullVary {
+    float4 position [[position]];
+};
+
+// One oversized triangle: no shared edge for the rasterizer to seam,
+// and three vertices instead of four.
+vertex FullVary full_vertex(uint vid [[vertex_id]]) {
+    float2 uv = float2(float((vid << 1) & 2), float(vid & 2));
+    return FullVary{float4(uv * 2.0 - 1.0, 0.0, 1.0)};
+}
+
+// An exact copy: no sampler, no filtering, no uv to get backwards, and
+// no colour conversion — the scene texture carries the drawable's own
+// format.
+fragment float4 blit_fragment(FullVary in [[stage_in]],
+                              texture2d<float, access::read> source [[texture(0)]]) {
+    return source.read(uint2(in.position.xy));
+}
+
+// nine bilinear taps == a seventeen-tap gaussian at sigma 2.6 texels
+constant float BLUR_W[5] = {0.153584, 0.256886, 0.125975, 0.034902, 0.005445};
+constant float BLUR_O[5] = {0.0, 1.44475, 3.37341, 5.30746, 7.24824};
+
+constant float GLASS_SIGMA_L0 = 5.2;
+constant float GLASS_MAX_LEVEL = 3.0;
+constant float GLASS_RIM_FLOOR = 0.1;
+constant float GLASS_RIM_FALLOFF = 1.7;
+constant float2 GLASS_LIGHT_DIR = float2(-0.70710678, -0.70710678);
+constant float3 GLASS_LUMA = float3(0.2126, 0.7152, 0.0722);
+constant float GLASS_OUTER_AMOUNT_RATIO = 0.25;
+constant float GLASS_OUTER_HEIGHT_RATIO = 0.5;
+constant float GLASS_VIBRANT_SATURATION = 2.069;
+constant float GLASS_VIBRANT_GAIN = 1.45;
+constant float GLASS_VIBRANT_BIAS = 0.05;
+constant float GLASS_GRAD_RADIUS_FACTOR = 1.5;
+
+static float3 srgb_to_linear3(float3 c) {
+    return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
+}
+
+static float3 linear_to_srgb3(float3 c) {
+    return select(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308);
+}
+
+static float4 blur_tap(texture2d<float> source, sampler s, float2 uv,
+                       constant BlurParams& params) {
+    float4 c = source.sample(s, uv, level(params.source_level));
+    if (params.decode != 0.0) {
+        // colour only: a transfer function never applies to alpha
+        return float4(srgb_to_linear3(c.rgb), c.a);
+    }
+    return c;
+}
+
+// The destination is half the resolution of the source, and the offsets
+// are in DESTINATION texels — which is what makes the downsample free:
+// each bilinear tap already averages a 2x2 neighbourhood.
+fragment float4 blur_fragment(FullVary in [[stage_in]],
+                              constant BlurParams& params [[buffer(0)]],
+                              texture2d<float> source [[texture(0)]]) {
+    constexpr sampler s(mag_filter::linear, min_filter::linear,
+                        mip_filter::linear, address::clamp_to_edge);
+    float2 uv = in.position.xy * params.inv_dst;
+    float2 step = params.direction * params.inv_dst;
+    float4 acc = blur_tap(source, s, uv, params) * BLUR_W[0];
+    for (uint i = 1; i < 5; i++) {
+        float2 away = step * BLUR_O[i];
+        acc += (blur_tap(source, s, uv + away, params) +
+                blur_tap(source, s, uv - away, params)) * BLUR_W[i];
+    }
+    return acc;
+}
+
+struct GlassInstance {
+    float4 rect;
+    float4 clip;
+    float4 radii;
+    float4 lens;    // blur, refraction band, refraction amount, chromatic
+    float4 finish;  // highlight band, highlight intensity, saturation, brightness
+    float4 touch;   // sheen, spot x, spot y, spot radius
+    uchar4 tint;
+    uchar4 highlight;
+    float spot_alpha;
+    float pad;
+};
+
+struct GlassVary {
+    float4 position [[position]];
+    uint id [[flat]];
+};
+
+// the lens profile: a quarter circle, one at the rim and flat at the
+// centre, with an INFINITE slope at the rim
+static float glass_circle_map(float x) {
+    float c = saturate(x);
+    return 1.0 - sqrt(max(1.0 - c * c, 0.0));
+}
+
+// the pyramid level a blur reads — `glass::level_for`, word for word
+static float glass_level(float sigma) {
+    return clamp(log2(max(sigma, GLASS_SIGMA_L0) / GLASS_SIGMA_L0), 0.0, GLASS_MAX_LEVEL);
+}
+
+// the analytic gradient of the rounded-rect field. Deliberately not
+// dfdx/dfdy: those are quantised to 2x2 fragment quads, which shows as
+// a stair-stepped rim
+static float2 glass_normal(float2 center_to_point, float2 corner_center) {
+    float2 s = float2(center_to_point.x < 0.0 ? -1.0 : 1.0,
+                      center_to_point.y < 0.0 ? -1.0 : 1.0);
+    float2 m = max(corner_center, 0.0);
+    float l = length(m);
+    if (l > 1e-5) {
+        return s * (m / l);
+    }
+    return corner_center.x > corner_center.y ? float2(s.x, 0.0) : float2(0.0, s.y);
+}
+
+vertex GlassVary glass_vertex(uint vid [[vertex_id]],
+                              uint iid [[instance_id]],
+                              device const GlassInstance* panes [[buffer(0)]],
+                              constant Uniforms& uniforms [[buffer(1)]]) {
+    GlassInstance pane = panes[iid];
+    float2 low = max(pane.rect.xy, pane.clip.xy);
+    float2 high = max(min(pane.rect.zw, pane.clip.zw), low);
+    float2 corner = unit_corners[vid];
+    GlassVary out;
+    out.position = to_ndc(mix(low, high, corner), uniforms.viewport);
+    out.id = iid;
+    return out;
+}
+
+fragment float4 glass_fragment(GlassVary in [[stage_in]],
+                               device const GlassInstance* panes [[buffer(0)]],
+                               constant ClipRound& round [[buffer(1)]],
+                               constant Uniforms& uniforms [[buffer(2)]],
+                               texture2d<float> pyramid [[texture(0)]]) {
+    // trilinear, so a blur that crosses a level slides instead of
+    // snapping
+    constexpr sampler s(mag_filter::linear, min_filter::linear,
+                        mip_filter::linear, address::clamp_to_edge);
+    GlassInstance pane = panes[in.id];
+    float2 point = in.position.xy;
+
+    float2 half_size = (pane.rect.zw - pane.rect.xy) * 0.5;
+    float2 center_to_point = point - pane.rect.xy - half_size;
+    float radius = corner_at(point, pane.rect, pane.radii);
+    float2 corner_to_point = abs(center_to_point) - half_size;
+    float2 corner_center = corner_to_point + radius;
+    float sdf = length(max(corner_center, 0.0)) +
+                min(max(corner_center.x, corner_center.y), 0.0) - radius;
+    float coverage = clamp(0.5 - sdf, 0.0, 1.0);
+    if (coverage <= 0.0) {
+        return float4(0.0);
+    }
+    float depth = max(-sdf, 0.0);
+
+    // the direction field, ovalised so a corner sweeps instead of
+    // kinking. The true radius already cut the shape above
+    float grad_radius = min(radius * GLASS_GRAD_RADIUS_FACTOR, min(half_size.x, half_size.y));
+    float2 normal = glass_normal(center_to_point, corner_to_point + grad_radius);
+
+    // two opposed bands on one quarter-circle profile. The main one
+    // samples INWARD: the rim magnifies, a convex lens. Outward pinches
+    float band = max(pane.lens.y, 1.0);
+    float inner = glass_circle_map(1.0 - depth / band);
+    float outer = glass_circle_map(1.0 - depth / (band * GLASS_OUTER_HEIGHT_RATIO));
+    float profile = inner - outer * GLASS_OUTER_AMOUNT_RATIO;
+    float2 displace = normal * (-pane.lens.z * profile);
+
+    // sharper where the lens works, frosted on the face
+    float sharpen = 1.0 - saturate(depth / band);
+    float mip = max(glass_level(pane.lens.x) - sharpen, 0.0);
+    float2 inv_viewport = 1.0 / uniforms.viewport;
+    float2 base = point * inv_viewport;
+    float4 sampled;
+    if (pane.lens.w > 0.0) {
+        float spread = pane.lens.w;
+        float4 red = pyramid.sample(s, base + displace * (1.0 - spread) * inv_viewport, level(mip));
+        float4 green = pyramid.sample(s, base + displace * inv_viewport, level(mip));
+        float4 blue = pyramid.sample(s, base + displace * (1.0 + spread) * inv_viewport, level(mip));
+        sampled = float4(red.r, green.g, blue.b, green.a);
+    } else {
+        sampled = pyramid.sample(s, base + displace * inv_viewport, level(mip));
+    }
+
+    // back to the engine's colour space FIRST: the saturation this
+    // material is tuned against runs on ENCODED values, unlike the
+    // blur, which must average in linear light
+    float alpha = max(sampled.a, 1e-4);
+    float3 rgb = linear_to_srgb3(sampled.rgb / alpha);
+    float luma = dot(rgb, GLASS_LUMA);
+    rgb = (luma + (rgb - luma) * pane.finish.z) * pane.finish.w;
+    float4 color = float4(rgb, sampled.a);
+
+    // the tint, over
+    float4 tint = float4(pane.tint) / 255.0;
+    color = float4(mix(color.rgb, tint.rgb, tint.a), tint.a + color.a * (1.0 - tint.a));
+
+    // the specular rim: a thin band lit along BOTH diagonals, in the
+    // colour of the scene under it, ADDED instead of painted
+    float rim = 1.0 - saturate(depth / max(pane.finish.x, 1.0));
+    float axis = abs(dot(normal, GLASS_LIGHT_DIR));
+    float ring = GLASS_RIM_FLOOR + (1.0 - GLASS_RIM_FLOOR) * pow(axis, GLASS_RIM_FALLOFF);
+    float4 highlight = float4(pane.highlight) / 255.0;
+    float strength = pane.finish.y * rim * rim * ring * highlight.a;
+    if (strength > 0.0) {
+        float grey = dot(color.rgb, GLASS_LUMA);
+        float3 vibrant = saturate(
+            (grey + (color.rgb - grey) * GLASS_VIBRANT_SATURATION) * GLASS_VIBRANT_GAIN
+            + GLASS_VIBRANT_BIAS);
+        color = float4(saturate(color.rgb + vibrant * highlight.rgb * strength), color.a);
+    }
+
+    // the touch: a flat wash plus a pool of light, both additive and
+    // both zero unless the pane asked
+    float spot = 0.0;
+    if (pane.spot_alpha > 0.0 && pane.touch.w > 0.0) {
+        float away = distance(point, pane.touch.yz);
+        float fall = 1.0 - saturate(away / pane.touch.w);
+        spot = pane.spot_alpha * fall * fall;
+    }
+    float touch = saturate(pane.touch.x + spot);
+    if (touch > 0.0) {
+        color = float4(saturate(color.rgb + touch), color.a);
+    }
+
+    // straight alpha out — the blend state premultiplies, exactly as it
+    // does for a rect
+    return float4(color.rgb, color.a * coverage * clip_cov(point, round));
+}
 "#;
 
 // MARK: - Selectors of the hot path
@@ -462,6 +767,10 @@ struct Sels {
     set_vertex_bytes: Sel,
     set_fragment_bytes: Sel,
     draw: Sel,
+    /// The plain three-vertex draw the fullscreen passes make.
+    draw_plain: Sel,
+    /// The mip a blur pass writes into.
+    set_level: Sel,
     set_fragment_texture: Sel,
     in_live_resize: Sel,
     set_presents_with_transaction: Sel,
@@ -501,6 +810,8 @@ impl Sels {
                 set_vertex_bytes: sel("setVertexBytes:length:atIndex:"),
                 set_fragment_bytes: sel("setFragmentBytes:length:atIndex:"),
                 draw: sel("drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:"),
+                draw_plain: sel("drawPrimitives:vertexStart:vertexCount:"),
+                set_level: sel("setLevel:"),
                 set_fragment_texture: sel("setFragmentTexture:atIndex:"),
                 in_live_resize: sel("inLiveResize"),
                 set_presents_with_transaction: sel("setPresentsWithTransaction:"),
@@ -524,6 +835,15 @@ struct MetalStack {
     queue: Id,
     rect_pipeline: Id,
     sprite_pipeline: Id,
+    /// The three pipelines liquid glass adds: the pane itself, one
+    /// separable blur pass, and the copy of the offscreen scene onto
+    /// the target a frame with glass cannot render into directly.
+    glass_pipeline: Id,
+    blur_pipeline: Id,
+    blit_pipeline: Id,
+    /// The render-target format the pipelines bound to — the scene
+    /// texture a glass frame renders into must match it.
+    format: u64,
     pass_class: Id, // MTLRenderPassDescriptor — the class object is stable
     sels: Sels,
 }
@@ -595,46 +915,101 @@ impl MetalStack {
                 return Err(format!("shader compile failed: {}", error_message(error)));
             }
             let rect_pipeline =
-                build_pipeline(device, library, "rect_vertex", "rect_fragment", format)?;
+                build_pipeline(device, library, "rect_vertex", "rect_fragment", format, true)?;
             let sprite_pipeline =
-                build_pipeline(device, library, "sprite_vertex", "sprite_fragment", format)?;
+                build_pipeline(device, library, "sprite_vertex", "sprite_fragment", format, true)?;
+            // a pane blends over the scene like any other paint; the
+            // blur and the blit REPLACE what they write (a pass that
+            // covers its whole destination has nothing to keep)
+            let glass_pipeline =
+                build_pipeline(device, library, "glass_vertex", "glass_fragment", format, true)?;
+            let blur_pipeline = build_pipeline(
+                device,
+                library,
+                "full_vertex",
+                "blur_fragment",
+                PIXEL_FORMAT_RGBA8_SRGB,
+                false,
+            )?;
+            let blit_pipeline =
+                build_pipeline(device, library, "full_vertex", "blit_fragment", format, false)?;
             msg_void(library, sel("release"));
             Ok(MetalStack {
                 device,
                 queue,
                 rect_pipeline,
                 sprite_pipeline,
+                glass_pipeline,
+                blur_pipeline,
+                blit_pipeline,
+                format,
                 pass_class: class("MTLRenderPassDescriptor"),
                 sels: Sels::new(),
             })
         }
     }
 
-    /// One pass over `target`: clear to `canvas`, then the runs in paint
-    /// order — the pipeline swaps only where rects and text alternate.
+    /// The frame, in as many passes as it takes.
+    ///
+    /// A frame with no glass is ONE pass, exactly as it always was:
+    /// clear to `canvas`, then the runs in paint order, the pipeline
+    /// swapping only where rects and text alternate.
+    ///
+    /// A pane of glass READS the scene, so it cannot share a pass with
+    /// the scene it reads. Each glass batch closes the pass before it,
+    /// blurs what is there into the pyramid, and opens a pass that
+    /// LOADS instead of clearing. `present_to` is the drawable a glass
+    /// frame is copied onto at the end — a drawable is
+    /// `framebufferOnly` and cannot be read, so the frame rendered into
+    /// an offscreen texture instead.
+    ///
     /// Returns the command buffer (autoreleased — the caller holds the
     /// pool and decides how to present it).
-    unsafe fn encode_frame(
-        &self,
-        target: Id,
-        canvas: Color,
-        viewport: (f32, f32),
-        instances: Id,
-        sprite_offset: usize,
-        runs: &[DrawRun],
-        rounds: &[RoundClip],
-        atlas_texture: Id,
-        textures: &[Id],
-    ) -> Id {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_frame(&self, frame: EncodeFrame) -> Id {
+        unsafe {
+            let command = msg_id(self.queue, self.sels.command_buffer);
+            let mut cleared = false;
+            let mut index = 0;
+            while index < frame.runs.len() {
+                let start = index;
+                while index < frame.runs.len() && frame.runs[index].kind != RunKind::Glass {
+                    index += 1;
+                }
+                if index > start || !cleared {
+                    self.encode_paint(command, &frame, &frame.runs[start..index], !cleared);
+                    cleared = true;
+                }
+                if index < frame.runs.len() {
+                    let run = frame.runs[index];
+                    if let Some(pyramid) = frame.pyramid {
+                        self.build_pyramid(command, pyramid, frame.target, frame.viewport, run.levels);
+                        self.encode_glass(command, &frame, run, pyramid);
+                    }
+                    index += 1;
+                }
+            }
+            if !cleared {
+                self.encode_paint(command, &frame, &[], true);
+            }
+            if !frame.present_to.is_null() {
+                self.encode_blit(command, frame.target, frame.present_to);
+            }
+            command
+        }
+    }
+
+    /// A render pass over `target`, with the load action the caller
+    /// owns: the FIRST pass of a frame clears to the canvas colour and
+    /// every pass after it loads what is already there.
+    unsafe fn begin_pass(&self, command: Id, target: Id, level: u64, load: u64, canvas: Color) -> Id {
         unsafe {
             let pass = msg_id(self.pass_class, self.sels.render_pass_descriptor);
-            let attachment = msg_id_u64(
-                msg_id(pass, self.sels.color_attachments),
-                self.sels.object_at,
-                0,
-            );
+            let attachment =
+                msg_id_u64(msg_id(pass, self.sels.color_attachments), self.sels.object_at, 0);
             msg_void_id(attachment, self.sels.set_texture, target);
-            msg_void_u64(attachment, self.sels.set_load_action, LOAD_ACTION_CLEAR);
+            msg_void_u64(attachment, self.sels.set_level, level);
+            msg_void_u64(attachment, self.sels.set_load_action, load);
             msg_void_u64(attachment, self.sels.set_store_action, STORE_ACTION_STORE);
             msg_void_clear_color(
                 attachment,
@@ -646,10 +1021,18 @@ impl MetalStack {
                     alpha: canvas.a as f64 / 255.0,
                 },
             );
-            let command = msg_id(self.queue, self.sels.command_buffer);
-            let encoder = msg_id_arg(command, self.sels.encoder, pass);
+            msg_id_arg(command, self.sels.encoder, pass)
+        }
+    }
+
+    /// One pass of rects and text — the pass this backend has always
+    /// encoded.
+    unsafe fn encode_paint(&self, command: Id, frame: &EncodeFrame, runs: &[DrawRun], clear: bool) {
+        unsafe {
+            let load = if clear { LOAD_ACTION_CLEAR } else { LOAD_ACTION_LOAD };
+            let encoder = self.begin_pass(command, frame.target, 0, load, frame.canvas);
             if !runs.is_empty() {
-                let size = [viewport.0, viewport.1];
+                let size = [frame.viewport.0, frame.viewport.1];
                 // argument bindings persist across pipeline swaps — the
                 // uniforms bind once
                 msg_void_ptr_u64_u64(
@@ -669,7 +1052,7 @@ impl MetalStack {
                         msg_void_ptr_u64_u64(
                             encoder,
                             self.sels.set_fragment_bytes,
-                            (&rounds[run.round as usize]) as *const RoundClip as *const c_void,
+                            (&frame.rounds[run.round as usize]) as *const RoundClip as *const c_void,
                             32,
                             1,
                         );
@@ -682,14 +1065,14 @@ impl MetalStack {
                                 msg_void_id_u64_u64(
                                     encoder,
                                     self.sels.set_vertex_buffer,
-                                    instances,
+                                    frame.instances,
                                     0,
                                     0,
                                 );
                                 msg_void_id_u64_u64(
                                     encoder,
                                     self.sels.set_fragment_buffer,
-                                    instances,
+                                    frame.instances,
                                     0,
                                     0,
                                 );
@@ -699,22 +1082,22 @@ impl MetalStack {
                                 msg_void_id_u64_u64(
                                     encoder,
                                     self.sels.set_vertex_buffer,
-                                    instances,
-                                    sprite_offset as u64,
+                                    frame.instances,
+                                    frame.sprite_offset as u64,
                                     0,
                                 );
                                 msg_void_id_u64_u64(
                                     encoder,
                                     self.sels.set_fragment_buffer,
-                                    instances,
-                                    sprite_offset as u64,
+                                    frame.instances,
+                                    frame.sprite_offset as u64,
                                     0,
                                 );
                                 // the shared atlas, or the run's own
                                 // dedicated texture — same pipeline
                                 let texture = match run.kind {
-                                    RunKind::Texture(index) => textures[index as usize],
-                                    _ => atlas_texture,
+                                    RunKind::Texture(index) => frame.textures[index as usize],
+                                    _ => frame.atlas_texture,
                                 };
                                 msg_void_id_u64(
                                     encoder,
@@ -723,6 +1106,8 @@ impl MetalStack {
                                     0,
                                 );
                             }
+                            // glass never reaches this pass
+                            RunKind::Glass => continue,
                         }
                         bound = Some(run.kind);
                     }
@@ -738,17 +1123,278 @@ impl MetalStack {
                 }
             }
             msg_void(encoder, self.sels.end_encoding);
-            command
+        }
+    }
+
+    /// One batch of panes, over the scene they just read.
+    unsafe fn encode_glass(
+        &self,
+        command: Id,
+        frame: &EncodeFrame,
+        run: DrawRun,
+        pyramid: &GlassTextures,
+    ) {
+        unsafe {
+            let encoder =
+                self.begin_pass(command, frame.target, 0, LOAD_ACTION_LOAD, frame.canvas);
+            let size = [frame.viewport.0, frame.viewport.1];
+            msg_void_ptr_u64_u64(
+                encoder,
+                self.sels.set_vertex_bytes,
+                size.as_ptr() as *const c_void,
+                8,
+                1,
+            );
+            msg_void_id(encoder, self.sels.set_pipeline, self.glass_pipeline);
+            msg_void_id_u64_u64(
+                encoder,
+                self.sels.set_vertex_buffer,
+                frame.instances,
+                frame.glass_offset as u64,
+                0,
+            );
+            msg_void_id_u64_u64(
+                encoder,
+                self.sels.set_fragment_buffer,
+                frame.instances,
+                frame.glass_offset as u64,
+                0,
+            );
+            msg_void_ptr_u64_u64(
+                encoder,
+                self.sels.set_fragment_bytes,
+                (&frame.rounds[run.round as usize]) as *const RoundClip as *const c_void,
+                32,
+                1,
+            );
+            msg_void_ptr_u64_u64(
+                encoder,
+                self.sels.set_fragment_bytes,
+                size.as_ptr() as *const c_void,
+                8,
+                2,
+            );
+            msg_void_id_u64(encoder, self.sels.set_fragment_texture, pyramid.ping, 0);
+            msg_void_u64x5(
+                encoder,
+                self.sels.draw,
+                PRIMITIVE_TRIANGLE,
+                0,
+                6,
+                run.count as u64,
+                run.base as u64,
+            );
+            msg_void(encoder, self.sels.end_encoding);
+        }
+    }
+
+    /// The blur pyramid, from the scene as it stands right now.
+    ///
+    /// Level 0 is the scene at half resolution blurred to sigma 5.2
+    /// device px, and each level halves again and composes another. The
+    /// downsample is FUSED into the horizontal pass: it writes the
+    /// smaller destination while sampling the larger source, and each
+    /// bilinear tap averages a 2x2 neighbourhood on the way. Ping and
+    /// pong are two textures on purpose — no pass ever reads the
+    /// texture it writes.
+    unsafe fn build_pyramid(
+        &self,
+        command: Id,
+        pyramid: &GlassTextures,
+        scene: Id,
+        viewport: (f32, f32),
+        max_level: u32,
+    ) {
+        unsafe {
+            let base_width = (viewport.0.max(1.0) as u32).div_ceil(2).max(1);
+            let base_height = (viewport.1.max(1.0) as u32).div_ceil(2).max(1);
+            for level in 0..=max_level.min(GLASS_MAX_LEVEL) {
+                let width = (base_width >> level).max(1);
+                let height = (base_height >> level).max(1);
+                let inv_dst = [1.0 / width as f32, 1.0 / height as f32];
+                // level 0 reads raw scene colour, which no format
+                // decodes for us
+                let (source, source_level, decode) = match level {
+                    0 => (scene, 0.0, 1.0),
+                    _ => (pyramid.ping, (level - 1) as f32, 0.0),
+                };
+                self.blur_pass(
+                    command,
+                    source,
+                    pyramid.pong,
+                    level,
+                    BlurParams {
+                        inv_dst,
+                        direction: [1.0, 0.0],
+                        source_level,
+                        decode,
+                        pad: [0.0, 0.0],
+                    },
+                );
+                self.blur_pass(
+                    command,
+                    pyramid.pong,
+                    pyramid.ping,
+                    level,
+                    BlurParams {
+                        inv_dst,
+                        direction: [0.0, 1.0],
+                        source_level: level as f32,
+                        decode: 0.0,
+                        pad: [0.0, 0.0],
+                    },
+                );
+            }
+        }
+    }
+
+    unsafe fn blur_pass(&self, command: Id, source: Id, target: Id, level: u32, params: BlurParams) {
+        unsafe {
+            // the pass covers its whole destination: there is nothing
+            // to load and nothing to clear
+            let encoder = self.begin_pass(
+                command,
+                target,
+                level as u64,
+                LOAD_ACTION_DONT_CARE,
+                Color::BLACK,
+            );
+            msg_void_id(encoder, self.sels.set_pipeline, self.blur_pipeline);
+            msg_void_ptr_u64_u64(
+                encoder,
+                self.sels.set_fragment_bytes,
+                (&params) as *const BlurParams as *const c_void,
+                32,
+                0,
+            );
+            msg_void_id_u64(encoder, self.sels.set_fragment_texture, source, 0);
+            msg_void_u64x3(encoder, self.sels.draw_plain, PRIMITIVE_TRIANGLE, 0, 3);
+            msg_void(encoder, self.sels.end_encoding);
+        }
+    }
+
+    /// The offscreen scene onto the drawable — an exact copy.
+    unsafe fn encode_blit(&self, command: Id, source: Id, target: Id) {
+        unsafe {
+            let encoder =
+                self.begin_pass(command, target, 0, LOAD_ACTION_DONT_CARE, Color::BLACK);
+            msg_void_id(encoder, self.sels.set_pipeline, self.blit_pipeline);
+            msg_void_id_u64(encoder, self.sels.set_fragment_texture, source, 0);
+            msg_void_u64x3(encoder, self.sels.draw_plain, PRIMITIVE_TRIANGLE, 0, 3);
+            msg_void(encoder, self.sels.end_encoding);
         }
     }
 }
 
+/// Everything one frame's encode needs — a struct because the call is
+/// deep and the arguments are many.
+struct EncodeFrame<'a> {
+    /// What the frame renders into: the drawable, or the offscreen
+    /// scene texture when the frame carries glass.
+    target: Id,
+    /// The drawable to copy onto at the end, or null.
+    present_to: Id,
+    canvas: Color,
+    viewport: (f32, f32),
+    instances: Id,
+    sprite_offset: usize,
+    glass_offset: usize,
+    runs: &'a [DrawRun],
+    rounds: &'a [RoundClip],
+    atlas_texture: Id,
+    textures: &'a [Id],
+    pyramid: Option<&'a GlassTextures>,
+}
+
+/// The deepest level of the blur pyramid — four levels in all, mirroring
+/// `bunny_ui::glass::MAX_LEVEL`.
+const GLASS_MAX_LEVEL: u32 = 3;
+
+/// The textures liquid glass needs: the ping and pong of the blur
+/// pyramid, and the offscreen scene a window frame renders into because
+/// its drawable cannot be read.
+struct GlassTextures {
+    ping: Id,
+    pong: Id,
+    /// Null when the target is readable already — the offscreen harness
+    /// renders into its own texture and needs no copy.
+    scene: Id,
+    size: (usize, usize),
+}
+
+impl GlassTextures {
+    /// Half resolution, four mips, private storage. Returns `None` when
+    /// any texture fails to come up — a frame then paints without its
+    /// panes instead of failing to present.
+    unsafe fn new(
+        device: Id,
+        size: (usize, usize),
+        format: u64,
+        offscreen_scene: bool,
+    ) -> Option<GlassTextures> {
+        unsafe {
+            if size.0 == 0 || size.1 == 0 {
+                return None;
+            }
+            let half = (size.0.div_ceil(2).max(1), size.1.div_ceil(2).max(1));
+            let ping = make_texture(device, PIXEL_FORMAT_RGBA8_SRGB, half, GLASS_MAX_LEVEL + 1);
+            let pong = make_texture(device, PIXEL_FORMAT_RGBA8_SRGB, half, GLASS_MAX_LEVEL + 1);
+            let scene = match offscreen_scene {
+                true => make_texture(device, format, size, 1),
+                false => null_mut(),
+            };
+            if ping.is_null() || pong.is_null() || (offscreen_scene && scene.is_null()) {
+                return None;
+            }
+            Some(GlassTextures { ping, pong, scene, size })
+        }
+    }
+
+    unsafe fn release(&self, sels: &Sels) {
+        unsafe {
+            for texture in [self.ping, self.pong, self.scene] {
+                if !texture.is_null() {
+                    msg_void(texture, sels.release);
+                }
+            }
+        }
+    }
+}
+
+unsafe fn make_texture(device: Id, format: u64, size: (usize, usize), levels: u32) -> Id {
+    unsafe {
+        let descriptor = msg_id_u64_u64_u64_bool(
+            class("MTLTextureDescriptor"),
+            sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+            format,
+            size.0 as u64,
+            size.1 as u64,
+            (levels > 1) as i8,
+        );
+        if levels > 1 {
+            msg_void_u64(descriptor, sel("setMipmapLevelCount:"), levels as u64);
+        }
+        msg_void_u64(
+            descriptor,
+            sel("setUsage:"),
+            TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ,
+        );
+        // the GPU alone touches these — the CPU never reads a pyramid
+        msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_PRIVATE);
+        msg_id_arg(device, sel("newTextureWithDescriptor:"), descriptor)
+    }
+}
+
+/// `blend` false is a REPLACING pipeline: a pass that covers its whole
+/// destination has nothing to blend with, and blending a blur or a blit
+/// would only fold the destination back in.
 unsafe fn build_pipeline(
     device: Id,
     library: Id,
     vertex: &str,
     fragment: &str,
     format: u64,
+    blend: bool,
 ) -> Result<Id, String> {
     unsafe {
         let vertex_fn = msg_id_arg(library, sel("newFunctionWithName:"), ns_string(vertex));
@@ -773,7 +1419,7 @@ unsafe fn build_pipeline(
         msg_void_u64(attachment, sel("setPixelFormat:"), format);
         // Source-over with straight alpha — the LITERAL blend_px formula:
         // rgb = s·sa + d·(1−sa); a = sa + da·(1−sa).
-        msg_void_bool(attachment, sel("setBlendingEnabled:"), 1);
+        msg_void_bool(attachment, sel("setBlendingEnabled:"), blend as i8);
         msg_void_u64(
             attachment,
             sel("setSourceRGBBlendFactor:"),
@@ -1331,6 +1977,10 @@ fn push_gradient(
 #[derive(Clone, Copy, PartialEq)]
 enum RunKind {
     Rects,
+    /// A batch of liquid-glass panes. It carries its own pass: the
+    /// scene has to be blurred into the pyramid BEFORE the panes read
+    /// it, and a pass boundary is what orders the two.
+    Glass,
     Sprites,
     /// Sprites read from a DEDICATED texture (an image too big for the
     /// shared atlas) — the index points into the frame's texture list.
@@ -1342,6 +1992,9 @@ struct DrawRun {
     kind: RunKind,
     base: u32,
     count: u32,
+    /// Glass only: how deep the pyramid must go for this batch — the
+    /// deepest blur any pane in it asked for.
+    levels: u32,
     /// Index into the frame's interned curves — a `u32` compare keeps
     /// run coalescing cheap, and the run only breaks when the SHAPE of
     /// the cut changes, which no scene of today ever does.
@@ -1351,7 +2004,37 @@ struct DrawRun {
 fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, round: u32, index: usize) {
     match runs.last_mut() {
         Some(run) if run.kind == kind && run.round == round => run.count += 1,
-        _ => runs.push(DrawRun { kind, base: index as u32, count: 1, round }),
+        _ => runs.push(DrawRun { kind, base: index as u32, count: 1, round, levels: 0 }),
+    }
+}
+
+fn box_union(a: Box4, b: Box4) -> Box4 {
+    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+}
+
+/// A pane joins the batch in front of it only if it does not TOUCH any
+/// pane already in it. One batch reads one capture of the scene, so two
+/// panes that overlap must not share it: the upper one would sample a
+/// blur taken before the lower one existed, and stacked glass would
+/// show nothing of the glass beneath it.
+fn note_glass(
+    runs: &mut Vec<DrawRun>,
+    round: u32,
+    index: usize,
+    bounds: Box4,
+    levels: u32,
+    batch: &mut Option<Box4>,
+) {
+    let joins = matches!(runs.last(), Some(run) if run.kind == RunKind::Glass && run.round == round)
+        && batch.is_some_and(|acc| box_intersect(acc, bounds).is_none());
+    if joins {
+        let run = runs.last_mut().expect("the run the match found");
+        run.count += 1;
+        run.levels = run.levels.max(levels);
+        *batch = batch.map(|acc| box_union(acc, bounds));
+    } else {
+        runs.push(DrawRun { kind: RunKind::Glass, base: index as u32, count: 1, round, levels });
+        *batch = Some(bounds);
     }
 }
 
@@ -1361,6 +2044,7 @@ fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, round: u32, index: usize) {
 struct FrameBatches {
     rects: Vec<RectInstance>,
     sprites: Vec<SpriteInstance>,
+    glass: Vec<GlassInstance>,
     runs: Vec<DrawRun>,
     /// The frame's interned curves — slot 0 is always [`NO_ROUND`], so
     /// a frame with no rounded clip binds once and moves on.
@@ -1386,6 +2070,7 @@ fn build_frame(
 ) -> Result<(), AtlasFull> {
     batches.rects.clear();
     batches.sprites.clear();
+    batches.glass.clear();
     batches.runs.clear();
     batches.textures.clear();
     batches.rounds.clear();
@@ -1396,6 +2081,9 @@ fn build_frame(
     // each entry: the hard cut, plus the index of the curve it lives
     // under (the CPU's inheritance rule, spoken in indices)
     let mut clips: Vec<(Box4, u32)> = Vec::new();
+    // the boxes the open glass batch already holds — a pane that
+    // touches one of them starts a batch of its own
+    let mut glass_batch: Option<Box4> = None;
     for command in display.iter() {
         match command {
             DrawCommand::FillRect { rect, color, corner_radius } => {
@@ -1411,9 +2099,58 @@ fn build_frame(
                 push_rect(out, snapped, clip, *color, radii, 0.0, KIND_FILL, 0.0);
                 note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
             }
-            // the pane answers in a pass of its own — see the glass
-            // encoder below
-            DrawCommand::Backdrop { .. } => continue,
+            DrawCommand::Backdrop { rect, glass, corner_radius } => {
+                let Some(clip) = effective_clip(&clips, whole) else { continue };
+                let snapped = snap_scaled(*rect, factor);
+                if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
+                    continue;
+                }
+                if box_intersect(snapped, clip).is_none() {
+                    continue;
+                }
+                let radii = corner_clamp(corner_radius * factor, snapped);
+                let paint = glass.scaled(factor);
+                batches.glass.push(GlassInstance {
+                    rect: [snapped.0 as f32, snapped.1 as f32, snapped.2 as f32, snapped.3 as f32],
+                    clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
+                    radii: wire_radii(radii),
+                    lens: [
+                        paint.blur as f32,
+                        paint.refraction_band as f32,
+                        paint.refraction_amount as f32,
+                        paint.chromatic as f32,
+                    ],
+                    finish: [
+                        paint.highlight_band as f32,
+                        paint.highlight_intensity as f32,
+                        paint.saturation as f32,
+                        paint.brightness as f32,
+                    ],
+                    touch: [
+                        paint.sheen as f32,
+                        paint.spot_center.x as f32,
+                        paint.spot_center.y as f32,
+                        paint.spot_radius as f32,
+                    ],
+                    tint: [paint.tint.r, paint.tint.g, paint.tint.b, paint.tint.a],
+                    highlight: [
+                        paint.highlight.r,
+                        paint.highlight.g,
+                        paint.highlight.b,
+                        paint.highlight.a,
+                    ],
+                    spot_alpha: paint.spot_alpha as f32,
+                    pad: 0.0,
+                });
+                note_glass(
+                    &mut batches.runs,
+                    round_of(&clips),
+                    batches.glass.len() - 1,
+                    snapped,
+                    bunny_ui::glass::levels_for(paint.blur) as u32,
+                    &mut glass_batch,
+                );
+            }
             DrawCommand::Gradient { rect, paint, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
                 let snapped = snap_scaled(*rect, factor);
@@ -1751,19 +2488,24 @@ fn as_bytes<T>(items: &[T]) -> &[u8] {
 /// the capacity. The size is EXACT before Metal is touched, so there is
 /// no speculative encode and no overflow retry. Returns the sprite
 /// byte offset.
+/// Uploads the frame's instances into one buffer, three regions each
+/// aligned to 256 bytes, and answers where the sprites and the panes
+/// start.
 unsafe fn upload_frame(
     slot: &mut FrameSlot,
     device: Id,
     sels: &Sels,
     batches: &FrameBatches,
-) -> usize {
+) -> (usize, usize) {
     unsafe {
         let rect_bytes = as_bytes(&batches.rects);
         let sprite_bytes = as_bytes(&batches.sprites);
+        let glass_bytes = as_bytes(&batches.glass);
         let sprite_offset = rect_bytes.len().next_multiple_of(256);
-        let total = sprite_offset + sprite_bytes.len();
+        let glass_offset = (sprite_offset + sprite_bytes.len()).next_multiple_of(256);
+        let total = glass_offset + glass_bytes.len();
         if total == 0 {
-            return 0;
+            return (0, 0);
         }
         if slot.buffer.is_null() || slot.capacity < total {
             if !slot.buffer.is_null() {
@@ -1787,7 +2529,14 @@ unsafe fn upload_frame(
                 sprite_bytes.len(),
             );
         }
-        sprite_offset
+        if !glass_bytes.is_empty() {
+            std::ptr::copy_nonoverlapping(
+                glass_bytes.as_ptr(),
+                contents.add(glass_offset),
+                glass_bytes.len(),
+            );
+        }
+        (sprite_offset, glass_offset)
     }
 }
 
@@ -1811,6 +2560,33 @@ struct MetalPresenter {
     /// Whether the layer currently presents inside the CATransaction —
     /// toggled ON only during live resize.
     transactional: bool,
+    /// The scene texture and the blur pyramid, made on the first frame
+    /// that carries glass and remade whenever the drawable resizes. A
+    /// window that never shows glass never allocates them.
+    glass: Option<GlassTextures>,
+}
+
+impl MetalPresenter {
+    /// Makes the glass textures if this frame needs them and the ones
+    /// in hand are the wrong size.
+    fn ensure_glass(&mut self, physical: (usize, usize)) {
+        if self.batches.glass.is_empty() {
+            return;
+        }
+        unsafe {
+            if let Some(textures) = &self.glass {
+                if textures.size == physical {
+                    return;
+                }
+                textures.release(&self.stack.sels);
+            }
+            self.glass =
+                GlassTextures::new(self.stack.device, physical, self.stack.format, true);
+            if self.glass.is_none() {
+                eprintln!("bunny_ui metal: no scene texture — the frame paints without its panes");
+            }
+        }
+    }
 }
 
 /// The skip key: the SAME list on the SAME target needs no new frame.
@@ -1932,7 +2708,7 @@ impl MetalPresenter {
             }
             self.build_with_retries(display, scale, physical, text, images);
             let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
-            let sprite_offset = upload_frame(
+            let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
                 self.stack.device,
                 &self.stack.sels,
@@ -1943,18 +2719,31 @@ impl MetalPresenter {
                 objc_autoreleasePoolPop(pool);
                 return;
             }
-            let target = msg_id(drawable, self.stack.sels.texture);
-            let command = self.stack.encode_frame(
+            let drawable_texture = msg_id(drawable, self.stack.sels.texture);
+            // a drawable cannot be READ, so a frame that carries glass
+            // renders into a scene texture of its own and is copied
+            // over at the end. A frame without glass never asks for
+            // one, and never pays for one
+            self.ensure_glass(physical);
+            let pyramid = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
+            let (target, present_to) = match pyramid {
+                Some(textures) => (textures.scene, drawable_texture),
+                None => (drawable_texture, null_mut()),
+            };
+            let command = self.stack.encode_frame(EncodeFrame {
                 target,
+                present_to,
                 canvas,
-                (physical.0 as f32, physical.1 as f32),
-                self.slots[index].buffer,
+                viewport: (physical.0 as f32, physical.1 as f32),
+                instances: self.slots[index].buffer,
                 sprite_offset,
-                &self.batches.runs,
-                &self.batches.rounds,
-                self.atlas.texture,
-                &self.batches.textures,
-            );
+                glass_offset,
+                runs: &self.batches.runs,
+                rounds: &self.batches.rounds,
+                atlas_texture: self.atlas.texture,
+                textures: &self.batches.textures,
+                pyramid,
+            });
             // live resize presents INSIDE the CATransaction: commit,
             // wait for the schedule, present — layer content and window
             // frame land together (the anti-tear toggle). every other
@@ -2032,6 +2821,7 @@ pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool
             batches: FrameBatches::default(),
             retained: None,
             transactional: false,
+            glass: None,
         };
         // anti-flash: the first clear happens before the window shows —
         // a virgin CAMetalLayer would flash black on order-front
@@ -2081,6 +2871,8 @@ pub(crate) fn present_window(
 pub struct OffscreenGpu {
     stack: MetalStack,
     target: Id,
+    /// The blur pyramid, made on the first frame that carries glass.
+    glass: Option<GlassTextures>,
     width: usize,
     height: usize,
     slots: [FrameSlot; 3],
@@ -2124,6 +2916,7 @@ impl OffscreenGpu {
             Some(OffscreenGpu {
                 stack,
                 target,
+                glass: None,
                 width,
                 height,
                 slots: [FrameSlot::empty(); 3],
@@ -2179,23 +2972,37 @@ impl OffscreenGpu {
                 }
             }
             let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
-            let sprite_offset = upload_frame(
+            let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
                 self.stack.device,
                 &self.stack.sels,
                 &self.batches,
             );
-            let command = self.stack.encode_frame(
-                self.target,
+            // the harness target is READABLE, so the panes read it
+            // where it lies: no scene texture, no copy at the end
+            if !self.batches.glass.is_empty() && self.glass.is_none() {
+                self.glass = GlassTextures::new(
+                    self.stack.device,
+                    (self.width, self.height),
+                    self.stack.format,
+                    false,
+                );
+            }
+            let pyramid = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
+            let command = self.stack.encode_frame(EncodeFrame {
+                target: self.target,
+                present_to: null_mut(),
                 canvas,
-                (self.width as f32, self.height as f32),
-                self.slots[index].buffer,
+                viewport: (self.width as f32, self.height as f32),
+                instances: self.slots[index].buffer,
                 sprite_offset,
-                &self.batches.runs,
-                &self.batches.rounds,
-                self.atlas.texture,
-                &self.batches.textures,
-            );
+                glass_offset,
+                runs: &self.batches.runs,
+                rounds: &self.batches.rounds,
+                atlas_texture: self.atlas.texture,
+                textures: &self.batches.textures,
+                pyramid,
+            });
             msg_void(command, self.stack.sels.commit);
             self.slots[index].command = msg_id(command, self.stack.sels.retain);
             if wait {
@@ -3006,5 +3813,153 @@ mod tests {
             gpu.chunks_exact(4).any(|pixel| pixel[..3] != [0xF2, 0xF3, 0xF7]),
             "the image painted through the dedicated texture"
         );
+    }
+
+    // MARK: - Liquid glass
+
+    fn glass_scene(glass: bunny_ui::layout::Glass, radius: f64) -> impl View {
+        // stripes make the blur legible and the lens unmistakable — a
+        // pane over a flat colour proves nothing
+        let bars = for_each(
+            (0..20).collect::<Vec<i32>>(),
+            |index: &i32| index.to_string(),
+            |index| {
+                empty()
+                    .frame_width(240.0)
+                    .frame_height(8.0)
+                    .background_color(if index % 2 == 0 {
+                        Color::hex(0x102A64)
+                    } else {
+                        Color::hex(0xE8D14A)
+                    })
+            },
+        )
+        .vertical();
+        zstack!((
+            bars,
+            empty().frame(150.0, 90.0).corner_radius(radius).glass(glass),
+        ))
+    }
+
+    /// The parity gate for glass: the material is a blur, a bilinear
+    /// sample and a saturate, resolved in f64 on one side and f32 on the
+    /// other, so it answers CLOSE, never equal. What it must not do is
+    /// answer differently in SHAPE — the tolerance is per channel and
+    /// the share of channels beyond one step is what would catch a lens
+    /// that bends the wrong way.
+    fn assert_glass_close(gpu: &[u8], cpu: &[u8], max_delta: u8, share_beyond: f64, label: &str) {
+        assert_eq!(gpu.len(), cpu.len(), "{label}: byte lengths differ");
+        let mut worst = 0u8;
+        let mut beyond = 0usize;
+        for (a, b) in gpu.iter().zip(cpu.iter()) {
+            let delta = a.abs_diff(*b);
+            worst = worst.max(delta);
+            if delta > 1 {
+                beyond += 1;
+            }
+        }
+        let share = beyond as f64 / gpu.len() as f64;
+        assert!(
+            worst <= max_delta,
+            "{label}: worst channel delta {worst} (allowed {max_delta}), {:.3}% beyond one",
+            share * 100.0
+        );
+        assert!(
+            share <= share_beyond,
+            "{label}: {:.3}% of channels beyond one step (allowed {:.3}%)",
+            share * 100.0,
+            share_beyond * 100.0
+        );
+    }
+
+    #[test]
+    fn the_material_matches_the_raster() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::Glass;
+        for (label, glass, radius) in [
+            ("regular", Glass::regular(), 24.0),
+            // the pure lens: the pyramid's own floor for a blur and a
+            // violent bend — this is the one that catches a rim that
+            // pinches instead of magnifying
+            (
+                "lens",
+                Glass::regular().blur(0.0).refraction(20.0, 32.0).tint(Color::rgba(255, 255, 255, 12)),
+                30.0,
+            ),
+            // the fringe: three samples per pixel instead of one
+            ("fringe", Glass::regular().chromatic(0.35), 18.0),
+            // a flat pane, and the deepest level of the pyramid
+            ("frosted", Glass::frosted(), 12.0),
+            // the rim alone, on a square pane: no corner to hide behind
+            (
+                "rim",
+                Glass::regular().refraction(0.0, 0.0).highlight(Color::WHITE, 5.0, 1.0),
+                0.0,
+            ),
+            // the touch lights
+            (
+                "touch",
+                Glass::regular().sheen(0.1).spot(bunny_ui::layout::UnitPoint::CENTER, 0.6, 0.4),
+                20.0,
+            ),
+        ] {
+            let root = glass_scene(glass, radius);
+            let (gpu, cpu) =
+                scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, Color::CANVAS);
+            // measured: the flat materials answer within TWO and the
+            // bending ones within three — a lens multiplies the f32/f64
+            // gap by how steep the scene is where it samples
+            assert_glass_close(&gpu, &cpu, 3, 0.005, label);
+        }
+    }
+
+    #[test]
+    fn stacked_panes_each_read_the_one_below() {
+        if !device_present() {
+            return;
+        }
+        // two panes that OVERLAP must not share one capture of the
+        // scene: the upper one would sample a blur taken before the
+        // lower one existed, and the glass under it would vanish
+        use bunny_ui::layout::Glass;
+        let root = zstack!((
+            empty()
+                .frame_width(240.0)
+                .frame_height(160.0)
+                .background_gradient(bunny_ui::layout::Gradient::linear(
+                    Color::hex(0x102A64),
+                    Color::hex(0xE8D14A),
+                )),
+            empty().frame(180.0, 110.0).corner_radius(28.0).glass(Glass::regular()),
+            empty().frame(90.0, 60.0).corner_radius(18.0).glass(Glass::clear()),
+        ));
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, Color::CANVAS);
+        // a pane over a pane compounds: the upper one samples a scene
+        // that already carries the lower one's own difference
+        assert_glass_close(&gpu, &cpu, 6, 0.015, "stacked panes");
+    }
+
+    #[test]
+    fn overlapping_panes_break_the_batch_and_apart_ones_share_it() {
+        // the walk's own rule, without a device: two panes that touch
+        // take two batches, two that do not take one
+        let batch = |first: Box4, second: Box4| {
+            let mut runs: Vec<DrawRun> = Vec::new();
+            let mut open: Option<Box4> = None;
+            note_glass(&mut runs, 0, 0, first, 1, &mut open);
+            note_glass(&mut runs, 0, 1, second, 2, &mut open);
+            runs
+        };
+        let apart = batch((0, 0, 10, 10), (20, 20, 30, 30));
+        assert_eq!(apart.len(), 1, "panes that never meet share one capture");
+        assert_eq!(apart[0].count, 2);
+        assert_eq!(apart[0].levels, 2, "the batch digs as deep as its deepest pane");
+
+        let over = batch((0, 0, 20, 20), (10, 10, 30, 30));
+        assert_eq!(over.len(), 2, "glass over glass takes a capture of its own");
+        assert_eq!(over[1].levels, 2);
     }
 }
