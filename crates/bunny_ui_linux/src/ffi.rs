@@ -2735,9 +2735,7 @@ const TEXT_MIMES: [&CStr; 3] = [c"text/plain;charset=utf-8", c"UTF8_STRING", c"t
 /// Claims the selection with a fresh data source serving `text`.
 pub fn clipboard_write(text: &str) {
     if is_x11() {
-        // the selections dance arrives in Q2
-        let _ = text;
-        return;
+        return crate::x11::clipboard_write(text);
     }
     with_client(|client| {
         if client.data_manager.is_null() || client.data_device.is_null() {
@@ -2780,8 +2778,7 @@ pub fn clipboard_write(text: &str) {
 /// never hang the UI thread.
 pub fn clipboard_read() -> Option<String> {
     if is_x11() {
-        // the selections dance arrives in Q2
-        return None;
+        return crate::x11::clipboard_read();
     }
     // the self short-circuit
     let own = with_client(|client| {

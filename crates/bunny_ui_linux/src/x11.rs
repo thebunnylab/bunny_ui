@@ -199,6 +199,27 @@ unsafe extern "C" {
         value_mask: u32,
         value_list: *const u32,
     ) -> Cookie;
+    fn xcb_set_selection_owner(
+        connection: *mut Connection,
+        owner: u32,
+        selection: u32,
+        time: u32,
+    ) -> Cookie;
+    fn xcb_convert_selection(
+        connection: *mut Connection,
+        requestor: u32,
+        selection: u32,
+        target: u32,
+        property: u32,
+        time: u32,
+    ) -> Cookie;
+    fn xcb_send_event(
+        connection: *mut Connection,
+        propagate: u8,
+        destination: u32,
+        event_mask: u32,
+        event: *const c_char,
+    ) -> Cookie;
 }
 
 #[link(name = "xkbcommon-x11")]
@@ -471,6 +492,47 @@ struct PropertyNotifyEvent {
     pad1: [u8; 3],
 }
 
+/// SelectionRequest — verified against xproto.h.
+#[repr(C)]
+struct SelectionRequestEvent {
+    response_type: u8,
+    pad0: u8,
+    sequence: u16,
+    time: u32,
+    owner: u32,
+    requestor: u32,
+    selection: u32,
+    target: u32,
+    property: u32,
+}
+
+/// SelectionNotify — verified against xproto.h. Doubles as the frame
+/// this door SENDS back to requestors (send_event wants 32 bytes; the
+/// tail pads).
+#[repr(C)]
+struct SelectionNotifyEvent {
+    response_type: u8,
+    pad0: u8,
+    sequence: u16,
+    time: u32,
+    requestor: u32,
+    selection: u32,
+    target: u32,
+    property: u32,
+    pad_tail: [u8; 8],
+}
+
+/// SelectionClear — verified against xproto.h.
+#[repr(C)]
+struct SelectionClearEvent {
+    response_type: u8,
+    pad0: u8,
+    sequence: u16,
+    time: u32,
+    owner: u32,
+    selection: u32,
+}
+
 const _: () = {
     assert!(std::mem::size_of::<GenericEvent>() == 32);
     assert!(std::mem::size_of::<ExposeEvent>() == 20);
@@ -497,7 +559,11 @@ const XCB_EXPOSE: u8 = 12;
 const XCB_DESTROY_NOTIFY: u8 = 17;
 const XCB_CONFIGURE_NOTIFY: u8 = 22;
 const XCB_PROPERTY_NOTIFY: u8 = 28;
+const XCB_SELECTION_CLEAR: u8 = 29;
+const XCB_SELECTION_REQUEST: u8 = 30;
+const XCB_SELECTION_NOTIFY: u8 = 31;
 const XCB_CLIENT_MESSAGE: u8 = 33;
+const PROPERTY_NEW_VALUE: u8 = 0;
 
 // request vocabulary (xproto.h)
 const WINDOW_CLASS_INPUT_OUTPUT: u16 = 1;
@@ -529,10 +595,23 @@ pub(crate) struct Atoms {
     pub(crate) wm_delete_window: u32,
     pub(crate) net_wm_name: u32,
     pub(crate) utf8_string: u32,
+    pub(crate) clipboard: u32,
+    pub(crate) targets: u32,
+    pub(crate) incr: u32,
+    /// The property selections land on — ours by name, reused per read.
+    pub(crate) transfer: u32,
 }
 
-const ATOM_NAMES: [&CStr; 4] =
-    [c"WM_PROTOCOLS", c"WM_DELETE_WINDOW", c"_NET_WM_NAME", c"UTF8_STRING"];
+const ATOM_NAMES: [&CStr; 8] = [
+    c"WM_PROTOCOLS",
+    c"WM_DELETE_WINDOW",
+    c"_NET_WM_NAME",
+    c"UTF8_STRING",
+    c"CLIPBOARD",
+    c"TARGETS",
+    c"INCR",
+    c"BUNNY_SELECTION",
+];
 
 use std::ffi::CStr;
 
@@ -543,7 +622,7 @@ fn intern_atoms(connection: *mut Connection) -> Atoms {
             xcb_intern_atom(connection, 0, name.to_bytes().len() as u16, name.as_ptr())
         })
         .collect();
-    let mut atoms = [0u32; 4];
+    let mut atoms = [0u32; 8];
     for (slot, cookie) in atoms.iter_mut().zip(cookies) {
         unsafe {
             let reply = xcb_intern_atom_reply(connection, cookie, std::ptr::null_mut());
@@ -558,6 +637,10 @@ fn intern_atoms(connection: *mut Connection) -> Atoms {
         wm_delete_window: atoms[1],
         net_wm_name: atoms[2],
         utf8_string: atoms[3],
+        clipboard: atoms[4],
+        targets: atoms[5],
+        incr: atoms[6],
+        transfer: atoms[7],
     }
 }
 
@@ -648,6 +731,12 @@ pub(crate) struct XClient {
     /// Client-side double click — X sends plain buttons, the shell
     /// counts (the same 400 ms / 4 px window every platform keeps).
     clicks: ClickClock,
+    /// Our claim on CLIPBOARD: the text this door serves. Cleared by
+    /// SelectionClear when someone else takes the selection.
+    source: Option<String>,
+    /// The freshest input timestamp — selections want a REAL time
+    /// (CurrentTime claims are second-class under ICCCM).
+    last_time: u32,
 }
 
 thread_local! {
@@ -719,8 +808,218 @@ pub(crate) fn connect() {
             cursors: [0; 6],
             cursor_current: None,
             clicks: ClickClock::default(),
+            source: None,
+            last_time: 0,
         })
     });
+}
+
+// MARK: - Clipboard (the selections dance)
+
+/// Claims CLIPBOARD and keeps the text to serve. X wants no serial —
+/// only a real timestamp and a live window.
+pub(crate) fn clipboard_write(text: &str) {
+    with_x(|client| {
+        let Some(win) = client.win.as_ref() else { return };
+        client.source = Some(text.to_string());
+        unsafe {
+            xcb_set_selection_owner(client.connection, win.id, client.atoms.clipboard, client.last_time);
+            xcb_flush(client.connection);
+        }
+    });
+}
+
+/// Answers one SelectionRequest: TARGETS lists what this door speaks,
+/// the text targets carry the bytes, anything else is refused with a
+/// null property — and the notify goes back whatever happened.
+fn serve_selection(event: &SelectionRequestEvent) {
+    with_x(|client| {
+        let atoms = &client.atoms;
+        // obsolete requestors pass property None: the target names it
+        let property = if event.property != 0 { event.property } else { event.target };
+        let answered = match &client.source {
+            Some(text) if event.selection == atoms.clipboard => unsafe {
+                if event.target == atoms.targets {
+                    let list = [atoms.targets, atoms.utf8_string, ATOM_STRING];
+                    xcb_change_property(
+                        client.connection,
+                        PROP_MODE_REPLACE,
+                        event.requestor,
+                        property,
+                        ATOM_ATOM,
+                        32,
+                        list.len() as u32,
+                        list.as_ptr().cast(),
+                    );
+                    true
+                } else if event.target == atoms.utf8_string || event.target == ATOM_STRING {
+                    // direct write — the big-request road carries any
+                    // realistic text; INCR out is the post-war stream
+                    xcb_change_property(
+                        client.connection,
+                        PROP_MODE_REPLACE,
+                        event.requestor,
+                        property,
+                        event.target,
+                        8,
+                        text.len() as u32,
+                        text.as_ptr().cast(),
+                    );
+                    true
+                } else {
+                    false
+                }
+            },
+            _ => false,
+        };
+        let notify = SelectionNotifyEvent {
+            response_type: XCB_SELECTION_NOTIFY,
+            pad0: 0,
+            sequence: 0,
+            time: event.time,
+            requestor: event.requestor,
+            selection: event.selection,
+            target: event.target,
+            property: if answered { property } else { 0 },
+            pad_tail: [0; 8],
+        };
+        unsafe {
+            xcb_send_event(
+                client.connection,
+                0,
+                event.requestor,
+                0,
+                (&raw const notify).cast(),
+            );
+            xcb_flush(client.connection);
+        }
+    });
+}
+
+/// One bounded wait for a specific event during a selection read: the
+/// wanted frame comes back, everything else queues for the main drain.
+fn pump_for(
+    deadline: Instant,
+    mut wanted: impl FnMut(*mut GenericEvent) -> bool,
+) -> Option<*mut GenericEvent> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let (connection, fd) = with_x(|client| {
+            (client.connection, unsafe { xcb_get_file_descriptor(client.connection) })
+        });
+        loop {
+            let event = unsafe { xcb_poll_for_event(connection) };
+            if event.is_null() {
+                break;
+            }
+            if wanted(event) {
+                return Some(event);
+            }
+            PENDING.with(|q| q.borrow_mut().push_back(event));
+        }
+        let mut fds = [PollFd { fd, events: POLLIN, revents: 0 }];
+        unsafe {
+            xcb_flush(connection);
+            poll(fds.as_mut_ptr(), 1, remaining.as_millis().min(200) as c_int);
+        }
+    }
+}
+
+/// Reads one property chunk (deleting it — the INCR handshake) and
+/// appends; answers (bytes_appended, was_incr_header).
+fn take_property(window: u32, out: &mut Vec<u8>) -> (usize, bool) {
+    with_x(|client| unsafe {
+        let cookie = xcb_get_property(
+            client.connection,
+            1, // delete — the reader's ack in the INCR protocol
+            window,
+            client.atoms.transfer,
+            0, // AnyPropertyType
+            0,
+            u32::MAX / 4,
+        );
+        let reply = xcb_get_property_reply(client.connection, cookie, std::ptr::null_mut());
+        if reply.is_null() {
+            return (0, false);
+        }
+        let incr = (*reply).kind == client.atoms.incr;
+        let length = xcb_get_property_value_length(reply).max(0) as usize;
+        if !incr && length > 0 {
+            let bytes = std::slice::from_raw_parts(
+                xcb_get_property_value(reply) as *const u8,
+                length,
+            );
+            out.extend_from_slice(bytes);
+        }
+        free(reply.cast());
+        xcb_flush(client.connection);
+        (length, incr)
+    })
+}
+
+/// Reads the CLIPBOARD selection. Our own claim answers from memory;
+/// a peer's arrives by convert → notify → property, INCR-streamed
+/// when large, all under the hard four-second cap the wayland door
+/// keeps — a hung owner must never hang the UI thread.
+pub(crate) fn clipboard_read() -> Option<String> {
+    // the self short-circuit: we are the owner, no round trip
+    let (own, window) = with_x(|client| {
+        (client.source.clone(), client.win.as_ref().map(|w| w.id))
+    });
+    if own.is_some() {
+        return own;
+    }
+    let window = window?;
+    with_x(|client| unsafe {
+        xcb_convert_selection(
+            client.connection,
+            window,
+            client.atoms.clipboard,
+            client.atoms.utf8_string,
+            client.atoms.transfer,
+            client.last_time,
+        );
+        xcb_flush(client.connection);
+    });
+    let deadline = Instant::now() + std::time::Duration::from_secs(4);
+    let notify = pump_for(deadline, |event| {
+        let kind = unsafe { (*event).response_type } & 0x7F;
+        kind == XCB_SELECTION_NOTIFY
+            && unsafe { (*(event as *mut SelectionNotifyEvent)).requestor } == window
+    })?;
+    let property = unsafe { (*(notify as *mut SelectionNotifyEvent)).property };
+    unsafe { free(notify.cast()) };
+    if property == 0 {
+        return None; // the owner refused the target
+    }
+    let mut bytes = Vec::new();
+    let (_, incr) = take_property(window, &mut bytes);
+    if incr {
+        // the streamed road: each PropertyNotify(NewValue) carries a
+        // chunk; the empty chunk closes the stream
+        loop {
+            let chunk_event = pump_for(deadline, |event| {
+                let kind = unsafe { (*event).response_type } & 0x7F;
+                if kind != XCB_PROPERTY_NOTIFY {
+                    return false;
+                }
+                let notify = event as *mut PropertyNotifyEvent;
+                unsafe {
+                    (*notify).window == window && (*notify).state == PROPERTY_NEW_VALUE
+                }
+            })?;
+            unsafe { free(chunk_event.cast()) };
+            let (appended, _) = take_property(window, &mut bytes);
+            if appended == 0 {
+                break;
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+    (!text.is_empty()).then_some(text)
 }
 
 // MARK: - Keyboard (xkbcommon-x11: the device keymap, server repeat)
@@ -1292,9 +1591,11 @@ fn interpret(event: *mut GenericEvent) -> Step {
         XCB_DESTROY_NOTIFY => Step::Quit,
         XCB_MOTION_NOTIFY => {
             let motion = event as *mut InputEvent;
-            let (x, y) = unsafe { ((*motion).event_x, (*motion).event_y) };
+            let (x, y, time) =
+                unsafe { ((*motion).event_x, (*motion).event_y, (*motion).time) };
             let scale = with_x(|client| {
                 client.pointer_pos = (x as f64, y as f64);
+                client.last_time = time;
                 client.win.as_ref().map(|w| w.scale).unwrap_or(1)
             });
             Step::Deliver(AppEvent::MouseMoved {
@@ -1313,7 +1614,10 @@ fn interpret(event: *mut GenericEvent) -> Step {
                     (*button).time,
                 )
             };
-            let scale = with_x(|client| client.win.as_ref().map(|w| w.scale).unwrap_or(1));
+            let scale = with_x(|client| {
+                client.last_time = time;
+                client.win.as_ref().map(|w| w.scale).unwrap_or(1)
+            });
             let (x, y) = (x as f64 / scale as f64, y as f64 / scale as f64);
             match (kind, detail) {
                 (XCB_BUTTON_PRESS, 1) => {
@@ -1348,8 +1652,12 @@ fn interpret(event: *mut GenericEvent) -> Step {
             // detectable autorepeat holds: a held key arrives as
             // repeated presses — each walks the same road the first
             // door's timer used to walk
-            let keycode = unsafe { (*(event as *mut InputEvent)).detail };
-            let road = with_x(|client| key_road(&mut client.keyboard, keycode as u32));
+            let (keycode, time) =
+                unsafe { ((*(event as *mut InputEvent)).detail, (*(event as *mut InputEvent)).time) };
+            let road = with_x(|client| {
+                client.last_time = time;
+                key_road(&mut client.keyboard, keycode as u32)
+            });
             deliver_key(road);
             Step::Silence
         }
@@ -1368,6 +1676,23 @@ fn interpret(event: *mut GenericEvent) -> Step {
         }
         XCB_LEAVE_NOTIFY => Step::Deliver(AppEvent::MouseExited),
         XCB_FOCUS_OUT => Step::Deliver(AppEvent::ResignKey),
+        XCB_SELECTION_REQUEST => {
+            let request = unsafe { std::ptr::read(event as *const SelectionRequestEvent) };
+            serve_selection(&request);
+            Step::Silence
+        }
+        XCB_SELECTION_CLEAR => {
+            // someone else took the selection — our claim is over
+            let cleared = unsafe { (*(event as *mut SelectionClearEvent)).selection };
+            with_x(|client| {
+                if cleared == client.atoms.clipboard {
+                    client.source = None;
+                }
+            });
+            Step::Silence
+        }
+        // a stray notify outside a read pump answers nothing
+        XCB_SELECTION_NOTIFY => Step::Silence,
         XCB_FOCUS_IN | XCB_PROPERTY_NOTIFY => Step::Silence,
         _ => {
             // the xkb extension's own events ride above the core range;
@@ -1397,11 +1722,16 @@ fn interpret(event: *mut GenericEvent) -> Step {
 }
 
 /// Pulls every queued xcb event and interprets it — events free after
-/// use (xcb mallocs each frame).
+/// use (xcb mallocs each frame). Frames a selection pump set aside go
+/// first: their order against fresh events must hold.
 fn drain_events() -> bool {
     let mut quit = false;
     loop {
-        let event = with_x(|client| unsafe { xcb_poll_for_event(client.connection) });
+        let event = PENDING
+            .with(|q| q.borrow_mut().pop_front())
+            .unwrap_or_else(|| {
+                with_x(|client| unsafe { xcb_poll_for_event(client.connection) })
+            });
         if event.is_null() {
             break;
         }
