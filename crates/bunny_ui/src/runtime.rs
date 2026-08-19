@@ -25,7 +25,7 @@ use crate::layout::{
 use crate::reconciler;
 use crate::image_engine::{ImageEngine, RawImages};
 use crate::text_engine::{FontSpec, MeasureCache, PixelFont, TextEngine, caret_from_x};
-use crate::text_input::{CaretState, EditCommand};
+use crate::text_input::{CaretState, EditCommand, word_around};
 use crate::view::{NodeList, View};
 
 /// The result of an edit command: `applied` = a focused field was there
@@ -765,6 +765,17 @@ impl Runtime {
             self.interaction.borrow_mut().pointer = Some(Point { x, y });
             return self.drag_thumb(&thumb, x, y);
         }
+        // a field under a sweeping hand owns the pointer the same way:
+        // the anchor stays where the press dropped it and the caret
+        // follows the x. Past the border the caret lands on whatever
+        // that x names in TEXT space, so the run rolls with the hand —
+        // a hand held perfectly still does not roll on, because no
+        // clock lives in here
+        let swept = self.interaction.borrow().field_drag.clone();
+        if let Some(path) = swept {
+            self.interaction.borrow_mut().pointer = Some(Point { x, y });
+            return self.sweep_to(&path, x);
+        }
         // a box that took the press owns every move until the release —
         // dragging a selection past the frame is one gesture, not two
         let grabbed = self.interaction.borrow().element_grab.clone();
@@ -1050,7 +1061,7 @@ impl Runtime {
     /// action fires here (up-inside is button semantics). `true` =
     /// repaint.
     pub fn pointer_pressed(&self, x: Px, y: Px) -> bool {
-        self.pointer_clicked(x, y, 1)
+        self.pointer_clicked(x, y, 1, false)
     }
 
     /// [`Self::pointer_pressed`] with the platform's click count — the
@@ -1060,7 +1071,12 @@ impl Runtime {
     /// `pointerdown`, which reports `detail` zero, so the web shell
     /// counts too. A box hears the number in `PointerDown`, and a view
     /// through `.on_click_count`.
-    pub fn pointer_clicked(&self, x: Px, y: Px, clicks: u8) -> bool {
+    ///
+    /// `shift` is the ONE modifier a press carries, because it is the
+    /// one that changes what a press MEANS: over a field it extends
+    /// the selection instead of replacing it. The others change what
+    /// the app does, and those travel as key patterns.
+    pub fn pointer_clicked(&self, x: Px, y: Px, clicks: u8, shift: bool) -> bool {
         // an open menu owns the press whole: a row fires ON THE DOWN
         // (menu semantics, not button semantics) and a press outside
         // closes and consumes — AppKit's own manners
@@ -1166,6 +1182,22 @@ impl Runtime {
             interaction.pressed = None;
             return true;
         }
+        // a press on a field takes the keyboard AND opens a selection.
+        // The field is the one target that acts on the DOWN: first
+        // responder follows the press everywhere, and a sweep cannot
+        // begin on an up. Nothing arms — a field has no up-inside
+        // action to mis-fire — and every move comes here until the
+        // release, so a sweep that leaves the box stays one gesture
+        if let Some(path) = target.as_deref().filter(|path| reconciler::has_editor(path)) {
+            let path = path.to_string();
+            self.select_at(&path, x, clicks, shift);
+            let mut interaction = self.interaction.borrow_mut();
+            interaction.pointer = Some(Point { x, y });
+            interaction.hovered = Some(path.clone());
+            interaction.pressed = None;
+            interaction.field_drag = Some(path);
+            return true;
+        }
         let mut interaction = self.interaction.borrow_mut();
         interaction.pointer = Some(Point { x, y });
         let changed = interaction.pressed != target || interaction.hovered != target;
@@ -1237,6 +1269,20 @@ impl Runtime {
             }
             return None;
         }
+        // a field's sweep ends with the button and what it selected
+        // STAYS — focus and caret both moved on the press, so there is
+        // nothing left for the release to decide
+        let swept = {
+            let mut interaction = self.interaction.borrow_mut();
+            let swept = interaction.field_drag.take();
+            if swept.is_some() {
+                interaction.pointer = Some(Point { x, y });
+            }
+            swept
+        };
+        if let Some(path) = swept {
+            return Some(path);
+        }
         // a divider or a thumb ends its drag on release — no action
         // fires, no focus moves
         if self.interaction.borrow().split_drag.is_some()
@@ -1261,10 +1307,6 @@ impl Runtime {
         };
         // outside the borrow: the action can write state and re-enter here
         match fired {
-            Some(path) if reconciler::has_editor(&path) => {
-                self.focus_at(&path, x);
-                Some(path)
-            }
             Some(path) if self.activate_clicks(&path, clicks) => {
                 self.blur();
                 Some(path)
@@ -1463,23 +1505,74 @@ impl Runtime {
             .or_insert(CaretState { caret: usize::MAX, anchor: None, marked: None });
     }
 
-    /// Focuses and places the caret from the click's X — prefix
-    /// measurement with the field's effective FONT (retained from the
-    /// last layout).
-    fn focus_at(&self, path: &str, x: Px) {
+    /// The press that opens a selection: focuses, puts the caret under
+    /// the pointer's X (prefix measurement with the field's effective
+    /// FONT, retained from the last layout) and DROPS THE ANCHOR there
+    /// — the sweep that follows extends from it.
+    ///
+    /// The count picks the unit, the way every text field does it: two
+    /// clicks take the word under the pointer, three take the line. And
+    /// `shift` keeps the anchor where it already was, which is the
+    /// keyboard's own extend done with the mouse.
+    fn select_at(&self, path: &str, x: Px, clicks: u8, shift: bool) {
         self.caret_visible.set(true);
+        let held = self.focus.borrow().as_deref() == Some(path);
         *self.focus.borrow_mut() = Some(path.to_string());
-        let mut probe = CaretState::default();
-        let text = match reconciler::run_editor(path, EditCommand::Read, &mut probe) {
-            Some(Some(text)) => text,
-            _ => {
-                self.carets
-                    .borrow_mut()
-                    .entry(path.to_string())
-                    .or_insert(CaretState { caret: usize::MAX, anchor: None, marked: None });
-                return;
-            }
+        let Some((text, caret)) = self.caret_under(path, x) else {
+            self.carets
+                .borrow_mut()
+                .entry(path.to_string())
+                .or_insert(CaretState { caret: usize::MAX, anchor: None, marked: None });
+            return;
         };
+        let previous = self.carets.borrow().get(path).copied().unwrap_or_default();
+        let state = match clicks {
+            // the third click takes the line — and a one-line field IS
+            // the line
+            3.. => CaretState { caret: text.len(), anchor: Some(0), marked: None },
+            2 => {
+                let (start, end) = word_around(&text, caret);
+                CaretState { caret: end, anchor: Some(start), marked: None }
+            }
+            // shift extends from where the selection already stood (or
+            // from the caret, when there was no selection to extend)
+            _ if shift && held => CaretState {
+                caret,
+                anchor: Some(previous.anchor.unwrap_or(previous.caret)),
+                marked: None,
+            },
+            // the plain press collapses and arms: anchor == caret is no
+            // selection at all, and the next move gives it width
+            _ => CaretState { caret, anchor: Some(caret), marked: None },
+        };
+        self.carets.borrow_mut().insert(path.to_string(), state);
+        self.reveal_caret(path);
+    }
+
+    /// A move with the button down: the caret walks to the pointer and
+    /// the anchor stays put. `true` = the selection moved and the frame
+    /// must repaint.
+    fn sweep_to(&self, path: &str, x: Px) -> bool {
+        let Some((_, caret)) = self.caret_under(path, x) else { return false };
+        let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
+        if state.caret == caret {
+            return false;
+        }
+        // a sweep that begins before the first layout has no anchor to
+        // sweep from — it drops one where it started
+        state.anchor = Some(state.anchor.unwrap_or(state.caret));
+        state.caret = caret;
+        self.carets.borrow_mut().insert(path.to_string(), state);
+        self.caret_visible.set(true);
+        self.reveal_caret(path);
+        true
+    }
+
+    /// The field's text and the byte the pointer's X names in it —
+    /// `None` when the path holds no editor.
+    fn caret_under(&self, path: &str, x: Px) -> Option<(String, usize)> {
+        let mut probe = CaretState::default();
+        let text = reconciler::run_editor(path, EditCommand::Read, &mut probe)??;
         let placement = self
             .last_fields
             .borrow()
@@ -1490,12 +1583,11 @@ impl Runtime {
             Some(field) => {
                 caret_from_x(&text, x - field.text_origin.x, &field.font, &*self.text, &self.cache)
             }
+            // before the first layout there is no run to measure
+            // against: the caret goes to the end, as it always did
             None => text.len(),
         };
-        self.carets
-            .borrow_mut()
-            .insert(path.to_string(), CaretState { caret, anchor: None, marked: None });
-        self.reveal_caret(path);
+        Some((text, caret))
     }
 
     /// The run follows the caret: the field scrolls its own text so the

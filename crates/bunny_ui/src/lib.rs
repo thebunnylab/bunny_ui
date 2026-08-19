@@ -2511,9 +2511,9 @@ mod tests {
 
         // a real double click is TWO press/release pairs, and the
         // platform's count climbs across them
-        runtime.pointer_clicked(x, y, 1);
+        runtime.pointer_clicked(x, y, 1, false);
         runtime.pointer_released(x, y);
-        runtime.pointer_clicked(x, y, 2);
+        runtime.pointer_clicked(x, y, 2, false);
         runtime.pointer_released(x, y);
         assert_eq!(*row.seen.borrow(), vec![1, 2]);
     }
@@ -2551,7 +2551,7 @@ mod tests {
         let double_click = |rect: crate::layout::Rect| {
             let (x, y) = (rect.origin.x + 2.0, rect.origin.y + 2.0);
             for clicks in [1, 2] {
-                runtime.pointer_clicked(x, y, clicks);
+                runtime.pointer_clicked(x, y, clicks, false);
                 runtime.pointer_released(x, y);
             }
         };
@@ -2566,7 +2566,7 @@ mod tests {
         let rect = targets[1];
         let (x, y) = (rect.origin.x + 2.0, rect.origin.y + 2.0);
         for clicks in [1, 2, 3] {
-            runtime.pointer_clicked(x, y, clicks);
+            runtime.pointer_clicked(x, y, clicks, false);
             runtime.pointer_released(x, y);
         }
         assert_eq!(row.doubled.get(), 2, "one more double inside the triple, not two");
@@ -2602,7 +2602,7 @@ mod tests {
         let targets: Vec<_> = result.hits.iter().map(|(_, rect)| *rect).collect();
         let click = |rect: crate::layout::Rect, clicks: u8| {
             let (x, y) = (rect.origin.x + 2.0, rect.origin.y + 2.0);
-            runtime.pointer_clicked(x, y, clicks);
+            runtime.pointer_clicked(x, y, clicks, false);
             runtime.pointer_released(x, y);
         };
 
@@ -3810,6 +3810,110 @@ mod tests {
         runtime.set_scroll_offset(&field_path, Point { x: end + 500.0, y: 0.0 });
         let clamped = runtime.layout(&form, viewport);
         assert_eq!(text_x(&clamped), home - end, "the clamp is the box's, not the caret's");
+    }
+
+    #[test]
+    fn the_mouse_sweeps_a_selection_and_the_count_picks_the_unit() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+        use crate::text_input::EditCommand;
+
+        #[derive(Clone, Copy)]
+        struct Form {
+            note: State<String>,
+        }
+
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                text_field("note", self.note.binding()).frame_width(200.0)
+            }
+        }
+
+        // eight points per cell in the test font: byte i sits at 8i
+        let form = Form { note: State::new("hello world".to_string()) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&form);
+        let viewport = Proposal::exact(Size { width: 240.0, height: 60.0 });
+        let result = runtime.layout(&form, viewport);
+        let (path, frame) = result.hits.last().expect("the field is a target").clone();
+        let run_x = frame.origin.x + 8.0;
+        let y = frame.origin.y + frame.size.height / 2.0;
+        let at = |byte: usize| run_x + 8.0 * byte as f64;
+        let selected = || {
+            let snapshot = runtime.ime_snapshot().expect("a focused field answers the platform");
+            snapshot.selected
+        };
+
+        // the press focuses and puts the caret under the pointer — a
+        // field acts on the DOWN, and there is nothing selected yet
+        assert!(runtime.pointer_clicked(at(2), y, 1, false));
+        assert_eq!(runtime.focused(), Some(path.clone()));
+        assert_eq!(selected(), (2, 0), "the anchor is armed, the selection empty");
+
+        // the hand sweeps: the anchor holds and the caret walks
+        assert!(runtime.pointer_moved(at(9), y));
+        assert_eq!(selected(), (2, 7));
+        // backwards past the anchor still reads as one range
+        assert!(runtime.pointer_moved(at(0), y));
+        assert_eq!(selected(), (0, 2));
+        assert!(runtime.pointer_moved(at(9), y));
+
+        // the release changes nothing — and it still names the field
+        assert_eq!(runtime.pointer_released(at(9), y), Some(path.clone()));
+        assert_eq!(selected(), (2, 7), "what the sweep took, it keeps");
+        assert_eq!(runtime.focused(), Some(path.clone()), "and the keyboard stayed");
+
+        // the selection is PAINTED, not just held
+        let painted = runtime.layout(&form, viewport);
+        assert!(painted.display.iter().any(|command| matches!(
+            command,
+            DrawCommand::FillRect { rect, color, .. }
+                if *color == Color::SELECTION && rect.size.width == 56.0
+        )));
+
+        // a move with the button up sweeps nothing
+        assert_eq!(selected(), (2, 7));
+        runtime.pointer_moved(at(1), y);
+        assert_eq!(selected(), (2, 7), "the sweep ended with the button");
+
+        // two clicks take the word under the pointer, three take the line
+        runtime.pointer_clicked(at(8), y, 2, false);
+        runtime.pointer_released(at(8), y);
+        assert_eq!(selected(), (6, 5), "the word `world`");
+        runtime.pointer_clicked(at(8), y, 3, false);
+        runtime.pointer_released(at(8), y);
+        assert_eq!(selected(), (0, 11), "and a one-line field IS the line");
+
+        // shift+click extends from where the selection stood instead of
+        // dropping a fresh caret
+        runtime.pointer_clicked(at(2), y, 1, false);
+        runtime.pointer_released(at(2), y);
+        runtime.pointer_clicked(at(5), y, 1, true);
+        runtime.pointer_released(at(5), y);
+        assert_eq!(selected(), (2, 3), "shift kept the anchor at 2");
+
+        // typing replaces what the mouse took — the two halves are one
+        // caret, not two
+        assert!(runtime.key(EditCommand::Insert("HEY".into())).applied);
+        assert!(runtime.render_stable(&form).contains("heHEY world"));
+
+        // and a sweep that leaves the box rolls the run under it
+        assert!(runtime.key(EditCommand::SelectAll).applied);
+        const LONG: &str = "a string far longer than the box can hold";
+        assert!(runtime.key(EditCommand::Insert(LONG.into())).applied);
+        // typing at the tail left the run scrolled; Home brings it back
+        assert!(runtime.key(EditCommand::Home(false)).applied);
+        runtime.layout(&form, viewport);
+        assert_eq!(runtime.scroll_offset(&path).x, 0.0);
+        runtime.pointer_clicked(frame.origin.x + 12.0, y, 1, false);
+        assert_eq!(runtime.scroll_offset(&path).x, 0.0, "the press is inside the box");
+        let out = frame.origin.x + frame.size.width + 400.0;
+        assert!(runtime.pointer_moved(out, y));
+        assert!(
+            runtime.scroll_offset(&path).x > 0.0,
+            "the run followed the hand out of the box",
+        );
+        assert_eq!(selected(), (0, LONG.len()), "and the sweep took everything it passed");
+        runtime.pointer_released(out, y);
     }
 
     #[test]

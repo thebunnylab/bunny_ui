@@ -243,7 +243,7 @@ pub(crate) unsafe fn sel(name: &str) -> Sel {
 /// coordinates (origin at top-left, logical points) — the AppKit flip
 /// already happened.
 pub enum AppEvent {
-    MouseDown { x: f64, y: f64, clicks: u8 },
+    MouseDown { x: f64, y: f64, clicks: u8, shift: bool },
     /// The right button (or a two-finger tap): the context-menu press.
     RightMouseDown { x: f64, y: f64 },
     MouseUp { x: f64, y: f64 },
@@ -411,7 +411,10 @@ extern "C" fn bunny_mouse_down(this: Id, _sel: Sel, event: Id) {
     }
     // AppKit already counts: 2 is the word, 3 is the line
     let clicks = unsafe { msg_u64(event, sel("clickCount")).min(255) as u8 };
-    dispatch(AppEvent::MouseDown { x, y, clicks });
+    // and shift is the one modifier a press carries: it extends a
+    // field's selection instead of replacing it
+    let shift = unsafe { msg_u64(event, sel("modifierFlags")) & (1 << 17) != 0 };
+    dispatch(AppEvent::MouseDown { x, y, clicks, shift });
 }
 
 extern "C" fn bunny_mouse_up(this: Id, _sel: Sel, event: Id) {

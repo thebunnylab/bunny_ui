@@ -117,7 +117,7 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
 /// What the exports feed the shell — the web twin of the mac AppEvent.
 enum Event {
     PointerMove { x: f64, y: f64 },
-    PointerDown { x: f64, y: f64, clicks: u8 },
+    PointerDown { x: f64, y: f64, clicks: u8, shift: bool },
     PointerUp { x: f64, y: f64 },
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
     Text(String),
@@ -250,8 +250,8 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
-            Event::PointerDown { x, y, clicks } => {
-                if runtime.pointer_clicked(x, y, clicks) {
+            Event::PointerDown { x, y, clicks, shift } => {
+                if runtime.pointer_clicked(x, y, clicks, shift) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
@@ -361,8 +361,8 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
 
     let handle = Box::new(move |event: Event| {
         match event {
-            Event::PointerDown { x, y, clicks } => {
-                let _ = runtime.pointer_clicked(x, y, clicks);
+            Event::PointerDown { x, y, clicks, shift } => {
+                let _ = runtime.pointer_clicked(x, y, clicks, shift);
                 // the glue asks this next: a press on a drag source is
                 // the ONLY thing that opens the move door in this mode
                 DRAG_ARMED.with(|armed| armed.set(runtime.drag_armed()));
@@ -496,7 +496,7 @@ pub extern "C" fn bunny_context_click(x: f64, y: f64) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn bunny_pointer_down(x: f64, y: f64, time_ms: f64, button: u32) {
+pub extern "C" fn bunny_pointer_down(x: f64, y: f64, time_ms: f64, button: u32, shift: u32) {
     // the glue hands the event's own timestamp and which button it was;
     // the count is the shell's to keep, because `pointerdown` carries
     // no count of its own. Only the PRIMARY button counts, the way
@@ -512,7 +512,7 @@ pub extern "C" fn bunny_pointer_down(x: f64, y: f64, time_ms: f64, button: u32) 
     } else {
         1
     };
-    dispatch(Event::PointerDown { x, y, clicks });
+    dispatch(Event::PointerDown { x, y, clicks, shift: shift != 0 });
 }
 
 #[unsafe(no_mangle)]

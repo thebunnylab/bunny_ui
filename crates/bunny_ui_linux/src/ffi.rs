@@ -1275,7 +1275,7 @@ pub enum AppEvent {
     Wake,
     ResignKey,
     MouseMoved { x: f64, y: f64 },
-    MouseDown { x: f64, y: f64, clicks: u8 },
+    MouseDown { x: f64, y: f64, clicks: u8, shift: bool },
     MouseUp { x: f64, y: f64 },
     RightMouseDown { x: f64, y: f64 },
     MouseExited,
@@ -2235,6 +2235,18 @@ enum KeyRoad {
 }
 
 /// The xkb walk for one PRESSED key: compose first (dead keys), then
+/// Is shift held right now? The one modifier a PRESS carries — over a
+/// field it extends the selection instead of replacing it.
+fn shift_held(keyboard: &Keyboard) -> bool {
+    if keyboard.state.is_null() {
+        return false;
+    }
+    unsafe {
+        xkb_state_mod_name_is_active(keyboard.state, c"Shift".as_ptr(), XKB_STATE_MODS_EFFECTIVE)
+            == 1
+    }
+}
+
 /// the stroke with both texts. `keycode` is already evdev+8.
 fn key_road(keyboard: &mut Keyboard, keycode: u32) -> KeyRoad {
     if keyboard.state.is_null() {
@@ -2920,13 +2932,17 @@ fn drain_protocol_events() {
                     (BTN_LEFT, true) => {
                         let clicks =
                             with_client(|client| client.clicks.click(time_ms, x, y));
+                        // shift rides in with the press: over a field it
+                        // EXTENDS the selection instead of replacing it,
+                        // and the keymap is the authority on who is held
+                        let shift = with_client(|client| shift_held(&client.keyboard));
                         // the frame conversation comes first: a press on
                         // a drag region moves the window, a control
                         // answers as the window's own button
                         let take =
                             if on_main { crown_take(x, y, clicks, false) } else { CrownTake::None };
                         if matches!(take, CrownTake::None) || !crown_execute(take, x, y) {
-                            dispatch(AppEvent::MouseDown { x, y, clicks });
+                            dispatch(AppEvent::MouseDown { x, y, clicks, shift });
                         }
                         // else: the compositor took the grab — the
                         // click is spent on the frame

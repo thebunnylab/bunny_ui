@@ -944,6 +944,10 @@ pub struct Interaction {
     /// every move until the release, even outside the frame (dragging
     /// a selection out of the box and back is one gesture).
     pub element_grab: Option<String>,
+    /// The field whose selection is being swept: the press dropped the
+    /// anchor, every move until the release carries the caret away
+    /// from it, and the release changes nothing.
+    pub field_drag: Option<String>,
     /// The tooltip the runtime decided to SHOW — resolved before
     /// layout like everything here (the delay is the shell's clock,
     /// never the scene's). The placement turns it into an overlay.

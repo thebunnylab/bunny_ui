@@ -99,6 +99,49 @@ pub(crate) fn clamp_index(text: &str, index: usize) -> usize {
     clamp_to_boundary(text, index)
 }
 
+/// What a second click takes: the run of same-kind chars around a byte
+/// index. Three kinds, and the one BEHIND the index wins a tie — so a
+/// press at the end of a word takes the word, and a press at its start
+/// takes it too.
+pub(crate) fn word_around(text: &str, index: usize) -> (usize, usize) {
+    // words beat punctuation beats blanks: a double click would rather
+    // hand you `name` than the comma or the gap beside it
+    let kind = |c: char| {
+        if c.is_alphanumeric() || c == '_' {
+            2
+        } else if c.is_whitespace() {
+            0
+        } else {
+            1
+        }
+    };
+    let index = clamp_to_boundary(text, index);
+    let behind = text[..index].chars().next_back().map(kind);
+    let ahead = text[index..].chars().next().map(kind);
+    let want = match (behind, ahead) {
+        (Some(behind), Some(ahead)) => behind.max(ahead),
+        (Some(behind), None) => behind,
+        (None, Some(ahead)) => ahead,
+        // an empty field has no word under anything
+        (None, None) => return (0, 0),
+    };
+    let mut start = index;
+    for (offset, c) in text[..index].char_indices().rev() {
+        if kind(c) != want {
+            break;
+        }
+        start = offset;
+    }
+    let mut end = index;
+    for (offset, c) in text[index..].char_indices() {
+        if kind(c) != want {
+            break;
+        }
+        end = index + offset + c.len_utf8();
+    }
+    (start, end)
+}
+
 /// Boundaries exposed to the crate (the layout's ellipsis walks them).
 pub(crate) fn boundary_after(text: &str, index: usize) -> usize {
     next_boundary(text, index)
@@ -378,6 +421,25 @@ mod tests {
         apply(&mut text, &mut state, EditCommand::Left(false));
         assert_eq!(state.marked, None);
         assert!(text.contains('y'), "committed as it was: {text}");
+    }
+
+    #[test]
+    fn a_second_click_takes_the_run_around_it() {
+        let text = "let name = \"caf\u{e9} au lait\";";
+        // inside a word, at its start, and at its end: the word
+        assert_eq!(&text[word_around(text, 6).0..word_around(text, 6).1], "name");
+        assert_eq!(&text[word_around(text, 4).0..word_around(text, 4).1], "name");
+        assert_eq!(&text[word_around(text, 8).0..word_around(text, 8).1], "name");
+        // a word behind the index beats a blank ahead of it
+        let (start, end) = word_around(text, 3);
+        assert_eq!(&text[start..end], "let");
+        // between blanks, the blanks; on punctuation, the punctuation
+        assert_eq!(&text[word_around(text, 26).0..word_around(text, 26).1], "\";");
+        // and the accent comes out whole, never split down the middle
+        let (start, end) = word_around(text, 13);
+        assert_eq!(&text[start..end], "caf\u{e9}");
+        // an empty field has nothing to take
+        assert_eq!(word_around("", 0), (0, 0));
     }
 
     #[test]

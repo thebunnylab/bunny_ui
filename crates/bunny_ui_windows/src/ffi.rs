@@ -499,7 +499,7 @@ pub(crate) fn com_init() {
 /// The shell's event vocabulary — the Windows twin of the mac AppEvent.
 /// Positions are LAYOUT coordinates (top-left origin, logical points).
 pub enum AppEvent {
-    MouseDown { x: f64, y: f64, clicks: u8 },
+    MouseDown { x: f64, y: f64, clicks: u8, shift: bool },
     /// The right button: the context-menu press.
     RightMouseDown { x: f64, y: f64 },
     MouseUp { x: f64, y: f64 },
@@ -1668,7 +1668,9 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             let raw_y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
             let clicks = count_click(raw_x, raw_y);
             let (x, y) = layout_point(hwnd, lparam);
-            dispatch(AppEvent::MouseDown { x, y, clicks });
+            // MK_SHIFT: the button message carries the modifier itself
+            let shift = wparam & 0x0004 != 0;
+            dispatch(AppEvent::MouseDown { x, y, clicks, shift });
             0
         }
         WM_LBUTTONUP => {
