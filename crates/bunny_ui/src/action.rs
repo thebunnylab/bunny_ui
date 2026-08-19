@@ -14,6 +14,25 @@
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ActionId(pub &'static str);
 
+/// What the keymap makes of one stroke. A chord is why this is not an
+/// `Option`: a stroke that STARTS a sequence fires nothing and belongs
+/// to nobody else — the keyboard is held until the next one resolves
+/// it or lets it go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyMatch {
+    /// A binding answered. The caller dispatches it.
+    Action(ActionId),
+    /// The stroke opened (or continued) a sequence. Nothing fired, and
+    /// the stroke is SPENT — the field must not type it, and the app's
+    /// which-key can read [`Runtime::pending_chord`] to show what is
+    /// still on offer.
+    ///
+    /// [`Runtime::pending_chord`]: crate::runtime::Runtime::pending_chord
+    Pending,
+    /// Nothing is bound. The stroke walks on, as it always did.
+    None,
+}
+
 /// Closes the innermost open popover. Every mounted popover registers
 /// a handler for it, and the runtime pre-binds Escape inside the
 /// reserved [`OVERLAY_CONTEXT`] — apps never wire this themselves.

@@ -74,6 +74,14 @@ struct TooltipLife {
     aged: bool,
 }
 
+/// One binding that takes a sequence of strokes. `context` is `None`
+/// for the global layer — the same two shelves single strokes have.
+struct Chord {
+    strokes: Box<[KeyPattern]>,
+    action: ActionId,
+    context: Option<&'static str>,
+}
+
 pub struct Runtime {
     ctx: Context,
     /// The root of the last pass — scopes `take_dirty` so it does not
@@ -140,6 +148,18 @@ pub struct Runtime {
     /// Context-scoped bindings (`bind_in`): active only while a mounted
     /// view declares the context (`.key_context(name)`).
     scoped_keymap: RefCell<HashMap<&'static str, HashMap<KeyPattern, ActionId>>>,
+    /// The bindings that take MORE than one stroke. A flat list, walked
+    /// on a keystroke: a product carries dozens of these beside
+    /// hundreds of single strokes, and comparing a two-element prefix
+    /// costs nothing next to the frame it precedes.
+    chords: RefCell<Vec<Chord>>,
+    /// The strokes of a sequence still in the air. Empty means the
+    /// keyboard is free.
+    pending: RefCell<Vec<KeyPattern>>,
+    /// A pending prefix that has seen one slow tick. The second one
+    /// drops it — the tooltip's own idiom, and the reason `cmd-k` can
+    /// never hold the keyboard for good.
+    pending_aged: Cell<bool>,
     /// The last APPLIED `.scroll_target` per region — the follow fires
     /// only when the target changes; in between, the wheel is sovereign.
     scroll_targets: RefCell<HashMap<String, String>>,
@@ -639,6 +659,9 @@ impl Runtime {
             theme_version: Cell::new(crate::theme::version()),
             keymap: RefCell::new(HashMap::default()),
             scoped_keymap: RefCell::new(HashMap::default()),
+            chords: RefCell::new(Vec::new()),
+            pending: RefCell::new(Vec::new()),
+            pending_aged: Cell::new(false),
             scroll_targets: RefCell::new(HashMap::default()),
             element_reveals: RefCell::new(HashMap::default()),
             auto_focused: RefCell::new(std::collections::HashSet::default()),
@@ -1104,6 +1127,9 @@ impl Runtime {
     /// the selection instead of replacing it. The others change what
     /// the app does, and those travel as key patterns.
     pub fn pointer_clicked(&self, x: Px, y: Px, clicks: u8, shift: bool) -> bool {
+        // the hand left the keyboard: a sequence in the air goes with
+        // it, the way it does in every editor that has chords
+        self.cancel_chord();
         // an open menu owns the press whole: a row fires ON THE DOWN
         // (menu semantics, not button semantics) and a press outside
         // closes and consumes — AppKit's own manners
@@ -1499,6 +1525,55 @@ impl Runtime {
         self.keymap.borrow_mut().insert(pattern, action);
     }
 
+    /// Binds a SEQUENCE of strokes — `cmd-k cmd-s`, the shape a
+    /// product's keymaps carry. Press the first and nothing fires: the
+    /// keyboard is held (the match answers [`KeyMatch::Pending`]) until
+    /// the next stroke completes the chord or lets it go.
+    ///
+    /// A sequence beats a single stroke on the same first key, and it
+    /// has to: a `cmd-k` that fired on its own could never be the start
+    /// of anything. One stroke here is just a [`Runtime::bind`].
+    ///
+    /// [`KeyMatch::Pending`]: crate::action::KeyMatch::Pending
+    pub fn bind_sequence(&self, strokes: &[KeyPattern], action: ActionId) {
+        self.push_chord(strokes, action, None);
+    }
+
+    /// [`Runtime::bind_sequence`] inside a key context — the scoped twin.
+    pub fn bind_sequence_in(
+        &self,
+        context: &'static str,
+        strokes: &[KeyPattern],
+        action: ActionId,
+    ) {
+        self.push_chord(strokes, action, Some(context));
+    }
+
+    fn push_chord(&self, strokes: &[KeyPattern], action: ActionId, context: Option<&'static str>) {
+        debug_assert!(!strokes.is_empty(), "a chord is at least one stroke");
+        if strokes.is_empty() {
+            return;
+        }
+        // one stroke is the plain table's business, and putting it here
+        // would hide it from `match_key`
+        if strokes.len() == 1 {
+            match context {
+                Some(context) => self.bind_in(context, strokes[0], action),
+                None => self.bind(strokes[0], action),
+            }
+            return;
+        }
+        let mut chords = self.chords.borrow_mut();
+        // a rebind overwrites, exactly like the single-stroke table
+        if let Some(chord) =
+            chords.iter_mut().find(|c| *c.strokes == *strokes && c.context == context)
+        {
+            chord.action = action;
+            return;
+        }
+        chords.push(Chord { strokes: strokes.into(), action, context });
+    }
+
     /// Binds the pattern INSIDE a key context: the binding only answers
     /// while some mounted view declares `.key_context(context)`. Scoped
     /// bindings beat global ones on the same pattern.
@@ -1525,6 +1600,10 @@ impl Runtime {
         self.scoped_keymap
             .borrow_mut()
             .retain(|context, _| context.starts_with(crate::action::RESERVED_PREFIX));
+        self.chords.borrow_mut().retain(|chord| {
+            chord.context.is_some_and(|name| name.starts_with(crate::action::RESERVED_PREFIX))
+        });
+        self.cancel_chord();
     }
 
     /// Empties ONE context — the layer-sized twin, for a cascade that
@@ -1540,6 +1619,7 @@ impl Runtime {
             return;
         }
         self.scoped_keymap.borrow_mut().remove(context);
+        self.chords.borrow_mut().retain(|chord| chord.context != Some(context));
     }
 
     /// The binding for the pattern: ACTIVE scoped contexts first (a
@@ -1565,6 +1645,100 @@ impl Runtime {
         }
         drop(scoped);
         self.keymap.borrow().get(pattern).copied()
+    }
+
+    /// One stroke offered to the keymap, which may be MID-CHORD. This
+    /// is the door a shell uses; [`Runtime::match_key`] stays the pure
+    /// lookup of a single pattern.
+    ///
+    /// Three answers, and the middle one is why this exists: a stroke
+    /// that opens a sequence fires nothing and is SPENT — it belongs to
+    /// the chord, not to the field and not to the app.
+    ///
+    /// The prefix cannot hold the keyboard for good. Escape lets it go,
+    /// a press of the pointer lets it go, a stroke that leads nowhere
+    /// ends it, and the shell's slow clock ages it out through
+    /// [`Runtime::chord_tick`].
+    pub fn chord(&self, pattern: &KeyPattern) -> crate::action::KeyMatch {
+        use crate::action::KeyMatch;
+        let held = !self.pending.borrow().is_empty();
+        // the explicit way out, and it consumes: a chord abandoned with
+        // Escape must not also close the app's palette behind it
+        if held && *pattern == KeyPattern::key(crate::action::Key::Escape) {
+            self.cancel_chord();
+            return KeyMatch::Pending;
+        }
+        self.pending.borrow_mut().push(*pattern);
+        self.pending_aged.set(false);
+        let live = |context: &Option<&'static str>| {
+            context.is_none_or(|name| reconciler::context_active(name))
+        };
+        let answer = {
+            let chords = self.chords.borrow();
+            let pending = self.pending.borrow();
+            let exact = chords
+                .iter()
+                .find(|chord| live(&chord.context) && *chord.strokes == pending[..])
+                .map(|chord| chord.action);
+            let ahead = chords.iter().any(|chord| {
+                live(&chord.context)
+                    && chord.strokes.len() > pending.len()
+                    && chord.strokes.starts_with(&pending)
+            });
+            match (exact, ahead) {
+                (Some(action), _) => Some(KeyMatch::Action(action)),
+                // a longer chord is still reachable: hold the keyboard
+                (None, true) => None,
+                (None, false) => Some(KeyMatch::None),
+            }
+        };
+        let Some(answer) = answer else { return KeyMatch::Pending };
+        // whatever it was, the sequence is over
+        let strokes = self.pending.borrow().len();
+        self.cancel_chord();
+        match answer {
+            KeyMatch::None if strokes == 1 => {
+                // a plain stroke that started nothing: the single-stroke
+                // table answers, exactly as it always did
+                self.match_key(pattern).map_or(KeyMatch::None, KeyMatch::Action)
+            }
+            // a sequence that dead-ended spends its last stroke: the
+            // hand was mid-chord, and re-reading it as a fresh one is
+            // how an editor fires something nobody asked for
+            other => other,
+        }
+    }
+
+    /// The strokes of a sequence still in the air — what a which-key
+    /// panel draws. Empty means the keyboard is free.
+    pub fn pending_chord(&self) -> Vec<KeyPattern> {
+        self.pending.borrow().clone()
+    }
+
+    /// Drops a sequence in the air. `true` = one was held.
+    pub fn cancel_chord(&self) -> bool {
+        self.pending_aged.set(false);
+        let mut pending = self.pending.borrow_mut();
+        let held = !pending.is_empty();
+        pending.clear();
+        held
+    }
+
+    /// The slow clock, aging a pending prefix: the SECOND tick drops
+    /// it. Same shape as the tooltip's wait — a delay is this tick seen
+    /// twice, and no clock ever enters the engine.
+    ///
+    /// `true` = something changed and the frame is worth painting (a
+    /// which-key panel just went away).
+    pub fn chord_tick(&self) -> bool {
+        if self.pending.borrow().is_empty() {
+            return false;
+        }
+        if !self.pending_aged.get() {
+            self.pending_aged.set(true);
+            return false;
+        }
+        self.cancel_chord()
     }
 
     /// Fires the innermost live handler. `false` = no handler mounted —

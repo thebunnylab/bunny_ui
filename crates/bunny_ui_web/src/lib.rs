@@ -20,6 +20,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use bunny_ui::layout::{Color, Size};
+use bunny_ui::action::KeyMatch;
 use bunny_ui::prelude::*;
 use bunny_ui::raster::Surface;
 use bunny_ui::runtime::Runtime;
@@ -93,7 +94,9 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
     // arrows, before any binding — and only it: a one-line field
     // declines and the stroke walks on, so the app keeps its Enter and
     // a list keeps its arrows
-    if pattern.is_plain()
+    let mid_chord = !runtime.pending_chord().is_empty();
+    if !mid_chord
+        && pattern.is_plain()
         && let Some(command) = match pattern.key {
             Key::Enter => Some(EditCommand::Newline),
             Key::Up => Some(EditCommand::Up(pattern.shift)),
@@ -104,13 +107,18 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
     {
         return true;
     }
-    // typing with a focused field is never stolen by a binding
-    let typing = runtime.focused().is_some() && pattern.is_text_input();
-    if !typing
-        && let Some(action) = runtime.match_key(&pattern)
-        && runtime.dispatch_action(action)
-    {
-        return true;
+    // typing with a focused field is never stolen by a binding — but
+    // MID-CHORD the keyboard belongs to the keymap: the stroke that
+    // finishes `cmd-k s` is not typing
+    let typing = !mid_chord && runtime.focused().is_some() && pattern.is_text_input();
+    if !typing {
+        match runtime.chord(&pattern) {
+            KeyMatch::Action(action) if runtime.dispatch_action(action) => return true,
+            // the stroke opened (or let go of) a sequence: it is spent,
+            // and a which-key panel may have just changed
+            KeyMatch::Pending => return true,
+            _ => {}
+        }
     }
     let edit = match pattern.key {
         Key::Backspace => Some(EditCommand::Backspace),
@@ -313,7 +321,9 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 present(&runtime, &full, size, scale, &mut surface);
             }
             Event::TooltipTick => {
-                if runtime.tooltip_tick() {
+                // the same slow beat ages a sequence in the air: two
+                // ticks and `cmd-k` lets the keyboard go
+                if runtime.tooltip_tick() | runtime.chord_tick() {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
@@ -406,7 +416,9 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
                 present(&runtime, runtime.dom_frame(&root, size), scale);
             }
             Event::TooltipTick => {
-                if runtime.tooltip_tick() {
+                // the same slow beat ages a sequence in the air: two
+                // ticks and `cmd-k` lets the keyboard go
+                if runtime.tooltip_tick() | runtime.chord_tick() {
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }

@@ -1,5 +1,10 @@
 //! A complete "go to file" — the first real SCREEN of bunny_ui.
 //!
+//! The keymap carries a SEQUENCE too: `\u{2318}K \u{2318}\u{21a9}` opens in a
+//! split, the same intent the single chord has. The first stroke fires
+//! nothing and holds the keyboard; Escape, the pointer, or simply
+//! waiting lets it go.
+//!
 //! ```sh
 //! cargo run -p bunny-ui-macos --example finder_window
 //! ```
@@ -380,6 +385,15 @@ fn main() {
     runtime.bind_in("finder", KeyPattern::key(Key::PageUp), PAGE_BACK);
     runtime.bind_in("finder", KeyPattern::key(Key::Enter), OPEN);
     runtime.bind_in("finder", KeyPattern::command(Key::Enter), OPEN_SPLIT);
+    // and the same intent as a SEQUENCE, the shape a workbench keymap
+    // carries: press \u{2318}K and nothing fires — the keyboard is held
+    // until \u{2318}\u{21a9} finishes the chord. Escape lets it go, so does
+    // the pointer, and so does waiting
+    runtime.bind_sequence_in(
+        "finder",
+        &[KeyPattern::command(Key::Char('k')), KeyPattern::command(Key::Enter)],
+        OPEN_SPLIT,
+    );
     runtime.bind_in("finder", KeyPattern::key(Key::Escape), DISMISS);
 
     bunny_ui_macos::run_window_with(

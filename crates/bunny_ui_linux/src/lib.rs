@@ -17,7 +17,7 @@ mod x11;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use bunny_ui::action::{Key, KeyPattern};
+use bunny_ui::action::{Key, KeyMatch, KeyPattern};
 use bunny_ui::layout::{Axis, Size};
 use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::View;
@@ -329,7 +329,11 @@ pub fn run_window_chrome(
             let Some(pattern) = key_pattern(stroke) else {
                 return false;
             };
-            if runtime.focused().is_some() && pattern.is_text_input() {
+            // MID-CHORD the keyboard belongs to the keymap: the stroke
+            // that finishes `cmd-k s` is not typing, and it is not the
+            // focused box's either
+            let mid_chord = !runtime.pending_chord().is_empty();
+            if !mid_chord && runtime.focused().is_some() && pattern.is_text_input() {
                 return false;
             }
             // a focused escape hatch owns its strokes: an editor's
@@ -343,8 +347,32 @@ pub fn run_window_chrome(
                 blit(&runtime, &*root);
                 return true;
             }
-            let Some(action) = runtime.match_key(&pattern) else {
-                return false;
+            // a field of MANY lines owns the bare break and the bare
+            // vertical arrows, before any binding — and only it: a
+            // one-line field declines and the stroke walks on, so the
+            // app keeps its Enter and a list keeps its arrows
+            if !mid_chord
+                && pattern.is_plain()
+                && let Some(command) = match pattern.key {
+                    Key::Enter => Some(EditCommand::Newline),
+                    Key::Up => Some(EditCommand::Up(pattern.shift)),
+                    Key::Down => Some(EditCommand::Down(pattern.shift)),
+                    _ => None,
+                }
+                && runtime.key(command).applied
+            {
+                blit(&runtime, &*root);
+                return true;
+            }
+            let action = match runtime.chord(&pattern) {
+                KeyMatch::Action(action) => action,
+                // the stroke opened (or let go of) a sequence: it is
+                // spent, and a which-key panel may have just changed
+                KeyMatch::Pending => {
+                    blit(&runtime, &*root);
+                    return true;
+                }
+                KeyMatch::None => return false,
             };
             if runtime.dispatch_action(action) {
                 blit(&runtime, &*root);
@@ -470,7 +498,10 @@ pub fn run_window_chrome(
                 // wait and then shows it: the delay is this tick twice
                 let blinked = runtime.blink();
                 let explained = runtime.tooltip_tick();
-                if blinked || explained {
+                // the same slow beat ages a sequence in the air: two
+                // ticks and `cmd-k` lets the keyboard go
+                let chorded = runtime.chord_tick();
+                if blinked || explained || chorded {
                     blit(runtime, root);
                 }
             }

@@ -5104,6 +5104,104 @@ mod tests {
     }
 
     #[test]
+    fn a_sequence_holds_the_keyboard_until_the_second_stroke() {
+        use crate::action::KeyMatch;
+        use crate::layout::{Proposal, Size};
+
+        const KEYMAP: ActionId = ActionId("workbench.open_keymap");
+        const QUICK_DOC: ActionId = ActionId("editor.quick_doc");
+        const LONE_K: ActionId = ActionId("app.lone_k");
+        const SAVE: ActionId = ActionId("app.save");
+        const ZEN: ActionId = ActionId("editor.zen");
+
+        #[derive(Clone, Copy)]
+        struct App {
+            editing: State<bool>,
+        }
+
+        impl Component for App {
+            fn body(self, _ctx: &Context) -> impl View {
+                let editor = self.editing.get().then(|| text("code").key_context("editor"));
+                vstack!(text("bench"), editor)
+            }
+        }
+
+        let viewport = Proposal::exact(Size { width: 200.0, height: 100.0 });
+        let app = App { editing: State::new(false) };
+        let runtime = Runtime::new();
+        runtime.settle(&app);
+        runtime.layout(&app, viewport);
+
+        let k = KeyPattern::command(Key::Char('k'));
+        let s_key = KeyPattern::command(Key::Char('s'));
+        let i = KeyPattern::command(Key::Char('i'));
+        let x = KeyPattern::command(Key::Char('x'));
+        let escape = KeyPattern::key(Key::Escape);
+
+        runtime.bind_sequence(&[k, s_key], KEYMAP);
+        runtime.bind_sequence_in("editor", &[k, i], QUICK_DOC);
+        runtime.bind(s_key, SAVE);
+        // a single stroke that is also a PREFIX can never fire: it is
+        // the start of something, and the sequence has to win
+        runtime.bind(k, LONE_K);
+
+        // the first stroke fires nothing and is spent — the keyboard is
+        // held, and a which-key panel can read what is on offer
+        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(runtime.pending_chord(), vec![k]);
+        // the second completes it
+        assert_eq!(runtime.chord(&s_key), KeyMatch::Action(KEYMAP));
+        assert!(runtime.pending_chord().is_empty(), "and the sequence is over");
+
+        // that same second stroke on its OWN is the single binding
+        assert_eq!(runtime.chord(&s_key), KeyMatch::Action(SAVE));
+
+        // a sequence that leads nowhere ends, and SPENDS its last
+        // stroke: re-reading it fresh is how an editor fires something
+        // nobody asked for
+        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(&x), KeyMatch::None);
+        assert!(runtime.pending_chord().is_empty());
+
+        // Escape is the way out, and it CONSUMES — a chord abandoned
+        // must not also close the palette standing behind it
+        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(&escape), KeyMatch::Pending);
+        assert!(runtime.pending_chord().is_empty());
+        // with nothing in the air, Escape is the app's again
+        runtime.bind(escape, ZEN);
+        assert_eq!(runtime.chord(&escape), KeyMatch::Action(ZEN));
+
+        // the hand leaving for the pointer drops it too
+        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        runtime.pointer_pressed(10.0, 10.0);
+        assert!(runtime.pending_chord().is_empty(), "a press ends the chord");
+
+        // and the slow clock ages it out: the SECOND tick drops it, the
+        // tooltip's own idiom
+        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert!(!runtime.chord_tick(), "one tick only ages it");
+        assert_eq!(runtime.pending_chord(), vec![k]);
+        assert!(runtime.chord_tick(), "the second lets the keyboard go");
+        assert!(runtime.pending_chord().is_empty());
+        assert!(!runtime.chord_tick(), "and an empty hand ticks for free");
+
+        // a scoped sequence answers only while its context is mounted
+        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(&i), KeyMatch::None, "the editor is not up");
+        app.editing.set(true);
+        runtime.settle(&app);
+        runtime.layout(&app, viewport);
+        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(&i), KeyMatch::Action(QUICK_DOC));
+
+        // and emptying the table takes the sequences with it
+        runtime.clear_bindings();
+        assert_eq!(runtime.chord(&k), KeyMatch::None, "no prefix left to hold");
+        assert!(runtime.pending_chord().is_empty());
+    }
+
+    #[test]
     fn the_key_table_can_be_emptied_so_a_cascade_re_installs() {
         use crate::layout::{Proposal, Size};
 
