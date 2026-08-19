@@ -74,6 +74,7 @@ type EglSurface = *mut c_void;
 type EglBool = c_uint;
 
 const EGL_PLATFORM_WAYLAND: u32 = 0x31D8;
+const EGL_PLATFORM_XCB_EXT: u32 = 0x31DC;
 const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
 const EGL_OPENGL_API: u32 = 0x30A2;
 const EGL_NO_CONTEXT: EglContext = std::ptr::null_mut();
@@ -109,6 +110,11 @@ struct EglFns {
         unsafe extern "C" fn(EglDisplay, EglConfig, EglContext, *const i32) -> EglContext,
     create_window_surface:
         unsafe extern "C" fn(EglDisplay, EglConfig, *mut c_void, *const i32) -> EglSurface,
+    /// The EGL 1.5 platform road: the native window is a POINTER to
+    /// the platform's window type (for xcb, `*mut xcb_window_t`) —
+    /// the classic pass-the-xid-by-value trap dissolves here.
+    create_platform_window_surface:
+        unsafe extern "C" fn(EglDisplay, EglConfig, *mut c_void, *const isize) -> EglSurface,
     create_pbuffer_surface:
         unsafe extern "C" fn(EglDisplay, EglConfig, *const i32) -> EglSurface,
     make_current:
@@ -159,6 +165,9 @@ fn loader() -> Option<&'static Loader> {
                         choose_config: std::mem::transmute(sym("eglChooseConfig")?),
                         create_context: std::mem::transmute(sym("eglCreateContext")?),
                         create_window_surface: std::mem::transmute(sym("eglCreateWindowSurface")?),
+                        create_platform_window_surface: std::mem::transmute(sym(
+                            "eglCreatePlatformWindowSurface",
+                        )?),
                         create_pbuffer_surface: std::mem::transmute(sym(
                             "eglCreatePbufferSurface",
                         )?),
@@ -796,42 +805,38 @@ enum TargetKind {
 }
 
 impl GlStack {
-    fn create(kind: TargetKind, native_display: *mut c_void) -> Option<GlStack> {
-        let result = Self::build(kind, native_display);
+    fn create(kind: TargetKind, platform: u32, native_display: *mut c_void) -> Option<GlStack> {
+        let result = Self::build(kind, platform, native_display);
         if let Err(reason) = &result {
             eprintln!("bunny_ui gl: {reason} — presenting by cpu");
         }
         result.ok()
     }
 
-    fn build(kind: TargetKind, native_display: *mut c_void) -> Result<GlStack, String> {
+    fn build(
+        kind: TargetKind,
+        platform: u32,
+        native_display: *mut c_void,
+    ) -> Result<GlStack, String> {
         let loader = loader().ok_or("no libEGL.so.1 on this system")?;
         let egl = &loader.egl;
         unsafe {
             let display = match kind {
                 TargetKind::Offscreen => {
                     // surfaceless first (the headless door Mesa keeps
-                    // open), the default display as the fallback
+                    // open), the caller's platform as the fallback
                     let surfaceless = (egl.get_platform_display)(
                         EGL_PLATFORM_SURFACELESS_MESA,
                         std::ptr::null_mut(),
                         std::ptr::null(),
                     );
                     if surfaceless.is_null() {
-                        (egl.get_platform_display)(
-                            EGL_PLATFORM_WAYLAND,
-                            native_display,
-                            std::ptr::null(),
-                        )
+                        (egl.get_platform_display)(platform, native_display, std::ptr::null())
                     } else {
                         surfaceless
                     }
                 }
-                _ => (egl.get_platform_display)(
-                    EGL_PLATFORM_WAYLAND,
-                    native_display,
-                    std::ptr::null(),
-                ),
+                _ => (egl.get_platform_display)(platform, native_display, std::ptr::null()),
             };
             if display.is_null() {
                 return Err("no EGL display".to_string());
@@ -2384,16 +2389,18 @@ impl GlPresenter {
         }
         let egl = &self.stack.egl.egl;
         if physical != self.buffer {
-            // wayland is kind: the buffer resizes in place, no view
-            // discipline, no backbuffer dance
-            unsafe {
-                (self.stack.egl.wl_egl.window_resize)(
-                    self.native_window,
-                    physical.0 as c_int,
-                    physical.1 as c_int,
-                    0,
-                    0,
-                );
+            // wayland resizes its egl window in place; the x11 surface
+            // tracks the X window by itself — nothing to say
+            if !self.native_window.is_null() {
+                unsafe {
+                    (self.stack.egl.wl_egl.window_resize)(
+                        self.native_window,
+                        physical.0 as c_int,
+                        physical.1 as c_int,
+                        0,
+                        0,
+                    );
+                }
             }
             self.buffer = physical;
         }
@@ -2444,38 +2451,66 @@ impl GlPresenter {
 }
 
 /// Builds the whole stack for one window: display, context, pipelines
-/// and the EGL surface over the wayland surface. `None` falls back to
-/// the CPU raster.
+/// and the EGL surface over the door's native window — the wayland
+/// surface through `wl_egl_window`, the x11 window through the EGL 1.5
+/// platform road. `None` falls back to the CPU raster.
 fn install() -> Option<GlPresenter> {
-    let (wl_display, wl_surface, scene) = crate::ffi::gpu_targets()?;
+    use crate::ffi::GpuTargets;
+    let targets = crate::ffi::gpu_targets()?;
+    let (platform, native_display, scene) = match &targets {
+        GpuTargets::Wayland { display, scene, .. } => (EGL_PLATFORM_WAYLAND, *display, *scene),
+        GpuTargets::X11 { connection, scene, .. } => (EGL_PLATFORM_XCB_EXT, *connection, *scene),
+    };
     let kind = if scene { TargetKind::SceneWindow } else { TargetKind::Window };
-    let mut stack = GlStack::create(kind, wl_display)?;
+    let mut stack = GlStack::create(kind, platform, native_display)?;
     let (width, height) = crate::ffi::gpu_buffer_size();
     let loader = stack.egl;
     unsafe {
-        let native_window = (loader.wl_egl.window_create)(
-            wl_surface,
-            width.max(1) as c_int,
-            height.max(1) as c_int,
-        );
-        if native_window.is_null() {
-            eprintln!("bunny_ui gl: no wl_egl_window — presenting by cpu");
-            return None;
-        }
-        let egl_surface = (loader.egl.create_window_surface)(
-            stack.display,
-            stack.config,
-            native_window,
-            std::ptr::null(),
-        );
+        // the wayland arm owns a wl_egl_window it must also resize and
+        // destroy; the x11 arm wraps the xid and the surface tracks
+        // the window by itself
+        let (native_window, egl_surface) = match &targets {
+            GpuTargets::Wayland { surface, .. } => {
+                let native_window = (loader.wl_egl.window_create)(
+                    *surface,
+                    width.max(1) as c_int,
+                    height.max(1) as c_int,
+                );
+                if native_window.is_null() {
+                    eprintln!("bunny_ui gl: no wl_egl_window — presenting by cpu");
+                    return None;
+                }
+                let egl_surface = (loader.egl.create_window_surface)(
+                    stack.display,
+                    stack.config,
+                    native_window,
+                    std::ptr::null(),
+                );
+                (native_window, egl_surface)
+            }
+            GpuTargets::X11 { window, .. } => {
+                let mut xid = *window;
+                let egl_surface = (loader.egl.create_platform_window_surface)(
+                    stack.display,
+                    stack.config,
+                    (&raw mut xid).cast(),
+                    std::ptr::null(),
+                );
+                (std::ptr::null_mut(), egl_surface)
+            }
+        };
         if egl_surface == EGL_NO_SURFACE {
-            (loader.wl_egl.window_destroy)(native_window);
+            if !native_window.is_null() {
+                (loader.wl_egl.window_destroy)(native_window);
+            }
             eprintln!("bunny_ui gl: no EGL surface — presenting by cpu");
             return None;
         }
         if (loader.egl.make_current)(stack.display, egl_surface, egl_surface, stack.context) == 0 {
             (loader.egl.destroy_surface)(stack.display, egl_surface);
-            (loader.wl_egl.window_destroy)(native_window);
+            if !native_window.is_null() {
+                (loader.wl_egl.window_destroy)(native_window);
+            }
             eprintln!("bunny_ui gl: make_current refused — presenting by cpu");
             return None;
         }
@@ -2485,7 +2520,9 @@ fn install() -> Option<GlPresenter> {
         if let Err(reason) = stack.finish_pipelines() {
             eprintln!("bunny_ui gl: {reason} — presenting by cpu");
             (loader.egl.destroy_surface)(stack.display, egl_surface);
-            (loader.wl_egl.window_destroy)(native_window);
+            if !native_window.is_null() {
+                (loader.wl_egl.window_destroy)(native_window);
+            }
             return None;
         }
         // the compositor must never resize the window past what the
@@ -2634,7 +2671,8 @@ impl OffscreenGl {
         if width == 0 || height == 0 {
             return None;
         }
-        let stack = GlStack::create(TargetKind::Offscreen, std::ptr::null_mut())?;
+        let stack =
+            GlStack::create(TargetKind::Offscreen, EGL_PLATFORM_WAYLAND, std::ptr::null_mut())?;
         let gl = &stack.gl;
         let (framebuffer, target) = unsafe {
             let target = make_texture(gl, width as u32, height as u32, None);
@@ -2901,7 +2939,8 @@ mod tests {
         if !device_present() {
             return;
         }
-        let stack = GlStack::create(TargetKind::Offscreen, std::ptr::null_mut());
+        let stack =
+            GlStack::create(TargetKind::Offscreen, EGL_PLATFORM_WAYLAND, std::ptr::null_mut());
         assert!(stack.is_some(), "the runtime shader compile must succeed");
     }
 

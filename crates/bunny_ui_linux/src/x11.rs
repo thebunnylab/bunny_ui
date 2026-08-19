@@ -2177,6 +2177,42 @@ fn refresh_wm_state(client: &mut XClient) {
     }
 }
 
+// MARK: - The gpu graft (the x11 side of gl.rs)
+
+/// What the EGL surface wraps on this door: the xcb connection and
+/// the window xid (Mesa's xcb platform speaks both natively).
+pub(crate) fn gpu_targets() -> Option<crate::ffi::GpuTargets> {
+    with_x(|client| {
+        client.win.as_ref().map(|win| crate::ffi::GpuTargets::X11 {
+            connection: client.connection.cast(),
+            window: win.id,
+            scene: win.scene,
+        })
+    })
+}
+
+pub(crate) fn gpu_buffer_size() -> (usize, usize) {
+    with_x(|client| {
+        client.win.as_ref().map_or((1, 1), |win| {
+            let scale = win.scale.max(1) as f64;
+            (
+                (win.logical.0 * scale).round().max(1.0) as usize,
+                (win.logical.1 * scale).round().max(1.0) as usize,
+            )
+        })
+    })
+}
+
+/// The only present gate this door needs: a living window. No map
+/// dance, no callback — the swap presents whenever it likes.
+pub(crate) fn gpu_can_present() -> bool {
+    with_x(|client| client.win.is_some())
+}
+
+pub(crate) fn gpu_note_present() {
+    with_x(|client| client.presents += 1);
+}
+
 // MARK: - The frame clock (no callbacks on this door — the deadline
 // heap paces at the refresh interval while unpaused)
 

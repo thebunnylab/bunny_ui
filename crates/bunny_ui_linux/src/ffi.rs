@@ -3048,26 +3048,33 @@ pub fn set_frame_driver_paused(paused: bool) {
 /// that does not compile) changes nothing — the shm road, byte for
 /// byte.
 pub fn install_gpu(_window: &WindowHandle) {
-    if is_x11() {
-        // the gpu crosses this door in Q5/Q6 — CPU presents until then
-        return;
-    }
     let _ = crate::gl::try_install();
 }
 
-/// What the EGL surface wraps: the connection, the main surface and
-/// whether the scene draws its own corners.
-pub(crate) fn gpu_targets() -> Option<(*mut c_void, *mut c_void, bool)> {
+/// What the GPU surface wraps — one variant per door.
+pub(crate) enum GpuTargets {
+    Wayland { display: *mut c_void, surface: *mut c_void, scene: bool },
+    X11 { connection: *mut c_void, window: u32, scene: bool },
+}
+
+pub(crate) fn gpu_targets() -> Option<GpuTargets> {
+    if is_x11() {
+        return crate::x11::gpu_targets();
+    }
     with_client(|client| {
-        client
-            .win
-            .as_ref()
-            .map(|win| (client.display as *mut c_void, win.surface as *mut c_void, win.scene))
+        client.win.as_ref().map(|win| GpuTargets::Wayland {
+            display: client.display as *mut c_void,
+            surface: win.surface as *mut c_void,
+            scene: win.scene,
+        })
     })
 }
 
-/// The buffer size the EGL window is born with, in device pixels.
+/// The buffer size the GPU surface is born with, in device pixels.
 pub(crate) fn gpu_buffer_size() -> (usize, usize) {
+    if is_x11() {
+        return crate::x11::gpu_buffer_size();
+    }
     with_client(|client| {
         client.win.as_ref().map_or((1, 1), |win| {
             let scale = win.scale.max(1) as f64;
@@ -3085,6 +3092,11 @@ pub(crate) fn gpu_buffer_size() -> (usize, usize) {
 /// `false` = the window is not configured yet; committing is illegal
 /// and the caller keeps its frame for the next redraw.
 pub(crate) fn gpu_pre_present(scale: usize) -> bool {
+    if is_x11() {
+        // no buffer scale to declare, no frame callback to arm — the
+        // deadline clock paces; the only gate is a living window
+        return crate::x11::gpu_can_present();
+    }
     with_client(|client| {
         let Some(win) = client.win.as_mut() else { return false };
         if !win.map.can_attach() {
@@ -3115,6 +3127,9 @@ pub(crate) fn gpu_pre_present(scale: usize) -> bool {
 /// The swap went through: the surface is mapped and the ack road sees
 /// a presenting commit — the CPU present's bookkeeping, verbatim.
 pub(crate) fn gpu_note_present() {
+    if is_x11() {
+        return crate::x11::gpu_note_present();
+    }
     with_client(|client| {
         if let Some(win) = client.win.as_mut() {
             win.map.on_present();
@@ -3127,6 +3142,13 @@ pub(crate) fn gpu_note_present() {
 /// render — the texture ceiling, spoken as the toplevel's max size in
 /// logical units.
 pub(crate) fn gpu_limit_size(max_px: usize) {
+    if is_x11() {
+        // x11 has no protocol max-size request the WM must honor the
+        // way xdg does; the texture ceiling is far past any monitor —
+        // the real-box ledger notes the WM_NORMAL_HINTS polish
+        let _ = max_px;
+        return;
+    }
     with_client(|client| {
         let Some(win) = client.win.as_ref() else { return };
         let logical = (max_px / win.scale.max(1)) as i32;
