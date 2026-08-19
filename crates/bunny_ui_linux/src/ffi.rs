@@ -1061,6 +1061,8 @@ struct Window {
     paused: bool,
     last_frame: Option<Instant>,
     maximized: bool,
+    /// Scene chrome: the shell owns the resize bands at the border.
+    scene: bool,
 }
 
 struct CursorState {
@@ -1247,6 +1249,9 @@ struct Client {
     panels: Vec<Option<Panel>>,
     /// 0 = the main window; N = panel N−1 (event translation).
     pointer_focus: usize,
+    /// The resize band under the pointer (0 = none) — it outranks the
+    /// scene's cursor while it holds.
+    edge_hover: u32,
     axis: AxisAccumulator,
     /// Counts presenting commits — the configure road checks whether
     /// an ack was followed by one.
@@ -1502,6 +1507,7 @@ fn connect() {
             },
             panels: Vec::new(),
             pointer_focus: 0,
+            edge_hover: 0,
             axis: AxisAccumulator::default(),
             presents: 0,
             quit: false,
@@ -1518,7 +1524,7 @@ fn connect() {
 /// One window this phase. Creation runs the first half of the map
 /// dance and BLOCKS until the compositor's first configure — from here
 /// on, attaching is legal and the first present maps the window.
-pub fn create_window(title: &str, width: f64, height: f64, _scene_chrome: bool) -> WindowHandle {
+pub fn create_window(title: &str, width: f64, height: f64, scene_chrome: bool) -> WindowHandle {
     if CLIENT.with(|slot| slot.borrow().is_none()) {
         connect();
     }
@@ -1572,6 +1578,7 @@ pub fn create_window(title: &str, width: f64, height: f64, _scene_chrome: bool) 
             paused: true,
             last_frame: None,
             maximized: false,
+            scene: scene_chrome,
         });
     });
     // the first configure arrives async; wait for it so the first
@@ -1947,8 +1954,51 @@ fn ensure_backing(client: &mut Client, width: usize, height: usize) -> bool {
         }
     }
     const XRGB8888: u32 = 1;
-    win.backing = make_backing(client.shm, width, height, XRGB8888, TAG_BUFFER);
+    const ARGB8888: u32 = 0;
+    // a scene-chrome window carries alpha: its corners round by mask
+    let format = if win.scene { ARGB8888 } else { XRGB8888 };
+    win.backing = make_backing(client.shm, width, height, format, TAG_BUFFER);
     win.backing.is_some()
+}
+
+/// The rounded corners the platforms give their windows — here the
+/// shell earns them: an anti-aliased quarter-circle mask over each
+/// corner, premultiplied because the surface carries real alpha.
+/// Runs only over the corner boxes a damage rect touched.
+fn mask_corners(map: *mut u8, width: usize, height: usize, radius: f64) {
+    let r = radius.min(width as f64 / 2.0).min(height as f64 / 2.0);
+    let span = r.ceil() as usize;
+    // center and the OUTWARD signs per corner: a pixel rounds only
+    // when it sits beyond the center toward its corner
+    let corners = [
+        (r - 0.5, r - 0.5, -1.0, -1.0, 0, 0),
+        (width as f64 - r - 0.5, r - 0.5, 1.0, -1.0, width - span, 0),
+        (r - 0.5, height as f64 - r - 0.5, -1.0, 1.0, 0, height - span),
+        (width as f64 - r - 0.5, height as f64 - r - 0.5, 1.0, 1.0, width - span, height - span),
+    ];
+    for (cx, cy, sx, sy, x0, y0) in corners {
+        for y in y0..(y0 + span).min(height) {
+            for x in x0..(x0 + span).min(width) {
+                let dx = x as f64 - cx;
+                let dy = y as f64 - cy;
+                if dx * sx <= 0.0 || dy * sy <= 0.0 {
+                    continue;
+                }
+                let coverage = (r + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+                let alpha = (coverage * 255.0).round() as u32;
+                if alpha == 255 {
+                    continue;
+                }
+                unsafe {
+                    let px = map.add((y * width + x) * 4);
+                    *px = (*px as u32 * alpha / 255) as u8;
+                    *px.add(1) = (*px.add(1) as u32 * alpha / 255) as u8;
+                    *px.add(2) = (*px.add(2) as u32 * alpha / 255) as u8;
+                    *px.add(3) = alpha as u8;
+                }
+            }
+        }
+    }
 }
 
 /// One shm pool, one buffer: the whole backing story. The main window
@@ -2082,6 +2132,9 @@ fn present_rows(width: usize, height: usize, rgba: &[u8], damage: &[(i64, i64, i
             }
         }
         backing.released = false;
+        if win.scene {
+            mask_corners(backing.map, width, height, 8.0 * win.scale as f64);
+        }
         let buffer = backing.buffer;
         unsafe {
             let surface_version = wl_proxy_get_version(win.surface);
@@ -2139,6 +2192,18 @@ pub enum Cursor {
     Pointing,
     ResizeLeftRight,
     ResizeUpDown,
+    ResizeNwSe,
+    ResizeNeSw,
+}
+
+/// The border band's cursor for an xdg resize-edge bitfield.
+fn edge_cursor(edge: u32) -> Cursor {
+    match edge {
+        5 | 10 => Cursor::ResizeNwSe,
+        6 | 9 => Cursor::ResizeNeSw,
+        1 | 2 => Cursor::ResizeUpDown,
+        _ => Cursor::ResizeLeftRight,
+    }
 }
 
 /// Theme names are inconsistent across the ecosystem; each style
@@ -2149,6 +2214,8 @@ fn cursor_names(cursor: Cursor) -> &'static [&'static CStr] {
         Cursor::Pointing => &[c"pointer", c"hand2", c"hand1", c"pointing_hand"],
         Cursor::ResizeLeftRight => &[c"ew-resize", c"sb_h_double_arrow", c"size_hor", c"col-resize"],
         Cursor::ResizeUpDown => &[c"ns-resize", c"sb_v_double_arrow", c"size_ver", c"row-resize"],
+        Cursor::ResizeNwSe => &[c"nwse-resize", c"size_fdiag", c"bd_double_arrow"],
+        Cursor::ResizeNeSw => &[c"nesw-resize", c"size_bdiag", c"fd_double_arrow"],
     }
 }
 
@@ -2168,7 +2235,13 @@ fn apply_cursor() {
         if client.cursor.theme.is_null() || client.pointer.is_null() {
             return;
         }
-        let cursor = cursor_names(client.cursor.current)
+        // a border band outranks the scene's own cursor
+        let effective = if client.edge_hover != 0 {
+            edge_cursor(client.edge_hover)
+        } else {
+            client.cursor.current
+        };
+        let cursor = cursor_names(effective)
             .iter()
             .map(|name| unsafe { wl_cursor_theme_get_cursor(client.cursor.theme, name.as_ptr()) })
             .find(|found| !found.is_null());
@@ -2525,6 +2598,26 @@ enum CrownTake {
     Menu,
     Control(ControlHit),
     ToggleMaximize,
+    Resize(u32),
+}
+
+/// The xdg resize-edge bitfield for a point near the border — a
+/// six-point band on every side of a scene-chrome window. Zero means
+/// the interior.
+fn resize_edge_of(x: f64, y: f64, width: f64, height: f64) -> u32 {
+    const BAND: f64 = 6.0;
+    let mut edge = 0;
+    if y < BAND {
+        edge |= 1; // top
+    } else if y > height - BAND {
+        edge |= 2; // bottom
+    }
+    if x < BAND {
+        edge |= 4; // left
+    } else if x > width - BAND {
+        edge |= 8; // right
+    }
+    edge
 }
 
 fn crown_take(x: f64, y: f64, clicks: u8, right: bool) -> CrownTake {
@@ -2575,6 +2668,11 @@ fn crown_execute(take: CrownTake, x: f64, y: f64) -> bool {
                 }
                 CrownTake::ToggleMaximize => {
                     request(win.toplevel, if win.maximized { 10 } else { 9 }, &mut no_args());
+                    wl_display_flush(client.display);
+                    true
+                }
+                CrownTake::Resize(edge) => {
+                    request(win.toplevel, 6, &mut [arg_o(seat), arg_u(serial), arg_u(edge)]);
                     wl_display_flush(client.display);
                     true
                 }
@@ -2913,12 +3011,28 @@ fn drain_protocol_events() {
                 apply_cursor();
                 dispatch(AppEvent::MouseMoved { x, y });
             }
-            Ev::PointerLeave => dispatch(AppEvent::MouseExited),
+            Ev::PointerLeave => {
+                with_client(|client| client.edge_hover = 0);
+                dispatch(AppEvent::MouseExited);
+            }
             Ev::PointerMotion { x, y } => {
-                let (x, y) = with_client(|client| {
+                let (band_changed, (x, y)) = with_client(|client| {
                     client.pointer_pos = (x, y);
-                    translate_pointer(client, x, y)
+                    let band = client
+                        .win
+                        .as_ref()
+                        .filter(|win| {
+                            client.pointer_focus == 0 && win.scene && !win.maximized
+                        })
+                        .map(|win| resize_edge_of(x, y, win.logical.0, win.logical.1))
+                        .unwrap_or(0);
+                    let changed = band != client.edge_hover;
+                    client.edge_hover = band;
+                    (changed, translate_pointer(client, x, y))
                 });
+                if band_changed {
+                    apply_cursor();
+                }
                 dispatch(AppEvent::MouseMoved { x, y });
             }
             Ev::PointerButton { serial, time_ms, button, pressed } => {
@@ -2941,8 +3055,23 @@ fn drain_protocol_events() {
                         // the frame conversation comes first: a press on
                         // a drag region moves the window, a control
                         // answers as the window's own button
-                        let take =
-                            if on_main { crown_take(x, y, clicks, false) } else { CrownTake::None };
+                        // the border of a scene-chrome window belongs
+                        // to the resize grab before anything else
+                        let edge = with_client(|client| {
+                            client
+                                .win
+                                .as_ref()
+                                .filter(|win| win.scene && !win.maximized)
+                                .map(|win| resize_edge_of(x, y, win.logical.0, win.logical.1))
+                                .unwrap_or(0)
+                        });
+                        let take = if on_main && edge != 0 {
+                            CrownTake::Resize(edge)
+                        } else if on_main {
+                            crown_take(x, y, clicks, false)
+                        } else {
+                            CrownTake::None
+                        };
                         if matches!(take, CrownTake::None) || !crown_execute(take, x, y) {
                             dispatch(AppEvent::MouseDown { x, y, clicks, shift });
                         }
