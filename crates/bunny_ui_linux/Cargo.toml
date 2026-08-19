@@ -33,3 +33,7 @@ path = "examples/image_window.rs"
 [[example]]
 name = "icon_window_linux"
 path = "examples/icon_window.rs"
+
+[[example]]
+name = "git_window_linux"
+path = "examples/git_window.rs"
