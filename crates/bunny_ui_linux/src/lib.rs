@@ -9,6 +9,7 @@
 #![cfg(target_os = "linux")]
 
 mod ffi;
+mod image;
 mod text;
 
 use std::cell::RefCell;
@@ -20,6 +21,7 @@ use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
+pub use image::LinuxImageEngine;
 pub use text::FreeTypeEngine;
 
 /// XKB keysym → the keymap vocabulary. Named keys come from the sym
@@ -64,9 +66,11 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
 /// Opens the window and enters the live cycle. Returns when the app
 /// quits (closing the window quits).
 pub fn run_window(title: &str, size: Size, root: impl View) {
-    // real text: the platform engine takes the place of the house
-    // default (the pictures follow at their phase)
-    let runtime = Runtime::new().text_engine(Rc::new(FreeTypeEngine::new()));
+    // real text and real images: the platform engines take the place
+    // of the house defaults
+    let runtime = Runtime::new()
+        .text_engine(Rc::new(FreeTypeEngine::new()))
+        .image_engine(Rc::new(LinuxImageEngine::new()));
     run_window_with(title, size, runtime, root)
 }
 

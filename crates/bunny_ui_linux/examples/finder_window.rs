@@ -370,9 +370,9 @@ impl Component for Finder {
 
 #[cfg(target_os = "linux")]
 fn main() {
-    // real text; the pictures join at their phase and the file icons
-    // degrade to the house placeholder until then
-    let runtime = Runtime::new().text_engine(Rc::new(bunny_ui_linux::FreeTypeEngine::new()));
+    let runtime = Runtime::new()
+        .text_engine(Rc::new(bunny_ui_linux::FreeTypeEngine::new()))
+        .image_engine(Rc::new(bunny_ui_linux::LinuxImageEngine::new()));
     // the app keymap: key → intent (the handlers live in the screen)
     runtime.bind_in("finder", KeyPattern::key(Key::Down), SELECT_NEXT);
     runtime.bind_in("finder", KeyPattern::key(Key::Up), SELECT_PREV);
