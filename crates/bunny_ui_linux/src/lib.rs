@@ -265,6 +265,27 @@ pub fn run_window_chrome(
         }
     };
 
+    // the frame conversation: a press on a `.window_drag_region()`
+    // (with no interactive target above) moves the window by the
+    // compositor's own grab; a `.window_control(…)` answers as the
+    // window's own button
+    ffi::set_chrome_gates(
+        Box::new({
+            let runtime = Rc::clone(&runtime);
+            move |x, y| runtime.window_drag_at(x, y)
+        }),
+        Box::new({
+            let runtime = Rc::clone(&runtime);
+            move |x, y| {
+                runtime.window_control_at(x, y).map(|control| match control {
+                    bunny_ui::layout::WindowControl::Close => ffi::ControlHit::Close,
+                    bunny_ui::layout::WindowControl::Minimize => ffi::ControlHit::Minimize,
+                    bunny_ui::layout::WindowControl::Maximize => ffi::ControlHit::Maximize,
+                })
+            }
+        }),
+    );
+
     // the gate: keymap BEFORE the input system — bare chars with a
     // focused field pass straight through (typing is never stolen); a
     // binding with no handler mounted does not consume; an AltGr chord

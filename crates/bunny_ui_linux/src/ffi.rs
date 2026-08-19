@@ -581,6 +581,24 @@ fn fixed_to_f64(fixed: i32) -> f64 {
 
 // MARK: - the dispatcher (decode only; interpretation happens in the loop)
 
+/// The wl_array the C side hands events — reads copy out immediately.
+#[repr(C)]
+struct WlArray {
+    size: usize,
+    alloc: usize,
+    data: *mut c_void,
+}
+
+fn array_u32s(array: *mut c_void) -> Vec<u32> {
+    if array.is_null() {
+        return Vec::new();
+    }
+    unsafe {
+        let array = &*(array as *const WlArray);
+        std::slice::from_raw_parts(array.data as *const u32, array.size / 4).to_vec()
+    }
+}
+
 /// Proxy identities for the dispatcher. Outputs carry their registry
 /// name so removal can find them: tag = OUTPUT_TAG_BASE + name.
 const TAG_REGISTRY: usize = 1;
@@ -614,7 +632,7 @@ enum Ev {
     GlobalRemove { name: u32 },
     Ping { serial: u32 },
     SurfaceConfigure { serial: u32 },
-    ToplevelConfigure { width: i32, height: i32 },
+    ToplevelConfigure { width: i32, height: i32, states: Vec<u32> },
     ToplevelClose,
     FrameDone,
     SurfaceEnter { output_ptr: usize },
@@ -695,6 +713,7 @@ unsafe extern "C" fn dispatcher(
             0 => push_ev(Ev::ToplevelConfigure {
                 width: unsafe { arg(0).i },
                 height: unsafe { arg(1).i },
+                states: array_u32s(unsafe { arg(2).a }),
             }),
             1 => push_ev(Ev::ToplevelClose),
             _ => {} // configure_bounds v4 / wm_capabilities v5 never arrive at our bind
@@ -1041,6 +1060,7 @@ struct Window {
     frame_inflight: bool,
     paused: bool,
     last_frame: Option<Instant>,
+    maximized: bool,
 }
 
 struct CursorState {
@@ -1201,6 +1221,7 @@ struct Client {
     registry: *mut Proxy,
     compositor: *mut Proxy,
     shm: *mut Proxy,
+    seat: *mut Proxy,
     pointer: *mut Proxy,
     keyboard_proxy: *mut Proxy,
     data_device: *mut Proxy,
@@ -1445,6 +1466,7 @@ fn connect() {
             registry,
             compositor,
             shm,
+            seat,
             pointer,
             keyboard_proxy,
             data_device,
@@ -1549,6 +1571,7 @@ pub fn create_window(title: &str, width: f64, height: f64, _scene_chrome: bool) 
             frame_inflight: false,
             paused: true,
             last_frame: None,
+            maximized: false,
         });
     });
     // the first configure arrives async; wait for it so the first
@@ -2323,6 +2346,107 @@ fn deliver_key(road: KeyRoad) {
     }
 }
 
+// MARK: - the crown (drag regions, window controls, the system menu)
+
+/// The window's own buttons, answered by the scene's semantic marks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ControlHit {
+    Close,
+    Minimize,
+    Maximize,
+}
+
+type DragGate = Box<dyn Fn(f64, f64) -> bool>;
+type ControlGate = Box<dyn Fn(f64, f64) -> Option<ControlHit>>;
+
+thread_local! {
+    static CHROME_GATES: RefCell<Option<(DragGate, ControlGate)>> = const { RefCell::new(None) };
+}
+
+pub fn set_chrome_gates(drag: DragGate, control: ControlGate) {
+    CHROME_GATES.with(|slot| *slot.borrow_mut() = Some((drag, control)));
+}
+
+/// What a main-window left press resolved to before the scene sees it.
+enum CrownTake {
+    None,
+    Move,
+    Menu,
+    Control(ControlHit),
+    ToggleMaximize,
+}
+
+fn crown_take(x: f64, y: f64, clicks: u8, right: bool) -> CrownTake {
+    CHROME_GATES.with(|slot| {
+        let gates = slot.borrow();
+        let Some((drag, control)) = gates.as_ref() else { return CrownTake::None };
+        if !right && let Some(hit) = control(x, y) {
+            return CrownTake::Control(hit);
+        }
+        if drag(x, y) {
+            if right {
+                return CrownTake::Menu;
+            }
+            if clicks >= 2 {
+                return CrownTake::ToggleMaximize;
+            }
+            return CrownTake::Move;
+        }
+        CrownTake::None
+    })
+}
+
+/// Executes a crown verb against the toplevel with the press serial.
+fn crown_execute(take: CrownTake, x: f64, y: f64) -> bool {
+    with_client(|client| {
+        let seat = client.seat;
+        let serial = client.serials.press;
+        let Some(win) = client.win.as_ref() else { return false };
+        if seat.is_null() {
+            return false;
+        }
+        unsafe {
+            match take {
+                CrownTake::None => false,
+                CrownTake::Move => {
+                    request(win.toplevel, 5, &mut [arg_o(seat), arg_u(serial)]);
+                    wl_display_flush(client.display);
+                    true
+                }
+                CrownTake::Menu => {
+                    request(
+                        win.toplevel,
+                        4,
+                        &mut [arg_o(seat), arg_u(serial), arg_i(x as i32), arg_i(y as i32)],
+                    );
+                    wl_display_flush(client.display);
+                    true
+                }
+                CrownTake::ToggleMaximize => {
+                    request(win.toplevel, if win.maximized { 10 } else { 9 }, &mut no_args());
+                    wl_display_flush(client.display);
+                    true
+                }
+                CrownTake::Control(hit) => {
+                    match hit {
+                        ControlHit::Close => client.quit = true,
+                        ControlHit::Minimize => request(win.toplevel, 13, &mut no_args()),
+                        ControlHit::Maximize => {
+                            request(
+                                win.toplevel,
+                                if win.maximized { 10 } else { 9 },
+                                &mut no_args(),
+                            );
+                        }
+                    }
+                    wl_display_flush(client.display);
+                    true
+                }
+            }
+        }
+    })
+}
+
 // MARK: - clipboard (the selection, both directions, never blocking)
 
 const SELF_MIME_PREFIX: &str = "pid/";
@@ -2550,10 +2674,12 @@ fn drain_protocol_events() {
             Ev::Ping { serial } => with_client(|client| unsafe {
                 request(client.wm_base, 3, &mut [arg_u(serial)]);
             }),
-            Ev::ToplevelConfigure { width, height } => with_client(|client| {
+            Ev::ToplevelConfigure { width, height, states } => with_client(|client| {
                 if let Some(win) = client.win.as_mut() {
                     // zero means "your choice": keep what we have
                     win.pending_size = (width > 0 && height > 0).then_some((width, height));
+                    const STATE_MAXIMIZED: u32 = 1;
+                    win.maximized = states.contains(&STATE_MAXIMIZED);
                 }
             }),
             Ev::SurfaceConfigure { serial } => {
@@ -2652,14 +2778,30 @@ fn drain_protocol_events() {
                 });
                 const BTN_LEFT: u32 = 0x110;
                 const BTN_RIGHT: u32 = 0x111;
+                let on_main = with_client(|client| client.pointer_focus == 0);
                 match (button, pressed) {
                     (BTN_LEFT, true) => {
                         let clicks =
                             with_client(|client| client.clicks.click(time_ms, x, y));
-                        dispatch(AppEvent::MouseDown { x, y, clicks });
+                        // the frame conversation comes first: a press on
+                        // a drag region moves the window, a control
+                        // answers as the window's own button
+                        let take =
+                            if on_main { crown_take(x, y, clicks, false) } else { CrownTake::None };
+                        if matches!(take, CrownTake::None) || !crown_execute(take, x, y) {
+                            dispatch(AppEvent::MouseDown { x, y, clicks });
+                        }
+                        // else: the compositor took the grab — the
+                        // click is spent on the frame
                     }
                     (BTN_LEFT, false) => dispatch(AppEvent::MouseUp { x, y }),
-                    (BTN_RIGHT, true) => dispatch(AppEvent::RightMouseDown { x, y }),
+                    (BTN_RIGHT, true) => {
+                        if on_main && matches!(crown_take(x, y, 1, true), CrownTake::Menu) {
+                            let _ = crown_execute(CrownTake::Menu, x, y);
+                        } else {
+                            dispatch(AppEvent::RightMouseDown { x, y });
+                        }
+                    }
                     _ => {}
                 }
             }
