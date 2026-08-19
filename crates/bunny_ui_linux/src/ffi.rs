@@ -2346,6 +2346,143 @@ fn deliver_key(road: KeyRoad) {
     }
 }
 
+// MARK: - the season's mirrors (the desktop portal over libdbus)
+
+#[link(name = "dbus-1")]
+unsafe extern "C" {
+    fn dbus_bus_get_private(kind: c_int, error: *mut DbusError) -> *mut c_void;
+    fn dbus_connection_close(connection: *mut c_void);
+    fn dbus_connection_unref(connection: *mut c_void);
+    fn dbus_error_init(error: *mut DbusError);
+    fn dbus_error_free(error: *mut DbusError);
+    fn dbus_message_new_method_call(
+        destination: *const c_char,
+        path: *const c_char,
+        interface: *const c_char,
+        method: *const c_char,
+    ) -> *mut c_void;
+    fn dbus_message_unref(message: *mut c_void);
+    fn dbus_message_iter_init_append(message: *mut c_void, iter: *mut DbusIter);
+    fn dbus_message_iter_append_basic(
+        iter: *mut DbusIter,
+        kind: c_int,
+        value: *const c_void,
+    ) -> c_int;
+    fn dbus_connection_send_with_reply_and_block(
+        connection: *mut c_void,
+        message: *mut c_void,
+        timeout_ms: c_int,
+        error: *mut DbusError,
+    ) -> *mut c_void;
+    fn dbus_message_iter_init(message: *mut c_void, iter: *mut DbusIter) -> c_int;
+    fn dbus_message_iter_recurse(iter: *mut DbusIter, sub: *mut DbusIter);
+    fn dbus_message_iter_get_arg_type(iter: *mut DbusIter) -> c_int;
+    fn dbus_message_iter_get_basic(iter: *mut DbusIter, value: *mut c_void);
+}
+
+#[repr(C)]
+struct DbusError {
+    name: *const c_char,
+    message: *const c_char,
+    dummy: [c_uint; 2],
+    padding: *mut c_void,
+}
+
+/// libdbus asks callers for 16 pointers of iterator space; the layout
+/// is opaque by contract.
+#[repr(C)]
+struct DbusIter {
+    opaque: [usize; 16],
+}
+
+const DBUS_TYPE_STRING: c_int = 115; // 's'
+const DBUS_TYPE_VARIANT: c_int = 118; // 'v'
+const DBUS_TYPE_UINT32: c_int = 117; // 'u'
+const DBUS_TYPE_BOOLEAN: c_int = 98; // 'b'
+const DBUS_BUS_SESSION: c_int = 0;
+
+/// One portal Settings.Read: connect, ask, unwrap the nested variant,
+/// close. A missing portal (this compositor runs none) answers `None`
+/// inside the timeout and the mirrors keep their defaults.
+fn portal_read(namespace: &CStr, key: &CStr) -> Option<(c_int, u64)> {
+    unsafe {
+        let mut error = DbusError {
+            name: std::ptr::null(),
+            message: std::ptr::null(),
+            dummy: [0; 2],
+            padding: std::ptr::null_mut(),
+        };
+        dbus_error_init(&mut error);
+        let connection = dbus_bus_get_private(DBUS_BUS_SESSION, &mut error);
+        if connection.is_null() {
+            dbus_error_free(&mut error);
+            return None;
+        }
+        let message = dbus_message_new_method_call(
+            c"org.freedesktop.portal.Desktop".as_ptr(),
+            c"/org/freedesktop/portal/desktop".as_ptr(),
+            c"org.freedesktop.portal.Settings".as_ptr(),
+            c"Read".as_ptr(),
+        );
+        let mut iter = DbusIter { opaque: [0; 16] };
+        dbus_message_iter_init_append(message, &mut iter);
+        let namespace_ptr = namespace.as_ptr();
+        let key_ptr = key.as_ptr();
+        dbus_message_iter_append_basic(&mut iter, DBUS_TYPE_STRING, (&raw const namespace_ptr).cast());
+        dbus_message_iter_append_basic(&mut iter, DBUS_TYPE_STRING, (&raw const key_ptr).cast());
+        let reply = dbus_connection_send_with_reply_and_block(connection, message, 250, &mut error);
+        dbus_message_unref(message);
+        let value = (!reply.is_null()).then(|| {
+            let mut top = DbusIter { opaque: [0; 16] };
+            let mut inner = DbusIter { opaque: [0; 16] };
+            let mut value = 0u64;
+            if dbus_message_iter_init(reply, &mut top) == 0 {
+                return None;
+            }
+            // Read answers Variant(Variant(actual)) — unwrap until flat
+            let mut kind = dbus_message_iter_get_arg_type(&mut top);
+            let cursor = &mut top;
+            while kind == DBUS_TYPE_VARIANT {
+                dbus_message_iter_recurse(cursor, &mut inner);
+                std::mem::swap(cursor, &mut inner);
+                kind = dbus_message_iter_get_arg_type(cursor);
+            }
+            dbus_message_iter_get_basic(cursor, (&raw mut value).cast());
+            Some((kind, value))
+        });
+        if !reply.is_null() {
+            dbus_message_unref(reply);
+        }
+        dbus_error_free(&mut error);
+        dbus_connection_close(connection);
+        dbus_connection_unref(connection);
+        value.flatten()
+    }
+}
+
+/// The standardized appearance key: 1 = dark, 2 = light, 0 = no say.
+pub fn os_prefers_dark() -> Option<bool> {
+    let (kind, value) = portal_read(c"org.freedesktop.appearance", c"color-scheme")?;
+    (kind == DBUS_TYPE_UINT32).then(|| color_scheme_wants_dark(value as u32)).flatten()
+}
+
+fn color_scheme_wants_dark(scheme: u32) -> Option<bool> {
+    match scheme {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+/// Best-effort: the gnome namespace answers where it exists; silence
+/// means animations stay on (accessibility never defaults to less).
+pub fn animations_enabled() -> bool {
+    match portal_read(c"org.gnome.desktop.interface", c"enable-animations") {
+        Some((kind, value)) if kind == DBUS_TYPE_BOOLEAN => value != 0,
+        _ => true,
+    }
+}
+
 // MARK: - the crown (drag regions, window controls, the system menu)
 
 /// The window's own buttons, answered by the scene's semantic marks.
@@ -3453,6 +3590,14 @@ mod tests {
         assert_eq!(resolve_scale(&[1, 2], &outputs), 2, "straddling takes the max");
         assert_eq!(resolve_scale(&[9], &outputs), 1, "an unknown output cannot vote");
         assert_eq!(resolve_scale(&[3], &[(3, 0)]), 1, "a zero scale clamps to one");
+    }
+
+    #[test]
+    fn the_color_scheme_reads_its_three_answers() {
+        assert_eq!(color_scheme_wants_dark(1), Some(true), "one is dark");
+        assert_eq!(color_scheme_wants_dark(2), Some(false), "two is light");
+        assert_eq!(color_scheme_wants_dark(0), None, "zero has no say");
+        assert_eq!(color_scheme_wants_dark(9), None, "the future has no say either");
     }
 
     #[test]
