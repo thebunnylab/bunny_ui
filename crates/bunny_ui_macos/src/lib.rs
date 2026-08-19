@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use bunny_ui::action::{Key, KeyPattern};
-use bunny_ui::layout::Size;
+use bunny_ui::layout::{Axis, Size};
 use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::View;
 
@@ -370,17 +370,13 @@ pub fn run_window_chrome(
         let interaction = runtime.interaction();
         // a live divider drag keeps the resizer even while the pointer
         // runs ahead of the seam; hovering the grip announces it
-        let over_grip = interaction.split_drag.is_some()
-            || interaction
-                .hovered
-                .as_deref()
-                .is_some_and(|target| target.ends_with("/#split"));
-        window.set_cursor(if over_grip {
-            ffi::Cursor::ResizeLeftRight
-        } else if interaction.hovered.is_some() {
-            ffi::Cursor::Pointing
-        } else {
-            ffi::Cursor::Arrow
+        window.set_cursor(match runtime.seam_axis() {
+            // lanes side by side: the seam travels left and right
+            Some(Axis::Horizontal) => ffi::Cursor::ResizeLeftRight,
+            // lanes stacked: it travels up and down
+            Some(Axis::Vertical) => ffi::Cursor::ResizeUpDown,
+            None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
+            None => ffi::Cursor::Arrow,
         });
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;

@@ -1483,6 +1483,7 @@ impl WindowHandle {
             Cursor::Arrow => "arrowCursor",
             Cursor::Pointing => "pointingHandCursor",
             Cursor::ResizeLeftRight => "resizeLeftRightCursor",
+            Cursor::ResizeUpDown => "resizeUpDownCursor",
         };
         unsafe {
             msg_void(msg_id(class("NSCursor"), sel(name)), sel("set"));
@@ -1490,13 +1491,15 @@ impl WindowHandle {
     }
 }
 
-/// What the pointer wears: the hand over an interactive target, the
-/// horizontal resizer over a split's grip, the arrow elsewhere.
+/// What the pointer wears: the hand over an interactive target, a
+/// resizer over a split's grip — the one that matches the way THAT
+/// seam travels — and the arrow elsewhere.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Cursor {
     Arrow,
     Pointing,
     ResizeLeftRight,
+    ResizeUpDown,
 }
 
 /// `kCGImageAlphaPremultipliedLast` — bytes R,G,B,A, alpha last.

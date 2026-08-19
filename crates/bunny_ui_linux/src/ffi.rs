@@ -2138,6 +2138,7 @@ pub enum Cursor {
     Arrow,
     Pointing,
     ResizeLeftRight,
+    ResizeUpDown,
 }
 
 /// Theme names are inconsistent across the ecosystem; each style
@@ -2147,6 +2148,7 @@ fn cursor_names(cursor: Cursor) -> &'static [&'static CStr] {
         Cursor::Arrow => &[c"default", c"left_ptr", c"arrow"],
         Cursor::Pointing => &[c"pointer", c"hand2", c"hand1", c"pointing_hand"],
         Cursor::ResizeLeftRight => &[c"ew-resize", c"sb_h_double_arrow", c"size_hor", c"col-resize"],
+        Cursor::ResizeUpDown => &[c"ns-resize", c"sb_v_double_arrow", c"size_ver", c"row-resize"],
     }
 }
 

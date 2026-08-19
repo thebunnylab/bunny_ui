@@ -393,6 +393,7 @@ const HALFTONE: i32 = 4;
 const IDC_ARROW: usize = 32512;
 const IDC_HAND: usize = 32649;
 const IDC_SIZEWE: usize = 32644;
+const IDC_SIZENS: usize = 32645;
 
 pub(crate) fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -1208,13 +1209,15 @@ fn clamp_damage(
 
 // MARK: - Cursor
 
-/// What the pointer wears: the hand over an interactive target, the
-/// horizontal resizer over a split's grip, the arrow elsewhere.
+/// What the pointer wears: the hand over an interactive target, a
+/// resizer over a split's grip — the one that matches the way THAT
+/// seam travels — and the arrow elsewhere.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Cursor {
     Arrow,
     Pointing,
     ResizeLeftRight,
+    ResizeUpDown,
 }
 
 thread_local! {
@@ -1228,6 +1231,7 @@ fn apply_cursor(cursor: Cursor) {
         Cursor::Arrow => IDC_ARROW,
         Cursor::Pointing => IDC_HAND,
         Cursor::ResizeLeftRight => IDC_SIZEWE,
+        Cursor::ResizeUpDown => IDC_SIZENS,
     };
     unsafe {
         SetCursor(LoadCursorW(0, id as *const u16));

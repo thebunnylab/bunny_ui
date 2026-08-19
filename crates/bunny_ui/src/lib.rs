@@ -2302,6 +2302,86 @@ mod tests {
     }
 
     #[test]
+    fn a_seam_names_the_axis_it_resizes() {
+        use crate::layout::{Axis, Proposal, Size};
+
+        // a workbench is seams in BOTH directions: a dock beside the
+        // editor, and a pane split downwards inside it
+        #[derive(Clone, Copy)]
+        struct Bench {
+            dock: State<f64>,
+            pane: State<f64>,
+        }
+
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                hsplit(
+                    self.dock.binding(),
+                    text("dock"),
+                    vsplit(self.pane.binding(), text("editor"), text("terminal")),
+                )
+            }
+        }
+
+        let bench = Bench { dock: State::new(200.0), pane: State::new(200.0) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&bench);
+        let result = runtime.layout(&bench, Proposal::exact(Size { width: 800.0, height: 400.0 }));
+        let grips: Vec<_> = result
+            .hits
+            .iter()
+            .filter(|(path, _)| path.ends_with("/#split"))
+            .cloned()
+            .collect();
+        assert_eq!(grips.len(), 2, "two seams: {grips:?}");
+        // the tall one divides lanes side by side; the wide one, lanes
+        // stacked — the geometry names them, not the order
+        let centre = |rect: crate::layout::Rect| {
+            (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)
+        };
+        let (side_by_side, _) = grips
+            .iter()
+            .find(|(_, rect)| rect.size.height > rect.size.width)
+            .cloned()
+            .expect("a seam between lanes side by side stands tall");
+        let (stacked, stacked_rect) = grips
+            .iter()
+            .find(|(_, rect)| rect.size.width > rect.size.height)
+            .cloned()
+            .expect("a seam between stacked lanes lies flat");
+        let _ = side_by_side;
+
+        // nothing under the pointer, nothing to dress
+        assert_eq!(runtime.seam_axis(), None);
+
+        // hovering a grip names the way THAT seam travels
+        for (path, rect) in &grips {
+            let (x, y) = centre(*rect);
+            runtime.pointer_moved(x, y);
+            let want = match rect.size.height > rect.size.width {
+                true => Axis::Horizontal,
+                false => Axis::Vertical,
+            };
+            assert_eq!(runtime.seam_axis(), Some(want), "over {path}");
+        }
+
+        // and a drag under way keeps it, even while the hand runs
+        // ahead of the seam and off every hit in the scene
+        let (x, y) = centre(stacked_rect);
+        runtime.pointer_pressed(x, y);
+        // the drag holds the SPLIT's path; the grip's suffix was the hit
+        assert_eq!(
+            runtime.interaction().split_drag.as_deref(),
+            stacked.strip_suffix("/#split"),
+        );
+        runtime.pointer_moved(x, y - 90.0);
+        assert_eq!(runtime.seam_axis(), Some(Axis::Vertical), "the drag keeps the resizer");
+        runtime.pointer_released(x, y - 90.0);
+        runtime.pointer_moved(5.0, 5.0);
+        assert_eq!(runtime.seam_axis(), None, "and the release gives it back");
+    }
+
+    #[test]
     fn a_fractional_drag_writes_a_share_and_stops_at_a_tenth() {
         use crate::layout::{Fraction, Proposal, Size};
 

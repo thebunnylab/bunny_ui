@@ -1345,6 +1345,34 @@ impl Runtime {
         }
     }
 
+    /// The seam the pointer is on, by the AXIS it resizes — `None` when
+    /// the pointer is not on one. It answers for the grip under the
+    /// hand and for a drag already under way, because a seam keeps the
+    /// pointer while the hand runs ahead of it.
+    ///
+    /// The shell dresses the pointer from this: a seam between lanes
+    /// side by side travels left and right; one between stacked lanes
+    /// travels up and down. Without the axis a workbench wears the same
+    /// arrow on every seam, and the cursor is the only thing that says
+    /// which way a seam moves before the hand pulls it.
+    pub fn seam_axis(&self) -> Option<crate::layout::Axis> {
+        let interaction = self.interaction.borrow();
+        let path = match interaction.split_drag.as_deref() {
+            Some(path) => path.to_string(),
+            None => interaction
+                .hovered
+                .as_deref()
+                .and_then(|target| target.strip_suffix("/#split"))?
+                .to_string(),
+        };
+        drop(interaction);
+        self.last_splits
+            .borrow()
+            .iter()
+            .find(|split| split.path == path)
+            .map(|split| split.axis)
+    }
+
     /// The pointer left the window: clears hover (an in-flight press
     /// already had its visual dropped by the drag's `pointer_moved`).
     pub fn pointer_exited(&self) -> bool {
