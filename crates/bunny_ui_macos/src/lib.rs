@@ -287,7 +287,22 @@ pub fn run_window_chrome(
                 // every step, so each presents on its own sublayer and
                 // the drawable keeps the hole (the ground behind the
                 // box paints; the layer composites over it).
-                let live = runtime.live_slices();
+                //
+                // WHILE THE WINDOW CHANGES SIZE they come home. A
+                // sublayer is placed by us and the window frame by the
+                // system, and the two land in different beats — a drag
+                // makes that beat visible as a mark that trails the
+                // corner it sits in. Inside the drawable there is no
+                // second beat: the presenter already commits it in the
+                // resize's own transaction, so the box moves with the
+                // window by construction. The layers come back, seeded
+                // afresh, when the hand lets go.
+                let resizing = window.in_live_resize();
+                if resizing {
+                    window.live_layer_sweep(&[]);
+                    runtime.forget_live_surfaces();
+                }
+                let live = if resizing { Vec::new() } else { runtime.live_slices() };
                 if live.is_empty() {
                     metal::present_window(
                         &display,
@@ -340,7 +355,9 @@ pub fn run_window_chrome(
                         );
                     }
                 }
-                window.live_layer_sweep(&runtime.live_paths());
+                if !resizing {
+                    window.live_layer_sweep(&runtime.live_paths());
+                }
             } else {
                 let mut slot = surface.borrow_mut();
                 let stale = match &*slot {
@@ -655,7 +672,9 @@ pub fn run_window_chrome(
                 let display = runtime.animation_frame(root, Size { width, height });
                 handler_present(runtime, display);
             } else if moved.islands {
-                if metal::active() {
+                // mid-resize the boxes are in the drawable, not on
+                // layers — a step repaints the scene like any other
+                if metal::active() && !window.in_live_resize() {
                     let scale = window.scale();
                     // the flip is into the world the boxes were PLACED
                     // in, not the one the view measures — mid-resize
@@ -680,8 +699,10 @@ pub fn run_window_chrome(
                         );
                     }
                 } else {
-                    // the CPU path has no layers — the damage diff
-                    // already confines the repaint to the box
+                    // the CPU path has no layers (the damage diff
+                    // already confines the repaint to the box), and
+                    // neither does a window mid-resize — there the box
+                    // rides the drawable, so a step is a scene frame
                     let (width, height) = window.content_size();
                     let display = runtime.animation_frame(root, Size { width, height });
                     handler_present(runtime, display);

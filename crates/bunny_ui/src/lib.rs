@@ -1724,6 +1724,15 @@ mod tests {
         let full = runtime.display_frame(&Bar, size);
         let slices = runtime.live_slices();
         assert_eq!(slices.len(), 1, "one live box, one slice");
+        // the scene DOES hold the box — carving is a choice, and a
+        // shell that declines it (a window mid-resize, where a layer of
+        // its own would land in a different beat) draws the box like
+        // anything else
+        assert!(full.iter().any(|command| matches!(
+            command,
+            crate::layout::DrawCommand::FillRect { color, .. }
+                if color.r == 1 && color.g == 2 && color.b == 3
+        )));
         let carved = full.without_slices(&slices);
         // the box's commands (its clip pair and its fill) leave; the
         // text beside it stays
@@ -1861,6 +1870,44 @@ mod tests {
         assert_eq!(retina.len(), 1, "a new scale is new pixels");
         assert_eq!(retina[0].width, 600);
         assert!(runtime.live_islands_all(2).is_empty());
+    }
+
+    /// A shell that dissolves a live box's surface (a window mid-resize
+    /// draws the box into the scene instead) has to say so, or the
+    /// ledger keeps answering for a surface that holds nothing and the
+    /// box comes back empty.
+    #[test]
+    fn a_dissolved_surface_is_seeded_again_on_the_next_present() {
+        use crate::anim::Loop;
+        use crate::custom::canvas;
+
+        #[derive(Clone, Copy)]
+        struct Mark;
+        impl Component for Mark {
+            fn body(self, _ctx: &Context) -> impl View {
+                canvas(|ctx, p| {
+                    p.fill(ctx.bounds(), crate::layout::Color::BLACK);
+                })
+                .looping(Loop::secs(1.0).fps(4.0))
+                .frame(24.0, 24.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = crate::layout::Size { width: 200.0, height: 60.0 };
+        let _ = runtime.display_frame(&Mark, size);
+        assert_eq!(runtime.live_islands_all(1).len(), 1, "the first present seeds it");
+        assert!(runtime.live_islands_all(1).is_empty(), "and the next one costs nothing");
+
+        // the shell took the surfaces away — the box was drawn into the
+        // scene while the window changed size
+        runtime.forget_live_surfaces();
+        assert_eq!(
+            runtime.live_islands_all(1).len(),
+            1,
+            "the surface is gone, so the picture is owed again",
+        );
+        assert!(runtime.live_islands_all(1).is_empty(), "and then it settles");
     }
 
     #[test]

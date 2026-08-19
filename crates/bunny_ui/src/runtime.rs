@@ -1787,6 +1787,18 @@ impl Runtime {
         self.focus.borrow().clone()
     }
 
+    /// Forgets what the live boxes left on their own surfaces — the
+    /// next present re-seeds every one of them.
+    ///
+    /// A shell calls this when the surfaces THEMSELVES went away: a
+    /// window that dissolves its layers while it changes size, a
+    /// presenter that was rebuilt. Without it the ledger would answer
+    /// "nothing changed" about a surface that no longer holds a
+    /// picture, and the box would come back empty.
+    pub fn forget_live_surfaces(&self) {
+        self.live_ledger.borrow_mut().clear();
+    }
+
     /// The viewport the last layout ran at — the world every retained
     /// frame was computed in.
     ///

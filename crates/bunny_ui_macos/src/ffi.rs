@@ -1410,6 +1410,14 @@ impl WindowHandle {
         });
     }
 
+    /// Is the window being dragged by an edge right now? While it is,
+    /// the live boxes come HOME into the drawable: a layer of their own
+    /// lands in a different beat than the window frame, and a drag is
+    /// exactly what makes that beat visible.
+    pub fn in_live_resize(&self) -> bool {
+        unsafe { msg_bool(self.view, sel("inLiveResize")) != 0 }
+    }
+
     /// Removes the layers of live boxes that left the scene.
     pub fn live_layer_sweep(&self, alive: &[String]) {
         LIVE_LAYERS.with(|layers| {
