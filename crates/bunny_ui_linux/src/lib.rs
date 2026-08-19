@@ -12,6 +12,8 @@ mod ffi;
 mod gl;
 mod image;
 mod text;
+mod vk;
+mod walk;
 mod x11;
 
 use std::cell::RefCell;
@@ -26,6 +28,7 @@ use ffi::AppEvent;
 pub use gl::OffscreenGl;
 pub use image::LinuxImageEngine;
 pub use text::FreeTypeEngine;
+pub use vk::OffscreenVk;
 
 /// XKB keysym → the keymap vocabulary. Named keys come from the sym
 /// table; the rest becomes `Char` through the base char (a clean
@@ -208,6 +211,19 @@ pub fn run_window_chrome(
                         &bitmap.to_rgba_bytes(),
                     );
                 }
+            }
+            if vk::active() {
+                // the front of the ladder: the same display list, no
+                // Surface in the path — the queue present is the frame
+                vk::present_window(
+                    &display,
+                    Size { width, height },
+                    scale,
+                    canvas,
+                    &*runtime.text(),
+                    &*runtime.images(),
+                );
+                return;
             }
             if gl::active() {
                 // GPU present: the same display list, no Surface in

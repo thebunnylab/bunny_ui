@@ -3048,6 +3048,12 @@ pub fn set_frame_driver_paused(paused: bool) {
 /// that does not compile) changes nothing — the shm road, byte for
 /// byte.
 pub fn install_gpu(_window: &WindowHandle) {
+    // the ladder, per the user's decision: vulkan first, gl when it
+    // cannot come up, cpu last (BUNNY_PRESENT=gl|cpu are the rungs'
+    // own escapes)
+    if crate::vk::try_install() {
+        return;
+    }
     let _ = crate::gl::try_install();
 }
 
@@ -3206,11 +3212,12 @@ fn drain_protocol_events() {
                 // very reveal on that cycle closing
                 if mapped {
                     let owed = with_client(|client| client.presents == before);
-                    if owed && crate::gl::active() {
-                        // an EGL surface never takes a bare commit (the
-                        // recorded old-compositor corruption) — the ack
-                        // rides a REAL present instead, and the skip
-                        // key forgets so the swap cannot decline
+                    if owed && (crate::vk::active() || crate::gl::active()) {
+                        // a GPU-owned surface never takes a bare commit
+                        // (the recorded old-compositor corruption) —
+                        // the ack rides a REAL present instead, and the
+                        // skip key forgets so the swap cannot decline
+                        crate::vk::invalidate();
                         crate::gl::invalidate();
                         dispatch(AppEvent::Redraw);
                     } else if owed {
@@ -3798,6 +3805,7 @@ const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500
 /// all — its EGL surface and `wl_egl_window` must die before the
 /// wayland surface they wrap.
 fn teardown() {
+    crate::vk::teardown();
     crate::gl::teardown();
     CLIENT.with(|slot| {
         let Some(client) = slot.borrow_mut().take() else { return };
