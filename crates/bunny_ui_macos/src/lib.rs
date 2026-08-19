@@ -317,6 +317,7 @@ pub fn run_window_chrome(
                             blit.frame.origin.y,
                             blit.frame.size.width,
                             blit.frame.size.height,
+                            height,
                             scale,
                             blit.width,
                             blit.height,
@@ -330,6 +331,7 @@ pub fn run_window_chrome(
                             frame.origin.y,
                             frame.size.width,
                             frame.size.height,
+                            height,
                         );
                     }
                 }
@@ -645,6 +647,10 @@ pub fn run_window_chrome(
             } else if moved.islands {
                 if metal::active() {
                     let scale = window.scale();
+                    // between layouts the window has not moved, so the
+                    // current content height IS the placing layout's
+                    // (a resize path always re-presents right after)
+                    let (_, height) = window.content_size();
                     for blit in runtime.live_islands(scale) {
                         window.live_layer_blit(
                             &blit.path,
@@ -652,6 +658,7 @@ pub fn run_window_chrome(
                             blit.frame.origin.y,
                             blit.frame.size.width,
                             blit.frame.size.height,
+                            height,
                             scale,
                             blit.width,
                             blit.height,

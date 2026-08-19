@@ -1295,11 +1295,13 @@ impl WindowHandle {
 
     /// Presents one live box on its own sublayer: the window behind it
     /// never redraws. `x`/`y` are the box's LAYOUT origin (top-left,
-    /// points); the pixels are straight RGBA and premultiply here (a
-    /// layer's contents composite premultiplied). The layer is keyed by
-    /// the box's identity and reused across steps; two backings
-    /// alternate so the picture on screen is never the one being
-    /// written.
+    /// points) and `view_height` is the height of the layout that
+    /// placed it — the bottom-left flip uses the SAME world the rect
+    /// was computed in, never whatever the view measures mid-resize.
+    /// The pixels are straight RGBA and premultiply here (a layer's
+    /// contents composite premultiplied). The layer is keyed by the
+    /// box's identity and reused across steps; two backings alternate
+    /// so the picture on screen is never the one being written.
     pub fn live_layer_blit(
         &self,
         key: &str,
@@ -1307,6 +1309,7 @@ impl WindowHandle {
         y: f64,
         w: f64,
         h: f64,
+        view_height: f64,
         scale: usize,
         px_width: usize,
         px_height: usize,
@@ -1326,9 +1329,6 @@ impl WindowHandle {
                     // the sublayer composites over the drawable — where
                     // the scene left the box's hole
                     msg_void_id(root, sel("addSublayer:"), layer);
-                    // no implicit fades: a step is a step, not a cross
-                    // dissolve
-                    msg_void_id(layer, sel("setActions:"), std::ptr::null_mut());
                     LiveLayer { layer, buffers: [Vec::new(), Vec::new()], flip: false }
                 });
                 // premultiply into the spare backing
@@ -1365,17 +1365,18 @@ impl WindowHandle {
                     0,
                 );
                 // AppKit's ground is bottom-left; layout's is top-left
-                let bounds = msg_rect(self.view, sel("bounds"));
-                msg_void_rect(
-                    entry.layer,
-                    sel("setFrame:"),
-                    CGRect {
-                        origin: CGPoint { x, y: bounds.size.height - y - h },
-                        size: CGSize { width: w, height: h },
-                    },
-                );
-                msg_void_f64(entry.layer, sel("setContentsScale:"), scale as f64);
-                msg_void_id(entry.layer, sel("setContents:"), image);
+                without_actions(|| {
+                    msg_void_rect(
+                        entry.layer,
+                        sel("setFrame:"),
+                        CGRect {
+                            origin: CGPoint { x, y: view_height - y - h },
+                            size: CGSize { width: w, height: h },
+                        },
+                    );
+                    msg_void_f64(entry.layer, sel("setContentsScale:"), scale as f64);
+                    msg_void_id(entry.layer, sel("setContents:"), image);
+                });
                 CGImageRelease(image);
                 CGColorSpaceRelease(space);
                 CGDataProviderRelease(provider);
@@ -1385,24 +1386,26 @@ impl WindowHandle {
 
     /// Re-places one live box's layer without touching its pixels —
     /// an ordinary frame carries a moved bar's mark along for the cost
-    /// of a frame set. A box with no layer yet is a no-op (its first
-    /// blit will place it).
-    pub fn live_layer_place(&self, key: &str, x: f64, y: f64, w: f64, h: f64) {
+    /// of a frame set. `view_height` is the placing layout's height,
+    /// like [`WindowHandle::live_layer_blit`] takes. A box with no
+    /// layer yet is a no-op (its first blit will place it).
+    pub fn live_layer_place(&self, key: &str, x: f64, y: f64, w: f64, h: f64, view_height: f64) {
         LIVE_LAYERS.with(|layers| {
             let layers = layers.borrow();
             let Some(entry) = layers.get(key) else {
                 return;
             };
             unsafe {
-                let bounds = msg_rect(self.view, sel("bounds"));
-                msg_void_rect(
-                    entry.layer,
-                    sel("setFrame:"),
-                    CGRect {
-                        origin: CGPoint { x, y: bounds.size.height - y - h },
-                        size: CGSize { width: w, height: h },
-                    },
-                );
+                without_actions(|| {
+                    msg_void_rect(
+                        entry.layer,
+                        sel("setFrame:"),
+                        CGRect {
+                            origin: CGPoint { x, y: view_height - y - h },
+                            size: CGSize { width: w, height: h },
+                        },
+                    );
+                });
             }
         });
     }
@@ -1556,6 +1559,24 @@ struct LiveLayer {
     layer: Id,
     buffers: [Vec<u8>; 2],
     flip: bool,
+}
+
+/// Mutates layers with the implicit animations OFF. Core Animation
+/// otherwise wraps every `setFrame:`/`setContents:` in a quarter-second
+/// implicit animation — a live-resized bar re-places its mark every
+/// frame and the layer would chase the position with that lag while the
+/// drawable lands instantly (the mark visibly dancing behind the
+/// window). The transaction NESTS: the changes still land with the run
+/// loop's outer transaction, which is the same one a live resize
+/// presents the drawable in — layer and window touch down together.
+unsafe fn without_actions(body: impl FnOnce()) {
+    unsafe {
+        let transaction = class("CATransaction");
+        msg_void(transaction, sel("begin"));
+        msg_void_bool(transaction, sel("setDisableActions:"), 1);
+        body();
+        msg_void(transaction, sel("commit"));
+    }
 }
 
 /// `drawRect:` — paints the dirty union from the backing through a
