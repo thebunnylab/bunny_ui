@@ -280,12 +280,23 @@ pub(crate) fn raster(
 /// evict the toolbar's icons.
 const TRACE_KEEP: usize = 128;
 
+/// One warm trace and the tick it was last asked for.
+struct Trace {
+    raster: Rc<ImageRaster>,
+    used: u64,
+}
+
 thread_local! {
-    /// Traced paths by `(key, physical width, physical height)`. The
-    /// key already folds the geometry, the paint and the ink — the
-    /// same contract the glyph rasters keep.
-    static TRACES: RefCell<HashMap<(u64, usize, usize), Rc<ImageRaster>>> =
-        RefCell::new(HashMap::default());
+    /// Traced paths by `(key, physical width, physical height)`, with
+    /// the cache's own access clock. The key already folds the
+    /// geometry, the paint and the ink — the same contract the glyph
+    /// rasters keep. Eviction drops the OLD half, never the table: a
+    /// live mark re-traces its moving currents on every step while the
+    /// arcs behind them hold one key each — a full clear used to throw
+    /// the still layers out with the churn and re-tessellate them a
+    /// moment later.
+    static TRACES: RefCell<(HashMap<(u64, usize, usize), Trace>, u64)> =
+        RefCell::new((HashMap::default(), 0));
 }
 
 /// The box a verb table needs, in its own coordinates — the CONTROL
@@ -355,16 +366,24 @@ pub(crate) fn raster_trace(
     if width == 0 || height == 0 || box_size.0 <= 0.0 || box_size.1 <= 0.0 {
         return None;
     }
-    TRACES.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(raster) = cache.get(&(key, width, height)) {
-            return Some(Rc::clone(raster));
+    TRACES.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let (cache, clock) = &mut *cell;
+        *clock += 1;
+        let now = *clock;
+        if let Some(entry) = cache.get_mut(&(key, width, height)) {
+            entry.used = now;
+            return Some(Rc::clone(&entry.raster));
         }
         if cache.len() >= TRACE_KEEP {
-            cache.clear();
+            // drop the old half: churning curves leave, still ones stay
+            let mut stamps: Vec<u64> = cache.values().map(|entry| entry.used).collect();
+            stamps.sort_unstable();
+            let cutoff = stamps[stamps.len() / 2];
+            cache.retain(|_, entry| entry.used > cutoff);
         }
         let raster = Rc::new(rasterize_trace(path, paint, ink, box_size, width, height));
-        cache.insert((key, width, height), Rc::clone(&raster));
+        cache.insert((key, width, height), Trace { raster: Rc::clone(&raster), used: now });
         Some(raster)
     })
 }

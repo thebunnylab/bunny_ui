@@ -1383,6 +1383,30 @@ impl WindowHandle {
         }
     }
 
+    /// Re-places one live box's layer without touching its pixels —
+    /// an ordinary frame carries a moved bar's mark along for the cost
+    /// of a frame set. A box with no layer yet is a no-op (its first
+    /// blit will place it).
+    pub fn live_layer_place(&self, key: &str, x: f64, y: f64, w: f64, h: f64) {
+        LIVE_LAYERS.with(|layers| {
+            let layers = layers.borrow();
+            let Some(entry) = layers.get(key) else {
+                return;
+            };
+            unsafe {
+                let bounds = msg_rect(self.view, sel("bounds"));
+                msg_void_rect(
+                    entry.layer,
+                    sel("setFrame:"),
+                    CGRect {
+                        origin: CGPoint { x, y: bounds.size.height - y - h },
+                        size: CGSize { width: w, height: h },
+                    },
+                );
+            }
+        });
+    }
+
     /// Removes the layers of live boxes that left the scene.
     pub fn live_layer_sweep(&self, alive: &[String]) {
         LIVE_LAYERS.with(|layers| {

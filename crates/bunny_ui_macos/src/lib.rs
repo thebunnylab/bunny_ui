@@ -306,8 +306,10 @@ pub fn run_window_chrome(
                         &*runtime.text(),
                         &*runtime.images(),
                     );
-                    // an ordinary frame refreshes every live layer (a
-                    // moved or re-inked box carries its surface along)
+                    // an ordinary frame repaints only the live boxes
+                    // whose picture changed (the ledger decides), and
+                    // re-places every layer so a moved bar carries its
+                    // mark along for the cost of a frame set
                     for blit in runtime.live_islands_all(scale) {
                         window.live_layer_blit(
                             &blit.path,
@@ -319,6 +321,15 @@ pub fn run_window_chrome(
                             blit.width,
                             blit.height,
                             &blit.rgba,
+                        );
+                    }
+                    for (path, frame) in runtime.live_frames() {
+                        window.live_layer_place(
+                            &path,
+                            frame.origin.x,
+                            frame.origin.y,
+                            frame.size.width,
+                            frame.size.height,
                         );
                     }
                 }

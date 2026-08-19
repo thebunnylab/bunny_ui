@@ -1771,6 +1771,39 @@ mod tests {
     }
 
     #[test]
+    fn an_ordinary_frame_never_repaints_an_unchanged_live_box() {
+        use crate::anim::Loop;
+        use crate::custom::canvas;
+
+        #[derive(Clone, Copy)]
+        struct Mark;
+        impl Component for Mark {
+            fn body(self, _ctx: &Context) -> impl View {
+                canvas(|ctx, p| {
+                    let red = (ctx.phase * 255.0).round() as u8;
+                    p.fill(ctx.bounds(), crate::layout::Color::rgba(red, 0, 0, 255));
+                })
+                .looping(Loop::secs(1.0).fps(4.0))
+                .frame(12.0, 12.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = crate::layout::Size { width: 12.0, height: 12.0 };
+        let _ = runtime.display_frame(&Mark, size);
+        // the first ordinary present seeds the surface...
+        assert_eq!(runtime.live_islands_all(1).len(), 1);
+        // ...and the next one (a wake, a poll — no step between them)
+        // rasters NOTHING: the ledger answers for the app's chatter
+        assert!(runtime.live_islands_all(1).is_empty());
+        // the placement is still re-announced for the layer to follow
+        assert_eq!(runtime.live_frames().len(), 1);
+        // a real step still repaints exactly once
+        assert!(runtime.tick(0.3).islands);
+        assert_eq!(runtime.live_islands(1).len(), 1);
+    }
+
+    #[test]
     fn reduce_motion_holds_a_looping_box_on_its_resting_frame() {
         use crate::anim::Loop;
         use crate::custom::canvas;

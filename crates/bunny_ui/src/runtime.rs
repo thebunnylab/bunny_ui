@@ -2240,7 +2240,10 @@ impl Runtime {
 
     /// Every live box, repainted at its current phase — the presenter
     /// calls it on an ordinary frame to seed (or refresh) the boxes'
-    /// own surfaces, dirty or not. The ledger updates the same way.
+    /// own surfaces. The ledger stays in charge: a box whose picture
+    /// did not change costs one paint pass and NO raster, so an app
+    /// that wakes often (a file watch, a poll) never pays the mark
+    /// again for a frame that left it alone.
     pub fn live_islands_all(&self, scale: usize) -> Vec<LiveBlit> {
         let paths: Vec<Rc<str>> = self
             .last_customs
@@ -2252,9 +2255,30 @@ impl Runtime {
         if paths.is_empty() {
             return Vec::new();
         }
-        // a full refresh repaints regardless of what the ledger holds
-        self.live_ledger.borrow_mut().clear();
         self.live_repaint(scale, &paths)
+    }
+
+    /// Where every live box sits right now — the presenter re-places
+    /// the boxes' surfaces on an ordinary frame (a moved bar carries
+    /// its mark along) without repainting a pixel.
+    pub fn live_frames(&self) -> Vec<(String, crate::layout::Rect)> {
+        self.last_customs
+            .borrow()
+            .iter()
+            .filter(|placement| placement.live.is_some())
+            .map(|placement| {
+                (
+                    placement.path.clone(),
+                    crate::layout::Rect {
+                        origin: crate::layout::Point {
+                            x: placement.frame.origin.x + placement.visible.origin.x,
+                            y: placement.frame.origin.y + placement.visible.origin.y,
+                        },
+                        size: placement.visible.size,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// The display-list ranges owned by the live boxes of the last
