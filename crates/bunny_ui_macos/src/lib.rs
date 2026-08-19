@@ -25,6 +25,17 @@ pub use image::CoreGraphicsImageEngine;
 pub use metal::OffscreenGpu;
 pub use text::CoreTextEngine;
 
+/// Points the shell's frame driver at the pace the runtime asks for:
+/// the display link for springs, one timer beat per step for loop
+/// clocks alone, and nothing at all for a still scene.
+fn sync_frame_driver(runtime: &Runtime) {
+    ffi::set_frame_driver(match runtime.frame_pace() {
+        bunny_ui::anim::FramePace::Display => ffi::DriverPace::Full,
+        bunny_ui::anim::FramePace::Slow(interval) => ffi::DriverPace::Slow(interval),
+        bunny_ui::anim::FramePace::Idle => ffi::DriverPace::Off,
+    });
+}
+
 /// AppKit keyCode → the keymap vocabulary. Named keys come from the
 /// virtual-key table; the rest becomes `Char` through the key's OWN
 /// character — what it types with no modifier applied, read from the
@@ -271,15 +282,47 @@ pub fn run_window_chrome(
             }
             if metal::active() {
                 // GPU present: the same display list, no Surface in the
-                // path — the drawable is the frame
-                metal::present_window(
-                    &display,
-                    Size { width, height },
-                    scale,
-                    canvas,
-                    &*runtime.text(),
-                    &*runtime.images(),
-                );
+                // path — the drawable is the frame. The LIVE boxes are
+                // carved out: their commands would churn the atlas on
+                // every step, so each presents on its own sublayer and
+                // the drawable keeps the hole (the ground behind the
+                // box paints; the layer composites over it).
+                let live = runtime.live_slices();
+                if live.is_empty() {
+                    metal::present_window(
+                        &display,
+                        Size { width, height },
+                        scale,
+                        canvas,
+                        &*runtime.text(),
+                        &*runtime.images(),
+                    );
+                } else {
+                    metal::present_window(
+                        &display.without_slices(&live),
+                        Size { width, height },
+                        scale,
+                        canvas,
+                        &*runtime.text(),
+                        &*runtime.images(),
+                    );
+                    // an ordinary frame refreshes every live layer (a
+                    // moved or re-inked box carries its surface along)
+                    for blit in runtime.live_islands_all(scale) {
+                        window.live_layer_blit(
+                            &blit.path,
+                            blit.frame.origin.x,
+                            blit.frame.origin.y,
+                            blit.frame.size.width,
+                            blit.frame.size.height,
+                            scale,
+                            blit.width,
+                            blit.height,
+                            &blit.rgba,
+                        );
+                    }
+                }
+                window.live_layer_sweep(&runtime.live_paths());
             } else {
                 let mut slot = surface.borrow_mut();
                 let stale = match &*slot {
@@ -361,7 +404,7 @@ pub fn run_window_chrome(
         }));
         // wake or park the frame driver — the event may have started
         // (or finished) an animation
-        ffi::set_frame_driver_paused(!runtime.wants_frame());
+        sync_frame_driver(runtime);
         }
     };
 
@@ -460,10 +503,19 @@ pub fn run_window_chrome(
         AppEvent::ResignKey => {
             // the user switched away: popovers close like the
             // platform's own (their panels never take key, so this
-            // only ever fires on the parent)
+            // only ever fires on the parent) — and the decorations
+            // freeze: they animate for eyes that are on them
+            runtime.set_loops_paused(true);
             if runtime.dismiss_all_overlays() {
                 blit(runtime, root);
+            } else {
+                sync_frame_driver(runtime);
             }
+        }
+        AppEvent::BecomeKey => {
+            // the front returns: a frozen loop resumes mid-phase
+            runtime.set_loops_paused(false);
+            sync_frame_driver(runtime);
         }
         AppEvent::MouseMoved { x, y } => {
             if runtime.pointer_moved(x, y) {
@@ -560,13 +612,39 @@ pub fn run_window_chrome(
         AppEvent::Frame { dt } => {
             // the tick path: springs advance, then layout only — zero
             // bodies on a stable tree; settle and effects belong to the
-            // real-event path
-            if runtime.tick(dt).any() {
+            // real-event path. A tick that moved ONLY loop clocks does
+            // even less: the live boxes repaint on their own layers and
+            // the scene is not touched at all.
+            let moved = runtime.tick(dt);
+            if moved.scene {
                 let (width, height) = window.content_size();
                 let display = runtime.animation_frame(root, Size { width, height });
                 handler_present(runtime, display);
+            } else if moved.islands {
+                if metal::active() {
+                    let scale = window.scale();
+                    for blit in runtime.live_islands(scale) {
+                        window.live_layer_blit(
+                            &blit.path,
+                            blit.frame.origin.x,
+                            blit.frame.origin.y,
+                            blit.frame.size.width,
+                            blit.frame.size.height,
+                            scale,
+                            blit.width,
+                            blit.height,
+                            &blit.rgba,
+                        );
+                    }
+                } else {
+                    // the CPU path has no layers — the damage diff
+                    // already confines the repaint to the box
+                    let (width, height) = window.content_size();
+                    let display = runtime.animation_frame(root, Size { width, height });
+                    handler_present(runtime, display);
+                }
             }
-            ffi::set_frame_driver_paused(!runtime.wants_frame());
+            sync_frame_driver(runtime);
         }
         AppEvent::ImeInsert { text } => {
             // the IME commit (or plain typing through the input system)

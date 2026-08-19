@@ -1700,6 +1700,47 @@ mod tests {
     }
 
     #[test]
+    fn the_scene_without_the_live_slices_keeps_everything_else() {
+        use crate::anim::Loop;
+        use crate::custom::canvas;
+
+        #[derive(Clone, Copy)]
+        struct Bar;
+        impl Component for Bar {
+            fn body(self, _ctx: &Context) -> impl View {
+                hstack!(
+                    canvas(|ctx, p| {
+                        p.fill(ctx.bounds(), crate::layout::Color::rgba(1, 2, 3, 255));
+                    })
+                    .looping(Loop::secs(1.0))
+                    .frame(10.0, 10.0),
+                    text("beside the mark")
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = crate::layout::Size { width: 120.0, height: 20.0 };
+        let full = runtime.display_frame(&Bar, size);
+        let slices = runtime.live_slices();
+        assert_eq!(slices.len(), 1, "one live box, one slice");
+        let carved = full.without_slices(&slices);
+        // the box's commands (its clip pair and its fill) leave; the
+        // text beside it stays
+        let (start, end) = slices[0];
+        assert_eq!(carved.as_slice().len(), full.as_slice().len() - (end - start));
+        assert!(carved.iter().all(|command| !matches!(
+            command,
+            crate::layout::DrawCommand::FillRect { color, .. }
+                if color.r == 1 && color.g == 2 && color.b == 3
+        )));
+        assert!(carved.iter().any(|command| matches!(
+            command,
+            crate::layout::DrawCommand::TextLine { .. }
+        )));
+    }
+
+    #[test]
     fn a_step_that_paints_the_same_picture_blits_nothing() {
         use crate::anim::Loop;
         use crate::custom::canvas;

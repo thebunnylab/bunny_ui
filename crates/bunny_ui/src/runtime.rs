@@ -2207,6 +2207,52 @@ impl Runtime {
         if dirty.is_empty() {
             return Vec::new();
         }
+        self.live_repaint(scale, &dirty)
+    }
+
+    /// Every live box, repainted at its current phase — the presenter
+    /// calls it on an ordinary frame to seed (or refresh) the boxes'
+    /// own surfaces, dirty or not. The ledger updates the same way.
+    pub fn live_islands_all(&self, scale: usize) -> Vec<LiveBlit> {
+        let paths: Vec<Rc<str>> = self
+            .last_customs
+            .borrow()
+            .iter()
+            .filter(|placement| placement.live.is_some())
+            .map(|placement| Rc::from(placement.path.as_str()))
+            .collect();
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        // a full refresh repaints regardless of what the ledger holds
+        self.live_ledger.borrow_mut().clear();
+        self.live_repaint(scale, &paths)
+    }
+
+    /// The display-list ranges owned by the live boxes of the last
+    /// layout — what a GPU presenter carves out of the scene (each box
+    /// presents on its own layer instead).
+    pub fn live_slices(&self) -> Vec<(usize, usize)> {
+        self.last_customs
+            .borrow()
+            .iter()
+            .filter(|placement| placement.live.is_some())
+            .map(|placement| placement.slice)
+            .collect()
+    }
+
+    /// The identities of the live boxes still placed — the presenter
+    /// sweeps dead layers against this list.
+    pub fn live_paths(&self) -> Vec<String> {
+        self.last_customs
+            .borrow()
+            .iter()
+            .filter(|placement| placement.live.is_some())
+            .map(|placement| placement.path.clone())
+            .collect()
+    }
+
+    fn live_repaint(&self, scale: usize, dirty: &[Rc<str>]) -> Vec<LiveBlit> {
         let customs = self.last_customs.borrow();
         let mut ledger = self.live_ledger.borrow_mut();
         // the ledger lives exactly as long as the placed live boxes
@@ -2220,7 +2266,7 @@ impl Runtime {
         for path in dirty {
             let Some(placement) = customs
                 .iter()
-                .find(|placement| placement.live.is_some() && *placement.path == *path)
+                .find(|placement| placement.live.is_some() && *placement.path == **path)
             else {
                 continue;
             };
@@ -2250,10 +2296,10 @@ impl Runtime {
                 placement.ink,
             );
             placement.element.element().paint(&ctx, &mut painter);
-            if ledger.get(&path).is_some_and(|last| last == display.as_slice()) {
+            if ledger.get(path).is_some_and(|last| last == display.as_slice()) {
                 continue;
             }
-            ledger.insert(Rc::clone(&path), display.as_slice().to_vec());
+            ledger.insert(Rc::clone(path), display.as_slice().to_vec());
             let physical = (
                 ((placement.visible.size.width.round() as usize) * scale).max(1),
                 ((placement.visible.size.height.round() as usize) * scale).max(1),

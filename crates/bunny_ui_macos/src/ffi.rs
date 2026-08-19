@@ -87,6 +87,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_void_bool(obj: Id, sel: Sel, a: i8);
     #[link_name = "objc_msgSend"]
+    fn msg_void_f64(obj: Id, sel: Sel, a: f64);
+    #[link_name = "objc_msgSend"]
     fn msg_f64(obj: Id, sel: Sel) -> f64;
     #[link_name = "objc_msgSend"]
     fn msg_bool_i64(obj: Id, sel: Sel, a: i64) -> i8;
@@ -279,6 +281,8 @@ pub enum AppEvent {
     /// The window stopped being key (the user switched apps or
     /// windows) — open popovers close, the platform's own manner.
     ResignKey,
+    /// The window is key again — a frozen decoration resumes.
+    BecomeKey,
     /// A task woke from somewhere else — a worker thread finished a
     /// step. The frame the shell already knows how to draw drains the
     /// queue on its way.
@@ -763,6 +767,17 @@ extern "C" fn bunny_window_did_resign_key(_this: Id, _sel: Sel, _note: Id) {
     dispatch(AppEvent::ResignKey);
 }
 
+extern "C" fn bunny_window_did_become_key(_this: Id, _sel: Sel, _note: Id) {
+    dispatch(AppEvent::BecomeKey);
+}
+
+extern "C" fn bunny_slow(_this: Id, _sel: Sel, _timer: Id) {
+    // the slow beat covers exactly one interval — the clocks advance by
+    // the step they were promised, with no wall clock in the path
+    let dt = SLOW.with(|slot| slot.get().1);
+    dispatch(AppEvent::Frame { dt });
+}
+
 extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, note: Id) {
     // AppKit re-lays the titlebar container on every resize and on the
     // way in and out of full screen, putting the buttons back where it
@@ -953,18 +968,75 @@ thread_local! {
     /// only while animations run. Zero-ivar classes: per-window state
     /// lives beside the run loop (the backing-store pattern).
     static LINK: Cell<Id> = const { Cell::new(std::ptr::null_mut()) };
+    /// The slow beat: `(timer, interval)`. Alive only while loop clocks
+    /// are the sole animation — one wake per step instead of a display
+    /// rate of empty ticks.
+    static SLOW: Cell<(Id, f64)> = const { Cell::new((std::ptr::null_mut(), 0.0)) };
+    /// The window delegate — the target the slow timer fires at.
+    static DELEGATE: Cell<Id> = const { Cell::new(std::ptr::null_mut()) };
 }
 
-/// Pauses or resumes the per-frame driver. Without a link (an older
-/// macOS) this is a no-op — animations then complete instantly.
-pub fn set_frame_driver_paused(paused: bool) {
+/// How fast the shell drives frames — the ffi twin of the runtime's
+/// pace, chosen after every present.
+#[derive(Clone, Copy, PartialEq)]
+pub enum DriverPace {
+    /// The display link runs — springs and flights are moving.
+    Full,
+    /// Only loop clocks live: a repeating timer beats once per step.
+    Slow(f64),
+    /// Nothing moves.
+    Off,
+}
+
+/// Points the frame driver at the pace the moment deserves. Without a
+/// display link (an older macOS) `Full` is a no-op — animations then
+/// complete instantly; the slow beat works everywhere (it is a plain
+/// timer).
+pub fn set_frame_driver(pace: DriverPace) {
+    let full = pace == DriverPace::Full;
     LINK.with(|slot| {
         let link = slot.get();
         if !link.is_null() {
-            unsafe { msg_void_bool(link, sel("setPaused:"), paused as i8) };
+            unsafe { msg_void_bool(link, sel("setPaused:"), (!full) as i8) };
+        }
+    });
+    SLOW.with(|slot| {
+        let (timer, interval) = slot.get();
+        match pace {
+            DriverPace::Slow(wanted) => {
+                if !timer.is_null() && (interval - wanted).abs() < f64::EPSILON {
+                    return;
+                }
+                if !timer.is_null() {
+                    unsafe { msg_void(timer, sel("invalidate")) };
+                }
+                let delegate = DELEGATE.with(|slot| slot.get());
+                if delegate.is_null() {
+                    return;
+                }
+                let fresh = unsafe {
+                    msg_timer(
+                        class("NSTimer"),
+                        sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+                        wanted,
+                        delegate,
+                        sel("bunnySlow:"),
+                        std::ptr::null_mut(),
+                        1,
+                    )
+                };
+                slot.set((fresh, wanted));
+            }
+            DriverPace::Full | DriverPace::Off => {
+                if !timer.is_null() {
+                    unsafe { msg_void(timer, sel("invalidate")) };
+                    slot.set((std::ptr::null_mut(), 0.0));
+                }
+            }
         }
     });
 }
+
 
 static REGISTER_CLASSES: Once = Once::new();
 
@@ -1165,8 +1237,20 @@ unsafe fn register_classes() {
         );
         class_addMethod(
             delegate,
+            sel("windowDidBecomeKey:"),
+            bunny_window_did_become_key as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            delegate,
             sel("bunnyBlink:"),
             bunny_blink as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            delegate,
+            sel("bunnySlow:"),
+            bunny_slow as *const c_void,
             types.as_ptr(),
         );
         class_addMethod(
@@ -1207,6 +1291,110 @@ impl WindowHandle {
     /// The screen's scale factor (retina = 2).
     pub fn scale(&self) -> usize {
         unsafe { msg_f64(self.window, sel("backingScaleFactor")).round().max(1.0) as usize }
+    }
+
+    /// Presents one live box on its own sublayer: the window behind it
+    /// never redraws. `x`/`y` are the box's LAYOUT origin (top-left,
+    /// points); the pixels are straight RGBA and premultiply here (a
+    /// layer's contents composite premultiplied). The layer is keyed by
+    /// the box's identity and reused across steps; two backings
+    /// alternate so the picture on screen is never the one being
+    /// written.
+    pub fn live_layer_blit(
+        &self,
+        key: &str,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        scale: usize,
+        px_width: usize,
+        px_height: usize,
+        rgba: &[u8],
+    ) {
+        unsafe {
+            let root = msg_id(self.view, sel("layer"));
+            if root.is_null() {
+                // a view without a backing layer presents by damage —
+                // the live path is the GPU presenter's
+                return;
+            }
+            LIVE_LAYERS.with(|layers| {
+                let mut layers = layers.borrow_mut();
+                let entry = layers.entry(key.to_string()).or_insert_with(|| {
+                    let layer = msg_id(class("CALayer"), sel("layer"));
+                    // the sublayer composites over the drawable — where
+                    // the scene left the box's hole
+                    msg_void_id(root, sel("addSublayer:"), layer);
+                    // no implicit fades: a step is a step, not a cross
+                    // dissolve
+                    msg_void_id(layer, sel("setActions:"), std::ptr::null_mut());
+                    LiveLayer { layer, buffers: [Vec::new(), Vec::new()], flip: false }
+                });
+                // premultiply into the spare backing
+                entry.flip = !entry.flip;
+                let backing = &mut entry.buffers[entry.flip as usize];
+                backing.clear();
+                backing.extend_from_slice(rgba);
+                for pixel in backing.chunks_exact_mut(4) {
+                    let alpha = pixel[3] as u32;
+                    if alpha < 255 {
+                        for channel in 0..3 {
+                            pixel[channel] = (pixel[channel] as u32 * alpha / 255) as u8;
+                        }
+                    }
+                }
+                let provider = CGDataProviderCreateWithData(
+                    std::ptr::null_mut(),
+                    backing.as_ptr(),
+                    backing.len(),
+                    std::ptr::null(),
+                );
+                let space = CGColorSpaceCreateDeviceRGB();
+                let image = CGImageCreate(
+                    px_width,
+                    px_height,
+                    8,
+                    32,
+                    px_width * 4,
+                    space,
+                    ALPHA_PREMULTIPLIED_LAST,
+                    provider,
+                    std::ptr::null(),
+                    false,
+                    0,
+                );
+                // AppKit's ground is bottom-left; layout's is top-left
+                let bounds = msg_rect(self.view, sel("bounds"));
+                msg_void_rect(
+                    entry.layer,
+                    sel("setFrame:"),
+                    CGRect {
+                        origin: CGPoint { x, y: bounds.size.height - y - h },
+                        size: CGSize { width: w, height: h },
+                    },
+                );
+                msg_void_f64(entry.layer, sel("setContentsScale:"), scale as f64);
+                msg_void_id(entry.layer, sel("setContents:"), image);
+                CGImageRelease(image);
+                CGColorSpaceRelease(space);
+                CGDataProviderRelease(provider);
+            });
+        }
+    }
+
+    /// Removes the layers of live boxes that left the scene.
+    pub fn live_layer_sweep(&self, alive: &[String]) {
+        LIVE_LAYERS.with(|layers| {
+            let mut layers = layers.borrow_mut();
+            layers.retain(|key, entry| {
+                if alive.iter().any(|path| path == key) {
+                    return true;
+                }
+                unsafe { msg_void(entry.layer, sel("removeFromSuperlayer")) };
+                false
+            });
+        });
     }
 
     /// Presents damaged rects only: syncs the ffi-owned backing store
@@ -1330,6 +1518,17 @@ thread_local! {
     /// One backing per VIEW — the main window and every popover panel
     /// present through the same `drawRect:`, each from its own store.
     static BACKING: RefCell<HashMap<usize, Backing>> = RefCell::new(HashMap::new());
+    /// One sublayer per LIVE box, keyed by identity — the box's own
+    /// presentation surface while its loop runs.
+    static LIVE_LAYERS: RefCell<HashMap<String, LiveLayer>> = RefCell::new(HashMap::new());
+}
+
+/// One live box's sublayer and its two alternating backings — the
+/// picture on screen is never the buffer being written.
+struct LiveLayer {
+    layer: Id,
+    buffers: [Vec<u8>; 2],
+    flip: bool,
 }
 
 /// `drawRect:` — paints the dirty union from the backing through a
@@ -1483,6 +1682,8 @@ pub fn create_window(
         // delegate: resize repaints, closing quits
         let delegate = msg_id(msg_id(class("BunnyDelegate"), sel("alloc")), sel("init"));
         msg_void_id(window, sel("setDelegate:"), delegate);
+        // the slow frame beat fires at the delegate too
+        DELEGATE.with(|slot| slot.set(delegate));
 
         // the caret blink half-period — the run loop retains the timer
         let _ = msg_timer(

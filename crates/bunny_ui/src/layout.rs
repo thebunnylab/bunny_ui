@@ -1136,6 +1136,27 @@ impl DisplayList {
             .collect();
         DisplayList { commands }
     }
+
+    /// A copy without the commands of `slices` — how a presenter leaves
+    /// a live box to the box's own surface. Each slice is a balanced
+    /// `start..end` run (the box closes the clip it opens), so the
+    /// remainder stays balanced too.
+    pub fn without_slices(&self, slices: &[(usize, usize)]) -> DisplayList {
+        let keep = |index: usize| {
+            !slices
+                .iter()
+                .any(|(start, end)| index >= *start && index < *end)
+        };
+        DisplayList {
+            commands: self
+                .commands
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| keep(*index))
+                .map(|(_, command)| command.clone())
+                .collect(),
+        }
+    }
 }
 
 /// How a split's seam and its floors are measured.
