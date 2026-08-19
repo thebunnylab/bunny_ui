@@ -1,0 +1,3 @@
+# Baked SPIR-V is bytes, never text — no newline normalization may
+# ever touch it (the drift test compares byte-for-byte).
+*.spv binary
