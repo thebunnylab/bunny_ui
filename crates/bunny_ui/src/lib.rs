@@ -1803,6 +1803,94 @@ mod tests {
         assert_eq!(runtime.live_islands(1).len(), 1);
     }
 
+    /// A live box owns a surface, and a surface holds the pixels it was
+    /// handed: place it bigger without new pixels and it STRETCHES the
+    /// old ones. The window resize is where that shows — the editor
+    /// deforms while the chrome around it stays sharp.
+    #[test]
+    fn a_live_box_that_grows_owes_its_surface_new_pixels() {
+        use crate::anim::Loop;
+        use crate::custom::canvas;
+
+        // the paint does NOT depend on the box's width: a caret is a
+        // caret whatever the window does. That is precisely the box the
+        // old ledger dropped on a resize.
+        #[derive(Clone, Copy)]
+        struct Caret;
+        impl Component for Caret {
+            fn body(self, _ctx: &Context) -> impl View {
+                canvas(|ctx, p| {
+                    let on = ctx.phase < 0.5;
+                    p.fill(
+                        crate::layout::Rect {
+                            origin: crate::layout::Point { x: 0.0, y: 0.0 },
+                            size: crate::layout::Size { width: 2.0, height: 12.0 },
+                        },
+                        crate::layout::Color::rgba(0, 0, 0, if on { 255 } else { 0 }),
+                    );
+                })
+                .looping(Loop::secs(1.0).fps(2.0))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let narrow = crate::layout::Size { width: 100.0, height: 40.0 };
+        let _ = runtime.display_frame(&Caret, narrow);
+        let seed = runtime.live_islands_all(1);
+        assert_eq!(seed.len(), 1, "the first present seeds the surface");
+        assert_eq!(seed[0].width, 100, "at the window's width");
+        // an unchanged frame still costs no raster — the whole point of
+        // the ledger, and it must survive this fix
+        assert!(runtime.live_islands_all(1).is_empty());
+
+        // the window grows. The box paints the SAME two-by-twelve bar,
+        // so the picture is byte for byte what it was — and the surface
+        // is now 300 wide with 100 points of pixels in it
+        let wide = crate::layout::Size { width: 300.0, height: 40.0 };
+        let _ = runtime.display_frame(&Caret, wide);
+        let grown = runtime.live_islands_all(1);
+        assert_eq!(grown.len(), 1, "a box that grew owes new pixels");
+        assert_eq!(grown[0].width, 300, "rasterized at the NEW size");
+        assert_eq!(grown[0].frame.size.width, 300.0, "and placed at it");
+        // and settling at the new size goes quiet again
+        assert!(runtime.live_islands_all(1).is_empty());
+
+        // the same law for the SCALE: dragging the window to a retina
+        // screen re-rasters, because those are new pixels too
+        let retina = runtime.live_islands_all(2);
+        assert_eq!(retina.len(), 1, "a new scale is new pixels");
+        assert_eq!(retina[0].width, 600);
+        assert!(runtime.live_islands_all(2).is_empty());
+    }
+
+    #[test]
+    fn the_last_viewport_is_the_world_a_live_layer_flips_into() {
+        use crate::anim::Loop;
+        use crate::custom::canvas;
+
+        #[derive(Clone, Copy)]
+        struct Mark;
+        impl Component for Mark {
+            fn body(self, _ctx: &Context) -> impl View {
+                canvas(|ctx, p| {
+                    p.fill(ctx.bounds(), crate::layout::Color::BLACK);
+                })
+                .looping(Loop::secs(1.0).fps(4.0))
+                .frame(10.0, 10.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        assert_eq!(runtime.last_viewport(), None, "nothing was laid out yet");
+        let size = crate::layout::Size { width: 220.0, height: 140.0 };
+        let _ = runtime.display_frame(&Mark, size);
+        assert_eq!(
+            runtime.last_viewport(),
+            Some(size),
+            "the shell flips a live layer into THIS height, not the view's",
+        );
+    }
+
     #[test]
     fn reduce_motion_holds_a_looping_box_on_its_resting_frame() {
         use crate::anim::Loop;

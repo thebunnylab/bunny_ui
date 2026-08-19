@@ -66,6 +66,14 @@ pub struct LiveBlit {
     pub rgba: Vec<u8>,
 }
 
+/// What one live box left on its own surface: the picture it painted
+/// and the PHYSICAL size those pixels were rasterized at. A step is
+/// dropped only when both still hold — same picture, same size.
+struct LiveCell {
+    display: Vec<crate::layout::DrawCommand>,
+    physical: (usize, usize),
+}
+
 /// The wait between a hover and its bubble — armed by the pointer,
 /// aged by one shell tick, shown on the next. No clock in sight.
 #[derive(Default)]
@@ -135,9 +143,16 @@ pub struct Runtime {
     /// element and its local coordinates through here.
     last_customs: RefCell<Vec<crate::layout::CustomPlacement>>,
     /// What each live box painted on its last step, in LOCAL
-    /// coordinates — a step that paints the same picture blits
+    /// coordinates, and the PHYSICAL size it was rasterized at — a
+    /// step that paints the same picture at the same size blits
     /// nothing. Swept against the live boxes still placed.
-    live_ledger: RefCell<motor::hash::FxHashMap<Rc<str>, Vec<crate::layout::DrawCommand>>>,
+    ///
+    /// The size belongs here as much as the picture. A live box owns a
+    /// surface of its own, and a surface holds the pixels it was given:
+    /// hand it a new frame without new pixels and it STRETCHES the old
+    /// ones. A box whose picture does not depend on its width would do
+    /// exactly that through a window resize.
+    live_ledger: RefCell<motor::hash::FxHashMap<Rc<str>, LiveCell>>,
     /// The theme version the last pass saw — switching themes rebuilds
     /// the retention ONCE (tokens read in a body are baked into the
     /// scene).
@@ -1772,6 +1787,21 @@ impl Runtime {
         self.focus.borrow().clone()
     }
 
+    /// The viewport the last layout ran at — the world every retained
+    /// frame was computed in.
+    ///
+    /// A shell that presents a box on its OWN surface flips into this
+    /// height, never the one the view measures: mid-resize the two
+    /// disagree, and a layer placed in the wrong world lands in the
+    /// wrong place. `None` before the first layout.
+    pub fn last_viewport(&self) -> Option<crate::layout::Size> {
+        let proposal = self.last_proposal.get()?;
+        Some(crate::layout::Size {
+            width: proposal.width?,
+            height: proposal.height?,
+        })
+    }
+
     /// Is the keyboard's owner taking TEXT right now? The key gate of
     /// every shell asks this before it lets a bare character through
     /// as typing: `false` and the stroke walks on to the box, then to
@@ -2594,13 +2624,22 @@ impl Runtime {
                 placement.ink,
             );
             placement.element.element().paint(&ctx, &mut painter);
-            if ledger.get(path).is_some_and(|last| last == display.as_slice()) {
-                continue;
-            }
-            ledger.insert(Rc::clone(path), display.as_slice().to_vec());
             let physical = (
                 ((placement.visible.size.width.round() as usize) * scale).max(1),
                 ((placement.visible.size.height.round() as usize) * scale).max(1),
+            );
+            // the SIZE counts as much as the picture: a box that grew
+            // without changing what it draws still owes its surface new
+            // pixels, or the surface stretches the old ones
+            if ledger
+                .get(path)
+                .is_some_and(|last| last.display == display.as_slice() && last.physical == physical)
+            {
+                continue;
+            }
+            ledger.insert(
+                Rc::clone(path),
+                LiveCell { display: display.as_slice().to_vec(), physical },
             );
             let bitmap = crate::raster::rasterize_with(
                 &display,

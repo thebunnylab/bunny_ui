@@ -307,9 +307,14 @@ pub fn run_window_chrome(
                         &*runtime.images(),
                     );
                     // an ordinary frame repaints only the live boxes
-                    // whose picture changed (the ledger decides), and
-                    // re-places every layer so a moved bar carries its
-                    // mark along for the cost of a frame set
+                    // whose picture changed OR whose size did (the
+                    // ledger decides), and re-places every layer so a
+                    // moved bar carries its mark along for the cost of
+                    // a frame set. The flip is into the LAYOUT's world,
+                    // which mid-resize is not the view's.
+                    let placed = runtime
+                        .last_viewport()
+                        .map_or(height, |viewport| viewport.height);
                     for blit in runtime.live_islands_all(scale) {
                         window.live_layer_blit(
                             &blit.path,
@@ -317,7 +322,7 @@ pub fn run_window_chrome(
                             blit.frame.origin.y,
                             blit.frame.size.width,
                             blit.frame.size.height,
-                            height,
+                            placed,
                             scale,
                             blit.width,
                             blit.height,
@@ -331,7 +336,7 @@ pub fn run_window_chrome(
                             frame.origin.y,
                             frame.size.width,
                             frame.size.height,
-                            height,
+                            placed,
                         );
                     }
                 }
@@ -652,10 +657,14 @@ pub fn run_window_chrome(
             } else if moved.islands {
                 if metal::active() {
                     let scale = window.scale();
-                    // between layouts the window has not moved, so the
-                    // current content height IS the placing layout's
-                    // (a resize path always re-presents right after)
-                    let (_, height) = window.content_size();
+                    // the flip is into the world the boxes were PLACED
+                    // in, not the one the view measures — mid-resize
+                    // the view is already the new size while the last
+                    // layout is still the old one
+                    let (_, measured) = window.content_size();
+                    let height = runtime
+                        .last_viewport()
+                        .map_or(measured, |viewport| viewport.height);
                     for blit in runtime.live_islands(scale) {
                         window.live_layer_blit(
                             &blit.path,
