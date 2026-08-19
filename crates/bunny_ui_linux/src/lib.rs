@@ -398,6 +398,14 @@ pub fn run_window_chrome(
                     blit(runtime, root);
                 }
             }
+            AppEvent::DismissOverlays => {
+                // the x11 outside-press: no compositor grab exists to
+                // dismiss for us — the shell watched the geometry and
+                // says so; the press itself follows as its own event
+                if runtime.dismiss_all_overlays() {
+                    blit(runtime, root);
+                }
+            }
             AppEvent::Text(text) => {
                 // typing, paste of characters, and the composed
                 // dead-key result — the same road for all of them

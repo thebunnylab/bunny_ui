@@ -1293,6 +1293,9 @@ pub enum AppEvent {
     Text(String),
     /// An editing key that passed the gate unconsumed.
     Key { sym: u32, shift: bool, command: bool },
+    /// A press landed outside every open overlay — the x11 door has no
+    /// compositor grab to say `popup_done`, so it says this instead.
+    DismissOverlays,
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
     ImeMark { text: String, caret: usize },
     ImeUnmark,
@@ -1668,9 +1671,15 @@ impl WindowHandle {
         }
     }
 
-    /// Layout coordinates ARE this platform's positioning currency —
-    /// wayland knows no screen — so the twins' conversion is identity.
+    /// Layout coordinates ARE the wayland door's positioning currency
+    /// (it knows no screen), so that conversion is identity. The x11
+    /// door has REAL screen coordinates: the window's root origin is
+    /// the base, and panels land absolutely.
     pub fn layout_rect_to_screen(&self, x: f64, y: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
+        if is_x11() {
+            let origin = crate::x11::window_origin_logical();
+            return (origin.0 + x, origin.1 + y, w, h);
+        }
         (x, y, w, h)
     }
 
@@ -1678,7 +1687,11 @@ impl WindowHandle {
     /// screen geometry, so the window's bounds inflate by a generous
     /// margin: core places freely (popovers may hang past the edge —
     /// the fidelity bar) and only pathological overflow is reined in.
+    /// The x11 door answers with the REAL root bounds instead.
     pub fn screen_bounds_in_layout(&self) -> Option<(f64, f64, f64, f64)> {
+        if is_x11() {
+            return crate::x11::screen_bounds_in_layout();
+        }
         const MARGIN: f64 = 512.0;
         let (w, h) = self.content_size();
         Some((-MARGIN, -MARGIN, w + 2.0 * MARGIN, h + 2.0 * MARGIN))
@@ -1689,6 +1702,9 @@ impl WindowHandle {
     pub fn set_scene_origin(&self, x: f64, y: f64) {
         if self.0 == 0 {
             return;
+        }
+        if is_x11() {
+            return crate::x11::set_scene_origin(self.0 - 1, x, y);
         }
         with_client(|client| {
             if let Some(Some(panel)) = client.panels.get_mut(self.0 - 1) {
@@ -1711,6 +1727,9 @@ impl WindowHandle {
         if self.0 == 0 {
             return;
         }
+        if is_x11() {
+            return crate::x11::panel_present(self.0 - 1, rect, width, height, rgba);
+        }
         panel_present(self.0 - 1, rect, width, height, rgba);
     }
 
@@ -1718,6 +1737,9 @@ impl WindowHandle {
     pub fn close_panel(&self) {
         if self.0 == 0 {
             return;
+        }
+        if is_x11() {
+            return crate::x11::close_panel(self.0 - 1);
         }
         with_client(|client| {
             let index = self.0 - 1;
@@ -1738,9 +1760,7 @@ impl WindowHandle {
 /// subsurface road (the mouse-following drag label).
 pub fn create_panel(_window: &WindowHandle, chip: bool) -> WindowHandle {
     if is_x11() {
-        // overlays cross this door in Q3 — a dead handle keeps the
-        // pool's shape and every present on it is a quiet no-op
-        return WindowHandle(0);
+        return WindowHandle(crate::x11::create_panel(chip));
     }
     with_client(|client| {
         client.panels.push(Some(Panel::new(chip)));

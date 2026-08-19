@@ -220,6 +220,117 @@ unsafe extern "C" {
         event_mask: u32,
         event: *const c_char,
     ) -> Cookie;
+    fn xcb_configure_window(
+        connection: *mut Connection,
+        window: u32,
+        value_mask: u16,
+        value_list: *const u32,
+    ) -> Cookie;
+    fn xcb_unmap_window(connection: *mut Connection, window: u32) -> Cookie;
+    fn xcb_create_colormap(
+        connection: *mut Connection,
+        alloc: u8,
+        colormap: u32,
+        window: u32,
+        visual: u32,
+    ) -> Cookie;
+    fn xcb_translate_coordinates(
+        connection: *mut Connection,
+        src_window: u32,
+        dst_window: u32,
+        src_x: i16,
+        src_y: i16,
+    ) -> Cookie;
+    fn xcb_translate_coordinates_reply(
+        connection: *mut Connection,
+        cookie: Cookie,
+        error: *mut *mut GenericEvent,
+    ) -> *mut TranslateCoordinatesReply;
+    fn xcb_screen_allowed_depths_iterator(screen: *const Screen) -> DepthIterator;
+    fn xcb_depth_next(iterator: *mut DepthIterator);
+    fn xcb_depth_visuals(depth: *const Depth) -> *const VisualType;
+    fn xcb_depth_visuals_length(depth: *const Depth) -> c_int;
+}
+
+#[link(name = "xcb-xfixes")]
+unsafe extern "C" {
+    /// The version handshake is mandatory before any xfixes request.
+    fn xcb_xfixes_query_version(
+        connection: *mut Connection,
+        major: u32,
+        minor: u32,
+    ) -> Cookie;
+    fn xcb_xfixes_query_version_reply(
+        connection: *mut Connection,
+        cookie: Cookie,
+        error: *mut *mut GenericEvent,
+    ) -> *mut c_void;
+    fn xcb_xfixes_create_region(
+        connection: *mut Connection,
+        region: u32,
+        rectangles_len: u32,
+        rectangles: *const Rectangle,
+    ) -> Cookie;
+    fn xcb_xfixes_destroy_region(connection: *mut Connection, region: u32) -> Cookie;
+    fn xcb_xfixes_set_window_shape_region(
+        connection: *mut Connection,
+        window: u32,
+        shape_kind: u8,
+        x_offset: i16,
+        y_offset: i16,
+        region: u32,
+    ) -> Cookie;
+}
+
+/// ShapeInput — the kind that decides where clicks land.
+const SHAPE_KIND_INPUT: u8 = 2;
+
+#[repr(C)]
+struct Rectangle {
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+}
+
+#[repr(C)]
+struct TranslateCoordinatesReply {
+    response_type: u8,
+    same_screen: u8,
+    sequence: u16,
+    length: u32,
+    child: u32,
+    dst_x: i16,
+    dst_y: i16,
+}
+
+/// `xcb_depth_t` fixed head — verified against xproto.h.
+#[repr(C)]
+struct Depth {
+    depth: u8,
+    pad0: u8,
+    visuals_len: u16,
+    pad1: [u8; 4],
+}
+
+#[repr(C)]
+struct DepthIterator {
+    data: *mut Depth,
+    rem: c_int,
+    index: c_int,
+}
+
+/// `xcb_visualtype_t` — verified against xproto.h.
+#[repr(C)]
+struct VisualType {
+    visual_id: u32,
+    class: u8,
+    bits_per_rgb_value: u8,
+    colormap_entries: u16,
+    red_mask: u32,
+    green_mask: u32,
+    blue_mask: u32,
+    pad0: [u8; 4],
 }
 
 #[link(name = "xkbcommon-x11")]
@@ -737,6 +848,30 @@ pub(crate) struct XClient {
     /// The freshest input timestamp — selections want a REAL time
     /// (CurrentTime claims are second-class under ICCCM).
     last_time: u32,
+    /// The 32-bit ground overlays paint on: depth, visual, colormap —
+    /// found once; absent on a server without ARGB (panels go opaque).
+    argb: Option<(u8, u32, u32)>,
+    /// The overlay pool's windows; `WindowHandle(N)` is slot N−1.
+    panels: Vec<Option<XPanel>>,
+}
+
+/// One overlay window: override-redirect, ARGB, placed in ROOT
+/// coordinates — a popover hangs past every edge natively.
+struct XPanel {
+    window: u32,
+    gc: u32,
+    backing: Option<Backing>,
+    /// The overlay's layout origin — the base for translating its
+    /// surface-local pointer events back into scene coordinates.
+    scene_origin: (f64, f64),
+    /// The drag chip never takes input at all.
+    chip: bool,
+    mapped: bool,
+    /// The last carved input inset, physical px — re-carved on resize.
+    carved: (usize, usize),
+    /// Where the panel sits on the root, physical px — the ground the
+    /// outside-press dismissal measures against.
+    root_rect: (i32, i32, i32, i32),
 }
 
 thread_local! {
@@ -810,8 +945,63 @@ pub(crate) fn connect() {
             clicks: ClickClock::default(),
             source: None,
             last_time: 0,
+            argb: None,
+            panels: Vec::new(),
         })
     });
+    // the ARGB ground and the xfixes handshake wait for the screen
+    // walk above — one extra pass, still inside connect
+    with_x(|client| {
+        client.argb = find_argb(client.connection);
+        unsafe {
+            let cookie = xcb_xfixes_query_version(client.connection, 6, 0);
+            let reply =
+                xcb_xfixes_query_version_reply(client.connection, cookie, std::ptr::null_mut());
+            if !reply.is_null() {
+                free(reply);
+            }
+        }
+    });
+}
+
+/// Walks the screen's depths for the 32-bit TrueColor visual — the
+/// ground overlays need for their shadow bleed. A colormap is minted
+/// for it (a depth different from the parent demands one, and border
+/// pixel besides — the classic BadMatch pair).
+fn find_argb(connection: *mut Connection) -> Option<(u8, u32, u32)> {
+    unsafe {
+        let setup = xcb_get_setup(connection);
+        let screens = xcb_setup_roots_iterator(setup);
+        if screens.rem <= 0 || screens.data.is_null() {
+            return None;
+        }
+        let screen = screens.data;
+        let mut depths = xcb_screen_allowed_depths_iterator(screen);
+        while depths.rem > 0 {
+            let depth = depths.data;
+            if (*depth).depth == 32 {
+                let visuals = xcb_depth_visuals(depth);
+                let count = xcb_depth_visuals_length(depth).max(0) as usize;
+                for index in 0..count {
+                    let visual = visuals.add(index);
+                    const TRUE_COLOR: u8 = 4;
+                    if (*visual).class == TRUE_COLOR {
+                        let colormap = xcb_generate_id(connection);
+                        xcb_create_colormap(
+                            connection,
+                            0, // AllocNone
+                            colormap,
+                            (*screen).root,
+                            (*visual).visual_id,
+                        );
+                        return Some((32, (*visual).visual_id, colormap));
+                    }
+                }
+            }
+            xcb_depth_next(&mut depths);
+        }
+        None
+    }
 }
 
 // MARK: - Clipboard (the selections dance)
@@ -1479,6 +1669,303 @@ fn handle_expose(x: u16, y: u16, w: u16, h: u16) {
     });
 }
 
+// MARK: - Overlays (override-redirect ARGB windows in root coordinates)
+
+/// The bleed lib.rs inflates every overlay by — the shadow ring. The
+/// input carve gives that ring back to whatever lies under it.
+const PANEL_BLEED: f64 = 32.0;
+
+/// Claims a pool slot and builds its window: override-redirect (the
+/// WM never decorates or moves it), ARGB when the ground offers it,
+/// its own input events. Returns the handle index (slot + 1).
+pub(crate) fn create_panel(chip: bool) -> usize {
+    with_x(|client| {
+        let (depth, visual, colormap) = client
+            .argb
+            .unwrap_or((0, client.root_visual, 0));
+        unsafe {
+            let id = xcb_generate_id(client.connection);
+            const CW_BORDER_PIXEL: u32 = 0x0008;
+            const CW_OVERRIDE_REDIRECT: u32 = 0x0200;
+            const CW_COLORMAP: u32 = 0x2000;
+            // value order follows the mask's bit order — the protocol law
+            let (mask, values): (u32, Vec<u32>) = if client.argb.is_some() {
+                (
+                    CW_BACK_PIXEL
+                        | CW_BORDER_PIXEL
+                        | CW_OVERRIDE_REDIRECT
+                        | CW_EVENT_MASK
+                        | CW_COLORMAP,
+                    vec![
+                        0, // transparent ground
+                        0, // border pixel — the BadMatch guard
+                        1, // override-redirect
+                        EVENT_MASK_BUTTON_PRESS
+                            | EVENT_MASK_BUTTON_RELEASE
+                            | EVENT_MASK_ENTER_WINDOW
+                            | EVENT_MASK_LEAVE_WINDOW
+                            | EVENT_MASK_POINTER_MOTION
+                            | EVENT_MASK_EXPOSURE,
+                        colormap,
+                    ],
+                )
+            } else {
+                (
+                    CW_BACK_PIXEL | CW_OVERRIDE_REDIRECT | CW_EVENT_MASK,
+                    vec![
+                        0,
+                        1,
+                        EVENT_MASK_BUTTON_PRESS
+                            | EVENT_MASK_BUTTON_RELEASE
+                            | EVENT_MASK_ENTER_WINDOW
+                            | EVENT_MASK_LEAVE_WINDOW
+                            | EVENT_MASK_POINTER_MOTION
+                            | EVENT_MASK_EXPOSURE,
+                    ],
+                )
+            };
+            xcb_create_window(
+                client.connection,
+                depth,
+                id,
+                client.root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                WINDOW_CLASS_INPUT_OUTPUT,
+                visual,
+                mask,
+                values.as_ptr(),
+            );
+            let gc = xcb_generate_id(client.connection);
+            xcb_create_gc(client.connection, gc, id, 0, std::ptr::null());
+            let panel = XPanel {
+                window: id,
+                gc,
+                backing: None,
+                scene_origin: (0.0, 0.0),
+                chip,
+                mapped: false,
+                carved: (0, 0),
+                root_rect: (0, 0, 0, 0),
+            };
+            let slot = client.panels.iter().position(Option::is_none);
+            match slot {
+                Some(index) => {
+                    client.panels[index] = Some(panel);
+                    index + 1
+                }
+                None => {
+                    client.panels.push(Some(panel));
+                    client.panels.len()
+                }
+            }
+        }
+    })
+}
+
+pub(crate) fn set_scene_origin(index: usize, x: f64, y: f64) {
+    with_x(|client| {
+        if let Some(Some(panel)) = client.panels.get_mut(index) {
+            panel.scene_origin = (x, y);
+        }
+    });
+}
+
+/// The window's own origin in root pixels — the truth every overlay
+/// placement builds on.
+fn window_root_origin(client: &mut XClient) -> (i32, i32) {
+    let Some(win) = client.win.as_ref() else { return (0, 0) };
+    unsafe {
+        let cookie = xcb_translate_coordinates(client.connection, win.id, client.root, 0, 0);
+        let reply =
+            xcb_translate_coordinates_reply(client.connection, cookie, std::ptr::null_mut());
+        if reply.is_null() {
+            return (0, 0);
+        }
+        let origin = ((*reply).dst_x as i32, (*reply).dst_y as i32);
+        free(reply.cast());
+        origin
+    }
+}
+
+/// Position, size and pixels land together: the straight RGBA slice
+/// premultiplies into ARGB on the way in (the fused pass every door
+/// keeps), the window configures in ROOT pixels and maps on its
+/// first present. The chip takes no input at all; a popover gives
+/// its bleed ring back through the input carve.
+pub(crate) fn panel_present(
+    index: usize,
+    rect: (f64, f64, f64, f64),
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+) {
+    with_x(|client| {
+        let connection = client.connection;
+        let scale = client.win.as_ref().map(|w| w.scale).unwrap_or(1);
+        let Some(Some(panel)) = client.panels.get_mut(index) else { return };
+        // the backing follows the size
+        let stale = panel
+            .backing
+            .as_ref()
+            .is_none_or(|backing| backing.width != width || backing.height != height);
+        if stale {
+            if let Some(old) = panel.backing.take() {
+                unsafe { drop_backing(connection, old) };
+            }
+            panel.backing = make_backing(connection, width, height);
+        }
+        let Some(backing) = panel.backing.as_ref() else { return };
+        // premultiply RGBA → BGRA in one pass (little-endian ARGB32)
+        let pixels = rgba.len().min(backing.len) / 4;
+        unsafe {
+            let target = std::slice::from_raw_parts_mut(backing.map, pixels * 4);
+            for (source_px, target_px) in
+                rgba.chunks_exact(4).take(pixels).zip(target.chunks_exact_mut(4))
+            {
+                let alpha = source_px[3] as u32;
+                target_px[0] = ((source_px[2] as u32 * alpha + 127) / 255) as u8;
+                target_px[1] = ((source_px[1] as u32 * alpha + 127) / 255) as u8;
+                target_px[2] = ((source_px[0] as u32 * alpha + 127) / 255) as u8;
+                target_px[3] = alpha as u8;
+            }
+        }
+        // root placement: the rect arrives ALREADY in logical root
+        // coordinates (layout_rect_to_screen added the window origin);
+        // device pixels from here, always stacked above
+        let x = (rect.0 * scale as f64).round() as i32;
+        let y = (rect.1 * scale as f64).round() as i32;
+        panel.root_rect = (x, y, width as i32, height as i32);
+        unsafe {
+            const CONFIG_X: u16 = 1;
+            const CONFIG_Y: u16 = 2;
+            const CONFIG_W: u16 = 4;
+            const CONFIG_H: u16 = 8;
+            const CONFIG_STACK: u16 = 64;
+            let values = [
+                x as u32,
+                y as u32,
+                width.max(1) as u32,
+                height.max(1) as u32,
+                0, // Above
+            ];
+            xcb_configure_window(
+                connection,
+                panel.window,
+                CONFIG_X | CONFIG_Y | CONFIG_W | CONFIG_H | CONFIG_STACK,
+                values.as_ptr(),
+            );
+            // the input carve: the chip passes everything through; a
+            // popover keeps its content and returns the bleed ring
+            if panel.carved != (width, height) {
+                panel.carved = (width, height);
+                let region = xcb_generate_id(connection);
+                if panel.chip {
+                    xcb_xfixes_create_region(connection, region, 0, std::ptr::null());
+                } else {
+                    let inset = (PANEL_BLEED * scale as f64).round() as i64;
+                    let rect = Rectangle {
+                        x: inset.min(i16::MAX as i64) as i16,
+                        y: inset.min(i16::MAX as i64) as i16,
+                        width: (width as i64 - 2 * inset).max(0) as u16,
+                        height: (height as i64 - 2 * inset).max(0) as u16,
+                    };
+                    xcb_xfixes_create_region(connection, region, 1, &rect);
+                }
+                xcb_xfixes_set_window_shape_region(
+                    connection,
+                    panel.window,
+                    SHAPE_KIND_INPUT,
+                    0,
+                    0,
+                    region,
+                );
+                xcb_xfixes_destroy_region(connection, region);
+            }
+            let depth = client.argb.map(|(depth, _, _)| depth).unwrap_or(client.root_depth);
+            xcb_shm_put_image(
+                connection,
+                panel.window,
+                panel.gc,
+                width as u16,
+                height as u16,
+                0,
+                0,
+                width as u16,
+                height as u16,
+                0,
+                0,
+                depth,
+                IMAGE_FORMAT_Z_PIXMAP,
+                0,
+                backing.segment,
+                0,
+            );
+            if !panel.mapped {
+                xcb_map_window(connection, panel.window);
+                panel.mapped = true;
+            }
+            xcb_flush(connection);
+        }
+    });
+}
+
+/// Hide and forget: the pool retires a panel whose overlay closed.
+pub(crate) fn close_panel(index: usize) {
+    with_x(|client| {
+        let connection = client.connection;
+        if let Some(slot) = client.panels.get_mut(index) {
+            if let Some(panel) = slot.take() {
+                unsafe {
+                    xcb_unmap_window(connection, panel.window);
+                    if let Some(backing) = panel.backing {
+                        drop_backing(connection, backing);
+                    }
+                    xcb_destroy_window(connection, panel.window);
+                    xcb_flush(connection);
+                }
+            }
+        }
+    });
+}
+
+/// The main window's origin in LOGICAL root coordinates — the base
+/// `layout_rect_to_screen` adds to, and the bounds math subtracts.
+pub(crate) fn window_origin_logical() -> (f64, f64) {
+    with_x(|client| {
+        let scale = client.win.as_ref().map(|w| w.scale).unwrap_or(1) as f64;
+        let origin = window_root_origin(client);
+        (origin.0 as f64 / scale, origin.1 as f64 / scale)
+    })
+}
+
+/// The whole root, in layout coordinates relative to the window — the
+/// REAL screen bounds the placement math clamps against (popovers may
+/// hang past the window; the screen edge is the only wall).
+pub(crate) fn screen_bounds_in_layout() -> Option<(f64, f64, f64, f64)> {
+    with_x(|client| {
+        let scale = client.win.as_ref().map(|w| w.scale).unwrap_or(1) as f64;
+        let origin = window_root_origin(client);
+        unsafe {
+            let setup = xcb_get_setup(client.connection);
+            let screens = xcb_setup_roots_iterator(setup);
+            if screens.rem <= 0 || screens.data.is_null() {
+                return None;
+            }
+            let screen = &*screens.data;
+            Some((
+                -(origin.0 as f64) / scale,
+                -(origin.1 as f64) / scale,
+                screen.width_in_pixels as f64 / scale,
+                screen.height_in_pixels as f64 / scale,
+            ))
+        }
+    })
+}
+
 // MARK: - The frame clock (no callbacks on this door — the deadline
 // heap paces at the refresh interval while unpaused)
 
@@ -1530,6 +2017,26 @@ enum Step {
     Deliver(AppEvent),
     Quit,
     Silence,
+}
+
+/// Which of our surfaces an input event landed on: the main window
+/// translates from (0,0); a panel from its scene origin — hit-testing
+/// follows the overlay math, not the server's window tree. Also the
+/// one place every input event stamps the selection timestamp.
+fn surface_base(window: u32, time: u32) -> Option<((f64, f64), f64)> {
+    with_x(|client| {
+        client.last_time = time;
+        let scale = client.win.as_ref().map(|w| w.scale).unwrap_or(1) as f64;
+        if client.win.as_ref().is_some_and(|w| w.id == window) {
+            return Some(((0.0, 0.0), scale));
+        }
+        client
+            .panels
+            .iter()
+            .flatten()
+            .find(|panel| panel.window == window)
+            .map(|panel| (panel.scene_origin, scale))
+    })
 }
 
 fn interpret(event: *mut GenericEvent) -> Step {
@@ -1591,34 +2098,65 @@ fn interpret(event: *mut GenericEvent) -> Step {
         XCB_DESTROY_NOTIFY => Step::Quit,
         XCB_MOTION_NOTIFY => {
             let motion = event as *mut InputEvent;
-            let (x, y, time) =
-                unsafe { ((*motion).event_x, (*motion).event_y, (*motion).time) };
-            let scale = with_x(|client| {
-                client.pointer_pos = (x as f64, y as f64);
-                client.last_time = time;
-                client.win.as_ref().map(|w| w.scale).unwrap_or(1)
-            });
+            let (window, x, y, time) = unsafe {
+                ((*motion).event, (*motion).event_x, (*motion).event_y, (*motion).time)
+            };
+            let Some((base, scale)) = surface_base(window, time) else {
+                return Step::Silence;
+            };
+            with_x(|client| client.pointer_pos = (x as f64, y as f64));
             Step::Deliver(AppEvent::MouseMoved {
-                x: x as f64 / scale as f64,
-                y: y as f64 / scale as f64,
+                x: base.0 + x as f64 / scale,
+                y: base.1 + y as f64 / scale,
             })
         }
         XCB_BUTTON_PRESS | XCB_BUTTON_RELEASE => {
             let button = event as *mut InputEvent;
-            let (detail, x, y, state, time) = unsafe {
+            let (window, detail, x, y, state, time, root_x, root_y) = unsafe {
                 (
+                    (*button).event,
                     (*button).detail,
                     (*button).event_x,
                     (*button).event_y,
                     (*button).state,
                     (*button).time,
+                    (*button).root_x,
+                    (*button).root_y,
                 )
             };
-            let scale = with_x(|client| {
-                client.last_time = time;
-                client.win.as_ref().map(|w| w.scale).unwrap_or(1)
-            });
-            let (x, y) = (x as f64 / scale as f64, y as f64 / scale as f64);
+            let Some((base, scale)) = surface_base(window, time) else {
+                return Step::Silence;
+            };
+            // no compositor grab exists on this door: a press on the
+            // MAIN window while a popover floats — outside all of them
+            // — dismisses first, then lands as its own event
+            if kind == XCB_BUTTON_PRESS && matches!(detail, 1 | 3) {
+                let outside_all = with_x(|client| {
+                    let on_main = client.win.as_ref().is_some_and(|w| w.id == window);
+                    let inset =
+                        (PANEL_BLEED * client.win.as_ref().map(|w| w.scale).unwrap_or(1) as f64)
+                            .round() as i32;
+                    on_main
+                        && client.panels.iter().flatten().any(|panel| panel.mapped && !panel.chip)
+                        && client.panels.iter().flatten().all(|panel| {
+                            if !panel.mapped || panel.chip {
+                                return true;
+                            }
+                            // the CONTENT box decides — the bleed ring
+                            // is click-through by carve, so a press on
+                            // it is visually outside the card
+                            let (px, py, pw, ph) = panel.root_rect;
+                            let (px, py) = (px + inset, py + inset);
+                            let (pw, ph) = ((pw - 2 * inset).max(0), (ph - 2 * inset).max(0));
+                            let (rx, ry) = (root_x as i32, root_y as i32);
+                            rx < px || ry < py || rx >= px + pw || ry >= py + ph
+                        })
+                });
+                if outside_all {
+                    dispatch(AppEvent::DismissOverlays);
+                }
+            }
+            let (x, y) = (base.0 + x as f64 / scale, base.1 + y as f64 / scale);
             match (kind, detail) {
                 (XCB_BUTTON_PRESS, 1) => {
                     let clicks = with_x(|client| client.clicks.click(time, x, y));
@@ -1664,17 +2202,31 @@ fn interpret(event: *mut GenericEvent) -> Step {
         XCB_KEY_RELEASE => Step::Silence,
         XCB_ENTER_NOTIFY => {
             let crossing = event as *mut CrossingEvent;
-            let (x, y) = unsafe { ((*crossing).event_x, (*crossing).event_y) };
-            let scale = with_x(|client| {
-                client.pointer_pos = (x as f64, y as f64);
-                client.win.as_ref().map(|w| w.scale).unwrap_or(1)
-            });
+            let (window, x, y, time) = unsafe {
+                ((*crossing).event, (*crossing).event_x, (*crossing).event_y, (*crossing).time)
+            };
+            let Some((base, scale)) = surface_base(window, time) else {
+                return Step::Silence;
+            };
+            with_x(|client| client.pointer_pos = (x as f64, y as f64));
             Step::Deliver(AppEvent::MouseMoved {
-                x: x as f64 / scale as f64,
-                y: y as f64 / scale as f64,
+                x: base.0 + x as f64 / scale,
+                y: base.1 + y as f64 / scale,
             })
         }
-        XCB_LEAVE_NOTIFY => Step::Deliver(AppEvent::MouseExited),
+        XCB_LEAVE_NOTIFY => {
+            // leaving a PANEL usually means entering the window (or a
+            // sibling) — only the main window's leave exits the scene
+            let window = unsafe { (*(event as *mut CrossingEvent)).event };
+            let main = with_x(|client| {
+                client.win.as_ref().is_some_and(|w| w.id == window)
+            });
+            if main {
+                Step::Deliver(AppEvent::MouseExited)
+            } else {
+                Step::Silence
+            }
+        }
         XCB_FOCUS_OUT => Step::Deliver(AppEvent::ResignKey),
         XCB_SELECTION_REQUEST => {
             let request = unsafe { std::ptr::read(event as *const SelectionRequestEvent) };
@@ -1814,6 +2366,15 @@ fn teardown() {
     X_CLIENT.with(|slot| {
         let Some(client) = slot.borrow_mut().take() else { return };
         unsafe {
+            for slot in &client.panels {
+                if let Some(panel) = slot {
+                    if let Some(backing) = &panel.backing {
+                        xcb_shm_detach(client.connection, backing.segment);
+                        shmdt(backing.map.cast());
+                    }
+                    xcb_destroy_window(client.connection, panel.window);
+                }
+            }
             if let Some(win) = client.win {
                 if let Some(backing) = win.backing {
                     drop_backing(client.connection, backing);
