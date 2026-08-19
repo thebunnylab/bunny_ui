@@ -7043,6 +7043,13 @@ mod tests {
                     text("preview.rs").italic(),
                     text("pinned.rs"),
                     text("both").bold().italic(),
+                    // the same sentence, written the two ways a hand
+                    // writes it. The second is the one that comes out
+                    // first: the face belongs to the view, the lean to
+                    // the state — and neither order may lose one
+                    text("lean first").italic().font(Font::Callout),
+                    text("role first").font(Font::Callout).italic(),
+                    text("mono").font(Font::Callout).monospaced(),
                 )
                 .spacing(0.0)
             }
@@ -7050,7 +7057,7 @@ mod tests {
 
         let runtime = Runtime::new();
         let result =
-            runtime.layout(&Tabs, crate::layout::Proposal::exact(Size { width: 200.0, height: 90.0 }));
+            runtime.layout(&Tabs, crate::layout::Proposal::exact(Size { width: 200.0, height: 180.0 }));
         let fonts: Vec<(String, FontSpec)> = result
             .display
             .iter()
@@ -7066,6 +7073,19 @@ mod tests {
         // the two modifiers compose: each carries only its own field
         assert_eq!(fonts[2].1.slant, Slant::Italic);
         assert_eq!(fonts[2].1.weight, Weight::Bold);
+        // and the ORDER cannot matter, because a modifier can only undo
+        // what it names: a role names a size and a weight, never a lean
+        // and never a face design
+        assert_eq!(fonts[3].1.slant, Slant::Italic, "lean, then role");
+        assert_eq!(fonts[3].1.size, 12.0, "and the role still sized it");
+        assert_eq!(fonts[4].1.slant, Slant::Italic, "role, then lean — the silent one");
+        assert_eq!(fonts[4].1.size, 12.0);
+        assert_eq!(fonts[3].1, fonts[4].1, "the same sentence, either way round");
+        assert_eq!(
+            fonts[5].1.design,
+            crate::text_engine::FontDesign::Mono,
+            "and a role does not undo a face either",
+        );
 
         // the LEAN is part of the font's identity: an upright and a
         // leaning line are two cache entries, never one answering for

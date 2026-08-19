@@ -946,14 +946,29 @@ fn apply(
         }),
         // font is an inherited scene property — the same Styled as the
         // visuals carries the patch (measure applies it on top of the env)
-        Modifier::Font(font) => wrap_styled(
-            out,
-            mark,
-            VisualProps {
-                font: FontPatch::full(FontSpec::resolve(*font)),
-                ..VisualProps::default()
-            },
-        ),
+        // a ROLE names a size and a weight — that is what `Headline` or
+        // `Callout` mean. It does not name a slant and it does not name
+        // a design, and those have modifiers of their own. Filling the
+        // slots anyway made `.font(…).italic()` come out upright and
+        // `.font(…).monospaced()` come out proportional: the nearer
+        // modifier wins a slot, and the role was claiming slots it had
+        // nothing to say about. Every modifier here carries ONLY what
+        // it names, so the chain reads the same written either way
+        Modifier::Font(font) => {
+            let spec = FontSpec::resolve(*font);
+            wrap_styled(
+                out,
+                mark,
+                VisualProps {
+                    font: FontPatch {
+                        size: Some(spec.size),
+                        weight: Some(spec.weight),
+                        ..FontPatch::default()
+                    },
+                    ..VisualProps::default()
+                },
+            )
+        }
         Modifier::Bold => wrap_styled(
             out,
             mark,

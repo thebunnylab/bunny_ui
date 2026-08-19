@@ -114,16 +114,10 @@ pub struct FontPatch {
 }
 
 impl FontPatch {
-    pub fn full(spec: FontSpec) -> FontPatch {
-        FontPatch {
-            size: Some(spec.size),
-            weight: Some(spec.weight),
-            design: Some(spec.design),
-            slant: Some(spec.slant),
-        }
-    }
-
     /// Merge of the stacked modifiers — the defined (closest) one wins.
+    /// A slot nobody named stays empty all the way to the env, which is
+    /// what makes the chain order-free: a modifier can only undo what
+    /// it actually speaks about.
     pub fn or(self, outer: FontPatch) -> FontPatch {
         FontPatch {
             size: self.size.or(outer.size),
