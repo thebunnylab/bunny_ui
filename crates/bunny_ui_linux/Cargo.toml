@@ -49,3 +49,7 @@ path = "examples/chrome_window.rs"
 [[example]]
 name = "countries_window_linux"
 path = "examples/countries_window.rs"
+
+[[example]]
+name = "bench_pipeline_linux"
+path = "examples/bench_pipeline_linux.rs"
