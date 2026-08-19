@@ -234,6 +234,7 @@ unsafe extern "C" {
         window: u32,
         visual: u32,
     ) -> Cookie;
+    fn xcb_ungrab_pointer(connection: *mut Connection, time: u32) -> Cookie;
     fn xcb_translate_coordinates(
         connection: *mut Connection,
         src_window: u32,
@@ -691,6 +692,7 @@ const EVENT_MASK_POINTER_MOTION: u32 = 0x0000_0040;
 const EVENT_MASK_EXPOSURE: u32 = 0x0000_8000;
 const EVENT_MASK_STRUCTURE_NOTIFY: u32 = 0x0002_0000;
 const EVENT_MASK_FOCUS_CHANGE: u32 = 0x0020_0000;
+const EVENT_MASK_PROPERTY_CHANGE: u32 = 0x0040_0000;
 const IMAGE_FORMAT_Z_PIXMAP: u8 = 2;
 const ATOM_ATOM: u32 = 4;
 const ATOM_STRING: u32 = 31;
@@ -711,9 +713,15 @@ pub(crate) struct Atoms {
     pub(crate) incr: u32,
     /// The property selections land on — ours by name, reused per read.
     pub(crate) transfer: u32,
+    pub(crate) net_wm_moveresize: u32,
+    pub(crate) net_wm_state: u32,
+    pub(crate) net_wm_state_max_horz: u32,
+    pub(crate) net_wm_state_max_vert: u32,
+    pub(crate) motif_wm_hints: u32,
+    pub(crate) wm_change_state: u32,
 }
 
-const ATOM_NAMES: [&CStr; 8] = [
+const ATOM_NAMES: [&CStr; 14] = [
     c"WM_PROTOCOLS",
     c"WM_DELETE_WINDOW",
     c"_NET_WM_NAME",
@@ -722,6 +730,12 @@ const ATOM_NAMES: [&CStr; 8] = [
     c"TARGETS",
     c"INCR",
     c"BUNNY_SELECTION",
+    c"_NET_WM_MOVERESIZE",
+    c"_NET_WM_STATE",
+    c"_NET_WM_STATE_MAXIMIZED_HORZ",
+    c"_NET_WM_STATE_MAXIMIZED_VERT",
+    c"_MOTIF_WM_HINTS",
+    c"WM_CHANGE_STATE",
 ];
 
 use std::ffi::CStr;
@@ -733,7 +747,7 @@ fn intern_atoms(connection: *mut Connection) -> Atoms {
             xcb_intern_atom(connection, 0, name.to_bytes().len() as u16, name.as_ptr())
         })
         .collect();
-    let mut atoms = [0u32; 8];
+    let mut atoms = [0u32; 14];
     for (slot, cookie) in atoms.iter_mut().zip(cookies) {
         unsafe {
             let reply = xcb_intern_atom_reply(connection, cookie, std::ptr::null_mut());
@@ -752,6 +766,12 @@ fn intern_atoms(connection: *mut Connection) -> Atoms {
         targets: atoms[5],
         incr: atoms[6],
         transfer: atoms[7],
+        net_wm_moveresize: atoms[8],
+        net_wm_state: atoms[9],
+        net_wm_state_max_horz: atoms[10],
+        net_wm_state_max_vert: atoms[11],
+        motif_wm_hints: atoms[12],
+        wm_change_state: atoms[13],
     }
 }
 
@@ -813,9 +833,14 @@ struct Window {
     mapped: bool,
     paused: bool,
     last_frame: Option<Instant>,
-    /// Scene chrome: the shell owns the border (crown arrives in Q4).
-    #[allow(dead_code)] // read from Q4 on — the flag lands with the door
+    /// Scene chrome: the shell owns the border — resize bands, the
+    /// crown verbs and the rounded corners.
     scene: bool,
+    /// The depth this window presents at (32 when the scene rides the
+    /// ARGB ground for its corners; the root depth otherwise).
+    depth: u8,
+    /// Mirrored off _NET_WM_STATE — bands and corners stand down.
+    maximized: bool,
 }
 
 pub(crate) struct XClient {
@@ -853,6 +878,9 @@ pub(crate) struct XClient {
     argb: Option<(u8, u32, u32)>,
     /// The overlay pool's windows; `WindowHandle(N)` is slot N−1.
     panels: Vec<Option<XPanel>>,
+    /// The resize band under the pointer (0 = none) — it outranks the
+    /// scene's own cursor while it holds.
+    edge_hover: u32,
 }
 
 /// One overlay window: override-redirect, ARGB, placed in ROOT
@@ -947,6 +975,7 @@ pub(crate) fn connect() {
             last_time: 0,
             argb: None,
             panels: Vec::new(),
+            edge_hover: 0,
         })
     });
     // the ARGB ground and the xfixes handshake wait for the screen
@@ -1327,11 +1356,25 @@ fn cursor_slot(cursor: Cursor) -> usize {
 }
 
 pub(crate) fn set_cursor(cursor: Cursor) {
-    with_x(|client| {
-        if client.cursor_current == Some(cursor) {
-            return;
-        }
+    let changed = with_x(|client| {
+        let was = client.cursor_current;
         client.cursor_current = Some(cursor);
+        was != Some(cursor)
+    });
+    if changed {
+        apply_current_cursor();
+    }
+}
+
+/// Applies the effective cursor: a live border band outranks the
+/// scene's own choice (the crown's certified override).
+fn apply_current_cursor() {
+    with_x(|client| {
+        let cursor = if client.edge_hover != 0 {
+            crate::ffi::edge_cursor(client.edge_hover)
+        } else {
+            client.cursor_current.unwrap_or(Cursor::Arrow)
+        };
         let Some(win) = client.win.as_ref() else { return };
         unsafe {
             if client.cursor_font == 0 {
@@ -1428,22 +1471,40 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, scene: bool) {
             // before the first present shows theme ground, never white
             let canvas = bunny_ui::theme::canvas();
             let back = ((canvas.r as u32) << 16) | ((canvas.g as u32) << 8) | canvas.b as u32;
-            let values = [
-                back,
-                EVENT_MASK_KEY_PRESS
-                    | EVENT_MASK_KEY_RELEASE
-                    | EVENT_MASK_BUTTON_PRESS
-                    | EVENT_MASK_BUTTON_RELEASE
-                    | EVENT_MASK_ENTER_WINDOW
-                    | EVENT_MASK_LEAVE_WINDOW
-                    | EVENT_MASK_POINTER_MOTION
-                    | EVENT_MASK_EXPOSURE
-                    | EVENT_MASK_STRUCTURE_NOTIFY
-                    | EVENT_MASK_FOCUS_CHANGE,
-            ];
+            let events = EVENT_MASK_KEY_PRESS
+                | EVENT_MASK_KEY_RELEASE
+                | EVENT_MASK_BUTTON_PRESS
+                | EVENT_MASK_BUTTON_RELEASE
+                | EVENT_MASK_ENTER_WINDOW
+                | EVENT_MASK_LEAVE_WINDOW
+                | EVENT_MASK_POINTER_MOTION
+                | EVENT_MASK_EXPOSURE
+                | EVENT_MASK_STRUCTURE_NOTIFY
+                | EVENT_MASK_FOCUS_CHANGE
+                | EVENT_MASK_PROPERTY_CHANGE;
+            const CW_BORDER_PIXEL: u32 = 0x0008;
+            const CW_COLORMAP: u32 = 0x2000;
+            // the scene rounds its corners — it needs the ARGB ground
+            // (with the border-pixel/colormap pair a foreign depth
+            // demands); everything else stays on the root visual
+            let scene_ground = scene.then_some(client.argb).flatten();
+            let (depth, visual, mask, values): (u8, u32, u32, Vec<u32>) = match scene_ground {
+                Some((depth, visual, colormap)) => (
+                    depth,
+                    visual,
+                    CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_EVENT_MASK | CW_COLORMAP,
+                    vec![0, 0, events, colormap],
+                ),
+                None => (
+                    0, // CopyFromParent
+                    client.root_visual,
+                    CW_BACK_PIXEL | CW_EVENT_MASK,
+                    vec![back, events],
+                ),
+            };
             xcb_create_window(
                 client.connection,
-                0, // CopyFromParent depth
+                depth,
                 id,
                 client.root,
                 0,
@@ -1452,10 +1513,27 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, scene: bool) {
                 physical.1.max(1),
                 0,
                 WINDOW_CLASS_INPUT_OUTPUT,
-                client.root_visual,
-                CW_BACK_PIXEL | CW_EVENT_MASK,
+                visual,
+                mask,
                 values.as_ptr(),
             );
+            if scene {
+                // the WM's own decorations stand down — the scene
+                // draws the bar and the crown answers the verbs
+                let hints: [u32; 5] = [2, 0, 0, 0, 0]; // flags=DECORATIONS, none
+                xcb_change_property(
+                    client.connection,
+                    PROP_MODE_REPLACE,
+                    id,
+                    client.atoms.motif_wm_hints,
+                    client.atoms.motif_wm_hints,
+                    32,
+                    5,
+                    hints.as_ptr().cast(),
+                );
+            }
+            let window_depth =
+                if depth == 0 { client.root_depth } else { depth };
             let gc = xcb_generate_id(client.connection);
             xcb_create_gc(client.connection, gc, id, 0, std::ptr::null());
             // the close handshake and both name spellings
@@ -1511,6 +1589,8 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, scene: bool) {
                 paused: true,
                 last_frame: None,
                 scene,
+                depth: window_depth,
+                maximized: false,
             });
         }
     });
@@ -1571,8 +1651,9 @@ pub(crate) fn present_rows(
             return;
         }
         let connection = client.connection;
-        let root_depth = client.root_depth;
+        let argb = client.argb.is_some();
         let win = client.win.as_mut().expect("window for the present");
+        let depth = win.depth;
         let backing = win.backing.as_ref().expect("backing for the present");
         for &rect in damage {
             let Some((x, y, w, h)) = clamp_rect(rect, width, height) else { continue };
@@ -1591,6 +1672,14 @@ pub(crate) fn present_rows(
                     target_px[3] = 0xFF;
                 }
             }
+        }
+        // the scene's corners round through the same premultiplied
+        // mask the wayland door wears — only on the ARGB ground
+        if win.scene && argb {
+            crate::ffi::mask_corners(backing.map, width, height, 8.0 * win.scale as f64);
+        }
+        for &rect in damage {
+            let Some((x, y, w, h)) = clamp_rect(rect, width, height) else { continue };
             unsafe {
                 xcb_shm_put_image(
                     connection,
@@ -1604,7 +1693,7 @@ pub(crate) fn present_rows(
                     h as u16,
                     x as i16,
                     y as i16,
-                    root_depth,
+                    depth,
                     IMAGE_FORMAT_Z_PIXMAP,
                     0,
                     backing.segment,
@@ -1637,8 +1726,8 @@ fn clamp_rect(
 fn handle_expose(x: u16, y: u16, w: u16, h: u16) {
     with_x(|client| {
         let connection = client.connection;
-        let root_depth = client.root_depth;
         let Some(win) = client.win.as_ref() else { return };
+        let root_depth = win.depth;
         let Some(backing) = win.backing.as_ref() else { return };
         let x1 = (x as usize + w as usize).min(backing.width);
         let y1 = (y as usize + h as usize).min(backing.height);
@@ -1966,6 +2055,128 @@ pub(crate) fn screen_bounds_in_layout() -> Option<(f64, f64, f64, f64)> {
     })
 }
 
+// MARK: - The crown (EWMH verbs — the WM moves, sizes and stacks)
+
+/// The xdg edge bitfield spoken as an EWMH moveresize direction.
+fn moveresize_direction(edge: u32) -> u32 {
+    match edge {
+        5 => 0,  // top-left
+        1 => 1,  // top
+        9 => 2,  // top-right
+        8 => 3,  // right
+        10 => 4, // bottom-right
+        2 => 5,  // bottom
+        6 => 6,  // bottom-left
+        4 => 7,  // left
+        _ => 8,  // move
+    }
+}
+
+const SUBSTRUCTURE_MASKS: u32 = 0x0008_0000 | 0x0010_0000; // notify | redirect
+
+/// Sends one client message to the root the way EWMH wants: both
+/// substructure masks, format 32.
+fn send_root_message(client: &mut XClient, window: u32, kind: u32, data: [u32; 5]) {
+    let message = ClientMessageEvent {
+        response_type: XCB_CLIENT_MESSAGE,
+        format: 32,
+        sequence: 0,
+        window,
+        kind,
+        data32: data,
+    };
+    unsafe {
+        xcb_send_event(
+            client.connection,
+            0,
+            client.root,
+            SUBSTRUCTURE_MASKS,
+            (&raw const message).cast(),
+        );
+        xcb_flush(client.connection);
+    }
+}
+
+/// Executes a crown verb through the WM. The implicit press grab is
+/// released first — a moveresize under our own grab never moves.
+fn crown_execute(take: crate::ffi::CrownTake, root_x: i16, root_y: i16) -> bool {
+    use crate::ffi::{ControlHit, CrownTake};
+    with_x(|client| {
+        let Some(win) = client.win.as_ref() else { return false };
+        let (id, time) = (win.id, client.last_time);
+        let atoms_moveresize = client.atoms.net_wm_moveresize;
+        let atoms_state = client.atoms.net_wm_state;
+        let max_pair = (client.atoms.net_wm_state_max_horz, client.atoms.net_wm_state_max_vert);
+        let change_state = client.atoms.wm_change_state;
+        let moveresize = |client: &mut XClient, direction: u32| {
+            unsafe { xcb_ungrab_pointer(client.connection, time) };
+            send_root_message(
+                client,
+                id,
+                atoms_moveresize,
+                [root_x as u32, root_y as u32, direction, 1, 1],
+            );
+        };
+        match take {
+            CrownTake::None => false,
+            CrownTake::Menu => false, // no WM menu on this door — the scene's own may answer
+            CrownTake::Move => {
+                moveresize(client, 8);
+                true
+            }
+            CrownTake::Resize(edge) => {
+                moveresize(client, moveresize_direction(edge));
+                true
+            }
+            CrownTake::Control(ControlHit::Close) => {
+                client.quit = true;
+                true
+            }
+            CrownTake::Control(ControlHit::Minimize) => {
+                const ICONIC: u32 = 3;
+                send_root_message(client, id, change_state, [ICONIC, 0, 0, 0, 0]);
+                true
+            }
+            CrownTake::Control(ControlHit::Maximize) | CrownTake::ToggleMaximize => {
+                const TOGGLE: u32 = 2;
+                send_root_message(
+                    client,
+                    id,
+                    atoms_state,
+                    [TOGGLE, max_pair.0, max_pair.1, 0, 1],
+                );
+                true
+            }
+        }
+    })
+}
+
+/// Re-reads _NET_WM_STATE off the main window — the maximized mirror
+/// bands and corners consult.
+fn refresh_wm_state(client: &mut XClient) {
+    let Some(win) = client.win.as_ref() else { return };
+    let (id, state_atom) = (win.id, client.atoms.net_wm_state);
+    let max_pair = (client.atoms.net_wm_state_max_horz, client.atoms.net_wm_state_max_vert);
+    unsafe {
+        let cookie =
+            xcb_get_property(client.connection, 0, id, state_atom, ATOM_ATOM, 0, 64);
+        let reply = xcb_get_property_reply(client.connection, cookie, std::ptr::null_mut());
+        if reply.is_null() {
+            return;
+        }
+        let count = (xcb_get_property_value_length(reply).max(0) as usize) / 4;
+        let atoms = std::slice::from_raw_parts(
+            xcb_get_property_value(reply) as *const u32,
+            count,
+        );
+        let maximized = atoms.contains(&max_pair.0) || atoms.contains(&max_pair.1);
+        free(reply.cast());
+        if let Some(win) = client.win.as_mut() {
+            win.maximized = maximized;
+        }
+    }
+}
+
 // MARK: - The frame clock (no callbacks on this door — the deadline
 // heap paces at the refresh interval while unpaused)
 
@@ -2104,7 +2315,28 @@ fn interpret(event: *mut GenericEvent) -> Step {
             let Some((base, scale)) = surface_base(window, time) else {
                 return Step::Silence;
             };
-            with_x(|client| client.pointer_pos = (x as f64, y as f64));
+            // a border band under the pointer outranks the scene's
+            // own cursor while it holds
+            let band_change = with_x(|client| {
+                client.pointer_pos = (x as f64, y as f64);
+                let win = client.win.as_ref()?;
+                let edge = if win.id != window || !win.scene || win.maximized {
+                    0
+                } else {
+                    crate::ffi::resize_edge_of(
+                        x as f64 / win.scale as f64,
+                        y as f64 / win.scale as f64,
+                        win.logical.0,
+                        win.logical.1,
+                    )
+                };
+                let was = client.edge_hover;
+                client.edge_hover = edge;
+                (was != edge).then_some(())
+            });
+            if band_change.is_some() {
+                apply_current_cursor();
+            }
             Step::Deliver(AppEvent::MouseMoved {
                 x: base.0 + x as f64 / scale,
                 y: base.1 + y as f64 / scale,
@@ -2127,6 +2359,56 @@ fn interpret(event: *mut GenericEvent) -> Step {
             let Some((base, scale)) = surface_base(window, time) else {
                 return Step::Silence;
             };
+            // the crown outranks the scene: a press on a scene-chrome
+            // main window asks the border bands first, then the drag
+            // and control gates — a consumed press never reaches the
+            // engine (the certified order of every door)
+            if kind == XCB_BUTTON_PRESS && matches!(detail, 1 | 3) {
+                let crown = with_x(|client| {
+                    let win = client.win.as_ref()?;
+                    if win.id != window || !win.scene {
+                        return None;
+                    }
+                    let logical_x = x as f64 / win.scale as f64;
+                    let logical_y = y as f64 / win.scale as f64;
+                    if detail == 1 && !win.maximized {
+                        let edge = crate::ffi::resize_edge_of(
+                            logical_x,
+                            logical_y,
+                            win.logical.0,
+                            win.logical.1,
+                        );
+                        if edge != 0 {
+                            return Some(crate::ffi::CrownTake::Resize(edge));
+                        }
+                    }
+                    Some(crate::ffi::crown_take(
+                        logical_x,
+                        logical_y,
+                        1,
+                        detail == 3,
+                    ))
+                });
+                if let Some(take) = crown {
+                    // clicks for the double-click maximize: recount
+                    // through the shared clock on the raw press
+                    let take = if matches!(take, crate::ffi::CrownTake::Move) {
+                        let clicks = with_x(|client| {
+                            client.clicks.click(time, root_x as f64, root_y as f64)
+                        });
+                        if clicks >= 2 {
+                            crate::ffi::CrownTake::ToggleMaximize
+                        } else {
+                            take
+                        }
+                    } else {
+                        take
+                    };
+                    if crown_execute(take, root_x, root_y) {
+                        return Step::Silence;
+                    }
+                }
+            }
             // no compositor grab exists on this door: a press on the
             // MAIN window while a popover floats — outside all of them
             // — dismisses first, then lands as its own event
@@ -2245,7 +2527,23 @@ fn interpret(event: *mut GenericEvent) -> Step {
         }
         // a stray notify outside a read pump answers nothing
         XCB_SELECTION_NOTIFY => Step::Silence,
-        XCB_FOCUS_IN | XCB_PROPERTY_NOTIFY => Step::Silence,
+        XCB_PROPERTY_NOTIFY => {
+            // the WM writes _NET_WM_STATE on the main window; the
+            // maximized mirror keeps bands and corners honest
+            let (window, atom) = unsafe {
+                let notify = event as *mut PropertyNotifyEvent;
+                ((*notify).window, (*notify).atom)
+            };
+            with_x(|client| {
+                let interesting = client.win.as_ref().is_some_and(|w| w.id == window)
+                    && atom == client.atoms.net_wm_state;
+                if interesting {
+                    refresh_wm_state(client);
+                }
+            });
+            Step::Silence
+        }
+        XCB_FOCUS_IN => Step::Silence,
         _ => {
             // the xkb extension's own events ride above the core range;
             // StateNotify feeds the modifier truth into the state

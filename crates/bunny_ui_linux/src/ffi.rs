@@ -2015,7 +2015,7 @@ fn ensure_backing(client: &mut Client, width: usize, height: usize) -> bool {
 /// shell earns them: an anti-aliased quarter-circle mask over each
 /// corner, premultiplied because the surface carries real alpha.
 /// Runs only over the corner boxes a damage rect touched.
-fn mask_corners(map: *mut u8, width: usize, height: usize, radius: f64) {
+pub(crate) fn mask_corners(map: *mut u8, width: usize, height: usize, radius: f64) {
     let r = radius.min(width as f64 / 2.0).min(height as f64 / 2.0);
     let span = r.ceil() as usize;
     // center and the OUTWARD signs per corner: a pixel rounds only
@@ -2247,7 +2247,7 @@ pub enum Cursor {
 }
 
 /// The border band's cursor for an xdg resize-edge bitfield.
-fn edge_cursor(edge: u32) -> Cursor {
+pub(crate) fn edge_cursor(edge: u32) -> Cursor {
     match edge {
         5 | 10 => Cursor::ResizeNwSe,
         6 | 9 => Cursor::ResizeNeSw,
@@ -2643,7 +2643,7 @@ pub fn set_chrome_gates(drag: DragGate, control: ControlGate) {
 }
 
 /// What a main-window left press resolved to before the scene sees it.
-enum CrownTake {
+pub(crate) enum CrownTake {
     None,
     Move,
     Menu,
@@ -2654,8 +2654,9 @@ enum CrownTake {
 
 /// The xdg resize-edge bitfield for a point near the border — a
 /// six-point band on every side of a scene-chrome window. Zero means
-/// the interior.
-fn resize_edge_of(x: f64, y: f64, width: f64, height: f64) -> u32 {
+/// the interior. (The x11 door speaks the same bitfield and folds it
+/// to EWMH directions at the send.)
+pub(crate) fn resize_edge_of(x: f64, y: f64, width: f64, height: f64) -> u32 {
     const BAND: f64 = 6.0;
     let mut edge = 0;
     if y < BAND {
@@ -2671,7 +2672,7 @@ fn resize_edge_of(x: f64, y: f64, width: f64, height: f64) -> u32 {
     edge
 }
 
-fn crown_take(x: f64, y: f64, clicks: u8, right: bool) -> CrownTake {
+pub(crate) fn crown_take(x: f64, y: f64, clicks: u8, right: bool) -> CrownTake {
     CHROME_GATES.with(|slot| {
         let gates = slot.borrow();
         let Some((drag, control)) = gates.as_ref() else { return CrownTake::None };
