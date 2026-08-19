@@ -2994,6 +2994,91 @@ mod tests {
     }
 
     #[test]
+    fn a_field_keeps_its_caret_and_its_name_through_a_split_above() {
+        use crate::layout::{Proposal, Size};
+
+        // the other half of PAIN 23: the port's editor is a box, but a
+        // FIELD is the same promise — and the reported symptom was not
+        // only that typing stopped, it was that `focused()` went on
+        // answering an address that no longer existed
+        #[derive(Clone, Copy)]
+        struct Bench {
+            split: State<bool>,
+            seam: State<f64>,
+            name: State<String>,
+        }
+
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                let field = text_field("name", self.name.binding()).id("subject");
+                if self.split.get() {
+                    Either::First(hsplit(self.seam.binding(), field, text("other")))
+                } else {
+                    Either::Second(field)
+                }
+            }
+        }
+
+        let bench = Bench {
+            split: State::new(false),
+            seam: State::new(200.0),
+            name: State::new(String::new()),
+        };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 600.0, height: 400.0 });
+        runtime.render_stable(&bench);
+        let result = runtime.layout(&bench, viewport);
+        let (path, rect) = result.hits.last().expect("the field is a target").clone();
+        runtime.pointer_clicked(rect.origin.x + 8.0, rect.origin.y + 8.0, 1, false);
+        runtime.pointer_released(rect.origin.x + 8.0, rect.origin.y + 8.0);
+        assert_eq!(runtime.focused(), Some(path.clone()));
+        assert!(runtime.key(EditCommand::Insert("deco".into())).applied);
+        assert!(runtime.key(EditCommand::Left(false)).applied);
+        assert!(runtime.key(EditCommand::Left(false)).applied);
+
+        // the tree edit ABOVE: every positional segment below it shifts
+        bench.split.set(true);
+        runtime.render_stable(&bench);
+        runtime.layout(&bench, viewport);
+
+        let moved = runtime.focused().expect("the keyboard stayed somewhere");
+        assert_ne!(moved, path, "the address moved with the tree");
+        assert!(
+            runtime.key(EditCommand::Insert("!".into())).applied,
+            "PAIN 23: the field types through a split above it",
+        );
+        // and the CARET went with it — the keyboard surviving in the
+        // wrong place would be its own bug
+        assert_eq!(bench.name.get(), "de!co", "two lefts, then the edit, all held");
+
+        // the honest half: an input that truly dies leaves NO stale
+        // address behind — the app can see it went
+        #[derive(Clone, Copy)]
+        struct Gone {
+            here: State<bool>,
+            name: State<String>,
+        }
+
+        impl Component for Gone {
+            fn body(self, _ctx: &Context) -> impl View {
+                self.here.get().then(|| text_field("name", self.name.binding()).id("only"))
+            }
+        }
+
+        let gone = Gone { here: State::new(true), name: State::new(String::new()) };
+        runtime.render_stable(&gone);
+        let result = runtime.layout(&gone, viewport);
+        let rect = result.hits.last().expect("the field is a target").1;
+        runtime.pointer_clicked(rect.origin.x + 8.0, rect.origin.y + 8.0, 1, false);
+        runtime.pointer_released(rect.origin.x + 8.0, rect.origin.y + 8.0);
+        assert!(runtime.focused().is_some());
+        gone.here.set(false);
+        runtime.render_stable(&gone);
+        runtime.layout(&gone, viewport);
+        assert_eq!(runtime.focused(), None, "a dead field answers None, never its old path");
+    }
+
+    #[test]
     fn a_moved_box_never_hears_that_it_lost_the_keyboard() {
         use crate::layout::{Proposal, Size};
         use std::cell::RefCell;
@@ -6456,6 +6541,67 @@ mod tests {
             )
             .spacing(10.0)
         }
+    }
+
+    /// PAIN 36's OTHER shape, and the one the dock actually has: a
+    /// transparent catcher laid OVER the pane's body, both accepting
+    /// the same drag, and the two the SAME size. Nothing tells them
+    /// apart but which is inside which.
+    #[derive(Clone)]
+    struct CaughtBoard {
+        on_catcher: State<usize>,
+        on_pane: State<usize>,
+    }
+
+    impl Component for CaughtBoard {
+        fn body(self, _ctx: &Context) -> impl View {
+            let on_catcher = self.on_catcher;
+            let on_pane = self.on_pane;
+            vstack!(
+                text("tab 7").on_drag(|| drag(TabDrag { index: 7 }, "tab 7")),
+                zstack!(
+                    text("body"),
+                    spacer().on_drop(move |tab: &TabDrag| on_catcher.set(tab.index)),
+                )
+                .frame(200.0, 80.0)
+                .on_drop(move |tab: &TabDrag| on_pane.set(tab.index)),
+            )
+            .spacing(10.0)
+        }
+    }
+
+    #[test]
+    fn a_transparent_catcher_over_a_body_takes_the_drop() {
+        use crate::layout::{Proposal, Size};
+
+        let board = CaughtBoard { on_catcher: State::new(0), on_pane: State::new(0) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&board);
+        let size = Size { width: 300.0, height: 200.0 };
+        let result = runtime.layout(&board, Proposal::exact(size));
+
+        // both regions cover the same 200x80 box: only the nesting can
+        // decide, which is the whole of pain 36
+        let same: Vec<_> = result
+            .drops
+            .iter()
+            .filter(|region| region.frame.size == (Size { width: 200.0, height: 80.0 }))
+            .collect();
+        assert_eq!(same.len(), 2, "the catcher and the pane share a box: {same:?}");
+        let target = same[0].frame;
+
+        let chip = result.drag_sources.first().expect("the tab lifts").rect;
+        runtime.pointer_pressed(chip.origin.x + 2.0, chip.origin.y + 2.0);
+        runtime.pointer_moved(chip.origin.x + 2.0, chip.origin.y + 30.0);
+        let (x, y) = (
+            target.origin.x + target.size.width / 2.0,
+            target.origin.y + target.size.height / 2.0,
+        );
+        runtime.pointer_moved(x, y);
+        runtime.pointer_released(x, y);
+
+        assert_eq!(board.on_catcher.get(), 7, "the catcher is inside, so it catches");
+        assert_eq!(board.on_pane.get(), 0, "and the pane under it hears nothing");
     }
 
     /// The two targets by their GEOMETRY — never by their index in the
