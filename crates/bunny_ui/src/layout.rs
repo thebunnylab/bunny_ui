@@ -205,6 +205,10 @@ pub struct LayoutEnv<'a> {
     /// a popover then overflows the window by plain geometry, and the
     /// whole policy stays testable headless.
     pub overlay_bounds: Option<Rect>,
+    /// How many PHYSICAL pixels one point covers. It only reaches a
+    /// custom box's paint — the geometry never consults it, so layout
+    /// stays resolution independent by construction.
+    pub scale: Px,
 }
 
 /// An open animation scope, walking down with the placement. The
@@ -1707,6 +1711,7 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
             anim: None,
             live: None,
             overlay_bounds: None,
+            scale: 1.0,
         },
     )
 }
@@ -3101,6 +3106,7 @@ impl LayoutNode {
                     focused,
                     caret_visible: focused && env.stamp.caret_visible,
                     phase,
+                    scale: env.scale,
                 };
                 let ink = out.foreground.last().copied().unwrap_or(Color::BLACK);
                 let mut painter =
@@ -4920,6 +4926,7 @@ mod tests {
             anim: None,
             live: None,
             overlay_bounds: None,
+            scale: 1.0,
         };
         node.measure(proposal, env).0
     }
@@ -4950,6 +4957,7 @@ mod tests {
                 anim: None,
                 live: None,
                 overlay_bounds: None,
+                scale: 1.0,
             },
         )
     }
@@ -5139,6 +5147,7 @@ mod tests {
             anim: None,
             live: None,
             overlay_bounds: None,
+            scale: 1.0,
         };
 
         let root = LayoutNode::Scroll {

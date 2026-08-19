@@ -248,6 +248,15 @@ pub struct PaintCtx<'a> {
     /// The paint must be a pure function of it — the geometry the
     /// measure answered never depends on the phase.
     pub phase: f64,
+    /// How many PHYSICAL pixels one point covers on this screen — `2.0`
+    /// on a retina display, `1.0` everywhere the shell says nothing.
+    ///
+    /// A box that draws parts which TOUCH needs it. Two neighbor bands
+    /// share one edge: if that edge falls in the middle of a pixel,
+    /// both sides cover half of it and a translucent color blends
+    /// twice — a darker thread down the seam. [`Self::snap`] puts the
+    /// edge on a whole pixel and the thread goes away.
+    pub scale: Px,
 }
 
 impl PaintCtx<'_> {
@@ -259,6 +268,36 @@ impl PaintCtx<'_> {
     /// The whole box in LOCAL coordinates — what a background fills.
     pub fn bounds(&self) -> Rect {
         Rect { origin: Point::ZERO, size: self.frame.size }
+    }
+
+    /// Moves one length onto the screen's pixel grid — the cure for the
+    /// seam between two parts that touch.
+    ///
+    /// ```ignore
+    /// let split = ctx.snap(row.y + row.height);
+    /// painter.fill(Rect::new(x, top, w, split - top), tint);
+    /// painter.fill(Rect::new(x, split, w, bottom - split), tint);
+    /// ```
+    ///
+    /// Both bands now end and start on the SAME whole pixel, so the
+    /// tint covers it once.
+    pub fn snap(&self, value: Px) -> Px {
+        (value * self.scale).round() / self.scale
+    }
+
+    /// [`Self::snap`] on the four edges of a box — origin and far edge,
+    /// never origin and size (a snapped size added to a snapped origin
+    /// lands off the grid again).
+    pub fn snap_rect(&self, rect: Rect) -> Rect {
+        let x = self.snap(rect.origin.x);
+        let y = self.snap(rect.origin.y);
+        Rect {
+            origin: Point { x, y },
+            size: Size {
+                width: self.snap(rect.origin.x + rect.size.width) - x,
+                height: self.snap(rect.origin.y + rect.size.height) - y,
+            },
+        }
     }
 }
 

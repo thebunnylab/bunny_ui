@@ -227,6 +227,9 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
     // the surface wants an INTEGER scale (the snapping contract);
     // fractional device ratios round to the nearest whole step
     let mut scale = (scale.round() as usize).max(1);
+    // a box that draws parts which TOUCH puts the shared edge on a
+    // whole PIXEL — it needs the screen's scale
+    runtime.set_device_scale(scale as f64);
     let mut surface: Option<(Surface, usize, Color)> = None;
 
     let present = move |runtime: &Runtime,
@@ -318,6 +321,7 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
             Event::Resize { width, height, scale: ratio } => {
                 size = Size { width, height };
                 scale = (ratio.round() as usize).max(1);
+                runtime.set_device_scale(scale as f64);
                 present(&runtime, &full, size, scale, &mut surface);
             }
             Event::TooltipTick => {

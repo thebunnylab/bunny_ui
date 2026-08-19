@@ -219,6 +219,9 @@ pub struct Runtime {
     /// viewport; the desktop shell sets the SCREEN — overflow becomes
     /// plain geometry.
     overlay_bounds: Cell<Option<Rect>>,
+    /// How many PHYSICAL pixels one layout point is worth on this
+    /// screen. The shell installs it; everyone else keeps `1.0`.
+    device_scale: Cell<Px>,
     /// The Dom mode's retained scene — [`Runtime::dom_frame`] diffs
     /// each new capture against it. Empty (and free) in every other
     /// mode.
@@ -283,6 +286,20 @@ impl Runtime {
     /// default — the viewport.
     pub fn set_overlay_bounds(&self, bounds: Option<Rect>) {
         self.overlay_bounds.set(bounds);
+    }
+
+    /// How many PHYSICAL pixels one layout point covers — what the
+    /// shell reads from the screen (`2.0` on a retina display). It
+    /// reaches the app through [`crate::custom::PaintCtx::scale`], so
+    /// a box that draws parts which TOUCH can put the shared edge on
+    /// a whole pixel. The default is `1.0`.
+    pub fn set_device_scale(&self, scale: Px) {
+        self.device_scale.set(scale.max(1.0));
+    }
+
+    /// The screen's scale, as the shell last told it.
+    pub fn device_scale(&self) -> Px {
+        self.device_scale.get()
     }
 
     /// Closes every open popover, outermost last — the app-switch
@@ -681,6 +698,7 @@ impl Runtime {
             last_drag_regions: RefCell::new(Vec::new()),
             last_control_regions: RefCell::new(Vec::new()),
             overlay_bounds: Cell::new(None),
+            device_scale: Cell::new(1.0),
             dom: RefCell::new(crate::dom::DomLowering::default()),
             root_is_boundary: Cell::new(false),
             printless: Cell::new(false),
@@ -2542,6 +2560,7 @@ impl Runtime {
                 focused,
                 caret_visible: focused && self.caret_visible.get(),
                 phase,
+                scale: self.device_scale.get(),
             };
             let origin = crate::layout::Point {
                 x: -placement.visible.origin.x,
@@ -3067,6 +3086,7 @@ impl Runtime {
             anim: None,
             live: None,
             overlay_bounds: self.overlay_bounds.get(),
+            scale: self.device_scale.get(),
         };
         let (result, scene) = if dom {
             let (result, scene) = crate::layout::layout_dom(&tree, proposal, env);
@@ -3119,6 +3139,9 @@ impl Runtime {
         size: crate::layout::Size,
         scale: usize,
     ) -> crate::raster::Bitmap {
+        // the pass paints for THIS screen: a box that snaps to the
+        // pixel grid reads the same number the rasterizer will use
+        self.set_device_scale(scale as Px);
         let result = self.layout(root, crate::layout::Proposal::exact(size));
         crate::raster::rasterize_with(
             &result.display,

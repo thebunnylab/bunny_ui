@@ -269,6 +269,9 @@ pub fn run_window_chrome(
         let present = Rc::clone(&present);
         move |runtime: &Runtime, root: &_| {
             let (width, height) = window.content_size();
+            // a box that draws parts which TOUCH puts the shared edge
+            // on a whole PIXEL — it needs the screen's scale
+            runtime.set_device_scale(window.scale() as f64);
             // popovers position against an inflated work area, in
             // layout coordinates — overflow past the window's edge is
             // plain geometry here, and welcome

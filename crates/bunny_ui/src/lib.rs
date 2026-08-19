@@ -4981,6 +4981,126 @@ mod tests {
     }
 
     #[test]
+    fn the_paint_knows_the_screen_scale_and_can_land_on_a_whole_pixel() {
+        use crate::custom::{CustomElement, Metrics, PaintCtx, Painter};
+        use crate::layout::{Point, Proposal, Rect, Size};
+        use crate::custom::custom;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // a box made of parts that TOUCH: the app puts the shared edge
+        // on a whole physical pixel, which needs the screen's scale
+        struct Bands {
+            seen: Rc<Cell<f64>>,
+        }
+
+        impl CustomElement for Bands {
+            fn measure(&self, proposal: Proposal, _metrics: &Metrics) -> Size {
+                Size {
+                    width: proposal.width.unwrap_or(0.0),
+                    height: proposal.height.unwrap_or(0.0),
+                }
+            }
+
+            fn paint(&self, ctx: &PaintCtx, painter: &mut Painter) {
+                self.seen.set(ctx.scale);
+                // the hairline the product wants: ONE physical pixel,
+                // whatever the screen is worth
+                let top = ctx.snap(4.0);
+                painter.fill(
+                    Rect {
+                        origin: Point { x: 0.0, y: top },
+                        size: Size { width: ctx.size().width, height: 1.0 / ctx.scale },
+                    },
+                    crate::layout::Color::BLACK,
+                );
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Sheet {
+            seen: &'static std::thread::LocalKey<Rc<Cell<f64>>>,
+        }
+
+        thread_local! {
+            static SEEN: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+        }
+
+        impl Component for Sheet {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Bands { seen: self.seen.with(Rc::clone) })
+            }
+        }
+
+        let sheet = Sheet { seen: &SEEN };
+        let runtime = Runtime::new();
+        runtime.render_stable(&sheet);
+        let size = Size { width: 16.0, height: 16.0 };
+
+        // no shell said anything: one point is one pixel
+        let plain = runtime.paint(&sheet, size);
+        assert_eq!(SEEN.with(|seen| seen.get()), 1.0, "the default scale is 1");
+        let rows = |bitmap: &crate::raster::Bitmap, height: usize| {
+            (0..height).filter(|&y| bitmap.pixel(0, y) != bitmap.pixel(0, 0)).count()
+        };
+        assert_eq!(rows(&plain, 16), 1, "a hairline is one row at 1x");
+
+        // a retina screen: the SAME code paints a thinner line, still
+        // exactly one physical row — the half point of sharpness the
+        // app cannot ask for without the number
+        let retina = runtime.paint_at_scale(&sheet, size, 2);
+        assert_eq!(SEEN.with(|seen| seen.get()), 2.0, "the shell's scale reaches the paint");
+        assert_eq!(retina.height(), 32, "the bitmap is physical");
+        assert_eq!(rows(&retina, 32), 1, "still one row, now half a point tall");
+        // and it starts where the snap put it: 4pt is physical row 8
+        assert_ne!(retina.pixel(0, 8), retina.pixel(0, 0), "the band opens on the snapped row");
+        assert_eq!(retina.pixel(0, 9), retina.pixel(0, 0), "and closes after ONE row");
+    }
+
+    #[test]
+    fn a_snapped_box_keeps_the_edge_two_neighbours_share() {
+        use crate::custom::{Metrics, PaintCtx};
+        use crate::layout::{Point, Rect, Size};
+        use crate::text_engine::{FontSpec, MeasureCache, PixelFont};
+
+        let engine = PixelFont;
+        let cache = MeasureCache::default();
+        let ctx = PaintCtx {
+            frame: Rect { origin: Point::ZERO, size: Size { width: 100.0, height: 100.0 } },
+            visible: Rect { origin: Point::ZERO, size: Size { width: 100.0, height: 100.0 } },
+            metrics: Metrics::new(&engine, &cache, FontSpec::DEFAULT),
+            focused: false,
+            caret_visible: false,
+            phase: 0.0,
+            scale: 2.0,
+        };
+
+        // the product's own line, `(v * scale).round() / scale`
+        assert_eq!(ctx.snap(10.4), 10.5, "a retina screen keeps the half point");
+        assert_eq!(ctx.snap(10.1), 10.0);
+
+        // the LAW of a figure made of parts: snapping moves EDGES, so
+        // two boxes that shared one still do. Snapping the size instead
+        // would open a gap here — a translucent tint would show it.
+        let top = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size { width: 20.0, height: 10.4 },
+        };
+        let bottom = Rect {
+            origin: Point { x: 0.0, y: 10.4 },
+            size: Size { width: 20.0, height: 9.6 },
+        };
+        let top = ctx.snap_rect(top);
+        let bottom = ctx.snap_rect(bottom);
+        assert_eq!(
+            top.origin.y + top.size.height,
+            bottom.origin.y,
+            "the seam stays ONE edge",
+        );
+        assert_eq!(bottom.origin.y, 10.5, "and it sits on a whole pixel");
+    }
+
+    #[test]
     fn paint_puts_ink_where_the_layout_put_the_text() {
         use crate::layout::Size;
 
