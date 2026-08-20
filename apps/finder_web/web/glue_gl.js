@@ -141,6 +141,12 @@ const bunnyGpuImports = {
     return gl.getParameter(gl.MAX_TEXTURE_SIZE) >>> 0;
   },
 
+  // the tier's one line on the way down, so a person can see WHY the
+  // page fell to the rasterizer
+  gl_log(pointer, length) {
+    console.warn(glText(pointer, length));
+  },
+
   gl_teardown() {
     gpuLoseContext();
   },

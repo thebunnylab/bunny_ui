@@ -275,7 +275,14 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
         if tier::active() {
             // the same display list, no Surface in the path — the frame
             // IS the drawable
-            tier::present_window(&display, size, scale, canvas);
+            tier::present_window(
+                &display,
+                size,
+                scale,
+                canvas,
+                &*runtime.text(),
+                &*runtime.images(),
+            );
             if runtime.wants_frame() {
                 unsafe { js_request_frame() };
             }
@@ -787,11 +794,76 @@ pub extern "C" fn bunny_gpu_selftest(packed: u32) -> u32 {
         a: packed as u8,
     };
     let size = bunny_ui::layout::Size { width: 4.0, height: 4.0 };
-    gpu::present_window(&bunny_ui::layout::DisplayList::default(), size, 1, colour);
+    let runtime = Runtime::new();
+    gpu::present_window(
+        &bunny_ui::layout::DisplayList::default(),
+        size,
+        1,
+        colour,
+        &*runtime.text(),
+        &*runtime.images(),
+    );
     let rgba = gpu::read_rgba((4, 4));
     let at = (1 * 4 + 1) * 4;
     ((rgba[at] as u32) << 24)
         | ((rgba[at + 1] as u32) << 16)
         | ((rgba[at + 2] as u32) << 8)
         | rgba[at + 3] as u32
+}
+
+// MARK: - Parity against the oracle
+
+/// One scene from the catalog, drawn twice: once by this tier and once
+/// by the rasterizer the tier must match. Returns the worst channel
+/// delta; the detail goes to the console, where a person can read it.
+///
+/// This is the first GPU tier in the repo that a machine can actually
+/// certify — the others compile for targets nobody here can run.
+#[cfg(feature = "gpu")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_gpu_parity(scene: u32) -> u32 {
+    use bunny_ui::layout::{Color, Size};
+
+    let size = Size { width: 120.0, height: 80.0 };
+    let scale = 2usize;
+    let canvas = Color::rgba(242, 243, 247, 255);
+    let (display, name) = bunny_ui::gpu::scenes::scene(scene);
+    let runtime = Runtime::new();
+    let physical = (
+        (size.width as usize * scale) as u32,
+        (size.height as usize * scale) as u32,
+    );
+    gpu::present_window(&display, size, scale, canvas, &*runtime.text(), &*runtime.images());
+    let mine = gpu::read_rgba(physical);
+    let theirs = bunny_ui::raster::rasterize_with(
+        &display,
+        physical.0 as usize,
+        physical.1 as usize,
+        scale,
+        canvas,
+        &*runtime.text(),
+        &*runtime.images(),
+    )
+    .to_rgba_bytes();
+
+    if mine.len() != theirs.len() {
+        gpu::say(&format!("parity {name}: sizes differ"));
+        return 255;
+    }
+    let mut worst = 0u8;
+    let mut beyond_one = 0usize;
+    for (a, b) in mine.iter().zip(theirs.iter()) {
+        let delta = a.abs_diff(*b);
+        worst = worst.max(delta);
+        if delta > 1 {
+            beyond_one += 1;
+        }
+    }
+    let share = beyond_one as f64 / mine.len() as f64;
+    gpu::say(&format!(
+        "parity {name}: worst {worst}, {:.4}% beyond one step ({beyond_one} of {})",
+        share * 100.0,
+        mine.len()
+    ));
+    worst as u32
 }

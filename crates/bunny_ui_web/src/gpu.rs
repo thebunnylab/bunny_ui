@@ -23,7 +23,13 @@
 
 use std::cell::{Cell, RefCell};
 
+use bunny_ui::gpu::shaders::PRELUDE_300ES;
+use bunny_ui::gpu::walk::{
+    build_frame, AtlasGround, FrameBatches, RectInstance, RunAtlas, RunKind, SpriteInstance,
+};
+use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::layout::{Color, DisplayList, Size};
+use bunny_ui::text_engine::TextEngine;
 
 #[link(wasm_import_module = "bunny_gpu")]
 unsafe extern "C" {
@@ -31,6 +37,7 @@ unsafe extern "C" {
     /// canvas. Zero back is a refusal — no WebGL2, a shader that would
     /// not compile, or `?present=cpu`. Non-zero is MAX_TEXTURE_SIZE.
     fn gl_init(kind: u32, width: u32, height: u32) -> u32;
+    fn gl_log(pointer: *const u8, len: usize);
     fn gl_teardown();
     fn gl_resize(width: u32, height: u32);
 
@@ -149,6 +156,271 @@ pub(crate) const GL_VERTEX_SHADER: u32 = 0x8B31;
 pub(crate) const GL_FRAGMENT_SHADER: u32 = 0x8B30;
 pub(crate) const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
 
+// MARK: - The pipelines (compiled once, at install)
+
+const GL_ARRAY_BUFFER: u32 = 0x8892;
+const GL_UNIFORM_BUFFER: u32 = 0x8A11;
+const GL_STREAM_DRAW: u32 = 0x88E0;
+const GL_FLOAT: u32 = 0x1406;
+const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_TEXTURE0: u32 = 0x84C0;
+const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
+const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
+const GL_TEXTURE_WRAP_S: u32 = 0x2802;
+const GL_TEXTURE_WRAP_T: u32 = 0x2803;
+const GL_NEAREST: i32 = 0x2600;
+const GL_CLAMP_TO_EDGE: i32 = 0x812F;
+const GL_UNPACK_ROW_LENGTH: u32 = 0x0CF2;
+const UBO_FRAME_BINDING: u32 = 0;
+const UBO_ROUND_BINDING: u32 = 1;
+
+struct Pipelines {
+    rect: u32,
+    sprite: u32,
+    vao_rect: u32,
+    vao_sprite: u32,
+    rects: u32,
+    sprites: u32,
+    frame_ubo: u32,
+    round_ubo: u32,
+    /// What each instance buffer currently holds, in bytes — a smaller
+    /// frame reuses the store, a bigger one re-opens it.
+    rect_cap: u32,
+    sprite_cap: u32,
+}
+
+pub(crate) fn say(message: &str) {
+    unsafe { gl_log(message.as_ptr(), message.len()) };
+}
+
+fn compile(kind: u32, source: &str) -> u32 {
+    unsafe { gl_compile_shader(kind, source.as_ptr(), source.len()) }
+}
+
+fn program(vertex: &str, fragment: &str, attribs: &[&str]) -> Result<u32, String> {
+    let vs = compile(GL_VERTEX_SHADER, vertex);
+    if vs == 0 {
+        return Err(last_log());
+    }
+    let fs = compile(GL_FRAGMENT_SHADER, fragment);
+    if fs == 0 {
+        return Err(last_log());
+    }
+    // the locations are bound by NAME before the link, exactly as the
+    // desktop tier binds them — one mechanism, both tiers
+    let handle = unsafe {
+        let handle = gl_link_program(vs, fs);
+        if handle == 0 {
+            return Err(last_log());
+        }
+        handle
+    };
+    // ...and again after, because a link is what fixes them
+    for (index, name) in attribs.iter().enumerate() {
+        unsafe { gl_bind_attrib_location(handle, index as u32, name.as_ptr(), name.len()) };
+    }
+    let relinked = if attribs.is_empty() {
+        handle
+    } else {
+        let again = unsafe { gl_link_program(vs, fs) };
+        if again == 0 { return Err(last_log()) } else { again }
+    };
+    unsafe {
+        let frame = "Frame";
+        gl_uniform_block(relinked, frame.as_ptr(), frame.len(), UBO_FRAME_BINDING);
+        let round = "Round";
+        gl_uniform_block(relinked, round.as_ptr(), round.len(), UBO_ROUND_BINDING);
+    }
+    Ok(relinked)
+}
+
+impl Pipelines {
+    fn build() -> Result<Pipelines, String> {
+        use bunny_ui::gpu::shaders as src;
+        let rect = program(
+            &format!("{}{}", PRELUDE_300ES, src::RECT_VERT),
+            &format!("{}{}{}", PRELUDE_300ES, src::SHARED_FRAG, src::RECT_FRAG_BODY),
+            &["a_rect", "a_clip", "a_params", "a_color", "a_color2", "a_point2", "a_radii"],
+        )?;
+        let sprite = program(
+            &format!("{}{}", PRELUDE_300ES, src::SPRITE_VERT),
+            &format!("{}{}{}", PRELUDE_300ES, src::SHARED_FRAG, src::SPRITE_FRAG_BODY),
+            &["a_dest", "a_tex", "a_clip"],
+        )?;
+        unsafe {
+            let atlas = "atlas";
+            gl_use_program(sprite);
+            let slot = gl_uniform_location(sprite, atlas.as_ptr(), atlas.len());
+            if slot != 0 {
+                gl_uniform1i(slot, 0);
+            }
+        }
+        let pipelines = unsafe {
+            Pipelines {
+                rect,
+                sprite,
+                vao_rect: gl_create_vertex_array(),
+                vao_sprite: gl_create_vertex_array(),
+                rects: gl_create_buffer(),
+                sprites: gl_create_buffer(),
+                frame_ubo: gl_create_buffer(),
+                round_ubo: gl_create_buffer(),
+                rect_cap: 0,
+                sprite_cap: 0,
+            }
+        };
+        unsafe {
+            // std140: Frame is one vec2 in a sixteen-byte register,
+            // Round is two vec4s
+            gl_bind_buffer(GL_UNIFORM_BUFFER, pipelines.frame_ubo);
+            gl_buffer_data_size(GL_UNIFORM_BUFFER, 16, GL_STREAM_DRAW);
+            gl_bind_buffer(GL_UNIFORM_BUFFER, pipelines.round_ubo);
+            gl_buffer_data_size(GL_UNIFORM_BUFFER, 32, GL_STREAM_DRAW);
+            gl_bind_buffer_base(GL_UNIFORM_BUFFER, UBO_FRAME_BINDING, pipelines.frame_ubo);
+            gl_bind_buffer_base(GL_UNIFORM_BUFFER, UBO_ROUND_BINDING, pipelines.round_ubo);
+        }
+        Ok(pipelines)
+    }
+}
+
+/// The instance attributes, re-pointed per run: the run's BASE rides
+/// the byte offset, the way the desktop tier carries it, so no shader
+/// ever asks which instance it is.
+fn rect_attribs(base: usize) {
+    let stride = std::mem::size_of::<RectInstance>() as i32;
+    for (index, offset, count, kind, normalized) in [
+        (0u32, 0usize, 4, GL_FLOAT, 0u32),
+        (1, 16, 4, GL_FLOAT, 0),
+        (2, 32, 4, GL_FLOAT, 0),
+        (3, 48, 4, GL_UNSIGNED_BYTE, 1),
+        (4, 52, 4, GL_UNSIGNED_BYTE, 1),
+        (5, 56, 2, GL_FLOAT, 0),
+        (6, 64, 4, GL_FLOAT, 0),
+    ] {
+        unsafe {
+            gl_enable_vertex_attrib_array(index);
+            gl_vertex_attrib_pointer(index, count, kind, normalized, stride, (base + offset) as i32);
+            gl_vertex_attrib_divisor(index, 1);
+        }
+    }
+}
+
+fn sprite_attribs(base: usize) {
+    let stride = std::mem::size_of::<SpriteInstance>() as i32;
+    for (index, offset) in [(0u32, 0usize), (1, 16), (2, 32)] {
+        unsafe {
+            gl_enable_vertex_attrib_array(index);
+            gl_vertex_attrib_pointer(index, 4, GL_FLOAT, 0, stride, (base + offset) as i32);
+            gl_vertex_attrib_divisor(index, 1);
+        }
+    }
+}
+
+/// Bytes of a slice of plain-old-data instances, for the upload.
+fn instance_bytes<T>(items: &[T]) -> &[u8] {
+    // every wire struct is `#[repr(C)]` and holds only floats and bytes
+    unsafe {
+        std::slice::from_raw_parts(items.as_ptr().cast::<u8>(), std::mem::size_of_val(items))
+    }
+}
+
+fn upload(target_buffer: u32, cap: &mut u32, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    unsafe {
+        gl_bind_buffer(GL_ARRAY_BUFFER, target_buffer);
+        if bytes.len() as u32 > *cap {
+            *cap = bytes.len() as u32;
+            gl_buffer_data_size(GL_ARRAY_BUFFER, *cap, GL_STREAM_DRAW);
+        } else {
+            // orphan: the driver renames the store instead of stalling
+            // on the frame still reading it. A blocking fence is
+            // illegal here, so renaming IS the synchronisation.
+            gl_buffer_data_size(GL_ARRAY_BUFFER, *cap, GL_STREAM_DRAW);
+        }
+        gl_buffer_sub_data(GL_ARRAY_BUFFER, 0, bytes.as_ptr(), bytes.len());
+    }
+}
+
+// MARK: - The ground (the one seam the walk asks a tier to fill)
+
+#[derive(Default)]
+struct WebGround {
+    shared: Option<u32>,
+    dedicated: std::collections::HashMap<u64, u32>,
+    next: u64,
+}
+
+impl AtlasGround for WebGround {
+    fn ensure_shared(&mut self, size: u32) -> bool {
+        if self.shared.is_some() {
+            return true;
+        }
+        let texture = unsafe {
+            let texture = gl_create_texture();
+            gl_bind_texture(GL_TEXTURE_2D, texture);
+            gl_tex_image_2d(
+                GL_TEXTURE_2D, 0, GL_RGBA as i32, size as i32, size as i32,
+                GL_RGBA, GL_UNSIGNED_BYTE, std::ptr::null(), 0,
+            );
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            texture
+        };
+        self.shared = Some(texture);
+        true
+    }
+
+    fn upload_shared(&mut self, x: u32, y: u32, w: u32, h: u32, bytes: &[u8], pitch_px: u32) {
+        let Some(texture) = self.shared else { return };
+        unsafe {
+            gl_bind_texture(GL_TEXTURE_2D, texture);
+            gl_pixel_storei(GL_UNPACK_ROW_LENGTH, pitch_px as i32);
+            gl_tex_sub_image_2d(
+                GL_TEXTURE_2D, 0, x as i32, y as i32, w as i32, h as i32,
+                GL_RGBA, GL_UNSIGNED_BYTE, bytes.as_ptr(), bytes.len(),
+            );
+            gl_pixel_storei(GL_UNPACK_ROW_LENGTH, 0);
+        }
+    }
+
+    fn drop_shared(&mut self) {
+        if let Some(texture) = self.shared.take() {
+            unsafe { gl_delete_texture(texture) };
+        }
+    }
+
+    fn make_dedicated(&mut self, w: u32, h: u32, bytes: &[u8], pitch_px: u32) -> Option<u64> {
+        let texture = unsafe {
+            let texture = gl_create_texture();
+            gl_bind_texture(GL_TEXTURE_2D, texture);
+            gl_pixel_storei(GL_UNPACK_ROW_LENGTH, pitch_px as i32);
+            gl_tex_image_2d(
+                GL_TEXTURE_2D, 0, GL_RGBA as i32, w as i32, h as i32,
+                GL_RGBA, GL_UNSIGNED_BYTE, bytes.as_ptr(), bytes.len(),
+            );
+            gl_pixel_storei(GL_UNPACK_ROW_LENGTH, 0);
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            texture
+        };
+        self.next += 1;
+        self.dedicated.insert(self.next, texture);
+        Some(self.next)
+    }
+
+    fn drop_dedicated(&mut self, id: u64) {
+        if let Some(texture) = self.dedicated.remove(&id) {
+            unsafe { gl_delete_texture(texture) };
+        }
+    }
+}
+
 /// A window never switches roads mid-flight, so the tier is chosen once
 /// and this is where the answer lives.
 struct Tier {
@@ -156,6 +428,10 @@ struct Tier {
     max_texture: u32,
     /// The physical size the drawable currently holds.
     physical: (u32, u32),
+    pipelines: Pipelines,
+    ground: WebGround,
+    atlas: RunAtlas,
+    batches: FrameBatches,
 }
 
 thread_local! {
@@ -188,7 +464,26 @@ pub(crate) fn try_install(kind: u32, physical: (u32, u32)) -> bool {
         gl_blend_func_separate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         gl_pixel_storei(GL_UNPACK_ALIGNMENT, 1);
     }
-    TIER.with(|slot| *slot.borrow_mut() = Some(Tier { max_texture, physical }));
+    let pipelines = match Pipelines::build() {
+        Ok(pipelines) => pipelines,
+        Err(log) => {
+            // a shader the device refuses is not a crash: the page has
+            // a rasterizer, and it says so once on the way down
+            say(&format!("bunny gl: {}", log.trim()));
+            unsafe { gl_teardown() };
+            return false;
+        }
+    };
+    TIER.with(|slot| {
+        *slot.borrow_mut() = Some(Tier {
+            max_texture,
+            physical,
+            pipelines,
+            ground: WebGround::default(),
+            atlas: RunAtlas::new(),
+            batches: FrameBatches::default(),
+        })
+    });
     true
 }
 
@@ -228,36 +523,150 @@ pub(crate) fn restored(physical: (u32, u32)) -> bool {
 
 /// Presents one display list. The frame IS the drawable: no `Surface`
 /// is allocated on this road, and the CPU bitmap is never built.
-pub(crate) fn present_window(display: &DisplayList, size: Size, scale: usize, canvas: Color) {
+pub(crate) fn present_window(
+    display: &DisplayList,
+    size: Size,
+    scale: usize,
+    canvas: Color,
+    text: &dyn TextEngine,
+    images: &dyn ImageEngine,
+) {
     let physical = (
         ((size.width.round() as usize) * scale).max(1) as u32,
         ((size.height.round() as usize) * scale).max(1) as u32,
     );
-    let stale = TIER.with(|slot| {
+    TIER.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let Some(tier) = slot.as_mut() else { return false };
-        let stale = tier.physical != physical;
-        tier.physical = physical;
-        stale
-    });
-    if stale {
-        unsafe { gl_resize(physical.0, physical.1) };
-    }
-    unsafe {
-        gl_bind_framebuffer(GL_FRAMEBUFFER, 0);
-        gl_viewport(0, 0, physical.0 as i32, physical.1 as i32);
-        // the clear takes the canvas colour STRAIGHT, the way the
-        // rasterizer fills its bitmap with it — no premultiply, because
-        // nothing has blended yet
-        gl_clear_color(
-            canvas.r as f32 / 255.0,
-            canvas.g as f32 / 255.0,
-            canvas.b as f32 / 255.0,
-            canvas.a as f32 / 255.0,
+        let Some(tier) = slot.as_mut() else { return };
+        if tier.physical != physical {
+            tier.physical = physical;
+            unsafe { gl_resize(physical.0, physical.1) };
+        }
+        unsafe {
+            gl_bind_framebuffer(GL_FRAMEBUFFER, 0);
+            gl_viewport(0, 0, physical.0 as i32, physical.1 as i32);
+            // the canvas colour goes on STRAIGHT, the way the
+            // rasterizer fills its bitmap with it — nothing has
+            // blended yet
+            gl_clear_color(
+                canvas.r as f32 / 255.0,
+                canvas.g as f32 / 255.0,
+                canvas.b as f32 / 255.0,
+                canvas.a as f32 / 255.0,
+            );
+            gl_clear(GL_COLOR_BUFFER_BIT);
+        }
+
+        // the walk, and the copying collector behind it: a full atlas
+        // drains, resets (growing once to the cap the device allows)
+        // and walks the frame again
+        let target = (physical.0 as usize, physical.1 as usize);
+        let mut walked = false;
+        for attempt in 0..3 {
+            let Tier { ground, atlas, batches, .. } = tier;
+            match build_frame(ground, display, scale, target, text, images, atlas, batches) {
+                Ok(()) => {
+                    walked = true;
+                    break;
+                }
+                Err(_) => {
+                    let grow = attempt == 0 && tier.max_texture >= 4096;
+                    let Tier { ground, atlas, .. } = tier;
+                    atlas.reset(ground, grow);
+                }
+            }
+        }
+        if !walked {
+            say("bunny gl: the atlas overflowed twice - the frame is short");
+            return;
+        }
+
+        let viewport = [physical.0 as f32, physical.1 as f32, 0.0, 0.0];
+        unsafe {
+            gl_bind_buffer(GL_UNIFORM_BUFFER, tier.pipelines.frame_ubo);
+            gl_buffer_sub_data(
+                GL_UNIFORM_BUFFER,
+                0,
+                viewport.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(&viewport),
+            );
+        }
+        upload(
+            tier.pipelines.rects,
+            &mut tier.pipelines.rect_cap,
+            instance_bytes(&tier.batches.rects),
         );
-        gl_clear(GL_COLOR_BUFFER_BIT);
-    }
-    let _ = display;
+        upload(
+            tier.pipelines.sprites,
+            &mut tier.pipelines.sprite_cap,
+            instance_bytes(&tier.batches.sprites),
+        );
+
+        // the runs, in paint order — the display list IS the order, and
+        // nothing here sorts or batches across it
+        let mut round = u32::MAX;
+        let mut program = 0u32;
+        for run in &tier.batches.runs {
+            if run.round != round {
+                round = run.round;
+                let curve = tier.batches.rounds[round as usize];
+                let block = [
+                    curve.box4[0], curve.box4[1], curve.box4[2], curve.box4[3],
+                    curve.radii[0], curve.radii[1], curve.radii[2], curve.radii[3],
+                ];
+                unsafe {
+                    gl_bind_buffer(GL_UNIFORM_BUFFER, tier.pipelines.round_ubo);
+                    gl_buffer_sub_data(
+                        GL_UNIFORM_BUFFER,
+                        0,
+                        block.as_ptr().cast::<u8>(),
+                        std::mem::size_of_val(&block),
+                    );
+                }
+            }
+            match run.kind {
+                RunKind::Rects => {
+                    if program != tier.pipelines.rect {
+                        program = tier.pipelines.rect;
+                        unsafe {
+                            gl_use_program(program);
+                            gl_bind_vertex_array(tier.pipelines.vao_rect);
+                            gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.rects);
+                        }
+                    }
+                    rect_attribs(run.base as usize * std::mem::size_of::<RectInstance>());
+                }
+                RunKind::Sprites | RunKind::Texture(_) => {
+                    if program != tier.pipelines.sprite {
+                        program = tier.pipelines.sprite;
+                        unsafe {
+                            gl_use_program(program);
+                            gl_bind_vertex_array(tier.pipelines.vao_sprite);
+                            gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.sprites);
+                        }
+                    }
+                    let texture = match run.kind {
+                        RunKind::Texture(index) => tier
+                            .batches
+                            .textures
+                            .get(index as usize)
+                            .and_then(|handle| tier.ground.dedicated.get(handle).copied())
+                            .unwrap_or(0),
+                        _ => tier.ground.shared.unwrap_or(0),
+                    };
+                    unsafe {
+                        gl_active_texture(GL_TEXTURE0);
+                        gl_bind_texture(GL_TEXTURE_2D, texture);
+                    }
+                    sprite_attribs(run.base as usize * std::mem::size_of::<SpriteInstance>());
+                }
+                // the pane arrives with the pyramid, one commit along
+                RunKind::Glass => continue,
+            }
+            unsafe { gl_draw_arrays_instanced(GL_TRIANGLES, 0, 6, run.count as i32) };
+        }
+        unsafe { gl_flush() };
+    });
 }
 
 pub(crate) const GL_FRAMEBUFFER: u32 = 0x8D40;
