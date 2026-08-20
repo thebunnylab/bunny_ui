@@ -77,6 +77,8 @@ fn css_weight(weight: Weight) -> u32 {
         Weight::Medium => 500,
         Weight::Semibold => 600,
         Weight::Bold => 700,
+        Weight::ExtraBold => 800,
+        Weight::Black => 900,
     }
 }
 

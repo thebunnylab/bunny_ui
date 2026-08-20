@@ -1721,7 +1721,7 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 ///
 /// A test pins the glue to this number: bump one side alone and the
 /// suite goes red before the browser ever gets the chance to.
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -2270,6 +2270,8 @@ fn weight_code(weight: Weight) -> u8 {
         Weight::Medium => 1,
         Weight::Semibold => 2,
         Weight::Bold => 3,
+        Weight::ExtraBold => 4,
+        Weight::Black => 5,
     }
 }
 

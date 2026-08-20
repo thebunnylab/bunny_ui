@@ -373,6 +373,7 @@ impl WicImageEngine {
             // intercepts glyphs and traced paths alike
             ImageSource::Symbol { .. }
             | ImageSource::Path { .. }
+            | ImageSource::Rgba { .. }
             | ImageSource::Faded { .. } => None,
         };
         let answer = decoded.as_ref().map(read);
@@ -537,6 +538,7 @@ impl ImageEngine for WicImageEngine {
             ImageSource::FileIcon { path, .. } => icon_rgba(path, width, height)?,
             ImageSource::Symbol { .. }
             | ImageSource::Path { .. }
+            | ImageSource::Rgba { .. }
             | ImageSource::Faded { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
                 return None;

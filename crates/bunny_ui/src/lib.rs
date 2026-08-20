@@ -1287,6 +1287,49 @@ mod tests {
     }
 
     #[test]
+    fn the_weight_scale_travels_as_a_number() {
+        use crate::text_engine::Weight;
+        // the six the vocabulary can now spell, and the code each one
+        // travels as — the glue's table is indexed by exactly this
+        let scale = [
+            Weight::Regular,
+            Weight::Medium,
+            Weight::Semibold,
+            Weight::Bold,
+            Weight::ExtraBold,
+            Weight::Black,
+        ];
+        let code_of = |weight: Weight| -> u8 {
+            let text = crate::dom::DomText {
+                content: std::sync::Arc::from("x"),
+                color: Color::BLACK,
+                inherits_ink: false,
+                font: crate::text_engine::FontSpec { weight, ..crate::text_engine::FontSpec::DEFAULT },
+                line_height: None,
+                text_align: None,
+                highlights: None,
+                truncation: None,
+            };
+            let bytes = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 1, text }]);
+            // count(4), op(1), id(4), color(4), inherits(1), size(4) —
+            // then the weight
+            bytes[18]
+        };
+        let codes: Vec<u8> = scale.iter().map(|weight| code_of(*weight)).collect();
+        assert_eq!(codes, vec![0, 1, 2, 3, 4, 5]);
+        // the glue mirrors them by hand: one CSS number per code
+        let glue = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        assert!(
+            glue.contains("const CSS_WEIGHTS = [400, 500, 600, 700, 800, 900];"),
+            "the glue's weight table drifted from the engine's scale"
+        );
+        // and the modifier carries the name through to the printed tree
+        let runtime = Runtime::new();
+        let printed = runtime.render_stable(&text("heavy").font_weight(Weight::ExtraBold));
+        assert!(printed.contains("[.fontWeight(.ExtraBold)]"), "{printed}");
+    }
+
+    #[test]
     fn a_vec_of_views_flattens_like_a_tuple() {
         let runtime = Runtime::new();
         // the same three children, spelled two ways — a Vec says what a

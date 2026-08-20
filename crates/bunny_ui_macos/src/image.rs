@@ -247,6 +247,7 @@ impl CoreGraphicsImageEngine {
             // intercepts glyphs and traced paths alike
             ImageSource::Symbol { .. }
             | ImageSource::Path { .. }
+            | ImageSource::Rgba { .. }
             | ImageSource::Faded { .. } => std::ptr::null_mut(),
         };
         let entry = (!image.is_null()).then(|| OwnedImage(image));
@@ -299,6 +300,7 @@ impl ImageEngine for CoreGraphicsImageEngine {
             ImageSource::FileIcon { path, .. } => unsafe { icon_rgba(path, width, height) }?,
             ImageSource::Symbol { .. }
             | ImageSource::Path { .. }
+            | ImageSource::Rgba { .. }
             | ImageSource::Faded { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
                 return None;

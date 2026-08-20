@@ -85,6 +85,8 @@ pub enum Modifier {
     /// points. Inherited, and an exception to "props is paint only": it
     /// sets what a paragraph measures.
     LineHeight(f64),
+    /// A weight by NAME — the rest of the font stays.
+    FontWeight(crate::text_engine::Weight),
     BackgroundHovered(Color),
     Opacity(f64),
     OpacityHovered(f64),
@@ -248,6 +250,7 @@ impl Modifier {
             Modifier::Id(name) => format!(" [.id({name:?})]"),
             Modifier::FontSize(size) => format!(" [.font(.system(size: {size}))]"),
             Modifier::LineHeight(height) => format!(" [.lineHeight({height})]"),
+            Modifier::FontWeight(weight) => format!(" [.fontWeight(.{weight:?})]"),
             Modifier::BackgroundHovered(color) => format!(" [.backgroundHovered({color})]"),
             Modifier::Opacity(value) => format!(" [.opacity({value})]"),
             Modifier::OpacityHovered(value) => format!(" [.opacityHovered({value})]"),
@@ -1072,6 +1075,14 @@ fn apply(
             out,
             mark,
             VisualProps { line_height: Some(*height), ..VisualProps::default() },
+        ),
+        Modifier::FontWeight(weight) => wrap_styled(
+            out,
+            mark,
+            VisualProps {
+                font: FontPatch { weight: Some(*weight), ..FontPatch::default() },
+                ..VisualProps::default()
+            },
         ),
         Modifier::MultilineTextAlignment(alignment) => wrap_styled(
             out,

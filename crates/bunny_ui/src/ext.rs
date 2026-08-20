@@ -54,6 +54,21 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.font_weight(Weight::ExtraBold)` — a weight by name. Only the
+    /// weight travels, so the size and the design of the scope survive;
+    /// `.bold()` is the same door with `Weight::Bold` spelled for you.
+    ///
+    /// Every platform that renders a NUMBER renders all six. CoreText
+    /// carries one emphasized face for the whole top half of the scale,
+    /// so on the desktop Semibold and heavier read as one bold until the
+    /// descriptor road lands.
+    fn font_weight(self, weight: crate::text_engine::Weight) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::FontWeight(weight),
+        }
+    }
+
     /// `.line_height(24.0)` — the box each line steps by, in points, the
     /// CSS `line-height`. A `text(…)` measures with the FONT's own box
     /// (`ascent + descent`); this overrides it, stepping the lines by the

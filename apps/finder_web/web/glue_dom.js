@@ -18,7 +18,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 5;
+const EXPECTED_ABI = 6;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -226,7 +226,7 @@ function cssFont(size, weight, mono, italic, named) {
   return `${italic ? "italic " : ""}${weight} ${size}px ${family}`;
 }
 
-const CSS_WEIGHTS = [400, 500, 600, 700];
+const CSS_WEIGHTS = [400, 500, 600, 700, 800, 900];
 
 function rgba(packed) {
   const r = (packed >>> 24) & 0xff;

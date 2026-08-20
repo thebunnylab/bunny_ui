@@ -26,6 +26,11 @@ pub enum Weight {
     Medium,
     Semibold,
     Bold,
+    /// 800 — heavier than bold, which display faces carry and the
+    /// vocabulary could not spell.
+    ExtraBold,
+    /// 900 — the heaviest a face usually offers.
+    Black,
 }
 
 /// Upright, or leaning. The preview tab of an editor writes its label

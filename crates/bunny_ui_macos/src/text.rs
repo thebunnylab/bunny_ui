@@ -251,14 +251,18 @@ unsafe fn create_upright(spec: &FontSpec) -> CTFontRef {
                 // emphasized covers Semibold/Bold with dignity
                 let kind = match spec.weight {
                     Weight::Regular | Weight::Medium => UI_FONT_SYSTEM,
-                    Weight::Semibold | Weight::Bold => UI_FONT_EMPHASIZED,
+                    Weight::Semibold | Weight::Bold | Weight::ExtraBold | Weight::Black => {
+                        UI_FONT_EMPHASIZED
+                    }
                 };
                 CTFontCreateUIFontForLanguage(kind, spec.size, std::ptr::null())
             }
             FontDesign::Mono => {
                 let name = match spec.weight {
                     Weight::Regular | Weight::Medium => "Menlo-Regular",
-                    Weight::Semibold | Weight::Bold => "Menlo-Bold",
+                    Weight::Semibold | Weight::Bold | Weight::ExtraBold | Weight::Black => {
+                        "Menlo-Bold"
+                    }
                 };
                 let cf_name = cf_string(name);
                 let font = CTFontCreateWithName(cf_name, spec.size, std::ptr::null());

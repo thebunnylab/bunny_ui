@@ -605,6 +605,8 @@ fn css_font(font: &crate::text_engine::FontSpec) -> String {
         crate::text_engine::Weight::Medium => 500,
         crate::text_engine::Weight::Semibold => 600,
         crate::text_engine::Weight::Bold => 700,
+        crate::text_engine::Weight::ExtraBold => 800,
+        crate::text_engine::Weight::Black => 900,
     };
     let family = match font.design {
         crate::text_engine::FontDesign::Mono => {

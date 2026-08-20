@@ -213,6 +213,8 @@ impl FreeTypeEngine {
                 Weight::Medium => 1,
                 Weight::Semibold => 2,
                 Weight::Bold => 3,
+                Weight::ExtraBold => 4,
+                Weight::Black => 5,
             },
             italic: font.slant == Slant::Italic,
             family: font.family,
