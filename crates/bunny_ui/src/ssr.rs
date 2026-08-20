@@ -473,6 +473,15 @@ impl Tree {
                 if let Some(height) = text.line_height {
                     element.style.insert("line-height", format!("{height}px"));
                 }
+                match text.text_align {
+                    Some(motor::views::TextAlignment::Center) => {
+                        element.style.insert("text-align", "center".into());
+                    }
+                    Some(motor::views::TextAlignment::Trailing) => {
+                        element.style.insert("text-align", "right".into());
+                    }
+                    _ => {}
+                }
                 if text.inherits_ink {
                     element.style.remove("color");
                 } else {

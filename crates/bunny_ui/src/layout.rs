@@ -317,6 +317,8 @@ pub struct LayoutEnv<'a> {
     /// The inherited line height a paragraph steps by. `None` = the
     /// face's own box; a value overrides it, set by `.line_height(…)`.
     pub line_height: Option<Px>,
+    /// Where a wrapped line sits inside its box. `None` = leading.
+    pub text_align: Option<motor::views::TextAlignment>,
     /// The pass's frame state — consulted BY PATH during placement.
     pub stamp: FrameStamp<'a>,
     /// The frame's animator — `None` in bare layouts (tests, direct
@@ -1361,6 +1363,10 @@ pub struct VisualProps {
     /// lines by it and centres the glyphs in the taller box — the CSS
     /// half-leading.
     pub line_height: Option<Px>,
+    /// Where each WRAPPED line sits inside the box the text was given.
+    /// Inherited beside the font; `None` is leading, which is where every
+    /// line has always been placed.
+    pub text_align: Option<motor::views::TextAlignment>,
     /// A soft halo behind the view: `(radius, color)`. The falloff is
     /// quadratic; the halo paints OUTSIDE the shape and follows the
     /// corner radius — including the notch behind a rounded corner,
@@ -1415,6 +1421,7 @@ impl VisualProps {
             foreground_pressed: self.foreground_pressed.or(outer.foreground_pressed),
             font: self.font.or(outer.font),
             line_height: self.line_height.or(outer.line_height),
+            text_align: self.text_align.or(outer.text_align),
             shadow: self.shadow.or(outer.shadow),
             opacity: self.opacity.or(outer.opacity),
             opacity_hovered: self.opacity_hovered.or(outer.opacity_hovered),
@@ -2292,6 +2299,7 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             line_height: None,
+            text_align: None,
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
@@ -2966,6 +2974,7 @@ impl LayoutNode {
                 let env = LayoutEnv {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
+                    text_align: props.text_align.or(env.text_align),
                     ..env
                 };
                 child.first_baseline(env)
@@ -3326,6 +3335,7 @@ impl LayoutNode {
                 let env = LayoutEnv {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
+                    text_align: props.text_align.or(env.text_align),
                     ..env
                 };
                 let (size, fit) = child.measure(proposal, env);
@@ -3396,6 +3406,7 @@ impl LayoutNode {
                             inherits_ink: false,
                             font: env.font,
                             line_height: env.line_height,
+                            text_align: env.text_align,
                             highlights: highlights
                                 .as_ref()
                                 .map(|h| (Rc::clone(&h.ranges), h.color)),
@@ -4322,6 +4333,7 @@ impl LayoutNode {
                 let env = LayoutEnv {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
+                    text_align: props.text_align.or(env.text_align),
                     anim: env.anim.map(|scope| AnimScope { colors: false, ..scope }),
                     ..env
                 };
@@ -4990,9 +5002,19 @@ fn place_text(
     let advance = env.line_height.unwrap_or(line_h);
     let leading = (advance - line_h) / 2.0;
     let top = frame.origin.y + leading;
+    // where a line sits in the room the box gives it: leading is offset
+    // zero, which is where every line has always been placed
+    let slide = |width: Px| -> Px {
+        let room = frame.size.width - width;
+        match env.text_align {
+            None | Some(motor::views::TextAlignment::Leading) => 0.0,
+            Some(motor::views::TextAlignment::Center) => room / 2.0,
+            Some(motor::views::TextAlignment::Trailing) => room,
+        }
+    };
 
     if metrics.width <= frame.size.width {
-        let origin = Point { x: frame.origin.x, y: top };
+        let origin = Point { x: frame.origin.x + slide(metrics.width), y: top };
         emit_text_runs(content, (0, content.len()), highlights, origin, base_color, env, out);
         return;
     }
@@ -5001,8 +5023,9 @@ fn place_text(
         // do not map onto the composed text) — honest v1, noted
         let composed: Arc<str> = Arc::from(truncate_to_width(content, mode, frame.size.width, env));
         let length = composed.len();
+        let cut = env.cache.get_or_measure(&composed, &env.font, env.text).width;
         out.draw(DrawCommand::TextLine {
-            origin: Point { x: frame.origin.x, y: top },
+            origin: Point { x: frame.origin.x + slide(cut), y: top },
             content: composed,
             range: (0, length),
             color: base_color,
@@ -5012,11 +5035,24 @@ fn place_text(
     }
     let lines = env.cache.get_or_break(content, &env.font, frame.size.width, env.text);
     for (line_index, (start, end)) in lines.iter().enumerate() {
+        // a centred or trailing line has to know its OWN width; a leading
+        // one never asks, so the common case measures nothing extra
+        let x = match env.text_align {
+            None | Some(motor::views::TextAlignment::Leading) => frame.origin.x,
+            _ => {
+                // the space a break swallowed is INVISIBLE, and counting
+                // it would slide the line half a space off centre — the
+                // browser trims it too, so the two lowerings agree
+                let line = content[*start..*end].trim_end();
+                let width = env.cache.get_or_measure(&Arc::from(line), &env.font, env.text).width;
+                frame.origin.x + slide(width)
+            }
+        };
         emit_text_runs(
             content,
             (*start, *end),
             highlights,
-            Point { x: frame.origin.x, y: top + line_index as Px * advance },
+            Point { x, y: top + line_index as Px * advance },
             base_color,
             env,
             out,
@@ -5821,6 +5857,7 @@ mod tests {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             line_height: None,
+            text_align: None,
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
@@ -5853,6 +5890,7 @@ mod tests {
                 scroll_offsets: &offsets,
                 font: FontSpec::DEFAULT,
                 line_height: None,
+                text_align: None,
                 stamp: FrameStamp::idle(interaction, &carets),
                 animator: None,
                 anim: None,
@@ -6044,6 +6082,7 @@ mod tests {
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
             line_height: None,
+            text_align: None,
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,

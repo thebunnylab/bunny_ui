@@ -1073,6 +1073,11 @@ fn apply(
             mark,
             VisualProps { line_height: Some(*height), ..VisualProps::default() },
         ),
+        Modifier::MultilineTextAlignment(alignment) => wrap_styled(
+            out,
+            mark,
+            VisualProps { text_align: Some(*alignment), ..VisualProps::default() },
+        ),
         Modifier::BackgroundHovered(color) => wrap_styled(
             out,
             mark,

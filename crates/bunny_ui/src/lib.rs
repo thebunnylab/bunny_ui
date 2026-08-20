@@ -8755,6 +8755,46 @@ mod tests {
     }
 
     #[test]
+    fn a_wrapped_line_sits_where_the_alignment_puts_it() {
+        use crate::layout::{DrawCommand, Proposal};
+        use motor::views::TextAlignment;
+        let runtime = Runtime::new();
+        let line_lefts = |display: &crate::layout::DisplayList| -> Vec<f64> {
+            display
+                .iter()
+                .filter_map(|command| match command {
+                    DrawCommand::TextLine { origin, .. } => Some(origin.x),
+                    _ => None,
+                })
+                .collect()
+        };
+        // PixelFont: 8px a glyph. "aa bbbb" wraps in a 40pt column into
+        // "aa" (16 wide) and "bbbb" (32) — centred, they start at 12 and
+        // 4; trailing, at 24 and 8.
+        let centred = text("aa bbbb")
+            .multiline_text_alignment(TextAlignment::Center)
+            .frame_width(40.0);
+        assert_eq!(
+            line_lefts(&runtime.layout(&centred, Proposal::unspecified()).display),
+            vec![12.0, 4.0],
+            "each line centres on its own width"
+        );
+        let trailing = text("aa bbbb")
+            .multiline_text_alignment(TextAlignment::Trailing)
+            .frame_width(40.0);
+        assert_eq!(
+            line_lefts(&runtime.layout(&trailing, Proposal::unspecified()).display),
+            vec![24.0, 8.0]
+        );
+        // unset, every line starts at the leading edge, as they always did
+        let plain = text("aa bbbb").frame_width(40.0);
+        assert_eq!(
+            line_lefts(&runtime.layout(&plain, Proposal::unspecified()).display),
+            vec![0.0, 0.0]
+        );
+    }
+
+    #[test]
     fn the_line_box_reaches_the_browser_on_the_wire() {
         use crate::text_engine::FontSpec;
 
@@ -8764,6 +8804,7 @@ mod tests {
             inherits_ink: false,
             font: FontSpec::DEFAULT,
             line_height: Some(24.0),
+            text_align: None,
             highlights: None,
             truncation: None,
         };
@@ -8774,6 +8815,7 @@ mod tests {
             inherits_ink: false,
             font: FontSpec::DEFAULT,
             line_height: None,
+            text_align: None,
             highlights: None,
             truncation: None,
         };
@@ -8797,6 +8839,7 @@ mod tests {
             inherits_ink: false,
             font: FontSpec { slant: Slant::Italic, ..FontSpec::DEFAULT },
             line_height: None,
+            text_align: None,
             highlights: None,
             truncation: None,
         };
@@ -8807,6 +8850,7 @@ mod tests {
             inherits_ink: false,
             font: FontSpec::DEFAULT,
             line_height: None,
+            text_align: None,
             highlights: None,
             truncation: None,
         };

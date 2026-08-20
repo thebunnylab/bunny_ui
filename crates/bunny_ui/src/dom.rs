@@ -319,6 +319,9 @@ pub struct DomText {
     /// its own lines by it, so the element wraps at the same rhythm the
     /// engine measured. `None` leaves the face's own box.
     pub line_height: Option<crate::layout::Px>,
+    /// Where each wrapped line sits in the box — `None` is leading, the
+    /// browser's own default for our writing direction.
+    pub text_align: Option<motor::views::TextAlignment>,
     /// Match highlight spans (byte ranges) + their color.
     pub highlights: Option<(Rc<Vec<(usize, usize)>>, Color)>,
     pub truncation: Option<Truncation>,
@@ -1904,6 +1907,12 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 // the line box, or 0 for "the face's own" — the browser
                 // steps its lines by the same number our placement does
                 push_f32(&mut out, text.line_height.unwrap_or(0.0));
+                // 0 leading (the default), 1 centre, 2 trailing
+                out.push(match text.text_align {
+                    None | Some(motor::views::TextAlignment::Leading) => 0,
+                    Some(motor::views::TextAlignment::Center) => 1,
+                    Some(motor::views::TextAlignment::Trailing) => 2,
+                });
                 out.push(match text.truncation {
                     None => 0,
                     Some(Truncation::Start) => 1,

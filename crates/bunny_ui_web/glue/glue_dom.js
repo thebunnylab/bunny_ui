@@ -708,6 +708,7 @@ function applyPatches(view, length) {
       const italic = u8();
       const family = text(u16());
       const lineHeight = f32();
+      const align = u8();
       const truncation = u8();
       const raw = bytes(u32());
       const spanCount = u16();
@@ -719,6 +720,8 @@ function applyPatches(view, length) {
         // AFTER the font shorthand, which resets line-height: 0 means
         // the face's own box, which is what an empty string restores
         el.style.lineHeight = lineHeight > 0 ? `${lineHeight}px` : "";
+        // 0 leading — the browser's own default for this direction
+        el.style.textAlign = align === 1 ? "center" : align === 2 ? "right" : "";
         // an inherited ink takes NO inline color: an inline one would
         // outrank the :hover rule of the box that owns both states
         el.style.color = inheritsInk ? "" : color;
