@@ -1511,6 +1511,7 @@ pub struct ForEach<T, I, F> {
     row: F,
     axis: Axis,
     spacing: Option<f64>,
+    align: Option<CrossAlign>,
 }
 
 impl<T, I, F, R> View for ForEach<T, I, F>
@@ -1531,18 +1532,18 @@ where
         }
         let (prints, layouts) = rows.into_parts();
         out.push(RenderNode::branch(
-            for_each_line(self.items.len(), self.axis, self.spacing),
+            for_each_line(self.items.len(), self.axis, self.spacing, self.align),
             prints,
         ));
         out.push_layout(LayoutNode::Stack {
             axis: self.axis,
             spacing: self.spacing.unwrap_or(0.0),
             // a column reads leading, a strip reads centered — the same
-            // defaults the stacks carry
-            align: match self.axis {
+            // defaults the stacks carry, until the caller says otherwise
+            align: self.align.unwrap_or(match self.axis {
                 Axis::Vertical => CrossAlign::Start,
                 Axis::Horizontal => CrossAlign::Center,
-            },
+            }),
             children: layouts,
         });
     }
@@ -1566,17 +1567,30 @@ impl<T, I, F> ForEach<T, I, F> {
         self.spacing = Some(spacing);
         self
     }
+
+    /// How each item sits across the run — the `.alignment(…)` an
+    /// explicit stack takes, which a generated one never could. Leading
+    /// down a column and centered along a strip until this says
+    /// otherwise, so a column of headings can center its rows without
+    /// wrapping each one in a frame.
+    pub fn cross_alignment(mut self, align: CrossAlign) -> Self {
+        self.align = Some(align);
+        self
+    }
 }
 
-/// The default column prints as it always did; an axis or a spacing of
-/// its own says so.
-fn for_each_line(count: usize, axis: Axis, spacing: Option<f64>) -> String {
+/// The default column prints as it always did; an axis, a spacing, or a
+/// cross alignment of its own says so.
+fn for_each_line(count: usize, axis: Axis, spacing: Option<f64>, align: Option<CrossAlign>) -> String {
     let mut line = format!("ForEach ({count}");
     if let Axis::Horizontal = axis {
         line.push_str(", axis: .horizontal");
     }
     if let Some(spacing) = spacing {
         line.push_str(&format!(", spacing: {spacing}"));
+    }
+    if let Some(align) = align {
+        line.push_str(&format!(", alignment: {align:?}"));
     }
     line.push(')');
     line
@@ -1615,7 +1629,7 @@ where
     F: Fn(&T) -> R + Clone + 'static,
     R: View,
 {
-    ForEach { items, id, row, axis: Axis::Vertical, spacing: None }
+    ForEach { items, id, row, axis: Axis::Vertical, spacing: None, align: None }
 }
 
 fn debug_assert_unique_ids(container: &str, ids: impl Iterator<Item = String>) {

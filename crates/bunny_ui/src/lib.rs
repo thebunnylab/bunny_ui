@@ -126,8 +126,8 @@ pub mod prelude {
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
-        Color, Fraction, Glass, Gradient, Point, Proposal, Px, Rect, Rendering, Side, Size,
-        Truncation, UnitPoint, VisualProps,
+        Color, CrossAlign, Fraction, Glass, Gradient, Point, Proposal, Px, Rect, Rendering, Side,
+        Size, Truncation, UnitPoint, VisualProps,
     };
     pub use crate::theme::{self, Theme};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
@@ -1274,6 +1274,15 @@ mod tests {
         assert!(
             runtime.render_stable(&column).contains("ForEach (2)"),
             "the default column prints as it always did"
+        );
+        // a cross alignment of its own — the frame-per-row a page used to
+        // write to center a column of headings, said once on the run
+        let rows = vec!["a", "b"];
+        let centered = for_each(rows, |id| id.to_string(), |id| text(*id))
+            .cross_alignment(crate::layout::CrossAlign::Center);
+        assert!(
+            runtime.render_stable(&centered).contains("ForEach (2, alignment: Center)"),
+            "a cross alignment of its own says so"
         );
     }
 
