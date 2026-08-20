@@ -64,6 +64,20 @@ unsafe extern "C" {
     fn js_apply_patches(pointer: *const u8, len: usize);
     /// Dom mode: fresh pixels for one canvas island (physical size).
     fn js_island(id: u32, pointer: *const u8, width: u32, height: u32);
+    /// A panic, on its way to the console. Without it a wasm abort is one
+    /// line of `unreachable` and a stack of numbers.
+    fn js_panic(pointer: *const u8, len: usize);
+}
+
+/// Sends a panic to the console instead of the bare `unreachable` a wasm
+/// abort leaves behind. Installed once at boot, before the first frame,
+/// so the first failure names itself.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        // keep the format minimal — the allocator may be poisoned
+        let message = info.to_string();
+        unsafe { js_panic(message.as_ptr(), message.len()) };
+    }));
 }
 
 /// The glue's key table, mirrored: one number per named key.
@@ -241,17 +255,31 @@ fn count_click(state: (f64, f64, f64, u8), x: f64, y: f64, now_ms: f64) -> (f64,
 }
 
 fn dispatch(event: Event) {
-    SHELL.with(|slot| {
-        if let Some(shell) = slot.borrow_mut().as_mut() {
-            (shell.handle)(event);
-        }
-    });
+    // Take the shell OUT of the cell for the length of the event, so the
+    // borrow is released before the handler runs. A `bunny_*` export that
+    // fires while this one is on the stack then finds `None` and no-ops,
+    // instead of a second `borrow_mut` that aborts — and, aborting, never
+    // releases the first, wedging every later call. A re-entrant event is
+    // dropped, not queued; the wake path already defers off the stack, so
+    // nothing on the normal road re-enters.
+    let taken = SHELL.with(|slot| slot.borrow_mut().take());
+    if let Some(mut shell) = taken {
+        (shell.handle)(event);
+        // Put it back, unless the handler booted a fresh shell in place.
+        SHELL.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(shell);
+            }
+        });
+    }
 }
 
 /// Boots the shell with the app's root view. The demo crate calls this
 /// from its exported `start`; everything after travels through events.
 #[cfg(feature = "canvas")]
 pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
+    install_panic_hook();
     let runtime = Runtime::new()
         .text_engine(Rc::new(CanvasTextEngine::new()))
         .image_engine(Rc::new(CanvasImageEngine::new()));
@@ -443,6 +471,7 @@ fn start_dom_with(
     hydrate: bool,
     root: impl View + 'static,
 ) {
+    install_panic_hook();
     let runtime = Runtime::new()
         .text_engine(Rc::new(CanvasTextEngine::new()))
         .image_engine(Rc::new(CanvasImageEngine::new()));

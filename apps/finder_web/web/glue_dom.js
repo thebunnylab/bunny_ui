@@ -1126,6 +1126,13 @@ const imports = {
       );
       el.getContext("2d").putImageData(new ImageData(pixels, width, height), 0, 0);
     },
+    // A panic on its way out of wasm: decode the message and log it, so
+    // an abort is a sentence instead of `unreachable` and a stack of
+    // numbers.
+    js_panic(pointer, length) {
+      const bytes = new Uint8Array(wasm.memory.buffer, pointer, length);
+      console.error("bunny panic: " + decoder.decode(bytes));
+    },
     js_measure_text(
       pointer,
       length,

@@ -174,6 +174,13 @@ const imports = {
     // this page only ever drives the canvas one
     js_apply_patches() {},
     js_island() {},
+    // A panic on its way out of wasm: decode the message and log it, so
+    // an abort is a sentence instead of `unreachable` and a stack of
+    // numbers.
+    js_panic(pointer, length) {
+      const bytes = new Uint8Array(wasm.memory.buffer, pointer, length);
+      console.error("bunny panic: " + new TextDecoder().decode(bytes));
+    },
     // The image edge: the engine hands the encoded bytes ONCE; the
     // browser decodes off-thread and calls bunny_image_ready when the
     // bitmap lands. Broken bytes park a null and never call back.
