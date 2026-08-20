@@ -109,7 +109,7 @@ flat out vec4 v_color2;
 flat out vec2 v_point2;
 flat out vec4 v_radii;
 
-pub const vec2 unit_corners[6] = vec2[6](
+const vec2 unit_corners[6] = vec2[6](
     vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
     vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0)
 );
@@ -215,7 +215,7 @@ in vec4 a_clip;
 flat out vec4 v_dest;
 flat out vec4 v_tex;
 
-pub const vec2 unit_corners[6] = vec2[6](
+const vec2 unit_corners[6] = vec2[6](
     vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
     vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0)
 );
@@ -258,7 +258,7 @@ layout(std140) uniform Frame {
 };
 uniform vec4 u_quad;
 
-pub const vec2 unit_corners[6] = vec2[6](
+const vec2 unit_corners[6] = vec2[6](
     vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
     vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0)
 );
@@ -320,8 +320,8 @@ uniform vec4 blur_step;
 uniform vec4 blur_mode;
 out vec4 out_color;
 
-pub const float BLUR_W[5] = float[5](0.153584, 0.256886, 0.125975, 0.034902, 0.005445);
-pub const float BLUR_O[5] = float[5](0.0, 1.44475, 3.37341, 5.30746, 7.24824);
+const float BLUR_W[5] = float[5](0.153584, 0.256886, 0.125975, 0.034902, 0.005445);
+const float BLUR_O[5] = float[5](0.0, 1.44475, 3.37341, 5.30746, 7.24824);
 
 vec3 srgb_to_linear3(vec3 c) {
     return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92,
@@ -374,7 +374,7 @@ flat out vec4 v_tint;
 flat out vec4 v_highlight;
 flat out float v_spot_alpha;
 
-pub const vec2 unit_corners[6] = vec2[6](
+const vec2 unit_corners[6] = vec2[6](
     vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
     vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0)
 );
@@ -409,18 +409,18 @@ flat in vec4 v_highlight;
 flat in float v_spot_alpha;
 out vec4 out_color;
 
-pub const float GLASS_SIGMA_L0 = 5.2;
-pub const float GLASS_MAX_LEVEL = 3.0;
-pub const float GLASS_RIM_FLOOR = 0.1;
-pub const float GLASS_RIM_FALLOFF = 1.7;
-pub const vec2 GLASS_LIGHT_DIR = vec2(-0.70710678, -0.70710678);
-pub const vec3 GLASS_LUMA = vec3(0.2126, 0.7152, 0.0722);
-pub const float GLASS_OUTER_AMOUNT_RATIO = 0.25;
-pub const float GLASS_OUTER_HEIGHT_RATIO = 0.5;
-pub const float GLASS_VIBRANT_SATURATION = 2.069;
-pub const float GLASS_VIBRANT_GAIN = 1.45;
-pub const float GLASS_VIBRANT_BIAS = 0.05;
-pub const float GLASS_GRAD_RADIUS_FACTOR = 1.5;
+const float GLASS_SIGMA_L0 = 5.2;
+const float GLASS_MAX_LEVEL = 3.0;
+const float GLASS_RIM_FLOOR = 0.1;
+const float GLASS_RIM_FALLOFF = 1.7;
+const vec2 GLASS_LIGHT_DIR = vec2(-0.70710678, -0.70710678);
+const vec3 GLASS_LUMA = vec3(0.2126, 0.7152, 0.0722);
+const float GLASS_OUTER_AMOUNT_RATIO = 0.25;
+const float GLASS_OUTER_HEIGHT_RATIO = 0.5;
+const float GLASS_VIBRANT_SATURATION = 2.069;
+const float GLASS_VIBRANT_GAIN = 1.45;
+const float GLASS_VIBRANT_BIAS = 0.05;
+const float GLASS_GRAD_RADIUS_FACTOR = 1.5;
 
 vec3 linear_to_srgb3(vec3 c) {
     return mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, c * 12.92,
