@@ -25,7 +25,8 @@ use std::cell::{Cell, RefCell};
 
 use bunny_ui::gpu::shaders::PRELUDE_300ES;
 use bunny_ui::gpu::walk::{
-    build_frame, AtlasGround, FrameBatches, RectInstance, RunAtlas, RunKind, SpriteInstance,
+    build_frame, AtlasGround, FrameBatches, GlassInstance, RectInstance, RunAtlas, RunKind,
+    SpriteInstance, GLASS_MAX_LEVEL,
 };
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::layout::{Color, DisplayList, Size};
@@ -177,8 +178,19 @@ const UBO_ROUND_BINDING: u32 = 1;
 struct Pipelines {
     rect: u32,
     sprite: u32,
+    glass: u32,
+    blur: u32,
+    blit: u32,
     vao_rect: u32,
     vao_sprite: u32,
+    vao_glass: u32,
+    /// A vertex array with no attributes at all: the full-screen
+    /// triangle builds its own corners from the vertex id.
+    vao_full: u32,
+    glass_buffer: u32,
+    glass_cap: u32,
+    blur_step: u32,
+    blur_mode: u32,
     rects: u32,
     sprites: u32,
     frame_ubo: u32,
@@ -247,20 +259,59 @@ impl Pipelines {
             &format!("{}{}{}", PRELUDE_300ES, src::SHARED_FRAG, src::SPRITE_FRAG_BODY),
             &["a_dest", "a_tex", "a_clip"],
         )?;
-        unsafe {
-            let atlas = "atlas";
-            gl_use_program(sprite);
-            let slot = gl_uniform_location(sprite, atlas.as_ptr(), atlas.len());
+        let glass = program(
+            &format!("{}{}", PRELUDE_300ES, src::GLASS_VERT),
+            &format!("{}{}{}", PRELUDE_300ES, src::SHARED_FRAG, src::GLASS_FRAG_BODY),
+            &[
+                "a_rect", "a_clip", "a_radii", "a_lens", "a_finish", "a_touch", "a_tint",
+                "a_highlight", "a_spot",
+            ],
+        )?;
+        let blur = program(
+            &format!("{}{}", PRELUDE_300ES, src::FULL_VERT),
+            &format!("{}{}", PRELUDE_300ES, src::BLUR_FRAG),
+            &[],
+        )?;
+        let blit = program(
+            &format!("{}{}", PRELUDE_300ES, src::FULL_VERT),
+            &format!("{}{}", PRELUDE_300ES, src::BLIT_FRAG),
+            &[],
+        )?;
+        let sampler = |handle: u32, name: &str| unsafe {
+            gl_use_program(handle);
+            let slot = gl_uniform_location(handle, name.as_ptr(), name.len());
             if slot != 0 {
                 gl_uniform1i(slot, 0);
             }
-        }
+        };
+        sampler(sprite, "atlas");
+        sampler(glass, "pyramid");
+        sampler(blur, "source");
+        sampler(blit, "source");
+        let (blur_step, blur_mode) = unsafe {
+            gl_use_program(blur);
+            let step = "blur_step";
+            let mode = "blur_mode";
+            (
+                gl_uniform_location(blur, step.as_ptr(), step.len()),
+                gl_uniform_location(blur, mode.as_ptr(), mode.len()),
+            )
+        };
         let pipelines = unsafe {
             Pipelines {
                 rect,
                 sprite,
+                glass,
+                blur,
+                blit,
+                blur_step,
+                blur_mode,
                 vao_rect: gl_create_vertex_array(),
                 vao_sprite: gl_create_vertex_array(),
+                vao_glass: gl_create_vertex_array(),
+                vao_full: gl_create_vertex_array(),
+                glass_buffer: gl_create_buffer(),
+                glass_cap: 0,
                 rects: gl_create_buffer(),
                 sprites: gl_create_buffer(),
                 frame_ubo: gl_create_buffer(),
@@ -340,6 +391,199 @@ fn upload(target_buffer: u32, cap: &mut u32, bytes: &[u8]) {
             gl_buffer_data_size(GL_ARRAY_BUFFER, *cap, GL_STREAM_DRAW);
         }
         gl_buffer_sub_data(GL_ARRAY_BUFFER, 0, bytes.as_ptr(), bytes.len());
+    }
+}
+
+// MARK: - Liquid glass (the scene texture and the blur pyramid)
+
+const GL_SRGB8_ALPHA8: i32 = 0x8C43;
+const GL_LINEAR: i32 = 0x2601;
+const GL_LINEAR_MIPMAP_LINEAR: i32 = 0x2703;
+const GL_TEXTURE_MAX_LEVEL: u32 = 0x813D;
+const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+
+/// A pane READS what is under it, so the scene cannot be drawn straight
+/// at the drawable: it goes to a texture, the pyramid is blurred out of
+/// that texture, and the whole thing is copied back at the end.
+struct GlassTargets {
+    scene: u32,
+    ping: u32,
+    pong: u32,
+    /// One framebuffer, re-pointed per pass — a framebuffer is a
+    /// pointer to an attachment, and re-pointing costs nothing next to
+    /// keeping ten alive.
+    fbo: u32,
+    size: (u32, u32),
+}
+
+/// A pyramid texture: four levels of `SRGB8_ALPHA8`, trilinear,
+/// clamped. Every level is allocated by hand — the chain is never
+/// GENERATED, it is blurred, one pass per level.
+///
+/// The format is where a browser differs from the desktop. Desktop GL
+/// asks for the encode with `GL_FRAMEBUFFER_SRGB`; GLES has no such
+/// toggle, because an sRGB attachment encodes on write and decodes on
+/// sample by specification, always. The enable/disable pair simply does
+/// not exist here, and the chain still averages in linear light.
+fn make_pyramid(width: u32, height: u32) -> u32 {
+    unsafe {
+        let texture = gl_create_texture();
+        gl_bind_texture(GL_TEXTURE_2D, texture);
+        gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, GLASS_MAX_LEVEL as i32);
+        for level in 0..=GLASS_MAX_LEVEL {
+            gl_tex_image_2d(
+                GL_TEXTURE_2D,
+                level as i32,
+                GL_SRGB8_ALPHA8,
+                (width >> level).max(1) as i32,
+                (height >> level).max(1) as i32,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                std::ptr::null(),
+                0,
+            );
+        }
+        texture
+    }
+}
+
+impl GlassTargets {
+    /// `None` when anything refuses — a frame then paints without its
+    /// panes rather than failing to present at all.
+    fn new(size: (u32, u32)) -> Option<GlassTargets> {
+        if size.0 == 0 || size.1 == 0 {
+            return None;
+        }
+        let half = (size.0.div_ceil(2).max(1), size.1.div_ceil(2).max(1));
+        unsafe {
+            let scene = gl_create_texture();
+            gl_bind_texture(GL_TEXTURE_2D, scene);
+            gl_tex_image_2d(
+                GL_TEXTURE_2D, 0, GL_RGBA as i32, size.0 as i32, size.1 as i32,
+                GL_RGBA, GL_UNSIGNED_BYTE, std::ptr::null(), 0,
+            );
+            // the scene is SAMPLED by the first blur pass, so it filters
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            let ping = make_pyramid(half.0, half.1);
+            let pong = make_pyramid(half.0, half.1);
+            let fbo = gl_create_framebuffer();
+            gl_bind_framebuffer(GL_FRAMEBUFFER, fbo);
+            gl_framebuffer_texture_2d(
+                GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, scene, 0,
+            );
+            if gl_check_framebuffer_status(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE {
+                gl_bind_framebuffer(GL_FRAMEBUFFER, 0);
+                return None;
+            }
+            gl_bind_framebuffer(GL_FRAMEBUFFER, 0);
+            Some(GlassTargets { scene, ping, pong, fbo, size })
+        }
+    }
+
+    fn release(&self) {
+        unsafe {
+            gl_delete_texture(self.scene);
+            gl_delete_texture(self.ping);
+            gl_delete_texture(self.pong);
+            gl_delete_framebuffer(self.fbo);
+        }
+    }
+}
+
+/// Blurs the pyramid down to `levels`. The downsample is FUSED into the
+/// horizontal pass — the destination is half the source, so each of the
+/// nine bilinear taps already averages a two-by-two and the reduction
+/// rides along free. That is why a heavy blur costs what a light one
+/// costs.
+fn build_pyramid(pipes: &Pipelines, targets: &GlassTargets, levels: u32) {
+    let base = (targets.size.0.div_ceil(2).max(1), targets.size.1.div_ceil(2).max(1));
+    unsafe {
+        gl_disable(GL_BLEND);
+        gl_bind_vertex_array(pipes.vao_full);
+        gl_use_program(pipes.blur);
+        gl_active_texture(GL_TEXTURE0);
+        gl_bind_framebuffer(GL_FRAMEBUFFER, targets.fbo);
+        for level in 0..=levels.min(GLASS_MAX_LEVEL) {
+            let width = (base.0 >> level).max(1);
+            let height = (base.1 >> level).max(1);
+            let inv = (1.0 / width as f32, 1.0 / height as f32);
+            // level zero reads RAW scene colour, which no format
+            // decoded for us — every level above reads an sRGB texture
+            // and the sampler has already decoded it
+            let (source, source_level, decode) = match level {
+                0 => (targets.scene, 0.0f32, 1.0f32),
+                _ => (targets.ping, (level - 1) as f32, 0.0),
+            };
+            for (pass, direction) in
+                [(targets.pong, (1.0f32, 0.0f32)), (targets.ping, (0.0f32, 1.0f32))]
+            {
+                let (from, from_level, decoding) = if pass == targets.pong {
+                    (source, source_level, decode)
+                } else {
+                    (targets.pong, level as f32, 0.0)
+                };
+                gl_framebuffer_texture_2d(
+                    GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, pass, level as i32,
+                );
+                gl_viewport(0, 0, width as i32, height as i32);
+                gl_bind_texture(GL_TEXTURE_2D, from);
+                gl_uniform4f(pipes.blur_step, inv.0, inv.1, direction.0, direction.1);
+                gl_uniform4f(pipes.blur_mode, from_level, decoding, 0.0, 0.0);
+                gl_draw_arrays(GL_TRIANGLES, 0, 3);
+            }
+        }
+        gl_enable(GL_BLEND);
+    }
+}
+
+/// Copies the scene texture onto the real target, texel for texel. The
+/// drawable is written, never read, so the frame lives in a texture
+/// until this last step.
+fn blit_scene(pipes: &Pipelines, targets: &GlassTargets, physical: (u32, u32)) {
+    unsafe {
+        gl_bind_framebuffer(GL_FRAMEBUFFER, 0);
+        gl_viewport(0, 0, physical.0 as i32, physical.1 as i32);
+        gl_disable(GL_BLEND);
+        gl_use_program(pipes.blit);
+        gl_bind_vertex_array(pipes.vao_full);
+        gl_active_texture(GL_TEXTURE0);
+        gl_bind_texture(GL_TEXTURE_2D, targets.scene);
+        gl_draw_arrays(GL_TRIANGLES, 0, 3);
+        // the scene must not still be BOUND when the next frame
+        // attaches it as a target: desktop GL shrugs at that, a browser
+        // calls it a feedback loop and drops the draw
+        gl_bind_texture(GL_TEXTURE_2D, 0);
+        gl_enable(GL_BLEND);
+    }
+}
+
+fn glass_attribs(base: usize) {
+    let stride = std::mem::size_of::<GlassInstance>() as i32;
+    for (index, offset, count, kind, normalized) in [
+        (0u32, 0usize, 4, GL_FLOAT, 0u32),
+        (1, 16, 4, GL_FLOAT, 0),
+        (2, 32, 4, GL_FLOAT, 0),
+        (3, 48, 4, GL_FLOAT, 0),
+        (4, 64, 4, GL_FLOAT, 0),
+        (5, 80, 4, GL_FLOAT, 0),
+        (6, 96, 4, GL_UNSIGNED_BYTE, 1),
+        (7, 100, 4, GL_UNSIGNED_BYTE, 1),
+        // the spot's alpha and the pad, read as a vec2 of floats
+        (8, 104, 2, GL_FLOAT, 0),
+    ] {
+        unsafe {
+            gl_enable_vertex_attrib_array(index);
+            gl_vertex_attrib_pointer(index, count, kind, normalized, stride, (base + offset) as i32);
+            gl_vertex_attrib_divisor(index, 1);
+        }
     }
 }
 
@@ -432,6 +676,9 @@ struct Tier {
     ground: WebGround,
     atlas: RunAtlas,
     batches: FrameBatches,
+    /// Built the first time a pane asks, and rebuilt when the window
+    /// changes size.
+    glass: Option<GlassTargets>,
 }
 
 thread_local! {
@@ -482,6 +729,7 @@ pub(crate) fn try_install(kind: u32, physical: (u32, u32)) -> bool {
             ground: WebGround::default(),
             atlas: RunAtlas::new(),
             batches: FrameBatches::default(),
+            glass: None,
         })
     });
     true
@@ -542,21 +790,6 @@ pub(crate) fn present_window(
             tier.physical = physical;
             unsafe { gl_resize(physical.0, physical.1) };
         }
-        unsafe {
-            gl_bind_framebuffer(GL_FRAMEBUFFER, 0);
-            gl_viewport(0, 0, physical.0 as i32, physical.1 as i32);
-            // the canvas colour goes on STRAIGHT, the way the
-            // rasterizer fills its bitmap with it — nothing has
-            // blended yet
-            gl_clear_color(
-                canvas.r as f32 / 255.0,
-                canvas.g as f32 / 255.0,
-                canvas.b as f32 / 255.0,
-                canvas.a as f32 / 255.0,
-            );
-            gl_clear(GL_COLOR_BUFFER_BIT);
-        }
-
         // the walk, and the copying collector behind it: a full atlas
         // drains, resets (growing once to the cap the device allows)
         // and walks the frame again
@@ -581,6 +814,41 @@ pub(crate) fn present_window(
             return;
         }
 
+        // a pane READS what is under it, so a frame that holds one
+        // cannot draw at the drawable: the drawable is write-only. It
+        // goes to a texture and comes back at the end.
+        let wants_glass = tier.batches.runs.iter().any(|run| run.kind == RunKind::Glass);
+        if wants_glass {
+            let stale = tier.glass.as_ref().is_none_or(|targets| targets.size != physical);
+            if stale {
+                if let Some(old) = tier.glass.take() {
+                    old.release();
+                }
+                tier.glass = GlassTargets::new(physical);
+            }
+        }
+        let scene_fbo = match (wants_glass, tier.glass.as_ref()) {
+            (true, Some(targets)) => targets.fbo,
+            // no pane, or the targets refused: straight at the drawable,
+            // and a refused pane paints without its blur rather than
+            // failing to present
+            _ => 0,
+        };
+        unsafe {
+            gl_bind_framebuffer(GL_FRAMEBUFFER, scene_fbo);
+            gl_viewport(0, 0, physical.0 as i32, physical.1 as i32);
+            // the canvas colour goes on STRAIGHT, the way the
+            // rasterizer fills its bitmap with it — nothing has
+            // blended yet
+            gl_clear_color(
+                canvas.r as f32 / 255.0,
+                canvas.g as f32 / 255.0,
+                canvas.b as f32 / 255.0,
+                canvas.a as f32 / 255.0,
+            );
+            gl_clear(GL_COLOR_BUFFER_BIT);
+        }
+
         let viewport = [physical.0 as f32, physical.1 as f32, 0.0, 0.0];
         unsafe {
             gl_bind_buffer(GL_UNIFORM_BUFFER, tier.pipelines.frame_ubo);
@@ -600,6 +868,11 @@ pub(crate) fn present_window(
             tier.pipelines.sprites,
             &mut tier.pipelines.sprite_cap,
             instance_bytes(&tier.batches.sprites),
+        );
+        upload(
+            tier.pipelines.glass_buffer,
+            &mut tier.pipelines.glass_cap,
+            instance_bytes(&tier.batches.glass),
         );
 
         // the runs, in paint order — the display list IS the order, and
@@ -660,10 +933,35 @@ pub(crate) fn present_window(
                     }
                     sprite_attribs(run.base as usize * std::mem::size_of::<SpriteInstance>());
                 }
-                // the pane arrives with the pyramid, one commit along
-                RunKind::Glass => continue,
+                RunKind::Glass => {
+                    let Some(targets) = tier.glass.as_ref() else { continue };
+                    // the pyramid is blurred out of the scene AS DRAWN
+                    // SO FAR — everything below this pane, and nothing
+                    // above it
+                    build_pyramid(&tier.pipelines, targets, run.levels);
+                    program = tier.pipelines.glass;
+                    unsafe {
+                        // the pyramid re-pointed the shared framebuffer
+                        // at its own levels; the scene has to be put
+                        // back before the pane draws into it
+                        gl_bind_framebuffer(GL_FRAMEBUFFER, targets.fbo);
+                        gl_framebuffer_texture_2d(
+                            GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, targets.scene, 0,
+                        );
+                        gl_viewport(0, 0, physical.0 as i32, physical.1 as i32);
+                        gl_use_program(program);
+                        gl_bind_vertex_array(tier.pipelines.vao_glass);
+                        gl_bind_buffer(GL_ARRAY_BUFFER, tier.pipelines.glass_buffer);
+                        gl_active_texture(GL_TEXTURE0);
+                        gl_bind_texture(GL_TEXTURE_2D, targets.ping);
+                    }
+                    glass_attribs(run.base as usize * std::mem::size_of::<GlassInstance>());
+                }
             }
             unsafe { gl_draw_arrays_instanced(GL_TRIANGLES, 0, 6, run.count as i32) };
+        }
+        if let (true, Some(targets)) = (wants_glass, tier.glass.as_ref()) {
+            blit_scene(&tier.pipelines, targets, physical);
         }
         unsafe { gl_flush() };
     });

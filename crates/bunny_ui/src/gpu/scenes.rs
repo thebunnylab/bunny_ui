@@ -11,7 +11,7 @@ use crate::layout::{Color, Corners, DisplayList, DrawCommand, Point, Rect, Size}
 pub const SIZE: Size = Size { width: 120.0, height: 80.0 };
 
 /// How many scenes the catalog holds.
-pub const COUNT: u32 = 7;
+pub const COUNT: u32 = 9;
 
 fn at(x: f64, y: f64, w: f64, h: f64) -> Rect {
     Rect { origin: Point { x, y }, size: Size { width: w, height: h } }
@@ -75,6 +75,38 @@ pub fn scene(index: u32) -> (DisplayList, &'static str) {
                 corner_radius: Corners::all(5.0),
             });
             "a shadow's falloff"
+        }
+        7 | 8 => {
+            // something to read THROUGH: the pane's whole job is what
+            // is under it
+            display.push(DrawCommand::FillRect {
+                rect: at(0.0, 0.0, 120.0, 40.0),
+                color: Color::rgba(200, 60, 40, 255),
+                corner_radius: Corners::ZERO,
+            });
+            display.push(DrawCommand::FillRect {
+                rect: at(0.0, 40.0, 120.0, 40.0),
+                color: Color::rgba(30, 120, 90, 255),
+                corner_radius: Corners::ZERO,
+            });
+            let pane = at(20.0, 20.0, 60.0, 40.0);
+            display.push(DrawCommand::Backdrop {
+                rect: pane,
+                glass: crate::layout::Glass::regular().resolve(pane),
+                corner_radius: Corners::all(10.0),
+            });
+            if index == 8 {
+                // a pane over a pane: the second one reads the first,
+                // so the batch must break and the capture happen twice
+                let over = at(50.0, 35.0, 50.0, 35.0);
+                display.push(DrawCommand::Backdrop {
+                    rect: over,
+                    glass: crate::layout::Glass::regular().resolve(over),
+                    corner_radius: Corners::all(8.0),
+                });
+                return (display, "two panes, each reading the one below");
+            }
+            "one pane of glass"
         }
         _ => {
             display.push(DrawCommand::TextLine {
