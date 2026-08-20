@@ -765,6 +765,18 @@ extern "C" fn bunny_scroll_wheel(this: Id, _sel: Sel, event: Id) {
     }
 }
 
+/// AppKit's word that a drag is about to move the window's frame. It
+/// comes before the first resized frame, and that is the point: the
+/// presenter arms its transaction here, so the whole drag runs under
+/// one contract instead of catching up on the second step.
+extern "C" fn bunny_window_will_start_live_resize(_this: Id, _sel: Sel, _note: Id) {
+    crate::metal::arm_transaction(true);
+}
+
+extern "C" fn bunny_window_did_end_live_resize(_this: Id, _sel: Sel, _note: Id) {
+    crate::metal::arm_transaction(false);
+}
+
 extern "C" fn bunny_window_did_resign_key(_this: Id, _sel: Sel, _note: Id) {
     dispatch(AppEvent::ResignKey);
 }
@@ -1228,6 +1240,20 @@ unsafe fn register_classes() {
             delegate,
             sel("windowDidMove:"),
             bunny_window_did_resize as *const c_void,
+            types.as_ptr(),
+        );
+        // the presenter's anti-tear contract is armed on AppKit's own
+        // word, one beat BEFORE the frame that would show the seam
+        class_addMethod(
+            delegate,
+            sel("windowWillStartLiveResize:"),
+            bunny_window_will_start_live_resize as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            delegate,
+            sel("windowDidEndLiveResize:"),
+            bunny_window_did_end_live_resize as *const c_void,
             types.as_ptr(),
         );
         // switching away closes the open popovers, the platform's way

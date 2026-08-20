@@ -2613,6 +2613,25 @@ thread_local! {
 }
 
 impl MetalPresenter {
+    /// Flips the layer's present contract and remembers it. The flag
+    /// has to be set BEFORE the drawable it governs is asked for: a
+    /// drawable taken under the asynchronous contract and then
+    /// presented inside the transaction is the one frame the layer
+    /// stretches from the size it used to have.
+    fn set_transactional(&mut self, live: bool) {
+        if live == self.transactional {
+            return;
+        }
+        unsafe {
+            msg_void_bool(
+                self.layer,
+                self.stack.sels.set_presents_with_transaction,
+                live as i8,
+            );
+        }
+        self.transactional = live;
+    }
+
     /// Waits out every in-flight frame — the precondition of an atlas
     /// reset (the one moment texel space is reused).
     fn drain_slots(&mut self) {
@@ -2707,6 +2726,12 @@ impl MetalPresenter {
                 self.scale = scale;
             }
             self.build_with_retries(display, scale, physical, text, images);
+            // the contract of THIS frame's drawable, settled before it
+            // is asked for. A window whose delegate armed the drag
+            // already agrees and this changes nothing; a size the app
+            // set itself has no delegate to speak for it, and lands here
+            let live = msg_bool(self.view, self.stack.sels.in_live_resize) != 0;
+            self.set_transactional(live);
             let index = acquire_slot(&mut self.slots, &mut self.cursor, &self.stack.sels);
             let (sprite_offset, glass_offset) = upload_frame(
                 &mut self.slots[index],
@@ -2748,15 +2773,6 @@ impl MetalPresenter {
             // wait for the schedule, present — layer content and window
             // frame land together (the anti-tear toggle). every other
             // frame presents async, no stall.
-            let live = msg_bool(self.view, self.stack.sels.in_live_resize) != 0;
-            if live != self.transactional {
-                msg_void_bool(
-                    self.layer,
-                    self.stack.sels.set_presents_with_transaction,
-                    live as i8,
-                );
-                self.transactional = live;
-            }
             if live {
                 msg_void(command, self.stack.sels.commit);
                 msg_void(command, self.stack.sels.wait_scheduled);
@@ -2843,6 +2859,20 @@ pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool
 /// frame on this, never mid-flight.
 pub(crate) fn active() -> bool {
     PRESENTER.with(|slot| slot.borrow().is_some())
+}
+
+/// Arms (or disarms) the layer's transactional present, from AppKit's
+/// own word that a drag is starting. It arrives BEFORE the first
+/// resized frame, which is the only moment early enough: by the time a
+/// frame observes `inLiveResize` the window has already grown, and a
+/// drawable of the old size stretched to the new bounds is what the
+/// eye reads as the whole UI drawn twice.
+pub(crate) fn arm_transaction(live: bool) {
+    PRESENTER.with(|slot| {
+        if let Some(presenter) = slot.borrow_mut().as_mut() {
+            presenter.set_transactional(live);
+        }
+    });
 }
 
 /// The GPU twin of the Surface + blit path: same display list in, one
