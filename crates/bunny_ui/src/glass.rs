@@ -600,3 +600,60 @@ fn corner_at(center_to_point: (f64, f64), radii: Corners) -> f64 {
         (true, false) => radii.bottom_left,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The four GPU tiers repeat this material textually, constant for
+    /// constant, and a shader is a string until a device compiles it —
+    /// so a number that drifts here drifts SILENTLY on every machine
+    /// that cannot run one of them.
+    ///
+    /// This is the vulkan tier's re-bake-and-compare gate, applied to a
+    /// string: the numbers below are the ones this module resolves in
+    /// f64, and the shader has to be carrying the same digits.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn the_shaders_carry_this_material_constant_for_constant() {
+        let glass = crate::gpu::shaders::GLASS_FRAG_BODY;
+        for (name, spelled) in [
+            ("GLASS_SIGMA_L0", format!("{SIGMA_L0}")),
+            ("GLASS_MAX_LEVEL", format!("{}.0", MAX_LEVEL)),
+            ("GLASS_RIM_FLOOR", format!("{RIM_FLOOR}")),
+            ("GLASS_RIM_FALLOFF", format!("{RIM_FALLOFF}")),
+            ("GLASS_OUTER_AMOUNT_RATIO", format!("{OUTER_AMOUNT_RATIO}")),
+            ("GLASS_OUTER_HEIGHT_RATIO", format!("{OUTER_HEIGHT_RATIO}")),
+            ("GLASS_VIBRANT_SATURATION", format!("{VIBRANT_SATURATION}")),
+            ("GLASS_VIBRANT_GAIN", format!("{VIBRANT_GAIN}")),
+            ("GLASS_VIBRANT_BIAS", format!("{VIBRANT_BIAS}")),
+            ("GLASS_GRAD_RADIUS_FACTOR", format!("{GRAD_RADIUS_FACTOR}")),
+        ] {
+            let declaration = format!("const float {name} = {spelled};");
+            assert!(
+                glass.contains(&declaration),
+                "the glass shader must declare `{declaration}` — this module says {spelled}",
+            );
+        }
+
+        // the nine taps: five weights and five offsets, the centre and
+        // four mirrored pairs. The shader writes them without the
+        // underscores this module groups its digits with.
+        let blur = crate::gpu::shaders::BLUR_FRAG;
+        // GLSL wants a float to LOOK like one: Rust prints 0.0 as `0`
+        let plain = |value: f64| match format!("{value}") {
+            spelled if spelled.contains('.') => spelled,
+            whole => format!("{whole}.0"),
+        };
+        let weights: Vec<String> = TAPS.iter().map(|(weight, _)| plain(*weight)).collect();
+        let offsets: Vec<String> = TAPS.iter().map(|(_, offset)| plain(*offset)).collect();
+        assert!(
+            blur.contains(&format!("const float BLUR_W[5] = float[5]({});", weights.join(", "))),
+            "the blur weights drifted from the taps this module resolves",
+        );
+        assert!(
+            blur.contains(&format!("const float BLUR_O[5] = float[5]({});", offsets.join(", "))),
+            "the blur offsets drifted from the taps this module resolves",
+        );
+    }
+}

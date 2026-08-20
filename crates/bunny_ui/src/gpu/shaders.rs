@@ -546,3 +546,101 @@ void main() {
     out_color = vec4(color.rgb, color.a * coverage * clip_cov(p));
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every source a tier concatenates, by name, so a new one cannot
+    /// join the set without joining the guards below.
+    const BODIES: [(&str, &str); 12] = [
+        ("SHARED_FRAG", SHARED_FRAG),
+        ("RECT_VERT", RECT_VERT),
+        ("RECT_FRAG_BODY", RECT_FRAG_BODY),
+        ("SPRITE_VERT", SPRITE_VERT),
+        ("SPRITE_FRAG_BODY", SPRITE_FRAG_BODY),
+        ("MASK_VERT", MASK_VERT),
+        ("MASK_FRAG_BODY", MASK_FRAG_BODY),
+        ("FULL_VERT", FULL_VERT),
+        ("BLIT_FRAG", BLIT_FRAG),
+        ("BLUR_FRAG", BLUR_FRAG),
+        ("GLASS_VERT", GLASS_VERT),
+        ("GLASS_FRAG_BODY", GLASS_FRAG_BODY),
+    ];
+
+    /// A shader is a STRING until a device compiles it, and the devices
+    /// that compile these are not all reachable from here — so nothing
+    /// but a browser ever told us when Rust leaked into the GLSL. It
+    /// did: a careless rewrite once spelled every `const` in this file
+    /// `pub const`, which is not a word the other compiler knows, and
+    /// four commits went by before anything said so.
+    ///
+    /// This is that sentence, said on every machine, in a millisecond.
+    #[test]
+    fn no_rust_leaks_into_the_shader_sources() {
+        // words that belong to the language this file is WRITTEN in and
+        // never to the language it CARRIES
+        const RUST_ONLY: [&str; 6] = ["pub ", "fn ", "let ", "->", "&str", "r#\""];
+        for (name, body) in BODIES {
+            for (number, line) in body.lines().enumerate() {
+                for word in RUST_ONLY {
+                    assert!(
+                        !line.contains(word),
+                        "{name} line {} carries `{word}`, which is Rust, not GLSL: {line}",
+                        number + 1,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The version directive must be the first line of a compiled unit
+    /// and there must be exactly one — so it lives in the prelude and
+    /// nowhere else. A body that grew its own would put a second
+    /// `#version` halfway down a stage and refuse to compile.
+    #[test]
+    fn the_version_comes_from_the_prelude_and_only_from_it() {
+        for prelude in [PRELUDE_330, PRELUDE_300ES] {
+            assert!(
+                prelude.starts_with("#version "),
+                "a prelude opens with its version: {prelude}",
+            );
+        }
+        for (name, body) in BODIES {
+            assert!(!body.contains("#version"), "{name} names a version of its own");
+        }
+    }
+
+    /// The fragment stage in GLSL ES has NO default float precision and
+    /// will not compile without one; `texelFetch` addresses a
+    /// four-thousand-texel atlas with an int; and `gl_FragCoord`
+    /// inherits the default float, which is the snapping contract.
+    #[test]
+    fn the_es_prelude_names_every_precision_it_owes() {
+        for kind in ["precision highp float;", "precision highp int;", "precision highp sampler2D;"] {
+            assert!(PRELUDE_300ES.contains(kind), "the ES prelude owes `{kind}`");
+        }
+        // and the desktop prelude must NOT: a core profile rejects them
+        assert!(!PRELUDE_330.contains("precision"), "a core profile takes no precision qualifier");
+    }
+
+    /// A stage is a prelude plus a body, and what a tier hands the
+    /// device has to look like one compiled unit — not two glued badly.
+    #[test]
+    fn a_stage_reads_as_one_unit() {
+        for prelude in [PRELUDE_330, PRELUDE_300ES] {
+            for (name, body) in BODIES {
+                let stage = format!("{prelude}{body}");
+                assert_eq!(
+                    stage.matches("#version").count(),
+                    1,
+                    "{name} under this prelude has more than one version line",
+                );
+                assert!(
+                    stage.lines().next().is_some_and(|line| line.starts_with("#version ")),
+                    "{name} under this prelude does not open with its version",
+                );
+            }
+        }
+    }
+}
