@@ -1501,24 +1501,23 @@ impl Runtime {
                 (region.content.height.round() - region.frame.size.height.round()).max(0.0);
             (max_x, max_y)
         };
-        // each AXIS routes to the innermost region under the point
-        // that travels that way — a diagonal gesture over a table
-        // scrolls the rows AND slides the columns, instead of losing
-        // half of itself inside the inner list
-        let region_y = (dy != 0.0)
-            .then(|| {
-                scrolls.iter().find(|region| {
-                    region.frame.contains(x, y) && travel(region).1 > 0.0
-                })
+        // each AXIS routes to the region that paints LAST among those
+        // under the point that travel that way — the pointer's own
+        // rule, walking the list back. A child paints over its parent
+        // and a layer over what it covers, so one comparison answers
+        // both "innermost" and "on top": a panel over a document takes
+        // the wheel, and the document behind it stays where it is.
+        //
+        // Per AXIS, because a diagonal gesture over a table scrolls the
+        // rows AND slides the columns, instead of losing half of itself
+        // inside the inner list.
+        let topmost = |axis: fn((Px, Px)) -> Px| {
+            scrolls.iter().rev().find(|region| {
+                region.frame.contains(x, y) && axis(travel(region)) > 0.0
             })
-            .flatten();
-        let region_x = (dx != 0.0)
-            .then(|| {
-                scrolls.iter().find(|region| {
-                    region.frame.contains(x, y) && travel(region).0 > 0.0
-                })
-            })
-            .flatten();
+        };
+        let region_y = (dy != 0.0).then(|| topmost(|(_, y)| y)).flatten();
+        let region_x = (dx != 0.0).then(|| topmost(|(x, _)| x)).flatten();
         if region_x.is_none() && region_y.is_none() {
             return false;
         }

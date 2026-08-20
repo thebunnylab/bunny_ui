@@ -1671,8 +1671,11 @@ impl ScrollAxes {
     }
 }
 
-/// A placed scroll region — the wheel's map. Regions enter
-/// child-before-parent: the innermost one under the point decides first.
+/// A placed scroll region — the wheel's map, in PAINT order (last =
+/// topmost), the same convention the overlays, the tooltips and the
+/// pointer's own hits already keep. A child paints over its parent and
+/// a layer over what it covers, so ONE walk back answers both
+/// "innermost" and "on top".
 #[derive(Clone, Debug)]
 pub struct ScrollRegion {
     pub path: String,
@@ -4030,6 +4033,22 @@ impl LayoutNode {
                 };
                 if let Some(path) = path {
                     out.region_stack.push(path.clone());
+                    // BEFORE the child, which puts the regions in the
+                    // paint order every other list here already keeps:
+                    // a child paints over its parent and a later layer
+                    // over the one it covers, so walking back finds the
+                    // innermost region of the topmost layer in one pass
+                    out.scrolls.push(ScrollRegion {
+                        path: path.clone(),
+                        frame,
+                        content,
+                        target: target.clone(),
+                        // a region inside an animation scope reveals its
+                        // target through the spring instead of snapping
+                        anim: env.anim.map(|scope| scope.spec),
+                        row_extent,
+                        row_offsets,
+                    });
                 }
                 if let Some(dom) = out.dom.as_mut() {
                     // viewport element + a content element sized to the
@@ -4086,20 +4105,6 @@ impl LayoutNode {
                     );
                 }
                 out.pop_clip();
-                if let Some(path) = path {
-                    // after the child: inner regions come EARLIER in the vec
-                    out.scrolls.push(ScrollRegion {
-                        path: path.clone(),
-                        frame,
-                        content,
-                        target: target.clone(),
-                        // a region inside an animation scope reveals its
-                        // target through the spring instead of snapping
-                        anim: env.anim.map(|scope| scope.spec),
-                        row_extent,
-                        row_offsets,
-                    });
-                }
             }
 
             (LayoutNode::Styled { props, child }, Fit::Wrapped(_, fit)) => {

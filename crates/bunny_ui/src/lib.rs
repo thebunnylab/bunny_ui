@@ -5395,6 +5395,127 @@ mod tests {
     }
 
     #[test]
+    fn the_wheel_goes_to_the_region_that_paints_last_under_the_point() {
+        use crate::layout::{Point, Proposal, Side, Size};
+
+        // a page that fills the window, and a panel over it that
+        // travels too — the shape of a settings modal over a document
+        #[derive(Clone, Copy)]
+        struct Stacked;
+
+        impl Component for Stacked {
+            fn body(self, _ctx: &Context) -> impl View {
+                zstack!(
+                    scroll(text("page").frame(400.0, 4000.0)).id("page"),
+                    scroll(text("panel").frame(180.0, 900.0)).id("panel").frame(200.0, 100.0),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        runtime.render_stable(&Stacked);
+        let result = runtime.layout(&Stacked, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let region = |suffix: &str| {
+            result
+                .scrolls
+                .iter()
+                .find(|region| region.path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("{suffix} is a region"))
+                .clone()
+        };
+        let (page, panel) = (region("[page]"), region("[panel]"));
+        // the page's frame contains the panel WHOLE — which is what
+        // made a first-match-wins pick answer with the wrong one
+        assert!(page.frame.contains(200.0, 150.0) && panel.frame.contains(200.0, 150.0));
+
+        assert!(runtime.wheel(200.0, 150.0, 0.0, -60.0));
+        assert!(runtime.scroll_offset(&panel.path).y > 0.0, "the panel under the pointer moves");
+        assert_eq!(runtime.scroll_offset(&page.path), Point::ZERO, "the page behind holds still");
+
+        // ...and beside the panel the page is what the pointer is over,
+        // so the page is what moves. A layer answers for what it covers
+        // and for nothing else.
+        assert!(runtime.wheel(20.0, 20.0, 0.0, -60.0));
+        assert!(runtime.scroll_offset(&page.path).y > 0.0, "beside it, the page is the one under the point");
+
+        // a popover's own list is the same law: it places AFTER the
+        // root, so it paints last and it answers
+        #[derive(Clone, Copy)]
+        struct Anchored {
+            open: State<bool>,
+        }
+
+        impl Component for Anchored {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(text("page").frame(400.0, 4000.0)).id("page").popover(
+                    self.open.binding(),
+                    Side::Trailing,
+                    move |_| {
+                        erased(scroll(text("list").frame(160.0, 900.0)).id("pop").frame(180.0, 120.0))
+                    },
+                )
+            }
+        }
+
+        let anchored = Anchored { open: State::new(true) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&anchored);
+        let result = runtime.layout(&anchored, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let find = |suffix: &str| {
+            result.scrolls.iter().find(|r| r.path.ends_with(suffix)).expect("region").clone()
+        };
+        let (page, pop) = (find("[page]"), find("[pop]"));
+        let at = (
+            pop.frame.origin.x + pop.frame.size.width / 2.0,
+            pop.frame.origin.y + pop.frame.size.height / 2.0,
+        );
+        assert!(page.frame.contains(at.0, at.1), "the page runs under the card");
+        assert!(runtime.wheel(at.0, at.1, 0.0, -60.0));
+        assert!(runtime.scroll_offset(&pop.path).y > 0.0, "the card's own list moves");
+        assert_eq!(runtime.scroll_offset(&page.path), Point::ZERO, "the page under it holds still");
+    }
+
+    #[test]
+    fn a_nested_region_still_beats_the_one_around_it() {
+        use crate::layout::{Point, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Nest;
+
+        impl Component for Nest {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(vstack((
+                    text("head").frame(300.0, 50.0),
+                    scroll(text("inner").frame(280.0, 900.0)).id("inner").frame(300.0, 100.0),
+                    text("tail").frame(300.0, 2000.0),
+                )))
+                .id("outer")
+            }
+        }
+
+        let runtime = Runtime::new();
+        runtime.render_stable(&Nest);
+        let result = runtime.layout(&Nest, Proposal::exact(Size { width: 300.0, height: 300.0 }));
+        let find = |suffix: &str| {
+            result.scrolls.iter().find(|r| r.path.ends_with(suffix)).expect("region").clone()
+        };
+        let (outer, inner) = (find("[outer]"), find("[inner]"));
+        let (x, y) = (150.0, inner.frame.origin.y + 50.0);
+        assert!(outer.frame.contains(x, y), "the outer runs under the inner");
+
+        // a child paints over its parent, so the same rule that puts a
+        // layer above what it covers puts the inner list above the page
+        // it sits in — nothing here needs a second law
+        assert!(runtime.wheel(x, y, 0.0, -60.0));
+        assert!(runtime.scroll_offset(&inner.path).y > 0.0, "the inner list takes it");
+        assert_eq!(runtime.scroll_offset(&outer.path), Point::ZERO, "the page around it holds still");
+
+        // and where only the outer travels, the outer answers
+        assert!(runtime.wheel(150.0, 20.0, 0.0, -60.0));
+        assert!(runtime.scroll_offset(&outer.path).y > 0.0);
+    }
+
+    #[test]
     fn a_named_family_travels_to_the_engine_and_names_only_the_face() {
         use crate::layout::{Proposal, Size};
         use crate::text_engine::{Family, FontPatch, LineMetrics, TextRaster, Weight};
