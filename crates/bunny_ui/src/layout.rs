@@ -3018,12 +3018,34 @@ impl LayoutNode {
             }
 
             LayoutNode::Layered { children, .. } => {
-                let measured: Vec<(Size, Fit)> =
+                let mut measured: Vec<(Size, Fit)> =
                     children.iter().map(|child| child.measure(proposal, env)).collect();
-                let size = measured.iter().fold(Size::default(), |acc, (size, _)| Size {
+                let mut size = measured.iter().fold(Size::default(), |acc, (size, _)| Size {
                     width: acc.width.max(size.width),
                     height: acc.height.max(size.height),
                 });
+                // The stack's last pass, on both axes at once: a layer too
+                // big to shrink decides the box, and a layer that CAN take
+                // that box was measured against a smaller one. Centring it
+                // there would walk a full-bleed wash off the corner it was
+                // painted for. Asked again, once.
+                for (index, child) in children.iter().enumerate() {
+                    let (answered, _) = &measured[index];
+                    let wider = size.width - answered.width > SETTLED
+                        && child.is_flexible(Axis::Horizontal);
+                    let taller = size.height - answered.height > SETTLED
+                        && child.is_flexible(Axis::Vertical);
+                    if !wider && !taller {
+                        continue;
+                    }
+                    let asked = Proposal {
+                        width: Some(if wider { size.width } else { answered.width }),
+                        height: Some(if taller { size.height } else { answered.height }),
+                    };
+                    measured[index] = child.measure(asked, env);
+                    size.width = size.width.max(measured[index].0.width);
+                    size.height = size.height.max(measured[index].0.height);
+                }
                 (size, Fit::Children(measured))
             }
 
@@ -4590,6 +4612,11 @@ fn measure_split(
     )
 }
 
+/// A difference within half a device pixel is arithmetic, not appetite:
+/// it must neither spin another round of a stack's waterfall nor send a
+/// child back to be measured a second time.
+const SETTLED: Px = 0.5;
+
 /// The stack algorithm: measures everyone ONCE with no restriction on the
 /// main axis (naturals + who is flexible), splits the leftover among the
 /// flexibles and re-measures only those. Shrinking never happens behind
@@ -4601,6 +4628,12 @@ fn measure_split(
 /// among the still-hungry and offers again. Every round retires at least
 /// one child, so the loop is bounded by the child count; shares within a
 /// round are equal, so no child's position buys it space.
+///
+/// A last pass hands the row's OWN thickness back. A child too big to
+/// shrink can make the row thicker than the box that holds it, and
+/// whoever CAN take that thickness was measured against the smaller
+/// number — so they are asked again, once. A rigid child keeps its size
+/// and is aligned instead, which is what alignment is for.
 fn measure_stack(
     axis: Axis,
     spacing: Px,
@@ -4645,9 +4678,6 @@ fn measure_stack(
     if let Some(total) = proposed_main
         && !flexible.is_empty()
     {
-        // Under-consumption within half a device pixel is arithmetic, not
-        // appetite — it must not spin another round.
-        const SETTLED: Px = 0.5;
         let rigid: Px = measured
             .iter()
             .enumerate()
@@ -4673,11 +4703,40 @@ fn measure_stack(
         }
     }
 
-    let main_sum: Px = measured.iter().map(|(size, _)| main(size)).sum::<Px>() + spacing_total;
-    let cross_max: Px = measured
+    // phase 3: the row's OWN thickness is the truth, not the box it
+    // started from. A rail of rigid icons makes the row taller than the
+    // window holding it, and a child measured against the smaller number
+    // would then be CENTRED in a row it could have filled — which is what
+    // makes a squashed window read as broken instead of as clipped: the
+    // body walks away from the bar above it and the gap it opens belongs
+    // to nobody. A rigid child keeps its size and its alignment, which is
+    // what alignment is for; a child that says it takes the room is asked
+    // again, ONCE, with the room the row really has.
+    let cross_axis = match axis {
+        Axis::Vertical => Axis::Horizontal,
+        Axis::Horizontal => Axis::Vertical,
+    };
+    let mut cross_max: Px = measured
         .iter()
         .map(|(size, _)| cross(size))
         .fold(0.0, Px::max);
+    for (index, child) in children.iter().enumerate() {
+        if cross(&measured[index].0) >= cross_max - SETTLED || !child.is_flexible(cross_axis) {
+            continue;
+        }
+        // the main axis is settled — only the thickness is news
+        let settled = main(&measured[index].0);
+        measured[index] = child.measure(
+            match axis {
+                Axis::Vertical => Proposal { width: Some(cross_max), height: Some(settled) },
+                Axis::Horizontal => Proposal { width: Some(settled), height: Some(cross_max) },
+            },
+            env,
+        );
+        cross_max = cross_max.max(cross(&measured[index].0));
+    }
+
+    let main_sum: Px = measured.iter().map(|(size, _)| main(size)).sum::<Px>() + spacing_total;
 
     let size = match axis {
         Axis::Vertical => Size { width: cross_max, height: main_sum },
@@ -5074,6 +5133,105 @@ mod tests {
         assert_eq!(result.frames.get("top").unwrap().origin.y, 0.0);
         assert_eq!(result.frames.get("gap").unwrap().size.height, 68.0);
         assert_eq!(result.frames.get("bottom").unwrap().origin.y, 84.0);
+    }
+
+    /// A box shorter than the rail it holds: ten rigid icons make the row
+    /// 280 tall while the box offers 174. The row answers 280, which is
+    /// honest — it cannot shrink an icon. What it must NOT do is leave the
+    /// body at the 174 it was asked for and CENTRE it inside the 280 it
+    /// became: the body walks away from the bar above it, the gap it opens
+    /// belongs to nobody, and a squashed window reads as broken instead of
+    /// as clipped. Whoever can take the row's own height is asked again.
+    #[test]
+    fn a_squashed_row_hands_its_own_height_to_whoever_can_fill_it() {
+        let rail = boundary(
+            "rail",
+            LayoutNode::Frame {
+                width: Some(48.0),
+                height: Some(280.0),
+                child: Box::new(LayoutNode::Spacer),
+            },
+        );
+        let row = LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing: 0.0,
+            align: CrossAlign::Center,
+            children: vec![rail, boundary("body", LayoutNode::Spacer)],
+        };
+        let result = layout(&row, Proposal { width: Some(1280.0), height: Some(174.0) });
+
+        assert_eq!(result.size.height, 280.0, "the row is as tall as the rail it cannot shrink");
+        let body = result.frames.get("body").unwrap();
+        assert_eq!(body.size.height, 280.0, "the body takes the row it is in");
+        assert_eq!(body.origin.y, 0.0, "and starts where the row starts");
+    }
+
+    /// The same rule on the other axis, which is where it reads worst. A
+    /// body too WIDE to shrink makes the frame wider than the window, and
+    /// a title bar centred inside that frame walks to the right — away
+    /// from the corner the window counts from, and away from the buttons
+    /// the system draws there. The bar takes the frame's width instead
+    /// and loses its right end to the window edge, which is what being
+    /// clipped means.
+    #[test]
+    fn a_squashed_column_keeps_its_bar_on_the_edge_the_window_counts_from() {
+        let bar = boundary(
+            "bar",
+            LayoutNode::Frame {
+                width: None,
+                height: Some(40.0),
+                child: Box::new(LayoutNode::Spacer),
+            },
+        );
+        let body = boundary(
+            "body",
+            LayoutNode::Frame {
+                width: Some(948.0),
+                height: None,
+                child: Box::new(LayoutNode::Spacer),
+            },
+        );
+        let column = LayoutNode::Stack {
+            axis: Axis::Vertical,
+            spacing: 0.0,
+            align: CrossAlign::Center,
+            children: vec![bar, body],
+        };
+        let result = layout(&column, Proposal { width: Some(500.0), height: Some(800.0) });
+
+        assert_eq!(result.size.width, 948.0, "the frame is as wide as the body it cannot shrink");
+        let bar = result.frames.get("bar").unwrap();
+        assert_eq!(bar.origin.x, 0.0, "the bar stays on the leading edge");
+        assert_eq!(bar.size.width, 948.0, "and takes the frame's own width");
+    }
+
+    /// A pile obeys the same rule, on both axes at once. The ambience
+    /// under a frame taller than the window answered the window, because
+    /// that is what it was asked; the frame could not shrink and answered
+    /// more. Centring the wash inside the pile slides it off the corner it
+    /// was painted for — it takes the box the layers ended up needing.
+    #[test]
+    fn a_layer_that_can_fill_the_pile_is_not_centred_in_it() {
+        let pile = LayoutNode::Layered {
+            align: CrossAlign::Center,
+            children: vec![
+                boundary("wash", LayoutNode::Spacer),
+                boundary(
+                    "frame",
+                    LayoutNode::Frame {
+                        width: None,
+                        height: Some(372.0),
+                        child: Box::new(LayoutNode::Spacer),
+                    },
+                ),
+            ],
+        };
+        let result = layout(&pile, Proposal { width: Some(1280.0), height: Some(240.0) });
+
+        assert_eq!(result.size.height, 372.0, "the pile is as tall as the frame in it");
+        let wash = result.frames.get("wash").unwrap();
+        assert_eq!(wash.size.height, 372.0, "the wash takes the pile");
+        assert_eq!(wash.origin.y, 0.0, "and starts where the pile starts");
     }
 
     #[test]
