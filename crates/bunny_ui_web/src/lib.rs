@@ -13,6 +13,20 @@
 //! of the display link — armed only while an animation wants frames.
 #![cfg(target_arch = "wasm32")]
 
+#[cfg(feature = "gpu")]
+mod gpu;
+#[cfg(feature = "gpu")]
+use gpu as tier;
+
+/// The tier that is not in this build: every door answers no and the
+/// branches fold away, so the call sites read the same either way.
+#[cfg(not(feature = "gpu"))]
+mod tier {
+    pub(crate) fn try_install(_kind: u32, _physical: (u32, u32)) -> bool { false }
+    pub(crate) fn active() -> bool { false }
+    pub(crate) fn teardown() {}
+}
+
 mod image;
 mod text;
 
@@ -237,6 +251,15 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
     // a box that draws parts which TOUCH puts the shared edge on a
     // whole PIXEL — it needs the screen's scale
     runtime.set_device_scale(scale as f64);
+    // the tier comes up before the first frame, and the first frame is
+    // already the one the page keeps
+    let physical = (
+        ((size.width.round() as usize) * scale).max(1) as u32,
+        ((size.height.round() as usize) * scale).max(1) as u32,
+    );
+    tier::try_install(0, physical);
+    // stays None on the GPU road: a page presenting by GPU never
+    // allocates the CPU bitmap at all
     let mut surface: Option<(Surface, usize, Color)> = None;
 
     let present = move |runtime: &Runtime,
@@ -248,6 +271,16 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
         let physical =
             ((size.width.round() as usize) * scale, (size.height.round() as usize) * scale);
         let display = root(runtime, size);
+        #[cfg(feature = "gpu")]
+        if tier::active() {
+            // the same display list, no Surface in the path — the frame
+            // IS the drawable
+            tier::present_window(&display, size, scale, canvas);
+            if runtime.wants_frame() {
+                unsafe { js_request_frame() };
+            }
+            return;
+        }
         let stale = match &*surface {
             Some((retained, kept_scale, kept_canvas)) => {
                 retained.bitmap().width() != physical.0
@@ -719,4 +752,46 @@ pub extern "C" fn bunny_field(
     let path = unsafe { String::from_raw_parts(path_pointer, path_len, path_len.max(1)) };
     let value = unsafe { String::from_raw_parts(value_pointer, value_len, value_len.max(1)) };
     dispatch(Event::Field { path, value, caret });
+}
+
+/// The WebGL2 context died. The CPU takes the page this very turn.
+#[cfg(feature = "gpu")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_gpu_lost() {
+    gpu::lost();
+}
+
+/// The context came back. One silent rebuild is owed; after that the
+/// CPU keeps the page for as long as it lives.
+#[cfg(feature = "gpu")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_gpu_restored(width: u32, height: u32) {
+    let _ = gpu::restored((width.max(1), height.max(1)));
+}
+
+/// Clears the drawable to one colour and reads the middle pixel back,
+/// packed as `0xRRGGBBAA`. The first thing a tier must be able to say,
+/// and the first thing a browser can check: the clear is exact, the
+/// readback is in the byte order the rasterizer writes, and the rows
+/// come home the way up the raster counts them.
+#[cfg(feature = "gpu")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_gpu_selftest(packed: u32) -> u32 {
+    if !gpu::active() {
+        return 0;
+    }
+    let colour = bunny_ui::layout::Color {
+        r: (packed >> 24) as u8,
+        g: (packed >> 16) as u8,
+        b: (packed >> 8) as u8,
+        a: packed as u8,
+    };
+    let size = bunny_ui::layout::Size { width: 4.0, height: 4.0 };
+    gpu::present_window(&bunny_ui::layout::DisplayList::default(), size, 1, colour);
+    let rgba = gpu::read_rgba((4, 4));
+    let at = (1 * 4 + 1) * 4;
+    ((rgba[at] as u32) << 24)
+        | ((rgba[at + 1] as u32) << 16)
+        | ((rgba[at + 2] as u32) << 8)
+        | rgba[at + 3] as u32
 }

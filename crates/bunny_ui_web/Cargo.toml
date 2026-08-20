@@ -4,8 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 
 [features]
-default = ["canvas"]
+default = ["canvas", "gpu"]
 canvas = ["bunny-ui/canvas"]
+# The WebGL2 tier. Off, the page presents through the CPU Surface
+# and the island canvases take putImageData — today's roads.
+gpu = ["bunny-ui/gpu", "canvas"]
 
 [dependencies]
 bunny-ui.workspace = true

@@ -4232,6 +4232,11 @@ mod tests {
         assert_eq!(
             include_str!("../../bunny_ui_web/glue/surface.js"),
             include_str!("../../../apps/finder_web/web/surface.js"),
+            "finder_web ships a surface.js that drifted from the canonical copy"
+        );
+        assert_eq!(
+            include_str!("../../bunny_ui_web/glue/glue_gl.js"),
+            include_str!("../../../apps/finder_web/web/glue_gl.js"),
             "finder_web ships a glue.js that drifted from the canonical copy"
         );
         assert_eq!(
