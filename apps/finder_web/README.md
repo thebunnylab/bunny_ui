@@ -55,6 +55,32 @@ one pane and six for two, and this comes in at two and three. The
 numbers are from Chrome on ANGLE over Metal; another browser or another
 GPU must say so again for itself.
 
+What it costs to present a full window, on the same machine, medians
+of five interleaved rounds of eleven samples with a cooldown between
+rounds. Every sample moves one command, because both roads skip a frame
+that did not change and the skip is not the thing being measured.
+
+| physical | gpu submit | cpu, fresh surface | cpu, damage only |
+| --- | --- | --- | --- |
+| 1520x1280 | &lt;0.1 | 8.2 | 4.2 |
+| 2560x1440 | &lt;0.1 | 13.6 | 7.6 |
+| 3024x1964 | &lt;0.1 | 22.2 | 12.6 |
+| 3840x2160 | &lt;0.1 | 31.0 | 17.5 |
+| 5120x2880 | &lt;0.1 | 54.9 | 31.0 |
+
+The GPU column INCLUDES the display-list walk, the instance and atlas
+upload, and the draw submission through `glFlush`. It EXCLUDES layout
+and settle, the GPU's own execution, and the browser's compositing. The
+CPU columns include `Surface::frame` and the RGBA mirror, and exclude
+the blit.
+
+The GPU numbers are written as "under a tenth" because that is all this
+clock can say: `performance.now()` on this page steps in 0.1 ms, and an
+empty scene reports the same figure as a five-thousand-pixel one. What
+the measurement does establish is the shape — the submit does not grow
+with the pixel count over a twelve-fold range, while the rasterizer's
+cost grows with it, from four milliseconds to thirty-one.
+
 **Islands**: inside the Dom page, `.rendering(Rendering::Gpu)` claims a
 canvas island for one subtree — our layout positions the element, our
 rasterizer fills it, and it redraws only when its content changes. The

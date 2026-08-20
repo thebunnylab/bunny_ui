@@ -169,6 +169,10 @@ const bunnyGpuImports = {
     into.drawImage(gl.canvas, 0, 0, width >>> 0, height >>> 0, 0, 0, width >>> 0, height >>> 0);
   },
 
+  gl_now() {
+    return performance.now();
+  },
+
   gl_teardown() {
     gpuLoseContext();
   },

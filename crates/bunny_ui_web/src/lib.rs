@@ -39,6 +39,8 @@ use bunny_ui::prelude::*;
 #[cfg(feature = "canvas")]
 use bunny_ui::raster::Surface;
 use bunny_ui::runtime::Runtime;
+#[cfg(feature = "gpu")]
+use gpu::gl_now;
 use bunny_ui::text_input::EditCommand;
 
 pub use image::CanvasImageEngine;
@@ -900,4 +902,64 @@ pub extern "C" fn bunny_gpu_parity(scene: u32) -> u32 {
         mine.len()
     ));
     worst as u32
+}
+
+/// One timed present of a full-window scene, in milliseconds.
+///
+/// `road` 0 is this tier, 1 is a FRESH `Surface` each sample (the shape
+/// the 2.2ms figure was taken in), 2 is the rasterizer in its damage
+/// steady state — the same surface, one command moved.
+///
+/// What a sample INCLUDES, because the house asks every line to say so:
+/// the display-list walk, the instance and atlas upload, and the draw
+/// submission through `glFlush` on road 0; `Surface::frame` plus the
+/// RGBA mirror on roads 1 and 2. It EXCLUDES layout and settle (the
+/// list is built once, outside the clock), GPU execution, and the
+/// browser's compositing.
+///
+/// Both roads skip an identical frame — the tier by its retained list,
+/// the surface by an empty damage set — so every sample perturbs one
+/// command, or the number would be the cost of the skip check.
+#[cfg(feature = "gpu")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_bench_present(road: u32, width: u32, height: u32, samples: u32) -> f64 {
+    use bunny_ui::layout::{Color, Size};
+
+    let scale = 2usize;
+    let logical = Size { width: width as f64 / scale as f64, height: height as f64 / scale as f64 };
+    let canvas = Color::rgba(242, 243, 247, 255);
+    let runtime = Runtime::new();
+
+    let build = |nudge: f64| bunny_ui::gpu::scenes::bench_scene(logical, nudge);
+
+    let physical = (width.max(1) as usize, height.max(1) as usize);
+    let mut best: Vec<f64> = Vec::with_capacity(samples as usize);
+    let mut surface = bunny_ui::raster::Surface::new(physical.0, physical.1, scale, canvas);
+    for sample in 0..samples {
+        // one command moves every sample: an identical frame is skipped
+        // by BOTH roads, and the skip is not what is being measured
+        let display = build((sample % 2) as f64 * 0.5);
+        let started = unsafe { gl_now() };
+        match road {
+            0 => {
+                gpu::present_window(
+                    None, &display, logical, scale, canvas,
+                    &*runtime.text(), &*runtime.images(),
+                );
+            }
+            1 => {
+                let mut fresh =
+                    bunny_ui::raster::Surface::new(physical.0, physical.1, scale, canvas);
+                let _ = fresh.frame(display, &*runtime.text(), &*runtime.images());
+                let _ = fresh.rgba();
+            }
+            _ => {
+                let _ = surface.frame(display, &*runtime.text(), &*runtime.images());
+                let _ = surface.rgba();
+            }
+        }
+        best.push(unsafe { gl_now() } - started);
+    }
+    best.sort_by(|a, b| a.partial_cmp(b).expect("no nan on a clock"));
+    best[best.len() / 2]
 }

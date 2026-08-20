@@ -40,6 +40,8 @@ unsafe extern "C" {
     fn gl_init(kind: u32, width: u32, height: u32) -> u32;
     fn gl_log(pointer: *const u8, len: usize);
     fn gl_island_blit(id: u32, width: u32, height: u32);
+    /// The page's own clock, for a line that must say what it timed.
+    pub(crate) fn gl_now() -> f64;
     fn gl_teardown();
     fn gl_resize(width: u32, height: u32);
 
