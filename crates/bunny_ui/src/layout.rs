@@ -2855,9 +2855,15 @@ impl LayoutNode {
     /// Flexible = wants the leftover space on the axis (the basis of
     /// stack distribution). Explicit priority, never a side effect of
     /// overflow.
-    pub(crate) fn is_flexible(&self, axis: Axis) -> bool {
+    pub(crate) fn is_flexible(&self, axis: Axis, enclosing_main: Option<Axis>) -> bool {
         match self {
-            LayoutNode::Spacer | LayoutNode::Fill => true,
+            // A spacer is flexible only on the MAIN axis of the stack that
+            // holds it, never across it — so a bar of them never makes its
+            // row take the leftover HEIGHT. With no stack in reach (a
+            // spacer measured on its own) it keeps the old bi-axial answer.
+            LayoutNode::Spacer => enclosing_main.map_or(true, |main| axis == main),
+            // a fill FILLS the offer on both axes — legitimately bi-axial
+            LayoutNode::Fill => true,
             // a split FILLS the offer on both axes — its whole job is
             // dividing the room it was given
             LayoutNode::Split { .. } => true,
@@ -2870,16 +2876,20 @@ impl LayoutNode {
             // then sizes the BOX, instead of centring one line in a hole
             LayoutNode::Field { multiline, .. } => axis == Axis::Horizontal || *multiline,
             LayoutNode::MaxFrame { max_width, max_height, child, .. } => match axis {
-                Axis::Horizontal => max_width.is_infinite() || child.is_flexible(axis),
-                Axis::Vertical => max_height.is_infinite() || child.is_flexible(axis),
+                Axis::Horizontal => {
+                    max_width.is_infinite() || child.is_flexible(axis, enclosing_main)
+                }
+                Axis::Vertical => {
+                    max_height.is_infinite() || child.is_flexible(axis, enclosing_main)
+                }
             },
             LayoutNode::Frame { width, height, child } => match axis {
-                Axis::Horizontal => width.is_none() && child.is_flexible(axis),
-                Axis::Vertical => height.is_none() && child.is_flexible(axis),
+                Axis::Horizontal => width.is_none() && child.is_flexible(axis, enclosing_main),
+                Axis::Vertical => height.is_none() && child.is_flexible(axis, enclosing_main),
             },
             // the layer is invisible to the question: a rule wide
             // enough to cross the box must never make the box flexible
-            LayoutNode::Overlay { child, .. } => child.is_flexible(axis),
+            LayoutNode::Overlay { child, .. } => child.is_flexible(axis, enclosing_main),
             LayoutNode::Padding { child, .. }
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::HoverGroup { child, .. }
@@ -2894,23 +2904,32 @@ impl LayoutNode {
             | LayoutNode::ContextSource { child, .. }
             | LayoutNode::DragSource { child, .. }
             | LayoutNode::DropTarget { child, .. }
-            | LayoutNode::Hinted { child, .. } => child.is_flexible(axis),
+            | LayoutNode::Hinted { child, .. } => child.is_flexible(axis, enclosing_main),
             // a stack that HOLDS something flexible is itself flexible
             // (a panel with a scroll inside wants the leftover space —
-            // nesting it must not freeze it at its natural extent)
-            LayoutNode::Stack { children, .. } | LayoutNode::Layered { children, .. } => {
-                children.iter().any(|child| child.is_flexible(axis))
+            // nesting it must not freeze it at its natural extent). It
+            // also RENAMES the main axis: its children answer against its
+            // own axis, not the grandparent's.
+            LayoutNode::Stack { children, axis: main, .. } => {
+                children.iter().any(|child| child.is_flexible(axis, Some(*main)))
+            }
+            // a layer pile has no main axis of its own — the question
+            // passes through it unchanged
+            LayoutNode::Layered { children, .. } => {
+                children.iter().any(|child| child.is_flexible(axis, enclosing_main))
             }
             LayoutNode::Boundary { children, .. } => {
-                children.len() == 1 && children[0].is_flexible(axis)
+                children.len() == 1 && children[0].is_flexible(axis, enclosing_main)
             }
-            // the app answers for its own box (the default is yes, the
-            // same answer a Rectangle gives)
-            LayoutNode::Custom { element, .. } => element.element().flexible(),
+            // the app answers for its own box, per axis (the default is
+            // yes on both, the same answer a Rectangle gives)
+            LayoutNode::Custom { element, .. } => element.element().flexible(axis),
             // skipped boundary: the flexibility is the retained tree's
             LayoutNode::BoundaryRef { path } => crate::reconciler::with_retained_layout(
                 path,
-                |layout| layout.map(|node| node.is_flexible(axis)).unwrap_or(false),
+                |layout| {
+                    layout.map(|node| node.is_flexible(axis, enclosing_main)).unwrap_or(false)
+                },
             ),
             _ => false,
         }
@@ -3178,9 +3197,9 @@ impl LayoutNode {
                 for (index, child) in children.iter().enumerate() {
                     let (answered, _) = &measured[index];
                     let wider = size.width - answered.width > SETTLED
-                        && child.is_flexible(Axis::Horizontal);
+                        && child.is_flexible(Axis::Horizontal, None);
                     let taller = size.height - answered.height > SETTLED
-                        && child.is_flexible(Axis::Vertical);
+                        && child.is_flexible(Axis::Vertical, None);
                     if !wider && !taller {
                         continue;
                     }
@@ -4845,7 +4864,7 @@ fn measure_stack(
     let flexible: Vec<usize> = children
         .iter()
         .enumerate()
-        .filter(|(_, child)| child.is_flexible(axis))
+        .filter(|(_, child)| child.is_flexible(axis, Some(axis)))
         .map(|(index, _)| index)
         .collect();
 
@@ -4898,7 +4917,9 @@ fn measure_stack(
         .map(|(size, _)| cross(size))
         .fold(0.0, Px::max);
     for (index, child) in children.iter().enumerate() {
-        if cross(&measured[index].0) >= cross_max - SETTLED || !child.is_flexible(cross_axis) {
+        if cross(&measured[index].0) >= cross_max - SETTLED
+            || !child.is_flexible(cross_axis, Some(axis))
+        {
             continue;
         }
         // the main axis is settled — only the thickness is news
@@ -5329,11 +5350,13 @@ mod tests {
                 child: Box::new(LayoutNode::Spacer),
             },
         );
+        // the body is a `Fill` — a bare spacer is flexible on the row's
+        // MAIN axis only, so filling the cross thickness is a fill's job
         let row = LayoutNode::Stack {
             axis: Axis::Horizontal,
             spacing: 0.0,
             align: CrossAlign::Center,
-            children: vec![rail, boundary("body", LayoutNode::Spacer)],
+            children: vec![rail, boundary("body", LayoutNode::Fill)],
         };
         let result = layout(&row, Proposal { width: Some(1280.0), height: Some(174.0) });
 
@@ -5352,12 +5375,15 @@ mod tests {
     /// clipped means.
     #[test]
     fn a_squashed_column_keeps_its_bar_on_the_edge_the_window_counts_from() {
+        // the bar fills the frame's width with a `Fill`: a bare spacer is
+        // flexible on the column's MAIN axis (vertical) only, and here the
+        // bar has to take the CROSS extent the too-wide body forced
         let bar = boundary(
             "bar",
             LayoutNode::Frame {
                 width: None,
                 height: Some(40.0),
-                child: Box::new(LayoutNode::Spacer),
+                child: Box::new(LayoutNode::Fill),
             },
         );
         let body = boundary(
@@ -5498,7 +5524,7 @@ mod tests {
             children: vec![chip.clone(), rule.clone()],
         };
         assert!(
-            layered.is_flexible(Axis::Horizontal),
+            layered.is_flexible(Axis::Horizontal, None),
             "a layered pile takes its children's flexibility"
         );
         let overlaid = LayoutNode::Overlay {
@@ -5508,9 +5534,52 @@ mod tests {
             child: Box::new(chip),
         };
         assert!(
-            !overlaid.is_flexible(Axis::Horizontal),
+            !overlaid.is_flexible(Axis::Horizontal, None),
             "an overlay answers for the BASE alone — the whole cure of the pain"
         );
+    }
+
+    #[test]
+    fn a_spacer_is_flexible_only_along_its_stacks_main_axis() {
+        // the cure of the title-bar pain: a bare spacer in a row pushes
+        // sideways and never lets the row eat the leftover HEIGHT
+        let row = |child: LayoutNode| LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing: 0.0,
+            align: CrossAlign::Center,
+            children: vec![
+                LayoutNode::Leaf { size: Size { width: 40.0, height: 20.0 } },
+                child,
+            ],
+        };
+        let bare = row(LayoutNode::Spacer);
+        assert!(bare.is_flexible(Axis::Horizontal, None), "the row spreads sideways");
+        assert!(
+            !bare.is_flexible(Axis::Vertical, None),
+            "and never takes the leftover height — what page::push worked around"
+        );
+        // the same holds through a Frame that pins the other axis, the
+        // way `spacer().frame_height(0.0)` used to have to
+        let framed = row(LayoutNode::Frame {
+            width: None,
+            height: Some(0.0),
+            child: Box::new(LayoutNode::Spacer),
+        });
+        assert!(!framed.is_flexible(Axis::Vertical, None));
+        assert!(framed.is_flexible(Axis::Horizontal, None));
+        // a column turns the axes over
+        let column = LayoutNode::Stack {
+            axis: Axis::Vertical,
+            spacing: 0.0,
+            align: CrossAlign::Center,
+            children: vec![LayoutNode::Spacer],
+        };
+        assert!(column.is_flexible(Axis::Vertical, None));
+        assert!(!column.is_flexible(Axis::Horizontal, None));
+        // a spacer measured on its own — no stack in reach — keeps the
+        // old bi-axial answer
+        assert!(LayoutNode::Spacer.is_flexible(Axis::Horizontal, None));
+        assert!(LayoutNode::Spacer.is_flexible(Axis::Vertical, None));
     }
 
     #[test]

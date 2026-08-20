@@ -217,7 +217,7 @@ impl Walk<'_> {
                     self.lower_into(child, &mut container.children);
                     // the flexible child grows — CSS wants the flag on
                     // the ITEM, so the walk stamps it here
-                    if child.is_flexible(*axis) {
+                    if child.is_flexible(*axis, Some(*axis)) {
                         for grown in &mut container.children[opened..] {
                             if let Some(layout) = grown.layout.as_mut() {
                                 layout.grow = true;
@@ -231,7 +231,7 @@ impl Walk<'_> {
                         Axis::Vertical => Axis::Horizontal,
                         Axis::Horizontal => Axis::Vertical,
                     };
-                    if child.is_flexible(cross) {
+                    if child.is_flexible(cross, Some(*axis)) {
                         for stretched in &mut container.children[opened..] {
                             if let Some(layout) = stretched.layout.as_mut() {
                                 layout.stretch = true;
@@ -775,7 +775,7 @@ impl Walk<'_> {
     /// `flex: 1 1 auto` — full when the box is definite, content-
     /// sized when it is not (a zero basis would collapse it).
     fn stamp_fill(child: &LayoutNode, lowered: &mut [DomNode]) {
-        if child.is_flexible(Axis::Vertical) {
+        if child.is_flexible(Axis::Vertical, None) {
             for node in lowered {
                 if let Some(layout) = node.layout.as_mut() {
                     layout.fill = true;
@@ -856,8 +856,8 @@ impl Walk<'_> {
             .and_then(|island| self.env.island_boxes.get(island))
             .copied();
         let flexible = (
-            subtree.is_flexible(Axis::Horizontal),
-            subtree.is_flexible(Axis::Vertical),
+            subtree.is_flexible(Axis::Horizontal, None),
+            subtree.is_flexible(Axis::Vertical, None),
         );
         // the reported box IS the container's offer — a pixel stack
         // proposes its extent to every child, flexible or not, and

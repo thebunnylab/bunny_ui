@@ -102,10 +102,15 @@ pub trait CustomElement: 'static {
         Response::ignored()
     }
 
-    /// Does the box want the leftover space of the stack that holds it?
-    /// The default is yes — the same answer a `Rectangle` gives. A
-    /// `.frame(…)` around it always wins.
-    fn flexible(&self) -> bool {
+    /// Does the box want the leftover space of the stack that holds it,
+    /// on the given axis? The default is yes on both — the same answer a
+    /// `Rectangle` gives. A `.frame(…)` around it always wins. Answer per
+    /// axis to take one direction and decline the other: a paragraph
+    /// takes the column's WIDTH (else the stack measures it unbounded and
+    /// it answers with the whole text on one line) but never leftover
+    /// HEIGHT.
+    fn flexible(&self, axis: crate::layout::Axis) -> bool {
+        let _ = axis;
         true
     }
 

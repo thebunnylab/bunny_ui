@@ -3033,7 +3033,7 @@ mod tests {
             fn name(&self) -> &str {
                 "eats-row"
             }
-            fn flexible(&self) -> bool {
+            fn flexible(&self, _axis: crate::layout::Axis) -> bool {
                 false
             }
             fn measure(
@@ -3106,7 +3106,7 @@ mod tests {
             fn name(&self) -> &str {
                 "pad"
             }
-            fn flexible(&self) -> bool {
+            fn flexible(&self, _axis: crate::layout::Axis) -> bool {
                 false
             }
             fn accepts_keys(&self) -> bool {
