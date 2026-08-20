@@ -49,6 +49,42 @@ pub(crate) struct RectInstance {
     pub(crate) radii: [f32; 4],
 }
 
+/// The deepest level of the blur pyramid — four levels in all,
+/// mirroring `bunny_ui::glass::MAX_LEVEL`.
+pub(crate) const GLASS_MAX_LEVEL: u32 = 3;
+
+/// One pane of liquid glass. Everything is snapped device pixels
+/// resolved on the CPU in f64, like every other instance here — the
+/// shader only evaluates the material.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // written whole, read by the GPU — never field by field
+pub(crate) struct GlassInstance {
+    pub(crate) rect: [f32; 4],   // x0, y0, x1, y1
+    pub(crate) clip: [f32; 4],   // the snapped clip-stack top
+    pub(crate) radii: [f32; 4],  // the four corners, clamped
+    pub(crate) lens: [f32; 4],   // blur, refraction band, amount, chromatic
+    pub(crate) finish: [f32; 4], // highlight band, intensity, saturation, brightness
+    pub(crate) touch: [f32; 4],  // sheen, spot x, spot y, spot radius
+    pub(crate) tint: [u8; 4],    // straight RGBA (a normalized attribute)
+    pub(crate) highlight: [u8; 4],
+    pub(crate) spot_alpha: f32,
+    pub(crate) pad: f32,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<GlassInstance>() == 112);
+    assert!(std::mem::offset_of!(GlassInstance, rect) == 0);
+    assert!(std::mem::offset_of!(GlassInstance, clip) == 16);
+    assert!(std::mem::offset_of!(GlassInstance, radii) == 32);
+    assert!(std::mem::offset_of!(GlassInstance, lens) == 48);
+    assert!(std::mem::offset_of!(GlassInstance, finish) == 64);
+    assert!(std::mem::offset_of!(GlassInstance, touch) == 80);
+    assert!(std::mem::offset_of!(GlassInstance, tint) == 96);
+    assert!(std::mem::offset_of!(GlassInstance, highlight) == 100);
+    assert!(std::mem::offset_of!(GlassInstance, spot_alpha) == 104);
+};
+
 /// One text run (or chunk of one): a rectangle of atlas texels copied
 /// 1:1 to the destination — texel fetch, no sampler, exact bytes.
 #[repr(C)]
@@ -539,6 +575,10 @@ fn push_gradient(
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum RunKind {
     Rects,
+    /// A batch of liquid-glass panes. It carries its own pass: the
+    /// scene has to be blurred into the pyramid BEFORE the panes read
+    /// it, and the pass boundary is what orders the two.
+    Glass,
     Sprites,
     /// Sprites read from a DEDICATED texture (an image too big for the
     /// shared atlas) — the index points into the frame's texture list.
@@ -554,12 +594,45 @@ pub(crate) struct DrawRun {
     /// run coalescing cheap, and the run only breaks when the SHAPE of
     /// the cut changes.
     pub(crate) round: u32,
+    /// Glass only: how deep the blur pyramid must go for this batch —
+    /// the deepest blur any pane in it asked for.
+    pub(crate) levels: u32,
 }
 
 fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, round: u32, index: usize) {
     match runs.last_mut() {
         Some(run) if run.kind == kind && run.round == round => run.count += 1,
-        _ => runs.push(DrawRun { kind, base: index as u32, count: 1, round }),
+        _ => runs.push(DrawRun { kind, base: index as u32, count: 1, round, levels: 0 }),
+    }
+}
+
+fn box_union(a: Box4, b: Box4) -> Box4 {
+    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+}
+
+/// A pane joins the batch in front of it only if it does not TOUCH any
+/// pane already in it. One batch reads ONE capture of the scene, so two
+/// panes that overlap must not share it: the upper one would sample a
+/// blur taken before the lower one existed, and stacked glass would
+/// show nothing of the glass beneath it.
+fn note_glass(
+    runs: &mut Vec<DrawRun>,
+    round: u32,
+    index: usize,
+    bounds: Box4,
+    levels: u32,
+    batch: &mut Option<Box4>,
+) {
+    let joins = matches!(runs.last(), Some(run) if run.kind == RunKind::Glass && run.round == round)
+        && batch.is_some_and(|acc| box_intersect(acc, bounds).is_none());
+    if joins {
+        let run = runs.last_mut().expect("the run the match found");
+        run.count += 1;
+        run.levels = run.levels.max(levels);
+        *batch = batch.map(|acc| box_union(acc, bounds));
+    } else {
+        runs.push(DrawRun { kind: RunKind::Glass, base: index as u32, count: 1, round, levels });
+        *batch = Some(bounds);
     }
 }
 
@@ -569,6 +642,7 @@ fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, round: u32, index: usize) {
 pub(crate) struct FrameBatches {
     pub(crate) rects: Vec<RectInstance>,
     pub(crate) sprites: Vec<SpriteInstance>,
+    pub(crate) glass: Vec<GlassInstance>,
     pub(crate) runs: Vec<DrawRun>,
     /// The frame's interned curves — slot 0 is always [`NO_ROUND`].
     pub(crate) rounds: Vec<RoundClip>,
@@ -595,6 +669,7 @@ pub(crate) fn build_frame(
 ) -> Result<(), AtlasFull> {
     batches.rects.clear();
     batches.sprites.clear();
+    batches.glass.clear();
     batches.runs.clear();
     batches.textures.clear();
     batches.rounds.clear();
@@ -605,6 +680,9 @@ pub(crate) fn build_frame(
     // each entry: the hard cut, plus the index of the curve it lives
     // under (the CPU's inheritance rule, spoken in indices)
     let mut clips: Vec<(Box4, u32)> = Vec::new();
+    // the boxes the open glass batch already holds — a pane that
+    // touches one of them starts a batch of its own
+    let mut glass_batch: Option<Box4> = None;
     for command in display.iter() {
         match command {
             DrawCommand::FillRect { rect, color, corner_radius } => {
@@ -620,8 +698,58 @@ pub(crate) fn build_frame(
                 push_rect(out, snapped, clip, *color, radii, 0.0, KIND_FILL, 0.0);
                 note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
             }
-            // the pane answers in a tier commit of its own
-            DrawCommand::Backdrop { .. } => continue,
+            DrawCommand::Backdrop { rect, glass, corner_radius } => {
+                let Some(clip) = effective_clip(&clips, whole) else { continue };
+                let snapped = snap_scaled(*rect, factor);
+                if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
+                    continue;
+                }
+                if box_intersect(snapped, clip).is_none() {
+                    continue;
+                }
+                let radii = corner_clamp(corner_radius * factor, snapped);
+                let paint = glass.scaled(factor);
+                batches.glass.push(GlassInstance {
+                    rect: [snapped.0 as f32, snapped.1 as f32, snapped.2 as f32, snapped.3 as f32],
+                    clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
+                    radii: wire_radii(radii),
+                    lens: [
+                        paint.blur as f32,
+                        paint.refraction_band as f32,
+                        paint.refraction_amount as f32,
+                        paint.chromatic as f32,
+                    ],
+                    finish: [
+                        paint.highlight_band as f32,
+                        paint.highlight_intensity as f32,
+                        paint.saturation as f32,
+                        paint.brightness as f32,
+                    ],
+                    touch: [
+                        paint.sheen as f32,
+                        paint.spot_center.x as f32,
+                        paint.spot_center.y as f32,
+                        paint.spot_radius as f32,
+                    ],
+                    tint: [paint.tint.r, paint.tint.g, paint.tint.b, paint.tint.a],
+                    highlight: [
+                        paint.highlight.r,
+                        paint.highlight.g,
+                        paint.highlight.b,
+                        paint.highlight.a,
+                    ],
+                    spot_alpha: paint.spot_alpha as f32,
+                    pad: 0.0,
+                });
+                note_glass(
+                    &mut batches.runs,
+                    round_of(&clips),
+                    batches.glass.len() - 1,
+                    snapped,
+                    bunny_ui::glass::levels_for(paint.blur) as u32,
+                    &mut glass_batch,
+                );
+            }
             DrawCommand::Gradient { rect, paint, corner_radius } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
                 let snapped = snap_scaled(*rect, factor);
@@ -931,5 +1059,35 @@ mod tests {
         assert_eq!(packer.place(65, 1), None, "wider than the atlas never fits");
         packer.reset();
         assert_eq!(packer.place(64, 32), Some((0, 0)), "reset reclaims everything");
+    }
+
+
+    #[test]
+    fn overlapping_panes_break_the_batch_and_apart_ones_share_it() {
+        // one batch reads ONE capture of the scene: two panes that
+        // touch take two batches, two that never meet take one
+        let batch = |first: Box4, second: Box4| {
+            let mut runs: Vec<DrawRun> = Vec::new();
+            let mut open: Option<Box4> = None;
+            note_glass(&mut runs, 0, 0, first, 1, &mut open);
+            note_glass(&mut runs, 0, 1, second, 2, &mut open);
+            runs
+        };
+        let apart = batch((0, 0, 10, 10), (20, 20, 30, 30));
+        assert_eq!(apart.len(), 1, "panes that never meet share one capture");
+        assert_eq!(apart[0].count, 2);
+        assert_eq!(apart[0].levels, 2, "the batch digs as deep as its deepest pane");
+
+        let over = batch((0, 0, 20, 20), (10, 10, 30, 30));
+        assert_eq!(over.len(), 2, "glass over glass takes a capture of its own");
+        assert_eq!(over[1].levels, 2);
+    }
+
+    #[test]
+    fn the_pane_instance_holds_its_layout() {
+        // the const asserts already gate the build; this pins the
+        // numbers in a place a person reads
+        assert_eq!(std::mem::size_of::<GlassInstance>(), 112);
+        assert_eq!(std::mem::offset_of!(GlassInstance, tint), 96);
     }
 }

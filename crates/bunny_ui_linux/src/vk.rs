@@ -38,8 +38,8 @@ use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
 
 use crate::walk::{
-    build_frame, AtlasFull, AtlasGround, FrameBatches, RectInstance, RoundClip, RunAtlas,
-    RunKind, SpriteInstance,
+    build_frame, AtlasFull, AtlasGround, DrawRun, FrameBatches, GlassInstance, RectInstance,
+    RoundClip, RunAtlas, RunKind, SpriteInstance, GLASS_MAX_LEVEL,
 };
 
 // MARK: - The committed shaders (SPIR-V beside their GLSL truth)
@@ -50,6 +50,13 @@ const SPRITE_VERT_SPV: &[u8] = include_bytes!("shaders/sprite.vert.spv");
 const SPRITE_FRAG_SPV: &[u8] = include_bytes!("shaders/sprite.frag.spv");
 const MASK_VERT_SPV: &[u8] = include_bytes!("shaders/mask.vert.spv");
 const MASK_FRAG_SPV: &[u8] = include_bytes!("shaders/mask.frag.spv");
+// liquid glass: the pane, one separable blur pass, and the copy of the
+// offscreen scene onto the target a frame with glass cannot draw into
+const GLASS_VERT_SPV: &[u8] = include_bytes!("shaders/glass.vert.spv");
+const GLASS_FRAG_SPV: &[u8] = include_bytes!("shaders/glass.frag.spv");
+const FULL_VERT_SPV: &[u8] = include_bytes!("shaders/full.vert.spv");
+const BLUR_FRAG_SPV: &[u8] = include_bytes!("shaders/blur.frag.spv");
+const BLIT_FRAG_SPV: &[u8] = include_bytes!("shaders/blit.frag.spv");
 
 /// The 56-byte push range every pipeline shares — layout mirrored in
 /// each shader's `Push` block, asserts are the defense against drift.
@@ -157,6 +164,9 @@ const ST_WAYLAND_SURFACE_CREATE_KHR: u32 = 1000006000;
 const FORMAT_B8G8R8A8_UNORM: u32 = 44;
 const FORMAT_R8G8B8A8_UNORM: u32 = 37;
 const FORMAT_R32G32_SFLOAT: u32 = 103;
+// the blur pyramid: sampling decodes and writing encodes, so the whole
+// chain averages in LINEAR light for free
+const FORMAT_R8G8B8A8_SRGB: u32 = 43;
 const FORMAT_R32G32B32A32_SFLOAT: u32 = 109;
 
 const COLORSPACE_SRGB_NONLINEAR: u32 = 0;
@@ -209,6 +219,7 @@ const FRONT_FACE_CCW: u32 = 1;
 const SAMPLE_COUNT_1: u32 = 1;
 const DYNAMIC_STATE_VIEWPORT: u32 = 0;
 const DYNAMIC_STATE_SCISSOR: u32 = 1;
+const ATTACHMENT_LOAD_LOAD: u32 = 0;
 const ATTACHMENT_LOAD_CLEAR: u32 = 1;
 const ATTACHMENT_STORE_STORE: u32 = 0;
 const ATTACHMENT_LOAD_DONT_CARE: u32 = 2;
@@ -219,6 +230,8 @@ const COMMAND_POOL_CREATE_RESET_BUFFER: u32 = 0x2;
 const COMMAND_BUFFER_USAGE_ONE_TIME: u32 = 0x1;
 const FENCE_CREATE_SIGNALED: u32 = 0x1;
 const FILTER_NEAREST: u32 = 0;
+const FILTER_LINEAR: u32 = 1;
+const SAMPLER_MIPMAP_MODE_LINEAR: u32 = 1;
 const SAMPLER_ADDRESS_CLAMP_TO_EDGE: u32 = 2;
 const DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: u32 = 1;
 const IMAGE_VIEW_TYPE_2D: u32 = 1;
@@ -1302,6 +1315,21 @@ struct VkStack {
     sprite_pipeline: Pipeline,
     mask_pipeline: Pipeline,
     command_pool: CommandPool,
+    /// The colour format the target wears — the scene a glass frame
+    /// renders into must match it, or no pipeline is compatible.
+    format: u32,
+    /// Trilinear and clamped: the pyramid is SAMPLED, unlike the atlas,
+    /// which only ever texel-fetches.
+    linear_sampler: Sampler,
+    /// The scene's first pass, which clears it.
+    scene_first_pass: RenderPass,
+    /// The scene again, to draw the panes over what they just read.
+    scene_pass: RenderPass,
+    /// One level of the blur pyramid.
+    pyramid_pass: RenderPass,
+    glass_pipeline: Pipeline,
+    blur_pipeline: Pipeline,
+    blit_pipeline: Pipeline,
 }
 
 fn find_memory_type(
@@ -1583,6 +1611,81 @@ impl VkStack {
             };
             let mut render_pass: RenderPass = 0;
             (fns.create_render_pass)(device, &pass_info, std::ptr::null(), &mut render_pass);
+
+            // Liquid glass needs two passes of its own. A pane READS the
+            // scene, and no pass samples the attachment it draws into,
+            // so a frame with glass renders into a scene image, blurs
+            // it, draws the panes over it, and copies the result onto
+            // the target at the end.
+            //
+            // The scene pass LOADS instead of clearing and ends
+            // shader-readable, which is exactly the pair of transitions
+            // the blur then the panes need — the driver does both, and
+            // no barrier of ours is involved.
+            let scene_attachment = AttachmentDescription {
+                flags: 0,
+                format,
+                samples: SAMPLE_COUNT_1,
+                load_op: ATTACHMENT_LOAD_LOAD,
+                store_op: ATTACHMENT_STORE_STORE,
+                stencil_load: ATTACHMENT_LOAD_DONT_CARE,
+                stencil_store: 1,
+                initial_layout: IMAGE_LAYOUT_SHADER_READ_ONLY,
+                final_layout: IMAGE_LAYOUT_SHADER_READ_ONLY,
+            };
+            let scene_info = RenderPassCreateInfo {
+                attachments: &scene_attachment,
+                ..pass_info
+            };
+            let mut scene_pass: RenderPass = 0;
+            (fns.create_render_pass)(device, &scene_info, std::ptr::null(), &mut scene_pass);
+            // the scene's FIRST pass, which clears: the image arrives
+            // with nothing in it and leaves shader-readable
+            let scene_first_attachment = AttachmentDescription {
+                load_op: ATTACHMENT_LOAD_CLEAR,
+                initial_layout: IMAGE_LAYOUT_UNDEFINED,
+                ..scene_attachment
+            };
+            let scene_first_info = RenderPassCreateInfo {
+                attachments: &scene_first_attachment,
+                ..pass_info
+            };
+            let mut scene_first_pass: RenderPass = 0;
+            (fns.create_render_pass)(
+                device,
+                &scene_first_info,
+                std::ptr::null(),
+                &mut scene_first_pass,
+            );
+            // one level of the pyramid: the pass covers its whole
+            // destination, so there is nothing to load and nothing to
+            // clear
+            let pyramid_attachment = AttachmentDescription {
+                flags: 0,
+                format: FORMAT_R8G8B8A8_SRGB,
+                samples: SAMPLE_COUNT_1,
+                load_op: ATTACHMENT_LOAD_DONT_CARE,
+                store_op: ATTACHMENT_STORE_STORE,
+                stencil_load: ATTACHMENT_LOAD_DONT_CARE,
+                stencil_store: 1,
+                initial_layout: IMAGE_LAYOUT_UNDEFINED,
+                final_layout: IMAGE_LAYOUT_SHADER_READ_ONLY,
+            };
+            let pyramid_info = RenderPassCreateInfo {
+                attachments: &pyramid_attachment,
+                ..pass_info
+            };
+            let mut pyramid_pass: RenderPass = 0;
+            (fns.create_render_pass)(device, &pyramid_info, std::ptr::null(), &mut pyramid_pass);
+            let linear_info = SamplerCreateInfo {
+                mag_filter: FILTER_LINEAR,
+                min_filter: FILTER_LINEAR,
+                mipmap_mode: SAMPLER_MIPMAP_MODE_LINEAR,
+                max_lod: (GLASS_MAX_LEVEL + 1) as f32,
+                ..sampler_info
+            };
+            let mut linear_sampler: Sampler = 0;
+            (fns.create_sampler)(device, &linear_info, std::ptr::null(), &mut linear_sampler);
             let mut command_pool: CommandPool = 0;
             let pool_info = CommandPoolCreateInfo {
                 s_type: ST_COMMAND_POOL_CREATE,
@@ -1620,6 +1723,14 @@ impl VkStack {
                 sprite_pipeline: 0,
                 mask_pipeline: 0,
                 command_pool,
+                format,
+                linear_sampler,
+                scene_first_pass,
+                scene_pass,
+                pyramid_pass,
+                glass_pipeline: 0,
+                blur_pipeline: 0,
+                blit_pipeline: 0,
             };
             stack.build_pipelines()?;
             Ok(stack)
@@ -1664,6 +1775,7 @@ impl VkStack {
         bindings: &[VertexInputBinding],
         attributes: &[VertexInputAttribute],
         blend: ColorBlendAttachment,
+        pass: RenderPass,
     ) -> Result<Pipeline, String> {
         let stages = [
             PipelineShaderStage {
@@ -1774,7 +1886,7 @@ impl VkStack {
             color_blend: &color_blend,
             dynamic: &dynamic,
             layout: self.pipeline_layout,
-            render_pass: self.render_pass,
+            render_pass: pass,
             subpass: 0,
             base_pipeline: 0,
             base_index: -1,
@@ -1851,12 +1963,39 @@ impl VkStack {
             VertexInputAttribute { location: 1, binding: 0, format: FORMAT_R32G32B32A32_SFLOAT, offset: 16 },
             VertexInputAttribute { location: 2, binding: 0, format: FORMAT_R32G32B32A32_SFLOAT, offset: 32 },
         ];
+        // a pane's instance: six vec4 and two normalized ubyte4, the
+        // 112-byte lattice every tier shares
+        let glass_binding = VertexInputBinding {
+            binding: 0,
+            stride: std::mem::size_of::<GlassInstance>() as u32,
+            input_rate: VERTEX_INPUT_RATE_INSTANCE,
+        };
+        let glass_attributes = [
+            VertexInputAttribute { location: 0, binding: 0, format: FORMAT_R32G32B32A32_SFLOAT, offset: 0 },
+            VertexInputAttribute { location: 1, binding: 0, format: FORMAT_R32G32B32A32_SFLOAT, offset: 16 },
+            VertexInputAttribute { location: 2, binding: 0, format: FORMAT_R32G32B32A32_SFLOAT, offset: 32 },
+            VertexInputAttribute { location: 3, binding: 0, format: FORMAT_R32G32B32A32_SFLOAT, offset: 48 },
+            VertexInputAttribute { location: 4, binding: 0, format: FORMAT_R32G32B32A32_SFLOAT, offset: 64 },
+            VertexInputAttribute { location: 5, binding: 0, format: FORMAT_R32G32B32A32_SFLOAT, offset: 80 },
+            VertexInputAttribute { location: 6, binding: 0, format: FORMAT_R8G8B8A8_UNORM_ATTR, offset: 96 },
+            VertexInputAttribute { location: 7, binding: 0, format: FORMAT_R8G8B8A8_UNORM_ATTR, offset: 100 },
+            VertexInputAttribute { location: 8, binding: 0, format: FORMAT_R32G32_SFLOAT, offset: 104 },
+        ];
+        // a pass that covers its whole destination has nothing to blend
+        // with: the blur and the blit REPLACE what they write
+        let replace = ColorBlendAttachment { blend_enable: 0, ..source_over };
+        let glass_vert = self.shader(GLASS_VERT_SPV)?;
+        let glass_frag = self.shader(GLASS_FRAG_SPV)?;
+        let full_vert = self.shader(FULL_VERT_SPV)?;
+        let blur_frag = self.shader(BLUR_FRAG_SPV)?;
+        let blit_frag = self.shader(BLIT_FRAG_SPV)?;
         self.rect_pipeline = self.pipeline(
             rect_vert,
             rect_frag,
             &[rect_binding],
             &rect_attributes,
             source_over,
+            self.render_pass,
         )?;
         self.sprite_pipeline = self.pipeline(
             sprite_vert,
@@ -1864,10 +2003,39 @@ impl VkStack {
             &[sprite_binding],
             &sprite_attributes,
             source_over,
+            self.render_pass,
         )?;
-        self.mask_pipeline = self.pipeline(mask_vert, mask_frag, &[], &[], multiply)?;
+        self.mask_pipeline =
+            self.pipeline(mask_vert, mask_frag, &[], &[], multiply, self.render_pass)?;
+        // the scene passes carry the SAME format as the target, so
+        // every pipeline built against one is compatible with all of
+        // them — only the pyramid, in its own format, needs its own
+        self.glass_pipeline = self.pipeline(
+            glass_vert,
+            glass_frag,
+            &[glass_binding],
+            &glass_attributes,
+            source_over,
+            self.scene_pass,
+        )?;
+        self.blur_pipeline =
+            self.pipeline(full_vert, blur_frag, &[], &[], replace, self.pyramid_pass)?;
+        self.blit_pipeline =
+            self.pipeline(full_vert, blit_frag, &[], &[], replace, self.render_pass)?;
         unsafe {
-            for module in [rect_vert, rect_frag, sprite_vert, sprite_frag, mask_vert, mask_frag] {
+            for module in [
+                rect_vert,
+                rect_frag,
+                sprite_vert,
+                sprite_frag,
+                mask_vert,
+                mask_frag,
+                glass_vert,
+                glass_frag,
+                full_vert,
+                blur_frag,
+                blit_frag,
+            ] {
                 (self.fns.destroy_shader_module)(self.device, module, std::ptr::null());
             }
         }
@@ -2066,6 +2234,271 @@ impl Drop for VkStack {
             (self.fns.destroy_sampler)(self.device, self.sampler, std::ptr::null());
             (self.fns.destroy_device)(self.device, std::ptr::null());
             (self.fns.destroy_instance)(self.instance, std::ptr::null());
+        }
+    }
+}
+
+
+// MARK: - The glass targets (the scene, and the pyramid it blurs into)
+
+/// What a frame with glass renders into.
+///
+/// No pass samples the attachment it draws into, so the scene goes to
+/// an image of its own and is copied onto the real target at the end.
+/// Ping and pong are two images on purpose: no blur pass ever reads the
+/// one it writes.
+///
+/// Every level of the pyramid needs a view and a framebuffer of its
+/// own to be RENDERED into, and one view over all of them to be
+/// SAMPLED — the fragment picks its level with an explicit lod.
+struct VkGlass {
+    scene: ImageHandle,
+    scene_memory: DeviceMemory,
+    scene_view: ImageView,
+    scene_set: DescriptorSet,
+    scene_framebuffer: Framebuffer,
+    ping: PyramidImage,
+    pong: PyramidImage,
+    extent: (u32, u32),
+}
+
+struct PyramidImage {
+    image: ImageHandle,
+    memory: DeviceMemory,
+    /// All four levels, for sampling.
+    view: ImageView,
+    set: DescriptorSet,
+    /// One view and one framebuffer per level, for rendering.
+    levels: [ImageView; (GLASS_MAX_LEVEL + 1) as usize],
+    framebuffers: [Framebuffer; (GLASS_MAX_LEVEL + 1) as usize],
+}
+
+impl VkStack {
+    /// An image that is both drawn into and sampled, with its memory,
+    /// its full view and the descriptor set that reads it.
+    fn attachment_image(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+        mips: u32,
+    ) -> Option<(ImageHandle, DeviceMemory, ImageView, DescriptorSet)> {
+        unsafe {
+            let info = ImageCreateInfo {
+                s_type: ST_IMAGE_CREATE,
+                p_next: std::ptr::null(),
+                flags: 0,
+                image_type: IMAGE_TYPE_2D,
+                format,
+                extent: [width, height, 1],
+                mip_levels: mips,
+                array_layers: 1,
+                samples: SAMPLE_COUNT_1,
+                tiling: IMAGE_TILING_OPTIMAL,
+                usage: IMAGE_USAGE_COLOR_ATTACHMENT | IMAGE_USAGE_SAMPLED,
+                sharing: SHARING_MODE_EXCLUSIVE,
+                family_count: 0,
+                families: std::ptr::null(),
+                initial_layout: IMAGE_LAYOUT_UNDEFINED,
+            };
+            let mut image: ImageHandle = 0;
+            if !ok((self.fns.create_image)(self.device, &info, std::ptr::null(), &mut image)) {
+                return None;
+            }
+            let mut requirements = std::mem::zeroed::<MemoryRequirements>();
+            (self.fns.get_image_memory_requirements)(self.device, image, &mut requirements);
+            let memory_type = find_memory_type(
+                &self.memory,
+                requirements.memory_type_bits,
+                MEMORY_PROPERTY_DEVICE_LOCAL,
+            )
+            .or_else(|| find_memory_type(&self.memory, requirements.memory_type_bits, 0))?;
+            let allocate = MemoryAllocateInfo {
+                s_type: ST_MEMORY_ALLOCATE,
+                p_next: std::ptr::null(),
+                size: requirements.size,
+                memory_type,
+            };
+            let mut memory: DeviceMemory = 0;
+            if !ok((self.fns.allocate_memory)(
+                self.device,
+                &allocate,
+                std::ptr::null(),
+                &mut memory,
+            )) {
+                (self.fns.destroy_image)(self.device, image, std::ptr::null());
+                return None;
+            }
+            (self.fns.bind_image_memory)(self.device, image, memory, 0);
+            let view = self.level_view(image, format, 0, mips)?;
+            let set = self.sampled_set(view, self.linear_sampler)?;
+            Some((image, memory, view, set))
+        }
+    }
+
+    /// A view over one slice of an image's mip chain.
+    fn level_view(
+        &self,
+        image: ImageHandle,
+        format: u32,
+        base: u32,
+        count: u32,
+    ) -> Option<ImageView> {
+        let info = ImageViewCreateInfo {
+            s_type: ST_IMAGE_VIEW_CREATE,
+            p_next: std::ptr::null(),
+            flags: 0,
+            image,
+            view_type: IMAGE_VIEW_TYPE_2D,
+            format,
+            components: [0; 4],
+            aspect: IMAGE_ASPECT_COLOR,
+            base_mip: base,
+            mip_count: count,
+            base_layer: 0,
+            layer_count: 1,
+        };
+        let mut view: ImageView = 0;
+        unsafe {
+            ok((self.fns.create_image_view)(self.device, &info, std::ptr::null(), &mut view))
+                .then_some(view)
+        }
+    }
+
+    /// A descriptor set that reads one view through one sampler.
+    fn sampled_set(&self, view: ImageView, sampler: Sampler) -> Option<DescriptorSet> {
+        unsafe {
+            let allocate = DescriptorSetAllocateInfo {
+                s_type: ST_DESCRIPTOR_SET_ALLOCATE,
+                p_next: std::ptr::null(),
+                pool: self.descriptor_pool,
+                count: 1,
+                layouts: &self.set_layout,
+            };
+            let mut set: DescriptorSet = 0;
+            if !ok((self.fns.allocate_descriptor_sets)(self.device, &allocate, &mut set)) {
+                return None;
+            }
+            let image_info = DescriptorImageInfo {
+                sampler,
+                image_view: view,
+                layout: IMAGE_LAYOUT_SHADER_READ_ONLY,
+            };
+            let write = WriteDescriptorSet {
+                s_type: ST_WRITE_DESCRIPTOR_SET,
+                p_next: std::ptr::null(),
+                set,
+                binding: 0,
+                array_element: 0,
+                count: 1,
+                descriptor_type: DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                image_info: &image_info,
+                buffer_info: std::ptr::null(),
+                texel_view: std::ptr::null(),
+            };
+            (self.fns.update_descriptor_sets)(self.device, 1, &write, 0, std::ptr::null());
+            Some(set)
+        }
+    }
+
+    fn framebuffer_of(
+        &self,
+        pass: RenderPass,
+        view: ImageView,
+        width: u32,
+        height: u32,
+    ) -> Option<Framebuffer> {
+        let info = FramebufferCreateInfo {
+            s_type: ST_FRAMEBUFFER_CREATE,
+            p_next: std::ptr::null(),
+            flags: 0,
+            render_pass: pass,
+            attachment_count: 1,
+            attachments: &view,
+            width,
+            height,
+            layers: 1,
+        };
+        let mut framebuffer: Framebuffer = 0;
+        unsafe {
+            ok((self.fns.create_framebuffer)(
+                self.device,
+                &info,
+                std::ptr::null(),
+                &mut framebuffer,
+            ))
+            .then_some(framebuffer)
+        }
+    }
+
+    fn pyramid_image(&self, width: u32, height: u32) -> Option<PyramidImage> {
+        let mips = GLASS_MAX_LEVEL + 1;
+        let (image, memory, view, set) =
+            self.attachment_image(width, height, FORMAT_R8G8B8A8_SRGB, mips)?;
+        let mut levels = [0 as ImageView; (GLASS_MAX_LEVEL + 1) as usize];
+        let mut framebuffers = [0 as Framebuffer; (GLASS_MAX_LEVEL + 1) as usize];
+        for level in 0..mips {
+            let index = level as usize;
+            levels[index] = self.level_view(image, FORMAT_R8G8B8A8_SRGB, level, 1)?;
+            framebuffers[index] = self.framebuffer_of(
+                self.pyramid_pass,
+                levels[index],
+                (width >> level).max(1),
+                (height >> level).max(1),
+            )?;
+        }
+        Some(PyramidImage { image, memory, view, set, levels, framebuffers })
+    }
+
+    /// The scene and its pyramid, at the target's size. `None` when any
+    /// object refuses — a frame then paints without its panes instead
+    /// of failing to present.
+    fn glass_targets(&self, extent: (u32, u32)) -> Option<VkGlass> {
+        if extent.0 == 0 || extent.1 == 0 {
+            return None;
+        }
+        let half = (extent.0.div_ceil(2).max(1), extent.1.div_ceil(2).max(1));
+        let (scene, scene_memory, scene_view, scene_set) =
+            self.attachment_image(extent.0, extent.1, self.format, 1)?;
+        let scene_framebuffer =
+            self.framebuffer_of(self.scene_pass, scene_view, extent.0, extent.1)?;
+        let ping = self.pyramid_image(half.0, half.1)?;
+        let pong = self.pyramid_image(half.0, half.1)?;
+        Some(VkGlass {
+            scene,
+            scene_memory,
+            scene_view,
+            scene_set,
+            scene_framebuffer,
+            ping,
+            pong,
+            extent,
+        })
+    }
+
+    fn release_glass(&self, glass: &VkGlass) {
+        unsafe {
+            (self.fns.destroy_framebuffer)(self.device, glass.scene_framebuffer, std::ptr::null());
+            (self.fns.destroy_image_view)(self.device, glass.scene_view, std::ptr::null());
+            (self.fns.destroy_image)(self.device, glass.scene, std::ptr::null());
+            (self.fns.free_memory)(self.device, glass.scene_memory, std::ptr::null());
+            for pyramid in [&glass.ping, &glass.pong] {
+                for index in 0..=(GLASS_MAX_LEVEL as usize) {
+                    (self.fns.destroy_framebuffer)(
+                        self.device,
+                        pyramid.framebuffers[index],
+                        std::ptr::null(),
+                    );
+                    (self.fns.destroy_image_view)(
+                        self.device,
+                        pyramid.levels[index],
+                        std::ptr::null(),
+                    );
+                }
+                (self.fns.destroy_image_view)(self.device, pyramid.view, std::ptr::null());
+                (self.fns.destroy_image)(self.device, pyramid.image, std::ptr::null());
+                (self.fns.free_memory)(self.device, pyramid.memory, std::ptr::null());
+            }
         }
     }
 }
@@ -2271,6 +2704,10 @@ struct VkSlot {
     sprites_memory: DeviceMemory,
     sprites_map: *mut u8,
     sprites_capacity: usize,
+    glass: BufferHandle,
+    glass_memory: DeviceMemory,
+    glass_map: *mut u8,
+    glass_capacity: usize,
     in_flight: bool,
 }
 
@@ -2338,6 +2775,10 @@ impl VkSlot {
                 sprites_memory: 0,
                 sprites_map: std::ptr::null_mut(),
                 sprites_capacity: 0,
+                glass: 0,
+                glass_memory: 0,
+                glass_map: std::ptr::null_mut(),
+                glass_capacity: 0,
                 in_flight: false,
             })
         }
@@ -2426,6 +2867,100 @@ fn drain_all(stack: &VkStack, slots: &mut [VkSlot; 3]) {
 
 // MARK: - The frame recorder (barriers, copies, passes, draws)
 
+/// The runs of one pass, in paint order — the pipeline swaps only where
+/// rects and text alternate. Glass never reaches here: a pane reads the
+/// scene, so it takes a pass of its own.
+fn draw_runs(
+    stack: &VkStack,
+    ground: &mut VkGround,
+    slot: &VkSlot,
+    command: CommandBuffer,
+    batches: &FrameBatches,
+    runs: &[DrawRun],
+    push: &mut Push,
+) {
+    let fns = &stack.fns;
+    unsafe {
+        let push_all = |command: CommandBuffer, push: &Push| {
+            (fns.cmd_push_constants)(
+                command,
+                stack.pipeline_layout,
+                SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT,
+                0,
+                std::mem::size_of::<Push>() as u32,
+                (push as *const Push).cast(),
+            );
+        };
+        let shared_set = ground
+            .shared
+            .and_then(|id| ground.textures.get(&id))
+            .map(|texture| texture.set)
+            .unwrap_or(0);
+        let mut bound: Option<RunKind> = None;
+        let mut bound_round = u32::MAX;
+        let mut bound_set: DescriptorSet = 0;
+        for run in runs {
+            if bound_round != run.round {
+                let round: &RoundClip = &batches.rounds[run.round as usize];
+                push.round_box = round.box4;
+                push.round_radii = round.radii;
+                push_all(command, push);
+                bound_round = run.round;
+            }
+            let swap = match (bound, run.kind) {
+                (Some(RunKind::Sprites | RunKind::Texture(_)), RunKind::Sprites
+                | RunKind::Texture(_)) => false,
+                (was, now) => was != Some(now),
+            };
+            if swap {
+                let pipeline = match run.kind {
+                    RunKind::Rects => stack.rect_pipeline,
+                    _ => stack.sprite_pipeline,
+                };
+                (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            }
+            match run.kind {
+                // a pane reads the scene: it takes a pass of its own
+                RunKind::Glass => continue,
+                RunKind::Rects => {
+                    let offset =
+                        run.base as u64 * std::mem::size_of::<RectInstance>() as u64;
+                    (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.rects, &offset);
+                }
+                RunKind::Sprites | RunKind::Texture(_) => {
+                    let offset =
+                        run.base as u64 * std::mem::size_of::<SpriteInstance>() as u64;
+                    (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.sprites, &offset);
+                    let set = match run.kind {
+                        RunKind::Texture(index) => batches
+                            .textures
+                            .get(index as usize)
+                            .and_then(|id| ground.textures.get(id))
+                            .map(|texture| texture.set)
+                            .unwrap_or(shared_set),
+                        _ => shared_set,
+                    };
+                    if set != bound_set && set != 0 {
+                        (fns.cmd_bind_descriptor_sets)(
+                            command,
+                            PIPELINE_BIND_POINT_GRAPHICS,
+                            stack.pipeline_layout,
+                            0,
+                            1,
+                            &set,
+                            0,
+                            std::ptr::null(),
+                        );
+                        bound_set = set;
+                    }
+                }
+            }
+            bound = Some(run.kind);
+            (fns.cmd_draw)(command, 6, run.count, 0, 0);
+        }
+    }
+}
+
 /// Records the whole frame into the slot's command buffer: upload
 /// barriers and copies first, then the render pass with the runs in
 /// paint order, then the optional corner mask.
@@ -2439,6 +2974,7 @@ fn record_frame(
     canvas: Color,
     batches: &FrameBatches,
     corner_mask: Option<f64>,
+    glass: Option<&VkGlass>,
 ) {
     let fns = &stack.fns;
     let command = slot.command;
@@ -2548,28 +3084,43 @@ fn record_frame(
             canvas.b as f32 / 255.0,
             canvas.a as f32 / 255.0,
         ];
-        let pass_begin = RenderPassBeginInfo {
-            s_type: ST_RENDER_PASS_BEGIN,
-            p_next: std::ptr::null(),
-            render_pass: stack.render_pass,
-            framebuffer,
-            render_area_offset: [0, 0],
-            render_area_extent: [extent.0, extent.1],
-            clear_count: 1,
-            clears: &clear,
+        // a frame with glass renders into a scene image of its own,
+        // because a pane READS the scene and no pass samples the
+        // attachment it draws into. The panes break it into segments:
+        // one pass per stretch of ordinary runs, the pyramid between
+        // them, and one copy onto the real target at the end
+        let (first_pass, target) = match glass {
+            Some(targets) => (stack.scene_first_pass, targets.scene_framebuffer),
+            None => (stack.render_pass, framebuffer),
         };
-        (fns.cmd_begin_render_pass)(command, &pass_begin, SUBPASS_CONTENTS_INLINE);
-        let viewport = Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: extent.0 as f32,
-            height: extent.1 as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
+        if let Some(targets) = glass {
+            prime_pyramid(stack, command, targets);
+        }
+        let open_pass = |pass: RenderPass, framebuffer: Framebuffer, extent: (u32, u32)| {
+            let pass_begin = RenderPassBeginInfo {
+                s_type: ST_RENDER_PASS_BEGIN,
+                p_next: std::ptr::null(),
+                render_pass: pass,
+                framebuffer,
+                render_area_offset: [0, 0],
+                render_area_extent: [extent.0, extent.1],
+                clear_count: 1,
+                clears: &clear,
+            };
+            (fns.cmd_begin_render_pass)(command, &pass_begin, SUBPASS_CONTENTS_INLINE);
+            let viewport = Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: extent.0 as f32,
+                height: extent.1 as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            (fns.cmd_set_viewport)(command, 0, 1, &viewport);
+            let scissor = Rect2D { offset: [0, 0], extent: [extent.0, extent.1] };
+            (fns.cmd_set_scissor)(command, 0, 1, &scissor);
         };
-        (fns.cmd_set_viewport)(command, 0, 1, &viewport);
-        let scissor = Rect2D { offset: [0, 0], extent: [extent.0, extent.1] };
-        (fns.cmd_set_scissor)(command, 0, 1, &scissor);
+        open_pass(first_pass, target, extent);
 
         let mut push = Push {
             round_box: [0.0; 4],
@@ -2589,72 +3140,40 @@ fn record_frame(
         };
         push_all(command, &push);
 
-        let shared_set = ground
-            .shared
-            .and_then(|id| ground.textures.get(&id))
-            .map(|texture| texture.set)
-            .unwrap_or(0);
-        let mut bound: Option<RunKind> = None;
-        let mut bound_round = u32::MAX;
-        let mut bound_set: DescriptorSet = 0;
-        for run in &batches.runs {
-            if bound_round != run.round {
-                let round: &RoundClip = &batches.rounds[run.round as usize];
-                push.round_box = round.box4;
-                push.round_radii = round.radii;
-                push_all(command, &push);
-                bound_round = run.round;
-            }
-            let swap = match (bound, run.kind) {
-                (Some(RunKind::Sprites | RunKind::Texture(_)), RunKind::Sprites
-                | RunKind::Texture(_)) => false,
-                (was, now) => was != Some(now),
-            };
-            if swap {
-                let pipeline = match run.kind {
-                    RunKind::Rects => stack.rect_pipeline,
-                    _ => stack.sprite_pipeline,
-                };
-                (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-            }
-            match run.kind {
-                RunKind::Rects => {
-                    let offset =
-                        run.base as u64 * std::mem::size_of::<RectInstance>() as u64;
-                    (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.rects, &offset);
-                }
-                RunKind::Sprites | RunKind::Texture(_) => {
-                    let offset =
-                        run.base as u64 * std::mem::size_of::<SpriteInstance>() as u64;
-                    (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.sprites, &offset);
-                    let set = match run.kind {
-                        RunKind::Texture(index) => batches
-                            .textures
-                            .get(index as usize)
-                            .and_then(|id| ground.textures.get(id))
-                            .map(|texture| texture.set)
-                            .unwrap_or(shared_set),
-                        _ => shared_set,
-                    };
-                    if set != bound_set && set != 0 {
-                        (fns.cmd_bind_descriptor_sets)(
+        match glass {
+            None => draw_runs(stack, ground, slot, command, batches, &batches.runs, &mut push),
+            Some(targets) => {
+                let runs = &batches.runs;
+                let mut index = 0;
+                while index < runs.len() {
+                    let start = index;
+                    while index < runs.len() && runs[index].kind != RunKind::Glass {
+                        index += 1;
+                    }
+                    if index > start {
+                        draw_runs(
+                            stack,
+                            ground,
+                            slot,
                             command,
-                            PIPELINE_BIND_POINT_GRAPHICS,
-                            stack.pipeline_layout,
-                            0,
-                            1,
-                            &set,
-                            0,
-                            std::ptr::null(),
+                            batches,
+                            &runs[start..index],
+                            &mut push,
                         );
-                        bound_set = set;
+                    }
+                    if index < runs.len() {
+                        // the pyramid needs the scene resolved, so the
+                        // pass closes before it and opens again after
+                        (fns.cmd_end_render_pass)(command);
+                        build_pyramid(stack, command, targets, extent, runs[index].levels);
+                        open_pass(stack.scene_pass, targets.scene_framebuffer, extent);
+                        push_all(command, &push);
+                        draw_glass(stack, command, slot, batches, targets, runs[index], &mut push);
+                        index += 1;
                     }
                 }
             }
-            bound = Some(run.kind);
-            (fns.cmd_draw)(command, 6, run.count, 0, 0);
         }
-
         // the scene's corners: four squares multiplied by the window's
         // own rounded coverage — premultiplied fade, per-pipeline blend
         if let Some(radius) = corner_mask {
@@ -2675,6 +3194,193 @@ fn record_frame(
             }
         }
         (fns.cmd_end_render_pass)(command);
+        // the scene, onto the target the caller actually presents
+        if let Some(targets) = glass {
+            open_pass(stack.render_pass, framebuffer, extent);
+            (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, stack.blit_pipeline);
+            (fns.cmd_bind_descriptor_sets)(
+                command,
+                PIPELINE_BIND_POINT_GRAPHICS,
+                stack.pipeline_layout,
+                0,
+                1,
+                &targets.scene_set,
+                0,
+                std::ptr::null(),
+            );
+            (fns.cmd_draw)(command, 3, 1, 0, 0);
+            (fns.cmd_end_render_pass)(command);
+        }
+    }
+}
+
+/// Every level of the pyramid, out of UNDEFINED and into the layout its
+/// descriptor promises. A level this frame never writes is still SEEN
+/// by the sampler's view, and a subresource in the wrong layout is not
+/// a maybe.
+fn prime_pyramid(stack: &VkStack, command: CommandBuffer, glass: &VkGlass) {
+    let fns = &stack.fns;
+    for image in [glass.ping.image, glass.pong.image] {
+        let barrier = ImageMemoryBarrier {
+            s_type: ST_IMAGE_MEMORY_BARRIER,
+            p_next: std::ptr::null(),
+            src_access: 0,
+            dst_access: ACCESS_SHADER_READ,
+            old_layout: IMAGE_LAYOUT_UNDEFINED,
+            new_layout: IMAGE_LAYOUT_SHADER_READ_ONLY,
+            src_family: u32::MAX,
+            dst_family: u32::MAX,
+            image,
+            aspect: IMAGE_ASPECT_COLOR,
+            base_mip: 0,
+            mip_count: GLASS_MAX_LEVEL + 1,
+            base_layer: 0,
+            layer_count: 1,
+        };
+        unsafe {
+            (fns.cmd_pipeline_barrier)(
+                command,
+                PIPELINE_STAGE_TOP,
+                PIPELINE_STAGE_FRAGMENT_SHADER,
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                1,
+                &barrier,
+            );
+        }
+    }
+}
+
+/// The blur pyramid, from the scene as it stands right now.
+///
+/// Level 0 is the scene at half resolution blurred to sigma 5.2 device
+/// px, and each level halves again and composes another. The downsample
+/// is FUSED into the horizontal pass: it writes the smaller destination
+/// while sampling the larger source, and each bilinear tap averages a
+/// 2x2 neighbourhood on the way. Ping and pong are two images on
+/// purpose — no pass ever reads the one it writes.
+fn build_pyramid(
+    stack: &VkStack,
+    command: CommandBuffer,
+    glass: &VkGlass,
+    extent: (u32, u32),
+    max_level: u32,
+) {
+    let fns = &stack.fns;
+    let base = (extent.0.div_ceil(2).max(1), extent.1.div_ceil(2).max(1));
+    unsafe {
+        for level in 0..=max_level.min(GLASS_MAX_LEVEL) {
+            let width = (base.0 >> level).max(1);
+            let height = (base.1 >> level).max(1);
+            let inv = (1.0 / width as f32, 1.0 / height as f32);
+            let index = level as usize;
+            // level 0 reads raw scene colour, which no format decodes
+            // for us
+            let (source, source_level, decode) = match level {
+                0 => (glass.scene_set, 0.0, 1.0),
+                _ => (glass.ping.set, (level - 1) as f32, 0.0),
+            };
+            for (target, set, from_level, decoding, direction) in [
+                (glass.pong.framebuffers[index], source, source_level, decode, (1.0f32, 0.0f32)),
+                (glass.ping.framebuffers[index], glass.pong.set, level as f32, 0.0, (0.0, 1.0)),
+            ] {
+                let clears = [0.0f32; 4];
+                let begin = RenderPassBeginInfo {
+                    s_type: ST_RENDER_PASS_BEGIN,
+                    p_next: std::ptr::null(),
+                    render_pass: stack.pyramid_pass,
+                    framebuffer: target,
+                    render_area_offset: [0, 0],
+                    render_area_extent: [width, height],
+                    clear_count: 1,
+                    clears: &clears,
+                };
+                (fns.cmd_begin_render_pass)(command, &begin, SUBPASS_CONTENTS_INLINE);
+                let viewport = Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f32,
+                    height: height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                (fns.cmd_set_viewport)(command, 0, 1, &viewport);
+                let scissor = Rect2D { offset: [0, 0], extent: [width, height] };
+                (fns.cmd_set_scissor)(command, 0, 1, &scissor);
+                (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, stack.blur_pipeline);
+                (fns.cmd_bind_descriptor_sets)(
+                    command,
+                    PIPELINE_BIND_POINT_GRAPHICS,
+                    stack.pipeline_layout,
+                    0,
+                    1,
+                    &set,
+                    0,
+                    std::ptr::null(),
+                );
+                // the frame's push block, reused field for field: the
+                // mode in `round_box`, the step in `quad`
+                let push = Push {
+                    round_box: [from_level, decoding, 0.0, 0.0],
+                    quad: [inv.0, inv.1, direction.0, direction.1],
+                    round_radii: [0.0; 4],
+                    viewport: [width as f32, height as f32],
+                };
+                (fns.cmd_push_constants)(
+                    command,
+                    stack.pipeline_layout,
+                    SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT,
+                    0,
+                    std::mem::size_of::<Push>() as u32,
+                    (&push as *const Push).cast(),
+                );
+                (fns.cmd_draw)(command, 3, 1, 0, 0);
+                (fns.cmd_end_render_pass)(command);
+            }
+        }
+    }
+}
+
+/// One batch of panes, over the scene they just read.
+fn draw_glass(
+    stack: &VkStack,
+    command: CommandBuffer,
+    slot: &VkSlot,
+    batches: &FrameBatches,
+    glass: &VkGlass,
+    run: DrawRun,
+    push: &mut Push,
+) {
+    let fns = &stack.fns;
+    unsafe {
+        let round: &RoundClip = &batches.rounds[run.round as usize];
+        push.round_box = round.box4;
+        push.round_radii = round.radii;
+        (fns.cmd_push_constants)(
+            command,
+            stack.pipeline_layout,
+            SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT,
+            0,
+            std::mem::size_of::<Push>() as u32,
+            (push as *const Push).cast(),
+        );
+        (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, stack.glass_pipeline);
+        (fns.cmd_bind_descriptor_sets)(
+            command,
+            PIPELINE_BIND_POINT_GRAPHICS,
+            stack.pipeline_layout,
+            0,
+            1,
+            &glass.ping.set,
+            0,
+            std::ptr::null(),
+        );
+        let offset = run.base as u64 * std::mem::size_of::<GlassInstance>() as u64;
+        (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.glass, &offset);
+        (fns.cmd_draw)(command, 6, run.count, 0, 0);
     }
 }
 
@@ -2683,6 +3389,7 @@ fn record_frame(
 fn upload_instances(stack: &VkStack, slot: &mut VkSlot, batches: &FrameBatches) -> bool {
     let rects_len = std::mem::size_of_val(batches.rects.as_slice());
     let sprites_len = std::mem::size_of_val(batches.sprites.as_slice());
+    let glass_len = std::mem::size_of_val(batches.glass.as_slice());
     if !VkSlot::ensure_side(
         stack,
         &mut slot.rects,
@@ -2697,6 +3404,13 @@ fn upload_instances(stack: &VkStack, slot: &mut VkSlot, batches: &FrameBatches) 
         &mut slot.sprites_map,
         &mut slot.sprites_capacity,
         sprites_len,
+    ) || !VkSlot::ensure_side(
+        stack,
+        &mut slot.glass,
+        &mut slot.glass_memory,
+        &mut slot.glass_map,
+        &mut slot.glass_capacity,
+        glass_len,
     ) {
         return false;
     }
@@ -2713,6 +3427,13 @@ fn upload_instances(stack: &VkStack, slot: &mut VkSlot, batches: &FrameBatches) 
                 batches.sprites.as_ptr() as *const u8,
                 slot.sprites_map,
                 sprites_len,
+            );
+        }
+        if glass_len > 0 {
+            std::ptr::copy_nonoverlapping(
+                batches.glass.as_ptr() as *const u8,
+                slot.glass_map,
+                glass_len,
             );
         }
     }
@@ -2882,6 +3603,30 @@ struct VkPresenter {
     ground: VkGround,
     batches: FrameBatches,
     retained: Option<(DisplayList, (usize, usize), usize, Color)>,
+    /// The scene image and the blur pyramid, made on the first frame
+    /// that carries glass and remade whenever the swapchain resizes. A
+    /// window that never shows glass never allocates them.
+    glass: Option<VkGlass>,
+}
+
+impl VkPresenter {
+    /// Makes the glass targets if this frame needs them and the ones in
+    /// hand are the wrong size.
+    fn ensure_glass(&mut self) {
+        if self.batches.glass.is_empty() {
+            return;
+        }
+        if let Some(targets) = &self.glass {
+            if targets.extent == self.swapchain.extent {
+                return;
+            }
+            self.stack.release_glass(targets);
+        }
+        self.glass = self.stack.glass_targets(self.swapchain.extent);
+        if self.glass.is_none() {
+            eprintln!("bunny_ui vk: no scene image — the frame paints without its panes");
+        }
+    }
 }
 
 fn frame_repeats(
@@ -3000,6 +3745,7 @@ impl VkPresenter {
             }
         }
         let corner_mask = self.scene.then_some(8.0 * scale as f64);
+        self.ensure_glass();
         record_frame(
             &self.stack,
             &mut self.ground,
@@ -3009,6 +3755,7 @@ impl VkPresenter {
             canvas,
             &self.batches,
             corner_mask,
+            self.glass.as_ref().filter(|_| !self.batches.glass.is_empty()),
         );
         unsafe {
             (self.stack.fns.end_command_buffer)(self.slots[index].command);
@@ -3162,6 +3909,7 @@ fn install() -> Option<VkPresenter> {
         ground: VkGround::new(),
         batches: FrameBatches::default(),
         retained: None,
+            glass: None,
     })
 }
 
@@ -3260,6 +4008,9 @@ pub struct OffscreenVk {
     atlas: RunAtlas,
     ground: VkGround,
     batches: FrameBatches,
+    /// The scene image and the blur pyramid, made on the first frame
+    /// that carries glass.
+    glass: Option<VkGlass>,
 }
 
 impl OffscreenVk {
@@ -3365,6 +4116,7 @@ impl OffscreenVk {
             atlas: RunAtlas::new(),
             ground: VkGround::new(),
             batches: FrameBatches::default(),
+            glass: None,
         })
     }
 
@@ -3418,6 +4170,9 @@ impl OffscreenVk {
         if !upload_instances(&self.stack, &mut self.slots[index], &self.batches) {
             return;
         }
+        if !self.batches.glass.is_empty() && self.glass.is_none() {
+            self.glass = self.stack.glass_targets((self.width as u32, self.height as u32));
+        }
         record_frame(
             &self.stack,
             &mut self.ground,
@@ -3427,6 +4182,7 @@ impl OffscreenVk {
             canvas,
             &self.batches,
             None,
+            self.glass.as_ref().filter(|_| !self.batches.glass.is_empty()),
         );
         // the readback tail rides the same command buffer: the pass
         // ended in TRANSFER_SRC (the offscreen final layout) — copy
@@ -4156,7 +4912,19 @@ mod tests {
             return;
         }
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders");
-        for stage in ["rect.vert", "rect.frag", "sprite.vert", "sprite.frag", "mask.vert", "mask.frag"] {
+        for stage in [
+            "rect.vert",
+            "rect.frag",
+            "sprite.vert",
+            "sprite.frag",
+            "mask.vert",
+            "mask.frag",
+            "glass.vert",
+            "glass.frag",
+            "full.vert",
+            "blur.frag",
+            "blit.frag",
+        ] {
             let out = std::env::temp_dir().join(format!("bunny-drift-{stage}.spv"));
             let status = std::process::Command::new("glslangValidator")
                 .arg("-V")
@@ -4180,6 +4948,131 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Push, round_radii), 32);
         assert_eq!(std::mem::offset_of!(Push, viewport), 48);
     }
+
+    // MARK: - Liquid glass
+
+    fn glass_scene(glass: bunny_ui::layout::Glass, radius: f64) -> impl View {
+        // stripes make the blur legible and the lens unmistakable — a
+        // pane over a flat colour proves nothing
+        let bars = for_each(
+            (0..20).collect::<Vec<i32>>(),
+            |index: &i32| index.to_string(),
+            |index| {
+                empty()
+                    .frame_width(240.0)
+                    .frame_height(8.0)
+                    .background_color(if index % 2 == 0 {
+                        Color::hex(0x102A64)
+                    } else {
+                        Color::hex(0xE8D14A)
+                    })
+            },
+        )
+        .vertical();
+        zstack!((
+            bars,
+            empty().frame(150.0, 90.0).corner_radius(radius).glass(glass),
+        ))
+    }
+
+    /// The parity gate for glass: the material is a blur, a bilinear
+    /// sample and a saturate, resolved in f64 on one side and f32 on
+    /// the other, so it answers CLOSE, never equal. The numbers are the
+    /// ones the mac tier measured against the same rasterizer — flat
+    /// materials within two, bending ones within three, because a lens
+    /// multiplies the gap by how steep the scene is where it lands.
+    fn assert_glass_close(gpu: &[u8], cpu: &[u8], max_delta: u8, share_beyond: f64, label: &str) {
+        assert_eq!(gpu.len(), cpu.len(), "{label}: byte lengths differ");
+        let mut worst = 0u8;
+        let mut beyond = 0usize;
+        for (a, b) in gpu.iter().zip(cpu.iter()) {
+            let delta = a.abs_diff(*b);
+            worst = worst.max(delta);
+            if delta > 1 {
+                beyond += 1;
+            }
+        }
+        let share = beyond as f64 / gpu.len() as f64;
+        assert!(
+            worst <= max_delta,
+            "{label}: worst channel delta {worst} (allowed {max_delta}), {:.3}% beyond one",
+            share * 100.0
+        );
+        assert!(
+            share <= share_beyond,
+            "{label}: {:.3}% of channels beyond one step (allowed {:.3}%)",
+            share * 100.0,
+            share_beyond * 100.0
+        );
+    }
+
+    #[test]
+    fn the_material_matches_the_raster() {
+        if !device_present() {
+            return;
+        }
+        use bunny_ui::layout::Glass;
+        for (label, glass, radius) in [
+            ("regular", Glass::regular(), 24.0),
+            // the pure lens: the pyramid's own floor for a blur and a
+            // violent bend — this is the one that catches a rim that
+            // pinches instead of magnifying
+            (
+                "lens",
+                Glass::regular()
+                    .blur(0.0)
+                    .refraction(20.0, 32.0)
+                    .tint(Color::rgba(255, 255, 255, 12)),
+                30.0,
+            ),
+            // the fringe: three samples per pixel instead of one
+            ("fringe", Glass::regular().chromatic(0.35), 18.0),
+            // a flat pane, and the deepest level of the pyramid
+            ("frosted", Glass::frosted(), 12.0),
+            // the rim alone, on a square pane: no corner to hide behind
+            (
+                "rim",
+                Glass::regular().refraction(0.0, 0.0).highlight(Color::WHITE, 5.0, 1.0),
+                0.0,
+            ),
+            // the touch lights
+            (
+                "touch",
+                Glass::regular().sheen(0.1).spot(bunny_ui::layout::UnitPoint::CENTER, 0.6, 0.4),
+                20.0,
+            ),
+        ] {
+            let root = glass_scene(glass, radius);
+            let (gpu, cpu) =
+                scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, Color::CANVAS);
+            assert_glass_close(&gpu, &cpu, 3, 0.005, label);
+        }
+    }
+
+    #[test]
+    fn stacked_panes_each_read_the_one_below() {
+        if !device_present() {
+            return;
+        }
+        // two panes that OVERLAP must not share one capture of the
+        // scene: the upper one would sample a blur taken before the
+        // lower one existed, and the glass under it would vanish
+        use bunny_ui::layout::Glass;
+        let root = zstack!((
+            empty()
+                .frame_width(240.0)
+                .frame_height(160.0)
+                .background_gradient(bunny_ui::layout::Gradient::linear(
+                    Color::hex(0x102A64),
+                    Color::hex(0xE8D14A),
+                )),
+            empty().frame(180.0, 110.0).corner_radius(28.0).glass(Glass::regular()),
+            empty().frame(90.0, 60.0).corner_radius(18.0).glass(Glass::clear()),
+        ));
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, Color::CANVAS);
+        // a pane over a pane compounds: the upper one samples a scene
+        // that already carries the lower one's own difference
+        assert_glass_close(&gpu, &cpu, 6, 0.015, "stacked panes");
+    }
 }
-
-
