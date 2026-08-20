@@ -473,29 +473,48 @@ fn parse_attributes<'a>(rest: &'a str, line: usize) -> Result<Vec<(&'a str, &'a 
     Ok(out)
 }
 
+/// One declaration out of an inline `style="fill:#b6aa9d;stroke:none"`.
+/// A file exported with its paint in a `style` attribute reads as a
+/// monochrome silhouette without this — the properties are simply not
+/// there for [`attribute`] to find.
+fn style_value<'a>(attributes: &'a [(&'a str, &'a str)], property: &str) -> Option<&'a str> {
+    let style = attribute(attributes, "style")?;
+    style.split(';').find_map(|declaration| {
+        let (key, value) = declaration.split_once(':')?;
+        (key.trim() == property).then(|| value.trim())
+    })
+}
+
+/// A paint property, from the inline `style` first and the presentation
+/// attribute second — the cascade a `style="…"` file expects (inline
+/// style wins over the attribute of the same name).
+fn paint_attr<'a>(attributes: &'a [(&'a str, &'a str)], key: &str) -> Option<&'a str> {
+    style_value(attributes, key).or_else(|| attribute(attributes, key))
+}
+
 /// Reads the paint attributes into the inherited state. Colors
 /// collapse: any value that is not `none` means "paint with the ink".
 fn absorb_paint(state: &mut Inherited, attributes: &[(&str, &str)], warnings: &mut Vec<String>) {
-    if let Some(value) = attribute(attributes, "fill") {
+    if let Some(value) = paint_attr(attributes, "fill") {
         state.fill = Some(value != "none");
         state.fill_tint = tint_of(value, "fill", warnings);
     }
-    if let Some(value) = attribute(attributes, "stroke") {
+    if let Some(value) = paint_attr(attributes, "stroke") {
         state.stroke = Some(value != "none");
         state.stroke_tint = tint_of(value, "stroke", warnings);
     }
-    if let Some(value) = attribute(attributes, "stroke-width") {
+    if let Some(value) = paint_attr(attributes, "stroke-width") {
         if let Ok(width) = value.trim().parse() {
             state.stroke_width = width;
         }
     }
     for key in ["fill-rule", "clip-rule"] {
-        if let Some(value) = attribute(attributes, key) {
+        if let Some(value) = paint_attr(attributes, key) {
             state.even_odd = value == "evenodd";
         }
     }
     for (key, kept) in [("stroke-linecap", "round"), ("stroke-linejoin", "round")] {
-        if let Some(value) = attribute(attributes, key) {
+        if let Some(value) = paint_attr(attributes, key) {
             if value != kept {
                 warnings.push(format!("{key}=\"{value}\" becomes round — the one shape the pen has."));
             }
@@ -1136,6 +1155,29 @@ mod tests {
             Verb::Line(x, y) => assert_eq!((x, y), (10.0, 0.0), "scale then shift"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A file that carries its paint in an inline `style` used to convert
+    /// to a monochrome silhouette — the properties were simply not there
+    /// for the presentation-attribute reader to find.
+    #[test]
+    fn inline_style_paints_the_shape() {
+        let svg =
+            r##"<svg viewBox="0 0 24 24"><path d="M0 0L8 0L8 8Z" style="fill:#b6aa9d"/></svg>"##;
+        let parsed = parse(svg).unwrap();
+        assert_eq!(parsed.draws.len(), 1);
+        assert_eq!(
+            parsed.draws[0].2,
+            Some(crate::layout::Color { r: 0xB6, g: 0xAA, b: 0x9D, a: 255 }),
+            "the inline style's fill becomes the draw's tint, not a silhouette"
+        );
+        // inline style wins over a presentation attribute of the same name
+        let both = r##"<svg viewBox="0 0 24 24"><path d="M0 0L8 0L8 8Z" fill="#000" style="fill:#b6aa9d"/></svg>"##;
+        let parsed = parse(both).unwrap();
+        assert_eq!(
+            parsed.draws[0].2,
+            Some(crate::layout::Color { r: 0xB6, g: 0xAA, b: 0x9D, a: 255 })
+        );
     }
 
     /// The status ring: a dashed circle — the dashes resolve offline

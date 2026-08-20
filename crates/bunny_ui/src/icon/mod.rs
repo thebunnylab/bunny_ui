@@ -303,7 +303,7 @@ thread_local! {
 /// hull, which a curve never leaves (the Bezier property). A hull is a
 /// few transparent pixels wider than the ink on a bent curve, and it
 /// costs one pass over the table instead of a flattening.
-pub(crate) fn bounds(path: &[Verb]) -> Option<(f64, f64, f64, f64)> {
+pub fn bounds(path: &[Verb]) -> Option<(f64, f64, f64, f64)> {
     let mut box_ = None;
     let mut eat = |x: f32, y: f32| {
         let (x, y) = (x as f64, y as f64);

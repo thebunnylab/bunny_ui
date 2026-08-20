@@ -82,6 +82,14 @@ theme_tokens! {
     backdrop,
 }
 
+impl Default for Theme {
+    /// The light theme, spelled once — installing a palette should not
+    /// mean writing all twenty-one tokens to reach the shipped ones.
+    fn default() -> Theme {
+        Theme::light()
+    }
+}
+
 impl Theme {
     /// The light one-pencil theme — the values the framework always used
     /// (the test defaults depend on this equality).
@@ -176,5 +184,10 @@ mod tests {
         install(Theme::light());
         assert_eq!(accent(), Theme::light().accent);
         assert_eq!(version(), before + 2);
+    }
+
+    #[test]
+    fn the_default_theme_is_the_light_one() {
+        assert_eq!(Theme::default(), Theme::light());
     }
 }
