@@ -49,6 +49,13 @@ pub enum ImageSource {
         ink: crate::icon::Ink,
         box_size: (f32, f32),
     },
+    /// Pixels the APP already holds: an RGBA buffer it filled itself,
+    /// straight through the one image door. The app owns what the bytes
+    /// mean (a decoded frame, a computed field, a heat map); the house
+    /// only resamples and uploads them, so every tier draws it the way
+    /// it draws any other image. No engine sees this variant either —
+    /// there is nothing to decode.
+    Rgba { key: u64, size: (u32, u32), rgba: Rc<[u8]> },
     /// Any source, seen through a VEIL — what `.opacity(…)` leaves for
     /// the pixel pipelines, where there is no offscreen layer to fade.
     /// The fade rides the identity, so the compositor, the GPU atlas
@@ -63,6 +70,7 @@ const BYTES_TAG: u64 = 0x62_6e_79_5f_62_79_74_65; // "bny_byte"
 const ICON_TAG: u64 = 0x62_6e_79_5f_69_63_6f_6e; // "bny_icon"
 const PATH_TAG: u64 = 0x62_6e_79_5f_70_61_74_68; // "bny_path"
 const FADE_TAG: u64 = 0x62_6e_79_5f_66_61_64_65; // "bny_fade"
+const RGBA_TAG: u64 = 0x62_6e_79_5f_72_67_62_61; // "bny_rgba"
 
 fn fx_hash(tag: u64, bytes: &[u8]) -> u64 {
     let mut hasher = motor::hash::FxHasher::default();
@@ -85,6 +93,26 @@ impl ImageSource {
     /// already carry an id (skips hashing a large blob).
     pub fn bytes_keyed(key: u64, bytes: impl Into<Rc<[u8]>>) -> ImageSource {
         ImageSource::Bytes { key, bytes: bytes.into() }
+    }
+
+    /// Pixels the app filled ITSELF — straight RGBA, `width × height × 4`,
+    /// row major, straight alpha (what the house compositor blends
+    /// everywhere). A decoded video frame, a computed field, a heat map:
+    /// the app owns the arithmetic, the house resamples and uploads.
+    ///
+    /// The identity is the app's, like [`ImageSource::bytes_keyed`] —
+    /// hashing a megapixel every frame would cost more than the upload
+    /// it saves. Give a buffer that CHANGES a new key (a frame counter
+    /// is enough); give a still one a constant, and every tier caches it
+    /// like any other picture.
+    pub fn rgba(key: u64, size: (u32, u32), rgba: impl Into<Rc<[u8]>>) -> ImageSource {
+        let rgba = rgba.into();
+        debug_assert_eq!(
+            rgba.len(),
+            (size.0 as usize) * (size.1 as usize) * 4,
+            "an RGBA buffer is width × height × 4 bytes"
+        );
+        ImageSource::Rgba { key: key ^ RGBA_TAG, size, rgba }
     }
 
     /// A tinted glyph — built at PLACEMENT, where the ink is known.
@@ -238,6 +266,7 @@ impl ImageSource {
             | ImageSource::FileIcon { key, .. }
             | ImageSource::Symbol { key, .. }
             | ImageSource::Path { key, .. }
+            | ImageSource::Rgba { key, .. }
             | ImageSource::Faded { key, .. } => *key,
         }
     }
@@ -274,6 +303,10 @@ impl PartialEq for ImageSource {
                 ImageSource::Path { key: other_key, .. },
             )
             | (
+                ImageSource::Rgba { key, .. },
+                ImageSource::Rgba { key: other_key, .. },
+            )
+            | (
                 ImageSource::Faded { key, .. },
                 ImageSource::Faded { key: other_key, .. },
             ) => key == other_key,
@@ -298,6 +331,9 @@ impl fmt::Debug for ImageSource {
             ),
             ImageSource::Path { key, verbs, .. } => {
                 write!(f, "path(0x{key:016x}, {} verbs)", verbs.len())
+            }
+            ImageSource::Rgba { key, size, .. } => {
+                write!(f, "rgba(0x{key:016x}, {}×{})", size.0, size.1)
             }
             ImageSource::Faded { inner, alpha, .. } => {
                 write!(f, "faded({inner:?}, {alpha})")
@@ -346,6 +382,27 @@ pub trait ImageEngine {
 /// compositor, the GPU atlas and the browser canvas consume literally
 /// the same bytes — parity by construction, not by agreement. Anything
 /// else is the platform's to decode.
+/// Nearest-neighbor into the destination size — integer division keeps
+/// it deterministic on every machine, which is what lets the CPU and the
+/// GPU tiers assert byte equality.
+fn resample_rgba(source: &[u8], (src_w, src_h): (u32, u32), width: usize, height: usize) -> Vec<u8> {
+    let (src_w, src_h) = (src_w as usize, src_h as usize);
+    let mut rgba = vec![0u8; width * height * 4];
+    if src_w == 0 || src_h == 0 {
+        return rgba;
+    }
+    for y in 0..height {
+        let sy = (y * src_h) / height;
+        for x in 0..width {
+            let sx = (x * src_w) / width;
+            let from = (sy * src_w + sx) * 4;
+            let to = (y * width + x) * 4;
+            rgba[to..to + 4].copy_from_slice(&source[from..from + 4]);
+        }
+    }
+    rgba
+}
+
 pub fn raster_source(
     engine: &dyn ImageEngine,
     source: &ImageSource,
@@ -358,6 +415,18 @@ pub fn raster_source(
         }
         ImageSource::Path { key, verbs, paint, ink, box_size } => {
             crate::icon::raster_trace(*key, verbs, *paint, *ink, *box_size, width, height)
+        }
+        // the app's own pixels: no decode, no platform — resampled to
+        // the box the frame asked for and handed on
+        ImageSource::Rgba { size, rgba, .. } => {
+            if width == 0 || height == 0 || size.0 == 0 || size.1 == 0 {
+                return None;
+            }
+            Some(Rc::new(ImageRaster {
+                width,
+                height,
+                rgba: resample_rgba(rgba, *size, width, height),
+            }))
         }
         ImageSource::Faded { key, inner, alpha } => {
             fade_raster(*key, engine, inner, *alpha, width, height)
@@ -381,6 +450,8 @@ pub fn intrinsic_of(engine: &dyn ImageEngine, source: &ImageSource) -> Option<(u
         ImageSource::Path { box_size, .. } => {
             Some((box_size.0.round() as u32, box_size.1.round() as u32))
         }
+        // the app declared its own box when it handed the pixels over
+        ImageSource::Rgba { size, .. } => Some(*size),
         // a veil never changes a size
         ImageSource::Faded { inner, .. } => intrinsic_of(engine, inner),
         _ => engine.intrinsic(source),
@@ -476,23 +547,11 @@ impl RawImages {
     /// keeps it deterministic on every machine.
     fn resample(
         bytes: &[u8],
-        (src_w, src_h): (u32, u32),
+        size: (u32, u32),
         width: usize,
         height: usize,
     ) -> Vec<u8> {
-        let source = &bytes[RAW_HEADER..];
-        let (src_w, src_h) = (src_w as usize, src_h as usize);
-        let mut rgba = vec![0u8; width * height * 4];
-        for y in 0..height {
-            let sy = (y * src_h) / height;
-            for x in 0..width {
-                let sx = (x * src_w) / width;
-                let from = (sy * src_w + sx) * 4;
-                let to = (y * width + x) * 4;
-                rgba[to..to + 4].copy_from_slice(&source[from..from + 4]);
-            }
-        }
-        rgba
+        resample_rgba(&bytes[RAW_HEADER..], size, width, height)
     }
 
     /// The file-icon checker: two colors derived from the identity, in
@@ -536,6 +595,8 @@ impl ImageEngine for RawImages {
             ImageSource::FileIcon { .. } => Some((FILE_ICON_SIZE, FILE_ICON_SIZE)),
             ImageSource::Symbol { .. }
             | ImageSource::Path { .. }
+            | ImageSource::Rgba { .. }
+            | ImageSource::Rgba { .. }
             | ImageSource::Faded { .. } => {
                 // the door intercepts what the house draws before any
                 // engine — a regression at a call site should be LOUD
@@ -566,6 +627,7 @@ impl ImageEngine for RawImages {
             ImageSource::FileIcon { key, .. } => RawImages::checker(*key, width, height),
             ImageSource::Symbol { .. }
             | ImageSource::Path { .. }
+            | ImageSource::Rgba { .. }
             | ImageSource::Faded { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
                 return None;
@@ -592,6 +654,27 @@ mod tests {
             1,
             &[255, 0, 0, 255, 0, 0, 255, 255],
         ))
+    }
+
+    /// The app's own pixels land exactly where the same pixels land
+    /// after a trip through the house's encoded format — same door, same
+    /// resample, so every tier draws the two identically.
+    #[test]
+    fn the_apps_own_pixels_match_the_encoded_road() {
+        let pixels: &[u8] = &[255, 0, 0, 255, 0, 0, 255, 255];
+        let engine = RawImages::default();
+        let direct = ImageSource::rgba(7, (2, 1), pixels);
+        assert_eq!(intrinsic_of(&engine, &direct), Some((2, 1)));
+        for (width, height) in [(2, 1), (4, 2), (1, 1)] {
+            let ours = raster_source(&engine, &direct, width, height).expect("pixels");
+            let encoded = raster_source(&engine, &two_by_one(), width, height).expect("pixels");
+            assert_eq!(ours.rgba, encoded.rgba, "{width}x{height} resamples the same");
+        }
+        // the identity is the app's, and a new key IS a new image
+        assert_eq!(direct, ImageSource::rgba(7, (2, 1), pixels));
+        assert_ne!(direct, ImageSource::rgba(8, (2, 1), pixels));
+        // no engine ever sees it — the door answers first
+        assert_eq!(format!("{direct:?}"), format!("rgba(0x{:016x}, 2×1)", direct.key()));
     }
 
     #[test]
