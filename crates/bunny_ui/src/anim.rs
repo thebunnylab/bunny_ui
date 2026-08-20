@@ -282,7 +282,14 @@ pub struct Animator {
     /// node; ticks alone (with no frame between them) sweep nothing.
     places: u64,
     /// Accessibility: every animation completes instantly.
-    reduce_motion: bool,
+    /// Springs and flights silenced — a retarget lands instantly.
+    springs_reduced: bool,
+    /// Loop clocks silenced — a `.looping(…)` box holds its still frame.
+    /// Split from its spring twin because the browser is a place where
+    /// the two want different answers: there the PLATFORM animates every
+    /// spring (a CSS transition) while our own clocks are the only motion
+    /// the engine still drives.
+    loops_reduced: bool,
     /// A RESIZE is not an animation: while this pass flag is on, a
     /// changed target SNAPS instead of starting a flight. The runtime
     /// raises it for any pass whose proposal differs from the last —
@@ -340,7 +347,7 @@ impl Animator {
         slot: Channel,
         target: Color,
     ) -> Color {
-        if self.reduce_motion {
+        if self.springs_reduced {
             return target;
         }
         let snap = self.snap_retargets;
@@ -373,7 +380,7 @@ impl Animator {
         spec: Spring,
         target: (f64, f64),
     ) -> (f64, f64) {
-        if self.reduce_motion {
+        if self.springs_reduced {
             return target;
         }
         let snap = self.snap_retargets;
@@ -399,7 +406,7 @@ impl Animator {
     /// reduced motion the answer is always the still frame and nothing
     /// is retained.
     pub(crate) fn resolve_phase(&mut self, key: &str, spec: Loop) -> f64 {
-        if self.reduce_motion {
+        if self.loops_reduced {
             return spec.quantise(spec.still);
         }
         let places = self.places;
@@ -447,7 +454,7 @@ impl Animator {
         to: (f64, f64),
         spec: Spring,
     ) {
-        if self.reduce_motion {
+        if self.springs_reduced {
             return;
         }
         match self.scrolls.get_mut(path) {
@@ -529,7 +536,7 @@ impl Animator {
     /// Are the loop clocks running — present, unfrozen, and not
     /// silenced by reduced motion?
     fn loops_alive(&self) -> bool {
-        !self.loops.is_empty() && !self.loops_paused && !self.reduce_motion
+        !self.loops.is_empty() && !self.loops_paused && !self.loops_reduced
     }
 
     /// The frame rate the moment deserves: springs and flights take the
@@ -554,10 +561,21 @@ impl Animator {
     /// and the retained motion is dropped. Loops go too — the still
     /// frame is the whole animation for a reduced-motion user.
     pub(crate) fn set_reduce_motion(&mut self, on: bool) {
-        self.reduce_motion = on;
-        if on {
+        self.set_motion(on, on);
+    }
+
+    /// The two halves apart: the browser silences its SPRINGS (the
+    /// platform animates those) and keeps its loops.
+    pub(crate) fn set_motion(&mut self, springs_reduced: bool, loops_reduced: bool) {
+        self.springs_reduced = springs_reduced;
+        self.loops_reduced = loops_reduced;
+        // each half drops what it alone retains: silencing the springs
+        // must not throw away a loop that is still meant to tick
+        if springs_reduced {
             self.entries.clear();
             self.scrolls.clear();
+        }
+        if loops_reduced {
             self.loops.clear();
         }
     }
@@ -565,7 +583,7 @@ impl Animator {
     /// Reduce motion, read by the runtime — an animated reveal snaps
     /// instead of flying while this is on.
     pub(crate) fn reduce_motion(&self) -> bool {
-        self.reduce_motion
+        self.springs_reduced
     }
 
     #[cfg(test)]
@@ -761,6 +779,28 @@ mod tests {
         let (moved, _) = animator.tick(0.55);
         assert!(moved.islands);
         assert_eq!(animator.resolve_phase("mark", spec), 0.5);
+    }
+
+    /// The browser's arrangement: it animates every spring itself (a
+    /// spec lowers to a CSS transition), so ours stay silent — while the
+    /// loop clocks, which nothing else drives, keep ticking.
+    #[test]
+    fn the_springs_can_be_the_platforms_while_the_loops_stay_ours() {
+        let mut animator = Animator::default();
+        animator.note_place();
+        animator.set_motion(true, false);
+        let spec = Loop::secs(1.0).fps(10.0);
+        let _ = animator.resolve_phase("mark", spec);
+        let (moved, _) = animator.tick(0.55);
+        assert!(moved.islands, "the clock still steps");
+        assert!(!moved.scene, "and it never touches the scene");
+        assert_eq!(animator.resolve_phase("mark", spec), 0.5);
+        assert!(animator.wants_frame(), "so the driver stays armed");
+
+        // the accessibility switch is still the coarse one: both halves
+        animator.set_reduce_motion(true);
+        assert!(!animator.wants_frame());
+        assert_eq!(animator.resolve_phase("mark", spec), spec.quantise(spec.still));
     }
 
     #[test]

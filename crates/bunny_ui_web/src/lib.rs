@@ -194,6 +194,8 @@ enum Event {
     /// commands).
     KeyChar(char, u32),
     Frame { dt: f64 },
+    /// The platform's motion preference, at boot and on every change.
+    Motion { allowed: bool },
     Resize { width: f64, height: f64, scale: f64 },
     /// The browser finished decoding a registered image — measure and
     /// paint can answer for real now.
@@ -426,6 +428,14 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
+            // the canvas shell drives every animation itself, so the
+            // reader's preference is the whole switch
+            Event::Motion { allowed } => {
+                runtime.set_reduce_motion(!allowed);
+                if runtime.wants_frame() {
+                    unsafe { js_request_frame() };
+                }
+            }
             Event::ImageReady | Event::Wake => {
                 // the layout reflows around the fresh intrinsic size
                 // (or around what a task just wrote) and the paint asks
@@ -478,7 +488,13 @@ fn start_dom_with(
     // a task that woke asks the page for one turn — the browser's
     // answer to the desktop's run loop source
     runtime.set_wake_hook(std::sync::Arc::new(|| unsafe { js_request_wake() }));
-    runtime.set_reduce_motion(true);
+    // the browser animates the SPRINGS (a spec lowers to a CSS
+    // transition, a programmatic scroll rides `scroll-behavior`), so ours
+    // stay silent. The loop clocks are the motion nothing else drives —
+    // they start silent too, and the page turns them on through
+    // `bunny_set_motion` once it has asked the platform whether motion is
+    // welcome here.
+    runtime.set_motion(true, true);
     // one context for every island on the page. A canvas per island
     // would hit the browser's context ceiling, and an island that
     // claimed webgl2 could never take putImageData back when the
@@ -647,7 +663,44 @@ fn start_dom_with(
                 }
                 DRAG_ARMED.with(|armed| armed.set(runtime.drag_armed()));
             }
-            // hover, wheel and ticks belong to the browser in this
+            // The reader's own answer about motion. Springs stay the
+            // browser's; the loops are ours, so they follow this.
+            Event::Motion { allowed } => {
+                runtime.set_motion(true, !allowed);
+                if runtime.wants_frame() {
+                    unsafe { js_request_frame() };
+                }
+            }
+            // A loop step: the clocks advance and the live boxes
+            // repaint on their own canvases. The scene is untouched —
+            // no body, no patch, no settle — which is what lets a
+            // decoration tick beside real elements without the page
+            // re-laying itself out around it.
+            Event::Frame { dt } => {
+                let moved = runtime.tick(dt);
+                if moved.islands {
+                    #[cfg(feature = "canvas")]
+                    for island in runtime.dom_islands(scale) {
+                        unsafe {
+                            js_island(
+                                island.id,
+                                island.rgba.as_ptr(),
+                                island.width as u32,
+                                island.height as u32,
+                            );
+                        }
+                    }
+                }
+                // a scene that moved is a real frame — but in this mode
+                // only the clocks tick, so this is the rare road
+                if moved.scene {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+                if runtime.wants_frame() {
+                    unsafe { js_request_frame() };
+                }
+            }
+            // hover, wheel and the rest belong to the browser in this
             // mode — nothing to do on our side of the border
             _ => {}
         }
@@ -819,6 +872,20 @@ pub extern "C" fn bunny_island_pointer(id: u32, kind: u32, x: f64, y: f64, mods:
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_abi_version() -> u32 {
     bunny_ui::dom::ABI_VERSION
+}
+
+/// Is motion welcome on this page? The glue reads the PLATFORM's own
+/// answer (`prefers-reduced-motion`) at boot and again whenever the
+/// viewer changes it, so a decoration that loops is the reader's choice
+/// and not the shell's guess.
+///
+/// The springs stay the browser's either way — in the element lowering
+/// an animation spec is a CSS transition, and driving it here as well
+/// would animate everything twice. This turns the LOOP clocks on: the
+/// motion nothing else drives.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_set_motion(allowed: u32) {
+    dispatch(Event::Motion { allowed: allowed != 0 });
 }
 
 /// Dom mode: the input edited. Both strings arrive through

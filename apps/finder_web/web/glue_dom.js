@@ -12,6 +12,8 @@ document.head.appendChild(sheet);
 
 let wasm = null;
 let wakeArmed = false;
+let frameArmed = false;
+let lastFrame = 0;
 const decoder = new TextDecoder();
 
 // The wire contract this file decodes (bunny_ui::dom::ABI_VERSION).
@@ -1059,7 +1061,20 @@ const imports = {
     typeof bunnyGlImports === "object" ? bunnyGlImports : bunnyGlStubsOrNothing(),
   bunny: {
     js_blit() {},
-    js_request_frame() {},
+    // The loop clocks' driver. Springs are the browser's here (a spec
+    // lowers to a CSS transition), so this only ever runs while a
+    // `.looping(…)` box is alive — and only when the reader allows
+    // motion at all.
+    js_request_frame() {
+      if (frameArmed) return;
+      frameArmed = true;
+      requestAnimationFrame((now) => {
+        frameArmed = false;
+        const dt = lastFrame ? (now - lastFrame) / 1000 : 0;
+        lastFrame = now;
+        wasm.bunny_frame(dt);
+      });
+    },
     // A task woke: ONE turn, out of the current job. Here the turn is
     // a patch pass, not a repaint — the browser owns the pixels.
     js_request_wake() {
@@ -1277,6 +1292,18 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       hydrated ? 1 : 0,
     );
     window.__bunnyBoot.start = performance.now() - startOpened;
+
+    // Is motion welcome? The PLATFORM answers, not this file: a reader
+    // who asked their system for less motion gets the resting frame, and
+    // one who did not gets the clocks. The engine drives only the loops
+    // either way — every spring here is a CSS transition already.
+    if (wasm.bunny_set_motion) {
+      const query = matchMedia("(prefers-reduced-motion: reduce)");
+      wasm.bunny_set_motion(query.matches ? 0 : 1);
+      query.addEventListener("change", (event) => {
+        if (wasm) wasm.bunny_set_motion(event.matches ? 0 : 1);
+      });
+    }
 
     // clicks resolve by DELEGATION: the browser already knows what
     // was pressed — the engine never sees a coordinate in this mode

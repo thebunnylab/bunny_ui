@@ -360,6 +360,17 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     const height = host.clientHeight;
     wasm.start(width, height, scale);
 
+    // Is motion welcome? The PLATFORM answers. This shell drives every
+    // animation itself, so the preference silences springs and clocks
+    // alike — and a reader who changes their mind is heard at once.
+    if (wasm.bunny_set_motion) {
+      const query = matchMedia("(prefers-reduced-motion: reduce)");
+      wasm.bunny_set_motion(query.matches ? 0 : 1);
+      query.addEventListener("change", (event) => {
+        if (wasm) wasm.bunny_set_motion(event.matches ? 0 : 1);
+      });
+    }
+
     const point = (event) => {
       const rect = host.getBoundingClientRect();
       return [event.clientX - rect.left, event.clientY - rect.top];

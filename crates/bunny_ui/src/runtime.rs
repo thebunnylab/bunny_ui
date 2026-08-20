@@ -2655,6 +2655,15 @@ impl Runtime {
         self.animator.borrow_mut().set_reduce_motion(on);
     }
 
+    /// The two halves of motion, set apart. A shell that delegates its
+    /// SPRINGS to the platform — the browser, where an animation spec
+    /// lowers to a CSS transition — silences ours and keeps the loop
+    /// clocks, which nothing else drives. `set_reduce_motion` is still
+    /// the coarse accessibility switch, and it silences both.
+    pub fn set_motion(&self, springs_reduced: bool, loops_reduced: bool) {
+        self.animator.borrow_mut().set_motion(springs_reduced, loops_reduced);
+    }
+
     /// The frame a TICK drives: layout only — no settle, no effect
     /// pump. A tick moves animated values, never state, so the pass
     /// runs zero bodies on a stable tree; settle and effects stay on
