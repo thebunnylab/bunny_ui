@@ -804,6 +804,23 @@ pub fn rasterize_with(
             DrawCommand::Image { rect, source } => {
                 let width = physical_extent(rect.size.width, scale);
                 let height = physical_extent(rect.size.height, scale);
+                // A traced path allocates its BOUNDING BOX, whatever it
+                // covers of it: contours near in depth and far apart on
+                // screen (a mesh batched by shading band, a face pulled
+                // into a shard) ask for tens of millions of pixels for a
+                // few thousand of ink, and nothing fails loudly — the
+                // frame just takes a second. An image may legitimately
+                // outgrow the surface (cover-and-clip is exactly that),
+                // so only a path is asked, and only when the box is
+                // ABSURD beside the surface rather than merely larger.
+                debug_assert!(
+                    !matches!(source, crate::image_engine::ImageSource::Path { .. })
+                        || width * height <= 4 * bitmap.width() * bitmap.height(),
+                    "a traced path asks for a {width}x{height} tile on a {}x{} surface — \
+                     batch by contour, or cap the box before you trace it",
+                    bitmap.width(),
+                    bitmap.height(),
+                );
                 if let Some(raster) = raster_source(images, source, width, height) {
                     bitmap.composite_rgba(
                         rect.origin.x,

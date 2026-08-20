@@ -278,7 +278,13 @@ pub(crate) fn raster(
 /// How many traced paths stay warm. Their own map, away from the
 /// glyphs: a diagram that rebuilds its curves every frame must never
 /// evict the toolbar's icons.
-const TRACE_KEEP: usize = 128;
+///
+/// One number for the whole page, so it has to hold a FRAME's worth of
+/// distinct traces, not a widget's: a mesh of a few hundred contours
+/// beside a commit graph beside a sparkline used to overrun 128 and
+/// evict itself several times per frame — never a hit, even when the
+/// geometry was bit-identical to the frame before.
+const TRACE_KEEP: usize = 2048;
 
 /// One warm trace and the tick it was last asked for.
 struct Trace {
