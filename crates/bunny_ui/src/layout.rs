@@ -443,7 +443,19 @@ pub enum LayoutNode {
     /// Overlay: all children in the same frame (ZStack, sheet on top).
     /// `align` is the HORIZONTAL edge each child sits on; the vertical
     /// one stays centered, exactly what SwiftUI's `.leading` means.
-    Layered { align: CrossAlign, children: Vec<LayoutNode> },
+    ///
+    /// `modal` says the topmost child CAPTURES what it COVERS: the
+    /// pointer and the wheel do not reach anything the scene painted
+    /// before it, whether or not the modal draws over that spot — a
+    /// press beside the card is as dead as a press on it.
+    ///
+    /// "Covers" is paint, not the window: a sibling drawn AFTER the
+    /// pile is drawn on TOP of the modal, and a thing on top of a
+    /// modal was never behind it. So a sheet hung deep in a stack
+    /// captures its own subtree and what came before, and nothing
+    /// else — which is why a sheet belongs where a sheet belongs, over
+    /// the scene it is modal to. A plain pile captures nothing.
+    Layered { align: CrossAlign, modal: bool, children: Vec<LayoutNode> },
     /// `.overlay(at, view)` — a layer painted OVER the box (or UNDER
     /// it, with `behind`), taking the box's size and giving it NOTHING
     /// back.
@@ -1671,6 +1683,29 @@ impl ScrollAxes {
     }
 }
 
+/// Where a modal layer drew its line: how long every list the pointer
+/// consults was when the layer went up. Everything recorded from those
+/// marks on is ABOVE the modal and still answers; what came before is
+/// what the modal covers, and it is out of reach until the modal
+/// closes.
+///
+/// ONE line across ALL of them, because a layer that captures the
+/// wheel but not the right press is not a modal — it is a modal with
+/// holes, and the holes are where the bugs live.
+///
+/// It is written on ENTRY to the layer, so the LAST write is the
+/// topmost one — nested sheets and sibling sheets both resolve to the
+/// one on top without a stack to keep.
+#[derive(Clone, Copy, Debug)]
+pub struct ModalFloor {
+    pub hits: usize,
+    pub scrolls: usize,
+    pub tooltips: usize,
+    pub menus: usize,
+    pub drag_sources: usize,
+    pub drops: usize,
+}
+
 /// A placed scroll region — the wheel's map, in PAINT order (last =
 /// topmost), the same convention the overlays, the tooltips and the
 /// pointer's own hits already keep. A child paints over its parent and
@@ -1972,6 +2007,9 @@ pub struct Placement {
     /// Regions whose virtual window failed to cover the visible band —
     /// the runtime invalidates their boundary for a follow-up pass.
     pub misses: Vec<String>,
+    /// The line the topmost modal layer drew, if any — `None` is a
+    /// scene with nothing capturing, and it costs nothing.
+    pub modal_floor: Option<ModalFloor>,
     /// Overlays queued by `Anchored` during the walk — drained AFTER
     /// the root places (an empty scene never allocates).
     overlay_queue: Vec<QueuedOverlay>,
@@ -2116,6 +2154,9 @@ pub struct LayoutResult {
     /// The placed popovers, in paint order (last = topmost) — each one
     /// a suffix slice of `display`.
     pub overlays: Vec<OverlayPlacement>,
+    /// The line the topmost modal layer drew — the pointer and the
+    /// wheel do not look under it.
+    pub modal_floor: Option<ModalFloor>,
     /// Window-drag regions — a press here with no interactive target
     /// drags the window on the desktop shell.
     pub drag_regions: Vec<Rect>,
@@ -2195,6 +2236,7 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         customs: out.customs,
         misses: out.misses,
         overlays: out.overlays,
+        modal_floor: out.modal_floor,
         drag_regions: out.drag_regions,
         control_regions: out.control_regions,
         tooltips: out.tooltips,
@@ -2235,6 +2277,7 @@ pub fn layout_dom(
             customs: out.customs,
             misses: out.misses,
             overlays: out.overlays,
+            modal_floor: out.modal_floor,
             drag_regions: out.drag_regions,
             control_regions: out.control_regions,
             tooltips: out.tooltips,
@@ -3954,8 +3997,21 @@ impl LayoutNode {
                 }
             }
 
-            (LayoutNode::Layered { align, children }, Fit::Children(fits)) => {
-                for (child, (size, fit)) in children.iter().zip(fits) {
+            (LayoutNode::Layered { align, modal, children }, Fit::Children(fits)) => {
+                for (index, (child, (size, fit))) in children.iter().zip(fits).enumerate() {
+                    // a modal pile draws its line here: everything
+                    // recorded from now on is ABOVE, and the walk back
+                    // stops at this mark instead of reaching under it
+                    if *modal && index > 0 {
+                        out.modal_floor = Some(ModalFloor {
+                            hits: out.hits.len(),
+                            scrolls: out.scrolls.len(),
+                            tooltips: out.tooltips.len(),
+                            menus: out.menus.len(),
+                            drag_sources: out.drag_sources.len(),
+                            drops: out.drops.len(),
+                        });
+                    }
                     // the alignment edge is horizontal — a 2pt accent bar
                     // hugs the leading side and still centers vertically
                     let origin = Point {
@@ -5224,6 +5280,7 @@ mod tests {
     #[test]
     fn a_layer_that_can_fill_the_pile_is_not_centred_in_it() {
         let pile = LayoutNode::Layered {
+            modal: false,
             align: CrossAlign::Center,
             children: vec![
                 boundary("wash", LayoutNode::Spacer),
@@ -5326,6 +5383,7 @@ mod tests {
         let rule = LayoutNode::Spacer;
         let chip = LayoutNode::Leaf { size: Size { width: 60.0, height: 20.0 } };
         let layered = LayoutNode::Layered {
+            modal: false,
             align: CrossAlign::Center,
             children: vec![chip.clone(), rule.clone()],
         };

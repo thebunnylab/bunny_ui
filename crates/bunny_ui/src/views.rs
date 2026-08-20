@@ -917,7 +917,7 @@ fn render_stack<C: View>(
             children: layouts,
         },
         // ZStack: all children in the same frame
-        None => LayoutNode::Layered { align, children: layouts },
+        None => LayoutNode::Layered { align, modal: false, children: layouts },
     });
 }
 

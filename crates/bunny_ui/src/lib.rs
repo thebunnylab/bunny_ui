@@ -5476,6 +5476,122 @@ mod tests {
     }
 
     #[test]
+    fn a_sheet_owns_what_it_covers() {
+        use crate::layout::{Point, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Stage {
+            behind: State<i32>,
+            open: State<bool>,
+        }
+
+        impl Component for Stage {
+            fn body(self, _ctx: &Context) -> impl View {
+                let behind = self.behind;
+                scroll(text("the page behind").frame(400.0, 4000.0))
+                    .id("page")
+                    .on_click(move || behind.add(1))
+                    .sheet(self.open.binding(), move |_| {
+                        erased(text("panel").frame(120.0, 80.0))
+                    })
+            }
+        }
+
+        let stage = Stage { behind: State::new(0), open: State::new(true) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&stage);
+        let result = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let page = result
+            .scrolls
+            .iter()
+            .find(|region| region.path.ends_with("[page]"))
+            .expect("the page is a region")
+            .path
+            .clone();
+
+        // the wheel over the sheet's own card, where the card has
+        // nothing scrollable: it stops there, it does not fall through
+        assert!(!runtime.wheel(200.0, 150.0, 0.0, -60.0), "nothing moved");
+        assert_eq!(runtime.scroll_offset(&page), Point::ZERO);
+
+        // and BESIDE the card too — a modal covers the window, not just
+        // the rectangle it paints. This is the half a frame test cannot
+        // do, because there is nothing drawn out here at all
+        assert!(!runtime.wheel(20.0, 20.0, 0.0, -60.0), "still nothing");
+        assert_eq!(runtime.scroll_offset(&page), Point::ZERO, "the page behind holds still");
+
+        // the pointer stops at the same line: a press straight through
+        // the card used to reach the page's own action
+        runtime.pointer_pressed(200.0, 150.0);
+        runtime.pointer_released(200.0, 150.0);
+        assert_eq!(stage.behind.get(), 0, "the card is not a window onto what it covers");
+        runtime.pointer_pressed(20.0, 20.0);
+        runtime.pointer_released(20.0, 20.0);
+        assert_eq!(stage.behind.get(), 0, "and neither is the room beside it");
+
+        // a right press does not reach through it either: the line is
+        // ONE line, across every list the pointer consults, because a
+        // layer that eats the wheel and not the menu is a modal with
+        // holes and the holes are where the bugs live
+        assert!(!runtime.context_click(200.0, 150.0), "no menu from what it covers");
+
+        // closed, everything answers again — the capture lives exactly
+        // as long as the sheet does
+        stage.open.set(false);
+        runtime.render_stable(&stage);
+        let _ = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        assert!(runtime.wheel(200.0, 150.0, 0.0, -60.0), "the page takes the wheel back");
+        assert!(runtime.scroll_offset(&page).y > 0.0);
+        runtime.pointer_pressed(200.0, 150.0);
+        runtime.pointer_released(200.0, 150.0);
+        assert_eq!(stage.behind.get(), 1, "and its action fires again");
+    }
+
+    #[test]
+    fn a_modal_covers_what_it_paints_over_and_not_the_window() {
+        use crate::layout::{Proposal, Size};
+
+        // the sheet hangs on the HEADER of a column, so the list below
+        // is placed after it — drawn ON TOP of the card, not behind it
+        #[derive(Clone, Copy)]
+        struct Misplaced {
+            open: State<bool>,
+        }
+
+        impl Component for Misplaced {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack((
+                    text("header").frame(400.0, 40.0).sheet(self.open.binding(), move |_| {
+                        erased(text("panel").frame(120.0, 80.0))
+                    }),
+                    scroll(text("list").frame(400.0, 4000.0)).id("list"),
+                ))
+            }
+        }
+
+        let stage = Misplaced { open: State::new(true) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&stage);
+        let result = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let list = result
+            .scrolls
+            .iter()
+            .find(|region| region.path.ends_with("[list]"))
+            .expect("the list is a region")
+            .path
+            .clone();
+
+        // and so it still answers. "Covers" is paint: a thing drawn on
+        // top of a modal was never behind it, and pretending otherwise
+        // would make capture depend on nothing the reader can see.
+        // A sheet that means to be modal to a scene hangs over that
+        // scene — this shape is the honest edge of the law, not a hole
+        // in it.
+        assert!(runtime.wheel(200.0, 200.0, 0.0, -60.0), "drawn after the sheet, so not covered");
+        assert!(runtime.scroll_offset(&list).y > 0.0);
+    }
+
+    #[test]
     fn a_nested_region_still_beats_the_one_around_it() {
         use crate::layout::{Point, Proposal, Size};
 

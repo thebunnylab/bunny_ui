@@ -796,8 +796,12 @@ fn apply(
             }
             // in layout, the sheet overlays the base — centered, the
             // way a modal sits over what it covers
+            // a sheet CAPTURES: what it covers is out of reach while
+            // it is up, which is what "modal" has always meant and what
+            // the comment above already claimed
             out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                 align: CrossAlign::Center,
+                modal: true,
                 children: vec![base, wrap_layout(sheet_layouts)],
             });
         }

@@ -120,6 +120,9 @@ pub struct Runtime {
     scroll_offsets: RefCell<HashMap<String, Point>>,
     /// The scroll regions of the last layout — the wheel map.
     last_scrolls: RefCell<Vec<ScrollRegion>>,
+    /// The line the topmost modal layer drew this frame — nothing the
+    /// scene placed under it answers the pointer or the wheel.
+    last_modal_floor: std::cell::Cell<Option<crate::layout::ModalFloor>>,
     /// The focused field (identity path) — owner of the keyboard.
     focus: RefCell<Option<String>>,
     /// Caret + selection per field — they survive blur/refocus and
@@ -381,9 +384,9 @@ impl Runtime {
     pub fn context_click(&self, x: Px, y: Px) -> bool {
         let was_open = self.close_menu();
         let cleared = self.clear_tooltip();
+        let menus = self.last_menus.borrow();
         let region = self
-            .last_menus
-            .borrow()
+            .reachable(&menus, |floor| floor.menus)
             .iter()
             .rev()
             .find(|region| region.rect.contains(x, y))
@@ -433,8 +436,8 @@ impl Runtime {
     /// walking back is also the only reason a target inside a popover
     /// beats the one on the page underneath it.
     fn drop_at(&self, x: Px, y: Px, value: &dyn std::any::Any) -> Option<crate::layout::DropRegion> {
-        self.last_drops
-            .borrow()
+        let drops = self.last_drops.borrow();
+        self.reachable(&drops, |floor| floor.drops)
             .iter()
             .rev()
             .find(|region| region.rect.contains(x, y) && region.accepts == value.type_id())
@@ -583,7 +586,7 @@ impl Runtime {
     fn hit_above(&self, own: &str, x: Px, y: Px) -> Option<String> {
         let hits = self.last_hits.borrow();
         let mut skipped_own = false;
-        for (path, rect) in hits.iter().rev() {
+        for (path, rect) in self.reachable(&hits, |floor| floor.hits).iter().rev() {
             if !rect.contains(x, y) {
                 continue;
             }
@@ -599,8 +602,8 @@ impl Runtime {
     /// The topmost tooltip region under the pointer — paint order, so
     /// the last one wins, mirroring the hits.
     fn tooltip_at(&self, x: Px, y: Px) -> Option<crate::layout::TooltipRegion> {
-        self.last_tooltips
-            .borrow()
+        let tooltips = self.last_tooltips.borrow();
+        self.reachable(&tooltips, |floor| floor.tooltips)
             .iter()
             .rev()
             .find(|region| region.rect.contains(x, y))
@@ -651,7 +654,11 @@ impl Runtime {
     /// `.window_drag_region()` where no interactive target wins — a
     /// button on the scene's own title bar still clicks.
     pub fn window_drag_at(&self, x: Px, y: Px) -> bool {
-        if crate::layout::hit_test(&self.last_hits.borrow(), x, y).is_some() {
+        let blocked = {
+            let hits = self.last_hits.borrow();
+            crate::layout::hit_test(self.reachable(&hits, |floor| floor.hits), x, y).is_some()
+        };
+        if blocked {
             return false;
         }
         self.last_drag_regions.borrow().iter().any(|region| region.contains(x, y))
@@ -680,6 +687,7 @@ impl Runtime {
             cache: MeasureCache::default(),
             scroll_offsets: RefCell::new(HashMap::default()),
             last_scrolls: RefCell::new(Vec::new()),
+            last_modal_floor: std::cell::Cell::new(None),
             focus: RefCell::new(None),
             carets: RefCell::new(HashMap::default()),
             caret_visible: Cell::new(true),
@@ -826,7 +834,30 @@ impl Runtime {
 
     /// The target under the point, against the last layout's hits.
     fn hover_target(&self, x: Px, y: Px) -> Option<String> {
-        crate::layout::hit_test(&self.last_hits.borrow(), x, y).map(str::to_string)
+        let hits = self.last_hits.borrow();
+        crate::layout::hit_test(self.reachable(&hits, |floor| floor.hits), x, y).map(str::to_string)
+    }
+
+    /// The tail of a placed list the pointer may still reach: a modal
+    /// layer draws ONE line across every list, and nothing recorded
+    /// under it answers — not where the layer paints and not beside
+    /// it either, because a modal owns what it covers whole. `mark` is
+    /// that layer's own count on THIS list.
+    ///
+    /// One line across ALL of them: a layer that eats the wheel but
+    /// not the right press is a modal with holes, and the holes are
+    /// where the bugs live.
+    ///
+    /// The line is drawn HERE and not inside `hit_test`, because the
+    /// window's own buttons ask that function directly, and a modal
+    /// must not swallow the traffic lights of the window it sits in.
+    fn reachable<'a, T>(
+        &self,
+        items: &'a [T],
+        mark: fn(&crate::layout::ModalFloor) -> usize,
+    ) -> &'a [T] {
+        let floor = self.last_modal_floor.get().map_or(0, |floor| mark(&floor));
+        &items[floor.min(items.len())..]
     }
 
     /// Pointer moved. `true` = the visible state changed (the shell
@@ -1201,9 +1232,9 @@ impl Runtime {
         }
         // a press on a drag source ARMS the lift — and the press goes
         // on: a click that never moves stays a click
+        let sources = self.last_drag_sources.borrow();
         let source = self
-            .last_drag_sources
-            .borrow()
+            .reachable(&sources, |floor| floor.drag_sources)
             .iter()
             .rev()
             .find(|region| region.rect.contains(x, y))
@@ -1471,16 +1502,22 @@ impl Runtime {
 
     // MARK: - Scrolling (offset is ENGINE state: no view invalidates)
 
-    /// Routes the wheel to the innermost region under the point WITH
-    /// travel on the delta's axis. AppKit convention: positive delta
-    /// reveals content above — the offset shrinks. `true` = it moved
-    /// (the shell repaints; no render: zero bodies).
+    /// Routes the wheel to the region that paints LAST among those
+    /// under the point WITH travel on the delta's axis — the innermost
+    /// one of the topmost layer, which is the pointer's own rule. A
+    /// modal layer's line stops the walk: what it covers does not
+    /// answer. AppKit convention: positive delta reveals content above
+    /// — the offset shrinks. `true` = something changed and the shell
+    /// repaints (no render: zero bodies).
     pub fn wheel(&self, x: Px, y: Px, dx: Px, dy: Px) -> bool {
         // the content is about to slide under a still pointer — the
         // explanation dies and so does the menu, rather than pointing
         // at the wrong row
+        // the tooltip and the menu die here, and that DEATH is a
+        // repaint: a wheel that moves nothing still took a bubble off
+        // the screen, and a shell told "nothing happened" leaves it
+        // painted over a scene that no longer explains it
         let explained = self.clear_tooltip() | self.close_menu();
-        let _ = explained; // folded into the returns below
         // the app's box gets the turn first: an editor scrolls itself.
         // What it ignores falls through to the region around it.
         let over = self
@@ -1511,15 +1548,19 @@ impl Runtime {
         // Per AXIS, because a diagonal gesture over a table scrolls the
         // rows AND slides the columns, instead of losing half of itself
         // inside the inner list.
+        // the same line the pointer stops at, on the regions' list:
+        // what a modal covers is out of reach while it is up, which is
+        // what makes a settings sheet a sheet and not a picture of one
+        let reachable = self.reachable(&scrolls, |floor| floor.scrolls);
         let topmost = |axis: fn((Px, Px)) -> Px| {
-            scrolls.iter().rev().find(|region| {
+            reachable.iter().rev().find(|region| {
                 region.frame.contains(x, y) && axis(travel(region)) > 0.0
             })
         };
         let region_y = (dy != 0.0).then(|| topmost(|(_, y)| y)).flatten();
         let region_x = (dx != 0.0).then(|| topmost(|(x, _)| x)).flatten();
         if region_x.is_none() && region_y.is_none() {
-            return false;
+            return explained;
         }
         let mut moved = false;
         let mut offsets = self.scroll_offsets.borrow_mut();
@@ -1548,7 +1589,7 @@ impl Runtime {
                 }
             }
         }
-        moved
+        moved || explained
     }
 
     /// Programmatic scrolling — the NEXT layout (same frame) already
@@ -3210,6 +3251,7 @@ impl Runtime {
         drop(carets);
         *self.last_hits.borrow_mut() = result.hits.clone();
         *self.last_scrolls.borrow_mut() = result.scrolls.clone();
+        self.last_modal_floor.set(result.modal_floor);
         *self.last_fields.borrow_mut() = result.fields.clone();
         *self.last_splits.borrow_mut() = result.splits.clone();
         *self.last_customs.borrow_mut() = result.customs.clone();
