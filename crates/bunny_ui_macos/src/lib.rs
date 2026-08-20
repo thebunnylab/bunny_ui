@@ -7,6 +7,7 @@
 
 #![cfg(target_os = "macos")]
 
+pub mod credentials;
 mod ffi;
 mod image;
 mod metal;

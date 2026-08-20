@@ -8,6 +8,7 @@
 
 #![cfg(target_os = "windows")]
 
+pub mod credentials;
 mod d3d;
 mod ffi;
 mod image;
