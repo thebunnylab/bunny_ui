@@ -770,6 +770,7 @@ impl View for CustomView {
 /// ```ignore
 /// custom(CodeSurface { document: doc.clone(), state })
 /// ```
+#[cfg(feature = "canvas")]
 pub fn custom(element: impl CustomElement) -> CustomView {
     CustomView { element: Custom::new(element) }
 }
@@ -784,6 +785,7 @@ pub fn custom(element: impl CustomElement) -> CustomView {
 ///     p.fill_rounded(Rect { origin: Point::ZERO, size }, ink, 6.0);
 /// })
 /// ```
+#[cfg(feature = "canvas")]
 pub fn canvas(paint: impl Fn(&PaintCtx, &mut Painter) + 'static) -> CustomView {
     custom(Painting(paint))
 }
@@ -801,7 +803,7 @@ impl<F: Fn(&PaintCtx, &mut Painter) + 'static> CustomElement for Painting<F> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "canvas"))]
 mod tests {
     use std::cell::Cell;
 

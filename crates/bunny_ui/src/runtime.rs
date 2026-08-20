@@ -118,6 +118,16 @@ pub struct Runtime {
     /// by region SITES, never by rows. The other input maps (carets,
     /// targets, auto-focus) release on the sweep.
     scroll_offsets: RefCell<HashMap<String, Point>>,
+    /// Scroll viewports the BROWSER reported (`bunny_dom_viewport`,
+    /// from a ResizeObserver) — the flow frame's window math reads
+    /// them; the pixel targets never fill them.
+    dom_viewports: RefCell<HashMap<String, (f64, f64)>>,
+    /// Browser-reported boxes by island path — a FLEXIBLE island
+    /// measures against its real box, not against a guess.
+    island_boxes: RefCell<HashMap<Rc<str>, (f64, f64)>>,
+    /// The app's boxes inside each island, frames ISLAND-LOCAL — the
+    /// canvas pointer door routes the browser's coordinates by them.
+    dom_customs: RefCell<Vec<(Rc<str>, crate::layout::CustomPlacement)>>,
     /// The scroll regions of the last layout — the wheel map.
     last_scrolls: RefCell<Vec<ScrollRegion>>,
     /// The line the topmost modal layer drew this frame — nothing the
@@ -209,6 +219,10 @@ pub struct Runtime {
     last_drag_sources: RefCell<Vec<crate::layout::DragSourceRegion>>,
     /// The `.on_drop(…)` regions of the last layout.
     last_drops: RefCell<Vec<crate::layout::DropRegion>>,
+    /// The rings the element tree currently shows — a drag moves
+    /// between targets without running one body, so the reuse
+    /// shortcut has to hear about it from here.
+    last_drop_rings: RefCell<Vec<bool>>,
     /// The pressed-but-not-lifted drag: its builder and where the
     /// press landed. Past the threshold it becomes the live value.
     drag_armed: RefCell<Option<(crate::layout::DragBuilder, Point)>>,
@@ -262,6 +276,19 @@ impl Default for Runtime {
 }
 
 impl Runtime {
+    /// A runtime with the deterministic house font.
+    ///
+    /// A runtime opens its own world: retention and identity are
+    /// thread state, and they reset when a runtime is born — a second
+    /// runtime on the same thread starts from nothing instead of
+    /// adopting the first one's retained bodies (whose recorded reads
+    /// would point at dead state slots and kill invalidation
+    /// silently). State declared OUTSIDE any pass — the app-scope
+    /// pattern every harness uses — has no owner and survives the
+    /// hand-over; state anchored inside the old world's bodies dies
+    /// with it, and so do its tasks. One runtime at a time per thread
+    /// is still the law: two runtimes ALTERNATING frames on one
+    /// thread would fight over one world.
     pub fn new() -> Self {
         Self::with_parts(Context::default(), Rc::new(PixelFont))
     }
@@ -677,6 +704,15 @@ impl Runtime {
     }
 
     fn with_parts(ctx: Context, text: Rc<dyn TextEngine>) -> Self {
+        // a runtime is born into its OWN world: whatever a previous
+        // runtime retained on this thread dies here — path identity
+        // means nothing across two runtimes, and stale reads pointing
+        // at old state slots would kill invalidation silently. App
+        // state declared outside any pass has no owner and survives.
+        crate::reconciler::reset_world();
+        crate::effects::reset();
+        crate::viewport::reset();
+        motor::identity::reset_world();
         let runtime = Runtime {
             ctx,
             last_root: RefCell::new(None),
@@ -686,6 +722,9 @@ impl Runtime {
             images: Rc::new(RawImages::default()),
             cache: MeasureCache::default(),
             scroll_offsets: RefCell::new(HashMap::default()),
+            dom_viewports: RefCell::new(HashMap::default()),
+            island_boxes: RefCell::new(HashMap::default()),
+            dom_customs: RefCell::new(Vec::new()),
             last_scrolls: RefCell::new(Vec::new()),
             last_modal_floor: std::cell::Cell::new(None),
             focus: RefCell::new(None),
@@ -713,6 +752,7 @@ impl Runtime {
             menu_items: RefCell::new(None),
             last_drag_sources: RefCell::new(Vec::new()),
             last_drops: RefCell::new(Vec::new()),
+            last_drop_rings: RefCell::new(Vec::new()),
             drag_armed: RefCell::new(None),
             pressed_clicks: Cell::new(1),
             drag_value: RefCell::new(None),
@@ -751,8 +791,30 @@ impl Runtime {
         {
             let offsets = self.scroll_offsets.borrow();
             let applied = self.scroll_targets.borrow();
-            crate::viewport::publish(self.last_scrolls.borrow().iter().filter_map(
-                |region| {
+            let last_scrolls = self.last_scrolls.borrow();
+            if last_scrolls.is_empty() {
+                // the FLOW frame never lays out, so no measured region
+                // exists — the browser's own reports stand in: offset
+                // from the scroll events, viewport from the observer,
+                // extents from the app (the window math's authority)
+                let viewports = self.dom_viewports.borrow();
+                crate::viewport::publish(offsets.keys().map(|path| {
+                    (
+                        path.clone(),
+                        crate::viewport::RegionSnapshot {
+                            offset_y: offsets.get(path).copied().unwrap_or_default().y,
+                            viewport: viewports
+                                .get(path)
+                                .map(|box_| box_.1)
+                                .unwrap_or(self.last_proposal.get().and_then(|p| p.height).unwrap_or(600.0)),
+                            row_extent: 0.0,
+                            offsets: None,
+                            applied: applied.get(path).cloned(),
+                        },
+                    )
+                }));
+            } else {
+                crate::viewport::publish(last_scrolls.iter().filter_map(|region| {
                     let row_extent = region.row_extent?;
                     Some((
                         region.path.clone(),
@@ -768,8 +830,8 @@ impl Runtime {
                             applied: applied.get(&region.path).cloned(),
                         },
                     ))
-                },
-            ));
+                }));
+            }
         }
         // new theme = stale retention (bodies baked old tokens into
         // the scene): rebuild once and continue incremental
@@ -1086,13 +1148,23 @@ impl Runtime {
 
     // MARK: - The app's own boxes (the escape hatch)
 
-    /// The app's box registered at `path` in the last layout.
+    /// The app's box registered at `path` in the last layout — the
+    /// pixel pass's ledger first, then the flow's (island-local
+    /// frames; keys and text carry no point, and the box's own world
+    /// is exactly what the ctx should say).
     fn custom_at(&self, path: &str) -> Option<crate::layout::CustomPlacement> {
         self.last_customs
             .borrow()
             .iter()
             .find(|placement| placement.path == path)
             .cloned()
+            .or_else(|| {
+                self.dom_customs
+                    .borrow()
+                    .iter()
+                    .find(|(_, placement)| placement.path == path)
+                    .map(|(_, placement)| placement.clone())
+            })
     }
 
     /// Hands one event to the app's box — the point arrives in the
@@ -1144,6 +1216,7 @@ impl Runtime {
         *self.focus.borrow_mut() = Some(path.to_string());
         if let Some(placement) = self.custom_at(path) {
             self.deliver(&placement, crate::custom::ElementEvent::Focused(true));
+            self.dirty_island_of(&placement.path);
         }
     }
 
@@ -1184,6 +1257,7 @@ impl Runtime {
         let response = self.deliver(&placement, crate::custom::ElementEvent::Key(stroke));
         if response.handled {
             self.caret_visible.set(true);
+            self.dirty_island_of(&placement.path);
         }
         response
     }
@@ -2192,6 +2266,7 @@ impl Runtime {
         // means something while focused goes quiet
         if let Some(placement) = dropped.as_deref().and_then(|path| self.custom_at(path)) {
             self.deliver(&placement, crate::custom::ElementEvent::Focused(false));
+            self.dirty_island_of(&placement.path);
         }
         dropped.is_some()
     }
@@ -2388,6 +2463,7 @@ impl Runtime {
             let response = self.deliver(&placement, event);
             if response.handled {
                 self.caret_visible.set(true);
+                self.dirty_island_of(&placement.path);
             }
             return Edited { applied: response.handled, output: response.text };
         }
@@ -2410,6 +2486,7 @@ impl Runtime {
     /// content moved under a still pointer (an action inserted/removed),
     /// hover re-resolves against the new hits and runs ONE extra pass —
     /// interaction always resolved BEFORE the pass that paints it.
+    #[cfg(feature = "canvas")]
     pub fn frame(
         &self,
         root: &impl View,
@@ -2527,34 +2604,242 @@ impl Runtime {
         result.display
     }
 
-    /// The frame in DOM mode: the same settle + layout machinery as
-    /// [`Runtime::display_frame`], then ONE capture pass over the now-
-    /// stable tree and the diff against the retained scene. The result
-    /// is the patch list that brings the element tree up to date —
-    /// empty when nothing observable changed (a hover, a caret blink).
+    /// The frame in DOM mode: settle, then the same convergence loop
+    /// as [`Runtime::layout`] — with the capture riding EVERY round,
+    /// so the settled round's scene is the one lowered and no second
+    /// walk ever runs. The result is the patch list that brings the
+    /// element tree up to date — empty when nothing observable
+    /// changed (a caret blink).
     ///
-    /// The engine never ticks springs here: animation specs lower into
-    /// the patches as CSS transitions and the browser animates.
+    /// Two idle costs of the pixel path stay out on purpose: the
+    /// engine never ticks springs here (animation specs lower into
+    /// the patches as CSS transitions and the browser animates), and
+    /// hover never re-resolves (the glue sends no pointer moves —
+    /// `:hover` belongs to the browser, and the scene is pointer-
+    /// invariant by construction).
     pub fn dom_frame(
         &self,
         root: &impl View,
         size: crate::layout::Size,
     ) -> Vec<crate::dom::DomPatch> {
-        // the pass settles state, applies scroll targets and heals
-        // virtual windows; its display list feeds the canvas islands
-        let _ = self.display_frame(root, size);
-        let (result, scene) = self.layout_once_with(
-            root,
-            crate::layout::Proposal::exact(size),
-            true,
-        );
-        let scene = scene.expect("the capture rode the pass");
-        self.dom.borrow_mut().lower(&scene, &result.display)
+        self.settle(root);
+        // everything that ran while settling — the reuse decision's
+        // whole evidence (a theme change already cleared retention,
+        // which re-runs every body and empties no promise wrongly)
+        let changed = reconciler::take_frame_runs();
+        let retained_groups = self.dom.borrow().group_paths();
+        // the tree, stable-root shortcut included — the flow twin of
+        // the pixel path's pass assembly
+        // a drag crossing targets runs no body at all, so the ring is
+        // news the reuse shortcut can only hear from the interaction
+        let rings = self.drop_rings();
+        let rings_held = *self.last_drop_rings.borrow() == rings;
+        *self.last_drop_rings.borrow_mut() = rings.clone();
+        let stable_root = (self.root_is_boundary.get()
+            && crate::theme::version() == self.theme_version.get()
+            && rings_held
+            && !self.has_pending_dirty())
+        .then(|| self.last_root.borrow().clone())
+        .flatten()
+        .filter(|path| reconciler::is_retained(path));
+        let tree = match stable_root {
+            Some(path) => {
+                reconciler::note_stable_frame();
+                crate::layout::LayoutNode::BoundaryRef { path }
+            }
+            None => {
+                let mut nodes = self.frame_pass(root);
+                let mut roots = nodes.take_layout();
+                self.root_is_boundary.set(matches!(
+                    roots.as_slice(),
+                    [crate::layout::LayoutNode::Boundary { .. }]
+                        | [crate::layout::LayoutNode::BoundaryRef { .. }]
+                ));
+                if roots.len() == 1 {
+                    roots.remove(0)
+                } else {
+                    crate::layout::LayoutNode::Stack {
+                        axis: crate::layout::Axis::Vertical,
+                        spacing: 0.0,
+                        align: crate::layout::CrossAlign::Start,
+                        children: roots,
+                    }
+                }
+            }
+        };
+        // the island door: only an island's own subtree may measure
+        // and place, locally — the flow walk itself never does
+        let interaction = self.interaction.borrow().clone();
+        let focus = self.focus.borrow().clone();
+        let carets = self.carets.borrow();
+        let stamp = crate::layout::FrameStamp {
+            interaction: &interaction,
+            focus: focus.as_deref(),
+            carets: &carets,
+            caret_visible: self.caret_visible.get(),
+        };
+        self.cache.begin_frame();
+        self.last_proposal.set(Some(crate::layout::Proposal::exact(size)));
+        let offsets = self.scroll_offsets.borrow();
+        let env = LayoutEnv {
+            text: &*self.text,
+            images: &*self.images,
+            cache: &self.cache,
+            scroll_offsets: &offsets,
+            font: FontSpec::DEFAULT,
+            stamp,
+            animator: Some(&self.animator),
+            live: None,
+            scale: self.device_scale.get(),
+            anim: None,
+            overlay_bounds: self.overlay_bounds.get(),
+        };
+        let no_promises = std::collections::HashSet::new();
+        let boxes = self.island_boxes.borrow();
+        let flow = crate::dom_flow::FlowEnv {
+            scroll_offsets: &*offsets,
+            size: (size.width, size.height),
+            layout: Some(env),
+            changed: &changed,
+            retained_groups: match rings_held {
+                true => &retained_groups,
+                // the ring moved: no boundary may promise this frame,
+                // or the walk never reaches the target that wears it
+                false => &no_promises,
+            },
+            island_boxes: &boxes,
+            drop_rings: &rings,
+        };
+        let output = crate::stats::time(crate::stats::Stage::Capture, || {
+            crate::dom_flow::lower(&tree, &flow)
+        });
+        drop(boxes);
+        self.seed_island_boxes(&output.scene);
+        *self.dom_customs.borrow_mut() = output.customs.clone();
+        drop(offsets);
+        drop(carets);
+        // the first field that asks for focus takes it — once
+        for (path, wants) in &output.fields {
+            if *wants
+                && !self.auto_focused.borrow().contains(path)
+            {
+                self.auto_focused.borrow_mut().insert(path.clone());
+                if self.focus.borrow().is_none() {
+                    self.focus(path);
+                }
+            }
+        }
+        self.dom.borrow_mut().lower(&output.scene, &output.display)
+    }
+
+    /// Hydration's engine half: run the same frame the build ran and
+    /// ADOPT its scene as the retained truth — the browser already
+    /// holds these elements, ids assigned by the same pre-order. The
+    /// next [`Runtime::dom_frame`] diffs against a page that is
+    /// already true and says nothing.
+    pub fn dom_adopt(&self, root: &impl View, size: crate::layout::Size) {
+        self.settle(root);
+        let _ = reconciler::take_frame_runs();
+        let retained_groups = self.dom.borrow().group_paths();
+        // a drag crossing targets runs no body at all, so the ring is
+        // news the reuse shortcut can only hear from the interaction
+        let rings = self.drop_rings();
+        let rings_held = *self.last_drop_rings.borrow() == rings;
+        *self.last_drop_rings.borrow_mut() = rings.clone();
+        let stable_root = (self.root_is_boundary.get()
+            && crate::theme::version() == self.theme_version.get()
+            && rings_held
+            && !self.has_pending_dirty())
+        .then(|| self.last_root.borrow().clone())
+        .flatten()
+        .filter(|path| reconciler::is_retained(path));
+        let tree = match stable_root {
+            Some(path) => {
+                reconciler::note_stable_frame();
+                crate::layout::LayoutNode::BoundaryRef { path }
+            }
+            None => {
+                let mut nodes = self.frame_pass(root);
+                let mut roots = nodes.take_layout();
+                self.root_is_boundary.set(matches!(
+                    roots.as_slice(),
+                    [crate::layout::LayoutNode::Boundary { .. }]
+                        | [crate::layout::LayoutNode::BoundaryRef { .. }]
+                ));
+                if roots.len() == 1 {
+                    roots.remove(0)
+                } else {
+                    crate::layout::LayoutNode::Stack {
+                        axis: crate::layout::Axis::Vertical,
+                        spacing: 0.0,
+                        align: crate::layout::CrossAlign::Start,
+                        children: roots,
+                    }
+                }
+            }
+        };
+        let interaction = self.interaction.borrow().clone();
+        let focus = self.focus.borrow().clone();
+        let carets = self.carets.borrow();
+        let stamp = crate::layout::FrameStamp {
+            interaction: &interaction,
+            focus: focus.as_deref(),
+            carets: &carets,
+            caret_visible: self.caret_visible.get(),
+        };
+        self.cache.begin_frame();
+        self.last_proposal.set(Some(crate::layout::Proposal::exact(size)));
+        let offsets = self.scroll_offsets.borrow();
+        let env = LayoutEnv {
+            text: &*self.text,
+            images: &*self.images,
+            cache: &self.cache,
+            scroll_offsets: &offsets,
+            font: FontSpec::DEFAULT,
+            stamp,
+            animator: Some(&self.animator),
+            live: None,
+            scale: self.device_scale.get(),
+            anim: None,
+            overlay_bounds: self.overlay_bounds.get(),
+        };
+        let changed: Vec<String> = Vec::new();
+        let no_promises = std::collections::HashSet::new();
+        let boxes = self.island_boxes.borrow();
+        let flow = crate::dom_flow::FlowEnv {
+            scroll_offsets: &*offsets,
+            size: (size.width, size.height),
+            layout: Some(env),
+            changed: &changed,
+            retained_groups: match rings_held {
+                true => &retained_groups,
+                // the ring moved: no boundary may promise this frame,
+                // or the walk never reaches the target that wears it
+                false => &no_promises,
+            },
+            island_boxes: &boxes,
+            drop_rings: &rings,
+        };
+        let output = crate::dom_flow::lower(&tree, &flow);
+        drop(boxes);
+        self.seed_island_boxes(&output.scene);
+        *self.dom_customs.borrow_mut() = output.customs.clone();
+        drop(offsets);
+        drop(carets);
+        self.dom.borrow_mut().adopt(&output.scene, &output.display);
+    }
+
+    /// A click resolved by the BROWSER: the glue walked up from the
+    /// event target to the nearest `[data-path]` and hands the path
+    /// straight to the action door — no engine hit test, no geometry.
+    pub fn dom_action(&self, path: &str, clicks: u8) -> bool {
+        reconciler::run_action(path, clicks)
     }
 
     /// The canvas islands whose pixels changed since the last call —
     /// rasterized at `scale` and ready to blit. Empty when the scene
     /// has no islands or nothing inside one moved.
+    #[cfg(feature = "canvas")]
     pub fn dom_islands(&self, scale: usize) -> Vec<crate::dom::IslandFrame> {
         self.dom
             .borrow_mut()
@@ -2588,6 +2873,21 @@ impl Runtime {
             .collect()
     }
 
+    /// Which drop targets a live drag rings, in walk order — the flow
+    /// lowering holds no geometry, so the comparison happens here,
+    /// against the regions the last layout recorded. A target that
+    /// paints its OWN preview takes no ring: one affordance per
+    /// target, and the app's wins.
+    fn drop_rings(&self) -> Vec<bool> {
+        let over = self.interaction.borrow().drag.as_ref().and_then(|live| live.over);
+        let Some(over) = over else { return Vec::new() };
+        self.last_drops
+            .borrow()
+            .iter()
+            .map(|region| region.over.is_none() && region.rect == over)
+            .collect()
+    }
+
     /// The scroll region path behind a Dom element id — the glue's
     /// scroll observer reports by id, the runtime scrolls by path.
     pub fn dom_scroll_path(&self, id: u32) -> Option<String> {
@@ -2603,6 +2903,7 @@ impl Runtime {
     /// The shell calls this when a tick reports `islands` and presents
     /// each blit on the box's own surface (a layer on macOS, the
     /// island canvas on the web) — the window behind it never redraws.
+    #[cfg(feature = "canvas")]
     pub fn live_islands(&self, scale: usize) -> Vec<LiveBlit> {
         let dirty = self.animator.borrow_mut().take_dirty_loops();
         if dirty.is_empty() {
@@ -2617,6 +2918,7 @@ impl Runtime {
     /// did not change costs one paint pass and NO raster, so an app
     /// that wakes often (a file watch, a poll) never pays the mark
     /// again for a frame that left it alone.
+    #[cfg(feature = "canvas")]
     pub fn live_islands_all(&self, scale: usize) -> Vec<LiveBlit> {
         let paths: Vec<Rc<str>> = self
             .last_customs
@@ -2634,6 +2936,7 @@ impl Runtime {
     /// Where every live box sits right now — the presenter re-places
     /// the boxes' surfaces on an ordinary frame (a moved bar carries
     /// its mark along) without repainting a pixel.
+    #[cfg(feature = "canvas")]
     pub fn live_frames(&self) -> Vec<(String, crate::layout::Rect)> {
         self.last_customs
             .borrow()
@@ -2657,6 +2960,7 @@ impl Runtime {
     /// The display-list ranges owned by the live boxes of the last
     /// layout — what a GPU presenter carves out of the scene (each box
     /// presents on its own layer instead).
+    #[cfg(feature = "canvas")]
     pub fn live_slices(&self) -> Vec<(usize, usize)> {
         self.last_customs
             .borrow()
@@ -2668,6 +2972,7 @@ impl Runtime {
 
     /// The identities of the live boxes still placed — the presenter
     /// sweeps dead layers against this list.
+    #[cfg(feature = "canvas")]
     pub fn live_paths(&self) -> Vec<String> {
         self.last_customs
             .borrow()
@@ -2677,6 +2982,7 @@ impl Runtime {
             .collect()
     }
 
+    #[cfg(feature = "canvas")]
     fn live_repaint(&self, scale: usize, dirty: &[Rc<str>]) -> Vec<LiveBlit> {
         let customs = self.last_customs.borrow();
         let mut ledger = self.live_ledger.borrow_mut();
@@ -2763,6 +3069,181 @@ impl Runtime {
             });
         }
         blits
+    }
+
+    /// The browser scrolled: the offset lands in the engine AND in
+    /// the retained scene, so the next diff meets its own echo and
+    /// emits nothing — the browser already moved.
+    pub fn dom_scrolled(&self, id: u32, x: f64, y: f64) {
+        let Some(path) = self.dom_scroll_path(id) else {
+            return;
+        };
+        self.set_scroll_offset(&path, crate::layout::Point { x, y });
+        self.dom.borrow_mut().note_scroll(id, x, y);
+        // the region's body IS the window function here — the fresh
+        // offset re-runs it (nearest retained boundary up the path)
+        let mut probe = path.as_str();
+        loop {
+            if reconciler::is_retained(probe) {
+                motor::identity::invalidate(probe);
+                break;
+            }
+            match probe.rfind('/') {
+                Some(cut) => probe = &probe[..cut],
+                None => break,
+            }
+        }
+    }
+
+    /// The browser reported a scroll element's box (a ResizeObserver
+    /// fired) — the flow frame's window math reads it next pass.
+    pub fn set_dom_viewport(&self, id: u32, width: f64, height: f64) {
+        let Some(path) = self.dom_scroll_path(id) else {
+            return;
+        };
+        self.dom_viewports.borrow_mut().insert(path, (width, height));
+    }
+
+    /// The browser reported a canvas island's box (its resize
+    /// observer fired). News re-runs the island's body so the next
+    /// frame measures against the REAL box; an echo of what the
+    /// engine already said returns false and costs nothing.
+    pub fn dom_island_box(&self, id: u32, width: f64, height: f64) -> bool {
+        let Some(path) = self.dom.borrow().island_path(id) else {
+            return false;
+        };
+        if let Some((w, h)) = self.island_boxes.borrow().get(path.as_ref()) {
+            if (w - width).abs() < 0.5 && (h - height).abs() < 0.5 {
+                return false;
+            }
+        }
+        self.island_boxes.borrow_mut().insert(Rc::clone(&path), (width, height));
+        // the island lives under a body — the fresh box re-runs it
+        // (nearest retained boundary up the path, the scroll's walk)
+        let mut probe: &str = path.as_ref();
+        loop {
+            if reconciler::is_retained(probe) {
+                motor::identity::invalidate(probe);
+                break;
+            }
+            match probe.rfind('/') {
+                Some(cut) => probe = &probe[..cut],
+                None => break,
+            }
+        }
+        true
+    }
+
+    /// A pointer event ON a canvas island, in the canvas's own
+    /// coordinates (`kind`: 0 down, 1 move, 2 up). The box under the
+    /// point hears it; a press GRABS the box until the release, the
+    /// way the desktop's pointer does; the release hands the keyboard
+    /// to a box that takes keys — first responder follows the click.
+    pub fn dom_island_pointer(&self, id: u32, kind: u32, x: f64, y: f64) -> bool {
+        let Some(island) = self.dom.borrow().island_path(id) else {
+            return false;
+        };
+        let grabbed = self.interaction.borrow().element_grab.clone();
+        let placement = match (kind, grabbed) {
+            // the grabbed box hears every move and the release,
+            // wherever the pointer went — dragging needs it
+            (1 | 2, Some(path)) => self
+                .dom_customs
+                .borrow()
+                .iter()
+                .find(|(_, custom)| custom.path == path)
+                .map(|(_, custom)| custom.clone()),
+            _ => self
+                .dom_customs
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(home, custom)| {
+                    home.as_ref() == island.as_ref() && custom.frame.contains(x, y)
+                })
+                .map(|(_, custom)| custom.clone()),
+        };
+        let Some(placement) = placement else {
+            return false;
+        };
+        let at = Self::local(&placement, x, y);
+        match kind {
+            0 => {
+                self.interaction.borrow_mut().element_grab =
+                    Some(placement.path.clone());
+                self.deliver(
+                    &placement,
+                    crate::custom::ElementEvent::PointerDown { at, clicks: 1 },
+                );
+            }
+            1 => {
+                let pressed = self.interaction.borrow().element_grab.is_some();
+                self.deliver(
+                    &placement,
+                    crate::custom::ElementEvent::PointerMoved { at, pressed },
+                );
+            }
+            2 => {
+                self.interaction.borrow_mut().element_grab = None;
+                self.deliver(&placement, crate::custom::ElementEvent::PointerUp { at });
+                if placement.element.element().accepts_keys() {
+                    self.focus_element(&placement.path);
+                } else {
+                    self.blur();
+                }
+            }
+            _ => return false,
+        }
+        self.dirty_island_of(&placement.path);
+        true
+    }
+
+    /// The paint of an app's box reads state OUTSIDE any body — no
+    /// boundary hears its changes. After an event reaches a box that
+    /// lives in an island, the island's body re-runs so the pixels
+    /// can follow; identical paint output still blits nothing (the
+    /// island ledger compares commands). A box from the pixel pass
+    /// is not in this ledger — the call is a no-op there.
+    fn dirty_island_of(&self, custom_path: &str) {
+        let island = self
+            .dom_customs
+            .borrow()
+            .iter()
+            .find(|(_, custom)| custom.path == custom_path)
+            .map(|(island, _)| Rc::clone(island));
+        let Some(island) = island else {
+            return;
+        };
+        let mut probe: &str = island.as_ref();
+        loop {
+            if reconciler::is_retained(probe) {
+                motor::identity::invalidate(probe);
+                break;
+            }
+            match probe.rfind('/') {
+                Some(cut) => probe = &probe[..cut],
+                None => break,
+            }
+        }
+    }
+
+    /// Every island the scene holds seeds its measured box once — so
+    /// the observer's FIRST report (which only echoes the mount) does
+    /// not buy a frame. Later reports that disagree are real news.
+    fn seed_island_boxes(&self, scene: &crate::dom::DomNode) {
+        fn walk(node: &crate::dom::DomNode, boxes: &mut HashMap<Rc<str>, (f64, f64)>) {
+            if let crate::dom::DomKind::Canvas { path: Some(path), .. } = &node.kind {
+                if let Some(layout) = &node.layout {
+                    if let (Some(w), Some(h)) = (layout.width, layout.height) {
+                        boxes.entry(Rc::clone(path)).or_insert((w, h));
+                    }
+                }
+            }
+            for child in &node.children {
+                walk(child, boxes);
+            }
+        }
+        walk(scene, &mut self.island_boxes.borrow_mut());
     }
 
     /// The text engine of this runtime — the shell pairs it with its
@@ -2958,6 +3439,7 @@ impl Runtime {
     /// tree's lines are not even formatted (printing is for people;
     /// frames are for pixels).
     fn frame_pass(&self, root: &impl View) -> NodeList {
+        crate::stats::note_body_pass();
         crate::view::set_print(false);
         self.printless.set(true);
         let nodes = self.render_pass(root);
@@ -3173,7 +3655,7 @@ impl Runtime {
         root: &impl View,
         proposal: crate::layout::Proposal,
     ) -> crate::layout::LayoutResult {
-        self.layout_once_with(root, proposal, false).0
+        self.layout_once_with(root, proposal, false, true).0
     }
 
     /// One layout pass, optionally with the Dom capture riding it.
@@ -3182,7 +3664,11 @@ impl Runtime {
         root: &impl View,
         proposal: crate::layout::Proposal,
         dom: bool,
+        collect_display: bool,
     ) -> (crate::layout::LayoutResult, Option<crate::dom::DomNode>) {
+        // every call walks measure+place (the stable-root shortcut
+        // skips BODIES, not geometry) — so every call counts
+        crate::stats::note_layout_pass();
         // STABLE boundary-root frame (hover, wheel, blink, the
         // post-settle layout): nothing dirty, same theme, retained
         // root — the walk would be all-skip and emit exactly ONE
@@ -3258,12 +3744,21 @@ impl Runtime {
             overlay_bounds: self.overlay_bounds.get(),
             scale: self.device_scale.get(),
         };
-        let (result, scene) = if dom {
-            let (result, scene) = crate::layout::layout_dom(&tree, proposal, env);
-            (result, Some(scene))
+        let stage = if dom {
+            crate::stats::Stage::Capture
         } else {
-            (crate::layout::layout_with(&tree, proposal, env), None)
+            crate::stats::Stage::Layout
         };
+        let (result, scene) = crate::stats::time(stage, || {
+            if dom {
+                let (result, scene) =
+                    crate::layout::layout_dom(&tree, proposal, env, collect_display);
+                (result, Some(scene))
+            } else {
+                (crate::layout::layout_with(&tree, proposal, env), None)
+            }
+        });
+        crate::stats::note_display(result.display.len());
         drop(offsets);
         drop(carets);
         *self.last_hits.borrow_mut() = result.hits.clone();
@@ -3298,12 +3793,14 @@ impl Runtime {
     /// A full frame down to the bitmap: layout at the viewport's exact
     /// proposal and rasterization of the display list — what the
     /// platform backend blits to the window.
+    #[cfg(feature = "canvas")]
     pub fn paint(&self, root: &impl View, size: crate::layout::Size) -> crate::raster::Bitmap {
         self.paint_at_scale(root, size, 1)
     }
 
     /// [`Runtime::paint`] at retina: layout in logical points, bitmap
     /// in physical pixels (`size × scale`).
+    #[cfg(feature = "canvas")]
     pub fn paint_at_scale(
         &self,
         root: &impl View,
@@ -3412,17 +3909,19 @@ impl Runtime {
     /// for no confirmation (a pass with no new dirt produced a
     /// consistent tree by definition; the next pass would be all-skip).
     pub fn settle(&self, root: &impl View) {
-        for _ in 0..8 {
-            // the same order as the print path: a task that resolved
-            // writes its state, then the pass reads it
-            self.poll_tasks();
-            self.frame_pass(root);
-            let observed_change = self.pump();
-            effects::sweep_tasks();
-            if !observed_change && !self.has_pending_dirty() && !motor::task::has_ready() {
-                return;
+        crate::stats::time(crate::stats::Stage::Settle, || {
+            for _ in 0..8 {
+                // the same order as the print path: a task that resolved
+                // writes its state, then the pass reads it
+                self.poll_tasks();
+                self.frame_pass(root);
+                let observed_change = self.pump();
+                effects::sweep_tasks();
+                if !observed_change && !self.has_pending_dirty() && !motor::task::has_ready() {
+                    return;
+                }
             }
-        }
+        })
     }
 
     fn has_pending_dirty(&self) -> bool {

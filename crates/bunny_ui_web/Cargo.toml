@@ -3,5 +3,9 @@ name = "bunny-ui-web"
 version = "0.1.0"
 edition.workspace = true
 
+[features]
+default = ["canvas"]
+canvas = ["bunny-ui/canvas"]
+
 [dependencies]
 bunny-ui.workspace = true

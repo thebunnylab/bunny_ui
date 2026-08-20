@@ -580,8 +580,10 @@ pub enum LayoutNode {
     /// Transparent to geometry everywhere; in Dom mode it becomes a
     /// CANVAS ISLAND — an element our layout positions, filled with the
     /// subtree's own draw commands. On pixel targets it dissolves:
-    /// everything is the pixel pipeline there already.
-    Island { child: Box<LayoutNode> },
+    /// everything is the pixel pipeline there already. `path` is the
+    /// island's identity: a flexible island has no slot to trust, so it
+    /// keys the box the browser reports for it by this path.
+    Island { path: Option<String>, child: Box<LayoutNode> },
     /// `.looping(...)`: the boxes below paint by a repeating clock.
     /// Transparent to geometry — the phase reaches the paint and
     /// nothing else, so a step of the loop repaints the box and the
@@ -644,12 +646,40 @@ pub enum LayoutNode {
         over: Option<DragOverAction>,
         child: Box<LayoutNode>,
     },
+    /// `.layout(Exact)`: this subtree keeps the ENGINE's layout on
+    /// the element lowering — measured, placed and captured with the
+    /// absolute machinery, pixel-partner to the canvas. Transparent on
+    /// every pixel target (they are exact already, by construction).
+    ExactLayout { child: Box<LayoutNode> },
+    /// A class for the ENCLOSING boundary's element, declared from
+    /// inside its body — the door a row uses to flip its own `<tr>`
+    /// class without its parent hearing. Invisible everywhere: zero
+    /// size, no paint, no hit.
+    BoundaryHint { class: Option<String> },
+    /// Element hints for the Dom lowering — a real tag, a class, an
+    /// id. Transparent everywhere else, like `.rendering()`: a pixel
+    /// target never knows the child was ever going to be a `<tr>`.
+    Hinted {
+        tag: Option<std::rc::Rc<str>>,
+        class: Option<std::rc::Rc<str>>,
+        dom_id: Option<std::rc::Rc<str>>,
+        child: Box<LayoutNode>,
+    },
     /// The escape hatch (`custom(…)` / `canvas(…)`): a box the APP
     /// measures and paints, in the same command vocabulary the built-ins
     /// emit. `path` is its identity — the address of the events it
     /// answers. On the element lowering it becomes a canvas island by
     /// construction: what the app paints is PIXELS, never elements.
     Custom { path: String, element: crate::custom::Custom },
+}
+
+/// How the element lowering lays a subtree out: the browser's flow
+/// (the default), or the engine's own numbers (`Exact` — pixel parity
+/// with the canvas, at the price of our layout running for it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutMode {
+    Flow,
+    Exact,
 }
 
 /// Where a subtree renders when the scene lowers to elements. The v1
@@ -1498,6 +1528,10 @@ impl DisplayList {
         self.commands.push(command);
     }
 
+    pub(crate) fn extend(&mut self, other: DisplayList) {
+        self.commands.extend(other.commands);
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &DrawCommand> {
         self.commands.iter()
     }
@@ -1977,6 +2011,13 @@ pub const SPLIT_GRIP: Px = 6.0;
 pub struct Placement {
     pub frames: Frames,
     pub display: DisplayList,
+    /// A Dom frame with no live island skips the display list — the
+    /// clip stack still runs, only the command collection sleeps.
+    skip_display: bool,
+    /// A canvas island placed this pass. When collection was OFF, the
+    /// runtime re-runs the pass collected — an island's birth costs
+    /// one extra walk; a steady frame costs none.
+    saw_island: bool,
     pub hits: Vec<(String, Rect)>,
     pub scrolls: Vec<ScrollRegion>,
     pub fields: Vec<FieldPlacement>,
@@ -2046,6 +2087,38 @@ pub struct Placement {
 }
 
 impl Placement {
+    /// A placement seeded with an inherited ink — an island placed
+    /// LOCALLY still paints with the foreground its subtree sits in.
+    pub(crate) fn with_ink(ink: Color) -> Placement {
+        Placement { foreground: vec![ink], ..Placement::default() }
+    }
+
+    /// [`Placement::with_ink`] with the Dom capture riding — the
+    /// `.layout(Exact)` door: a LOCAL absolute lowering of one
+    /// subtree, spliced back into the flow by the caller.
+    pub(crate) fn with_capture(size: Size, ink: Color) -> Placement {
+        Placement {
+            foreground: vec![ink],
+            dom: Some(crate::dom::DomCapture::new(size)),
+            ..Placement::default()
+        }
+    }
+
+    /// Takes the capture out — the caller splices its scene.
+    pub(crate) fn take_capture(&mut self) -> crate::dom::DomCapture {
+        self.dom.take().expect("the capture was riding")
+    }
+
+    /// A draw command joins the display list — unless this pass skips
+    /// collection (a Dom frame with no live island: nothing consumes
+    /// the list, so nothing pays for it).
+    #[inline]
+    fn draw(&mut self, command: DrawCommand) {
+        if !self.skip_display {
+            self.display.push(command);
+        }
+    }
+
     /// The command carries this node's OWN box; the stack keeps the
     /// intersection, because a hit consults the stack. Snapping and
     /// intersecting commute (round is monotone), so the consumers'
@@ -2058,12 +2131,12 @@ impl Placement {
                 .unwrap_or(Rect { origin: rect.origin, size: Size::default() }),
             None => rect,
         };
-        self.display.push(DrawCommand::PushClip { rect, corner_radius: corner_radius.into() });
+        self.draw(DrawCommand::PushClip { rect, corner_radius: corner_radius.into() });
         self.clip.push(clipped);
     }
 
     fn pop_clip(&mut self) {
-        self.display.push(DrawCommand::PopClip);
+        self.draw(DrawCommand::PopClip);
         self.clip.pop();
     }
 
@@ -2151,6 +2224,9 @@ pub struct LayoutResult {
     /// Virtual windows that failed to cover the visible band this
     /// frame — the runtime re-materializes them in a follow-up pass.
     pub misses: Vec<String>,
+    /// A canvas island placed while display collection was off — the
+    /// runtime re-runs the pass collected.
+    pub(crate) saw_island: bool,
     /// The placed popovers, in paint order (last = topmost) — each one
     /// a suffix slice of `display`.
     pub overlays: Vec<OverlayPlacement>,
@@ -2235,6 +2311,7 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         splits: out.splits,
         customs: out.customs,
         misses: out.misses,
+        saw_island: out.saw_island,
         overlays: out.overlays,
         modal_floor: out.modal_floor,
         drag_regions: out.drag_regions,
@@ -2253,10 +2330,12 @@ pub fn layout_dom(
     root: &LayoutNode,
     proposal: Proposal,
     env: LayoutEnv,
+    collect_display: bool,
 ) -> (LayoutResult, crate::dom::DomNode) {
     let (size, fit) = root.measure(proposal, env);
     let mut out = Placement {
         dom: Some(crate::dom::DomCapture::new(size)),
+        skip_display: !collect_display,
         ..Placement::default()
     };
     root.place(Rect { origin: Point::default(), size }, fit, env, &mut out);
@@ -2276,6 +2355,7 @@ pub fn layout_dom(
             splits: out.splits,
             customs: out.customs,
             misses: out.misses,
+            saw_island: out.saw_island,
             overlays: out.overlays,
             modal_floor: out.modal_floor,
             drag_regions: out.drag_regions,
@@ -2775,7 +2855,7 @@ impl LayoutNode {
     /// Flexible = wants the leftover space on the axis (the basis of
     /// stack distribution). Explicit priority, never a side effect of
     /// overflow.
-    fn is_flexible(&self, axis: Axis) -> bool {
+    pub(crate) fn is_flexible(&self, axis: Axis) -> bool {
         match self {
             LayoutNode::Spacer | LayoutNode::Fill => true,
             // a split FILLS the offer on both axes — its whole job is
@@ -2805,7 +2885,7 @@ impl LayoutNode {
             | LayoutNode::HoverGroup { child, .. }
             | LayoutNode::Styled { child, .. }
             | LayoutNode::Animated { child, .. }
-            | LayoutNode::Island { child }
+            | LayoutNode::Island { child, .. }
             | LayoutNode::Live { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
@@ -2813,7 +2893,8 @@ impl LayoutNode {
             | LayoutNode::Tooltip { child, .. }
             | LayoutNode::ContextSource { child, .. }
             | LayoutNode::DragSource { child, .. }
-            | LayoutNode::DropTarget { child, .. } => child.is_flexible(axis),
+            | LayoutNode::DropTarget { child, .. }
+            | LayoutNode::Hinted { child, .. } => child.is_flexible(axis),
             // a stack that HOLDS something flexible is itself flexible
             // (a panel with a scroll inside wants the leftover space —
             // nesting it must not freeze it at its natural extent)
@@ -2857,7 +2938,7 @@ impl LayoutNode {
             }
             LayoutNode::Overlay { child, .. } => child.first_baseline(env),
             LayoutNode::Animated { child, .. }
-            | LayoutNode::Island { child }
+            | LayoutNode::Island { child, .. }
             | LayoutNode::Live { child, .. }
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::HoverGroup { child, .. }
@@ -2868,6 +2949,7 @@ impl LayoutNode {
             | LayoutNode::ContextSource { child, .. }
             | LayoutNode::DragSource { child, .. }
             | LayoutNode::DropTarget { child, .. }
+            | LayoutNode::Hinted { child, .. }
             | LayoutNode::Frame { child, .. } => child.first_baseline(env),
             // lane A leads the seam — its text sets the shared line
             LayoutNode::Split { children, .. } => {
@@ -2995,6 +3077,18 @@ impl LayoutNode {
             }
 
             LayoutNode::DragSource { child, .. } | LayoutNode::DropTarget { child, .. } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            LayoutNode::Hinted { child, .. } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            LayoutNode::BoundaryHint { .. } => (Size::default(), Fit::Leaf),
+
+            LayoutNode::ExactLayout { child } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -3204,7 +3298,7 @@ impl LayoutNode {
             }
 
             // the island claims a renderer, never a pixel of geometry
-            LayoutNode::Island { child } => {
+            LayoutNode::Island { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -3285,7 +3379,7 @@ impl LayoutNode {
                     dom.set_background(Color::FILL);
                     dom.close();
                 }
-                out.display.push(DrawCommand::FillRect {
+                out.draw(DrawCommand::FillRect {
                     rect: frame,
                     color: Color::FILL,
                     corner_radius: Corners::ZERO,
@@ -3352,7 +3446,7 @@ impl LayoutNode {
                 // field chrome: tokens read at PLACEMENT — a retheme
                 // repaints without re-running a single body
                 let theme = crate::theme::current();
-                out.display.push(DrawCommand::FillRect {
+                out.draw(DrawCommand::FillRect {
                     rect: frame,
                     color: theme.field,
                     corner_radius: Corners::all(FIELD_RADIUS),
@@ -3434,7 +3528,7 @@ impl LayoutNode {
                             let x1 = text_origin.x
                                 + width_of(start, tail)
                                 + if over { line_h / 2.0 } else { 0.0 };
-                            out.display.push(DrawCommand::FillRect {
+                            out.draw(DrawCommand::FillRect {
                                 rect: Rect {
                                     origin: Point { x: x0, y },
                                     size: Size { width: x1 - x0, height: line_h },
@@ -3445,7 +3539,7 @@ impl LayoutNode {
                         }
                     }
                     if start < end {
-                        out.display.push(DrawCommand::TextLine {
+                        out.draw(DrawCommand::TextLine {
                             origin: Point { x: text_origin.x, y },
                             content: sample.clone(),
                             range: (start, end),
@@ -3461,7 +3555,7 @@ impl LayoutNode {
                         if head < tail {
                             let x0 = text_origin.x + width_of(start, head);
                             let x1 = text_origin.x + width_of(start, tail);
-                            out.display.push(DrawCommand::FillRect {
+                            out.draw(DrawCommand::FillRect {
                                 rect: Rect {
                                     origin: Point { x: x0, y: y + line_h - 1.0 },
                                     size: Size { width: x1 - x0, height: 1.0 },
@@ -3478,7 +3572,7 @@ impl LayoutNode {
                 if let Some(caret) = caret {
                     let index = line_of(lines, caret);
                     let (start, _) = lines[index];
-                    out.display.push(DrawCommand::FillRect {
+                    out.draw(DrawCommand::FillRect {
                         rect: Rect {
                             origin: Point {
                                 x: text_origin.x + width_of(start, caret.max(start)),
@@ -3491,7 +3585,7 @@ impl LayoutNode {
                     });
                 }
                 out.pop_clip();
-                out.display.push(DrawCommand::StrokeRect {
+                out.draw(DrawCommand::StrokeRect {
                     rect: frame,
                     color: if focused { theme.focus } else { theme.field_border },
                     width: 1.0,
@@ -3530,7 +3624,7 @@ impl LayoutNode {
                     dom.set_border(Color::OUTLINE, 1.0);
                     dom.close();
                 }
-                out.display.push(DrawCommand::StrokeRect {
+                out.draw(DrawCommand::StrokeRect {
                     rect: frame,
                     color: Color::OUTLINE,
                     width: 1.0,
@@ -3602,6 +3696,7 @@ impl LayoutNode {
                 // the box becomes a canvas island, and the island slices
                 // exactly the commands between here and the close
                 let start = out.display.len();
+                out.saw_island = true;
                 if let Some(dom) = out.dom.as_mut() {
                     // the island covers what is VISIBLE, never the whole
                     // box: a box that declared four thousand points of
@@ -3670,6 +3765,16 @@ impl LayoutNode {
                     anchor,
                     anchor_visible,
                 });
+            }
+
+            (LayoutNode::Hinted { child, .. }, Fit::Wrapped(_, fit)) => {
+                child.place(frame, *fit, env, out);
+            }
+
+            (LayoutNode::BoundaryHint { .. }, Fit::Leaf) => {}
+
+            (LayoutNode::ExactLayout { child }, Fit::Wrapped(_, fit)) => {
+                child.place(frame, *fit, env, out);
             }
 
             (LayoutNode::DragRegion { child }, Fit::Wrapped(_, fit)) => {
@@ -3766,7 +3871,7 @@ impl LayoutNode {
                             .is_some_and(|live| live.over == Some(rect));
                     if ringed {
                         let accent = crate::theme::current().accent;
-                        out.display.push(DrawCommand::StrokeRect {
+                        out.draw(DrawCommand::StrokeRect {
                             rect: frame,
                             color: accent,
                             width: 2.0,
@@ -3799,7 +3904,7 @@ impl LayoutNode {
                         dom.set_border(Color::OUTLINE, 1.0);
                         dom.close();
                     }
-                    out.display.push(DrawCommand::StrokeRect {
+                    out.draw(DrawCommand::StrokeRect {
                         rect: frame,
                         color: Color::OUTLINE,
                         width: 1.0,
@@ -3822,14 +3927,14 @@ impl LayoutNode {
                         // clip is built in, never a separate modifier
                         if let Some(rect) = cover_rect(frame, intrinsic_of(&*env.images, source)) {
                             out.push_clip(frame, 0.0);
-                            out.display.push(DrawCommand::Image {
+                            out.draw(DrawCommand::Image {
                                 rect,
                                 source: source.clone(),
                             });
                             out.pop_clip();
                         }
                     } else if frame.size.width > 0.0 && frame.size.height > 0.0 {
-                        out.display.push(DrawCommand::Image {
+                        out.draw(DrawCommand::Image {
                             rect: frame,
                             source: source.clone(),
                         });
@@ -3867,7 +3972,7 @@ impl LayoutNode {
                         },
                         size: Size { width: side, height: side },
                     };
-                    out.display.push(DrawCommand::Image {
+                    out.draw(DrawCommand::Image {
                         rect,
                         source: ImageSource::symbol(*symbol, color),
                     });
@@ -4116,6 +4221,10 @@ impl LayoutNode {
                         crate::dom::DomKind::Scroll {
                             path: path.clone(),
                             offset: (offset.x, offset.y),
+                            // the ABSOLUTE capture keeps reveal in the
+                            // engine (SetScroll from measured frames) —
+                            // the record stays silent here
+                            target: None,
                         },
                         frame,
                         frame.origin,
@@ -4194,7 +4303,7 @@ impl LayoutNode {
                 let fade_from = out.display.len();
                 // the halo goes first — everything else paints over it
                 if let Some((radius, color)) = props.shadow {
-                    out.display.push(DrawCommand::Shadow {
+                    out.draw(DrawCommand::Shadow {
                         rect: frame,
                         radius,
                         color: animated(crate::anim::Channel::Shadow, color),
@@ -4207,7 +4316,7 @@ impl LayoutNode {
                 // halo is under it and therefore inside it — hang the
                 // halo on a wrapper to keep it out
                 if let Some(glass) = props.glass {
-                    out.display.push(DrawCommand::Backdrop {
+                    out.draw(DrawCommand::Backdrop {
                         rect: frame,
                         glass: glass.resolve(frame),
                         corner_radius: props.corner_radius.unwrap_or_default(),
@@ -4229,7 +4338,7 @@ impl LayoutNode {
                     props.background
                 };
                 if let Some(color) = background {
-                    out.display.push(DrawCommand::FillRect {
+                    out.draw(DrawCommand::FillRect {
                         rect: frame,
                         color: animated(crate::anim::Channel::Background, color),
                         corner_radius: props.corner_radius.unwrap_or_default(),
@@ -4239,7 +4348,7 @@ impl LayoutNode {
                 // child: the two compose, and the geometry resolves to
                 // px here — the shaders only evaluate
                 if let Some(gradient) = props.gradient {
-                    out.display.push(DrawCommand::Gradient {
+                    out.draw(DrawCommand::Gradient {
                         rect: frame,
                         paint: gradient.resolve(frame),
                         corner_radius: props.corner_radius.unwrap_or_default(),
@@ -4272,7 +4381,7 @@ impl LayoutNode {
                     out.foreground.pop();
                 }
                 if let Some((color, width)) = props.border {
-                    out.display.push(DrawCommand::StrokeRect {
+                    out.draw(DrawCommand::StrokeRect {
                         rect: frame,
                         color: animated(crate::anim::Channel::Border, color),
                         width,
@@ -4355,12 +4464,13 @@ impl LayoutNode {
                 child.place(frame, *fit, env, out);
             }
 
-            (LayoutNode::Island { child }, Fit::Wrapped(_, fit)) => {
+            (LayoutNode::Island { child, .. }, Fit::Wrapped(_, fit)) => {
                 // Dom mode: a canvas element in the flow, filled with
                 // the subtree's OWN draw commands (the display range
                 // between open and close). Pixel targets place through:
                 // everything is the pixel pipeline there already.
                 if out.dom.is_some() {
+                    out.saw_island = true;
                     let start = out.display.len();
                     if let Some(dom) = out.dom.as_mut() {
                         dom.open_canvas(frame, start);
@@ -4523,7 +4633,7 @@ impl LayoutNode {
                     // measure from the same origin, so a flight above
                     // never bends the captured interior
                     dom.open(
-                        crate::dom::DomKind::Group { path: path.clone() },
+                        crate::dom::DomKind::Group { path: std::rc::Rc::from(path.as_str()) },
                         real,
                         real.origin,
                     );
@@ -4838,7 +4948,7 @@ fn place_text(
         // do not map onto the composed text) — honest v1, noted
         let composed: Arc<str> = Arc::from(truncate_to_width(content, mode, frame.size.width, env));
         let length = composed.len();
-        out.display.push(DrawCommand::TextLine {
+        out.draw(DrawCommand::TextLine {
             origin: frame.origin,
             content: composed,
             range: (0, length),
@@ -4883,7 +4993,7 @@ fn emit_text_runs(
         font: env.font,
     };
     let Some(highlight) = highlights else {
-        out.display.push(whole());
+        out.draw(whole());
         return;
     };
 
@@ -4907,7 +5017,7 @@ fn emit_text_runs(
         segments.push((cursor, line_end, false));
     }
     if segments.len() == 1 && !segments[0].2 {
-        out.display.push(whole());
+        out.draw(whole());
         return;
     }
 
@@ -4917,7 +5027,7 @@ fn emit_text_runs(
         } else {
             env.cache.get_or_measure(&content[line_start..start], &env.font, env.text).width
         };
-        out.display.push(DrawCommand::TextLine {
+        out.draw(DrawCommand::TextLine {
             origin: Point { x: origin.x + offset, y: origin.y },
             content: content.clone(),
             range: (start, end),
@@ -5011,7 +5121,7 @@ pub const SCROLLBAR_GRAB: Px = 12.0;
 
 const FIELD_PAD_H: Px = 8.0;
 const FIELD_PAD_V: Px = 5.0;
-const FIELD_RADIUS: Px = 5.0;
+pub(crate) const FIELD_RADIUS: Px = 5.0;
 const FIELD_CARET_W: Px = 1.5;
 
 /// The region's thumb — draw-only at this stage (drag arrives with
@@ -5034,7 +5144,7 @@ fn draw_scrollbar(
     let travel = track - thumb_h;
     let thumb_y = frame.origin.y + SCROLLBAR_INSET + travel * (offset_y / max_y);
     let thumb_x = frame.origin.x + frame.size.width - SCROLLBAR_INSET - SCROLLBAR_W;
-    out.display.push(DrawCommand::FillRect {
+    out.draw(DrawCommand::FillRect {
         rect: Rect {
             origin: Point { x: thumb_x, y: thumb_y },
             size: Size { width: SCROLLBAR_W, height: thumb_h },
@@ -5086,7 +5196,7 @@ fn draw_scrollbar_h(
     let travel = track - thumb_w;
     let thumb_x = frame.origin.x + SCROLLBAR_INSET + travel * (offset_x / max_x);
     let thumb_y = frame.origin.y + frame.size.height - SCROLLBAR_INSET - SCROLLBAR_W;
-    out.display.push(DrawCommand::FillRect {
+    out.draw(DrawCommand::FillRect {
         rect: Rect {
             origin: Point { x: thumb_x, y: thumb_y },
             size: Size { width: thumb_w, height: SCROLLBAR_W },
@@ -6255,6 +6365,7 @@ mod tests {
     /// The pain the front came to kill, end to end: a bordered rounded
     /// island whose child paints its own background — the child's
     /// corner dies at the curve, the border paints OVER the cut child.
+    #[cfg(feature = "canvas")]
     #[test]
     fn a_box_finally_holds_its_children() {
         let island = styled(

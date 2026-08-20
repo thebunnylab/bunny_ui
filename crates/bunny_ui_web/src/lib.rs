@@ -22,6 +22,7 @@ use std::rc::Rc;
 use bunny_ui::layout::{Color, Size};
 use bunny_ui::action::KeyMatch;
 use bunny_ui::prelude::*;
+#[cfg(feature = "canvas")]
 use bunny_ui::raster::Surface;
 use bunny_ui::runtime::Runtime;
 use bunny_ui::text_input::EditCommand;
@@ -164,6 +165,10 @@ enum Event {
     /// Dom mode: the browser's scroll observer — the element scrolled
     /// and the engine mirrors the offset (the dual ownership).
     DomScroll { id: u32, x: f64, y: f64 },
+    DomViewport { id: u32, width: f64, height: f64 },
+    DomBox { id: u32, width: f64, height: f64 },
+    IslandPointer { id: u32, kind: u32, x: f64, y: f64 },
+    Action { path: String, clicks: u8 },
     /// Dom mode: the browser's input edited — value + selectionStart.
     Field { path: String, value: String, caret: usize },
 }
@@ -217,6 +222,7 @@ fn dispatch(event: Event) {
 
 /// Boots the shell with the app's root view. The demo crate calls this
 /// from its exported `start`; everything after travels through events.
+#[cfg(feature = "canvas")]
 pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
     let runtime = Runtime::new()
         .text_engine(Rc::new(CanvasTextEngine::new()))
@@ -344,7 +350,12 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 present(&runtime, &full, size, scale, &mut surface);
             }
             // Dom-mode traffic — this shell rasterizes, nothing to do
-            Event::DomScroll { .. } | Event::Field { .. } => {}
+            Event::DomScroll { .. }
+            | Event::DomViewport { .. }
+            | Event::DomBox { .. }
+            | Event::IslandPointer { .. }
+            | Event::Action { .. }
+            | Event::Field { .. } => {}
         }
     });
     SHELL.with(|slot| {
@@ -360,6 +371,23 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
 /// and programmatic scrolls ride `scroll-behavior`, so the browser
 /// animates while the engine stays event-driven.
 pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static) {
+    start_dom_with(width, height, scale, false, root)
+}
+
+/// [`start_dom`] over a page the BUILD already painted: the runtime
+/// adopts the served elements as its retained truth, and the first
+/// frame says nothing — only the islands blit their first pixels.
+pub fn start_dom_hydrated(width: f64, height: f64, scale: f64, root: impl View + 'static) {
+    start_dom_with(width, height, scale, true, root)
+}
+
+fn start_dom_with(
+    width: f64,
+    height: f64,
+    scale: f64,
+    hydrate: bool,
+    root: impl View + 'static,
+) {
     let runtime = Runtime::new()
         .text_engine(Rc::new(CanvasTextEngine::new()))
         .image_engine(Rc::new(CanvasImageEngine::new()));
@@ -369,6 +397,11 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
     runtime.set_reduce_motion(true);
     let mut size = Size { width, height };
     let scale = (scale.round() as usize).max(1);
+    if hydrate {
+        // the page shipped painted: adopt it, and let the first frame
+        // agree in silence
+        runtime.dom_adopt(&root, size);
+    }
 
     // patches first, then any island whose pixels changed — the
     // element exists before its bitmap arrives
@@ -377,6 +410,7 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
             let bytes = bunny_ui::dom::encode(&patches);
             unsafe { js_apply_patches(bytes.as_ptr(), bytes.len()) };
         }
+        #[cfg(feature = "canvas")]
         for island in runtime.dom_islands(scale) {
             unsafe {
                 js_island(
@@ -387,6 +421,8 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
                 );
             }
         }
+        #[cfg(not(feature = "canvas"))]
+        let _ = scale;
     }
 
     let handle = Box::new(move |event: Event| {
@@ -404,12 +440,35 @@ pub fn start_dom(width: f64, height: f64, scale: f64, root: impl View + 'static)
                 present(&runtime, runtime.dom_frame(&root, size), scale);
             }
             Event::DomScroll { id, x, y } => {
-                // the browser moved the element; the engine mirrors the
-                // offset so windows re-materialize and reveals compose
-                if let Some(path) = runtime.dom_scroll_path(id) {
-                    runtime.set_scroll_offset(&path, bunny_ui::layout::Point { x, y });
+                // the browser moved: the offset folds into the engine
+                // AND the retained scene (the diff meets its own echo),
+                // and the region's window body re-runs
+                runtime.dom_scrolled(id, x, y);
+                present(&runtime, runtime.dom_frame(&root, size), scale);
+            }
+            Event::DomViewport { id, width, height } => {
+                // stored for the next window math — no frame of its own
+                runtime.set_dom_viewport(id, width, height);
+            }
+            Event::DomBox { id, width, height } => {
+                // a flexible island's real box — news re-measures the
+                // island against it; an echo costs nothing
+                if runtime.dom_island_box(id, width, height) {
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
+            }
+            Event::IslandPointer { id, kind, x, y } => {
+                // the canvas's own coordinates, routed to the app's
+                // box under the point — the pixels follow its answer
+                if runtime.dom_island_pointer(id, kind, x, y) {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
+            Event::Action { path, clicks } => {
+                // the browser resolved the press; the engine runs the
+                // handler and the frame follows
+                runtime.dom_action(&path, clicks);
+                present(&runtime, runtime.dom_frame(&root, size), scale);
             }
             Event::Field { path, value, caret } => {
                 if runtime.sync_field(&path, &value, caret) {
@@ -605,6 +664,45 @@ pub extern "C" fn bunny_image_ready(_key_hi: u32, _key_lo: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_wake() {
     dispatch(Event::Wake);
+}
+
+/// Dom mode: the browser resolved a click to the nearest interactive
+/// path — no coordinates cross the border in this mode.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_action(pointer: *mut u8, len: usize, clicks: u32) {
+    let path = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
+    // the browser counted the press for us: a `click` carries its own
+    // detail, so a double never needs a clock on this side
+    dispatch(Event::Action { path, clicks: clicks.max(1).min(255) as u8 });
+}
+
+/// Dom mode: a scroll box resized (the glue's ResizeObserver) — the
+/// window math reads the real box next frame.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_dom_viewport(id: u32, width: f64, height: f64) {
+    dispatch(Event::DomViewport { id, width, height });
+}
+
+/// Dom mode: a canvas island's resize observer fired — the box the
+/// browser really gave the element.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_dom_box(id: u32, width: f64, height: f64) {
+    dispatch(Event::DomBox { id, width, height });
+}
+
+/// Dom mode: a pointer event on a canvas island, in the canvas's own
+/// coordinates (`kind`: 0 down, 1 move, 2 up).
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_island_pointer(id: u32, kind: u32, x: f64, y: f64) {
+    dispatch(Event::IslandPointer { id, kind, x, y });
+}
+
+/// The wire contract this binary encodes. The glue reads it before it
+/// boots and refuses a stream it was not written for — see
+/// `bunny_ui::dom::ABI_VERSION` for the bump checklist.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_abi_version() -> u32 {
+    bunny_ui::dom::ABI_VERSION
 }
 
 /// Dom mode: the input edited. Both strings arrive through

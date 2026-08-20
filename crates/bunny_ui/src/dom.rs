@@ -45,7 +45,7 @@ pub enum DomKind {
     /// The mount point — id 0, never created or removed.
     Root,
     /// A component boundary: the diff matches it by identity path.
-    Group { path: String },
+    Group { path: std::rc::Rc<str> },
     /// A styled box (background, border, radius, shadow, interaction).
     Box,
     /// One run of text — the browser renders and selects it natively.
@@ -53,7 +53,14 @@ pub enum DomKind {
     /// A native `<input>` — the browser owns the editing.
     Field(DomField),
     /// A scroll viewport; `offset` is ours, the element mirrors it.
-    Scroll { path: Option<String>, offset: (Px, Px) },
+    Scroll {
+        path: Option<String>,
+        offset: (Px, Px),
+        /// The item id the region follows (`.scroll_target`/.reveal) —
+        /// the DIFF turns a CHANGE here into a Reveal (dense) or a
+        /// SetScroll at the row's slot (virtual).
+        target: Option<String>,
+    },
     /// The sized content inside a scroll — the extent the browser
     /// scrolls through (a virtual list sizes it to ALL rows).
     Content,
@@ -61,7 +68,13 @@ pub enum DomKind {
     /// element; the subtree's draw commands fill it. `origin` is the
     /// island's ABSOLUTE frame origin (the commands translate by it)
     /// and `display` the `[start, end)` range into the pass's list.
-    Canvas { origin: (Px, Px), display: (usize, usize) },
+    Canvas {
+        origin: (Px, Px),
+        display: (usize, usize),
+        /// The island's identity — a flexible island's real box comes
+        /// back from the browser keyed by it.
+        path: Option<std::rc::Rc<str>>,
+    },
     /// An `<img>` — the browser fetches, decodes and paints it. The
     /// record carries the IDENTITY; the shell's registry maps it to a
     /// URL the browser can load.
@@ -71,6 +84,30 @@ pub enum DomKind {
     /// and press flip through the box above with no patch of their
     /// own.
     Icon(DomIcon),
+    /// A flow container: `display:flex; flex-direction:column`. Two
+    /// variants instead of a payload so the keyed match's discriminant
+    /// tells the axes apart — an axis change recreates the element.
+    FlexColumn,
+    /// The row twin: `display:flex; flex-direction:row`.
+    FlexRow,
+    /// Layered children: `display:grid`, everyone in the same cell.
+    Layers,
+    /// A CLEAN boundary, by promise: no body under this path ran this
+    /// frame, so the retained subtree still holds — the diff keeps it
+    /// wholesale and never descends. Internal to the walk and the
+    /// diff; the wire never carries it.
+    Reuse { path: std::rc::Rc<str> },
+    /// A popover under the root (the portal). The glue positions it
+    /// from the anchor's real box — the identity is the overlay path.
+    Popover {
+        path: String,
+        /// The anchor's identity: a Group the walk wraps around the
+        /// anchored child (`{path}/#anchor`). The diff resolves it to
+        /// an element id and ships the relation as one patch.
+        anchor: String,
+        /// 0 top, 1 bottom, 2 leading, 3 trailing.
+        side: u8,
+    },
 }
 
 /// One image element. `key` is the source identity ([`crate::
@@ -123,7 +160,7 @@ pub struct DomStyle {
     pub shadow: Option<(Px, Color)>,
     /// The action path of the enclosing `Interactive` — the glue posts
     /// clicks back with it, and `:hover`/`:active` scope to it.
-    pub interactive: Option<String>,
+    pub interactive: Option<std::rc::Rc<str>>,
     /// `(response, damping)` of the enclosing animation scope — the
     /// glue lowers it to a CSS transition; the engine never ticks here.
     pub transition: Option<(f64, f64)>,
@@ -184,7 +221,7 @@ pub struct DomStyle {
 }
 
 impl DomStyle {
-    fn from_props(props: &VisualProps) -> DomStyle {
+    pub(crate) fn from_props(props: &VisualProps) -> DomStyle {
         DomStyle {
             background: props.background,
             gradient: props.gradient,
@@ -251,7 +288,7 @@ impl GlassFilter {
     /// The colour an element paints, once the tint is folded in: the
     /// tint sits under the box's own background, so the background wins
     /// where it is opaque and the tint shows through where it is not.
-    fn under(tint: Color, background: Option<Color>) -> Option<Color> {
+    pub(crate) fn under(tint: Color, background: Option<Color>) -> Option<Color> {
         let Some(background) = background else { return Some(tint) };
         let over = background.a as f64 / 255.0;
         let channel = |top: u8, under: u8| {
@@ -303,12 +340,19 @@ pub struct DomField {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DomNode {
     pub kind: DomKind,
-    /// Offset from the parent NODE's origin (logical px).
+    /// Offset from the parent NODE's origin (logical px). Owned by
+    /// the ABSOLUTE lowering; a flow node leaves all four at zero and
+    /// speaks through `layout`.
     pub x: Px,
     pub y: Px,
     pub width: Px,
     pub height: Px,
     pub style: DomStyle,
+    /// `Some` = this node lives in the FLOW: the browser lays it out
+    /// from these semantics and the geometry fields above stay silent.
+    pub layout: Option<DomLayout>,
+    /// Real-element hints (tag, class, id) — the Dom's alone.
+    pub hints: DomHints,
     pub children: Vec<DomNode>,
 }
 
@@ -325,7 +369,7 @@ pub(crate) struct DomCapture {
     /// Armed by an `Animated` scope; the next opened node takes it.
     pending_transition: Option<(f64, f64)>,
     /// Armed by an `Interactive`; the next opened box takes it.
-    pending_interactive: Option<String>,
+    pending_interactive: Option<std::rc::Rc<str>>,
     /// The ancestors that declared themselves hover groups.
     groups: Vec<u64>,
     /// How many overlay layers are open around here. What a layer
@@ -365,6 +409,8 @@ impl DomCapture {
                 background: Some(crate::theme::current().canvas),
                 ..DomStyle::default()
             },
+            layout: None,
+            hints: DomHints::default(),
             children: Vec::new(),
         };
         DomCapture {
@@ -393,6 +439,7 @@ impl DomCapture {
             self.swallowed += 1;
             return;
         }
+        crate::stats::note_capture_node();
         let parent_origin = self.stack.last().map(|(origin, _)| *origin).unwrap_or_default();
         let mut style = match &kind {
             DomKind::Box => DomStyle::default(),
@@ -413,6 +460,8 @@ impl DomCapture {
             width: frame.size.width,
             height: frame.size.height,
             style,
+            layout: None,
+            hints: DomHints::default(),
             children: Vec::new(),
         };
         // the node inherits the ink until a `Styled` says otherwise
@@ -510,7 +559,6 @@ impl DomCapture {
         parent.children.push(node);
     }
 
-    /// A childless element — open and close in one move.
     /// Arms a `.tooltip(…)` for the NEXT opened node — the placement
     /// calls it just before the wrapped child places.
     pub(crate) fn arm_tooltip(&mut self, text: Arc<str>) {
@@ -519,6 +567,7 @@ impl DomCapture {
         }
     }
 
+    /// A childless element — open and close in one move.
     pub(crate) fn leaf(&mut self, kind: DomKind, frame: Rect) {
         if self.island > 0 {
             return;
@@ -565,7 +614,7 @@ impl DomCapture {
     }
 
     pub(crate) fn arm_interactive(&mut self, path: &str) {
-        self.pending_interactive = Some(path.to_string());
+        self.pending_interactive = Some(std::rc::Rc::from(path));
     }
 
     /// Opens the box a hover group owns. It exists only in this mode
@@ -621,6 +670,7 @@ impl DomCapture {
             DomKind::Canvas {
                 origin: (frame.origin.x, frame.origin.y),
                 display: (start, start),
+                path: None,
             },
             frame,
             frame.origin,
@@ -648,6 +698,55 @@ impl DomCapture {
     }
 }
 
+// MARK: - The flow records
+
+/// The FLOW record: what a flow node tells the browser about layout —
+/// semantics, never coordinates. `None` on a node means the absolute
+/// lowering owns its geometry (today's whole scene; tomorrow only a
+/// `.layout(Exact)` interior). The wire twin of [`DomStyle`]: a full
+/// replace, one write per changed node.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DomLayout {
+    /// Gap between a flex container's children, px.
+    pub gap: Option<f64>,
+    /// Cross-axis alignment: 0 start, 1 center, 2 end, 3 baseline.
+    pub align: Option<u8>,
+    /// Padding `(top, right, bottom, left)`, px.
+    pub padding: Option<(f64, f64, f64, f64)>,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+    pub max_width: Option<f64>,
+    pub max_height: Option<f64>,
+    /// The flexible child: `flex:1 1 0` and a zeroed min-size.
+    pub grow: bool,
+    /// A virtual row's absolute offset inside its content box, px.
+    pub slot_y: Option<f64>,
+    /// The child follows its container's cross size — `align-self:
+    /// stretch`, and no pinned size on the stretched axis.
+    pub stretch: bool,
+    /// The child takes the container's OFFER and keeps its content
+    /// floor — `flex: 1 1 auto`. A wrapper's proposal semantics: the
+    /// interior fills a definite box, and an auto box still sizes to
+    /// the content instead of collapsing to a zero basis.
+    pub fill: bool,
+}
+
+/// Element hints only the Dom consumes — a real tag, a class, an id.
+/// Every other lowering ignores them, like `.rendering(Gpu)` on a
+/// pixel target. Empty on everything the engine makes by itself.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DomHints {
+    pub tag: Option<std::rc::Rc<str>>,
+    pub class: Option<std::rc::Rc<str>>,
+    pub dom_id: Option<std::rc::Rc<str>>,
+}
+
+impl DomHints {
+    pub fn is_empty(&self) -> bool {
+        self.tag.is_none() && self.class.is_none() && self.dom_id.is_none()
+    }
+}
+
 // MARK: - Patches
 
 /// The element kind a `Create` patch carries — what the glue
@@ -663,6 +762,10 @@ pub enum CreateKind {
     Canvas,
     Image,
     Icon,
+    FlexColumn,
+    FlexRow,
+    Layers,
+    Popover,
     /// A `<textarea>`: the field of many lines. A separate kind because
     /// the ELEMENT differs — a field that changes shape is recreated,
     /// which is the only way an input becomes a textarea.
@@ -683,9 +786,10 @@ pub struct IslandFrame {
 /// the Dom up to date.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DomPatch {
-    /// A new element under `parent`, appended (positions are absolute
-    /// within the parent, so sibling order only decides paint stacking).
-    Create { id: u32, parent: u32, kind: CreateKind },
+    /// A new element under `parent`, placed before sibling `before`
+    /// (0 = appended). Under the absolute lowering order only decides
+    /// paint stacking; under the flow it IS the layout.
+    Create { id: u32, parent: u32, before: u32, kind: CreateKind, hints: DomHints },
     /// Removes the element AND its subtree.
     Remove { id: u32 },
     SetTransform { id: u32, x: f64, y: f64 },
@@ -698,6 +802,24 @@ pub enum DomPatch {
     SetScroll { id: u32, x: f64, y: f64 },
     SetImage { id: u32, image: DomImage },
     SetIcon { id: u32, icon: DomIcon },
+    /// The FULL flow record — the glue resets and applies, the exact
+    /// twin of `SetStyle` for the other half of an element's truth.
+    SetLayout { id: u32, layout: DomLayout },
+    /// The element moves before sibling `before` (0 = to the end)
+    /// under `parent` — one `insertBefore`, identity intact. Emitted
+    /// for flow parents only: absolute children never need it.
+    Move { id: u32, parent: u32, before: u32 },
+    /// Scroll container `id` brings `target` into view — the browser
+    /// computes the offset (dense lists only; a virtual list's rows
+    /// may not exist, so its reveal stays an engine `SetScroll`).
+    Reveal { id: u32, target: u32 },
+    /// The popover's anchor relation: the glue positions `id` from
+    /// element `anchor`'s real box on `side`, repositioning while
+    /// either of them moves. `path` keys the dismissal doors.
+    SetAnchor { id: u32, anchor: u32, side: u8, path: String },
+    /// The element's LIVE hints changed — class and id re-attribute in
+    /// place (the tag never changes without a recreation).
+    SetHints { id: u32, class: Option<std::rc::Rc<str>>, dom_id: Option<std::rc::Rc<str>> },
 }
 
 // MARK: - Lowering (retained scene + diff)
@@ -727,6 +849,7 @@ struct LowerCtx<'a> {
     next_id: &'a mut u32,
     display: &'a [DrawCommand],
     islands: &'a mut HashMap<u32, Island>,
+    group_paths: &'a mut std::collections::HashSet<std::rc::Rc<str>>,
 }
 
 /// The retained side of the Dom mode: last frame's scene with ids.
@@ -738,6 +861,13 @@ pub struct DomLowering {
     root: Option<Retained>,
     next_id: u32,
     islands: HashMap<u32, Island>,
+    /// Anchor relations already shipped: popover element id → anchor
+    /// element id. A relation re-ships when the anchor recreates.
+    anchors_sent: HashMap<u32, u32>,
+    /// Every retained Group's identity path — the walk consults this
+    /// before promising a reuse (a promise the diff cannot keep would
+    /// mount a hole).
+    group_paths: std::collections::HashSet<std::rc::Rc<str>>,
 }
 
 impl DomLowering {
@@ -746,6 +876,14 @@ impl DomLowering {
     /// mounts everything. `display` is the SAME pass's draw list —
     /// canvas islands slice their command ranges out of it.
     pub fn lower(
+        &mut self,
+        scene: &DomNode,
+        display: &crate::layout::DisplayList,
+    ) -> Vec<DomPatch> {
+        crate::stats::time(crate::stats::Stage::Diff, || self.lower_timed(scene, display))
+    }
+
+    fn lower_timed(
         &mut self,
         scene: &DomNode,
         display: &crate::layout::DisplayList,
@@ -772,6 +910,7 @@ impl DomLowering {
                     next_id: &mut next_id,
                     display: display.as_slice(),
                     islands: &mut self.islands,
+                    group_paths: &mut self.group_paths,
                 };
                 root.children = create_children(scene, 0, &mut ctx, &mut patches);
                 self.next_id = next_id;
@@ -783,12 +922,130 @@ impl DomLowering {
                     next_id: &mut next_id,
                     display: display.as_slice(),
                     islands: &mut self.islands,
+                    group_paths: &mut self.group_paths,
                 };
                 diff_node(root, scene, &mut ctx, &mut patches);
                 self.next_id = next_id;
             }
         }
+        // popovers: resolve each portal's anchor to a real element and
+        // ship the relation when it changed — the walk only runs while
+        // a popover exists (or just left)
+        if !self.anchors_sent.is_empty()
+            || patches
+                .iter()
+                .any(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Popover, .. }))
+        {
+            let mut relations: Vec<(u32, u32, u8, String)> = Vec::new();
+            if let Some(root) = self.root.as_ref() {
+                fn group_id(node: &Retained, path: &str) -> Option<u32> {
+                    if let DomKind::Group { path: here } = &node.node.kind
+                        && **here == *path
+                    {
+                        return Some(node.id);
+                    }
+                    node.children.iter().find_map(|child| group_id(child, path))
+                }
+                fn collect(
+                    node: &Retained,
+                    root: &Retained,
+                    out: &mut Vec<(u32, u32, u8, String)>,
+                ) {
+                    if let DomKind::Popover { path, anchor, side } = &node.node.kind
+                        && let Some(anchor_id) = group_id(root, anchor)
+                    {
+                        out.push((node.id, anchor_id, *side, path.clone()));
+                    }
+                    for child in &node.children {
+                        collect(child, root, out);
+                    }
+                }
+                collect(root, root, &mut relations);
+            }
+            let live: std::collections::HashSet<u32> =
+                relations.iter().map(|(id, ..)| *id).collect();
+            self.anchors_sent.retain(|id, _| live.contains(id));
+            for (id, anchor, side, path) in relations {
+                if self.anchors_sent.get(&id) != Some(&anchor) {
+                    self.anchors_sent.insert(id, anchor);
+                    patches.push(DomPatch::SetAnchor { id, anchor, side, path });
+                }
+            }
+        }
         patches
+    }
+
+    /// The browser reported a scroll: fold the offset into the
+    /// retained scene so the NEXT diff sees its own echo and stays
+    /// silent — the browser already moved, patching it back would
+    /// fight the wheel.
+    pub(crate) fn note_scroll(&mut self, id: u32, x: Px, y: Px) {
+        fn walk(retained: &mut Retained, id: u32, x: Px, y: Px) -> bool {
+            if retained.id == id {
+                if let DomKind::Scroll { offset, .. } = &mut retained.node.kind {
+                    *offset = (x, y);
+                }
+                return true;
+            }
+            retained.children.iter_mut().any(|child| walk(child, id, x, y))
+        }
+        if let Some(root) = self.root.as_mut() {
+            walk(root, id, x, y);
+        }
+    }
+
+    /// Hydration: the served page already holds the mount, so the
+    /// lowering ADOPTS the scene as its retained truth — ids assigned
+    /// in the exact pre-order the mount stream used, groups and
+    /// islands registered, zero patches emitted. Islands stay dirty:
+    /// a built page ships their boxes empty, and the first blit after
+    /// boot fills them.
+    pub(crate) fn adopt(&mut self, scene: &DomNode, display: &crate::layout::DisplayList) {
+        fn adopt_node(node: &DomNode, ctx: &mut LowerCtx) -> Retained {
+            let id = *ctx.next_id;
+            *ctx.next_id += 1;
+            if let DomKind::Group { path } = &node.kind {
+                ctx.group_paths.insert(path.clone());
+            }
+            let mut retained = Retained {
+                id,
+                node: shallow(node),
+                children: Vec::new(),
+            };
+            if matches!(node.kind, DomKind::Canvas { .. }) {
+                note_island(id, node, ctx);
+            }
+            retained.children =
+                node.children.iter().map(|child| adopt_node(child, ctx)).collect();
+            retained
+        }
+        self.next_id = 1;
+        self.group_paths.clear();
+        self.islands.clear();
+        self.anchors_sent.clear();
+        let mut next_id = self.next_id;
+        let mut ctx = LowerCtx {
+            next_id: &mut next_id,
+            display: display.as_slice(),
+            islands: &mut self.islands,
+            group_paths: &mut self.group_paths,
+        };
+        let mut root = Retained { id: 0, node: shallow(scene), children: Vec::new() };
+        root.children = scene.children.iter().map(|child| adopt_node(child, &mut ctx)).collect();
+        self.next_id = next_id;
+        self.root = Some(root);
+    }
+
+    /// The retained Groups' identity paths — the flow walk consults
+    /// them before promising a reuse.
+    pub(crate) fn group_paths(&self) -> std::collections::HashSet<std::rc::Rc<str>> {
+        self.group_paths.clone()
+    }
+
+    /// Does the retained scene hold any canvas island? The runtime
+    /// skips display-list collection when none is alive.
+    pub(crate) fn has_islands(&self) -> bool {
+        !self.islands.is_empty()
     }
 
     /// The islands whose pixels no longer match, cleared of their flag.
@@ -803,6 +1060,22 @@ impl DomLowering {
                 (*id, island.width, island.height, island.commands.clone())
             })
             .collect()
+    }
+
+    /// The island path behind a canvas element id — the glue's
+    /// resize observer reports by id, the runtime keys the box by
+    /// the island's path.
+    pub fn island_path(&self, id: u32) -> Option<std::rc::Rc<str>> {
+        fn walk(retained: &Retained, id: u32) -> Option<std::rc::Rc<str>> {
+            if retained.id == id {
+                return match &retained.node.kind {
+                    DomKind::Canvas { path, .. } => path.clone(),
+                    _ => None,
+                };
+            }
+            retained.children.iter().find_map(|child| walk(child, id))
+        }
+        self.root.as_ref().and_then(|root| walk(root, id))
     }
 
     /// The scroll region path an element id belongs to — the glue's
@@ -844,13 +1117,21 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::Canvas { .. } => CreateKind::Canvas,
         DomKind::Image(_) => CreateKind::Image,
         DomKind::Icon(_) => CreateKind::Icon,
+        DomKind::FlexColumn => CreateKind::FlexColumn,
+        DomKind::FlexRow => CreateKind::FlexRow,
+        DomKind::Layers => CreateKind::Layers,
+        DomKind::Popover { .. } => CreateKind::Popover,
+        // a reuse only exists where a retained group matched; reaching
+        // creation means the promise broke — mount an empty anchor and
+        // let the next frame heal it
+        DomKind::Reuse { .. } => CreateKind::Group,
     }
 }
 
 /// The island's slice of the pass's display list, moved to island-
 /// local coordinates (the raster surface starts at zero).
 fn island_commands(node: &DomNode, ctx: &LowerCtx) -> Vec<DrawCommand> {
-    let DomKind::Canvas { origin, display } = &node.kind else {
+    let DomKind::Canvas { origin, display, .. } = &node.kind else {
         return Vec::new();
     };
     let slice = ctx
@@ -927,6 +1208,26 @@ fn note_island(id: u32, node: &DomNode, ctx: &mut LowerCtx) {
 
 /// Emits the patches that build `node` (already positioned) under
 /// `parent` and returns its retained mirror.
+/// [`create_subtree`] with a real position: the root lands `before`
+/// its next sibling (0 = append). The interior appends in order — a
+/// fresh subtree has nothing to dodge.
+fn create_subtree_before(
+    node: &DomNode,
+    parent: u32,
+    before: u32,
+    ctx: &mut LowerCtx,
+    patches: &mut Vec<DomPatch>,
+) -> Retained {
+    let opened = patches.len();
+    let created = create_subtree(node, parent, ctx, patches);
+    if before != 0
+        && let DomPatch::Create { before: slot, .. } = &mut patches[opened]
+    {
+        *slot = before;
+    }
+    created
+}
+
 fn create_subtree(
     node: &DomNode,
     parent: u32,
@@ -935,9 +1236,28 @@ fn create_subtree(
 ) -> Retained {
     let id = *ctx.next_id;
     *ctx.next_id += 1;
-    patches.push(DomPatch::Create { id, parent, kind: create_kind(&node.kind) });
-    patches.push(DomPatch::SetTransform { id, x: node.x, y: node.y });
-    patches.push(DomPatch::SetSize { id, width: node.width, height: node.height });
+    patches.push(DomPatch::Create {
+        id,
+        parent,
+        before: 0,
+        kind: create_kind(&node.kind),
+        hints: node.hints.clone(),
+    });
+    if let DomKind::Group { path } = &node.kind {
+        ctx.group_paths.insert(path.clone());
+    }
+    match &node.layout {
+        // a flow node speaks semantics; its geometry fields are silent
+        Some(layout) => {
+            if *layout != DomLayout::default() {
+                patches.push(DomPatch::SetLayout { id, layout: layout.clone() });
+            }
+        }
+        None => {
+            patches.push(DomPatch::SetTransform { id, x: node.x, y: node.y });
+            patches.push(DomPatch::SetSize { id, width: node.width, height: node.height });
+        }
+    }
     if node.style != DomStyle::default() {
         patches.push(DomPatch::SetStyle { id, style: node.style.clone() });
     }
@@ -989,6 +1309,18 @@ fn remove_subtree(retained: &Retained, ctx: &mut LowerCtx, patches: &mut Vec<Dom
         }
     }
     forget_islands(retained, ctx.islands);
+    fn forget_groups(
+        retained: &Retained,
+        groups: &mut std::collections::HashSet<std::rc::Rc<str>>,
+    ) {
+        if let DomKind::Group { path } = &retained.node.kind {
+            groups.remove(path);
+        }
+        for child in &retained.children {
+            forget_groups(child, groups);
+        }
+    }
+    forget_groups(retained, ctx.group_paths);
 }
 
 /// Diffs one matched pair: geometry, style, kind payload, children.
@@ -998,16 +1330,46 @@ fn diff_node(
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
+    // the promise, honored: the walk never descended, the diff never
+    // traverses — the retained subtree IS the frame's truth here
+    if let DomKind::Reuse { .. } = &new.kind {
+        crate::stats::note_diff_reuse();
+        return;
+    }
+    crate::stats::note_diff_visit();
     let id = retained.id;
     let old = &retained.node;
-    if (old.x, old.y) != (new.x, new.y) {
-        patches.push(DomPatch::SetTransform { id, x: new.x, y: new.y });
-    }
-    if (old.width, old.height) != (new.width, new.height) {
-        patches.push(DomPatch::SetSize { id, width: new.width, height: new.height });
+    match &new.layout {
+        // a flow node speaks semantics — its geometry fields are silent
+        Some(layout) => {
+            if old.layout.as_ref() != Some(layout) {
+                patches.push(DomPatch::SetLayout { id, layout: layout.clone() });
+            }
+        }
+        None => {
+            // an absolute node that WAS flow clears its record first
+            if old.layout.is_some() {
+                patches.push(DomPatch::SetLayout { id, layout: DomLayout::default() });
+            }
+            if (old.x, old.y) != (new.x, new.y) {
+                patches.push(DomPatch::SetTransform { id, x: new.x, y: new.y });
+            }
+            if (old.width, old.height) != (new.width, new.height) {
+                patches.push(DomPatch::SetSize { id, width: new.width, height: new.height });
+            }
+        }
     }
     if old.style != new.style {
         patches.push(DomPatch::SetStyle { id, style: new.style.clone() });
+    }
+    if old.hints != new.hints {
+        // class and id re-attribute live; a TAG change would need a
+        // recreation and the walk never changes one on a kept identity
+        patches.push(DomPatch::SetHints {
+            id,
+            class: new.hints.class.clone(),
+            dom_id: new.hints.dom_id.clone(),
+        });
     }
     match (&old.kind, &new.kind) {
         (DomKind::Text(before), DomKind::Text(after)) if before != after => {
@@ -1031,8 +1393,72 @@ fn diff_node(
         }
         _ => {}
     }
+    let previous_target = old_kind_for_reveal(retained);
     retained.node = shallow(new);
+    let followed = match (&previous_target, &new.kind) {
+        // the region follows an item: a CHANGED target reveals it —
+        // virtual rows by their slot (they may not exist yet), dense
+        // rows by the browser's own scrollIntoView
+        (
+            Some(before),
+            DomKind::Scroll { target: Some(after), .. },
+        ) if before.as_deref() != Some(after.as_str()) => Some(after.clone()),
+        (None, DomKind::Scroll { target: Some(after), .. }) => Some(after.clone()),
+        _ => None,
+    };
     diff_children(retained, new, ctx, patches);
+    if let Some(target) = followed {
+        reveal_target(retained, new, &target, patches);
+    }
+}
+
+/// The retained Scroll's PREVIOUS target (before `shallow` runs, the
+/// caller captures it) — `None` when the node is not a scroll region.
+fn old_kind_for_reveal(retained: &Retained) -> Option<Option<String>> {
+    match &retained.node.kind {
+        DomKind::Scroll { target, .. } => Some(target.clone()),
+        _ => None,
+    }
+}
+
+/// Emits the reveal for `target` under an already-diffed scroll node:
+/// a virtual row scrolls to its slot, a dense row asks the browser.
+fn reveal_target(
+    retained: &Retained,
+    new: &DomNode,
+    target: &str,
+    patches: &mut Vec<DomPatch>,
+) {
+    let suffix = format!("[{target}]");
+    // the scene knows the slot; the retention knows the element
+    let slot = new
+        .children
+        .first()
+        .into_iter()
+        .flat_map(|content| content.children.iter())
+        .find_map(|row| match &row.kind {
+            DomKind::Group { path } if path.ends_with(&suffix) => {
+                row.layout.as_ref().and_then(|layout| layout.slot_y)
+            }
+            _ => None,
+        });
+    match slot {
+        Some(y) => patches.push(DomPatch::SetScroll { id: retained.id, x: 0.0, y }),
+        None => {
+            let row_id = retained
+                .children
+                .first()
+                .into_iter()
+                .flat_map(|content| content.children.iter())
+                .find_map(|row| match &row.node.kind {
+                    DomKind::Group { path } if path.ends_with(&suffix) => Some(row.id),
+                    _ => None,
+                });
+            if let Some(row) = row_id {
+                patches.push(DomPatch::Reveal { id: retained.id, target: row });
+            }
+        }
+    }
 }
 
 /// Matches the children lists: groups by identity path (a slid window
@@ -1044,8 +1470,15 @@ fn diff_children(
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
+    // under a FLOW parent sibling order IS the layout, so the matching
+    // must also reconcile positions; under an absolute parent order
+    // only decides paint stacking and the old path stays byte-for-byte
+    if new.layout.is_some() {
+        diff_children_ordered(retained, new, ctx, patches);
+        return;
+    }
     let old_children = std::mem::take(&mut retained.children);
-    let mut by_path: HashMap<String, Retained> = HashMap::new();
+    let mut by_path: HashMap<std::rc::Rc<str>, Retained> = HashMap::new();
     let mut by_index: Vec<Option<Retained>> = Vec::with_capacity(old_children.len());
     for old in old_children {
         if let DomKind::Group { path } = &old.node.kind {
@@ -1059,7 +1492,7 @@ fn diff_children(
     let mut next: Vec<Retained> = Vec::with_capacity(new.children.len());
     for (index, child) in new.children.iter().enumerate() {
         let matched = match &child.kind {
-            DomKind::Group { path } => by_path.remove(path),
+            DomKind::Group { path } | DomKind::Reuse { path } => by_path.remove(path),
             // a kind change at the same index is remove+create — the
             // mismatched retained goes BACK to its slot so the leftover
             // sweep emits its remove (taking and filtering would drop
@@ -1096,7 +1529,183 @@ fn diff_children(
     retained.children = next;
 }
 
+/// The keyed, ORDERED reconciliation a flow parent needs. Groups match
+/// by identity path, everything else by old position and kind — and
+/// then position itself reconciles: fresh children are created back to
+/// front, each placed `before` its already-real next sibling (an
+/// insert costs zero moves), while surviving children off the longest
+/// increasing subsequence of their old order move with one `Move`
+/// each — a swap of two rows is exactly two patches.
+fn diff_children_ordered(
+    retained: &mut Retained,
+    new: &DomNode,
+    ctx: &mut LowerCtx,
+    patches: &mut Vec<DomPatch>,
+) {
+    // the ALIGNED fast path: same length, every child matching its
+    // old position (groups by path, the rest by kind) — the shape of
+    // almost every frame. One plain loop, zero allocation; the keyed
+    // machinery below only runs when something actually reordered,
+    // mounted or left.
+    let aligned = retained.children.len() == new.children.len()
+        && retained.children.iter().zip(&new.children).all(|(old, child)| {
+            match (&old.node.kind, &child.kind) {
+                (DomKind::Group { path: was }, DomKind::Group { path: now }) => was == now,
+                // a reuse promise aligns with the group it promised
+                (DomKind::Group { path: was }, DomKind::Reuse { path: now }) => was == now,
+                (old_kind, new_kind) => {
+                    std::mem::discriminant(old_kind) == std::mem::discriminant(new_kind)
+                }
+            }
+        });
+    if aligned {
+        for (old, child) in retained.children.iter_mut().zip(&new.children) {
+            diff_node(old, child, ctx, patches);
+        }
+        return;
+    }
+
+    enum Plan<'a> {
+        Survivor { old_position: usize, node: Retained },
+        Fresh(&'a DomNode),
+    }
+
+    let old_children = std::mem::take(&mut retained.children);
+    let mut by_path: HashMap<std::rc::Rc<str>, (usize, Retained)> = HashMap::new();
+    let mut by_index: Vec<Option<Retained>> = Vec::with_capacity(old_children.len());
+    for (position, old) in old_children.into_iter().enumerate() {
+        if let DomKind::Group { path } = &old.node.kind {
+            by_path.insert(path.clone(), (position, old));
+            by_index.push(None);
+        } else {
+            by_index.push(Some(old));
+        }
+    }
+
+    // match first — creation waits for the placement walk below
+    let mut plan: Vec<Plan> = Vec::with_capacity(new.children.len());
+    for (index, child) in new.children.iter().enumerate() {
+        let matched = match &child.kind {
+            DomKind::Group { path } | DomKind::Reuse { path } => by_path.remove(path),
+            kind => by_index.get_mut(index).and_then(|slot| match slot.take() {
+                Some(old)
+                    if std::mem::discriminant(&old.node.kind)
+                        == std::mem::discriminant(kind) =>
+                {
+                    Some((index, old))
+                }
+                Some(old) => {
+                    *slot = Some(old);
+                    None
+                }
+                None => None,
+            }),
+        };
+        match matched {
+            Some((old_position, mut old)) => {
+                diff_node(&mut old, child, ctx, patches);
+                plan.push(Plan::Survivor { old_position, node: old });
+            }
+            None => plan.push(Plan::Fresh(child)),
+        }
+    }
+
+    // removals go out before placements: an anchor is never a corpse
+    for (_, (_, leftover)) in by_path {
+        remove_subtree(&leftover, ctx, patches);
+    }
+    for leftover in by_index.into_iter().flatten() {
+        remove_subtree(&leftover, ctx, patches);
+    }
+
+    // the stable spine: survivors whose old order already reads in
+    // increasing sequence stay put; everything else moves or mounts
+    let survivor_positions: Vec<(usize, usize)> = plan
+        .iter()
+        .enumerate()
+        .filter_map(|(at, entry)| match entry {
+            Plan::Survivor { old_position, .. } => Some((at, *old_position)),
+            Plan::Fresh(_) => None,
+        })
+        .collect();
+    let stable: std::collections::HashSet<usize> =
+        longest_increasing(&survivor_positions).into_iter().collect();
+
+    // back to front: the anchor below is always already real
+    let parent = retained.id;
+    let mut anchor = 0u32;
+    let mut next: Vec<Option<Retained>> = plan
+        .iter()
+        .map(|_| None)
+        .collect();
+    for at in (0..plan.len()).rev() {
+        match plan.pop().expect("walking the plan") {
+            Plan::Survivor { node, .. } => {
+                if !stable.contains(&at) {
+                    patches.push(DomPatch::Move { id: node.id, parent, before: anchor });
+                }
+                anchor = node.id;
+                next[at] = Some(node);
+            }
+            Plan::Fresh(child) => {
+                let created = create_subtree_before(child, parent, anchor, ctx, patches);
+                anchor = created.id;
+                next[at] = Some(created);
+            }
+        }
+    }
+    retained.children = next.into_iter().map(|slot| slot.expect("planned")).collect();
+}
+
+/// The `at` indices of the longest increasing run of `old_position`s —
+/// the survivors that need no move. O(n log n), std only.
+fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
+    let mut tails: Vec<usize> = Vec::new(); // indices into `pairs`
+    let mut parents: Vec<Option<usize>> = vec![None; pairs.len()];
+    for (index, &(_, old_position)) in pairs.iter().enumerate() {
+        let place = tails
+            .partition_point(|&tail| pairs[tail].1 < old_position);
+        if place > 0 {
+            parents[index] = Some(tails[place - 1]);
+        }
+        if place == tails.len() {
+            tails.push(index);
+        } else {
+            tails[place] = index;
+        }
+    }
+    let mut run = Vec::with_capacity(tails.len());
+    let mut cursor = tails.last().copied();
+    while let Some(index) = cursor {
+        run.push(pairs[index].0);
+        cursor = parents[index];
+    }
+    run.reverse();
+    run
+}
+
 // MARK: - The wire encoding
+
+/// The version of the wire contract between [`encode`] and the glue.
+///
+/// The glue is a hand-written mirror of this module, and the two bind
+/// once, at page load. So the gate lives at boot: the shell exports
+/// this number, the glue compares it with the number it was written
+/// for, and refuses to start on a mismatch. A stale pairing dies with
+/// one clear sentence — never with a `RangeError` half-way down a
+/// stream it cannot read.
+///
+/// Bump this constant when ANY of these change:
+/// - the op codes or their payloads (the table on [`encode`])
+/// - the create kinds (0 group .. 13 editor)
+/// - the style mask bits or their field order
+/// - the weight or truncation codes
+/// - the key table or the modifier bits (the shell's `named_key`)
+/// - the field padding the glue mirrors (`FIELD_PAD_V`/`FIELD_PAD_H`)
+///
+/// A test pins the glue to this number: bump one side alone and the
+/// suite goes red before the browser ever gets the chance to.
+pub const ABI_VERSION: u32 = 4;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -1104,11 +1713,13 @@ fn diff_children(
 /// ```text
 /// u32 count
 /// per patch: u8 op, u32 id, payload
-///   1 create        u32 parent, u8 kind (0 group, 1 box, 2 text,
-///                                        3 field, 4 scroll, 5 content,
-///                                        6 canvas, 7 image, 8 icon,
-///                                        9 editor — the field of many
-///                                        lines, a `<textarea>`)
+///   1 create        u32 parent, u32 before (0 = append), three hint
+///                   strings (u8 len + utf8 each: tag, class, id),
+///                   u8 kind (0 group, 1 box, 2 text, 3 field,
+///                            4 scroll, 5 content, 6 canvas, 7 image,
+///                            8 icon, 9 flex column, 10 flex row,
+///                            11 layers, 12 popover, 13 editor — the
+///                            field of many lines, a `<textarea>`)
 ///   2 remove        —
 ///   3 set transform f32 x, f32 y
 ///   4 set size      f32 w, f32 h
@@ -1189,16 +1800,45 @@ fn diff_children(
 ///                   rides the geometry: the `<svg>` draws with
 ///                   `currentColor`, so hover and press flip through
 ///                   the box above with no patch of their own
+///  11 set layout    u16 mask, fields in bit order:
+///                   0 gap f32,  1 align u8 (0 start, 1 center,
+///                   2 end, 3 baseline),  2 padding f32 x4 (t r b l),
+///                   3 width f32,  4 height f32,  5 max width f32,
+///                   6 max height f32,  7 grow (flag, no payload),
+///                   8 slot y f32 (a virtual row's offset),
+///                   9 stretch (flag, no payload),
+///                   10 fill (flag, no payload)
+///  12 move          u32 parent, u32 before (0 = to the end)
+///  13 reveal        u32 target — the container scrolls it into view
+///  14 set anchor    u32 anchor element, u8 side (0 top, 1 bottom,
+///                   2 leading, 3 trailing), u16 len + utf8 path —
+///                   the browser positions the card from the anchor's
+///                   real box, and the path keys the dismissal doors
+///  15 set hints     two hint strings (u8 len + utf8 each: class, id)
+///                   — the LIVE half of the hints, re-attributed in
+///                   place. The tag never changes without a recreation
 /// ```
 pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
+    crate::stats::time(crate::stats::Stage::Encode, || {
+        let out = encode_unclocked(patches);
+        crate::stats::note_encode(patches.len(), out.len());
+        out
+    })
+}
+
+fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
     let mut out = Vec::with_capacity(patches.len() * 16 + 4);
     push_u32(&mut out, patches.len() as u32);
     for patch in patches {
         match patch {
-            DomPatch::Create { id, parent, kind } => {
+            DomPatch::Create { id, parent, before, kind, hints } => {
                 out.push(1);
                 push_u32(&mut out, *id);
                 push_u32(&mut out, *parent);
+                push_u32(&mut out, *before);
+                push_hint(&mut out, hints.tag.as_deref());
+                push_hint(&mut out, hints.class.as_deref());
+                push_hint(&mut out, hints.dom_id.as_deref());
                 out.push(match kind {
                     CreateKind::Group => 0,
                     CreateKind::Box => 1,
@@ -1209,7 +1849,11 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
                     CreateKind::Canvas => 6,
                     CreateKind::Image => 7,
                     CreateKind::Icon => 8,
-                    CreateKind::Editor => 9,
+                    CreateKind::FlexColumn => 9,
+                    CreateKind::FlexRow => 10,
+                    CreateKind::Layers => 11,
+                    CreateKind::Popover => 12,
+                    CreateKind::Editor => 13,
                 });
             }
             DomPatch::Remove { id } => {
@@ -1318,6 +1962,96 @@ pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
                     }
                     push_bytes_u32(&mut out, crate::icon::to_svg_path(draw.path).as_bytes());
                 }
+            }
+            DomPatch::SetLayout { id, layout } => {
+                out.push(11);
+                push_u32(&mut out, *id);
+                let mut mask = 0u16;
+                if layout.gap.is_some() {
+                    mask |= 1;
+                }
+                if layout.align.is_some() {
+                    mask |= 1 << 1;
+                }
+                if layout.padding.is_some() {
+                    mask |= 1 << 2;
+                }
+                if layout.width.is_some() {
+                    mask |= 1 << 3;
+                }
+                if layout.height.is_some() {
+                    mask |= 1 << 4;
+                }
+                if layout.max_width.is_some() {
+                    mask |= 1 << 5;
+                }
+                if layout.max_height.is_some() {
+                    mask |= 1 << 6;
+                }
+                if layout.grow {
+                    mask |= 1 << 7;
+                }
+                if layout.slot_y.is_some() {
+                    mask |= 1 << 8;
+                }
+                if layout.stretch {
+                    mask |= 1 << 9;
+                }
+                if layout.fill {
+                    mask |= 1 << 10;
+                }
+                push_u16(&mut out, mask);
+                if let Some(gap) = layout.gap {
+                    push_f32(&mut out, gap);
+                }
+                if let Some(align) = layout.align {
+                    out.push(align);
+                }
+                if let Some((top, right, bottom, left)) = layout.padding {
+                    push_f32(&mut out, top);
+                    push_f32(&mut out, right);
+                    push_f32(&mut out, bottom);
+                    push_f32(&mut out, left);
+                }
+                if let Some(width) = layout.width {
+                    push_f32(&mut out, width);
+                }
+                if let Some(height) = layout.height {
+                    push_f32(&mut out, height);
+                }
+                if let Some(max_width) = layout.max_width {
+                    push_f32(&mut out, max_width);
+                }
+                if let Some(max_height) = layout.max_height {
+                    push_f32(&mut out, max_height);
+                }
+                if let Some(slot_y) = layout.slot_y {
+                    push_f32(&mut out, slot_y);
+                }
+            }
+            DomPatch::Move { id, parent, before } => {
+                out.push(12);
+                push_u32(&mut out, *id);
+                push_u32(&mut out, *parent);
+                push_u32(&mut out, *before);
+            }
+            DomPatch::Reveal { id, target } => {
+                out.push(13);
+                push_u32(&mut out, *id);
+                push_u32(&mut out, *target);
+            }
+            DomPatch::SetAnchor { id, anchor, side, path } => {
+                out.push(14);
+                push_u32(&mut out, *id);
+                push_u32(&mut out, *anchor);
+                out.push(*side);
+                push_bytes_u16(&mut out, path.as_bytes());
+            }
+            DomPatch::SetHints { id, class, dom_id } => {
+                out.push(15);
+                push_u32(&mut out, *id);
+                push_hint(&mut out, class.as_deref());
+                push_hint(&mut out, dom_id.as_deref());
             }
         }
     }
@@ -1526,6 +2260,20 @@ fn push_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+/// One hint string: `u8` length + utf8 (0 = none). Hints are short by
+/// construction — a tag or a class list, never content.
+fn push_hint(out: &mut Vec<u8>, hint: Option<&str>) {
+    match hint {
+        Some(value) => {
+            let bytes = value.as_bytes();
+            let len = bytes.len().min(u8::MAX as usize);
+            out.push(len as u8);
+            out.extend_from_slice(&bytes[..len]);
+        }
+        None => out.push(0),
+    }
+}
+
 fn push_f32(out: &mut Vec<u8>, value: f64) {
     out.extend_from_slice(&(value as f32).to_le_bytes());
 }
@@ -1568,7 +2316,12 @@ mod tests {
             | DomPatch::SetField { id, .. }
             | DomPatch::SetImage { id, .. }
             | DomPatch::SetIcon { id, .. }
-            | DomPatch::SetScroll { id, .. } => *id,
+            | DomPatch::SetScroll { id, .. }
+            | DomPatch::SetLayout { id, .. }
+            | DomPatch::Move { id, .. }
+            | DomPatch::Reveal { id, .. }
+            | DomPatch::SetAnchor { id, .. }
+            | DomPatch::SetHints { id, .. } => *id,
         }
     }
 
@@ -1620,7 +2373,7 @@ mod tests {
         let creates: Vec<_> = patches
             .iter()
             .filter_map(|patch| match patch {
-                DomPatch::Create { id, parent, kind } => Some((*id, *parent, *kind)),
+                DomPatch::Create { id, parent, kind, .. } => Some((*id, *parent, *kind)),
                 _ => None,
             })
             .collect();
@@ -1740,25 +2493,38 @@ mod tests {
         view.gap.set(12.0);
         let patches = runtime.dom_frame(&view, size);
 
+        // under the flow the browser reflows: the padded node re-
+        // records its ONE layout, and the component beside it hears
+        // NOTHING — not even a transform
         let on_inner: Vec<_> =
             patches.iter().filter(|patch| patch_id(patch) >= inner_group).collect();
-        assert_eq!(on_inner.len(), 1, "the moved component: {patches:?}");
-        assert!(
-            matches!(on_inner[0], DomPatch::SetTransform { id, .. } if *id == inner_group),
-            "one transform on the boundary, interior byte-identical: {patches:?}"
-        );
+        assert!(on_inner.is_empty(), "the sibling never hears a padding: {patches:?}");
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        assert!(matches!(
+            &patches[0],
+            DomPatch::SetLayout { layout, .. } if layout.padding == Some((12.0, 12.0, 12.0, 12.0))
+        ));
     }
 
+    /// The browser owns the wheel in this mode: a scroll it reported
+    /// folds into the retained scene BEFORE the next diff, so the
+    /// frame meets its own echo and says nothing back.
     #[test]
-    fn a_wheel_is_one_scroll_patch() {
+    fn a_browser_scroll_echoes_to_silence() {
         let (runtime, view, size) = mini();
         view.count.set(30);
-        let _ = runtime.dom_frame(&view, size);
+        let mount = runtime.dom_frame(&view, size);
+        let scroll_id = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Scroll, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("a scroll region mounted");
 
-        assert!(runtime.wheel(100.0, 80.0, 0.0, -40.0), "the region moved");
+        runtime.dom_scrolled(scroll_id, 0.0, 40.0);
         let patches = runtime.dom_frame(&view, size);
-        assert_eq!(patches.len(), 1, "content never moves — the offset does: {patches:?}");
-        assert!(matches!(patches[0], DomPatch::SetScroll { .. }));
+        assert!(patches.is_empty(), "the echo stays silent: {patches:?}");
     }
 
     #[test]
@@ -1768,17 +2534,27 @@ mod tests {
 
         impl Component for Big {
             fn body(self, _ctx: &Context) -> impl View {
+                // the flow's one requirement: the app DECLARES the row
+                // extent (the browser owns layout; nothing measures)
                 virtual_list(10_000, |row| format!("row{row}"), |row| {
                     text(format!("item {row}"))
                 })
+                .row_height(20.0)
             }
         }
 
         let runtime = Runtime::new();
         let size = Size { width: 200.0, height: 150.0 };
-        let _ = runtime.dom_frame(&Big, size);
+        let mount = runtime.dom_frame(&Big, size);
+        let scroll_id = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Scroll, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the region mounted");
 
-        assert!(runtime.wheel(100.0, 80.0, 0.0, -50_000.0));
+        runtime.dom_scrolled(scroll_id, 0.0, 50_000.0);
         let patches = runtime.dom_frame(&Big, size);
 
         let created: Vec<u32> = patches
@@ -1795,10 +2571,16 @@ mod tests {
         // a slid window never drags an existing element around (the only
         // transforms dress the freshly created ones)
         let moved_survivor = patches.iter().any(|patch| {
-            matches!(patch, DomPatch::SetTransform { id, .. } if !created.contains(id))
+            matches!(patch, DomPatch::SetTransform { id, .. } | DomPatch::Move { id, .. }
+                if !created.contains(id))
         });
         assert!(!moved_survivor, "nothing moves in content coordinates: {patches:?}");
-        assert!(patches.iter().any(|p| matches!(p, DomPatch::SetScroll { .. })));
+        // the offset was the BROWSER's news — echoing it back would
+        // fight the wheel
+        assert!(
+            !patches.iter().any(|p| matches!(p, DomPatch::SetScroll { .. })),
+            "the reported offset never echoes: {patches:?}"
+        );
     }
 
     #[test]
@@ -1876,17 +2658,21 @@ mod tests {
         assert_eq!(kind_of(&Note { text: State::new(String::new()) }, size), CreateKind::Editor);
         assert_eq!(kind_of(&Name { text: State::new(String::new()) }, size), CreateKind::Field);
 
-        // the wire says 9, beside the eight that came before it
-        let runtime = Runtime::new();
-        let view = Note { text: State::new(String::new()) };
-        let bytes = encode(&runtime.dom_frame(&view, size));
-        let creates: Vec<u8> = bytes
-            .windows(2)
-            .filter(|pair| pair[0] == 1)
-            .map(|pair| pair[1])
-            .collect();
-        assert!(!creates.is_empty(), "the stream carries at least one create");
-        assert!(bytes.contains(&9), "the editor kind rides the stream: {creates:?}");
+        // the wire says 13, behind the flow vocabulary that took 9 —
+        // the kind is the LAST byte of a create, after the parent, the
+        // sibling it lands before, and the three hints
+        let wire = encode(&[DomPatch::Create {
+            id: 1,
+            parent: 0,
+            before: 0,
+            kind: CreateKind::Editor,
+            hints: DomHints::default(),
+        }]);
+        assert_eq!(
+            *wire.last().expect("a create on the wire"),
+            13,
+            "the editor kind rides the stream: {wire:?}"
+        );
     }
 
     #[test]
@@ -1993,6 +2779,7 @@ mod tests {
         assert_eq!(runtime.dom_frame(&CloseGlyph, size), vec![], "hover is the browser's");
     }
 
+    #[cfg(feature = "canvas")]
     #[test]
     fn an_island_mounts_as_one_canvas_and_redraws_only_on_change() {
         #[derive(Clone)]
@@ -2033,6 +2820,11 @@ mod tests {
 
         let islands = runtime.dom_islands(1);
         assert_eq!(islands.len(), 1);
+        assert_eq!(
+            (islands[0].width, islands[0].height),
+            (20, 10),
+            "the pixels match the island's box"
+        );
         assert!(
             islands[0].rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
             "the island has ink"
@@ -2054,16 +2846,362 @@ mod tests {
         assert_eq!(runtime.dom_islands(1).len(), 1, "fresh pixels follow the state");
     }
 
+    /// A FLEXIBLE island guesses at mount, then the browser reports
+    /// the box it really gave the element — the island re-measures
+    /// against that box and the pixels agree with the element. The
+    /// observer's echo of what the engine already said buys nothing.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn a_flexible_island_takes_the_browsers_box() {
+        #[derive(Clone)]
+        struct WithFlexIsland;
+
+        impl Component for WithFlexIsland {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("above the island"),
+                    spacer()
+                        .background_color(Color::hex(0x3B82F6))
+                        .rendering(Rendering::Gpu)
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 120.0, height: 80.0 };
+        let mount = runtime.dom_frame(&WithFlexIsland, size);
+        let canvas_id = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Canvas, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the island mounted");
+        let _ = runtime.dom_islands(1);
+
+        // the browser gave the flexible element ITS box
+        assert!(
+            runtime.dom_island_box(canvas_id, 300.0, 40.0),
+            "a fresh box is news"
+        );
+        let patches = runtime.dom_frame(&WithFlexIsland, size);
+        assert!(
+            patches
+                .iter()
+                .all(|patch| !matches!(patch, DomPatch::Create { .. } | DomPatch::Remove { .. })),
+            "the element already belongs to the browser — only pixels move: {patches:?}"
+        );
+        let islands = runtime.dom_islands(1);
+        assert_eq!(islands.len(), 1, "fresh pixels at the reported size");
+        assert_eq!((islands[0].width, islands[0].height), (300, 40));
+
+        // the observer echoes what the engine now says — no frame
+        assert!(
+            !runtime.dom_island_box(canvas_id, 300.0, 40.0),
+            "an echo is not news"
+        );
+    }
+
+    /// The Scratch pattern: a custom element whose measure EATS the
+    /// width proposal. The island discovers that axis by probing two
+    /// proposals, leaves it to the browser (`align-self: stretch`, no
+    /// pinned width), and re-measures against the box the observer
+    /// reports — the pixels and the element converge in one round.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn a_hungry_island_stretches_and_takes_the_reported_box() {
+        struct EatsWidth;
+
+        impl crate::custom::CustomElement for EatsWidth {
+            fn name(&self) -> &str {
+                "eats-width"
+            }
+            fn measure(
+                &self,
+                proposal: crate::layout::Proposal,
+                _metrics: &crate::custom::Metrics,
+            ) -> Size {
+                Size { width: proposal.width.unwrap_or(24.0), height: 30.0 }
+            }
+            fn paint(&self, ctx: &crate::custom::PaintCtx, painter: &mut crate::custom::Painter) {
+                painter.fill(ctx.bounds(), Color::hex(0x3B82F6));
+            }
+        }
+
+        #[derive(Clone)]
+        struct WithHungryIsland;
+
+        impl Component for WithHungryIsland {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(text("above"), crate::custom::custom(EatsWidth))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 240.0, height: 120.0 };
+        let mount = runtime.dom_frame(&WithHungryIsland, size);
+        let canvas_id = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Canvas, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the island mounted");
+        let stretched = mount.iter().any(|patch| {
+            matches!(
+                patch,
+                DomPatch::SetLayout { id, layout }
+                    if *id == canvas_id
+                        && layout.stretch
+                        && layout.width.is_none()
+                        && layout.height == Some(30.0)
+            )
+        });
+        assert!(stretched, "width is the browser's, height is pinned: {mount:?}");
+        let _ = runtime.dom_islands(1);
+
+        // the browser stretched the element and the observer reported
+        assert!(runtime.dom_island_box(canvas_id, 500.0, 30.0));
+        let _ = runtime.dom_frame(&WithHungryIsland, size);
+        let islands = runtime.dom_islands(1);
+        assert_eq!(islands.len(), 1);
+        assert_eq!((islands[0].width, islands[0].height), (500, 30));
+    }
+
+    /// The window's box FLOWS DOWN: the mount point is a one-slot
+    /// column, and a vertically flexible app takes the offer through
+    /// every wrapper on the way (`fill`, `flex: 1 1 auto`) — the
+    /// finder's padded panel reaches the bottom of the window, like
+    /// the engine that proposes its box has always guaranteed.
+    #[test]
+    fn the_windows_box_flows_down_to_a_padded_panel() {
+        #[derive(Clone)]
+        struct Paned;
+
+        impl Component for Paned {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("toolbar"),
+                    virtual_list(100, |row| format!("r{row}"), |row| {
+                        text(format!("row {row}"))
+                    })
+                )
+                .padding_length(28.0)
+                .background_color(Color::hex(0x10141B))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&Paned, Size { width: 400.0, height: 300.0 });
+        // the first element under the root carries the offer
+        let first = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, parent: 0, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the app mounted");
+        let takes = |wanted: u32| {
+            mount.iter().any(|patch| {
+                matches!(
+                    patch,
+                    DomPatch::SetLayout { id, layout } if *id == wanted && layout.fill
+                )
+            })
+        };
+        assert!(takes(first), "the root child takes the window: {mount:?}");
+    }
+
+    /// The finder's exact shape, kept honest: a width-hungry custom
+    /// under padding wrappers, between a toolbar and a virtual list.
+    /// The browser's report must reach it through the whole chain.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn a_report_reaches_an_island_behind_wrappers() {
+        struct EatsRow;
+
+        impl crate::custom::CustomElement for EatsRow {
+            fn name(&self) -> &str {
+                "eats-row"
+            }
+            fn flexible(&self) -> bool {
+                false
+            }
+            fn measure(
+                &self,
+                proposal: crate::layout::Proposal,
+                _metrics: &crate::custom::Metrics,
+            ) -> Size {
+                Size { width: proposal.width.unwrap_or(0.0), height: 46.0 }
+            }
+            fn paint(&self, ctx: &crate::custom::PaintCtx, painter: &mut crate::custom::Painter) {
+                painter.fill(ctx.bounds(), Color::hex(0x3B82F6));
+            }
+        }
+
+        #[derive(Clone)]
+        struct Pane;
+
+        impl Component for Pane {
+            fn body(self, _ctx: &Context) -> impl View {
+                use motor::views::Edge;
+                crate::vstack!(crate::vstack!(
+                    crate::hstack!(text("toolbar")),
+                    crate::custom::custom(EatsRow)
+                        .padding_edge(Edge::Leading, 10.0)
+                        .padding_edge(Edge::Trailing, 10.0)
+                        .padding_edge(Edge::Bottom, 8.0),
+                    virtual_list(1_000, |row| format!("r{row}"), |row| {
+                        text(format!("row {row}"))
+                    })
+                ))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 760.0, height: 640.0 };
+        let mount = runtime.dom_frame(&Pane, size);
+        let canvas_id = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Canvas, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the island mounted");
+        let _ = runtime.dom_islands(1);
+
+        assert!(
+            runtime.dom_island_box(canvas_id, 682.0, 46.0),
+            "the report is news"
+        );
+        let _ = runtime.dom_frame(&Pane, size);
+        let islands = runtime.dom_islands(1);
+        assert_eq!(islands.len(), 1, "the report re-rastered the island");
+        assert_eq!((islands[0].width, islands[0].height), (682, 46));
+    }
+
+    /// The Scratch demo's whole life under flow: a click on the
+    /// canvas reaches the app's box in the box's OWN coordinates,
+    /// the release hands it the keyboard, and typing lands as text —
+    /// the same doors the desktop and the canvas mode use.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn a_click_on_an_island_reaches_the_apps_box() {
+        #[derive(Clone)]
+        struct Pad {
+            mark: State<f64>,
+            note: State<std::sync::Arc<str>>,
+        }
+
+        impl crate::custom::CustomElement for Pad {
+            fn name(&self) -> &str {
+                "pad"
+            }
+            fn flexible(&self) -> bool {
+                false
+            }
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn measure(
+                &self,
+                proposal: crate::layout::Proposal,
+                _metrics: &crate::custom::Metrics,
+            ) -> Size {
+                Size { width: proposal.width.unwrap_or(200.0), height: 40.0 }
+            }
+            fn paint(&self, ctx: &crate::custom::PaintCtx, painter: &mut crate::custom::Painter) {
+                painter.fill(ctx.bounds(), Color::hex(0x3B82F6));
+                painter.fill(
+                    Rect {
+                        origin: Point { x: self.mark.get(), y: 0.0 },
+                        size: Size { width: 2.0, height: 4.0 },
+                    },
+                    Color::hex(0xFFFFFF),
+                );
+            }
+            fn event(
+                &self,
+                event: &crate::custom::ElementEvent,
+                _ctx: &crate::custom::EventCtx,
+            ) -> crate::custom::Response {
+                match event {
+                    crate::custom::ElementEvent::PointerDown { at, .. } => {
+                        self.mark.set(at.x);
+                        crate::custom::Response::handled()
+                    }
+                    crate::custom::ElementEvent::Text(text) => {
+                        self.note
+                            .set(std::sync::Arc::from(format!("{}{text}", self.note.get())));
+                        crate::custom::Response::handled()
+                    }
+                    _ => crate::custom::Response::ignored(),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct WithPad {
+            mark: State<f64>,
+            note: State<std::sync::Arc<str>>,
+        }
+
+        impl Component for WithPad {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("above"),
+                    crate::custom::custom(Pad { mark: self.mark, note: self.note })
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 400.0, height: 200.0 };
+        let view = WithPad {
+            mark: State::new(0.0),
+            note: State::new(std::sync::Arc::from("")),
+        };
+        let mount = runtime.dom_frame(&view, size);
+        let canvas_id = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Canvas, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the island mounted");
+        let _ = runtime.dom_islands(1);
+
+        // the press lands in the box's own coordinates
+        assert!(runtime.dom_island_pointer(canvas_id, 0, 25.0, 10.0));
+        assert_eq!(view.mark.get(), 25.0, "the box heard the press where it happened");
+        assert!(runtime.dom_island_pointer(canvas_id, 2, 25.0, 10.0));
+
+        // the release handed it the keyboard: typing reaches the box
+        let answer = runtime.key(EditCommand::Insert("hi".into()));
+        assert!(answer.applied, "the focused box types");
+        assert_eq!(view.note.get().as_ref(), "hi");
+
+        // and the pixels follow the state
+        let _ = runtime.dom_frame(&view, size);
+        assert_eq!(runtime.dom_islands(1).len(), 1, "fresh pixels follow the press");
+    }
+
     #[test]
     fn the_encoding_is_byte_stable() {
         let patches = vec![
-            DomPatch::Create { id: 7, parent: 0, kind: CreateKind::Box },
+            DomPatch::Create {
+                id: 7,
+                parent: 0,
+                before: 0,
+                kind: CreateKind::Box,
+                hints: DomHints::default(),
+            },
             DomPatch::SetTransform { id: 7, x: 10.0, y: 20.0 },
             DomPatch::SetStyle {
                 id: 7,
                 style: DomStyle {
                     background: Some(Color::hex(0x112233)),
-                    interactive: Some("go".to_string()),
+                    interactive: Some(std::rc::Rc::from("go")),
                     ..DomStyle::default()
                 },
             },
@@ -2075,6 +3213,8 @@ mod tests {
             &[1],
             &7u32.to_le_bytes()[..],
             &0u32.to_le_bytes()[..],
+            &0u32.to_le_bytes()[..],
+            &[0, 0, 0],
             &[1],
             &[3],
             &7u32.to_le_bytes()[..],
@@ -2167,8 +3307,13 @@ mod tests {
         assert!(!patches.is_empty());
         for patch in &patches {
             assert!(
-                matches!(patch, DomPatch::SetSize { .. } | DomPatch::SetTransform { .. }),
-                "a resize is geometry only: {patch:?}"
+                matches!(
+                    patch,
+                    DomPatch::SetSize { .. }
+                        | DomPatch::SetTransform { .. }
+                        | DomPatch::SetLayout { .. }
+                ),
+                "a resize is geometry records only — the image never re-travels: {patch:?}"
             );
         }
     }
@@ -2188,6 +3333,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "canvas")]
     #[test]
     fn a_kind_swap_recreates_the_element() {
         let runtime = Runtime::new();
@@ -2204,21 +3350,30 @@ mod tests {
 
         view.image_on.set(false);
         let patches = runtime.dom_frame(&view, size);
+        // the swapped subtree leaves whole (one remove on its root
+        // covers the image inside) and the replacement mounts fresh —
+        // nothing ever mutates the old element in place
         assert!(
-            patches.iter().any(|patch| matches!(
-                patch,
-                DomPatch::Remove { id } if *id == image_id
-            )),
-            "a kind change never mutates in place: {patches:?}"
+            patches.iter().any(|patch| matches!(patch, DomPatch::Remove { .. })),
+            "the old subtree leaves: {patches:?}"
         );
         assert!(patches
             .iter()
             .any(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Box, .. })));
+        assert!(
+            !patches.iter().any(|patch| matches!(
+                patch,
+                DomPatch::SetImage { id, .. } if *id == image_id
+            )),
+            "the image element is never retargeted into something else: {patches:?}"
+        );
     }
 
+    #[cfg(feature = "canvas")]
     #[derive(Clone)]
     struct Isle;
 
+    #[cfg(feature = "canvas")]
     impl Component for Isle {
         fn body(self, _ctx: &Context) -> impl View {
             image(tiny_image(200))
@@ -2228,6 +3383,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "canvas")]
     #[test]
     fn an_image_inside_an_island_stays_pixels() {
         let runtime = Runtime::new();
@@ -2300,25 +3456,46 @@ mod tests {
             })
             .collect();
         assert!(!top_level.is_empty(), "the popover mounted: {patches:?}");
-        assert_eq!(top_level[0].1, 0, "the first created node hangs off the root");
+        // the PORTAL: the popover hangs off the root, and its anchor
+        // relation travels as one patch. Opening re-wraps the anchored
+        // child in its anchor group (bounded churn, that subtree only)
+        // — every OTHER sibling stays silent.
+        assert!(
+            top_level.iter().any(|(_, parent)| *parent == 0),
+            "the popover hangs off the root: {patches:?}"
+        );
+        assert!(
+            patches.iter().any(|patch| matches!(patch, DomPatch::SetAnchor { .. })),
+            "the anchor relation travels: {patches:?}"
+        );
         let fresh: Vec<u32> = top_level.iter().map(|(id, _)| *id).collect();
+        let anchored: Vec<u32> = patches
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Remove { id } => Some(*id),
+                _ => None,
+            })
+            .collect();
         for patch in &patches {
+            let id = patch_id(patch);
             assert!(
-                !mounted.contains(&patch_id(patch)) || fresh.contains(&patch_id(patch)),
-                "an old sibling moved on open: {patch:?}"
+                !mounted.contains(&id) || fresh.contains(&id) || anchored.contains(&id),
+                "an untouched sibling moved on open: {patch:?}"
             );
         }
 
-        // closing removes the subtree and, again, nothing else
+        // closing removes the portal and unwraps the anchor — nothing
+        // beyond those two subtrees moves
         view.open.set(false);
         let patches = runtime.dom_frame(&view, size);
-        assert!(
-            patches
-                .iter()
-                .all(|patch| matches!(patch, DomPatch::Remove { id } if fresh.contains(id))),
-            "closing is removal only: {patches:?}"
-        );
         assert!(!patches.is_empty());
+        assert!(
+            patches.iter().any(|patch| matches!(
+                patch,
+                DomPatch::Remove { id } if fresh.contains(id)
+            )),
+            "the popover left: {patches:?}"
+        );
     }
 
     #[test]
@@ -2624,5 +3801,438 @@ mod tests {
         let folded = GlassFilter::under(tint, Some(veil)).expect("a colour");
         assert!(folded.r > 0 && folded.r < 255, "a veil mixes with the tint: {folded:?}");
         assert!(folded.a > veil.a, "and the two alphas compose: {folded:?}");
+    }
+
+    /// Two runtimes in sequence on ONE thread — every #[test] runs on
+    /// its own thread, so both must live in this body. The second
+    /// runtime opens its own world: its reads bind to the states that
+    /// are alive NOW, and invalidation works. Before the world reset
+    /// this pinned the opposite: the second runtime adopted the first
+    /// one's retention, every set landed on unread slots, and every
+    /// update diffed to nothing, forever.
+    #[test]
+    fn a_second_runtime_opens_its_own_world() {
+        #[derive(Clone, Copy)]
+        struct Lamp {
+            on: State<bool>,
+        }
+
+        impl Component for Lamp {
+            fn body(self, _ctx: &Context) -> impl View {
+                let lit = self.on.get();
+                text("lamp")
+                    .background_color(if lit {
+                        Color::hex(0xFFD75A)
+                    } else {
+                        Color::hex(0x30343A)
+                    })
+                    .on_click(|| {})
+            }
+        }
+
+        let size = Size { width: 120.0, height: 60.0 };
+
+        // world one, alive and invalidating
+        let first = Lamp { on: State::new(false) };
+        let elder = Runtime::new();
+        assert!(!elder.dom_frame(&first, size).is_empty(), "the first world mounts");
+        first.on.set(true);
+        assert!(
+            !elder.dom_frame(&first, size).is_empty(),
+            "the first world invalidates"
+        );
+
+        // world two: the same shape, new states, a new runtime
+        let second = Lamp { on: State::new(false) };
+        let newborn = Runtime::new();
+        assert!(!newborn.dom_frame(&second, size).is_empty(), "the second world mounts");
+        second.on.set(true);
+        let patches = newborn.dom_frame(&second, size);
+        assert!(
+            !patches.is_empty(),
+            "the second world invalidates — its reads bind to living states"
+        );
+    }
+
+    // MARK: - The flow vocabulary (the wire half; the capture rides
+    // in the next round)
+
+    fn flow_row(path: &str) -> DomNode {
+        DomNode {
+            kind: DomKind::Group { path: std::rc::Rc::from(path) },
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+            style: DomStyle::default(),
+            layout: Some(DomLayout::default()),
+            hints: DomHints::default(),
+            children: Vec::new(),
+        }
+    }
+
+    fn flow_root(children: Vec<DomNode>) -> DomNode {
+        DomNode {
+            kind: DomKind::Root,
+            x: 0.0,
+            y: 0.0,
+            width: 400.0,
+            height: 300.0,
+            style: DomStyle::default(),
+            layout: Some(DomLayout { gap: Some(8.0), ..DomLayout::default() }),
+            hints: DomHints::default(),
+            children,
+        }
+    }
+
+    /// The reorder contract: two rows trade places in a five-row flow
+    /// list, and the wire carries exactly two `Move`s — the stable
+    /// spine never travels.
+    #[test]
+    fn a_swap_under_flow_is_two_moves() {
+        let mut lowering = DomLowering::default();
+        let display = crate::layout::DisplayList::default();
+        let rows = |order: &[&str]| flow_root(order.iter().map(|p| flow_row(p)).collect());
+
+        let mount = lowering.lower(&rows(&["a", "b", "c", "d", "e"]), &display);
+        assert_eq!(
+            mount.iter().filter(|p| matches!(p, DomPatch::Create { .. })).count(),
+            5,
+            "{mount:#?}"
+        );
+
+        let swapped = lowering.lower(&rows(&["a", "d", "c", "b", "e"]), &display);
+        let moves: Vec<_> =
+            swapped.iter().filter(|p| matches!(p, DomPatch::Move { .. })).collect();
+        assert_eq!(moves.len(), 2, "a swap is two moves: {swapped:#?}");
+        assert!(
+            !swapped.iter().any(|p| matches!(
+                p,
+                DomPatch::Create { .. } | DomPatch::Remove { .. } | DomPatch::SetTransform { .. }
+            )),
+            "nothing mounts, nothing leaves, nothing is positioned by hand: {swapped:#?}"
+        );
+    }
+
+    /// A mid-list insert lands `before` its real next sibling — zero
+    /// moves, and the survivors stay silent.
+    #[test]
+    fn an_insert_under_flow_is_one_positioned_create() {
+        let mut lowering = DomLowering::default();
+        let display = crate::layout::DisplayList::default();
+        let rows = |order: &[&str]| flow_root(order.iter().map(|p| flow_row(p)).collect());
+
+        let mount = lowering.lower(&rows(&["a", "b", "c"]), &display);
+        let ids: Vec<u32> = mount
+            .iter()
+            .filter_map(|p| match p {
+                DomPatch::Create { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+
+        let grown = lowering.lower(&rows(&["a", "new", "b", "c"]), &display);
+        let creates: Vec<_> = grown
+            .iter()
+            .filter_map(|p| match p {
+                DomPatch::Create { id, before, .. } => Some((*id, *before)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(creates.len(), 1, "{grown:#?}");
+        assert_eq!(
+            creates[0].1, ids[1],
+            "the fresh row lands before what was row b: {grown:#?}"
+        );
+        assert!(
+            !grown.iter().any(|p| matches!(p, DomPatch::Move { .. })),
+            "an insert never moves a survivor: {grown:#?}"
+        );
+    }
+
+    /// A flow node's layout travels as ONE record — and its geometry
+    /// fields never do.
+    #[test]
+    fn a_flow_layout_change_is_one_setlayout() {
+        let mut lowering = DomLowering::default();
+        let display = crate::layout::DisplayList::default();
+        let with_gap = |gap: f64| {
+            let mut root = flow_root(vec![flow_row("a")]);
+            root.layout = Some(DomLayout { gap: Some(gap), ..DomLayout::default() });
+            root
+        };
+
+        let _ = lowering.lower(&with_gap(8.0), &display);
+        let regapped = lowering.lower(&with_gap(12.0), &display);
+        assert_eq!(regapped.len(), 1, "{regapped:#?}");
+        assert!(matches!(
+            &regapped[0],
+            DomPatch::SetLayout { id: 0, layout } if layout.gap == Some(12.0)
+        ));
+    }
+
+    /// The three new encodings, pinned byte for byte.
+    #[test]
+    fn the_flow_encoding_is_byte_stable() {
+        let patches = vec![
+            DomPatch::SetLayout {
+                id: 5,
+                layout: DomLayout {
+                    gap: Some(8.0),
+                    grow: true,
+                    slot_y: Some(120.0),
+                    ..DomLayout::default()
+                },
+            },
+            DomPatch::Move { id: 5, parent: 1, before: 9 },
+            DomPatch::Reveal { id: 3, target: 44 },
+        ];
+        let bytes = encode(&patches);
+        let expected: Vec<u8> = [
+            &3u32.to_le_bytes()[..],
+            &[11],
+            &5u32.to_le_bytes()[..],
+            &(1u16 | 1 << 7 | 1 << 8).to_le_bytes()[..],
+            &8f32.to_le_bytes()[..],
+            &120f32.to_le_bytes()[..],
+            &[12],
+            &5u32.to_le_bytes()[..],
+            &1u32.to_le_bytes()[..],
+            &9u32.to_le_bytes()[..],
+            &[13],
+            &3u32.to_le_bytes()[..],
+            &44u32.to_le_bytes()[..],
+        ]
+        .concat();
+        assert_eq!(bytes, expected);
+    }
+
+    /// The keyboard's reveal under flow: the region follows its item,
+    /// and a CHANGED target scrolls to the row's slot — the engine
+    /// commands once, the browser's echo comes back silent.
+    #[test]
+    fn a_reveal_scrolls_to_the_slot() {
+        #[derive(Clone)]
+        struct Follows {
+            selected: State<usize>,
+        }
+
+        impl Component for Follows {
+            fn body(self, _ctx: &Context) -> impl View {
+                let selected = self.selected.get();
+                virtual_list(1_000, |row| format!("r{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+                .row_height(20.0)
+                .reveal(selected)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Follows { selected: State::new(0) };
+        let size = Size { width: 200.0, height: 100.0 };
+        let _ = runtime.dom_frame(&view, size);
+
+        view.selected.set(500);
+        let patches = runtime.dom_frame(&view, size);
+        let scrolled = patches.iter().find_map(|patch| match patch {
+            DomPatch::SetScroll { y, .. } => Some(*y),
+            _ => None,
+        });
+        assert_eq!(scrolled, Some(500.0 * 20.0), "the region jumps to the slot: {patches:?}");
+    }
+
+    /// The LAW, pinned: a flow frame never asks the text engine for a
+    /// number. The browser wraps, measures and breaks — zero cache
+    /// calls, zero crossings, on the mount and on every update.
+    #[test]
+    fn a_flow_frame_never_measures_text() {
+        #[derive(Clone)]
+        struct Wordy {
+            flip: State<bool>,
+        }
+
+        impl Component for Wordy {
+            fn body(self, _ctx: &Context) -> impl View {
+                let on = self.flip.get();
+                crate::vstack!(
+                    text("a long paragraph that would have wrapped through the cache"),
+                    text(if on { "state one" } else { "state two" }),
+                    text("another line of prose beside a spacer"),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Wordy { flip: State::new(false) };
+        let size = Size { width: 120.0, height: 200.0 };
+        let _ = crate::stats::take();
+        let _ = runtime.dom_frame(&view, size);
+        let mount = crate::stats::take();
+        assert_eq!(mount.measure_misses, 0, "the mount never measured");
+        assert_eq!(mount.measure_hits, 0, "not even a warm hit");
+
+        view.flip.set(true);
+        let _ = runtime.dom_frame(&view, size);
+        let update = crate::stats::take();
+        assert_eq!(update.measure_misses + update.measure_hits, 0, "nor the update");
+    }
+
+    /// The O(change) proof, pinned by NUMBER: an untouched component
+    /// is not even traversed. One row flips among fifty; the diff
+    /// visits a handful of nodes and reuses every clean sibling.
+    #[test]
+    fn an_untouched_subtree_is_not_even_traversed() {
+        #[derive(Clone, Copy)]
+        struct Cell {
+            on: State<bool>,
+        }
+
+        impl Component for Cell {
+            fn body(self, _ctx: &Context) -> impl View {
+                let on = self.on.get();
+                let toggle = self.on;
+                text(if on { "on" } else { "off" })
+                    .background_color(if on {
+                        Color::hex(0x3B82F6)
+                    } else {
+                        Color::rgba(0, 0, 0, 0)
+                    })
+                    .on_click(move || toggle.set(!toggle.get()))
+            }
+        }
+
+        #[derive(Clone)]
+        struct Grid {
+            cells: std::rc::Rc<Vec<State<bool>>>,
+        }
+
+        impl Component for Grid {
+            fn body(self, _ctx: &Context) -> impl View {
+                let cells = self.cells.clone();
+                crate::vstack!(list(
+                    (0..50).collect::<Vec<_>>(),
+                    |i| i.to_string(),
+                    move |i| Cell { on: cells[*i] },
+                ))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Grid { cells: std::rc::Rc::new((0..50).map(|_| State::new(false)).collect()) };
+        let size = Size { width: 200.0, height: 400.0 };
+        let _ = runtime.dom_frame(&view, size);
+
+        let _ = crate::stats::take();
+        view.cells[7].set(true);
+        let patches = runtime.dom_frame(&view, size);
+        let stats = crate::stats::take();
+
+        assert_eq!(patches.len(), 2, "the flip is two style records: {patches:?}");
+        assert!(
+            stats.diff_visited < 20,
+            "the diff visited {} nodes for one flipped cell",
+            stats.diff_visited
+        );
+        assert!(
+            stats.diff_reused >= 49,
+            "every clean sibling reused wholesale, got {}",
+            stats.diff_reused
+        );
+        assert!(
+            stats.capture_nodes < 30,
+            "the walk never descended the clean rows, built {}",
+            stats.capture_nodes
+        );
+    }
+
+    /// `.layout(Exact)`: the subtree keeps the engine's numbers on
+    /// the element lowering — absolute geometry inside a relative box
+    /// the flow carries. The interior positions are the SAME ones the
+    /// pixel targets compute: parity by construction, pinned here.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn an_exact_subtree_keeps_the_engines_numbers() {
+        use crate::layout::LayoutMode;
+
+        #[derive(Clone, Copy)]
+        struct Mixed;
+
+        impl Component for Mixed {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("flow above"),
+                    crate::vstack!(text("pinned"), text("exact"))
+                        .frame(120.0, 60.0)
+                        .layout(LayoutMode::Exact),
+                    text("flow below"),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 200.0 };
+        let patches = runtime.dom_frame(&Mixed, size);
+
+        // the exact interior speaks geometry: transforms and sizes
+        let transforms =
+            patches.iter().filter(|p| matches!(p, DomPatch::SetTransform { .. })).count();
+        assert!(
+            transforms >= 2,
+            "the exact interior is positioned by our numbers: {patches:#?}"
+        );
+        // and the flow around it never is (the wrapper itself carries
+        // a layout record, not a transform)
+        let flow_texts = patches
+            .iter()
+            .filter(|p| matches!(p, DomPatch::SetText { .. }))
+            .count();
+        assert_eq!(flow_texts, 4, "{patches:#?}");
+        // a second frame with nothing changed is silent — the exact
+        // subtree diffs like everything else
+        assert!(runtime.dom_frame(&Mixed, size).is_empty());
+    }
+
+    // MARK: - The ABI handshake
+
+    /// The glue mirrors this module by hand, so the two halves of the
+    /// contract are pinned to one number. Bump [`ABI_VERSION`] without
+    /// touching the glue — or the other way around — and this test
+    /// goes red before any browser meets the mismatch.
+    #[test]
+    fn the_glue_expects_this_abi() {
+        let pin = format!("const EXPECTED_ABI = {};", ABI_VERSION);
+        let element = include_str!("../../bunny_ui_web/glue/glue_dom.js");
+        assert!(
+            element.contains(&pin),
+            "glue_dom.js expects a different ABI than the engine encodes"
+        );
+        let canvas = include_str!("../../bunny_ui_web/glue/glue.js");
+        assert!(
+            canvas.contains(&pin),
+            "glue.js expects a different ABI than the engine encodes"
+        );
+    }
+
+    /// The canonical glue lives beside the shell crate; every app
+    /// ships a byte-identical copy. One diverging copy is a fork of
+    /// the wire contract — this keeps the fleet on one file.
+    #[test]
+    fn the_shipped_glue_is_the_canonical_glue() {
+        assert_eq!(
+            include_str!("../../bunny_ui_web/glue/glue_dom.js"),
+            include_str!("../../../apps/finder_web/web/glue_dom.js"),
+            "finder_web ships a glue_dom.js that drifted from the canonical copy"
+        );
+        assert_eq!(
+            include_str!("../../bunny_ui_web/glue/glue.js"),
+            include_str!("../../../apps/finder_web/web/glue.js"),
+            "finder_web ships a glue.js that drifted from the canonical copy"
+        );
+        assert_eq!(
+            include_str!("../../bunny_ui_web/glue/glue_dom.js"),
+            include_str!("../../../apps/bench_web/web/glue_dom.js"),
+            "bench_web ships a glue_dom.js that drifted from the canonical copy"
+        );
     }
 }

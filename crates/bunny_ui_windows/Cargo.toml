@@ -5,7 +5,7 @@ edition.workspace = true
 description = "bunny-ui Windows shell — native window and bitmap blit, dependency-free Win32 FFI"
 
 [dependencies]
-bunny-ui.workspace = true
+bunny-ui = { workspace = true, features = ["canvas"] }
 
 [dev-dependencies]
 # examples only (the real countries app in a native window)

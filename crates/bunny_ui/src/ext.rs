@@ -331,6 +331,47 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// Everywhere else the modifier dissolves (pixel targets already
     /// are the pixel pipeline). `Rendering::Auto` is the default table:
     /// v1 lowers everything to elements.
+    /// The REAL element the Dom lowering builds for this view — a
+    /// `<tr>`, a `<td>`, a `<button>`. Semantic HTML when the page
+    /// wants it; every other lowering ignores the hint, the way a
+    /// pixel target ignores `.rendering()`.
+    fn element(self, tag: impl Into<String>) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::ElementHint(Some(std::rc::Rc::from(tag.into().as_str())), None, None),
+        }
+    }
+
+    /// The Dom element's `class` attribute — for a stylesheet the
+    /// page brings, or a harness that looks elements up by it.
+    fn css_class(self, class: impl Into<String>) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::ElementHint(None, Some(std::rc::Rc::from(class.into().as_str())), None),
+        }
+    }
+
+    /// The Dom element's `id` attribute.
+    fn element_id(self, id: impl Into<String>) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::ElementHint(None, None, Some(std::rc::Rc::from(id.into().as_str())),),
+        }
+    }
+
+    /// The element lowering keeps the ENGINE's layout for this
+    /// subtree: measured, placed and positioned by our numbers —
+    /// pixel parity with the canvas where the design demands it.
+    /// The flow around it never notices.
+    #[cfg(feature = "canvas")]
+    fn layout(self, mode: crate::layout::LayoutMode) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::LayoutMode(mode),
+        }
+    }
+
+    #[cfg(feature = "canvas")]
     fn rendering(self, mode: crate::layout::Rendering) -> Modified<Self> {
         Modified {
             base: self,

@@ -117,6 +117,11 @@ pub enum Modifier {
     /// WINDOW — the scene's own title bar on a chrome-less window.
     WindowDragRegion,
     WindowControl(crate::layout::WindowControl),
+    /// Dom hints: `(tag, class, id)` — only the element lowering
+    /// consumes them; everything else passes through.
+    ElementHint(Option<std::rc::Rc<str>>, Option<std::rc::Rc<str>>, Option<std::rc::Rc<str>>),
+    /// `.layout(Exact)` — the element lowering keeps our numbers here.
+    LayoutMode(crate::layout::LayoutMode),
 
     // MARK: - Real interaction (a pointer target without chrome — the Button
     // without the outfit; the action fires on up-inside like the Button's)
@@ -273,6 +278,10 @@ impl Modifier {
                 }
             )
             .into(),
+            Modifier::ElementHint(tag, class, dom_id) => {
+                format!(" [.element({tag:?}, {class:?}, {dom_id:?})]")
+            }
+            Modifier::LayoutMode(mode) => format!(" [.layout({mode:?})]"),
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
@@ -326,7 +335,8 @@ fn rewrite_scroll_node(
             spec,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
-        LayoutNode::Island { child } => LayoutNode::Island {
+        LayoutNode::Island { path, child } => LayoutNode::Island {
+            path,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
         LayoutNode::Live { spec, child } => LayoutNode::Live {
@@ -379,7 +389,8 @@ fn rewrite_field_node(
             spec,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
-        LayoutNode::Island { child } => LayoutNode::Island {
+        LayoutNode::Island { path, child } => LayoutNode::Island {
+            path,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
         LayoutNode::Live { spec, child } => LayoutNode::Live {
@@ -439,7 +450,8 @@ fn rewrite_pixel_node(
             spec,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
-        LayoutNode::Island { child } => LayoutNode::Island {
+        LayoutNode::Island { path, child } => LayoutNode::Island {
+            path,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
         LayoutNode::Live { spec, child } => LayoutNode::Live {
@@ -494,7 +506,8 @@ fn rewrite_text_node(
             spec,
             child: Box::new(rewrite_text_node(*child, rewrite)),
         },
-        LayoutNode::Island { child } => LayoutNode::Island {
+        LayoutNode::Island { path, child } => LayoutNode::Island {
+            path,
             child: Box::new(rewrite_text_node(*child, rewrite)),
         },
         LayoutNode::Live { spec, child } => LayoutNode::Live {
@@ -1155,7 +1168,11 @@ fn apply(
             // Auto is the table's business (v1: everything lowers
             // to Dom); only an explicit Gpu claims an island node
             if *mode == crate::layout::Rendering::Gpu {
-                out.wrap_layout_from(mark, |node| LayoutNode::Island {
+                // the island's identity: the flexible case keys
+                // its browser-reported box by this path
+                let path = motor::identity::cursor_scope();
+                out.wrap_layout_from(mark, move |node| LayoutNode::Island {
+                    path,
                     child: Box::new(node),
                 });
             }
@@ -1188,6 +1205,24 @@ fn apply(
             out.wrap_layout_from(mark, |node| LayoutNode::DragRegion {
                 child: Box::new(node),
             });
+        }
+        Modifier::ElementHint(tag, class, dom_id) => {
+            let (tag, class, dom_id) = (tag.clone(), class.clone(), dom_id.clone());
+            out.wrap_layout_from(mark, move |node| LayoutNode::Hinted {
+                tag,
+                class,
+                dom_id,
+                child: Box::new(node),
+            });
+        }
+        Modifier::LayoutMode(mode) => {
+            // Auto is what every target does already; only Exact asks
+            // the element lowering to keep the engine's numbers
+            if *mode == crate::layout::LayoutMode::Exact {
+                out.wrap_layout_from(mark, |node| LayoutNode::ExactLayout {
+                    child: Box::new(node),
+                });
+            }
         }
         Modifier::OnClick(action) => {
             // the same registration as the Button: action retained in the

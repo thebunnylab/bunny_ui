@@ -41,6 +41,7 @@ pub mod action;
 pub mod anim;
 pub mod custom;
 pub mod dom;
+mod dom_flow;
 pub mod effects;
 pub mod erased;
 pub mod ext;
@@ -50,10 +51,13 @@ pub mod image_engine;
 pub mod layout;
 pub mod modifier;
 pub mod one_of;
+#[cfg(feature = "canvas")]
 pub mod raster;
 mod reconciler;
 pub mod runtime;
+pub mod ssr;
 pub mod state_ext;
+pub mod stats;
 pub mod text_engine;
 pub mod text_input;
 pub mod theme;
@@ -107,8 +111,10 @@ pub mod prelude {
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
     pub use crate::custom::{
         Custom, CustomElement, ElementEvent, EventCtx, ImeContext, Metrics, PaintCtx, Painter,
-        Response, canvas, custom,
+        Response,
     };
+    #[cfg(feature = "canvas")]
+    pub use crate::custom::{canvas, custom};
     pub use crate::erased::{CustomModifier, Erased, erased};
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
@@ -2936,16 +2942,23 @@ mod tests {
                 _ => None,
             })
             .expect("the box lowers to an island");
-        let size = patches
+        // the flow lowering carries a box in the layout record: the
+        // height is PINNED to one screen, and the width belongs to the
+        // browser — the island stretches and reports its real box back
+        let layout = patches
             .iter()
             .find_map(|patch| match patch {
-                crate::dom::DomPatch::SetSize { id, width, height } if *id == canvas => {
-                    Some((*width, *height))
+                crate::dom::DomPatch::SetLayout { id, layout } if *id == canvas => {
+                    Some(layout.clone())
                 }
                 _ => None,
             })
             .expect("the island is sized");
-        assert_eq!(size, (300.0, 200.0), "the island is the window, not the content");
+        assert_eq!(
+            layout.height,
+            Some(200.0),
+            "the island is the window, not the content"
+        );
     }
 
     #[test]
@@ -5820,6 +5833,7 @@ mod tests {
         assert_eq!(fonts, vec![(9.0, Weight::Bold), (26.0, Weight::Regular)]);
     }
 
+    #[cfg(feature = "canvas")]
     #[test]
     fn a_box_rounds_only_the_corners_it_names() {
         use crate::layout::{Color, Corners, DrawCommand, Proposal, Size};
@@ -6411,6 +6425,7 @@ mod tests {
         theme::install(Theme::light());
     }
 
+    #[cfg(feature = "canvas")]
     #[test]
     fn a_surface_repaints_a_real_hover_incrementally() {
         use crate::layout::{Proposal, Size};
@@ -7037,6 +7052,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "canvas")]
     #[test]
     fn a_fill_image_covers_and_clips_inside_its_frame() {
         use crate::layout::{DrawCommand, LayoutNode, Proposal, layout};

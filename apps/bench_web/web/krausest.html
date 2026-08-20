@@ -2,27 +2,30 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>bunny_ui — finder in the dom</title>
+    <title>bunny_ui — keyed benchmark</title>
     <style>
       html,
       body {
         margin: 0;
         height: 100%;
         background: #101216;
-        display: grid;
-        place-items: center;
       }
-      /* the backdrop comes from the engine's theme, via the patches */
       #app {
         position: relative;
-        width: 760px;
-        height: 640px;
+        width: 900px;
+        height: 800px;
         overflow: hidden;
+        margin: 0 auto;
       }
     </style>
   </head>
   <body>
     <div id="app"></div>
-    <script src="glue_dom.js?v=21"></script>
+    <script>
+      window.BUNNY_WASM = "bench_web.wasm";
+      window.BUNNY_START = "start_keyed";
+    </script>
+    <script src="glue_dom.js?v=11"></script>
+    <script src="keyed_driver.js?v=4"></script>
   </body>
 </html>

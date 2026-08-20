@@ -8,7 +8,7 @@ edition.workspace = true
 autoexamples = false
 
 [dependencies]
-bunny-ui.workspace = true
+bunny-ui = { workspace = true, features = ["canvas"] }
 
 [dev-dependencies]
 countries-core.workspace = true

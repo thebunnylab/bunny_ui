@@ -132,6 +132,7 @@ thread_local! {
     static RETAINED: RefCell<BTreeMap<String, Entry>> = const { RefCell::new(BTreeMap::new()) };
     static PASS: RefCell<PassState> = RefCell::new(PassState::default());
     static LAST_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static FRAME_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A boundary's retained layout tree, borrowed in place — measure and
@@ -481,7 +482,11 @@ pub(crate) fn run_isolated(root: &str) {
 }
 
 fn covers(ancestor: &str, path: &str) -> bool {
-    path == ancestor || path.starts_with(&format!("{ancestor}/"))
+    // byte compare, no allocation: this runs once per retained entry
+    // per assembly walk — a format! here taxed every pass
+    path.len() >= ancestor.len()
+        && path.as_bytes().starts_with(ancestor.as_bytes())
+        && (path.len() == ancestor.len() || path.as_bytes()[ancestor.len()] == b'/')
 }
 
 /// The pass's effect queue: the root region + the whole retention under
@@ -732,13 +737,37 @@ pub(crate) fn clear() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
 }
 
+/// The world-reset twin of [`clear`]: the retention AND every per-pass
+/// assembly falls. A newborn runtime starts from nothing — see
+/// `motor::identity::reset_world` for the other half of the contract.
+pub(crate) fn reset_world() {
+    RETAINED.with(|retained| retained.borrow_mut().clear());
+    PASS.with(|pass| *pass.borrow_mut() = PassState::default());
+    LAST_BODY_RUNS.with(|last| last.borrow_mut().clear());
+    FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().clear());
+    ACTIVE_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
+    HANDLERS.with(|handlers| handlers.borrow_mut().clear());
+    ACTIONS.with(|actions| actions.borrow_mut().clear());
+    EDITORS.with(|editors| editors.borrow_mut().clear());
+    SPLITS.with(|splits| splits.borrow_mut().clear());
+    CUSTOMS.with(|customs| customs.borrow_mut().clear());
+}
+
 pub(crate) fn end_pass() {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         pass.active = false;
         let runs = std::mem::take(&mut pass.body_runs);
+        FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().extend(runs.iter().cloned()));
         LAST_BODY_RUNS.with(|last| *last.borrow_mut() = runs);
     });
+}
+
+/// Every body that ran since the last drain — a FRAME may settle over
+/// several passes, and the reuse decision needs all of them. The Dom
+/// frame drains this once per event.
+pub(crate) fn take_frame_runs() -> Vec<String> {
+    FRAME_BODY_RUNS.with(|frame| std::mem::take(&mut *frame.borrow_mut()))
 }
 
 /// Instrumentation: the bodies that ran in the last pass (identity

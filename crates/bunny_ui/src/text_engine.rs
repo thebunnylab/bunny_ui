@@ -581,8 +581,10 @@ impl MeasureCache {
         {
             // hot hit: zero allocation, zero movement — just rejuvenates
             used.set(self.frame.get());
+            crate::stats::note_measure(true);
             return *metrics;
         }
+        crate::stats::note_measure(false);
         let measured = engine.measure_line(text, font);
         self.lines
             .borrow_mut()

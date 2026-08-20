@@ -60,6 +60,13 @@ impl CustomElement for Scratch {
         true
     }
 
+    // the box wants the row's width, never the column's leftover —
+    // the measure below pins the height and this keeps the stacks
+    // from offering more
+    fn flexible(&self) -> bool {
+        false
+    }
+
     fn measure(&self, proposal: bunny_ui::layout::Proposal, _metrics: &Metrics) -> Size {
         Size { width: proposal.width.unwrap_or(0.0), height: Self::HEIGHT }
     }
@@ -312,7 +319,10 @@ impl Component for Finder {
                     }
                 },
             )
-            .reveal(selected_index),
+            .reveal(selected_index)
+            // the flow page owns layout in the browser, so the row
+            // extent is DECLARED — the one number the window math needs
+            .row_height(29.0),
         )
         .alignment(HorizontalAlignment::Leading)
         .padding_edge(Edge::Bottom, 10.0)
@@ -528,8 +538,13 @@ pub extern "C" fn start(width: f64, height: f64, scale: f64) {
 }
 
 /// The Dom page calls this one — the SAME scene, rendered at home.
-/// `scale` rasters the canvas islands at the device's density.
+/// `scale` rasters the canvas islands at the device's density;
+/// `hydrate` says the page shipped painted and the boot adopts it.
 #[unsafe(no_mangle)]
-pub extern "C" fn start_dom(width: f64, height: f64, scale: f64) {
-    bunny_ui_web::start_dom(width, height, scale, finder());
+pub extern "C" fn start_dom(width: f64, height: f64, scale: f64, hydrate: u32) {
+    if hydrate != 0 {
+        bunny_ui_web::start_dom_hydrated(width, height, scale, finder());
+    } else {
+        bunny_ui_web::start_dom(width, height, scale, finder());
+    }
 }

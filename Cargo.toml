@@ -10,6 +10,7 @@ members = [
     "crates/countries_core",
     "apps/countries_pure",
     "apps/finder_web",
+    "apps/bench_web",
 ]
 
 [workspace.package]
@@ -18,7 +19,7 @@ edition = "2024"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bunny-ui = { path = "crates/bunny_ui" }
+bunny-ui = { path = "crates/bunny_ui", default-features = false }
 countries-core = { path = "crates/countries_core" }
 
 countries-pure = { path = "apps/countries_pure" }
@@ -39,3 +40,19 @@ lto = true
 # comfort: the glue never reads it, and a stack trace from a shipped
 # build was never going to be read by a person anyway
 strip = true
+# a panic in the browser has nowhere to unwind to: the shell is one
+# thread behind an FFI border, and the unwinding tables are bytes the
+# download pays for a landing nobody catches
+panic = "abort"
+
+# The SPEED twin: what a benchmark ships. Baseline-tier wasm runs the
+# size-optimized code several times slower, and a harness presses the
+# button before the optimizer catches up — a scoreboard binary pays
+# bytes for first-second speed.
+[profile.webspeed]
+inherits = "release"
+opt-level = 3
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1
