@@ -147,6 +147,26 @@ const bunnyGpuImports = {
     console.warn(glText(pointer, length));
   },
 
+  // One island, copied out of the shared surface into its own element.
+  // A canvas that took webgl2 can never take "2d" again, so the islands
+  // keep their 2d contexts and the TIER keeps one context for all of
+  // them — which is also the only arrangement a lost context can fall
+  // back from without recreating an element the engine cannot emit.
+  gl_island_blit(id, width, height) {
+    if (!gl) return;
+    const element = typeof elements !== "undefined" ? elements.get(id >>> 0) : null;
+    if (!element) return;
+    if (element.width !== (width >>> 0) || element.height !== (height >>> 0)) {
+      element.width = width >>> 0;
+      element.height = height >>> 0;
+    }
+    const into = element.getContext("2d");
+    if (!into) return;
+    // without this the island ghosts its previous frame underneath
+    into.globalCompositeOperation = "copy";
+    into.drawImage(gl.canvas, 0, 0, width >>> 0, height >>> 0, 0, 0, width >>> 0, height >>> 0);
+  },
+
   gl_teardown() {
     gpuLoseContext();
   },

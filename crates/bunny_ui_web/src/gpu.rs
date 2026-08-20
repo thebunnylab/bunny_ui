@@ -39,6 +39,7 @@ unsafe extern "C" {
     /// not compile, or `?present=cpu`. Non-zero is MAX_TEXTURE_SIZE.
     fn gl_init(kind: u32, width: u32, height: u32) -> u32;
     fn gl_log(pointer: *const u8, len: usize);
+    fn gl_island_blit(id: u32, width: u32, height: u32);
     fn gl_teardown();
     fn gl_resize(width: u32, height: u32);
 
@@ -772,6 +773,7 @@ pub(crate) fn restored(physical: (u32, u32)) -> bool {
 /// Presents one display list. The frame IS the drawable: no `Surface`
 /// is allocated on this road, and the CPU bitmap is never built.
 pub(crate) fn present_window(
+    island: Option<(u32, (u32, u32))>,
     display: &DisplayList,
     size: Size,
     scale: usize,
@@ -779,10 +781,10 @@ pub(crate) fn present_window(
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
 ) {
-    let physical = (
+    let physical = island.map(|(_, box4)| box4).unwrap_or((
         ((size.width.round() as usize) * scale).max(1) as u32,
         ((size.height.round() as usize) * scale).max(1) as u32,
-    );
+    ));
     TIER.with(|slot| {
         let mut slot = slot.borrow_mut();
         let Some(tier) = slot.as_mut() else { return };
@@ -962,6 +964,11 @@ pub(crate) fn present_window(
         }
         if let (true, Some(targets)) = (wants_glass, tier.glass.as_ref()) {
             blit_scene(&tier.pipelines, targets, physical);
+        }
+        if let Some((id, _)) = island {
+            // the shared surface holds this island's pixels: hand them
+            // to its own element before the next island overwrites them
+            unsafe { gl_island_blit(id, physical.0, physical.1) };
         }
         unsafe { gl_flush() };
     });

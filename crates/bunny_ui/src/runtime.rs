@@ -2836,11 +2836,15 @@ impl Runtime {
         reconciler::run_action(path, clicks)
     }
 
-    /// The canvas islands whose pixels changed since the last call —
-    /// rasterized at `scale` and ready to blit. Empty when the scene
-    /// has no islands or nothing inside one moved.
+    /// The canvas islands whose CONTENT changed since the last call —
+    /// each one's display list and its physical size, with no pixels.
+    /// A tier that paints its own islands takes this road;
+    /// [`Runtime::dom_islands`] is the CPU twin and is built on it.
+    ///
+    /// The dirty marks are CONSUMED, so a frame calls one of the two
+    /// and never both.
     #[cfg(feature = "canvas")]
-    pub fn dom_islands(&self, scale: usize) -> Vec<crate::dom::IslandFrame> {
+    pub fn dom_island_lists(&self, scale: usize) -> Vec<crate::dom::IslandList> {
         self.dom
             .borrow_mut()
             .take_dirty_islands()
@@ -2854,19 +2858,32 @@ impl Runtime {
                     ((width.round() as usize) * scale).max(1),
                     ((height.round() as usize) * scale).max(1),
                 );
+                crate::dom::IslandList { id, width: physical.0, height: physical.1, display }
+            })
+            .collect()
+    }
+
+    /// The canvas islands whose pixels changed since the last call —
+    /// rasterized at `scale` and ready to blit. Empty when the scene
+    /// has no islands or nothing inside one moved.
+    #[cfg(feature = "canvas")]
+    pub fn dom_islands(&self, scale: usize) -> Vec<crate::dom::IslandFrame> {
+        self.dom_island_lists(scale)
+            .into_iter()
+            .map(|island| {
                 let bitmap = crate::raster::rasterize_with(
-                    &display,
-                    physical.0,
-                    physical.1,
+                    &island.display,
+                    island.width,
+                    island.height,
                     scale,
                     crate::layout::Color::rgba(0, 0, 0, 0),
                     &*self.text,
                     &*self.images,
                 );
                 crate::dom::IslandFrame {
-                    id,
-                    width: physical.0,
-                    height: physical.1,
+                    id: island.id,
+                    width: island.width,
+                    height: island.height,
                     rgba: bitmap.to_rgba_bytes(),
                 }
             })

@@ -772,6 +772,15 @@ pub enum CreateKind {
     Editor,
 }
 
+/// One island's display list and the box it paints into — what a tier
+/// that owns its own pixels needs, and nothing more.
+pub struct IslandList {
+    pub id: u32,
+    pub width: usize,
+    pub height: usize,
+    pub display: crate::layout::DisplayList,
+}
+
 /// One island's fresh pixels — the shell blits them into the island's
 /// `<canvas>`. Only islands whose commands actually changed re-raster.
 pub struct IslandFrame {

@@ -276,6 +276,7 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
             // the same display list, no Surface in the path — the frame
             // IS the drawable
             tier::present_window(
+                None,
                 &display,
                 size,
                 scale,
@@ -435,6 +436,11 @@ fn start_dom_with(
     // answer to the desktop's run loop source
     runtime.set_wake_hook(std::sync::Arc::new(|| unsafe { js_request_wake() }));
     runtime.set_reduce_motion(true);
+    // one context for every island on the page. A canvas per island
+    // would hit the browser's context ceiling, and an island that
+    // claimed webgl2 could never take putImageData back when the
+    // context is lost — the element itself keeps its 2d road.
+    tier::try_install(1, (1, 1));
     let mut size = Size { width, height };
     let scale = (scale.round() as usize).max(1);
     if hydrate {
@@ -451,6 +457,33 @@ fn start_dom_with(
             unsafe { js_apply_patches(bytes.as_ptr(), bytes.len()) };
         }
         #[cfg(feature = "canvas")]
+        #[cfg(feature = "gpu")]
+        if tier::active() {
+            // the dirty marks are CONSUMED by whichever road reads
+            // them, so the branch is here and never inside the loop
+            let mut lists = runtime.dom_island_lists(scale);
+            // one backing resize per distinct SIZE, not per island
+            lists.sort_by_key(|island| (island.width, island.height));
+            for island in lists {
+                let physical = (island.width as u32, island.height as u32);
+                let size = bunny_ui::layout::Size {
+                    width: island.width as f64 / scale as f64,
+                    height: island.height as f64 / scale as f64,
+                };
+                tier::present_window(
+                    Some((island.id, physical)),
+                    &island.display,
+                    size,
+                    scale,
+                    // an island sits OVER the page's own elements: it
+                    // clears to nothing, never to the theme's canvas
+                    Color::rgba(0, 0, 0, 0),
+                    &*runtime.text(),
+                    &*runtime.images(),
+                );
+            }
+            return;
+        }
         for island in runtime.dom_islands(scale) {
             unsafe {
                 js_island(
@@ -796,6 +829,7 @@ pub extern "C" fn bunny_gpu_selftest(packed: u32) -> u32 {
     let size = bunny_ui::layout::Size { width: 4.0, height: 4.0 };
     let runtime = Runtime::new();
     gpu::present_window(
+        None,
         &bunny_ui::layout::DisplayList::default(),
         size,
         1,
@@ -833,7 +867,7 @@ pub extern "C" fn bunny_gpu_parity(scene: u32) -> u32 {
         (size.width as usize * scale) as u32,
         (size.height as usize * scale) as u32,
     );
-    gpu::present_window(&display, size, scale, canvas, &*runtime.text(), &*runtime.images());
+    gpu::present_window(None, &display, size, scale, canvas, &*runtime.text(), &*runtime.images());
     let mine = gpu::read_rgba(physical);
     let theirs = bunny_ui::raster::rasterize_with(
         &display,

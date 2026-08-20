@@ -1021,7 +1021,35 @@ function sendField(path, value, caret) {
   );
 }
 
+// glue_gl.js may be absent (a build without the tier, a file that
+// failed to load). Every verb answers zero, `gl_init` included, so the
+// tier refuses and the islands take putImageData as they always have.
+function bunnyGpuStubsOrNothing() {
+  const stubs = {};
+  for (const name of GPU_VERBS) stubs[name] = () => 0;
+  return stubs;
+}
+
+const GPU_VERBS = [
+  "gl_init", "gl_log", "gl_island_blit", "gl_teardown", "gl_resize",
+  "gl_viewport", "gl_clear_color", "gl_clear", "gl_enable", "gl_disable",
+  "gl_blend_func_separate", "gl_pixel_storei", "gl_finish", "gl_flush",
+  "gl_compile_shader", "gl_link_program", "gl_bind_attrib_location", "gl_use_program",
+  "gl_uniform_location", "gl_uniform_block", "gl_uniform1i", "gl_uniform4f", "gl_last_log",
+  "gl_create_buffer", "gl_bind_buffer", "gl_bind_buffer_base", "gl_buffer_data_size",
+  "gl_buffer_sub_data", "gl_delete_buffer",
+  "gl_create_vertex_array", "gl_bind_vertex_array", "gl_enable_vertex_attrib_array",
+  "gl_vertex_attrib_pointer", "gl_vertex_attrib_divisor",
+  "gl_create_texture", "gl_bind_texture", "gl_active_texture", "gl_tex_parameteri",
+  "gl_tex_image_2d", "gl_tex_sub_image_2d", "gl_delete_texture",
+  "gl_create_framebuffer", "gl_bind_framebuffer", "gl_framebuffer_texture_2d",
+  "gl_check_framebuffer_status", "gl_delete_framebuffer",
+  "gl_draw_arrays", "gl_draw_arrays_instanced", "gl_read_pixels",
+];
+
 const imports = {
+  bunny_gpu:
+    typeof bunnyGpuImports === "object" ? bunnyGpuImports : bunnyGpuStubsOrNothing(),
   bunny: {
     js_blit() {},
     js_request_frame() {},
@@ -1195,6 +1223,7 @@ const bootOpened = performance.now();
 WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
   ({ instance }) => {
     wasm = instance.exports;
+    if (typeof gpuAttach === "function") gpuAttach(wasm);
     window.__bunny = wasm;
     window.__bunnyDebug = { elements, pseudoRules };
     // the ABI gate: a missing export counts as version 0
