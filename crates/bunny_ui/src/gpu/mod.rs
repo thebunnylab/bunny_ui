@@ -12,4 +12,5 @@
 //! two against each other. A tier that walks its own scene drifts, and
 //! the drift is silent.
 
+pub mod shaders;
 pub mod walk;
