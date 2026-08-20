@@ -197,8 +197,10 @@ pub(crate) trait AtlasGround {
     /// The shared texture exists at `size`×`size` (create if absent).
     fn ensure_shared(&mut self, size: u32) -> bool;
     /// One tile of straight-RGBA rows into virgin shared space.
-    /// `pitch_px` is the source raster's row length in PIXELS.
-    fn upload_shared(&mut self, x: u32, y: u32, w: u32, h: u32, bytes: *const u8, pitch_px: u32);
+    /// `pitch_px` is the source raster's row length in PIXELS, and
+    /// `bytes` starts at the tile's first texel and runs to the end of
+    /// the raster — the rows after the first are `pitch_px` apart.
+    fn upload_shared(&mut self, x: u32, y: u32, w: u32, h: u32, bytes: &[u8], pitch_px: u32);
     /// Drops the shared texture (the copying collector's reset).
     fn drop_shared(&mut self);
     /// A whole texture of its own for an image too big to shelf.
@@ -410,7 +412,7 @@ impl RunAtlas {
                     y,
                     chunk_width,
                     height,
-                    unsafe { raster.rgba.as_ptr().add(chunk_x as usize * 4) },
+                    &raster.rgba[chunk_x as usize * 4..],
                     raster.width as u32,
                 );
                 tiles.push(Tile { x, y, width: chunk_width, height });
@@ -478,7 +480,7 @@ impl RunAtlas {
                     y,
                     chunk_width,
                     height,
-                    unsafe { raster.rgba.as_ptr().add(chunk_x as usize * 4) },
+                    &raster.rgba[chunk_x as usize * 4..],
                     raster.width as u32,
                 );
                 tiles.push(Tile { x, y, width: chunk_width, height });

@@ -1805,7 +1805,7 @@ impl AtlasGround for GlGround<'_> {
         self.shared.is_some()
     }
 
-    fn upload_shared(&mut self, x: u32, y: u32, w: u32, h: u32, bytes: *const u8, pitch_px: u32) {
+    fn upload_shared(&mut self, x: u32, y: u32, w: u32, h: u32, bytes: &[u8], pitch_px: u32) {
         let Some(texture) = *self.shared else { return };
         unsafe {
             (self.gl.bind_texture)(GL_TEXTURE_2D, texture);
@@ -1819,7 +1819,7 @@ impl AtlasGround for GlGround<'_> {
                 h as i32,
                 GL_RGBA,
                 GL_UNSIGNED_BYTE,
-                bytes.cast(),
+                bytes.as_ptr().cast(),
             );
             (self.gl.pixel_storei)(GL_UNPACK_ROW_LENGTH, 0);
         }

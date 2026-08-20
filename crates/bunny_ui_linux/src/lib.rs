@@ -569,6 +569,9 @@ mod tests {
             alt,
             chars_ignoring: base.to_string(),
             types_text: false,
+            // the fixture names the KEY; what it typed is the live
+            // layout's answer and no test here asks for one
+            typed: None,
         }
     }
 

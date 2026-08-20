@@ -2622,9 +2622,9 @@ impl AtlasGround for VkGroundView<'_> {
         true
     }
 
-    fn upload_shared(&mut self, x: u32, y: u32, w: u32, h: u32, bytes: *const u8, pitch_px: u32) {
+    fn upload_shared(&mut self, x: u32, y: u32, w: u32, h: u32, bytes: &[u8], pitch_px: u32) {
         if let Some(id) = self.ground.shared {
-            self.ground.stage(id, x, y, w, h, bytes, pitch_px);
+            self.ground.stage(id, x, y, w, h, bytes.as_ptr(), pitch_px);
         }
     }
 
