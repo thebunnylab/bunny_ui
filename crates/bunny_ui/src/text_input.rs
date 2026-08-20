@@ -51,6 +51,12 @@ pub enum EditCommand {
     Newline,
     Up(bool),
     Down(bool),
+    /// The field's OWN key, offered to `.on_submit` before anyone
+    /// else: the bare break in a one-line field, `⌘↵` in a field of
+    /// many. It is not an edit — the text never moves — so the
+    /// model below answers nothing and the field's own closure runs
+    /// the app's handler.
+    Submit,
     /// Reads the whole text without mutating (IME synchronization uses it).
     Read,
     /// Returns the selection without mutating (`None` = collapsed).
@@ -298,6 +304,9 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
         // the runtime answered these before the command got here: they
         // need the wrap, and the wrap is not in this file
         EditCommand::Newline | EditCommand::Up(_) | EditCommand::Down(_) => {}
+        // not an edit at all: the field's closure ran the app's
+        // handler and never called down here
+        EditCommand::Submit => {}
     }
     None
 }

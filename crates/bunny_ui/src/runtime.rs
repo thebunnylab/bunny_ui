@@ -1116,11 +1116,12 @@ impl Runtime {
         }
     }
 
-    /// One keystroke offered to the focused box BEFORE the keymap: an
-    /// editor owns its arrows, its Enter and its Tab while it has the
-    /// keyboard. The answer's `text` is what a copy hands the
-    /// platform's clipboard; `handled: false` sends the stroke on to
-    /// the app's bindings.
+    /// One keystroke offered to whoever holds the keyboard BEFORE the
+    /// keymap: an editor owns its arrows, its Enter and its Tab while
+    /// it has focus, and a field of many lines owns the `⌘↵` its
+    /// `.on_submit` asked for. The answer's `text` is what a copy
+    /// hands the platform's clipboard; `handled: false` sends the
+    /// stroke on to the app's bindings.
     pub fn key_stroke(&self, pattern: &KeyPattern) -> crate::custom::Response {
         // an open menu takes Escape before anyone — its owner is the
         // runtime, so no reconciler handler could; a live drag is next
@@ -1128,6 +1129,18 @@ impl Runtime {
             && (self.close_menu() || self.cancel_drag())
         {
             return crate::custom::Response::handled();
+        }
+        // a field of MANY lines owns `⌘↵`: the bare break is its
+        // newline, so its submit has to be the chord — and the app
+        // only loses that chord where the field named a handler
+        if *pattern == KeyPattern::command(crate::action::Key::Enter) {
+            let focused = self.focus.borrow().clone();
+            if let Some(path) = focused
+                && self.field_at(&path).is_some_and(|field| field.multiline)
+                && self.submit(&path).applied
+            {
+                return crate::custom::Response::handled();
+            }
         }
         let Some(placement) = self.focused_custom() else {
             return crate::custom::Response::ignored();
@@ -2034,8 +2047,24 @@ impl Runtime {
     fn insert_break(&self, path: &str) -> Edited {
         match self.field_at(path).is_some_and(|field| field.multiline) {
             true => self.key(EditCommand::Insert("\n".into())),
-            false => Edited { applied: false, output: None },
+            // a one-line field has no break to take, so the bare
+            // stroke is its SUBMIT — and where the app named none it
+            // still declines, the way it always did
+            false => self.submit(path),
         }
+    }
+
+    /// The field's own key, offered to `.on_submit`. A field that
+    /// named no handler declines and the stroke walks on to the app's
+    /// keys, which is what the bare Enter did before the door existed.
+    fn submit(&self, path: &str) -> Edited {
+        let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
+        // the empty answer is the field saying the stroke is spent
+        let taken = matches!(
+            reconciler::run_editor(path, EditCommand::Submit, &mut state),
+            Some(Some(_))
+        );
+        Edited { applied: taken, output: None }
     }
 
     /// A vertical arrow, offered to the focused field. The caret walks

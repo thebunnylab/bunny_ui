@@ -4902,6 +4902,94 @@ mod tests {
     }
 
     #[test]
+    fn a_field_answers_its_own_key_and_only_where_the_app_asked() {
+        use crate::action::{Key, KeyPattern};
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::EditCommand;
+
+        #[derive(Clone, Copy)]
+        struct Panel {
+            note: State<String>,
+            name: State<String>,
+            bare: State<String>,
+            sent: State<i32>,
+            committed: State<i32>,
+        }
+
+        impl Component for Panel {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack((
+                    text_editor("write a note", self.note.binding())
+                        .on_submit(move || self.committed.add(1))
+                        .frame(120.0, 72.0),
+                    text_field("name", self.name.binding())
+                        .on_submit(move || self.sent.add(1))
+                        .frame(120.0, 26.0),
+                    text_field("nothing", self.bare.binding()).frame_width(120.0),
+                ))
+            }
+        }
+
+        let panel = Panel {
+            note: State::new(String::new()),
+            name: State::new(String::new()),
+            bare: State::new(String::new()),
+            sent: State::new(0),
+            committed: State::new(0),
+        };
+        let runtime = Runtime::new();
+        runtime.render_stable(&panel);
+        let result =
+            runtime.layout(&panel, Proposal::exact(Size { width: 240.0, height: 240.0 }));
+        // by the slot each field holds in the body — a one-line field
+        // keeps its natural height whatever box it is given, so the
+        // three cannot be told apart by size
+        let field_of = |slot: &str| {
+            result
+                .hits
+                .iter()
+                .find(|(path, _)| path.ends_with(slot))
+                .map(|(_, rect)| (rect.origin.x + 8.0, rect.origin.y + rect.size.height / 2.0))
+                .expect("the field is a target")
+        };
+        let click = |(x, y): (f64, f64)| {
+            runtime.pointer_clicked(x, y, 1, false);
+            runtime.pointer_released(x, y);
+        };
+        let (note, name, bare) = (field_of("#0"), field_of("#1"), field_of("#2"));
+
+        // the one-line field: the bare Enter IS its submit
+        click(name);
+        assert!(runtime.key(EditCommand::Insert("deco".into())).applied);
+        assert!(runtime.key(EditCommand::Newline).applied, "the field took its own key");
+        assert_eq!(panel.sent.get(), 1, "and the app heard it");
+        assert_eq!(panel.name.get(), "deco", "a submit is not an edit");
+
+        // and the chord stays the app's there: one door per field
+        assert!(
+            !runtime.key_stroke(&KeyPattern::command(Key::Enter)).handled,
+            "the chord over a one-line field belongs to the app"
+        );
+        assert_eq!(panel.sent.get(), 1);
+
+        // a field that named no handler declines exactly as it always did
+        click(bare);
+        assert!(!runtime.key(EditCommand::Newline).applied, "no handler, no door");
+
+        // the many-line field keeps Enter for its break...
+        click(note);
+        assert!(runtime.key(EditCommand::Insert("ab".into())).applied);
+        assert!(runtime.key(EditCommand::Newline).applied);
+        assert_eq!(panel.note.get(), "ab\n", "Enter is still the break");
+        assert_eq!(panel.committed.get(), 0, "and a break is not a submit");
+
+        // ...and puts its own key on the chord, before the keymap
+        assert!(runtime.key_stroke(&KeyPattern::command(Key::Enter)).handled);
+        assert_eq!(panel.committed.get(), 1);
+        assert_eq!(panel.note.get(), "ab\n", "the chord left the note alone");
+    }
+
+    #[test]
     fn actions_register_dispatch_and_the_innermost_wins() {
         const PING: ActionId = ActionId("test.ping");
 

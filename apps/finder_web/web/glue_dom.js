@@ -194,6 +194,10 @@ function createElementOf(kind) {
       // NEVER during a live composition — the browser owns that dance
       if (!composing) report(input);
     });
+    // the browser's focus IS the engine's here, and it has to travel
+    // before the first stroke: an Enter on an untouched box would
+    // otherwise reach whichever field typed last
+    input.addEventListener("focus", () => report(input));
     function report(input) {
       const path = input.dataset.path ?? "";
       sendField(path, input.value, input.selectionStart ?? input.value.length);
@@ -782,16 +786,20 @@ WebAssembly.instantiateStreaming(fetch("finder_web.wasm"), imports).then(
       wasm.bunny_pointer_up(x, y);
     });
     // the browser owns the <input>s in this mode. What still belongs
-    // to the engine: Escape (the keymap dismisses the popover) and
-    // every stroke a focused canvas island wants — a box the app
-    // paints has no element to type into.
+    // to the engine: Escape (the keymap dismisses the popover), Enter
+    // (the field's own submit — the engine answers only where the app
+    // named one) and every stroke a focused canvas island wants — a
+    // box the app paints has no element to type into. Neither shared
+    // key is prevented: an input does nothing with them anyway, and
+    // taking them would be taking them from the browser for nothing.
+    const SHARED = { 7: true, 10: true };
     window.addEventListener("keydown", (event) => {
       const typing = event.target && event.target.tagName === "INPUT";
       const mods = modifiers(event);
       const code = KEYS[event.key];
       if (code !== undefined) {
-        if (typing && code !== 7) return;
-        if (code !== 7) event.preventDefault();
+        if (typing && !SHARED[code]) return;
+        if (!typing && code !== 7) event.preventDefault();
         wasm.bunny_key(code, mods);
         return;
       }

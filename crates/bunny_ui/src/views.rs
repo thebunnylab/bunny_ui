@@ -182,6 +182,22 @@ pub struct TextField {
     placeholder: Arc<str>,
     text: Binding<String>,
     multiline: bool,
+    submit: Option<Rc<dyn Fn()>>,
+}
+
+impl TextField {
+    /// What the field's OWN key runs — the pair of a button's
+    /// `.on_click`. A one-line field submits on the bare Enter; a
+    /// field of many lines keeps Enter for its break and submits on
+    /// `⌘↵`, which is where every box with a Send button puts it.
+    ///
+    /// Naming no handler leaves the field exactly as it was: the
+    /// stroke walks on to the app's keys, and a list under a search
+    /// box still answers Enter.
+    pub fn on_submit(mut self, submit: impl Fn() + 'static) -> Self {
+        self.submit = Some(Rc::new(submit));
+        self
+    }
 }
 
 impl View for TextField {
@@ -198,9 +214,18 @@ impl View for TextField {
             Some(path) => {
                 let binding = self.text.clone();
                 let multiline = self.multiline;
+                let submit = self.submit.clone();
                 crate::reconciler::attribute_editor(
                     path.clone(),
                     Rc::new(move |command, state| {
+                        // the field's own key never touches the text.
+                        // An EMPTY answer says a handler took the
+                        // stroke; no answer at all says the app named
+                        // none, and the stroke walks on
+                        if matches!(command, crate::text_input::EditCommand::Submit) {
+                            submit.as_ref()?();
+                            return Some(String::new());
+                        }
                         // a ONE-line field cannot hold a break: a paste
                         // of several lines arrives flattened, the way
                         // every one-line field on every platform takes it
@@ -423,7 +448,12 @@ where
 }
 
 pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> TextField {
-    TextField { placeholder: Arc::from(placeholder.into()), text, multiline: false }
+    TextField {
+        placeholder: Arc::from(placeholder.into()),
+        text,
+        multiline: false,
+        submit: None,
+    }
 }
 
 /// `TextEditor("Placeholder", text: $binding)` — the same field, of
@@ -434,9 +464,15 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
 ///
 /// Enter inserts a break here, and only here: a one-line field lets the
 /// stroke through to the app's bindings, so a chord like `⌘↵` keeps
-/// meaning what the app says it means.
+/// meaning what the app says it means. `.on_submit` takes that chord
+/// for the box itself, and only where the app asked for it.
 pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> TextField {
-    TextField { placeholder: Arc::from(placeholder.into()), text, multiline: true }
+    TextField {
+        placeholder: Arc::from(placeholder.into()),
+        text,
+        multiline: true,
+        submit: None,
+    }
 }
 
 /// `ProgressView()`

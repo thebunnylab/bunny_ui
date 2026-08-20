@@ -167,7 +167,12 @@ impl Component for Finder {
                 {
                     let query = self.query;
                     let hint = self.drop_hint;
+                    let picked = self.selected;
                     text_field("Search ten thousand files…", self.query.binding())
+                        // Enter takes the first match — the field's OWN
+                        // key, heard before the keymap and without a Go
+                        // button the scene has not got (pain 58)
+                        .on_submit(move || picked.set(0))
                         .monospaced()
                         // drop a row here: the search becomes the file,
                         // and the LEFT half searches the name while the
