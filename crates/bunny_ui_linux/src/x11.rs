@@ -2478,11 +2478,23 @@ fn interpret(event: *mut GenericEvent) -> Step {
             match (kind, detail) {
                 (XCB_BUTTON_PRESS, 1) => {
                     let clicks = with_x(|client| client.clicks.click(time, x, y));
+                    // the X keymask, in the shell's own mapping: Control
+                    // is the accelerator and carries `command`, Mod1
+                    // carries `option` — the same words the key road
+                    // and the Wayland backend use
+                    const SHIFT_MASK: u16 = 0x1;
+                    const CONTROL_MASK: u16 = 0x4;
+                    const MOD1_MASK: u16 = 0x8;
                     Step::Deliver(AppEvent::MouseDown {
                         x,
                         y,
                         clicks,
-                        shift: state & 0x1 != 0,
+                        modifiers: bunny_ui::action::Modifiers {
+                            shift: state & SHIFT_MASK != 0,
+                            command: state & CONTROL_MASK != 0,
+                            option: state & MOD1_MASK != 0,
+                            control: false,
+                        },
                     })
                 }
                 (XCB_BUTTON_RELEASE, 1) => Step::Deliver(AppEvent::MouseUp { x, y }),

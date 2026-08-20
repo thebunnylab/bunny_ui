@@ -500,7 +500,7 @@ pub(crate) fn com_init() {
 /// The shell's event vocabulary — the Windows twin of the mac AppEvent.
 /// Positions are LAYOUT coordinates (top-left origin, logical points).
 pub enum AppEvent {
-    MouseDown { x: f64, y: f64, clicks: u8, shift: bool },
+    MouseDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     /// The right button: the context-menu press.
     RightMouseDown { x: f64, y: f64 },
     MouseUp { x: f64, y: f64 },
@@ -616,6 +616,25 @@ fn base_char(vk: u32, scan_code: u32) -> String {
         return String::new();
     }
     String::from_utf16_lossy(&buffer[..count as usize])
+}
+
+/// What the hand was holding at a press, in the shell's OWN mapping —
+/// the same one the key road uses, so a chord and a click name the
+/// same modifier by the same word: Ctrl is the accelerator and carries
+/// `command`, Alt carries `option`, and `control` stays false because
+/// the Windows key belongs to the system.
+///
+/// The button message brings shift and control with it (`MK_SHIFT`,
+/// `MK_CONTROL`); Alt is not in that word and has to be asked for.
+fn held_modifiers(wparam: usize) -> bunny_ui::action::Modifiers {
+    const MK_CONTROL: usize = 0x0008;
+    const MK_SHIFT: usize = 0x0004;
+    bunny_ui::action::Modifiers {
+        shift: wparam & MK_SHIFT != 0,
+        command: wparam & MK_CONTROL != 0,
+        option: unsafe { GetKeyState(VK_MENU) } as u16 & 0x8000 != 0,
+        control: false,
+    }
 }
 
 /// Builds the stroke for one `WM_KEYDOWN`/`WM_SYSKEYDOWN`.
@@ -1705,9 +1724,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             let raw_y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
             let clicks = count_click(raw_x, raw_y);
             let (x, y) = layout_point(hwnd, lparam);
-            // MK_SHIFT: the button message carries the modifier itself
-            let shift = wparam & 0x0004 != 0;
-            dispatch(AppEvent::MouseDown { x, y, clicks, shift });
+            dispatch(AppEvent::MouseDown { x, y, clicks, modifiers: held_modifiers(wparam) });
             0
         }
         WM_LBUTTONUP => {

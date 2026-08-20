@@ -88,6 +88,18 @@ fn named_key(code: u32) -> Option<bunny_ui::action::Key> {
 }
 
 /// The modifier bits the glue sends: 1 shift, 2 command, 4 option, 8
+/// control — the same word for a press as for a stroke, because the
+/// glue reads them from the same event fields either way.
+fn held(mods: u32) -> bunny_ui::action::Modifiers {
+    bunny_ui::action::Modifiers {
+        shift: mods & 1 != 0,
+        command: mods & 2 != 0,
+        option: mods & 4 != 0,
+        control: mods & 8 != 0,
+    }
+}
+
+/// The modifier bits the glue sends: 1 shift, 2 command, 4 option, 8
 /// control.
 fn pattern(key: bunny_ui::action::Key, mods: u32) -> KeyPattern {
     KeyPattern {
@@ -158,7 +170,7 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
 /// What the exports feed the shell — the web twin of the mac AppEvent.
 enum Event {
     PointerMove { x: f64, y: f64 },
-    PointerDown { x: f64, y: f64, clicks: u8, shift: bool },
+    PointerDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     PointerUp { x: f64, y: f64 },
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
     Text(String),
@@ -183,7 +195,7 @@ enum Event {
     DomScroll { id: u32, x: f64, y: f64 },
     DomViewport { id: u32, width: f64, height: f64 },
     DomBox { id: u32, width: f64, height: f64 },
-    IslandPointer { id: u32, kind: u32, x: f64, y: f64 },
+    IslandPointer { id: u32, kind: u32, x: f64, y: f64, mods: u32 },
     Action { path: String, clicks: u8 },
     /// Dom mode: the browser's input edited — value + selectionStart.
     Field { path: String, value: String, caret: usize },
@@ -326,8 +338,8 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
-            Event::PointerDown { x, y, clicks, shift } => {
-                if runtime.pointer_clicked(x, y, clicks, shift) {
+            Event::PointerDown { x, y, clicks, modifiers } => {
+                if runtime.pointer_clicked(x, y, clicks, modifiers) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
@@ -502,8 +514,8 @@ fn start_dom_with(
 
     let handle = Box::new(move |event: Event| {
         match event {
-            Event::PointerDown { x, y, clicks, shift } => {
-                let _ = runtime.pointer_clicked(x, y, clicks, shift);
+            Event::PointerDown { x, y, clicks, modifiers } => {
+                let _ = runtime.pointer_clicked(x, y, clicks, modifiers);
                 // the glue asks this next: a press on a drag source is
                 // the ONLY thing that opens the move door in this mode
                 DRAG_ARMED.with(|armed| armed.set(runtime.drag_armed()));
@@ -532,10 +544,10 @@ fn start_dom_with(
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
-            Event::IslandPointer { id, kind, x, y } => {
+            Event::IslandPointer { id, kind, x, y, mods } => {
                 // the canvas's own coordinates, routed to the app's
                 // box under the point — the pixels follow its answer
-                if runtime.dom_island_pointer(id, kind, x, y) {
+                if runtime.dom_island_pointer(id, kind, x, y, held(mods)) {
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
@@ -662,7 +674,7 @@ pub extern "C" fn bunny_context_click(x: f64, y: f64) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn bunny_pointer_down(x: f64, y: f64, time_ms: f64, button: u32, shift: u32) {
+pub extern "C" fn bunny_pointer_down(x: f64, y: f64, time_ms: f64, button: u32, mods: u32) {
     // the glue hands the event's own timestamp and which button it was;
     // the count is the shell's to keep, because `pointerdown` carries
     // no count of its own. Only the PRIMARY button counts, the way
@@ -678,7 +690,7 @@ pub extern "C" fn bunny_pointer_down(x: f64, y: f64, time_ms: f64, button: u32, 
     } else {
         1
     };
-    dispatch(Event::PointerDown { x, y, clicks, shift: shift != 0 });
+    dispatch(Event::PointerDown { x, y, clicks, modifiers: held(mods) });
 }
 
 #[unsafe(no_mangle)]
@@ -768,8 +780,8 @@ pub extern "C" fn bunny_dom_box(id: u32, width: f64, height: f64) {
 /// Dom mode: a pointer event on a canvas island, in the canvas's own
 /// coordinates (`kind`: 0 down, 1 move, 2 up).
 #[unsafe(no_mangle)]
-pub extern "C" fn bunny_island_pointer(id: u32, kind: u32, x: f64, y: f64) {
-    dispatch(Event::IslandPointer { id, kind, x, y });
+pub extern "C" fn bunny_island_pointer(id: u32, kind: u32, x: f64, y: f64, mods: u32) {
+    dispatch(Event::IslandPointer { id, kind, x, y, mods });
 }
 
 /// The wire contract this binary encodes. The glue reads it before it

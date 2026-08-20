@@ -618,7 +618,12 @@ pub enum ElementEvent {
     PointerMoved { at: Point, pressed: bool },
     /// `clicks` is the platform's own count — 2 selects a word, 3 a
     /// line, and the box never needs a clock of its own.
-    PointerDown { at: Point, clicks: u8 },
+    ///
+    /// `modifiers` is what the hand was holding. The framework spends
+    /// none of them: what command and a click MEAN over this box's
+    /// content is the box's own answer, and no gate above it could
+    /// give one.
+    PointerDown { at: Point, clicks: u8, modifiers: crate::action::Modifiers },
     PointerUp { at: Point },
     /// The wheel turned over the box. Ignore it and the scroll region
     /// around the box takes the turn instead.
@@ -1095,7 +1100,11 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                ElementEvent::PointerDown { at: Point { x: 10.0, y: 10.0 }, clicks: 1 },
+                ElementEvent::PointerDown {
+                    at: Point { x: 10.0, y: 10.0 },
+                    clicks: 1,
+                    modifiers: crate::action::Modifiers::NONE,
+                },
                 ElementEvent::PointerMoved {
                     at: Point { x: 290.0, y: 290.0 },
                     pressed: true
@@ -1206,6 +1215,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct Commander {
         seen: Rc<std::cell::RefCell<Vec<(crate::action::Key, Option<char>)>>>,
+        pressed: Rc<std::cell::RefCell<Vec<crate::action::Modifiers>>>,
     }
 
     impl CustomElement for Commander {
@@ -1225,6 +1235,10 @@ mod tests {
                     self.seen.borrow_mut().push((stroke.pattern.key, stroke.typed));
                     Response::handled()
                 }
+                ElementEvent::PointerDown { modifiers, .. } => {
+                    self.pressed.borrow_mut().push(*modifiers);
+                    Response::handled()
+                }
                 _ => Response::ignored(),
             }
         }
@@ -1240,6 +1254,41 @@ mod tests {
             use crate::ext::ViewExt;
             custom(self.box_).frame(200.0, 40.0)
         }
+    }
+
+    #[test]
+    fn a_press_says_what_the_hand_was_holding() {
+        use crate::action::Modifiers;
+
+        let commander = Commander::default();
+        let runtime = Runtime::new();
+        let view = Commanding { box_: commander.clone() };
+        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(40.0) });
+
+        // a plain press: nothing held, and the box can say so in one
+        // question instead of four
+        runtime.pointer_clicked(10.0, 20.0, 1, Modifiers::NONE);
+        assert_eq!(commander.pressed.borrow()[0], Modifiers::NONE);
+        assert!(!commander.pressed.borrow()[0].any());
+
+        // command and a click is a jump to a definition in one box and
+        // nothing at all in the next: the framework spends none of it
+        let command = Modifiers { command: true, ..Modifiers::NONE };
+        runtime.pointer_clicked(10.0, 20.0, 1, command);
+        assert_eq!(commander.pressed.borrow()[1], command);
+        assert!(commander.pressed.borrow()[1].any());
+
+        // shift extends a selection from the caret — the one the
+        // framework DOES read, and it still reaches the box
+        runtime.pointer_clicked(10.0, 20.0, 1, Modifiers::SHIFT);
+        assert_eq!(commander.pressed.borrow()[2], Modifiers::SHIFT);
+
+        // the door the press road carried before it could carry the
+        // rest: a bare bool still means shift, and nothing else
+        runtime.pointer_clicked(10.0, 20.0, 1, true);
+        assert_eq!(commander.pressed.borrow()[3], Modifiers::SHIFT);
+        runtime.pointer_clicked(10.0, 20.0, 1, false);
+        assert_eq!(commander.pressed.borrow()[4], Modifiers::NONE);
     }
 
     #[test]

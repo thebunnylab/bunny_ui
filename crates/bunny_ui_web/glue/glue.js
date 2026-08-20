@@ -379,7 +379,9 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       // `mousedown`, and this door stays on pointer events so touch
       // and pen keep working. The shell counts, from the event's own
       // timestamp and the button it came from.
-      wasm.bunny_pointer_down(x, y, event.timeStamp, event.button, event.shiftKey ? 1 : 0);
+      // the same four bits a stroke carries: what the hand holds means
+      // the same thing whether it arrives with a key or with a click
+      wasm.bunny_pointer_down(x, y, event.timeStamp, event.button, modifiers(event));
     });
     host.addEventListener("contextmenu", (event) => {
       // the scene offers its own menu — the browser's stays home

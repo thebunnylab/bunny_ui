@@ -247,7 +247,7 @@ pub(crate) unsafe fn sel(name: &str) -> Sel {
 /// coordinates (origin at top-left, logical points) — the AppKit flip
 /// already happened.
 pub enum AppEvent {
-    MouseDown { x: f64, y: f64, clicks: u8, shift: bool },
+    MouseDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     /// The right button (or a two-finger tap): the context-menu press.
     RightMouseDown { x: f64, y: f64 },
     MouseUp { x: f64, y: f64 },
@@ -401,6 +401,17 @@ extern "C" fn bunny_right_mouse_down(this: Id, _sel: Sel, event: Id) {
     dispatch(AppEvent::RightMouseDown { x, y });
 }
 
+/// The four the keymap names, out of one AppKit bitfield — the same
+/// bits the key road reads, in one place so the two cannot drift.
+fn modifiers_of(flags: u64) -> bunny_ui::action::Modifiers {
+    bunny_ui::action::Modifiers {
+        shift: flags & (1 << 17) != 0,
+        control: flags & (1 << 18) != 0,
+        option: flags & (1 << 19) != 0,
+        command: flags & (1 << 20) != 0,
+    }
+}
+
 extern "C" fn bunny_mouse_down(this: Id, _sel: Sel, event: Id) {
     let (x, y) = unsafe { event_layout_point(this, event) };
     // the scene's own title bar: a press on a drag region (with no
@@ -417,10 +428,8 @@ extern "C" fn bunny_mouse_down(this: Id, _sel: Sel, event: Id) {
     }
     // AppKit already counts: 2 is the word, 3 is the line
     let clicks = unsafe { msg_u64(event, sel("clickCount")).min(255) as u8 };
-    // and shift is the one modifier a press carries: it extends a
-    // field's selection instead of replacing it
-    let shift = unsafe { msg_u64(event, sel("modifierFlags")) & (1 << 17) != 0 };
-    dispatch(AppEvent::MouseDown { x, y, clicks, shift });
+    let modifiers = unsafe { modifiers_of(msg_u64(event, sel("modifierFlags"))) };
+    dispatch(AppEvent::MouseDown { x, y, clicks, modifiers });
 }
 
 extern "C" fn bunny_mouse_up(this: Id, _sel: Sel, event: Id) {
@@ -748,12 +757,13 @@ extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
     unsafe {
         let code = msg_u16(event, sel("keyCode"));
         let flags = msg_u64(event, sel("modifierFlags"));
+        let held = modifiers_of(flags);
         let stroke = KeyStroke {
             code,
-            shift: flags & (1 << 17) != 0,
-            control: flags & (1 << 18) != 0,
-            option: flags & (1 << 19) != 0,
-            command: flags & (1 << 20) != 0,
+            shift: held.shift,
+            control: held.control,
+            option: held.option,
+            command: held.command,
             chars: text_argument_to_string(msg_id(event, sel("characters"))),
             typed: typed_character(event, flags),
             chars_bare: bare_characters(event),

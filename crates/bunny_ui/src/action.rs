@@ -88,6 +88,47 @@ pub enum Key {
     Char(char),
 }
 
+/// What the hand was holding — the same four the keymap names, in the
+/// same order, because a press and a stroke ask the same question with
+/// different hardware.
+///
+/// A press needs them for the same reason a stroke does: only the box
+/// under the pointer knows what command and shift MEAN over its own
+/// content. Command and a click is a jump to a definition in one box
+/// and nothing at all in the next, and no gate above can decide that.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Modifiers {
+    pub shift: bool,
+    pub command: bool,
+    pub option: bool,
+    pub control: bool,
+}
+
+impl Modifiers {
+    /// Nothing held.
+    pub const NONE: Modifiers =
+        Modifiers { shift: false, command: false, option: false, control: false };
+
+    /// Shift alone — the one a press used to carry, kept as a name so
+    /// the ordinary case reads as a word.
+    pub const SHIFT: Modifiers = Modifiers { shift: true, ..Modifiers::NONE };
+
+    /// Is anything at all held? A plain press is the common case and
+    /// the one a box answers fastest.
+    pub const fn any(&self) -> bool {
+        self.shift || self.command || self.option || self.control
+    }
+}
+
+impl From<bool> for Modifiers {
+    /// Shift, and nothing else — what the press door carried before it
+    /// could carry the rest, so every caller that says `false` or
+    /// hands over a shift flag keeps meaning what it meant.
+    fn from(shift: bool) -> Modifiers {
+        Modifiers { shift, ..Modifiers::NONE }
+    }
+}
+
 /// The pattern the keymap matches — EXACT modifiers (Cmd+Enter does not
 /// match the Enter binding). `Eq + Hash`: a direct map key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

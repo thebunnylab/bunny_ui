@@ -3181,9 +3181,9 @@ mod tests {
         let _ = runtime.dom_islands(1);
 
         // the press lands in the box's own coordinates
-        assert!(runtime.dom_island_pointer(canvas_id, 0, 25.0, 10.0));
+        assert!(runtime.dom_island_pointer(canvas_id, 0, 25.0, 10.0, false));
         assert_eq!(view.mark.get(), 25.0, "the box heard the press where it happened");
-        assert!(runtime.dom_island_pointer(canvas_id, 2, 25.0, 10.0));
+        assert!(runtime.dom_island_pointer(canvas_id, 2, 25.0, 10.0, false));
 
         // the release handed it the keyboard: typing reaches the box
         let answer = runtime.key(EditCommand::Insert("hi".into()));

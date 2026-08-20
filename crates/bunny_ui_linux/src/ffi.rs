@@ -1284,7 +1284,7 @@ pub enum AppEvent {
     Wake,
     ResignKey,
     MouseMoved { x: f64, y: f64 },
-    MouseDown { x: f64, y: f64, clicks: u8, shift: bool },
+    MouseDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     MouseUp { x: f64, y: f64 },
     RightMouseDown { x: f64, y: f64 },
     MouseExited,
@@ -2366,15 +2366,25 @@ pub(crate) enum KeyRoad {
 }
 
 /// The xkb walk for one PRESSED key: compose first (dead keys), then
-/// Is shift held right now? The one modifier a PRESS carries — over a
-/// field it extends the selection instead of replacing it.
-fn shift_held(keyboard: &Keyboard) -> bool {
+/// What the hand is holding right now, in the shell's OWN mapping —
+/// the same one the key road uses, so a chord and a click name the
+/// same modifier by the same word: Control is the accelerator and
+/// carries `command`, Mod1 carries `option`, and `control` stays false.
+///
+/// The keyboard is the authority on who is held, even for a press:
+/// xkb keeps the effective state and the pointer has none of its own.
+fn held_modifiers(keyboard: &Keyboard) -> bunny_ui::action::Modifiers {
     if keyboard.state.is_null() {
-        return false;
+        return bunny_ui::action::Modifiers::NONE;
     }
-    unsafe {
-        xkb_state_mod_name_is_active(keyboard.state, c"Shift".as_ptr(), XKB_STATE_MODS_EFFECTIVE)
-            == 1
+    let active = |name: &CStr| unsafe {
+        xkb_state_mod_name_is_active(keyboard.state, name.as_ptr(), XKB_STATE_MODS_EFFECTIVE) == 1
+    };
+    bunny_ui::action::Modifiers {
+        shift: active(c"Shift"),
+        command: active(c"Control"),
+        option: active(c"Mod1"),
+        control: false,
     }
 }
 
@@ -3323,10 +3333,11 @@ fn drain_protocol_events() {
                     (BTN_LEFT, true) => {
                         let clicks =
                             with_client(|client| client.clicks.click(time_ms, x, y));
-                        // shift rides in with the press: over a field it
-                        // EXTENDS the selection instead of replacing it,
-                        // and the keymap is the authority on who is held
-                        let shift = with_client(|client| shift_held(&client.keyboard));
+                        // what the hand holds rides in with the press:
+                        // the framework spends only the shift, and the
+                        // box under the pointer spends the rest
+                        let modifiers =
+                            with_client(|client| held_modifiers(&client.keyboard));
                         // the frame conversation comes first: a press on
                         // a drag region moves the window, a control
                         // answers as the window's own button
@@ -3348,7 +3359,7 @@ fn drain_protocol_events() {
                             CrownTake::None
                         };
                         if matches!(take, CrownTake::None) || !crown_execute(take, x, y) {
-                            dispatch(AppEvent::MouseDown { x, y, clicks, shift });
+                            dispatch(AppEvent::MouseDown { x, y, clicks, modifiers });
                         }
                         // else: the compositor took the grab — the
                         // click is spent on the frame

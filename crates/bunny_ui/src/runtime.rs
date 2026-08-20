@@ -1277,11 +1277,21 @@ impl Runtime {
     /// counts too. A box hears the number in `PointerDown`, and a view
     /// through `.on_click_count`.
     ///
-    /// `shift` is the ONE modifier a press carries, because it is the
-    /// one that changes what a press MEANS: over a field it extends
-    /// the selection instead of replacing it. The others change what
-    /// the app does, and those travel as key patterns.
-    pub fn pointer_clicked(&self, x: Px, y: Px, clicks: u8, shift: bool) -> bool {
+    /// The press carries what the hand was HOLDING, and all of it. The
+    /// framework itself only ever reads the shift — over a field it
+    /// extends the selection instead of replacing it — but the rest is
+    /// not the framework's to spend: command and a click is a jump to a
+    /// definition in one box and nothing in the next, and only the box
+    /// under the pointer knows which.
+    pub fn pointer_clicked(
+        &self,
+        x: Px,
+        y: Px,
+        clicks: u8,
+        modifiers: impl Into<crate::action::Modifiers>,
+    ) -> bool {
+        let modifiers = modifiers.into();
+        let shift = modifiers.shift;
         // the hand left the keyboard: a sequence in the air goes with
         // it, the way it does in every editor that has chords
         self.cancel_chord();
@@ -1363,7 +1373,7 @@ impl Runtime {
             let at = Self::local(&placement, x, y);
             let response = self.deliver(
                 &placement,
-                crate::custom::ElementEvent::PointerDown { at, clicks },
+                crate::custom::ElementEvent::PointerDown { at, clicks, modifiers },
             );
             if response.rises {
                 let above = self.hit_above(&placement.path, x, y);
@@ -3160,7 +3170,15 @@ impl Runtime {
     /// point hears it; a press GRABS the box until the release, the
     /// way the desktop's pointer does; the release hands the keyboard
     /// to a box that takes keys — first responder follows the click.
-    pub fn dom_island_pointer(&self, id: u32, kind: u32, x: f64, y: f64) -> bool {
+    pub fn dom_island_pointer(
+        &self,
+        id: u32,
+        kind: u32,
+        x: f64,
+        y: f64,
+        modifiers: impl Into<crate::action::Modifiers>,
+    ) -> bool {
+        let modifiers = modifiers.into();
         let Some(island) = self.dom.borrow().island_path(id) else {
             return false;
         };
@@ -3194,7 +3212,7 @@ impl Runtime {
                     Some(placement.path.clone());
                 self.deliver(
                     &placement,
-                    crate::custom::ElementEvent::PointerDown { at, clicks: 1 },
+                    crate::custom::ElementEvent::PointerDown { at, clicks: 1, modifiers },
                 );
             }
             1 => {

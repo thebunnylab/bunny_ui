@@ -101,13 +101,13 @@ function wireIsland(el, id) {
       // still counts
     }
     event.preventDefault();
-    wasm.bunny_island_pointer(id, 0, event.offsetX, event.offsetY);
+    wasm.bunny_island_pointer(id, 0, event.offsetX, event.offsetY, modifiers(event));
   });
   el.addEventListener("pointermove", (event) => {
-    wasm.bunny_island_pointer(id, 1, event.offsetX, event.offsetY);
+    wasm.bunny_island_pointer(id, 1, event.offsetX, event.offsetY, modifiers(event));
   });
   el.addEventListener("pointerup", (event) => {
-    wasm.bunny_island_pointer(id, 2, event.offsetX, event.offsetY);
+    wasm.bunny_island_pointer(id, 2, event.offsetX, event.offsetY, modifiers(event));
   });
 }
 
