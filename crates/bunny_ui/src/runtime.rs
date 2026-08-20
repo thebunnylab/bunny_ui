@@ -2884,7 +2884,11 @@ impl Runtime {
                     id: island.id,
                     width: island.width,
                     height: island.height,
-                    rgba: bitmap.to_rgba_bytes(),
+                    // the island cleared to NOTHING, so the blend left
+                    // the colour multiplied by its own coverage —
+                    // `putImageData` reads straight and would multiply
+                    // it a second time
+                    rgba: crate::raster::unpremultiplied(&bitmap.to_rgba_bytes()),
                 }
             })
             .collect()

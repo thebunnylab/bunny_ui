@@ -170,6 +170,25 @@ fn blend_px(src: u32, dst: u32) -> u32 {
     (channel(24) << 24) | (channel(16) << 16) | (channel(8) << 8) | a
 }
 
+/// Straight-alpha RGBA from bytes that were blended onto a TRANSPARENT
+/// ground. `blend_px` leaves `rgb = colour x coverage` there, which is
+/// the premultiplied convention; `ImageData` and a canvas blit both
+/// read straight. Wherever alpha is 255 this changes nothing, which is
+/// why only islands ever need it.
+pub fn unpremultiplied(rgba: &[u8]) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    for pixel in out.chunks_exact_mut(4) {
+        let alpha = pixel[3] as u32;
+        if alpha == 0 || alpha == 255 {
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            *channel = ((*channel as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
+        }
+    }
+    out
+}
+
 impl Bitmap {
     pub fn new(width: usize, height: usize, background: Color) -> Self {
         Bitmap {
@@ -1196,6 +1215,49 @@ impl Surface {
 
 #[cfg(test)]
 mod tests {
+
+    /// An island clears to NOTHING, and `blend_px` over nothing leaves
+    /// the colour already multiplied by its own coverage: a half-alpha
+    /// red lands as (128, 0, 0, 128). Those bytes go to `putImageData`,
+    /// which reads them as STRAIGHT by specification — so the browser
+    /// multiplies by the alpha a second time and the pane composites at
+    /// a quarter instead of a half.
+    ///
+    /// The pixel tiers never saw it: over an OPAQUE background the
+    /// alpha is 255 and the two conventions are the same number. Only a
+    /// transparent destination tells them apart, and only islands have
+    /// one.
+    #[test]
+    fn an_island_over_nothing_carries_its_alpha_home() {
+        let mut display = crate::layout::DisplayList::default();
+        display.push(crate::layout::DrawCommand::FillRect {
+            rect: crate::layout::Rect {
+                origin: crate::layout::Point { x: 0.0, y: 0.0 },
+                size: crate::layout::Size { width: 4.0, height: 4.0 },
+            },
+            color: crate::layout::Color::rgba(255, 0, 0, 128),
+            corner_radius: crate::layout::Corners::ZERO,
+        });
+        let bitmap = crate::raster::rasterize_with(
+            &display,
+            4,
+            4,
+            1,
+            crate::layout::Color::rgba(0, 0, 0, 0),
+            &crate::text_engine::PixelFont,
+            &crate::image_engine::RawImages::default(),
+        );
+        let straight = crate::raster::unpremultiplied(&bitmap.to_rgba_bytes());
+        assert_eq!(
+            &straight[..4],
+            &[255, 0, 0, 128],
+            "a half-covered red is FULL red at half alpha, not half red"
+        );
+        // and an opaque pixel is untouched: the two conventions agree
+        // wherever alpha is 255, which is why this never bit the window
+        let opaque = crate::raster::unpremultiplied(&[10, 20, 30, 255]);
+        assert_eq!(opaque, vec![10, 20, 30, 255]);
+    }
     use super::*;
     use crate::layout::{DrawCommand, Glass, Point};
 
