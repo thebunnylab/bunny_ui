@@ -152,11 +152,16 @@ impl Stroke {
     /// character are dropped HERE, once, so no shell has to remember
     /// them and no shell can forget them.
     ///
-    /// A chord types nothing — and every platform asked under command
-    /// or control answers with the key's own character anyway, which
-    /// would be a lie about what reached the screen. A control
-    /// character is not text: control and the letter A make U+0001,
-    /// and a box asking what was typed must not be told that.
+    /// A chord types nothing. Asked under command, the Mac hands back
+    /// the key's own character — measured, not assumed — which would
+    /// be a lie about what reached the screen. A control character is
+    /// not text either: control and the letter A make U+0001, and a
+    /// box asking what was typed must not be told that.
+    ///
+    /// A chord that DOES type is not this door's business: the shells
+    /// where one exists — AltGr is control and alt together on two of
+    /// them — send it down the character road before the gate ever
+    /// runs, and it arrives as text.
     pub fn new(pattern: KeyPattern, typed: Option<char>) -> Stroke {
         let chord = pattern.command || pattern.control;
         Stroke { pattern, typed: typed.filter(|typed| !chord && !typed.is_control()) }
@@ -166,17 +171,23 @@ impl Stroke {
     /// modifiers that made the character are SPENT, so a binding
     /// written as the character alone matches it.
     ///
-    /// `None` when the key typed nothing. Shift and option are spent
-    /// here because they are what produced the character; command and
-    /// control never get this far, because a chord types nothing.
+    /// There is a second spelling only where a modifier CHANGED the
+    /// character. Shift and the space bar still make a space, and a
+    /// binding on the space bar must not fire for shift-space; the same
+    /// for any held modifier a layout ignores, which is how a plain
+    /// Alt reads on the platforms where Alt types nothing. Shift and a
+    /// letter only change its case, and a keymap spells a letter in one
+    /// case anyway.
+    ///
+    /// `None` when the key typed nothing, and `None` when what it typed
+    /// is the key's own name said again.
     pub fn typed_pattern(&self) -> Option<KeyPattern> {
-        self.typed.map(|typed| KeyPattern {
-            key: Key::Char(typed),
-            shift: false,
-            command: false,
-            option: false,
-            control: false,
-        })
+        let typed = self.typed?;
+        let renamed = match self.pattern.key {
+            Key::Char(base) => !base.eq_ignore_ascii_case(&typed),
+            _ => true,
+        };
+        renamed.then(|| KeyPattern::key(Key::Char(typed)))
     }
 }
 

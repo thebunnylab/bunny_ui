@@ -4941,6 +4941,32 @@ mod tests {
             "the key beats the character it typed"
         );
 
+        // a modifier the layout IGNORED leaves no second spelling: the
+        // space bar with shift still makes a space, and a binding on
+        // the space bar must not fire for shift-space. This is the same
+        // shape as a plain Alt on a platform where Alt types nothing —
+        // the character comes back unchanged, and an unchanged
+        // character is the key's own name said twice
+        const LEADER: ActionId = ActionId("test.leader");
+        let runtime = Runtime::new();
+        runtime.bind(KeyPattern::key(Key::Char(' ')), LEADER);
+        let shift_space = KeyPattern { shift: true, ..KeyPattern::key(Key::Char(' ')) };
+        assert_eq!(
+            runtime.chord(Stroke::new(shift_space, Some(' '))),
+            KeyMatch::None,
+            "shift-space is not the space bar"
+        );
+        assert_eq!(
+            runtime.chord(Stroke::new(KeyPattern::key(Key::Char(' ')), Some(' '))),
+            KeyMatch::Action(LEADER),
+            "and the space bar still is"
+        );
+        // shift and a letter only change its case, and a keymap spells
+        // a letter in ONE case: no second reading there either
+        runtime.bind(KeyPattern::key(Key::Char('a')), REPEAT);
+        let shift_a = KeyPattern { shift: true, ..KeyPattern::key(Key::Char('a')) };
+        assert_eq!(runtime.chord(Stroke::new(shift_a, Some('A'))), KeyMatch::None);
+
         // a chord types nothing, so nothing answers for it by character
         let runtime = Runtime::new();
         runtime.bind(KeyPattern::key(Key::Char('$')), PUSH_INDENT);
