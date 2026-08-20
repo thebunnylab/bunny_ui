@@ -1005,6 +1005,12 @@ pub struct Glass {
     /// the material's own: a value below the first level of the blur
     /// pyramid renders as that level. The minimum glass is light
     /// glass, never clear glass.
+    ///
+    /// CAUTION: the blur decides what the LENS has left to bend. A
+    /// blur erases every detail thinner than itself, so a heavy blur
+    /// over hairlines leaves a tinted box with a bright rim and no
+    /// bend at all — which is how a fake looks. Give the scene behind
+    /// the pane shapes wider than the blur, or lower the blur.
     pub blur: Option<Px>,
     /// Composited OVER the blurred backdrop.
     pub tint: Option<Color>,
