@@ -14,19 +14,19 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use bunny_ui::image_engine::{ImageEngine, ImageSource, raster_source};
-use bunny_ui::layout::{Color, Corners, DisplayList, DrawCommand, Rect};
-use bunny_ui::raster::physical_extent;
-use bunny_ui::text_engine::{FontKey, FontSpec, TextEngine};
+use crate::image_engine::{ImageEngine, ImageSource, raster_source};
+use crate::layout::{Color, Corners, DisplayList, DrawCommand, Rect};
+use crate::raster::physical_extent;
+use crate::text_engine::{FontKey, FontSpec, TextEngine};
 
 /// The run atlas: text tiles append into one shared texture. Runs wider
 /// than a chunk split into seamless chunks (texel reads are 1:1, a seam
 /// cannot show). Overflow drains the in-flight frames, resets the whole
 /// atlas and re-inserts the current frame — a copying collector, not a
 /// per-tile free list.
-pub(crate) const ATLAS_CHUNK_WIDTH: u32 = 1024;
-pub(crate) const ATLAS_INITIAL_SIZE: u32 = 2048;
-pub(crate) const ATLAS_MAX_SIZE: u32 = 4096;
+pub const ATLAS_CHUNK_WIDTH: u32 = 1024;
+pub const ATLAS_INITIAL_SIZE: u32 = 2048;
+pub const ATLAS_MAX_SIZE: u32 = 4096;
 
 // MARK: - The wire format shared with both tiers' shaders
 
@@ -36,22 +36,22 @@ pub(crate) const ATLAS_MAX_SIZE: u32 = 4096;
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // written whole, read by the GPU — never field by field
-pub(crate) struct RectInstance {
-    pub(crate) rect: [f32; 4],   // x0, y0, x1, y1 (the shadow ships EXPANDED)
-    pub(crate) clip: [f32; 4],   // the snapped clip-stack top
-    pub(crate) params: [f32; 4], // aspect (the ellipse only), thickness/reach/first, kind, expansion/second
-    pub(crate) color: [u8; 4],   // straight RGBA (a normalized attribute)
+pub struct RectInstance {
+    pub rect: [f32; 4],   // x0, y0, x1, y1 (the shadow ships EXPANDED)
+    pub clip: [f32; 4],   // the snapped clip-stack top
+    pub params: [f32; 4], // aspect (the ellipse only), thickness/reach/first, kind, expansion/second
+    pub color: [u8; 4],   // straight RGBA (a normalized attribute)
     /// A gradient's second half rides here: the far color plus one
     /// point (centre for the rings, end for the line).
-    pub(crate) pad: [u8; 12],
+    pub pad: [u8; 12],
     /// The four corners, clockwise from the top left, CLAMPED in
     /// device px — the shader only picks the one its quadrant owns.
-    pub(crate) radii: [f32; 4],
+    pub radii: [f32; 4],
 }
 
 /// The deepest level of the blur pyramid — four levels in all,
-/// mirroring `bunny_ui::glass::MAX_LEVEL`.
-pub(crate) const GLASS_MAX_LEVEL: u32 = 3;
+/// mirroring `crate::glass::MAX_LEVEL`.
+pub const GLASS_MAX_LEVEL: u32 = 3;
 
 /// One pane of liquid glass. Everything is snapped device pixels
 /// resolved on the CPU in f64, like every other instance here — the
@@ -59,17 +59,17 @@ pub(crate) const GLASS_MAX_LEVEL: u32 = 3;
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // written whole, read by the GPU — never field by field
-pub(crate) struct GlassInstance {
-    pub(crate) rect: [f32; 4],   // x0, y0, x1, y1
-    pub(crate) clip: [f32; 4],   // the snapped clip-stack top
-    pub(crate) radii: [f32; 4],  // the four corners, clamped
-    pub(crate) lens: [f32; 4],   // blur, refraction band, amount, chromatic
-    pub(crate) finish: [f32; 4], // highlight band, intensity, saturation, brightness
-    pub(crate) touch: [f32; 4],  // sheen, spot x, spot y, spot radius
-    pub(crate) tint: [u8; 4],    // straight RGBA (a normalized attribute)
-    pub(crate) highlight: [u8; 4],
-    pub(crate) spot_alpha: f32,
-    pub(crate) pad: f32,
+pub struct GlassInstance {
+    pub rect: [f32; 4],   // x0, y0, x1, y1
+    pub clip: [f32; 4],   // the snapped clip-stack top
+    pub radii: [f32; 4],  // the four corners, clamped
+    pub lens: [f32; 4],   // blur, refraction band, amount, chromatic
+    pub finish: [f32; 4], // highlight band, intensity, saturation, brightness
+    pub touch: [f32; 4],  // sheen, spot x, spot y, spot radius
+    pub tint: [u8; 4],    // straight RGBA (a normalized attribute)
+    pub highlight: [u8; 4],
+    pub spot_alpha: f32,
+    pub pad: f32,
 }
 
 const _: () = {
@@ -90,10 +90,10 @@ const _: () = {
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // written whole, read by the GPU — never field by field
-pub(crate) struct SpriteInstance {
-    pub(crate) dest: [f32; 4], // x0, y0, x1, y1 in device px
-    pub(crate) tex: [f32; 4],  // atlas texel origin + the same extent
-    pub(crate) clip: [f32; 4],
+pub struct SpriteInstance {
+    pub dest: [f32; 4], // x0, y0, x1, y1 in device px
+    pub tex: [f32; 4],  // atlas texel origin + the same extent
+    pub clip: [f32; 4],
 }
 
 const _: () = {
@@ -114,9 +114,9 @@ const _: () = {
 
 /// A snapped box in device pixels, `[x0, y0, x1, y1)` — the same tuple
 /// the Surface uses for damage and clips.
-pub(crate) type Box4 = (i64, i64, i64, i64);
+pub type Box4 = (i64, i64, i64, i64);
 
-pub(crate) fn box_intersect(a: Box4, b: Box4) -> Option<Box4> {
+pub fn box_intersect(a: Box4, b: Box4) -> Option<Box4> {
     let rect = (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3));
     (rect.0 < rect.2 && rect.1 < rect.3).then_some(rect)
 }
@@ -125,7 +125,7 @@ pub(crate) fn box_intersect(a: Box4, b: Box4) -> Option<Box4> {
 /// size separately, then round each edge on its own. The operation order
 /// matters: it is what makes neighbors close without a seam, and parity
 /// is byte-level.
-pub(crate) fn snap_scaled(rect: Rect, factor: f64) -> Box4 {
+pub fn snap_scaled(rect: Rect, factor: f64) -> Box4 {
     let sx = rect.origin.x * factor;
     let sy = rect.origin.y * factor;
     let sw = rect.size.width * factor;
@@ -140,13 +140,13 @@ pub(crate) fn snap_scaled(rect: Rect, factor: f64) -> Box4 {
 
 /// The CPU's radius clamp, verbatim — the same `Corners::clamped` the
 /// raster runs, against the SNAPPED extent.
-pub(crate) fn corner_clamp(scaled: Corners, snapped: Box4) -> Corners {
+pub fn corner_clamp(scaled: Corners, snapped: Box4) -> Corners {
     scaled.clamped((snapped.2 - snapped.0) as f64, (snapped.3 - snapped.1) as f64)
 }
 
 /// The four corners as a shader reads them, clockwise from the top
 /// left — the ONE place the field order is spoken.
-pub(crate) fn wire_radii(radii: Corners) -> [f32; 4] {
+pub fn wire_radii(radii: Corners) -> [f32; 4] {
     [
         radii.top_left as f32,
         radii.top_right as f32,
@@ -161,14 +161,14 @@ pub(crate) fn wire_radii(radii: Corners) -> [f32; 4] {
 /// until now — and multiplying coverage by 1.0 is exact.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) struct RoundClip {
+pub struct RoundClip {
     /// The rounded clip's OWN snapped box in device px — the cut can
     /// be smaller without the corner moving.
-    pub(crate) box4: [f32; 4],
+    pub box4: [f32; 4],
     /// The four corners. They fit the second 16-byte register the
     /// constant block was already padding out to, so the cut carries
     /// four for the price of one.
-    pub(crate) radii: [f32; 4],
+    pub radii: [f32; 4],
 }
 
 const _: () = {
@@ -178,22 +178,22 @@ const _: () = {
 };
 
 /// Slot zero of every frame — the cut that never bends.
-pub(crate) const NO_ROUND: RoundClip = RoundClip { box4: [0.0; 4], radii: [0.0; 4] };
+pub const NO_ROUND: RoundClip = RoundClip { box4: [0.0; 4], radii: [0.0; 4] };
 
-pub(crate) const KIND_FILL: f32 = 0.0;
-pub(crate) const KIND_STROKE: f32 = 1.0;
-pub(crate) const KIND_SHADOW: f32 = 2.0;
-pub(crate) const KIND_RADIAL: f32 = 3.0;
-pub(crate) const KIND_LINEAR: f32 = 4.0;
+pub const KIND_FILL: f32 = 0.0;
+pub const KIND_STROKE: f32 = 1.0;
+pub const KIND_SHADOW: f32 = 2.0;
+pub const KIND_RADIAL: f32 = 3.0;
+pub const KIND_LINEAR: f32 = 4.0;
 /// The elliptical rings: the ASPECT rides params.x (the corner slot),
 /// start and end radii stay in params.y/.w.
-pub(crate) const KIND_ELLIPTIC: f32 = 5.0;
+pub const KIND_ELLIPTIC: f32 = 5.0;
 
 // MARK: - The ground seam (what a tier must offer the atlas)
 
 /// Where tiles physically land. The walk keeps every allocation
 /// decision; the ground only moves bytes and mints handles.
-pub(crate) trait AtlasGround {
+pub trait AtlasGround {
     /// The shared texture exists at `size`×`size` (create if absent).
     fn ensure_shared(&mut self, size: u32) -> bool;
     /// One tile of straight-RGBA rows into virgin shared space.
@@ -212,11 +212,11 @@ pub(crate) trait AtlasGround {
 
 /// One rectangle of atlas texels.
 #[derive(Clone, Copy)]
-pub(crate) struct Tile {
-    pub(crate) x: u32,
-    pub(crate) y: u32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
+pub struct Tile {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 struct Shelf {
@@ -229,19 +229,19 @@ struct Shelf {
 /// its height with room, or opens a new shelf below. There is no
 /// per-tile free list — reclamation is the atlas RESET (drain, clear,
 /// re-insert the live frame), a copying collector in one move.
-pub(crate) struct ShelfPacker {
+pub struct ShelfPacker {
     width: u32,
     height: u32,
     shelves: Vec<Shelf>,
-    pub(crate) next_y: u32,
+    pub next_y: u32,
 }
 
 impl ShelfPacker {
-    pub(crate) fn new(width: u32, height: u32) -> ShelfPacker {
+    pub fn new(width: u32, height: u32) -> ShelfPacker {
         ShelfPacker { width, height, shelves: Vec::new(), next_y: 0 }
     }
 
-    pub(crate) fn place(&mut self, width: u32, height: u32) -> Option<(u32, u32)> {
+    pub fn place(&mut self, width: u32, height: u32) -> Option<(u32, u32)> {
         if width > self.width || height == 0 || width == 0 {
             return None;
         }
@@ -261,7 +261,7 @@ impl ShelfPacker {
         None
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.shelves.clear();
         self.next_y = 0;
     }
@@ -269,20 +269,20 @@ impl ShelfPacker {
 
 /// The atlas is full — the caller drains the in-flight frames, resets
 /// (growing once to the cap) and walks the frame again.
-pub(crate) struct AtlasFull;
+pub struct AtlasFull;
 
 /// One cached run: the engine's raster uploaded as chunk tiles. The
 /// color sits IN the key — the engine bakes it, which keeps emoji true
 /// and byte parity possible; a theme flip mints new tiles and the old
 /// ones fall with the next reset.
-pub(crate) struct RunEntry {
+pub struct RunEntry {
     font: FontKey,
     color: u32,
     scale: u32,
     content: String,
-    pub(crate) tiles: Vec<Tile>,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
+    pub tiles: Vec<Tile>,
+    pub width: u32,
+    pub height: u32,
 }
 
 fn packed_color(color: Color) -> u32 {
@@ -302,13 +302,13 @@ fn run_hash(font: FontKey, color: u32, scale: u32, content: &str) -> u64 {
 
 /// One cached image on the shared atlas: its chunk tiles at one
 /// physical size.
-pub(crate) struct ImageEntry {
-    pub(crate) tiles: Vec<Tile>,
+pub struct ImageEntry {
+    pub tiles: Vec<Tile>,
 }
 
 /// What `resolve_image` hands the frame walk: shared tiles, or one
 /// whole dedicated texture.
-pub(crate) enum ResolvedImage<'a> {
+pub enum ResolvedImage<'a> {
     Tiles(&'a ImageEntry),
     Dedicated(u64, u32, u32),
 }
@@ -329,16 +329,16 @@ const DEDICATED_KEEP: usize = 8;
 /// space, so a frame still riding the GPU never sees its texels
 /// change. The only operation that reuses space is `reset`, and reset
 /// requires the caller to DRAIN in-flight frames first.
-pub(crate) struct RunAtlas {
-    pub(crate) size: u32,
-    pub(crate) packer: ShelfPacker,
-    pub(crate) entries: HashMap<u64, Vec<RunEntry>>,
-    pub(crate) images: HashMap<(u64, u32, u32), ImageEntry>,
-    pub(crate) dedicated: HashMap<(u64, u32, u32), (u64, u32, u32)>,
+pub struct RunAtlas {
+    pub size: u32,
+    pub packer: ShelfPacker,
+    pub entries: HashMap<u64, Vec<RunEntry>>,
+    pub images: HashMap<(u64, u32, u32), ImageEntry>,
+    pub dedicated: HashMap<(u64, u32, u32), (u64, u32, u32)>,
 }
 
 impl RunAtlas {
-    pub(crate) fn new() -> RunAtlas {
+    pub fn new() -> RunAtlas {
         RunAtlas {
             size: ATLAS_INITIAL_SIZE,
             packer: ShelfPacker::new(ATLAS_INITIAL_SIZE, ATLAS_INITIAL_SIZE),
@@ -352,7 +352,7 @@ impl RunAtlas {
     /// once (2048 → 4096); the ground re-makes it lazily. The caller
     /// MUST have drained in-flight frames — this is the one moment
     /// texel space is reused.
-    pub(crate) fn reset(&mut self, ground: &mut dyn AtlasGround, grow: bool) {
+    pub fn reset(&mut self, ground: &mut dyn AtlasGround, grow: bool) {
         if grow && self.size < ATLAS_MAX_SIZE {
             self.size = ATLAS_MAX_SIZE;
             ground.drop_shared();
@@ -371,7 +371,7 @@ impl RunAtlas {
     /// The tiles for one run — warm from the map, or rasterized by the
     /// engine, chunked and uploaded. `Ok(None)` means the engine had
     /// nothing to paint (the CPU path skips those too).
-    pub(crate) fn resolve(
+    pub fn resolve(
         &mut self,
         ground: &mut dyn AtlasGround,
         slice: &str,
@@ -447,7 +447,7 @@ impl RunAtlas {
     /// or resampled by the engine and uploaded: small rides the shared
     /// atlas in chunk tiles, big claims a dedicated texture. `Ok(None)`
     /// = the engine has nothing yet (async decode, broken bytes).
-    pub(crate) fn resolve_image(
+    pub fn resolve_image(
         &mut self,
         ground: &mut dyn AtlasGround,
         source: &ImageSource,
@@ -510,9 +510,11 @@ impl RunAtlas {
     }
 
     /// The atlas footprint — cached runs + images + dedicated, and the
-    /// shelf depth. The warm-frame tests pin upload reuse with it.
-    #[cfg(test)]
-    pub(crate) fn footprint(&self) -> (usize, u32) {
+    /// shelf depth. The warm-frame tests pin upload reuse with it, and
+    /// those tests live in the TIERS, one crate over — so this cannot
+    /// hide behind `cfg(test)`. Nothing calls it in a shipped build,
+    /// and the linker drops it there.
+    pub fn footprint(&self) -> (usize, u32) {
         let entries: usize = self.entries.values().map(Vec::len).sum();
         (
             entries + self.images.len() + self.dedicated.len(),
@@ -575,7 +577,7 @@ fn push_gradient(
 /// A maximal run of one instance kind, in paint order — the draw-call
 /// unit. Batches break only where rects and text alternate.
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) enum RunKind {
+pub enum RunKind {
     Rects,
     /// A batch of liquid-glass panes. It carries its own pass: the
     /// scene has to be blurred into the pyramid BEFORE the panes read
@@ -588,17 +590,17 @@ pub(crate) enum RunKind {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct DrawRun {
-    pub(crate) kind: RunKind,
-    pub(crate) base: u32,
-    pub(crate) count: u32,
+pub struct DrawRun {
+    pub kind: RunKind,
+    pub base: u32,
+    pub count: u32,
     /// Index into the frame's interned curves — a `u32` compare keeps
     /// run coalescing cheap, and the run only breaks when the SHAPE of
     /// the cut changes.
-    pub(crate) round: u32,
+    pub round: u32,
     /// Glass only: how deep the blur pyramid must go for this batch —
     /// the deepest blur any pane in it asked for.
-    pub(crate) levels: u32,
+    pub levels: u32,
 }
 
 fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, round: u32, index: usize) {
@@ -641,16 +643,16 @@ fn note_glass(
 /// The instance lists of one frame, retained so their capacity survives
 /// across frames.
 #[derive(Default)]
-pub(crate) struct FrameBatches {
-    pub(crate) rects: Vec<RectInstance>,
-    pub(crate) sprites: Vec<SpriteInstance>,
-    pub(crate) glass: Vec<GlassInstance>,
-    pub(crate) runs: Vec<DrawRun>,
+pub struct FrameBatches {
+    pub rects: Vec<RectInstance>,
+    pub sprites: Vec<SpriteInstance>,
+    pub glass: Vec<GlassInstance>,
+    pub runs: Vec<DrawRun>,
     /// The frame's interned curves — slot 0 is always [`NO_ROUND`].
-    pub(crate) rounds: Vec<RoundClip>,
+    pub rounds: Vec<RoundClip>,
     /// Dedicated texture handles this frame reads (borrowed from the
     /// atlas's cache — the ground owns and releases them).
-    pub(crate) textures: Vec<u64>,
+    pub textures: Vec<u64>,
 }
 
 /// Walks the display list in paint order and fills the frame batches.
@@ -659,7 +661,7 @@ pub(crate) struct FrameBatches {
 /// `Err(AtlasFull)` asks the caller to drain, reset the atlas and walk
 /// again.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_frame(
+pub fn build_frame(
     ground: &mut dyn AtlasGround,
     display: &DisplayList,
     scale: usize,
@@ -748,7 +750,7 @@ pub(crate) fn build_frame(
                     round_of(&clips),
                     batches.glass.len() - 1,
                     snapped,
-                    bunny_ui::glass::levels_for(paint.blur) as u32,
+                    crate::glass::levels_for(paint.blur) as u32,
                     &mut glass_batch,
                 );
             }
@@ -763,7 +765,7 @@ pub(crate) fn build_frame(
                 }
                 let radii = corner_clamp(corner_radius * factor, snapped);
                 match paint.scaled(factor) {
-                    bunny_ui::layout::GradientPaint::Radial {
+                    crate::layout::GradientPaint::Radial {
                         center,
                         start,
                         end,
@@ -796,7 +798,7 @@ pub(crate) fn build_frame(
                     // the line's two ends fill the four numbers the
                     // struct still had: its start in the params, its
                     // end in the point — the quad stays the box
-                    bunny_ui::layout::GradientPaint::Linear { start, end, from, to } => {
+                    crate::layout::GradientPaint::Linear { start, end, from, to } => {
                         push_gradient(
                             out,
                             snapped,
@@ -1042,7 +1044,7 @@ mod tests {
     fn the_wire_structs_hold_their_layout() {
         // the const asserts already gate the build; this pins the numbers
         // in a place a failing CI can point at
-        assert_eq!(std::mem::size_of::<RectInstance>(), 64);
+        assert_eq!(std::mem::size_of::<RectInstance>(), 80);
         assert_eq!(std::mem::align_of::<RectInstance>(), 4);
         assert_eq!(std::mem::size_of::<SpriteInstance>(), 48);
         assert_eq!(std::mem::size_of::<RoundClip>(), 32);

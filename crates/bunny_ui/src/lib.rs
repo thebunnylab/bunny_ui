@@ -51,6 +51,8 @@ pub mod image_engine;
 pub mod layout;
 pub mod modifier;
 pub mod one_of;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 #[cfg(feature = "canvas")]
 pub mod raster;
 mod reconciler;

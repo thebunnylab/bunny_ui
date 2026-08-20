@@ -14,7 +14,6 @@ mod gl;
 mod image;
 mod text;
 mod vk;
-mod walk;
 mod x11;
 
 use std::cell::RefCell;

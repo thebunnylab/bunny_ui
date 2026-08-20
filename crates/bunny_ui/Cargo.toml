@@ -16,6 +16,11 @@ canvas = []
 # svg2icon converter. Off by default — the shipped binary carries no
 # parser. Its tests need it too: `cargo test --features svg`.
 svg = []
+# The tiers' shared half: the wire structs, the shelf atlas and the
+# display-list walk. It implies `canvas`, because the walk measures
+# through the rasterizer and every tier keeps the CPU path as its
+# oracle and its floor.
+gpu = ["canvas"]
 
 [dependencies]
 motor.workspace = true

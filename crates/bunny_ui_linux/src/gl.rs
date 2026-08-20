@@ -54,7 +54,7 @@ use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
 
-use crate::walk::{
+use bunny_ui::gpu::walk::{
     build_frame, AtlasFull, AtlasGround, DrawRun, FrameBatches, GlassInstance, RectInstance,
     RoundClip, RunAtlas, RunKind, SpriteInstance, GLASS_MAX_LEVEL,
 };
