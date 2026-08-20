@@ -1024,7 +1024,7 @@ function sendField(path, value, caret) {
 // glue_gl.js may be absent (a build without the tier, a file that
 // failed to load). Every verb answers zero, `gl_init` included, so the
 // tier refuses and the islands take putImageData as they always have.
-function bunnyGpuStubsOrNothing() {
+function bunnyGlStubsOrNothing() {
   const stubs = {};
   for (const name of GPU_VERBS) stubs[name] = () => 0;
   return stubs;
@@ -1049,7 +1049,7 @@ const GPU_VERBS = [
 
 const imports = {
   bunny_gpu:
-    typeof bunnyGpuImports === "object" ? bunnyGpuImports : bunnyGpuStubsOrNothing(),
+    typeof bunnyGlImports === "object" ? bunnyGlImports : bunnyGlStubsOrNothing(),
   bunny: {
     js_blit() {},
     js_request_frame() {},

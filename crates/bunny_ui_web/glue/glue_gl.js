@@ -78,7 +78,7 @@ function gpuLoseContext() {
   gl = null;
 }
 
-const bunnyGpuImports = {
+const bunnyGlImports = {
   // `kind` 0 is the page's own surface, 1 the islands' backing canvas.
   // 0 back means refused — no WebGL2, a shader that would not compile,
   // or `?present=cpu`. Non-zero is MAX_TEXTURE_SIZE, which the atlas

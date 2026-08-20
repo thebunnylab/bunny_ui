@@ -116,7 +116,7 @@ function imageKey(hi, lo) {
 // glue_gl.js may be absent (a build without the tier, a file that
 // failed to load). Every verb answers zero, `gl_init` included, so the
 // tier refuses and the page presents by CPU.
-function bunnyGpuStubsOrNothing() {
+function bunnyGlStubsOrNothing() {
   const stubs = {};
   for (const name of GPU_VERBS) stubs[name] = () => 0;
   return stubs;
@@ -141,7 +141,7 @@ const GPU_VERBS = [
 
 const imports = {
   bunny_gpu:
-    typeof bunnyGpuImports === "object" ? bunnyGpuImports : bunnyGpuStubsOrNothing(),
+    typeof bunnyGlImports === "object" ? bunnyGlImports : bunnyGlStubsOrNothing(),
   bunny: {
     js_blit(pointer, width, height) {
       const context = painter();
