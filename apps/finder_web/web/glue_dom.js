@@ -18,7 +18,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 4;
+const EXPECTED_ABI = 5;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -707,6 +707,7 @@ function applyPatches(view, length) {
       const mono = u8();
       const italic = u8();
       const family = text(u16());
+      const lineHeight = f32();
       const truncation = u8();
       const raw = bytes(u32());
       const spanCount = u16();
@@ -715,6 +716,9 @@ function applyPatches(view, length) {
       const spanColor = rgba(u32());
       if (el) {
         el.style.font = cssFont(size, weight, mono, italic, family);
+        // AFTER the font shorthand, which resets line-height: 0 means
+        // the face's own box, which is what an empty string restores
+        el.style.lineHeight = lineHeight > 0 ? `${lineHeight}px` : "";
         // an inherited ink takes NO inline color: an inline one would
         // outrank the :hover rule of the box that owns both states
         el.style.color = inheritsInk ? "" : color;

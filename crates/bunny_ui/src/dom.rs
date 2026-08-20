@@ -315,6 +315,10 @@ pub struct DomText {
     /// down. `color` stays as the record of what it inherits.
     pub inherits_ink: bool,
     pub font: FontSpec,
+    /// The line box, when `.line_height(…)` set one — the browser steps
+    /// its own lines by it, so the element wraps at the same rhythm the
+    /// engine measured. `None` leaves the face's own box.
+    pub line_height: Option<crate::layout::Px>,
     /// Match highlight spans (byte ranges) + their color.
     pub highlights: Option<(Rc<Vec<(usize, usize)>>, Color)>,
     pub truncation: Option<Truncation>,
@@ -1714,7 +1718,7 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 ///
 /// A test pins the glue to this number: bump one side alone and the
 /// suite goes red before the browser ever gets the chance to.
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -1897,6 +1901,9 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 out.push(matches!(text.font.design, FontDesign::Mono) as u8);
                 out.push(matches!(text.font.slant, crate::text_engine::Slant::Italic) as u8);
                 push_family(&mut out, &text.font);
+                // the line box, or 0 for "the face's own" — the browser
+                // steps its lines by the same number our placement does
+                push_f32(&mut out, text.line_height.unwrap_or(0.0));
                 out.push(match text.truncation {
                     None => 0,
                     Some(Truncation::Start) => 1,

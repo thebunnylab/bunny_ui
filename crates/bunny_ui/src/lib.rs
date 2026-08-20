@@ -1287,6 +1287,32 @@ mod tests {
     }
 
     #[test]
+    fn line_height_steps_the_lines_and_centres_them() {
+        use crate::layout::{DrawCommand, Proposal};
+        let runtime = Runtime::new();
+        let line_tops = |display: &crate::layout::DisplayList| -> Vec<f64> {
+            display
+                .iter()
+                .filter_map(|command| match command {
+                    DrawCommand::TextLine { origin, .. } => Some(origin.y),
+                    _ => None,
+                })
+                .collect()
+        };
+        // PixelFont is 8px a glyph, 16 tall; "aaa bbb" is 56 wide and
+        // wraps in a 30pt column into "aaa" and "bbb". A 24pt line box
+        // steps the lines by 24 and splits the 8pt of extra leading, so
+        // the first line sits 4 down.
+        let para = text("aaa bbb").line_height(24.0).frame_width(30.0);
+        let stepped = line_tops(&runtime.layout(&para, Proposal::unspecified()).display);
+        assert_eq!(stepped, vec![4.0, 28.0], "each line steps by 24, centred by a 4pt half-leading");
+        // and with no line height the lines step by the face's own 16
+        let plain = text("aaa bbb").frame_width(30.0);
+        let bare = line_tops(&runtime.layout(&plain, Proposal::unspecified()).display);
+        assert_eq!(bare, vec![0.0, 16.0], "unset, the old face box stands");
+    }
+
+    #[test]
     fn what_a_task_lands_reaches_the_next_frame() {
         #[derive(Clone, Copy)]
         struct Panel {
@@ -8729,6 +8755,39 @@ mod tests {
     }
 
     #[test]
+    fn the_line_box_reaches_the_browser_on_the_wire() {
+        use crate::text_engine::FontSpec;
+
+        let stepped = crate::dom::DomText {
+            content: std::sync::Arc::from("a paragraph"),
+            color: Color::hex(0x202531),
+            inherits_ink: false,
+            font: FontSpec::DEFAULT,
+            line_height: Some(24.0),
+            highlights: None,
+            truncation: None,
+        };
+        let with = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: stepped }]);
+        let plain = crate::dom::DomText {
+            content: std::sync::Arc::from("a paragraph"),
+            color: Color::hex(0x202531),
+            inherits_ink: false,
+            font: FontSpec::DEFAULT,
+            line_height: None,
+            highlights: None,
+            truncation: None,
+        };
+        let without = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: plain }]);
+
+        // the same stream, four bytes apart — the line box is an f32
+        // beside the family, and NONE travels as a plain zero
+        assert_eq!(with.len(), without.len());
+        assert_ne!(with, without);
+        assert!(without.windows(4).any(|window| window == 0f32.to_le_bytes()));
+        assert!(with.windows(4).any(|window| window == 24f32.to_le_bytes()));
+    }
+
+    #[test]
     fn the_lean_reaches_the_browser_on_the_wire() {
         use crate::text_engine::{FontSpec, Slant};
 
@@ -8737,6 +8796,7 @@ mod tests {
             color: Color::hex(0x202531),
             inherits_ink: false,
             font: FontSpec { slant: Slant::Italic, ..FontSpec::DEFAULT },
+            line_height: None,
             highlights: None,
             truncation: None,
         };
@@ -8746,6 +8806,7 @@ mod tests {
             color: Color::hex(0x202531),
             inherits_ink: false,
             font: FontSpec::DEFAULT,
+            line_height: None,
             highlights: None,
             truncation: None,
         };

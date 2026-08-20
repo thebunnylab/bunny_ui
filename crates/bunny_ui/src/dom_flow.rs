@@ -74,6 +74,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         ink: Vec::new(),
         ink_scopes: Vec::new(),
         font: FontSpec::DEFAULT,
+        line_height: None,
         pending_interactive: None,
         pending_transition: None,
         pending_tooltip: None,
@@ -129,6 +130,9 @@ struct Walk<'a> {
     /// inherits instead of painting its own color.
     ink_scopes: Vec<usize>,
     font: FontSpec,
+    /// The inherited line box, mirroring `font` — the browser steps the
+    /// lines by it, the way our own placement does.
+    line_height: Option<crate::layout::Px>,
     pending_interactive: Option<std::rc::Rc<str>>,
     pending_transition: Option<(f64, f64)>,
     /// A tooltip armed by a wrapper, landing on the next box that
@@ -345,7 +349,9 @@ impl Walk<'_> {
             }
             LayoutNode::Styled { props, child } => {
                 let outer_font = self.font;
+                let outer_line_height = self.line_height;
                 self.font = props.font.apply_over(self.font);
+                self.line_height = props.line_height.or(self.line_height);
 
                 let states = props.foreground_hovered.is_some()
                     || props.foreground_pressed.is_some();
@@ -397,6 +403,7 @@ impl Walk<'_> {
                 }
                 self.ink.pop();
                 self.font = outer_font;
+                self.line_height = outer_line_height;
                 Self::stamp_fill(child, &mut boxed.children);
                 Self::inherit_stretch(&mut boxed);
                 out.push(boxed);
@@ -407,6 +414,7 @@ impl Walk<'_> {
                     color: self.current_ink(),
                     inherits_ink: !self.ink_scopes.is_empty(),
                     font: self.font,
+                    line_height: self.line_height,
                     highlights: highlights
                         .as_ref()
                         .map(|h| (std::rc::Rc::clone(&h.ranges), h.color)),

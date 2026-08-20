@@ -314,6 +314,9 @@ pub struct LayoutEnv<'a> {
     pub cache: &'a MeasureCache,
     pub scroll_offsets: &'a HashMap<String, Point>,
     pub font: FontSpec,
+    /// The inherited line height a paragraph steps by. `None` = the
+    /// face's own box; a value overrides it, set by `.line_height(…)`.
+    pub line_height: Option<Px>,
     /// The pass's frame state — consulted BY PATH during placement.
     pub stamp: FrameStamp<'a>,
     /// The frame's animator — `None` in bare layouts (tests, direct
@@ -1352,6 +1355,12 @@ pub struct VisualProps {
     /// already at measure time (hover state is still forbidden to touch
     /// it).
     pub font: FontPatch,
+    /// Inherited line height, the same exception as `font`: it sets the
+    /// box a paragraph measures, so it travels at measure time. `None`
+    /// keeps the face's own box (`ascent + descent`); a value steps the
+    /// lines by it and centres the glyphs in the taller box — the CSS
+    /// half-leading.
+    pub line_height: Option<Px>,
     /// A soft halo behind the view: `(radius, color)`. The falloff is
     /// quadratic; the halo paints OUTSIDE the shape and follows the
     /// corner radius — including the notch behind a rounded corner,
@@ -1405,6 +1414,7 @@ impl VisualProps {
             foreground_hovered: self.foreground_hovered.or(outer.foreground_hovered),
             foreground_pressed: self.foreground_pressed.or(outer.foreground_pressed),
             font: self.font.or(outer.font),
+            line_height: self.line_height.or(outer.line_height),
             shadow: self.shadow.or(outer.shadow),
             opacity: self.opacity.or(outer.opacity),
             opacity_hovered: self.opacity_hovered.or(outer.opacity_hovered),
@@ -2281,6 +2291,7 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
             cache: &cache,
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
+            line_height: None,
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
@@ -2952,7 +2963,11 @@ impl LayoutNode {
                 Some(FIELD_PAD_V + metrics.ascent)
             }
             LayoutNode::Styled { props, child } => {
-                let env = LayoutEnv { font: props.font.apply_over(env.font), ..env };
+                let env = LayoutEnv {
+                    font: props.font.apply_over(env.font),
+                    line_height: props.line_height.or(env.line_height),
+                    ..env
+                };
                 child.first_baseline(env)
             }
             LayoutNode::Overlay { child, .. } => child.first_baseline(env),
@@ -2996,21 +3011,24 @@ impl LayoutNode {
             LayoutNode::Text { content, truncation, .. } => {
                 let metrics = env.cache.get_or_measure(content, &env.font, env.text);
                 let natural = metrics.width;
-                let line_h = metrics.height();
+                // the line box a paragraph steps by: the face's own box,
+                // or the inherited `.line_height(…)` when one is set. With
+                // none, it is exactly the old `ascent + descent`.
+                let advance = env.line_height.unwrap_or(metrics.height());
                 // REAL word wrapping, with the engine's measurements —
                 // the width goes into the cache key (probe mode);
                 // truncation turns wrapping off: one line, always
                 let size = match proposal.width {
                     Some(width) if width > 0.0 && width < natural => {
                         if truncation.is_some() {
-                            Size { width, height: line_h }
+                            Size { width, height: advance }
                         } else {
                             let lines =
                                 env.cache.get_or_break(content, &env.font, width, env.text);
-                            Size { width, height: lines.len() as Px * line_h }
+                            Size { width, height: lines.len() as Px * advance }
                         }
                     }
-                    _ => Size { width: natural, height: line_h },
+                    _ => Size { width: natural, height: advance },
                 };
                 (size, Fit::Leaf)
             }
@@ -3305,7 +3323,11 @@ impl LayoutNode {
             LayoutNode::Styled { props, child } => {
                 // the inherited font swaps HERE, at measure time — the
                 // sanctioned VisualProps exception (font changes measure)
-                let env = LayoutEnv { font: props.font.apply_over(env.font), ..env };
+                let env = LayoutEnv {
+                    font: props.font.apply_over(env.font),
+                    line_height: props.line_height.or(env.line_height),
+                    ..env
+                };
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -3373,6 +3395,7 @@ impl LayoutNode {
                             // hover ink is open above this leaf
                             inherits_ink: false,
                             font: env.font,
+                            line_height: env.line_height,
                             highlights: highlights
                                 .as_ref()
                                 .map(|h| (Rc::clone(&h.ranges), h.color)),
@@ -4298,6 +4321,7 @@ impl LayoutNode {
                 let colors = env.anim.filter(|scope| scope.colors);
                 let env = LayoutEnv {
                     font: props.font.apply_over(env.font),
+                    line_height: props.line_height.or(env.line_height),
                     anim: env.anim.map(|scope| AnimScope { colors: false, ..scope }),
                     ..env
                 };
@@ -4959,9 +4983,17 @@ fn place_text(
     }
     let metrics = env.cache.get_or_measure(content, &env.font, env.text);
     let line_h = metrics.height();
+    // the step between lines, and the half-leading that centres the glyph
+    // box inside a taller one — the baseline stays ascent-based, so the
+    // engine's own raster is unchanged. With no `.line_height(…)` the
+    // advance IS the face's box and the leading is zero: byte-identical.
+    let advance = env.line_height.unwrap_or(line_h);
+    let leading = (advance - line_h) / 2.0;
+    let top = frame.origin.y + leading;
 
     if metrics.width <= frame.size.width {
-        emit_text_runs(content, (0, content.len()), highlights, frame.origin, base_color, env, out);
+        let origin = Point { x: frame.origin.x, y: top };
+        emit_text_runs(content, (0, content.len()), highlights, origin, base_color, env, out);
         return;
     }
     if let Some(mode) = truncation {
@@ -4970,7 +5002,7 @@ fn place_text(
         let composed: Arc<str> = Arc::from(truncate_to_width(content, mode, frame.size.width, env));
         let length = composed.len();
         out.draw(DrawCommand::TextLine {
-            origin: frame.origin,
+            origin: Point { x: frame.origin.x, y: top },
             content: composed,
             range: (0, length),
             color: base_color,
@@ -4984,7 +5016,7 @@ fn place_text(
             content,
             (*start, *end),
             highlights,
-            Point { x: frame.origin.x, y: frame.origin.y + line_index as Px * line_h },
+            Point { x: frame.origin.x, y: top + line_index as Px * advance },
             base_color,
             env,
             out,
@@ -5788,6 +5820,7 @@ mod tests {
             cache: &cache,
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
+            line_height: None,
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,
@@ -5819,6 +5852,7 @@ mod tests {
                 cache: &cache,
                 scroll_offsets: &offsets,
                 font: FontSpec::DEFAULT,
+                line_height: None,
                 stamp: FrameStamp::idle(interaction, &carets),
                 animator: None,
                 anim: None,
@@ -6009,6 +6043,7 @@ mod tests {
             cache: &cache,
             scroll_offsets: &offsets,
             font: FontSpec::DEFAULT,
+            line_height: None,
             stamp: FrameStamp::idle(&interaction, &carets),
             animator: None,
             anim: None,

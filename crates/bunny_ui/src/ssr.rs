@@ -468,6 +468,11 @@ impl Tree {
                     return;
                 };
                 element.style.insert("font", css_font(&text.font));
+                // after the font shorthand, which resets it — the served
+                // page steps its lines the way the engine measured them
+                if let Some(height) = text.line_height {
+                    element.style.insert("line-height", format!("{height}px"));
+                }
                 if text.inherits_ink {
                     element.style.remove("color");
                 } else {

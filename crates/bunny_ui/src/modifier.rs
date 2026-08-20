@@ -81,6 +81,10 @@ pub enum Modifier {
     FontFamily(crate::text_engine::Family),
     /// A size out of the preset scale — the rest of the font stays.
     FontSize(f64),
+    /// The box each line of text steps by — the CSS `line-height`, in
+    /// points. Inherited, and an exception to "props is paint only": it
+    /// sets what a paragraph measures.
+    LineHeight(f64),
     BackgroundHovered(Color),
     Opacity(f64),
     OpacityHovered(f64),
@@ -243,6 +247,7 @@ impl Modifier {
             }
             Modifier::Id(name) => format!(" [.id({name:?})]"),
             Modifier::FontSize(size) => format!(" [.font(.system(size: {size}))]"),
+            Modifier::LineHeight(height) => format!(" [.lineHeight({height})]"),
             Modifier::BackgroundHovered(color) => format!(" [.backgroundHovered({color})]"),
             Modifier::Opacity(value) => format!(" [.opacity({value})]"),
             Modifier::OpacityHovered(value) => format!(" [.opacityHovered({value})]"),
@@ -1062,6 +1067,11 @@ fn apply(
                 font: FontPatch { size: Some(*size), ..FontPatch::default() },
                 ..VisualProps::default()
             },
+        ),
+        Modifier::LineHeight(height) => wrap_styled(
+            out,
+            mark,
+            VisualProps { line_height: Some(*height), ..VisualProps::default() },
         ),
         Modifier::BackgroundHovered(color) => wrap_styled(
             out,
