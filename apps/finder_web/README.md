@@ -22,6 +22,39 @@ path text brightens under the pointer without one patch crossing;
 animation specs become CSS transitions. The browser renders at home;
 the engine still owns every position.
 
+**The GPU tier**: both pages present through WebGL2 when the browser
+gives it. The engine walks the same display list the desktop walks, into
+the same wire structs, and the shaders are the same source the OpenGL
+tier compiles — only the prelude differs, because a browser speaks GLSL
+ES 3.00 and must name its precisions. The CPU rasterizer stays as the
+oracle, the fallback, and the answer for a device that refuses.
+
+Add `?present=cpu` to any URL to refuse the tier and compare the two
+pictures side by side. A lost context falls back on its own: the tier
+rebuilds once in silence, and a second loss hands the page to the
+rasterizer for as long as it lives.
+
+The tier is measured against the rasterizer, in the browser, on the
+device that runs it:
+
+| scene | worst channel | beyond one step |
+| --- | --- | --- |
+| flat opaque rects | 0 | 0.0000% |
+| a translucent veil | 0 | 0.0000% |
+| a rounded fill | 1 | 0.0000% |
+| a stroke ring | 1 | 0.0000% |
+| a rounded clip | 1 | 0.0000% |
+| a shadow's falloff | 1 | 0.0000% |
+| a pixel-font run | 0 | 0.0000% |
+| one pane of glass | 2 | 0.0234% |
+| two panes stacked | 3 | 0.0938% |
+
+Flat colour and pixel-font text are byte-exact. The anti-aliased shapes
+stay within one step, where the gate allows two. Glass allows three for
+one pane and six for two, and this comes in at two and three. The
+numbers are from Chrome on ANGLE over Metal; another browser or another
+GPU must say so again for itself.
+
 **Islands**: inside the Dom page, `.rendering(Rendering::Gpu)` claims a
 canvas island for one subtree — our layout positions the element, our
 rasterizer fills it, and it redraws only when its content changes. The
@@ -39,8 +72,22 @@ python3 -m http.server 8871 --directory web
 Then open http://localhost:8871 (canvas) or
 http://localhost:8871/dom.html (dom + island).
 
-One binary carries both shells (~497 KB through the `web` profile —
-`opt-level = "z"`, one codegen unit, lto, and the name table stripped). Ten thousand rows
+One WebGL2 context serves every island on the page. A context for each
+would meet the browser's ceiling, and an island element that claimed
+WebGL2 could never take `putImageData` again — so a lost context would
+leave the whole page dark. The island keeps its own 2d road; the tier
+keeps the GL, and copies each island into its element.
+
+The tier costs 57 KB of the binary, 22 KB compressed. A page that does
+not want it builds without:
+
+```
+cargo build --profile web -p finder-web --target wasm32-unknown-unknown --no-default-features
+```
+
+One binary carries both shells and the tier (653 KB through the `web`
+profile — `opt-level = "z"`, one codegen unit, lto, and the name table
+stripped; 597 KB without the tier). Ten thousand rows
 stay virtualized in both modes: the scroll geometry is honest to the
 full extent, and only the visible window exists.
 

@@ -6,6 +6,15 @@ edition.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = ["gpu"]
+# The WebGL2 tier. Declared here too so the size of the page WITHOUT it
+# is one build away, and the cost is a number in the record rather than
+# an argument.
+gpu = ["bunny-ui-web/gpu"]
+
 [dependencies]
 bunny-ui = { workspace = true, features = ["canvas"] }
-bunny-ui-web = { path = "../../crates/bunny_ui_web" }
+bunny-ui-web = { path = "../../crates/bunny_ui_web", default-features = false, features = [
+    "canvas",
+] }

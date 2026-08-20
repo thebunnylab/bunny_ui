@@ -456,8 +456,7 @@ fn start_dom_with(
             let bytes = bunny_ui::dom::encode(&patches);
             unsafe { js_apply_patches(bytes.as_ptr(), bytes.len()) };
         }
-        #[cfg(feature = "canvas")]
-        #[cfg(feature = "gpu")]
+        #[cfg(all(feature = "canvas", feature = "gpu"))]
         if tier::active() {
             // the dirty marks are CONSUMED by whichever road reads
             // them, so the branch is here and never inside the loop
@@ -484,6 +483,7 @@ fn start_dom_with(
             }
             return;
         }
+        #[cfg(feature = "canvas")]
         for island in runtime.dom_islands(scale) {
             unsafe {
                 js_island(
