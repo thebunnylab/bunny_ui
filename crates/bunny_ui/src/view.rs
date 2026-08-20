@@ -306,6 +306,32 @@ impl<C: View> View for Option<C> {
     }
 }
 
+/// A `Vec` of views flattens into its parent the way a tuple does — the
+/// answer to a list whose length the source cannot spell, and to the
+/// twelfth tuple running out.
+///
+/// ```ignore
+/// vstack(rows.into_iter().map(card).collect::<Vec<_>>())
+/// ```
+///
+/// Identity is POSITIONAL, exactly as in a tuple: item `i` owns `#i`.
+/// That is the honest reading of a bare `Vec` — it carries no names —
+/// but it means an insertion in the middle re-associates every state
+/// below it with a different item. Where the items have identities of
+/// their own (rows of a table, a list that reorders), use
+/// [`crate::views::for_each`] and its `id` closure: that is what keeps a
+/// row's state, its animation and its caret with the row.
+impl<C: View> View for Vec<C> {
+    type Arity = Many;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        for (position, view) in self.iter().enumerate() {
+            let _frame = motor::identity::enter(format!("#{position}"));
+            view.render_into(ctx, out);
+        }
+    }
+}
+
 /// SwiftUI's `TupleView` — the implicit container of a multi-statement
 /// `@ViewBuilder` block, flattened into the parent's children.
 macro_rules! tuple_view {

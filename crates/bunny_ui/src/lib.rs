@@ -1287,6 +1287,20 @@ mod tests {
     }
 
     #[test]
+    fn a_vec_of_views_flattens_like_a_tuple() {
+        let runtime = Runtime::new();
+        // the same three children, spelled two ways — a Vec says what a
+        // tuple says, which is what lets a list of unknown length exist
+        let tupled = runtime.render_stable(&vstack((text("a"), text("b"), text("c"))));
+        let listed =
+            runtime.render_stable(&vstack(vec![text("a"), text("b"), text("c")]));
+        assert_eq!(tupled, listed);
+        // and it is Many, so it flattens INTO the stack rather than
+        // wrapping itself in one
+        assert_eq!(listed.matches("Text").count(), 3);
+    }
+
+    #[test]
     fn line_height_steps_the_lines_and_centres_them() {
         use crate::layout::{DrawCommand, Proposal};
         let runtime = Runtime::new();
