@@ -111,7 +111,9 @@ const bunnyGpuImports = {
     target.addEventListener(
       "webglcontextrestored",
       () => {
-        if (glWasm && glWasm.bunny_gpu_restored) glWasm.bunny_gpu_restored();
+        if (glWasm && glWasm.bunny_gpu_restored) {
+          glWasm.bunny_gpu_restored(target.width, target.height);
+        }
       },
       false,
     );
