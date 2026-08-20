@@ -2340,6 +2340,12 @@ pub struct KeyStroke {
     pub alt: bool,
     pub chars_ignoring: String,
     pub types_text: bool,
+    /// The character this key TYPED, under the modifiers actually
+    /// held — the LIVE xkb state's answer, not the clean one. It is
+    /// what a box that refuses text still needs: shift and a bracket
+    /// make a brace, and which key makes a brace is the layout's
+    /// answer, never a table's.
+    pub typed: Option<char>,
 }
 
 thread_local! {
@@ -2417,6 +2423,10 @@ pub(crate) fn key_road(keyboard: &mut Keyboard, keycode: u32) -> KeyRoad {
                 == 1
         };
         let printable = !text.is_empty() && !text.chars().any(|ch| ch.is_control());
+        // the same read, kept as the CHARACTER and not only as the
+        // verdict: what the key typed is an answer of its own, and the
+        // live state already had it
+        let typed = printable.then(|| text.chars().next()).flatten();
         // the AltGr rule: a level-3 chord that types IS text — it
         // skips the gate so the binding never steals the character
         let types_text = printable && active(c"Mod5");
@@ -2428,6 +2438,7 @@ pub(crate) fn key_road(keyboard: &mut Keyboard, keycode: u32) -> KeyRoad {
                 alt: active(c"Mod1"),
                 chars_ignoring,
                 types_text,
+                typed,
             },
             text,
         )

@@ -4902,6 +4902,64 @@ mod tests {
     }
 
     #[test]
+    fn a_binding_spelled_as_the_character_finds_the_key_that_types_it() {
+        use crate::action::{ActionId, Key, KeyMatch, KeyPattern, Stroke};
+
+        const PUSH_INDENT: ActionId = ActionId("test.push_indent");
+        const REPEAT: ActionId = ActionId("test.repeat");
+        const SPELLED_BY_KEY: ActionId = ActionId("test.spelled_by_key");
+
+        let runtime = Runtime::new();
+        // how a hand writes a keymap: the character, not the key and
+        // the modifier that make it. Nobody spells `shift-.` when they
+        // mean `>` — and until now those bindings were dead, because no
+        // keyboard produces a bare `>`
+        runtime.bind(KeyPattern::key(Key::Char('>')), PUSH_INDENT);
+        runtime.bind(KeyPattern::key(Key::Char('.')), REPEAT);
+
+        // the physical stroke: shift and the period key, which types `>`
+        let shifted = KeyPattern { shift: true, ..KeyPattern::key(Key::Char('.')) };
+        assert_eq!(
+            runtime.chord(Stroke::new(shifted, Some('>'))),
+            KeyMatch::Action(PUSH_INDENT),
+            "the character spelling found it"
+        );
+
+        // and the bare key still answers its own binding: one stroke,
+        // one reading, and the two never trade places
+        assert_eq!(
+            runtime.chord(Stroke::new(KeyPattern::key(Key::Char('.')), Some('.'))),
+            KeyMatch::Action(REPEAT),
+        );
+
+        // an app that spelled BOTH gets the one it was more precise
+        // about: the key's own spelling wins, always
+        runtime.bind(shifted, SPELLED_BY_KEY);
+        assert_eq!(
+            runtime.chord(Stroke::new(shifted, Some('>'))),
+            KeyMatch::Action(SPELLED_BY_KEY),
+            "the key beats the character it typed"
+        );
+
+        // a chord types nothing, so nothing answers for it by character
+        let runtime = Runtime::new();
+        runtime.bind(KeyPattern::key(Key::Char('$')), PUSH_INDENT);
+        let chord = KeyPattern { shift: true, ..KeyPattern::command(Key::Char('4')) };
+        assert_eq!(
+            runtime.chord(Stroke::new(chord, Some('$'))),
+            KeyMatch::None,
+            "cmd-shift-4 is a chord, and a chord types nothing"
+        );
+
+        // the same key with no chord modifier DOES answer
+        let plain = KeyPattern { shift: true, ..KeyPattern::key(Key::Char('4')) };
+        assert_eq!(
+            runtime.chord(Stroke::new(plain, Some('$'))),
+            KeyMatch::Action(PUSH_INDENT),
+        );
+    }
+
+    #[test]
     fn a_field_answers_its_own_key_and_only_where_the_app_asked() {
         use crate::action::{Key, KeyPattern};
         use crate::layout::{Proposal, Size};

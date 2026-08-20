@@ -201,7 +201,7 @@ impl CustomElement for Sketch {
                 self.caption.set(Arc::from(format!("{}{text}", self.caption.get())));
                 Response::handled()
             }
-            ElementEvent::Key(pattern) => match pattern.key {
+            ElementEvent::Key(stroke) => match stroke.pattern.key {
                 Key::Backspace => {
                     let mut caption = self.caption.get().to_string();
                     caption.pop();

@@ -20,7 +20,7 @@ mod x11;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use bunny_ui::action::{Key, KeyMatch, KeyPattern};
+use bunny_ui::action::{Key, KeyMatch, KeyPattern, Stroke};
 use bunny_ui::layout::{Axis, Size};
 use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::View;
@@ -361,7 +361,7 @@ pub fn run_window_chrome(
             // a focused escape hatch owns its strokes: an editor's
             // arrows, Enter and Tab are its own, and a copy hands the
             // text back for the clipboard
-            let taken = runtime.key_stroke(&pattern);
+            let taken = runtime.key_stroke(Stroke::new(pattern, stroke.typed));
             if taken.handled {
                 if let Some(text) = taken.text {
                     ffi::clipboard_write(&text);
@@ -386,7 +386,7 @@ pub fn run_window_chrome(
                 blit(&runtime, &*root);
                 return true;
             }
-            let action = match runtime.chord(&pattern) {
+            let action = match runtime.chord(Stroke::new(pattern, stroke.typed)) {
                 KeyMatch::Action(action) => action,
                 // the stroke opened (or let go of) a sequence: it is
                 // spent, and a which-key panel may have just changed

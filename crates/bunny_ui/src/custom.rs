@@ -628,7 +628,13 @@ pub enum ElementEvent {
     /// A keystroke, while the box has focus — arrows, Enter, Tab and
     /// the shortcuts, exactly as the keymap spells them. What the box
     /// ignores goes on to the app's key bindings.
-    Key(crate::action::KeyPattern),
+    ///
+    /// The stroke carries BOTH questions: `pattern` names the key, and
+    /// `typed` is the character that key put on the screen. A box that
+    /// refuses text still hears what a stroke would have typed, which
+    /// is the only way to know that shift and the bracket key made a
+    /// `{` — the layout knows, and no table in an app does.
+    Key(crate::action::Stroke),
     /// Text to insert: typing, a paste, or the commit of a
     /// composition. The framework opens no clipboard — the shell reads
     /// it and the text arrives here.
@@ -1193,6 +1199,87 @@ mod tests {
 
     // MARK: - The keyboard
 
+    /// A box in COMMAND mode: it refuses text, so every bare stroke
+    /// walks the ordinary road — and it writes down what each one typed.
+    #[derive(Clone, Default)]
+    struct Commander {
+        seen: Rc<std::cell::RefCell<Vec<(crate::action::Key, Option<char>)>>>,
+    }
+
+    impl CustomElement for Commander {
+        fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+
+        fn accepts_keys(&self) -> bool {
+            true
+        }
+
+        fn takes_text(&self) -> bool {
+            false
+        }
+
+        fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
+            match event {
+                ElementEvent::Key(stroke) => {
+                    self.seen.borrow_mut().push((stroke.pattern.key, stroke.typed));
+                    Response::handled()
+                }
+                _ => Response::ignored(),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct Commanding {
+        box_: Commander,
+    }
+
+    impl Component for Commanding {
+        fn body(self, _ctx: &ViewContext) -> impl View {
+            use crate::ext::ViewExt;
+            custom(self.box_).frame(200.0, 40.0)
+        }
+    }
+
+    #[test]
+    fn a_box_that_refuses_text_still_hears_what_the_key_typed() {
+        use crate::action::{Key, KeyPattern, Stroke};
+
+        let commander = Commander::default();
+        let runtime = Runtime::new();
+        let view = Commanding { box_: commander.clone() };
+        runtime.layout(&view, Proposal { width: Some(200.0), height: Some(40.0) });
+        runtime.pointer_pressed(10.0, 20.0);
+        runtime.pointer_released(10.0, 20.0);
+        assert!(runtime.focused().is_some(), "the box took the keyboard");
+
+        // shift and the digit four. The PATTERN names the key — a four,
+        // with shift — and that is what a chord has to match. What it
+        // TYPED is a dollar sign, and no table in the app could know
+        // that: on another layout a dollar comes off another key.
+        let four = KeyPattern { shift: true, ..KeyPattern::key(Key::Char('4')) };
+        assert!(runtime.key_stroke(Stroke::new(four, Some('$'))).handled);
+        assert_eq!(
+            commander.seen.borrow().as_slice(),
+            &[(Key::Char('4'), Some('$'))],
+            "the key is the key, and the character is the character"
+        );
+
+        // a chord types nothing, and the law lives in ONE place: a shell
+        // may hand over whatever its platform said under command, and
+        // every platform asked under command answers with the key's own
+        // character, which would be a lie about what reached the screen
+        let chord = KeyPattern { shift: true, ..KeyPattern::command(Key::Char('4')) };
+        assert!(runtime.key_stroke(Stroke::new(chord, Some('$'))).handled);
+        assert_eq!(commander.seen.borrow()[1], (Key::Char('4'), None), "a chord types nothing");
+        let ctrl = KeyPattern { shift: true, ..KeyPattern::control(Key::Char('4')) };
+        assert!(runtime.key_stroke(Stroke::new(ctrl, Some('$'))).handled);
+        assert_eq!(commander.seen.borrow()[2], (Key::Char('4'), None));
+
+        // and a key the platform gave no character for says so plainly
+        assert!(runtime.key_stroke(KeyPattern::key(Key::Down)).handled);
+        assert_eq!(commander.seen.borrow()[3], (Key::Down, None));
+    }
+
     /// A one-line editor built from the app's own parts — enough to
     /// prove the keyboard, the clipboard and the input system reach a
     /// box the framework knows nothing about.
@@ -1238,8 +1325,8 @@ mod tests {
                     let text = self.text.replace(String::new());
                     Response::text(text)
                 }
-                ElementEvent::Key(pattern)
-                    if pattern.key == crate::action::Key::Backspace =>
+                ElementEvent::Key(stroke)
+                    if stroke.pattern.key == crate::action::Key::Backspace =>
                 {
                     self.text.borrow_mut().pop();
                     Response::handled()

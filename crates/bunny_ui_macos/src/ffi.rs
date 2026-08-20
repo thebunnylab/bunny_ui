@@ -453,9 +453,18 @@ pub struct KeyStroke {
     pub option: bool,
     pub command: bool,
     pub chars: String,
-    /// `charactersIgnoringModifiers` — which ignores command and option
-    /// and APPLIES shift, so it is the typing char, not the key's name.
-    pub chars_ignoring: String,
+    /// The character this key TYPED, under the modifiers actually
+    /// held. `charactersByApplyingModifiers:` with the event's own
+    /// flags — the same selector the bare read uses, asked the other
+    /// question, so one API answers both and the layout answers both
+    /// the same way.
+    ///
+    /// NOT `charactersIgnoringModifiers`, which was here before and
+    /// which nobody read: it ignores OPTION, and option is exactly the
+    /// modifier that types on the layouts this framework is written
+    /// for — on this machine option and the digit four make a cent
+    /// sign, and that read would have answered "4".
+    pub typed: Option<char>,
     /// The key's OWN character, with no modifier applied at all
     /// (`charactersByApplyingModifiers:0`) — what a `Char` pattern must
     /// match, and read through the USER'S LAYOUT, so the Brazilian
@@ -710,6 +719,31 @@ unsafe fn bare_characters(event: Id) -> String {
     }
 }
 
+/// What the key put on the screen, under the modifiers held — the
+/// twin of [`bare_characters`], asked with the event's own flags
+/// instead of none.
+///
+/// A control character is not text: control and the letter A answer
+/// with U+0001 here, and a box asking what was typed must not be told
+/// that. The chord modifiers are dropped a level up, where the stroke
+/// is made, so this only has to be honest about what it read.
+unsafe fn typed_character(event: Id, flags: u64) -> Option<char> {
+    unsafe {
+        let selector = sel("charactersByApplyingModifiers:");
+        if msg_bool_sel(class("NSEvent"), sel("instancesRespondToSelector:"), selector) == 0 {
+            return None;
+        }
+        let typed = text_argument_to_string(msg_id_u64(event, selector, flags));
+        // a control character is not text, and neither is the private
+        // block F700-F8FF where AppKit files its function keys — the
+        // pattern already names those, by name
+        typed
+            .chars()
+            .next()
+            .filter(|char| !char.is_control() && !('\u{F700}'..='\u{F8FF}').contains(char))
+    }
+}
+
 extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
     unsafe {
         let code = msg_u16(event, sel("keyCode"));
@@ -721,9 +755,7 @@ extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
             option: flags & (1 << 19) != 0,
             command: flags & (1 << 20) != 0,
             chars: text_argument_to_string(msg_id(event, sel("characters"))),
-            chars_ignoring: text_argument_to_string(
-                msg_id(event, sel("charactersIgnoringModifiers")),
-            ),
+            typed: typed_character(event, flags),
             chars_bare: bare_characters(event),
         };
 

@@ -556,6 +556,12 @@ pub struct KeyStroke {
     pub alt: bool,
     pub chars_ignoring: String,
     pub types_text: bool,
+    /// The character this key TYPED, under the modifiers actually
+    /// held — the same `ToUnicode`, asked with the REAL keyboard state
+    /// instead of a clean one. It is what a box that refuses text
+    /// still needs: shift and a bracket make a brace, and which key
+    /// makes a brace is the layout's answer, never a table's.
+    pub typed: Option<char>,
 }
 
 thread_local! {
@@ -568,6 +574,31 @@ thread_local! {
 /// only translates what the gate declined.
 pub fn set_key_gate(gate: Box<dyn FnMut(&KeyStroke) -> bool>) {
     KEY_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+/// What the key TYPED, under the modifiers actually held — the twin
+/// of [`base_char`], asked with the live keyboard state.
+///
+/// A control character is not text, and the no-mutation flag keeps the
+/// kernel's dead-key state untouched, so a dead key answers nothing
+/// here and its composed letter arrives later on the character road.
+/// The chord modifiers are dropped a level up, where the stroke is
+/// made, so this only has to be honest about what it read.
+fn typed_char(vk: u32, scan_code: u32) -> Option<char> {
+    const DONT_CHANGE_STATE: u32 = 0x4;
+    let mut state = [0u8; 256];
+    let mut buffer = [0u16; 8];
+    let count = unsafe {
+        GetKeyboardState(state.as_mut_ptr());
+        ToUnicode(vk, scan_code, state.as_ptr(), buffer.as_mut_ptr(), 8, DONT_CHANGE_STATE)
+    };
+    if count <= 0 {
+        return None;
+    }
+    String::from_utf16_lossy(&buffer[..count as usize])
+        .chars()
+        .next()
+        .filter(|char| !char.is_control())
 }
 
 /// The base character a key would type with NO modifiers held. The
@@ -594,19 +625,21 @@ fn key_stroke_of(wparam: usize, lparam: isize) -> KeyStroke {
     let shift = unsafe { GetKeyState(VK_SHIFT) } as u16 & 0x8000 != 0;
     let control = unsafe { GetKeyState(VK_CONTROL) } as u16 & 0x8000 != 0;
     let alt = unsafe { GetKeyState(VK_MENU) } as u16 & 0x8000 != 0;
-    // the AltGr verdict needs the REAL state: does this chord type?
-    let types_text = control && alt && {
-        const DONT_CHANGE_STATE: u32 = 0x4;
-        let mut state = [0u8; 256];
-        let mut buffer = [0u16; 8];
-        unsafe {
-            GetKeyboardState(state.as_mut_ptr());
-            ToUnicode(vk, scan_code, state.as_ptr(), buffer.as_mut_ptr(), 8, DONT_CHANGE_STATE)
-                > 0
-                && buffer[0] >= 0x20
-        }
-    };
-    KeyStroke { vk, shift, control, alt, chars_ignoring: base_char(vk, scan_code), types_text }
+    // the character the live modifiers make, which is two answers in
+    // one: WHAT was typed, and — because AltGr is Ctrl+Alt on this
+    // platform — whether a chord types at all. The verdict used to
+    // throw the character away and keep only the bool
+    let typed = typed_char(vk, scan_code);
+    let types_text = control && alt && typed.is_some();
+    KeyStroke {
+        vk,
+        shift,
+        control,
+        alt,
+        chars_ignoring: base_char(vk, scan_code),
+        types_text,
+        typed,
+    }
 }
 
 // MARK: - Clipboard

@@ -99,6 +99,87 @@ pub struct KeyPattern {
     pub control: bool,
 }
 
+/// One keystroke, as the platform read it: the pattern that NAMES the
+/// key, and the character that key TYPES under the modifiers held.
+///
+/// Two fields because they are two questions, and one answer cannot
+/// serve both. The pattern carries the key's OWN character, read
+/// through the user's layout, so a chord spelled with a backslash
+/// matches the key the user pressed and not the `|` that key would
+/// have typed. The typed character is the other half — what a box that
+/// REFUSES text still needs, because what a `{` means is the box's
+/// business, and which key makes a `{` is the layout's: on ABNT2, US,
+/// AZERTY and Dvorak it is a different key, and no table in an app can
+/// know which.
+///
+/// `typed` is `None` when command or control is held. Those are the
+/// chord modifiers: a chord types nothing, and every platform asked
+/// under them answers with the key's base character, which would be a
+/// lie about what reached the screen.
+///
+/// It is what the key ALONE types. A dead key answers with its mark
+/// and not with the letter it will compose — the composed letter is
+/// the input system's, and it arrives by the text door.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Stroke {
+    pub pattern: KeyPattern,
+    pub typed: Option<char>,
+}
+
+impl From<KeyPattern> for Stroke {
+    /// A stroke that types nothing — what a test spells, and what a
+    /// shell answers for a key its platform gives no character for.
+    fn from(pattern: KeyPattern) -> Stroke {
+        Stroke { pattern, typed: None }
+    }
+}
+
+impl From<&KeyPattern> for Stroke {
+    fn from(pattern: &KeyPattern) -> Stroke {
+        Stroke::from(*pattern)
+    }
+}
+
+impl From<&Stroke> for Stroke {
+    fn from(stroke: &Stroke) -> Stroke {
+        *stroke
+    }
+}
+
+impl Stroke {
+    /// The stroke, and what it typed. A shell may hand over whatever
+    /// its platform said: the two things that are never a typed
+    /// character are dropped HERE, once, so no shell has to remember
+    /// them and no shell can forget them.
+    ///
+    /// A chord types nothing — and every platform asked under command
+    /// or control answers with the key's own character anyway, which
+    /// would be a lie about what reached the screen. A control
+    /// character is not text: control and the letter A make U+0001,
+    /// and a box asking what was typed must not be told that.
+    pub fn new(pattern: KeyPattern, typed: Option<char>) -> Stroke {
+        let chord = pattern.command || pattern.control;
+        Stroke { pattern, typed: typed.filter(|typed| !chord && !typed.is_control()) }
+    }
+
+    /// How the same key would be spelled by what it TYPES — the
+    /// modifiers that made the character are SPENT, so a binding
+    /// written as the character alone matches it.
+    ///
+    /// `None` when the key typed nothing. Shift and option are spent
+    /// here because they are what produced the character; command and
+    /// control never get this far, because a chord types nothing.
+    pub fn typed_pattern(&self) -> Option<KeyPattern> {
+        self.typed.map(|typed| KeyPattern {
+            key: Key::Char(typed),
+            shift: false,
+            command: false,
+            option: false,
+            control: false,
+        })
+    }
+}
+
 impl KeyPattern {
     /// The bare key.
     pub const fn key(key: Key) -> KeyPattern {

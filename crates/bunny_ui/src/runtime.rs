@@ -1153,7 +1153,12 @@ impl Runtime {
     /// `.on_submit` asked for. The answer's `text` is what a copy
     /// hands the platform's clipboard; `handled: false` sends the
     /// stroke on to the app's bindings.
-    pub fn key_stroke(&self, pattern: &KeyPattern) -> crate::custom::Response {
+    pub fn key_stroke(
+        &self,
+        stroke: impl Into<crate::action::Stroke>,
+    ) -> crate::custom::Response {
+        let stroke = stroke.into();
+        let pattern = &stroke.pattern;
         // an open menu takes Escape before anyone — its owner is the
         // runtime, so no reconciler handler could; a live drag is next
         if *pattern == KeyPattern::key(crate::action::Key::Escape)
@@ -1176,8 +1181,7 @@ impl Runtime {
         let Some(placement) = self.focused_custom() else {
             return crate::custom::Response::ignored();
         };
-        let response =
-            self.deliver(&placement, crate::custom::ElementEvent::Key(*pattern));
+        let response = self.deliver(&placement, crate::custom::ElementEvent::Key(stroke));
         if response.handled {
             self.caret_visible.set(true);
         }
@@ -1745,8 +1749,10 @@ impl Runtime {
     /// a press of the pointer lets it go, a stroke that leads nowhere
     /// ends it, and the shell's slow clock ages it out through
     /// [`Runtime::chord_tick`].
-    pub fn chord(&self, pattern: &KeyPattern) -> crate::action::KeyMatch {
+    pub fn chord(&self, stroke: impl Into<crate::action::Stroke>) -> crate::action::KeyMatch {
         use crate::action::KeyMatch;
+        let stroke = stroke.into();
+        let pattern = &stroke.pattern;
         let held = !self.pending.borrow().is_empty();
         // the explicit way out, and it consumes: a chord abandoned with
         // Escape must not also close the app's palette behind it
@@ -1785,8 +1791,19 @@ impl Runtime {
         match answer {
             KeyMatch::None if strokes == 1 => {
                 // a plain stroke that started nothing: the single-stroke
-                // table answers, exactly as it always did
-                self.match_key(pattern).map_or(KeyMatch::None, KeyMatch::Action)
+                // table answers — first for the KEY it is, and then for
+                // the character it TYPED. A keymap written by a hand
+                // spells `>` and `$` and `?`, never `shift-.`, and
+                // which key makes a `?` is the layout's answer: the
+                // second reading is the only one that can find it.
+                //
+                // The key's own spelling always wins, so an app that
+                // wrote both gets the one it was more precise about.
+                self.match_key(pattern)
+                    .or_else(|| {
+                        stroke.typed_pattern().and_then(|typed| self.match_key(&typed))
+                    })
+                    .map_or(KeyMatch::None, KeyMatch::Action)
             }
             // a sequence that dead-ended spends its last stroke: the
             // hand was mid-chord, and re-reading it as a fresh one is

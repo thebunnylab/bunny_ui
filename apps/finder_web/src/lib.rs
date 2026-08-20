@@ -97,7 +97,7 @@ impl CustomElement for Scratch {
                 self.note.set(Arc::from(format!("{}{text}", self.note.get())));
                 Response::handled()
             }
-            ElementEvent::Key(pattern) if pattern.key == Key::Backspace => {
+            ElementEvent::Key(stroke) if stroke.pattern.key == Key::Backspace => {
                 let mut note = self.note.get().to_string();
                 note.pop();
                 self.note.set(Arc::from(note));
