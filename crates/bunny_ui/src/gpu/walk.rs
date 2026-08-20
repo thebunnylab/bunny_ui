@@ -160,7 +160,7 @@ pub fn wire_radii(radii: Corners) -> [f32; 4] {
 /// Four zero radii are the straight rectangle every clip has been
 /// until now — and multiplying coverage by 1.0 is exact.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct RoundClip {
     /// The rounded clip's OWN snapped box in device px — the cut can
     /// be smaller without the corner moving.
@@ -269,6 +269,7 @@ impl ShelfPacker {
 
 /// The atlas is full — the caller drains the in-flight frames, resets
 /// (growing once to the cap) and walks the frame again.
+#[derive(Debug)]
 pub struct AtlasFull;
 
 /// One cached run: the engine's raster uploaded as chunk tiles. The
@@ -576,7 +577,7 @@ fn push_gradient(
 
 /// A maximal run of one instance kind, in paint order — the draw-call
 /// unit. Batches break only where rects and text alternate.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RunKind {
     Rects,
     /// A batch of liquid-glass panes. It carries its own pass: the
@@ -1036,9 +1037,238 @@ fn round_of(clips: &[(Box4, u32)]) -> u32 {
 
 // MARK: - Tests (the pure allocator and the wire)
 
+// MARK: - The ground a host can watch
+
+/// An [`AtlasGround`] that allocates nothing and remembers everything.
+/// A tier's ground talks to a device; this one talks to a `Vec`, so the
+/// walk runs on any machine — including the two whose tiers no desk
+/// here can execute.
+#[derive(Default)]
+pub struct RecordingGround {
+    /// The shared texture's side, once it exists.
+    pub shared: Option<u32>,
+    /// Every tile handed over: x, y, w, h, and the pitch it was cut from.
+    pub uploads: Vec<(u32, u32, u32, u32, u32)>,
+    /// Dedicated textures minted, by handle and size.
+    pub dedicated: Vec<(u64, u32, u32)>,
+    /// How many times the copying collector wiped the shared texture.
+    pub drops: usize,
+    next: u64,
+}
+
+impl AtlasGround for RecordingGround {
+    fn ensure_shared(&mut self, size: u32) -> bool {
+        self.shared = Some(size);
+        true
+    }
+
+    fn upload_shared(&mut self, x: u32, y: u32, w: u32, h: u32, bytes: &[u8], pitch_px: u32) {
+        // the rows after the first are a pitch apart, and the last one
+        // is only `w` wide — what the slice must hold, exactly
+        let needed = (h as usize - 1) * pitch_px as usize * 4 + w as usize * 4;
+        assert!(
+            bytes.len() >= needed,
+            "a tile of {w}x{h} at pitch {pitch_px} wants {needed} bytes, got {}",
+            bytes.len()
+        );
+        self.uploads.push((x, y, w, h, pitch_px));
+    }
+
+    fn drop_shared(&mut self) {
+        self.shared = None;
+        self.drops += 1;
+    }
+
+    fn make_dedicated(&mut self, w: u32, h: u32, bytes: &[u8], pitch_px: u32) -> Option<u64> {
+        assert!(bytes.len() >= (h as usize - 1) * pitch_px as usize * 4 + w as usize * 4);
+        self.next += 1;
+        self.dedicated.push((self.next, w, h));
+        Some(self.next)
+    }
+
+    fn drop_dedicated(&mut self, id: u64) {
+        self.dedicated.retain(|(held, _, _)| *held != id);
+    }
+}
+
+impl FrameBatches {
+    /// One number over the instance bytes, for a tier to compare against
+    /// another machine's. Same walk, same number — so a scene that
+    /// disagrees on pixels but agrees here has a bug BELOW the walk, and
+    /// that halves the search.
+    pub fn checksum(&self) -> u64 {
+        fn feed(hash: &mut u64, bytes: &[u8]) {
+            for byte in bytes {
+                *hash ^= *byte as u64;
+                *hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for rect in &self.rects {
+            feed(&mut hash, &rect.rect.map(f32::to_le_bytes).concat());
+            feed(&mut hash, &rect.clip.map(f32::to_le_bytes).concat());
+            feed(&mut hash, &rect.params.map(f32::to_le_bytes).concat());
+            feed(&mut hash, &rect.color);
+            feed(&mut hash, &rect.pad);
+            feed(&mut hash, &rect.radii.map(f32::to_le_bytes).concat());
+        }
+        for sprite in &self.sprites {
+            feed(&mut hash, &sprite.dest.map(f32::to_le_bytes).concat());
+            feed(&mut hash, &sprite.tex.map(f32::to_le_bytes).concat());
+            feed(&mut hash, &sprite.clip.map(f32::to_le_bytes).concat());
+        }
+        for round in &self.rounds {
+            feed(&mut hash, &round.box4.map(f32::to_le_bytes).concat());
+            feed(&mut hash, &round.radii.map(f32::to_le_bytes).concat());
+        }
+        for run in &self.runs {
+            feed(&mut hash, &run.base.to_le_bytes());
+            feed(&mut hash, &run.count.to_le_bytes());
+            feed(&mut hash, &run.round.to_le_bytes());
+        }
+        hash
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scene the golden walks: one of every shape the tiers answer,
+    /// in paint order, with a rounded clip around the middle of it.
+    fn scene() -> DisplayList {
+        let mut display = DisplayList::default();
+        let box_at = |x: f64, y: f64, w: f64, h: f64| Rect {
+            origin: crate::layout::Point { x, y },
+            size: crate::layout::Size { width: w, height: h },
+        };
+        display.push(DrawCommand::FillRect {
+            rect: box_at(0.0, 0.0, 100.0, 60.0),
+            color: Color::rgba(20, 30, 40, 255),
+            corner_radius: Corners::ZERO,
+        });
+        display.push(DrawCommand::Shadow {
+            rect: box_at(10.0, 10.0, 40.0, 20.0),
+            radius: 6.0,
+            color: Color::rgba(0, 0, 0, 80),
+            corner_radius: Corners::all(4.0),
+        });
+        display.push(DrawCommand::PushClip {
+            rect: box_at(8.0, 8.0, 60.0, 40.0),
+            corner_radius: Corners::all(5.0),
+        });
+        display.push(DrawCommand::FillRect {
+            rect: box_at(12.0, 12.0, 30.0, 16.0),
+            color: Color::rgba(200, 40, 40, 255),
+            corner_radius: Corners::all(3.0),
+        });
+        display.push(DrawCommand::StrokeRect {
+            rect: box_at(12.0, 12.0, 30.0, 16.0),
+            color: Color::rgba(255, 255, 255, 128),
+            width: 2.0,
+            corner_radius: Corners::all(3.0),
+        });
+        display.push(DrawCommand::TextLine {
+            origin: crate::layout::Point { x: 14.0, y: 32.0 },
+            content: std::sync::Arc::from("hi"),
+            range: (0, 2),
+            color: Color::rgba(240, 240, 240, 255),
+            font: FontSpec::DEFAULT,
+        });
+        display.push(DrawCommand::PopClip);
+        display
+    }
+
+    #[test]
+    fn the_walk_says_the_same_bytes_to_every_tier() {
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let mut batches = FrameBatches::default();
+        build_frame(
+            &mut ground,
+            &scene(),
+            2,
+            (200, 120),
+            &crate::text_engine::PixelFont,
+            &crate::image_engine::RawImages::default(),
+            &mut atlas,
+            &mut batches,
+        )
+        .expect("the scene fits the atlas");
+
+        // three rect kinds and no more: the fill, the halo, the ring,
+        // and the fill inside the cut
+        assert_eq!(batches.rects.len(), 4, "one instance per rect command");
+        assert!(!batches.sprites.is_empty(), "the label rode the atlas");
+        assert!(batches.glass.is_empty(), "no pane in this scene");
+
+        // slot 0 is the straight cut, and the rounded clip interned once
+        assert_eq!(batches.rounds.len(), 2, "NO_ROUND, then the one curve");
+        assert_eq!(batches.rounds[0], NO_ROUND);
+        assert_eq!(batches.rounds[1].radii, [10.0, 10.0, 10.0, 10.0], "5 points at scale 2");
+
+        // the runs break where the KIND changes and where the CUT does,
+        // never in between
+        let shape: Vec<(RunKind, u32, u32)> =
+            batches.runs.iter().map(|run| (run.kind, run.count, run.round)).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (RunKind::Rects, 2, 0),
+                (RunKind::Rects, 2, 1),
+                (RunKind::Sprites, batches.sprites.len() as u32, 1),
+            ],
+            "the fill and halo outside the cut, then the pair inside it, then the label"
+        );
+
+        // the tiles never overlap and never leave the atlas
+        for (x, y, w, h, _) in &ground.uploads {
+            assert!(x + w <= ATLAS_INITIAL_SIZE && y + h <= ATLAS_INITIAL_SIZE);
+        }
+
+        // the number a tier on another machine can compare against
+        let first = batches.checksum();
+        let mut again = FrameBatches::default();
+        let mut ground2 = RecordingGround::default();
+        let mut atlas2 = RunAtlas::new();
+        build_frame(
+            &mut ground2,
+            &scene(),
+            2,
+            (200, 120),
+            &crate::text_engine::PixelFont,
+            &crate::image_engine::RawImages::default(),
+            &mut atlas2,
+            &mut again,
+        )
+        .expect("the scene fits the atlas");
+        assert_eq!(first, again.checksum(), "the same scene is the same bytes");
+    }
+
+    #[test]
+    fn a_warm_frame_uploads_nothing_new() {
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let mut batches = FrameBatches::default();
+        let walk = |ground: &mut RecordingGround, atlas: &mut RunAtlas, batches: &mut FrameBatches| {
+            build_frame(
+                ground,
+                &scene(),
+                2,
+                (200, 120),
+                &crate::text_engine::PixelFont,
+                &crate::image_engine::RawImages::default(),
+                atlas,
+                batches,
+            )
+            .expect("the scene fits the atlas");
+        };
+        walk(&mut ground, &mut atlas, &mut batches);
+        let cold = ground.uploads.len();
+        assert!(cold > 0, "the first frame cut the tiles");
+        walk(&mut ground, &mut atlas, &mut batches);
+        assert_eq!(ground.uploads.len(), cold, "a warm frame re-cuts nothing");
+    }
 
     #[test]
     fn the_wire_structs_hold_their_layout() {
