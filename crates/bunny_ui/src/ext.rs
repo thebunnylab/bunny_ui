@@ -664,6 +664,32 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         self.on_click_count(move |_| action())
     }
 
+    /// `.on_hover(|inside| …)` — the pointer arriving and leaving, as
+    /// STATE the app can hold. The pair of `.on_click`, and the thing
+    /// the five hover modifiers beside it already know and keep to
+    /// themselves: `background_hovered` and its family are PAINT, and
+    /// paint tells an app nothing.
+    ///
+    /// It is what a submenu is made of. A flyout that opens on hover
+    /// cannot be built out of a modifier that only changes a colour,
+    /// and a submenu that opens on a CLICK is a different gesture —
+    /// on top of a menu that was itself opened by one.
+    ///
+    /// ```ignore
+    /// row.on_hover(move |inside| open.set(inside))
+    /// ```
+    ///
+    /// The view becomes a pointer target, exactly as `.on_click` makes
+    /// one — a view nothing can hit is a view nothing can hover. It
+    /// fires ONCE per change: `true` when the pointer arrives, `false`
+    /// when it leaves, and never twice for the same answer.
+    fn on_hover(self, action: impl Fn(bool) + 'static) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::OnHover(std::rc::Rc::new(move |inside| action(inside != 0))),
+        }
+    }
+
     /// The same target, told HOW MANY clicks the press carried: 1, then
     /// 2 on the double, 3 on the triple. The count is the PLATFORM's —
     /// the framework holds no clock — and it is the same number the

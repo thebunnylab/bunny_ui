@@ -126,6 +126,10 @@ pub enum Modifier {
     // MARK: - Real interaction (a pointer target without chrome — the Button
     // without the outfit; the action fires on up-inside like the Button's)
     OnClick(crate::reconciler::ClickAction),
+    /// `.on_hover(|inside| …)` — the pointer arriving and leaving, as
+    /// STATE the app can hold. The five hover modifiers beside it are
+    /// paint and tell nobody anything.
+    OnHover(crate::reconciler::ClickAction),
     OnAction(crate::action::ActionId, Rc<dyn Fn()>),
 
     // MARK: - Interaction (the action fires at render, as in the headless engine)
@@ -283,6 +287,7 @@ impl Modifier {
             }
             Modifier::LayoutMode(mode) => format!(" [.layout({mode:?})]"),
             Modifier::OnClick(_) => " [.onClick()]".into(),
+            Modifier::OnHover(_) => " [.onHover()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
             Modifier::OnTapGesture(_) => " [.onTapGesture()]".into(),
@@ -1229,6 +1234,23 @@ fn apply(
             // reconciler, frame in the hit-test under the cursor identity
             if let Some(path) = motor::identity::cursor_scope() {
                 crate::reconciler::attribute_action(path.clone(), action.clone());
+                out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
+                    path,
+                    child: Box::new(node),
+                });
+            }
+        }
+        Modifier::OnHover(action) => {
+            // a view can only be hovered if it is a TARGET, so this
+            // registers the same frame `.on_click` would — under a
+            // reserved key beside the click's own, which is how the
+            // popover's dismiss already rides. A view with both keeps
+            // one path and answers two questions.
+            if let Some(path) = motor::identity::cursor_scope() {
+                crate::reconciler::attribute_action(
+                    format!("{path}/{}", crate::reconciler::HOVER_KEY),
+                    action.clone(),
+                );
                 out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
                     path,
                     child: Box::new(node),

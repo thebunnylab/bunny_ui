@@ -1272,6 +1272,21 @@ impl<I, F> VirtualList<I, F> {
     }
 }
 
+impl<I, F> VirtualList<I, F> {
+    /// The extent the window math counts rows by. A MEASURED row wins:
+    /// the placement lays the rows out by what they measured, so a
+    /// window counting by any other number drifts one row's difference
+    /// per row and walks off the viewport. The declaration is the
+    /// answer only where nothing measures — the browser's own flow,
+    /// which publishes a zero extent and leaves the app the authority.
+    fn window_extent(&self, measured: f64) -> f64 {
+        match measured > 0.0 {
+            true => measured,
+            false => self.declared_extent.unwrap_or(0.0),
+        }
+    }
+}
+
 impl<I, F, R> View for VirtualList<I, F>
 where
     I: Fn(usize) -> String + Clone + 'static,
@@ -1331,10 +1346,9 @@ where
                 (first, last)
             }
             (Some(snap), None)
-                if (self.declared_extent.unwrap_or(snap.row_extent)) > 0.0
-                    && self.count > 0 =>
+                if self.window_extent(snap.row_extent) > 0.0 && self.count > 0 =>
             {
-                let extent = self.declared_extent.unwrap_or(snap.row_extent);
+                let extent = self.window_extent(snap.row_extent);
                 let rows_in_view =
                     (snap.viewport / extent).ceil().max(1.0) as usize + 1;
                 // the retained offset clamps HERE the way place will
@@ -1388,9 +1402,9 @@ where
                 (first, last)
             }
             (Some(snap), None)
-                if self.declared_extent.unwrap_or(snap.row_extent) > 0.0 =>
+                if self.window_extent(snap.row_extent) > 0.0 =>
             {
-                let extent = self.declared_extent.unwrap_or(snap.row_extent);
+                let extent = self.window_extent(snap.row_extent);
                 let buffer = (snap.viewport / extent).ceil().max(1.0) as usize + 1;
                 (index.saturating_sub(buffer), (index + buffer).min(self.count - 1))
             }

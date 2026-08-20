@@ -548,3 +548,33 @@ pub extern "C" fn start_dom(width: f64, height: f64, scale: f64, hydrate: u32) {
         bunny_ui_web::start_dom(width, height, scale, finder());
     }
 }
+
+/// Reports what the scroll region and the window math actually see, so
+/// a browser can say it instead of a guess. Writes six numbers at
+/// `out`: the region's frame height, its content height, the declared
+/// row extent, the retained offset, how many text runs the frame
+/// painted, and how many rows the viewport has room for.
+#[unsafe(no_mangle)]
+pub extern "C" fn finder_debug_window(width: f64, height: f64, out: *mut f64) {
+    use bunny_ui::layout::{DrawCommand, Proposal, Size};
+    let size = Size { width, height };
+    let runtime = bunny_ui::runtime::Runtime::new();
+    let root = finder();
+    let _ = runtime.display_frame(&root, size);
+    let result = runtime.layout(&root, Proposal::exact(size));
+    let region = result.scrolls.first().cloned();
+    let display = runtime.display_frame(&root, size);
+    let painted = display
+        .iter()
+        .filter(|command| matches!(command, DrawCommand::TextLine { .. }))
+        .count();
+    let numbers = [
+        region.as_ref().map_or(0.0, |r| r.frame.size.height),
+        region.as_ref().map_or(0.0, |r| r.content.height),
+        region.as_ref().and_then(|r| r.row_extent).unwrap_or(0.0),
+        region.as_ref().map_or(0.0, |r| r.frame.origin.y),
+        painted as f64,
+        result.scrolls.len() as f64,
+    ];
+    unsafe { std::ptr::copy_nonoverlapping(numbers.as_ptr(), out, numbers.len()) };
+}

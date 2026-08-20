@@ -164,6 +164,12 @@ pub(crate) fn note_stable_frame() {
 
 const REF_MARK: char = '\u{1}';
 
+/// The reserved suffix a view's `.on_hover` is registered under, beside
+/// the click's own key at the same path. A hit test never sees it: the
+/// hit list carries the bare path, and only the runtime spells this
+/// one out.
+pub const HOVER_KEY: &str = "#hover";
+
 pub(crate) fn begin_pass(dirty: HashSet<String>) {
     PASS.with(|pass| {
         *pass.borrow_mut() = PassState {
@@ -529,7 +535,22 @@ pub(crate) fn assemble_actions(root: &str) {
             map.insert(key, action);
         }
     });
+    // a scene with no `.on_hover` pays nothing for one: the runtime
+    // asks this before it copies a path to compare against
+    let watched = map.keys().any(|key| key.ends_with(HOVER_KEY));
+    HOVER_WATCHED.with(|flag| flag.set(watched));
     ACTIONS.with(|actions| *actions.borrow_mut() = map);
+}
+
+thread_local! {
+    static HOVER_WATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Does any view on screen want to hear the pointer arrive? Answered
+/// once per pass, so the hover road can cost nothing at all in a scene
+/// that never asked.
+pub(crate) fn hover_watched() -> bool {
+    HOVER_WATCHED.with(|flag| flag.get())
 }
 
 /// Fires the target's action (the key comes from the hit-test).

@@ -697,6 +697,57 @@ mod tests {
         assert_eq!(region.row_extent, Some(16.0));
     }
 
+    /// Scrolling a UNIFORM virtual list deep must keep the viewport
+    /// COVERED — not merely busy. The window counts rows by one extent
+    /// and the placement lays them out by another, so a mismatch of a
+    /// single pixel walks the window off the screen one row at a time:
+    /// at nine hundred rows it has drifted nine hundred pixels, and
+    /// what is left is the handful of rows the two bands still share.
+    ///
+    /// Counting painted rows does not catch it. The window is still
+    /// full of rows; they are simply above the viewport. So this asks
+    /// the question the eye asks: is anything drawn near the BOTTOM?
+    #[test]
+    fn a_deep_window_still_covers_the_bottom_of_the_viewport() {
+        #[derive(Clone, Copy)]
+        struct Deep;
+        impl Component for Deep {
+            fn body(self, _ctx: &Context) -> impl View {
+                virtual_list(10_000, |row| format!("row{row}"), |row| {
+                    text(format!("file_{row:04}.rs")).frame_height(28.0)
+                })
+                // the shape the finder ships: a row that MEASURES 28
+                // and a declaration that says 29
+                .row_height(29.0)
+            }
+        }
+        let size = crate::layout::Size { width: 300.0, height: 640.0 };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&Deep, size);
+        let result = runtime.layout(&Deep, crate::layout::Proposal::exact(size));
+        let region = result.scrolls.first().expect("the region exists").clone();
+
+        for step in 1..=40 {
+            let offset = step as f64 * size.height;
+            runtime.set_scroll_offset(&region.path, crate::layout::Point { x: 0.0, y: offset });
+            let display = runtime.display_frame(&Deep, size);
+            // the deepest text the frame drew, in the region's own space
+            let lowest = display
+                .iter()
+                .filter_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { origin, .. } => Some(origin.y),
+                    _ => None,
+                })
+                .fold(f64::MIN, f64::max);
+            assert!(
+                lowest >= region.frame.origin.y + region.frame.size.height - 40.0,
+                "step {step} at offset {offset}: the lowest row painted sits at {lowest}, \
+                 leaving the bottom of the region (ends at {}) empty",
+                region.frame.origin.y + region.frame.size.height,
+            );
+        }
+    }
+
     #[test]
     fn variable_rows_keep_the_geometry_honest() {
         #[derive(Clone, Copy)]
@@ -4914,6 +4965,130 @@ mod tests {
             assert!(runtime.key(EditCommand::Down(false)).applied);
         }
         assert_eq!(selected(), (27, 0));
+    }
+
+    #[test]
+    fn a_view_hears_the_pointer_arrive_and_leave() {
+        use crate::layout::{Proposal, Size};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // ONE log, written by both rows, because the ORDER is the law
+        // under test: a flyout handing over to the next one must hear
+        // it closed before the next hears it opened
+        #[derive(Clone)]
+        struct Menu {
+            log: Rc<RefCell<Vec<&'static str>>>,
+        }
+
+        impl Component for Menu {
+            fn body(self, _ctx: &Context) -> impl View {
+                let first = Rc::clone(&self.log);
+                let second = Rc::clone(&self.log);
+                vstack((
+                    text("Language Servers").frame(200.0, 40.0).on_hover(move |inside| {
+                        first.borrow_mut().push(if inside { "servers in" } else { "servers out" });
+                    }),
+                    text("Extensions").frame(200.0, 40.0).on_hover(move |inside| {
+                        second
+                            .borrow_mut()
+                            .push(if inside { "extensions in" } else { "extensions out" });
+                    }),
+                ))
+            }
+        }
+
+        let menu = Menu { log: Rc::new(RefCell::new(Vec::new())) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&menu);
+        runtime.layout(&menu, Proposal::exact(Size { width: 200.0, height: 100.0 }));
+
+        // the pointer arrives on the first row: the flyout opens, which
+        // is the whole gesture a submenu is made of
+        runtime.pointer_moved(100.0, 20.0);
+        assert_eq!(menu.log.borrow().as_slice(), &["servers in"]);
+
+        // moving INSIDE the same row says nothing new: it fires on the
+        // CHANGE, not on the pointer
+        runtime.pointer_moved(120.0, 30.0);
+        assert_eq!(menu.log.borrow().len(), 1, "still once");
+
+        // onto the second row, and the ORDER is the point: the row the
+        // pointer left hears it FIRST, so two flyouts are never open at
+        // the same moment
+        runtime.pointer_moved(100.0, 60.0);
+        assert_eq!(
+            menu.log.borrow().as_slice(),
+            &["servers in", "servers out", "extensions in"],
+            "left before arrived"
+        );
+
+        // and off the menu entirely
+        runtime.pointer_exited();
+        assert_eq!(
+            menu.log.borrow().as_slice(),
+            &["servers in", "servers out", "extensions in", "extensions out"],
+        );
+    }
+
+    #[test]
+    fn content_sliding_under_a_still_pointer_is_an_arrival() {
+        use crate::layout::{Point, Proposal, Size};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // the pointer never moves. The LIST does — and a row that
+        // slides under a hand is a row the hand is on, which is what
+        // every list in every editor already looks like
+        #[derive(Clone)]
+        struct Rows {
+            log: Rc<RefCell<Vec<String>>>,
+        }
+
+        impl Component for Rows {
+            fn body(self, _ctx: &Context) -> impl View {
+                let log = Rc::clone(&self.log);
+                scroll(for_each(
+                    (0..20).collect::<Vec<usize>>(),
+                    |row| format!("row{row}"),
+                    move |row| {
+                        let (log, row) = (Rc::clone(&log), *row);
+                        text(format!("row {row}")).frame(200.0, 20.0).on_hover(move |inside| {
+                            if inside {
+                                log.borrow_mut().push(format!("row {row}"));
+                            }
+                        })
+                    },
+                ))
+                .id("rows")
+            }
+        }
+
+        let rows = Rows { log: Rc::new(RefCell::new(Vec::new())) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&rows);
+        let viewport = Proposal::exact(Size { width: 200.0, height: 100.0 });
+        runtime.layout(&rows, viewport);
+
+        // the hand lands on the third row and STAYS there
+        runtime.pointer_moved(100.0, 50.0);
+        assert_eq!(rows.log.borrow().as_slice(), &["row 2".to_string()]);
+
+        // the wheel slides the list by two rows under it. Nothing about
+        // the pointer changed; what it is over did
+        assert!(runtime.wheel(100.0, 50.0, 0.0, -40.0));
+        assert_eq!(runtime.scroll_offset("Rows/[rows]"), Point { x: 0.0, y: 40.0 });
+        let _ = runtime.frame(
+            &rows,
+            Size { width: 200.0, height: 100.0 },
+            1,
+            crate::layout::Color::rgb(0, 0, 0),
+        );
+        assert_eq!(
+            rows.log.borrow().as_slice(),
+            &["row 2".to_string(), "row 4".to_string()],
+            "the row that slid under the hand is the row the hand is on"
+        );
     }
 
     #[test]

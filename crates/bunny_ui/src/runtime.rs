@@ -894,6 +894,43 @@ impl Runtime {
 
     // MARK: - Pointer (resolved BEFORE layout — the LAW)
 
+    /// Runs a pointer road and then tells the views the pointer left
+    /// one and arrived at another.
+    ///
+    /// EVERY road that can move the hover comes through here, instead
+    /// of each of the seven places that assign it — a law spread over
+    /// seven sites is a law with six chances to be forgotten, and the
+    /// last one that happened cost a whole round.
+    ///
+    /// It fires OUTSIDE every borrow this file holds: an app's closure
+    /// may come straight back in through the front door, and a hover
+    /// that fired mid-borrow would meet a runtime busy with itself.
+    fn watching_hover<T>(&self, road: impl FnOnce() -> T) -> (T, bool) {
+        // nobody asked: the road runs and not one path is copied
+        if !reconciler::hover_watched() {
+            return (road(), false);
+        }
+        let before = self.interaction.borrow().hovered.clone();
+        let out = road();
+        let after = self.interaction.borrow().hovered.clone();
+        if before == after {
+            return (out, false);
+        }
+        let told = |path: Option<&str>, inside: u8| match path {
+            Some(path) => reconciler::run_action(
+                &format!("{path}/{}", reconciler::HOVER_KEY),
+                inside,
+            ),
+            None => false,
+        };
+        // left first, then arrived: a view that hands its state to the
+        // next one must not be told it is gone AFTER the next one was
+        // told it is here
+        let left = told(before.as_deref(), 0);
+        let arrived = told(after.as_deref(), 1);
+        (out, left || arrived)
+    }
+
     /// The target under the point, against the last layout's hits.
     fn hover_target(&self, x: Px, y: Px) -> Option<String> {
         let hits = self.last_hits.borrow();
@@ -927,6 +964,11 @@ impl Runtime {
     /// pressed target: dragging out drops the visual, coming back
     /// re-arms it (AppKit).
     pub fn pointer_moved(&self, x: Px, y: Px) -> bool {
+        let (repaint, told) = self.watching_hover(|| self.pointer_moved_road(x, y));
+        repaint || told
+    }
+
+    fn pointer_moved_road(&self, x: Px, y: Px) -> bool {
         // a live divider drag owns the pointer: the move becomes a lane
         // extent, the retained writer reaches the binding, and the app's
         // state change re-lays the frame — hover stays untouched
@@ -1291,6 +1333,17 @@ impl Runtime {
         modifiers: impl Into<crate::action::Modifiers>,
     ) -> bool {
         let modifiers = modifiers.into();
+        let (repaint, told) = self.watching_hover(|| self.pointer_clicked_road(x, y, clicks, modifiers));
+        repaint || told
+    }
+
+    fn pointer_clicked_road(
+        &self,
+        x: Px,
+        y: Px,
+        clicks: u8,
+        modifiers: crate::action::Modifiers,
+    ) -> bool {
         let shift = modifiers.shift;
         // the hand left the keyboard: a sequence in the air goes with
         // it, the way it does in every editor that has chords
@@ -1430,6 +1483,10 @@ impl Runtime {
     /// click). Returns the fired/focused path; the pressed visual
     /// always clears.
     pub fn pointer_released(&self, x: Px, y: Px) -> Option<String> {
+        self.watching_hover(|| self.pointer_released_road(x, y)).0
+    }
+
+    fn pointer_released_road(&self, x: Px, y: Px) -> Option<String> {
         // taken at the TOP so it cannot leak: every release resets it,
         // including the ones that end a drag, a grab, a seam or a thumb
         // and fire no action at all, so the next gesture starts at one
@@ -1567,6 +1624,11 @@ impl Runtime {
     /// The pointer left the window: clears hover (an in-flight press
     /// already had its visual dropped by the drag's `pointer_moved`).
     pub fn pointer_exited(&self) -> bool {
+        let (repaint, told) = self.watching_hover(|| self.pointer_exited_road());
+        repaint || told
+    }
+
+    fn pointer_exited_road(&self) -> bool {
         let explained = self.clear_tooltip();
         let _ = explained;
         let hovered = {
