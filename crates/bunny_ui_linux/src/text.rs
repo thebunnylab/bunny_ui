@@ -47,6 +47,22 @@ unsafe extern "C" {
     fn FcCharSetCreate() -> *mut c_void;
     fn FcCharSetAddChar(cs: *mut c_void, ucs4: u32) -> c_int;
     fn FcCharSetDestroy(cs: *mut c_void);
+    /// The roster road: an object set names WHICH properties the
+    /// listing carries, and the font set that comes back is the
+    /// caller's to destroy.
+    fn FcObjectSetCreate() -> *mut c_void;
+    fn FcObjectSetAdd(os: *mut c_void, object: *const c_char) -> c_int;
+    fn FcObjectSetDestroy(os: *mut c_void);
+    fn FcFontList(cfg: *mut c_void, p: *mut c_void, os: *mut c_void) -> *mut FcFontSet;
+    fn FcFontSetDestroy(set: *mut FcFontSet);
+}
+
+/// fontconfig's own listing shape — the two counts and the array.
+#[repr(C)]
+struct FcFontSet {
+    nfont: c_int,
+    sfont: c_int,
+    fonts: *mut *mut c_void,
 }
 
 // MARK: - FreeType ABI (API calls + offset reads verified by extraction)
@@ -156,6 +172,9 @@ struct FaceKey {
     mono: bool,
     weight: u8,
     italic: bool,
+    /// The family the app named. A number, so the key stays cheap —
+    /// the name itself is only needed once, when the face is opened.
+    family: bunny_ui::text_engine::Family,
     /// f64 bits of the LOGICAL size — fractional sizes are contract.
     size_bits: u64,
     scale: usize,
@@ -196,6 +215,7 @@ impl FreeTypeEngine {
                 Weight::Bold => 3,
             },
             italic: font.slant == Slant::Italic,
+            family: font.family,
             size_bits: font.size.to_bits(),
             scale,
         }
@@ -210,7 +230,16 @@ impl FreeTypeEngine {
         }
         let (path, index) = unsafe {
             let pattern = FcPatternCreate();
-            let family: &CStr = if key.mono { c"monospace" } else { c"sans-serif" };
+            // a family the app NAMED is the most specific thing anyone
+            // said about this text; fontconfig substitutes its own way
+            // out of a name this machine has not got, so an unknown one
+            // degrades instead of failing
+            let named = key.family.name().and_then(|name| CString::new(&*name).ok());
+            let family: &CStr = match &named {
+                Some(name) => name,
+                None if key.mono => c"monospace",
+                None => c"sans-serif",
+            };
             FcPatternAddString(pattern, c"family".as_ptr(), family.as_ptr().cast());
             // the fc scale: regular 80, medium 100, demibold 180, bold 200
             let weight = [80, 100, 180, 200][key.weight as usize];
@@ -402,6 +431,40 @@ struct Shaped {
 }
 
 impl TextEngine for FreeTypeEngine {
+    fn families(&self) -> Vec<std::sync::Arc<str>> {
+        if self.config.is_null() {
+            return Vec::new();
+        }
+        unsafe {
+            let pattern = FcPatternCreate();
+            let objects = FcObjectSetCreate();
+            FcObjectSetAdd(objects, c"family".as_ptr());
+            let listed = FcFontList(self.config, pattern, objects);
+            let mut names: Vec<std::sync::Arc<str>> = Vec::new();
+            if !listed.is_null() {
+                for index in 0..(*listed).nfont.max(0) {
+                    let face = *(*listed).fonts.offset(index as isize);
+                    let mut value: *mut u8 = std::ptr::null_mut();
+                    if FcPatternGetString(face, c"family".as_ptr(), 0, &mut value)
+                        == FC_RESULT_MATCH
+                        && !value.is_null()
+                    {
+                        let name = CStr::from_ptr(value.cast()).to_string_lossy();
+                        names.push(std::sync::Arc::from(&*name));
+                    }
+                }
+                FcFontSetDestroy(listed);
+            }
+            FcObjectSetDestroy(objects);
+            FcPatternDestroy(pattern);
+            // one face per FILE comes back, so a family with four
+            // weights is listed four times
+            names.sort();
+            names.dedup();
+            names
+        }
+    }
+
     fn measure_line(&self, text: &str, font: &FontSpec) -> LineMetrics {
         let key = Self::key(font, 1);
         let Some(primary) = self.face(&key) else {

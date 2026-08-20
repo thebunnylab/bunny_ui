@@ -76,6 +76,9 @@ pub enum Modifier {
         over: Option<crate::layout::DragOverAction>,
     },
     Monospaced,
+    /// `.font_family(…)` — the face itself, by name. Only the family
+    /// travels: a size, a weight and a lean around it all survive.
+    FontFamily(crate::text_engine::Family),
     /// A size out of the preset scale — the rest of the font stays.
     FontSize(f64),
     BackgroundHovered(Color),
@@ -226,6 +229,9 @@ impl Modifier {
             Modifier::OnDrag(_) => " [.onDrag()]".into(),
             Modifier::OnDrop { .. } => " [.onDrop()]".into(),
             Modifier::Monospaced => " [.monospaced()]".into(),
+            Modifier::FontFamily(family) => {
+                format!(" [.font_family({:?})]", family.name().unwrap_or_default())
+            }
             Modifier::Id(name) => format!(" [.id({name:?})]"),
             Modifier::FontSize(size) => format!(" [.font(.system(size: {size}))]"),
             Modifier::BackgroundHovered(color) => format!(" [.backgroundHovered({color})]"),
@@ -1012,6 +1018,16 @@ fn apply(
             mark,
             VisualProps {
                 font: FontPatch { design: Some(FontDesign::Mono), ..FontPatch::default() },
+                ..VisualProps::default()
+            },
+        ),
+        // only the face travels: the size, the weight and the lean
+        // around it are slots this modifier says nothing about
+        Modifier::FontFamily(family) => wrap_styled(
+            out,
+            mark,
+            VisualProps {
+                font: FontPatch { family: Some(*family), ..FontPatch::default() },
                 ..VisualProps::default()
             },
         ),

@@ -169,7 +169,8 @@ struct IDWriteFactory {
 #[repr(C)]
 struct IDWriteFontCollectionVtbl {
     unknown: crate::ffi::UnknownVtbl,
-    _pad_3: [usize; 1],
+    /// Returns the count itself, not an HRESULT.
+    get_font_family_count: unsafe extern "system" fn(*mut IDWriteFontCollection) -> u32,
     get_font_family: unsafe extern "system" fn(
         *mut IDWriteFontCollection,
         u32,
@@ -192,7 +193,11 @@ struct IDWriteFontCollection {
 #[repr(C)]
 struct IDWriteFontFamilyVtbl {
     unknown: crate::ffi::UnknownVtbl,
-    _pad_3_6: [usize; 4],
+    _pad_3_5: [usize; 3],
+    get_family_names: unsafe extern "system" fn(
+        *mut IDWriteFontFamily,
+        *mut *mut IDWriteLocalizedStrings,
+    ) -> Hresult,
     get_first_matching_font: unsafe extern "system" fn(
         *mut IDWriteFontFamily,
         u32,
@@ -204,6 +209,32 @@ struct IDWriteFontFamilyVtbl {
 #[repr(C)]
 struct IDWriteFontFamily {
     vtbl: *const IDWriteFontFamilyVtbl,
+}
+
+// slots 0-2 IUnknown; 3 GetCount; 4 FindLocaleName; 5 GetLocaleNameLength;
+// 6 GetLocaleName; 7 GetStringLength; 8 GetString.
+#[repr(C)]
+struct IDWriteLocalizedStringsVtbl {
+    unknown: crate::ffi::UnknownVtbl,
+    /// Returns the count itself, not an HRESULT.
+    get_count: unsafe extern "system" fn(*mut IDWriteLocalizedStrings) -> u32,
+    _pad_4_6: [usize; 3],
+    /// The length WITHOUT the terminator; the buffer must hold one more.
+    get_string_length: unsafe extern "system" fn(
+        *mut IDWriteLocalizedStrings,
+        u32,
+        *mut u32,
+    ) -> Hresult,
+    get_string: unsafe extern "system" fn(
+        *mut IDWriteLocalizedStrings,
+        u32,
+        *mut u16,
+        u32,
+    ) -> Hresult,
+}
+#[repr(C)]
+struct IDWriteLocalizedStrings {
+    vtbl: *const IDWriteLocalizedStringsVtbl,
 }
 
 // slots 3..=10 family/weight/stretch/style/symbol/names/strings/
@@ -525,7 +556,14 @@ impl DirectWriteEngine {
 fn create_slot(factories: &Factories, spec: &FontSpec) -> Option<FontSlot> {
     unsafe {
         let dwrite = factories.dwrite.as_ptr();
-        let mut family = family_of(spec.design);
+        // a family the app NAMED is the most specific thing anyone said
+        // about this text; the road below already degrades a name this
+        // machine has not got, so it needs nothing of its own
+        let named = spec.family.name();
+        let mut family: &str = match &named {
+            Some(name) => name,
+            None => family_of(spec.design),
+        };
 
         // the font box, from the family's face — not from any string
         let mut collection: *mut IDWriteFontCollection = std::ptr::null_mut();
@@ -666,6 +704,81 @@ impl Default for DirectWriteEngine {
 }
 
 impl TextEngine for DirectWriteEngine {
+    fn families(&self) -> Vec<std::sync::Arc<str>> {
+        let Some(factories) = self.factories.as_ref() else {
+            return Vec::new();
+        };
+        unsafe {
+            let dwrite = factories.dwrite.as_ptr();
+            let mut collection: *mut IDWriteFontCollection = std::ptr::null_mut();
+            if !com_ok(((*(*dwrite).vtbl).get_system_font_collection)(
+                dwrite,
+                &mut collection,
+                0,
+            )) {
+                return Vec::new();
+            }
+            let Some(collection) = Com::from_raw(collection) else {
+                return Vec::new();
+            };
+            let count = ((*(*collection.as_ptr()).vtbl).get_font_family_count)(
+                collection.as_ptr(),
+            );
+            let mut names: Vec<std::sync::Arc<str>> = Vec::new();
+            for index in 0..count {
+                let mut family: *mut IDWriteFontFamily = std::ptr::null_mut();
+                if !com_ok(((*(*collection.as_ptr()).vtbl).get_font_family)(
+                    collection.as_ptr(),
+                    index,
+                    &mut family,
+                )) {
+                    continue;
+                }
+                let Some(family) = Com::from_raw(family) else {
+                    continue;
+                };
+                let mut strings: *mut IDWriteLocalizedStrings = std::ptr::null_mut();
+                if !com_ok(((*(*family.as_ptr()).vtbl).get_family_names)(
+                    family.as_ptr(),
+                    &mut strings,
+                )) {
+                    continue;
+                }
+                let Some(strings) = Com::from_raw(strings) else {
+                    continue;
+                };
+                // the first locale is the family's own name — a roster
+                // is a list of names, not a translation table
+                if ((*(*strings.as_ptr()).vtbl).get_count)(strings.as_ptr()) == 0 {
+                    continue;
+                }
+                let mut length = 0u32;
+                if !com_ok(((*(*strings.as_ptr()).vtbl).get_string_length)(
+                    strings.as_ptr(),
+                    0,
+                    &mut length,
+                )) {
+                    continue;
+                }
+                // the length leaves the terminator out; the buffer holds it
+                let mut buffer = vec![0u16; length as usize + 1];
+                if !com_ok(((*(*strings.as_ptr()).vtbl).get_string)(
+                    strings.as_ptr(),
+                    0,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                )) {
+                    continue;
+                }
+                buffer.truncate(length as usize);
+                names.push(std::sync::Arc::from(String::from_utf16_lossy(&buffer).as_str()));
+            }
+            names.sort();
+            names.dedup();
+            names
+        }
+    }
+
     fn measure_line(&self, text: &str, font: &FontSpec) -> LineMetrics {
         let Some(factories) = self.factories.as_ref() else {
             return self.fallback.measure_line(text, font);

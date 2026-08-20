@@ -15,6 +15,7 @@
 //! proposal is a classic bug.
 
 use std::cell::RefCell;
+use std::sync::Arc;
 use motor::hash::FxHashMap as HashMap;
 
 use crate::layout::{Color, Px};
@@ -44,6 +45,64 @@ pub enum FontDesign {
     Mono,
 }
 
+/// A font family the app named. The NUMBER is what travels — the
+/// layout carries it, the caches key on it, and a shell that speaks
+/// strings asks the table for the name once, the same way an image
+/// identity travels as a number and the shell keeps the registry.
+/// Zero is the system's own face, which is what a scene that never
+/// names a family keeps.
+///
+/// A name the engine cannot shape is not an error here: the table
+/// holds it, the engine falls back to the system face, and the app
+/// sees the same text in a face it did not ask for — which is what
+/// every platform does with a missing family.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Family(u16);
+
+thread_local! {
+    /// The named families, in the order they were first named. Slot
+    /// zero is the system's and carries no name.
+    static FAMILY_NAMES: RefCell<Vec<Arc<str>>> = RefCell::new(vec![Arc::from("")]);
+    static FAMILY_IDS: RefCell<HashMap<Arc<str>, u16>> = RefCell::new(HashMap::default());
+}
+
+impl Family {
+    /// The system's own face — where every scene starts.
+    pub const SYSTEM: Family = Family(0);
+
+    /// The family under this name. The same name always gives the same
+    /// number: the table only grows, and it grows once per name in the
+    /// life of the process.
+    pub fn named(name: &str) -> Family {
+        if name.is_empty() {
+            return Family::SYSTEM;
+        }
+        if let Some(id) = FAMILY_IDS.with(|ids| ids.borrow().get(name).copied()) {
+            return Family(id);
+        }
+        FAMILY_NAMES.with(|names| {
+            let mut names = names.borrow_mut();
+            // a table this deep is a leak, not a design: the scene
+            // keeps the system face rather than growing without end
+            let Ok(id) = u16::try_from(names.len()) else {
+                return Family::SYSTEM;
+            };
+            let name: Arc<str> = Arc::from(name);
+            names.push(name.clone());
+            FAMILY_IDS.with(|ids| ids.borrow_mut().insert(name, id));
+            Family(id)
+        })
+    }
+
+    /// The name the app gave, or `None` for the system's own face.
+    pub fn name(self) -> Option<Arc<str>> {
+        match self.0 {
+            0 => None,
+            id => FAMILY_NAMES.with(|names| names.borrow().get(id as usize).cloned()),
+        }
+    }
+}
+
 /// A resolved font — what the layout carries and the engine consumes.
 /// `size` is fractional by contract (10.5px is a real dense-UI case).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -52,6 +111,8 @@ pub struct FontSpec {
     pub weight: Weight,
     pub design: FontDesign,
     pub slant: Slant,
+    /// The family the app named, or the system's own.
+    pub family: Family,
 }
 
 impl FontSpec {
@@ -60,6 +121,7 @@ impl FontSpec {
         weight: Weight::Regular,
         design: FontDesign::Default,
         slant: Slant::Upright,
+        family: Family::SYSTEM,
     };
 
     /// The API text styles, in desktop metrics.
@@ -76,7 +138,19 @@ impl FontSpec {
             Font::Caption => (10.0, Weight::Regular),
             Font::Caption2 => (10.0, Weight::Regular),
         };
-        FontSpec { size, weight, design: FontDesign::Default, slant: Slant::Upright }
+        FontSpec {
+            size,
+            weight,
+            design: FontDesign::Default,
+            slant: Slant::Upright,
+            family: Family::SYSTEM,
+        }
+    }
+
+    /// The same font in a named family — the door a live preview asks
+    /// for, and the one a settings page writes through.
+    pub fn family(self, name: &str) -> FontSpec {
+        FontSpec { family: Family::named(name), ..self }
     }
 
     /// The hashable key (f64 is not `Eq`): size quantized in thousandths
@@ -86,6 +160,7 @@ impl FontSpec {
             size_milli: (self.size * 1000.0).round() as u32,
             weight: self.weight,
             design: self.design,
+            family: self.family,
             slant: self.slant,
         }
     }
@@ -97,6 +172,8 @@ pub struct FontKey {
     size_milli: u32,
     weight: Weight,
     design: FontDesign,
+    /// In the KEY as well: two families are two rasters.
+    family: Family,
     /// In the KEY as well: an upright and a leaning line are two
     /// rasters, and one cache entry must never answer for the other.
     slant: Slant,
@@ -111,6 +188,7 @@ pub struct FontPatch {
     pub weight: Option<Weight>,
     pub design: Option<FontDesign>,
     pub slant: Option<Slant>,
+    pub family: Option<Family>,
 }
 
 impl FontPatch {
@@ -124,6 +202,7 @@ impl FontPatch {
             weight: self.weight.or(outer.weight),
             design: self.design.or(outer.design),
             slant: self.slant.or(outer.slant),
+            family: self.family.or(outer.family),
         }
     }
 
@@ -133,6 +212,7 @@ impl FontPatch {
             weight: self.weight.unwrap_or(base.weight),
             design: self.design.unwrap_or(base.design),
             slant: self.slant.unwrap_or(base.slant),
+            family: self.family.unwrap_or(base.family),
         }
     }
 }
@@ -169,6 +249,14 @@ pub struct TextRaster {
 /// `Rc<dyn TextEngine>` is the shape that crosses the `Runtime`.
 pub trait TextEngine {
     fn measure_line(&self, text: &str, font: &FontSpec) -> LineMetrics;
+
+    /// The families this engine can shape, for an app that offers the
+    /// choice. Sorted, and without the system's own face — that one
+    /// has no name and is already the default. An engine with a single
+    /// built-in face answers nothing, which is the honest answer.
+    fn families(&self) -> Vec<Arc<str>> {
+        Vec::new()
+    }
 
     /// `None` = nothing to paint (empty string, zero width). `scale` is
     /// the retina factor — the raster comes out in physical pixels.

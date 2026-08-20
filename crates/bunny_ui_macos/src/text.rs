@@ -76,6 +76,13 @@ unsafe extern "C" {
         leading: *mut f64,
     ) -> f64;
     fn CTLineDraw(line: CTLineRef, context: CGContextRef);
+    /// Every family this Mac can shape, as a CFArray of CFStrings —
+    /// the caller owns it.
+    fn CTFontManagerCopyAvailableFontFamilyNames() -> *const c_void;
+    /// The family the font ACTUALLY belongs to — the only way to know
+    /// whether a name was honoured, because creating by name never
+    /// fails: an unknown one silently answers a default face.
+    fn CTFontCopyFamilyName(font: CTFontRef) -> CFStringRef;
     static kCTFontAttributeName: CFStringRef;
     static kCTForegroundColorFromContextAttributeName: CFStringRef;
 }
@@ -91,6 +98,16 @@ unsafe extern "C" {
     ) -> CFStringRef;
     /// UTF-16 units — the count the attributes' `CFRange` uses.
     fn CFStringGetLength(string: CFStringRef) -> isize;
+    fn CFArrayGetCount(array: *const c_void) -> isize;
+    fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+    /// Copies the string out as UTF-8. Answers 0 when the buffer is too
+    /// small, which is the only failure worth a second try.
+    fn CFStringGetCString(
+        string: CFStringRef,
+        buffer: *mut u8,
+        size: isize,
+        encoding: u32,
+    ) -> u8;
     fn CFAttributedStringCreateMutable(
         allocator: *const c_void,
         max_length: isize,
@@ -176,8 +193,58 @@ unsafe fn create_font(spec: &FontSpec) -> CTFontRef {
     }
 }
 
+/// `kCTFontBoldTrait` — bit 1 of the symbolic traits.
+const FONT_TRAIT_BOLD: u32 = 2;
+
+/// A named family carries its own weights, so the bold face is asked
+/// for through the traits. A family without one keeps the regular —
+/// the same way the lean degrades rather than fails.
+unsafe fn emphasize(font: CTFontRef, spec: &FontSpec) -> CTFontRef {
+    if matches!(spec.weight, Weight::Regular | Weight::Medium) {
+        return font;
+    }
+    unsafe {
+        let bold = CTFontCreateCopyWithSymbolicTraits(
+            font,
+            spec.size,
+            std::ptr::null(),
+            FONT_TRAIT_BOLD,
+            FONT_TRAIT_BOLD,
+        );
+        if bold.is_null() {
+            font
+        } else {
+            CFRelease(font as *const c_void);
+            bold
+        }
+    }
+}
+
 unsafe fn create_upright(spec: &FontSpec) -> CTFontRef {
     unsafe {
+        // a family the app NAMED is the most specific thing anyone
+        // said about this text, so it comes before the design. A name
+        // this Mac does not carry answers NULL and the scene keeps the
+        // face it would have had anyway
+        if let Some(name) = spec.family.name() {
+            let cf_name = cf_string(&name);
+            let font = CTFontCreateWithName(cf_name, spec.size, std::ptr::null());
+            CFRelease(cf_name);
+            // creating by name NEVER fails — a name this Mac does not
+            // carry comes back as some default face instead. So the
+            // font is asked what family it landed in, and only a font
+            // that landed where it was sent is kept
+            if !font.is_null() {
+                let landed = CTFontCopyFamilyName(font);
+                let honoured = cf_string_out(landed)
+                    .is_some_and(|landed| landed.eq_ignore_ascii_case(&name));
+                CFRelease(landed as *const c_void);
+                if honoured {
+                    return emphasize(font, spec);
+                }
+                CFRelease(font as *const c_void);
+            }
+        }
         match spec.design {
             FontDesign::Default => {
                 // fine-grained weights via CTFontDescriptor come later —
@@ -261,7 +328,54 @@ impl Default for CoreTextEngine {
     }
 }
 
+/// One CFString out as UTF-8. The buffer grows once when the name is
+/// longer than the room offered — family names are short, and the
+/// second try is sized from the string itself.
+unsafe fn cf_string_out(string: CFStringRef) -> Option<String> {
+    unsafe {
+        // UTF-16 units × 3 covers every UTF-8 expansion, + the NUL
+        let room = (CFStringGetLength(string).max(0) as usize) * 3 + 1;
+        let mut buffer = vec![0u8; room];
+        if CFStringGetCString(
+            string,
+            buffer.as_mut_ptr(),
+            room as isize,
+            KCF_STRING_ENCODING_UTF8,
+        ) == 0
+        {
+            return None;
+        }
+        let end = buffer.iter().position(|byte| *byte == 0).unwrap_or(room);
+        buffer.truncate(end);
+        String::from_utf8(buffer).ok()
+    }
+}
+
 impl TextEngine for CoreTextEngine {
+    fn families(&self) -> Vec<std::sync::Arc<str>> {
+        unsafe {
+            let array = CTFontManagerCopyAvailableFontFamilyNames();
+            if array.is_null() {
+                return Vec::new();
+            }
+            let mut names = Vec::new();
+            for index in 0..CFArrayGetCount(array) {
+                let value = CFArrayGetValueAtIndex(array, index) as CFStringRef;
+                // the dot-prefixed ones are the system's own internal
+                // faces: a menu that lists them offers what nobody can
+                // choose on purpose
+                if let Some(name) = cf_string_out(value)
+                    && !name.starts_with('.')
+                {
+                    names.push(std::sync::Arc::from(name.as_str()));
+                }
+            }
+            CFRelease(array);
+            names.sort();
+            names
+        }
+    }
+
     fn measure_line(&self, text: &str, font: &FontSpec) -> LineMetrics {
         let ct_font = self.font(font);
         unsafe {
@@ -379,6 +493,34 @@ mod tests {
             .expect("has ink");
         assert!(raster.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
         assert!(raster.baseline > 0 && raster.baseline <= raster.height);
+    }
+
+    #[test]
+    fn the_roster_is_real_and_a_named_family_shapes_with_it() {
+        let engine = CoreTextEngine::new();
+
+        let families = engine.families();
+        assert!(families.len() > 10, "a Mac carries more than ten: {}", families.len());
+        assert!(families.windows(2).all(|pair| pair[0] <= pair[1]), "sorted");
+        assert!(!families.iter().any(|name| name.starts_with('.')), "no internal faces");
+        let menlo = families.iter().any(|name| &**name == "Menlo");
+        assert!(menlo, "every Mac carries Menlo");
+
+        // a named family really shapes: the same string at the same
+        // size comes out a different width than the system's face
+        let system = engine.measure_line("iiiii", &FontSpec::DEFAULT);
+        let mono = engine.measure_line("iiiii", &FontSpec::DEFAULT.family("Menlo"));
+        assert!(
+            (system.width - mono.width).abs() > 1.0,
+            "a grid font and the UI font do not agree on five i's: {} vs {}",
+            system.width,
+            mono.width
+        );
+
+        // and a name this Mac does not carry keeps the face it had —
+        // the scene degrades, it never fails
+        let missing = engine.measure_line("iiiii", &FontSpec::DEFAULT.family("Nothing At All"));
+        assert_eq!(missing.width, system.width, "an unknown family keeps the system face");
     }
 
     #[test]

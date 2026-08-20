@@ -520,6 +520,21 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.font_family("Menlo")` — the face by name, for a scene that
+    /// lets the reader choose one. It inherits like every other font
+    /// modifier and it names ONLY the family: a `.bold()` or a
+    /// `.font_size(11.0)` on either side of it survives.
+    ///
+    /// A name the engine cannot shape falls back to the system's own
+    /// face, the way it does everywhere. `Runtime::font_families()`
+    /// says which names an engine can answer.
+    fn font_family(self, name: &str) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::FontFamily(crate::text_engine::Family::named(name)),
+        }
+    }
+
     /// Alternate background under the nearest interactive target's hover
     /// (list rows, chips) — pure paint, layout untouched (the LAW).
     fn background_hovered(self, color: Color) -> Modified<Self> {

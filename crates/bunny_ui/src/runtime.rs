@@ -2714,6 +2714,18 @@ impl Runtime {
         Rc::clone(&self.text)
     }
 
+    /// The font families this runtime's engine can shape — sorted, and
+    /// without the system's own face, which every scene already has.
+    /// A scene offering the reader a choice of face fills its list
+    /// from here and writes the answer with `.font_family(…)`.
+    ///
+    /// The roster is the PLATFORM's, so it is read once and not on
+    /// every body: the headless engine answers nothing, and a browser
+    /// answers only what the page is allowed to see.
+    pub fn font_families(&self) -> Vec<std::sync::Arc<str>> {
+        self.text.families()
+    }
+
     pub fn render(&self, root: &impl View) -> String {
         // retention built without print has no line to expand —
         // rebuild once and go back to normal incremental

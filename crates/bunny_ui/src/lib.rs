@@ -5395,6 +5395,67 @@ mod tests {
     }
 
     #[test]
+    fn a_named_family_travels_to_the_engine_and_names_only_the_face() {
+        use crate::layout::{Proposal, Size};
+        use crate::text_engine::{Family, FontPatch, LineMetrics, TextRaster, Weight};
+
+        // the table: one number per name, for the life of the process
+        let menlo = Family::named("Menlo");
+        assert_eq!(menlo, Family::named("Menlo"), "the same name is the same face");
+        assert_ne!(menlo, Family::named("Georgia"));
+        assert_eq!(menlo.name().as_deref(), Some("Menlo"));
+        assert_eq!(Family::SYSTEM.name(), None, "the system's face has no name of its own");
+        assert_eq!(Family::named(""), Family::SYSTEM, "and no name IS the system's face");
+
+        // two families are two cache keys — one raster must never
+        // answer for the other
+        let base = FontSpec::DEFAULT;
+        assert_ne!(base.family("Menlo").key(), base.family("Georgia").key());
+
+        // the patch names ONLY the face: a size and a weight on either
+        // side of it survive, like every other font modifier
+        let over = FontSpec { size: 11.0, weight: Weight::Bold, ..base };
+        let patched = FontPatch { family: Some(menlo), ..FontPatch::default() }.apply_over(over);
+        assert_eq!(patched.family, menlo);
+        assert_eq!(patched.size, 11.0, "the size around it survives");
+        assert_eq!(patched.weight, Weight::Bold, "and the weight");
+
+        // and it reaches the engine through the scene: this one gives
+        // the named family twice the room, so the frame says whether
+        // the face crossed the border
+        struct ByFamily;
+        impl TextEngine for ByFamily {
+            fn measure_line(&self, text: &str, font: &FontSpec) -> LineMetrics {
+                let wide = font.family.name().is_some_and(|name| &*name == "Menlo");
+                LineMetrics {
+                    width: text.chars().count() as f64 * if wide { 20.0 } else { 10.0 },
+                    ascent: 15.0,
+                    descent: 5.0,
+                }
+            }
+            fn raster_line(
+                &self,
+                _text: &str,
+                _font: &FontSpec,
+                _color: Color,
+                _scale: usize,
+            ) -> Option<TextRaster> {
+                None
+            }
+        }
+
+        let runtime = Runtime::new().text_engine(Rc::new(ByFamily));
+        let plain = runtime.layout(&text("abcd"), Proposal::unspecified());
+        assert_eq!(plain.size, Size { width: 40.0, height: 20.0 });
+        let named = runtime.layout(&text("abcd").font_family("Menlo"), Proposal::unspecified());
+        assert_eq!(named.size, Size { width: 80.0, height: 20.0 }, "the face crossed");
+
+        // the roster is the ENGINE's word, and an engine with one face
+        // answers nothing rather than making a name up
+        assert!(runtime.font_families().is_empty());
+    }
+
+    #[test]
     fn font_style_inherits_and_overrides() {
         use crate::layout::{DrawCommand, Proposal};
 

@@ -30,6 +30,7 @@ use bunny_ui::text_engine::{
 unsafe extern "C" {
     /// Writes THREE f64 at `out` — width, ascent, descent — in logical
     /// px. Ascent and descent come from the font, not the string's ink.
+    #[allow(clippy::too_many_arguments)]
     fn js_measure_text(
         ptr: *const u8,
         len: usize,
@@ -37,6 +38,8 @@ unsafe extern "C" {
         weight: u32,
         mono: u32,
         italic: u32,
+        family_ptr: *const u8,
+        family_len: usize,
         out: *mut f64,
     );
     /// Draws one line into a `width × height` physical rectangle and
@@ -51,6 +54,8 @@ unsafe extern "C" {
         weight: u32,
         mono: u32,
         italic: u32,
+        family_ptr: *const u8,
+        family_len: usize,
         scale: f64,
         width: u32,
         height: u32,
@@ -129,9 +134,30 @@ impl Default for CanvasTextEngine {
     }
 }
 
+/// The CSS generic families a browser guarantees it can shape. The
+/// page cannot READ the machine's font list — `queryLocalFonts` is
+/// Chromium's alone, asks the reader for permission and answers late —
+/// so this roster is what the engine can honestly promise, and a page
+/// that ships faces of its own already knows their names.
+const WEB_FAMILIES: [&str; 6] =
+    ["cursive", "fantasy", "monospace", "sans-serif", "serif", "system-ui"];
+
+/// The family's name for the border, or an empty slice for the
+/// system's own face — a null crossing costs nothing, and the face
+/// nobody named is the common one.
+fn family_name(font: &FontSpec) -> Option<std::sync::Arc<str>> {
+    font.family.name()
+}
+
 impl TextEngine for CanvasTextEngine {
+    fn families(&self) -> Vec<std::sync::Arc<str>> {
+        WEB_FAMILIES.iter().map(|name| std::sync::Arc::from(*name)).collect()
+    }
+
     fn measure_line(&self, text: &str, font: &FontSpec) -> LineMetrics {
         let mut out = [0.0f64; 3];
+        let family = family_name(font);
+        let family = family.as_deref().unwrap_or("");
         unsafe {
             js_measure_text(
                 text.as_ptr(),
@@ -140,6 +166,8 @@ impl TextEngine for CanvasTextEngine {
                 css_weight(font.weight),
                 mono_flag(font),
                 italic_flag(font),
+                family.as_ptr(),
+                family.len(),
                 out.as_mut_ptr(),
             );
         }
@@ -173,6 +201,8 @@ impl TextEngine for CanvasTextEngine {
             return None;
         }
         let mut rgba = vec![0u8; width * height * 4];
+        let family = family_name(font);
+        let family = family.as_deref().unwrap_or("");
         unsafe {
             js_raster_text(
                 text.as_ptr(),
@@ -181,6 +211,8 @@ impl TextEngine for CanvasTextEngine {
                 css_weight(font.weight),
                 mono_flag(font),
                 italic_flag(font),
+                family.as_ptr(),
+                family.len(),
                 scale as f64,
                 width as u32,
                 height as u32,

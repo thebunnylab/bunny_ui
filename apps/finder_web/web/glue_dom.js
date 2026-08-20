@@ -116,10 +116,22 @@ function inkSurface(width, height) {
   return inkContext;
 }
 
-function cssFont(size, weight, mono, italic) {
-  const family = mono
+// The family name off the border, or null for the face nobody named —
+// a zero length is the common case and costs one comparison.
+function familyOf(pointer, length) {
+  return length
+    ? decoder.decode(new Uint8Array(wasm.memory.buffer, pointer, length))
+    : null;
+}
+
+// A family the app NAMED comes first and the house stack stays behind
+// it as the fallback — a name this machine does not carry then reads
+// in the face it would have had anyway.
+function cssFont(size, weight, mono, italic, named) {
+  const house = mono
     ? 'ui-monospace, Menlo, Consolas, monospace'
     : 'system-ui, -apple-system, "Segoe UI", sans-serif';
+  const family = named ? `"${named.replace(/"/g, "")}", ${house}` : house;
   // CSS order is style, then weight, then size — a leaning label is a
   // real face, never a skew we paint ourselves
   return `${italic ? "italic " : ""}${weight} ${size}px ${family}`;
@@ -461,6 +473,7 @@ function applyPatches(view, length) {
       const weight = CSS_WEIGHTS[u8()];
       const mono = u8();
       const italic = u8();
+      const family = text(u16());
       const truncation = u8();
       const raw = bytes(u32());
       const spanCount = u16();
@@ -468,7 +481,7 @@ function applyPatches(view, length) {
       for (let s = 0; s < spanCount; s++) spans.push([u32(), u32()]);
       const spanColor = rgba(u32());
       if (el) {
-        el.style.font = cssFont(size, weight, mono, italic);
+        el.style.font = cssFont(size, weight, mono, italic, family);
         // an inherited ink takes NO inline color: an inline one would
         // outrank the :hover rule of the box that owns both states
         el.style.color = inheritsInk ? "" : color;
@@ -505,11 +518,12 @@ function applyPatches(view, length) {
       const weight = CSS_WEIGHTS[u8()];
       const mono = u8();
       const italic = u8();
+      const family = text(u16());
       const content = text(u32());
       const placeholder = text(u32());
       const path = text(u16());
       if (el) {
-        el.style.font = cssFont(size, weight, mono, italic);
+        el.style.font = cssFont(size, weight, mono, italic, family);
         el.style.color = color;
         el.placeholder = placeholder;
         el.dataset.path = path;
@@ -663,12 +677,22 @@ const imports = {
       );
       el.getContext("2d").putImageData(new ImageData(pixels, width, height), 0, 0);
     },
-    js_measure_text(pointer, length, size, weight, mono, italic, out) {
+    js_measure_text(
+      pointer,
+      length,
+      size,
+      weight,
+      mono,
+      italic,
+      familyPointer,
+      familyLength,
+      out,
+    ) {
       const text = decoder.decode(
         new Uint8Array(wasm.memory.buffer, pointer, length),
       );
       const ink = inkSurface();
-      ink.font = cssFont(size, weight, mono, italic);
+      ink.font = cssFont(size, weight, mono, italic, familyOf(familyPointer, familyLength));
       const probe = ink.measureText(text || "Mg");
       const metrics = new Float64Array(wasm.memory.buffer, out, 3);
       metrics[0] = text ? probe.width : 0;
@@ -684,6 +708,8 @@ const imports = {
       weight,
       mono,
       italic,
+      familyPointer,
+      familyLength,
       scale,
       width,
       height,
@@ -698,7 +724,7 @@ const imports = {
       ink.setTransform(1, 0, 0, 1, 0, 0);
       ink.clearRect(0, 0, width, height);
       ink.setTransform(scale, 0, 0, scale, 0, 0);
-      ink.font = cssFont(size, weight, mono, italic);
+      ink.font = cssFont(size, weight, mono, italic, familyOf(familyPointer, familyLength));
       ink.textBaseline = "alphabetic";
       const r = (color >>> 24) & 0xff;
       const g = (color >>> 16) & 0xff;
