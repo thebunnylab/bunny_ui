@@ -3,8 +3,18 @@
 // frames the engine hands back. No frameworks, no bindgen output —
 // this file IS the web platform layer.
 
-const canvas = document.getElementById("app");
-const context = canvas.getContext("2d");
+// `host` and `surface` come from surface.js, loaded before this file.
+// The 2d context is claimed on the FIRST blit, never at load: a canvas
+// that has answered "2d" can never answer "webgl2".
+let paintCanvas = null;
+let paintContext = null;
+function painter() {
+  if (!paintContext) {
+    paintCanvas = surface("2d");
+    paintContext = paintCanvas.getContext("2d");
+  }
+  return paintContext;
+}
 
 // The wire contract this file mirrors (bunny_ui::dom::ABI_VERSION):
 // the key table, the modifier bits, the import/export surface. The
@@ -106,9 +116,10 @@ function imageKey(hi, lo) {
 const imports = {
   bunny: {
     js_blit(pointer, width, height) {
-      if (canvas.width !== width || canvas.height !== height) {
-        canvas.width = width;
-        canvas.height = height;
+      const context = painter();
+      if (paintCanvas.width !== width || paintCanvas.height !== height) {
+        paintCanvas.width = width;
+        paintCanvas.height = height;
       }
       const pixels = new Uint8ClampedArray(
         wasm.memory.buffer,
@@ -305,16 +316,16 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         `This page speaks ABI ${EXPECTED_ABI}. ` +
         `The wasm speaks ABI ${abi}. ` +
         `Deploy the page and the wasm together, then reload.`;
-      canvas.replaceWith(notice);
+      host.replaceChildren(notice);
       return;
     }
     const scale = window.devicePixelRatio || 1;
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
+    const width = host.clientWidth;
+    const height = host.clientHeight;
     wasm.start(width, height, scale);
 
     const point = (event) => {
-      const rect = canvas.getBoundingClientRect();
+      const rect = host.getBoundingClientRect();
       return [event.clientX - rect.left, event.clientY - rect.top];
     };
     // the tooltip's slow clock: two beats after the pointer settles —
@@ -328,12 +339,12 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         setTimeout(() => wasm.bunny_tooltip_tick(), 720),
       ];
     };
-    canvas.addEventListener("pointermove", (event) => {
+    host.addEventListener("pointermove", (event) => {
       const [x, y] = point(event);
       wasm.bunny_pointer_move(x, y);
       armTooltip();
     });
-    canvas.addEventListener("pointerdown", (event) => {
+    host.addEventListener("pointerdown", (event) => {
       const [x, y] = point(event);
       // `pointerdown` reports detail 0 — the browser only counts on
       // `mousedown`, and this door stays on pointer events so touch
@@ -341,17 +352,17 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       // timestamp and the button it came from.
       wasm.bunny_pointer_down(x, y, event.timeStamp, event.button, event.shiftKey ? 1 : 0);
     });
-    canvas.addEventListener("contextmenu", (event) => {
+    host.addEventListener("contextmenu", (event) => {
       // the scene offers its own menu — the browser's stays home
       event.preventDefault();
       const [x, y] = point(event);
       wasm.bunny_context_click(x, y);
     });
-    canvas.addEventListener("pointerup", (event) => {
+    host.addEventListener("pointerup", (event) => {
       const [x, y] = point(event);
       wasm.bunny_pointer_up(x, y);
     });
-    canvas.addEventListener(
+    host.addEventListener(
       "wheel",
       (event) => {
         event.preventDefault();
