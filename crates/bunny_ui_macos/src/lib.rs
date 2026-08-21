@@ -768,6 +768,14 @@ pub fn run_window_chrome(
             }
         }
         }
+        // EVERY event, not only the ones that repainted. An event can arm a
+        // TIMER without changing a pixel — a hover that starts a settle, a
+        // debounce waiting for typing to stop — and the pace those timers need
+        // is exactly what `sync_frame_driver` reads. Syncing only inside
+        // `blit` left the driver parked with a sleeper on the queue: the clock
+        // is the frame tick, so the sleeper never woke, and the card it was
+        // waiting for arrived on whatever unrelated click came next.
+        sync_frame_driver(runtime);
     }));
 
     // first frame, and the run loop takes over
