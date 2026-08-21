@@ -627,7 +627,16 @@ pub enum LayoutNode {
     /// items at the pointer. The RUNTIME owns the open menu (macOS has
     /// no app state for menus and neither do we); the panel rides the
     /// overlay machinery and leaves the window on the desktop.
-    ContextSource { items: std::rc::Rc<[crate::views::MenuItem]>, child: Box<LayoutNode> },
+    ContextSource {
+        items: std::rc::Rc<[crate::views::MenuItem]>,
+        /// `.on_context_click(…)`: the app hears the press instead, and draws
+        /// whatever it wants at the point. The door exists because a menu row
+        /// in a real app is rarely a label and an action — it carries a
+        /// keybind hint, a state dot, a checked mark, a submenu — and none of
+        /// that fits items the runtime owns.
+        on_click: Option<ContextClick>,
+        child: Box<LayoutNode>,
+    },
     /// `.on_drag(…)`: pressing the child and moving past the threshold
     /// begins a typed drag. The closure builds the payload AT LIFT —
     /// fresh state, never a stale capture.
@@ -1810,6 +1819,25 @@ pub struct TooltipRegion {
 pub struct MenuRegion {
     pub items: std::rc::Rc<[crate::views::MenuItem]>,
     pub rect: Rect,
+    /// The app's own answer to the press, when it asked for one
+    /// (`.on_context_click`). A region carries this OR `items`: the
+    /// framework's panel and an app-drawn one are two answers to the same
+    /// gesture, and a region that gave both would open two menus.
+    pub on_click: Option<ContextClick>,
+}
+
+/// What an app does with a right press it asked to hear — the point, in
+/// WINDOW coordinates, which is where a panel of its own would be placed.
+///
+/// A cheap handle rather than the closure itself, so the tree stays `Debug`
+/// (the pattern `Custom` set).
+#[derive(Clone)]
+pub struct ContextClick(pub std::rc::Rc<dyn Fn(Point)>);
+
+impl std::fmt::Debug for ContextClick {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("on_context_click")
+    }
 }
 
 /// The closure that builds a payload at lift — a cheap handle that
@@ -3872,10 +3900,14 @@ impl LayoutNode {
                 child.place(frame, *fit, env, out);
             }
 
-            (LayoutNode::ContextSource { items, child }, Fit::Wrapped(_, fit)) => {
+            (LayoutNode::ContextSource { items, on_click, child }, Fit::Wrapped(_, fit)) => {
                 // outer before inner: the innermost menu wins the press
                 if let Some(rect) = clip_of(out, frame) {
-                    out.menus.push(MenuRegion { items: items.clone(), rect });
+                    out.menus.push(MenuRegion {
+                        items: items.clone(),
+                        rect,
+                        on_click: on_click.clone(),
+                    });
                 }
                 child.place(frame, *fit, env, out);
             }

@@ -421,6 +421,14 @@ impl Runtime {
         let Some(region) = region else {
             return was_open || cleared;
         };
+        // The app asked to hear this one: it gets the point and answers it
+        // however it likes, and the runtime opens nothing. Whichever region is
+        // INNER wins the press, which is the same precedence a menu of items
+        // has — the two doors are one gesture with two answers.
+        if let Some(handler) = region.on_click {
+            handler.0(Point { x, y });
+            return true;
+        }
         let entries: Vec<Option<std::sync::Arc<str>>> = region
             .items
             .iter()

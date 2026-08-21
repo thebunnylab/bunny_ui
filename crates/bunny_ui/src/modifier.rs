@@ -66,6 +66,9 @@ pub enum Modifier {
     Tooltip(std::sync::Arc<str>, crate::layout::Side),
     /// `.context_menu(…)` — items a right press offers at the pointer.
     ContextMenu(std::rc::Rc<[crate::views::MenuItem]>),
+    /// `.on_context_click(…)` — the app hears the right press at the point
+    /// and answers it itself. The runtime opens nothing.
+    OnContextClick(crate::layout::ContextClick),
     /// `.on_drag(…)` — the view lifts into a typed drag.
     OnDrag(crate::layout::DragBuilder),
     /// `.on_drop(…)` — the view takes a typed drag, and may paint its
@@ -241,6 +244,7 @@ impl Modifier {
             Modifier::Clipped => " [.clipped()]".into(),
             Modifier::Tooltip(text, _) => format!(" [.tooltip({text:?})]"),
             Modifier::ContextMenu(items) => format!(" [.contextMenu({} items)]", items.len()),
+            Modifier::OnContextClick(_) => " [.onContextClick]".to_owned(),
             Modifier::OnDrag(_) => " [.onDrag()]".into(),
             Modifier::OnDrop { .. } => " [.onDrop()]".into(),
             Modifier::Monospaced => " [.monospaced()]".into(),
@@ -986,7 +990,18 @@ fn apply(
             }
         }),
         Modifier::ContextMenu(items) => out.wrap_layout_from(mark, |node| {
-            LayoutNode::ContextSource { items: items.clone(), child: Box::new(node) }
+            LayoutNode::ContextSource {
+                items: items.clone(),
+                on_click: None,
+                child: Box::new(node),
+            }
+        }),
+        Modifier::OnContextClick(action) => out.wrap_layout_from(mark, |node| {
+            LayoutNode::ContextSource {
+                items: std::rc::Rc::from([] as [crate::views::MenuItem; 0]),
+                on_click: Some(action.clone()),
+                child: Box::new(node),
+            }
         }),
         Modifier::OnDrag(payload) => out.wrap_layout_from(mark, |node| {
             LayoutNode::DragSource { payload: payload.clone(), child: Box::new(node) }

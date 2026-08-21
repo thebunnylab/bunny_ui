@@ -505,6 +505,31 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified { base: self, modifier: Modifier::ContextMenu(items.into()) }
     }
 
+    /// `.on_context_click(…)` — the right press inside this view reaches the
+    /// APP, at the point, and the runtime opens nothing of its own.
+    ///
+    /// The door exists because a menu row in a real app is rarely a label and
+    /// an action: it carries a keybind hint, a state dot, a checked mark, a
+    /// second line, a submenu — and none of that fits items the runtime owns.
+    /// A host that wants its own panel needs the one thing only the runtime
+    /// has, which is the press and where it landed.
+    ///
+    /// The point is in WINDOW coordinates, which is where a panel of the app's
+    /// own would be placed. Regions resolve innermost-first, like
+    /// [`Self::context_menu`]'s, and the two are one precedence: whichever
+    /// region is inner answers the press, whether it answers with items or
+    /// with a closure.
+    ///
+    /// ```ignore
+    /// row.on_context_click(move |at| shell.open_menu(entries(), 220.0, at))
+    /// ```
+    fn on_context_click(self, action: impl Fn(crate::layout::Point) + 'static) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::OnContextClick(crate::layout::ContextClick(Rc::new(action))),
+        }
+    }
+
     /// `.on_drag(…)` — pressing this view and moving past the
     /// threshold lifts a typed drag. The closure builds the payload AT
     /// LIFT (fresh state, never a stale capture); the label follows

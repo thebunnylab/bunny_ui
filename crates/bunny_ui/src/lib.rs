@@ -7684,6 +7684,98 @@ mod tests {
         assert!(runtime.interaction().menu.is_none());
     }
 
+
+    /// `.on_context_click` hands the press to the APP, at the point, and the
+    /// runtime opens nothing of its own.
+    ///
+    /// It exists because a menu row in a real app is rarely a label and an
+    /// action — Trinity's carry a keybind hint, a status dot, a checked mark,
+    /// a submenu — and a host that draws its own panel needs the one thing
+    /// only the runtime has: the press, and where it landed.
+    #[test]
+    fn a_right_press_can_be_the_apps_instead() {
+        #[derive(Clone)]
+        struct Row {
+            at: State<Option<(f64, f64)>>,
+        }
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                let at = self.at;
+                vstack!(
+                    text("file_0001.rs")
+                        .on_context_click(move |point| at.set(Some((point.x, point.y)))),
+                    text("below"),
+                )
+                .spacing(30.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Row { at: State::new(None) };
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+
+        // Outside every region: nothing, as before.
+        assert!(!runtime.context_click(200.0, 150.0));
+        assert_eq!(view.at.get(), None);
+
+        // Inside: the app hears the point, in WINDOW coordinates…
+        assert!(runtime.context_click(30.0, 8.0));
+        assert_eq!(view.at.get(), Some((30.0, 8.0)));
+        // …and no menu of the runtime's own opened over it.
+        let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
+        assert!(
+            !result
+                .overlays
+                .iter()
+                .any(|overlay| overlay.path == crate::layout::MENU_PATH),
+            "the runtime opened nothing",
+        );
+        assert!(runtime.interaction().menu.is_none());
+    }
+
+    /// The two doors are ONE gesture with two answers: whichever region is
+    /// inner wins the press, and an app-drawn menu inside a card that offers
+    /// its own items is the app's.
+    #[test]
+    fn the_innermost_region_answers_whichever_door_it_is() {
+        #[derive(Clone)]
+        struct Nest {
+            heard: State<usize>,
+            picked: State<usize>,
+        }
+        impl Component for Nest {
+            fn body(self, _ctx: &Context) -> impl View {
+                let (heard, picked) = (self.heard, self.picked);
+                vstack!(
+                    text("inner").on_context_click(move |_| heard.set(heard.get() + 1)),
+                    text("outer"),
+                )
+                .spacing(30.0)
+                .context_menu(vec![menu_item("Card", move || {
+                    picked.set(picked.get() + 1);
+                })])
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Nest { heard: State::new(0), picked: State::new(0) };
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
+
+        // Over the inner row: the app's door.
+        assert!(runtime.context_click(30.0, 8.0));
+        assert_eq!(view.heard.get(), 1);
+        assert!(runtime.interaction().menu.is_none(), "and no panel of the runtime's");
+
+        // Over the card but not the row: the items the card offered. (The
+        // card hugs its children, so a point far to the right is outside it —
+        // the second row is what "inside the card, outside the row" means.)
+        assert!(runtime.context_click(10.0, 45.0));
+        assert_eq!(view.heard.get(), 1, "the inner region did not hear this one");
+        assert!(runtime.interaction().menu.is_some(), "the card's own menu opened");
+    }
+
     #[test]
     fn a_divider_is_never_a_pick() {
         #[derive(Clone)]
