@@ -313,6 +313,12 @@ impl Walk<'_> {
                 Self::inherit_stretch(&mut container);
                 out.push(container);
             }
+            // A hug is a native flow rule on the web: a box that is not told
+            // to grow already takes what its content needs, and the cap that
+            // rides above it is a `max-height` on the frame outside. So the
+            // node passes through and the child lowers as itself.
+            LayoutNode::Hug { child, .. } => self.lower_into(child, out),
+
             LayoutNode::MaxFrame { max_width, max_height, align, child } => {
                 let mut container = node(DomKind::FlexColumn);
                 {

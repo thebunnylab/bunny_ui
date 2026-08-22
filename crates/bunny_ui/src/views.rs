@@ -716,6 +716,7 @@ where
 pub struct ScrollView<C> {
     content: C,
     axes: crate::layout::ScrollAxes,
+    hug: bool,
 }
 
 impl<C> ScrollView<C> {
@@ -728,6 +729,22 @@ impl<C> ScrollView<C> {
     /// Both ways.
     pub fn both_axes(mut self) -> Self {
         self.axes = crate::layout::ScrollAxes::Both;
+        self
+    }
+
+    /// Take at most what the content needs.
+    ///
+    /// A region normally answers what it was OFFERED on its scrolling axis —
+    /// that is what lets one fill a panel, and it is the right default. A
+    /// surface that must be as tall as its document *up to a cap* wants the
+    /// other rule: without this, wrapping the region in a `.frame_max(…)`
+    /// gives a box that is always exactly the cap, with three lines of text
+    /// in it and a lot of air.
+    ///
+    /// The region still travels, still gets its bar, and still keeps whatever
+    /// it does not use — the stack's waterfall re-splits the surplus.
+    pub fn hugging(mut self) -> Self {
+        self.hug = true;
         self
     }
 }
@@ -743,17 +760,25 @@ impl<C: View> View for ScrollView<C> {
             if crate::view::print_enabled() { "ScrollView".to_string() } else { String::new() },
             prints,
         ));
-        out.push_layout(LayoutNode::Scroll {
+        let region = LayoutNode::Scroll {
             path: motor::identity::cursor_scope(),
             target: None,
             axes: self.axes,
             child: Box::new(wrap_layout(layouts)),
+        };
+        out.push_layout(if self.hug {
+            LayoutNode::Hug {
+                axis: if self.axes.vertical() { Axis::Vertical } else { Axis::Horizontal },
+                child: Box::new(region),
+            }
+        } else {
+            region
         });
     }
 }
 
 pub fn scroll<C: View>(content: C) -> ScrollView<C> {
-    ScrollView { content, axes: crate::layout::ScrollAxes::Vertical }
+    ScrollView { content, axes: crate::layout::ScrollAxes::Vertical, hug: false }
 }
 
 /// What a drag carries: the typed value, erased for the wire between

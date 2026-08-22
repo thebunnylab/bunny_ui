@@ -503,6 +503,22 @@ pub enum LayoutNode {
         axes: ScrollAxes,
         child: Box<LayoutNode>,
     },
+    /// Takes AT MOST what its child needs on one axis.
+    ///
+    /// The axis is measured OPEN, so the child answers its natural extent,
+    /// and this node then answers `min(natural, offered)`. It stays flexible
+    /// so the stack's waterfall still offers it the room — it simply gives
+    /// back what it does not use, which the waterfall already re-splits.
+    ///
+    /// The one thing that needs it is a scroll region that must be as tall as
+    /// its content up to a cap and no taller: a region answers what it is
+    /// PROPOSED (that is what lets one fill a panel), so a card wrapping one
+    /// in a `MaxFrame` is a card that is always exactly the cap, whatever is
+    /// in it.
+    Hug {
+        axis: Axis,
+        child: Box<LayoutNode>,
+    },
     /// A two-lane split with a user-draggable divider. The position is
     /// APP state — the view renders the binding's value into `at`, the
     /// runtime writes the drag back through a retained closure — and
@@ -2918,6 +2934,11 @@ impl LayoutNode {
                 Axis::Vertical => axes.vertical(),
                 Axis::Horizontal => axes.horizontal(),
             },
+            // Flexible so the waterfall OFFERS it the room; it answers with
+            // less when its child needs less, and the surplus goes back.
+            LayoutNode::Hug { axis: hugging, child } => {
+                axis == *hugging || child.is_flexible(axis, enclosing_main)
+            }
             // a field takes the offered width (like the real TextField),
             // and a many-line one takes the offered HEIGHT: `.frame_height`
             // then sizes the BOX, instead of centring one line in a hole
@@ -3021,7 +3042,8 @@ impl LayoutNode {
             | LayoutNode::DragSource { child, .. }
             | LayoutNode::DropTarget { child, .. }
             | LayoutNode::Hinted { child, .. }
-            | LayoutNode::Frame { child, .. } => child.first_baseline(env),
+            | LayoutNode::Frame { child, .. }
+            | LayoutNode::Hug { child, .. } => child.first_baseline(env),
             // lane A leads the seam — its text sets the shared line
             LayoutNode::Split { children, .. } => {
                 children.first().and_then(|child| child.first_baseline(env))
@@ -3326,6 +3348,33 @@ impl LayoutNode {
                 let size = Size {
                     width: resolve(proposal.width, *max_width, child_size.width),
                     height: resolve(proposal.height, *max_height, child_size.height),
+                };
+                (size, Fit::Wrapped(child_size, Box::new(fit)))
+            }
+
+            LayoutNode::Hug { axis, child } => {
+                let vertical = matches!(axis, Axis::Vertical);
+                let (child_size, fit) = child.measure(
+                    Proposal {
+                        width: if vertical { proposal.width } else { None },
+                        height: if vertical { None } else { proposal.height },
+                    },
+                    env,
+                );
+                let clamp = |offered: Option<Px>, natural: Px| {
+                    offered.map_or(natural, |offered| natural.min(offered))
+                };
+                let size = Size {
+                    width: if vertical {
+                        proposal.width.unwrap_or(child_size.width)
+                    } else {
+                        clamp(proposal.width, child_size.width)
+                    },
+                    height: if vertical {
+                        clamp(proposal.height, child_size.height)
+                    } else {
+                        proposal.height.unwrap_or(child_size.height)
+                    },
                 };
                 (size, Fit::Wrapped(child_size, Box::new(fit)))
             }
@@ -4231,6 +4280,12 @@ impl LayoutNode {
                     y: frame.origin.y + (frame.size.height - child_size.height) / 2.0,
                 };
                 child.place(Rect { origin, size: child_size }, *fit, env, out);
+            }
+
+            (LayoutNode::Hug { child, .. }, Fit::Wrapped(_, fit)) => {
+                // The frame, never the child's measured size: a region placed
+                // smaller than what it measured is exactly what travels.
+                child.place(frame, *fit, env, out);
             }
 
             (LayoutNode::MaxFrame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
@@ -6096,6 +6151,78 @@ mod tests {
                 .map(|index| boundary(&format!("row{index}"), text(4)))
                 .collect(),
         }
+    }
+
+    /// A hugging region takes what its content needs, and no more.
+    ///
+    /// The plain rule — answer what you were offered — is what lets a region
+    /// fill a panel, and it is why a card wrapping one in a cap is a card
+    /// that is always exactly the cap. `.hugging()` is the other rule, and
+    /// both have to keep working.
+    #[test]
+    fn a_hugging_region_takes_what_its_content_needs_and_a_plain_one_takes_the_offer() {
+        let engine = PixelFont;
+        let images = RawImages::default();
+        let cache = MeasureCache::default();
+        let offsets = HashMap::default();
+        let interaction = Interaction::default();
+        let carets = HashMap::default();
+        let env = || LayoutEnv {
+            text: &engine,
+            images: &images,
+            cache: &cache,
+            scroll_offsets: &offsets,
+            font: FontSpec::DEFAULT,
+            line_height: None,
+            text_align: None,
+            stamp: FrameStamp::idle(&interaction, &carets),
+            animator: None,
+            anim: None,
+            live: None,
+            overlay_bounds: None,
+            scale: 1.0,
+        };
+        let region = || LayoutNode::Scroll {
+            axes: crate::layout::ScrollAxes::Vertical,
+            path: Some("doc".to_string()),
+            target: None,
+            // 3 rows of 16 = 48, well under the 200 on offer.
+            child: Box::new(rows(3)),
+        };
+        let offer = Proposal { width: Some(100.0), height: Some(200.0) };
+
+        let (plain, _) = region().measure(offer, env());
+        assert_eq!(plain.height, 200.0, "a plain region fills what it was offered");
+
+        let hugging = LayoutNode::Hug { axis: Axis::Vertical, child: Box::new(region()) };
+        let (hugged, _) = hugging.measure(offer, env());
+        assert_eq!(hugged.height, 48.0, "a hugging one stops at its content");
+
+        // …and past the offer it is the offer that wins, which is the cap.
+        let tall = LayoutNode::Hug {
+            axis: Axis::Vertical,
+            child: Box::new(LayoutNode::Scroll {
+                axes: crate::layout::ScrollAxes::Vertical,
+                path: Some("doc".to_string()),
+                target: None,
+                child: Box::new(rows(40)),
+            }),
+        };
+        let (capped, fit) = tall.measure(offer, env());
+        assert_eq!(capped.height, 200.0);
+
+        // …and the region still travels, because it is PLACED at the cap
+        // while it measured its whole content.
+        let mut out = Placement::default();
+        tall.place(
+            Rect { origin: Point { x: 0.0, y: 0.0 }, size: capped },
+            fit,
+            env(),
+            &mut out,
+        );
+        assert_eq!(out.scrolls.len(), 1);
+        assert_eq!(out.scrolls[0].frame.size.height, 200.0, "the viewport is the cap");
+        assert_eq!(out.scrolls[0].content.height, 640.0, "…and the content is the document");
     }
 
     #[test]
