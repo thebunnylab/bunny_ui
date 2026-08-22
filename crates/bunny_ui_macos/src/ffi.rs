@@ -251,7 +251,7 @@ pub enum AppEvent {
     /// The right button (or a two-finger tap): the context-menu press.
     RightMouseDown { x: f64, y: f64 },
     MouseUp { x: f64, y: f64 },
-    MouseMoved { x: f64, y: f64 },
+    MouseMoved { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     /// The pointer left the window — without this event the hover would
     /// stay stuck at the edge (the reason for using NSTrackingArea).
     MouseExited,
@@ -442,7 +442,10 @@ extern "C" fn bunny_mouse_up(this: Id, _sel: Sel, event: Id) {
 /// moved (without it the pressed visual won't release when dragging out).
 extern "C" fn bunny_mouse_moved(this: Id, _sel: Sel, event: Id) {
     let (x, y) = unsafe { event_layout_point(this, event) };
-    dispatch(AppEvent::MouseMoved { x, y });
+    // the same flags the press reads, off the same event — what a box
+    // needs to offer a command-click before the hand commits to it
+    let modifiers = unsafe { modifiers_of(msg_u64(event, sel("modifierFlags"))) };
+    dispatch(AppEvent::MouseMoved { x, y, modifiers });
 }
 
 extern "C" fn bunny_mouse_exited(_this: Id, _sel: Sel, _event: Id) {

@@ -628,8 +628,8 @@ pub fn run_window_chrome(
             runtime.set_loops_paused(false);
             sync_frame_driver(runtime);
         }
-        AppEvent::MouseMoved { x, y } => {
-            if runtime.pointer_moved(x, y) {
+        AppEvent::MouseMoved { x, y, modifiers } => {
+            if runtime.pointer_moved(x, y, modifiers) {
                 blit(runtime, root);
             }
         }

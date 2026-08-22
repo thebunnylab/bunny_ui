@@ -433,8 +433,8 @@ pub fn run_window_chrome(
                     blit(runtime, root);
                 }
             }
-            AppEvent::MouseMoved { x, y } => {
-                if runtime.pointer_moved(x, y) {
+            AppEvent::MouseMoved { x, y, modifiers } => {
+                if runtime.pointer_moved(x, y, modifiers) {
                     blit(runtime, root);
                 }
             }

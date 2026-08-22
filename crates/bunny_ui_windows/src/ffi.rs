@@ -504,7 +504,7 @@ pub enum AppEvent {
     /// The right button: the context-menu press.
     RightMouseDown { x: f64, y: f64 },
     MouseUp { x: f64, y: f64 },
-    MouseMoved { x: f64, y: f64 },
+    MouseMoved { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     /// The pointer left the window — without this event the hover would
     /// stay stuck at the edge (the reason for TrackMouseEvent).
     MouseExited,
@@ -633,6 +633,19 @@ fn held_modifiers(wparam: usize) -> bunny_ui::action::Modifiers {
         shift: wparam & MK_SHIFT != 0,
         command: wparam & MK_CONTROL != 0,
         option: unsafe { GetKeyState(VK_MENU) } as u16 & 0x8000 != 0,
+        control: false,
+    }
+}
+
+/// The same reading, ASKED of the keyboard instead of read off a
+/// message. The non-client messages carry a hit-test code where the
+/// button ones carry the modifier word, so the bar has to ask.
+fn held_modifiers_now() -> bunny_ui::action::Modifiers {
+    let down = |key| unsafe { GetKeyState(key) } as u16 & 0x8000 != 0;
+    bunny_ui::action::Modifiers {
+        shift: down(VK_SHIFT),
+        command: down(VK_CONTROL),
+        option: down(VK_MENU),
         control: false,
     }
 }
@@ -1598,6 +1611,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 dispatch(AppEvent::MouseMoved {
                     x: point.x as f64 / factor,
                     y: point.y as f64 / factor,
+                    modifiers: held_modifiers_now(),
                 });
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -1667,7 +1681,9 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 }
             }
             let (x, y) = layout_point(hwnd, lparam);
-            dispatch(AppEvent::MouseMoved { x, y });
+            // `WM_MOUSEMOVE` carries the same modifier word the button
+            // messages do, so the move reads it the same way
+            dispatch(AppEvent::MouseMoved { x, y, modifiers: held_modifiers(wparam) });
             0
         }
         WM_MOUSELEAVE => {

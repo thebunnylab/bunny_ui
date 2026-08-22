@@ -275,7 +275,7 @@ fn main() {
     let mut inside = true;
     let hover = measure("hover (stamp+layout)", 5, 200, 0, || {
         let y = row.origin.y + row.size.height / 2.0;
-        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 });
+        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false);
         inside = !inside;
         runtime.layout(&finder, viewport);
     });
@@ -311,7 +311,7 @@ fn main() {
     let mut inside = true;
     reports.push(measure("hover repaint (damage)", 3, 200, 0, || {
         let y = row.origin.y + row.size.height / 2.0;
-        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 });
+        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false);
         inside = !inside;
         let damage = surface.frame(runtime.layout(&finder, viewport).display, &PixelFont, &RawImages::default());
         std::hint::black_box(damage.len());

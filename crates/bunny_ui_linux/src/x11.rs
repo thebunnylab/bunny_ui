@@ -912,6 +912,25 @@ thread_local! {
     static PENDING: RefCell<VecDeque<*mut GenericEvent>> = const { RefCell::new(VecDeque::new()) };
 }
 
+/// The X keymask, in the shell's own mapping: Control is the
+/// accelerator and carries `command`, Mod1 carries `option`, and
+/// `control` stays false — the same words the key road and the
+/// Wayland backend use.
+///
+/// A press, a move and an entry all carry the mask, so all three read
+/// it here and the three cannot drift.
+fn held_modifiers(state: u16) -> bunny_ui::action::Modifiers {
+    const SHIFT_MASK: u16 = 0x1;
+    const CONTROL_MASK: u16 = 0x4;
+    const MOD1_MASK: u16 = 0x8;
+    bunny_ui::action::Modifiers {
+        shift: state & SHIFT_MASK != 0,
+        command: state & CONTROL_MASK != 0,
+        option: state & MOD1_MASK != 0,
+        control: false,
+    }
+}
+
 fn with_x<R>(body: impl FnOnce(&mut XClient) -> R) -> R {
     X_CLIENT.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -2345,8 +2364,14 @@ fn interpret(event: *mut GenericEvent) -> Step {
         XCB_DESTROY_NOTIFY => Step::Quit,
         XCB_MOTION_NOTIFY => {
             let motion = event as *mut InputEvent;
-            let (window, x, y, time) = unsafe {
-                ((*motion).event, (*motion).event_x, (*motion).event_y, (*motion).time)
+            let (window, x, y, time, state) = unsafe {
+                (
+                    (*motion).event,
+                    (*motion).event_x,
+                    (*motion).event_y,
+                    (*motion).time,
+                    (*motion).state,
+                )
             };
             let Some((base, scale)) = surface_base(window, time) else {
                 return Step::Silence;
@@ -2376,6 +2401,7 @@ fn interpret(event: *mut GenericEvent) -> Step {
             Step::Deliver(AppEvent::MouseMoved {
                 x: base.0 + x as f64 / scale,
                 y: base.1 + y as f64 / scale,
+                modifiers: held_modifiers(state),
             })
         }
         XCB_BUTTON_PRESS | XCB_BUTTON_RELEASE => {
@@ -2478,23 +2504,11 @@ fn interpret(event: *mut GenericEvent) -> Step {
             match (kind, detail) {
                 (XCB_BUTTON_PRESS, 1) => {
                     let clicks = with_x(|client| client.clicks.click(time, x, y));
-                    // the X keymask, in the shell's own mapping: Control
-                    // is the accelerator and carries `command`, Mod1
-                    // carries `option` — the same words the key road
-                    // and the Wayland backend use
-                    const SHIFT_MASK: u16 = 0x1;
-                    const CONTROL_MASK: u16 = 0x4;
-                    const MOD1_MASK: u16 = 0x8;
                     Step::Deliver(AppEvent::MouseDown {
                         x,
                         y,
                         clicks,
-                        modifiers: bunny_ui::action::Modifiers {
-                            shift: state & SHIFT_MASK != 0,
-                            command: state & CONTROL_MASK != 0,
-                            option: state & MOD1_MASK != 0,
-                            control: false,
-                        },
+                        modifiers: held_modifiers(state),
                     })
                 }
                 (XCB_BUTTON_RELEASE, 1) => Step::Deliver(AppEvent::MouseUp { x, y }),
@@ -2532,8 +2546,14 @@ fn interpret(event: *mut GenericEvent) -> Step {
         XCB_KEY_RELEASE => Step::Silence,
         XCB_ENTER_NOTIFY => {
             let crossing = event as *mut CrossingEvent;
-            let (window, x, y, time) = unsafe {
-                ((*crossing).event, (*crossing).event_x, (*crossing).event_y, (*crossing).time)
+            let (window, x, y, time, state) = unsafe {
+                (
+                    (*crossing).event,
+                    (*crossing).event_x,
+                    (*crossing).event_y,
+                    (*crossing).time,
+                    (*crossing).state,
+                )
             };
             let Some((base, scale)) = surface_base(window, time) else {
                 return Step::Silence;
@@ -2542,6 +2562,7 @@ fn interpret(event: *mut GenericEvent) -> Step {
             Step::Deliver(AppEvent::MouseMoved {
                 x: base.0 + x as f64 / scale,
                 y: base.1 + y as f64 / scale,
+                modifiers: held_modifiers(state),
             })
         }
         XCB_LEAVE_NOTIFY => {

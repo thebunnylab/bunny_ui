@@ -102,6 +102,12 @@ pub struct Runtime {
     /// Pointer state for the frame — resolved BEFORE layout (the LAW:
     /// hover swaps paint, never measurement) and stamped at expansion.
     interaction: RefCell<Interaction>,
+    /// What the hand was holding on the last move. It sits OUTSIDE the
+    /// interaction record on purpose: the framework spends none of it,
+    /// so it is not scene vocabulary and must not enter the layout the
+    /// way a hovered path does. It is remembered for one reason — a
+    /// hover that re-resolves after a layout has no shell to ask.
+    pointer_modifiers: std::cell::Cell<crate::action::Modifiers>,
     /// The text edge of the frame — PixelFont by default (headless,
     /// byte-stable); the shell installs the platform engine.
     text: Rc<dyn TextEngine>,
@@ -726,6 +732,7 @@ impl Runtime {
             last_root: RefCell::new(None),
             last_hits: RefCell::new(Vec::new()),
             interaction: RefCell::new(Interaction::default()),
+            pointer_modifiers: std::cell::Cell::new(crate::action::Modifiers::NONE),
             text,
             images: Rc::new(RawImages::default()),
             cache: MeasureCache::default(),
@@ -971,12 +978,23 @@ impl Runtime {
     /// repaints). During a press, hover only re-resolves against the
     /// pressed target: dragging out drops the visual, coming back
     /// re-arms it (AppKit).
-    pub fn pointer_moved(&self, x: Px, y: Px) -> bool {
-        let (repaint, told) = self.watching_hover(|| self.pointer_moved_road(x, y));
+    ///
+    /// The move carries what the hand is HOLDING, the same as the
+    /// press. The framework spends none of it: a box under the pointer
+    /// is the only one that knows whether a held command makes its
+    /// content a door, and it wants to say so BEFORE the press.
+    ///
+    /// The runtime remembers them, so a hover that re-resolves after a
+    /// layout — content sliding under a still hand — replays the move
+    /// the way it really was.
+    pub fn pointer_moved(&self, x: Px, y: Px, modifiers: impl Into<crate::action::Modifiers>) -> bool {
+        let modifiers = modifiers.into();
+        self.pointer_modifiers.set(modifiers);
+        let (repaint, told) = self.watching_hover(|| self.pointer_moved_road(x, y, modifiers));
         repaint || told
     }
 
-    fn pointer_moved_road(&self, x: Px, y: Px) -> bool {
+    fn pointer_moved_road(&self, x: Px, y: Px, modifiers: crate::action::Modifiers) -> bool {
         // a live divider drag owns the pointer: the move becomes a lane
         // extent, the retained writer reaches the binding, and the app's
         // state change re-lays the frame — hover stays untouched
@@ -1009,7 +1027,8 @@ impl Runtime {
             self.interaction.borrow_mut().pointer = Some(Point { x, y });
             if let Some(placement) = self.custom_at(&path) {
                 let at = Self::local(&placement, x, y);
-                let event = crate::custom::ElementEvent::PointerMoved { at, pressed: true };
+                let event =
+                    crate::custom::ElementEvent::PointerMoved { at, pressed: true, modifiers };
                 return self.deliver(&placement, event).handled;
             }
             // the box left the scene mid-drag: the gesture ends with it
@@ -1041,7 +1060,8 @@ impl Runtime {
         let used = match over {
             Some(placement) => {
                 let at = Self::local(&placement, x, y);
-                let event = crate::custom::ElementEvent::PointerMoved { at, pressed: false };
+                let event =
+                    crate::custom::ElementEvent::PointerMoved { at, pressed: false, modifiers };
                 self.deliver(&placement, event).handled
             }
             None => false,
@@ -2634,7 +2654,7 @@ impl Runtime {
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
         let pointer = self.interaction.borrow().pointer;
         if let Some(point) = pointer
-            && self.pointer_moved(point.x, point.y)
+            && self.pointer_moved(point.x, point.y, self.pointer_modifiers.get())
         {
             result = self.layout(root, crate::layout::Proposal::exact(size));
         }
@@ -2719,7 +2739,7 @@ impl Runtime {
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
         let pointer = self.interaction.borrow().pointer;
         if let Some(point) = pointer
-            && self.pointer_moved(point.x, point.y)
+            && self.pointer_moved(point.x, point.y, self.pointer_modifiers.get())
         {
             result = self.layout(root, crate::layout::Proposal::exact(size));
         }
@@ -3335,7 +3355,7 @@ impl Runtime {
                 let pressed = self.interaction.borrow().element_grab.is_some();
                 self.deliver(
                     &placement,
-                    crate::custom::ElementEvent::PointerMoved { at, pressed },
+                    crate::custom::ElementEvent::PointerMoved { at, pressed, modifiers },
                 );
             }
             2 => {

@@ -1283,7 +1283,7 @@ pub enum AppEvent {
     Redraw,
     Wake,
     ResignKey,
-    MouseMoved { x: f64, y: f64 },
+    MouseMoved { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     MouseDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     MouseUp { x: f64, y: f64 },
     RightMouseDown { x: f64, y: f64 },
@@ -3294,7 +3294,8 @@ fn drain_protocol_events() {
                 // a stale enter serial means an ignored set_cursor —
                 // re-assert, then let the scene see the entry as a move
                 apply_cursor();
-                dispatch(AppEvent::MouseMoved { x, y });
+                let modifiers = with_client(|client| held_modifiers(&client.keyboard));
+                dispatch(AppEvent::MouseMoved { x, y, modifiers });
             }
             Ev::PointerLeave => {
                 with_client(|client| client.edge_hover = 0);
@@ -3318,7 +3319,11 @@ fn drain_protocol_events() {
                 if band_changed {
                     apply_cursor();
                 }
-                dispatch(AppEvent::MouseMoved { x, y });
+                // the keyboard is the authority on who is held, the
+                // same as it is for a press: the pointer has no state
+                // of its own on this platform
+                let modifiers = with_client(|client| held_modifiers(&client.keyboard));
+                dispatch(AppEvent::MouseMoved { x, y, modifiers });
             }
             Ev::PointerButton { serial, time_ms, button, pressed } => {
                 let (x, y) = with_client(|client| {

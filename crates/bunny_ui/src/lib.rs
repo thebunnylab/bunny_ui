@@ -2574,7 +2574,7 @@ mod tests {
 
         // press the grip, drag right: the binding follows the pointer
         assert!(runtime.pointer_pressed(grip_center_x, 300.0));
-        assert!(runtime.pointer_moved(400.0, 300.0));
+        assert!(runtime.pointer_moved(400.0, 300.0, false));
         assert_eq!(bench.seam.get(), 400.0);
         let dragged = runtime.layout(&bench, viewport);
         let moved = dragged
@@ -2586,12 +2586,12 @@ mod tests {
         assert!((moved.1.origin.x + moved.1.size.width / 2.0 - 400.5).abs() < 0.75);
 
         // past the floor the clamp holds — and a release fires nothing
-        runtime.pointer_moved(5.0, 300.0);
+        runtime.pointer_moved(5.0, 300.0, false);
         assert_eq!(bench.seam.get(), 120.0);
         assert_eq!(runtime.pointer_released(5.0, 300.0), None);
 
         // after the release the pointer is free again: moving does not drag
-        runtime.pointer_moved(700.0, 300.0);
+        runtime.pointer_moved(700.0, 300.0, false);
         assert_eq!(bench.seam.get(), 120.0);
         let _ = grip_path;
     }
@@ -2635,7 +2635,7 @@ mod tests {
         // Drag it LEFT and the dock gets wider — the pointer names the
         // dock's edge, and the dock is what the binding holds.
         assert!(runtime.pointer_pressed(centre, 300.0));
-        assert!(runtime.pointer_moved(800.0, 300.0));
+        assert!(runtime.pointer_moved(800.0, 300.0, false));
         assert!(
             (bench.seam.get() - (1199.0 - 800.0)).abs() < 1.0,
             "the far lane is what was written: {}",
@@ -2644,7 +2644,7 @@ mod tests {
 
         // The floors still name the lanes: pushing the grip at the window's
         // edge cannot squeeze the LEADING lane under its own floor.
-        runtime.pointer_moved(10.0, 300.0);
+        runtime.pointer_moved(10.0, 300.0, false);
         assert!(
             (bench.seam.get() - (1199.0 - 320.0)).abs() < 1.0,
             "the editor keeps its 320: {}",
@@ -2775,7 +2775,7 @@ mod tests {
         // hovering a grip names the way THAT seam travels
         for (path, rect) in &grips {
             let (x, y) = centre(*rect);
-            runtime.pointer_moved(x, y);
+            runtime.pointer_moved(x, y, false);
             let want = match rect.size.height > rect.size.width {
                 true => Axis::Horizontal,
                 false => Axis::Vertical,
@@ -2792,10 +2792,10 @@ mod tests {
             runtime.interaction().split_drag.as_deref(),
             stacked.strip_suffix("/#split"),
         );
-        runtime.pointer_moved(x, y - 90.0);
+        runtime.pointer_moved(x, y - 90.0, false);
         assert_eq!(runtime.seam_axis(), Some(Axis::Vertical), "the drag keeps the resizer");
         runtime.pointer_released(x, y - 90.0);
-        runtime.pointer_moved(5.0, 5.0);
+        runtime.pointer_moved(5.0, 5.0, false);
         assert_eq!(runtime.seam_axis(), None, "and the release gives it back");
     }
 
@@ -2829,14 +2829,14 @@ mod tests {
 
         assert!(runtime.pointer_pressed(grip_center_x, 300.0));
         // the pointer names points; what lands in the binding is a share
-        assert!(runtime.pointer_moved(250.0, 300.0));
+        assert!(runtime.pointer_moved(250.0, 300.0, false));
         assert_eq!(panes.share.get(), Fraction(0.25));
 
         // the floor is RELATIVE — a tenth of the pair, not a number of
         // points, so it holds at every window size
-        runtime.pointer_moved(1.0, 300.0);
+        runtime.pointer_moved(1.0, 300.0, false);
         assert_eq!(panes.share.get(), Fraction(0.1));
-        runtime.pointer_moved(2000.0, 300.0);
+        runtime.pointer_moved(2000.0, 300.0, false);
         assert_eq!(panes.share.get(), Fraction(0.9));
         assert_eq!(runtime.pointer_released(2000.0, 300.0), None);
     }
@@ -2922,7 +2922,7 @@ mod tests {
         let mark_alpha = || {
             runtime.render_stable(&chip);
             // the pointer sits over the label, well clear of the mark
-            runtime.pointer_moved(6.0, 8.0);
+            runtime.pointer_moved(6.0, 8.0, false);
             let result = runtime.layout(&chip, viewport);
             result
                 .display
@@ -2953,7 +2953,7 @@ mod tests {
             .map(|(_, rect)| *rect)
             .next_back()
             .expect("the mark is a target of its own");
-        runtime.pointer_moved(mark_rect.origin.x + 2.0, mark_rect.origin.y + 2.0);
+        runtime.pointer_moved(mark_rect.origin.x + 2.0, mark_rect.origin.y + 2.0, false);
         let over = runtime.layout(&chip, viewport);
         let alpha = over
             .display
@@ -3032,10 +3032,10 @@ mod tests {
         // inside the band it landed, so nothing jumps on the first move
         let grab_y = thumb.origin.y + 4.0;
         assert!(runtime.pointer_pressed(thumb.origin.x + 2.0, grab_y));
-        assert!(runtime.pointer_moved(thumb.origin.x + 2.0, grab_y + 1.0));
+        assert!(runtime.pointer_moved(thumb.origin.x + 2.0, grab_y + 1.0, false));
         let after_one = runtime.scroll_offset(&region.path).y;
         assert!(after_one > 0.0 && after_one < 100.0, "one point of thumb is a small step: {after_one}");
-        assert!(runtime.pointer_moved(thumb.origin.x + 2.0, 10_000.0));
+        assert!(runtime.pointer_moved(thumb.origin.x + 2.0, 10_000.0, false));
         assert_eq!(
             runtime.scroll_offset(&region.path).y,
             3800.0,
@@ -3043,7 +3043,7 @@ mod tests {
         );
         assert_eq!(runtime.pointer_released(thumb.origin.x + 2.0, 10_000.0), None);
         // after the release the pointer is free again
-        runtime.pointer_moved(150.0, 100.0);
+        runtime.pointer_moved(150.0, 100.0, false);
         assert_eq!(runtime.scroll_offset(&region.path).y, 3800.0);
     }
 
@@ -4229,7 +4229,7 @@ mod tests {
         let viewport = Proposal::exact(Size { width: 200.0, height: 100.0 });
         let cold = runtime.layout(&tapper, viewport);
 
-        assert!(runtime.pointer_moved(cx, cy), "entering the target changes the state");
+        assert!(runtime.pointer_moved(cx, cy, false), "entering the target changes the state");
         let hot = runtime.layout(&tapper, viewport);
         assert!(runtime.body_runs().is_empty(), "hover repaints with ZERO bodies");
 
@@ -4250,7 +4250,7 @@ mod tests {
         assert_ne!(backgrounds(&cold), backgrounds(&hot), "the paint changes");
 
         // 1px within the same target: nothing to repaint
-        assert!(!runtime.pointer_moved(cx + 1.0, cy));
+        assert!(!runtime.pointer_moved(cx + 1.0, cy, false));
     }
 
     #[test]
@@ -4295,7 +4295,7 @@ mod tests {
         let cx = target.origin.x + target.size.width / 2.0;
         let cy = target.origin.y + target.size.height / 2.0;
 
-        runtime.pointer_moved(cx, cy);
+        runtime.pointer_moved(cx, cy, false);
         let hot = runtime.layout(&CloseGlyph, viewport);
         assert_eq!(ink(&hot), BRIGHT, "the pointer brightens it");
         // the LAW: ink is paint — no frame moves under the pointer
@@ -4336,12 +4336,12 @@ mod tests {
         let (runtime, tapper, cx, cy) = pressable();
 
         runtime.pointer_pressed(cx, cy);
-        runtime.pointer_moved(199.0, 99.0);
+        runtime.pointer_moved(199.0, 99.0, false);
         assert!(
             runtime.interaction().hovered.is_none(),
             "dragging out releases the visual"
         );
-        runtime.pointer_moved(cx, cy);
+        runtime.pointer_moved(cx, cy, false);
         assert_eq!(
             runtime.interaction().hovered,
             runtime.interaction().pressed,
@@ -4355,7 +4355,7 @@ mod tests {
     fn pointer_exited_clears_the_hover() {
         let (runtime, _tapper, cx, cy) = pressable();
 
-        runtime.pointer_moved(cx, cy);
+        runtime.pointer_moved(cx, cy, false);
         assert!(runtime.pointer_exited());
         assert!(runtime.interaction().hovered.is_none());
         assert!(!runtime.pointer_exited(), "already clear — nothing to repaint");
@@ -4806,12 +4806,12 @@ mod tests {
         assert_eq!(selected(), (2, 0), "the anchor is armed, the selection empty");
 
         // the hand sweeps: the anchor holds and the caret walks
-        assert!(runtime.pointer_moved(at(9), y));
+        assert!(runtime.pointer_moved(at(9), y, false));
         assert_eq!(selected(), (2, 7));
         // backwards past the anchor still reads as one range
-        assert!(runtime.pointer_moved(at(0), y));
+        assert!(runtime.pointer_moved(at(0), y, false));
         assert_eq!(selected(), (0, 2));
-        assert!(runtime.pointer_moved(at(9), y));
+        assert!(runtime.pointer_moved(at(9), y, false));
 
         // the release changes nothing — and it still names the field
         assert_eq!(runtime.pointer_released(at(9), y), Some(path.clone()));
@@ -4828,7 +4828,7 @@ mod tests {
 
         // a move with the button up sweeps nothing
         assert_eq!(selected(), (2, 7));
-        runtime.pointer_moved(at(1), y);
+        runtime.pointer_moved(at(1), y, false);
         assert_eq!(selected(), (2, 7), "the sweep ended with the button");
 
         // two clicks take the word under the pointer, three take the line
@@ -4863,7 +4863,7 @@ mod tests {
         runtime.pointer_clicked(frame.origin.x + 12.0, y, 1, false);
         assert_eq!(runtime.scroll_offset(&path).x, 0.0, "the press is inside the box");
         let out = frame.origin.x + frame.size.width + 400.0;
-        assert!(runtime.pointer_moved(out, y));
+        assert!(runtime.pointer_moved(out, y, false));
         assert!(
             runtime.scroll_offset(&path).x > 0.0,
             "the run followed the hand out of the box",
@@ -5154,18 +5154,18 @@ mod tests {
 
         // the pointer arrives on the first row: the flyout opens, which
         // is the whole gesture a submenu is made of
-        runtime.pointer_moved(100.0, 20.0);
+        runtime.pointer_moved(100.0, 20.0, false);
         assert_eq!(menu.log.borrow().as_slice(), &["servers in"]);
 
         // moving INSIDE the same row says nothing new: it fires on the
         // CHANGE, not on the pointer
-        runtime.pointer_moved(120.0, 30.0);
+        runtime.pointer_moved(120.0, 30.0, false);
         assert_eq!(menu.log.borrow().len(), 1, "still once");
 
         // onto the second row, and the ORDER is the point: the row the
         // pointer left hears it FIRST, so two flyouts are never open at
         // the same moment
-        runtime.pointer_moved(100.0, 60.0);
+        runtime.pointer_moved(100.0, 60.0, false);
         assert_eq!(
             menu.log.borrow().as_slice(),
             &["servers in", "servers out", "extensions in"],
@@ -5220,7 +5220,7 @@ mod tests {
         runtime.layout(&rows, viewport);
 
         // the hand lands on the third row and STAYS there
-        runtime.pointer_moved(100.0, 50.0);
+        runtime.pointer_moved(100.0, 50.0, false);
         assert_eq!(rows.log.borrow().as_slice(), &["row 2".to_string()]);
 
         // the wheel slides the list by two rows under it. Nothing about
@@ -6795,7 +6795,7 @@ mod tests {
             .get(1)
             .expect("second row is a pointer target")
             .1;
-        runtime.pointer_moved(target.origin.x + 4.0, target.origin.y + 4.0);
+        runtime.pointer_moved(target.origin.x + 4.0, target.origin.y + 4.0, false);
         let result = runtime.layout(&Rows, viewport);
         let oracle = rasterize_scaled(&result.display, 120, 80, 1, Color::CANVAS);
         let damage = surface.frame(result.display, &PixelFont, &RawImages::default());
@@ -7442,7 +7442,7 @@ mod tests {
         };
         // prime the retained geometry, then hover the labelled view
         let _ = runtime.layout(&Rail, crate::layout::Proposal::exact(size));
-        runtime.pointer_moved(10.0, 8.0);
+        runtime.pointer_moved(10.0, 8.0, false);
         assert_eq!(overlay_count(&runtime), 0, "no bubble before the wait");
         // the first beat only ages the wait
         assert!(!runtime.tooltip_tick(), "one beat is not the delay");
@@ -7473,7 +7473,7 @@ mod tests {
         assert_eq!(says, vec!["Settings".to_string()]);
 
         // moving OFF the anchor takes the bubble with it
-        assert!(runtime.pointer_moved(10.0, 60.0), "leaving repaints");
+        assert!(runtime.pointer_moved(10.0, 60.0, false), "leaving repaints");
         assert_eq!(overlay_count(&runtime), 0, "the bubble left with the pointer");
     }
 
@@ -7499,7 +7499,7 @@ mod tests {
         let size = Size { width: 200.0, height: 120.0 };
         let _ = runtime.layout(&view, crate::layout::Proposal::exact(size));
         // show the bubble over the first line
-        runtime.pointer_moved(10.0, 8.0);
+        runtime.pointer_moved(10.0, 8.0, false);
         runtime.tooltip_tick();
         assert!(runtime.tooltip_tick(), "the bubble is up");
         // pressing the OTHER line must still arm and fire — a popover
@@ -7529,12 +7529,12 @@ mod tests {
         let runtime = Runtime::new();
         let size = Size { width: 100.0, height: 40.0 };
         let _ = runtime.layout(&One, crate::layout::Proposal::exact(size));
-        runtime.pointer_moved(10.0, 8.0);
+        runtime.pointer_moved(10.0, 8.0, false);
         runtime.pointer_pressed(10.0, 8.0);
         assert!(!runtime.tooltip_tick(), "a press ends the wait");
         assert!(!runtime.tooltip_tick());
         runtime.pointer_released(10.0, 8.0);
-        runtime.pointer_moved(10.0, 8.0);
+        runtime.pointer_moved(10.0, 8.0, false);
         runtime.wheel(10.0, 8.0, 0.0, 3.0);
         assert!(!runtime.tooltip_tick(), "a wheel ends the wait");
         assert!(!runtime.tooltip_tick());
@@ -7607,7 +7607,7 @@ mod tests {
             .first()
             .expect("the chip is a target")
             .1;
-        assert!(runtime.pointer_moved(hit.origin.x + 2.0, hit.origin.y + 2.0));
+        assert!(runtime.pointer_moved(hit.origin.x + 2.0, hit.origin.y + 2.0, false));
         assert_eq!(runtime.dom_frame(&Chip, size), vec![], "a group hover is zero patches");
     }
 
@@ -7709,7 +7709,7 @@ mod tests {
 
         // hovering the first row highlights it and quiets the scene
         let row_y = menu.frame.origin.y + 5.0 + 12.0;
-        runtime.pointer_moved(menu.frame.origin.x + 20.0, row_y);
+        runtime.pointer_moved(menu.frame.origin.x + 20.0, row_y, false);
         let stamped = runtime.interaction();
         assert_eq!(stamped.menu.as_ref().and_then(|open| open.hovered), Some(0));
         assert_eq!(stamped.hovered, None, "the scene under the menu goes quiet");
@@ -7918,7 +7918,7 @@ mod tests {
             .find(|region| region.rect.size.width == 60.0)
             .expect("the chip explains itself")
             .rect;
-        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 4.0);
+        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 4.0, false);
         for _ in 0..40 {
             runtime.tooltip_tick();
         }
@@ -7955,7 +7955,7 @@ mod tests {
             .expect("the chip lifts")
             .rect;
         runtime.pointer_pressed(chip.origin.x + 4.0, chip.origin.y + 4.0);
-        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 40.0);
+        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 40.0, false);
         let label = runtime.interaction().drag.map(|live| live.label.to_string());
         assert_eq!(label.as_deref(), Some("chip"));
     }
@@ -8036,12 +8036,12 @@ mod tests {
 
         let chip = result.drag_sources.first().expect("the tab lifts").rect;
         runtime.pointer_pressed(chip.origin.x + 2.0, chip.origin.y + 2.0);
-        runtime.pointer_moved(chip.origin.x + 2.0, chip.origin.y + 30.0);
+        runtime.pointer_moved(chip.origin.x + 2.0, chip.origin.y + 30.0, false);
         let (x, y) = (
             target.origin.x + target.size.width / 2.0,
             target.origin.y + target.size.height / 2.0,
         );
-        runtime.pointer_moved(x, y);
+        runtime.pointer_moved(x, y, false);
         runtime.pointer_released(x, y);
 
         assert_eq!(board.on_catcher.get(), 7, "the catcher is inside, so it catches");
@@ -8098,9 +8098,9 @@ mod tests {
         let (chip, _) = chip_and_pane(&result);
 
         runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0);
-        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0);
+        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0, false);
         let (x, y) = (chip.origin.x + 4.0, chip.origin.y + 4.0);
-        runtime.pointer_moved(x, y);
+        runtime.pointer_moved(x, y, false);
         runtime.pointer_released(x, y);
 
         assert_eq!(view.on_chip.get(), 7, "the chip took its own drop");
@@ -8116,9 +8116,9 @@ mod tests {
         let (_, pane) = chip_and_pane(&result);
 
         runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0);
-        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0);
+        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0, false);
         let (x, y) = (pane.origin.x + 4.0, pane.origin.y + pane.size.height - 4.0);
-        runtime.pointer_moved(x, y);
+        runtime.pointer_moved(x, y, false);
         runtime.pointer_released(x, y);
 
         assert_eq!(view.on_pane.get(), 7);
@@ -8163,9 +8163,9 @@ mod tests {
             .frame;
 
         runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0);
-        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0);
+        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0, false);
         let (x, y) = (chip.origin.x + 4.0, chip.origin.y + 4.0);
-        runtime.pointer_moved(x, y);
+        runtime.pointer_moved(x, y, false);
         runtime.pointer_released(x, y);
 
         assert_eq!(view.landed.get(), 3, "the pane caught what the chip cannot take");
@@ -8179,8 +8179,8 @@ mod tests {
         let (chip, _) = chip_and_pane(&result);
 
         runtime.pointer_pressed(source.origin.x + 4.0, source.origin.y + 4.0);
-        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0);
-        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 4.0);
+        runtime.pointer_moved(source.origin.x + 4.0, source.origin.y + 40.0, false);
+        runtime.pointer_moved(chip.origin.x + 4.0, chip.origin.y + 4.0, false);
         let over = runtime.layout(&view, crate::layout::Proposal::exact(size));
 
         let accent = crate::theme::current().accent;
@@ -8239,7 +8239,7 @@ mod tests {
         let (runtime, view, size) = drag_board();
         // press on the tab, move past the threshold: the drag lifts
         runtime.pointer_pressed(20.0, 8.0);
-        assert!(runtime.pointer_moved(30.0, 20.0), "the lift repaints");
+        assert!(runtime.pointer_moved(30.0, 20.0, false), "the lift repaints");
         let live = runtime.interaction().drag.expect("a drag is live");
         assert_eq!(&*live.label, "tab 2");
         // the chip follows the cursor as an overlay
@@ -8270,7 +8270,7 @@ mod tests {
             .rect;
         let (cx, cy) =
             (target.origin.x + target.size.width / 2.0, target.origin.y + target.size.height / 2.0);
-        assert!(runtime.pointer_moved(cx, cy));
+        assert!(runtime.pointer_moved(cx, cy, false));
         assert_eq!(runtime.interaction().drag.unwrap().over, Some(target));
         let ringed = runtime.layout(&view, crate::layout::Proposal::exact(size));
         let accent = crate::theme::current().accent;
@@ -8294,7 +8294,7 @@ mod tests {
     fn a_wrong_type_never_lights_nor_lands() {
         let (runtime, view, size) = drag_board();
         runtime.pointer_pressed(20.0, 8.0);
-        runtime.pointer_moved(30.0, 20.0);
+        runtime.pointer_moved(30.0, 20.0, false);
         let result = runtime.layout(&view, crate::layout::Proposal::exact(size));
         let trash = result
             .drops
@@ -8304,7 +8304,7 @@ mod tests {
             .rect;
         let (cx, cy) =
             (trash.origin.x + trash.size.width / 2.0, trash.origin.y + trash.size.height / 2.0);
-        runtime.pointer_moved(cx, cy);
+        runtime.pointer_moved(cx, cy, false);
         assert_eq!(runtime.interaction().drag.unwrap().over, None, "the types do not meet");
         runtime.pointer_released(cx, cy);
         assert_eq!(view.wrong.get(), 0, "nothing landed");
@@ -8315,7 +8315,7 @@ mod tests {
     fn escape_sends_the_drag_home() {
         let (runtime, view, _) = drag_board();
         runtime.pointer_pressed(20.0, 8.0);
-        runtime.pointer_moved(60.0, 40.0);
+        runtime.pointer_moved(60.0, 40.0, false);
         assert!(runtime.interaction().drag.is_some());
         let handled = runtime
             .key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape));
@@ -8656,13 +8656,13 @@ mod tests {
             source.origin.x + source.size.width / 2.0,
             source.origin.y + source.size.height / 2.0,
         );
-        runtime.pointer_moved(source.origin.x + 30.0, source.origin.y + 30.0);
+        runtime.pointer_moved(source.origin.x + 30.0, source.origin.y + 30.0, false);
         assert!(runtime.interaction().drag.is_some(), "the drag lifted");
         let quarter = (
             target.origin.x + target.size.width * 0.25,
             target.origin.y + target.size.height * 0.75,
         );
-        runtime.pointer_moved(quarter.0, quarter.1);
+        runtime.pointer_moved(quarter.0, quarter.1, false);
         // the preview heard the place WHILE the drag moves — this is
         // the whole of pain 31: the veil can be painted now
         assert_eq!(view.zone.get(), Some((25, 75)), "the hand reports its quarter");
@@ -8728,17 +8728,17 @@ mod tests {
             source.origin.y + source.size.height / 2.0,
         );
         // lift sideways, away from the target below
-        runtime.pointer_moved(source.origin.x + 40.0, source.origin.y);
-        runtime.pointer_moved(inside.0, inside.1);
+        runtime.pointer_moved(source.origin.x + 40.0, source.origin.y, false);
+        runtime.pointer_moved(inside.0, inside.1, false);
         assert_eq!(view.seen.get(), vec!["over".to_string()], "entering speaks once");
 
         // moving WITHIN the same box does not re-enter, it just moves
-        runtime.pointer_moved(inside.0 + 4.0, inside.1 + 4.0);
+        runtime.pointer_moved(inside.0 + 4.0, inside.1 + 4.0, false);
         assert_eq!(view.seen.get(), vec!["over".to_string(), "over".to_string()]);
 
         // leaving the box: exactly ONE None, no matter how far it goes
-        runtime.pointer_moved(inside.0, target.origin.y + target.size.height + 30.0);
-        runtime.pointer_moved(inside.0, target.origin.y + target.size.height + 40.0);
+        runtime.pointer_moved(inside.0, target.origin.y + target.size.height + 30.0, false);
+        runtime.pointer_moved(inside.0, target.origin.y + target.size.height + 40.0, false);
         let log = view.seen.get();
         assert_eq!(log.last().map(String::as_str), Some("left"));
         assert_eq!(
@@ -8748,7 +8748,7 @@ mod tests {
         );
 
         // back in, then Escape — the preview must not be left hanging
-        runtime.pointer_moved(inside.0, inside.1);
+        runtime.pointer_moved(inside.0, inside.1, false);
         assert_eq!(view.seen.get().last().map(String::as_str), Some("over"));
         let handled =
             runtime.key_stroke(&crate::action::KeyPattern::key(crate::action::Key::Escape));
@@ -8816,7 +8816,7 @@ mod tests {
             source.origin.x + source.size.width / 2.0,
             source.origin.y + source.size.height / 2.0,
         );
-        runtime.pointer_moved(source.origin.x + 30.0, source.origin.y + 20.0);
+        runtime.pointer_moved(source.origin.x + 30.0, source.origin.y + 20.0, false);
         let visible_top = (target.rect.origin.x + 10.0, target.rect.origin.y + 1.0);
         runtime.pointer_released(visible_top.0, visible_top.1);
         let (local_y, height) = view.at.get().expect("it landed");
@@ -8867,10 +8867,11 @@ mod tests {
             source.origin.y + source.size.height / 2.0,
         );
         assert!(runtime.drag_armed(), "the press armed it — this is what the glue asks");
-        runtime.pointer_moved(source.origin.x + 40.0, source.origin.y);
+        runtime.pointer_moved(source.origin.x + 40.0, source.origin.y, false);
         runtime.pointer_moved(
             target.origin.x + target.size.width / 2.0,
             target.origin.y + target.size.height / 2.0,
+            false,
         );
         assert!(runtime.interaction().drag.is_some(), "the drag is live in this mode too");
 

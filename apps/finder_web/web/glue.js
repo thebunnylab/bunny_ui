@@ -388,7 +388,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     };
     host.addEventListener("pointermove", (event) => {
       const [x, y] = point(event);
-      wasm.bunny_pointer_move(x, y);
+      wasm.bunny_pointer_move(x, y, modifiers(event));
       armTooltip();
     });
     host.addEventListener("pointerdown", (event) => {

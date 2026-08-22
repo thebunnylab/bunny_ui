@@ -637,7 +637,14 @@ impl<'a> Painter<'a> {
 pub enum ElementEvent {
     /// The pointer moved. `pressed` = the box owns the drag (the press
     /// started here), so the point can be outside the frame.
-    PointerMoved { at: Point, pressed: bool },
+    ///
+    /// `modifiers` is what the hand is holding WHILE it moves, the same
+    /// field the press carries and spent by the framework in the same
+    /// way — not at all. It is how a box offers before it acts: a
+    /// symbol under a held command underlines and the pointer becomes a
+    /// hand, which is how a reader learns a word is a door before
+    /// pressing it.
+    PointerMoved { at: Point, pressed: bool, modifiers: crate::action::Modifiers },
     /// `clicks` is the platform's own count — 2 selects a word, 3 a
     /// line, and the box never needs a clock of its own.
     ///
@@ -1117,7 +1124,7 @@ mod tests {
         runtime.layout(&view, Proposal { width: Some(200.0), height: Some(100.0) });
 
         assert!(runtime.pointer_pressed(20.0, 20.0), "the press lands in the box");
-        runtime.pointer_moved(300.0, 300.0);
+        runtime.pointer_moved(300.0, 300.0, false);
         assert_eq!(runtime.pointer_released(300.0, 300.0), None, "no action fires under it");
         let seen = log.borrow().clone();
         assert_eq!(
@@ -1130,7 +1137,8 @@ mod tests {
                 },
                 ElementEvent::PointerMoved {
                     at: Point { x: 290.0, y: 290.0 },
-                    pressed: true
+                    pressed: true,
+                    modifiers: crate::action::Modifiers::NONE,
                 },
                 ElementEvent::PointerUp { at: Point { x: 290.0, y: 290.0 } },
             ],
@@ -1222,13 +1230,74 @@ mod tests {
         let runtime = Runtime::new();
         let view = Screen { log: Rc::clone(&log) };
         runtime.layout(&view, Proposal { width: Some(40.0), height: Some(40.0) });
-        runtime.pointer_moved(12.0, 8.0);
+        runtime.pointer_moved(12.0, 8.0, false);
         assert_eq!(
             log.borrow().last(),
-            Some(&ElementEvent::PointerMoved { at: Point { x: 12.0, y: 8.0 }, pressed: false })
+            Some(&ElementEvent::PointerMoved {
+                at: Point { x: 12.0, y: 8.0 },
+                pressed: false,
+                modifiers: crate::action::Modifiers::NONE,
+            })
         );
         runtime.pointer_exited();
         assert_eq!(log.borrow().last(), Some(&ElementEvent::PointerExited));
+    }
+
+    /// A move says what the hand HOLDS, so a box can offer before the
+    /// hand commits: a symbol under a held command underlines, and the
+    /// reader learns the word is a door before pressing it.
+    #[test]
+    fn a_move_carries_what_the_hand_is_holding() {
+        #[derive(Clone)]
+        struct Screen {
+            log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
+        }
+        impl Component for Screen {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                custom(Recorder::new(&self.log))
+            }
+        }
+        let held = crate::action::Modifiers {
+            command: true,
+            ..crate::action::Modifiers::NONE
+        };
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let runtime = Runtime::new();
+        let view = Screen { log: Rc::clone(&log) };
+        runtime.layout(&view, Proposal { width: Some(40.0), height: Some(40.0) });
+        runtime.pointer_moved(12.0, 8.0, held);
+        assert_eq!(
+            log.borrow().last(),
+            Some(&ElementEvent::PointerMoved {
+                at: Point { x: 12.0, y: 8.0 },
+                pressed: false,
+                modifiers: held,
+            })
+        );
+
+        // a press keeps the grab, and the drag's moves say it too
+        runtime.pointer_clicked(12.0, 8.0, 1, held);
+        runtime.pointer_moved(90.0, 90.0, held);
+        assert_eq!(
+            log.borrow().last(),
+            Some(&ElementEvent::PointerMoved {
+                at: Point { x: 90.0, y: 90.0 },
+                pressed: true,
+                modifiers: held,
+            }),
+            "the grabbed box hears the modifiers outside its own frame"
+        );
+
+        // letting go of the key is a move like any other
+        runtime.pointer_moved(90.0, 90.0, false);
+        assert_eq!(
+            log.borrow().last(),
+            Some(&ElementEvent::PointerMoved {
+                at: Point { x: 90.0, y: 90.0 },
+                pressed: true,
+                modifiers: crate::action::Modifiers::NONE,
+            })
+        );
     }
 
     // MARK: - The keyboard

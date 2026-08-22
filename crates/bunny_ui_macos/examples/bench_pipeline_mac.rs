@@ -428,7 +428,7 @@ fn main() {
     let mut inside = true;
     reports.push(measure("hover (stamp+layout)", 5, 200, || {
         let y = row.origin.y + row.size.height / 2.0;
-        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 });
+        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false);
         inside = !inside;
         runtime.layout(&finder, viewport);
     }));
@@ -491,7 +491,7 @@ fn main() {
     let mut inside = true;
     reports.push(measure("hover repaint (damage)", 3, 200, || {
         let y = row.origin.y + row.size.height / 2.0;
-        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 });
+        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false);
         inside = !inside;
         let damage = surface.frame(runtime.layout(&finder, viewport).display, &*engine, &RawImages::default());
         std::hint::black_box(damage.len());
@@ -514,7 +514,7 @@ fn main() {
     let mut inside = true;
     reports.push(measure("hover present (repaint+rgba)", 3, 200, || {
         let y = row.origin.y + row.size.height / 2.0;
-        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 });
+        runtime.pointer_moved(row.origin.x + 30.0, if inside { y } else { 4.0 }, false);
         inside = !inside;
         surface.frame(runtime.layout(&finder, viewport).display, &*engine, &RawImages::default());
         std::hint::black_box(surface.rgba().len());

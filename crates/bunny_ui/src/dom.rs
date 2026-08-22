@@ -2450,7 +2450,7 @@ mod tests {
                 (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)
             })
             .expect("row1 is clickable");
-        assert!(runtime.pointer_moved(target.0, target.1), "the hover state flipped");
+        assert!(runtime.pointer_moved(target.0, target.1, false), "the hover state flipped");
 
         let patches = runtime.dom_frame(&view, size);
         assert_eq!(patches, vec![], "hover is the browser's — the scene never moves");
@@ -2808,7 +2808,7 @@ mod tests {
                 (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)
             })
             .expect("the glyph is a target");
-        assert!(runtime.pointer_moved(target.0, target.1), "the hover state flipped");
+        assert!(runtime.pointer_moved(target.0, target.1, false), "the hover state flipped");
         assert_eq!(runtime.dom_frame(&CloseGlyph, size), vec![], "hover is the browser's");
     }
 
@@ -3765,7 +3765,7 @@ mod tests {
                 (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)
             })
             .expect("the glyph is a target");
-        assert!(runtime.pointer_moved(target.0, target.1), "the hover state flipped");
+        assert!(runtime.pointer_moved(target.0, target.1, false), "the hover state flipped");
         assert_eq!(runtime.dom_frame(&CloseButton, size), vec![], "hover is the browser's");
     }
 

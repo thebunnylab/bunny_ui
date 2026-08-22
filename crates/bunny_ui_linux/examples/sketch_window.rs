@@ -177,7 +177,7 @@ impl CustomElement for Sketch {
                 self.extend(*at);
                 Response::handled()
             }
-            ElementEvent::PointerMoved { at, pressed } => {
+            ElementEvent::PointerMoved { at, pressed, .. } => {
                 self.pointer.set(Some(*at));
                 if *pressed {
                     self.extend(*at);

@@ -183,7 +183,7 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
 
 /// What the exports feed the shell — the web twin of the mac AppEvent.
 enum Event {
-    PointerMove { x: f64, y: f64 },
+    PointerMove { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     PointerDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     PointerUp { x: f64, y: f64 },
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
@@ -363,8 +363,8 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
         let tick =
             |runtime: &Runtime, size: Size| runtime.animation_frame(&root, size);
         match event {
-            Event::PointerMove { x, y } => {
-                if runtime.pointer_moved(x, y) {
+            Event::PointerMove { x, y, modifiers } => {
+                if runtime.pointer_moved(x, y, modifiers) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
@@ -657,8 +657,8 @@ fn start_dom_with(
             // press that armed a drag and its release (the glue opens
             // the door and closes it) — so a drag works here too and
             // the zero-patch hover stays untouched, by construction
-            Event::PointerMove { x, y } => {
-                if runtime.pointer_moved(x, y) {
+            Event::PointerMove { x, y, modifiers } => {
+                if runtime.pointer_moved(x, y, modifiers) {
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
                 DRAG_ARMED.with(|armed| armed.set(runtime.drag_armed()));
@@ -729,9 +729,12 @@ pub extern "C" fn bunny_text(pointer: *mut u8, len: usize) {
     dispatch(Event::Text(text));
 }
 
+/// `mods` is the same four bits a press and a stroke carry: 1 shift,
+/// 2 command, 4 option, 8 control. A move says what the hand HOLDS, so
+/// a box can offer a command-click before the hand commits to it.
 #[unsafe(no_mangle)]
-pub extern "C" fn bunny_pointer_move(x: f64, y: f64) {
-    dispatch(Event::PointerMove { x, y });
+pub extern "C" fn bunny_pointer_move(x: f64, y: f64, mods: u32) {
+    dispatch(Event::PointerMove { x, y, modifiers: held(mods) });
 }
 
 /// One beat of the glue's slow clock: the tooltip ages, then shows.
