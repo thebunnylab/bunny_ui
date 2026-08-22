@@ -85,6 +85,21 @@ unsafe extern "C" {
     fn CTFontCopyFamilyName(font: CTFontRef) -> CFStringRef;
     static kCTFontAttributeName: CFStringRef;
     static kCTForegroundColorFromContextAttributeName: CFStringRef;
+    /// Add a face to THIS PROCESS's font list. Nothing outside the app
+    /// sees it, and it goes away with the app.
+    fn CTFontManagerRegisterGraphicsFont(font: *mut c_void, error: *mut *const c_void) -> bool;
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGDataProviderCreateWithData(
+        info: *mut c_void,
+        data: *const u8,
+        size: usize,
+        release: *const c_void,
+    ) -> *mut c_void;
+    fn CGDataProviderRelease(provider: *mut c_void);
+    fn CGFontCreateWithDataProvider(provider: *mut c_void) -> *mut c_void;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -313,6 +328,57 @@ pub struct CoreTextEngine {
 impl CoreTextEngine {
     pub fn new() -> Self {
         CoreTextEngine { fonts: RefCell::new(HashMap::new()) }
+    }
+
+    /// Add a face this process SHIPS to the ones it can shape.
+    ///
+    /// Without it an app can only name faces the machine already has
+    /// installed, and [`FontSpec::family`] on a bundled one comes back as
+    /// some default face instead — silently, because creating a font by
+    /// name never fails. An app that carries its own typeface therefore
+    /// renders in the system's on every machine but the designer's.
+    ///
+    /// Process-scoped: nothing outside this app sees the face, and it goes
+    /// away when the app does. Registering the same face twice is a no-op
+    /// that answers `false`, which is why the answer is worth reading only
+    /// at boot.
+    ///
+    /// The bytes must outlive the process because CoreGraphics is handed
+    /// them WITHOUT a release callback — it reads them for as long as the
+    /// face is registered. `&'static [u8]` is the contract, and
+    /// `include_bytes!` is what satisfies it.
+    ///
+    /// Returns whether the face was added.
+    pub fn register_font(&self, bytes: &'static [u8]) -> bool {
+        // The cache is keyed by FontSpec, and a spec that missed before
+        // this call cached the fallback it got. Drop it, or the very face
+        // just registered stays invisible for the life of the app.
+        self.fonts.borrow_mut().clear();
+        unsafe {
+            let provider = CGDataProviderCreateWithData(
+                std::ptr::null_mut(),
+                bytes.as_ptr(),
+                bytes.len(),
+                std::ptr::null(),
+            );
+            if provider.is_null() {
+                return false;
+            }
+            let font = CGFontCreateWithDataProvider(provider);
+            CGDataProviderRelease(provider);
+            if font.is_null() {
+                return false;
+            }
+            let mut error: *const c_void = std::ptr::null();
+            let added = CTFontManagerRegisterGraphicsFont(font, &raw mut error);
+            if !error.is_null() {
+                CFRelease(error);
+            }
+            // The CGFont is deliberately NOT released: a registered face is
+            // owned by the process's font list for as long as the process
+            // lives, and this is called a handful of times at boot.
+            added
+        }
     }
 
     fn font(&self, spec: &FontSpec) -> CTFontRef {
