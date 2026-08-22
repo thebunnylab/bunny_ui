@@ -336,6 +336,7 @@ pub struct Split<T: 'static, A, B> {
     axis: Axis,
     min_a: f64,
     min_b: f64,
+    trailing: bool,
     a: A,
     b: B,
 }
@@ -350,7 +351,7 @@ where
     A: View<Arity = Single>,
     B: View<Arity = Single>,
 {
-    Split { at, axis: Axis::Horizontal, min_a: T::FLOOR, min_b: T::FLOOR, a, b }
+    Split { at, axis: Axis::Horizontal, min_a: T::FLOOR, min_b: T::FLOOR, trailing: false, a, b }
 }
 
 /// `vsplit(at, top, bottom)` — the same seam, stacked. `at` is the TOP
@@ -361,7 +362,7 @@ where
     A: View<Arity = Single>,
     B: View<Arity = Single>,
 {
-    Split { at, axis: Axis::Vertical, min_a: T::FLOOR, min_b: T::FLOOR, a, b }
+    Split { at, axis: Axis::Vertical, min_a: T::FLOOR, min_b: T::FLOOR, trailing: false, a, b }
 }
 
 impl<T, A, B> Split<T, A, B> {
@@ -371,6 +372,21 @@ impl<T, A, B> Split<T, A, B> {
     pub fn min_sizes(mut self, min_a: f64, min_b: f64) -> Self {
         self.min_a = min_a;
         self.min_b = min_b;
+        self
+    }
+
+    /// The seam names the TRAILING lane: that lane is exactly `at`, and
+    /// everything the window gains goes to the LEADING one.
+    ///
+    /// A workbench needs this the moment it grows a dock on the right or
+    /// along the bottom. A dock has to BE the trailing lane to sit on
+    /// that side — and the trailing lane is otherwise the one that
+    /// absorbs the window, so the dock swells with the screen while the
+    /// surface the user came for stays the size it was born. This is the
+    /// mirror, floors included: `min_sizes` keeps naming the lanes, and
+    /// the drag writes back the lane the app is actually holding.
+    pub fn seam_on_trailing(mut self) -> Self {
+        self.trailing = true;
         self
     }
 }
@@ -433,6 +449,7 @@ where
                     at,
                     min_a: self.min_a,
                     min_b: self.min_b,
+                    trailing: self.trailing,
                     children: layouts,
                 });
             }

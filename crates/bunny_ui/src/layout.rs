@@ -535,6 +535,12 @@ pub enum LayoutNode {
         at: Px,
         min_a: Px,
         min_b: Px,
+        /// Which lane the seam names. `false` — the default — is lane A:
+        /// it is exactly `at` and everything the window gains goes to B.
+        /// `true` is the mirror, which is what a dock on the trailing
+        /// side needs: it has to BE lane B to sit on that side, and lane
+        /// B is otherwise the one that absorbs the window.
+        trailing: bool,
         children: Vec<LayoutNode>,
     },
     /// A virtualized vertical run: `count` rows, only a window of them
@@ -2062,6 +2068,9 @@ pub struct SplitPlacement {
     pub room: Px,
     pub min_a: Px,
     pub min_b: Px,
+    /// Which lane the seam names — see [`LayoutNode::Split`]. The drag
+    /// reads it so the pointer writes back the lane the app is holding.
+    pub trailing: bool,
 }
 
 /// A placed escape hatch — what the runtime needs to route an event
@@ -3425,8 +3434,10 @@ impl LayoutNode {
                 (size, Fit::ScrollContent(content, Box::new(fit)))
             }
 
-            LayoutNode::Split { axis, unit, at, min_a, min_b, children, .. } => {
-                measure_split(*axis, *unit, *at, *min_a, *min_b, children, proposal, env)
+            LayoutNode::Split { axis, unit, at, min_a, min_b, trailing, children, .. } => {
+                measure_split(
+                    *axis, *unit, *at, *min_a, *min_b, *trailing, children, proposal, env,
+                )
             }
 
             LayoutNode::Interactive { child, .. }
@@ -4147,7 +4158,7 @@ impl LayoutNode {
             }
 
             (
-                LayoutNode::Split { path, axis, unit, min_a, min_b, children, .. },
+                LayoutNode::Split { path, axis, unit, min_a, min_b, trailing, children, .. },
                 Fit::Children(fits),
             ) => {
                 // the seam's metrics, read before the fits move into
@@ -4219,6 +4230,7 @@ impl LayoutNode {
                     room,
                     min_a: *min_a,
                     min_b: *min_b,
+                    trailing: *trailing,
                 });
             }
 
@@ -4890,6 +4902,7 @@ fn measure_split(
     at: Px,
     min_a: Px,
     min_b: Px,
+    trailing: bool,
     children: &[LayoutNode],
     proposal: Proposal,
     env: LayoutEnv,
@@ -4916,8 +4929,17 @@ fn measure_split(
 
     let (a_main, b_main) = match proposed_main {
         Some(total) => {
-            let a = resolve_seam(unit, at, min_a, min_b, total - thickness);
-            (Some(a), Some((total - a - thickness).max(0.0)))
+            let room = total - thickness;
+            if trailing {
+                // The seam names B, so B is resolved against ITS own floor
+                // and A takes what is left — the mirror of the plain case,
+                // floors included.
+                let b = resolve_seam(unit, at, min_b, min_a, room);
+                (Some((room - b).max(0.0)), Some(b))
+            } else {
+                let a = resolve_seam(unit, at, min_a, min_b, room);
+                (Some(a), Some((room - a).max(0.0)))
+            }
         }
         None => (None, None),
     };
@@ -5775,6 +5797,7 @@ mod tests {
             at,
             min_a: 100.0,
             min_b: 100.0,
+            trailing: false,
             children: vec![
                 boundary("a", LayoutNode::Spacer),
                 LayoutNode::Frame {
@@ -5807,6 +5830,62 @@ mod tests {
         assert_eq!(high.frames.get("a").unwrap().size.width, 1099.0);
     }
 
+    /// A seam that names the TRAILING lane pins that lane and feeds the
+    /// leading one — the mirror, floors and all.
+    ///
+    /// This is what a dock on the right or along the bottom needs. Such a
+    /// dock has to BE the trailing lane to sit on that side, and the
+    /// trailing lane is otherwise the one that absorbs the window: without
+    /// this the dock swells with the screen while the surface the user came
+    /// for stays the size it was born.
+    #[test]
+    fn a_trailing_seam_pins_the_far_lane_and_feeds_the_near_one() {
+        let split = |at: f64, width: f64| {
+            layout(
+                &LayoutNode::Split {
+                    path: "seam".into(),
+                    axis: Axis::Horizontal,
+                    unit: SeamUnit::Points,
+                    at,
+                    min_a: 320.0,
+                    min_b: 180.0,
+                    trailing: true,
+                    children: vec![
+                        boundary("a", LayoutNode::Spacer),
+                        LayoutNode::Frame {
+                            width: Some(1.0),
+                            height: None,
+                            child: Box::new(LayoutNode::Spacer),
+                        },
+                        boundary("b", LayoutNode::Spacer),
+                    ],
+                },
+                Proposal { width: Some(width), height: Some(700.0) },
+            )
+        };
+
+        // B is the seam's own number, and A takes the rest.
+        let narrow = split(248.0, 1200.0);
+        assert_eq!(narrow.frames.get("b").unwrap().size.width, 248.0);
+        assert_eq!(narrow.frames.get("a").unwrap().size.width, 951.0);
+
+        // Twice the window: the pinned lane does not move, and every point
+        // gained goes to the lane that was never named.
+        let wide = split(248.0, 2400.0);
+        assert_eq!(wide.frames.get("b").unwrap().size.width, 248.0);
+        assert_eq!(wide.frames.get("a").unwrap().size.width, 2151.0);
+
+        // The floors keep naming the lanes: B cannot go under min_b, and
+        // A cannot be squeezed under min_a however far the seam is pushed.
+        let squeezed = split(0.0, 1200.0);
+        assert_eq!(squeezed.frames.get("b").unwrap().size.width, 180.0);
+        let greedy = split(9999.0, 1200.0);
+        assert_eq!(greedy.frames.get("a").unwrap().size.width, 320.0);
+
+        // …and the placement tells the drag which lane it is holding.
+        assert!(narrow.splits[0].trailing);
+    }
+
     #[test]
     fn a_split_stacks_its_lanes_when_the_axis_says_so() {
         // the same seam, turned: a panel with a list on top and a
@@ -5818,6 +5897,7 @@ mod tests {
             at: 300.0,
             min_a: 80.0,
             min_b: 80.0,
+            trailing: false,
             children: vec![
                 boundary("top", LayoutNode::Spacer),
                 LayoutNode::Frame {

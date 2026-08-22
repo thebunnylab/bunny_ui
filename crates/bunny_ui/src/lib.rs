@@ -2596,6 +2596,63 @@ mod tests {
         let _ = grip_path;
     }
 
+    /// Dragging a TRAILING seam writes back the lane the app is holding.
+    ///
+    /// The pointer lands where it lands; what changes is which side of it
+    /// the binding names. Get this backwards and a dock resizes the wrong
+    /// way under the hand — the grip goes left and the dock grows — which
+    /// is the kind of wrong that reads as the whole workbench being broken.
+    #[test]
+    fn dragging_a_trailing_seam_writes_the_far_lane() {
+        #[derive(Clone)]
+        struct Bench {
+            seam: State<f64>,
+        }
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                hsplit(self.seam.binding(), text("editor"), text("dock"))
+                    .min_sizes(320.0, 180.0)
+                    .seam_on_trailing()
+            }
+        }
+
+        let bench = Bench { seam: State::new(248.0) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&bench);
+        let viewport = Proposal::exact(Size { width: 1200.0, height: 700.0 });
+        let result = runtime.layout(&bench, viewport);
+
+        // The seam sits 248 from the TRAILING edge, not from the leading one.
+        let grip = result
+            .hits
+            .iter()
+            .find(|(path, _)| path.ends_with("/#split"))
+            .expect("the seam registers a grip")
+            .1;
+        let centre = grip.origin.x + grip.size.width / 2.0;
+        assert!((centre - (1200.0 - 248.0)).abs() < 1.0, "the grip rides the dock's edge: {centre}");
+
+        // Drag it LEFT and the dock gets wider — the pointer names the
+        // dock's edge, and the dock is what the binding holds.
+        assert!(runtime.pointer_pressed(centre, 300.0));
+        assert!(runtime.pointer_moved(800.0, 300.0));
+        assert!(
+            (bench.seam.get() - (1199.0 - 800.0)).abs() < 1.0,
+            "the far lane is what was written: {}",
+            bench.seam.get(),
+        );
+
+        // The floors still name the lanes: pushing the grip at the window's
+        // edge cannot squeeze the LEADING lane under its own floor.
+        runtime.pointer_moved(10.0, 300.0);
+        assert!(
+            (bench.seam.get() - (1199.0 - 320.0)).abs() < 1.0,
+            "the editor keeps its 320: {}",
+            bench.seam.get(),
+        );
+        runtime.pointer_released(10.0, 300.0);
+    }
+
     #[test]
     fn a_fractional_seam_keeps_its_share_when_the_window_moves() {
         use crate::layout::{Fraction, Proposal, Size};

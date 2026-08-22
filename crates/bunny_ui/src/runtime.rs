@@ -1093,16 +1093,26 @@ impl Runtime {
         // the pointer names lane A's extent in POINTS; what the binding
         // holds is whatever unit the seam speaks, so the clamp runs in
         // that unit and the write-back is already in it
+        //
+        // …unless the seam names the TRAILING lane, in which case the
+        // pointer still lands where it lands and the app is holding the
+        // OTHER side of it: the reach is mirrored across the room, and
+        // the floors swap with it.
         let reached = pointer_main - origin_main;
+        let (reached, near, far) = if split.trailing {
+            ((split.room - reached).max(0.0), split.min_b, split.min_a)
+        } else {
+            (reached, split.min_a, split.min_b)
+        };
         let at = match split.unit {
-            crate::layout::SeamUnit::Points => reached
-                .clamp(split.min_a, (split.room - split.min_b).max(split.min_a)),
+            crate::layout::SeamUnit::Points => {
+                reached.clamp(near, (split.room - far).max(near))
+            }
             crate::layout::SeamUnit::Fraction => {
                 if split.room <= 0.0 {
                     return false;
                 }
-                (reached / split.room)
-                    .clamp(split.min_a, (1.0 - split.min_b).max(split.min_a))
+                (reached / split.room).clamp(near, (1.0 - far).max(near))
             }
         };
         reconciler::run_split(path, at)
