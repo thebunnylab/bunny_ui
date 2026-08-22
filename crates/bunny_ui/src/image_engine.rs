@@ -35,7 +35,16 @@ pub enum ImageSource {
     /// the GPU atlas and the damage diff work untouched (the contract
     /// the text atlas has kept since day one). No engine ever sees this
     /// variant: [`raster_source`] intercepts it first.
-    Symbol { key: u64, symbol: crate::icon::Symbol, color: crate::layout::Color },
+    ///
+    /// `forced` spends the drawing's own palette: every draw takes
+    /// `color`, whatever tint it declares. It rides the key like the
+    /// ink does, so the two readings of one glyph are two identities.
+    Symbol {
+        key: u64,
+        symbol: crate::icon::Symbol,
+        color: crate::layout::Color,
+        forced: bool,
+    },
     /// A path the app TRACED while the frame ran — the runtime twin of
     /// the glyph: the verbs come from data (a squiggle under a word, a
     /// lane of a commit graph, a sparkline), so nothing about it can be
@@ -118,15 +127,49 @@ impl ImageSource {
     /// A tinted glyph — built at PLACEMENT, where the ink is known.
     /// One 64-bit mix per icon per frame: the symbol's key is already
     /// well spread, the tint only has to move it somewhere unique.
+    ///
+    /// A draw that declares its OWN tint keeps it: the crab stays
+    /// orange under any ink, which is what a file-type set is for.
+    /// [`ImageSource::symbol_forced`] is the other reading.
     pub fn symbol(symbol: crate::icon::Symbol, color: crate::layout::Color) -> ImageSource {
-        let packed = ((color.r as u64) << 24)
+        ImageSource::inked(symbol, color, false)
+    }
+
+    /// The same glyph read as a MASK: this ink, and nothing else. Every
+    /// draw takes `color`, and the palette the drawing carries is spent.
+    ///
+    /// A monochrome bar wants this. On a stripe the ink IS the state —
+    /// dim while the panel sleeps, accent while it is open — and a slot
+    /// that borrows a file-type glyph so the set grows without new art
+    /// would otherwise be the one icon on the bar that answers nothing.
+    ///
+    /// It is the exact inverse of the per-draw tint, and both readings
+    /// are right: a tree names a language and wants its colours; a bar
+    /// names a state and wants one.
+    pub fn symbol_forced(
+        symbol: crate::icon::Symbol,
+        color: crate::layout::Color,
+    ) -> ImageSource {
+        ImageSource::inked(symbol, color, true)
+    }
+
+    /// The one mix both readings go through. `forced` sits above the
+    /// packed colour, so an unforced glyph keeps the identity it has
+    /// always had and the forced twin can never land on it.
+    fn inked(
+        symbol: crate::icon::Symbol,
+        color: crate::layout::Color,
+        forced: bool,
+    ) -> ImageSource {
+        let packed = ((forced as u64) << 32)
+            | ((color.r as u64) << 24)
             | ((color.g as u64) << 16)
             | ((color.b as u64) << 8)
             | color.a as u64;
         let mut key = symbol.key ^ packed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         key = key.wrapping_mul(0xff51_afd7_ed55_8ccd);
         key ^= key >> 33;
-        ImageSource::Symbol { key, symbol, color }
+        ImageSource::Symbol { key, symbol, color, forced }
     }
 
     /// A traced path — built at PAINT, where the geometry is known.
@@ -324,10 +367,17 @@ impl fmt::Debug for ImageSource {
                 write!(f, "bytes(0x{key:016x}, {}b)", bytes.len())
             }
             ImageSource::FileIcon { path, .. } => write!(f, "file-icon({path})"),
-            ImageSource::Symbol { symbol, color, .. } => write!(
+            ImageSource::Symbol { symbol, color, forced, .. } => write!(
                 f,
-                "symbol({}, #{:02x}{:02x}{:02x}{:02x})",
-                symbol.name, color.r, color.g, color.b, color.a
+                "symbol({}, #{:02x}{:02x}{:02x}{:02x}{})",
+                symbol.name,
+                color.r,
+                color.g,
+                color.b,
+                color.a,
+                // only the forced reading says so: every print that
+                // came before this door keeps the words it had
+                if *forced { ", forced" } else { "" }
             ),
             ImageSource::Path { key, verbs, .. } => {
                 write!(f, "path(0x{key:016x}, {} verbs)", verbs.len())
@@ -410,8 +460,8 @@ pub fn raster_source(
     height: usize,
 ) -> Option<Rc<ImageRaster>> {
     match source {
-        ImageSource::Symbol { key, symbol, color } => {
-            crate::icon::raster(*key, symbol, *color, width, height)
+        ImageSource::Symbol { key, symbol, color, forced } => {
+            crate::icon::raster(*key, symbol, *color, *forced, width, height)
         }
         ImageSource::Path { key, verbs, paint, ink, box_size } => {
             crate::icon::raster_trace(*key, verbs, *paint, *ink, *box_size, width, height)

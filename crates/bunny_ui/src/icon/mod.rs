@@ -255,6 +255,7 @@ pub(crate) fn raster(
     key: u64,
     symbol: &Symbol,
     color: Color,
+    forced: bool,
     width: usize,
     height: usize,
 ) -> Option<Rc<ImageRaster>> {
@@ -269,7 +270,7 @@ pub(crate) fn raster(
         if cache.len() >= ICON_KEEP {
             cache.clear();
         }
-        let raster = Rc::new(rasterize(symbol.glyph, color, width, height));
+        let raster = Rc::new(rasterize(symbol.glyph, color, forced, width, height));
         cache.insert((key, width, height), Rc::clone(&raster));
         Some(raster)
     })
@@ -445,7 +446,18 @@ fn rasterize_trace(
 /// largest CENTRED square of the destination, every draw piles its
 /// coverage in by MAX, and the tint lands once at the end — straight
 /// alpha, physical pixels, the same contract text rasters keep.
-fn rasterize(glyph: &Glyph, color: Color, width: usize, height: usize) -> ImageRaster {
+///
+/// `forced` reads the drawing as a MASK: `color` covers every draw and
+/// the palette it carries is spent. A glyph with no tint of its own
+/// rasterizes to the same bytes either way — the flag can only take
+/// away.
+fn rasterize(
+    glyph: &Glyph,
+    color: Color,
+    forced: bool,
+    width: usize,
+    height: usize,
+) -> ImageRaster {
     let side = width.min(height) as f64;
     let scale = side / ICON_GRID;
     let placing = vector::Placing {
@@ -467,7 +479,7 @@ fn rasterize(glyph: &Glyph, color: Color, width: usize, height: usize) -> ImageR
         union.clear();
     };
     for draw in glyph.draws {
-        let ink = draw.tint.unwrap_or(color);
+        let ink = if forced { color } else { draw.tint.unwrap_or(color) };
         if run_color.is_some() && run_color != Some(ink) {
             flush(&mut union, &mut run_color, &mut rgba);
         }
@@ -611,15 +623,15 @@ mod tests {
 
     #[test]
     fn the_glyph_cache_returns_the_same_allocation() {
-        let first = raster(1234, &SQUARE, INK, 24, 24).unwrap();
-        let second = raster(1234, &SQUARE, INK, 24, 24).unwrap();
+        let first = raster(1234, &SQUARE, INK, false, 24, 24).unwrap();
+        let second = raster(1234, &SQUARE, INK, false, 24, 24).unwrap();
         assert!(Rc::ptr_eq(&first, &second));
     }
 
     #[test]
     fn a_zero_side_paints_nothing() {
-        assert!(raster(9, &SQUARE, INK, 0, 24).is_none());
-        assert!(raster(9, &SQUARE, INK, 24, 0).is_none());
+        assert!(raster(9, &SQUARE, INK, false, 0, 24).is_none());
+        assert!(raster(9, &SQUARE, INK, false, 24, 0).is_none());
     }
 
     /// The oldest pin in the book: a glyph that IS a rectangle must
@@ -627,7 +639,7 @@ mod tests {
     /// untouched zeros outside, nothing in between.
     #[test]
     fn a_rectangle_glyph_matches_the_house_fill() {
-        let raster = rasterize(&SQUARE_GLYPH, INK, 24, 24);
+        let raster = rasterize(&SQUARE_GLYPH, INK, false, 24, 24);
         for y in 0..24 {
             for x in 0..24 {
                 let want: [u8; 4] = if (4..20).contains(&x) && (4..20).contains(&y) {
@@ -667,7 +679,7 @@ mod tests {
             ],
         };
         let ink = Color { r: 20, g: 40, b: 60, a: 255 };
-        let raster = rasterize(&TWO_TONE, ink, 24, 24);
+        let raster = rasterize(&TWO_TONE, ink, false, 24, 24);
         let pixel = |x: usize, y: usize| {
             let at = (y * 24 + x) * 4;
             [raster.rgba[at], raster.rgba[at + 1], raster.rgba[at + 2], raster.rgba[at + 3]]
@@ -675,6 +687,70 @@ mod tests {
         assert_eq!(pixel(5, 12), [ORANGE.r, ORANGE.g, ORANGE.b, 255], "the crab stays orange");
         assert_eq!(pixel(18, 12), [ink.r, ink.g, ink.b, 255], "the plain half takes the ink");
         assert_eq!(pixel(12, 12)[3], 0, "the gap stays air");
+    }
+
+    /// The inverse reading: a bar names a STATE, so the palette the
+    /// drawing carries is spent and the whole glyph answers one ink.
+    #[test]
+    fn a_forced_glyph_spends_its_own_palette() {
+        const ORANGE: Color = Color { r: 0xF7, g: 0x8C, b: 0x3C, a: 255 };
+        const LEFT: &[Verb] = &[
+            Verb::Move(2.0, 2.0),
+            Verb::Line(11.0, 2.0),
+            Verb::Line(11.0, 22.0),
+            Verb::Line(2.0, 22.0),
+            Verb::Close,
+        ];
+        const RIGHT: &[Verb] = &[
+            Verb::Move(13.0, 2.0),
+            Verb::Line(22.0, 2.0),
+            Verb::Line(22.0, 22.0),
+            Verb::Line(13.0, 22.0),
+            Verb::Close,
+        ];
+        const TWO_TONE: Glyph = Glyph {
+            draws: &[
+                Draw { paint: Paint::Fill(Rule::NonZero), path: LEFT, tint: Some(ORANGE) },
+                Draw { paint: Paint::Fill(Rule::NonZero), path: RIGHT, tint: None },
+            ],
+        };
+        let accent = Color { r: 137, g: 87, b: 229, a: 255 };
+        let raster = rasterize(&TWO_TONE, accent, true, 24, 24);
+        let pixel = |x: usize, y: usize| {
+            let at = (y * 24 + x) * 4;
+            [raster.rgba[at], raster.rgba[at + 1], raster.rgba[at + 2], raster.rgba[at + 3]]
+        };
+        let want = [accent.r, accent.g, accent.b, 255];
+        assert_eq!(pixel(5, 12), want, "the half that named a colour gives it up");
+        assert_eq!(pixel(18, 12), want, "the plain half is unchanged");
+        assert_eq!(pixel(12, 12)[3], 0, "the gap stays air");
+    }
+
+    /// A drawing with no palette of its own rasterizes to the SAME
+    /// bytes either way — forcing can only take away, so every glyph
+    /// the house already ships is untouched by the door.
+    #[test]
+    fn forcing_a_plain_glyph_changes_no_byte() {
+        let ink = Color { r: 20, g: 40, b: 60, a: 255 };
+        let plain = rasterize(&SQUARE_GLYPH, ink, false, 24, 24);
+        let forced = rasterize(&SQUARE_GLYPH, ink, true, 24, 24);
+        assert_eq!(plain.rgba, forced.rgba);
+    }
+
+    /// The two readings are two IDENTITIES: the caches, the atlas and
+    /// the damage diff compare by key, so one bar slot could otherwise
+    /// serve the tree's crab out of a warm tile.
+    #[test]
+    fn the_forced_reading_is_its_own_identity() {
+        let ink = Color { r: 0x89, g: 0x57, b: 0xE5, a: 255 };
+        let plain = crate::image_engine::ImageSource::symbol(SQUARE, ink);
+        let forced = crate::image_engine::ImageSource::symbol_forced(SQUARE, ink);
+        assert_ne!(plain.key(), forced.key(), "one glyph, two readings, two keys");
+        assert_eq!(
+            forced.key(),
+            crate::image_engine::ImageSource::symbol_forced(SQUARE, ink).key(),
+            "and the forced key is stable"
+        );
     }
 
     /// A circle of four cubics against the house pill — the corner
@@ -699,7 +775,7 @@ mod tests {
         const CIRCLE: Glyph =
             Glyph { draws: &[Draw { paint: Paint::Fill(Rule::NonZero), path: CIRCLE_PATH, tint: None }] };
         let side = 48;
-        let raster = rasterize(&CIRCLE, INK, side, side);
+        let raster = rasterize(&CIRCLE, INK, false, side, side);
         let radius = side as f64 / 2.0;
         let mut beyond_two = 0usize;
         for y in 0..side {
@@ -728,7 +804,7 @@ mod tests {
         // the glyph door and the runtime door share the same stone: a
         // 24 unit square drawn as a const glyph and the SAME verbs
         // traced into a 24 point box must land byte for byte
-        let glyph = rasterize(&SQUARE_GLYPH, INK, 24, 24);
+        let glyph = rasterize(&SQUARE_GLYPH, INK, false, 24, 24);
         let trace = rasterize_trace(
             SQUARE_PATH,
             Paint::Fill(Rule::NonZero),

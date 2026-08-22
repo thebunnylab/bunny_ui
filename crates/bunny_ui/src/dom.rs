@@ -134,6 +134,9 @@ pub struct DomIcon {
     /// Under a hover ink the element takes NO color of its own: the
     /// box above declares both states and CSS carries them down.
     pub inherits_ink: bool,
+    /// The drawing reads as a MASK: no draw carries its own colour to
+    /// the browser, so every path takes the element's ink.
+    pub forced: bool,
 }
 
 /// The visual record of a node — everything CSS will say about it.
@@ -1978,7 +1981,10 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                     };
                     out.push(paint);
                     push_f32(&mut out, width as f64);
-                    match draw.tint {
+                    // a forced drawing hands over NO colour of its
+                    // own, which is what makes every path inherit the
+                    // element's ink — the browser already had the rule
+                    match draw.tint.filter(|_| !icon.forced) {
                         Some(tint) => {
                             out.push(1);
                             push_u32(&mut out, pack_color(tint));
@@ -3659,6 +3665,7 @@ mod tests {
             symbol: MARK,
             color: Color::hex(0x8A94A6),
             inherits_ink: false,
+            forced: false,
         };
         let bytes = encode(&[DomPatch::SetIcon { id: 7, icon }]);
         let expected: Vec<u8> = [
@@ -3678,6 +3685,36 @@ mod tests {
         ]
         .concat();
         assert_eq!(bytes, expected);
+    }
+
+    /// A forced drawing hands the browser NO colour of its own, so
+    /// every path inherits the element's ink — the rule the glue
+    /// already had, reached by saying nothing instead of saying more.
+    #[test]
+    fn a_forced_icon_hands_over_no_palette() {
+        const ORANGE: Color = Color::hex(0xF78C3C);
+        const TWO_TONE: crate::icon::Glyph = crate::icon::Glyph {
+            draws: &[crate::icon::Draw {
+                paint: crate::icon::Paint::Stroke { width: 2.0 },
+                path: MARK_PATH,
+                tint: Some(ORANGE),
+            }],
+        };
+        const CRAB: crate::icon::Symbol = crate::icon::Symbol::new("test.crab", &TWO_TONE);
+        let record = |forced| DomIcon {
+            key: CRAB.key,
+            symbol: CRAB,
+            color: Color::hex(0x8957E5),
+            inherits_ink: false,
+            forced,
+        };
+        let plain = encode(&[DomPatch::SetIcon { id: 7, icon: record(false) }]);
+        let forced = encode(&[DomPatch::SetIcon { id: 7, icon: record(true) }]);
+        // the tinted stream carries the flag AND four colour bytes the
+        // forced one never sends
+        assert_eq!(plain.len(), forced.len() + 4);
+        assert_ne!(plain, forced);
+        assert_ne!(record(false), record(true), "the diff sees the two apart");
     }
 
     #[test]

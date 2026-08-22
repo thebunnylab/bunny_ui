@@ -462,7 +462,10 @@ pub enum LayoutNode {
     /// idiom. It paints the largest CENTRED square of its frame, which
     /// is also what the browser's default `preserveAspectRatio` does —
     /// the pixel pipelines and the Dom agree without an attribute.
-    Icon { symbol: crate::icon::Symbol, resizable: bool },
+    /// A house glyph. `forced` spends the drawing's own palette, so
+    /// the inherited ink covers every stroke — see
+    /// [`crate::views::Icon::monochrome`].
+    Icon { symbol: crate::icon::Symbol, resizable: bool, forced: bool },
     /// Fills whatever the proposal gives (Rectangle).
     Fill,
     Stack { axis: Axis, spacing: Px, align: CrossAlign, children: Vec<LayoutNode> },
@@ -4162,7 +4165,7 @@ impl LayoutNode {
                 }
             },
 
-            (LayoutNode::Icon { symbol, .. }, Fit::Leaf) => {
+            (LayoutNode::Icon { symbol, forced, .. }, Fit::Leaf) => {
                 // the ink is the INHERITED one, the same line Text
                 // reads — .foreground_color and the hover/press inks
                 // reach a glyph with zero new API
@@ -4179,6 +4182,7 @@ impl LayoutNode {
                             symbol: *symbol,
                             color,
                             inherits_ink: false,
+                            forced: *forced,
                         }),
                         frame,
                     );
@@ -4194,7 +4198,11 @@ impl LayoutNode {
                     };
                     out.draw(DrawCommand::Image {
                         rect,
-                        source: ImageSource::symbol(*symbol, color),
+                        source: if *forced {
+                            ImageSource::symbol_forced(*symbol, color)
+                        } else {
+                            ImageSource::symbol(*symbol, color)
+                        },
                     });
                 }
             }
@@ -6792,7 +6800,7 @@ mod tests {
     const CHECK: crate::icon::Symbol = crate::icon::Symbol::new("test.check", &CHECK_GLYPH);
 
     fn icon_node(resizable: bool) -> LayoutNode {
-        LayoutNode::Icon { symbol: CHECK, resizable }
+        LayoutNode::Icon { symbol: CHECK, resizable, forced: false }
     }
 
     #[test]
@@ -6858,6 +6866,28 @@ mod tests {
         // flip without ever looking at pixels
         assert_eq!(sources[0].key(), ImageSource::symbol(CHECK, ink).key());
         assert_ne!(sources[0].key(), ImageSource::symbol(CHECK, Color::hex(0x000000)).key());
+    }
+
+    /// `.monochrome()` carries the FORCED reading down to the paint:
+    /// the same inherited ink, the other identity.
+    #[test]
+    fn a_monochrome_icon_asks_for_the_forced_reading() {
+        let ink = Color::hex(0x8957E5);
+        let root = styled(
+            VisualProps { foreground: Some(ink), ..VisualProps::default() },
+            LayoutNode::Icon { symbol: CHECK, resizable: false, forced: true },
+        );
+        let result = layout(&root, Proposal::unspecified());
+        let source = result
+            .display
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Image { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .expect("the glyph paints");
+        assert_eq!(source.key(), ImageSource::symbol_forced(CHECK, ink).key());
+        assert_ne!(source.key(), ImageSource::symbol(CHECK, ink).key());
     }
 
     #[test]

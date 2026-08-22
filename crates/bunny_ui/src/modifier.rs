@@ -458,11 +458,11 @@ fn rewrite_pixel_node(
         bool,
         Option<ContentMode>,
     ) -> LayoutNode,
-    icon: &impl Fn(crate::icon::Symbol, bool) -> LayoutNode,
+    icon: &impl Fn(crate::icon::Symbol, bool, bool) -> LayoutNode,
 ) -> LayoutNode {
     match node {
         LayoutNode::Image { source, resizable, fit } => rewrite(source, resizable, fit),
-        LayoutNode::Icon { symbol, resizable } => icon(symbol, resizable),
+        LayoutNode::Icon { symbol, resizable, forced } => icon(symbol, resizable, forced),
         LayoutNode::Styled { props, child } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
@@ -1188,7 +1188,7 @@ fn apply(
             rewrite_pixel_node(
                 node,
                 &|source, _, fit| LayoutNode::Image { source, resizable: true, fit },
-                &|symbol, _| LayoutNode::Icon { symbol, resizable: true },
+                &|symbol, _, forced| LayoutNode::Icon { symbol, resizable: true, forced },
             )
         }),
         Modifier::AspectRatio(mode) => out.wrap_layout_from(mark, |node| {
@@ -1200,7 +1200,7 @@ fn apply(
                     fit: Some(*mode),
                 },
                 // a glyph is a square — it has its one ratio already
-                &|symbol, resizable| LayoutNode::Icon { symbol, resizable },
+                &|symbol, resizable, forced| LayoutNode::Icon { symbol, resizable, forced },
             )
         }),
         Modifier::Animated(spec) => {

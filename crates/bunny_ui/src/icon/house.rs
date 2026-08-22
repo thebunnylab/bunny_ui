@@ -339,10 +339,10 @@ mod tests {
         let ink = Color { r: 0, g: 0, b: 0, a: 255 };
         for symbol in ALL {
             for side in [16usize, 24, 32, 48] {
-                let first = super::super::rasterize(symbol.glyph, ink, side, side);
+                let first = super::super::rasterize(symbol.glyph, ink, false, side, side);
                 let inked = first.rgba.chunks_exact(4).filter(|px| px[3] > 0).count();
                 assert!(inked > side, "{} is bare at {side}", symbol.name);
-                let again = super::super::rasterize(symbol.glyph, ink, side, side);
+                let again = super::super::rasterize(symbol.glyph, ink, false, side, side);
                 assert_eq!(first.rgba, again.rgba, "{} wobbles at {side}", symbol.name);
                 // the four corner pixels stay air
                 for (x, y) in [(0, 0), (side - 1, 0), (0, side - 1), (side - 1, side - 1)] {

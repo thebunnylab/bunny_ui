@@ -621,14 +621,41 @@ pub fn image(source: crate::image_engine::ImageSource) -> Image {
 /// icon(symbol::FOLDER).resizable().frame(24.0, 24.0)
 /// ```
 #[derive(Clone)]
-pub struct Icon(pub crate::icon::Symbol);
+pub struct Icon {
+    symbol: crate::icon::Symbol,
+    forced: bool,
+}
+
+impl Icon {
+    /// One ink over the whole drawing — the palette the glyph carries
+    /// is spent, and the inherited ink covers every stroke.
+    ///
+    /// A drawing may name its own colours (a language mark that is the
+    /// same orange in any theme), and on a shelf of file types that is
+    /// the point. A monochrome BAR is the other reading: there the ink
+    /// is the state — dim while the panel sleeps, accent while it is
+    /// open — and a slot that borrows a file-type glyph so the set
+    /// grows without new art needs the drawing to answer the ink like
+    /// every other slot on the bar.
+    ///
+    /// A glyph that declares no tint of its own paints the same either
+    /// way: this can only take away.
+    pub fn monochrome(mut self) -> Self {
+        self.forced = true;
+        self
+    }
+}
 
 impl View for Icon {
     type Arity = Single;
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf(format!("Icon ({})", self.0.name)));
-        out.push_layout(LayoutNode::Icon { symbol: self.0, resizable: false });
+        out.push(RenderNode::leaf(format!("Icon ({})", self.symbol.name)));
+        out.push_layout(LayoutNode::Icon {
+            symbol: self.symbol,
+            resizable: false,
+            forced: self.forced,
+        });
     }
 }
 
@@ -868,7 +895,7 @@ pub fn menu_divider() -> MenuItem {
 }
 
 pub fn icon(symbol: crate::icon::Symbol) -> Icon {
-    Icon(symbol)
+    Icon { symbol, forced: false }
 }
 
 // MARK: - Containers

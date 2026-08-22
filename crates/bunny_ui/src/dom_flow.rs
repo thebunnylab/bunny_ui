@@ -474,12 +474,13 @@ impl Walk<'_> {
                     None => out.push(node(DomKind::Box)),
                 }
             }
-            LayoutNode::Icon { symbol, .. } => {
+            LayoutNode::Icon { symbol, forced, .. } => {
                 out.push(node(DomKind::Icon(crate::dom::DomIcon {
                     key: symbol.key,
                     symbol: *symbol,
                     color: self.current_ink(),
                     inherits_ink: !self.ink_scopes.is_empty(),
+                    forced: *forced,
                 })));
             }
             LayoutNode::Scroll { path, target, child, .. } => {
