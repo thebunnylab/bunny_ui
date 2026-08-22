@@ -4886,13 +4886,49 @@ pub(crate) fn group_key(path: &str) -> u64 {
 /// The clamp is the seam's ONLY guard: a binding may hold anything
 /// (a restored window, a hand-typed number, a drag in flight), and
 /// what reaches the lanes always fits between the floors.
-pub(crate) fn resolve_seam(unit: SeamUnit, at: Px, min_a: Px, min_b: Px, room: Px) -> Px {
+/// Whose floor survives when the room cannot hold both of them.
+///
+/// A floor says *below this the lane is useless*, and a window can always be
+/// dragged small enough that two of them do not fit. One has to break, and
+/// which one is a policy — so it is named rather than left to the order the
+/// arithmetic happens to run in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Squeeze {
+    /// The seam's own lane keeps its floor; the other lane yields. The plain
+    /// seam's rule: there the seam names the LEADING lane, and the leading
+    /// lane is the one that was declared first for a reason.
+    OwnLane,
+    /// The other lane keeps its floor; the seam's own lane yields. A trailing
+    /// seam names the auxiliary side — a dock, an inspector — and the lane it
+    /// does NOT name is the surface the window exists to show. A workbench
+    /// that crushes its editor to hold a dock at its minimum has its
+    /// priorities exactly inverted.
+    OtherLane,
+}
+
+pub(crate) fn resolve_seam(
+    unit: SeamUnit,
+    at: Px,
+    min_own: Px,
+    min_other: Px,
+    room: Px,
+    squeeze: Squeeze,
+) -> Px {
     let room = room.max(0.0);
     let (want, floor, ceiling) = match unit {
-        SeamUnit::Points => (at, min_a, room - min_b),
-        SeamUnit::Fraction => (at * room, min_a * room, room - min_b * room),
+        SeamUnit::Points => (at, min_own, room - min_other),
+        SeamUnit::Fraction => (at * room, min_own * room, room - min_other * room),
     };
-    want.clamp(floor, ceiling.max(floor))
+    match squeeze {
+        Squeeze::OwnLane => want.clamp(floor, ceiling.max(floor)),
+        // The ceiling is where the OTHER lane reaches its floor, so honouring
+        // it is honouring that floor; this lane's own floor comes down to meet
+        // it rather than pushing through it.
+        Squeeze::OtherLane => {
+            let ceiling = ceiling.max(0.0);
+            want.clamp(floor.min(ceiling), ceiling)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4934,10 +4970,10 @@ fn measure_split(
                 // The seam names B, so B is resolved against ITS own floor
                 // and A takes what is left — the mirror of the plain case,
                 // floors included.
-                let b = resolve_seam(unit, at, min_b, min_a, room);
+                let b = resolve_seam(unit, at, min_b, min_a, room, Squeeze::OtherLane);
                 (Some((room - b).max(0.0)), Some(b))
             } else {
-                let a = resolve_seam(unit, at, min_a, min_b, room);
+                let a = resolve_seam(unit, at, min_a, min_b, room, Squeeze::OwnLane);
                 (Some(a), Some((room - a).max(0.0)))
             }
         }
@@ -5884,6 +5920,64 @@ mod tests {
 
         // …and the placement tells the drag which lane it is holding.
         assert!(narrow.splits[0].trailing);
+    }
+
+    /// When the room cannot hold both floors, which one breaks is a POLICY,
+    /// and the two seams answer it in mirror.
+    ///
+    /// A window can always be dragged small enough that two floors do not
+    /// fit. A plain seam keeps its own lane's floor, because there it names
+    /// the leading lane. A trailing seam names the AUXILIARY side, so it is
+    /// that side which gives — a workbench whose editor is crushed to hold a
+    /// dock at its minimum has its priorities exactly inverted, and the only
+    /// thing standing between those two behaviours is this choice.
+    #[test]
+    fn a_room_too_small_for_both_floors_breaks_the_named_one_only_when_it_leads() {
+        let lanes = |trailing: bool, width: f64| {
+            let result = layout(
+                &LayoutNode::Split {
+                    path: "seam".into(),
+                    axis: Axis::Horizontal,
+                    unit: SeamUnit::Points,
+                    at: 248.0,
+                    min_a: 320.0,
+                    min_b: 180.0,
+                    trailing,
+                    children: vec![
+                        boundary("a", LayoutNode::Spacer),
+                        LayoutNode::Frame {
+                            width: Some(1.0),
+                            height: None,
+                            child: Box::new(LayoutNode::Spacer),
+                        },
+                        boundary("b", LayoutNode::Spacer),
+                    ],
+                },
+                Proposal { width: Some(width), height: Some(700.0) },
+            );
+            (
+                result.frames.get("a").unwrap().size.width,
+                result.frames.get("b").unwrap().size.width,
+            )
+        };
+
+        // Roomy. The trailing seam puts 248 on B, the lane it names, and A
+        // takes the rest. The plain seam names A — whose floor here is 320,
+        // ABOVE the seam's own number, so the floor wins: a seam is a
+        // preference and a floor is a requirement.
+        assert_eq!(lanes(false, 900.0), (320.0, 579.0));
+        assert_eq!(lanes(true, 900.0), (651.0, 248.0));
+
+        // 400 holds neither pair of floors (320 + 180 + 1 = 501).
+        // The plain seam keeps A — the lane it names, and the leading one.
+        assert_eq!(lanes(false, 400.0), (320.0, 79.0));
+        // The trailing seam keeps A too — the lane it does NOT name, which is
+        // the one the window exists to show. B yields all the way down.
+        assert_eq!(lanes(true, 400.0), (320.0, 79.0));
+
+        // …and past the point where even one floor fits, the yielding lane
+        // reaches zero rather than pushing the other through its floor.
+        assert_eq!(lanes(true, 300.0), (299.0, 0.0));
     }
 
     #[test]
