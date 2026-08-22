@@ -8,6 +8,7 @@
 #![cfg(target_os = "macos")]
 
 pub mod credentials;
+pub mod dialog;
 mod ffi;
 mod image;
 mod metal;

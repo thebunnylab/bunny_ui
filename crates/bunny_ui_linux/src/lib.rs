@@ -9,6 +9,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod credentials;
+pub mod dialog;
 mod ffi;
 mod gl;
 mod image;

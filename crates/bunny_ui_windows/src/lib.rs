@@ -10,6 +10,7 @@
 
 pub mod credentials;
 mod d3d;
+pub mod dialog;
 mod ffi;
 mod image;
 mod text;

@@ -1198,6 +1198,13 @@ fn take_property(window: u32, out: &mut Vec<u8>) -> (usize, bool) {
     })
 }
 
+/// The main window's id — what a system panel needs to hang from, so
+/// the desktop can make it modal to the app that asked. `None` before
+/// the window is up.
+pub(crate) fn main_window() -> Option<u32> {
+    with_x(|client| client.win.as_ref().map(|win| win.id))
+}
+
 /// Reads the CLIPBOARD selection. Our own claim answers from memory;
 /// a peer's arrives by convert → notify → property, INCR-streamed
 /// when large, all under the hard four-second cap the wayland door

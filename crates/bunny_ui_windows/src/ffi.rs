@@ -1049,6 +1049,14 @@ fn composition_string(himc: isize, kind: u32) -> Option<String> {
 /// `PostMessageW` is the thread-safe half of the pump.
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 
+/// The window a system panel hangs from — a modal with no owner is a
+/// window of its own on the taskbar, and the app behind it stays
+/// clickable. `0` before the window is up, which the platform reads as
+/// "no owner".
+pub(crate) fn main_window() -> Hwnd {
+    MAIN_HWND.load(Ordering::Acquire)
+}
+
 /// The wake hook for `Runtime::set_wake_hook`: a worker thread asks
 /// the pump for one more turn. Posted messages coalesce naturally in
 /// the queue; a signal raised during a frame lands on the next turn.
