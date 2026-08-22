@@ -273,6 +273,27 @@ impl Side {
     }
 }
 
+/// What the pointer should LOOK like over a box.
+///
+/// The shell's own rule — anything hovered gets the hand — is right for a
+/// scene of buttons and rows, and wrong for the two surfaces a workbench
+/// spends its day in: text under a hand reads as a link, and there was no way
+/// to say otherwise because there was no I-beam to name and no door to name it
+/// through.
+///
+/// A box answers per POINT ([`crate::custom::CustomElement::cursor`]), because
+/// one box is often several surfaces: an editor's gutter is not its text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Cursor {
+    /// The plain arrow — chrome, gutters, anything that is not text and not
+    /// a control.
+    Arrow,
+    /// The I-beam: this is text, and a press puts a caret in it.
+    Text,
+    /// The hand: this does something when pressed.
+    Pointing,
+}
+
 /// Padding insets, per edge.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct Edges {

@@ -1621,6 +1621,29 @@ impl Runtime {
     /// travels up and down. Without the axis a workbench wears the same
     /// arrow on every seam, and the cursor is the only thing that says
     /// which way a seam moves before the hand pulls it.
+    /// What the pointer should look like where it is — the box under it
+    /// answers, or `None` and the shell's own rule stands.
+    ///
+    /// Topmost first, because the boxes are placed in paint order and the one
+    /// drawn last is the one the eye sees. The point reaches the box in ITS
+    /// coordinates, with the viewport beside it: a surface whose regions move
+    /// with the scroll (a pinned gutter) cannot answer from an x alone.
+    pub fn hovered_cursor(&self) -> Option<crate::layout::Cursor> {
+        let at = self.interaction.borrow().pointer?;
+        let customs = self.last_customs.borrow();
+        customs.iter().rev().find_map(|placement| {
+            let local = crate::layout::Point {
+                x: at.x - placement.frame.origin.x,
+                y: at.y - placement.frame.origin.y,
+            };
+            let inside = local.x >= 0.0
+                && local.y >= 0.0
+                && local.x <= placement.frame.size.width
+                && local.y <= placement.frame.size.height;
+            inside.then(|| placement.element.element().cursor(local, placement.visible)).flatten()
+        })
+    }
+
     pub fn seam_axis(&self) -> Option<crate::layout::Axis> {
         let interaction = self.interaction.borrow();
         let path = match interaction.split_drag.as_deref() {

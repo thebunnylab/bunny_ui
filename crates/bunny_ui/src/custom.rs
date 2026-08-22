@@ -102,6 +102,23 @@ pub trait CustomElement: 'static {
         Response::ignored()
     }
 
+    /// What the pointer should look like at `at`, in LOCAL coordinates.
+    ///
+    /// `None` — the default — leaves the shell's own rule standing: the hand
+    /// over anything hoverable, the arrow elsewhere. That rule is right for a
+    /// scene of rows and buttons and wrong for text, which under a hand reads
+    /// as a link.
+    ///
+    /// `visible` comes along because one box is often several surfaces and the
+    /// boundary between them can MOVE: an editor's gutter is pinned to the
+    /// viewport, so "am I over the gutter" is a question about how far the
+    /// region has travelled, not about the box's own x.
+    fn cursor(&self, at: crate::layout::Point, visible: crate::layout::Rect)
+        -> Option<crate::layout::Cursor> {
+        let _ = (at, visible);
+        None
+    }
+
     /// Does the box want the leftover space of the stack that holds it,
     /// on the given axis? The default is yes on both — the same answer a
     /// `Rectangle` gives. A `.frame(…)` around it always wins. Answer per

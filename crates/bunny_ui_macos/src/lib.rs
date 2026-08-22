@@ -468,8 +468,16 @@ pub fn run_window_chrome(
             Some(Axis::Horizontal) => ffi::Cursor::ResizeLeftRight,
             // lanes stacked: it travels up and down
             Some(Axis::Vertical) => ffi::Cursor::ResizeUpDown,
-            None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
-            None => ffi::Cursor::Arrow,
+            // The BOX under the pointer answers first — text wants an I-beam,
+            // and the rule below cannot know that. Only where nobody answers
+            // does the old rule stand: the hand over anything hoverable.
+            None => match runtime.hovered_cursor() {
+                Some(bunny_ui::layout::Cursor::Text) => ffi::Cursor::Text,
+                Some(bunny_ui::layout::Cursor::Pointing) => ffi::Cursor::Pointing,
+                Some(bunny_ui::layout::Cursor::Arrow) => ffi::Cursor::Arrow,
+                None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
+                None => ffi::Cursor::Arrow,
+            },
         });
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;

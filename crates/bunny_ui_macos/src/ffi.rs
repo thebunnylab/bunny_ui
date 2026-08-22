@@ -1612,6 +1612,7 @@ impl WindowHandle {
     pub fn set_cursor(&self, cursor: Cursor) {
         let name = match cursor {
             Cursor::Arrow => "arrowCursor",
+            Cursor::Text => "IBeamCursor",
             Cursor::Pointing => "pointingHandCursor",
             Cursor::ResizeLeftRight => "resizeLeftRightCursor",
             Cursor::ResizeUpDown => "resizeUpDownCursor",
@@ -1628,6 +1629,8 @@ impl WindowHandle {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Cursor {
     Arrow,
+    /// The I-beam, for text a press puts a caret in.
+    Text,
     Pointing,
     ResizeLeftRight,
     ResizeUpDown,
