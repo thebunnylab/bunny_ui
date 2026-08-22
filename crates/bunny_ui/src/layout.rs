@@ -1312,6 +1312,35 @@ pub struct GlassPaint {
 }
 
 impl GlassPaint {
+    /// Every number that changes what this material answers, as bytes a memo
+    /// can compare — so a pane whose knobs have not moved is recognised
+    /// without deriving it again.
+    #[must_use]
+    pub fn signature(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(96);
+        for value in [
+            self.blur,
+            self.refraction_band,
+            self.refraction_amount,
+            self.chromatic,
+            self.highlight_band,
+            self.highlight_intensity,
+            self.saturation,
+            self.brightness,
+            self.sheen,
+            self.spot_center.x,
+            self.spot_center.y,
+            self.spot_radius,
+            self.spot_alpha,
+        ] {
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        for color in [self.tint, self.highlight] {
+            out.extend_from_slice(&[color.r, color.g, color.b, color.a]);
+        }
+        out
+    }
+
     /// The same material in device pixels — the rasterizers work there.
     pub fn scaled(self, factor: f64) -> GlassPaint {
         GlassPaint {

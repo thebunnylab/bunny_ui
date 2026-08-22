@@ -119,6 +119,21 @@ pub fn srgb_to_linear(value: f64) -> f64 {
     }
 }
 
+/// [`srgb_to_linear`] for every value a channel can hold.
+///
+/// The decode is a `powf`, and the pyramid runs it **seventeen taps deep per
+/// destination texel, four texels a tap, three channels a texel**. For one
+/// card-sized pane that is around a hundred and ninety million of them, which
+/// measured at three hundred milliseconds — a frame and a half, on a surface
+/// whose whole job is to feel weightless.
+///
+/// A stored texel is a byte, so the answer is a table rather than a faster
+/// curve: it is **exact**, not an approximation, and the pane's pixels are
+/// bit-for-bit what the `powf` produced.
+static DECODE: std::sync::LazyLock<[f64; 256]> = std::sync::LazyLock::new(|| {
+    std::array::from_fn(|byte| srgb_to_linear(byte as f64 / 255.0))
+});
+
 /// The sRGB transfer function, encoding.
 pub fn linear_to_srgb(value: f64) -> f64 {
     if value <= 0.003_130_8 {
@@ -175,19 +190,13 @@ struct Plane {
 }
 
 impl Plane {
-    /// One texel, as stored, normalized.
-    fn texel(&self, tx: i64, ty: i64) -> [f64; 4] {
+    /// One texel, as stored — the bytes, clamped to the plane.
+    fn bytes(&self, tx: i64, ty: i64) -> [u8; 4] {
         let tx = tx.clamp(0, self.full.0 as i64 - 1) - self.x0;
         let ty = ty.clamp(0, self.full.1 as i64 - 1) - self.y0;
         let tx = tx.clamp(0, self.width as i64 - 1) as usize;
         let ty = ty.clamp(0, self.height as i64 - 1) as usize;
-        let pixel = self.texels[ty * self.width + tx];
-        [
-            pixel[0] as f64 / 255.0,
-            pixel[1] as f64 / 255.0,
-            pixel[2] as f64 / 255.0,
-            pixel[3] as f64 / 255.0,
-        ]
+        self.texels[ty * self.width + tx]
     }
 
     /// A bilinear sample in uv, answering in LINEAR light — the filter
@@ -208,12 +217,26 @@ impl Plane {
             if weight == 0.0 {
                 continue;
             }
-            let mut texel = self.texel(ix + dx, iy + dy);
-            if self.srgb {
-                for channel in &mut texel[..3] {
-                    *channel = srgb_to_linear(*channel);
-                }
-            }
+            let raw = self.bytes(ix + dx, iy + dy);
+            // Decoding a STORED byte is a table lookup, and the table holds
+            // exactly what the transfer function answers — the arithmetic is
+            // the same, the `powf` is not run a hundred and ninety million
+            // times a frame.
+            let texel = if self.srgb {
+                [
+                    DECODE[raw[0] as usize],
+                    DECODE[raw[1] as usize],
+                    DECODE[raw[2] as usize],
+                    f64::from(raw[3]) / 255.0,
+                ]
+            } else {
+                [
+                    f64::from(raw[0]) / 255.0,
+                    f64::from(raw[1]) / 255.0,
+                    f64::from(raw[2]) / 255.0,
+                    f64::from(raw[3]) / 255.0,
+                ]
+            };
             for channel in 0..4 {
                 out[channel] += texel[channel] * weight;
             }
@@ -429,6 +452,33 @@ impl Lens {
     /// How deep the pyramid must go for this pane.
     pub fn levels(&self) -> usize {
         levels_for(self.glass.blur)
+    }
+
+    /// Everything about this pane that changes what it answers — the box,
+    /// the corners and every knob of the material — as bytes a memo can
+    /// compare.
+    #[must_use]
+    pub fn signature(&self, band: (i64, i64, i64, i64)) -> Vec<u8> {
+        let mut out = Vec::with_capacity(160);
+        for value in [self.rect.0, self.rect.1, self.rect.2, self.rect.3] {
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        for value in [
+            self.radii.top_left,
+            self.radii.top_right,
+            self.radii.bottom_right,
+            self.radii.bottom_left,
+        ] {
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        for value in [self.viewport.0, self.viewport.1] {
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        for value in [band.0, band.1, band.2, band.3] {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out.extend_from_slice(&self.glass.signature());
+        out
     }
 
     /// The device-px area the pane reads — its own box plus the reach

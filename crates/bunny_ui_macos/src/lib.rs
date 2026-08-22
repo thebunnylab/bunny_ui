@@ -205,11 +205,20 @@ pub fn run_window_chrome(
     // the open popovers' child panels, pooled by identity path
     let panels: Rc<RefCell<std::collections::HashMap<String, ffi::WindowHandle>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
+    // The scene a popover's MATERIAL samples, kept per panel beside the base
+    // commands it was rasterized from. A card that scrolls its own text does
+    // not move the window behind it, and re-rasterizing that window every
+    // frame to hand the pane the same pixels is fifteen milliseconds a frame
+    // spent proving nothing changed.
+    type Beneath = (Vec<bunny_ui::layout::DrawCommand>, (usize, usize), bunny_ui::raster::Bitmap);
+    let beneaths: Rc<RefCell<std::collections::HashMap<String, Beneath>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
     // present takes a READY display list to the window — the tick path
     // reuses it without paying settle, effects or the IME tail
     let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
+        let beneaths = Rc::clone(&beneaths);
         move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
             let (width, height) = window.content_size();
             let scale = window.scale();
@@ -234,6 +243,7 @@ pub fn run_window_chrome(
                     if let Some(panel) = store.remove(&path) {
                         panel.close_panel(&window);
                     }
+                    beneaths.borrow_mut().remove(&path);
                 }
                 for overlay in &overlays {
                     // the panel is BLED around the frame so the card's
@@ -252,7 +262,48 @@ pub fn run_window_chrome(
                     let slice = full_display.translated_slice(overlay.display, -x, -y);
                     let panel_physical =
                         ((w.round() as usize) * scale, (h.round() as usize) * scale);
-                    let bitmap = bunny_ui::raster::rasterize_with(
+                    // What a MATERIAL inside the popover samples. The panel
+                    // carries only the popover's own commands, so a pane in
+                    // one would otherwise read transparency and show nothing
+                    // — which is a glass card with no glass on it. The window
+                    // under the panel is rasterized into the panel's own
+                    // pixels and handed over for sampling ONLY: the panel has
+                    // to stay transparent everywhere the popover does not
+                    // paint, so this is never drawn.
+                    //
+                    // Skipped when the popover asks for no material, which is
+                    // every menu and every tooltip.
+                    let wants_backdrop = slice.iter().any(|command| {
+                        matches!(command, bunny_ui::layout::DrawCommand::Backdrop { .. })
+                    });
+                    if wants_backdrop {
+                        let base = full_display.translated_slice(
+                            (0, overlays.first().map_or(full_display.len(), |o| o.display.0)),
+                            -x,
+                            -y,
+                        );
+                        let commands: Vec<_> = base.iter().cloned().collect();
+                        let mut kept = beneaths.borrow_mut();
+                        let stale = kept.get(&overlay.path).is_none_or(|(was, size, _)| {
+                            *size != panel_physical || *was != commands
+                        });
+                        if stale {
+                            let fresh = bunny_ui::raster::rasterize_with(
+                                &base,
+                                panel_physical.0,
+                                panel_physical.1,
+                                scale,
+                                canvas,
+                                &*runtime.text(),
+                                &*runtime.images(),
+                            );
+                            kept.insert(overlay.path.clone(), (commands, panel_physical, fresh));
+                        }
+                    } else {
+                        beneaths.borrow_mut().remove(&overlay.path);
+                    }
+                    let kept = beneaths.borrow();
+                    let bitmap = bunny_ui::raster::rasterize_over(
                         &slice,
                         panel_physical.0,
                         panel_physical.1,
@@ -260,7 +311,10 @@ pub fn run_window_chrome(
                         bunny_ui::layout::Color { r: 0, g: 0, b: 0, a: 0 },
                         &*runtime.text(),
                         &*runtime.images(),
+                        kept.get(&overlay.path).map(|(_, _, bitmap)| bitmap),
                     );
+                    drop(kept);
+
                     // the panel's CGImage is premultiplied; the house
                     // compositor is straight — one pass, panel-sized
                     let mut rgba = bitmap.to_rgba_bytes();

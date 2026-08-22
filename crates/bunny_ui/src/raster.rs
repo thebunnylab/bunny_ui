@@ -32,6 +32,14 @@ pub struct Bitmap {
     pixels: Vec<u32>,
     /// Clip stack in physical px (intersections already resolved) — `set`
     /// checks the top; fill, stroke and text respect it for free.
+    /// What a material SAMPLES, when it is not this bitmap.
+    ///
+    /// A pane reads what is already painted behind it, which is normally this
+    /// bitmap's own pixels. A popover, though, is presented on a panel of its
+    /// own carrying only its own slice of the scene — so a material inside one
+    /// samples transparency and shows nothing. The host seeds this with the
+    /// window under the panel, and the pane reads it instead.
+    beneath: Option<Vec<u32>>,
     clip: Vec<ClipEntry>,
     /// The stack top, MIRRORED flat: `set` runs per pixel and must not
     /// pay a `Vec` deref there. An empty stack mirrors as the open
@@ -142,6 +150,87 @@ fn pack(color: Color) -> u32 {
     ((color.r as u32) << 24) | ((color.g as u32) << 16) | ((color.b as u32) << 8) | color.a as u32
 }
 
+#[expect(clippy::cast_possible_truncation, reason = "each field is one byte of the word")]
+const fn unpack(word: u32) -> Color {
+    Color {
+        r: (word >> 24) as u8,
+        g: (word >> 16) as u8,
+        b: (word >> 8) as u8,
+        a: word as u8,
+    }
+}
+
+// =============================================================================
+// The pane memo
+// =============================================================================
+
+/// One pane of glass's last answer, kept so a surface whose backdrop has not
+/// moved does not derive it again.
+///
+/// **Why one entry and not a map.** There is one pane on screen at a time in
+/// practice — a card, a menu, a sheet — and a memo of a card-sized pane is
+/// several megabytes. A second pane evicts the first, which is the behaviour a
+/// map of two would have anyway and costs nothing to reason about.
+///
+/// **What it is keyed on.** The lens (its box, its corners, every knob of the
+/// material) and the SCENE under it, compared byte for byte. Not a hash: a
+/// comparison of the same bytes is faster than hashing them once, and it
+/// cannot collide. The destination is deliberately absent — the composite
+/// answers a colour and a coverage, and blending that onto whatever is there
+/// stays per-frame.
+struct Memo {
+    signature: Vec<u8>,
+    source: Vec<u32>,
+    shaded: Vec<(u32, f32)>,
+}
+
+thread_local! {
+    static MEMO: std::cell::RefCell<Option<Memo>> = const { std::cell::RefCell::new(None) };
+}
+
+impl Memo {
+    /// The pane's answer over `band`, computed by `derive` only when the lens
+    /// or the scene under it has changed.
+    fn answer(
+        lens: &Lens,
+        pixels: &[u32],
+        stride: usize,
+        band: (i64, i64, i64, i64),
+        derive: impl FnOnce() -> Vec<(u32, f32)>,
+    ) -> Vec<(u32, f32)> {
+        let signature = lens.signature(band);
+        let source = read_band(pixels, stride, lens.area());
+        let hit = MEMO.with_borrow(|memo| {
+            memo.as_ref()
+                .filter(|memo| memo.signature == signature && memo.source == source)
+                .map(|memo| memo.shaded.clone())
+        });
+        if let Some(shaded) = hit {
+            return shaded;
+        }
+        let shaded = derive();
+        MEMO.with_borrow_mut(|memo| {
+            *memo = Some(Memo { signature, source, shaded: shaded.clone() });
+        });
+        shaded
+    }
+}
+
+/// The scene inside `area`, row by row — what a pane reads, and nothing else.
+fn read_band(pixels: &[u32], stride: usize, area: (i64, i64, i64, i64)) -> Vec<u32> {
+    let height = (pixels.len() / stride.max(1)) as i64;
+    let x0 = area.0.clamp(0, stride as i64);
+    let x1 = area.2.clamp(x0, stride as i64);
+    let y0 = area.1.clamp(0, height);
+    let y1 = area.3.clamp(y0, height);
+    let mut out = Vec::with_capacity(((x1 - x0) * (y1 - y0)).max(0) as usize);
+    for y in y0..y1 {
+        let row = y as usize * stride;
+        out.extend_from_slice(&pixels[row + x0 as usize..row + x1 as usize]);
+    }
+    out
+}
+
 /// Exact division by 255 with rounding — the integer-compositing
 /// classic: `round(x / 255)` without float.
 fn div255(x: u32) -> u32 {
@@ -195,6 +284,7 @@ impl Bitmap {
             width,
             height,
             pixels: vec![pack(background); width * height],
+            beneath: None,
             clip: Vec::new(),
             top_cut: OPEN_CUT,
             top_round: None,
@@ -410,12 +500,38 @@ impl Bitmap {
             glass,
             viewport: (self.width as f64, self.height as f64),
         };
-        let pyramid =
-            Pyramid::build(&self.pixels, self.width, self.height, lens.area(), lens.levels());
-        for y in y0.max(cy0)..y1.min(cy1) {
-            for x in x0.max(cx0)..x1.min(cx1) {
-                if let Some((color, coverage)) = lens.shade(&pyramid, x, y) {
-                    self.set_covered(x, y, color, coverage);
+        // The scene the pane bends: this bitmap, or what the host said is
+        // under it. A pane over nothing shows nothing, and a panel that
+        // carries only its own commands IS nothing.
+        let source = self.beneath.as_ref().unwrap_or(&self.pixels);
+        let (bx0, by0) = (x0.max(cx0), y0.max(cy0));
+        let (bx1, by1) = (x1.min(cx1), y1.min(cy1));
+        // What the composite answers depends on the LENS and on the scene
+        // under it — never on what has been painted over that scene since. A
+        // card that scrolls its own text is a pane whose backdrop has not
+        // moved, so the answer is last frame's, and re-deriving it is the
+        // difference between a surface that scrolls and one that does not.
+        let shaded = Memo::answer(&lens, source, self.width, (bx0, by0, bx1, by1), || {
+            let pyramid =
+                Pyramid::build(source, self.width, self.height, lens.area(), lens.levels());
+            let mut out = Vec::with_capacity(((bx1 - bx0) * (by1 - by0)).max(0) as usize);
+            for y in by0..by1 {
+                for x in bx0..bx1 {
+                    out.push(lens.shade(&pyramid, x, y).map_or((0u32, 0.0f32), |(color, cov)| {
+                        #[expect(clippy::cast_possible_truncation, reason = "coverage is 0..=1")]
+                        (pack(color), cov as f32)
+                    }));
+                }
+            }
+            out
+        });
+        let mut at = 0usize;
+        for y in by0..by1 {
+            for x in bx0..bx1 {
+                let (color, coverage) = shaded[at];
+                at += 1;
+                if coverage > 0.0 {
+                    self.set_covered(x, y, unpack(color), f64::from(coverage));
                 }
             }
         }
@@ -765,7 +881,36 @@ pub fn rasterize_with(
     text: &dyn TextEngine,
     images: &dyn ImageEngine,
 ) -> Bitmap {
+    rasterize_over(display, width, height, scale, background, text, images, None)
+}
+
+/// [`rasterize_with`], with a scene a material may SAMPLE but that is never
+/// painted.
+///
+/// The one caller is a host presenting a popover on its own panel: the panel
+/// carries only the popover's commands, so a `Backdrop` inside it has nothing
+/// behind it to blur or bend and the material reads as absent. `beneath` is
+/// the window under the panel, in the panel's own pixels — sampling-only,
+/// because the panel has to stay transparent everywhere the popover does not
+/// paint.
+///
+/// Its dimensions must match `width` × `height`; a mismatch is ignored rather
+/// than stretched.
+#[expect(clippy::too_many_arguments, reason = "a rasterizer takes what it takes")]
+pub fn rasterize_over(
+    display: &DisplayList,
+    width: usize,
+    height: usize,
+    scale: usize,
+    background: Color,
+    text: &dyn TextEngine,
+    images: &dyn ImageEngine,
+    beneath: Option<&Bitmap>,
+) -> Bitmap {
     let mut bitmap = Bitmap::new(width, height, background);
+    bitmap.beneath = beneath
+        .filter(|under| under.width == width && under.height == height)
+        .map(|under| under.pixels.clone());
     let factor = scale as f64;
     for command in display.iter() {
         match command {
