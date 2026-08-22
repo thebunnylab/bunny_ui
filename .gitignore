@@ -1,7 +1,6 @@
 /target
 .DS_Store
 gitignore/
-# tool state and build artifacts
-.claude/
+# build artifacts
 apps/*/web/*.wasm
 apps/bench_web/web/index.html
