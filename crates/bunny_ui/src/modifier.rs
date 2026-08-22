@@ -343,11 +343,14 @@ fn rewrite_scroll_node(
         Option<String>,
         crate::layout::ScrollAxes,
         bool,
+        Option<crate::layout::Point>,
         Box<LayoutNode>,
     ) -> LayoutNode,
 ) -> LayoutNode {
     match node {
-        LayoutNode::Scroll { path, axes, fill, child, .. } => rewrite(path, axes, fill, child),
+        LayoutNode::Scroll { path, axes, fill, commanded, child, .. } => {
+            rewrite(path, axes, fill, commanded, child)
+        }
         LayoutNode::Styled { props, child } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
@@ -1176,12 +1179,15 @@ fn apply(
             })
         }),
         Modifier::ScrollTarget(id) => out.wrap_layout_from(mark, |node| {
-            rewrite_scroll_node(node, &|path, axes, fill, child| LayoutNode::Scroll {
-                path,
-                target: Some(id.clone()),
-                axes,
-                fill,
-                child,
+            rewrite_scroll_node(node, &|path, axes, fill, commanded, child| {
+                LayoutNode::Scroll {
+                    path,
+                    target: Some(id.clone()),
+                    axes,
+                    commanded,
+                    fill,
+                    child,
+                }
             })
         }),
         Modifier::Resizable => out.wrap_layout_from(mark, |node| {

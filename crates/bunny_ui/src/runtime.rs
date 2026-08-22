@@ -200,6 +200,11 @@ pub struct Runtime {
     /// drops it — the tooltip's own idiom, and the reason `cmd-k` can
     /// never hold the keyboard for good.
     pending_aged: Cell<bool>,
+    /// The offset last PUBLISHED to each region's binding. It is what
+    /// tells a value the app WROTE apart from the value the region
+    /// itself landed on and reported: only one of the two can differ
+    /// from this, and whichever does is the one that moved.
+    scroll_commands: RefCell<HashMap<String, Point>>,
     /// The last APPLIED `.scroll_target` per region — the follow fires
     /// only when the target changes; in between, the wheel is sovereign.
     scroll_targets: RefCell<HashMap<String, String>>,
@@ -763,6 +768,7 @@ impl Runtime {
             chords: RefCell::new(Vec::new()),
             pending: RefCell::new(Vec::new()),
             pending_aged: Cell::new(false),
+            scroll_commands: RefCell::new(HashMap::default()),
             scroll_targets: RefCell::new(HashMap::default()),
             element_reveals: RefCell::new(HashMap::default()),
             auto_focused: RefCell::new(std::collections::HashSet::default()),
@@ -887,6 +893,7 @@ impl Runtime {
             reconciler::assemble_actions(pass_root);
             reconciler::assemble_editors(pass_root);
             reconciler::assemble_splits(pass_root);
+            reconciler::assemble_scrolls(pass_root);
             reconciler::assemble_customs(pass_root);
             reconciler::assemble_handlers(pass_root);
             reconciler::assemble_contexts(pass_root);
@@ -3306,8 +3313,14 @@ impl Runtime {
         let Some(path) = self.dom_scroll_path(id) else {
             return;
         };
-        self.set_scroll_offset(&path, crate::layout::Point { x, y });
+        let landed = crate::layout::Point { x, y };
+        self.set_scroll_offset(&path, landed);
         self.dom.borrow_mut().note_scroll(id, x, y);
+        // a region the app holds in a binding hears where the browser
+        // put it — the same report the wheel makes on the pixel path
+        if reconciler::run_scroll(&path, landed) {
+            self.scroll_commands.borrow_mut().insert(path.clone(), landed);
+        }
         // the region's body IS the window function here — the fresh
         // offset re-runs it (nearest retained boundary up the path)
         let mut probe = path.as_str();
@@ -3671,6 +3684,58 @@ impl Runtime {
         moved
     }
 
+    /// Settles each region that holds its offset in a BINDING, both
+    /// ways, in one pass.
+    ///
+    /// One value is compared against what was last published to the
+    /// binding, and that is the whole rule: whichever side differs from
+    /// it is the side that moved.
+    ///
+    /// - The app wrote: the region goes there, clamped to the travel it
+    ///   actually has, and the clamped value goes back — the app's
+    ///   state and the region never disagree about where it is.
+    /// - Nobody wrote: the wheel, a thumb or a reveal may have moved
+    ///   the region, and the binding is told where it landed.
+    ///
+    /// `true` = an offset moved and the caller relayouts.
+    fn apply_scroll_offsets(&self, result: &crate::layout::LayoutResult) -> bool {
+        let mut moved = false;
+        for region in &result.scrolls {
+            let Some(commanded) = region.commanded else { continue };
+            let travel = |content: Px, extent: Px| (content.round() - extent.round()).max(0.0);
+            let max_x = travel(region.content.width, region.frame.size.width);
+            let max_y = travel(region.content.height, region.frame.size.height);
+            let published = self.scroll_commands.borrow().get(&region.path).copied();
+            let current = self.scroll_offset(&region.path);
+            if published == Some(commanded) {
+                // the app is holding a stale reading: the region moved
+                // under it, and the binding hears where it landed
+                if current != commanded {
+                    self.scroll_commands.borrow_mut().insert(region.path.clone(), current);
+                    reconciler::run_scroll(&region.path, current);
+                }
+                continue;
+            }
+            // the app WROTE. A write is sovereign over anything still
+            // in flight, exactly as the wheel is
+            self.animator.borrow_mut().cancel_scroll(&region.path);
+            let wanted = Point {
+                x: commanded.x.clamp(0.0, max_x),
+                y: commanded.y.clamp(0.0, max_y),
+            };
+            self.scroll_commands.borrow_mut().insert(region.path.clone(), wanted);
+            if wanted != current {
+                self.set_scroll_offset(&region.path, wanted);
+                moved = true;
+            }
+            // a value past the end comes home already clamped
+            if wanted != commanded {
+                reconciler::run_scroll(&region.path, wanted);
+            }
+        }
+        moved
+    }
+
     /// The FRAME-path pass: identical to the print one, but the printed
     /// tree's lines are not even formatted (printing is for people;
     /// frames are for pixels).
@@ -3721,7 +3786,9 @@ impl Runtime {
         // strip for a frame, never a hang. The wheel and a user blur
         // are never fought.
         for _ in 0..2 {
-            let moved = self.apply_scroll_targets(&result) | self.apply_element_reveals(&result);
+            let moved = self.apply_scroll_targets(&result)
+                | self.apply_element_reveals(&result)
+                | self.apply_scroll_offsets(&result);
             let focused = self.apply_auto_focus(&result);
             // a miss measured on the round a target just moved is
             // spurious — it audited the PRE-jump offset; the relayout

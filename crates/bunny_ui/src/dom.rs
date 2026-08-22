@@ -2560,6 +2560,59 @@ mod tests {
         assert!(patches.is_empty(), "the echo stays silent: {patches:?}");
     }
 
+    /// The same region held in the app's own state, in this mode: the
+    /// browser is the clamp and the observer is the report, so the
+    /// binding tells the truth without the engine measuring anything.
+    #[test]
+    fn a_commanded_region_travels_both_ways_in_the_browser() {
+        use crate::layout::Point;
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            at: State<Point>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(crate::views::for_each(
+                    (0..30).collect::<Vec<i32>>(),
+                    |line| line.to_string(),
+                    |line| text(format!("line {line}")).frame(200.0, 20.0),
+                ))
+                .offset(self.at.binding())
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { at: State::new(Point::default()) };
+        let size = Size { width: 200.0, height: 150.0 };
+        let mount = runtime.dom_frame(&page, size);
+        let scroll_id = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, kind: CreateKind::Scroll, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("a scroll region mounted");
+
+        // the browser scrolled: the binding hears where it landed, and
+        // the echo is still silent
+        runtime.dom_scrolled(scroll_id, 0.0, 40.0);
+        let echo = runtime.dom_frame(&page, size);
+        assert_eq!(page.at.get(), Point { x: 0.0, y: 40.0 }, "the app was told");
+        assert!(echo.is_empty(), "and the echo stays silent: {echo:?}");
+
+        // the app commands: one patch, and it is the offset
+        page.at.set(Point { x: 0.0, y: 260.0 });
+        let commanded = runtime.dom_frame(&page, size);
+        assert!(
+            commanded.iter().any(|patch| matches!(
+                patch,
+                DomPatch::SetScroll { id, y, .. } if *id == scroll_id && *y == 260.0
+            )),
+            "the browser is told where to go: {commanded:?}"
+        );
+    }
+
     #[test]
     fn a_virtual_jump_is_creates_removes_and_the_offset() {
         #[derive(Clone, Copy)]

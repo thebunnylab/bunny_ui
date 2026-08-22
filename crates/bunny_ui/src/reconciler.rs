@@ -56,6 +56,10 @@ pub(crate) type EditorEntry = (String, EditorFn);
 /// like the actions — a skipped view's divider still drags.
 pub(crate) type SplitFn = Rc<dyn Fn(crate::layout::Px)>;
 pub(crate) type SplitEntry = (String, SplitFn);
+/// A scroll-offset writer registered at render: where the region
+/// landed goes back to the binding the app is holding it in.
+pub(crate) type ScrollFn = Rc<dyn Fn(crate::layout::Point)>;
+pub(crate) type ScrollEntry = (String, ScrollFn);
 
 /// A NAMED action handler registered at render: (registration path,
 /// id, what runs). Retained like the actions — a skipped view's
@@ -78,6 +82,8 @@ pub(crate) struct Entry {
     pub editors: Vec<EditorEntry>,
     /// The body's split-position writers — same retention.
     pub splits: Vec<SplitEntry>,
+    /// The body's scroll-offset writers — same retention.
+    pub scrolls: Vec<ScrollEntry>,
     /// The paths of the app's own boxes (`custom(…)`) — the map that
     /// says a focused escape hatch is still on screen.
     /// `(path, does it take the keyboard)` — the second half is
@@ -100,6 +106,7 @@ struct BuildingFrame {
     actions: Vec<ActionEntry>,
     editors: Vec<EditorEntry>,
     splits: Vec<SplitEntry>,
+    scrolls: Vec<ScrollEntry>,
     customs: Vec<(String, bool)>,
     handlers: Vec<HandlerEntry>,
     contexts: Vec<&'static str>,
@@ -118,6 +125,7 @@ struct PassState {
     root_actions: Vec<ActionEntry>,
     root_editors: Vec<EditorEntry>,
     root_splits: Vec<SplitEntry>,
+    root_scrolls: Vec<ScrollEntry>,
     root_customs: Vec<(String, bool)>,
     root_handlers: Vec<HandlerEntry>,
     root_contexts: Vec<&'static str>,
@@ -220,32 +228,35 @@ pub(crate) fn finish_entry(
     node: RenderNode,
     layout: LayoutNode,
 ) {
-    let (effects, actions, editors, splits, customs, handlers, contexts) = PASS.with(|pass| {
-        let mut pass = pass.borrow_mut();
-        match pass.building.pop() {
-            Some(frame) => {
-                debug_assert_eq!(frame.path, path, "entries close in the order they open");
-                (
-                    frame.effects,
-                    frame.actions,
-                    frame.editors,
-                    frame.splits,
-                    frame.customs,
-                    frame.handlers,
-                    frame.contexts,
-                )
+    let (effects, actions, editors, splits, scrolls, customs, handlers, contexts) =
+        PASS.with(|pass| {
+            let mut pass = pass.borrow_mut();
+            match pass.building.pop() {
+                Some(frame) => {
+                    debug_assert_eq!(frame.path, path, "entries close in the order they open");
+                    (
+                        frame.effects,
+                        frame.actions,
+                        frame.editors,
+                        frame.splits,
+                        frame.scrolls,
+                        frame.customs,
+                        frame.handlers,
+                        frame.contexts,
+                    )
+                }
+                None => (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
             }
-            None => (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ),
-        }
-    });
+        });
     let parent_segments = motor::identity::current_path_segments()
         .split_last()
         .map(|(_, parents)| parents.to_vec())
@@ -262,6 +273,7 @@ pub(crate) fn finish_entry(
                 actions,
                 editors,
                 splits,
+                scrolls,
                 customs,
                 handlers,
                 contexts,
@@ -317,6 +329,19 @@ pub(crate) fn attribute_split(path: String, split: SplitFn) {
             frame.splits.push((path, split));
         } else {
             pass.root_splits.push((path, split));
+        }
+    });
+}
+
+/// A scroll-offset writer registered during render — the split's twin,
+/// and the same attribution.
+pub(crate) fn attribute_scroll(path: String, scroll: ScrollFn) {
+    PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        if let Some(frame) = pass.building.last_mut() {
+            frame.scrolls.push((path, scroll));
+        } else {
+            pass.root_scrolls.push((path, scroll));
         }
     });
 }
@@ -572,6 +597,7 @@ thread_local! {
     /// actions.
     static EDITORS: RefCell<HashMap<String, EditorFn>> = RefCell::new(HashMap::default());
     static SPLITS: RefCell<HashMap<String, SplitFn>> = RefCell::new(HashMap::default());
+    static SCROLLS: RefCell<HashMap<String, ScrollFn>> = RefCell::new(HashMap::default());
     /// The app's boxes on screen this pass — paths only.
     static CUSTOMS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// The subset that answers `accepts_keys` — who may HOLD the
@@ -619,6 +645,26 @@ pub(crate) fn assemble_splits(root: &str) {
     SPLITS.with(|splits| *splits.borrow_mut() = map);
 }
 
+/// The scroll-offset writers, assembled the same way.
+pub(crate) fn assemble_scrolls(root: &str) {
+    let mut map: HashMap<String, ScrollFn> = HashMap::default();
+    RETAINED.with(|retained| {
+        for (path, entry) in retained.borrow().iter() {
+            if covers(root, path) {
+                for (key, scroll) in &entry.scrolls {
+                    map.insert(key.clone(), scroll.clone());
+                }
+            }
+        }
+    });
+    PASS.with(|pass| {
+        for (key, scroll) in std::mem::take(&mut pass.borrow_mut().root_scrolls) {
+            map.insert(key, scroll);
+        }
+    });
+    SCROLLS.with(|scrolls| *scrolls.borrow_mut() = map);
+}
+
 /// Reassembles the escape-hatch map from retention — the editors' twin
 /// for the boxes the app paints.
 pub(crate) fn assemble_customs(root: &str) {
@@ -661,6 +707,20 @@ pub(crate) fn run_split(path: &str, at: crate::layout::Px) -> bool {
     match split {
         Some(split) => {
             split(at);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Hands the offset a region LANDED on to its retained writer, so the
+/// binding the app holds it in tells the truth. `false` = no writer at
+/// the path — the region was never given a binding.
+pub(crate) fn run_scroll(path: &str, offset: crate::layout::Point) -> bool {
+    let scroll = SCROLLS.with(|scrolls| scrolls.borrow().get(path).cloned());
+    match scroll {
+        Some(scroll) => {
+            scroll(offset);
             true
         }
         None => false,
@@ -771,6 +831,7 @@ pub(crate) fn reset_world() {
     ACTIONS.with(|actions| actions.borrow_mut().clear());
     EDITORS.with(|editors| editors.borrow_mut().clear());
     SPLITS.with(|splits| splits.borrow_mut().clear());
+    SCROLLS.with(|scrolls| scrolls.borrow_mut().clear());
     CUSTOMS.with(|customs| customs.borrow_mut().clear());
 }
 

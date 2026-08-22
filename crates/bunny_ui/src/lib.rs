@@ -5623,6 +5623,88 @@ mod tests {
         assert_eq!(*log.borrow(), vec!["second"]);
     }
 
+    /// A region can hold its offset in the app's own state, both ways:
+    /// the app WRITES where to go, and the wheel tells it where the
+    /// region landed. It is what an anchor that names a POSITION needs
+    /// — "put this line in the middle" is not a visibility.
+    #[test]
+    fn an_app_can_command_and_read_a_regions_offset() {
+        use crate::layout::{Point, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            at: State<Point>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(for_each(
+                    (0..40).collect::<Vec<i32>>(),
+                    |line| line.to_string(),
+                    |line| text(format!("line {line}")).frame(200.0, 20.0),
+                ))
+                .offset(self.at.binding())
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { at: State::new(Point::default()) };
+        let size = Size { width: 200.0, height: 100.0 };
+        let path = "Page";
+        let _ = runtime.settled_layout(&page, Proposal::exact(size));
+
+        // the wheel is sovereign, and the binding hears where it landed
+        assert!(runtime.wheel(100.0, 50.0, 0.0, -60.0));
+        let _ = runtime.settled_layout(&page, Proposal::exact(size));
+        assert_eq!(runtime.scroll_offset(path).y, 60.0);
+        assert_eq!(page.at.get().y, 60.0, "the app reads a true offset");
+
+        // and the app can say WHERE: the middle of the window, which
+        // no reveal could express
+        page.at.set(Point { x: 0.0, y: 320.0 });
+        let _ = runtime.settled_layout(&page, Proposal::exact(size));
+        assert_eq!(runtime.scroll_offset(path).y, 320.0, "the region went there");
+
+        // a value past the end comes home already clamped: the app's
+        // state and the region never disagree about where it is
+        page.at.set(Point { x: 0.0, y: 9000.0 });
+        let _ = runtime.settled_layout(&page, Proposal::exact(size));
+        let travel = 40.0 * 20.0 - 100.0;
+        assert_eq!(runtime.scroll_offset(path).y, travel);
+        assert_eq!(page.at.get().y, travel, "clamped, and the app was told");
+
+        // a frame that changes nothing writes nothing — a region at
+        // rest must not dirty the world every pass
+        let before = page.at.get();
+        let _ = runtime.settled_layout(&page, Proposal::exact(size));
+        assert_eq!(page.at.get(), before);
+    }
+
+    /// A region with no binding is untouched: the offset stays the
+    /// engine's, and nothing is written anywhere.
+    #[test]
+    fn a_region_without_a_binding_keeps_the_offset_to_itself() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(for_each(
+                    (0..40).collect::<Vec<i32>>(),
+                    |line| line.to_string(),
+                    |line| text(format!("line {line}")).frame(200.0, 20.0),
+                ))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 100.0 };
+        let _ = runtime.settled_layout(&Page, Proposal::exact(size));
+        assert!(runtime.wheel(100.0, 50.0, 0.0, -40.0));
+        let _ = runtime.settled_layout(&Page, Proposal::exact(size));
+        assert_eq!(runtime.scroll_offset("Page").y, 40.0);
+    }
+
     /// The other end of the bridge, walked whole: a bare stroke reaches
     /// the keymap, the keymap names an action, and the host's table
     /// ANSWERS it — which is what makes the stroke consumed.

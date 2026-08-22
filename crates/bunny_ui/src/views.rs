@@ -762,6 +762,7 @@ pub struct ScrollView<C> {
     axes: crate::layout::ScrollAxes,
     hug: bool,
     fill: bool,
+    offset: Option<Binding<crate::layout::Point>>,
 }
 
 impl<C> ScrollView<C> {
@@ -796,6 +797,39 @@ impl<C> ScrollView<C> {
         self
     }
 
+    /// The region's offset, in the app's own hands.
+    ///
+    /// `.reveal`/`.scroll_target` answer *"bring this into view by the
+    /// shortest distance"*, which is the right contract for a caret
+    /// following the keyboard and the only one there was. It cannot say
+    /// *"put this line in the MIDDLE"*, and two ordinary things need
+    /// exactly that: the anchors that name a POSITION for the cursor's
+    /// line in the window, and a page that moves the cursor N lines and
+    /// rolls the same distance, so the line ends at the height it
+    /// started at.
+    ///
+    /// The wheel stays sovereign. It writes the region as it always
+    /// did, and the binding is told where it landed — so the app reads
+    /// a true offset without listening for anything. When the app
+    /// WRITES, the region goes there on the next layout, clamped to the
+    /// travel it has; a value past the end comes back to the binding
+    /// already clamped, so the app's state and the region never
+    /// disagree.
+    ///
+    /// ```ignore
+    /// scroll(lines).offset(self.at.binding())
+    /// // put the caret's line in the middle of the window
+    /// self.at.set(Point { x: 0.0, y: caret_top - viewport / 2.0 })
+    /// ```
+    ///
+    /// The cost is that every turn of the wheel writes app state, which
+    /// re-runs the body that reads it — a region only pays it by asking
+    /// for this.
+    pub fn offset(mut self, offset: Binding<crate::layout::Point>) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
     /// Take at most what the content needs.
     ///
     /// A region normally answers what it was OFFERED on its scrolling axis —
@@ -824,10 +858,28 @@ impl<C: View> View for ScrollView<C> {
             if crate::view::print_enabled() { "ScrollView".to_string() } else { String::new() },
             prints,
         ));
+        let path = motor::identity::cursor_scope();
+        // the binding's value rides the node the way a seam's `at`
+        // does, and the writer that sends a move back is retained
+        // beside it — the region is placed long after the body ran
+        let commanded = self.offset.as_ref().map(|offset| offset.wrappedValue());
+        if let (Some(path), Some(offset)) = (path.clone(), self.offset.clone()) {
+            crate::reconciler::attribute_scroll(
+                path,
+                Rc::new(move |landed| {
+                    // a clamp can pin the region: a repeated value must
+                    // not dirty the world
+                    if offset.wrappedValue() != landed {
+                        offset.set(landed);
+                    }
+                }),
+            );
+        }
         let region = LayoutNode::Scroll {
-            path: motor::identity::cursor_scope(),
+            path,
             target: None,
             axes: self.axes,
+            commanded,
             fill: self.fill,
             child: Box::new(wrap_layout(layouts)),
         };
@@ -843,7 +895,13 @@ impl<C: View> View for ScrollView<C> {
 }
 
 pub fn scroll<C: View>(content: C) -> ScrollView<C> {
-    ScrollView { content, axes: crate::layout::ScrollAxes::Vertical, hug: false, fill: false }
+    ScrollView {
+        content,
+        axes: crate::layout::ScrollAxes::Vertical,
+        hug: false,
+        fill: false,
+        offset: None,
+    }
 }
 
 /// What a drag carries: the typed value, erased for the wire between
@@ -1281,6 +1339,7 @@ where
         // retained offset (a remounted list restores the position)
         out.push_layout(LayoutNode::Scroll {
             target: None,
+            commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
             path: motor::identity::cursor_scope(),
@@ -1560,6 +1619,7 @@ where
         ));
         out.push_layout(LayoutNode::Scroll {
             target: reveal_id,
+            commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
             path: motor::identity::cursor_scope(),
@@ -1771,6 +1831,7 @@ impl<H: View, C: View> View for Section<H, C> {
         out.push_layout(if self.kind == "List" {
             LayoutNode::Scroll {
                 target: None,
+                commanded: None,
                 axes: crate::layout::ScrollAxes::Vertical,
                 fill: false,
                 path: motor::identity::cursor_scope(),

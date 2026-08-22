@@ -483,13 +483,20 @@ impl Walk<'_> {
                     forced: *forced,
                 })));
             }
-            LayoutNode::Scroll { path, target, child, .. } => {
-                let offset = self
-                    .env
-                    .scroll_offsets
-                    .get(path.as_deref().unwrap_or(""))
-                    .copied()
-                    .unwrap_or_default();
+            LayoutNode::Scroll { path, target, commanded, child, .. } => {
+                // a region the app holds in a binding takes the app's
+                // value: here the BROWSER is the clamp and the scroll
+                // observer writes back what it settled on, so a value
+                // past the end makes one round trip and comes home
+                // true. Without a binding the engine's retained offset
+                // stands, exactly as it did.
+                let offset = commanded.unwrap_or_else(|| {
+                    self.env
+                        .scroll_offsets
+                        .get(path.as_deref().unwrap_or(""))
+                        .copied()
+                        .unwrap_or_default()
+                });
                 let mut scroll = node(DomKind::Scroll {
                     path: path.clone(),
                     offset: (offset.x, offset.y),

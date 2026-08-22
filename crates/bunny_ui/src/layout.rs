@@ -525,6 +525,11 @@ pub enum LayoutNode {
         /// Which way the region travels. A list is vertical; an editor
         /// without wrap, a terminal and a spreadsheet go sideways too.
         axes: ScrollAxes,
+        /// The offset the APP is holding, read at render — `Some` only
+        /// when the region was given a binding. It is the value, the
+        /// way a split carries `at`; the writer that sends a move back
+        /// is retained beside it.
+        commanded: Option<Point>,
         /// The child is at least as big as the VIEWPORT on the scrolling
         /// axes, however little content it holds.
         ///
@@ -1865,6 +1870,9 @@ pub struct ScrollRegion {
     pub content: Size,
     /// The declared scroll target (`.scroll_target(id)`), if any.
     pub target: Option<String>,
+    /// The offset the app is holding, when the region was given a
+    /// binding to hold it in (`.offset(binding)`).
+    pub commanded: Option<Point>,
     /// A region under an animation scope reveals its target through
     /// this spring instead of snapping.
     pub anim: Option<crate::anim::Spring>,
@@ -4395,7 +4403,7 @@ impl LayoutNode {
             }
 
             (
-                LayoutNode::Scroll { path, target, axes, child, .. },
+                LayoutNode::Scroll { path, target, axes, commanded, child, .. },
                 Fit::ScrollContent(content, fit),
             ) => {
                 // per-axis travel over SNAPPED values: "scrollable by
@@ -4439,6 +4447,7 @@ impl LayoutNode {
                         frame,
                         content,
                         target: target.clone(),
+                        commanded: *commanded,
                         // a region inside an animation scope reveals its
                         // target through the spring instead of snapping
                         anim: env.anim.map(|scope| scope.spec),
@@ -6101,6 +6110,7 @@ mod tests {
                 boundary(
                     "region",
                     LayoutNode::Scroll {
+                        commanded: None,
                         axes: crate::layout::ScrollAxes::Vertical,
                         fill: false,
                         path: None,
@@ -6441,6 +6451,7 @@ mod tests {
             scale: 1.0,
         };
         let region = || LayoutNode::Scroll {
+            commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
             path: Some("doc".to_string()),
@@ -6461,6 +6472,7 @@ mod tests {
         let tall = LayoutNode::Hug {
             axis: Axis::Vertical,
             child: Box::new(LayoutNode::Scroll {
+                commanded: None,
                 axes: crate::layout::ScrollAxes::Vertical,
                 fill: false,
                 path: Some("doc".to_string()),
@@ -6511,6 +6523,7 @@ mod tests {
         };
 
         let root = LayoutNode::Scroll {
+            commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
             path: Some("list".to_string()),
@@ -6546,6 +6559,7 @@ mod tests {
             child: Box::new(text(4)),
         };
         let root = LayoutNode::Scroll {
+            commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
             path: Some("list".to_string()),
@@ -6580,6 +6594,7 @@ mod tests {
     #[test]
     fn scrollbar_appears_only_with_overflow() {
         let scroll = |count: usize| LayoutNode::Scroll {
+            commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
             path: Some("list".to_string()),

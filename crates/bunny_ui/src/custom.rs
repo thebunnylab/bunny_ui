@@ -981,6 +981,7 @@ mod tests {
         // shows — the contract that keeps a long document cheap
         let (bar, seen) = Bar::new(Color::FILL);
         let scroll = LayoutNode::Scroll {
+            commanded: None,
             axes: crate::layout::ScrollAxes::Vertical,
             fill: false,
             path: None,
