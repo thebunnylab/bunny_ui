@@ -1939,7 +1939,19 @@ pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHan
         msg_void_bool(view, sel("setWantsLayer:"), 1);
         msg_void_id(panel, sel("setContentView:"), view);
 
-        // hover and exit work inside the panel like anywhere else
+        // hover and exit work inside the panel like anywhere else — but
+        // ActiveInKeyWindow does NOT, because a popover panel never takes
+        // key (that is the whole point of a panel: the window behind it
+        // keeps the keyboard). With the window's own 0x223 the tracking
+        // area is simply inactive and the panel receives no moves at all:
+        // the rows of a menu never light, a submenu never opens, and a
+        // tooltip inside a popover never appears.
+        //
+        // 0x243 = MouseEnteredAndExited | MouseMoved | **ActiveInActiveApp**
+        // | InVisibleRect. ActiveInActiveApp rather than ActiveAlways: a
+        // popover belonging to an app that is not frontmost should not be
+        // tracking the pointer, and the shell already dismisses on an app
+        // switch.
         let area = msg_id(class("NSTrackingArea"), sel("alloc"));
         let area = msg_init_tracking(
             area,
@@ -1948,7 +1960,7 @@ pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHan
                 origin: CGPoint { x: 0.0, y: 0.0 },
                 size: CGSize { width: 0.0, height: 0.0 },
             },
-            0x223,
+            0x243,
             view,
             std::ptr::null_mut(),
         );
