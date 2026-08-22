@@ -5511,6 +5511,160 @@ mod tests {
         assert!(!runtime.dispatch_action(POKE), "an unmounted handler does not respond");
     }
 
+    /// A host mounts a TABLE outside the tree: the shape ninety actions
+    /// from a shared `const` arrive in. It answers when nothing in the
+    /// tree claims the id, and it stands across passes.
+    #[test]
+    fn a_host_mounts_a_table_outside_the_tree() {
+        const LEFT: ActionId = ActionId("test.vim.left");
+        const RIGHT: ActionId = ActionId("test.vim.right");
+
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("a page that claims nothing")
+            }
+        }
+
+        let runtime = Runtime::new();
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        for (id, verb) in [(LEFT, "left"), (RIGHT, "right")] {
+            let log = Rc::clone(&log);
+            runtime.on_action(id, move || log.borrow_mut().push(verb));
+        }
+        runtime.render_stable(&Page);
+
+        assert!(runtime.dispatch_action(LEFT));
+        assert!(runtime.dispatch_action(RIGHT));
+        assert_eq!(*log.borrow(), vec!["left", "right"]);
+
+        // a pass does not sweep it: the host mounted it, not the tree
+        runtime.render(&Page);
+        assert!(runtime.dispatch_action(LEFT));
+        assert_eq!(log.borrow().len(), 3);
+
+        // an id nobody took still answers nobody — the key walks on
+        assert!(!runtime.dispatch_action(ActionId("test.vim.nowhere")));
+
+        // and the host takes its own table down
+        runtime.clear_action_handlers();
+        assert!(!runtime.dispatch_action(LEFT), "the table came down whole");
+    }
+
+    /// The host's table is the FLOOR: a mounted view claiming the same
+    /// id shadows it, and the floor comes back when that view leaves.
+    /// It is the same law the tree keeps among its own.
+    #[test]
+    fn a_mounted_view_shadows_the_hosts_table() {
+        const JUMP: ActionId = ActionId("test.vim.jump");
+
+        #[derive(Clone, Copy)]
+        struct Pane {
+            focused: State<bool>,
+            local: State<i32>,
+        }
+        impl Component for Pane {
+            fn body(self, _ctx: &Context) -> impl View {
+                let local = self.local;
+                if self.focused.get() {
+                    Either::First(text("pane").on_action(JUMP, move || local.add(1)))
+                } else {
+                    Either::Second(text("pane"))
+                }
+            }
+        }
+
+        let runtime = Runtime::new();
+        let pane = Pane { focused: State::new(false), local: State::new(0) };
+        let host = Rc::new(std::cell::Cell::new(0));
+        {
+            let host = Rc::clone(&host);
+            runtime.on_action(JUMP, move || host.set(host.get() + 1));
+        }
+        runtime.render_stable(&pane);
+
+        assert!(runtime.dispatch_action(JUMP));
+        assert_eq!((host.get(), pane.local.get()), (1, 0), "the floor answers");
+
+        pane.focused.set(true);
+        runtime.render_stable(&pane);
+        assert!(runtime.dispatch_action(JUMP));
+        assert_eq!((host.get(), pane.local.get()), (1, 1), "the view shadows it");
+
+        pane.focused.set(false);
+        runtime.render_stable(&pane);
+        assert!(runtime.dispatch_action(JUMP));
+        assert_eq!((host.get(), pane.local.get()), (2, 1), "and the floor comes back");
+    }
+
+    /// Mounting an id twice REPLACES it, the way a rebind does — a
+    /// cascade re-installed must not fire the layer it replaced.
+    #[test]
+    fn mounting_a_host_handler_twice_replaces_it() {
+        const VERB: ActionId = ActionId("test.vim.verb");
+
+        #[derive(Clone, Copy)]
+        struct Blank;
+        impl Component for Blank {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("blank")
+            }
+        }
+
+        let runtime = Runtime::new();
+        runtime.render_stable(&Blank);
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        for layer in ["first", "second"] {
+            let log = Rc::clone(&log);
+            runtime.on_action(VERB, move || log.borrow_mut().push(layer));
+        }
+        assert!(runtime.dispatch_action(VERB));
+        assert_eq!(*log.borrow(), vec!["second"]);
+    }
+
+    /// The other end of the bridge, walked whole: a bare stroke reaches
+    /// the keymap, the keymap names an action, and the host's table
+    /// ANSWERS it — which is what makes the stroke consumed.
+    #[test]
+    fn a_stroke_crosses_the_keymap_into_the_hosts_table() {
+        const NEXT_WORD: ActionId = ActionId("test.vim.next_word");
+
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("no view claims a thing")
+            }
+        }
+
+        let runtime = Runtime::new();
+        runtime.render_stable(&Page);
+        let moved = Rc::new(std::cell::Cell::new(0));
+        {
+            let moved = Rc::clone(&moved);
+            runtime.on_action(NEXT_WORD, move || moved.set(moved.get() + 1));
+        }
+        runtime.bind(KeyPattern::key(Key::Char('w')), NEXT_WORD);
+
+        let stroke = KeyPattern::key(Key::Char('w'));
+        let action = match runtime.chord(&stroke) {
+            crate::action::KeyMatch::Action(action) => action,
+            other => panic!("the map answers the bare key, got {other:?}"),
+        };
+        assert!(runtime.dispatch_action(action), "the stroke is consumed");
+        assert_eq!(moved.get(), 1);
+
+        // an action the host never took leaves the stroke alone, so a
+        // field downstream still types it
+        runtime.bind(KeyPattern::key(Key::Char('q')), ActionId("test.vim.unmounted"));
+        let orphan = match runtime.chord(&KeyPattern::key(Key::Char('q'))) {
+            crate::action::KeyMatch::Action(action) => action,
+            other => panic!("bound, got {other:?}"),
+        };
+        assert!(!runtime.dispatch_action(orphan), "a binding with no handler walks on");
+    }
+
     #[test]
     fn handlers_reregister_with_fresh_captures() {
         use crate::layout::{Proposal, Size};

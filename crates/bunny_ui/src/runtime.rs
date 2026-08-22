@@ -99,6 +99,12 @@ pub struct Runtime {
     /// in paint order — the hit-test
     /// map for pointer events.
     last_hits: RefCell<Vec<(String, Rect)>>,
+    /// Handlers the HOST mounted, outside any view. The tree's own
+    /// handlers are the reconciler's and are rebuilt every pass; these
+    /// stand until the host takes them down, and they are the OUTERMOST
+    /// registration there is — any mounted view claiming the same id
+    /// shadows them.
+    hosted_handlers: RefCell<HashMap<ActionId, Rc<dyn Fn()>>>,
     /// Pointer state for the frame — resolved BEFORE layout (the LAW:
     /// hover swaps paint, never measurement) and stamped at expansion.
     interaction: RefCell<Interaction>,
@@ -731,6 +737,7 @@ impl Runtime {
             ctx,
             last_root: RefCell::new(None),
             last_hits: RefCell::new(Vec::new()),
+            hosted_handlers: RefCell::new(HashMap::default()),
             interaction: RefCell::new(Interaction::default()),
             pointer_modifiers: std::cell::Cell::new(crate::action::Modifiers::NONE),
             text,
@@ -2051,11 +2058,65 @@ impl Runtime {
         self.cancel_chord()
     }
 
-    /// Fires the innermost live handler. `false` = no handler mounted —
+    /// Mounts an action's handler OUTSIDE the view tree — the door for
+    /// a TABLE.
+    ///
+    /// `.on_action(id, f)` is a view, and a view is the right shape for
+    /// the ten actions an app writes by hand. It is the wrong shape for
+    /// ninety of them coming from a shared `const`: a table does not
+    /// expand into a chain of modifiers, and the ones that could be
+    /// written out would still be a screen of plumbing between the
+    /// table and the tree.
+    ///
+    /// ```ignore
+    /// for (id, verb) in VIM_VERBS {          // a const, shared with the
+    ///     let doc = doc.clone();             // other renderer
+    ///     runtime.on_action(*id, move || doc.run(*verb));
+    /// }
+    /// ```
+    ///
+    /// A host handler is the OUTERMOST there is: any mounted view that
+    /// claims the same id shadows it, which is the same law the tree
+    /// keeps among its own — the innermost wins. Registering an id
+    /// twice replaces it, exactly as a rebind does.
+    ///
+    /// Unlike a view's, this handler does not die with a subtree. The
+    /// host mounted it and the host takes it down —
+    /// [`Runtime::clear_action_handlers`].
+    pub fn on_action(&self, id: ActionId, handler: impl Fn() + 'static) {
+        self.hosted_handlers.borrow_mut().insert(id, Rc::new(handler));
+    }
+
+    /// Takes the host's whole table down, so a cascade can be
+    /// RE-INSTALLED instead of piled onto — the twin of
+    /// [`Runtime::clear_bindings`], for the other end of the bridge.
+    ///
+    /// The tree's own handlers are untouched: they are not the host's
+    /// to remove, and they come back with the next pass anyway.
+    pub fn clear_action_handlers(&self) {
+        self.hosted_handlers.borrow_mut().clear();
+    }
+
+    /// Fires the innermost live handler. `false` = nobody answered —
     /// the caller decides the fallback (the gate lets the key continue
     /// on to the field).
+    ///
+    /// The tree answers first, whatever depth it is at, and the host's
+    /// table is the floor beneath it.
     pub fn dispatch_action(&self, id: ActionId) -> bool {
-        reconciler::run_handler(id)
+        if reconciler::run_handler(id) {
+            return true;
+        }
+        // out of the borrow before it runs: a handler writes state, and
+        // may mount another one
+        let hosted = self.hosted_handlers.borrow().get(&id).cloned();
+        match hosted {
+            Some(handler) => {
+                handler();
+                true
+            }
+            None => false,
+        }
     }
 
     // MARK: - Focus and keyboard (the focused field owns the keyboard)
