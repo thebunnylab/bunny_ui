@@ -958,6 +958,7 @@ mod tests {
         let (bar, seen) = Bar::new(Color::FILL);
         let scroll = LayoutNode::Scroll {
             axes: crate::layout::ScrollAxes::Vertical,
+            fill: false,
             path: None,
             target: None,
             child: Box::new(LayoutNode::Frame {

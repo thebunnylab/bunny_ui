@@ -734,6 +734,7 @@ pub struct ScrollView<C> {
     content: C,
     axes: crate::layout::ScrollAxes,
     hug: bool,
+    fill: bool,
 }
 
 impl<C> ScrollView<C> {
@@ -746,6 +747,25 @@ impl<C> ScrollView<C> {
     /// Both ways.
     pub fn both_axes(mut self) -> Self {
         self.axes = crate::layout::ScrollAxes::Both;
+        self
+    }
+
+    /// The content is at least as big as the REGION on the axes it travels,
+    /// however little of it there is.
+    ///
+    /// A travelling axis is proposed nothing — that is what lets the content
+    /// answer its own extent and hand the region the thumb, the wheel and the
+    /// travel. The cost is glass that belongs to nobody: a document shorter
+    /// than the panel ends, and the space below its last line is not the
+    /// document's, so a press there reaches no one. Every editor puts the
+    /// caret at the end of the file for that press, and the same is true
+    /// sideways of the widest line.
+    ///
+    /// The content still SCROLLS on what it actually holds — this grows the
+    /// lane it is placed in, not what it answered, exactly as a split's lane
+    /// is not its child's answer.
+    pub fn fill_viewport(mut self) -> Self {
+        self.fill = true;
         self
     }
 
@@ -781,6 +801,7 @@ impl<C: View> View for ScrollView<C> {
             path: motor::identity::cursor_scope(),
             target: None,
             axes: self.axes,
+            fill: self.fill,
             child: Box::new(wrap_layout(layouts)),
         };
         out.push_layout(if self.hug {
@@ -795,7 +816,7 @@ impl<C: View> View for ScrollView<C> {
 }
 
 pub fn scroll<C: View>(content: C) -> ScrollView<C> {
-    ScrollView { content, axes: crate::layout::ScrollAxes::Vertical, hug: false }
+    ScrollView { content, axes: crate::layout::ScrollAxes::Vertical, hug: false, fill: false }
 }
 
 /// What a drag carries: the typed value, erased for the wire between
@@ -1234,6 +1255,7 @@ where
         out.push_layout(LayoutNode::Scroll {
             target: None,
             axes: crate::layout::ScrollAxes::Vertical,
+            fill: false,
             path: motor::identity::cursor_scope(),
             child: Box::new(LayoutNode::Stack {
                 axis: Axis::Vertical,
@@ -1512,6 +1534,7 @@ where
         out.push_layout(LayoutNode::Scroll {
             target: reveal_id,
             axes: crate::layout::ScrollAxes::Vertical,
+            fill: false,
             path: motor::identity::cursor_scope(),
             child: Box::new(LayoutNode::VirtualStack {
                 row_extent: self
@@ -1722,6 +1745,7 @@ impl<H: View, C: View> View for Section<H, C> {
             LayoutNode::Scroll {
                 target: None,
                 axes: crate::layout::ScrollAxes::Vertical,
+                fill: false,
                 path: motor::identity::cursor_scope(),
                 child: Box::new(stacked),
             }

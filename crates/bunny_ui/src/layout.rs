@@ -501,6 +501,18 @@ pub enum LayoutNode {
         /// Which way the region travels. A list is vertical; an editor
         /// without wrap, a terminal and a spreadsheet go sideways too.
         axes: ScrollAxes,
+        /// The child is at least as big as the VIEWPORT on the scrolling
+        /// axes, however little content it holds.
+        ///
+        /// A scrolling axis is proposed nothing — that is what lets the child
+        /// answer its own extent and hand the region the thumb, the wheel and
+        /// the travel. The cost is that a child SMALLER than the region
+        /// leaves glass the child does not own: a short file ends and the
+        /// panel below its last line belongs to nobody, so a press there
+        /// misses the editor entirely. Every editor puts the caret at the end
+        /// of the file for that press, and the same is true sideways of the
+        /// widest line.
+        fill: bool,
         child: Box<LayoutNode>,
     },
     /// Takes AT MOST what its child needs on one axis.
@@ -3417,7 +3429,7 @@ impl LayoutNode {
                 (size, Fit::Wrapped(child_size, Box::new(fit)))
             }
 
-            LayoutNode::Scroll { axes, child, .. } => {
+            LayoutNode::Scroll { axes, fill, child, .. } => {
                 // the scrolling axes stay OPEN — the content takes its
                 // natural extent there and the region travels through it
                 let (content, fit) = child.measure(
@@ -3430,6 +3442,19 @@ impl LayoutNode {
                 let size = Size {
                     width: proposal.width.unwrap_or(content.width),
                     height: proposal.height.unwrap_or(content.height),
+                };
+                // The lane the child is PLACED in, which is not always the
+                // extent it answered — the same asymmetry a split's lanes
+                // have. Filling grows it to the region on the travelling
+                // axes, so the glass under a short document belongs to the
+                // document.
+                let content = if *fill {
+                    Size {
+                        width: if axes.horizontal() { content.width.max(size.width) } else { content.width },
+                        height: if axes.vertical() { content.height.max(size.height) } else { content.height },
+                    }
+                } else {
+                    content
                 };
                 (size, Fit::ScrollContent(content, Box::new(fit)))
             }
@@ -4341,7 +4366,7 @@ impl LayoutNode {
             }
 
             (
-                LayoutNode::Scroll { path, target, axes, child },
+                LayoutNode::Scroll { path, target, axes, child, .. },
                 Fit::ScrollContent(content, fit),
             ) => {
                 // per-axis travel over SNAPPED values: "scrollable by
@@ -6048,6 +6073,7 @@ mod tests {
                     "region",
                     LayoutNode::Scroll {
                         axes: crate::layout::ScrollAxes::Vertical,
+                        fill: false,
                         path: None,
                         target: None,
                         child: Box::new(boundary("content", text(1000))),
@@ -6387,6 +6413,7 @@ mod tests {
         };
         let region = || LayoutNode::Scroll {
             axes: crate::layout::ScrollAxes::Vertical,
+            fill: false,
             path: Some("doc".to_string()),
             target: None,
             // 3 rows of 16 = 48, well under the 200 on offer.
@@ -6406,6 +6433,7 @@ mod tests {
             axis: Axis::Vertical,
             child: Box::new(LayoutNode::Scroll {
                 axes: crate::layout::ScrollAxes::Vertical,
+                fill: false,
                 path: Some("doc".to_string()),
                 target: None,
                 child: Box::new(rows(40)),
@@ -6455,6 +6483,7 @@ mod tests {
 
         let root = LayoutNode::Scroll {
             axes: crate::layout::ScrollAxes::Vertical,
+            fill: false,
             path: Some("list".to_string()),
             target: None,
             child: Box::new(rows(10)),
@@ -6489,6 +6518,7 @@ mod tests {
         };
         let root = LayoutNode::Scroll {
             axes: crate::layout::ScrollAxes::Vertical,
+            fill: false,
             path: Some("list".to_string()),
             target: None,
             child: Box::new(LayoutNode::Stack {
@@ -6522,6 +6552,7 @@ mod tests {
     fn scrollbar_appears_only_with_overflow() {
         let scroll = |count: usize| LayoutNode::Scroll {
             axes: crate::layout::ScrollAxes::Vertical,
+            fill: false,
             path: Some("list".to_string()),
             target: None,
             child: Box::new(rows(count)),
