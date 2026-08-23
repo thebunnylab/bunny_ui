@@ -48,6 +48,18 @@ pub fn erased<V: View<Arity = Single>>(view: V) -> Erased {
     Erased::new(view)
 }
 
+/// The same, from a BORROW — the door the render walk uses.
+///
+/// The copy is made INSIDE this frame, which opens and closes on its
+/// own. A clone spelt at the call site would instead reserve its slot
+/// in the caller's frame, and the caller here is one level of the
+/// render recursion: a debug build keeps every local's slot for the
+/// whole function, so that copy would be stack every descendant pays.
+#[inline(never)]
+pub fn erased_from<V: View<Arity = Single> + Clone>(view: &V) -> Erased {
+    Erased(Rc::new(view.clone()))
+}
+
 /// `ViewModifier` / `EnvironmentalModifier` — Swift's
 /// `func body(content:)`, re-applied on every render (it is what makes
 /// `RootViewAppearance`'s `blur(radius:)` recompute when `isActive`

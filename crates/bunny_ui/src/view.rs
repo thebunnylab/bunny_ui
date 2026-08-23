@@ -205,6 +205,69 @@ pub trait Component: Clone + 'static {
     fn body(self, ctx: &Context) -> impl View;
 }
 
+// MARK: - Rendering a component without stacking its payload
+//
+// A body takes `self` BY VALUE, so the payload is copied once per
+// level. That is the contract and it is fine. What is NOT fine is the
+// copy being made in the frame of the RECURSION: a debug build gives
+// every local its own slot for the whole function, live or not, so a
+// copy named in `render_into` is stack that every descendant of that
+// view pays for. A shell with a hundred `State`s and a tree twenty
+// deep turns a few kilobytes into megabytes, and the thread runs out
+// before a screen is even mounted.
+//
+// The cure is boring and it is all here: anything holding a copy of
+// the payload gets its OWN frame, one that pops before the descent
+// begins or opens after it ends. The payload is still copied — it is
+// just never copied ON TOP of itself.
+
+/// Runs a component's body from a BORROW.
+///
+/// The copy the body consumes lives in THIS frame, which pops the
+/// moment the body hands its view back — before a single child
+/// renders. Written at the call site instead, the same copy would
+/// reserve its slot in the caller's frame for the whole subtree.
+#[inline(never)]
+fn run_body<'a, T: Component>(view: &T, ctx: &'a Context) -> impl View + use<'a, T> {
+    view.clone().body(ctx)
+}
+
+/// Files the finished body under its identity.
+///
+/// Everything here runs AFTER the descent and needs a slot for nothing
+/// during it — including the second copy of the payload, the one the
+/// retention keeps so a skipped view can answer from cache.
+#[inline(never)]
+fn retain_entry<T: Component>(view: &T, ctx: &Context, path: &str, body: NodeList) {
+    let (print_children, layout_children) = body.into_parts();
+    crate::reconciler::finish_entry(
+        path,
+        crate::erased::erased_from(view),
+        ctx.clone(),
+        RenderNode::branch(short_type_name::<T>(), print_children),
+        crate::layout::LayoutNode::Boundary {
+            path: path.to_string(),
+            children: layout_children,
+        },
+    );
+}
+
+/// The same tail, for a render with no pass around it: nothing is
+/// retained, so the two lists go straight out.
+///
+/// It earns its own frame for a second reason. A debug frame reserves
+/// room for the locals of every BRANCH, taken or not, so this one was
+/// costing the retained path too — on every level.
+#[inline(never)]
+fn close_loose<T: Component>(body: NodeList, out: &mut NodeList) {
+    let (print_children, layout_children) = body.into_parts();
+    out.push(RenderNode::branch(short_type_name::<T>(), print_children));
+    out.push_layout(crate::layout::LayoutNode::Boundary {
+        path: short_type_name::<T>(),
+        children: layout_children,
+    });
+}
+
 impl<T: Component> View for T {
     type Arity = Single;
 
@@ -217,13 +280,8 @@ impl<T: Component> View for T {
         // retention — the pre-reconciler behavior.
         let Some(path) = motor::identity::current_view_path() else {
             let mut body = NodeList::new();
-            self.clone().body(ctx).render_into(ctx, &mut body);
-            let (print_children, layout_children) = body.into_parts();
-            out.push(RenderNode::branch(short_type_name::<T>(), print_children));
-            out.push_layout(crate::layout::LayoutNode::Boundary {
-                path: short_type_name::<T>(),
-                children: layout_children,
-            });
+            run_body(self, ctx).render_into(ctx, &mut body);
+            close_loose::<T>(body, out);
             return;
         };
 
@@ -242,20 +300,8 @@ impl<T: Component> View for T {
         motor::identity::begin_view_reads(&path);
         crate::reconciler::begin_entry(&path);
         let mut body = NodeList::new();
-        self.clone().body(ctx).render_into(ctx, &mut body);
-        let (print_children, layout_children) = body.into_parts();
-        let node = RenderNode::branch(short_type_name::<T>(), print_children);
-        let boundary = crate::layout::LayoutNode::Boundary {
-            path: path.clone(),
-            children: layout_children,
-        };
-        crate::reconciler::finish_entry(
-            &path,
-            crate::erased::erased(self.clone()),
-            ctx.clone(),
-            node,
-            boundary,
-        );
+        run_body(self, ctx).render_into(ctx, &mut body);
+        retain_entry(self, ctx, &path, body);
         out.push_view_ref(&path);
     }
 }
@@ -390,4 +436,128 @@ pub(crate) fn short_type_name<T: ?Sized>() -> String {
     // generics: `path::DetailRow<bunny_ui::views::Text>` → `DetailRow`
     let base = full.split('<').next().unwrap_or(full);
     base.rsplit("::").next().unwrap_or(base).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use motor::state::State;
+
+    use crate::state_ext::StateExt as _;
+
+    use crate::layout::{Proposal, Size};
+    use crate::runtime::Runtime;
+    use crate::views::{text, vstack};
+
+    use super::*;
+
+    thread_local! {
+        static BASE: Cell<usize> = const { Cell::new(0) };
+        static DEEPEST: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    /// Where this frame sits. A LOCAL, kept opaque — `&0u8` is a
+    /// promoted constant and lives in the binary, never on the stack.
+    #[inline(never)]
+    fn here() -> usize {
+        let anchor = 0u8;
+        std::hint::black_box(&anchor) as *const u8 as usize
+    }
+
+    #[inline(never)]
+    fn mark() {
+        let now = here();
+        DEEPEST.with(|deepest| deepest.set(deepest.get().min(now)));
+    }
+
+    #[derive(Clone, Copy)]
+    struct Payload<const N: usize> {
+        states: [State<u64>; N],
+    }
+
+    impl<const N: usize> Payload<N> {
+        fn new() -> Payload<N> {
+            Payload { states: [(); N].map(|_| State::new(0u64)) }
+        }
+
+        /// A read, so the payload is not weight the compiler may drop.
+        fn sum(&self) -> u64 {
+            self.states.iter().map(|state| state.get()).sum()
+        }
+    }
+
+    /// One level of a tree that carries its whole payload BY VALUE —
+    /// the shape an app's shell has when every screen hangs off it.
+    #[derive(Clone, Copy)]
+    struct Level<const N: usize> {
+        payload: Payload<N>,
+        left: usize,
+    }
+
+    impl<const N: usize> Component for Level<N> {
+        fn body(self, _ctx: &Context) -> impl View {
+            mark();
+            let deeper =
+                (self.left > 0).then(|| Level { payload: self.payload, left: self.left - 1 });
+            vstack((text(format!("level {} of {}", self.left, self.payload.sum())), deeper))
+        }
+    }
+
+    /// Stack bytes ONE level of the recursion costs, for a payload of
+    /// `N` states. A stack overflow aborts the process, so the number
+    /// is the high-water mark and never "did it survive".
+    fn per_level<const N: usize>(depth: usize) -> usize {
+        // its own thread: a generous stack, and the identity arenas are
+        // thread-local, so a measurement never reads another's world
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = Runtime::new();
+                let root = Level { payload: Payload::<N>::new(), left: depth };
+                let base = here();
+                BASE.with(|cell| cell.set(base));
+                DEEPEST.with(|cell| cell.set(base));
+                let _ = runtime
+                    .settled_layout(&root, Proposal::exact(Size { width: 900.0, height: 700.0 }));
+                let deepest = DEEPEST.with(|cell| cell.get());
+                (base - deepest) / depth
+            })
+            .expect("a thread for the probe")
+            .join()
+            .expect("the probe finished")
+    }
+
+    /// How many times a component's payload is re-materialized per
+    /// level of the render recursion.
+    ///
+    /// A body takes `self` BY VALUE, so ONE copy per level is the
+    /// contract: the view a body returns holds the children it built,
+    /// and those children carry what they were given. Every copy above
+    /// that is accident, and accident is what puts a ceiling on how
+    /// deep a tree with a fat shell may go — a debug frame reserves
+    /// room for every local it declares, live or not, so anything the
+    /// recursive frame names is stack that every descendant pays for.
+    ///
+    /// Measured as a DIFFERENCE between two payload sizes, which
+    /// cancels the framework's own fixed cost per level and most of
+    /// what the machine and the compiler contribute. The bound sits
+    /// between what this pass costs (2.1) and what a single copy
+    /// coming back costs (3.2), so it catches one — and it is not a
+    /// number to tune: a release build elides the copies and answers
+    /// near zero, which passes.
+    #[test]
+    fn a_payload_is_not_re_materialized_all_the_way_down() {
+        const DEPTH: usize = 40;
+        let slim = per_level::<50>(DEPTH);
+        let fat = per_level::<150>(DEPTH);
+        let added = size_of::<Payload<150>>() - size_of::<Payload<50>>();
+        let copies = fat.saturating_sub(slim) as f64 / added as f64;
+        assert!(
+            copies <= 3.0,
+            "a payload is copied {copies:.2}× per level \
+             (slim {slim} B, fat {fat} B, {added} B of payload apart) — \
+             a copy of `self` is being named in the recursive frame again",
+        );
+    }
 }
