@@ -148,6 +148,8 @@ unsafe extern "C" {
     fn msg_void_id_i64(obj: Id, sel: Sel, a: Id, b: i64);
     #[link_name = "objc_msgSend"]
     fn msg_void_id_i64_id(obj: Id, sel: Sel, a: Id, b: i64, c: Id);
+    #[link_name = "objc_msgSendSuper"]
+    fn msg_super_bool_id(sup: *const ObjcSuper, sel: Sel, a: Id) -> i8;
     #[link_name = "objc_msgSend"]
     fn msg_void_rect_bool(obj: Id, sel: Sel, rect: CGRect, flag: i8);
     #[link_name = "objc_msgSend"]
@@ -758,6 +760,66 @@ unsafe fn typed_character(event: Id, flags: u64) -> Option<char> {
     }
 }
 
+/// The receiver-and-class pair `objc_msgSendSuper` walks up from —
+/// how an added method still reaches the implementation it shadowed.
+#[repr(C)]
+pub(crate) struct ObjcSuper {
+    receiver: Id,
+    class: Id,
+}
+
+/// NSView's own `performKeyEquivalent:` — the walk into the subviews
+/// this override would otherwise swallow (the page's ⌘C in a form
+/// lives down there).
+unsafe fn key_equivalent_super(this: Id, event: Id) -> i8 {
+    let sup = ObjcSuper { receiver: this, class: class("NSView") };
+    unsafe { msg_super_bool_id(&sup, sel("performKeyEquivalent:"), event) }
+}
+
+/// `performKeyEquivalent:` — the app's chords survive the island
+/// holding the keyboard. A click on a hosted page hands the first
+/// responder to the platform view and `keyDown:` stops arriving; but
+/// AppKit walks the view tree for COMMAND chords before any of that,
+/// and this view is visited before its children. Three rules:
+/// - only while the view is NOT the responder: when it is, the chord
+///   arrives by `keyDown:` as ever, and running the gate twice would
+///   break a pending two-step chord.
+/// - command chords only — everything else is the page's to type (a
+///   form that is being typed in must receive the typing).
+/// - not consumed → super, so the page keeps its own chords.
+extern "C" fn bunny_perform_key_equivalent(this: Id, _sel: Sel, event: Id) -> i8 {
+    unsafe {
+        let window = msg_id(this, sel("window"));
+        if window.is_null() {
+            return key_equivalent_super(this, event);
+        }
+        let responder = msg_id(window, sel("firstResponder"));
+        if std::ptr::eq(responder, this) {
+            return key_equivalent_super(this, event);
+        }
+        let flags = msg_u64(event, sel("modifierFlags"));
+        let held = modifiers_of(flags);
+        if !held.command {
+            return key_equivalent_super(this, event);
+        }
+        let code = msg_u16(event, sel("keyCode"));
+        let stroke = KeyStroke {
+            code,
+            shift: held.shift,
+            control: held.control,
+            option: held.option,
+            command: held.command,
+            chars: text_argument_to_string(msg_id(event, sel("characters"))),
+            typed: typed_character(event, flags),
+            chars_bare: bare_characters(event),
+        };
+        if gate_consumed(&stroke) {
+            return 1; // the keymap dispatched — the event dies here
+        }
+        key_equivalent_super(this, event)
+    }
+}
+
 extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
     unsafe {
         let code = msg_u16(event, sel("keyCode"));
@@ -1163,6 +1225,15 @@ unsafe fn register_classes() {
             sel("keyDown:"),
             bunny_key_down as *const c_void,
             types.as_ptr(),
+        );
+        // the chord road that survives a hosted page holding the
+        // first responder — see bunny_perform_key_equivalent
+        let key_equivalent_types = CString::new("c@:@").expect("type encoding");
+        class_addMethod(
+            view,
+            sel("performKeyEquivalent:"),
+            bunny_perform_key_equivalent as *const c_void,
+            key_equivalent_types.as_ptr(),
         );
         let draw_types = CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}").expect("type encoding");
         class_addMethod(
