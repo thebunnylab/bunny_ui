@@ -5235,6 +5235,60 @@ fn measure_stack(
             .sum();
         let mut budget = (total - rigid - spacing_total).max(0.0);
         let mut pool = flexible;
+
+        // Before the quotas: WHO here actually wants a size?
+        //
+        // The waterfall below only ever hands surplus downward — a child
+        // that takes less than its quota releases the rest. Nothing in it
+        // lets a child that wants MORE take from one that wants nothing
+        // in particular, and that is the case a strip beside a spacer
+        // is: the hug clamps at its quota and answers "full", the spacer
+        // swallows its quota and answers "full", and the loop stops on
+        // the first round with the hug pinned at half the row.
+        //
+        // So ask each one what it does with the WHOLE budget. A child
+        // that takes less than all of it has an IDEAL and is bounded; a
+        // child that swallows it is a filler with no size of its own.
+        // When the bounded ones fit together, they take what they asked
+        // for and the fillers absorb what is left — which is the rule a
+        // reader already expects, and the one the quota was hiding.
+        //
+        // Only from TWO flexibles up: a single one is offered the whole
+        // budget by the loop anyway, so the probe would be a measure
+        // spent to learn nothing.
+        //
+        // And only when someone's NATURAL size — phase 1 already has it,
+        // free — is bigger than the quota it is about to be handed.
+        // That is the whole trap: an ideal below the quota is released
+        // as surplus by the loop below, exactly as it always was. Two
+        // panes that both take whatever they are given are naturals of
+        // nothing, and they skip the probe entirely.
+        let quota = budget / pool.len() as Px;
+        let wants_more = pool.iter().any(|&index| main(&measured[index].0) > quota + SETTLED);
+        if pool.len() > 1 && wants_more {
+            let probes: Vec<(usize, (Size, Fit))> = pool
+                .iter()
+                .map(|&index| {
+                    (index, children[index].measure(cross_proposal(Some(budget)), env))
+                })
+                .collect();
+            let (bounded, fillers): (Vec<_>, Vec<_>) = probes
+                .into_iter()
+                .partition(|(_, (size, _))| main(size) < budget - SETTLED);
+            let wanted: Px = bounded.iter().map(|(_, (size, _))| main(size)).sum();
+            // all three have to hold: someone with an ideal, someone to
+            // absorb, and room for every ideal. Without the last one the
+            // bounded children are in genuine contention and the quota
+            // below is the fair answer
+            if !bounded.is_empty() && !fillers.is_empty() && wanted <= budget {
+                for (index, answer) in bounded {
+                    measured[index] = answer;
+                }
+                budget = (budget - wanted).max(0.0);
+                pool = fillers.into_iter().map(|(index, _)| index).collect();
+            }
+        }
+
         loop {
             let share = budget / pool.len() as Px;
             for &index in &pool {

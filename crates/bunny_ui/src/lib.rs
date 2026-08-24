@@ -5758,6 +5758,86 @@ mod tests {
         assert!(!bare_round, "and no corner of its own is rounded");
     }
 
+    /// A lane that HUGS beside a spacer takes what it needs, not half
+    /// the row.
+    ///
+    /// The waterfall only ever hands surplus DOWNWARD: a child that
+    /// takes less than its quota releases the rest. Nothing lets a
+    /// child that wants MORE take from a filler that wants nothing in
+    /// particular — so a hug and a spacer both answered "I took the
+    /// whole quota" on the first round and the loop stopped there, with
+    /// the hug pinned at half the row and the other half blank.
+    #[test]
+    fn a_hugging_lane_beside_a_spacer_takes_what_it_needs() {
+        use crate::layout::{Proposal, Size};
+
+        const ROW: f64 = 1000.0;
+        const CONTENT: f64 = 720.0;
+
+        #[derive(Clone, Copy)]
+        struct Strip {
+            lane: State<f64>,
+        }
+        impl Component for Strip {
+            fn body(self, _ctx: &Context) -> impl View {
+                let lane = self.lane;
+                hstack((
+                    scroll(empty().frame(CONTENT, 24.0))
+                        .horizontal()
+                        .hugging()
+                        .on_measure(move |size| lane.set(size.width)),
+                    spacer(),
+                ))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let strip = Strip { lane: State::new(0.0) };
+        let _ = runtime
+            .settled_layout(&strip, Proposal::exact(Size { width: ROW, height: 40.0 }));
+        assert_eq!(
+            strip.lane.get(),
+            CONTENT,
+            "the hug asked for {CONTENT} of a {ROW} row and the spacer wanted nothing",
+        );
+    }
+
+    /// Two lanes that both want more than half still split it evenly.
+    ///
+    /// The tier only moves surplus that EXISTS. When every ideal cannot
+    /// fit, the children are in genuine contention and the quota is the
+    /// fair answer — the same one this stack has always given.
+    #[test]
+    fn two_hugging_lanes_that_do_not_fit_still_share_the_row() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Strip {
+            left: State<f64>,
+            right: State<f64>,
+        }
+        impl Component for Strip {
+            fn body(self, _ctx: &Context) -> impl View {
+                let (left, right) = (self.left, self.right);
+                let lane = |width: f64| scroll(empty().frame(width, 24.0)).horizontal().hugging();
+                hstack((
+                    lane(700.0).on_measure(move |size| left.set(size.width)),
+                    lane(900.0).on_measure(move |size| right.set(size.width)),
+                ))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let strip = Strip { left: State::new(0.0), right: State::new(0.0) };
+        let _ = runtime
+            .settled_layout(&strip, Proposal::exact(Size { width: 1000.0, height: 40.0 }));
+        assert_eq!(
+            (strip.left.get(), strip.right.get()),
+            (500.0, 500.0),
+            "1600 of ideal into a 1000 row is contention, and the quota is fair",
+        );
+    }
+
     /// The size a view resolved to reaches the app, and reaches it in
     /// the SAME frame — a body that turns the measurement into a frame
     /// runs before anything is painted.
