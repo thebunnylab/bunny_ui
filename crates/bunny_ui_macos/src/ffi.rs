@@ -1852,7 +1852,13 @@ static REGISTER_SEGMENT: Once = Once::new();
 /// buffer's rows count from the top.
 extern "C" fn bunny_segment_hit(this: Id, _sel: Sel, point: CGPoint) -> Id {
     SEGMENTS.with(|segments| {
-        let segments = segments.borrow();
+        // AppKit asks hitTest RE-ENTRANTLY — a setFrame: invalidates
+        // tracking and asks right then. While the table is being
+        // written the answer is "not mine": a pointer question in the
+        // middle of a blit falls through to the page for one event
+        let Ok(segments) = segments.try_borrow() else {
+            return std::ptr::null_mut();
+        };
         let Some(slot) = segments.values().find(|slot| std::ptr::eq(slot.view, this)) else {
             return std::ptr::null_mut();
         };
@@ -1935,9 +1941,14 @@ impl WindowHandle {
         px_height: usize,
     ) {
         unsafe { register_segment_class() };
-        SEGMENTS.with(|segments| {
-            let mut segments = segments.borrow_mut();
-            let slot = segments.entry(key.to_string()).or_insert_with(|| unsafe {
+        // NOTHING Objective-C runs while the table is borrowed:
+        // AppKit asks hitTest RE-ENTRANTLY from addSubview: and
+        // setFrame:, and the hit answer reads this same table — a
+        // borrow held across the send is the abort the first QA found
+        let known = SEGMENTS.with(|segments| segments.borrow().get(key).map(|slot| slot.view));
+        let view = match known {
+            Some(view) => view,
+            None => unsafe {
                 let view = msg_id(class("BunnySegmentView"), sel("alloc"));
                 let view = msg_init_rect(
                     view,
@@ -1964,16 +1975,29 @@ impl WindowHandle {
                     ),
                     None => msg_void_id(self.view, sel("addSubview:"), view),
                 }
-                SegmentSlot {
-                    view,
-                    rgba: Vec::new(),
-                    width: 0,
-                    height: 0,
-                    scale,
-                    buffers: [Vec::new(), Vec::new()],
-                    flip: false,
-                }
-            });
+                SEGMENTS.with(|segments| {
+                    segments.borrow_mut().insert(
+                        key.to_string(),
+                        SegmentSlot {
+                            view,
+                            rgba: Vec::new(),
+                            width: 0,
+                            height: 0,
+                            scale,
+                            buffers: [Vec::new(), Vec::new()],
+                            flip: false,
+                        },
+                    );
+                });
+                view
+            },
+        };
+        // the pixels land in the table first; the layer reads them
+        // AFTER the borrow is gone. The backing stays put between the
+        // two: one thread, and its only writer is this function.
+        let (pointer, length) = SEGMENTS.with(|segments| {
+            let mut segments = segments.borrow_mut();
+            let slot = segments.get_mut(key).expect("the slot was just made");
             slot.rgba.clear();
             slot.rgba.extend_from_slice(rgba);
             slot.width = px_width;
@@ -1991,91 +2015,100 @@ impl WindowHandle {
                     }
                 }
             }
-            let (x, y, w, h) = frame;
-            unsafe {
-                let provider = CGDataProviderCreateWithData(
-                    std::ptr::null_mut(),
-                    backing.as_ptr(),
-                    backing.len(),
-                    std::ptr::null(),
-                );
-                let space = CGColorSpaceCreateDeviceRGB();
-                let image = CGImageCreate(
-                    px_width,
-                    px_height,
-                    8,
-                    32,
-                    px_width * 4,
-                    space,
-                    ALPHA_PREMULTIPLIED_LAST,
-                    provider,
-                    std::ptr::null(),
-                    false,
-                    0,
-                );
-                let layer = msg_id(slot.view, sel("layer"));
-                without_actions(|| {
-                    msg_void_rect(
-                        slot.view,
-                        sel("setFrame:"),
-                        CGRect {
-                            origin: CGPoint { x, y: view_height - y - h },
-                            size: CGSize { width: w, height: h },
-                        },
-                    );
-                    if !layer.is_null() {
-                        msg_void_f64(layer, sel("setContentsScale:"), scale as f64);
-                        msg_void_id(layer, sel("setContents:"), image);
-                    }
-                });
-                CGImageRelease(image);
-                CGColorSpaceRelease(space);
-                CGDataProviderRelease(provider);
-            }
+            (backing.as_ptr(), backing.len())
         });
+        let (x, y, w, h) = frame;
+        unsafe {
+            let provider = CGDataProviderCreateWithData(
+                std::ptr::null_mut(),
+                pointer,
+                length,
+                std::ptr::null(),
+            );
+            let space = CGColorSpaceCreateDeviceRGB();
+            let image = CGImageCreate(
+                px_width,
+                px_height,
+                8,
+                32,
+                px_width * 4,
+                space,
+                ALPHA_PREMULTIPLIED_LAST,
+                provider,
+                std::ptr::null(),
+                false,
+                0,
+            );
+            let layer = msg_id(view, sel("layer"));
+            without_actions(|| {
+                msg_void_rect(
+                    view,
+                    sel("setFrame:"),
+                    CGRect {
+                        origin: CGPoint { x, y: view_height - y - h },
+                        size: CGSize { width: w, height: h },
+                    },
+                );
+                if !layer.is_null() {
+                    msg_void_f64(layer, sel("setContentsScale:"), scale as f64);
+                    msg_void_id(layer, sel("setContents:"), image);
+                }
+            });
+            CGImageRelease(image);
+            CGColorSpaceRelease(space);
+            CGDataProviderRelease(provider);
+        }
     }
 
     /// Re-places one segment without touching its pixels — the same
     /// commands at a new flip height (the window grew, the content
     /// did not). A segment with no surface yet is a no-op.
     pub fn segment_place(&self, key: &str, frame: (f64, f64, f64, f64), view_height: f64) {
-        SEGMENTS.with(|segments| {
-            let segments = segments.borrow();
-            let Some(slot) = segments.get(key) else {
-                return;
-            };
-            let (x, y, w, h) = frame;
-            unsafe {
-                without_actions(|| {
-                    msg_void_rect(
-                        slot.view,
-                        sel("setFrame:"),
-                        CGRect {
-                            origin: CGPoint { x, y: view_height - y - h },
-                            size: CGSize { width: w, height: h },
-                        },
-                    );
-                });
-            }
-        });
+        // the view leaves the borrow before the send — hitTest reads
+        // the table the moment a frame moves
+        let Some(view) =
+            SEGMENTS.with(|segments| segments.borrow().get(key).map(|slot| slot.view))
+        else {
+            return;
+        };
+        let (x, y, w, h) = frame;
+        unsafe {
+            without_actions(|| {
+                msg_void_rect(
+                    view,
+                    sel("setFrame:"),
+                    CGRect {
+                        origin: CGPoint { x, y: view_height - y - h },
+                        size: CGSize { width: w, height: h },
+                    },
+                );
+            });
+        }
     }
 
     /// Removes the segments that left the scene — nothing painted
-    /// above the host this frame, so nothing covers it.
+    /// above the host this frame, so nothing covers it. The dead
+    /// leave the table FIRST and their views after: removal asks
+    /// hitTest too.
     pub fn segment_sweep(&self, alive: &[String]) {
-        SEGMENTS.with(|segments| {
+        let dead: Vec<Id> = SEGMENTS.with(|segments| {
             let mut segments = segments.borrow_mut();
+            let mut dead = Vec::new();
             segments.retain(|key, slot| {
                 if alive.iter().any(|path| path == key) {
                     return true;
                 }
-                unsafe {
-                    msg_void(slot.view, sel("removeFromSuperview"));
-                    msg_void(slot.view, sel("release"));
-                }
+                dead.push(slot.view);
                 false
             });
+            dead
         });
+        for view in dead {
+            unsafe {
+                msg_void(view, sel("removeFromSuperview"));
+                msg_void(view, sel("release"));
+            }
+        }
     }
 }
 
