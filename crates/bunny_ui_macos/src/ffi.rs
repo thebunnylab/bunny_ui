@@ -822,6 +822,11 @@ extern "C" fn bunny_window_will_start_live_resize(_this: Id, _sel: Sel, _note: I
 
 extern "C" fn bunny_window_did_end_live_resize(_this: Id, _sel: Sel, _note: Id) {
     crate::metal::arm_transaction(false);
+    // the hand let go: one more frame NOW, so everything that held
+    // back during the drag — a hosted engine's throttled size, the
+    // live layers coming home — lands exact without waiting for the
+    // next pointer wiggle
+    dispatch(AppEvent::Redraw);
 }
 
 extern "C" fn bunny_window_did_resign_key(_this: Id, _sel: Sel, _note: Id) {
@@ -1591,7 +1596,13 @@ impl WindowHandle {
                 let child = make();
                 msg_void_id(container, sel("addSubview:"), child);
                 msg_void_id(self.view, sel("addSubview:"), container);
-                HostSlot { container, child, stamp: stamp.to_string() }
+                HostSlot {
+                    container,
+                    child,
+                    stamp: stamp.to_string(),
+                    child_box: (0.0, 0.0),
+                    child_sized_at: None,
+                }
             });
             let (x, y, w, h) = frame;
             let (vx, vy, vw, vh) = window;
@@ -1611,13 +1622,29 @@ impl WindowHandle {
                         },
                     );
                     // the tenant keeps the WHOLE box, container-local:
-                    // the cut shows through, the content never rewraps
+                    // the cut shows through, the content never rewraps.
+                    // Mid live-resize its SIZE waits out the breath —
+                    // the clip tracks the window exactly either way,
+                    // and the strip in between shows the scene's own
+                    // ground instead of the engine's white; the end of
+                    // the gesture redraws and the exact size lands.
+                    let size_changed = (w, h) != slot.child_box;
+                    let hold = size_changed
+                        && self.in_live_resize()
+                        && slot
+                            .child_sized_at
+                            .is_some_and(|at| at.elapsed() < HOST_RESIZE_BREATH);
+                    let (cw, ch) = if hold { slot.child_box } else { (w, h) };
+                    if size_changed && !hold {
+                        slot.child_box = (w, h);
+                        slot.child_sized_at = Some(std::time::Instant::now());
+                    }
                     msg_void_rect(
                         slot.child,
                         sel("setFrame:"),
                         CGRect {
-                            origin: CGPoint { x: -vx, y: vh + vy - h },
-                            size: CGSize { width: w, height: h },
+                            origin: CGPoint { x: -vx, y: vh + vy - ch },
+                            size: CGSize { width: cw, height: ch },
                         },
                     );
                 }
@@ -1799,7 +1826,17 @@ struct HostSlot {
     container: Id,
     child: Id,
     stamp: String,
+    /// The size the tenant last received — the throttle's memory.
+    child_box: (f64, f64),
+    /// When it received it — mid live-resize a new size waits out
+    /// [`HOST_RESIZE_BREATH`] before the next one lands.
+    child_sized_at: Option<std::time::Instant>,
 }
+
+/// The breath between sizes a hosted engine is given mid-resize. It
+/// renders OUT of process: sixty sizes a second starve it into a
+/// visible chase, ten a second it lands each one.
+const HOST_RESIZE_BREATH: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The tenant's view mounted under `key`, if any — where a drained
 /// command is spent.
