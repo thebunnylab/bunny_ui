@@ -119,7 +119,7 @@ pub mod prelude {
     #[cfg(feature = "canvas")]
     pub use crate::custom::{canvas, custom};
     pub use crate::erased::{CustomModifier, Erased, erased};
-    pub use crate::host::{HostSpec, webview};
+    pub use crate::host::{HostSpec, WebviewHandle, webview};
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
     pub use crate::icon::house as symbol;
@@ -6271,7 +6271,7 @@ mod tests {
             .settled_layout(&Page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
         let hosts = runtime.hosts();
         assert_eq!(hosts.len(), 1);
-        let HostSpec::Webview { url } = &hosts[0].spec;
+        let HostSpec::Webview { url, .. } = &hosts[0].spec;
         assert_eq!(&**url, "https://example.test/docs");
         // the page takes the leftover beside the rigid column
         assert_eq!(hosts[0].frame.origin.x, 100.0);
@@ -6350,6 +6350,97 @@ mod tests {
         let hosts = runtime.hosts();
         assert_eq!(hosts.len(), 1, "the retained tree keeps the box");
         assert_eq!(hosts[0].frame.size.width, 180.0);
+    }
+
+    /// The page's reports reach the app through retained writers, by
+    /// the path the shell reads off the placement — and they keep
+    /// reaching it after the body is skipped, like every writer.
+    #[test]
+    fn a_page_report_reaches_the_retained_writers() {
+        use crate::host::{HostSpec, webview};
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Page {
+            landed: State<String>,
+            heard: State<String>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let (landed, heard) = (self.landed, self.heard);
+                webview("https://example.test/")
+                    .user_script("window.early = true")
+                    .on_navigate(move |url| landed.set(url.to_string()))
+                    .on_message(move |body| heard.set(body.to_string()))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { landed: State::new(String::new()), heard: State::new(String::new()) };
+        let _ = runtime
+            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let hosts = runtime.hosts();
+        let path = hosts[0].path.clone();
+        let HostSpec::Webview { scripts, .. } = &hosts[0].spec;
+        assert_eq!(scripts.len(), 1, "the user script rides in the spec");
+
+        assert!(runtime.webview_navigated(&path, "https://example.test/docs"));
+        assert_eq!(page.landed.get(), "https://example.test/docs");
+        assert!(runtime.webview_posted(&path, "loaded"));
+        assert_eq!(page.heard.get(), "loaded");
+        assert!(!runtime.webview_navigated("nobody/here", "x"), "no writer, no lie");
+    }
+
+    /// A handle's commands drain addressed to the bound page, an eval
+    /// gets a token, and the answer finds its way back to the app's
+    /// own callback — the whole imperative loop, headless.
+    #[test]
+    fn an_eval_answer_finds_its_way_back_by_token() {
+        use crate::host::{WebviewHandle, WebviewOp, webview};
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Page {
+            handle: WebviewHandle,
+            title: State<String>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                webview("https://example.test/").handle(&self.handle)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { handle: WebviewHandle::new(), title: State::new(String::new()) };
+        let _ = runtime
+            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let path = runtime.hosts()[0].path.clone();
+
+        page.handle.navigate("https://example.test/next");
+        let title = page.title;
+        page.handle.eval("document.title", move |result| {
+            title.set(result.unwrap_or_else(|error| format!("thrown: {error}")));
+        });
+
+        let ops = runtime.webview_commands();
+        assert_eq!(ops.len(), 2, "both commands drain, in order");
+        assert!(
+            matches!(&ops[0], WebviewOp::Navigate { path: at, url }
+                if *at == path && &**url == "https://example.test/next")
+        );
+        let WebviewOp::Eval { path: at, token, js } = &ops[1] else {
+            panic!("the second op is the eval");
+        };
+        assert_eq!(*at, path);
+        assert_eq!(&**js, "document.title");
+
+        // a second drain finds the queue spent
+        assert!(runtime.webview_commands().is_empty());
+
+        assert!(runtime.webview_eval_done(*token, Ok("\"a page\"".into())));
+        assert_eq!(page.title.get(), "\"a page\"");
+        // the token was spent with the answer
+        assert!(!runtime.webview_eval_done(*token, Ok("again".into())));
     }
 
     /// A probe under a SKIPPED body still reports. The retained tree is

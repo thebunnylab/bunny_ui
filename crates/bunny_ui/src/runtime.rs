@@ -170,6 +170,14 @@ pub struct Runtime {
     /// The native hosts of the last layout — the boxes the shell
     /// mounts platform views over, each frame.
     last_hosts: RefCell<Vec<crate::layout::HostPlacement>>,
+    /// Eval answers still owed: the app's `then`, keyed by the token
+    /// the drain stamped on the op. The shell answers through
+    /// [`Runtime::webview_eval_done`]; a swept page answers late or
+    /// never, and the entry waits — bounded by evals in flight.
+    webview_evals: RefCell<HashMap<u64, crate::host::EvalSink>>,
+    /// The next eval token — one counter for the whole runtime, so a
+    /// late answer can never land on another page's question.
+    webview_eval_next: Cell<u64>,
     /// What each live box painted on its last step, in LOCAL
     /// coordinates, and the PHYSICAL size it was rasterized at — a
     /// step that paints the same picture at the same size blits
@@ -769,6 +777,8 @@ impl Runtime {
             last_splits: RefCell::new(Vec::new()),
             last_customs: RefCell::new(Vec::new()),
             last_hosts: RefCell::new(Vec::new()),
+            webview_evals: RefCell::new(HashMap::default()),
+            webview_eval_next: Cell::new(0),
             live_ledger: RefCell::new(motor::hash::FxHashMap::default()),
             theme_version: Cell::new(crate::theme::version()),
             keymap: RefCell::new(HashMap::default()),
@@ -904,6 +914,7 @@ impl Runtime {
             reconciler::assemble_splits(pass_root);
             reconciler::assemble_scrolls(pass_root);
             reconciler::assemble_measures(pass_root);
+            reconciler::assemble_webviews(pass_root);
             reconciler::assemble_customs(pass_root);
             reconciler::assemble_handlers(pass_root);
             reconciler::assemble_contexts(pass_root);
@@ -3232,6 +3243,62 @@ impl Runtime {
     /// frame.
     pub fn hosts(&self) -> Vec<crate::layout::HostPlacement> {
         self.last_hosts.borrow().clone()
+    }
+
+    /// The shell reports: the engine committed a navigation. Routed to
+    /// the page's retained `on_navigate`; `false` = nothing listening.
+    pub fn webview_navigated(&self, path: &str, url: &str) -> bool {
+        reconciler::run_webview_navigated(path, url)
+    }
+
+    /// The shell reports: the page posted on the bus
+    /// (`window.bunny.post(…)`). Routed to the retained `on_message`;
+    /// `false` = nothing listening.
+    pub fn webview_posted(&self, path: &str, body: &str) -> bool {
+        reconciler::run_webview_posted(path, body)
+    }
+
+    /// Drains what the app queued on its webview handles, addressed by
+    /// the path each handle is bound to — the shell spends these on
+    /// the mounted engines, once per frame. An Eval keeps its `then`
+    /// here, keyed by the stamped token, until
+    /// [`Runtime::webview_eval_done`] answers it.
+    pub fn webview_commands(&self) -> Vec<crate::host::WebviewOp> {
+        use crate::host::{WebviewCommand, WebviewOp};
+        let mut ops = Vec::new();
+        for (path, commands) in reconciler::drain_webview_commands() {
+            for command in commands {
+                ops.push(match command {
+                    WebviewCommand::Navigate(url) => {
+                        WebviewOp::Navigate { path: path.clone(), url }
+                    }
+                    WebviewCommand::Back => WebviewOp::Back { path: path.clone() },
+                    WebviewCommand::Forward => WebviewOp::Forward { path: path.clone() },
+                    WebviewCommand::Eval { js, then } => {
+                        let token = self.webview_eval_next.get();
+                        self.webview_eval_next.set(token + 1);
+                        self.webview_evals.borrow_mut().insert(token, then);
+                        WebviewOp::Eval { path: path.clone(), token, js }
+                    }
+                });
+            }
+        }
+        ops
+    }
+
+    /// The shell's answer to an Eval op — fires the app's `then`,
+    /// outside the borrow (the callback writes state). An unknown
+    /// token answers `false` and nothing runs: the question was
+    /// already answered, or never asked.
+    pub fn webview_eval_done(&self, token: u64, result: crate::host::EvalResult) -> bool {
+        let then = self.webview_evals.borrow_mut().remove(&token);
+        match then {
+            Some(then) => {
+                then(result);
+                true
+            }
+            None => false,
+        }
     }
 
     #[cfg(feature = "canvas")]

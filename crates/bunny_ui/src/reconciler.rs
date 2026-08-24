@@ -71,6 +71,25 @@ pub(crate) type MeasureEntry = (String, MeasureFn);
 pub(crate) type HandlerFn = Rc<dyn Fn()>;
 pub(crate) type HandlerEntry = (String, crate::action::ActionId, HandlerFn);
 
+/// A webview's app-side hooks, registered at render: the navigation
+/// and message writers, and the handle's command queue. Retained like
+/// the scroll writers — a skipped body's page keeps reporting, and
+/// its handle keeps commanding.
+#[derive(Clone)]
+pub(crate) struct WebviewHooks {
+    /// The page moved — fires with the committed url.
+    pub navigated: Option<WebviewReport>,
+    /// The page posted — fires with the string it sent.
+    pub posted: Option<WebviewReport>,
+    /// The handle's queue — drained by the runtime, spent by the shell.
+    pub commands: Option<crate::host::CommandQueue>,
+}
+
+/// A page report's writer — a navigation or a posted message, handed
+/// to the app as the string it is.
+pub(crate) type WebviewReport = Rc<dyn Fn(&str)>;
+pub(crate) type WebviewEntry = (String, WebviewHooks);
+
 pub(crate) struct Entry {
     pub value: Erased,
     pub ctx: Context,
@@ -90,6 +109,8 @@ pub(crate) struct Entry {
     pub scrolls: Vec<ScrollEntry>,
     /// The body's measurement probes — same retention.
     pub measures: Vec<MeasureEntry>,
+    /// The body's webview hooks — same retention.
+    pub webviews: Vec<WebviewEntry>,
     /// The paths of the app's own boxes (`custom(…)`) — the map that
     /// says a focused escape hatch is still on screen.
     /// `(path, does it take the keyboard)` — the second half is
@@ -114,6 +135,7 @@ struct BuildingFrame {
     splits: Vec<SplitEntry>,
     scrolls: Vec<ScrollEntry>,
     measures: Vec<MeasureEntry>,
+    webviews: Vec<WebviewEntry>,
     customs: Vec<(String, bool)>,
     handlers: Vec<HandlerEntry>,
     contexts: Vec<&'static str>,
@@ -134,6 +156,7 @@ struct PassState {
     root_splits: Vec<SplitEntry>,
     root_scrolls: Vec<ScrollEntry>,
     root_measures: Vec<MeasureEntry>,
+    root_webviews: Vec<WebviewEntry>,
     root_customs: Vec<(String, bool)>,
     root_handlers: Vec<HandlerEntry>,
     root_contexts: Vec<&'static str>,
@@ -236,7 +259,7 @@ pub(crate) fn finish_entry(
     node: RenderNode,
     layout: LayoutNode,
 ) {
-    let (effects, actions, editors, splits, scrolls, measures, customs, handlers, contexts) =
+    let (effects, actions, editors, splits, scrolls, measures, webviews, customs, handlers, contexts) =
         PASS.with(|pass| {
             let mut pass = pass.borrow_mut();
             match pass.building.pop() {
@@ -249,12 +272,14 @@ pub(crate) fn finish_entry(
                         frame.splits,
                         frame.scrolls,
                         frame.measures,
+                        frame.webviews,
                         frame.customs,
                         frame.handlers,
                         frame.contexts,
                     )
                 }
                 None => (
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -285,6 +310,7 @@ pub(crate) fn finish_entry(
                 splits,
                 scrolls,
                 measures,
+                webviews,
                 customs,
                 handlers,
                 contexts,
@@ -366,6 +392,19 @@ pub(crate) fn attribute_measure(path: String, measure: MeasureFn) {
             frame.measures.push((path, measure));
         } else {
             pass.root_measures.push((path, measure));
+        }
+    });
+}
+
+/// A webview's hooks registered during render — the scroll writer's
+/// attribution, for the page's own reports and the handle's commands.
+pub(crate) fn attribute_webview(path: String, hooks: WebviewHooks) {
+    PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        if let Some(frame) = pass.building.last_mut() {
+            frame.webviews.push((path, hooks));
+        } else {
+            pass.root_webviews.push((path, hooks));
         }
     });
 }
@@ -623,6 +662,7 @@ thread_local! {
     static SPLITS: RefCell<HashMap<String, SplitFn>> = RefCell::new(HashMap::default());
     static SCROLLS: RefCell<HashMap<String, ScrollFn>> = RefCell::new(HashMap::default());
     static MEASURES: RefCell<HashMap<String, MeasureFn>> = RefCell::new(HashMap::default());
+    static WEBVIEWS: RefCell<HashMap<String, WebviewHooks>> = RefCell::new(HashMap::default());
     /// The app's boxes on screen this pass — paths only.
     static CUSTOMS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// The subset that answers `accepts_keys` — who may HOLD the
@@ -708,6 +748,74 @@ pub(crate) fn assemble_measures(root: &str) {
         }
     });
     MEASURES.with(|measures| *measures.borrow_mut() = map);
+}
+
+/// The webview hooks, assembled the same way.
+pub(crate) fn assemble_webviews(root: &str) {
+    let mut map: HashMap<String, WebviewHooks> = HashMap::default();
+    RETAINED.with(|retained| {
+        for (path, entry) in retained.borrow().iter() {
+            if covers(root, path) {
+                for (key, hooks) in &entry.webviews {
+                    map.insert(key.clone(), hooks.clone());
+                }
+            }
+        }
+    });
+    PASS.with(|pass| {
+        for (key, hooks) in std::mem::take(&mut pass.borrow_mut().root_webviews) {
+            map.insert(key, hooks);
+        }
+    });
+    WEBVIEWS.with(|webviews| *webviews.borrow_mut() = map);
+}
+
+/// Hands a committed navigation to the page's retained writer.
+/// `false` = nothing listening at the path.
+pub(crate) fn run_webview_navigated(path: &str, url: &str) -> bool {
+    let navigated = WEBVIEWS
+        .with(|webviews| webviews.borrow().get(path).and_then(|hooks| hooks.navigated.clone()));
+    match navigated {
+        Some(navigated) => {
+            navigated(url);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Hands what the page posted to the app's retained writer.
+/// `false` = nothing listening at the path.
+pub(crate) fn run_webview_posted(path: &str, body: &str) -> bool {
+    let posted = WEBVIEWS
+        .with(|webviews| webviews.borrow().get(path).and_then(|hooks| hooks.posted.clone()));
+    match posted {
+        Some(posted) => {
+            posted(body);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Drains every handle's queued commands, paired with the path the
+/// handle is bound to — the runtime stamps eval tokens and the shell
+/// spends the rest.
+pub(crate) fn drain_webview_commands() -> Vec<(String, Vec<crate::host::WebviewCommand>)> {
+    WEBVIEWS.with(|webviews| {
+        webviews
+            .borrow()
+            .iter()
+            .filter_map(|(path, hooks)| {
+                let queue = hooks.commands.as_ref()?;
+                let commands = std::mem::take(&mut *queue.borrow_mut());
+                if commands.is_empty() {
+                    return None;
+                }
+                Some((path.clone(), commands))
+            })
+            .collect()
+    })
 }
 
 /// Reassembles the escape-hatch map from retention — the editors' twin

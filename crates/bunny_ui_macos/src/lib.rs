@@ -453,10 +453,18 @@ pub fn run_window_chrome(
             let placed =
                 runtime.last_viewport().map_or(height, |viewport| viewport.height);
             for host in &hosts {
-                let bunny_ui::host::HostSpec::Webview { url } = &host.spec;
+                let bunny_ui::host::HostSpec::Webview { url, scripts } = &host.spec;
+                // the stamp fingerprints the whole spec: a changed url
+                // OR script set re-instructs; the separators are
+                // control characters no url or script spells
+                let mut stamp = String::from(&**url);
+                for script in scripts.iter() {
+                    stamp.push('\u{1}');
+                    stamp.push_str(script);
+                }
                 window.host_place(
                     &host.path,
-                    url,
+                    &stamp,
                     (
                         host.frame.origin.x,
                         host.frame.origin.y,
@@ -470,8 +478,8 @@ pub fn run_window_chrome(
                         host.visible.size.height,
                     ),
                     placed,
-                    || webview::create(url),
-                    webview::navigate,
+                    || webview::create(url, scripts),
+                    |child, _stamp| webview::update(child, url, scripts),
                 );
             }
             window.host_sweep(
@@ -482,6 +490,41 @@ pub fn run_window_chrome(
     let blit = {
         let present = Rc::clone(&present);
         move |runtime: &Runtime, root: &_| {
+            // the handles' commands are spent BEFORE the frame
+            // renders: the state an expired eval writes lands in this
+            // very layout, and a navigation the app just asked for is
+            // already the engine's when the frame goes up
+            for op in runtime.webview_commands() {
+                use bunny_ui::host::WebviewOp;
+                match op {
+                    WebviewOp::Navigate { path, url } => {
+                        if let Some(child) = ffi::host_child(&path) {
+                            webview::navigate(child, &url);
+                        }
+                    }
+                    WebviewOp::Back { path } => {
+                        if let Some(child) = ffi::host_child(&path) {
+                            webview::back(child);
+                        }
+                    }
+                    WebviewOp::Forward { path } => {
+                        if let Some(child) = ffi::host_child(&path) {
+                            webview::forward(child);
+                        }
+                    }
+                    // an eval with no page answers NOW, with a name —
+                    // never silence that looks like a slow page
+                    WebviewOp::Eval { path, token, js } => match ffi::host_child(&path) {
+                        Some(child) => webview::eval(child, token, &js),
+                        None => {
+                            let _ = runtime.webview_eval_done(
+                                token,
+                                Err("the webview is not mounted".into()),
+                            );
+                        }
+                    },
+                }
+            }
             let (width, height) = window.content_size();
             // a box that draws parts which TOUCH puts the shared edge
             // on a whole PIXEL — it needs the screen's scale
@@ -638,6 +681,39 @@ pub fn run_window_chrome(
             }
         }),
     );
+
+    // what the pages report — navigations, the bus, eval answers —
+    // lands here from WebKit's own runloop callbacks, and re-renders
+    // exactly when a retained writer ran
+    webview::set_dispatch({
+        let runtime = Rc::clone(&runtime);
+        let root = Rc::clone(&root);
+        let blit = blit.clone();
+        move |event| {
+            let root = &*root;
+            match event {
+                webview::WebviewEvent::Navigated { view, url } => {
+                    if let Some(path) = ffi::host_key_of_child(view)
+                        && runtime.webview_navigated(&path, &url)
+                    {
+                        blit(&runtime, root);
+                    }
+                }
+                webview::WebviewEvent::Posted { view, body } => {
+                    if let Some(path) = ffi::host_key_of_child(view)
+                        && runtime.webview_posted(&path, &body)
+                    {
+                        blit(&runtime, root);
+                    }
+                }
+                webview::WebviewEvent::EvalDone { token, result } => {
+                    if runtime.webview_eval_done(token, result) {
+                        blit(&runtime, root);
+                    }
+                }
+            }
+        }
+    });
 
     let handler_runtime = Rc::clone(&runtime);
     let handler_root = Rc::clone(&root);

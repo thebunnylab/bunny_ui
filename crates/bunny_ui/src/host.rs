@@ -20,6 +20,7 @@
 //! with the framework's own commands and clip like everything else.
 //! The host is for content that arrives with its own renderer.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use motor::state::Context;
@@ -34,14 +35,151 @@ use crate::view::{NodeList, Single, View};
 /// re-instructs the mounted view, it never re-creates the box.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostSpec {
-    /// The OS webview, showing `url`.
-    Webview { url: Rc<str> },
+    /// The OS webview: `url` to show, and the app's user scripts —
+    /// injected at document start, on every navigation, so a page
+    /// never renders before the instrumentation is in place.
+    Webview { url: Rc<str>, scripts: Rc<[Rc<str>]> },
+}
+
+/// What the page sends back through the one return channel. The engine
+/// serializes the value; a page that threw answers with the error's
+/// name — never an empty answer that looks like a quiet page.
+pub type EvalResult = Result<String, String>;
+
+/// A handle's queue, shared between the app's clone and the retained
+/// registration — the runtime drains it once per frame.
+pub(crate) type CommandQueue = Rc<RefCell<Vec<WebviewCommand>>>;
+
+/// An eval's `then`, parked in the runtime until the shell answers.
+pub(crate) type EvalSink = Box<dyn FnOnce(EvalResult)>;
+
+/// A command the app queued on a [`WebviewHandle`] — drained by the
+/// shell each frame ([`crate::runtime::Runtime::webview_commands`])
+/// and spent on the mounted engine.
+pub enum WebviewCommand {
+    /// Point the engine at a url (the declarative `webview(url)` stays
+    /// the mount-time truth; this is the imperative door).
+    Navigate(Rc<str>),
+    /// One step back in the engine's own navigation stack.
+    Back,
+    /// And one forward.
+    Forward,
+    /// Evaluate `js` as an EXPRESSION in the page, and hand the
+    /// serialized value back — `then` fires on the app's own thread,
+    /// on a later frame.
+    Eval { js: Rc<str>, then: Box<dyn FnOnce(EvalResult)> },
+}
+
+/// A drained command, addressed — what a shell spends on the mounted
+/// engine, once per frame
+/// ([`crate::runtime::Runtime::webview_commands`]).
+pub enum WebviewOp {
+    Navigate { path: String, url: Rc<str> },
+    Back { path: String },
+    Forward { path: String },
+    /// The answer goes back through
+    /// [`crate::runtime::Runtime::webview_eval_done`], by token — an
+    /// op whose page is not mounted deserves an `Err` with a name,
+    /// never silence.
+    Eval { path: String, token: u64, js: Rc<str> },
+}
+
+/// The imperative half of the webview, because a page is a document
+/// with a navigation stack, not a view tree — a declarative API
+/// pretending otherwise would be a fiction over `goBack()`.
+///
+/// Cheap to clone, bound to a view with [`WebviewView::handle`]. The
+/// commands queue here and the shell spends them on the mounted
+/// engine each frame; a handle bound to nothing queues into the void
+/// (an eval's answer then names it: the webview is not mounted).
+///
+/// ```ignore
+/// let page = WebviewHandle::new();
+/// webview(url).handle(&page)
+/// // …later, from a click:
+/// page.eval("document.title", move |title| tab.set(title));
+/// ```
+#[derive(Clone, Default)]
+pub struct WebviewHandle {
+    queue: CommandQueue,
+}
+
+impl WebviewHandle {
+    pub fn new() -> WebviewHandle {
+        WebviewHandle::default()
+    }
+
+    /// Points the page at `url` — the engine's own load, asynchronous
+    /// and cancellable by the next call.
+    pub fn navigate(&self, url: impl Into<Rc<str>>) {
+        self.queue.borrow_mut().push(WebviewCommand::Navigate(url.into()));
+    }
+
+    /// One step back in the page's own history.
+    pub fn back(&self) {
+        self.queue.borrow_mut().push(WebviewCommand::Back);
+    }
+
+    /// And one forward.
+    pub fn forward(&self) {
+        self.queue.borrow_mut().push(WebviewCommand::Forward);
+    }
+
+    /// Evaluates `js` as an EXPRESSION in the page and hands the
+    /// value back, serialized (`Ok` is JSON; a page that threw
+    /// answers `Err` with the error's name). `then` fires on the
+    /// app's own thread, on a later frame — never re-entrantly.
+    pub fn eval(&self, js: impl Into<Rc<str>>, then: impl FnOnce(EvalResult) + 'static) {
+        self.queue
+            .borrow_mut()
+            .push(WebviewCommand::Eval { js: js.into(), then: Box::new(then) });
+    }
+
+    pub(crate) fn share_queue(&self) -> CommandQueue {
+        Rc::clone(&self.queue)
+    }
 }
 
 /// The view a webview enters the scene as — see [`webview`].
 #[derive(Clone)]
 pub struct WebviewView {
     url: Rc<str>,
+    scripts: Vec<Rc<str>>,
+    on_navigate: Option<crate::reconciler::WebviewReport>,
+    on_message: Option<crate::reconciler::WebviewReport>,
+    handle: Option<WebviewHandle>,
+}
+
+impl WebviewView {
+    /// A script the engine runs at DOCUMENT START, on every
+    /// navigation — the page never renders before the app's
+    /// instrumentation is in place. Main frame only.
+    pub fn user_script(mut self, src: impl Into<Rc<str>>) -> WebviewView {
+        self.scripts.push(src.into());
+        self
+    }
+
+    /// The page moved: fires with the committed url — the engine's own
+    /// navigations included (a link click is a navigation the app
+    /// never asked for, and history wants it anyway).
+    pub fn on_navigate(mut self, action: impl Fn(&str) + 'static) -> WebviewView {
+        self.on_navigate = Some(Rc::new(action));
+        self
+    }
+
+    /// The page posted: `window.bunny.post(…)` in the page lands here,
+    /// as the string the page sent. The same channel discipline
+    /// `.task` uses — the page posts, the app receives.
+    pub fn on_message(mut self, action: impl Fn(&str) + 'static) -> WebviewView {
+        self.on_message = Some(Rc::new(action));
+        self
+    }
+
+    /// Binds the imperative half — see [`WebviewHandle`].
+    pub fn handle(mut self, handle: &WebviewHandle) -> WebviewView {
+        self.handle = Some(handle.clone());
+        self
+    }
 }
 
 impl View for WebviewView {
@@ -57,9 +195,27 @@ impl View for WebviewView {
         // key the platform view by — the box still holds its space, it
         // just mounts nothing
         let path = motor::identity::cursor_scope().unwrap_or_default();
+        if !path.is_empty()
+            && (self.on_navigate.is_some() || self.on_message.is_some() || self.handle.is_some())
+        {
+            // the writers are retained beside the node, like a scroll
+            // binding's — a skipped body's page keeps reporting, and
+            // its handle keeps commanding
+            crate::reconciler::attribute_webview(
+                path.clone(),
+                crate::reconciler::WebviewHooks {
+                    navigated: self.on_navigate.clone(),
+                    posted: self.on_message.clone(),
+                    commands: self.handle.as_ref().map(WebviewHandle::share_queue),
+                },
+            );
+        }
         out.push_layout(LayoutNode::Host {
             path,
-            spec: HostSpec::Webview { url: self.url.clone() },
+            spec: HostSpec::Webview {
+                url: self.url.clone(),
+                scripts: self.scripts.clone().into(),
+            },
         });
     }
 }
@@ -71,7 +227,16 @@ impl View for WebviewView {
 ///
 /// ```ignore
 /// webview("https://docs.example.dev")
+///     .user_script("window.bunny.post('early')")
+///     .on_message(move |body| log.update(|l| l.push(body.into())))
+///     .on_navigate(move |url| history.update(|h| h.push(url.into())))
 /// ```
 pub fn webview(url: impl Into<Rc<str>>) -> WebviewView {
-    WebviewView { url: url.into() }
+    WebviewView {
+        url: url.into(),
+        scripts: Vec::new(),
+        on_navigate: None,
+        on_message: None,
+        handle: None,
+    }
 }

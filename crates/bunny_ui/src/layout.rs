@@ -6746,7 +6746,10 @@ mod tests {
     fn host(path: &str) -> LayoutNode {
         LayoutNode::Host {
             path: path.into(),
-            spec: crate::host::HostSpec::Webview { url: "https://example.test/".into() },
+            spec: crate::host::HostSpec::Webview {
+                url: "https://example.test/".into(),
+                scripts: Vec::new().into(),
+            },
         }
     }
 

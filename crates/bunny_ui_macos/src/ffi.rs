@@ -1792,6 +1792,25 @@ struct HostSlot {
     stamp: String,
 }
 
+/// The tenant's view mounted under `key`, if any — where a drained
+/// command is spent.
+pub(crate) fn host_child(key: &str) -> Option<Id> {
+    HOST_VIEWS.with(|hosts| hosts.borrow().get(key).map(|slot| slot.child))
+}
+
+/// The key a tenant's view is mounted under — how a report that
+/// arrives holding the VIEW (a navigation, a posted message) finds
+/// its box's identity.
+pub(crate) fn host_key_of_child(child: Id) -> Option<String> {
+    HOST_VIEWS.with(|hosts| {
+        hosts
+            .borrow()
+            .iter()
+            .find(|(_, slot)| std::ptr::eq(slot.child, child))
+            .map(|(key, _)| key.clone())
+    })
+}
+
 /// One live box's sublayer and its two alternating backings — the
 /// picture on screen is never the buffer being written.
 struct LiveLayer {

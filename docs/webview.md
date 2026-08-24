@@ -1,9 +1,11 @@
 # A webview
 
-*Status: the native host and the macOS webview floor are standing —
+*Status: the native host, the macOS webview and its instrumentation
+floor — user scripts, the message bus, navigation reports, eval with
+the value coming back — are standing;
 `cargo run -p bunny-ui-macos --example browser_window` is the proof.
-The imperative handle, the message bus, WebView2, WebKitGTK and the
-web's iframe are open.*
+Snapshot, devtools-by-handle, WebView2, WebKitGTK and the web's
+iframe are open.*
 
 An app sometimes has to show a web page — the preview of the thing it
 is building, a documentation site, an OAuth dance. Bundling a browser
@@ -42,8 +44,9 @@ Built on the host. The declarative half is a view like any other:
 
 ```rust
 webview("https://docs.example.dev")
-    .on_navigate(move |nav| history.update(|h| h.push(nav)))
-    .messages(bus)   // window.bunny.post(…) in the page ⇄ the bus out here
+    .user_script(src)   // document-start, every navigation
+    .on_navigate(move |url| history.update(|h| h.push(url.into())))
+    .on_message(move |body| bus.send(body))   // window.bunny.post(…) in the page
 ```
 
 The imperative half is a handle, because a page is a document with a
@@ -51,17 +54,23 @@ navigation stack, not a view tree, and a declarative API pretending
 otherwise would be a fiction over `goBack()`:
 
 ```rust
-handle.navigate(url);
-handle.eval(js).await;          // a value comes back, serialized
-handle.user_script(src);        // document-start, every navigation
-handle.snapshot().await;        // the page as an image
-handle.devtools();              // the engine's own inspector
+let page = WebviewHandle::new();   // bound with .handle(&page)
+page.navigate(url);
+page.back();
+page.eval("document.title", move |answer| { /* the value, serialized */ });
 ```
+
+`eval` takes an expression and answers on a later frame: `Ok` is the
+value as JSON, and a page that threw answers `Err` with the error's
+name — never silence that looks like a slow page. A snapshot (the page
+as an image) and opening the engine's own inspector are the handle's
+open seats.
 
 User scripts run at document start, so a page never renders before the
 app's instrumentation is in place. The message bus is the same channel
-discipline `.task` already uses: the page posts, the app receives; the
-sender crosses the boundary, never the scene.
+discipline `.task` already uses: the page posts, the app receives —
+and everything the page sends back rides that one channel, the eval
+answers included.
 
 ## Capabilities
 
