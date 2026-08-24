@@ -6364,30 +6364,48 @@ mod tests {
         struct Page {
             landed: State<String>,
             heard: State<String>,
+            spoke: State<String>,
+            fetched: State<String>,
         }
         impl Component for Page {
             fn body(self, _ctx: &Context) -> impl View {
                 let (landed, heard) = (self.landed, self.heard);
+                let (spoke, fetched) = (self.spoke, self.fetched);
                 webview("https://example.test/")
                     .user_script("window.early = true")
                     .on_navigate(move |url| landed.set(url.to_string()))
                     .on_message(move |body| heard.set(body.to_string()))
+                    .on_console(move |line| spoke.set(line.to_string()))
+                    .on_request(move |line| fetched.set(line.to_string()))
             }
         }
 
         let runtime = Runtime::new();
-        let page = Page { landed: State::new(String::new()), heard: State::new(String::new()) };
+        let page = Page {
+            landed: State::new(String::new()),
+            heard: State::new(String::new()),
+            spoke: State::new(String::new()),
+            fetched: State::new(String::new()),
+        };
         let _ = runtime
             .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
         let hosts = runtime.hosts();
         let path = hosts[0].path.clone();
-        let HostSpec::Webview { scripts, .. } = &hosts[0].spec;
+        let HostSpec::Webview { scripts, console, requests, .. } = &hosts[0].spec;
         assert_eq!(scripts.len(), 1, "the user script rides in the spec");
+        assert!(
+            *console && *requests,
+            "the declared hooks ride in the spec — the shell only injects what is watched"
+        );
 
         assert!(runtime.webview_navigated(&path, "https://example.test/docs"));
         assert_eq!(page.landed.get(), "https://example.test/docs");
         assert!(runtime.webview_posted(&path, "loaded"));
         assert_eq!(page.heard.get(), "loaded");
+        assert!(runtime.webview_console(&path, "warn: low"));
+        assert_eq!(page.spoke.get(), "warn: low");
+        assert!(runtime.webview_requested(&path, "GET https://example.test/api 200"));
+        assert_eq!(page.fetched.get(), "GET https://example.test/api 200");
         assert!(!runtime.webview_navigated("nobody/here", "x"), "no writer, no lie");
     }
 

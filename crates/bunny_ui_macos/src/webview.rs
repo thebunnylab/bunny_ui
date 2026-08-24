@@ -61,6 +61,10 @@ pub(crate) enum WebviewEvent {
     Navigated { view: Id, url: String },
     /// The page called `window.bunny.post(…)`.
     Posted { view: Id, body: String },
+    /// The page's console spoke — `"level: what it said"`.
+    Console { view: Id, line: String },
+    /// A request of the page's completed — `"METHOD url status"`.
+    Requested { view: Id, line: String },
     /// An eval answered, by token — `Ok` is JSON, `Err` the thrown
     /// error's name.
     EvalDone { token: u64, result: Result<String, String> },
@@ -101,6 +105,54 @@ fn dispatch(event: WebviewEvent) {
 const BOOT: &str = "window.bunny = { post: function(m) { \
     window.webkit.messageHandlers.bunny.postMessage(String(m)); } };";
 
+/// The console hook — `WebviewCapability::ConsoleMessages` on this
+/// backend is an injected wrap: each level forwards a line and then
+/// speaks as before, and an uncaught error reports too. Injected only
+/// when the app declared `on_console`: nothing is captured for a page
+/// nobody watches.
+const CONSOLE_HOOK: &str = "(function() { \
+    function forward(line) { try { \
+        window.webkit.messageHandlers.bunnyConsole.postMessage(line); } catch (e) {} } \
+    var levels = ['log', 'info', 'warn', 'error']; \
+    for (var i = 0; i < levels.length; i++) { (function(level) { \
+        var original = console[level]; \
+        console[level] = function() { \
+            var parts = []; \
+            for (var j = 0; j < arguments.length; j++) { var a = arguments[j]; \
+                try { parts.push(typeof a === 'string' ? a : JSON.stringify(a)); } \
+                catch (e) { parts.push(String(a)); } } \
+            forward(level + ': ' + parts.join(' ')); \
+            if (original) { original.apply(console, arguments); } \
+        }; })(levels[i]); } \
+    addEventListener('error', function(e) { forward('error: ' + e.message); }); \
+})();";
+
+/// The network wrap — `WebviewCapability::NetworkRequests` on this
+/// backend: fetch and XHR report on completion, as
+/// `METHOD url status`. BLIND to subresources by construction — an
+/// image or a stylesheet never crosses fetch. Injected only when the
+/// app declared `on_request`.
+const NET_WRAP: &str = "(function() { \
+    function forward(line) { try { \
+        window.webkit.messageHandlers.bunnyNet.postMessage(line); } catch (e) {} } \
+    var original = window.fetch; \
+    if (original) { window.fetch = function(input, init) { \
+        var method = (init && init.method) || (input && input.method) || 'GET'; \
+        var url = (typeof input === 'string') ? input : ((input && input.url) || String(input)); \
+        var pending = original.apply(this, arguments); \
+        pending.then(function(response) { forward(method + ' ' + url + ' ' + response.status); }, \
+                     function() { forward(method + ' ' + url + ' failed'); }); \
+        return pending; }; } \
+    var open = XMLHttpRequest.prototype.open; \
+    XMLHttpRequest.prototype.open = function(method, url) { \
+        this.__bunny = method + ' ' + url; return open.apply(this, arguments); }; \
+    var send = XMLHttpRequest.prototype.send; \
+    XMLHttpRequest.prototype.send = function() { var xhr = this; \
+        xhr.addEventListener('loadend', function() { \
+            forward((xhr.__bunny || '? ?') + ' ' + (xhr.status || 'failed')); }); \
+        return send.apply(this, arguments); }; \
+})();";
+
 /// `userContentController:didReceiveScriptMessage:` — the one return
 /// channel. `bunny` is the app's bus; `bunnyEval` carries eval
 /// answers in a `token \t ok|err \t payload` envelope (stringify
@@ -119,6 +171,14 @@ extern "C" fn bridge_message(_this: Id, _sel: Sel, _controller: Id, message: Id)
             "bunny" => {
                 let view = msg_id(message, sel("webView"));
                 dispatch(WebviewEvent::Posted { view, body });
+            }
+            "bunnyConsole" => {
+                let view = msg_id(message, sel("webView"));
+                dispatch(WebviewEvent::Console { view, line: body });
+            }
+            "bunnyNet" => {
+                let view = msg_id(message, sel("webView"));
+                dispatch(WebviewEvent::Requested { view, line: body });
             }
             "bunnyEval" => {
                 let mut parts = body.splitn(3, '\t');
@@ -193,13 +253,14 @@ fn bridge() -> Id {
 }
 
 /// Creates the engine's view, already instrumented and navigating to
-/// `url`. The reference comes back with ONE retain — the host's sweep
-/// releases it when the box leaves the scene.
-pub(crate) fn create(url: &str, scripts: &[std::rc::Rc<str>]) -> Id {
+/// the spec's url. The reference comes back with ONE retain — the
+/// host's sweep releases it when the box leaves the scene.
+pub(crate) fn create(spec: &bunny_ui::host::HostSpec) -> Id {
+    let bunny_ui::host::HostSpec::Webview { url, .. } = spec;
     unsafe {
         let config =
             msg_id(msg_id(class("WKWebViewConfiguration"), sel("alloc")), sel("init"));
-        install_bridge(msg_id(config, sel("userContentController")), scripts);
+        install_bridge(msg_id(config, sel("userContentController")), spec);
         let view = msg_id(class("WKWebView"), sel("alloc"));
         let view = msg_init_config(
             view,
@@ -226,13 +287,14 @@ pub(crate) fn create(url: &str, scripts: &[std::rc::Rc<str>]) -> Id {
     }
 }
 
-/// Hands the controller the bridge and every document-start script:
-/// the bus first (a user script may want to post), the app's after,
-/// in declaration order. Main frame only.
-unsafe fn install_bridge(controller: Id, scripts: &[std::rc::Rc<str>]) {
+/// Hands the controller the bridge and the document-start scripts.
+/// Every channel registers up front (a registered name that never
+/// speaks costs nothing, and re-adding one throws); the scripts are
+/// [`apply_scripts`]'s.
+unsafe fn install_bridge(controller: Id, spec: &bunny_ui::host::HostSpec) {
     unsafe {
         let bridge = bridge();
-        for channel in ["bunny", "bunnyEval"] {
+        for channel in ["bunny", "bunnyConsole", "bunnyNet", "bunnyEval"] {
             msg_void_id_id(
                 controller,
                 sel("addScriptMessageHandler:name:"),
@@ -240,8 +302,25 @@ unsafe fn install_bridge(controller: Id, scripts: &[std::rc::Rc<str>]) {
                 ns(channel),
             );
         }
+        apply_scripts(controller, spec);
+    }
+}
+
+/// The document-start set, in a fixed order: the bus first (a user
+/// script may want to post), then the hooks the app DECLARED — a page
+/// nobody watches pays for no capture — then the app's own scripts,
+/// in declaration order.
+unsafe fn apply_scripts(controller: Id, spec: &bunny_ui::host::HostSpec) {
+    let bunny_ui::host::HostSpec::Webview { scripts, console, requests, .. } = spec;
+    unsafe {
         add_script(controller, BOOT);
-        for script in scripts {
+        if *console {
+            add_script(controller, CONSOLE_HOOK);
+        }
+        if *requests {
+            add_script(controller, NET_WRAP);
+        }
+        for script in scripts.iter() {
             add_script(controller, script);
         }
     }
@@ -266,18 +345,25 @@ unsafe fn add_script(controller: Id, source: &str) {
 
 /// Re-instructs a MOUNTED view after its spec changed: the scripts
 /// are replaced (they take effect on the next navigation, which the
-/// caller's `navigate` provides) and the page re-points.
-pub(crate) fn update(view: Id, url: &str, scripts: &[std::rc::Rc<str>]) {
+/// closing `navigate` provides) and the page re-points.
+pub(crate) fn update(view: Id, spec: &bunny_ui::host::HostSpec) {
+    let bunny_ui::host::HostSpec::Webview { url, .. } = spec;
     unsafe {
         let config = msg_id(view, sel("configuration"));
         let controller = msg_id(config, sel("userContentController"));
         msg_void(controller, sel("removeAllUserScripts"));
-        add_script(controller, BOOT);
-        for script in scripts {
-            add_script(controller, script);
-        }
+        apply_scripts(controller, spec);
         navigate(view, url);
     }
+}
+
+/// What this backend serves, as the value the app reads
+/// (`docs/webview.md` — the capability table's WKWebView column):
+/// console and requests by injected hook, no response bodies, and
+/// synthetic input is the open question the table names.
+pub fn capabilities() -> &'static [bunny_ui::host::WebviewCapability] {
+    use bunny_ui::host::WebviewCapability;
+    &[WebviewCapability::ConsoleMessages, WebviewCapability::NetworkRequests]
 }
 
 /// Points the engine at `url` — the load is the engine's own affair,

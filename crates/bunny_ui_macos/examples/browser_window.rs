@@ -11,8 +11,9 @@
 //! - the page renders and scrolls natively inside the pane, and the
 //!   framework's own chrome paints around it, never over it;
 //! - the bar shows the COMMITTED url (the delegate reporting), and the
-//!   footer shows what the page posted on the bus — the user script
-//!   posts the title as soon as the document loads, no click needed;
+//!   footer shows what the page posted on the bus, said on its console
+//!   and fetched — the user script does all three as soon as the
+//!   document loads, no click needed;
 //! - "read the title" asks the page (`document.title` by eval) and
 //!   the answer lands beside the button;
 //! - switch pages in the sidebar: the SAME view navigates; back and
@@ -37,9 +38,13 @@ const PAGES: [(&str, &str); 3] = [
 ];
 
 /// Posted on the bus by the page itself, at document load — the
-/// instrumentation is in place before the page renders.
+/// instrumentation is in place before the page renders. It also
+/// speaks on the console and fetches its own page, so the two hooks
+/// have something to catch without a click.
 const REPORTER: &str = "addEventListener('DOMContentLoaded', function() { \
-    window.bunny.post('the page says: ' + document.title); });";
+    window.bunny.post('the page says: ' + document.title); \
+    console.log('hello from the page'); \
+    fetch(location.href); });";
 
 #[derive(Clone)]
 struct Browser {
@@ -47,6 +52,8 @@ struct Browser {
     shown: State<bool>,
     committed: State<String>,
     posted: State<String>,
+    spoke: State<String>,
+    fetched: State<String>,
     title: State<String>,
     handle: WebviewHandle,
 }
@@ -129,15 +136,24 @@ impl Component for Browser {
             .padding_length(8.0)
         };
 
+        let (spoke, fetched) = (self.spoke, self.fetched);
         let pane = webview(PAGES[page.get()].1)
             .user_script(REPORTER)
             .on_navigate(move |url| committed.set(url.to_string()))
             .on_message(move |body| posted.set(body.to_string()))
+            .on_console(move |line| spoke.set(line.to_string()))
+            .on_request(move |line| fetched.set(line.to_string()))
             .handle(&handle);
 
-        let footer = text(self.posted.get())
-            .foreground_color(theme::fg_secondary())
-            .padding_length(8.0);
+        let footer = vstack!(
+            text(format!("bus: {}", self.posted.get())),
+            text(format!("console: {}", self.spoke.get())),
+            text(format!("network: {}", self.fetched.get()))
+        )
+        .spacing(2.0)
+        .alignment(HorizontalAlignment::Leading)
+        .foreground_color(theme::fg_secondary())
+        .padding_length(8.0);
 
         hstack!(
             sidebar,
@@ -169,7 +185,9 @@ fn main() {
             page: State::new(0),
             shown: State::new(true),
             committed: State::new(String::new()),
-            posted: State::new(String::from("nothing posted yet")),
+            posted: State::new(String::from("nothing yet")),
+            spoke: State::new(String::from("nothing yet")),
+            fetched: State::new(String::from("nothing yet")),
             title: State::new(String::new()),
             handle: WebviewHandle::new(),
         },

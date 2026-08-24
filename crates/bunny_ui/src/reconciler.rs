@@ -81,6 +81,10 @@ pub(crate) struct WebviewHooks {
     pub navigated: Option<WebviewReport>,
     /// The page posted — fires with the string it sent.
     pub posted: Option<WebviewReport>,
+    /// The page's console spoke — fires with `"level: what it said"`.
+    pub console: Option<WebviewReport>,
+    /// A request of the page's completed — `"METHOD url status"`.
+    pub requested: Option<WebviewReport>,
     /// The handle's queue — drained by the runtime, spent by the shell.
     pub commands: Option<crate::host::CommandQueue>,
 }
@@ -770,32 +774,43 @@ pub(crate) fn assemble_webviews(root: &str) {
     WEBVIEWS.with(|webviews| *webviews.borrow_mut() = map);
 }
 
-/// Hands a committed navigation to the page's retained writer.
-/// `false` = nothing listening at the path.
-pub(crate) fn run_webview_navigated(path: &str, url: &str) -> bool {
-    let navigated = WEBVIEWS
-        .with(|webviews| webviews.borrow().get(path).and_then(|hooks| hooks.navigated.clone()));
-    match navigated {
-        Some(navigated) => {
-            navigated(url);
+/// Hands one page report to its retained writer — cloned out of the
+/// borrow before it runs, like every other door. `false` = nothing
+/// listening at the path.
+fn run_webview_report(
+    path: &str,
+    pick: impl Fn(&WebviewHooks) -> Option<WebviewReport>,
+    line: &str,
+) -> bool {
+    let report =
+        WEBVIEWS.with(|webviews| webviews.borrow().get(path).and_then(|hooks| pick(hooks)));
+    match report {
+        Some(report) => {
+            report(line);
             true
         }
         None => false,
     }
 }
 
-/// Hands what the page posted to the app's retained writer.
-/// `false` = nothing listening at the path.
+/// A committed navigation, to the page's `on_navigate`.
+pub(crate) fn run_webview_navigated(path: &str, url: &str) -> bool {
+    run_webview_report(path, |hooks| hooks.navigated.clone(), url)
+}
+
+/// What the page posted, to the page's `on_message`.
 pub(crate) fn run_webview_posted(path: &str, body: &str) -> bool {
-    let posted = WEBVIEWS
-        .with(|webviews| webviews.borrow().get(path).and_then(|hooks| hooks.posted.clone()));
-    match posted {
-        Some(posted) => {
-            posted(body);
-            true
-        }
-        None => false,
-    }
+    run_webview_report(path, |hooks| hooks.posted.clone(), body)
+}
+
+/// A console line, to the page's `on_console`.
+pub(crate) fn run_webview_console(path: &str, line: &str) -> bool {
+    run_webview_report(path, |hooks| hooks.console.clone(), line)
+}
+
+/// A completed request, to the page's `on_request`.
+pub(crate) fn run_webview_requested(path: &str, line: &str) -> bool {
+    run_webview_report(path, |hooks| hooks.requested.clone(), line)
 }
 
 /// Drains every handle's queued commands, paired with the path the

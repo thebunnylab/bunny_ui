@@ -6749,6 +6749,8 @@ mod tests {
             spec: crate::host::HostSpec::Webview {
                 url: "https://example.test/".into(),
                 scripts: Vec::new().into(),
+                console: false,
+                requests: false,
             },
         }
     }

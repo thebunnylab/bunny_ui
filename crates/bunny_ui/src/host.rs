@@ -38,7 +38,35 @@ pub enum HostSpec {
     /// The OS webview: `url` to show, and the app's user scripts —
     /// injected at document start, on every navigation, so a page
     /// never renders before the instrumentation is in place.
-    Webview { url: Rc<str>, scripts: Rc<[Rc<str>]> },
+    Webview {
+        url: Rc<str>,
+        scripts: Rc<[Rc<str>]>,
+        /// The app listens to the page's console — a backend that
+        /// serves it by injected hook only pays the hook when this is
+        /// on (nothing is captured for a page nobody watches).
+        console: bool,
+        /// The app observes the page's requests — same rule. The
+        /// injected wrap sees `fetch` and XHR, never subresources; a
+        /// backend with native capture sees everything.
+        requests: bool,
+    },
+}
+
+/// What a webview backend can serve — the capability table of
+/// `docs/webview.md` as a value. The three engines do not offer the
+/// same instrumentation and the API does not pretend they do: an app
+/// reads the shell's declared set and decides its own shape per
+/// platform, instead of half-working on two of three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebviewCapability {
+    /// The page's console reaches `on_console`.
+    ConsoleMessages,
+    /// The page's fetch/XHR traffic reaches `on_request`.
+    NetworkRequests,
+    /// Response BODIES can be read — no injected wrap serves this.
+    NetworkBodies,
+    /// Input can be synthesized into the page.
+    SyntheticInput,
 }
 
 /// What the page sends back through the one return channel. The engine
@@ -147,6 +175,8 @@ pub struct WebviewView {
     scripts: Vec<Rc<str>>,
     on_navigate: Option<crate::reconciler::WebviewReport>,
     on_message: Option<crate::reconciler::WebviewReport>,
+    on_console: Option<crate::reconciler::WebviewReport>,
+    on_request: Option<crate::reconciler::WebviewReport>,
     handle: Option<WebviewHandle>,
 }
 
@@ -175,6 +205,26 @@ impl WebviewView {
         self
     }
 
+    /// The page's console, one line per call: `"level: what it said"`
+    /// (uncaught errors included). Served where the backend declares
+    /// [`WebviewCapability::ConsoleMessages`] — on WKWebView by an
+    /// injected hook, which only rides when this is declared.
+    pub fn on_console(mut self, action: impl Fn(&str) + 'static) -> WebviewView {
+        self.on_console = Some(Rc::new(action));
+        self
+    }
+
+    /// The page's requests, one line per completion:
+    /// `"METHOD url status"`. Served where the backend declares
+    /// [`WebviewCapability::NetworkRequests`] — on WKWebView by an
+    /// injected wrap of fetch and XHR, which is BLIND to
+    /// subresources (an image, a stylesheet); a backend with native
+    /// capture sees everything.
+    pub fn on_request(mut self, action: impl Fn(&str) + 'static) -> WebviewView {
+        self.on_request = Some(Rc::new(action));
+        self
+    }
+
     /// Binds the imperative half — see [`WebviewHandle`].
     pub fn handle(mut self, handle: &WebviewHandle) -> WebviewView {
         self.handle = Some(handle.clone());
@@ -195,9 +245,12 @@ impl View for WebviewView {
         // key the platform view by — the box still holds its space, it
         // just mounts nothing
         let path = motor::identity::cursor_scope().unwrap_or_default();
-        if !path.is_empty()
-            && (self.on_navigate.is_some() || self.on_message.is_some() || self.handle.is_some())
-        {
+        let listening = self.on_navigate.is_some()
+            || self.on_message.is_some()
+            || self.on_console.is_some()
+            || self.on_request.is_some()
+            || self.handle.is_some();
+        if !path.is_empty() && listening {
             // the writers are retained beside the node, like a scroll
             // binding's — a skipped body's page keeps reporting, and
             // its handle keeps commanding
@@ -206,6 +259,8 @@ impl View for WebviewView {
                 crate::reconciler::WebviewHooks {
                     navigated: self.on_navigate.clone(),
                     posted: self.on_message.clone(),
+                    console: self.on_console.clone(),
+                    requested: self.on_request.clone(),
                     commands: self.handle.as_ref().map(WebviewHandle::share_queue),
                 },
             );
@@ -215,6 +270,8 @@ impl View for WebviewView {
             spec: HostSpec::Webview {
                 url: self.url.clone(),
                 scripts: self.scripts.clone().into(),
+                console: self.on_console.is_some(),
+                requests: self.on_request.is_some(),
             },
         });
     }
@@ -237,6 +294,8 @@ pub fn webview(url: impl Into<Rc<str>>) -> WebviewView {
         scripts: Vec::new(),
         on_navigate: None,
         on_message: None,
+        on_console: None,
+        on_request: None,
         handle: None,
     }
 }

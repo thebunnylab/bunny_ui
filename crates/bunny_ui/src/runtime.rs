@@ -3258,6 +3258,18 @@ impl Runtime {
         reconciler::run_webview_posted(path, body)
     }
 
+    /// The shell reports: the page's console spoke. Routed to the
+    /// retained `on_console`; `false` = nothing listening.
+    pub fn webview_console(&self, path: &str, line: &str) -> bool {
+        reconciler::run_webview_console(path, line)
+    }
+
+    /// The shell reports: a request of the page's completed. Routed to
+    /// the retained `on_request`; `false` = nothing listening.
+    pub fn webview_requested(&self, path: &str, line: &str) -> bool {
+        reconciler::run_webview_requested(path, line)
+    }
+
     /// Drains what the app queued on its webview handles, addressed by
     /// the path each handle is bound to — the shell spends these on
     /// the mounted engines, once per frame. An Eval keeps its `then`

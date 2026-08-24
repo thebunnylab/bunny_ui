@@ -13,7 +13,7 @@ mod ffi;
 mod image;
 mod metal;
 mod text;
-mod webview;
+pub mod webview;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -453,11 +453,16 @@ pub fn run_window_chrome(
             let placed =
                 runtime.last_viewport().map_or(height, |viewport| viewport.height);
             for host in &hosts {
-                let bunny_ui::host::HostSpec::Webview { url, scripts } = &host.spec;
-                // the stamp fingerprints the whole spec: a changed url
-                // OR script set re-instructs; the separators are
-                // control characters no url or script spells
+                let bunny_ui::host::HostSpec::Webview { url, scripts, console, requests } =
+                    &host.spec;
+                // the stamp fingerprints the whole spec: a changed
+                // url, script set or declared hook re-instructs; the
+                // separators are control characters no url or script
+                // spells
                 let mut stamp = String::from(&**url);
+                stamp.push('\u{2}');
+                stamp.push(if *console { 'c' } else { '-' });
+                stamp.push(if *requests { 'r' } else { '-' });
                 for script in scripts.iter() {
                     stamp.push('\u{1}');
                     stamp.push_str(script);
@@ -478,8 +483,8 @@ pub fn run_window_chrome(
                         host.visible.size.height,
                     ),
                     placed,
-                    || webview::create(url, scripts),
-                    |child, _stamp| webview::update(child, url, scripts),
+                    || webview::create(&host.spec),
+                    |child, _stamp| webview::update(child, &host.spec),
                 );
             }
             window.host_sweep(
@@ -702,6 +707,20 @@ pub fn run_window_chrome(
                 webview::WebviewEvent::Posted { view, body } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_posted(&path, &body)
+                    {
+                        blit(&runtime, root);
+                    }
+                }
+                webview::WebviewEvent::Console { view, line } => {
+                    if let Some(path) = ffi::host_key_of_child(view)
+                        && runtime.webview_console(&path, &line)
+                    {
+                        blit(&runtime, root);
+                    }
+                }
+                webview::WebviewEvent::Requested { view, line } => {
+                    if let Some(path) = ffi::host_key_of_child(view)
+                        && runtime.webview_requested(&path, &line)
                     {
                         blit(&runtime, root);
                     }

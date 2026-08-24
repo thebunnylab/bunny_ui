@@ -2,7 +2,8 @@
 
 *Status: the native host, the macOS webview and its instrumentation
 floor — user scripts, the message bus, navigation reports, eval with
-the value coming back — are standing;
+the value coming back, console and request capture by injected hook —
+are standing;
 `cargo run -p bunny-ui-macos --example browser_window` is the proof.
 Snapshot, devtools-by-handle, WebView2, WebKitGTK and the web's
 iframe are open.*
@@ -47,7 +48,13 @@ webview("https://docs.example.dev")
     .user_script(src)   // document-start, every navigation
     .on_navigate(move |url| history.update(|h| h.push(url.into())))
     .on_message(move |body| bus.send(body))   // window.bunny.post(…) in the page
+    .on_console(move |line| log.push(line))   // "level: what it said"
+    .on_request(move |line| net.push(line))   // "METHOD url status"
 ```
+
+The two hooks are capability-gated (the table below), and a backend
+that serves them by injection only pays when they are declared —
+nothing is captured for a page nobody watches.
 
 The imperative half is a handle, because a page is a document with a
 navigation stack, not a view tree, and a declarative API pretending
@@ -93,8 +100,9 @@ widget is for showing the web and observing what an app's own pages
 do — a dev tool watching the server it just started, a test harness
 reading the console of the page it drives.
 
-The declared set is a value the app can read, so a feature that needs
-a capability can decide its own shape per platform instead of
+The declared set is a value the app can read — on macOS,
+`bunny_ui_macos::webview::capabilities()` — so a feature that needs a
+capability can decide its own shape per platform instead of
 half-working on two of three.
 
 ## What this is not
