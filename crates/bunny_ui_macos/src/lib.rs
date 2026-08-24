@@ -1027,7 +1027,18 @@ pub fn run_window_chrome(
             // even less: the live boxes repaint on their own layers and
             // the scene is not touched at all.
             let moved = runtime.tick(dt);
-            if moved.scene {
+            // Mid-drag there is exactly ONE presenter: the resize step
+            // itself, arriving at display cadence. A tick present lands
+            // with its own latency BETWEEN two steps, so the window
+            // shows sizes out of order and the whole drag trembles — an
+            // app with a blinking caret or a hover under the held
+            // pointer trembles, and an example with no clocks stays
+            // fluid, which is exactly the pair that found this. The
+            // clocks still advanced; the next step carries what they
+            // moved, and a hand held still mid-drag parks the scene
+            // until it moves — the same stillness every step ends in.
+            if window.in_live_resize() {
+            } else if moved.scene {
                 let (width, height) = window.content_size();
                 let display = runtime.animation_frame(root, Size { width, height });
                 handler_present(runtime, display);
