@@ -67,6 +67,10 @@ struct Browser {
     fetched: State<String>,
     title: State<String>,
     handle: WebviewHandle,
+    /// `--workbench`: the rows the heavy rail carries — the dial that turns
+    /// this fluid example into the workbench's resize. Zero is the example
+    /// as it always was.
+    rows: usize,
 }
 
 impl Component for Browser {
@@ -237,7 +241,7 @@ impl Component for Browser {
         .foreground_color(theme::fg_secondary())
         .padding_length(8.0);
 
-        hstack!(
+        let center = hstack!(
             sidebar,
             if shown.get() {
                 Either::First(vstack!(bar, zstack!(pane, toast), footer))
@@ -252,7 +256,40 @@ impl Component for Browser {
                     .alignment(HorizontalAlignment::Center),
                 )
             }
+        );
+
+        // `--workbench`: the same island, wearing the workbench's anatomy —
+        // fixed flanks left and right, and a rail whose layout costs real
+        // milliseconds per resize step. The island's margins stay fixed, so
+        // the autoresize spring is as exact here as in the bare example; what
+        // changes is only how long OUR side of a resize step takes. If this
+        // costume trembles, the trembling is the present pipeline meeting a
+        // heavy scene, not the app that happens to own the scene.
+        if self.rows == 0 {
+            return Either::First(center);
+        }
+        let rows: Vec<_> = (0..self.rows)
+            .map(|i| {
+                text(format!("row {i} — the rail the workbench carries"))
+                    .font_size(11.0)
+                    .foreground_color(theme::fg_secondary())
+            })
+            .collect();
+        let rail = vstack(rows)
+        .spacing(2.0)
+        .alignment(HorizontalAlignment::Leading)
+        .padding_length(8.0)
+        .frame_width(300.0)
+        .background_color(theme::panel())
+        .clipped();
+        let flank = vstack!(
+            text("the far dock").foreground_color(theme::fg_secondary()),
+            spacer()
         )
+        .padding_length(8.0)
+        .frame_width(220.0)
+        .background_color(theme::panel());
+        Either::Second(hstack!(rail, center, flank))
     }
 }
 
@@ -273,6 +310,15 @@ fn main() {
             fetched: State::new(String::from("nothing yet")),
             title: State::new(String::new()),
             handle: WebviewHandle::new(),
+            rows: if std::env::args().any(|arg| arg == "--workbench") {
+                std::env::args()
+                    .skip_while(|arg| arg != "--rows")
+                    .nth(1)
+                    .and_then(|arg| arg.parse().ok())
+                    .unwrap_or(1500)
+            } else {
+                0
+            },
         },
     );
 }
