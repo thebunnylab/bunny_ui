@@ -13,6 +13,7 @@ mod ffi;
 mod image;
 mod metal;
 mod text;
+mod webview;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -442,6 +443,40 @@ pub fn run_window_chrome(
                     window.blit_partial(width, height, retained.rgba(), &damage);
                 }
             }
+            // the native hosts: platform views composited above the
+            // scene, in the holes the layout keeps (`docs/webview.md`).
+            // Mounted on first sight, placed every frame, swept when
+            // the subtree goes. The flip is into the LAYOUT's world,
+            // like the live layers — mid-resize the view's own height
+            // is not the world the rects were computed in.
+            let hosts = runtime.hosts();
+            let placed =
+                runtime.last_viewport().map_or(height, |viewport| viewport.height);
+            for host in &hosts {
+                let bunny_ui::host::HostSpec::Webview { url } = &host.spec;
+                window.host_place(
+                    &host.path,
+                    url,
+                    (
+                        host.frame.origin.x,
+                        host.frame.origin.y,
+                        host.frame.size.width,
+                        host.frame.size.height,
+                    ),
+                    (
+                        host.visible.origin.x,
+                        host.visible.origin.y,
+                        host.visible.size.width,
+                        host.visible.size.height,
+                    ),
+                    placed,
+                    || webview::create(url),
+                    webview::navigate,
+                );
+            }
+            window.host_sweep(
+                &hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>(),
+            );
         }
     });
     let blit = {

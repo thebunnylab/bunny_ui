@@ -1531,6 +1531,123 @@ impl WindowHandle {
         });
     }
 
+    /// Mounts and places one native host box — the platform view that
+    /// composites ABOVE the scene, in the hole the layout keeps
+    /// (`docs/webview.md`). Two views per host: a clipping container
+    /// (ours) and the tenant's view inside it, so a host in a scroll
+    /// region shows the window's worth and nothing escapes.
+    ///
+    /// `frame` is the box's LAYOUT rect (top-left, points) and
+    /// `window` the rect the clip lets through, box-LOCAL — both
+    /// straight from the placement. `view_height` is the placing
+    /// layout's height: the bottom-left flip uses the world the rects
+    /// were computed in, like [`WindowHandle::live_layer_blit`]. An
+    /// empty window hides the view instead of unmounting it — a page
+    /// keeps its state while it is scrolled off.
+    ///
+    /// `make` runs once, when the key first appears, and returns the
+    /// tenant's view with ONE retain that [`WindowHandle::host_sweep`]
+    /// releases. `update` runs when `stamp` changed — how a navigation
+    /// lands without a re-mount.
+    pub fn host_place(
+        &self,
+        key: &str,
+        stamp: &str,
+        frame: (f64, f64, f64, f64),
+        window: (f64, f64, f64, f64),
+        view_height: f64,
+        make: impl FnOnce() -> Id,
+        update: impl FnOnce(Id, &str),
+    ) {
+        HOST_VIEWS.with(|hosts| {
+            let mut hosts = hosts.borrow_mut();
+            let slot = hosts.entry(key.to_string()).or_insert_with(|| unsafe {
+                let container = msg_id(class("NSView"), sel("alloc"));
+                let container = msg_init_rect(
+                    container,
+                    sel("initWithFrame:"),
+                    CGRect {
+                        origin: CGPoint { x: 0.0, y: 0.0 },
+                        size: CGSize { width: 0.0, height: 0.0 },
+                    },
+                );
+                // the container is the CLIP: whatever the tenant
+                // draws stays inside the window the layout granted
+                msg_void_bool(container, sel("setWantsLayer:"), 1);
+                let layer = msg_id(container, sel("layer"));
+                if !layer.is_null() {
+                    msg_void_bool(layer, sel("setMasksToBounds:"), 1);
+                }
+                // between our placements the view hangs from the
+                // TOP-left corner the layout counts from — the same
+                // masks the live layers keep, in view units
+                msg_void_i64(
+                    container,
+                    sel("setAutoresizingMask:"),
+                    (Self::LAYER_MIN_Y_MARGIN | Self::LAYER_MAX_X_MARGIN) as i64,
+                );
+                let child = make();
+                msg_void_id(container, sel("addSubview:"), child);
+                msg_void_id(self.view, sel("addSubview:"), container);
+                HostSlot { container, child, stamp: stamp.to_string() }
+            });
+            let (x, y, w, h) = frame;
+            let (vx, vy, vw, vh) = window;
+            unsafe {
+                if vw <= 0.0 || vh <= 0.0 {
+                    msg_void_bool(slot.container, sel("setHidden:"), 1);
+                } else {
+                    msg_void_bool(slot.container, sel("setHidden:"), 0);
+                    // the container lands on the visible cut, flipped
+                    // into AppKit's bottom-left world
+                    msg_void_rect(
+                        slot.container,
+                        sel("setFrame:"),
+                        CGRect {
+                            origin: CGPoint { x: x + vx, y: view_height - (y + vy) - vh },
+                            size: CGSize { width: vw, height: vh },
+                        },
+                    );
+                    // the tenant keeps the WHOLE box, container-local:
+                    // the cut shows through, the content never rewraps
+                    msg_void_rect(
+                        slot.child,
+                        sel("setFrame:"),
+                        CGRect {
+                            origin: CGPoint { x: -vx, y: vh + vy - h },
+                            size: CGSize { width: w, height: h },
+                        },
+                    );
+                }
+                if slot.stamp != stamp {
+                    slot.stamp = stamp.to_string();
+                    update(slot.child, stamp);
+                }
+            }
+        });
+    }
+
+    /// Removes the hosts that left the scene — the subtree went, the
+    /// platform view goes with it. Releases the two holds
+    /// [`WindowHandle::host_place`] took: the container's alloc and
+    /// the tenant's `make`.
+    pub fn host_sweep(&self, alive: &[String]) {
+        HOST_VIEWS.with(|hosts| {
+            let mut hosts = hosts.borrow_mut();
+            hosts.retain(|key, slot| {
+                if alive.iter().any(|path| path == key) {
+                    return true;
+                }
+                unsafe {
+                    msg_void(slot.container, sel("removeFromSuperview"));
+                    msg_void(slot.child, sel("release"));
+                    msg_void(slot.container, sel("release"));
+                }
+                false
+            });
+        });
+    }
+
     /// Presents damaged rects only: syncs the ffi-owned backing store
     /// (partial copy — a hover copies one row of bytes) and marks each
     /// rect dirty; AppKit calls `drawRect:` with the union and the view
@@ -1661,6 +1778,18 @@ thread_local! {
     /// One sublayer per LIVE box, keyed by identity — the box's own
     /// presentation surface while its loop runs.
     static LIVE_LAYERS: RefCell<HashMap<String, LiveLayer>> = RefCell::new(HashMap::new());
+    /// One platform view per HOST box, keyed by identity — the native
+    /// content that composites above the scene.
+    static HOST_VIEWS: RefCell<HashMap<String, HostSlot>> = RefCell::new(HashMap::new());
+}
+
+/// One mounted native host: the clipping container (ours), the
+/// tenant's view inside it, and the stamp the tenant last applied — a
+/// changed spec re-instructs the view, it never re-mounts it.
+struct HostSlot {
+    container: Id,
+    child: Id,
+    stamp: String,
 }
 
 /// One live box's sublayer and its two alternating backings — the

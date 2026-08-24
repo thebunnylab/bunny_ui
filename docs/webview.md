@@ -1,6 +1,9 @@
 # A webview
 
-*Status: design. Nothing here is built; the macOS backend comes first.*
+*Status: the native host and the macOS webview floor are standing —
+`cargo run -p bunny-ui-macos --example browser_window` is the proof.
+The imperative handle, the message bus, WebView2, WebKitGTK and the
+web's iframe are open.*
 
 An app sometimes has to show a web page — the preview of the thing it
 is building, a documentation site, an OAuth dance. Bundling a browser
