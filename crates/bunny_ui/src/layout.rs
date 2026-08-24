@@ -3206,7 +3206,23 @@ impl LayoutNode {
                         } else {
                             let lines =
                                 env.cache.get_or_break(content, &env.font, width, env.text);
-                            Size { width, height: lines.len() as Px * advance }
+                            // A paragraph told how tall it may be answers
+                            // that, not what it wishes it were. Answering
+                            // the wish is what put a card's text over the
+                            // card: the parent centres what it was told,
+                            // so an answer bigger than the room leaks HALF
+                            // of itself upward, into the sibling above.
+                            //
+                            // Proposed nothing on this axis, it still
+                            // answers everything — which is what a
+                            // scrolling region asks for, and how a column
+                            // of text keeps growing.
+                            Size {
+                                width,
+                                height: rows_that_fit(lines.len(), advance, proposal.height)
+                                    as Px
+                                    * advance,
+                            }
                         }
                     }
                     _ => Size { width: natural, height: advance },
@@ -5415,7 +5431,30 @@ fn place_text(
         return;
     }
     let lines = env.cache.get_or_break(content, &env.font, frame.size.width, env.text);
-    for (line_index, (start, end)) in lines.iter().enumerate() {
+    // the same rule the measure used, so the two never disagree about
+    // which line is the last one
+    let shown = rows_that_fit(lines.len(), advance, Some(frame.size.height));
+    for (line_index, (start, end)) in lines.iter().enumerate().take(shown) {
+        // the last line of a paragraph that was CUT says so, the way a
+        // single line that does not fit already did
+        if line_index + 1 == shown && shown < lines.len() {
+            let rest: Arc<str> = Arc::from(content[*start..].trim_end());
+            let composed: Arc<str> =
+                Arc::from(truncate_to_width(&rest, Truncation::End, frame.size.width, env));
+            let length = composed.len();
+            let cut = env.cache.get_or_measure(&composed, &env.font, env.text).width;
+            out.draw(DrawCommand::TextLine {
+                origin: Point {
+                    x: frame.origin.x + slide(cut),
+                    y: top + line_index as Px * advance,
+                },
+                content: composed,
+                range: (0, length),
+                color: base_color,
+                font: env.font,
+            });
+            break;
+        }
         // a centred or trailing line has to know its OWN width; a leading
         // one never asks, so the common case measures nothing extra
         let x = match env.text_align {
@@ -5511,6 +5550,24 @@ const ELLIPSIS: &str = "…";
 
 /// Composes the ellipsis version that fits the width — the most content
 /// possible, measured for real (every candidate goes through the cache).
+/// How many whole lines fit in the room, of the `lines` there are.
+///
+/// One line always does. A box too short for even that gets a single
+/// ellipsized line instead of nothing, because a row of text that
+/// vanishes reads as a bug and a row that says "…" reads as a cap.
+///
+/// `None` room is not a small room — it is the question not asked, and
+/// the answer is every line. A scrolling region proposes exactly that.
+fn rows_that_fit(lines: usize, advance: Px, room: Option<Px>) -> usize {
+    match room {
+        Some(room) if room > 0.0 && advance > 0.0 => {
+            let whole = ((room + SETTLED) / advance).floor().max(1.0) as usize;
+            lines.min(whole)
+        }
+        _ => lines,
+    }
+}
+
 fn truncate_to_width(content: &str, mode: Truncation, width: Px, env: LayoutEnv) -> String {
     let fits = |candidate: &str| {
         env.cache.get_or_measure(candidate, &env.font, env.text).width <= width

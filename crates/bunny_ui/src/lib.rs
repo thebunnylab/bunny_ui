@@ -5802,6 +5802,93 @@ mod tests {
         );
     }
 
+    /// A text taller than its room paints what FITS, inside the box,
+    /// and says it was cut.
+    ///
+    /// A paragraph used to answer the height it wished it had. The
+    /// parent centres what it is told, so an answer bigger than the room
+    /// leaked half of itself UPWARD — into the sibling above it — and
+    /// half below. A clip could not even rescue that: cutting a block
+    /// centred on its overflow shows the middle of the text.
+    #[test]
+    fn a_text_taller_than_its_room_paints_what_fits() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+
+        const BOX: f64 = 36.0;
+
+        #[derive(Clone, Copy)]
+        struct Card;
+        impl Component for Card {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack(
+                    text(
+                        "um dek bastante longo que quebra em varias linhas quando a coluna \
+                         e estreita e o cartao nao tem altura para todas elas",
+                    )
+                    .frame_max(f64::INFINITY, BOX, Alignment::Leading),
+                )
+                .frame(200.0, BOX)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let result =
+            runtime.settled_layout(&Card, Proposal::exact(Size { width: 200.0, height: BOX }));
+        let painted: Vec<(f64, String)> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::TextLine { origin, content, range, .. } => {
+                    Some((origin.y, content[range.0..range.1].to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(!painted.is_empty(), "the text paints");
+        for (y, line) in &painted {
+            assert!(
+                *y >= 0.0 && *y <= BOX,
+                "every line sits inside the box, and {line:?} is at {y}",
+            );
+        }
+        assert!(
+            painted.last().is_some_and(|(_, line)| line.ends_with('…')),
+            "the last one says there is more: {painted:?}",
+        );
+    }
+
+    /// Proposed no height, a paragraph still answers every line.
+    ///
+    /// That is not a small room — it is the question not asked, and it is
+    /// exactly what a scrolling region asks, which is how a column of
+    /// text keeps growing past the window.
+    #[test]
+    fn a_text_asked_for_no_height_keeps_every_line() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+
+        const BODY: &str = "um dek bastante longo que quebra em varias linhas quando a coluna \
+                            e estreita e o cartao nao tem altura para todas elas";
+
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(text(BODY).frame_max(f64::INFINITY, f64::INFINITY, Alignment::Leading))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let result =
+            runtime.settled_layout(&Page, Proposal::exact(Size { width: 200.0, height: 36.0 }));
+        let lines = result
+            .display
+            .iter()
+            .filter(|command| matches!(command, DrawCommand::TextLine { .. }))
+            .count();
+        assert!(lines >= 6, "the whole paragraph is there to scroll through, got {lines}");
+    }
+
     /// The same row, too NARROW for the content. The hug still takes
     /// the room instead of half of it.
     ///
