@@ -3248,6 +3248,36 @@ impl Runtime {
         self.last_hosts.borrow().clone()
     }
 
+    /// The display-list ranges that painted ABOVE each host — the
+    /// scene interleaved with the islands. Each entry names the host
+    /// the range covers: the commands from that host's mark to the
+    /// next host's (the tail is capped at the first overlay, which
+    /// presents on its own surface already). A shell carves these out
+    /// of the window's present and composites each on a surface of
+    /// its own, between the platform views — paint order stays the
+    /// truth, island or no island. A layout with nothing painted
+    /// after its hosts answers nothing here, and costs nothing.
+    pub fn host_segments(&self, display_len: usize) -> Vec<(String, (usize, usize))> {
+        let hosts = self.last_hosts.borrow();
+        if hosts.is_empty() {
+            return Vec::new();
+        }
+        let cap = self
+            .last_overlays
+            .borrow()
+            .first()
+            .map_or(display_len, |overlay| overlay.display.0)
+            .min(display_len);
+        let mut segments = Vec::new();
+        for (index, host) in hosts.iter().enumerate() {
+            let end = hosts.get(index + 1).map_or(cap, |next| next.mark).min(cap);
+            if host.mark < end {
+                segments.push((host.path.clone(), (host.mark, end)));
+            }
+        }
+        segments
+    }
+
     /// The shell reports: the engine committed a navigation. Routed to
     /// the page's retained `on_navigate`; `false` = nothing listening.
     pub fn webview_navigated(&self, path: &str, url: &str) -> bool {

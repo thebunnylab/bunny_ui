@@ -147,6 +147,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_void_id_i64(obj: Id, sel: Sel, a: Id, b: i64);
     #[link_name = "objc_msgSend"]
+    fn msg_void_id_i64_id(obj: Id, sel: Sel, a: Id, b: i64, c: Id);
+    #[link_name = "objc_msgSend"]
     fn msg_void_rect_bool(obj: Id, sel: Sel, rect: CGRect, flag: i8);
     #[link_name = "objc_msgSend"]
     fn msg_void_i64(obj: Id, sel: Sel, a: i64);
@@ -1809,6 +1811,234 @@ pub(crate) fn host_key_of_child(child: Id) -> Option<String> {
             .find(|(_, slot)| std::ptr::eq(slot.child, child))
             .map(|(key, _)| key.clone())
     })
+}
+
+/// One segment surface: the scene's commands that painted ABOVE a
+/// host, composited over the platform view — the sandwich that keeps
+/// paint order the truth, island or no island. The straight RGBA
+/// stays here because the HIT TEST reads it: a painted pixel claims
+/// the pointer, a clear one lets it fall through to the page below.
+struct SegmentSlot {
+    view: Id,
+    rgba: Vec<u8>,
+    width: usize,
+    height: usize,
+    scale: usize,
+    /// Two premultiplied backings, alternating — the picture on
+    /// screen is never the buffer being written (the live layers'
+    /// discipline).
+    buffers: [Vec<u8>; 2],
+    flip: bool,
+}
+
+thread_local! {
+    static SEGMENTS: RefCell<HashMap<String, SegmentSlot>> = RefCell::new(HashMap::new());
+}
+
+static REGISTER_SEGMENT: Once = Once::new();
+
+/// The segment view's whole hit policy, in one answer: alpha claims.
+/// `point` arrives in the SUPERVIEW's coordinates (bottom-left); the
+/// buffer's rows count from the top.
+extern "C" fn bunny_segment_hit(this: Id, _sel: Sel, point: CGPoint) -> Id {
+    SEGMENTS.with(|segments| {
+        let segments = segments.borrow();
+        let Some(slot) = segments.values().find(|slot| std::ptr::eq(slot.view, this)) else {
+            return std::ptr::null_mut();
+        };
+        let frame = unsafe { msg_rect(this, sel("frame")) };
+        let x = point.x - frame.origin.x;
+        let up = point.y - frame.origin.y;
+        if x < 0.0 || up < 0.0 || x >= frame.size.width || up >= frame.size.height {
+            return std::ptr::null_mut();
+        }
+        let column = ((x * slot.scale as f64) as usize).min(slot.width.saturating_sub(1));
+        let row = (((frame.size.height - up) * slot.scale as f64) as usize)
+            .min(slot.height.saturating_sub(1));
+        let index = (row * slot.width + column) * 4 + 3;
+        match slot.rgba.get(index) {
+            Some(alpha) if *alpha > 8 => this,
+            _ => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Every pointer verb the segment view claims goes to the content
+/// view unchanged — the event still carries its window coordinates,
+/// so the shell's own handlers resolve it like any other.
+extern "C" fn bunny_segment_forward(this: Id, cmd: Sel, event: Id) {
+    unsafe {
+        let superview = msg_id(this, sel("superview"));
+        if !superview.is_null() {
+            msg_void_id(superview, cmd, event);
+        }
+    }
+}
+
+unsafe fn register_segment_class() {
+    REGISTER_SEGMENT.call_once(|| unsafe {
+        let name = CString::new("BunnySegmentView").expect("class name");
+        let segment = objc_allocateClassPair(class("NSView"), name.as_ptr(), 0);
+        let hit_types = CString::new("@@:{CGPoint=dd}").expect("type encoding");
+        class_addMethod(
+            segment,
+            sel("hitTest:"),
+            bunny_segment_hit as *const c_void,
+            hit_types.as_ptr(),
+        );
+        let forward_types = CString::new("v@:@").expect("type encoding");
+        for verb in
+            ["mouseDown:", "mouseUp:", "rightMouseDown:", "mouseDragged:", "scrollWheel:"]
+        {
+            class_addMethod(
+                segment,
+                sel(verb),
+                bunny_segment_forward as *const c_void,
+                forward_types.as_ptr(),
+            );
+        }
+        objc_registerClassPair(segment);
+    });
+}
+
+impl WindowHandle {
+    /// Presents one segment — the commands that painted above `host`,
+    /// rasterized by the caller into straight window-sized RGBA. The
+    /// surface mounts DIRECTLY ABOVE the host's container, so content
+    /// between two hosts lands between their pages; it spans the
+    /// window (the toast straddling the pane's edge shows both
+    /// halves), stretches with it, and the caller re-blits on change.
+    pub fn segment_blit(
+        &self,
+        key: &str,
+        host_key: &str,
+        rgba: &[u8],
+        logical: (f64, f64),
+        scale: usize,
+        px_width: usize,
+        px_height: usize,
+    ) {
+        unsafe { register_segment_class() };
+        SEGMENTS.with(|segments| {
+            let mut segments = segments.borrow_mut();
+            let slot = segments.entry(key.to_string()).or_insert_with(|| unsafe {
+                let view = msg_id(class("BunnySegmentView"), sel("alloc"));
+                let view = msg_init_rect(
+                    view,
+                    sel("initWithFrame:"),
+                    CGRect {
+                        origin: CGPoint { x: 0.0, y: 0.0 },
+                        size: CGSize { width: logical.0, height: logical.1 },
+                    },
+                );
+                msg_void_bool(view, sel("setWantsLayer:"), 1);
+                // width and height follow the window between blits —
+                // the next present re-blits the pixels anyway
+                msg_void_i64(view, sel("setAutoresizingMask:"), 18);
+                match host_child_container(host_key) {
+                    // NSWindowAbove = 1: directly over the page it covers
+                    Some(container) => msg_void_id_i64_id(
+                        self.view,
+                        sel("addSubview:positioned:relativeTo:"),
+                        view,
+                        1,
+                        container,
+                    ),
+                    None => msg_void_id(self.view, sel("addSubview:"), view),
+                }
+                SegmentSlot {
+                    view,
+                    rgba: Vec::new(),
+                    width: 0,
+                    height: 0,
+                    scale,
+                    buffers: [Vec::new(), Vec::new()],
+                    flip: false,
+                }
+            });
+            slot.rgba.clear();
+            slot.rgba.extend_from_slice(rgba);
+            slot.width = px_width;
+            slot.height = px_height;
+            slot.scale = scale;
+            slot.flip = !slot.flip;
+            let backing = &mut slot.buffers[slot.flip as usize];
+            backing.clear();
+            backing.extend_from_slice(rgba);
+            for pixel in backing.chunks_exact_mut(4) {
+                let alpha = pixel[3] as u32;
+                if alpha < 255 {
+                    for channel in 0..3 {
+                        pixel[channel] = (pixel[channel] as u32 * alpha / 255) as u8;
+                    }
+                }
+            }
+            unsafe {
+                let provider = CGDataProviderCreateWithData(
+                    std::ptr::null_mut(),
+                    backing.as_ptr(),
+                    backing.len(),
+                    std::ptr::null(),
+                );
+                let space = CGColorSpaceCreateDeviceRGB();
+                let image = CGImageCreate(
+                    px_width,
+                    px_height,
+                    8,
+                    32,
+                    px_width * 4,
+                    space,
+                    ALPHA_PREMULTIPLIED_LAST,
+                    provider,
+                    std::ptr::null(),
+                    false,
+                    0,
+                );
+                let layer = msg_id(slot.view, sel("layer"));
+                without_actions(|| {
+                    msg_void_rect(
+                        slot.view,
+                        sel("setFrame:"),
+                        CGRect {
+                            origin: CGPoint { x: 0.0, y: 0.0 },
+                            size: CGSize { width: logical.0, height: logical.1 },
+                        },
+                    );
+                    if !layer.is_null() {
+                        msg_void_f64(layer, sel("setContentsScale:"), scale as f64);
+                        msg_void_id(layer, sel("setContents:"), image);
+                    }
+                });
+                CGImageRelease(image);
+                CGColorSpaceRelease(space);
+                CGDataProviderRelease(provider);
+            }
+        });
+    }
+
+    /// Removes the segments that left the scene — nothing painted
+    /// above the host this frame, so nothing covers it.
+    pub fn segment_sweep(&self, alive: &[String]) {
+        SEGMENTS.with(|segments| {
+            let mut segments = segments.borrow_mut();
+            segments.retain(|key, slot| {
+                if alive.iter().any(|path| path == key) {
+                    return true;
+                }
+                unsafe {
+                    msg_void(slot.view, sel("removeFromSuperview"));
+                    msg_void(slot.view, sel("release"));
+                }
+                false
+            });
+        });
+    }
+}
+
+/// The host's clipping container, for stacking a segment right above
+/// its page.
+fn host_child_container(key: &str) -> Option<Id> {
+    HOST_VIEWS.with(|hosts| hosts.borrow().get(key).map(|slot| slot.container))
 }
 
 /// One live box's sublayer and its two alternating backings — the

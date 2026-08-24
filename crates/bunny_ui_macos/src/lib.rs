@@ -215,11 +215,18 @@ pub fn run_window_chrome(
     type Beneath = (Vec<bunny_ui::layout::DrawCommand>, (usize, usize), bunny_ui::raster::Bitmap);
     let beneaths: Rc<RefCell<std::collections::HashMap<String, Beneath>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
+    // The commands each host SEGMENT was last rasterized from — the
+    // ledger that keeps a steady frame from re-proving the same
+    // pixels (the beneaths' twin, for the sandwich above the island).
+    type SegmentKept = (Vec<bunny_ui::layout::DrawCommand>, (usize, usize));
+    let segments_kept: Rc<RefCell<std::collections::HashMap<String, SegmentKept>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
     // present takes a READY display list to the window — the tick path
     // reuses it without paying settle, effects or the IME tail
     let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
+        let segments_kept = Rc::clone(&segments_kept);
         let beneaths = Rc::clone(&beneaths);
         move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
             let (width, height) = window.content_size();
@@ -234,6 +241,16 @@ pub fn run_window_chrome(
                 Some(first) => full_display.translated_slice((0, first.display.0), 0.0, 0.0),
                 None => full_display.clone(),
             };
+            // the sandwich: what painted ABOVE a host leaves the
+            // window's present and composites on a segment surface
+            // between the platform views — paint order stays the
+            // truth over the islands. A scene with nothing after its
+            // hosts answers nothing here and pays nothing. Every
+            // carve below cuts from the ORIGINAL list: ranges never
+            // chase indices another carve already moved.
+            let segments = runtime.host_segments(full_display.len());
+            let segment_ranges: Vec<(usize, usize)> =
+                segments.iter().map(|(_, range)| *range).collect();
             {
                 let mut store = panels.borrow_mut();
                 let mut dead: Vec<String> = store
@@ -360,7 +377,13 @@ pub fn run_window_chrome(
                     runtime.forget_live_surfaces();
                 }
                 let live = if resizing { Vec::new() } else { runtime.live_slices() };
-                if live.is_empty() {
+                // one carve, all ranges against the original indices
+                // (a live box above a host is carved TWICE over the
+                // same commands, which removes them once — its hidden
+                // layer below the page is waste the segment covers)
+                let mut carve = live.clone();
+                carve.extend(segment_ranges.iter().copied());
+                if carve.is_empty() {
                     metal::present_window(
                         &display,
                         Size { width, height },
@@ -371,7 +394,7 @@ pub fn run_window_chrome(
                     );
                 } else {
                     metal::present_window(
-                        &display.without_slices(&live),
+                        &display.without_slices(&carve),
                         Size { width, height },
                         scale,
                         canvas,
@@ -434,6 +457,13 @@ pub fn run_window_chrome(
                     ));
                 }
                 let (retained, _, _) = slot.as_mut().expect("surface for the frame");
+                // the CPU surface keeps the same law: the segments'
+                // commands leave the window and ride their surfaces
+                let display = if segment_ranges.is_empty() {
+                    display
+                } else {
+                    display.without_slices(&segment_ranges)
+                };
                 let damage = retained.frame(display, &*runtime.text(), &*runtime.images());
                 if !damage.is_empty() {
                     // present only the wounds: damage-only mirror sync +
@@ -490,6 +520,47 @@ pub fn run_window_chrome(
             window.host_sweep(
                 &hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>(),
             );
+            // the segments themselves: rasterized only when their
+            // commands changed (the ledger's answer, the beneaths'
+            // discipline), blitted between the platform views, swept
+            // the frame nothing paints above a host
+            {
+                let mut kept = segments_kept.borrow_mut();
+                for (host, range) in &segments {
+                    let slice = full_display.translated_slice(*range, 0.0, 0.0);
+                    let commands: Vec<_> = slice.iter().cloned().collect();
+                    let stale = kept
+                        .get(host)
+                        .is_none_or(|(was, size)| *was != commands || *size != physical);
+                    if !stale {
+                        continue;
+                    }
+                    let bitmap = bunny_ui::raster::rasterize_over(
+                        &slice,
+                        physical.0,
+                        physical.1,
+                        scale,
+                        bunny_ui::layout::Color { r: 0, g: 0, b: 0, a: 0 },
+                        &*runtime.text(),
+                        &*runtime.images(),
+                        None,
+                    );
+                    window.segment_blit(
+                        host,
+                        host,
+                        &bitmap.to_rgba_bytes(),
+                        (width, height),
+                        scale,
+                        physical.0,
+                        physical.1,
+                    );
+                    kept.insert(host.clone(), (commands, physical));
+                }
+                let alive: Vec<String> =
+                    segments.iter().map(|(host, _)| host.clone()).collect();
+                kept.retain(|key, _| alive.iter().any(|host| host == key));
+                window.segment_sweep(&alive);
+            }
         }
     });
     let blit = {

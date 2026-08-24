@@ -6361,6 +6361,54 @@ mod tests {
         assert_eq!(hosts[0].visible.origin.y, 0.0);
     }
 
+    /// The scene interleaves with the island: what paints AFTER the
+    /// host is a segment the shell composites above it — and a scene
+    /// with nothing after its hosts answers nothing, which is the
+    /// price everyone else pays.
+    #[test]
+    fn what_paints_after_a_host_is_a_segment_above_it() {
+        use crate::host::webview;
+        use crate::layout::{Color, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Layered;
+        impl Component for Layered {
+            fn body(self, _ctx: &Context) -> impl View {
+                zstack!(
+                    webview("https://example.test/"),
+                    text("saving…")
+                        .padding_length(8.0)
+                        .background_color(Color { r: 30, g: 30, b: 30, a: 255 })
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let result = runtime
+            .settled_layout(&Layered, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let segments = runtime.host_segments(result.display.len());
+        assert_eq!(segments.len(), 1, "one host, one tail: {segments:?}");
+        let (path, (start, end)) = segments[0].clone();
+        assert_eq!(path, runtime.hosts()[0].path, "the segment names the host it covers");
+        assert!(end > start, "the toast's commands live in the tail");
+        assert_eq!(end, result.display.len(), "the tail runs to the end of the scene");
+
+        #[derive(Clone, Copy)]
+        struct Plain;
+        impl Component for Plain {
+            fn body(self, _ctx: &Context) -> impl View {
+                hstack!(text("side"), webview("https://example.test/"))
+            }
+        }
+        let runtime = Runtime::new();
+        let result = runtime
+            .settled_layout(&Plain, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        assert!(
+            runtime.host_segments(result.display.len()).is_empty(),
+            "nothing painted after the host — nothing to lift, nothing to pay"
+        );
+    }
+
     /// A webview under a SKIPPED body still places: the retained tree
     /// keeps the node, so the shell keeps the box — a page must not
     /// unmount because a body above it went quiet.

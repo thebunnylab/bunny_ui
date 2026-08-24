@@ -20,8 +20,12 @@
 //! - type a url in the bar and press enter (a bare host name gets
 //!   https:// for free); a committed navigation writes the real url
 //!   back into the field;
-//! - "popover" opens a card over the page — the island contract,
-//!   resolved: on this OS the popover rides its own child panel;
+//! - "popover" opens a card over the page — presented on its own
+//!   child panel, the overlay road;
+//! - the toast in the corner is IN-SCENE content over the page — the
+//!   sandwich: paint order is the truth over the island too. Click it
+//!   and it answers; click the clear space beside it and the PAGE
+//!   answers;
 //! - switch pages in the sidebar: the SAME view navigates; back and
 //!   forward walk the engine's own history;
 //! - hide the pane: the subtree goes and the view goes with it; show
@@ -203,6 +207,26 @@ impl Component for Browser {
             .on_request(move |line| fetched.set(line.to_string()))
             .handle(&handle);
 
+        // the sandwich, demonstrated: this is IN-SCENE content over
+        // the page — no panel, no popover, just paint order. Its
+        // pixels claim the pointer; the clear space around it lets
+        // clicks fall through to the page.
+        let toast = {
+            let title = self.title;
+            vstack!(
+                spacer(),
+                hstack!(
+                    spacer(),
+                    text("an in-scene toast, over the page")
+                        .padding_length(10.0)
+                        .background_color(theme::panel())
+                        .corner_radius(8.0)
+                        .on_click(move || title.set("the toast took the click".into()))
+                )
+            )
+            .padding_length(16.0)
+        };
+
         let footer = vstack!(
             text(format!("bus: {}", self.posted.get())),
             text(format!("console: {}", self.spoke.get())),
@@ -216,7 +240,7 @@ impl Component for Browser {
         hstack!(
             sidebar,
             if shown.get() {
-                Either::First(vstack!(bar, pane, footer))
+                Either::First(vstack!(bar, zstack!(pane, toast), footer))
             } else {
                 Either::Second(
                     vstack!(

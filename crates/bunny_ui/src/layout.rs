@@ -2214,6 +2214,12 @@ pub struct HostPlacement {
     pub region: Option<String>,
     /// What the box holds — the shell mounts by it.
     pub spec: crate::host::HostSpec,
+    /// Where in the display list the host stood: every command after
+    /// this mark painted ABOVE the host, and a shell that composites
+    /// the platform view over the scene carves that tail out and
+    /// presents it on a surface of its own — paint order stays the
+    /// truth, island or no island.
+    pub mark: usize,
 }
 
 /// The grip band's thickness over a split divider, in points.
@@ -4201,6 +4207,7 @@ impl LayoutNode {
                         visible: window,
                         region: out.region_stack.last().cloned(),
                         spec: spec.clone(),
+                        mark: out.display.len(),
                     });
                 }
                 // no draw command: the scene keeps the ground, and the

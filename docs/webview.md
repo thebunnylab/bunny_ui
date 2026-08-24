@@ -5,8 +5,9 @@ floor — user scripts, the message bus, navigation reports, eval with
 the value coming back, console and request capture by injected hook,
 and the snapshot — are standing;
 `cargo run -p bunny-ui-macos --example browser_window` is the proof,
-and the web's own lowering — the iframe — is standing beside it.
-WebView2 and WebKitGTK are open.*
+the web's own lowering — the iframe — is standing beside it, and the
+scene interleaves with the island: what paints after a host
+composites above it. WebView2 and WebKitGTK are open.*
 
 An app sometimes has to show a web page — the preview of the thing it
 is building, a documentation site, an OAuth dance. Bundling a browser
@@ -21,15 +22,23 @@ Two pieces, and the first is more general than the second.
 ## The native host
 
 A box owned by a platform view. The framework positions it, sizes it,
-clips it to the box, shows and hides it with the subtree — and paints
-**around** it, never over it.
+clips it to the box, shows and hides it with the subtree — and keeps
+**paint order the truth**, island or no island.
 
-That last clause is the contract, and it is stated here rather than
-discovered by the first popover: a native child view composites above
-the scene. Nothing the framework draws can appear on top of it — not a
-tooltip, not a menu, not a drag ghost. An overlay that would cross the
-island repositions, or becomes a native view itself. The host reports
-its rectangle so the app can make that call deliberately.
+The platform's law is that a native child view composites above the
+scene, and the framework answers it on two roads rather than letting
+the law leak into the app. Whatever the scene paints AFTER the host —
+a toast in the corner, a veil, anything a z-stack puts over the pane —
+leaves the window's own present and composites on a **segment
+surface** above the platform view: its painted pixels claim the
+pointer, its clear ones let the click fall through to the page. An
+overlay — a popover, a sheet — presents on a surface of its own, the
+road it already travels. A scene with nothing painted after its hosts
+mints no segment and pays nothing.
+
+One thing stays honestly out of reach: the page's pixels are the
+engine's, so a material above the island tints — it does not blur.
+The host reports its rectangle for the calls that remain deliberate.
 
 This is a different door from `canvas` and `custom`, which paint with
 the framework's own commands and clip like everything else. The host
