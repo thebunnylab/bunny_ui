@@ -235,6 +235,11 @@ pub fn run_window_chrome(
             let scale = window.scale();
             let canvas = bunny_ui::theme::canvas();
             let physical = ((width.round() as usize) * scale, (height.round() as usize) * scale);
+            // BUNNY_PRESENT_TRACE=1: one line per present into
+            // /tmp/bunny-present.trace — the tape a trembling resize is
+            // diagnosed from (what presented, at which size, how long it
+            // took, and whether the window moved under it).
+            let _traced = trace::begin("P", width, height, window.in_live_resize(), full_display.len());
             // the window presents everything BEFORE the first popover;
             // each popover re-presents its own slice on a child panel
             // in screen coordinates — that is how it leaves the window
@@ -1151,4 +1156,57 @@ pub fn run_window_chrome(
     // first frame, and the run loop takes over
     ffi::dispatch(AppEvent::Redraw);
     ffi::run();
+}
+
+// =============================================================================
+// BUNNY_PRESENT_TRACE — the tape a trembling resize is diagnosed from
+// =============================================================================
+
+/// `BUNNY_PRESENT_TRACE=1` appends one line per present to
+/// `/tmp/bunny-present.trace`: begin (`P <ms> <w>x<h> live=<0|1>
+/// cmds=<n>`) and end (`E <ms> dur=<ms>`). Off, it costs one branch.
+mod trace {
+    use std::io::Write as _;
+
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("BUNNY_PRESENT_TRACE").is_some())
+    }
+
+    fn ms() -> f64 {
+        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
+    }
+
+    fn line(args: std::fmt::Arguments<'_>) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/bunny-present.trace")
+        {
+            let _ = writeln!(file, "{args}");
+        }
+    }
+
+    /// Logged on drop, so every exit of a present answers with its
+    /// duration.
+    pub(crate) struct Traced(std::time::Instant);
+
+    impl Drop for Traced {
+        fn drop(&mut self) {
+            line(format_args!(
+                "E {:.1} dur={:.1}",
+                ms(),
+                self.0.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
+    }
+
+    pub(crate) fn begin(kind: &str, w: f64, h: f64, live: bool, cmds: usize) -> Option<Traced> {
+        if !on() {
+            return None;
+        }
+        line(format_args!("{kind} {:.1} {w:.0}x{h:.0} live={} cmds={cmds}", ms(), u8::from(live)));
+        Some(Traced(std::time::Instant::now()))
+    }
 }
