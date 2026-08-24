@@ -5802,6 +5802,74 @@ mod tests {
         );
     }
 
+    /// A label that knows how to ELLIPSIZE yields under pressure, and
+    /// never pushes the button beside it off the row.
+    ///
+    /// The three spellings a composer could reach for all missed: a
+    /// `frame_max(∞)` reads as a filler and truncates with room to
+    /// spare; a FINITE `frame_max` was not flexible at all, so the row
+    /// overflowed and the send button was clipped away; and a hug
+    /// yields correctly but cuts the word in half where the product
+    /// writes "…". A text that carries a truncation already knows how
+    /// to be smaller — it just was not allowed to say so.
+    #[test]
+    fn a_truncating_label_yields_before_the_button_does() {
+        use crate::layout::{DrawCommand, Proposal, Size, Truncation};
+
+        const LABEL: &str = "Default (recommended) — a model name of arbitrary length";
+        const SEND: f64 = 80.0;
+
+        #[derive(Clone, Copy)]
+        struct Composer {
+            label: State<f64>,
+            send: State<f64>,
+        }
+        impl Component for Composer {
+            fn body(self, _ctx: &Context) -> impl View {
+                let (label, send) = (self.label, self.send);
+                hstack((
+                    text(LABEL)
+                        .truncation_mode(Truncation::End)
+                        .on_measure(move |size| label.set(size.width)),
+                    spacer(),
+                    empty()
+                        .frame(SEND, 24.0)
+                        .on_measure(move |size| send.set(size.width)),
+                ))
+            }
+        }
+
+        let row = |width: f64| {
+            let runtime = Runtime::new();
+            let composer = Composer { label: State::new(0.0), send: State::new(0.0) };
+            let result = runtime
+                .settled_layout(&composer, Proposal::exact(Size { width, height: 40.0 }));
+            let painted = result
+                .display
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::TextLine { content, range, .. } => {
+                        Some(content[range.0..range.1].to_string())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            (composer.label.get(), composer.send.get(), painted)
+        };
+
+        // wide: the label takes its natural and the spacer eats the rest
+        let (wide_label, wide_send, wide_text) = row(900.0);
+        assert_eq!(wide_send, SEND, "the button keeps its size");
+        assert!(!wide_text.ends_with('…'), "nothing to cut: {wide_text:?}");
+
+        // narrow: the LABEL gives way, and says so
+        let (tight_label, tight_send, tight_text) = row(260.0);
+        assert_eq!(tight_send, SEND, "the button is never pushed off the row");
+        assert!(tight_label < wide_label, "the label yielded: {tight_label} < {wide_label}");
+        assert!(tight_label + SEND <= 260.0 + 0.5, "the row holds them both");
+        assert!(tight_text.ends_with('…'), "and it says it was cut: {tight_text:?}");
+    }
+
     /// A text taller than its room paints what FITS, inside the box,
     /// and says it was cut.
     ///

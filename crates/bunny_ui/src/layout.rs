@@ -3061,6 +3061,19 @@ impl LayoutNode {
             // and a many-line one takes the offered HEIGHT: `.frame_height`
             // then sizes the BOX, instead of centring one line in a hole
             LayoutNode::Field { multiline, .. } => axis == Axis::Horizontal || *multiline,
+            // A text that carries a truncation already knows how to be
+            // narrower: it drops what does not fit and says so with an
+            // ellipsis. That makes it an appetite with a CEILING — its
+            // own natural — which is exactly what the waterfall serves
+            // first, so a label gives way before the button beside it
+            // is pushed off the row.
+            //
+            // Only along the row that HOLDS it. In a column its width is
+            // the cross axis, and taking the leftover there would
+            // stretch a short label out to the widest sibling.
+            LayoutNode::Text { truncation: Some(_), .. } => {
+                axis == Axis::Horizontal && enclosing_main == Some(Axis::Horizontal)
+            }
             LayoutNode::MaxFrame { max_width, max_height, child, .. } => match axis {
                 Axis::Horizontal => {
                     max_width.is_infinite() || child.is_flexible(axis, enclosing_main)
