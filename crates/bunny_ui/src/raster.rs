@@ -951,6 +951,68 @@ pub fn list_bounds(
     })
 }
 
+/// Does anything `display[range]` paints land inside `rect`? The
+/// sandwich's overlap question: a tail that never touches its island
+/// has no business on a layer, and a dock painted after a centred
+/// pane must not tremble on one.
+///
+/// The answer is a SUPERSET on purpose, and free of the text engine:
+/// a text line's box extends to infinity on the right (measuring
+/// every line every frame is a cost the steady state must not pay).
+/// A false yes carves what would have carved anyway; a no is always
+/// honest. Clips are ignored for the same reason.
+pub fn range_covers(
+    display: &DisplayList,
+    range: (usize, usize),
+    rect: crate::layout::Rect,
+) -> bool {
+    let (x0, y0) = (rect.origin.x, rect.origin.y);
+    let (x1, y1) = (x0 + rect.size.width, y0 + rect.size.height);
+    let hits = |bx0: f64, by0: f64, bx1: f64, by1: f64| {
+        bx0 < x1 && bx1 > x0 && by0 < y1 && by1 > y0
+    };
+    display
+        .iter()
+        .skip(range.0)
+        .take(range.1.saturating_sub(range.0))
+        .any(|command| match command {
+            DrawCommand::FillRect { rect, .. }
+            | DrawCommand::Gradient { rect, .. }
+            | DrawCommand::Backdrop { rect, .. }
+            | DrawCommand::Image { rect, .. } => hits(
+                rect.origin.x,
+                rect.origin.y,
+                rect.origin.x + rect.size.width,
+                rect.origin.y + rect.size.height,
+            ),
+            DrawCommand::StrokeRect { rect, width, .. } => {
+                let reach = (width / 2.0).max(1.0);
+                hits(
+                    rect.origin.x - reach,
+                    rect.origin.y - reach,
+                    rect.origin.x + rect.size.width + reach,
+                    rect.origin.y + rect.size.height + reach,
+                )
+            }
+            DrawCommand::Shadow { rect, radius, .. } => {
+                let reach = radius.max(1.0);
+                hits(
+                    rect.origin.x - reach,
+                    rect.origin.y - reach,
+                    rect.origin.x + rect.size.width + reach,
+                    rect.origin.y + rect.size.height + reach,
+                )
+            }
+            DrawCommand::TextLine { origin, font, .. } => hits(
+                origin.x - 1.0,
+                origin.y - 1.0,
+                f64::INFINITY,
+                origin.y + font.size * 3.0,
+            ),
+            DrawCommand::PushClip { .. } | DrawCommand::PopClip => false,
+        })
+}
+
 /// [`rasterize_with`], with a scene a material may SAMPLE but that is never
 /// painted.
 ///
@@ -1444,6 +1506,51 @@ impl Surface {
 
 #[cfg(test)]
 mod tests {
+
+    /// The carve's overlap question errs toward carving, never toward
+    /// hiding: rects answer exactly, a text line reaches right to
+    /// infinity, and a tail that flanks its island — a dock beside
+    /// it, a footer under it — answers NO, so it stays in the scene.
+    #[test]
+    fn a_flanking_tail_does_not_cover_the_island() {
+        use crate::layout::{Corners, DrawCommand, Point, Rect, Size};
+        use crate::text_engine::FontSpec;
+        let island = Rect {
+            origin: Point { x: 100.0, y: 0.0 },
+            size: Size { width: 300.0, height: 300.0 },
+        };
+        let boxed = |x: f64, y: f64, w: f64, h: f64| DrawCommand::FillRect {
+            rect: Rect { origin: Point { x, y }, size: Size { width: w, height: h } },
+            color: crate::layout::Color { r: 10, g: 10, b: 10, a: 255 },
+            corner_radius: Corners::ZERO,
+        };
+        let mut flanking = crate::layout::DisplayList::default();
+        // the right dock, and the footer under everything
+        flanking.push(boxed(420.0, 0.0, 80.0, 300.0));
+        flanking.push(boxed(0.0, 320.0, 500.0, 40.0));
+        // a text line in the dock: its box reaches to infinity on the
+        // right, and the island sits to its LEFT — still no
+        flanking.push(DrawCommand::TextLine {
+            origin: Point { x: 430.0, y: 10.0 },
+            content: std::sync::Arc::from("dock"),
+            range: (0, 4),
+            color: crate::layout::Color { r: 10, g: 10, b: 10, a: 255 },
+            font: FontSpec::DEFAULT,
+        });
+        assert!(
+            !super::range_covers(&flanking, (0, flanking.len()), island),
+            "nothing lands on the island — nothing to lift"
+        );
+
+        let mut toast = crate::layout::DisplayList::default();
+        toast.push(boxed(360.0, 250.0, 60.0, 30.0));
+        assert!(
+            super::range_covers(&toast, (0, toast.len()), island),
+            "a corner of the toast is on the page"
+        );
+        // and the range is honoured: asked about nothing, it says no
+        assert!(!super::range_covers(&toast, (1, 1), island));
+    }
 
     /// An island clears to NOTHING, and `blend_px` over nothing leaves
     /// the colour already multiplied by its own coverage: a half-alpha

@@ -300,7 +300,34 @@ pub fn run_window_chrome(
             // hosts answers nothing here and pays nothing. Every
             // carve below cuts from the ORIGINAL list: ranges never
             // chase indices another carve already moved.
-            let segments = runtime.host_segments(full_display.len());
+            // a tail only becomes a segment when something in it
+            // actually LANDS on its island — a dock painted after a
+            // centred pane never touches it, and half a workbench on
+            // a layer would tremble through every resize. A disjoint
+            // tail stays in the scene, and a scene with none pays
+            // exactly what it paid before the sandwich existed.
+            let segments: Vec<(String, (usize, usize))> = runtime
+                .host_segments(full_display.len())
+                .into_iter()
+                .filter(|(path, range)| {
+                    hosts.iter().any(|host| {
+                        host.path == *path
+                            && host.visible.size.width > 0.0
+                            && host.visible.size.height > 0.0
+                            && bunny_ui::raster::range_covers(
+                                &full_display,
+                                *range,
+                                bunny_ui::layout::Rect {
+                                    origin: bunny_ui::layout::Point {
+                                        x: host.frame.origin.x + host.visible.origin.x,
+                                        y: host.frame.origin.y + host.visible.origin.y,
+                                    },
+                                    size: host.visible.size,
+                                },
+                            )
+                    })
+                })
+                .collect();
             let segment_ranges: Vec<(usize, usize)> =
                 segments.iter().map(|(_, range)| *range).collect();
             {
