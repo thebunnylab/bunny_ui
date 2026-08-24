@@ -7212,6 +7212,47 @@ mod tests {
         assert_eq!(stage.behind.get(), 0, "and nothing reached the page");
     }
 
+    /// A press beside the card does not close a sheet.
+    ///
+    /// A popover on this road dismisses when the press lands outside
+    /// it — that is what a popover is. A sheet is not: it closes when
+    /// its own content says so, and a modal that a stray click can
+    /// dismiss is not modal. Riding the same machinery must not lend
+    /// it the same manners.
+    #[test]
+    fn a_press_beside_a_sheet_does_not_close_it() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Stage {
+            open: State<bool>,
+            behind: State<i32>,
+        }
+        impl Component for Stage {
+            fn body(self, _ctx: &Context) -> impl View {
+                let behind = self.behind;
+                text("the page behind")
+                    .frame(400.0, 300.0)
+                    .on_click(move || behind.add(1))
+                    .sheet(self.open.binding(), |_| {
+                        erased(text("panel").frame(120.0, 80.0))
+                    })
+            }
+        }
+
+        let stage = Stage { open: State::new(true), behind: State::new(0) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&stage);
+        let _ = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+
+        // the far corner: outside the card, inside the window
+        runtime.pointer_pressed(20.0, 20.0);
+        runtime.pointer_released(20.0, 20.0);
+        runtime.render_stable(&stage);
+        assert!(stage.open.get(), "the sheet is still up");
+        assert_eq!(stage.behind.get(), 0, "and the press reached nothing behind it");
+    }
+
     #[test]
     fn a_modal_covers_what_it_paints_over_and_not_the_window() {
         use crate::layout::{Proposal, Size};
