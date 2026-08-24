@@ -769,6 +769,13 @@ pub enum LayoutNode {
     /// answers. On the element lowering it becomes a canvas island by
     /// construction: what the app paints is PIXELS, never elements.
     Custom { path: String, element: crate::custom::Custom },
+    /// The native host (`webview(…)`): a box a PLATFORM view owns. The
+    /// framework measures and places it and paints AROUND it, never
+    /// over it — the platform composites the view above the scene, and
+    /// [`HostPlacement`] is how the shell learns where. It emits no
+    /// draw command: the scene keeps the ground, the view lands on
+    /// top.
+    Host { path: String, spec: crate::host::HostSpec },
 }
 
 /// How the element lowering lays a subtree out: the browser's flow
@@ -2168,6 +2175,26 @@ pub struct CustomPlacement {
     pub slice: (usize, usize),
 }
 
+/// A placed native host — what the shell needs to mount the platform
+/// view over the scene (mirror of [`CustomPlacement`], minus paint: a
+/// host has no commands, the platform draws).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostPlacement {
+    pub path: String,
+    pub frame: Rect,
+    /// What the clip stack lets through, in the box's LOCAL
+    /// coordinates — the shell clips the platform view to it, so a
+    /// host inside a scroll region hides instead of escaping it. An
+    /// empty window is a box entirely clipped away: the view hides,
+    /// it is not unmounted (a page keeps its state while it is
+    /// scrolled off).
+    pub visible: Rect,
+    /// The scroll region the box sits inside, if any.
+    pub region: Option<String>,
+    /// What the box holds — the shell mounts by it.
+    pub spec: crate::host::HostSpec,
+}
+
 /// The grip band's thickness over a split divider, in points.
 pub const SPLIT_GRIP: Px = 6.0;
 
@@ -2189,6 +2216,9 @@ pub struct Placement {
     /// The app's own boxes, in paint order — where an event goes when
     /// the hit-test lands on one.
     pub customs: Vec<CustomPlacement>,
+    /// The native hosts, in paint order — where the shell mounts the
+    /// platform views that composite above the scene.
+    pub hosts: Vec<HostPlacement>,
     /// Stack of the inherited foreground — the top colors the text.
     foreground: Vec<Color>,
     /// Stack of the nearest `Interactive`'s `(hovered, pressed)` — the
@@ -2400,6 +2430,9 @@ pub struct LayoutResult {
     pub splits: Vec<SplitPlacement>,
     /// The app's own boxes — the addresses an event resolves against.
     pub customs: Vec<CustomPlacement>,
+    /// The native hosts — the boxes the shell mounts platform views
+    /// over, each frame.
+    pub hosts: Vec<HostPlacement>,
     /// Virtual windows that failed to cover the visible band this
     /// frame — the runtime re-materializes them in a follow-up pass.
     pub misses: Vec<String>,
@@ -2491,6 +2524,7 @@ pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> Lay
         fields: out.fields,
         splits: out.splits,
         customs: out.customs,
+        hosts: out.hosts,
         misses: out.misses,
         saw_island: out.saw_island,
         overlays: out.overlays,
@@ -2535,6 +2569,7 @@ pub fn layout_dom(
             fields: out.fields,
             splits: out.splits,
             customs: out.customs,
+            hosts: out.hosts,
             misses: out.misses,
             saw_island: out.saw_island,
             overlays: out.overlays,
@@ -3126,6 +3161,10 @@ impl LayoutNode {
             // the app answers for its own box, per axis (the default is
             // yes on both, the same answer a Rectangle gives)
             LayoutNode::Custom { element, .. } => element.element().flexible(axis),
+            // a hosted view fills what the stack offers on both axes —
+            // a page has no natural size the layout could ask;
+            // `.frame(…)` around it pins it
+            LayoutNode::Host { .. } => true,
             // skipped boundary: the flexibility is the retained tree's
             LayoutNode::BoundaryRef { path } => crate::reconciler::with_retained_layout(
                 path,
@@ -3278,6 +3317,17 @@ impl LayoutNode {
                 let metrics = crate::custom::Metrics::new(env.text, env.cache, env.font);
                 (element.element().measure(proposal, &metrics), Fit::Leaf)
             }
+
+            // the host takes what was proposed, and zero on an axis
+            // the parent left open: the platform view holds a document,
+            // not a measurement, so there is no natural size to answer
+            LayoutNode::Host { .. } => (
+                Size {
+                    width: proposal.width.unwrap_or(0.0),
+                    height: proposal.height.unwrap_or(0.0),
+                },
+                Fit::Leaf,
+            ),
 
             LayoutNode::Image { source, resizable, fit } => {
                 let size = match source {
@@ -4065,6 +4115,44 @@ impl LayoutNode {
                 if let Some(index) = placed {
                     out.customs[index].slice = (start, end);
                 }
+            }
+
+            (LayoutNode::Host { path, spec }, Fit::Leaf) => {
+                // the same window a custom box reads: what the clip
+                // lets through, in the box's own coordinates — the
+                // shell clips the platform view by it, so a host
+                // inside a scroll region never escapes it
+                let window = out.current_clip().map_or(
+                    Rect { origin: Point::ZERO, size: frame.size },
+                    |clip| {
+                        clip.intersection(frame).map_or(
+                            Rect { origin: Point::ZERO, size: Size::default() },
+                            |clip| Rect {
+                                origin: Point {
+                                    x: clip.origin.x - frame.origin.x,
+                                    y: clip.origin.y - frame.origin.y,
+                                },
+                                size: clip.size,
+                            },
+                        )
+                    },
+                );
+                // a host without identity is decoration: nothing to
+                // key the platform view by, so nothing mounts
+                if !path.is_empty() {
+                    // the box reports its rectangle — the app decides
+                    // what may cross the island and what repositions
+                    out.frames.record(path, frame);
+                    out.hosts.push(HostPlacement {
+                        path: path.clone(),
+                        frame,
+                        visible: window,
+                        region: out.region_stack.last().cloned(),
+                        spec: spec.clone(),
+                    });
+                }
+                // no draw command: the scene keeps the ground, and the
+                // platform composites the view above it
             }
 
             (LayoutNode::Anchored { path, side, overlay, child }, Fit::Wrapped(_, fit)) => {
@@ -6653,6 +6741,66 @@ mod tests {
                 .map(|index| boundary(&format!("row{index}"), text(4)))
                 .collect(),
         }
+    }
+
+    fn host(path: &str) -> LayoutNode {
+        LayoutNode::Host {
+            path: path.into(),
+            spec: crate::host::HostSpec::Webview { url: "https://example.test/".into() },
+        }
+    }
+
+    /// The host is a hole the scene keeps, not a paint: the placement
+    /// carries its box to the shell, and the display list stays empty
+    /// — the platform view composites above whatever the scene painted
+    /// around it.
+    #[test]
+    fn a_host_reports_its_box_and_paints_nothing() {
+        let result =
+            layout(&host("pane"), Proposal { width: Some(300.0), height: Some(200.0) });
+        assert_eq!(result.hosts.len(), 1);
+        let placed = &result.hosts[0];
+        assert_eq!(placed.path, "pane");
+        let full = Rect {
+            origin: Point::ZERO,
+            size: Size { width: 300.0, height: 200.0 },
+        };
+        assert_eq!(placed.frame, full);
+        // no clip above: the window is the whole box, box-local
+        assert_eq!(placed.visible, full);
+        assert!(result.display.is_empty(), "a host paints nothing");
+        // the box reports its rectangle — the app reads it to decide
+        // what may cross the island and what repositions
+        assert_eq!(result.frames.get("pane"), Some(full));
+    }
+
+    /// A host beside a rigid box takes the leftover, the way a filler
+    /// does — a page has no natural size that could hold the lane.
+    #[test]
+    fn a_host_fills_the_leftover_beside_a_rigid_box() {
+        let root = LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children: vec![
+                LayoutNode::Leaf { size: Size { width: 100.0, height: 50.0 } },
+                host("pane"),
+            ],
+        };
+        let result = layout(&root, Proposal { width: Some(300.0), height: Some(200.0) });
+        let placed = &result.hosts[0];
+        assert_eq!(placed.frame.origin.x, 100.0);
+        assert_eq!(placed.frame.size.width, 200.0);
+        assert_eq!(placed.frame.size.height, 200.0);
+    }
+
+    /// A host without identity mounts nothing — a decorative render
+    /// has no address to key a platform view by. The box still holds
+    /// its space.
+    #[test]
+    fn a_host_without_identity_mounts_nothing() {
+        let result = layout(&host(""), Proposal { width: Some(10.0), height: Some(10.0) });
+        assert!(result.hosts.is_empty());
     }
 
     /// A hugging region takes what its content needs, and no more.

@@ -46,6 +46,7 @@ pub mod effects;
 pub mod erased;
 pub mod ext;
 pub mod glass;
+pub mod host;
 pub mod icon;
 pub mod image_engine;
 pub mod layout;
@@ -118,6 +119,7 @@ pub mod prelude {
     #[cfg(feature = "canvas")]
     pub use crate::custom::{canvas, custom};
     pub use crate::erased::{CustomModifier, Erased, erased};
+    pub use crate::host::{HostSpec, webview};
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
     pub use crate::icon::house as symbol;
@@ -6243,6 +6245,111 @@ mod tests {
         let _ = runtime
             .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 400.0 }));
         assert_eq!((page.top.get(), page.bottom.get()), (30.0, 70.0));
+    }
+
+    /// A webview is a box the scene keeps a hole for: the runtime
+    /// hands the shell its box and its url, and the display list gets
+    /// no command for it — the platform's own engine draws there.
+    #[test]
+    fn a_webview_is_a_box_the_shell_mounts_by() {
+        use crate::host::{HostSpec, webview};
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                hstack((
+                    text("side").frame(100.0, 300.0),
+                    webview("https://example.test/docs"),
+                ))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let _ = runtime
+            .settled_layout(&Page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let hosts = runtime.hosts();
+        assert_eq!(hosts.len(), 1);
+        let HostSpec::Webview { url } = &hosts[0].spec;
+        assert_eq!(&**url, "https://example.test/docs");
+        // the page takes the leftover beside the rigid column
+        assert_eq!(hosts[0].frame.origin.x, 100.0);
+        assert_eq!(hosts[0].frame.size.width, 300.0);
+    }
+
+    /// Inside a scroll region the host's window is what the clip lets
+    /// through — the shell clips the platform view by it, so a page
+    /// taller than the region shows the region's worth and nothing
+    /// escapes it.
+    #[test]
+    fn a_webview_inside_a_scroll_learns_its_window() {
+        use crate::host::webview;
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(webview("https://example.test/").frame(200.0, 400.0))
+                    .frame(200.0, 150.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let _ = runtime
+            .settled_layout(&Page, Proposal::exact(Size { width: 200.0, height: 150.0 }));
+        let hosts = runtime.hosts();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].frame.size.height, 400.0, "the box keeps its declared height");
+        assert_eq!(hosts[0].visible.size.height, 150.0, "the window is the region's worth");
+        assert_eq!(hosts[0].visible.origin.y, 0.0);
+    }
+
+    /// A webview under a SKIPPED body still places: the retained tree
+    /// keeps the node, so the shell keeps the box — a page must not
+    /// unmount because a body above it went quiet.
+    #[test]
+    fn a_webview_under_a_skipped_body_still_places() {
+        use crate::host::webview;
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Pane;
+        impl Component for Pane {
+            fn body(self, _ctx: &Context) -> impl View {
+                webview("https://example.test/")
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Outer {
+            room: State<f64>,
+        }
+        impl Component for Outer {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack(Pane).frame(self.room.get(), 300.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Outer { room: State::new(300.0) };
+        let proposal = Proposal::exact(Size { width: 400.0, height: 300.0 });
+        let _ = runtime.settled_layout(&page, proposal);
+        assert_eq!(runtime.hosts()[0].frame.size.width, 300.0);
+
+        // the outer re-runs and hands down a different width; the
+        // pane's body is skipped, and the host still places, resized
+        page.room.set(180.0);
+        let _ = runtime.settled_layout(&page, proposal);
+        let runs = runtime.body_runs();
+        assert!(
+            !runs.iter().any(|path| path.ends_with("Pane")),
+            "the pane body was skipped, which is the case under test: {runs:?}"
+        );
+        let hosts = runtime.hosts();
+        assert_eq!(hosts.len(), 1, "the retained tree keeps the box");
+        assert_eq!(hosts[0].frame.size.width, 180.0);
     }
 
     /// A probe under a SKIPPED body still reports. The retained tree is

@@ -791,6 +791,12 @@ impl Walk<'_> {
             LayoutNode::Island { .. } | LayoutNode::Custom { .. } => {
                 out.push(node(DomKind::Box));
             }
+            // the web's own native view is the iframe — a later round
+            // mints it (`docs/webview.md`); until then the host lowers
+            // to an empty box, and the design doc says so
+            LayoutNode::Host { .. } => {
+                out.push(node(DomKind::Box));
+            }
             LayoutNode::Anchored { path, side, overlay, child } => {
                 // the anchor gets an IDENTITY the glue can find: a
                 // group wrapped around the child, keyed off the

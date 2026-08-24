@@ -167,6 +167,9 @@ pub struct Runtime {
     /// The app's own boxes from the last layout — an event resolves its
     /// element and its local coordinates through here.
     last_customs: RefCell<Vec<crate::layout::CustomPlacement>>,
+    /// The native hosts of the last layout — the boxes the shell
+    /// mounts platform views over, each frame.
+    last_hosts: RefCell<Vec<crate::layout::HostPlacement>>,
     /// What each live box painted on its last step, in LOCAL
     /// coordinates, and the PHYSICAL size it was rasterized at — a
     /// step that paints the same picture at the same size blits
@@ -765,6 +768,7 @@ impl Runtime {
             last_fields: RefCell::new(Vec::new()),
             last_splits: RefCell::new(Vec::new()),
             last_customs: RefCell::new(Vec::new()),
+            last_hosts: RefCell::new(Vec::new()),
             live_ledger: RefCell::new(motor::hash::FxHashMap::default()),
             theme_version: Cell::new(crate::theme::version()),
             keymap: RefCell::new(HashMap::default()),
@@ -3223,6 +3227,13 @@ impl Runtime {
             .collect()
     }
 
+    /// The native hosts placed by the last layout — the shell mounts,
+    /// places and sweeps the platform views by these boxes, each
+    /// frame.
+    pub fn hosts(&self) -> Vec<crate::layout::HostPlacement> {
+        self.last_hosts.borrow().clone()
+    }
+
     #[cfg(feature = "canvas")]
     fn live_repaint(&self, scale: usize, dirty: &[Rc<str>]) -> Vec<LiveBlit> {
         let customs = self.last_customs.borrow();
@@ -4115,6 +4126,7 @@ impl Runtime {
         *self.last_fields.borrow_mut() = result.fields.clone();
         *self.last_splits.borrow_mut() = result.splits.clone();
         *self.last_customs.borrow_mut() = result.customs.clone();
+        *self.last_hosts.borrow_mut() = result.hosts.clone();
         *self.last_overlays.borrow_mut() = result.overlays.clone();
         *self.last_tooltips.borrow_mut() = result.tooltips.clone();
         *self.last_menus.borrow_mut() = result.menus.clone();
