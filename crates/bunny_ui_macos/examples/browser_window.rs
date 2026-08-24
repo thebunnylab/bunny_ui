@@ -71,6 +71,11 @@ struct Browser {
     /// this fluid example into the workbench's resize. Zero is the example
     /// as it always was.
     rows: usize,
+    /// `--blink`: the workbench's OTHER half — a caret-style clock that
+    /// keeps tick frames coming through a resize drag. The costume without
+    /// it stays fluid; the heartbeat is what races the resize presenter.
+    blink: bool,
+    caret: State<bool>,
 }
 
 impl Component for Browser {
@@ -138,9 +143,30 @@ impl Component for Browser {
             })
         };
 
+        let beat = self.blink.then(|| {
+            let caret = self.caret;
+            hstack!(
+                text("beat").foreground_color(theme::fg_secondary()),
+                spacer().frame(8.0, 14.0).background_color(if caret.get() {
+                    theme::control_hovered()
+                } else {
+                    theme::panel()
+                })
+            )
+            .spacing(6.0)
+            .alignment(VerticalAlignment::Center)
+            .task(move || async move {
+                loop {
+                    task::sleep(std::time::Duration::from_millis(450)).await;
+                    caret.update(|on| *on = !*on);
+                }
+            })
+        });
+
         let sidebar = vstack!(
             vstack(links).spacing(6.0).alignment(HorizontalAlignment::Leading),
             spacer(),
+            beat,
             ask,
             shoot,
             text(title.get()).foreground_color(theme::fg_secondary()),
@@ -319,6 +345,8 @@ fn main() {
             } else {
                 0
             },
+            blink: std::env::args().any(|arg| arg == "--blink"),
+            caret: State::new(false),
         },
     );
 }
