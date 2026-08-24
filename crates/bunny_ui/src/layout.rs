@@ -4456,12 +4456,9 @@ impl LayoutNode {
                     // hugs the leading side and still centers vertically
                     let origin = Point {
                         x: frame.origin.x
-                            + match align {
-                                CrossAlign::Start | CrossAlign::Baseline => 0.0,
-                                CrossAlign::Center => (frame.size.width - size.width) / 2.0,
-                                CrossAlign::End => frame.size.width - size.width,
-                            },
-                        y: frame.origin.y + (frame.size.height - size.height) / 2.0,
+                            + align_offset(frame.size.width, size.width, *align),
+                        y: frame.origin.y
+                            + align_offset(frame.size.height, size.height, CrossAlign::Center),
                     };
                     child.place(Rect { origin, size }, fit, env, out);
                 }
@@ -4477,8 +4474,10 @@ impl LayoutNode {
 
             (LayoutNode::Frame { child, .. }, Fit::Wrapped(child_size, fit)) => {
                 let origin = Point {
-                    x: frame.origin.x + (frame.size.width - child_size.width) / 2.0,
-                    y: frame.origin.y + (frame.size.height - child_size.height) / 2.0,
+                    x: frame.origin.x
+                        + align_offset(frame.size.width, child_size.width, CrossAlign::Center),
+                    y: frame.origin.y
+                        + align_offset(frame.size.height, child_size.height, CrossAlign::Center),
                 };
                 child.place(Rect { origin, size: child_size }, *fit, env, out);
             }
@@ -4491,12 +4490,9 @@ impl LayoutNode {
 
             (LayoutNode::MaxFrame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
                 let x = frame.origin.x
-                    + match align {
-                        CrossAlign::Start | CrossAlign::Baseline => 0.0,
-                        CrossAlign::Center => (frame.size.width - child_size.width) / 2.0,
-                        CrossAlign::End => frame.size.width - child_size.width,
-                    };
-                let y = frame.origin.y + (frame.size.height - child_size.height) / 2.0;
+                    + align_offset(frame.size.width, child_size.width, *align);
+                let y = frame.origin.y
+                    + align_offset(frame.size.height, child_size.height, CrossAlign::Center);
                 child.place(Rect { origin: Point { x, y }, size: child_size }, *fit, env, out);
             }
 
@@ -5563,6 +5559,28 @@ const ELLIPSIS: &str = "…";
 
 /// Composes the ellipsis version that fits the width — the most content
 /// possible, measured for real (every candidate goes through the cache).
+/// Where a child sits inside the room it was given, on one axis.
+///
+/// An alignment offset is a share of the LEFTOVER, and a child bigger
+/// than the room leaves none: the share goes negative and the content
+/// slides out the LEADING side, behind whatever border is there. A
+/// reader then sees "ttings" where a panel is titled "Settings" — not
+/// a clipped end, a missing beginning — and a `.clipped()` cannot rescue
+/// it, because cutting something centred on its own overflow shows the
+/// middle of it.
+///
+/// So an offset is never negative. Content that does not fit starts at
+/// the leading edge and overflows trailing, which is the one direction
+/// a clip cuts predictably and a reader can still read into.
+fn align_offset(room: Px, child: Px, align: CrossAlign) -> Px {
+    let leftover = room - child;
+    match align {
+        CrossAlign::Start | CrossAlign::Baseline => 0.0,
+        CrossAlign::Center => (leftover / 2.0).max(0.0),
+        CrossAlign::End => leftover.max(0.0),
+    }
+}
+
 /// How many whole lines fit in the room, of the `lines` there are.
 ///
 /// One line always does. A box too short for even that gets a single
@@ -5793,14 +5811,16 @@ fn place_stack(
         .map(|baselines| baselines.iter().fold(0.0_f64, |acc, b| acc.max(*b)));
     for (index, (child, (size, fit))) in children.iter().zip(fits).enumerate() {
         let cross_offset = |extent: Px, len: Px| match align {
-            CrossAlign::Start => 0.0,
-            CrossAlign::Center => (extent - len) / 2.0,
-            CrossAlign::End => extent - len,
             CrossAlign::Baseline => match (&baselines, shared) {
                 (Some(baselines), Some(shared)) => shared - baselines[index],
                 // a vertical stack has no shared baseline: start
                 _ => 0.0,
             },
+            // a squashed window can be narrower than a rigid child, and
+            // the same rule holds there as everywhere: the leftover is
+            // never negative, so the child starts at the leading edge
+            // instead of hanging half of itself off the near side
+            align => align_offset(extent, len, align),
         };
         let origin = match axis {
             Axis::Vertical => Point {

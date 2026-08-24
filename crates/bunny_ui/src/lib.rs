@@ -5802,6 +5802,56 @@ mod tests {
         );
     }
 
+    /// Content too wide for its box starts at the LEADING edge. It
+    /// never centres its own overflow.
+    ///
+    /// A centring offset is a share of the LEFTOVER, and when there is
+    /// no leftover the share is negative — so a row wider than the dock
+    /// lane holding it slid half of itself out the left side, behind
+    /// the dock's own border. A reader saw "ttings" where the panel is
+    /// titled "Settings": not a clipped end, a missing beginning.
+    ///
+    /// It is the same defect wrapped text had going up and down, on the
+    /// other axis and for any content. A clip cannot rescue it either:
+    /// cutting something centred on its overflow shows the middle.
+    #[test]
+    fn content_too_wide_for_its_box_starts_at_the_leading_edge() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+
+        const LANE: f64 = 180.0;
+
+        #[derive(Clone, Copy)]
+        struct Dock;
+        impl Component for Dock {
+            fn body(self, _ctx: &Context) -> impl View {
+                // a header row that needs more than the lane has
+                vstack(
+                    hstack((
+                        text("Settings").frame(150.0, 20.0),
+                        text("New Thread").frame(150.0, 20.0),
+                    ))
+                    .frame(LANE, 20.0),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let result =
+            runtime.settled_layout(&Dock, Proposal::exact(Size { width: LANE, height: 60.0 }));
+        let leftmost = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::TextLine { origin, .. } => Some(origin.x),
+                _ => None,
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            leftmost >= 0.0,
+            "nothing is painted left of the lane; the leftmost glyph sits at {leftmost}",
+        );
+    }
+
     /// A label that knows how to ELLIPSIZE yields under pressure, and
     /// never pushes the button beside it off the row.
     ///
