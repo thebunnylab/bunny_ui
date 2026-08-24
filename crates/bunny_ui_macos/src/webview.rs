@@ -348,8 +348,14 @@ unsafe fn add_script(controller: Id, source: &str) {
 }
 
 /// Re-instructs a MOUNTED view after its spec changed: the scripts
-/// are replaced (they take effect on the next navigation, which the
-/// closing `navigate` provides) and the page re-points.
+/// are replaced (they take effect on the next navigation) and the
+/// page re-points — AFTER comparing with where the engine already
+/// is. The comparison is the whole point: an app that folds the
+/// committed url back into its spec must not reload the page the
+/// engine just arrived at, and with the spec carrying the real url a
+/// remount boards at the real page. The imperative
+/// `WebviewHandle::navigate` never compares — asking again for the
+/// page you are on is a reload, like the browser button it is.
 pub(crate) fn update(view: Id, spec: &bunny_ui::host::HostSpec) {
     let bunny_ui::host::HostSpec::Webview { url, .. } = spec;
     unsafe {
@@ -357,7 +363,22 @@ pub(crate) fn update(view: Id, spec: &bunny_ui::host::HostSpec) {
         let controller = msg_id(config, sel("userContentController"));
         msg_void(controller, sel("removeAllUserScripts"));
         apply_scripts(controller, spec);
-        navigate(view, url);
+        if current_url(view).as_deref() != Some(&**url) {
+            navigate(view, url);
+        }
+    }
+}
+
+/// Where the engine is right now — the committed url, the same string
+/// [`WebviewEvent::Navigated`] reported (so an app folding that
+/// report into its spec compares equal, redirects included).
+unsafe fn current_url(view: Id) -> Option<String> {
+    unsafe {
+        let url = msg_id(view, sel("URL"));
+        if url.is_null() {
+            return None;
+        }
+        Some(to_string(msg_id(url, sel("absoluteString"))))
     }
 }
 
