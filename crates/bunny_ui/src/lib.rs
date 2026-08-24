@@ -5802,6 +5802,89 @@ mod tests {
         );
     }
 
+    /// The same row, too NARROW for the content. The hug still takes
+    /// the room instead of half of it.
+    ///
+    /// This is the regime the first pass missed. It classified a child
+    /// by what it did with the whole budget — and a hug whose content
+    /// is BIGGER than the budget clamps at the budget, which reads
+    /// exactly like swallowing it. The trap the fix was written against,
+    /// one storey up.
+    #[test]
+    fn a_hugging_lane_takes_a_narrow_row_whole() {
+        use crate::layout::{Proposal, Size};
+
+        const ROW: f64 = 300.0;
+        const SPACING: f64 = 16.0;
+
+        #[derive(Clone, Copy)]
+        struct Strip {
+            lane: State<f64>,
+        }
+        impl Component for Strip {
+            fn body(self, _ctx: &Context) -> impl View {
+                let lane = self.lane;
+                hstack((
+                    scroll(empty().frame(720.0, 24.0))
+                        .horizontal()
+                        .hugging()
+                        .on_measure(move |size| lane.set(size.width)),
+                    spacer(),
+                ))
+                .spacing(SPACING)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let strip = Strip { lane: State::new(0.0) };
+        let _ = runtime
+            .settled_layout(&strip, Proposal::exact(Size { width: ROW, height: 40.0 }));
+        assert_eq!(
+            strip.lane.get(),
+            ROW - SPACING,
+            "content past the room takes the room; the spacer wanted nothing",
+        );
+    }
+
+    /// A child that says it FILLS is not served an ideal it never had.
+    ///
+    /// The discriminator is whether an appetite has a ceiling, and the
+    /// natural size alone cannot say: a `.frame_max(∞)` around narrow
+    /// text has a natural, and still wants everything. Reading the
+    /// natural as an ideal would pin it at its content and hand the row
+    /// to the spacer beside it.
+    #[test]
+    fn a_filler_with_a_natural_size_is_still_a_filler() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Strip {
+            lane: State<f64>,
+        }
+        impl Component for Strip {
+            fn body(self, _ctx: &Context) -> impl View {
+                let lane = self.lane;
+                hstack((
+                    empty()
+                        .frame(120.0, 24.0)
+                        .frame_max(f64::INFINITY, 24.0, Alignment::Center)
+                        .on_measure(move |size| lane.set(size.width)),
+                    spacer(),
+                ))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let strip = Strip { lane: State::new(0.0) };
+        let _ = runtime
+            .settled_layout(&strip, Proposal::exact(Size { width: 1000.0, height: 40.0 }));
+        assert_eq!(
+            strip.lane.get(),
+            500.0,
+            "two children that both want everything share it, as they always did",
+        );
+    }
+
     /// Two lanes that both want more than half still split it evenly.
     ///
     /// The tier only moves surplus that EXISTS. When every ideal cannot

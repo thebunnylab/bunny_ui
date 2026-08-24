@@ -5236,6 +5236,29 @@ fn measure_stack(
         let mut budget = (total - rigid - spacing_total).max(0.0);
         let mut pool = flexible;
 
+        // Equal quotas, and the surplus of whoever takes less re-splits
+        // among the rest until a round leaves nothing. It runs twice
+        // now: once over the children that named a size, then over the
+        // ones that only fill.
+        let waterfall = |measured: &mut Vec<(Size, Fit)>, pool: Vec<usize>, budget: Px| {
+            let (mut pool, mut budget) = (pool, budget);
+            while !pool.is_empty() {
+                let share = budget / pool.len() as Px;
+                for &index in &pool {
+                    measured[index] = children[index].measure(cross_proposal(Some(share)), env);
+                }
+                let (under, full): (Vec<usize>, Vec<usize>) = pool
+                    .into_iter()
+                    .partition(|&index| main(&measured[index].0) < share - SETTLED);
+                if under.is_empty() || full.is_empty() {
+                    break;
+                }
+                budget -= under.iter().map(|&index| main(&measured[index].0)).sum::<Px>();
+                budget = budget.max(0.0);
+                pool = full;
+            }
+        };
+
         // Before the quotas: WHO here actually wants a size?
         //
         // The waterfall below only ever hands surplus downward — a child
@@ -5246,64 +5269,51 @@ fn measure_stack(
         // swallows its quota and answers "full", and the loop stops on
         // the first round with the hug pinned at half the row.
         //
-        // So ask each one what it does with the WHOLE budget. A child
-        // that takes less than all of it has an IDEAL and is bounded; a
-        // child that swallows it is a filler with no size of its own.
-        // When the bounded ones fit together, they take what they asked
-        // for and the fillers absorb what is left — which is the rule a
-        // reader already expects, and the one the quota was hiding.
+        // The question that separates them is whether an appetite has a
+        // CEILING, and it must be asked against the child's own natural
+        // — never against the budget. A hug whose content is bigger than
+        // the room clamps at the room, and clamping at the room reads
+        // exactly like swallowing it; asked that way, the child that
+        // needs this most looks like the one that does not need it at
+        // all.
         //
-        // Only from TWO flexibles up: a single one is offered the whole
-        // budget by the loop anyway, so the probe would be a measure
-        // spent to learn nothing.
+        // So offer each child a hair more than its own natural, which
+        // phase one already measured. One that takes less than the offer
+        // has a size it wants and cannot use more. One that takes the
+        // offer would have taken any offer — it fills, and its natural
+        // was never an ideal. That last part is why the natural alone
+        // will not do: a `.frame_max(∞)` around narrow text has a
+        // natural and still wants the whole row.
         //
-        // And only when someone's NATURAL size — phase 1 already has it,
-        // free — is bigger than the quota it is about to be handed.
-        // That is the whole trap: an ideal below the quota is released
-        // as surplus by the loop below, exactly as it always was. Two
-        // panes that both take whatever they are given are naturals of
-        // nothing, and they skip the probe entirely.
+        // Only from TWO flexibles up, and only when someone's natural is
+        // bigger than the quota it is about to be handed. An ideal below
+        // the quota comes back as surplus and always did, so there is
+        // nothing here to win — two panes that take whatever they are
+        // given are naturals of nothing and never reach the probe.
         let quota = budget / pool.len() as Px;
         let wants_more = pool.iter().any(|&index| main(&measured[index].0) > quota + SETTLED);
         if pool.len() > 1 && wants_more {
-            let probes: Vec<(usize, (Size, Fit))> = pool
-                .iter()
-                .map(|&index| {
-                    (index, children[index].measure(cross_proposal(Some(budget)), env))
-                })
-                .collect();
-            let (bounded, fillers): (Vec<_>, Vec<_>) = probes
-                .into_iter()
-                .partition(|(_, (size, _))| main(size) < budget - SETTLED);
-            let wanted: Px = bounded.iter().map(|(_, (size, _))| main(size)).sum();
-            // all three have to hold: someone with an ideal, someone to
-            // absorb, and room for every ideal. Without the last one the
-            // bounded children are in genuine contention and the quota
-            // below is the fair answer
-            if !bounded.is_empty() && !fillers.is_empty() && wanted <= budget {
-                for (index, answer) in bounded {
-                    measured[index] = answer;
-                }
-                budget = (budget - wanted).max(0.0);
-                pool = fillers.into_iter().map(|(index, _)| index).collect();
+            let (bounded, fillers): (Vec<usize>, Vec<usize>) =
+                pool.iter().partition(|&&index| {
+                    let offer = main(&measured[index].0) + 1.0;
+                    main(&children[index].measure(cross_proposal(Some(offer)), env).0)
+                        < offer - SETTLED
+                });
+            // The bounded contend for the whole budget among themselves,
+            // and whatever they leave is the fillers'. When their ideals
+            // fit, each gets what it asked for; when they do not, the
+            // quota among them is the fair answer and the fillers get
+            // nothing — which is right, because nothing is what they
+            // asked for.
+            if !bounded.is_empty() && !fillers.is_empty() {
+                waterfall(&mut measured, bounded.clone(), budget);
+                let taken: Px = bounded.iter().map(|&index| main(&measured[index].0)).sum();
+                budget = (budget - taken).max(0.0);
+                pool = fillers;
             }
         }
 
-        loop {
-            let share = budget / pool.len() as Px;
-            for &index in &pool {
-                measured[index] = children[index].measure(cross_proposal(Some(share)), env);
-            }
-            let (under, full): (Vec<usize>, Vec<usize>) = pool
-                .into_iter()
-                .partition(|&index| main(&measured[index].0) < share - SETTLED);
-            if under.is_empty() || full.is_empty() {
-                break;
-            }
-            budget -= under.iter().map(|&index| main(&measured[index].0)).sum::<Px>();
-            budget = budget.max(0.0);
-            pool = full;
-        }
+        waterfall(&mut measured, pool, budget);
     }
 
     // phase 3: the row's OWN thickness is the truth, not the box it
