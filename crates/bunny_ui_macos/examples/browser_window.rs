@@ -16,6 +16,11 @@
 //!   document loads, no click needed;
 //! - "read the title" asks the page (`document.title` by eval) and
 //!   the answer lands beside the button;
+//! - type a url in the bar and press enter (a bare host name gets
+//!   https:// for free); a committed navigation writes the real url
+//!   back into the field;
+//! - "popover" opens a card over the page — the island contract,
+//!   resolved: on this OS the popover rides its own child panel;
 //! - switch pages in the sidebar: the SAME view navigates; back and
 //!   forward walk the engine's own history;
 //! - hide the pane: the subtree goes and the view goes with it; show
@@ -50,7 +55,8 @@ const REPORTER: &str = "addEventListener('DOMContentLoaded', function() { \
 struct Browser {
     page: State<usize>,
     shown: State<bool>,
-    committed: State<String>,
+    address: State<String>,
+    popped: State<bool>,
     posted: State<String>,
     spoke: State<String>,
     fetched: State<String>,
@@ -60,8 +66,8 @@ struct Browser {
 
 impl Component for Browser {
     fn body(self, _ctx: &Context) -> impl View {
-        let (page, shown) = (self.page.clone(), self.shown.clone());
-        let (committed, posted, title) = (self.committed, self.posted, self.title);
+        let (page, shown) = (self.page, self.shown);
+        let (address, posted, title) = (self.address, self.posted, self.title);
         let handle = self.handle;
 
         let chip = |label: String| {
@@ -126,10 +132,46 @@ impl Component for Browser {
         let bar = {
             let back = handle.clone();
             let forward = handle.clone();
+            let go = handle.clone();
+            let popped = self.popped;
             hstack!(
                 chip("back".into()).on_click(move || back.back()),
                 chip("forward".into()).on_click(move || forward.forward()),
-                text(committed.get()).foreground_color(theme::fg_secondary())
+                // the address doubles as the report: typing edits it,
+                // enter navigates, and a committed navigation (a link
+                // click included) writes the real url back
+                text_field("type a url and press enter", address.binding()).on_submit(
+                    move || {
+                        let typed = address.get();
+                        let target = if typed.contains("://") {
+                            typed
+                        } else {
+                            format!("https://{typed}")
+                        };
+                        go.navigate(target);
+                    },
+                ),
+                // the island contract, demonstrated: on this OS a
+                // popover rides its own child panel, so it composites
+                // over the page below it
+                chip("popover".into()).on_click(move || popped.set(true)).popover(
+                    popped.binding(),
+                    Side::Bottom,
+                    |_| {
+                        erased(
+                            vstack!(
+                                text("a card over the page"),
+                                text("this popover rides its own panel, so it may cross the island")
+                                    .foreground_color(theme::fg_secondary()),
+                                text("escape or click outside to close")
+                                    .foreground_color(theme::fg_secondary())
+                            )
+                            .spacing(4.0)
+                            .alignment(HorizontalAlignment::Leading)
+                            .padding_length(12.0),
+                        )
+                    },
+                )
             )
             .spacing(8.0)
             .alignment(VerticalAlignment::Center)
@@ -139,7 +181,7 @@ impl Component for Browser {
         let (spoke, fetched) = (self.spoke, self.fetched);
         let pane = webview(PAGES[page.get()].1)
             .user_script(REPORTER)
-            .on_navigate(move |url| committed.set(url.to_string()))
+            .on_navigate(move |url| address.set(url.to_string()))
             .on_message(move |body| posted.set(body.to_string()))
             .on_console(move |line| spoke.set(line.to_string()))
             .on_request(move |line| fetched.set(line.to_string()))
@@ -184,7 +226,8 @@ fn main() {
         Browser {
             page: State::new(0),
             shown: State::new(true),
-            committed: State::new(String::new()),
+            address: State::new(String::new()),
+            popped: State::new(false),
             posted: State::new(String::from("nothing yet")),
             spoke: State::new(String::from("nothing yet")),
             fetched: State::new(String::from("nothing yet")),
