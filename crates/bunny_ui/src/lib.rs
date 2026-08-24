@@ -5623,6 +5623,141 @@ mod tests {
         assert_eq!(*log.borrow(), vec!["second"]);
     }
 
+    /// A field's content can carry runs of another ink — the same
+    /// record and the same splitter a `text(…)` uses, so a template
+    /// variable stays yellow while the line is being edited.
+    #[test]
+    fn a_field_tints_runs_of_its_own_content() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+        const TEMPLATE: Color = Color::hex(0xE5C07B);
+
+        #[derive(Clone, Copy)]
+        struct Bar {
+            url: State<String>,
+        }
+        impl Component for Bar {
+            fn body(self, _ctx: &Context) -> impl View {
+                // "https://{{host}}/v1" — the braces are the run
+                let text = self.url.get();
+                let start = text.find("{{").unwrap_or(0);
+                let end = text.find("}}").map(|at| at + 2).unwrap_or(start);
+                text_field("url", self.url.binding())
+                    .highlight(vec![(start, end)], TEMPLATE)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let bar = Bar { url: State::new("https://{{host}}/v1".to_string()) };
+        let result = runtime
+            .settled_layout(&bar, Proposal::exact(Size { width: 400.0, height: 40.0 }));
+        let inks: Vec<(Color, String)> = result
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::TextLine { content, range, color, .. } => {
+                    Some((*color, content[range.0..range.1].to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inks.len(), 3, "three runs, not one line: {inks:?}");
+        assert_eq!(inks[0].1, "https://");
+        assert_eq!(inks[1], (TEMPLATE, "{{host}}".to_string()), "the variable is tinted");
+        assert_eq!(inks[2].1, "/v1");
+        assert_ne!(inks[0].0, TEMPLATE, "the rest keeps the inherited ink");
+    }
+
+    /// The ranges index the CONTENT, so an empty field showing its
+    /// placeholder ignores them — otherwise a stale range would tint a
+    /// slice of a string it never named.
+    #[test]
+    fn an_empty_field_ignores_the_runs_of_a_content_it_has_not_got() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Bar {
+            url: State<String>,
+        }
+        impl Component for Bar {
+            fn body(self, _ctx: &Context) -> impl View {
+                text_field("type a url here", self.url.binding())
+                    .highlight(vec![(0, 4)], Color::hex(0xE5C07B))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let bar = Bar { url: State::new(String::new()) };
+        let result = runtime
+            .settled_layout(&bar, Proposal::exact(Size { width: 400.0, height: 40.0 }));
+        let runs = result
+            .display
+            .iter()
+            .filter(|command| matches!(command, DrawCommand::TextLine { .. }))
+            .count();
+        assert_eq!(runs, 1, "the placeholder is one run in the placeholder ink");
+    }
+
+    /// A bare field paints no ground, no edge and no rounding, so what
+    /// is behind it is the ground — a grid cell that is editable
+    /// without wearing a box the design never had.
+    #[test]
+    fn a_bare_field_wears_no_chrome_of_its_own() {
+        use crate::layout::{Corners, DrawCommand, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Cell {
+            value: State<String>,
+            bare: bool,
+        }
+        impl Component for Cell {
+            fn body(self, _ctx: &Context) -> impl View {
+                let field = text_field("", self.value.binding());
+                if self.bare {
+                    Either::First(field.bare())
+                } else {
+                    Either::Second(field)
+                }
+            }
+        }
+
+        let room = Proposal::exact(Size { width: 200.0, height: 30.0 });
+        let boxes = |bare: bool| {
+            let runtime = Runtime::new();
+            let cell = Cell { value: State::new("value".to_string()), bare };
+            let result = runtime.settled_layout(&cell, room);
+            let fills = result
+                .display
+                .iter()
+                .filter(|command| matches!(command, DrawCommand::FillRect { .. }))
+                .count();
+            let strokes = result
+                .display
+                .iter()
+                .filter(|command| matches!(command, DrawCommand::StrokeRect { .. }))
+                .count();
+            let round = result.display.iter().any(|command| match command {
+                DrawCommand::FillRect { corner_radius, .. }
+                | DrawCommand::StrokeRect { corner_radius, .. } => {
+                    *corner_radius != Corners::ZERO
+                }
+                _ => false,
+            });
+            (fills, strokes, round)
+        };
+
+        let (themed_fills, themed_strokes, themed_round) = boxes(false);
+        assert!(themed_fills >= 1, "the themed field paints its ground");
+        assert_eq!(themed_strokes, 1, "and its edge");
+        assert!(themed_round, "with the field radius");
+
+        let (bare_fills, bare_strokes, bare_round) = boxes(true);
+        assert_eq!(bare_strokes, 0, "a bare field draws no edge");
+        assert!(bare_fills < themed_fills, "and no ground of its own");
+        // the field is not focused here, so there is no caret — which
+        // IS rounded by design, and is not chrome
+        assert!(!bare_round, "and no corner of its own is rounded");
+    }
+
     /// The size a view resolved to reaches the app, and reaches it in
     /// the SAME frame — a body that turns the measurement into a frame
     /// runs before anything is painted.

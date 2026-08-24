@@ -401,14 +401,55 @@ fn rewrite_scroll_node(
 
 /// Descends through wrappers to the `Field` node and rewrites it —
 /// same order-immunity as the text and scroll rewrites.
+/// Everything a `Field` node carries. A modifier changes ONE of these
+/// and hands the rest back untouched — the shape that keeps
+/// `.auto_focus()` from erasing a `.highlight()` written before it.
+struct FieldParts {
+    path: String,
+    content: std::sync::Arc<str>,
+    placeholder: std::sync::Arc<str>,
+    multiline: bool,
+    auto_focus: bool,
+    bare: bool,
+    highlights: Option<TextHighlight>,
+}
+
+impl FieldParts {
+    fn into_node(self) -> LayoutNode {
+        LayoutNode::Field {
+            path: self.path,
+            content: self.content,
+            placeholder: self.placeholder,
+            multiline: self.multiline,
+            auto_focus: self.auto_focus,
+            bare: self.bare,
+            highlights: self.highlights,
+        }
+    }
+}
+
 fn rewrite_field_node(
     node: LayoutNode,
-    rewrite: &impl Fn(String, std::sync::Arc<str>, std::sync::Arc<str>, bool) -> LayoutNode,
+    rewrite: &impl Fn(FieldParts) -> LayoutNode,
 ) -> LayoutNode {
     match node {
-        LayoutNode::Field { path, content, placeholder, multiline, .. } => {
-            rewrite(path, content, placeholder, multiline)
-        }
+        LayoutNode::Field {
+            path,
+            content,
+            placeholder,
+            multiline,
+            auto_focus,
+            bare,
+            highlights,
+        } => rewrite(FieldParts {
+            path,
+            content,
+            placeholder,
+            multiline,
+            auto_focus,
+            bare,
+            highlights,
+        }),
         LayoutNode::Styled { props, child } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_field_node(*child, rewrite)),
@@ -1168,11 +1209,17 @@ fn apply(
         // `Styled` (`.font()`/`.foreground_color()` before or after, the
         // order does not matter) — on non-text they are no-ops on purpose
         // (SwiftUI parity: truncationMode outside text does nothing)
+        // both leaves that draw text answer to it: the record is the
+        // same, and so is the splitter that reads it
         Modifier::Highlight(ranges, color) => out.wrap_layout_from(mark, |node| {
-            rewrite_text_node(node, &|content, _, truncation| LayoutNode::Text {
+            let highlight = TextHighlight { ranges: ranges.clone(), color: *color };
+            let node = rewrite_text_node(node, &|content, _, truncation| LayoutNode::Text {
                 content,
-                highlights: Some(TextHighlight { ranges: ranges.clone(), color: *color }),
+                highlights: Some(highlight.clone()),
                 truncation,
+            });
+            rewrite_field_node(node, &|parts| {
+                FieldParts { highlights: Some(highlight.clone()), ..parts }.into_node()
             })
         }),
         Modifier::TruncationMode(mode) => out.wrap_layout_from(mark, |node| {
@@ -1261,8 +1308,8 @@ fn apply(
             });
         }
         Modifier::AutoFocus => out.wrap_layout_from(mark, |node| {
-            rewrite_field_node(node, &|path, content, placeholder, multiline| {
-                LayoutNode::Field { path, content, placeholder, multiline, auto_focus: true }
+            rewrite_field_node(node, &|parts| {
+                FieldParts { auto_focus: true, ..parts }.into_node()
             })
         }),
         Modifier::KeyContext(name) => {

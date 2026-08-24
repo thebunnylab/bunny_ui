@@ -437,7 +437,19 @@ impl Walk<'_> {
                 text.style.tooltip = self.pending_tooltip.take();
                 out.push(text);
             }
-            LayoutNode::Field { path, content, placeholder, auto_focus, multiline } => {
+            LayoutNode::Field {
+                path,
+                content,
+                placeholder,
+                auto_focus,
+                multiline,
+                bare,
+                // a browser input paints ONE colour: there is no way to
+                // ink a range inside it without giving up the native
+                // caret, the native selection and the composition. The
+                // record is honoured on the pixel path and ignored here.
+                highlights: _,
+            } => {
                 self.fields.push((path.clone(), *auto_focus));
                 let theme = crate::theme::current();
                 let mut field = node(DomKind::Field(crate::dom::DomField {
@@ -449,10 +461,11 @@ impl Walk<'_> {
                     multiline: *multiline,
                 }));
                 field.style = DomStyle {
-                    background: Some(theme.field),
-                    border: Some((theme.field_border, 1.0)),
-                    corner_radius: Some(crate::layout::Corners::all(crate::layout::FIELD_RADIUS)),
-                    focus_border: Some(theme.focus),
+                    background: (!*bare).then_some(theme.field),
+                    border: (!*bare).then_some((theme.field_border, 1.0)),
+                    corner_radius: (!*bare)
+                        .then_some(crate::layout::Corners::all(crate::layout::FIELD_RADIUS)),
+                    focus_border: (!*bare).then_some(theme.focus),
                     placeholder_color: Some(theme.placeholder),
                     ..DomStyle::default()
                 };

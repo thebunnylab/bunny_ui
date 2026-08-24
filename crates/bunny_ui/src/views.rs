@@ -183,6 +183,7 @@ pub struct TextField {
     text: Binding<String>,
     multiline: bool,
     submit: Option<Rc<dyn Fn()>>,
+    bare: bool,
 }
 
 impl TextField {
@@ -196,6 +197,23 @@ impl TextField {
     /// box still answers Enter.
     pub fn on_submit(mut self, submit: impl Fn() + 'static) -> Self {
         self.submit = Some(Rc::new(submit));
+        self
+    }
+
+    /// No chrome of its own — no ground, no edge, no rounded corner.
+    ///
+    /// A field wears the theme's box, which is right almost everywhere
+    /// and wrong wherever the field IS the surface: a cell in a grid
+    /// with its own stripes, a title that becomes editable in place, a
+    /// line of a table. There the box is one the design never had, and
+    /// there was no way to take it off.
+    ///
+    /// What is behind shows through, so the caller's own background is
+    /// the ground. Everything that is not paint stays: the padding, the
+    /// caret, the selection, the scroll that follows it, and the key
+    /// gate.
+    pub fn bare(mut self) -> Self {
+        self.bare = true;
         self
     }
 }
@@ -251,6 +269,9 @@ impl View for TextField {
                     }),
                 );
                 out.push_layout(LayoutNode::Field {
+                    bare: self.bare,
+                    // a chain writes this, never the constructor
+                    highlights: None,
                     path,
                     content: Arc::from(value),
                     placeholder: self.placeholder.clone(),
@@ -470,6 +491,7 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
         text,
         multiline: false,
         submit: None,
+        bare: false,
     }
 }
 
@@ -489,6 +511,7 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         text,
         multiline: true,
         submit: None,
+        bare: false,
     }
 }
 

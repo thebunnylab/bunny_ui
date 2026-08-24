@@ -632,6 +632,19 @@ pub enum LayoutNode {
         /// `.auto_focus()`: the runtime focuses this field on its FIRST
         /// appearance — and never again (a user blur is final).
         auto_focus: bool,
+        /// No chrome of its own: no fill, no border, and the clip is
+        /// square. What is behind the field shows through, so a cell in
+        /// a grid can be editable without wearing a box the design
+        /// never had. Padding, caret, selection and the key gate are
+        /// untouched — this is paint, and only paint.
+        bare: bool,
+        /// Stretches of the CONTENT in another ink — the same record a
+        /// `text(…)` carries, read by the same run splitter. It is what
+        /// tints a `{{variable}}` inside an editable line.
+        ///
+        /// The ranges index the content, so a field showing its
+        /// PLACEHOLDER ignores them.
+        highlights: Option<TextHighlight>,
     },
     /// View boundary (`Component`): records the frame at the identity
     /// path — the address for tests and, later on, for hit-testing.
@@ -3646,7 +3659,15 @@ impl LayoutNode {
             }
 
             (
-                LayoutNode::Field { path, content, placeholder, multiline, auto_focus },
+                LayoutNode::Field {
+                    path,
+                    content,
+                    placeholder,
+                    multiline,
+                    auto_focus,
+                    bare,
+                    highlights,
+                },
                 Fit::Leaf,
             ) => {
                 let multiline = *multiline;
@@ -3672,11 +3693,15 @@ impl LayoutNode {
                                 multiline,
                             }),
                             frame,
+                            // a bare field carries no ground, no edge
+                            // and no rounding here either — the caller's
+                            // own box is what shows
                             crate::dom::DomStyle {
-                                background: Some(theme.field),
-                                border: Some((theme.field_border, 1.0)),
-                                corner_radius: Some(Corners::all(FIELD_RADIUS)),
-                                focus_border: Some(theme.focus),
+                                background: (!*bare).then_some(theme.field),
+                                border: (!*bare).then_some((theme.field_border, 1.0)),
+                                corner_radius: (!*bare)
+                                    .then_some(Corners::all(FIELD_RADIUS)),
+                                focus_border: (!*bare).then_some(theme.focus),
                                 placeholder_color: Some(theme.placeholder),
                                 ..crate::dom::DomStyle::default()
                             },
@@ -3705,11 +3730,16 @@ impl LayoutNode {
                 // field chrome: tokens read at PLACEMENT — a retheme
                 // repaints without re-running a single body
                 let theme = crate::theme::current();
-                out.draw(DrawCommand::FillRect {
-                    rect: frame,
-                    color: theme.field,
-                    corner_radius: Corners::all(FIELD_RADIUS),
-                });
+                // a bare field paints no ground of its own: the caller's
+                // background is the ground, and a grid cell has none
+                let radius = if *bare { Corners::ZERO } else { Corners::all(FIELD_RADIUS) };
+                if !*bare {
+                    out.draw(DrawCommand::FillRect {
+                        rect: frame,
+                        color: theme.field,
+                        corner_radius: radius,
+                    });
+                }
                 // the placeholder walks the SAME path as the real text:
                 // same origin, same font, same breaks — only the ink drops
                 let sample: &Arc<str> = if content.is_empty() { placeholder } else { content };
@@ -3756,7 +3786,7 @@ impl LayoutNode {
                 // everything the field writes is cut by its own box:
                 // a string longer than the field stops at the border
                 // instead of painting over the neighbour
-                out.push_clip(frame, FIELD_RADIUS);
+                out.push_clip(frame, if *bare { 0.0 } else { FIELD_RADIUS });
                 let width_of = |from: usize, to: usize| {
                     env.cache.get_or_measure(&sample[from..to], &env.font, env.text).width
                 };
@@ -3798,13 +3828,18 @@ impl LayoutNode {
                         }
                     }
                     if start < end {
-                        out.draw(DrawCommand::TextLine {
-                            origin: Point { x: text_origin.x, y },
-                            content: sample.clone(),
-                            range: (start, end),
+                        // the SAME splitter a `text(…)` uses, on the
+                        // same record — the placeholder is not the
+                        // content, so its ranges would name nothing
+                        emit_text_runs(
+                            sample,
+                            (start, end),
+                            highlights.as_ref().filter(|_| !content.is_empty()),
+                            Point { x: text_origin.x, y },
                             color,
-                            font: env.font,
-                        });
+                            env,
+                            out,
+                        );
                     }
                     // the live composition gets the IME underline (the
                     // caret's ink — the composition's visual pair)
@@ -3844,12 +3879,14 @@ impl LayoutNode {
                     });
                 }
                 out.pop_clip();
-                out.draw(DrawCommand::StrokeRect {
-                    rect: frame,
-                    color: if focused { theme.focus } else { theme.field_border },
-                    width: 1.0,
-                    corner_radius: Corners::all(FIELD_RADIUS),
-                });
+                if !*bare {
+                    out.draw(DrawCommand::StrokeRect {
+                        rect: frame,
+                        color: if focused { theme.focus } else { theme.field_border },
+                        width: 1.0,
+                        corner_radius: radius,
+                    });
+                }
                 // the field is a pointer target (clicking focuses) —
                 // clipped like any hit
                 let visible = match out.current_clip() {
