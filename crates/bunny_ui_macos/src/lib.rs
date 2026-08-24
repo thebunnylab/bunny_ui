@@ -238,6 +238,56 @@ pub fn run_window_chrome(
             // the window presents everything BEFORE the first popover;
             // each popover re-presents its own slice on a child panel
             // in screen coordinates — that is how it leaves the window
+            // the native hosts FIRST — before the window's own
+            // present, before the popover panels, before anything
+            // that blocks. A hosted engine renders OUT of process:
+            // the sooner it holds its frame, the sooner its relayout
+            // runs — in parallel with everything below — and a live
+            // resize stops reading as the page chasing the window.
+            // Mounted on first sight, placed every frame, swept when
+            // the subtree goes; the flip is into the LAYOUT's world,
+            // like the live layers.
+            let hosts = runtime.hosts();
+            let placed =
+                runtime.last_viewport().map_or(height, |viewport| viewport.height);
+            for host in &hosts {
+                let bunny_ui::host::HostSpec::Webview { url, scripts, console, requests } =
+                    &host.spec;
+                // the stamp fingerprints the whole spec: a changed
+                // url, script set or declared hook re-instructs; the
+                // separators are control characters no url or script
+                // spells
+                let mut stamp = String::from(&**url);
+                stamp.push('\u{2}');
+                stamp.push(if *console { 'c' } else { '-' });
+                stamp.push(if *requests { 'r' } else { '-' });
+                for script in scripts.iter() {
+                    stamp.push('\u{1}');
+                    stamp.push_str(script);
+                }
+                window.host_place(
+                    &host.path,
+                    &stamp,
+                    (
+                        host.frame.origin.x,
+                        host.frame.origin.y,
+                        host.frame.size.width,
+                        host.frame.size.height,
+                    ),
+                    (
+                        host.visible.origin.x,
+                        host.visible.origin.y,
+                        host.visible.size.width,
+                        host.visible.size.height,
+                    ),
+                    placed,
+                    || webview::create(&host.spec),
+                    |child, _stamp| webview::update(child, &host.spec),
+                );
+            }
+            window.host_sweep(
+                &hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>(),
+            );
             let overlays = runtime.overlays();
             let display = match overlays.first() {
                 Some(first) => full_display.translated_slice((0, first.display.0), 0.0, 0.0),
@@ -475,53 +525,6 @@ pub fn run_window_chrome(
                     window.blit_partial(width, height, retained.rgba(), &damage);
                 }
             }
-            // the native hosts: platform views composited above the
-            // scene, in the holes the layout keeps (`docs/webview.md`).
-            // Mounted on first sight, placed every frame, swept when
-            // the subtree goes. The flip is into the LAYOUT's world,
-            // like the live layers — mid-resize the view's own height
-            // is not the world the rects were computed in.
-            let hosts = runtime.hosts();
-            let placed =
-                runtime.last_viewport().map_or(height, |viewport| viewport.height);
-            for host in &hosts {
-                let bunny_ui::host::HostSpec::Webview { url, scripts, console, requests } =
-                    &host.spec;
-                // the stamp fingerprints the whole spec: a changed
-                // url, script set or declared hook re-instructs; the
-                // separators are control characters no url or script
-                // spells
-                let mut stamp = String::from(&**url);
-                stamp.push('\u{2}');
-                stamp.push(if *console { 'c' } else { '-' });
-                stamp.push(if *requests { 'r' } else { '-' });
-                for script in scripts.iter() {
-                    stamp.push('\u{1}');
-                    stamp.push_str(script);
-                }
-                window.host_place(
-                    &host.path,
-                    &stamp,
-                    (
-                        host.frame.origin.x,
-                        host.frame.origin.y,
-                        host.frame.size.width,
-                        host.frame.size.height,
-                    ),
-                    (
-                        host.visible.origin.x,
-                        host.visible.origin.y,
-                        host.visible.size.width,
-                        host.visible.size.height,
-                    ),
-                    placed,
-                    || webview::create(&host.spec),
-                    |child, _stamp| webview::update(child, &host.spec),
-                );
-            }
-            window.host_sweep(
-                &hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>(),
-            );
             // the segments themselves: rasterized only when their
             // commands changed (the ledger's answer, the beneaths'
             // discipline), blitted between the platform views, swept

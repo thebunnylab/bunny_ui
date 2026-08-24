@@ -1585,15 +1585,19 @@ impl WindowHandle {
                 if !layer.is_null() {
                     msg_void_bool(layer, sel("setMasksToBounds:"), 1);
                 }
-                // between our placements the view hangs from the
-                // TOP-left corner the layout counts from — the same
-                // masks the live layers keep, in view units
-                msg_void_i64(
-                    container,
-                    sel("setAutoresizingMask:"),
-                    (Self::LAYER_MIN_Y_MARGIN | Self::LAYER_MAX_X_MARGIN) as i64,
-                );
+                // width and height SIZABLE, margins fixed: during a
+                // live resize APPKIT ITSELF drives both views at the
+                // start of the resize cycle — the earliest beat there
+                // is, the one a vanilla autoresizing app gets — and
+                // the hosted engine starts its relayout before our own
+                // frame has even begun. Our placement lands right
+                // after as the exact truth (for the edge-anchored
+                // fill pane the spring IS exact; elsewhere it is a
+                // sixty-a-second approximation we correct).
+                const SIZABLE: i64 = 2 | 16;
+                msg_void_i64(container, sel("setAutoresizingMask:"), SIZABLE);
                 let child = make();
+                msg_void_i64(child, sel("setAutoresizingMask:"), SIZABLE);
                 msg_void_id(container, sel("addSubview:"), child);
                 msg_void_id(self.view, sel("addSubview:"), container);
                 HostSlot { container, child, stamp: stamp.to_string() }
@@ -1616,27 +1620,13 @@ impl WindowHandle {
                         },
                     );
                     // the tenant keeps the WHOLE box, container-local:
-                    // the cut shows through, the content never rewraps.
-                    // Mid live-resize its size rides the GRID — always
-                    // at least the target, top-left anchored, so the
-                    // exact clip reveals at the window's own pace over
-                    // content the engine already laid out, and only a
-                    // grid crossing costs a relayout. The end of the
-                    // gesture redraws and the exact size lands.
-                    let (cw, ch) = if self.in_live_resize() {
-                        (
-                            (w / HOST_RESIZE_GRID).ceil() * HOST_RESIZE_GRID,
-                            (h / HOST_RESIZE_GRID).ceil() * HOST_RESIZE_GRID,
-                        )
-                    } else {
-                        (w, h)
-                    };
+                    // the cut shows through, the content never rewraps
                     msg_void_rect(
                         slot.child,
                         sel("setFrame:"),
                         CGRect {
-                            origin: CGPoint { x: -vx, y: vh + vy - ch },
-                            size: CGSize { width: cw, height: ch },
+                            origin: CGPoint { x: -vx, y: vh + vy - h },
+                            size: CGSize { width: w, height: h },
                         },
                     );
                 }
@@ -1819,14 +1809,6 @@ struct HostSlot {
     child: Id,
     stamp: String,
 }
-
-/// The grid a hosted engine is sized on MID-RESIZE, in points. It
-/// renders OUT of process, so sixty sizes a second starve it into a
-/// visible chase — but a size that stands still costs it nothing. On
-/// the grid the clip reveals at the window's own pace over content
-/// the engine already laid out, and a relayout only happens on a
-/// crossing: a dozen per drag instead of sixty a second.
-const HOST_RESIZE_GRID: f64 = 64.0;
 
 /// The tenant's view mounted under `key`, if any — where a drained
 /// command is spent.
