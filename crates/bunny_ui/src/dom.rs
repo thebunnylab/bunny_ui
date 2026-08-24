@@ -84,6 +84,11 @@ pub enum DomKind {
     /// and press flip through the box above with no patch of their
     /// own.
     Icon(DomIcon),
+    /// An `<iframe>` — the native host's web lowering: the browser's
+    /// own island, holding a page the way the desktop shells hold the
+    /// OS webview. The island contract is the one the DOM already
+    /// enforces; a changed `src` navigates, it never re-mounts.
+    Iframe { src: std::rc::Rc<str> },
     /// A flow container: `display:flex; flex-direction:column`. Two
     /// variants instead of a payload so the keyed match's discriminant
     /// tells the axes apart — an axis change recreates the element.
@@ -780,6 +785,8 @@ pub enum CreateKind {
     /// the ELEMENT differs — a field that changes shape is recreated,
     /// which is the only way an input becomes a textarea.
     Editor,
+    /// An `<iframe>`: the native host's page.
+    Iframe,
 }
 
 /// One island's display list and the box it paints into — what a tier
@@ -821,6 +828,10 @@ pub enum DomPatch {
     SetScroll { id: u32, x: f64, y: f64 },
     SetImage { id: u32, image: DomImage },
     SetIcon { id: u32, icon: DomIcon },
+    /// The iframe navigates — the diff only ships a CHANGED src, so
+    /// the write is the navigation (writing the same one would
+    /// reload).
+    SetIframe { id: u32, src: std::rc::Rc<str> },
     /// The FULL flow record — the glue resets and applies, the exact
     /// twin of `SetStyle` for the other half of an element's truth.
     SetLayout { id: u32, layout: DomLayout },
@@ -1136,6 +1147,7 @@ fn create_kind(kind: &DomKind) -> CreateKind {
         DomKind::Canvas { .. } => CreateKind::Canvas,
         DomKind::Image(_) => CreateKind::Image,
         DomKind::Icon(_) => CreateKind::Icon,
+        DomKind::Iframe { .. } => CreateKind::Iframe,
         DomKind::FlexColumn => CreateKind::FlexColumn,
         DomKind::FlexRow => CreateKind::FlexRow,
         DomKind::Layers => CreateKind::Layers,
@@ -1297,6 +1309,9 @@ fn create_subtree(
         DomKind::Icon(icon) => {
             patches.push(DomPatch::SetIcon { id, icon: *icon });
         }
+        DomKind::Iframe { src } => {
+            patches.push(DomPatch::SetIframe { id, src: std::rc::Rc::clone(src) });
+        }
         _ => {}
     }
     let children = create_children(node, id, ctx, patches);
@@ -1409,6 +1424,11 @@ fn diff_node(
         }
         (DomKind::Icon(before), DomKind::Icon(after)) if before != after => {
             patches.push(DomPatch::SetIcon { id, icon: *after });
+        }
+        (DomKind::Iframe { src: before }, DomKind::Iframe { src: after })
+            if before != after =>
+        {
+            patches.push(DomPatch::SetIframe { id, src: std::rc::Rc::clone(after) });
         }
         _ => {}
     }
@@ -1716,7 +1736,7 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 ///
 /// Bump this constant when ANY of these change:
 /// - the op codes or their payloads (the table on [`encode`])
-/// - the create kinds (0 group .. 13 editor)
+/// - the create kinds (0 group .. 14 iframe)
 /// - the style mask bits or their field order
 /// - the weight or truncation codes
 /// - the key table or the modifier bits (the shell's `named_key`)
@@ -1724,7 +1744,7 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 ///
 /// A test pins the glue to this number: bump one side alone and the
 /// suite goes red before the browser ever gets the chance to.
-pub const ABI_VERSION: u32 = 6;
+pub const ABI_VERSION: u32 = 7;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -1873,6 +1893,7 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                     CreateKind::Layers => 11,
                     CreateKind::Popover => 12,
                     CreateKind::Editor => 13,
+                    CreateKind::Iframe => 14,
                 });
             }
             DomPatch::Remove { id } => {
@@ -1993,6 +2014,11 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                     }
                     push_bytes_u32(&mut out, crate::icon::to_svg_path(draw.path).as_bytes());
                 }
+            }
+            DomPatch::SetIframe { id, src } => {
+                out.push(16);
+                push_u32(&mut out, *id);
+                push_bytes_u32(&mut out, src.as_bytes());
             }
             DomPatch::SetLayout { id, layout } => {
                 out.push(11);
@@ -2349,6 +2375,7 @@ mod tests {
             | DomPatch::SetField { id, .. }
             | DomPatch::SetImage { id, .. }
             | DomPatch::SetIcon { id, .. }
+            | DomPatch::SetIframe { id, .. }
             | DomPatch::SetScroll { id, .. }
             | DomPatch::SetLayout { id, .. }
             | DomPatch::Move { id, .. }
@@ -4029,6 +4056,60 @@ mod tests {
             )),
             "nothing mounts, nothing leaves, nothing is positioned by hand: {swapped:#?}"
         );
+    }
+
+    /// An iframe's src is a PATCH, never a re-mount: the element (and
+    /// whatever state the page holds in it) survives the navigation,
+    /// and an unchanged page ships nothing at all.
+    #[test]
+    fn an_iframe_navigates_by_patch() {
+        let mut lowering = DomLowering::default();
+        let display = crate::layout::DisplayList::default();
+        let page = |src: &str| {
+            flow_root(vec![DomNode {
+                kind: DomKind::Iframe { src: std::rc::Rc::from(src) },
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+                style: DomStyle::default(),
+                layout: Some(DomLayout {
+                    grow: true,
+                    stretch: true,
+                    ..DomLayout::default()
+                }),
+                hints: DomHints::default(),
+                children: Vec::new(),
+            }])
+        };
+
+        let mount = lowering.lower(&page("https://a.test/"), &display);
+        assert!(
+            mount.iter().any(|patch| matches!(
+                patch,
+                DomPatch::Create { kind: CreateKind::Iframe, .. }
+            )),
+            "the element mounts as an iframe: {mount:#?}"
+        );
+        assert!(
+            mount.iter().any(|patch| matches!(
+                patch,
+                DomPatch::SetIframe { src, .. } if &**src == "https://a.test/"
+            )),
+            "the src rides the mount: {mount:#?}"
+        );
+
+        let steady = lowering.lower(&page("https://a.test/"), &display);
+        assert!(steady.is_empty(), "an unchanged page ships nothing: {steady:#?}");
+
+        let moved = lowering.lower(&page("https://b.test/"), &display);
+        assert_eq!(moved.len(), 1, "a navigation is ONE patch: {moved:#?}");
+        assert!(matches!(
+            &moved[0],
+            DomPatch::SetIframe { src, .. } if &**src == "https://b.test/"
+        ));
+        // and the wire carries it without complaint
+        assert!(!encode(&moved).is_empty());
     }
 
     /// A mid-list insert lands `before` its real next sibling — zero

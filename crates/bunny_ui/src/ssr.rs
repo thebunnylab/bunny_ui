@@ -114,6 +114,15 @@ impl Tree {
         let (tag, style): (&'static str, &[(&'static str, &str)]) = match kind {
             CreateKind::Canvas => ("canvas", &[]),
             CreateKind::Image => ("img", &[("pointer-events", "none")]),
+            CreateKind::Iframe => (
+                "iframe",
+                &[
+                    ("border", "0"),
+                    ("box-sizing", "border-box"),
+                    ("min-width", "0"),
+                    ("min-height", "0"),
+                ],
+            ),
             CreateKind::Icon => ("svg", &[("pointer-events", "none")]),
             CreateKind::Field => (
                 "input",
@@ -281,6 +290,11 @@ impl Tree {
                     element
                         .style
                         .insert("transform", format!("translate({}, {})", px(*x), px(*y)));
+                }
+            }
+            DomPatch::SetIframe { id, src } => {
+                if let Some(element) = self.elements.get_mut(id) {
+                    element.attrs.insert("src", src.to_string());
                 }
             }
             DomPatch::SetSize { id, width, height } => {

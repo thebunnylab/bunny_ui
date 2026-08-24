@@ -4,8 +4,9 @@
 floor — user scripts, the message bus, navigation reports, eval with
 the value coming back, console and request capture by injected hook,
 and the snapshot — are standing;
-`cargo run -p bunny-ui-macos --example browser_window` is the proof.
-WebView2, WebKitGTK and the web's iframe are open.*
+`cargo run -p bunny-ui-macos --example browser_window` is the proof,
+and the web's own lowering — the iframe — is standing beside it.
+WebView2 and WebKitGTK are open.*
 
 An app sometimes has to show a web page — the preview of the thing it
 is building, a documentation site, an OAuth dance. Bundling a browser
@@ -36,7 +37,12 @@ is for content that arrives with its own renderer: a webview first,
 and whatever else the platform draws that we do not.
 
 In the web lowering the "native view" is an `iframe`, and the island
-contract is the one the DOM already enforces.
+contract is the one the DOM already enforces. This half is built: the
+host lowers to an `iframe` that grows and stretches like the filler
+it is, and a changed url is ONE patch — the element (and the page's
+state in it) survives the navigation. The instrumentation channels do
+not cross this border: a cross-origin page is the browser's island,
+sealed by the browser's own rules.
 
 ## The widget
 

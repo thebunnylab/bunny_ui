@@ -20,7 +20,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 6;
+const EXPECTED_ABI = 7;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -285,7 +285,8 @@ function createElementOf(kind, tag) {
 function createElementRaw(kind, tag) {
   // 0 group, 1 box, 2 text, 3 field, 4 scroll, 5 content, 6 canvas,
   // 7 image, 8 icon, 9 flex column, 10 flex row, 11 layers, 12 popover,
-  // 13 editor — the field of MANY lines, a `<textarea>`
+  // 13 editor — the field of MANY lines, a `<textarea>` —
+  // 14 iframe — the native host's page
   if (kind === 9 || kind === 10) {
     // a FLOW container: static, the browser lays its children out
     const el = document.createElement(tag || "div");
@@ -314,6 +315,14 @@ function createElementRaw(kind, tag) {
     // the element in the stream
     canvas.style.cssText = "";
     return canvas;
+  }
+  if (kind === 14) {
+    // the native host's web lowering: the browser's own island. The
+    // page inside draws, scrolls and reads input by itself — pointer
+    // events stay ON, unlike an img's
+    const frame = document.createElement("iframe");
+    frame.style.cssText = "border:0;box-sizing:border-box;min-width:0;min-height:0;";
+    return frame;
   }
   if (kind === 7) {
     const img = document.createElement("img");
@@ -934,6 +943,12 @@ function applyPatches(view, length) {
           el.removeAttribute("id");
         }
       }
+    } else if (op === 16) {
+      // the iframe navigates: the diff only ships a CHANGED src, so
+      // the write is the navigation (the same one would reload)
+      const src = text(u32());
+      const el = elements.get(id);
+      if (el) el.src = src;
     } else if (op === 14) {
       // the popover's anchor relation — position now, and again
       // whenever anything scrolls or the window resizes

@@ -791,11 +791,19 @@ impl Walk<'_> {
             LayoutNode::Island { .. } | LayoutNode::Custom { .. } => {
                 out.push(node(DomKind::Box));
             }
-            // the web's own native view is the iframe — a later round
-            // mints it (`docs/webview.md`); until then the host lowers
-            // to an empty box, and the design doc says so
-            LayoutNode::Host { .. } => {
-                out.push(node(DomKind::Box));
+            // the native host's web lowering (`docs/webview.md`): the
+            // "native view" is an iframe, and the island contract is
+            // the one the DOM already enforces
+            LayoutNode::Host { spec, .. } => {
+                let crate::host::HostSpec::Webview { url, .. } = spec;
+                let mut frame = node(DomKind::Iframe { src: std::rc::Rc::clone(url) });
+                let layout = frame.layout.as_mut().expect("flow node");
+                // a page is a filler on both axes by construction — it
+                // grows along the stack and stretches across it; a
+                // `.frame(…)` above pins it like anything else
+                layout.grow = true;
+                layout.stretch = true;
+                out.push(frame);
             }
             LayoutNode::Anchored { path, side, overlay, child } => {
                 // the anchor gets an IDENTITY the glue can find: a
@@ -1020,6 +1028,42 @@ mod tests {
             highlights: None,
             truncation: None,
         }
+    }
+
+    /// The native host lowers to the browser's own island: an iframe
+    /// carrying its url, hungry on both axes — a page has no natural
+    /// size, so the row it sits in hands it the leftover.
+    #[test]
+    fn a_host_lowers_to_an_iframe_that_fills() {
+        let tree = LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children: vec![
+                text_node("side"),
+                LayoutNode::Host {
+                    path: "pane".into(),
+                    spec: crate::host::HostSpec::Webview {
+                        url: "https://example.test/docs".into(),
+                        scripts: Vec::new().into(),
+                        console: false,
+                        requests: false,
+                    },
+                },
+            ],
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let row = &scene.children[0];
+        let pane = &row.children[1];
+        assert!(
+            matches!(&pane.kind, DomKind::Iframe { src } if &**src == "https://example.test/docs"),
+            "the host is an iframe with its url: {:?}",
+            pane.kind
+        );
+        let layout = pane.layout.as_ref().expect("flow");
+        assert!(layout.grow, "the page takes the leftover");
+        assert!(layout.stretch, "and follows the cross axis");
     }
 
     /// The dream mapping: a vstack with spacing IS a flex column with
