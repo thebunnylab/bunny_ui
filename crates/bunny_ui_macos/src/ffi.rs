@@ -1596,13 +1596,7 @@ impl WindowHandle {
                 let child = make();
                 msg_void_id(container, sel("addSubview:"), child);
                 msg_void_id(self.view, sel("addSubview:"), container);
-                HostSlot {
-                    container,
-                    child,
-                    stamp: stamp.to_string(),
-                    child_box: (0.0, 0.0),
-                    child_sized_at: None,
-                }
+                HostSlot { container, child, stamp: stamp.to_string() }
             });
             let (x, y, w, h) = frame;
             let (vx, vy, vw, vh) = window;
@@ -1623,22 +1617,20 @@ impl WindowHandle {
                     );
                     // the tenant keeps the WHOLE box, container-local:
                     // the cut shows through, the content never rewraps.
-                    // Mid live-resize its SIZE waits out the breath —
-                    // the clip tracks the window exactly either way,
-                    // and the strip in between shows the scene's own
-                    // ground instead of the engine's white; the end of
-                    // the gesture redraws and the exact size lands.
-                    let size_changed = (w, h) != slot.child_box;
-                    let hold = size_changed
-                        && self.in_live_resize()
-                        && slot
-                            .child_sized_at
-                            .is_some_and(|at| at.elapsed() < HOST_RESIZE_BREATH);
-                    let (cw, ch) = if hold { slot.child_box } else { (w, h) };
-                    if size_changed && !hold {
-                        slot.child_box = (w, h);
-                        slot.child_sized_at = Some(std::time::Instant::now());
-                    }
+                    // Mid live-resize its size rides the GRID — always
+                    // at least the target, top-left anchored, so the
+                    // exact clip reveals at the window's own pace over
+                    // content the engine already laid out, and only a
+                    // grid crossing costs a relayout. The end of the
+                    // gesture redraws and the exact size lands.
+                    let (cw, ch) = if self.in_live_resize() {
+                        (
+                            (w / HOST_RESIZE_GRID).ceil() * HOST_RESIZE_GRID,
+                            (h / HOST_RESIZE_GRID).ceil() * HOST_RESIZE_GRID,
+                        )
+                    } else {
+                        (w, h)
+                    };
                     msg_void_rect(
                         slot.child,
                         sel("setFrame:"),
@@ -1826,17 +1818,15 @@ struct HostSlot {
     container: Id,
     child: Id,
     stamp: String,
-    /// The size the tenant last received — the throttle's memory.
-    child_box: (f64, f64),
-    /// When it received it — mid live-resize a new size waits out
-    /// [`HOST_RESIZE_BREATH`] before the next one lands.
-    child_sized_at: Option<std::time::Instant>,
 }
 
-/// The breath between sizes a hosted engine is given mid-resize. It
-/// renders OUT of process: sixty sizes a second starve it into a
-/// visible chase, ten a second it lands each one.
-const HOST_RESIZE_BREATH: std::time::Duration = std::time::Duration::from_millis(100);
+/// The grid a hosted engine is sized on MID-RESIZE, in points. It
+/// renders OUT of process, so sixty sizes a second starve it into a
+/// visible chase — but a size that stands still costs it nothing. On
+/// the grid the clip reveals at the window's own pace over content
+/// the engine already laid out, and a relayout only happens on a
+/// crossing: a dozen per drag instead of sixty a second.
+const HOST_RESIZE_GRID: f64 = 64.0;
 
 /// The tenant's view mounted under `key`, if any — where a drained
 /// command is spent.
