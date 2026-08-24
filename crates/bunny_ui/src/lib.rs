@@ -5623,6 +5623,178 @@ mod tests {
         assert_eq!(*log.borrow(), vec!["second"]);
     }
 
+    /// The size a view resolved to reaches the app, and reaches it in
+    /// the SAME frame — a body that turns the measurement into a frame
+    /// runs before anything is painted.
+    #[test]
+    fn a_view_reports_the_size_it_resolved_to() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            lines: State<usize>,
+            measured: State<Size>,
+            reports: State<usize>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let measured = self.measured;
+                let reports = self.reports;
+                vstack(for_each(
+                    (0..self.lines.get()).collect::<Vec<usize>>(),
+                    |line| line.to_string(),
+                    |line| text(format!("line {line}")).frame(200.0, 20.0),
+                ))
+                .on_measure(move |size| {
+                    measured.set(size);
+                    reports.set(reports.get() + 1);
+                })
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page {
+            lines: State::new(3),
+            measured: State::new(Size::default()),
+            reports: State::new(0),
+        };
+        let room = Proposal::exact(Size { width: 400.0, height: 400.0 });
+
+        let _ = runtime.settled_layout(&page, room);
+        assert_eq!(page.measured.get().height, 60.0, "three lines of twenty");
+        assert_eq!(page.reports.get(), 1);
+
+        // a view at REST says nothing: a probe that fired every frame
+        // would dirty the world forever
+        let _ = runtime.settled_layout(&page, room);
+        assert_eq!(page.reports.get(), 1, "a size that did not change is not news");
+
+        // and a size that changes reports the new one, once
+        page.lines.set(5);
+        let _ = runtime.settled_layout(&page, room);
+        assert_eq!(page.measured.get().height, 100.0);
+        assert_eq!(page.reports.get(), 2);
+    }
+
+    /// The reaction lands in the same frame as the report: a body that
+    /// turns a measured height into a FRAME shows the right size on the
+    /// first paint, never a wrong one corrected on the next.
+    #[test]
+    fn a_body_that_reacts_to_a_measure_runs_before_the_paint() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Card {
+            natural: State<f64>,
+        }
+        impl Component for Card {
+            fn body(self, _ctx: &Context) -> impl View {
+                let natural = self.natural;
+                // the document measures freely; the card caps it
+                let document = vstack(for_each(
+                    (0..9).collect::<Vec<usize>>(),
+                    |line| line.to_string(),
+                    |line| text(format!("line {line}")).frame(200.0, 20.0),
+                ))
+                .on_measure(move |size| natural.set(size.height));
+                let capped = self.natural.get().min(120.0);
+                vstack(document).frame(200.0, if capped > 0.0 { capped } else { 400.0 })
+            }
+        }
+
+        let runtime = Runtime::new();
+        let card = Card { natural: State::new(0.0) };
+        let result = runtime
+            .settled_layout(&card, Proposal::exact(Size { width: 400.0, height: 400.0 }));
+        assert_eq!(card.natural.get(), 180.0, "nine lines of twenty, unrestricted");
+        // the FRAME this pass produced already carries the cap — the
+        // 400 the first pass used never reaches a pixel
+        let root = result.frames.get("Card").expect("the card is placed");
+        assert_eq!(root.size.height, 120.0, "capped, in the same frame");
+    }
+
+    /// Two probes in one body are two addresses. They sit at different
+    /// positions, and a position is what the identity is made of — but
+    /// the segment is fixed, so this is the collision worth pinning.
+    #[test]
+    fn two_probes_in_one_body_do_not_share_an_address() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            top: State<f64>,
+            bottom: State<f64>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let (top, bottom) = (self.top, self.bottom);
+                vstack((
+                    text("a").frame(100.0, 30.0).on_measure(move |s| top.set(s.height)),
+                    text("b").frame(100.0, 70.0).on_measure(move |s| bottom.set(s.height)),
+                ))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { top: State::new(0.0), bottom: State::new(0.0) };
+        let _ = runtime
+            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 400.0 }));
+        assert_eq!((page.top.get(), page.bottom.get()), (30.0, 70.0));
+    }
+
+    /// A probe under a SKIPPED body still reports. The retained tree is
+    /// what the frame is laid out from, so the node is still placed —
+    /// and the writer is retained beside it, like every other one.
+    #[test]
+    fn a_probe_under_a_skipped_body_still_reports() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Inner {
+            seen: State<f64>,
+        }
+        impl Component for Inner {
+            fn body(self, _ctx: &Context) -> impl View {
+                let seen = self.seen;
+                // the WIDTH follows the room the outer hands down, so
+                // the measured size can move while this body does not
+                empty()
+                    .frame_max(f64::INFINITY, 40.0, Alignment::Center)
+                    .on_measure(move |size| seen.set(size.width))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Outer {
+            room: State<f64>,
+            seen: State<f64>,
+        }
+        impl Component for Outer {
+            fn body(self, _ctx: &Context) -> impl View {
+                // the outer re-runs on `room`; the inner's payload never
+                // changes, so its body is skipped
+                vstack(Inner { seen: self.seen }).frame(self.room.get(), 400.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Outer { room: State::new(300.0), seen: State::new(0.0) };
+        let room = Proposal::exact(Size { width: 400.0, height: 400.0 });
+        let _ = runtime.settled_layout(&page, room);
+        assert_eq!(page.seen.get(), 300.0);
+
+        // the outer re-runs and hands down a different width; the inner
+        // body is SKIPPED, and the probe still reports the new size
+        page.room.set(180.0);
+        let _ = runtime.settled_layout(&page, room);
+        let runs = runtime.body_runs();
+        assert!(
+            !runs.iter().any(|path| path.ends_with("Inner")),
+            "the inner body was skipped, which is the case under test: {runs:?}"
+        );
+        assert_eq!(page.seen.get(), 180.0, "the probe reported through the retention");
+    }
+
     /// A region can hold its offset in the app's own state, both ways:
     /// the app WRITES where to go, and the wheel tells it where the
     /// region landed. It is what an anchor that names a POSITION needs

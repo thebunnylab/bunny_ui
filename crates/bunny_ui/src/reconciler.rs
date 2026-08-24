@@ -60,6 +60,10 @@ pub(crate) type SplitEntry = (String, SplitFn);
 /// landed goes back to the binding the app is holding it in.
 pub(crate) type ScrollFn = Rc<dyn Fn(crate::layout::Point)>;
 pub(crate) type ScrollEntry = (String, ScrollFn);
+/// A measurement probe registered at render: the size a view resolved
+/// to goes back to the app that asked for it.
+pub(crate) type MeasureFn = Rc<dyn Fn(crate::layout::Size)>;
+pub(crate) type MeasureEntry = (String, MeasureFn);
 
 /// A NAMED action handler registered at render: (registration path,
 /// id, what runs). Retained like the actions — a skipped view's
@@ -84,6 +88,8 @@ pub(crate) struct Entry {
     pub splits: Vec<SplitEntry>,
     /// The body's scroll-offset writers — same retention.
     pub scrolls: Vec<ScrollEntry>,
+    /// The body's measurement probes — same retention.
+    pub measures: Vec<MeasureEntry>,
     /// The paths of the app's own boxes (`custom(…)`) — the map that
     /// says a focused escape hatch is still on screen.
     /// `(path, does it take the keyboard)` — the second half is
@@ -107,6 +113,7 @@ struct BuildingFrame {
     editors: Vec<EditorEntry>,
     splits: Vec<SplitEntry>,
     scrolls: Vec<ScrollEntry>,
+    measures: Vec<MeasureEntry>,
     customs: Vec<(String, bool)>,
     handlers: Vec<HandlerEntry>,
     contexts: Vec<&'static str>,
@@ -126,6 +133,7 @@ struct PassState {
     root_editors: Vec<EditorEntry>,
     root_splits: Vec<SplitEntry>,
     root_scrolls: Vec<ScrollEntry>,
+    root_measures: Vec<MeasureEntry>,
     root_customs: Vec<(String, bool)>,
     root_handlers: Vec<HandlerEntry>,
     root_contexts: Vec<&'static str>,
@@ -228,7 +236,7 @@ pub(crate) fn finish_entry(
     node: RenderNode,
     layout: LayoutNode,
 ) {
-    let (effects, actions, editors, splits, scrolls, customs, handlers, contexts) =
+    let (effects, actions, editors, splits, scrolls, measures, customs, handlers, contexts) =
         PASS.with(|pass| {
             let mut pass = pass.borrow_mut();
             match pass.building.pop() {
@@ -240,12 +248,14 @@ pub(crate) fn finish_entry(
                         frame.editors,
                         frame.splits,
                         frame.scrolls,
+                        frame.measures,
                         frame.customs,
                         frame.handlers,
                         frame.contexts,
                     )
                 }
                 None => (
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -274,6 +284,7 @@ pub(crate) fn finish_entry(
                 editors,
                 splits,
                 scrolls,
+                measures,
                 customs,
                 handlers,
                 contexts,
@@ -342,6 +353,19 @@ pub(crate) fn attribute_scroll(path: String, scroll: ScrollFn) {
             frame.scrolls.push((path, scroll));
         } else {
             pass.root_scrolls.push((path, scroll));
+        }
+    });
+}
+
+/// A measurement probe registered during render — the scroll writer's
+/// twin, and the same attribution.
+pub(crate) fn attribute_measure(path: String, measure: MeasureFn) {
+    PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        if let Some(frame) = pass.building.last_mut() {
+            frame.measures.push((path, measure));
+        } else {
+            pass.root_measures.push((path, measure));
         }
     });
 }
@@ -598,6 +622,7 @@ thread_local! {
     static EDITORS: RefCell<HashMap<String, EditorFn>> = RefCell::new(HashMap::default());
     static SPLITS: RefCell<HashMap<String, SplitFn>> = RefCell::new(HashMap::default());
     static SCROLLS: RefCell<HashMap<String, ScrollFn>> = RefCell::new(HashMap::default());
+    static MEASURES: RefCell<HashMap<String, MeasureFn>> = RefCell::new(HashMap::default());
     /// The app's boxes on screen this pass — paths only.
     static CUSTOMS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// The subset that answers `accepts_keys` — who may HOLD the
@@ -665,6 +690,26 @@ pub(crate) fn assemble_scrolls(root: &str) {
     SCROLLS.with(|scrolls| *scrolls.borrow_mut() = map);
 }
 
+/// The measurement probes, assembled the same way.
+pub(crate) fn assemble_measures(root: &str) {
+    let mut map: HashMap<String, MeasureFn> = HashMap::default();
+    RETAINED.with(|retained| {
+        for (path, entry) in retained.borrow().iter() {
+            if covers(root, path) {
+                for (key, measure) in &entry.measures {
+                    map.insert(key.clone(), measure.clone());
+                }
+            }
+        }
+    });
+    PASS.with(|pass| {
+        for (key, measure) in std::mem::take(&mut pass.borrow_mut().root_measures) {
+            map.insert(key, measure);
+        }
+    });
+    MEASURES.with(|measures| *measures.borrow_mut() = map);
+}
+
 /// Reassembles the escape-hatch map from retention — the editors' twin
 /// for the boxes the app paints.
 pub(crate) fn assemble_customs(root: &str) {
@@ -721,6 +766,27 @@ pub(crate) fn run_scroll(path: &str, offset: crate::layout::Point) -> bool {
     match scroll {
         Some(scroll) => {
             scroll(offset);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Did any view in this pass ask to be measured? O(1), and it is what
+/// keeps a scene with no probe from paying for the feature: the frame
+/// record holds thousands of entries and walking it per layout to
+/// discover there is nothing to report would be a real cost.
+pub(crate) fn has_measures() -> bool {
+    MEASURES.with(|measures| !measures.borrow().is_empty())
+}
+
+/// Hands a view's resolved size to the probe that asked for it.
+/// `false` = no probe at the path.
+pub(crate) fn run_measure(path: &str, size: crate::layout::Size) -> bool {
+    let measure = MEASURES.with(|measures| measures.borrow().get(path).cloned());
+    match measure {
+        Some(measure) => {
+            measure(size);
             true
         }
         None => false,
@@ -832,6 +898,7 @@ pub(crate) fn reset_world() {
     EDITORS.with(|editors| editors.borrow_mut().clear());
     SPLITS.with(|splits| splits.borrow_mut().clear());
     SCROLLS.with(|scrolls| scrolls.borrow_mut().clear());
+    MEASURES.with(|measures| measures.borrow_mut().clear());
     CUSTOMS.with(|customs| customs.borrow_mut().clear());
 }
 

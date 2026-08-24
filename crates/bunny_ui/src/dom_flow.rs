@@ -580,6 +580,14 @@ impl Walk<'_> {
                 }
                 out.push(container);
             }
+            // In this mode the BROWSER lays out, so there is no
+            // resolved size here to hand back: the probe lowers as its
+            // child and stays quiet. Reporting a box from this side
+            // would mean observing the element, which is a road of its
+            // own — and a number invented here would be worse than no
+            // number at all.
+            LayoutNode::Measured { child, .. } => self.lower_into(child, out),
+
             LayoutNode::Boundary { path, children } => {
                 // a CLEAN boundary is a promise, not a walk: no body
                 // under it ran, the retained group still holds, and

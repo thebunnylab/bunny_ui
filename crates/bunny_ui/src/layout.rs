@@ -466,6 +466,14 @@ pub enum LayoutNode {
     /// the inherited ink covers every stroke — see
     /// [`crate::views::Icon::monochrome`].
     Icon { symbol: crate::icon::Symbol, resizable: bool, forced: bool },
+    /// A view whose resolved size goes back to the app (`.on_measure`).
+    ///
+    /// Transparent to the layout in both directions: it measures as its
+    /// child and places at the frame it is given. All it adds is the
+    /// RECORD — the frame lands in [`LayoutResult::frames`] under
+    /// `path`, which is the only thing the runtime needs to hand the
+    /// size over.
+    Measured { path: String, child: Box<LayoutNode> },
     /// Fills whatever the proposal gives (Rectangle).
     Fill,
     Stack { axis: Axis, spacing: Px, align: CrossAlign, children: Vec<LayoutNode> },
@@ -2317,6 +2325,11 @@ pub fn hit_test(hits: &[(String, Rect)], x: Px, y: Px) -> Option<&str> {
         .map(|(path, _)| path.as_str())
 }
 
+/// The last segment of a measurement probe's path. It is punctuation an
+/// app cannot spell — `.id` rejects the brackets and the slash — so a
+/// probe's record can never be confused with a boundary's.
+pub(crate) const MEASURE_SEGMENT: &str = "/#measure";
+
 /// The absolute frames the placement pass produces, addressable by the
 /// identity path of the boundaries.
 #[derive(Default, Debug)]
@@ -2328,6 +2341,16 @@ impl Frames {
     fn record(&mut self, path: &str, frame: Rect) {
         self.entries.push((path.to_string(), frame));
     }
+
+    /// The probes' own frames — the entries a `Measured` node recorded,
+    /// told apart by the segment only that node writes.
+    pub(crate) fn measured(&self) -> impl Iterator<Item = (&str, &Rect)> {
+        self.entries
+            .iter()
+            .filter(|(path, _)| path.ends_with(MEASURE_SEGMENT))
+            .map(|(path, frame)| (path.as_str(), frame))
+    }
+
 
     /// The exact frame for the path (the first one, if repeated).
     pub fn get(&self, path: &str) -> Option<Rect> {
@@ -3071,6 +3094,9 @@ impl LayoutNode {
             LayoutNode::Boundary { children, .. } => {
                 children.len() == 1 && children[0].is_flexible(axis, enclosing_main)
             }
+            // a probe is not a box: it answers for its child in every
+            // direction, or measuring a view would change it
+            LayoutNode::Measured { child, .. } => child.is_flexible(axis, enclosing_main),
             // the app answers for its own box, per axis (the default is
             // yes on both, the same answer a Rectangle gives)
             LayoutNode::Custom { element, .. } => element.element().flexible(axis),
@@ -3139,6 +3165,7 @@ impl LayoutNode {
             LayoutNode::Boundary { children, .. } => {
                 children.first().and_then(|child| child.first_baseline(env))
             }
+            LayoutNode::Measured { child, .. } => child.first_baseline(env),
             LayoutNode::BoundaryRef { path } => crate::reconciler::with_retained_layout(
                 path,
                 |layout| layout.and_then(|node| node.first_baseline(env)),
@@ -3533,6 +3560,11 @@ impl LayoutNode {
             LayoutNode::Live { child, .. } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            LayoutNode::Measured { child, .. } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Children(vec![(size, fit)]))
             }
 
             LayoutNode::Boundary { children, .. } => {
@@ -4853,6 +4885,17 @@ impl LayoutNode {
                     {
                         out.misses.push(path.clone());
                     }
+                }
+            }
+
+            (LayoutNode::Measured { path, child }, Fit::Children(fits)) => {
+                // the record is the whole job: the child is placed at
+                // exactly the frame this node was given
+                out.frames.record(path, frame);
+                let mut fits = fits;
+                if !fits.is_empty() {
+                    let (_, fit) = fits.remove(0);
+                    child.place(frame, fit, env, out);
                 }
             }
 

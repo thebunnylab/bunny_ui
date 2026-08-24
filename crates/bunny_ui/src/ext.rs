@@ -795,6 +795,45 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.on_measure(|size| …)` — the size this view RESOLVED to, handed
+    /// back as it changes.
+    ///
+    /// A view answers its size to the layout, and until now the answer
+    /// went one way: the app proposed and never heard back. That is
+    /// fine for anything the layout can finish on its own, and it is
+    /// not enough for a shape whose size is an INPUT somewhere else —
+    /// a window that wants to be as tall as its content, a card that
+    /// must cap at a fraction of the screen, a menu that decides which
+    /// side to open on.
+    ///
+    /// ```ignore
+    /// let height = State::new(0.0);
+    /// document_view()
+    ///     .on_measure(move |size| height.set(size.height))
+    /// ```
+    ///
+    /// It fires only when the size CHANGES, so a view at rest costs
+    /// nothing and a handler that writes state cannot spin. The report
+    /// lands inside the SAME frame: the layout that resolved the size
+    /// is followed by the read, and a body that reacts re-runs before
+    /// anything is painted — no frame of lag, and no flash of the
+    /// wrong size.
+    ///
+    /// The one thing it cannot do is chase itself. A handler that
+    /// changes the size it just heard about settles on the NEXT frame
+    /// instead of this one, because the convergence loop is capped —
+    /// the cap is what makes a wrong reaction a late frame rather than
+    /// a hang.
+    ///
+    /// Not in flow mode: there the BROWSER lays out, so this side has
+    /// no resolved size to hand over and the probe stays quiet.
+    fn on_measure(self, report: impl Fn(crate::layout::Size) + 'static) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::OnMeasure(Rc::new(report)),
+        }
+    }
+
     /// Paints stretches of the TEXT in another color (byte ranges into
     /// the content) — a finder's match highlight. Only affects `text(…)`.
     fn highlight(self, ranges: Vec<(usize, usize)>, color: Color) -> Modified<Self> {

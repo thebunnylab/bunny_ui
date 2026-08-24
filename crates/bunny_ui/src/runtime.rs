@@ -200,6 +200,10 @@ pub struct Runtime {
     /// drops it — the tooltip's own idiom, and the reason `cmd-k` can
     /// never hold the keyboard for good.
     pending_aged: Cell<bool>,
+    /// The size last HANDED to each measurement probe. A probe fires on
+    /// change and only on change: a view at rest costs nothing, and a
+    /// handler that writes state cannot spin against its own report.
+    measures: RefCell<HashMap<String, crate::layout::Size>>,
     /// The offset last PUBLISHED to each region's binding. It is what
     /// tells a value the app WROTE apart from the value the region
     /// itself landed on and reported: only one of the two can differ
@@ -768,6 +772,7 @@ impl Runtime {
             chords: RefCell::new(Vec::new()),
             pending: RefCell::new(Vec::new()),
             pending_aged: Cell::new(false),
+            measures: RefCell::new(HashMap::default()),
             scroll_commands: RefCell::new(HashMap::default()),
             scroll_targets: RefCell::new(HashMap::default()),
             element_reveals: RefCell::new(HashMap::default()),
@@ -894,6 +899,7 @@ impl Runtime {
             reconciler::assemble_editors(pass_root);
             reconciler::assemble_splits(pass_root);
             reconciler::assemble_scrolls(pass_root);
+            reconciler::assemble_measures(pass_root);
             reconciler::assemble_customs(pass_root);
             reconciler::assemble_handlers(pass_root);
             reconciler::assemble_contexts(pass_root);
@@ -3684,6 +3690,42 @@ impl Runtime {
         moved
     }
 
+    /// Hands every probe the size its view resolved to, when that size
+    /// CHANGED since the last time it heard.
+    ///
+    /// `true` = a probe fired, so the caller relayouts — which is what
+    /// puts the report and the reaction to it in the SAME frame. A body
+    /// that turns a measured height into a frame gets to run before
+    /// anything is painted, instead of showing one frame at the wrong
+    /// size and correcting it on the next.
+    ///
+    /// A probe whose view left the tree keeps no entry: the ledger is
+    /// swept against the frames this layout actually recorded, so a
+    /// view that comes back reports again rather than staying silent
+    /// on a stale match.
+    fn apply_measures(&self, result: &crate::layout::LayoutResult) -> bool {
+        // the cheap question first: a scene that never asked to be
+        // measured must not pay a walk of the frame record to find out
+        if !reconciler::has_measures() && self.measures.borrow().is_empty() {
+            return false;
+        }
+        let mut fired = false;
+        let mut seen: Vec<String> = Vec::new();
+        for (path, rect) in result.frames.measured() {
+            seen.push(path.to_string());
+            let last = self.measures.borrow().get(path).copied();
+            if last == Some(rect.size) {
+                continue;
+            }
+            self.measures.borrow_mut().insert(path.to_string(), rect.size);
+            // outside the borrow: the handler writes state, and the
+            // write is the whole point
+            fired |= reconciler::run_measure(path, rect.size);
+        }
+        self.measures.borrow_mut().retain(|path, _| seen.iter().any(|kept| kept == path));
+        fired
+    }
+
     /// Settles each region that holds its offset in a BINDING, both
     /// ways, in one pass.
     ///
@@ -3788,7 +3830,8 @@ impl Runtime {
         for _ in 0..2 {
             let moved = self.apply_scroll_targets(&result)
                 | self.apply_element_reveals(&result)
-                | self.apply_scroll_offsets(&result);
+                | self.apply_scroll_offsets(&result)
+                | self.apply_measures(&result);
             let focused = self.apply_auto_focus(&result);
             // a miss measured on the round a target just moved is
             // spurious — it audited the PRE-jump offset; the relayout

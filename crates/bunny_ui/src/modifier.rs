@@ -103,6 +103,9 @@ pub enum Modifier {
     TruncationMode(Truncation),
     /// The scroll region follows this item id when it changes.
     ScrollTarget(String),
+    /// `.on_measure(|size| …)` — the size the view resolved to, handed
+    /// back to the app.
+    OnMeasure(Rc<dyn Fn(crate::layout::Size)>),
     /// The field asks for focus on its first appearance.
     AutoFocus,
     /// A soft halo behind the view: (radius, color).
@@ -269,6 +272,7 @@ impl Modifier {
             }
             Modifier::TruncationMode(mode) => format!(" [.truncationMode(.{mode:?})]"),
             Modifier::ScrollTarget(id) => format!(" [.scrollTarget({id:?})]"),
+            Modifier::OnMeasure(_) => " [.onMeasure]".into(),
             Modifier::AutoFocus => " [.autoFocus()]".into(),
             Modifier::Shadow(radius, color) => format!(" [.shadow(radius: {radius}, {color})]"),
             // the knobs a chain named, in a fixed order — the print of
@@ -1178,6 +1182,20 @@ fn apply(
                 truncation: Some(*mode),
             })
         }),
+        Modifier::OnMeasure(report) => {
+            // the probe is addressed by WHERE it sits, with a segment of
+            // its own so it can never collide with the identity the
+            // subtree uses for its state
+            let Some(scope) = motor::identity::cursor_scope() else {
+                return;
+            };
+            let path = format!("{scope}/#measure");
+            crate::reconciler::attribute_measure(path.clone(), report.clone());
+            out.wrap_layout_from(mark, |node| LayoutNode::Measured {
+                path: path.clone(),
+                child: Box::new(node),
+            });
+        }
         Modifier::ScrollTarget(id) => out.wrap_layout_from(mark, |node| {
             rewrite_scroll_node(node, &|path, axes, fill, commanded, child| {
                 LayoutNode::Scroll {
