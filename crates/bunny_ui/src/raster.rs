@@ -884,6 +884,73 @@ pub fn rasterize_with(
     rasterize_over(display, width, height, scale, background, text, images, None)
 }
 
+/// The superset box of everything a list paints, in LOGICAL points —
+/// how a presenter that gives a slice its own surface sizes that
+/// surface by the CONTENT instead of the window (a toast's segment
+/// rasterizes a toast, never a screen). Clips are ignored on purpose:
+/// a superset stays safe. `None` = the list paints nothing at all.
+pub fn list_bounds(
+    display: &DisplayList,
+    text: &dyn TextEngine,
+) -> Option<crate::layout::Rect> {
+    let cache = crate::text_engine::MeasureCache::default();
+    let mut bounds: Option<(f64, f64, f64, f64)> = None;
+    let mut fold = |x0: f64, y0: f64, x1: f64, y1: f64| {
+        bounds = Some(match bounds {
+            Some((bx0, by0, bx1, by1)) => (bx0.min(x0), by0.min(y0), bx1.max(x1), by1.max(y1)),
+            None => (x0, y0, x1, y1),
+        });
+    };
+    for command in display.iter() {
+        match command {
+            DrawCommand::FillRect { rect, .. }
+            | DrawCommand::Gradient { rect, .. }
+            | DrawCommand::Backdrop { rect, .. }
+            | DrawCommand::Image { rect, .. } => fold(
+                rect.origin.x,
+                rect.origin.y,
+                rect.origin.x + rect.size.width,
+                rect.origin.y + rect.size.height,
+            ),
+            // a stroke straddles its edge — one point of slack covers it
+            DrawCommand::StrokeRect { rect, width, .. } => {
+                let reach = (width / 2.0).max(1.0);
+                fold(
+                    rect.origin.x - reach,
+                    rect.origin.y - reach,
+                    rect.origin.x + rect.size.width + reach,
+                    rect.origin.y + rect.size.height + reach,
+                );
+            }
+            DrawCommand::Shadow { rect, radius, .. } => {
+                let reach = radius.max(1.0);
+                fold(
+                    rect.origin.x - reach,
+                    rect.origin.y - reach,
+                    rect.origin.x + rect.size.width + reach,
+                    rect.origin.y + rect.size.height + reach,
+                );
+            }
+            DrawCommand::TextLine { origin, content, range, font, .. } => {
+                let metrics = cache.get_or_measure(&content[range.0..range.1], font, text);
+                // a point of slack per edge: measure vs raster
+                // rounding never crosses it, and a superset is safe
+                fold(
+                    origin.x - 1.0,
+                    origin.y - 1.0,
+                    origin.x + metrics.width + 1.0,
+                    origin.y + metrics.height() + 1.0,
+                );
+            }
+            DrawCommand::PushClip { .. } | DrawCommand::PopClip => {}
+        }
+    }
+    bounds.map(|(x0, y0, x1, y1)| crate::layout::Rect {
+        origin: Point { x: x0, y: y0 },
+        size: crate::layout::Size { width: x1 - x0, height: y1 - y0 },
+    })
+}
+
 /// [`rasterize_with`], with a scene a material may SAMPLE but that is never
 /// painted.
 ///

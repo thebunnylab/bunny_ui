@@ -1732,6 +1732,13 @@ impl WindowHandle {
     /// rects for now (AppKit may restore it at resize edges; a cosmetic
     /// glitch we accept).
     pub fn set_cursor(&self, cursor: Cursor) {
+        // the shell speaks only when its answer CHANGES. Re-asserting
+        // the same cursor on every pointer event fights whatever a
+        // platform view set for its own content — a webview's hand
+        // over a link would flicker against our arrow forever.
+        if LAST_CURSOR.with(|last| last.replace(Some(cursor))) == Some(cursor) {
+            return;
+        }
         let name = match cursor {
             Cursor::Arrow => "arrowCursor",
             Cursor::Text => "IBeamCursor",
@@ -1833,6 +1840,9 @@ struct SegmentSlot {
 
 thread_local! {
     static SEGMENTS: RefCell<HashMap<String, SegmentSlot>> = RefCell::new(HashMap::new());
+    /// The cursor the shell last chose — the gate that keeps it from
+    /// re-asserting an unchanged answer every pointer event.
+    static LAST_CURSOR: Cell<Option<Cursor>> = const { Cell::new(None) };
 }
 
 static REGISTER_SEGMENT: Once = Once::new();
@@ -1903,17 +1913,23 @@ unsafe fn register_segment_class() {
 
 impl WindowHandle {
     /// Presents one segment — the commands that painted above `host`,
-    /// rasterized by the caller into straight window-sized RGBA. The
-    /// surface mounts DIRECTLY ABOVE the host's container, so content
-    /// between two hosts lands between their pages; it spans the
-    /// window (the toast straddling the pane's edge shows both
-    /// halves), stretches with it, and the caller re-blits on change.
+    /// rasterized by the caller into straight RGBA sized to the
+    /// CONTENT's box, never the window (a toast's segment carries a
+    /// toast). The surface mounts DIRECTLY ABOVE the host's
+    /// container, so content between two hosts lands between their
+    /// pages. `frame` is the content box in LAYOUT coordinates
+    /// (top-left, points) and `view_height` the placing layout's
+    /// height — the live layers' flip, and their hang-from-top-left
+    /// masks: a stale bitmap never stretches, the next place moves it
+    /// whole.
+    #[expect(clippy::too_many_arguments, reason = "a presenter takes what it takes")]
     pub fn segment_blit(
         &self,
         key: &str,
         host_key: &str,
         rgba: &[u8],
-        logical: (f64, f64),
+        frame: (f64, f64, f64, f64),
+        view_height: f64,
         scale: usize,
         px_width: usize,
         px_height: usize,
@@ -1928,13 +1944,15 @@ impl WindowHandle {
                     sel("initWithFrame:"),
                     CGRect {
                         origin: CGPoint { x: 0.0, y: 0.0 },
-                        size: CGSize { width: logical.0, height: logical.1 },
+                        size: CGSize { width: 0.0, height: 0.0 },
                     },
                 );
                 msg_void_bool(view, sel("setWantsLayer:"), 1);
-                // width and height follow the window between blits —
-                // the next present re-blits the pixels anyway
-                msg_void_i64(view, sel("setAutoresizingMask:"), 18);
+                msg_void_i64(
+                    view,
+                    sel("setAutoresizingMask:"),
+                    (Self::LAYER_MIN_Y_MARGIN | Self::LAYER_MAX_X_MARGIN) as i64,
+                );
                 match host_child_container(host_key) {
                     // NSWindowAbove = 1: directly over the page it covers
                     Some(container) => msg_void_id_i64_id(
@@ -1973,6 +1991,7 @@ impl WindowHandle {
                     }
                 }
             }
+            let (x, y, w, h) = frame;
             unsafe {
                 let provider = CGDataProviderCreateWithData(
                     std::ptr::null_mut(),
@@ -2000,8 +2019,8 @@ impl WindowHandle {
                         slot.view,
                         sel("setFrame:"),
                         CGRect {
-                            origin: CGPoint { x: 0.0, y: 0.0 },
-                            size: CGSize { width: logical.0, height: logical.1 },
+                            origin: CGPoint { x, y: view_height - y - h },
+                            size: CGSize { width: w, height: h },
                         },
                     );
                     if !layer.is_null() {
@@ -2012,6 +2031,31 @@ impl WindowHandle {
                 CGImageRelease(image);
                 CGColorSpaceRelease(space);
                 CGDataProviderRelease(provider);
+            }
+        });
+    }
+
+    /// Re-places one segment without touching its pixels — the same
+    /// commands at a new flip height (the window grew, the content
+    /// did not). A segment with no surface yet is a no-op.
+    pub fn segment_place(&self, key: &str, frame: (f64, f64, f64, f64), view_height: f64) {
+        SEGMENTS.with(|segments| {
+            let segments = segments.borrow();
+            let Some(slot) = segments.get(key) else {
+                return;
+            };
+            let (x, y, w, h) = frame;
+            unsafe {
+                without_actions(|| {
+                    msg_void_rect(
+                        slot.view,
+                        sel("setFrame:"),
+                        CGRect {
+                            origin: CGPoint { x, y: view_height - y - h },
+                            size: CGSize { width: w, height: h },
+                        },
+                    );
+                });
             }
         });
     }
@@ -2039,6 +2083,13 @@ impl WindowHandle {
 /// its page.
 fn host_child_container(key: &str) -> Option<Id> {
     HOST_VIEWS.with(|hosts| hosts.borrow().get(key).map(|slot| slot.container))
+}
+
+/// The shell steps back from the cursor: whatever owns it now (a
+/// webview's own hover, mostly) keeps it, and the NEXT thing the
+/// shell wants — even the arrow — asserts again.
+pub(crate) fn yield_cursor() {
+    LAST_CURSOR.with(|last| last.set(None));
 }
 
 /// One live box's sublayer and its two alternating backings — the

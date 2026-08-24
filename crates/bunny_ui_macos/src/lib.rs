@@ -215,10 +215,12 @@ pub fn run_window_chrome(
     type Beneath = (Vec<bunny_ui::layout::DrawCommand>, (usize, usize), bunny_ui::raster::Bitmap);
     let beneaths: Rc<RefCell<std::collections::HashMap<String, Beneath>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
-    // The commands each host SEGMENT was last rasterized from — the
-    // ledger that keeps a steady frame from re-proving the same
-    // pixels (the beneaths' twin, for the sandwich above the island).
-    type SegmentKept = (Vec<bunny_ui::layout::DrawCommand>, (usize, usize));
+    // The commands each host SEGMENT was last rasterized from, with
+    // the content box and scale they were rasterized at — the ledger
+    // that keeps a steady frame from re-proving the same pixels (the
+    // beneaths' twin, for the sandwich above the island).
+    type SegmentKept =
+        (Vec<bunny_ui::layout::DrawCommand>, (f64, f64, f64, f64), usize);
     let segments_kept: Rc<RefCell<std::collections::HashMap<String, SegmentKept>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
     // present takes a READY display list to the window — the tick path
@@ -526,19 +528,46 @@ pub fn run_window_chrome(
             // the frame nothing paints above a host
             {
                 let mut kept = segments_kept.borrow_mut();
+                let mut alive: Vec<String> = Vec::new();
                 for (host, range) in &segments {
                     let slice = full_display.translated_slice(*range, 0.0, 0.0);
-                    let commands: Vec<_> = slice.iter().cloned().collect();
-                    let stale = kept
-                        .get(host)
-                        .is_none_or(|(was, size)| *was != commands || *size != physical);
-                    if !stale {
+                    // the surface is the CONTENT's box, never the
+                    // window: a toast's segment rasterizes a toast —
+                    // which is what keeps a live resize at the
+                    // window's own pace
+                    let Some(bounds) =
+                        bunny_ui::raster::list_bounds(&slice, &*runtime.text())
+                    else {
+                        continue; // nothing paints — nothing to lift
+                    };
+                    let pad = 2.0;
+                    let x0 = (bounds.origin.x - pad).max(0.0);
+                    let y0 = (bounds.origin.y - pad).max(0.0);
+                    let x1 = (bounds.origin.x + bounds.size.width + pad).min(width);
+                    let y1 = (bounds.origin.y + bounds.size.height + pad).min(height);
+                    if x1 <= x0 || y1 <= y0 {
                         continue;
                     }
+                    alive.push(host.clone());
+                    let frame = (x0, y0, x1 - x0, y1 - y0);
+                    let commands: Vec<_> = slice.iter().cloned().collect();
+                    let stale = kept.get(host).is_none_or(|(was, box_, at)| {
+                        *was != commands || *box_ != frame || *at != scale
+                    });
+                    if !stale {
+                        // same picture — at most a new flip height
+                        window.segment_place(host, frame, placed);
+                        continue;
+                    }
+                    let box_physical = (
+                        ((x1 - x0) * scale as f64).round().max(1.0) as usize,
+                        ((y1 - y0) * scale as f64).round().max(1.0) as usize,
+                    );
+                    let local = full_display.translated_slice(*range, -x0, -y0);
                     let bitmap = bunny_ui::raster::rasterize_over(
-                        &slice,
-                        physical.0,
-                        physical.1,
+                        &local,
+                        box_physical.0,
+                        box_physical.1,
                         scale,
                         bunny_ui::layout::Color { r: 0, g: 0, b: 0, a: 0 },
                         &*runtime.text(),
@@ -549,15 +578,14 @@ pub fn run_window_chrome(
                         host,
                         host,
                         &bitmap.to_rgba_bytes(),
-                        (width, height),
+                        frame,
+                        placed,
                         scale,
-                        physical.0,
-                        physical.1,
+                        box_physical.0,
+                        box_physical.1,
                     );
-                    kept.insert(host.clone(), (commands, physical));
+                    kept.insert(host.clone(), (commands, frame, scale));
                 }
-                let alive: Vec<String> =
-                    segments.iter().map(|(host, _)| host.clone()).collect();
                 kept.retain(|key, _| alive.iter().any(|host| host == key));
                 window.segment_sweep(&alive);
             }
@@ -627,7 +655,7 @@ pub fn run_window_chrome(
         let interaction = runtime.interaction();
         // a live divider drag keeps the resizer even while the pointer
         // runs ahead of the seam; hovering the grip announces it
-        window.set_cursor(match runtime.seam_axis() {
+        let desired = match runtime.seam_axis() {
             // lanes side by side: the seam travels left and right
             Some(Axis::Horizontal) => ffi::Cursor::ResizeLeftRight,
             // lanes stacked: it travels up and down
@@ -642,7 +670,27 @@ pub fn run_window_chrome(
                 None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
                 None => ffi::Cursor::Arrow,
             },
+        };
+        // over the island with only the DEFAULT to say, the shell
+        // YIELDS: the engine owns the cursor over its own page (the
+        // hand over a link is the webview's to give). Yielding also
+        // rearms the gate, so the first real claim off the island —
+        // or on it, a toast's hand — asserts again.
+        let over_host = interaction.pointer.is_some_and(|point| {
+            runtime.hosts().iter().any(|host| {
+                let x0 = host.frame.origin.x + host.visible.origin.x;
+                let y0 = host.frame.origin.y + host.visible.origin.y;
+                point.x >= x0
+                    && point.y >= y0
+                    && point.x < x0 + host.visible.size.width
+                    && point.y < y0 + host.visible.size.height
+            })
         });
+        if over_host && desired == ffi::Cursor::Arrow {
+            ffi::yield_cursor();
+        } else {
+            window.set_cursor(desired);
+        }
         ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
             let rect = snapshot.caret_rect;
             (
