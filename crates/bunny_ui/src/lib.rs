@@ -6459,6 +6459,22 @@ mod tests {
         assert_eq!(page.title.get(), "\"a page\"");
         // the token was spent with the answer
         assert!(!runtime.webview_eval_done(*token, Ok("again".into())));
+
+        // the snapshot walks the same road, with its own ledger
+        use crate::host::WebviewSnapshot;
+        let seen = State::new(0_usize);
+        page.handle.snapshot(move |result| {
+            seen.set(result.map(|shot| shot.rgba.len()).unwrap_or(0));
+        });
+        let ops = runtime.webview_commands();
+        let WebviewOp::Snapshot { token, .. } = &ops[0] else {
+            panic!("the snapshot drains as its own op");
+        };
+        assert!(runtime.webview_snapshot_done(
+            *token,
+            Ok(WebviewSnapshot { width: 2, height: 1, rgba: vec![0; 8] }),
+        ));
+        assert_eq!(seen.get(), 8, "the pixels reached the app's own callback");
     }
 
     /// A probe under a SKIPPED body still reports. The retained tree is

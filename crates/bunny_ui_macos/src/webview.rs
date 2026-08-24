@@ -41,6 +41,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_bool_id(obj: Id, sel: Sel, a: Id) -> i8;
     #[link_name = "objc_msgSend"]
+    fn msg_i64(obj: Id, sel: Sel) -> i64;
+    #[link_name = "objc_msgSend"]
     fn msg_bool_sel(obj: Id, sel: Sel, a: Sel) -> i8;
     #[link_name = "objc_msgSend"]
     fn msg_init_config(obj: Id, sel: Sel, frame: CGRect, config: Id) -> Id;
@@ -68,6 +70,8 @@ pub(crate) enum WebviewEvent {
     /// An eval answered, by token — `Ok` is JSON, `Err` the thrown
     /// error's name.
     EvalDone { token: u64, result: Result<String, String> },
+    /// A snapshot answered, by token — straight RGBA, tightly packed.
+    SnapshotDone { token: u64, result: Result<(usize, usize, Vec<u8>), String> },
 }
 
 thread_local! {
@@ -424,6 +428,131 @@ pub(crate) fn eval(view: Id, token: u64, js: &str) {
             ns(&wrapped),
             null_mut(),
         );
+    }
+}
+
+/// The ONE Objective-C block in this crate. `takeSnapshotWithConfiguration:`
+/// has no other door — there is no message-bus detour for pixels the
+/// way there is for an eval's value — so the block literal is written
+/// by hand: the layout the runtime documents, a POD capture (the
+/// token), and no copy/dispose helpers, which tells `_Block_copy`
+/// that a byte copy is the whole move.
+#[repr(C)]
+struct SnapshotBlock {
+    isa: *const c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: extern "C" fn(*mut SnapshotBlock, Id, Id),
+    descriptor: *const BlockDescriptor,
+    /// The capture — plain data, safe to byte-copy.
+    token: u64,
+}
+
+#[repr(C)]
+struct BlockDescriptor {
+    reserved: u64,
+    size: u64,
+}
+
+static SNAPSHOT_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+    reserved: 0,
+    size: std::mem::size_of::<SnapshotBlock>() as u64,
+};
+
+#[link(name = "System", kind = "dylib")]
+unsafe extern "C" {
+    static _NSConcreteStackBlock: [*const c_void; 32];
+}
+
+/// The completion lands here, on the main thread: `(image, error)`.
+extern "C" fn snapshot_landed(block: *mut SnapshotBlock, image: Id, error: Id) {
+    let token = unsafe { (*block).token };
+    let result = if image.is_null() {
+        Err(unsafe { error_name(error) })
+    } else {
+        unsafe { image_rgba(image) }
+    };
+    dispatch(WebviewEvent::SnapshotDone { token, result });
+}
+
+/// The page as an image — the answer rides the dispatch, by token,
+/// like an eval's. `WKSnapshotConfiguration` stays nil: the visible
+/// viewport is the picture.
+pub(crate) fn snapshot(view: Id, token: u64) {
+    let block = SnapshotBlock {
+        isa: (&raw const _NSConcreteStackBlock) as *const c_void,
+        flags: 0,
+        reserved: 0,
+        invoke: snapshot_landed,
+        descriptor: &SNAPSHOT_DESCRIPTOR,
+        token,
+    };
+    unsafe {
+        // the engine copies the block before this call returns — the
+        // stack literal only has to live through the send
+        msg_void_id_id(
+            view,
+            sel("takeSnapshotWithConfiguration:completionHandler:"),
+            null_mut(),
+            (&raw const block) as Id,
+        );
+    }
+}
+
+/// The error's own words, or a name for silence.
+unsafe fn error_name(error: Id) -> String {
+    if error.is_null() {
+        return String::from("the engine answered nothing");
+    }
+    unsafe {
+        let description = msg_id(error, sel("localizedDescription"));
+        let text = to_string(description);
+        if text.is_empty() { String::from("the engine refused unnamed") } else { text }
+    }
+}
+
+/// NSImage → straight RGBA, tightly packed. The floor accepts what a
+/// snapshot actually produces (8-bit RGBA or RGB); anything stranger
+/// is refused by name rather than misread.
+unsafe fn image_rgba(image: Id) -> Result<(usize, usize, Vec<u8>), String> {
+    unsafe {
+        let tiff = msg_id(image, sel("TIFFRepresentation"));
+        if tiff.is_null() {
+            return Err(String::from("the image had no representation"));
+        }
+        let rep = msg_id_id(class("NSBitmapImageRep"), sel("imageRepWithData:"), tiff);
+        if rep.is_null() {
+            return Err(String::from("the image did not decode"));
+        }
+        let width = msg_i64(rep, sel("pixelsWide")) as usize;
+        let height = msg_i64(rep, sel("pixelsHigh")) as usize;
+        let samples = msg_i64(rep, sel("samplesPerPixel")) as usize;
+        let bits = msg_i64(rep, sel("bitsPerSample")) as usize;
+        let stride = msg_i64(rep, sel("bytesPerRow")) as usize;
+        if width == 0 || height == 0 {
+            return Err(String::from("the image had no pixels"));
+        }
+        if bits != 8 || (samples != 4 && samples != 3) {
+            return Err(format!(
+                "unexpected pixel format: {samples} samples of {bits} bits"
+            ));
+        }
+        let data = msg_id(rep, sel("bitmapData")) as *const u8;
+        if data.is_null() {
+            return Err(String::from("the image kept its bytes"));
+        }
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for row in 0..height {
+            let line = data.add(row * stride);
+            for column in 0..width {
+                let pixel = line.add(column * samples);
+                rgba.push(*pixel);
+                rgba.push(*pixel.add(1));
+                rgba.push(*pixel.add(2));
+                rgba.push(if samples == 4 { *pixel.add(3) } else { 255 });
+            }
+        }
+        Ok((width, height, rgba))
     }
 }
 

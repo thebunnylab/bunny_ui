@@ -15,7 +15,8 @@
 //!   and fetched — the user script does all three as soon as the
 //!   document loads, no click needed;
 //! - "read the title" asks the page (`document.title` by eval) and
-//!   the answer lands beside the button;
+//!   the answer lands beside the button; "snapshot" asks for the
+//!   pixels and reports the size it got back;
 //! - type a url in the bar and press enter (a bare host name gets
 //!   https:// for free); a committed navigation writes the real url
 //!   back into the field;
@@ -115,10 +116,25 @@ impl Component for Browser {
             })
         };
 
+        let shoot = {
+            let handle = handle.clone();
+            let title = title;
+            chip("snapshot".into()).on_click(move || {
+                let title = title;
+                handle.snapshot(move |answer| {
+                    title.set(match answer {
+                        Ok(shot) => format!("{} x {} px", shot.width, shot.height),
+                        Err(error) => format!("refused: {error}"),
+                    });
+                });
+            })
+        };
+
         let sidebar = vstack!(
             vstack(links).spacing(6.0).alignment(HorizontalAlignment::Leading),
             spacer(),
             ask,
+            shoot,
             text(title.get()).foreground_color(theme::fg_secondary()),
             spacer().frame_height(12.0),
             toggle

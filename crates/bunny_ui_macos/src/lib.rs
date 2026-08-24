@@ -528,6 +528,15 @@ pub fn run_window_chrome(
                             );
                         }
                     },
+                    WebviewOp::Snapshot { path, token } => match ffi::host_child(&path) {
+                        Some(child) => webview::snapshot(child, token),
+                        None => {
+                            let _ = runtime.webview_snapshot_done(
+                                token,
+                                Err("the webview is not mounted".into()),
+                            );
+                        }
+                    },
                 }
             }
             let (width, height) = window.content_size();
@@ -727,6 +736,14 @@ pub fn run_window_chrome(
                 }
                 webview::WebviewEvent::EvalDone { token, result } => {
                     if runtime.webview_eval_done(token, result) {
+                        blit(&runtime, root);
+                    }
+                }
+                webview::WebviewEvent::SnapshotDone { token, result } => {
+                    let result = result.map(|(width, height, rgba)| {
+                        bunny_ui::host::WebviewSnapshot { width, height, rgba }
+                    });
+                    if runtime.webview_snapshot_done(token, result) {
                         blit(&runtime, root);
                     }
                 }

@@ -175,8 +175,10 @@ pub struct Runtime {
     /// [`Runtime::webview_eval_done`]; a swept page answers late or
     /// never, and the entry waits — bounded by evals in flight.
     webview_evals: RefCell<HashMap<u64, crate::host::EvalSink>>,
-    /// The next eval token — one counter for the whole runtime, so a
-    /// late answer can never land on another page's question.
+    /// Snapshot answers still owed — the eval ledger's twin.
+    webview_snaps: RefCell<HashMap<u64, crate::host::SnapshotSink>>,
+    /// The next eval or snapshot token — ONE counter for the whole
+    /// runtime, so a late answer can never land on another question.
     webview_eval_next: Cell<u64>,
     /// What each live box painted on its last step, in LOCAL
     /// coordinates, and the PHYSICAL size it was rasterized at — a
@@ -778,6 +780,7 @@ impl Runtime {
             last_customs: RefCell::new(Vec::new()),
             last_hosts: RefCell::new(Vec::new()),
             webview_evals: RefCell::new(HashMap::default()),
+            webview_snaps: RefCell::new(HashMap::default()),
             webview_eval_next: Cell::new(0),
             live_ledger: RefCell::new(motor::hash::FxHashMap::default()),
             theme_version: Cell::new(crate::theme::version()),
@@ -3292,6 +3295,12 @@ impl Runtime {
                         self.webview_evals.borrow_mut().insert(token, then);
                         WebviewOp::Eval { path: path.clone(), token, js }
                     }
+                    WebviewCommand::Snapshot { then } => {
+                        let token = self.webview_eval_next.get();
+                        self.webview_eval_next.set(token + 1);
+                        self.webview_snaps.borrow_mut().insert(token, then);
+                        WebviewOp::Snapshot { path: path.clone(), token }
+                    }
                 });
             }
         }
@@ -3304,6 +3313,22 @@ impl Runtime {
     /// already answered, or never asked.
     pub fn webview_eval_done(&self, token: u64, result: crate::host::EvalResult) -> bool {
         let then = self.webview_evals.borrow_mut().remove(&token);
+        match then {
+            Some(then) => {
+                then(result);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The shell's answer to a Snapshot op — the eval door's twin.
+    pub fn webview_snapshot_done(
+        &self,
+        token: u64,
+        result: crate::host::SnapshotResult,
+    ) -> bool {
+        let then = self.webview_snaps.borrow_mut().remove(&token);
         match then {
             Some(then) => {
                 then(result);

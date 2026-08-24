@@ -2,11 +2,10 @@
 
 *Status: the native host, the macOS webview and its instrumentation
 floor — user scripts, the message bus, navigation reports, eval with
-the value coming back, console and request capture by injected hook —
-are standing;
+the value coming back, console and request capture by injected hook,
+and the snapshot — are standing;
 `cargo run -p bunny-ui-macos --example browser_window` is the proof.
-Snapshot, devtools-by-handle, WebView2, WebKitGTK and the web's
-iframe are open.*
+WebView2, WebKitGTK and the web's iframe are open.*
 
 An app sometimes has to show a web page — the preview of the thing it
 is building, a documentation site, an OAuth dance. Bundling a browser
@@ -65,13 +64,15 @@ let page = WebviewHandle::new();   // bound with .handle(&page)
 page.navigate(url);
 page.back();
 page.eval("document.title", move |answer| { /* the value, serialized */ });
+page.snapshot(move |answer| { /* the page as straight RGBA */ });
 ```
 
 `eval` takes an expression and answers on a later frame: `Ok` is the
 value as JSON, and a page that threw answers `Err` with the error's
-name — never silence that looks like a slow page. A snapshot (the page
-as an image) and opening the engine's own inspector are the handle's
-open seats.
+name — never silence that looks like a slow page. `snapshot` answers
+the same way, with the pixels the engine shows right now. Opening the
+engine's own inspector stays the OS's door (on macOS the view is
+inspectable: right-click, Inspect Element).
 
 User scripts run at document start, so a page never renders before the
 app's instrumentation is in place. The message bus is the same channel

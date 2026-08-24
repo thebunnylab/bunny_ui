@@ -81,6 +81,22 @@ pub(crate) type CommandQueue = Rc<RefCell<Vec<WebviewCommand>>>;
 /// An eval's `then`, parked in the runtime until the shell answers.
 pub(crate) type EvalSink = Box<dyn FnOnce(EvalResult)>;
 
+/// The page as an image: straight RGBA, row-major, tightly packed —
+/// the same bytes `ImageSource::Rgba` takes, so a snapshot can go
+/// straight back into a scene.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WebviewSnapshot {
+    pub width: usize,
+    pub height: usize,
+    pub rgba: Vec<u8>,
+}
+
+/// A snapshot's answer — the image, or the engine's refusal by name.
+pub type SnapshotResult = Result<WebviewSnapshot, String>;
+
+/// A snapshot's `then`, parked like an eval's.
+pub(crate) type SnapshotSink = Box<dyn FnOnce(SnapshotResult)>;
+
 /// A command the app queued on a [`WebviewHandle`] — drained by the
 /// shell each frame ([`crate::runtime::Runtime::webview_commands`])
 /// and spent on the mounted engine.
@@ -96,6 +112,8 @@ pub enum WebviewCommand {
     /// serialized value back — `then` fires on the app's own thread,
     /// on a later frame.
     Eval { js: Rc<str>, then: Box<dyn FnOnce(EvalResult)> },
+    /// The page as an image — what the engine shows right now.
+    Snapshot { then: SnapshotSink },
 }
 
 /// A drained command, addressed — what a shell spends on the mounted
@@ -110,6 +128,10 @@ pub enum WebviewOp {
     /// op whose page is not mounted deserves an `Err` with a name,
     /// never silence.
     Eval { path: String, token: u64, js: Rc<str> },
+    /// The answer goes back through
+    /// [`crate::runtime::Runtime::webview_snapshot_done`], by token —
+    /// the same law as the eval's.
+    Snapshot { path: String, token: u64 },
 }
 
 /// The imperative half of the webview, because a page is a document
@@ -161,6 +183,13 @@ impl WebviewHandle {
         self.queue
             .borrow_mut()
             .push(WebviewCommand::Eval { js: js.into(), then: Box::new(then) });
+    }
+
+    /// The page as an image, as the engine shows it right now —
+    /// `then` fires on the app's own thread, on a later frame, with
+    /// the pixels or the engine's refusal by name.
+    pub fn snapshot(&self, then: impl FnOnce(SnapshotResult) + 'static) {
+        self.queue.borrow_mut().push(WebviewCommand::Snapshot { then: Box::new(then) });
     }
 
     pub(crate) fn share_queue(&self) -> CommandQueue {
