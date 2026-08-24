@@ -5804,6 +5804,61 @@ mod tests {
         );
     }
 
+    /// A sheet leaves the scene, the way a popover does.
+    ///
+    /// A native child view — a web page, a video surface — sits ABOVE
+    /// everything the scene paints; that is the island contract. A
+    /// popover already answers it by construction: it presents its own
+    /// slice on its own surface, so it crosses the island. A sheet was
+    /// an in-scene pile, so a palette opened over a page rendered
+    /// UNDERNEATH the page, and there was nothing an app could write to
+    /// get out of the way.
+    ///
+    /// Now it rides the same machinery: its own slice, its own
+    /// placement, and the window presents only what came before it.
+    #[test]
+    fn a_sheet_leaves_the_scene_like_a_popover_does() {
+        use crate::layout::{Proposal, Size};
+
+        const WINDOW: Size = Size { width: 800.0, height: 600.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            open: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("the page under it").frame(WINDOW.width, WINDOW.height).sheet(
+                    self.open.binding(),
+                    |_| crate::erased::erased(text("the palette").frame(300.0, 200.0)),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { open: State::new(false) };
+
+        let shut = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert!(shut.overlays.is_empty(), "nothing is presented while it is closed");
+
+        page.open.set(true);
+        let open = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(open.overlays.len(), 1, "the sheet is presented on its own");
+
+        let sheet = &open.overlays[0];
+        assert_eq!(sheet.frame.size, Size { width: 300.0, height: 200.0 });
+        assert_eq!(
+            (sheet.frame.origin.x, sheet.frame.origin.y),
+            (250.0, 200.0),
+            "centred in the window, not anchored to anything",
+        );
+        // the slice is what a shell re-presents; the window draws only
+        // what came BEFORE it, which is how the page stays below
+        let (start, end) = sheet.display;
+        assert!(start < end, "the slice holds the sheet's own commands");
+        assert_eq!(end, open.display.len(), "and it is the last thing placed");
+    }
+
     /// Content too wide for its box starts at the LEADING edge. It
     /// never centres its own overflow.
     ///
@@ -7111,6 +7166,50 @@ mod tests {
         runtime.pointer_pressed(200.0, 150.0);
         runtime.pointer_released(200.0, 150.0);
         assert_eq!(stage.behind.get(), 1, "and its action fires again");
+    }
+
+    /// The sheet's own content still answers the pointer.
+    ///
+    /// The modal line is drawn before the sheet is placed, so
+    /// everything the sheet records lands ABOVE it. Get that backwards
+    /// and the sheet blocks the world including itself — a dialog whose
+    /// buttons are dead, which is worse than the defect it came from.
+    #[test]
+    fn a_sheet_answers_inside_the_line_it_draws() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Stage {
+            behind: State<i32>,
+            confirmed: State<i32>,
+        }
+
+        impl Component for Stage {
+            fn body(self, _ctx: &Context) -> impl View {
+                let (behind, confirmed) = (self.behind, self.confirmed);
+                text("the page behind")
+                    .frame(400.0, 300.0)
+                    .on_click(move || behind.add(1))
+                    .sheet(State::new(true).binding(), move |_| {
+                        erased(
+                            text("Confirm")
+                                .frame(120.0, 40.0)
+                                .on_click(move || confirmed.add(1)),
+                        )
+                    })
+            }
+        }
+
+        let stage = Stage { behind: State::new(0), confirmed: State::new(0) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&stage);
+        let _ = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+
+        // dead centre is the card: its own action fires
+        runtime.pointer_pressed(200.0, 150.0);
+        runtime.pointer_released(200.0, 150.0);
+        assert_eq!(stage.confirmed.get(), 1, "the sheet's own button works");
+        assert_eq!(stage.behind.get(), 0, "and nothing reached the page");
     }
 
     #[test]

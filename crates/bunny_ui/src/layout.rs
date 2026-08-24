@@ -684,6 +684,23 @@ pub enum LayoutNode {
     /// win, no scroll clip cuts it, and the Dom capture mounts it as
     /// the root's last child (the portal, by construction). The anchor
     /// re-resolves on every layout: scroll and resize re-anchor free.
+    /// `.sheet(…)`: a modal layer that LEAVES the scene.
+    ///
+    /// Geometrically it is a pile — the content centres over the child
+    /// and the child keeps its own frame. What makes it its own node is
+    /// where it is PRESENTED: like a popover, its commands go out as
+    /// their own slice, so a shell that puts overlays on their own
+    /// surfaces lifts it above a native child view instead of painting
+    /// it underneath one.
+    ///
+    /// It also CAPTURES: what it covers is out of reach while it is up,
+    /// which is what modal has always meant.
+    Sheet {
+        /// The sheet's identity, carried into its placement.
+        path: String,
+        content: Rc<LayoutNode>,
+        child: Box<LayoutNode>,
+    },
     Anchored {
         /// The popover's identity (dismiss registrations key on it).
         path: String,
@@ -2089,7 +2106,11 @@ pub struct MenuOpen {
 #[derive(Debug)]
 struct QueuedOverlay {
     path: String,
-    side: Side,
+    /// Where it hangs from. `None` is a SHEET: it hangs from nothing
+    /// and centres in the window — never in the overlay container,
+    /// which on a desktop is the whole screen. A sheet is modal to the
+    /// window it belongs to and has no business outside it.
+    side: Option<Side>,
     node: Rc<LayoutNode>,
     anchor: Rect,
     anchor_visible: bool,
@@ -2943,8 +2964,30 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
             width: Some(container.size.width),
             height: Some(container.size.height),
         };
+        // a sheet is measured against the WINDOW; a popover may leave it
+        let room = match queued.side {
+            Some(_) => container,
+            None => viewport,
+        };
+        let proposal = match queued.side {
+            Some(_) => proposal,
+            None => Proposal {
+                width: Some(room.size.width),
+                height: Some(room.size.height),
+            },
+        };
         let (size, fit) = queued.node.measure(proposal, env);
-        let frame = anchored_frame(queued.anchor, queued.side, size, container);
+        let frame = match queued.side {
+            Some(side) => anchored_frame(queued.anchor, side, size, container),
+            None => Rect {
+                origin: Point {
+                    x: room.origin.x + align_offset(room.size.width, size.width, CrossAlign::Center),
+                    y: room.origin.y
+                        + align_offset(room.size.height, size.height, CrossAlign::Center),
+                },
+                size,
+            },
+        };
         let start = out.display.len();
         queued.node.place(frame, fit, env, out);
         let end = out.display.len();
@@ -3131,6 +3174,7 @@ impl LayoutNode {
             | LayoutNode::Animated { child, .. }
             | LayoutNode::Island { child, .. }
             | LayoutNode::Live { child, .. }
+            | LayoutNode::Sheet { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
             | LayoutNode::ControlRegion { child, .. }
@@ -3207,6 +3251,7 @@ impl LayoutNode {
             | LayoutNode::Live { child, .. }
             | LayoutNode::Interactive { child, .. }
             | LayoutNode::HoverGroup { child, .. }
+            | LayoutNode::Sheet { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
             | LayoutNode::ControlRegion { child, .. }
@@ -3344,6 +3389,13 @@ impl LayoutNode {
                 // a synchronous square — no decode, no reflow, ever
                 let side = crate::icon::natural_size(&env.font) as u32;
                 (image_size(Some((side, side)), *resizable, None, proposal), Fit::Leaf)
+            }
+
+            // the child's geometry IS the node's — a sheet floats over
+            // it and never enlarges what it covers
+            LayoutNode::Sheet { child, .. } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
             // the anchor's geometry IS the node's — the overlay never
@@ -4155,6 +4207,29 @@ impl LayoutNode {
                 // platform composites the view above it
             }
 
+            (LayoutNode::Sheet { path, content, child }, Fit::Wrapped(_, fit)) => {
+                child.place(frame, *fit, env, out);
+                // the line the modal draws: everything recorded from
+                // here on is ABOVE it, and the walk back stops at the
+                // mark instead of reaching under it
+                out.modal_floor = Some(ModalFloor {
+                    hits: out.hits.len(),
+                    scrolls: out.scrolls.len(),
+                    tooltips: out.tooltips.len(),
+                    menus: out.menus.len(),
+                    drag_sources: out.drag_sources.len(),
+                    drops: out.drops.len(),
+                });
+                // and out of the scene, on the popover's own road
+                out.overlay_queue.push(QueuedOverlay {
+                    path: path.clone(),
+                    side: None,
+                    node: Rc::clone(content),
+                    anchor: frame,
+                    anchor_visible: true,
+                });
+            }
+
             (LayoutNode::Anchored { path, side, overlay, child }, Fit::Wrapped(_, fit)) => {
                 child.place(frame, *fit, env, out);
                 // the REAL anchor: un-shift the in-flight animation
@@ -4173,7 +4248,7 @@ impl LayoutNode {
                     .is_none_or(|clip| anchor.intersection(clip).is_some());
                 out.overlay_queue.push(QueuedOverlay {
                     path: path.clone(),
-                    side: *side,
+                    side: Some(*side),
                     node: Rc::clone(overlay),
                     anchor,
                     anchor_visible,

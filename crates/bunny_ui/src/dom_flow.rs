@@ -249,6 +249,17 @@ impl Walk<'_> {
                 Self::inherit_stretch(&mut container);
                 out.push(container);
             }
+            // In flow mode there is no native child view to cross and
+            // no second surface to present on: the sheet is a layer over
+            // the page, which is what it looks like anyway.
+            LayoutNode::Sheet { content, child, .. } => {
+                let mut container = node(DomKind::Layers);
+                container.layout.as_mut().expect("flow node").align =
+                    Some(align_code(crate::layout::CrossAlign::Center));
+                self.lower_into(child, &mut container.children);
+                self.lower_into(content, &mut container.children);
+                out.push(container);
+            }
             LayoutNode::Layered { align, children, .. } => {
                 let mut container = node(DomKind::Layers);
                 container.layout.as_mut().expect("flow node").align =

@@ -866,10 +866,12 @@ fn apply(
             content,
         } if is_presented.get() => {
             let mut sheet_nodes = NodeList::new();
+            let path;
             {
                 // The sheet is a sub-root with its own identity: what the
                 // closure builds anchors here and dies when it closes.
                 let _frame = motor::identity::enter("sheet");
+                path = motor::identity::cursor_scope();
                 content(ctx).render_into(ctx, &mut sheet_nodes);
             }
             let (sheet_prints, sheet_layouts) = sheet_nodes.into_parts();
@@ -877,16 +879,30 @@ fn apply(
                 node.children
                     .push(RenderNode::branch("Sheet", sheet_prints));
             }
-            // in layout, the sheet overlays the base — centered, the
-            // way a modal sits over what it covers
-            // a sheet CAPTURES: what it covers is out of reach while
-            // it is up, which is what "modal" has always meant and what
-            // the comment above already claimed
-            out.wrap_layout_from(mark, |base| LayoutNode::Layered {
-                align: CrossAlign::Center,
-                modal: true,
-                children: vec![base, wrap_layout(sheet_layouts)],
-            });
+            // The sheet centres over the base and CAPTURES: what it
+            // covers is out of reach while it is up, which is what
+            // modal has always meant.
+            //
+            // It also leaves the scene, on the road the popover already
+            // travels — its own slice, presented on its own surface. A
+            // native child view sits above everything the scene paints,
+            // so an in-scene pile would open UNDERNEATH a web page, and
+            // no app could write its way out of that.
+            //
+            // Outside a pass there is no identity to carry, so it stays
+            // a plain pile: nothing is presenting anything anyway.
+            match path {
+                Some(path) => out.wrap_layout_from(mark, |base| LayoutNode::Sheet {
+                    path: path.clone(),
+                    content: Rc::new(wrap_layout(sheet_layouts.clone())),
+                    child: Box::new(base),
+                }),
+                None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
+                    align: CrossAlign::Center,
+                    modal: true,
+                    children: vec![base, wrap_layout(sheet_layouts.clone())],
+                }),
+            }
         }
         Modifier::Popover {
             is_presented,
