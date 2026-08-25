@@ -1013,6 +1013,111 @@ pub fn range_covers(
         })
 }
 
+/// Splits `display[range]` at `rect`: the exact commands that land on
+/// the island leave for a surface of their own, and everything else
+/// STAYS in the scene. The whole-tail carve was pain enough to name —
+/// one focus ring hugging a pane's edge lifted the ring, the stripe
+/// and the entire status bar onto a layer that re-rasterized through
+/// every resize step.
+///
+/// Returns the carve ranges (what the presenter cuts from the window's
+/// list — one per lifted command, clips left behind as harmless empty
+/// pairs) and the lifted list itself, each command re-wrapped in the
+/// clip stack that governed it where it stood. `None` = nothing in the
+/// range lands on the island. The overlap test is [`range_covers`]'s:
+/// a superset, free of the text engine.
+pub fn carve_covering(
+    display: &DisplayList,
+    range: (usize, usize),
+    rect: crate::layout::Rect,
+) -> Option<(Vec<(usize, usize)>, DisplayList)> {
+    let (x0, y0) = (rect.origin.x, rect.origin.y);
+    let (x1, y1) = (x0 + rect.size.width, y0 + rect.size.height);
+    let hits = |bx0: f64, by0: f64, bx1: f64, by1: f64| {
+        bx0 < x1 && bx1 > x0 && by0 < y1 && by1 > y0
+    };
+    let covers = |command: &DrawCommand| match command {
+        DrawCommand::FillRect { rect, .. }
+        | DrawCommand::Gradient { rect, .. }
+        | DrawCommand::Backdrop { rect, .. }
+        | DrawCommand::Image { rect, .. } => hits(
+            rect.origin.x,
+            rect.origin.y,
+            rect.origin.x + rect.size.width,
+            rect.origin.y + rect.size.height,
+        ),
+        DrawCommand::StrokeRect { rect, width, .. } => {
+            let reach = (width / 2.0).max(1.0);
+            hits(
+                rect.origin.x - reach,
+                rect.origin.y - reach,
+                rect.origin.x + rect.size.width + reach,
+                rect.origin.y + rect.size.height + reach,
+            )
+        }
+        DrawCommand::Shadow { rect, radius, .. } => {
+            let reach = radius.max(1.0);
+            hits(
+                rect.origin.x - reach,
+                rect.origin.y - reach,
+                rect.origin.x + rect.size.width + reach,
+                rect.origin.y + rect.size.height + reach,
+            )
+        }
+        DrawCommand::TextLine { origin, font, .. } => {
+            hits(origin.x - 1.0, origin.y - 1.0, f64::INFINITY, origin.y + font.size * 3.0)
+        }
+        DrawCommand::PushClip { .. } | DrawCommand::PopClip => false,
+    };
+    let mut carves: Vec<(usize, usize)> = Vec::new();
+    let mut lifted = DisplayList::default();
+    // the clip stack that governs each command travels with it: a
+    // lifted command repaints under the clips it stood under, and the
+    // stack is emitted fresh per run of lifted neighbours
+    let mut clips: Vec<DrawCommand> = Vec::new();
+    let mut open = 0usize;
+    for (offset, command) in display
+        .iter()
+        .skip(range.0)
+        .take(range.1.saturating_sub(range.0))
+        .enumerate()
+    {
+        let index = range.0 + offset;
+        match command {
+            DrawCommand::PushClip { .. } => clips.push(command.clone()),
+            DrawCommand::PopClip => {
+                clips.pop();
+            }
+            _ if covers(command) => {
+                // extend the previous run when nothing (and no clip
+                // change) sits between — one wrap serves the pair
+                match carves.last_mut() {
+                    Some((_, end)) if *end == index && open == clips.len() => {
+                        *end = index + 1;
+                        lifted.push(command.clone());
+                    }
+                    _ => {
+                        for _ in 0..open {
+                            lifted.push(DrawCommand::PopClip);
+                        }
+                        for clip in &clips {
+                            lifted.push(clip.clone());
+                        }
+                        open = clips.len();
+                        lifted.push(command.clone());
+                        carves.push((index, index + 1));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for _ in 0..open {
+        lifted.push(DrawCommand::PopClip);
+    }
+    if carves.is_empty() { None } else { Some((carves, lifted)) }
+}
+
 /// [`rasterize_with`], with a scene a material may SAMPLE but that is never
 /// painted.
 ///
@@ -1550,6 +1655,77 @@ mod tests {
         );
         // and the range is honoured: asked about nothing, it says no
         assert!(!super::range_covers(&toast, (1, 1), island));
+    }
+
+    /// The finer carve, the one the workbench demanded: a focus ring
+    /// hugging the pane lifts ALONE, under the clip that governed it —
+    /// and the status bar painted after it STAYS in the scene instead
+    /// of trembling on a layer it never needed.
+    #[test]
+    fn the_carve_lifts_the_ring_and_leaves_the_footer() {
+        use crate::layout::{Corners, DrawCommand, Point, Rect, Size};
+        use crate::text_engine::FontSpec;
+        let island = Rect {
+            origin: Point { x: 289.0, y: 106.0 },
+            size: Size { width: 951.0, height: 668.0 },
+        };
+        let ink = crate::layout::Color { r: 10, g: 10, b: 10, a: 255 };
+        let mut tail = crate::layout::DisplayList::default();
+        tail.push(DrawCommand::PushClip {
+            rect: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size { width: 1280.0, height: 800.0 },
+            },
+            corner_radius: Corners::ZERO,
+        });
+        // the ring around the pane — its stroke rides the island's edge
+        tail.push(DrawCommand::StrokeRect {
+            rect: Rect {
+                origin: Point { x: 40.0, y: 40.0 },
+                size: Size { width: 1200.0, height: 734.0 },
+            },
+            color: ink,
+            width: 2.0,
+            corner_radius: Corners::ZERO,
+        });
+        tail.push(DrawCommand::PopClip);
+        // the status bar, whole, under everything
+        tail.push(DrawCommand::FillRect {
+            rect: Rect {
+                origin: Point { x: 0.0, y: 780.0 },
+                size: Size { width: 1280.0, height: 20.0 },
+            },
+            color: ink,
+            corner_radius: Corners::ZERO,
+        });
+        tail.push(DrawCommand::TextLine {
+            origin: Point { x: 28.0, y: 781.0 },
+            content: std::sync::Arc::from("task/branch"),
+            range: (0, 11),
+            color: ink,
+            font: FontSpec::DEFAULT,
+        });
+
+        let (carves, lifted) =
+            super::carve_covering(&tail, (0, tail.len()), island).expect("the ring lands");
+        assert_eq!(carves, vec![(1, 2)], "the ring alone leaves the scene");
+        let lifted: Vec<_> = lifted.iter().cloned().collect();
+        assert_eq!(lifted.len(), 3, "clip, ring, clip closed: {lifted:?}");
+        assert!(matches!(lifted[0], DrawCommand::PushClip { .. }));
+        assert!(matches!(lifted[1], DrawCommand::StrokeRect { .. }));
+        assert!(matches!(lifted[2], DrawCommand::PopClip));
+
+        // a tail of footer alone answers None — nothing lifts at all
+        let mut footer = crate::layout::DisplayList::default();
+        footer.push(DrawCommand::FillRect {
+            rect: Rect {
+                origin: Point { x: 0.0, y: 780.0 },
+                size: Size { width: 1280.0, height: 20.0 },
+            },
+            color: ink,
+            corner_radius: Corners::ZERO,
+        });
+        assert!(super::carve_covering(&footer, (0, footer.len()), island).is_none());
     }
 
     /// An island clears to NOTHING, and `blend_px` over nothing leaves

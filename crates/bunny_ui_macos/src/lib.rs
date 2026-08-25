@@ -305,36 +305,35 @@ pub fn run_window_chrome(
             // hosts answers nothing here and pays nothing. Every
             // carve below cuts from the ORIGINAL list: ranges never
             // chase indices another carve already moved.
-            // a tail only becomes a segment when something in it
-            // actually LANDS on its island — a dock painted after a
-            // centred pane never touches it, and half a workbench on
-            // a layer would tremble through every resize. A disjoint
-            // tail stays in the scene, and a scene with none pays
-            // exactly what it paid before the sandwich existed.
-            let segments: Vec<(String, (usize, usize))> = runtime
+            // only what actually LANDS on an island leaves the scene —
+            // command by command, each under the clips that governed
+            // it. A focus ring hugging the pane lifts alone; the
+            // stripe beside it and the status bar under it STAY, and a
+            // scene with nothing on its islands pays exactly what it
+            // paid before the sandwich existed.
+            let mut segment_ranges: Vec<(usize, usize)> = Vec::new();
+            let segments: Vec<(String, bunny_ui::layout::DisplayList)> = runtime
                 .host_segments(full_display.len())
                 .into_iter()
-                .filter(|(path, range)| {
-                    hosts.iter().any(|host| {
-                        host.path == *path
+                .filter_map(|(path, range)| {
+                    let host = hosts.iter().find(|host| {
+                        host.path == path
                             && host.visible.size.width > 0.0
                             && host.visible.size.height > 0.0
-                            && bunny_ui::raster::range_covers(
-                                &full_display,
-                                *range,
-                                bunny_ui::layout::Rect {
-                                    origin: bunny_ui::layout::Point {
-                                        x: host.frame.origin.x + host.visible.origin.x,
-                                        y: host.frame.origin.y + host.visible.origin.y,
-                                    },
-                                    size: host.visible.size,
-                                },
-                            )
-                    })
+                    })?;
+                    let island = bunny_ui::layout::Rect {
+                        origin: bunny_ui::layout::Point {
+                            x: host.frame.origin.x + host.visible.origin.x,
+                            y: host.frame.origin.y + host.visible.origin.y,
+                        },
+                        size: host.visible.size,
+                    };
+                    let (carves, lifted) =
+                        bunny_ui::raster::carve_covering(&full_display, range, island)?;
+                    segment_ranges.extend(carves);
+                    Some((path, lifted))
                 })
                 .collect();
-            let segment_ranges: Vec<(usize, usize)> =
-                segments.iter().map(|(_, range)| *range).collect();
             {
                 let mut store = panels.borrow_mut();
                 let mut dead: Vec<String> = store
@@ -564,14 +563,13 @@ pub fn run_window_chrome(
             {
                 let mut kept = segments_kept.borrow_mut();
                 let mut alive: Vec<String> = Vec::new();
-                for (host, range) in &segments {
-                    let slice = full_display.translated_slice(*range, 0.0, 0.0);
+                for (host, slice) in &segments {
                     // the surface is the CONTENT's box, never the
-                    // window: a toast's segment rasterizes a toast —
+                    // window: a ring's segment rasterizes a ring —
                     // which is what keeps a live resize at the
                     // window's own pace
                     let Some(bounds) =
-                        bunny_ui::raster::list_bounds(&slice, &*runtime.text())
+                        bunny_ui::raster::list_bounds(slice, &*runtime.text())
                     else {
                         continue; // nothing paints — nothing to lift
                     };
@@ -598,7 +596,7 @@ pub fn run_window_chrome(
                         ((x1 - x0) * scale as f64).round().max(1.0) as usize,
                         ((y1 - y0) * scale as f64).round().max(1.0) as usize,
                     );
-                    let local = full_display.translated_slice(*range, -x0, -y0);
+                    let local = slice.translated_slice((0, slice.len()), -x0, -y0);
                     let bitmap = bunny_ui::raster::rasterize_over(
                         &local,
                         box_physical.0,
@@ -864,33 +862,43 @@ pub fn run_window_chrome(
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_navigated(&path, &url)
                     {
-                        blit(&runtime, root);
+                        if !window.in_live_resize() {
+                            blit(&runtime, root);
+                        }
                     }
                 }
                 webview::WebviewEvent::Posted { view, body } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_posted(&path, &body)
                     {
-                        blit(&runtime, root);
+                        if !window.in_live_resize() {
+                            blit(&runtime, root);
+                        }
                     }
                 }
                 webview::WebviewEvent::Console { view, line } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_console(&path, &line)
                     {
-                        blit(&runtime, root);
+                        if !window.in_live_resize() {
+                            blit(&runtime, root);
+                        }
                     }
                 }
                 webview::WebviewEvent::Requested { view, line } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_requested(&path, &line)
                     {
-                        blit(&runtime, root);
+                        if !window.in_live_resize() {
+                            blit(&runtime, root);
+                        }
                     }
                 }
                 webview::WebviewEvent::EvalDone { token, result } => {
                     if runtime.webview_eval_done(token, result) {
-                        blit(&runtime, root);
+                        if !window.in_live_resize() {
+                            blit(&runtime, root);
+                        }
                     }
                 }
                 webview::WebviewEvent::SnapshotDone { token, result } => {
@@ -898,7 +906,9 @@ pub fn run_window_chrome(
                         bunny_ui::host::WebviewSnapshot { width, height, rgba }
                     });
                     if runtime.webview_snapshot_done(token, result) {
-                        blit(&runtime, root);
+                        if !window.in_live_resize() {
+                            blit(&runtime, root);
+                        }
                     }
                 }
             }
@@ -912,7 +922,19 @@ pub fn run_window_chrome(
         let runtime = &handler_runtime;
         let root = &*handler_root;
         match event {
-        AppEvent::Redraw | AppEvent::Wake => blit(runtime, root),
+        AppEvent::Redraw => blit(runtime, root),
+        // the single-presenter law reaches the queue: a worker's wake
+        // mid-drag would present with its own latency between two
+        // resize steps — the trembling's other half once the clocks
+        // yielded, because a workbench is never without a watcher or
+        // a language server answering. The ready tasks keep their
+        // flag; the next step, or the end-of-drag redraw, drains them
+        // with the frame it was already paying for.
+        AppEvent::Wake => {
+            if !window.in_live_resize() {
+                blit(runtime, root);
+            }
+        }
         AppEvent::ResignKey => {
             // the user switched away: popovers close like the
             // platform's own (their panels never take key, so this
@@ -1218,4 +1240,5 @@ mod trace {
         line(format_args!("{kind} {:.1} {w:.0}x{h:.0} live={} cmds={cmds}", ms(), u8::from(live)));
         Some(Traced(std::time::Instant::now()))
     }
+
 }
