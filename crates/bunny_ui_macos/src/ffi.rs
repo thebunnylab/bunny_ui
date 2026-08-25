@@ -182,6 +182,7 @@ unsafe extern "C" {
         size: usize,
         release: *const c_void,
     ) -> *mut c_void;
+    fn CGDataProviderCreateWithCFData(data: *const c_void) -> *mut c_void;
     fn CGDataProviderRelease(provider: *mut c_void);
     pub(crate) fn CGContextDrawImage(context: Id, rect: CGRect, image: Id);
     pub(crate) fn CGContextSetInterpolationQuality(context: Id, quality: i32);
@@ -207,6 +208,7 @@ unsafe extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     pub(crate) fn CFRelease(cf: *const c_void);
+    fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
     fn CFRunLoopGetMain() -> Id;
     fn CFRunLoopSourceCreate(
         allocator: Id,
@@ -906,6 +908,24 @@ extern "C" fn bunny_slow(_this: Id, _sel: Sel, _timer: Id) {
     dispatch(AppEvent::Frame { dt });
 }
 
+/// A data provider that OWNS a copy of the bytes. A layer's contents
+/// are read by the render server AFTER the transaction closes: a
+/// provider that only borrows the shell's buffer paints a small image
+/// — the commit copies it inline — and silently paints NOTHING once
+/// the image is big enough to be mapped instead of copied. An
+/// island-sized segment was invisible while a toast-sized one showed,
+/// with identical calls. CFData owns the copy, the provider retains
+/// the CFData, the image retains the provider: the pixels stay
+/// truthful for as long as the layer shows them.
+unsafe fn owned_provider(bytes: *const u8, length: usize) -> *mut c_void {
+    unsafe {
+        let data = CFDataCreate(std::ptr::null(), bytes, length as isize);
+        let provider = CGDataProviderCreateWithCFData(data);
+        CFRelease(data);
+        provider
+    }
+}
+
 /// Removes CoreAnimation's implicit animations from a layer the shell
 /// created. AppKit turns them off for the backing layers IT makes; a
 /// layer handed to `setLayer:` — or added as a raw sublayer — keeps
@@ -1594,12 +1614,7 @@ impl WindowHandle {
                         }
                     }
                 }
-                let provider = CGDataProviderCreateWithData(
-                    std::ptr::null_mut(),
-                    backing.as_ptr(),
-                    backing.len(),
-                    std::ptr::null(),
-                );
+                let provider = owned_provider(backing.as_ptr(), backing.len());
                 let space = CGColorSpaceCreateDeviceRGB();
                 let image = CGImageCreate(
                     px_width,
@@ -2173,12 +2188,7 @@ impl WindowHandle {
         });
         let (x, y, w, h) = frame;
         unsafe {
-            let provider = CGDataProviderCreateWithData(
-                std::ptr::null_mut(),
-                pointer,
-                length,
-                std::ptr::null(),
-            );
+            let provider = owned_provider(pointer, length);
             let space = CGColorSpaceCreateDeviceRGB();
             let image = CGImageCreate(
                 px_width,
