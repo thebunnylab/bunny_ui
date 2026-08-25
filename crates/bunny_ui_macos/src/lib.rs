@@ -1021,7 +1021,16 @@ pub fn run_window_chrome(
             // the same slow beat ages a sequence in the air: two ticks
             // and `cmd-k` lets the keyboard go
             let chorded = runtime.chord_tick();
-            if blinked || explained || chorded {
+            // …but never mid-drag: the resize steps are the only presenter
+            // there. A caret blinking in a focused URL bar presented whole
+            // frames between two steps and the two geometries composited
+            // as a ghost of the entire chrome (the page, being the
+            // engine's own surface, stayed clean — which is what named
+            // this path). The clock still aged; the caret shows its next
+            // phase on the step that lands — and the RESIZE path itself
+            // must never be gated: holding it back leaves the compositor
+            // stretching a stale drawable through the whole drag.
+            if (blinked || explained || chorded) && !window.in_live_resize() {
                 blit(runtime, root);
             }
         }
