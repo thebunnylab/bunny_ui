@@ -862,43 +862,33 @@ pub fn run_window_chrome(
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_navigated(&path, &url)
                     {
-                        if !window.in_live_resize() {
-                            blit(&runtime, root);
-                        }
+                        blit(&runtime, root);
                     }
                 }
                 webview::WebviewEvent::Posted { view, body } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_posted(&path, &body)
                     {
-                        if !window.in_live_resize() {
-                            blit(&runtime, root);
-                        }
+                        blit(&runtime, root);
                     }
                 }
                 webview::WebviewEvent::Console { view, line } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_console(&path, &line)
                     {
-                        if !window.in_live_resize() {
-                            blit(&runtime, root);
-                        }
+                        blit(&runtime, root);
                     }
                 }
                 webview::WebviewEvent::Requested { view, line } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_requested(&path, &line)
                     {
-                        if !window.in_live_resize() {
-                            blit(&runtime, root);
-                        }
+                        blit(&runtime, root);
                     }
                 }
                 webview::WebviewEvent::EvalDone { token, result } => {
                     if runtime.webview_eval_done(token, result) {
-                        if !window.in_live_resize() {
-                            blit(&runtime, root);
-                        }
+                        blit(&runtime, root);
                     }
                 }
                 webview::WebviewEvent::SnapshotDone { token, result } => {
@@ -906,9 +896,7 @@ pub fn run_window_chrome(
                         bunny_ui::host::WebviewSnapshot { width, height, rgba }
                     });
                     if runtime.webview_snapshot_done(token, result) {
-                        if !window.in_live_resize() {
-                            blit(&runtime, root);
-                        }
+                        blit(&runtime, root);
                     }
                 }
             }
@@ -922,19 +910,7 @@ pub fn run_window_chrome(
         let runtime = &handler_runtime;
         let root = &*handler_root;
         match event {
-        AppEvent::Redraw => blit(runtime, root),
-        // the single-presenter law reaches the queue: a worker's wake
-        // mid-drag would present with its own latency between two
-        // resize steps — the trembling's other half once the clocks
-        // yielded, because a workbench is never without a watcher or
-        // a language server answering. The ready tasks keep their
-        // flag; the next step, or the end-of-drag redraw, drains them
-        // with the frame it was already paying for.
-        AppEvent::Wake => {
-            if !window.in_live_resize() {
-                blit(runtime, root);
-            }
-        }
+        AppEvent::Redraw | AppEvent::Wake => blit(runtime, root),
         AppEvent::ResignKey => {
             // the user switched away: popovers close like the
             // platform's own (their panels never take key, so this
