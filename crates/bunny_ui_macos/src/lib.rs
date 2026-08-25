@@ -312,17 +312,8 @@ pub fn run_window_chrome(
             // scene with nothing on its islands pays exactly what it
             // paid before the sandwich existed.
             let mut segment_ranges: Vec<(usize, usize)> = Vec::new();
-            // mid-drag the sandwich itself yields: nothing lifts, the
-            // tail paints in the drawable (a ring's sliver hides
-            // behind the page for the length of the gesture), the
-            // per-step rasters stop, and the end-of-drag redraw lifts
-            // again — the same coming-home the live layers do
-            let segments: Vec<(String, bunny_ui::layout::DisplayList)> = if window
-                .in_live_resize()
-            {
-                Vec::new()
-            } else {
-                runtime.host_segments(full_display.len())
+            let segments: Vec<(String, bunny_ui::layout::DisplayList)> = runtime
+                .host_segments(full_display.len())
                 .into_iter()
                 .filter_map(|(path, range)| {
                     let host = hosts.iter().find(|host| {
@@ -342,8 +333,7 @@ pub fn run_window_chrome(
                     segment_ranges.extend(carves);
                     Some((path, lifted))
                 })
-                .collect()
-            };
+                .collect();
             {
                 let mut store = panels.borrow_mut();
                 let mut dead: Vec<String> = store
@@ -396,17 +386,9 @@ pub fn run_window_chrome(
                         );
                         let commands: Vec<_> = base.iter().cloned().collect();
                         let mut kept = beneaths.borrow_mut();
-                        let moved = kept.get(&overlay.path).is_none_or(|(was, size, _)| {
+                        let stale = kept.get(&overlay.path).is_none_or(|(was, size, _)| {
                             *size != panel_physical || *was != commands
                         });
-                        // fifteen milliseconds of window raster is a
-                        // price a DRAG must never pay: mid-resize the
-                        // panel keeps blurring the sample it has (a
-                        // panel BORN mid-drag still gets its first),
-                        // and the end-of-drag redraw refreshes it
-                        let stale = moved
-                            && (!window.in_live_resize()
-                                || kept.get(&overlay.path).is_none());
                         if stale {
                             let fresh = bunny_ui::raster::rasterize_with(
                                 &base,
@@ -1258,6 +1240,5 @@ mod trace {
         line(format_args!("{kind} {:.1} {w:.0}x{h:.0} live={} cmds={cmds}", ms(), u8::from(live)));
         Some(Traced(std::time::Instant::now()))
     }
-
 
 }
