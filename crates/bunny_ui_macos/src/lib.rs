@@ -948,7 +948,22 @@ pub fn run_window_chrome(
         let root = &*handler_root;
         match event {
         AppEvent::Redraw => blit(runtime, root, trace::Origin::Redraw),
-        AppEvent::Wake => blit(runtime, root, trace::Origin::Wake),
+        AppEvent::Wake => {
+            // Mid-drag there is exactly ONE presenter — the law the
+            // tick path already obeys below. A worker's wake used to
+            // present a whole scene between two steps of the resize:
+            // measured on a workbench as 113 same-size presents
+            // inside one 2.9 s gesture, every one via wake — a caret
+            // clock and its kin racing the drag. The WORK is not held
+            // back: the tasks are polled and their state lands; the
+            // next step of the resize (or the end-of-gesture Redraw)
+            // presents what they moved. Only the present yields.
+            if window.in_live_resize() {
+                runtime.poll_tasks();
+            } else {
+                blit(runtime, root, trace::Origin::Wake);
+            }
+        }
         AppEvent::ResignKey => {
             // the user switched away: popovers close like the
             // platform's own (their panels never take key, so this
