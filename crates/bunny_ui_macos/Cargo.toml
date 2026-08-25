@@ -11,3 +11,9 @@ bunny-ui = { workspace = true, features = ["canvas"] }
 # examples only (the real countries app in a native window)
 countries-core.workspace = true
 countries-pure.workspace = true
+
+# the present tape reader carries its own golden-tape tests; the other
+# examples stay on autodiscovery
+[[example]]
+name = "trace_report"
+test = true
