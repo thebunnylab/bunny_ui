@@ -2173,17 +2173,14 @@ impl WindowHandle {
             slot.height = px_height;
             slot.scale = scale;
             slot.flip = !slot.flip;
+            // the bytes arrive ALREADY premultiplied: a raster onto a
+            // transparent ground leaves rgb = colour x coverage (the
+            // rasterizer's own words). Multiplying here again squared
+            // the alpha — an opaque toast never showed it, and a
+            // nine-percent border faded to nothing
             let backing = &mut slot.buffers[slot.flip as usize];
             backing.clear();
             backing.extend_from_slice(rgba);
-            for pixel in backing.chunks_exact_mut(4) {
-                let alpha = pixel[3] as u32;
-                if alpha < 255 {
-                    for channel in 0..3 {
-                        pixel[channel] = (pixel[channel] as u32 * alpha / 255) as u8;
-                    }
-                }
-            }
             (backing.as_ptr(), backing.len())
         });
         let (x, y, w, h) = frame;

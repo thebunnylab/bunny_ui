@@ -441,18 +441,13 @@ pub fn run_window_chrome(
                     );
                     drop(kept);
 
-                    // the panel's CGImage is premultiplied; the house
-                    // compositor is straight — one pass, panel-sized
-                    let mut rgba = bitmap.to_rgba_bytes();
-                    for pixel in rgba.chunks_exact_mut(4) {
-                        let alpha = pixel[3] as u32;
-                        if alpha < 255 {
-                            for channel in 0..3 {
-                                pixel[channel] =
-                                    (pixel[channel] as u32 * alpha / 255) as u8;
-                            }
-                        }
-                    }
+                    // a raster onto a transparent ground is ALREADY
+                    // premultiplied (rgb = colour x coverage) — exactly
+                    // what the panel's CGImage declares. Multiplying
+                    // here again squared the alpha: card bodies are
+                    // opaque and never showed it, their soft shadows
+                    // were quietly half as deep as designed
+                    let rgba = bitmap.to_rgba_bytes();
                     panel.blit_partial(
                         panel_physical.0,
                         panel_physical.1,
