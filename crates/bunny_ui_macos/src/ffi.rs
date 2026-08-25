@@ -907,11 +907,45 @@ extern "C" fn bunny_slow(_this: Id, _sel: Sel, _timer: Id) {
 }
 
 extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, note: Id) {
-    // AppKit re-lays the titlebar container on every resize and on the
-    // way in and out of full screen, putting the buttons back where it
-    // wants them — so the app's placement is re-applied here. The
-    // notification names the window, so nothing global is needed.
+    window_frame_changed(note, "resize");
+}
+
+extern "C" fn bunny_window_did_move(_this: Id, _sel: Sel, note: Id) {
+    window_frame_changed(note, "move");
+}
+
+extern "C" fn bunny_window_did_change_backing(_this: Id, _sel: Sel, note: Id) {
+    window_frame_changed(note, "backing");
+}
+
+// AppKit re-lays the titlebar container on every resize and on the
+// way in and out of full screen, putting the buttons back where it
+// wants them — so the app's placement is re-applied here. The
+// notification names the window, so nothing global is needed.
+//
+// All three notifications answer the same way, but the tape tells
+// them apart: a drag on the left or top edge moves the origin AND
+// the size, so `move` and `resize` both arrive on every step.
+fn window_frame_changed(note: Id, kind: &str) {
     let window = unsafe { msg_id(note, sel("object")) };
+    if crate::trace::active() {
+        unsafe {
+            let view = msg_id(window, sel("contentView"));
+            if !view.is_null() {
+                let bounds = msg_rect(view, sel("bounds"));
+                let live = msg_bool(view, sel("inLiveResize")) != 0;
+                crate::trace::mark(
+                    "R",
+                    format_args!(
+                        "{:.0}x{:.0} kind={kind} live={}",
+                        bounds.size.width,
+                        bounds.size.height,
+                        u8::from(live)
+                    ),
+                );
+            }
+        }
+    }
     place_traffic_lights(window);
     dispatch(AppEvent::Redraw);
 }
@@ -1353,7 +1387,7 @@ unsafe fn register_classes() {
         class_addMethod(
             delegate,
             sel("windowDidChangeBackingProperties:"),
-            bunny_window_did_resize as *const c_void,
+            bunny_window_did_change_backing as *const c_void,
             types.as_ptr(),
         );
         // a moved window re-clamps its popovers against the screen —
@@ -1362,7 +1396,7 @@ unsafe fn register_classes() {
         class_addMethod(
             delegate,
             sel("windowDidMove:"),
-            bunny_window_did_resize as *const c_void,
+            bunny_window_did_move as *const c_void,
             types.as_ptr(),
         );
         // the presenter's anti-tear contract is armed on AppKit's own
@@ -1973,6 +2007,7 @@ extern "C" fn bunny_segment_forward(this: Id, cmd: Sel, event: Id) {
 
 unsafe fn register_segment_class() {
     REGISTER_SEGMENT.call_once(|| unsafe {
+        crate::trace::mark("X", format_args!("what=segment-class"));
         let name = CString::new("BunnySegmentView").expect("class name");
         let segment = objc_allocateClassPair(class("NSView"), name.as_ptr(), 0);
         let hit_types = CString::new("@@:{CGPoint=dd}").expect("type encoding");

@@ -225,21 +225,25 @@ pub fn run_window_chrome(
         Rc::new(RefCell::new(std::collections::HashMap::new()));
     // present takes a READY display list to the window — the tick path
     // reuses it without paying settle, effects or the IME tail
-    let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
+    let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList, trace::Origin)> = Rc::new({
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
         let segments_kept = Rc::clone(&segments_kept);
         let beneaths = Rc::clone(&beneaths);
-        move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
+        move |runtime: &Runtime,
+              full_display: bunny_ui::layout::DisplayList,
+              via: trace::Origin| {
             let (width, height) = window.content_size();
             let scale = window.scale();
             let canvas = bunny_ui::theme::canvas();
             let physical = ((width.round() as usize) * scale, (height.round() as usize) * scale);
-            // BUNNY_PRESENT_TRACE=1: one line per present into
-            // /tmp/bunny-present.trace — the tape a trembling resize is
-            // diagnosed from (what presented, at which size, how long it
-            // took, and whether the window moved under it).
-            let _traced = trace::begin("P", width, height, window.in_live_resize(), full_display.len());
+            let live_resize = window.in_live_resize();
+            // BUNNY_PRESENT_TRACE=1: the tape a trembling resize is
+            // diagnosed from — what presented, at which size, on whose
+            // ask, how long each stage took, and whether the window
+            // moved under it. See the `trace` module for the format.
+            let mut traced =
+                trace::begin(width, height, live_resize, full_display.len(), via);
             // the window presents everything BEFORE the first popover;
             // each popover re-presents its own slice on a child panel
             // in screen coordinates — that is how it leaves the window
@@ -293,6 +297,7 @@ pub fn run_window_chrome(
             window.host_sweep(
                 &hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>(),
             );
+            traced.stage("H", format_args!("hosts={}", hosts.len()));
             let overlays = runtime.overlays();
             let display = match overlays.first() {
                 Some(first) => full_display.translated_slice((0, first.display.0), 0.0, 0.0),
@@ -437,6 +442,7 @@ pub fn run_window_chrome(
                     );
                 }
             }
+            traced.stage("O", format_args!("panels={}", overlays.len()));
             if metal::active() {
                 // GPU present: the same display list, no Surface in the
                 // path — the drawable is the frame. The LIVE boxes are
@@ -454,7 +460,7 @@ pub fn run_window_chrome(
                 // resize's own transaction, so the box moves with the
                 // window by construction. The layers come back, seeded
                 // afresh, when the hand lets go.
-                let resizing = window.in_live_resize();
+                let resizing = live_resize;
                 if resizing {
                     window.live_layer_sweep(&[]);
                     runtime.forget_live_surfaces();
@@ -556,6 +562,10 @@ pub fn run_window_chrome(
                     window.blit_partial(width, height, retained.rgba(), &damage);
                 }
             }
+            traced.stage(
+                "M",
+                format_args!("sync={}", u8::from(metal::active() && live_resize)),
+            );
             // the segments themselves: rasterized only when their
             // commands changed (the ledger's answer, the beneaths'
             // discipline), blitted between the platform views, swept
@@ -563,6 +573,8 @@ pub fn run_window_chrome(
             {
                 let mut kept = segments_kept.borrow_mut();
                 let mut alive: Vec<String> = Vec::new();
+                let mut rastered = 0usize;
+                let mut raster_px = 0usize;
                 for (host, slice) in &segments {
                     // the surface is the CONTENT's box, never the
                     // window: a ring's segment rasterizes a ring —
@@ -618,15 +630,21 @@ pub fn run_window_chrome(
                         box_physical.1,
                     );
                     kept.insert(host.clone(), (commands, frame, scale));
+                    rastered += 1;
+                    raster_px += box_physical.0 * box_physical.1;
                 }
                 kept.retain(|key, _| alive.iter().any(|host| host == key));
                 window.segment_sweep(&alive);
+                traced.stage(
+                    "S",
+                    format_args!("n={} raster={rastered} px={raster_px}", alive.len()),
+                );
             }
         }
     });
     let blit = {
         let present = Rc::clone(&present);
-        move |runtime: &Runtime, root: &_| {
+        move |runtime: &Runtime, root: &_, via: trace::Origin| {
             // the handles' commands are spent BEFORE the frame
             // renders: the state an expired eval writes lands in this
             // very layout, and a navigation the app just asked for is
@@ -684,7 +702,7 @@ pub fn run_window_chrome(
                 },
             ));
             let display = runtime.display_frame(root, Size { width, height });
-            present(runtime, display);
+            present(runtime, display, via);
         let interaction = runtime.interaction();
         // a live divider drag keeps the resizer even while the pointer
         // runs ahead of the seam; hovering the grip announces it
@@ -786,7 +804,7 @@ pub fn run_window_chrome(
                 if let Some(text) = taken.text {
                     ffi::clipboard_write(&text);
                 }
-                blit(&runtime, &*root);
+                blit(&runtime, &*root, trace::Origin::Input);
                 return true;
             }
             // a field of MANY lines owns the bare break and the bare
@@ -803,7 +821,7 @@ pub fn run_window_chrome(
                 }
                 && runtime.key(command).applied
             {
-                blit(&runtime, &*root);
+                blit(&runtime, &*root, trace::Origin::Input);
                 return true;
             }
             let action = match runtime.chord(Stroke::new(pattern, stroke.typed)) {
@@ -811,13 +829,13 @@ pub fn run_window_chrome(
                 // the stroke opened (or let go of) a sequence: it is
                 // spent, and a which-key panel may have just changed
                 KeyMatch::Pending => {
-                    blit(&runtime, &*root);
+                    blit(&runtime, &*root, trace::Origin::Input);
                     return true;
                 }
                 KeyMatch::None => return false,
             };
             if runtime.dispatch_action(action) {
-                blit(&runtime, &*root);
+                blit(&runtime, &*root, trace::Origin::Input);
                 true
             } else {
                 false
@@ -862,33 +880,33 @@ pub fn run_window_chrome(
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_navigated(&path, &url)
                     {
-                        blit(&runtime, root);
+                        blit(&runtime, root, trace::Origin::Web);
                     }
                 }
                 webview::WebviewEvent::Posted { view, body } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_posted(&path, &body)
                     {
-                        blit(&runtime, root);
+                        blit(&runtime, root, trace::Origin::Web);
                     }
                 }
                 webview::WebviewEvent::Console { view, line } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_console(&path, &line)
                     {
-                        blit(&runtime, root);
+                        blit(&runtime, root, trace::Origin::Web);
                     }
                 }
                 webview::WebviewEvent::Requested { view, line } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_requested(&path, &line)
                     {
-                        blit(&runtime, root);
+                        blit(&runtime, root, trace::Origin::Web);
                     }
                 }
                 webview::WebviewEvent::EvalDone { token, result } => {
                     if runtime.webview_eval_done(token, result) {
-                        blit(&runtime, root);
+                        blit(&runtime, root, trace::Origin::Web);
                     }
                 }
                 webview::WebviewEvent::SnapshotDone { token, result } => {
@@ -896,7 +914,7 @@ pub fn run_window_chrome(
                         bunny_ui::host::WebviewSnapshot { width, height, rgba }
                     });
                     if runtime.webview_snapshot_done(token, result) {
-                        blit(&runtime, root);
+                        blit(&runtime, root, trace::Origin::Web);
                     }
                 }
             }
@@ -910,7 +928,8 @@ pub fn run_window_chrome(
         let runtime = &handler_runtime;
         let root = &*handler_root;
         match event {
-        AppEvent::Redraw | AppEvent::Wake => blit(runtime, root),
+        AppEvent::Redraw => blit(runtime, root, trace::Origin::Redraw),
+        AppEvent::Wake => blit(runtime, root, trace::Origin::Wake),
         AppEvent::ResignKey => {
             // the user switched away: popovers close like the
             // platform's own (their panels never take key, so this
@@ -918,7 +937,7 @@ pub fn run_window_chrome(
             // freeze: they animate for eyes that are on them
             runtime.set_loops_paused(true);
             if runtime.dismiss_all_overlays() {
-                blit(runtime, root);
+                blit(runtime, root, trace::Origin::Input);
             } else {
                 sync_frame_driver(runtime);
             }
@@ -930,35 +949,35 @@ pub fn run_window_chrome(
         }
         AppEvent::MouseMoved { x, y, modifiers } => {
             if runtime.pointer_moved(x, y, modifiers) {
-                blit(runtime, root);
+                blit(runtime, root, trace::Origin::Input);
             }
         }
         AppEvent::RightMouseDown { x, y } => {
             // the runtime opens (or closes) the context menu; the
             // panel presents like any overlay — outside the window too
             if runtime.context_click(x, y) {
-                blit(runtime, root);
+                blit(runtime, root, trace::Origin::Input);
             }
         }
         AppEvent::MouseDown { x, y, clicks, modifiers } => {
             if runtime.pointer_clicked(x, y, clicks, modifiers) {
-                blit(runtime, root);
+                blit(runtime, root, trace::Origin::Input);
             }
         }
         AppEvent::MouseUp { x, y } => {
             // fires on up-inside; the pressed visual always clears
             let _ = runtime.pointer_released(x, y);
-            blit(runtime, root);
+            blit(runtime, root, trace::Origin::Input);
         }
         AppEvent::MouseExited => {
             if runtime.pointer_exited() {
-                blit(runtime, root);
+                blit(runtime, root, trace::Origin::Input);
             }
         }
         AppEvent::Wheel { x, y, dx, dy } => {
             // offset is engine state: repaint without render (zero bodies)
             if runtime.wheel(x, y, dx, dy) {
-                blit(runtime, root);
+                blit(runtime, root, trace::Origin::Input);
             }
         }
         AppEvent::Key { code, shift, command, chars } => {
@@ -975,7 +994,7 @@ pub fn run_window_chrome(
                 53 => {
                     // esc releases focus
                     if runtime.blur() {
-                        blit(runtime, root);
+                        blit(runtime, root, trace::Origin::Input);
                     }
                     None
                 }
@@ -994,7 +1013,7 @@ pub fn run_window_chrome(
                         ffi::clipboard_write(text);
                     }
                     if cut.output.is_some() {
-                        blit(runtime, root);
+                        blit(runtime, root, trace::Origin::Input);
                     }
                     None
                 }
@@ -1007,7 +1026,7 @@ pub fn run_window_chrome(
             if let Some(edit) = edit
                 && runtime.key(edit).applied
             {
-                blit(runtime, root);
+                blit(runtime, root, trace::Origin::Input);
             }
         }
         AppEvent::Blink => {
@@ -1029,7 +1048,7 @@ pub fn run_window_chrome(
             // must never be gated: holding it back leaves the compositor
             // stretching a stale drawable through the whole drag.
             if (blinked || explained || chorded) && !window.in_live_resize() {
-                blit(runtime, root);
+                blit(runtime, root, trace::Origin::Blink);
             }
         }
         AppEvent::Frame { dt } => {
@@ -1053,7 +1072,7 @@ pub fn run_window_chrome(
             } else if moved.scene {
                 let (width, height) = window.content_size();
                 let display = runtime.animation_frame(root, Size { width, height });
-                handler_present(runtime, display);
+                handler_present(runtime, display, trace::Origin::Frame);
             } else if moved.islands {
                 // mid-resize the boxes are in the drawable, not on
                 // layers — a step repaints the scene like any other
@@ -1088,7 +1107,7 @@ pub fn run_window_chrome(
                     // rides the drawable, so a step is a scene frame
                     let (width, height) = window.content_size();
                     let display = runtime.animation_frame(root, Size { width, height });
-                    handler_present(runtime, display);
+                    handler_present(runtime, display, trace::Origin::Frame);
                 }
             }
             sync_frame_driver(runtime);
@@ -1096,7 +1115,7 @@ pub fn run_window_chrome(
         AppEvent::ImeInsert { text } => {
             // the IME commit (or plain typing through the input system)
             if runtime.key(EditCommand::Insert(text)).applied {
-                blit(runtime, root);
+                blit(runtime, root, trace::Origin::Input);
             }
         }
         AppEvent::ImeMark { text, location, length } => {
@@ -1105,12 +1124,12 @@ pub fn run_window_chrome(
                 caret_utf16: (location as usize, length as usize),
             };
             if runtime.key(command).applied {
-                blit(runtime, root);
+                blit(runtime, root, trace::Origin::Input);
             }
         }
         AppEvent::ImeUnmark => {
             if runtime.key(EditCommand::Unmark).applied {
-                blit(runtime, root);
+                blit(runtime, root, trace::Origin::Input);
             }
         }
         AppEvent::Command { selector } => {
@@ -1135,7 +1154,7 @@ pub fn run_window_chrome(
                 "cancelOperation:" => {
                     // esc releases focus
                     if runtime.blur() {
-                        blit(runtime, root);
+                        blit(runtime, root, trace::Origin::Input);
                     }
                     None
                 }
@@ -1146,7 +1165,7 @@ pub fn run_window_chrome(
             if let Some(edit) = edit
                 && runtime.key(edit).applied
             {
-                blit(runtime, root);
+                blit(runtime, root, trace::Origin::Input);
             }
         }
         }
@@ -1166,18 +1185,96 @@ pub fn run_window_chrome(
 }
 
 // =============================================================================
-// BUNNY_PRESENT_TRACE — the tape a trembling resize is diagnosed from
+// BUNNY_PRESENT_TRACE — the tape a trembling present is diagnosed from
 // =============================================================================
 
-/// `BUNNY_PRESENT_TRACE=1` appends one line per present to
-/// `/tmp/bunny-present.trace`: begin (`P <ms> <w>x<h> live=<0|1>
-/// cmds=<n>`) and end (`E <ms> dur=<ms>`). Off, it costs one branch.
+/// The present tape. `BUNNY_PRESENT_TRACE=1` writes one file per
+/// process — `/tmp/bunny-present.<pid>.trace`, truncated on start, so
+/// two processes never interleave on one tape. Any other value is used
+/// as the path, with a literal `{pid}` replaced by the process id.
+/// `BUNNY_TRACE_TAG` stamps the header with free text (a build or an
+/// experiment name). Off, each mark costs one branch.
+///
+/// One event per line. Times are milliseconds from the first mark of
+/// the process:
+///
+/// ```text
+/// # bunny-trace v2 pid=<pid> t0=<unix_ms> tag=<tag>
+/// R <ms> <w>x<h> kind=<resize|move|backing> live=<0|1>
+/// P <ms> <w>x<h> live=<0|1> cmds=<n> via=<origin>
+/// H <ms> dur=<ms> hosts=<n>
+/// O <ms> dur=<ms> panels=<n>
+/// M <ms> dur=<ms> sync=<0|1>
+/// S <ms> dur=<ms> n=<alive> raster=<n> px=<n>
+/// E <ms> dur=<ms>
+/// X <ms> what=<name>
+/// ```
+///
+/// `R` is a window callback (which notification asked, and at what
+/// size). `P` opens a present; `H` (host pass), `O` (overlay panels),
+/// `M` (scene presented, `sync` = inside the resize transaction) and
+/// `S` (segments: mounted, rasterized, pixels) each carry the time
+/// since the previous mark of the same present; `E` closes it with the
+/// total. `X` names a one-time cost (`sync-on`, `sync-off`,
+/// `buffer-grow`, `atlas-drain`, `segment-class`). `via` names the
+/// code path that asked for the present: `redraw` (a window callback),
+/// `wake` (a worker), `input` (an event), `frame` (the animation
+/// tick), `web` (a page report), `blink` (the slow clock).
 mod trace {
     use std::io::Write as _;
 
-    fn on() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("BUNNY_PRESENT_TRACE").is_some())
+    /// The code path that asked for a present.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Origin {
+        Redraw,
+        Wake,
+        Input,
+        Frame,
+        Web,
+        Blink,
+    }
+
+    impl Origin {
+        fn name(self) -> &'static str {
+            match self {
+                Origin::Redraw => "redraw",
+                Origin::Wake => "wake",
+                Origin::Input => "input",
+                Origin::Frame => "frame",
+                Origin::Web => "web",
+                Origin::Blink => "blink",
+            }
+        }
+    }
+
+    /// The tape, opened once — truncated, headed, and kept. Opening
+    /// per line was measurable inside the present it was measuring.
+    fn out() -> Option<&'static std::sync::Mutex<std::fs::File>> {
+        static OUT: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+            std::sync::OnceLock::new();
+        OUT.get_or_init(|| {
+            let value = std::env::var("BUNNY_PRESENT_TRACE").ok()?;
+            let pid = std::process::id();
+            let path = if value == "1" || value.is_empty() {
+                format!("/tmp/bunny-present.{pid}.trace")
+            } else {
+                value.replace("{pid}", &pid.to_string())
+            };
+            let mut file = std::fs::File::create(path).ok()?;
+            let t0 = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |t| t.as_millis());
+            let tag = std::env::var("BUNNY_TRACE_TAG").unwrap_or_default();
+            let _ = writeln!(file, "# bunny-trace v2 pid={pid} t0={t0} tag={tag}");
+            Some(std::sync::Mutex::new(file))
+        })
+        .as_ref()
+    }
+
+    /// True when the tape is on — the gate a caller checks before
+    /// paying for anything a mark would need.
+    pub(crate) fn active() -> bool {
+        out().is_some()
     }
 
     fn ms() -> f64 {
@@ -1186,35 +1283,68 @@ mod trace {
     }
 
     fn line(args: std::fmt::Arguments<'_>) {
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/bunny-present.trace")
+        if let Some(file) = out()
+            && let Ok(mut file) = file.lock()
         {
             let _ = writeln!(file, "{args}");
         }
     }
 
-    /// Logged on drop, so every exit of a present answers with its
+    /// One line outside a present — the window callbacks (`R`) and the
+    /// one-time costs (`X`).
+    pub(crate) fn mark(kind: &str, args: std::fmt::Arguments<'_>) {
+        if !active() {
+            return;
+        }
+        line(format_args!("{kind} {:.1} {args}", ms()));
+    }
+
+    /// The marks of one present: `P` on begin, one line per stage, and
+    /// `E` with the total on drop — so every exit answers with its
     /// duration.
-    pub(crate) struct Traced(std::time::Instant);
+    pub(crate) struct Traced(Option<Stages>);
+
+    struct Stages {
+        start: std::time::Instant,
+        last: std::time::Instant,
+    }
+
+    impl Traced {
+        /// Closes one stage: the line carries the time since the
+        /// previous mark of this present.
+        pub(crate) fn stage(&mut self, kind: &str, args: std::fmt::Arguments<'_>) {
+            if let Some(stages) = &mut self.0 {
+                let now = std::time::Instant::now();
+                let dur = now.duration_since(stages.last).as_secs_f64() * 1000.0;
+                line(format_args!("{kind} {:.1} dur={dur:.1} {args}", ms()));
+                stages.last = now;
+            }
+        }
+    }
 
     impl Drop for Traced {
         fn drop(&mut self) {
-            line(format_args!(
-                "E {:.1} dur={:.1}",
-                ms(),
-                self.0.elapsed().as_secs_f64() * 1000.0
-            ));
+            if let Some(stages) = &self.0 {
+                line(format_args!(
+                    "E {:.1} dur={:.1}",
+                    ms(),
+                    stages.start.elapsed().as_secs_f64() * 1000.0
+                ));
+            }
         }
     }
 
-    pub(crate) fn begin(kind: &str, w: f64, h: f64, live: bool, cmds: usize) -> Option<Traced> {
-        if !on() {
-            return None;
+    pub(crate) fn begin(w: f64, h: f64, live: bool, cmds: usize, via: Origin) -> Traced {
+        if !active() {
+            return Traced(None);
         }
-        line(format_args!("{kind} {:.1} {w:.0}x{h:.0} live={} cmds={cmds}", ms(), u8::from(live)));
-        Some(Traced(std::time::Instant::now()))
+        line(format_args!(
+            "P {:.1} {w:.0}x{h:.0} live={} cmds={cmds} via={}",
+            ms(),
+            u8::from(live),
+            via.name()
+        ));
+        let now = std::time::Instant::now();
+        Traced(Some(Stages { start: now, last: now }))
     }
-
 }

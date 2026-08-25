@@ -2512,6 +2512,7 @@ unsafe fn upload_frame(
                 msg_void(slot.buffer, sels.release);
             }
             let capacity = total.next_multiple_of(4096);
+            crate::trace::mark("X", format_args!("what=buffer-grow bytes={capacity}"));
             slot.buffer = msg_id_u64_u64(
                 device,
                 sel("newBufferWithLength:options:"),
@@ -2622,6 +2623,10 @@ impl MetalPresenter {
         if live == self.transactional {
             return;
         }
+        crate::trace::mark(
+            "X",
+            format_args!("what=sync-{}", if live { "on" } else { "off" }),
+        );
         unsafe {
             msg_void_bool(
                 self.layer,
@@ -2674,6 +2679,7 @@ impl MetalPresenter {
                         eprintln!("bunny_ui metal: atlas overflow survived two resets");
                         return;
                     }
+                    crate::trace::mark("X", format_args!("what=atlas-drain"));
                     self.drain_slots();
                     self.atlas.reset(true);
                 }
