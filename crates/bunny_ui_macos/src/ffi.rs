@@ -906,6 +906,41 @@ extern "C" fn bunny_slow(_this: Id, _sel: Sel, _timer: Id) {
     dispatch(AppEvent::Frame { dt });
 }
 
+/// Removes CoreAnimation's implicit animations from a layer the shell
+/// created. AppKit turns them off for the backing layers IT makes; a
+/// layer handed to `setLayer:` — or added as a raw sublayer — keeps
+/// the default quarter-second actions, and the first abrupt step of a
+/// live resize then CROSSFADES the old content over the new: the
+/// whole window reads double-exposed until the animation lands, which
+/// no native window does. Per-mutation `setDisableActions:` cannot
+/// cover this — the resize mutates the layer from APPKIT's own
+/// transaction. The dictionary answers at the layer, for every
+/// transaction; NSNull is CoreAnimation's own word for "no action".
+pub(crate) unsafe fn kill_layer_actions(layer: Id) {
+    unsafe {
+        let null = msg_id(class("NSNull"), sel("null"));
+        let actions = msg_id(class("NSMutableDictionary"), sel("dictionary"));
+        for key in [
+            "bounds",
+            "position",
+            "frame",
+            "contents",
+            "contentsScale",
+            "hidden",
+            "sublayers",
+            "onOrderIn",
+            "onOrderOut",
+            "transform",
+        ] {
+            let key = CString::new(key).expect("action key");
+            let key =
+                msg_id_cstr(class("NSString"), sel("stringWithUTF8String:"), key.as_ptr());
+            msg_void_id_id(actions, sel("setObject:forKey:"), null, key);
+        }
+        msg_void_id(layer, sel("setActions:"), actions);
+    }
+}
+
 extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, note: Id) {
     window_frame_changed(note, "resize");
 }
@@ -1519,6 +1554,10 @@ impl WindowHandle {
                 let mut layers = layers.borrow_mut();
                 let entry = layers.entry(key.to_string()).or_insert_with(|| {
                     let layer = msg_id(class("CALayer"), sel("layer"));
+                    // a raw sublayer keeps CA's default quarter-second
+                    // actions — the trail and the order-in fade both
+                    // die here, for every transaction that touches it
+                    unsafe { kill_layer_actions(layer) };
                     // the sublayer composites over the drawable — where
                     // the scene left the box's hole
                     msg_void_id(root, sel("addSublayer:"), layer);

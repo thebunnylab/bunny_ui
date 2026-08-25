@@ -2828,6 +2828,11 @@ pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool
         // frame pacing for an event-driven present
         msg_void_bool(layer, sel("setAllowsNextDrawableTimeout:"), 0);
         msg_void_f64(layer, sel("setContentsScale:"), scale);
+        // the layer is OURS, so AppKit never disables CA's implicit
+        // actions on it — and an abrupt resize step would crossfade
+        // the old drawable over the new for a quarter second, the
+        // whole window double-exposed (no native window does this)
+        crate::ffi::kill_layer_actions(layer);
         msg_void_id(view, sel("setLayer:"), layer);
 
         let device = stack.device;
