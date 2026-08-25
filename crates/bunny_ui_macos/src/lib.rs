@@ -316,29 +316,48 @@ pub fn run_window_chrome(
             // stripe beside it and the status bar under it STAY, and a
             // scene with nothing on its islands pays exactly what it
             // paid before the sandwich existed.
+            //
+            // WHILE THE WINDOW CHANGES SIZE the segments come home,
+            // under the law the live boxes already obey: a segment's
+            // commands change on every step of a resize, and a
+            // changed segment is a CPU raster of its whole box INSIDE
+            // the present. A border hugging an island rasterized the
+            // island — measured at ~3.3M pixels and ~165 ms per step,
+            // an 18-step drag where the same gesture without it ran
+            // 198 — so the drag starved and the compositor stretched
+            // stale frames between rare presents, which is what a
+            // trembling resize IS. Home, the commands paint in the
+            // drawable and move with the window by construction; the
+            // island covers its one-point overlap for the length of
+            // the gesture, and the end-of-gesture Redraw mints the
+            // segment back.
             let mut segment_ranges: Vec<(usize, usize)> = Vec::new();
-            let segments: Vec<(String, bunny_ui::layout::DisplayList)> = runtime
-                .host_segments(full_display.len())
-                .into_iter()
-                .filter_map(|(path, range)| {
-                    let host = hosts.iter().find(|host| {
-                        host.path == path
-                            && host.visible.size.width > 0.0
-                            && host.visible.size.height > 0.0
-                    })?;
-                    let island = bunny_ui::layout::Rect {
-                        origin: bunny_ui::layout::Point {
-                            x: host.frame.origin.x + host.visible.origin.x,
-                            y: host.frame.origin.y + host.visible.origin.y,
-                        },
-                        size: host.visible.size,
-                    };
-                    let (carves, lifted) =
-                        bunny_ui::raster::carve_covering(&full_display, range, island)?;
-                    segment_ranges.extend(carves);
-                    Some((path, lifted))
-                })
-                .collect();
+            let segments: Vec<(String, bunny_ui::layout::DisplayList)> = if live_resize {
+                Vec::new()
+            } else {
+                runtime
+                    .host_segments(full_display.len())
+                    .into_iter()
+                    .filter_map(|(path, range)| {
+                        let host = hosts.iter().find(|host| {
+                            host.path == path
+                                && host.visible.size.width > 0.0
+                                && host.visible.size.height > 0.0
+                        })?;
+                        let island = bunny_ui::layout::Rect {
+                            origin: bunny_ui::layout::Point {
+                                x: host.frame.origin.x + host.visible.origin.x,
+                                y: host.frame.origin.y + host.visible.origin.y,
+                            },
+                            size: host.visible.size,
+                        };
+                        let (carves, lifted) =
+                            bunny_ui::raster::carve_covering(&full_display, range, island)?;
+                        segment_ranges.extend(carves);
+                        Some((path, lifted))
+                    })
+                    .collect()
+            };
             {
                 let mut store = panels.borrow_mut();
                 let mut dead: Vec<String> = store
