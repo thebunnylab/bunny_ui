@@ -192,6 +192,8 @@ unsafe extern "system" {
     ) -> i32;
     fn IsWindowVisible(hwnd: Hwnd) -> i32;
     fn GetWindowLongW(hwnd: Hwnd, index: i32) -> i32;
+    fn SetFocus(hwnd: Hwnd) -> Hwnd;
+    fn GetFocus() -> Hwnd;
 }
 
 #[repr(C)]
@@ -1769,6 +1771,12 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_LBUTTONDOWN => {
+            // a click on the scene takes the keyboard BACK from the
+            // island: the platform moves activation on a click, never
+            // the focus, and the engine's child grabs it at creation —
+            // without this a field beside a page can never hear a key
+            // (the mac's responder move, spelled by hand)
+            reclaim_keyboard();
             // the grab: a drag that leaves the window keeps reporting
             unsafe {
                 SetCapture(hwnd);
@@ -1789,6 +1797,9 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_RBUTTONDOWN => {
+            // the same reclaim as the left press — a context ask is
+            // still the scene's click
+            reclaim_keyboard();
             let (x, y) = layout_point(hwnd, lparam);
             dispatch(AppEvent::RightMouseDown { x, y });
             0
@@ -2202,6 +2213,22 @@ pub fn run() {
 /// platform's `command` — the `key_pattern` law.)
 pub(crate) fn control_held() -> bool {
     unsafe { GetKeyState(VK_CONTROL) as u16 & 0x8000 != 0 }
+}
+
+/// Puts the keyboard back in the scene's hands — the main window is
+/// where the pump reads keys from, and any click that reached OUR
+/// window procedure (the window, a panel, a segment) was a click on
+/// scene content. A no-op when the scene already holds it.
+fn reclaim_keyboard() {
+    let main = MAIN_HWND.load(Ordering::Acquire);
+    if main == 0 {
+        return;
+    }
+    unsafe {
+        if GetFocus() != main {
+            SetFocus(main);
+        }
+    }
 }
 
 pub(crate) fn gate_consumes(stroke: &KeyStroke) -> bool {
