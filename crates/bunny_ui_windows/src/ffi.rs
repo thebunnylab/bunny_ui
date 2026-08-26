@@ -191,6 +191,8 @@ unsafe extern "system" {
         flags: u32,
     ) -> i32;
     fn IsWindowVisible(hwnd: Hwnd) -> i32;
+    fn IsWindow(hwnd: Hwnd) -> i32;
+    fn GetWindowLongW(hwnd: Hwnd, index: i32) -> i32;
 }
 
 #[repr(C)]
@@ -354,6 +356,13 @@ const WS_POPUP: u32 = 0x8000_0000;
 const WS_EX_LAYERED: u32 = 0x0008_0000;
 const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
 const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+// host container styles: a child clips to its parent by law, and the
+// two clip bits keep siblings and the parent's own paint off it
+const WS_CHILD: u32 = 0x4000_0000;
+const WS_CLIPCHILDREN: u32 = 0x0200_0000;
+const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
+const WS_VISIBLE: u32 = 0x1000_0000;
+const GWL_STYLE: i32 = -16;
 const SW_SHOWNOACTIVATE: i32 = 4;
 const SW_HIDE: i32 = 0;
 const ULW_ALPHA: u32 = 2;
@@ -1724,9 +1733,14 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
         }
         WM_MOUSEACTIVATE => {
             if hwnd != MAIN_HWND.load(Ordering::Acquire) {
-                // a panel never takes the keyboard — the second belt
-                // beside WS_EX_NOACTIVATE
-                return MA_NOACTIVATE;
+                let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+                if style & WS_CHILD == 0 {
+                    // a panel never takes the keyboard — the second belt
+                    // beside WS_EX_NOACTIVATE
+                    return MA_NOACTIVATE;
+                }
+                // a child surface (a segment over a host) is part of the
+                // window: a click on it activates the window it lives in
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -2036,7 +2050,9 @@ pub fn create_window(title: &str, width: f64, height: f64, scene_chrome: bool) -
     SCENE_CHROME.with(|cell| cell.set(scene_chrome));
     let class_name = register_class();
     let title = wide(title);
-    let style = WS_OVERLAPPEDWINDOW;
+    // WS_CLIPCHILDREN: the CPU road's GDI paint excludes the native
+    // hosts' rects, so nothing ever flashes under an island
+    let style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
     const CW_USEDEFAULT: i32 = i32::MIN; // 0x80000000
     let hwnd = unsafe {
         CreateWindowExW(
@@ -2400,6 +2416,229 @@ pub fn create_panel(owner: &WindowHandle) -> WindowHandle {
     WindowHandle { hwnd }
 }
 
+// MARK: - Native hosts
+//
+// A box a PLATFORM view owns (`docs/webview.md`): the scene keeps a
+// hole, and a child window fills it. Two windows per host on the mac
+// (container + tenant); here the CONTAINER is ours and the tenant is
+// whatever the platform mounts inside it (WebView2 parents its own
+// child tree into the container). The container IS the clip: a child
+// never draws outside its parent's client area, so placing the
+// container at the visible cut and the tenant at the whole box's
+// negative offset shows a cut without ever rewrapping the content.
+
+/// One mounted host: the clipping container, the spec fingerprint the
+/// mount was last instructed with, and whether the cut is shown.
+struct HostSlot {
+    container: Hwnd,
+    stamp: String,
+    hidden: bool,
+}
+
+thread_local! {
+    /// Alive hosts by placement path — the mac's `HOST_VIEWS` twin.
+    static HOST_SLOTS: RefCell<HashMap<String, HostSlot>> = RefCell::new(HashMap::new());
+}
+
+/// The container a host mounted under `key` lives in — what a segment
+/// surface stacks directly above, and what the tenant is keyed by.
+pub(crate) fn host_container(key: &str) -> Option<Hwnd> {
+    HOST_SLOTS.with(|slots| slots.borrow().get(key).map(|slot| slot.container))
+}
+
+/// The container's own class: a clip, not a participant — every
+/// message takes the default road, and the tenant inside answers for
+/// itself. (The shared "BunnyWindow" proc would answer with main-window
+/// semantics.)
+unsafe extern "system" fn host_pane_proc(
+    hwnd: Hwnd,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+fn register_host_pane_class() -> Vec<u16> {
+    static ONCE: OnceLock<Vec<u16>> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let name = wide("BunnyHostPane");
+        let class = WndClassW {
+            style: 0,
+            wnd_proc: host_pane_proc,
+            cls_extra: 0,
+            wnd_extra: 0,
+            instance: unsafe { GetModuleHandleW(std::ptr::null()) },
+            icon: 0,
+            cursor: 0,
+            background: 0,
+            menu_name: std::ptr::null(),
+            class_name: name.as_ptr(),
+        };
+        unsafe {
+            RegisterClassW(&class);
+        }
+        name
+    })
+    .clone()
+}
+
+/// A fresh container, born HIDDEN at zero size — the first placement
+/// positions it and shows it, so nothing flashes at stale coordinates.
+fn create_host_pane(parent: Hwnd) -> Hwnd {
+    let class_name = register_host_pane_class();
+    let title = wide("");
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            title.as_ptr(),
+            WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            0,
+            0,
+            0,
+            0,
+            parent,
+            0,
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null(),
+        )
+    };
+    assert!(hwnd != 0, "the platform refused the host pane");
+    hwnd
+}
+
+impl WindowHandle {
+    /// Mounts, places, clips, shows and hides one host, keyed by its
+    /// placement path — the mac `host_place` with the flip gone (this
+    /// platform already counts from the top-left) and the tenant's
+    /// geometry handed to a closure (the tenant is sized by a COM call
+    /// that belongs to the webview module, not here).
+    ///
+    /// `frame` is the layout rect and `visible` the BOX-LOCAL cut, both
+    /// in logical points; `make` runs once on first sight with the
+    /// fresh container; `place` runs every frame with the tenant's
+    /// container-local rect in physical pixels and whether the cut is
+    /// shown; `update` runs when `stamp` changed.
+    ///
+    /// No platform call runs while the slot table is borrowed —
+    /// `SetWindowPos` delivers messages synchronously, and a proc that
+    /// asks about hosts mid-write must find an answer, not a borrow.
+    pub fn host_place(
+        &self,
+        key: &str,
+        stamp: &str,
+        frame: (f64, f64, f64, f64),
+        visible: (f64, f64, f64, f64),
+        make: impl FnOnce(Hwnd),
+        update: impl FnOnce(&str),
+        place: impl FnOnce((i32, i32, i32, i32), bool),
+    ) {
+        // the TRUE fractional factor: the tenant's bounds are physical
+        // pixels, and the ceil'd raster scale would misplace the island
+        // by up to 60% on a 125% monitor
+        let factor = shared_factor();
+        let px = |v: f64| (v * factor).round() as i32;
+        let (x, y, w, h) = frame;
+        let (vx, vy, vw, vh) = visible;
+
+        let known = HOST_SLOTS
+            .with(|slots| slots.borrow().get(key).map(|slot| slot.container));
+        let container = match known {
+            Some(container) => container,
+            None => {
+                let container = create_host_pane(self.hwnd);
+                make(container);
+                HOST_SLOTS.with(|slots| {
+                    slots.borrow_mut().insert(
+                        key.to_string(),
+                        HostSlot {
+                            container,
+                            stamp: stamp.to_string(),
+                            hidden: true,
+                        },
+                    );
+                });
+                container
+            }
+        };
+
+        let shown = vw > 0.0 && vh > 0.0;
+        if shown {
+            unsafe {
+                SetWindowPos(
+                    container,
+                    0,
+                    px(x + vx),
+                    px(y + vy),
+                    px(vw),
+                    px(vh),
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+        let was_hidden = HOST_SLOTS.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            let slot = slots.get_mut(key).expect("the slot mounted above");
+            std::mem::replace(&mut slot.hidden, !shown)
+        });
+        // hide, never unmount — a page keeps its state while scrolled
+        // off; the show lands AFTER the placement so nothing flashes
+        if shown && was_hidden {
+            unsafe {
+                ShowWindow(container, SW_SHOWNOACTIVATE);
+            }
+        } else if !shown && !was_hidden {
+            unsafe {
+                ShowWindow(container, SW_HIDE);
+            }
+        }
+        // the tenant keeps the WHOLE box at negative offset: the cut
+        // shows through, the content never rewraps
+        place((px(-vx), px(-vy), px(w), px(h)), shown);
+
+        let stale = HOST_SLOTS.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            let slot = slots.get_mut(key).expect("the slot mounted above");
+            if slot.stamp == stamp {
+                false
+            } else {
+                slot.stamp = stamp.to_string();
+                true
+            }
+        });
+        if stale {
+            update(stamp);
+        }
+    }
+
+    /// Retires every host that left the scene: the tenant first (a
+    /// webview must `Close()` before its window dies), then the
+    /// container — which takes whatever the platform mounted inside it.
+    pub fn host_sweep(&self, alive: &[String], mut retire: impl FnMut(&str)) {
+        let dead: Vec<(String, Hwnd)> = HOST_SLOTS.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            let keys: Vec<String> = slots
+                .keys()
+                .filter(|key| !alive.contains(key))
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .map(|key| {
+                    let slot = slots.remove(&key).expect("collected above");
+                    (key, slot.container)
+                })
+                .collect()
+        });
+        for (key, container) in dead {
+            retire(&key);
+            unsafe {
+                DestroyWindow(container);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2486,6 +2725,110 @@ mod tests {
         assert!((y - (-12.0)).abs() < 1.0, "y lands in the scene: {y}");
         panel.close_panel();
         unsafe {
+            DestroyWindow(window.hwnd);
+        }
+    }
+
+    #[test]
+    fn a_host_mounts_places_and_sweeps() {
+        use std::cell::Cell;
+        let window = create_window("bunny host", 200.0, 150.0, false);
+        MAIN_HWND.store(window.hwnd, Ordering::Release);
+        let factor = shared_factor();
+        let px = |v: f64| (v * factor).round() as i32;
+
+        // first sight: the container is born, the tenant is asked once,
+        // and the placement hands the WHOLE box at negative offset
+        let made = Cell::new(0);
+        let placed = Cell::new((0, 0, 0, 0));
+        let shown = Cell::new(false);
+        window.host_place(
+            "a/pane",
+            "stamp-1",
+            (10.0, 20.0, 100.0, 80.0),
+            (5.0, 0.0, 60.0, 80.0),
+            |_| made.set(made.get() + 1),
+            |_| panic!("a fresh mount never re-instructs"),
+            |rect, visible| {
+                placed.set(rect);
+                shown.set(visible);
+            },
+        );
+        assert_eq!(made.get(), 1);
+        assert!(shown.get());
+        assert_eq!(placed.get(), (px(-5.0), 0, px(100.0), px(80.0)));
+        let container = host_container("a/pane").expect("the slot holds the container");
+        unsafe {
+            // the container's OWN visibility bit: IsWindowVisible asks
+            // the whole ancestor chain, and the test window never shows
+            let style = GetWindowLongW(container, GWL_STYLE) as u32;
+            assert!(style & WS_VISIBLE != 0, "a non-empty cut shows");
+            assert!(style & WS_CHILD != 0, "the container is a child of the window");
+        }
+        // the container sits at the visible cut, sized to it
+        let mut rect = Rect::default();
+        let mut origin = Point { x: 0, y: 0 };
+        unsafe {
+            GetWindowRect(container, &mut rect);
+            ClientToScreen(window.hwnd, &mut origin);
+        }
+        assert_eq!(rect.left - origin.x, px(15.0));
+        assert_eq!(rect.top - origin.y, px(20.0));
+        assert_eq!(rect.right - rect.left, px(60.0));
+        assert_eq!(rect.bottom - rect.top, px(80.0));
+
+        // the same stamp neither remakes nor re-instructs
+        window.host_place(
+            "a/pane",
+            "stamp-1",
+            (10.0, 20.0, 100.0, 80.0),
+            (5.0, 0.0, 60.0, 80.0),
+            |_| made.set(made.get() + 10),
+            |_| panic!("the stamp did not change"),
+            |_, _| {},
+        );
+        assert_eq!(made.get(), 1);
+
+        // a changed stamp re-instructs the SAME container
+        let updated = Cell::new(false);
+        window.host_place(
+            "a/pane",
+            "stamp-2",
+            (10.0, 20.0, 100.0, 80.0),
+            (5.0, 0.0, 60.0, 80.0),
+            |_| made.set(made.get() + 10),
+            |_| updated.set(true),
+            |_, _| {},
+        );
+        assert!(updated.get());
+        assert_eq!(made.get(), 1);
+
+        // an empty cut hides — never unmounts
+        window.host_place(
+            "a/pane",
+            "stamp-2",
+            (10.0, 20.0, 100.0, 80.0),
+            (0.0, 0.0, 0.0, 0.0),
+            |_| made.set(made.get() + 10),
+            |_| panic!("hiding is not an instruction"),
+            |_, visible| assert!(!visible, "an empty cut reports hidden"),
+        );
+        unsafe {
+            let style = GetWindowLongW(container, GWL_STYLE) as u32;
+            assert!(style & WS_VISIBLE == 0, "an empty cut hides");
+        }
+        assert!(host_container("a/pane").is_some(), "hidden is still mounted");
+
+        // the sweep retires the tenant first, then the container
+        let retired = Cell::new(0);
+        window.host_sweep(&[], |key| {
+            assert_eq!(key, "a/pane");
+            retired.set(retired.get() + 1);
+        });
+        assert_eq!(retired.get(), 1);
+        assert!(host_container("a/pane").is_none(), "the registry empties");
+        unsafe {
+            assert!(IsWindow(container) == 0, "the container died with the slot");
             DestroyWindow(window.hwnd);
         }
     }
