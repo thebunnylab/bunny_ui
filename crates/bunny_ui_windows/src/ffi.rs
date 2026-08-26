@@ -659,7 +659,7 @@ fn held_modifiers_now() -> bunny_ui::action::Modifiers {
 }
 
 /// Builds the stroke for one `WM_KEYDOWN`/`WM_SYSKEYDOWN`.
-fn key_stroke_of(wparam: usize, lparam: isize) -> KeyStroke {
+pub(crate) fn key_stroke_of(wparam: usize, lparam: isize) -> KeyStroke {
     let vk = wparam as u32;
     let scan_code = ((lparam >> 16) & 0x1FF) as u32;
     let shift = unsafe { GetKeyState(VK_SHIFT) } as u16 & 0x8000 != 0;
@@ -1004,7 +1004,7 @@ pub fn sync_ime(state: Option<(bool, usize, (f64, f64, f64, f64))>) {
 }
 
 /// Whether a composition is live — the gate's first question.
-fn ime_composing() -> bool {
+pub(crate) fn ime_composing() -> bool {
     IME.with(|cell| cell.get().marked)
 }
 
@@ -2186,18 +2186,26 @@ pub fn run() {
                 // the IME consumed was never the keymap's to take
                 && msg.wparam as u32 != VK_PROCESSKEY
                 && !ime_composing()
-                && {
-                    let stroke = key_stroke_of(msg.wparam, msg.lparam);
-                    KEY_GATE.with(|slot| {
-                        slot.borrow_mut().as_mut().is_some_and(|gate| gate(&stroke))
-                    })
-                };
+                && gate_consumes(&key_stroke_of(msg.wparam, msg.lparam));
             if !gated {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
     }
+}
+
+/// ONE gate body for the two keyboards: the pump's (the scene holds
+/// focus) and the island's accelerator road (the page does) — a chord
+/// consumed here never reaches whoever asked.
+/// Is the platform's accelerator key held right now? (Ctrl is this
+/// platform's `command` — the `key_pattern` law.)
+pub(crate) fn control_held() -> bool {
+    unsafe { GetKeyState(VK_CONTROL) as u16 & 0x8000 != 0 }
+}
+
+pub(crate) fn gate_consumes(stroke: &KeyStroke) -> bool {
+    KEY_GATE.with(|slot| slot.borrow_mut().as_mut().is_some_and(|gate| gate(stroke)))
 }
 
 // MARK: - WindowHandle

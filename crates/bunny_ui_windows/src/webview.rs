@@ -28,9 +28,24 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use bunny_ui::host::{HostSpec, WebviewInput};
+use bunny_ui::action::Modifiers;
+use bunny_ui::host::{HostSpec, MouseButton, WebviewCapability, WebviewInput};
 
 use crate::ffi::{Guid, Hresult, Hwnd, Rect, UnknownVtbl, com_init, com_ok, wide};
+
+/// What this backend serves, as the value the app reads
+/// (`docs/webview.md` — the capability table's WebView2 column):
+/// console and requests NATIVELY, synthetic input by the browser's
+/// own input pipeline — and no response bodies yet, because core has
+/// no door a body could travel through (the engine-side road exists;
+/// declaring the cell with no door would be an empty answer).
+pub fn capabilities() -> &'static [WebviewCapability] {
+    &[
+        WebviewCapability::ConsoleMessages,
+        WebviewCapability::NetworkRequests,
+        WebviewCapability::SyntheticInput,
+    ]
+}
 
 #[link(name = "kernel32", kind = "raw-dylib")]
 unsafe extern "system" {
@@ -420,6 +435,14 @@ const IID_RESPONSE_RECEIVED: Guid = Guid {
     d3: 0x40c3,
     d4: [0xa2, 0xde, 0xd4, 0xf4, 0x58, 0xe6, 0x98, 0x28],
 };
+/// `ICoreWebView2AcceleratorKeyPressedEventHandler`
+/// {B29C7E28-FA79-41A8-8E44-65811C76DCB2}.
+const IID_ACCELERATOR: Guid = Guid {
+    d1: 0xb29c7e28,
+    d2: 0xfa79,
+    d3: 0x41a8,
+    d4: [0x8e, 0x44, 0x65, 0x81, 0x1c, 0x76, 0xdc, 0xb2],
+};
 
 // MARK: - Consumed vtables (header order, indexes cited, runs padded)
 
@@ -706,6 +729,24 @@ struct ResponseViewVtbl {
     _pad_5_6: [usize; 2],
 }
 
+/// `ICoreWebView2AcceleratorKeyPressedEventArgs` — 9 slots.
+#[repr(C)]
+struct AcceleratorArgsVtbl {
+    unknown: UnknownVtbl, // 0-2
+    /// 3 `get_KeyEventKind(*kind)` — 0 KEY_DOWN, 1 KEY_UP,
+    /// 2 SYSTEM_KEY_DOWN, 3 SYSTEM_KEY_UP.
+    get_key_event_kind: unsafe extern "system" fn(*mut c_void, *mut i32) -> Hresult,
+    /// 4 `get_VirtualKey(*vk)`.
+    get_virtual_key: unsafe extern "system" fn(*mut c_void, *mut u32) -> Hresult,
+    /// 5 `get_KeyEventLParam(*lparam)`.
+    get_key_event_lparam: unsafe extern "system" fn(*mut c_void, *mut i32) -> Hresult,
+    /// 6 get_PhysicalKeyStatus; 7 get_Handled.
+    _pad_6_7: [usize; 2],
+    /// 8 `put_Handled(BOOL)` — TRUE suppresses both the browser's
+    /// default action and the page's sight of the stroke.
+    put_handled: unsafe extern "system" fn(*mut c_void, i32) -> Hresult,
+}
+
 /// `IStream` — 14 slots; the snapshot needs a rewind and a read.
 #[repr(C)]
 struct StreamVtbl {
@@ -946,7 +987,6 @@ enum Queued {
     Forward,
     Eval { token: u64, js: Rc<str> },
     Snapshot { token: u64 },
-    #[allow(dead_code)] // spent when the hand is built
     Input(WebviewInput),
 }
 
@@ -1274,6 +1314,21 @@ fn controller_landed(path: &str, generation: u64, hr: Hresult, controller: *mut 
         let _ = ((*(*controller).vtbl).add_got_focus)(controller, on_focus, &mut token);
         com_release(on_focus);
 
+        // the chords outrank the island: while the page holds the
+        // keyboard this event is the one road an app chord has back —
+        // the pump's own gate runs behind it, so one stroke can never
+        // meet both gates
+        let on_accelerator = handler2(IID_ACCELERATOR, move |_sender, args| {
+            accelerator_pressed(args as *mut c_void);
+            0
+        });
+        let _ = ((*(*controller).vtbl).add_accelerator_key_pressed)(
+            controller,
+            on_accelerator,
+            &mut token,
+        );
+        com_release(on_accelerator);
+
         // the pair contract needs the refusal leg pure: with the
         // built-in error page a dead host would COMMIT an error
         // document and answer on both legs
@@ -1309,9 +1364,7 @@ fn controller_landed(path: &str, generation: u64, hr: Hresult, controller: *mut 
             },
             Queued::Eval { token, js } => unsafe { eval_core(core, token, &js) },
             Queued::Snapshot { token } => unsafe { snapshot_core(core, token) },
-            // the hand is not built on this backend yet: fire and
-            // forget takes the forgetting road
-            Queued::Input(_) => {}
+            Queued::Input(event) => unsafe { send_input(core, &event) },
         }
     }
 
@@ -2143,11 +2196,275 @@ pub(crate) fn snapshot(path: &str, token: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// The hand — not built on this backend yet. Fire-and-forget takes
-/// the forgetting road, exactly as a backend without the capability
-/// is allowed to.
-pub(crate) fn input(path: &str, _event: &WebviewInput) {
-    let _ = path;
+/// One synthetic event into the page — the capability the table calls
+/// `SyntheticInput`, served here by the DevTools Protocol's `Input`
+/// domain: the event enters the browser's own input pipeline, above
+/// the renderer, so the page reads `isTrusted` as true — the same
+/// road every browser-automation hand rides, and the whole reason the
+/// door exists (a synthetic DOM event, real sites refuse).
+///
+/// Coordinates are CSS px from the viewport's top-left — exactly the
+/// contract's own words, so there is no flip and no DPI math (the
+/// mac's window-point machinery has no twin). The scroll deltas pass
+/// through UNCHANGED: `WebviewInput`'s signs are the page's, and so
+/// are the wheel event's (the mac negated because CoreGraphics counts
+/// the other way; nothing to do here). No closed-ears guard either —
+/// a protocol event can never walk back into the shell's own window
+/// procedure, and a key the page declines stays declined (a child of
+/// another process does not bubble; the one road back is the
+/// accelerator, which a synthetic event never rides).
+pub(crate) fn input(path: &str, event: &WebviewInput) {
+    if let Asked::Live(core) = ask(path, Queued::Input(event.clone())) {
+        unsafe { send_input(core, event) }
+    }
+}
+
+/// The buttons a page reads by mask: 1 left, 2 right, 4 middle.
+const fn button_mask(button: MouseButton) -> u32 {
+    match button {
+        MouseButton::Left => 1,
+        MouseButton::Right => 2,
+        MouseButton::Middle => 4,
+    }
+}
+
+const fn button_name(button: MouseButton) -> &'static str {
+    match button {
+        MouseButton::Left => "left",
+        MouseButton::Right => "right",
+        MouseButton::Middle => "middle",
+    }
+}
+
+/// What the keyboard was holding, in the protocol's own bits
+/// (Alt 1, Ctrl 2, Meta 4, Shift 8) — mapped by the shell's key law:
+/// `option` is Alt and `command` is Ctrl, the platform's accelerator.
+const fn cdp_modifiers(modifiers: Modifiers) -> u32 {
+    (modifiers.option as u32)
+        | ((modifiers.command as u32) << 1)
+        | ((modifiers.control as u32) << 2)
+        | ((modifiers.shift as u32) << 3)
+}
+
+/// One mouse event, spelled for the protocol.
+unsafe fn mouse(
+    core: *mut WebView2,
+    kind: &str,
+    x: f64,
+    y: f64,
+    button: &str,
+    buttons: u32,
+    clicks: u32,
+    modifiers: u32,
+    wheel: Option<(f64, f64)>,
+) {
+    let mut params = format!(
+        "{{\"type\":\"{kind}\",\"x\":{x},\"y\":{y},\"button\":\"{button}\",\
+         \"buttons\":{buttons},\"clickCount\":{clicks},\"modifiers\":{modifiers},\
+         \"pointerType\":\"mouse\""
+    );
+    if let Some((dx, dy)) = wheel {
+        params.push_str(&format!(",\"deltaX\":{dx},\"deltaY\":{dy}"));
+    }
+    params.push('}');
+    unsafe { cdp(core, "Input.dispatchMouseEvent", &params) }
+}
+
+unsafe fn send_input(core: *mut WebView2, event: &WebviewInput) {
+    unsafe {
+        match event {
+            WebviewInput::Click { x, y, clicks, button } => {
+                // a double click is two PAIRS, counted 1 then 2 — the
+                // page reads the count off the second press, and one
+                // press carrying a 2 is a lie a hand never tells
+                let (name, mask) = (button_name(*button), button_mask(*button));
+                for count in 1..=(*clicks).clamp(1, 3) {
+                    mouse(core, "mousePressed", *x, *y, name, mask, count, 0, None);
+                    mouse(core, "mouseReleased", *x, *y, name, 0, count, 0, None);
+                }
+            }
+            WebviewInput::Hover { x, y } => {
+                mouse(core, "mouseMoved", *x, *y, "none", 0, 0, 0, None);
+            }
+            WebviewInput::Down { x, y, button, clicks, modifiers } => {
+                mouse(
+                    core,
+                    "mousePressed",
+                    *x,
+                    *y,
+                    button_name(*button),
+                    button_mask(*button),
+                    (*clicks).clamp(1, 3),
+                    cdp_modifiers(*modifiers),
+                    None,
+                );
+            }
+            WebviewInput::Drag { x, y, button, modifiers } => {
+                // a move with the mask still held is what the page
+                // reads a drag by
+                mouse(
+                    core,
+                    "mouseMoved",
+                    *x,
+                    *y,
+                    "none",
+                    button_mask(*button),
+                    0,
+                    cdp_modifiers(*modifiers),
+                    None,
+                );
+            }
+            WebviewInput::Up { x, y, button, clicks, modifiers } => {
+                mouse(
+                    core,
+                    "mouseReleased",
+                    *x,
+                    *y,
+                    button_name(*button),
+                    0,
+                    (*clicks).clamp(1, 3),
+                    cdp_modifiers(*modifiers),
+                    None,
+                );
+            }
+            WebviewInput::Scroll { x, y, dx, dy } => {
+                mouse(core, "mouseWheel", *x, *y, "none", 0, 0, 0, Some((*dx, *dy)));
+            }
+            WebviewInput::Type { text } => {
+                // the commit door — the protocol's own IME/paste
+                // insertion, the `insertText:replacementRange:` twin:
+                // it lands in a field, in a contenteditable, under a
+                // keyboard layout nobody guessed
+                let quoted = json::Json::Str(text.to_string()).source();
+                cdp(core, "Input.insertText", &format!("{{\"text\":{quoted}}}"));
+            }
+            WebviewInput::Key { key } => send_key(core, key),
+        }
+    }
+}
+
+/// One named key: `(vk, code, text)` in the page's own vocabulary — a
+/// name nobody knows presses nothing. Pure, so the table is testable.
+fn key_spec(key: &str) -> Option<(u32, &'static str, &'static str, Option<&'static str>)> {
+    Some(match key {
+        "Enter" | "Return" => (0x0D, "Enter", "Enter", Some("\r")),
+        "Tab" => (0x09, "Tab", "Tab", None),
+        "Escape" | "Esc" => (0x1B, "Escape", "Escape", None),
+        "Backspace" => (0x08, "Backspace", "Backspace", None),
+        "Delete" => (0x2E, "Delete", "Delete", None),
+        "ArrowUp" => (0x26, "ArrowUp", "ArrowUp", None),
+        "ArrowDown" => (0x28, "ArrowDown", "ArrowDown", None),
+        "ArrowLeft" => (0x25, "ArrowLeft", "ArrowLeft", None),
+        "ArrowRight" => (0x27, "ArrowRight", "ArrowRight", None),
+        "Home" => (0x24, "Home", "Home", None),
+        "End" => (0x23, "End", "End", None),
+        "PageUp" => (0x21, "PageUp", "PageUp", None),
+        "PageDown" => (0x22, "PageDown", "PageDown", None),
+        "Space" => (0x20, " ", "Space", Some(" ")),
+        _ => return None,
+    })
+}
+
+/// One press and release of a key, delivered to the page. A key that
+/// TYPES goes down as `keyDown` with its text (the page hears the
+/// character too); one that does not goes down raw.
+unsafe fn send_key(core: *mut WebView2, key: &str) {
+    unsafe {
+        if let Some((vk, name, code, text)) = key_spec(key) {
+            let name = json::Json::Str(name.to_string()).source();
+            let down_kind = if text.is_some() { "keyDown" } else { "rawKeyDown" };
+            let mut down = format!(
+                "{{\"type\":\"{down_kind}\",\"key\":{name},\"code\":\"{code}\",\
+                 \"windowsVirtualKeyCode\":{vk},\"nativeVirtualKeyCode\":{vk}"
+            );
+            if let Some(text) = text {
+                let text = json::Json::Str(text.to_string()).source();
+                down.push_str(&format!(",\"text\":{text},\"unmodifiedText\":{text}"));
+            }
+            down.push('}');
+            cdp(core, "Input.dispatchKeyEvent", &down);
+            cdp(
+                core,
+                "Input.dispatchKeyEvent",
+                &format!(
+                    "{{\"type\":\"keyUp\",\"key\":{name},\"code\":\"{code}\",\
+                     \"windowsVirtualKeyCode\":{vk},\"nativeVirtualKeyCode\":{vk}}}"
+                ),
+            );
+            return;
+        }
+        // a single character IS its own key name, typed; anything
+        // else presses nothing
+        if key.chars().count() == 1 {
+            let quoted = json::Json::Str(key.to_string()).source();
+            cdp(
+                core,
+                "Input.dispatchKeyEvent",
+                &format!(
+                    "{{\"type\":\"keyDown\",\"key\":{quoted},\"text\":{quoted},\
+                     \"unmodifiedText\":{quoted}}}"
+                ),
+            );
+            cdp(
+                core,
+                "Input.dispatchKeyEvent",
+                &format!("{{\"type\":\"keyUp\",\"key\":{quoted}}}"),
+            );
+        }
+    }
+}
+
+/// One protocol call whose answer nobody reads — the input door is
+/// fire-and-forget, like the hand it stands for.
+unsafe fn cdp(core: *mut WebView2, method: &str, params: &str) {
+    let method = wide(method);
+    let params = wide(params);
+    let completed = handler2(IID_DEVTOOLS_CALL, |_hr, _json| 0);
+    unsafe {
+        let _ = ((*(*core).vtbl).call_devtools_protocol_method)(
+            core,
+            method.as_ptr(),
+            params.as_ptr(),
+            completed,
+        );
+        com_release(completed);
+    }
+}
+
+/// The chords outrank the island (the mac's a8086b7, on this door):
+/// command chords only — Ctrl is this platform's `command` — and the
+/// same ONE gate body the pump runs; consumed means the page never
+/// sees the stroke. Everything else is the page's to type, and a
+/// chord the app declines falls through to the engine's own
+/// accelerators (Ctrl+F's find bar, F12's devtools).
+fn accelerator_pressed(args: *mut c_void) {
+    const KEY_DOWN: i32 = 0;
+    const SYSTEM_KEY_DOWN: i32 = 2;
+    /// `VK_PROCESSKEY` — the IME owns this stroke.
+    const VK_PROCESSKEY: u32 = 0xE5;
+    let (kind, vk, lparam) = unsafe {
+        let vtbl = *(args as *mut *const AcceleratorArgsVtbl);
+        let mut kind = 0i32;
+        let mut vk = 0u32;
+        let mut lparam = 0i32;
+        let _ = ((*vtbl).get_key_event_kind)(args, &mut kind);
+        let _ = ((*vtbl).get_virtual_key)(args, &mut vk);
+        let _ = ((*vtbl).get_key_event_lparam)(args, &mut lparam);
+        (kind, vk, lparam)
+    };
+    if kind != KEY_DOWN && kind != SYSTEM_KEY_DOWN {
+        return;
+    }
+    if vk == VK_PROCESSKEY || crate::ffi::ime_composing() || !crate::ffi::control_held() {
+        return;
+    }
+    let stroke = crate::ffi::key_stroke_of(vk as usize, lparam as isize);
+    if crate::ffi::gate_consumes(&stroke) {
+        unsafe {
+            let vtbl = *(args as *mut *const AcceleratorArgsVtbl);
+            let _ = ((*vtbl).put_handled)(args, 1);
+        }
+    }
 }
 
 /// One table read, one verdict — acted on OUTSIDE the borrow, so a
@@ -2446,6 +2763,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<ResponseReceivedArgsVtbl>(), 5 * slot);
         assert_eq!(std::mem::size_of::<ResourceRequestVtbl>(), 10 * slot);
         assert_eq!(std::mem::size_of::<ResponseViewVtbl>(), 7 * slot);
+        assert_eq!(std::mem::size_of::<AcceleratorArgsVtbl>(), 9 * slot);
         assert_eq!(std::mem::size_of::<StreamVtbl>(), 14 * slot);
         assert_eq!(std::mem::size_of::<Handler2Vtbl>(), 4 * slot);
         assert_eq!(std::mem::size_of::<Handler1Vtbl>(), 4 * slot);
@@ -2502,6 +2820,36 @@ mod tests {
         }
         assert_eq!(error_name(999), "the engine refused unnamed");
         assert_eq!(error_name(13), "the host name did not resolve");
+    }
+
+    #[test]
+    fn the_key_table_speaks_the_pages_vocabulary() {
+        assert_eq!(key_spec("Enter"), Some((0x0D, "Enter", "Enter", Some("\r"))));
+        assert_eq!(key_spec("Return"), key_spec("Enter"));
+        assert_eq!(key_spec("Esc"), key_spec("Escape"));
+        // the space key NAMES itself as the character it types
+        assert_eq!(key_spec("Space"), Some((0x20, " ", "Space", Some(" "))));
+        assert_eq!(key_spec("ArrowDown"), Some((0x28, "ArrowDown", "ArrowDown", None)));
+        // a name nobody knows presses nothing (single chars take the
+        // typed road instead)
+        assert_eq!(key_spec("Hyperspace"), None);
+        assert_eq!(key_spec("a"), None);
+    }
+
+    #[test]
+    fn the_modifier_bits_follow_the_shells_own_law() {
+        // option→Alt(1), command→Ctrl(2), control→Meta(4), shift→Shift(8)
+        let none = Modifiers::NONE;
+        assert_eq!(cdp_modifiers(none), 0);
+        let mut m = Modifiers::NONE;
+        m.shift = true;
+        assert_eq!(cdp_modifiers(m), 8);
+        m.command = true;
+        assert_eq!(cdp_modifiers(m), 10);
+        m.option = true;
+        assert_eq!(cdp_modifiers(m), 11);
+        m.control = true;
+        assert_eq!(cdp_modifiers(m), 15);
     }
 
     #[test]
