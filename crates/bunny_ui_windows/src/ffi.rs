@@ -191,7 +191,6 @@ unsafe extern "system" {
         flags: u32,
     ) -> i32;
     fn IsWindowVisible(hwnd: Hwnd) -> i32;
-    fn IsWindow(hwnd: Hwnd) -> i32;
     fn GetWindowLongW(hwnd: Hwnd, index: i32) -> i32;
 }
 
@@ -361,7 +360,6 @@ const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 const WS_CHILD: u32 = 0x4000_0000;
 const WS_CLIPCHILDREN: u32 = 0x0200_0000;
 const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
-const WS_VISIBLE: u32 = 0x1000_0000;
 const GWL_STYLE: i32 = -16;
 const SW_SHOWNOACTIVATE: i32 = 4;
 const SW_HIDE: i32 = 0;
@@ -426,7 +424,7 @@ pub(crate) fn com_ok(hr: Hresult) -> bool {
 
 /// A COM identity, written literally with a comment naming it.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Guid {
     pub d1: u32,
     pub d2: u16,
@@ -1746,6 +1744,9 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
         }
         WM_MOVE => {
             if hwnd == MAIN_HWND.load(Ordering::Acquire) {
+                // the engine repositions its own popups — a select
+                // dropdown, autofill — after the parent's move lands
+                crate::webview::nudge_all();
                 // owned panels do not ride the owner on their own —
                 // the present repositions them, so a caption drag asks
                 // for one
@@ -1973,6 +1974,9 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             LEAVE_ARMED.with(|armed| armed.borrow_mut().remove(&hwnd));
             // closing the MAIN window quits — a panel dies in silence
             if hwnd == MAIN_HWND.load(Ordering::Acquire) {
+                // the tenants close before the windows they parent
+                // into (the swapchain law, extended)
+                crate::webview::teardown_all();
                 // the swapchain must not outlive its window
                 crate::d3d::teardown();
                 unsafe {
@@ -2642,6 +2646,16 @@ impl WindowHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `WS_VISIBLE` — the container's OWN bit, read by the host test
+    /// (`IsWindowVisible` asks the whole ancestor chain, and a test
+    /// window never shows).
+    const WS_VISIBLE: u32 = 0x1000_0000;
+
+    #[link(name = "user32", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn IsWindow(hwnd: Hwnd) -> i32;
+    }
 
     #[test]
     fn the_scale_policy_rounds_up_and_keeps_the_factor() {

@@ -555,6 +555,97 @@ impl ImageEngine for WicImageEngine {
     }
 }
 
+/// An empty growable memory stream — what the webview's snapshot hands
+/// `CapturePreview` to fill (the one shlwapi door, shared).
+pub(crate) fn empty_stream() -> *mut c_void {
+    unsafe { SHCreateMemStream(std::ptr::null(), 0) as *mut c_void }
+}
+
+/// One-shot decode to tight straight RGBA at the intrinsic size, with
+/// every refusal NAMED — the webview's snapshot road (the engine
+/// answers PNG bytes; the contract answers pixels or a sentence).
+/// Builds its own factory: snapshots are rare, and the engine's
+/// retained one is instance state behind the trait.
+pub(crate) fn decode_rgba(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
+    com_init();
+    unsafe {
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_WIC_IMAGING_FACTORY,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_IWIC_IMAGING_FACTORY,
+            &mut raw,
+        );
+        if !com_ok(hr) {
+            return Err(String::from("no imaging factory for the snapshot"));
+        }
+        let factory =
+            Com::from_raw(raw as *mut IWICImagingFactory).ok_or("no imaging factory")?;
+        let factory_ptr = factory.as_ptr();
+        let stream = SHCreateMemStream(bytes.as_ptr(), bytes.len() as u32);
+        let stream = Com::from_raw(stream).ok_or("no stream over the snapshot bytes")?;
+        let mut decoder: *mut IWICBitmapDecoder = std::ptr::null_mut();
+        let hr = ((*(*factory_ptr).vtbl).create_decoder_from_stream)(
+            factory_ptr,
+            stream.as_ptr(),
+            std::ptr::null(),
+            0,
+            &mut decoder,
+        );
+        if !com_ok(hr) {
+            return Err(String::from("the image did not decode"));
+        }
+        let decoder = Com::from_raw(decoder).ok_or("the image did not decode")?;
+        let mut frame: *mut IWICBitmapFrameDecode = std::ptr::null_mut();
+        if !com_ok(((*(*decoder.as_ptr()).vtbl).get_frame)(decoder.as_ptr(), 0, &mut frame)) {
+            return Err(String::from("the image holds no frame"));
+        }
+        let frame = Com::from_raw(frame).ok_or("the image holds no frame")?;
+        let mut converter: *mut IWICFormatConverter = std::ptr::null_mut();
+        if !com_ok(((*(*factory_ptr).vtbl).create_format_converter)(factory_ptr, &mut converter))
+        {
+            return Err(String::from("the converter refused to exist"));
+        }
+        let converter = Com::from_raw(converter).ok_or("the converter refused to exist")?;
+        let hr = ((*(*converter.as_ptr()).vtbl).initialize)(
+            converter.as_ptr(),
+            frame.as_ptr() as *mut c_void,
+            &WIC_PIXEL_32BPP_RGBA,
+            0,
+            std::ptr::null_mut(),
+            0.0,
+            0,
+        );
+        if !com_ok(hr) {
+            return Err(String::from("the converter refused RGBA"));
+        }
+        let mut width = 0u32;
+        let mut height = 0u32;
+        let hr = ((*(*converter.as_ptr()).vtbl).source.get_size)(
+            converter.as_ptr() as *mut c_void,
+            &mut width,
+            &mut height,
+        );
+        if !com_ok(hr) || width == 0 || height == 0 {
+            return Err(String::from("the image had no pixels"));
+        }
+        let (width, height) = (width as usize, height as usize);
+        let mut rgba = vec![0u8; width * height * 4];
+        let hr = ((*(*converter.as_ptr()).vtbl).source.copy_pixels)(
+            converter.as_ptr() as *mut c_void,
+            std::ptr::null(),
+            (width * 4) as u32,
+            rgba.len() as u32,
+            rgba.as_mut_ptr(),
+        );
+        if !com_ok(hr) {
+            return Err(String::from("the image kept its bytes"));
+        }
+        Ok((width, height, rgba))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

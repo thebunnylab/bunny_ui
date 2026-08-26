@@ -14,6 +14,7 @@ pub mod dialog;
 mod ffi;
 mod image;
 mod text;
+pub mod webview;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -158,6 +159,51 @@ pub fn run_window_chrome(
                 // not a frame
                 return;
             }
+            // the native hosts FIRST — before the window's own present
+            // and the overlay panels. A hosted engine renders OUT of
+            // process: the sooner it holds its frame the sooner its
+            // relayout runs in parallel with everything below — and
+            // inside a WM_SIZE turn this is the earliest beat the
+            // platform has (no throttles: the mac deleted its own)
+            let hosts = runtime.hosts();
+            for host in &hosts {
+                let bunny_ui::host::HostSpec::Webview { url, scripts, console, requests } =
+                    &host.spec;
+                // the stamp fingerprints the whole spec — a change
+                // re-instructs the mounted view, never re-creates it
+                let mut stamp = String::with_capacity(url.len() + 4);
+                stamp.push_str(url);
+                stamp.push('\u{2}');
+                stamp.push(if *console { 'c' } else { '-' });
+                stamp.push(if *requests { 'r' } else { '-' });
+                for script in scripts.iter() {
+                    stamp.push('\u{1}');
+                    stamp.push_str(script);
+                }
+                window.host_place(
+                    &host.path,
+                    &stamp,
+                    (
+                        host.frame.origin.x,
+                        host.frame.origin.y,
+                        host.frame.size.width,
+                        host.frame.size.height,
+                    ),
+                    (
+                        host.visible.origin.x,
+                        host.visible.origin.y,
+                        host.visible.size.width,
+                        host.visible.size.height,
+                    ),
+                    |container| webview::create(&host.path, container, &host.spec),
+                    |_stamp| webview::update(&host.path, &host.spec),
+                    |bounds, shown| webview::place(&host.path, bounds, shown),
+                );
+            }
+            window.host_sweep(
+                &hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>(),
+                |key| webview::sweep(key),
+            );
             // the window presents everything BEFORE the first overlay;
             // each overlay re-presents its own slice on an owned panel
             // in screen coordinates — that is how it leaves the window
@@ -257,6 +303,29 @@ pub fn run_window_chrome(
     let blit = {
         let present = Rc::clone(&present);
         move |runtime: &Runtime, root: &_| {
+            // the webview commands are spent BEFORE the frame renders,
+            // so the state an expired eval writes lands in THIS layout.
+            // An op whose page is not mounted answers immediately —
+            // never silence that looks like a slow page.
+            for op in runtime.webview_commands() {
+                use bunny_ui::host::WebviewOp;
+                match op {
+                    WebviewOp::Navigate { path, url } => webview::navigate(&path, &url),
+                    WebviewOp::Back { path } => webview::back(&path),
+                    WebviewOp::Forward { path } => webview::forward(&path),
+                    WebviewOp::Input { path, event } => webview::input(&path, &event),
+                    WebviewOp::Eval { path, token, js } => {
+                        if let Err(why) = webview::eval(&path, token, &js) {
+                            let _ = runtime.webview_eval_done(token, Err(why));
+                        }
+                    }
+                    WebviewOp::Snapshot { path, token } => {
+                        if let Err(why) = webview::snapshot(&path, token) {
+                            let _ = runtime.webview_snapshot_done(token, Err(why));
+                        }
+                    }
+                }
+            }
             let (width, height) = window.content_size();
             // a box that draws parts which TOUCH puts the shared edge
             // on a whole PIXEL — it needs the screen's scale
@@ -402,6 +471,53 @@ pub fn run_window_chrome(
             }
         }
     }));
+
+    // everything a page reports lands here and runs the matching
+    // runtime door; a door that ran a retained writer re-presents —
+    // but never mid-drag (the state is written; the resize's own
+    // presenter shows it, the one-presenter law)
+    webview::set_dispatch({
+        let runtime = Rc::clone(&runtime);
+        let root = Rc::clone(&root);
+        let blit = blit.clone();
+        move |event| {
+            let woke = match event {
+                webview::WebviewEvent::Navigated { path, url } => {
+                    runtime.webview_navigated(&path, &url)
+                }
+                webview::WebviewEvent::NavigationFailed { path, url, why } => {
+                    runtime.webview_navigate_failed(&path, &url, &why)
+                }
+                webview::WebviewEvent::Posted { path, body } => {
+                    runtime.webview_posted(&path, &body)
+                }
+                webview::WebviewEvent::Console { path, line } => {
+                    runtime.webview_console(&path, &line)
+                }
+                webview::WebviewEvent::Requested { path, line } => {
+                    runtime.webview_requested(&path, &line)
+                }
+                webview::WebviewEvent::EvalDone { token, result } => {
+                    runtime.webview_eval_done(token, result)
+                }
+                webview::WebviewEvent::SnapshotDone { token, result } => runtime
+                    .webview_snapshot_done(
+                        token,
+                        result.map(|(width, height, rgba)| bunny_ui::host::WebviewSnapshot {
+                            width,
+                            height,
+                            rgba,
+                        }),
+                    ),
+                // a click landed in the island: what a click beside a
+                // popover dismisses, this dismisses too
+                webview::WebviewEvent::FocusTaken => runtime.dismiss_all_overlays(),
+            };
+            if woke && !ffi::in_size_move() {
+                blit(&runtime, &*root);
+            }
+        }
+    });
 
     let handler_runtime = Rc::clone(&runtime);
     let handler_root = Rc::clone(&root);
