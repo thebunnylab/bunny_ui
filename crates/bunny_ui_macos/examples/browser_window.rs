@@ -22,6 +22,9 @@
 //!   back into the field;
 //! - "popover" opens a card over the page — presented on its own
 //!   child panel, the overlay road;
+//! - "a dead url" points the engine at a host that does not resolve:
+//!   the refusal lands in the footer by name instead of hanging for
+//!   ever waiting for a commit that is not coming;
 //! - the toast in the corner is IN-SCENE content over the page — the
 //!   sandwich: paint order is the truth over the island too. Click it
 //!   and it answers; click the clear space beside it and the PAGE
@@ -56,6 +59,10 @@ const REPORTER: &str = "addEventListener('DOMContentLoaded', function() { \
     console.log('hello from the page'); \
     fetch(location.href); });";
 
+/// A host that does not resolve — the refusal the second navigation
+/// hook was written for.
+const DEAD: &str = "https://a-host-that-does-not-resolve.invalid/";
+
 #[derive(Clone)]
 struct Browser {
     page: State<usize>,
@@ -65,6 +72,8 @@ struct Browser {
     posted: State<String>,
     spoke: State<String>,
     fetched: State<String>,
+    /// What a refused load answered — the other leg of the pair.
+    refused: State<String>,
     title: State<String>,
     handle: WebviewHandle,
     /// `--workbench`: the rows the heavy rail carries — the dial that turns
@@ -143,6 +152,11 @@ impl Component for Browser {
             })
         };
 
+        let dead = {
+            let handle = handle.clone();
+            chip("a dead url".into()).on_click(move || handle.navigate(DEAD))
+        };
+
         let beat = self.blink.then(|| {
             let caret = self.caret;
             hstack!(
@@ -169,6 +183,7 @@ impl Component for Browser {
             beat,
             ask,
             shoot,
+            dead,
             text(title.get()).foreground_color(theme::fg_secondary()),
             spacer().frame_height(12.0),
             toggle
@@ -228,10 +243,11 @@ impl Component for Browser {
             .padding_length(8.0)
         };
 
-        let (spoke, fetched) = (self.spoke, self.fetched);
+        let (spoke, fetched, refused) = (self.spoke, self.fetched, self.refused);
         let pane = webview(PAGES[page.get()].1)
             .user_script(REPORTER)
             .on_navigate(move |url| address.set(url.to_string()))
+            .on_navigate_failed(move |url, why| refused.set(format!("{url} — {why}")))
             .on_message(move |body| posted.set(body.to_string()))
             .on_console(move |line| spoke.set(line.to_string()))
             .on_request(move |line| fetched.set(line.to_string()))
@@ -260,7 +276,8 @@ impl Component for Browser {
         let footer = vstack!(
             text(format!("bus: {}", self.posted.get())),
             text(format!("console: {}", self.spoke.get())),
-            text(format!("network: {}", self.fetched.get()))
+            text(format!("network: {}", self.fetched.get())),
+            text(format!("refused: {}", self.refused.get()))
         )
         .spacing(2.0)
         .alignment(HorizontalAlignment::Leading)
@@ -334,6 +351,7 @@ fn main() {
             posted: State::new(String::from("nothing yet")),
             spoke: State::new(String::from("nothing yet")),
             fetched: State::new(String::from("nothing yet")),
+            refused: State::new(String::from("nothing yet")),
             title: State::new(String::new()),
             handle: WebviewHandle::new(),
             rows: if std::env::args().any(|arg| arg == "--workbench") {

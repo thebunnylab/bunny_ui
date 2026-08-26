@@ -61,6 +61,9 @@ unsafe extern "C" {
 pub(crate) enum WebviewEvent {
     /// The engine committed a navigation — link clicks included.
     Navigated { view: Id, url: String },
+    /// The engine REFUSED one: the url it tried, and why — the other
+    /// leg of the same pair, so no load ends in silence.
+    NavigationFailed { view: Id, url: String, why: String },
     /// The page called `window.bunny.post(…)`.
     Posted { view: Id, body: String },
     /// The page's console spoke — `"level: what it said"`.
@@ -217,6 +220,66 @@ extern "C" fn bridge_committed(_this: Id, _sel: Sel, view: Id, _navigation: Id) 
     }
 }
 
+/// `webView:didFailProvisionalNavigation:withError:` and
+/// `webView:didFailNavigation:withError:` — the two ways a load ends
+/// WITHOUT a commit: the first before any byte of the new page
+/// arrived (a dead host, a bad certificate), the second after the
+/// document started. The app hears one sentence for both, because the
+/// app's question is the same one: it is not going to arrive.
+///
+/// A CANCELLED load is not a failure and never reports: it is what
+/// the engine says when a newer navigation took the tab, and that one
+/// answers for both. Reporting it would tell an app its live load
+/// died at the moment it actually started.
+extern "C" fn bridge_failed(_this: Id, _sel: Sel, view: Id, _navigation: Id, error: Id) {
+    unsafe {
+        if cancelled(error) {
+            return;
+        }
+        let url = failing_url(view, error);
+        dispatch(WebviewEvent::NavigationFailed { view, url, why: error_name(error) });
+    }
+}
+
+/// Did the engine stop this load because another one replaced it?
+/// `NSURLErrorCancelled`, in the domain's own numbering.
+unsafe fn cancelled(error: Id) -> bool {
+    const NS_URL_ERROR_CANCELLED: i64 = -999;
+    if error.is_null() {
+        return false;
+    }
+    unsafe {
+        msg_i64(error, sel("code")) == NS_URL_ERROR_CANCELLED
+            && to_string(msg_id(error, sel("domain"))) == "NSURLErrorDomain"
+    }
+}
+
+/// The url a refused load was AIMING at. The view's own url is the
+/// page still on screen — the one that did not go anywhere — so the
+/// error's own record comes first: the loader files the target under
+/// two keys, as a string and as an NSURL.
+unsafe fn failing_url(view: Id, error: Id) -> String {
+    unsafe {
+        let info = if error.is_null() { null_mut() } else { msg_id(error, sel("userInfo")) };
+        if !info.is_null() {
+            let text = msg_id_id(info, sel("objectForKey:"), ns("NSErrorFailingURLStringKey"));
+            if !text.is_null()
+                && msg_bool_id(text, sel("isKindOfClass:"), class("NSString")) != 0
+            {
+                return to_string(text);
+            }
+            let url = msg_id_id(info, sel("objectForKey:"), ns("NSErrorFailingURLKey"));
+            if !url.is_null() {
+                let text = to_string(msg_id(url, sel("absoluteString")));
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+        }
+        current_url(view).unwrap_or_default()
+    }
+}
+
 /// The one bridge instance, built on first use: an NSObject that
 /// answers the script messages and the navigation delegate calls.
 fn bridge() -> Id {
@@ -241,6 +304,18 @@ fn bridge() -> Id {
                 bridge_committed as *const c_void,
                 message_types.as_ptr(),
             );
+            let failure_types = CString::new("v@:@@@").expect("type encoding");
+            for leg in [
+                "webView:didFailProvisionalNavigation:withError:",
+                "webView:didFailNavigation:withError:",
+            ] {
+                class_addMethod(
+                    bridge,
+                    sel(leg),
+                    bridge_failed as *const c_void,
+                    failure_types.as_ptr(),
+                );
+            }
             for protocol in ["WKScriptMessageHandler", "WKNavigationDelegate"] {
                 let protocol = CString::new(protocol).expect("protocol name");
                 let protocol = objc_getProtocol(protocol.as_ptr());

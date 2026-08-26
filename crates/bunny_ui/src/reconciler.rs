@@ -79,6 +79,8 @@ pub(crate) type HandlerEntry = (String, crate::action::ActionId, HandlerFn);
 pub(crate) struct WebviewHooks {
     /// The page moved — fires with the committed url.
     pub navigated: Option<WebviewReport>,
+    /// The page did NOT move — fires with the url and the reason.
+    pub failed: Option<WebviewFailure>,
     /// The page posted — fires with the string it sent.
     pub posted: Option<WebviewReport>,
     /// The page's console spoke — fires with `"level: what it said"`.
@@ -92,6 +94,10 @@ pub(crate) struct WebviewHooks {
 /// A page report's writer — a navigation or a posted message, handed
 /// to the app as the string it is.
 pub(crate) type WebviewReport = Rc<dyn Fn(&str)>;
+/// A refused load's writer — the url it tried, and why it never
+/// arrived. Two strings because a failure that hides either half
+/// tells the app nothing it can act on.
+pub(crate) type WebviewFailure = Rc<dyn Fn(&str, &str)>;
 pub(crate) type WebviewEntry = (String, WebviewHooks);
 
 pub(crate) struct Entry {
@@ -796,6 +802,20 @@ fn run_webview_report(
 /// A committed navigation, to the page's `on_navigate`.
 pub(crate) fn run_webview_navigated(path: &str, url: &str) -> bool {
     run_webview_report(path, |hooks| hooks.navigated.clone(), url)
+}
+
+/// A refused load, to the page's `on_navigate_failed` — the report
+/// door with two words instead of one.
+pub(crate) fn run_webview_failed(path: &str, url: &str, why: &str) -> bool {
+    let report = WEBVIEWS
+        .with(|webviews| webviews.borrow().get(path).and_then(|hooks| hooks.failed.clone()));
+    match report {
+        Some(report) => {
+            report(url, why);
+            true
+        }
+        None => false,
+    }
 }
 
 /// What the page posted, to the page's `on_message`.

@@ -3284,6 +3284,14 @@ impl Runtime {
         reconciler::run_webview_navigated(path, url)
     }
 
+    /// The shell reports: the engine REFUSED a load — a dead host, a
+    /// bad certificate, a server that is down. Routed to the page's
+    /// retained `on_navigate_failed`, with the url it tried and the
+    /// engine's own words; `false` = nothing listening.
+    pub fn webview_navigate_failed(&self, path: &str, url: &str, why: &str) -> bool {
+        reconciler::run_webview_failed(path, url, why)
+    }
+
     /// The shell reports: the page posted on the bus
     /// (`window.bunny.post(…)`). Routed to the retained `on_message`;
     /// `false` = nothing listening.

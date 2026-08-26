@@ -6580,6 +6580,67 @@ mod tests {
         assert_eq!(seen.get(), 8, "the pixels reached the app's own callback");
     }
 
+    /// Every load answers in exactly ONE of the pair. The commit door
+    /// is the happy one; the refusal door carries two words — where
+    /// the load was going, and why it never arrived — because an app
+    /// that only hears commits waits for ever on a dead host.
+    #[test]
+    fn a_refused_load_answers_where_the_commit_would_have() {
+        use crate::host::webview;
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Page {
+            landed: State<String>,
+            refused: State<String>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let (landed, refused) = (self.landed, self.refused);
+                webview("https://example.test/")
+                    .on_navigate(move |url| landed.set(url.to_string()))
+                    .on_navigate_failed(move |url, why| refused.set(format!("{url}: {why}")))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page =
+            Page { landed: State::new(String::new()), refused: State::new(String::new()) };
+        let _ = runtime
+            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let path = runtime.hosts()[0].path.clone();
+
+        assert!(runtime.webview_navigate_failed(
+            &path,
+            "https://gone.test/",
+            "the host was not found"
+        ));
+        assert_eq!(page.refused.get(), "https://gone.test/: the host was not found");
+        assert!(page.landed.get().is_empty(), "a refusal is not a commit");
+        assert!(!runtime.webview_navigate_failed("nobody/here", "x", "y"), "no writer, no lie");
+
+        // and the failure hook ALONE is enough to register the page:
+        // an app may watch only for what goes wrong
+        #[derive(Clone)]
+        struct Watcher {
+            refused: State<String>,
+        }
+        impl Component for Watcher {
+            fn body(self, _ctx: &Context) -> impl View {
+                let refused = self.refused;
+                webview("https://example.test/")
+                    .on_navigate_failed(move |_, why| refused.set(why.to_string()))
+            }
+        }
+        let runtime = Runtime::new();
+        let watcher = Watcher { refused: State::new(String::new()) };
+        let _ = runtime
+            .settled_layout(&watcher, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let path = runtime.hosts()[0].path.clone();
+        assert!(runtime.webview_navigate_failed(&path, "https://gone.test/", "no route"));
+        assert_eq!(watcher.refused.get(), "no route");
+    }
+
     /// A probe under a SKIPPED body still reports. The retained tree is
     /// what the frame is laid out from, so the node is still placed —
     /// and the writer is retained beside it, like every other one.

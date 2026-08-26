@@ -897,6 +897,13 @@ pub fn run_window_chrome(
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
+                webview::WebviewEvent::NavigationFailed { view, url, why } => {
+                    if let Some(path) = ffi::host_key_of_child(view)
+                        && runtime.webview_navigate_failed(&path, &url, &why)
+                    {
+                        blit(&runtime, root, trace::Origin::Web);
+                    }
+                }
                 webview::WebviewEvent::Posted { view, body } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_posted(&path, &body)

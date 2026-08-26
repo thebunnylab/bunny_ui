@@ -1,9 +1,9 @@
 # A webview
 
 *Status: the native host, the macOS webview and its instrumentation
-floor — user scripts, the message bus, navigation reports, eval with
-the value coming back, console and request capture by injected hook,
-and the snapshot — are standing;
+floor — user scripts, the message bus, navigation reports (both legs:
+the commit and the refusal), eval with the value coming back, console
+and request capture by injected hook, and the snapshot — are standing;
 `cargo run -p bunny-ui-macos --example browser_window` is the proof,
 the web's own lowering — the iframe — is standing beside it, and the
 scene interleaves with the island: what paints after a host
@@ -61,10 +61,17 @@ Built on the host. The declarative half is a view like any other:
 webview("https://docs.example.dev")
     .user_script(src)   // document-start, every navigation
     .on_navigate(move |url| history.update(|h| h.push(url.into())))
+    .on_navigate_failed(move |url, why| status.set(format!("{url} — {why}")))
     .on_message(move |body| bus.send(body))   // window.bunny.post(…) in the page
     .on_console(move |line| log.push(line))   // "level: what it said"
     .on_request(move |line| net.push(line))   // "METHOD url status"
 ```
+
+The two navigation hooks are ONE pair, and every load answers in
+exactly one of them: an app that waits for the commit before it calls
+a page ready waits for ever on a dead host, a bad certificate or a
+server that is down. A load another navigation replaced is not a
+failure — the one that replaced it reports for both.
 
 The two hooks are capability-gated (the table below), and a backend
 that serves them by injection only pays when they are declared —

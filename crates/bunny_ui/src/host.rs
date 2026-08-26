@@ -203,6 +203,7 @@ pub struct WebviewView {
     url: Rc<str>,
     scripts: Vec<Rc<str>>,
     on_navigate: Option<crate::reconciler::WebviewReport>,
+    on_navigate_failed: Option<crate::reconciler::WebviewFailure>,
     on_message: Option<crate::reconciler::WebviewReport>,
     on_console: Option<crate::reconciler::WebviewReport>,
     on_request: Option<crate::reconciler::WebviewReport>,
@@ -223,6 +224,27 @@ impl WebviewView {
     /// never asked for, and history wants it anyway).
     pub fn on_navigate(mut self, action: impl Fn(&str) + 'static) -> WebviewView {
         self.on_navigate = Some(Rc::new(action));
+        self
+    }
+
+    /// The page did NOT move: a load the engine refused fires with the
+    /// url it tried and the reason in the engine's own words — a name
+    /// a person can read, never a number.
+    ///
+    /// The two hooks are one pair, and every load answers in exactly
+    /// one of them: an app that waits for `on_navigate` before it
+    /// calls a page ready waits for ever on a dead host, a bad
+    /// certificate or a server that is down. A load that ANOTHER
+    /// navigation replaced is not a failure — the one that replaced it
+    /// reports for both.
+    ///
+    /// ```ignore
+    /// webview(url)
+    ///     .on_navigate(move |url| bar.set(url.into()))
+    ///     .on_navigate_failed(move |url, why| bar.set(format!("{url} — {why}")))
+    /// ```
+    pub fn on_navigate_failed(mut self, action: impl Fn(&str, &str) + 'static) -> WebviewView {
+        self.on_navigate_failed = Some(Rc::new(action));
         self
     }
 
@@ -275,6 +297,7 @@ impl View for WebviewView {
         // just mounts nothing
         let path = motor::identity::cursor_scope().unwrap_or_default();
         let listening = self.on_navigate.is_some()
+            || self.on_navigate_failed.is_some()
             || self.on_message.is_some()
             || self.on_console.is_some()
             || self.on_request.is_some()
@@ -287,6 +310,7 @@ impl View for WebviewView {
                 path.clone(),
                 crate::reconciler::WebviewHooks {
                     navigated: self.on_navigate.clone(),
+                    failed: self.on_navigate_failed.clone(),
                     posted: self.on_message.clone(),
                     console: self.on_console.clone(),
                     requested: self.on_request.clone(),
@@ -322,6 +346,7 @@ pub fn webview(url: impl Into<Rc<str>>) -> WebviewView {
         url: url.into(),
         scripts: Vec::new(),
         on_navigate: None,
+        on_navigate_failed: None,
         on_message: None,
         on_console: None,
         on_request: None,
