@@ -22,6 +22,12 @@
 //!   back into the field;
 //! - "popover" opens a card over the page — presented on its own
 //!   child panel, the overlay road;
+//! - the PROBE is the page's own witness: the user script draws it at
+//!   a known place and reports every event it feels, with the
+//!   coordinates and whether the page trusts it. Click its target
+//!   with the real mouse, then press "drive the page" and read the
+//!   two lines: the app's hand says `trusted=true` like the hand on
+//!   the desk, which is what a synthetic DOM event cannot say;
 //! - "a dead url" points the engine at a host that does not resolve:
 //!   the refusal lands in the footer by name instead of hanging for
 //!   ever waiting for a commit that is not coming;
@@ -37,7 +43,8 @@
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 
-use bunny_ui::host::webview;
+use bunny_ui::action::Modifiers;
+use bunny_ui::host::{MouseButton, WebviewInput, webview};
 use bunny_ui::prelude::*;
 #[cfg(target_os = "macos")]
 use bunny_ui_macos::CoreTextEngine;
@@ -59,8 +66,47 @@ const REPORTER: &str = "addEventListener('DOMContentLoaded', function() { \
     console.log('hello from the page'); \
     fetch(location.href); });";
 
-/// A host that does not resolve — the refusal the second navigation
-/// hook was written for.
+/// The page's own witness, at document start: a box at a KNOWN place,
+/// and a line on the bus for every event that reaches it — what it
+/// was, where the page thinks it landed, and whether the page trusts
+/// it. The target sits at 30,30 to 270,70 and the field at 30,82 to
+/// 270,106, in the CSS pixels the handle's own doors take, so a
+/// report can be read against the coordinates that were asked for.
+const PROBE: &str = "addEventListener('DOMContentLoaded', function() { \
+    var box = document.createElement('div'); \
+    box.style.cssText = 'position:fixed;box-sizing:border-box;left:20px;top:20px;\
+width:260px;height:110px;border:2px solid #55f;background:#eef;z-index:2147483647;\
+font:12px sans-serif;color:#224'; \
+    var target = document.createElement('div'); \
+    target.id = 'target'; \
+    target.textContent = 'the probe: press me'; \
+    target.style.cssText = 'position:absolute;left:8px;top:8px;width:240px;height:40px;\
+background:#dde;text-align:center;line-height:40px'; \
+    var field = document.createElement('input'); \
+    field.id = 'field'; \
+    field.style.cssText = 'position:absolute;left:8px;top:60px;width:240px;height:24px'; \
+    box.appendChild(target); box.appendChild(field); document.body.appendChild(box); \
+    function say(event) { \
+        var who = event.target && event.target.id ? '#' + event.target.id \
+            : (event.target && event.target.tagName || '?'); \
+        var line = event.type + ' on ' + who; \
+        if (event.clientX !== undefined) { \
+            line += ' at ' + Math.round(event.clientX) + ',' + Math.round(event.clientY); } \
+        if (event.type === 'wheel') { line += ' dy=' + Math.round(event.deltaY); } \
+        if (event.type === 'keydown') { line += ' key=' + event.key; } \
+        if (event.type === 'input') { line += ' value=' + event.target.value; } \
+        window.bunny.post(line + ' trusted=' + event.isTrusted); } \
+    ['mousemove', 'mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', \
+     'wheel', 'keydown', 'input'].forEach(function(name) { \
+        document.addEventListener(name, say, true); }); });";
+
+/// Where the probe's two halves are, in the CSS pixels the handle
+/// takes — the numbers the drive sequence aims at.
+const TARGET: (f64, f64) = (150.0, 50.0);
+const FIELD: (f64, f64) = (150.0, 94.0);
+
+/// A host that does not resolve — the refusal the second hook was
+/// written for.
 const DEAD: &str = "https://a-host-that-does-not-resolve.invalid/";
 
 #[derive(Clone)]
@@ -76,6 +122,11 @@ struct Browser {
     refused: State<String>,
     title: State<String>,
     handle: WebviewHandle,
+    /// `--drive`: the hand runs itself once the first page commits,
+    /// so the whole vocabulary reports on stdout with no click.
+    drive: bool,
+    /// Once is once — every later navigation is a commit too.
+    fired: State<bool>,
     /// `--workbench`: the rows the heavy rail carries — the dial that turns
     /// this fluid example into the workbench's resize. Zero is the example
     /// as it always was.
@@ -152,6 +203,14 @@ impl Component for Browser {
             })
         };
 
+        // the hand, spelled out: the two short doors, the held right
+        // press the vocabulary keeps for a hand, and the text that
+        // lands as a commit
+        let drive = {
+            let handle = handle.clone();
+            chip("drive the page".into()).on_click(move || drive_the_page(&handle))
+        };
+
         let dead = {
             let handle = handle.clone();
             chip("a dead url".into()).on_click(move || handle.navigate(DEAD))
@@ -183,6 +242,7 @@ impl Component for Browser {
             beat,
             ask,
             shoot,
+            drive,
             dead,
             text(title.get()).foreground_color(theme::fg_secondary()),
             spacer().frame_height(12.0),
@@ -244,11 +304,38 @@ impl Component for Browser {
         };
 
         let (spoke, fetched, refused) = (self.spoke, self.fetched, self.refused);
+        let (driving, fired) = (self.drive, self.fired);
+        let armed = handle.clone();
         let pane = webview(PAGES[page.get()].1)
             .user_script(REPORTER)
-            .on_navigate(move |url| address.set(url.to_string()))
-            .on_navigate_failed(move |url, why| refused.set(format!("{url} — {why}")))
-            .on_message(move |body| posted.set(body.to_string()))
+            .user_script(PROBE)
+            .on_navigate(move |url| {
+                address.set(url.to_string());
+                // `--drive`: the hand needs a page under it, and a
+                // commit is when there is one
+                if driving && !fired.get() {
+                    fired.set(true);
+                    let armed = armed.clone();
+                    task::spawn(async move {
+                        // the page has to be under the hand: a commit
+                        // is when there is one, plus a beat for the
+                        // probe's own script to draw itself
+                        task::sleep(std::time::Duration::from_millis(1200)).await;
+                        drive_the_page(&armed);
+                    })
+                    .detach();
+                }
+            })
+            // the footer says it, and stdout keeps the whole run: the
+            // probe reports faster than a person reads
+            .on_navigate_failed(move |url, why| {
+                println!("[{}] refused: {url} — {why}", stamp());
+                refused.set(format!("{url} — {why}"));
+            })
+            .on_message(move |body| {
+                println!("[{}] bus: {body}", stamp());
+                posted.set(body.to_string());
+            })
             .on_console(move |line| spoke.set(line.to_string()))
             .on_request(move |line| fetched.set(line.to_string()))
             .handle(&handle);
@@ -336,6 +423,74 @@ impl Component for Browser {
     }
 }
 
+/// The whole vocabulary, once, at the probe's own coordinates: the
+/// pointer arrives, presses, presses twice, presses the other button,
+/// then the field takes the keyboard and the page takes the wheel.
+/// Each step is its own beat so the page's reports read in order.
+fn drive_the_page(handle: &WebviewHandle) {
+    let handle = handle.clone();
+    // detached on purpose: the hand outlives the click that asked for
+    // it, and a dropped handle would cancel it mid-sequence
+    task::spawn(async move {
+        let (x, y) = TARGET;
+        handle.hover(x, y);
+        beat().await;
+        handle.click(x, y);
+        beat().await;
+        handle.input(WebviewInput::Click { x, y, clicks: 2, button: MouseButton::Left });
+        beat().await;
+        let (field_x, field_y) = FIELD;
+        handle.click(field_x, field_y);
+        beat().await;
+        handle.type_text("a hand the app lends");
+        beat().await;
+        handle.key("Enter");
+        beat().await;
+        handle.scroll(400.0, 400.0, 0.0, 240.0);
+        beat().await;
+        // the OTHER pair: a load that answers by refusal. The page on
+        // screen does not move, so the probe is still there for the
+        // last step
+        handle.navigate(DEAD);
+        beat().await;
+        beat().await;
+        // the held half of the vocabulary LAST: the right press leaves
+        // the page's own menu open, and a menu takes the machine until
+        // a person closes it
+        handle.input(WebviewInput::Down {
+            x,
+            y,
+            button: MouseButton::Right,
+            clicks: 1,
+            modifiers: Modifiers::NONE,
+        });
+        handle.input(WebviewInput::Up {
+            x,
+            y,
+            button: MouseButton::Right,
+            clicks: 1,
+            modifiers: Modifiers::NONE,
+        });
+        beat().await;
+        println!("[{}] the hand is done — the page's menu is open, escape closes it", stamp());
+    })
+    .detach();
+}
+
+/// Milliseconds since the process started — the ruler for how long a
+/// report takes to come back.
+fn stamp() -> u128 {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis()
+}
+
+/// One beat between steps — long enough for the engine to answer, and
+/// for the reports to arrive in the order they were asked for.
+async fn beat() {
+    task::sleep(std::time::Duration::from_millis(250)).await;
+}
+
 #[cfg(target_os = "macos")]
 fn main() {
     let runtime = Runtime::new().text_engine(Rc::new(CoreTextEngine::new()));
@@ -354,6 +509,8 @@ fn main() {
             refused: State::new(String::from("nothing yet")),
             title: State::new(String::new()),
             handle: WebviewHandle::new(),
+            drive: std::env::args().any(|arg| arg == "--drive"),
+            fired: State::new(false),
             rows: if std::env::args().any(|arg| arg == "--workbench") {
                 std::env::args()
                     .skip_while(|arg| arg != "--rows")

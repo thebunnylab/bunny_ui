@@ -701,6 +701,13 @@ pub fn run_window_chrome(
                             );
                         }
                     },
+                    // a hand over a page that left is a hand over
+                    // nothing: there is no answer to refuse in
+                    WebviewOp::Input { path, event } => {
+                        if let Some(child) = ffi::host_child(&path) {
+                            webview::input(child, &event);
+                        }
+                    }
                 }
             }
             let (width, height) = window.content_size();

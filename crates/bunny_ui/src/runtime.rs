@@ -3339,6 +3339,10 @@ impl Runtime {
                         self.webview_snaps.borrow_mut().insert(token, then);
                         WebviewOp::Snapshot { path: path.clone(), token }
                     }
+                    // no token: nothing comes back from a hand
+                    WebviewCommand::Input(event) => {
+                        WebviewOp::Input { path: path.clone(), event }
+                    }
                 });
             }
         }

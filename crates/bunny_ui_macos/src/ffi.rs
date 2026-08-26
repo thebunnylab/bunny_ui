@@ -299,6 +299,24 @@ pub enum AppEvent {
 
 thread_local! {
     static HANDLER: RefCell<Option<Box<dyn FnMut(AppEvent)>>> = const { RefCell::new(None) };
+    /// True while the app is lending a hosted page a synthetic hand
+    /// ([`lend_hand`]).
+    static LENDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `work` with the SCENE's ears closed.
+///
+/// A synthetic event is addressed at the platform view, and whatever
+/// the engine does not consume walks up the responder chain — into
+/// the app's own view, which is the one that asked for the event in
+/// the first place, inside the very frame that sent it. The scene
+/// must not hear a phantom press at a point it never named, and the
+/// re-entered handler would be a borrow of what is already borrowed.
+pub(crate) fn lend_hand<T>(work: impl FnOnce() -> T) -> T {
+    let held = LENDING.with(|lending| lending.replace(true));
+    let answer = work();
+    LENDING.with(|lending| lending.set(held));
+    answer
 }
 
 /// Registers who receives the events (the shell's loop).
@@ -309,6 +327,11 @@ pub fn set_handler(handler: Box<dyn FnMut(AppEvent)>) {
 /// Delivers an event to the handler — used by the callbacks and by the
 /// first frame.
 pub fn dispatch(event: AppEvent) {
+    if LENDING.with(Cell::get) {
+        // the page declined it and the chain walked it back here —
+        // see `lend_hand`
+        return;
+    }
     HANDLER.with(|slot| {
         if let Some(handler) = slot.borrow_mut().as_mut() {
             handler(event);

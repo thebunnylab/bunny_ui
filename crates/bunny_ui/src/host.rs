@@ -26,6 +26,7 @@ use std::rc::Rc;
 use motor::state::Context;
 use motor::view::RenderNode;
 
+use crate::action::Modifiers;
 use crate::layout::LayoutNode;
 use crate::view::{NodeList, Single, View};
 
@@ -74,6 +75,63 @@ pub enum WebviewCapability {
 /// name — never an empty answer that looks like a quiet page.
 pub type EvalResult = Result<String, String>;
 
+/// Which button a synthetic press uses. A page reads the three by
+/// number, and the middle one is the wheel pressed down.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MouseButton {
+    /// The primary button.
+    #[default]
+    Left,
+    /// The secondary button — it opens the PAGE's own context menu.
+    Right,
+    /// The wheel, pressed.
+    Middle,
+}
+
+/// One synthetic event, in CSS pixels from the view's own top-left
+/// corner — the hand an app lends the page it holds.
+///
+/// The vocabulary has two halves. `Click`, `Hover`, `Scroll`, `Type`
+/// and `Key` are what a tool does: each one is complete in itself. The
+/// other three — `Down`, `Drag`, `Up` — are what a HAND does: a
+/// button that stays held between events, which is the only way to
+/// spell a drag or a selection.
+///
+/// Served where the backend declares
+/// [`WebviewCapability::SyntheticInput`]; a backend without the
+/// capability drops what it cannot send (the door is
+/// fire-and-forget — there is no answer to refuse in).
+#[derive(Clone, Debug, PartialEq)]
+pub enum WebviewInput {
+    /// Press and release at a point: `clicks` is 1, 2 or 3, and a 2
+    /// gets the press-release pair the page counts a double-click by.
+    Click { x: f64, y: f64, clicks: u32, button: MouseButton },
+    /// Move the pointer with nothing held — what makes a hover state
+    /// appear.
+    Hover { x: f64, y: f64 },
+    /// The wheel at a point. The deltas are the PAGE's own signs: `dy`
+    /// counts DOWN and `dx` counts RIGHT, the way the page reads them
+    /// in a wheel event.
+    Scroll { x: f64, y: f64, dx: f64, dy: f64 },
+    /// Insert text where the page's focus is — a commit, the way a
+    /// paste or an input method lands, not one key after another. It
+    /// works in every field, a `contenteditable` included.
+    Type { text: Rc<str> },
+    /// One named key: `Enter`, `Tab`, `Escape`, `Backspace`,
+    /// `Delete`, `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`,
+    /// `Home`, `End`, `PageUp`, `PageDown`, `Space` — the names the
+    /// page itself uses. A single character is that character's key.
+    Key { key: Rc<str> },
+    /// Press without releasing — the start of a drag or a selection.
+    Down { x: f64, y: f64, button: MouseButton, clicks: u32, modifiers: Modifiers },
+    /// Move with the button still held — the middle of one.
+    Drag { x: f64, y: f64, button: MouseButton, modifiers: Modifiers },
+    /// Release — the end of one. `clicks` is the count the press
+    /// carried, so a page counting double-clicks sees the same number
+    /// twice.
+    Up { x: f64, y: f64, button: MouseButton, clicks: u32, modifiers: Modifiers },
+}
+
 /// A handle's queue, shared between the app's clone and the retained
 /// registration — the runtime drains it once per frame.
 pub(crate) type CommandQueue = Rc<RefCell<Vec<WebviewCommand>>>;
@@ -114,6 +172,9 @@ pub enum WebviewCommand {
     Eval { js: Rc<str>, then: Box<dyn FnOnce(EvalResult)> },
     /// The page as an image — what the engine shows right now.
     Snapshot { then: SnapshotSink },
+    /// One synthetic event into the page — fire-and-forget, like the
+    /// hand it stands for.
+    Input(WebviewInput),
 }
 
 /// A drained command, addressed — what a shell spends on the mounted
@@ -132,6 +193,10 @@ pub enum WebviewOp {
     /// [`crate::runtime::Runtime::webview_snapshot_done`], by token —
     /// the same law as the eval's.
     Snapshot { path: String, token: u64 },
+    /// No token and no answer: the shell spends it on the engine, or
+    /// the page is not there and the event is spent on nothing — the
+    /// same as a hand that moves over a window which just closed.
+    Input { path: String, event: WebviewInput },
 }
 
 /// The imperative half of the webview, because a page is a document
@@ -190,6 +255,54 @@ impl WebviewHandle {
     /// the pixels or the engine's refusal by name.
     pub fn snapshot(&self, then: impl FnOnce(SnapshotResult) + 'static) {
         self.queue.borrow_mut().push(WebviewCommand::Snapshot { then: Box::new(then) });
+    }
+
+    /// One synthetic event into the page — the whole vocabulary, for
+    /// the drag and the right press the short doors below do not
+    /// spell. Fire-and-forget: a hand gets no receipt either.
+    ///
+    /// ```ignore
+    /// page.input(WebviewInput::Down {
+    ///     x: 40.0,
+    ///     y: 120.0,
+    ///     button: MouseButton::Left,
+    ///     clicks: 1,
+    ///     modifiers: Modifiers::NONE,
+    /// });
+    /// ```
+    pub fn input(&self, event: WebviewInput) {
+        self.queue.borrow_mut().push(WebviewCommand::Input(event));
+    }
+
+    /// One press and release at a point, with the primary button —
+    /// the event nine calls in ten want. CSS pixels, from the view's
+    /// own top-left corner.
+    pub fn click(&self, x: f64, y: f64) {
+        self.input(WebviewInput::Click { x, y, clicks: 1, button: MouseButton::Left });
+    }
+
+    /// The pointer moves there, holding nothing — what makes a hover
+    /// state appear.
+    pub fn hover(&self, x: f64, y: f64) {
+        self.input(WebviewInput::Hover { x, y });
+    }
+
+    /// The wheel at a point, in the page's own signs: `dy` counts
+    /// DOWN and `dx` counts RIGHT.
+    pub fn scroll(&self, x: f64, y: f64, dx: f64, dy: f64) {
+        self.input(WebviewInput::Scroll { x, y, dx, dy });
+    }
+
+    /// Types into whatever the page has focused — a commit, the way a
+    /// paste lands, not one key after another.
+    pub fn type_text(&self, text: impl Into<Rc<str>>) {
+        self.input(WebviewInput::Type { text: text.into() });
+    }
+
+    /// One named key, by the name the page itself uses: `Enter`,
+    /// `Tab`, `Escape`, `ArrowDown` — see [`WebviewInput::Key`].
+    pub fn key(&self, key: impl Into<Rc<str>>) {
+        self.input(WebviewInput::Key { key: key.into() });
     }
 
     pub(crate) fn share_queue(&self) -> CommandQueue {

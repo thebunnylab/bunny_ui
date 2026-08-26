@@ -3,7 +3,8 @@
 *Status: the native host, the macOS webview and its instrumentation
 floor — user scripts, the message bus, navigation reports (both legs:
 the commit and the refusal), eval with the value coming back, console
-and request capture by injected hook, and the snapshot — are standing;
+and request capture by injected hook, the snapshot, and synthetic
+input as real NSEvents the page trusts — are standing;
 `cargo run -p bunny-ui-macos --example browser_window` is the proof,
 the web's own lowering — the iframe — is standing beside it, and the
 scene interleaves with the island: what paints after a host
@@ -87,6 +88,15 @@ page.navigate(url);
 page.back();
 page.eval("document.title", move |answer| { /* the value, serialized */ });
 page.snapshot(move |answer| { /* the page as straight RGBA */ });
+
+page.click(120.0, 48.0);          // CSS px, from the view's top-left
+page.type_text("a query");        // into whatever the page has focused
+page.key("Enter");
+page.hover(x, y);
+page.scroll(x, y, 0.0, 240.0);    // the page's own signs: dy counts down
+page.input(WebviewInput::Down {   // and the whole vocabulary, for a drag
+    x, y, button: MouseButton::Right, clicks: 1, modifiers: Modifiers::NONE,
+});
 ```
 
 `eval` takes an expression and answers on a later frame: `Ok` is the
@@ -95,6 +105,30 @@ name — never silence that looks like a slow page. `snapshot` answers
 the same way, with the pixels the engine shows right now. Opening the
 engine's own inspector stays the OS's door (on macOS the view is
 inspectable: right-click, Inspect Element).
+
+The input door is the hand an app lends the page. Its vocabulary has
+two halves: `click`, `hover`, `scroll`, `type_text` and `key` are what
+a tool does — each one complete in itself — while `Down`, `Drag` and
+`Up` are what a hand does, a button that stays held between events,
+which is the only way to spell a drag or a selection. Fire and
+forget: a hand gets no receipt.
+
+Where the backend serves it by REAL platform events — on macOS,
+NSEvents addressed at the view — the page cannot tell the app's hand
+from the one on the desk: `isTrusted` is true, and a control that
+guards on it works. That is the whole reason the door exists, because
+the alternative an app reaches for is a synthetic DOM event
+(`el.click()`), which real sites refuse. Typing is a COMMIT rather
+than a run of keystrokes, so it lands in a field, in a
+`contenteditable`, and under a keyboard layout nobody guessed.
+
+Two truths a driver has to know. A right press opens the PAGE's own
+menu, and a menu takes the machine until a person closes it — so it
+is the last event of a sequence, never the middle one. And what the
+engine does not consume walks back up the responder chain: while the
+app is lending the hand the scene's ears are closed, but a key the
+page declines can still reach the app afterwards, exactly as it does
+when a person types into a focused page.
 
 User scripts run at document start, so a page never renders before the
 app's instrumentation is in place. The message bus is the same channel
@@ -114,7 +148,7 @@ like a quiet page.
 | console messages | injected hook | native | native |
 | network: requests observed | injected wrap (fetch/XHR) | native | native |
 | network: response bodies | no | yes | yes |
-| synthetic input | open question | native | open question |
+| synthetic input | NSEvent, trusted | native | open question |
 | devtools | external inspector | built in | embeddable |
 
 The table is the design's honest centre. An app that needs full
@@ -139,7 +173,8 @@ message channel, and it stays there.
 ## Order of work
 
 The macOS backend first, because WKWebView is the floor — the weakest
-network story, the open input question — and an API grown on the
-richest backend would be wrong on the other two. The capability table
+network story, and the one where synthetic input had no answer at
+all — and an API grown on the richest backend would be wrong on the
+other two. The capability table
 above is the acceptance sheet: each cell either works or refuses by
 name.

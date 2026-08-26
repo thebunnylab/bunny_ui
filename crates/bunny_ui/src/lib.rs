@@ -6641,6 +6641,82 @@ mod tests {
         assert_eq!(watcher.refused.get(), "no route");
     }
 
+    /// The hand the app lends the page. Every word of the vocabulary
+    /// drains addressed to the bound page, in the order it was
+    /// queued, and NONE of them parks an answer: a hand gets no
+    /// receipt.
+    #[test]
+    fn the_hand_the_app_lends_the_page_drains_in_order() {
+        use crate::action::Modifiers;
+        use crate::host::{MouseButton, WebviewHandle, WebviewInput, WebviewOp, webview};
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Page {
+            handle: WebviewHandle,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                webview("https://example.test/").handle(&self.handle)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { handle: WebviewHandle::new() };
+        let _ = runtime
+            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let path = runtime.hosts()[0].path.clone();
+
+        page.handle.click(12.0, 40.0);
+        page.handle.hover(12.0, 41.0);
+        page.handle.scroll(12.0, 41.0, 0.0, 240.0);
+        page.handle.type_text("a page");
+        page.handle.key("Enter");
+        // the half the short doors do not spell: a held right press
+        page.handle.input(WebviewInput::Down {
+            x: 12.0,
+            y: 40.0,
+            button: MouseButton::Right,
+            clicks: 2,
+            modifiers: Modifiers::SHIFT,
+        });
+
+        let ops = runtime.webview_commands();
+        assert_eq!(ops.len(), 6, "the whole hand drains");
+        let events: Vec<WebviewInput> = ops
+            .iter()
+            .map(|op| {
+                let WebviewOp::Input { path: at, event } = op else {
+                    panic!("a hand never takes a token");
+                };
+                assert_eq!(*at, path, "every event is addressed to the bound page");
+                event.clone()
+            })
+            .collect();
+        assert_eq!(
+            events[0],
+            WebviewInput::Click { x: 12.0, y: 40.0, clicks: 1, button: MouseButton::Left },
+            "the short door means one press of the primary button"
+        );
+        assert_eq!(events[1], WebviewInput::Hover { x: 12.0, y: 41.0 });
+        assert_eq!(events[2], WebviewInput::Scroll { x: 12.0, y: 41.0, dx: 0.0, dy: 240.0 });
+        assert_eq!(events[3], WebviewInput::Type { text: "a page".into() });
+        assert_eq!(events[4], WebviewInput::Key { key: "Enter".into() });
+        assert_eq!(
+            events[5],
+            WebviewInput::Down {
+                x: 12.0,
+                y: 40.0,
+                button: MouseButton::Right,
+                clicks: 2,
+                modifiers: Modifiers::SHIFT,
+            }
+        );
+
+        // the queue is spent, and nothing is parked waiting to answer
+        assert!(runtime.webview_commands().is_empty());
+    }
+
     /// A probe under a SKIPPED body still reports. The retained tree is
     /// what the frame is laid out from, so the node is still placed —
     /// and the writer is retained beside it, like every other one.
