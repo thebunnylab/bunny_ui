@@ -30,10 +30,18 @@
 //!   coordinates and whether the page trusts it. Click its target
 //!   with the real mouse, then press "drive the page" and read the
 //!   two lines: the app's hand says `trusted=true` like the hand on
-//!   the desk, which is what a synthetic DOM event cannot say;
+//!   the desk, which is what a synthetic DOM event cannot say. (The
+//!   hand rides the DevTools Protocol here, and the last step's right
+//!   press opens the ENGINE's own menu exactly as on the mac — a menu
+//!   takes the machine until a person closes it, so it stays the last
+//!   event of the sequence. Its Inspect row is the devtools door);
 //! - "a dead url" points the engine at a host that does not resolve:
 //!   the refusal lands in the footer by name instead of hanging for
-//!   ever waiting for a commit that is not coming;
+//!   ever waiting for a commit that is not coming. (One observed
+//!   difference from the mac: this engine COMMITS a blank document
+//!   for the refused load — the built-in error page is off, so the
+//!   bar keeps the last real url and the pair contract holds, but
+//!   the old page's pixels leave the pane where WKWebView kept them);
 //! - the toast in the corner is IN-SCENE content over the page — the
 //!   sandwich: paint order is the truth over the island too. Click it
 //!   and it answers; click the clear space beside it and the PAGE

@@ -8,7 +8,14 @@ input as real NSEvents the page trusts — are standing;
 `cargo run -p bunny-ui-macos --example browser_window` is the proof,
 the web's own lowering — the iframe — is standing beside it, and the
 scene interleaves with the island: what paints after a host
-composites above it. WebView2 and WebKitGTK are open.*
+composites above it. WebView2 stands too, the same floor behind the
+same API — the Evergreen runtime found by registry at zero bundled
+bytes, console and requests served NATIVELY (the DevTools Protocol
+and the response-received event, richer than the injected wraps),
+synthetic input by protocol with `isTrusted` true, and the sandwich
+riding owned per-pixel-alpha popups;
+`cargo run -p bunny-ui-windows --example browser_window` is that
+proof, `--drive` its witness. WebKitGTK is open.*
 
 An app sometimes has to show a web page — the preview of the thing it
 is building, a documentation site, an OAuth dance. Bundling a browser
@@ -147,9 +154,14 @@ like a quiet page.
 | -- | -- | -- | -- |
 | console messages | injected hook | native | native |
 | network: requests observed | injected wrap (fetch/XHR) | native | native |
-| network: response bodies | no | yes | yes |
+| network: response bodies | no | yes¹ | yes |
 | synthetic input | NSEvent, trusted | native | open question |
 | devtools | external inspector | built in | embeddable |
+
+¹ Engine-ready, core door open: the engine can hand a response body
+over, but no hook of this API carries bytes yet — so the backend does
+not DECLARE `NetworkBodies`, because a declared capability nothing can
+ask through would be an empty answer with a checkmark on it.
 
 The table is the design's honest centre. An app that needs full
 network capture on every OS needs a proxy or its own engine; this

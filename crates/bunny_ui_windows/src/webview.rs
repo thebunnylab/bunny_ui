@@ -49,7 +49,6 @@ pub fn capabilities() -> &'static [WebviewCapability] {
 
 #[link(name = "kernel32", kind = "raw-dylib")]
 unsafe extern "system" {
-    fn LoadLibraryW(name: *const u16) -> isize;
     fn LoadLibraryExW(name: *const u16, file: isize, flags: u32) -> isize;
     fn GetProcAddress(module: isize, name: *const u8) -> *const c_void;
 }
@@ -274,9 +273,25 @@ type CreateEnvInternalFn =
 fn create_environment(completed: *mut c_void) -> Result<(), String> {
     let user_data = wide(&user_data_folder());
     unsafe {
-        let loader = LoadLibraryW(wide("WebView2Loader.dll").as_ptr());
-        if loader != 0 {
-            let entry = GetProcAddress(loader, c"CreateCoreWebView2EnvironmentWithOptions".as_ptr().cast());
+        // the belt is EXE-LOCAL by intent: an app author who CHOSE to
+        // drop the official loader beside the exe gets the documented
+        // ABI — a stray loader on the PATH (a toolkit's, a game's) is
+        // nobody's choice and never rides
+        let local_loader = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("WebView2Loader.dll")))
+            .filter(|path| path.exists());
+        if let Some(path) = local_loader {
+            let loader =
+                LoadLibraryExW(wide(&path.to_string_lossy()).as_ptr(), 0, ALTERED_SEARCH);
+            let entry = if loader != 0 {
+                GetProcAddress(
+                    loader,
+                    c"CreateCoreWebView2EnvironmentWithOptions".as_ptr().cast(),
+                )
+            } else {
+                std::ptr::null()
+            };
             if !entry.is_null() {
                 let create: CreateEnvFn = std::mem::transmute(entry);
                 let hr =
