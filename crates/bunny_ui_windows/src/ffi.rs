@@ -52,7 +52,7 @@ struct Point {
 }
 
 #[repr(C)]
-struct Msg {
+pub(crate) struct Msg {
     hwnd: Hwnd,
     message: u32,
     wparam: usize,
@@ -134,8 +134,8 @@ unsafe extern "system" {
     ) -> Hwnd;
     fn DefWindowProcW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn GetMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32) -> i32;
-    fn TranslateMessage(msg: *const Msg) -> i32;
-    fn DispatchMessageW(msg: *const Msg) -> isize;
+    pub(crate) fn TranslateMessage(msg: *const Msg) -> i32;
+    pub(crate) fn DispatchMessageW(msg: *const Msg) -> isize;
     fn PostQuitMessage(code: i32);
     fn PostMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> i32;
     fn DestroyWindow(hwnd: Hwnd) -> i32;
@@ -361,6 +361,7 @@ const WS_CHILD: u32 = 0x4000_0000;
 const WS_CLIPCHILDREN: u32 = 0x0200_0000;
 const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
 const GWL_STYLE: i32 = -16;
+const SWP_NOSIZE: u32 = 0x0001;
 const SW_SHOWNOACTIVATE: i32 = 4;
 const SW_HIDE: i32 = 0;
 const ULW_ALPHA: u32 = 2;
@@ -1303,7 +1304,17 @@ pub enum Cursor {
 thread_local! {
     /// The cursor the scene wants right now — `WM_SETCURSOR` re-applies
     /// it every time the system would reset to the class cursor.
-    static CURRENT_CURSOR: Cell<Cursor> = const { Cell::new(Cursor::Arrow) };
+    /// `None` = YIELDED: over a native host's island the engine owns
+    /// the hand, and the shell says nothing until it has a real claim.
+    static CURRENT_CURSOR: Cell<Option<Cursor>> = const { Cell::new(Some(Cursor::Arrow)) };
+}
+
+/// The shell stops asserting a cursor — the pointer sits over an
+/// island and the only answer is the default arrow. The engine's own
+/// `WM_SETCURSOR` rules there; yielding rearms the gate so the first
+/// claim OFF the island speaks again.
+pub(crate) fn yield_cursor() {
+    CURRENT_CURSOR.with(|cell| cell.set(None));
 }
 
 fn apply_cursor(cursor: Cursor) {
@@ -1676,11 +1687,14 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
         }
         WM_ERASEBKGND => 1,
         WM_SETCURSOR => {
-            if (lparam & 0xFFFF) == HTCLIENT {
-                apply_cursor(CURRENT_CURSOR.with(|cell| cell.get()));
-                1
-            } else {
-                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            match CURRENT_CURSOR.with(|cell| cell.get()) {
+                Some(cursor) if (lparam & 0xFFFF) == HTCLIENT => {
+                    apply_cursor(cursor);
+                    1
+                }
+                // yielded (the island's engine owns the hand) or a
+                // non-client hit: the default road answers
+                _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
             }
         }
         WM_MOUSEMOVE => {
@@ -1950,6 +1964,9 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             unsafe {
                 KillTimer(hwnd, TIMER_RESIZE);
             }
+            // the end-of-gesture redraw mints the segments back — for
+            // the length of the drag they came home to the drawable
+            dispatch(AppEvent::Redraw);
             0
         }
         WM_ACTIVATE => {
@@ -2272,8 +2289,8 @@ impl WindowHandle {
     /// on every `WM_SETCURSOR`.
     pub fn set_cursor(&self, cursor: Cursor) {
         let changed = CURRENT_CURSOR.with(|cell| {
-            let previous = cell.replace(cursor);
-            previous != cursor
+            let previous = cell.replace(Some(cursor));
+            previous != Some(cursor)
         });
         if changed {
             apply_cursor(cursor);
@@ -2384,6 +2401,14 @@ impl WindowHandle {
         });
     }
 
+    /// Brings a panel over its sibling surfaces without taking the
+    /// keyboard — an overlay outranks a segment riding the same owner.
+    pub fn raise(&self) {
+        unsafe {
+            SetWindowPos(self.hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+
     /// Retires a panel: hidden, forgotten, destroyed.
     pub fn close_panel(&self) {
         unsafe {
@@ -2442,12 +2467,6 @@ struct HostSlot {
 thread_local! {
     /// Alive hosts by placement path — the mac's `HOST_VIEWS` twin.
     static HOST_SLOTS: RefCell<HashMap<String, HostSlot>> = RefCell::new(HashMap::new());
-}
-
-/// The container a host mounted under `key` lives in — what a segment
-/// surface stacks directly above, and what the tenant is keyed by.
-pub(crate) fn host_container(key: &str) -> Option<Hwnd> {
-    HOST_SLOTS.with(|slots| slots.borrow().get(key).map(|slot| slot.container))
 }
 
 /// The container's own class: a clip, not a participant — every
@@ -2643,6 +2662,184 @@ impl WindowHandle {
     }
 }
 
+// MARK: - Segment surfaces (the sandwich)
+//
+// What the scene paints AFTER a host leaves the window's own present
+// and composites on a surface ABOVE the platform view: an owned
+// per-pixel-alpha popup, the overlay road's own window kind — a
+// LAYERED CHILD would be the mac's exact shape, but the platform
+// grants layered children only to a process with a Windows 8 compat
+// manifest, and this crate ships no build step to embed one
+// (measured: CreateWindowExW answers ERROR_INVALID_PARAMETER). An
+// owned popup composites above the owner and every child of it, the
+// island included; it repositions on the present like the panels do.
+// One consequence, named: every segment rides above EVERY island, so
+// content between two overlapping hosts cannot land between their
+// pages on this platform.
+//
+// The platform's own law does the hit policy: a layered window is
+// transparent to the pointer wherever its alpha is zero, so the
+// painted pixels claim the click and the clear ones let it fall
+// through to the page. (The mac claims at alpha > 8; here the floor
+// is the platform's own — alpha > 0 — and the antialiased fringe
+// resolves to the scene either way.) The surface shares the
+// "BunnyWindow" class, so its events ride the panel road:
+// `set_scene_origin` re-maps them and the runtime never learns which
+// surface the pointer touched.
+
+thread_local! {
+    /// Alive segment surfaces by host path.
+    static SEGMENTS: RefCell<HashMap<String, Hwnd>> = RefCell::new(HashMap::new());
+}
+
+/// Premultiplied RGBA → premultiplied BGRA: a swizzle and NOTHING
+/// else. A raster onto a transparent ground already left its colors
+/// multiplied by coverage — multiplying again squares the alpha
+/// (the mac's 60425dd lesson; `present_layered` multiplies because
+/// its input is straight).
+pub(crate) fn swizzle_premultiplied_bgra(rgba: &[u8], out: &mut [u8]) {
+    for (source, dest) in rgba.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+        dest[0] = source[2];
+        dest[1] = source[1];
+        dest[2] = source[0];
+        dest[3] = source[3];
+    }
+}
+
+/// A fresh segment surface: an owned popup like the panels, never
+/// activated, born hidden — the first blit positions and shows it.
+fn create_segment(owner: Hwnd) -> Hwnd {
+    let class_name = register_class();
+    let title = wide("");
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            class_name.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            owner,
+            0,
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null(),
+        )
+    };
+    assert!(hwnd != 0, "the platform refused the segment surface");
+    hwnd
+}
+
+impl WindowHandle {
+    /// Rasterized pixels for one segment: position, size and picture
+    /// land in ONE atomic call, the panel road exactly — except the
+    /// copy is a SWIZZLE, because the segment's raster is already
+    /// premultiplied.
+    pub fn segment_blit(
+        &self,
+        key: &str,
+        rgba: &[u8],
+        frame: (f64, f64, f64, f64),
+        px_width: usize,
+        px_height: usize,
+    ) {
+        let known = SEGMENTS.with(|segments| segments.borrow().get(key).copied());
+        let hwnd = match known {
+            Some(hwnd) => hwnd,
+            None => {
+                let hwnd = create_segment(self.hwnd);
+                SEGMENTS.with(|segments| {
+                    segments.borrow_mut().insert(key.to_string(), hwnd);
+                });
+                hwnd
+            }
+        };
+        if px_width == 0 || px_height == 0 || !ensure_backing(hwnd, px_width, px_height) {
+            return;
+        }
+        // the segment's events translate into the scene like a panel's
+        WindowHandle { hwnd }.set_scene_origin(frame.0, frame.1);
+        let screen = self.layout_rect_to_screen(frame.0, frame.1, frame.2, frame.3);
+        BACKING.with(|stores| {
+            let mut stores = stores.borrow_mut();
+            let backing = stores.get_mut(&hwnd).expect("backing for the segment");
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(backing.bits, px_width * px_height * 4)
+            };
+            swizzle_premultiplied_bgra(rgba, bytes);
+            let position = Point { x: screen.left, y: screen.top };
+            let size = SizePx { cx: px_width as i32, cy: px_height as i32 };
+            let source = Point { x: 0, y: 0 };
+            let blend = BlendFunction {
+                op: AC_SRC_OVER,
+                flags: 0,
+                source_constant_alpha: 255,
+                alpha_format: AC_SRC_ALPHA,
+            };
+            unsafe {
+                UpdateLayeredWindow(
+                    hwnd,
+                    0,
+                    &position,
+                    &size,
+                    backing.dc,
+                    &source,
+                    0,
+                    &blend,
+                    ULW_ALPHA,
+                );
+                if IsWindowVisible(hwnd) == 0 {
+                    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
+            }
+        });
+    }
+
+    /// Re-places a segment whose picture did not change — the box
+    /// moved (or the window did), the pixels stay.
+    pub fn segment_place(&self, key: &str, frame: (f64, f64, f64, f64)) {
+        let Some(hwnd) = SEGMENTS.with(|segments| segments.borrow().get(key).copied()) else {
+            return;
+        };
+        WindowHandle { hwnd }.set_scene_origin(frame.0, frame.1);
+        let screen = self.layout_rect_to_screen(frame.0, frame.1, frame.2, frame.3);
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                0,
+                screen.left,
+                screen.top,
+                0,
+                0,
+                SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// Retires every segment no host needs this frame — the table
+    /// entry leaves FIRST, then the window (destruction re-enters the
+    /// proc, and a question mid-write deserves an answer).
+    pub fn segment_sweep(&self, alive: &[String]) {
+        let dead: Vec<Hwnd> = SEGMENTS.with(|segments| {
+            let mut segments = segments.borrow_mut();
+            let keys: Vec<String> = segments
+                .keys()
+                .filter(|key| !alive.contains(key))
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .filter_map(|key| segments.remove(&key))
+                .collect()
+        });
+        for hwnd in dead {
+            unsafe {
+                DestroyWindow(hwnd);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2651,6 +2848,11 @@ mod tests {
     /// (`IsWindowVisible` asks the whole ancestor chain, and a test
     /// window never shows).
     const WS_VISIBLE: u32 = 0x1000_0000;
+
+    /// The test's own window into the registry.
+    fn host_container(key: &str) -> Option<Hwnd> {
+        HOST_SLOTS.with(|slots| slots.borrow().get(key).map(|slot| slot.container))
+    }
 
     #[link(name = "user32", kind = "raw-dylib")]
     unsafe extern "system" {

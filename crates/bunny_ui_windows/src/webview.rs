@@ -2593,17 +2593,16 @@ mod tests {
     /// stands for real, through the loader-free ladder.
     #[test]
     fn the_environment_stands_when_the_runtime_is_installed() {
+        use crate::ffi::{DispatchMessageW, Msg, TranslateMessage};
         #[link(name = "user32", kind = "raw-dylib")]
         unsafe extern "system" {
             fn PeekMessageW(
-                message: *mut [usize; 6],
+                message: *mut Msg,
                 hwnd: isize,
                 min: u32,
                 max: u32,
                 remove: u32,
             ) -> i32;
-            fn TranslateMessage(message: *const [usize; 6]) -> i32;
-            fn DispatchMessageW(message: *const [usize; 6]) -> isize;
         }
         if client_dll_candidates().is_empty() {
             eprintln!("webview smoke: no WebView2 runtime on this machine; skipping");
@@ -2628,7 +2627,7 @@ mod tests {
                 "the environment never landed"
             );
             unsafe {
-                let mut message = [0usize; 6];
+                let mut message: Msg = std::mem::zeroed();
                 const PM_REMOVE: u32 = 1;
                 if PeekMessageW(&mut message, 0, 0, 0, PM_REMOVE) != 0 {
                     TranslateMessage(&message);

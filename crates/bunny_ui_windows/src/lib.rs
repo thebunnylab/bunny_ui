@@ -141,11 +141,19 @@ pub fn run_window_chrome(
     // the open popovers' panels, pooled by identity path
     let panels: Rc<RefCell<std::collections::HashMap<String, ffi::WindowHandle>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
+    // the commands each host SEGMENT was last rasterized from, with
+    // the box and scale that held them — unchanged means re-placed,
+    // never re-rastered
+    type SegmentKept =
+        std::collections::HashMap<String, (Vec<bunny_ui::layout::DrawCommand>, (f64, f64, f64, f64), usize)>;
+    let segments_kept: Rc<RefCell<SegmentKept>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
     // present takes a READY display list to the window — the tick path
     // reuses it without paying settle or effects
     let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
+        let segments_kept = Rc::clone(&segments_kept);
         move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
             let (width, height) = window.content_size();
             let scale = window.scale();
@@ -204,6 +212,100 @@ pub fn run_window_chrome(
                 &hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>(),
                 |key| webview::sweep(key),
             );
+            // the sandwich: what painted ABOVE a host leaves the
+            // window's present and composites on a segment surface
+            // over the island. MID-DRAG the segments come home to the
+            // drawable and move with the window by construction; the
+            // end-of-gesture Redraw mints them back (the mac's law).
+            let mut segment_ranges: Vec<(usize, usize)> = Vec::new();
+            let segments: Vec<(String, bunny_ui::layout::DisplayList)> =
+                if ffi::in_size_move() {
+                    Vec::new()
+                } else {
+                    runtime
+                        .host_segments(full_display.len())
+                        .into_iter()
+                        .filter_map(|(path, range)| {
+                            let host = hosts.iter().find(|host| {
+                                host.path == path
+                                    && host.visible.size.width > 0.0
+                                    && host.visible.size.height > 0.0
+                            })?;
+                            let island = bunny_ui::layout::Rect {
+                                origin: bunny_ui::layout::Point {
+                                    x: host.frame.origin.x + host.visible.origin.x,
+                                    y: host.frame.origin.y + host.visible.origin.y,
+                                },
+                                size: host.visible.size,
+                            };
+                            let (carves, lifted) =
+                                bunny_ui::raster::carve_covering(&full_display, range, island)?;
+                            segment_ranges.extend(carves);
+                            Some((path, lifted))
+                        })
+                        .collect()
+                };
+            // the segments themselves: rasterized only when their
+            // commands changed (the ledger's answer), blitted between
+            // the platform views, swept the frame nothing paints above
+            // a host
+            {
+                let mut kept = segments_kept.borrow_mut();
+                let mut alive: Vec<String> = Vec::new();
+                for (host, slice) in &segments {
+                    // the surface is the CONTENT's box, never the
+                    // window: a ring's segment rasterizes a ring
+                    let Some(bounds) =
+                        bunny_ui::raster::list_bounds(slice, &*runtime.text())
+                    else {
+                        continue; // nothing paints — nothing to lift
+                    };
+                    let pad = 2.0;
+                    let x0 = (bounds.origin.x - pad).max(0.0);
+                    let y0 = (bounds.origin.y - pad).max(0.0);
+                    let x1 = (bounds.origin.x + bounds.size.width + pad).min(width);
+                    let y1 = (bounds.origin.y + bounds.size.height + pad).min(height);
+                    if x1 <= x0 || y1 <= y0 {
+                        continue;
+                    }
+                    alive.push(host.clone());
+                    let frame = (x0, y0, x1 - x0, y1 - y0);
+                    let commands: Vec<_> = slice.iter().cloned().collect();
+                    let stale = kept.get(host).is_none_or(|(was, box_, at)| {
+                        *was != commands || *box_ != frame || *at != scale
+                    });
+                    if !stale {
+                        // same picture — at most a new place
+                        window.segment_place(host, frame);
+                        continue;
+                    }
+                    let box_physical = (
+                        ((x1 - x0) * scale as f64).round().max(1.0) as usize,
+                        ((y1 - y0) * scale as f64).round().max(1.0) as usize,
+                    );
+                    let local = slice.translated_slice((0, slice.len()), -x0, -y0);
+                    let bitmap = bunny_ui::raster::rasterize_over(
+                        &local,
+                        box_physical.0,
+                        box_physical.1,
+                        scale,
+                        bunny_ui::layout::Color { r: 0, g: 0, b: 0, a: 0 },
+                        &*runtime.text(),
+                        &*runtime.images(),
+                        None,
+                    );
+                    window.segment_blit(
+                        host,
+                        &bitmap.to_rgba_bytes(),
+                        frame,
+                        box_physical.0,
+                        box_physical.1,
+                    );
+                    kept.insert(host.clone(), (commands, frame, scale));
+                }
+                kept.retain(|key, _| alive.iter().any(|host| host == key));
+                window.segment_sweep(&alive);
+            }
             // the window presents everything BEFORE the first overlay;
             // each overlay re-presents its own slice on an owned panel
             // in screen coordinates — that is how it leaves the window
@@ -258,8 +360,19 @@ pub fn run_window_chrome(
                         panel_physical.1,
                         &bitmap.to_rgba_bytes(),
                     );
+                    // an overlay outranks the sandwich: the popover
+                    // rides above any segment sharing the owner
+                    panel.raise();
                 }
             }
+            // both roads carve the lifted ranges out of the window's
+            // own present — the segments carry those pixels now, and
+            // the ranges index the ORIGINAL list
+            let display = if segment_ranges.is_empty() {
+                display
+            } else {
+                display.without_slices(&segment_ranges)
+            };
             if d3d::active() {
                 // GPU present: the same display list, no Surface in the
                 // path — the swapchain is the frame
@@ -344,14 +457,32 @@ pub fn run_window_chrome(
             // a live divider drag keeps the resizer even while the
             // pointer runs ahead of the seam; hovering the grip
             // announces it
-            window.set_cursor(match runtime.seam_axis() {
+            let desired = match runtime.seam_axis() {
                 // lanes side by side: the seam travels left and right
                 Some(Axis::Horizontal) => ffi::Cursor::ResizeLeftRight,
                 // lanes stacked: it travels up and down
                 Some(Axis::Vertical) => ffi::Cursor::ResizeUpDown,
                 None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
                 None => ffi::Cursor::Arrow,
+            };
+            // over the island with only the DEFAULT to say, the shell
+            // YIELDS: the engine owns the cursor over its own page
+            // (the hand over a link is the webview's to give)
+            let over_host = interaction.pointer.is_some_and(|point| {
+                runtime.hosts().iter().any(|host| {
+                    let x0 = host.frame.origin.x + host.visible.origin.x;
+                    let y0 = host.frame.origin.y + host.visible.origin.y;
+                    point.x >= x0
+                        && point.y >= y0
+                        && point.x < x0 + host.visible.size.width
+                        && point.y < y0 + host.visible.size.height
+                })
             });
+            if over_host && desired == ffi::Cursor::Arrow {
+                ffi::yield_cursor();
+            } else {
+                window.set_cursor(desired);
+            }
             // the input system's mirror: the doors answer from this
             // without asking the runtime mid-message
             ffi::sync_ime(runtime.ime_snapshot().map(|snapshot| {
@@ -526,7 +657,16 @@ pub fn run_window_chrome(
         let runtime = &handler_runtime;
         let root = &*handler_root;
         match event {
-            AppEvent::Redraw | AppEvent::Wake => blit(runtime, root),
+            // Redraw is NEVER gated — it IS the resize presenter, and
+            // holding it back leaves the compositor stretching a stale
+            // frame. A worker's wake mid-drag polls on the next turn
+            // instead of racing the one presenter (the mac's law).
+            AppEvent::Redraw => blit(runtime, root),
+            AppEvent::Wake => {
+                if !ffi::in_size_move() {
+                    blit(runtime, root);
+                }
+            }
             AppEvent::SettingsChanged => {
                 runtime.set_reduce_motion(!ffi::animations_enabled());
                 if mirror_theme {
@@ -653,15 +793,19 @@ pub fn run_window_chrome(
                 // the same slow beat ages a sequence in the air: two
                 // ticks and `cmd-k` lets the keyboard go
                 let chorded = runtime.chord_tick();
-                if blinked || explained || chorded {
+                if (blinked || explained || chorded) && !ffi::in_size_move() {
+                    // mid-drag the clock yields: the WM_SIZE redraw is
+                    // the one presenter
                     blit(runtime, root);
                 }
             }
             AppEvent::Frame { dt } => {
                 // the tick path: springs advance, then layout only —
                 // zero bodies on a stable tree; settle and effects
-                // belong to the real-event path
-                if runtime.tick(dt).any() {
+                // belong to the real-event path. Mid-drag the springs
+                // still advance but present nothing — exactly ONE
+                // presenter while the window changes size.
+                if runtime.tick(dt).any() && !ffi::in_size_move() {
                     let (width, height) = window.content_size();
                     let display = runtime.animation_frame(root, Size { width, height });
                     handler_present(runtime, display);
