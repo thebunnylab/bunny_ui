@@ -458,6 +458,23 @@ const IID_ACCELERATOR: Guid = Guid {
     d3: 0x41a8,
     d4: [0x8e, 0x44, 0x65, 0x81, 0x1c, 0x76, 0xdc, 0xb2],
 };
+/// `ICoreWebView2_11` {0BE78E56-C193-4051-B943-23B460C08BDB} — the
+/// context-menu door (runtime 101+, 2022); an older runtime keeps the
+/// engine's own menu, whole.
+const IID_WEBVIEW2_11: Guid = Guid {
+    d1: 0x0be78e56,
+    d2: 0xc193,
+    d3: 0x4051,
+    d4: [0xb9, 0x43, 0x23, 0xb4, 0x60, 0xc0, 0x8b, 0xdb],
+};
+/// `ICoreWebView2ContextMenuRequestedEventHandler`
+/// {04D3FE1D-AB87-42FB-A898-DA241D35B63C}.
+const IID_CONTEXT_MENU: Guid = Guid {
+    d1: 0x04d3fe1d,
+    d2: 0xab87,
+    d3: 0x42fb,
+    d4: [0xa8, 0x98, 0xda, 0x24, 0x1d, 0x35, 0xb6, 0x3c],
+};
 
 // MARK: - Consumed vtables (header order, indexes cited, runs padded)
 
@@ -742,6 +759,70 @@ struct ResponseViewVtbl {
     get_status_code: unsafe extern "system" fn(*mut c_void, *mut i32) -> Hresult,
     /// 5 get_ReasonPhrase; 6 GetContent.
     _pad_5_6: [usize; 2],
+}
+
+/// `ICoreWebView2_11` — 102 slots; reached by QI for the menu door
+/// alone, so everything before it rides as one pad.
+#[repr(C)]
+struct WebView2_11Vtbl {
+    /// 0-2 IUnknown; 3-60 the base; 61-98 the `_2`..`_10` chain;
+    /// 99 CallDevToolsProtocolMethodForSession.
+    _pad_0_99: [usize; 100],
+    /// 100 `add_ContextMenuRequested(handler, *token)`.
+    add_context_menu_requested:
+        unsafe extern "system" fn(*mut WebView2_11, *mut c_void, *mut i64) -> Hresult,
+    /// 101 remove_ContextMenuRequested.
+    _pad_101: [usize; 1],
+}
+#[repr(C)]
+struct WebView2_11 {
+    vtbl: *const WebView2_11Vtbl,
+}
+
+/// `ICoreWebView2ContextMenuRequestedEventArgs` — 11 slots.
+#[repr(C)]
+struct ContextMenuArgsVtbl {
+    unknown: UnknownVtbl, // 0-2
+    /// 3 `get_MenuItems(**collection)`.
+    get_menu_items: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> Hresult,
+    /// 4 get_ContextMenuTarget; 5 get_Location;
+    /// 6 put_SelectedCommandId; 7 get_SelectedCommandId;
+    /// 8 put_Handled; 9 get_Handled; 10 GetDeferral. `Handled` stays
+    /// untouched — the ENGINE shows the trimmed menu.
+    _pad_4_10: [usize; 7],
+}
+
+/// `ICoreWebView2ContextMenuItemCollection` — 7 slots.
+#[repr(C)]
+struct MenuItemsVtbl {
+    unknown: UnknownVtbl, // 0-2
+    /// 3 `get_Count(*count)`.
+    get_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> Hresult,
+    /// 4 `GetValueAtIndex(index, **item)`.
+    get_value_at_index:
+        unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> Hresult,
+    /// 5 `RemoveValueAtIndex(index)`.
+    remove_value_at_index: unsafe extern "system" fn(*mut c_void, u32) -> Hresult,
+    /// 6 InsertValueAtIndex.
+    _pad_6: [usize; 1],
+}
+
+/// `ICoreWebView2ContextMenuItem` — 16 slots.
+#[repr(C)]
+struct MenuItemVtbl {
+    unknown: UnknownVtbl, // 0-2
+    /// 3 `get_Name(**name)` — the STABLE identifier ("back",
+    /// "saveAs", "inspectElement"), never the localized label.
+    get_name: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> Hresult,
+    /// 4 get_Label; 5 get_CommandId; 6 get_ShortcutKeyDescription;
+    /// 7 get_Icon.
+    _pad_4_7: [usize; 4],
+    /// 8 `get_Kind(*kind)` — 0 command, 1 checkbox, 2 radio,
+    /// 3 separator, 4 submenu.
+    get_kind: unsafe extern "system" fn(*mut c_void, *mut i32) -> Hresult,
+    /// 9-12 is-enabled/is-checked pairs; 13 get_Children;
+    /// 14-15 add/remove_CustomItemSelected.
+    _pad_9_15: [usize; 7],
 }
 
 /// `ICoreWebView2AcceleratorKeyPressedEventArgs` — 9 slots.
@@ -1343,6 +1424,21 @@ fn controller_landed(path: &str, generation: u64, hr: Hresult, controller: *mut 
             &mut token,
         );
         com_release(on_accelerator);
+
+        // the menu over the page wears the mac's cut: the engine still
+        // owns it, but the browser-chrome rows (Save as, Print, Send
+        // tab…) leave and the WebKit set stays. An older runtime has
+        // no door and keeps the whole menu, honestly.
+        if let Some(core11) = com_query(core as *mut c_void, &IID_WEBVIEW2_11) {
+            let core11 = core11 as *mut WebView2_11;
+            let on_menu = handler2(IID_CONTEXT_MENU, move |_sender, args| {
+                trim_context_menu(args as *mut c_void);
+                0
+            });
+            let _ = ((*(*core11).vtbl).add_context_menu_requested)(core11, on_menu, &mut token);
+            com_release(on_menu);
+            com_release(core11 as *mut c_void);
+        }
 
         // the pair contract needs the refusal leg pure: with the
         // built-in error page a dead host would COMMIT an error
@@ -2446,6 +2542,104 @@ unsafe fn cdp(core: *mut WebView2, method: &str, params: &str) {
     }
 }
 
+/// What survives the trim: the WebKit menu's own vocabulary — the
+/// navigation row, the editing set a field needs, the copies a link
+/// or an image offers, and Inspect (the devtools door). Everything
+/// the trim does not NAME leaves, so a new Edge row never sneaks in.
+const MENU_KEEP: [&str; 14] = [
+    "back",
+    "forward",
+    "reload",
+    "inspectElement",
+    "undo",
+    "redo",
+    "cut",
+    "copy",
+    "paste",
+    "pasteAndMatchStyle",
+    "selectAll",
+    "copyLinkLocation",
+    "copyImage",
+    "copyImageLocation",
+];
+
+/// `COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR`.
+const MENU_SEPARATOR: i32 = 3;
+
+/// One item's name and kind, read and released.
+unsafe fn menu_item_facts(items: *mut c_void, index: u32) -> Option<(String, i32)> {
+    unsafe {
+        let items_vtbl = *(items as *mut *const MenuItemsVtbl);
+        let mut item: *mut c_void = std::ptr::null_mut();
+        if !com_ok(((*items_vtbl).get_value_at_index)(items, index, &mut item))
+            || item.is_null()
+        {
+            return None;
+        }
+        let item_vtbl = *(item as *mut *const MenuItemVtbl);
+        let mut name: *mut u16 = std::ptr::null_mut();
+        let _ = ((*item_vtbl).get_name)(item, &mut name);
+        let mut kind = 0i32;
+        let _ = ((*item_vtbl).get_kind)(item, &mut kind);
+        let name = take_ws(name);
+        com_release(item);
+        Some((name, kind))
+    }
+}
+
+/// The engine's menu, wearing the mac's cut: rows the keep-list does
+/// not name leave (back to front, so the indexes hold), and then the
+/// separators settle — never first, never last, never doubled. The
+/// engine still draws and runs what remains; `Handled` is never set.
+fn trim_context_menu(args: *mut c_void) {
+    unsafe {
+        let vtbl = *(args as *mut *const ContextMenuArgsVtbl);
+        let mut items: *mut c_void = std::ptr::null_mut();
+        if !com_ok(((*vtbl).get_menu_items)(args, &mut items)) || items.is_null() {
+            return;
+        }
+        let items_vtbl = *(items as *mut *const MenuItemsVtbl);
+        let mut count = 0u32;
+        let _ = ((*items_vtbl).get_count)(items, &mut count);
+        for index in (0..count).rev() {
+            let Some((name, kind)) = menu_item_facts(items, index) else {
+                continue;
+            };
+            if kind != MENU_SEPARATOR && !MENU_KEEP.contains(&name.as_str()) {
+                let _ = ((*items_vtbl).remove_value_at_index)(items, index);
+            }
+        }
+        // the separators: a break can only stand between two rows
+        let mut count = 0u32;
+        let _ = ((*items_vtbl).get_count)(items, &mut count);
+        let mut index = 0u32;
+        let mut at_break = true; // the top edge counts as one
+        while index < count {
+            let Some((_, kind)) = menu_item_facts(items, index) else {
+                index += 1;
+                continue;
+            };
+            if kind == MENU_SEPARATOR && at_break {
+                let _ = ((*items_vtbl).remove_value_at_index)(items, index);
+                count -= 1;
+            } else {
+                at_break = kind == MENU_SEPARATOR;
+                index += 1;
+            }
+        }
+        while count > 0 {
+            match menu_item_facts(items, count - 1) {
+                Some((_, kind)) if kind == MENU_SEPARATOR => {
+                    let _ = ((*items_vtbl).remove_value_at_index)(items, count - 1);
+                    count -= 1;
+                }
+                _ => break,
+            }
+        }
+        com_release(items);
+    }
+}
+
 /// The chords outrank the island (the mac's a8086b7, on this door):
 /// command chords only — Ctrl is this platform's `command` — and the
 /// same ONE gate body the pump runs; consumed means the page never
@@ -2779,6 +2973,10 @@ mod tests {
         assert_eq!(std::mem::size_of::<ResourceRequestVtbl>(), 10 * slot);
         assert_eq!(std::mem::size_of::<ResponseViewVtbl>(), 7 * slot);
         assert_eq!(std::mem::size_of::<AcceleratorArgsVtbl>(), 9 * slot);
+        assert_eq!(std::mem::size_of::<WebView2_11Vtbl>(), 102 * slot);
+        assert_eq!(std::mem::size_of::<ContextMenuArgsVtbl>(), 11 * slot);
+        assert_eq!(std::mem::size_of::<MenuItemsVtbl>(), 7 * slot);
+        assert_eq!(std::mem::size_of::<MenuItemVtbl>(), 16 * slot);
         assert_eq!(std::mem::size_of::<StreamVtbl>(), 14 * slot);
         assert_eq!(std::mem::size_of::<Handler2Vtbl>(), 4 * slot);
         assert_eq!(std::mem::size_of::<Handler1Vtbl>(), 4 * slot);
