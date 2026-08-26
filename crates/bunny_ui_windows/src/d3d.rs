@@ -701,13 +701,19 @@ const _: () = {
 // carries the viewport AND the run's base index — `SV_InstanceID`
 // restarts at zero per draw, so the shaders add the base themselves.
 const SHADER_SOURCE: &str = r#"
+// Every cbuffer owns its register: the old source parked all three on
+// b0 and leaned on per-entry dead-code elimination, which held until
+// glass_fragment referenced Frame AND Round in one pass — and until a
+// stricter d3dcompiler_47 refused the double claim outright (X4578,
+// found live: one machine's system compiler failed the whole GPU road
+// over it).
 cbuffer Frame : register(b0) {
     float2 viewport;
     uint base_instance;
     uint frame_pad;
 };
 
-cbuffer Round : register(b0) {
+cbuffer Round : register(b1) {
     float4 round_box;
     float4 round_radii;
 };
@@ -935,9 +941,10 @@ Texture2D<float4> pyramid : register(t1);
 
 // the blur's own numbers: the mip it reads and whether the source is
 // raw scene colour, then one over the destination size and the
-// direction of the pass. It rides the Round slot — the two never share
-// a pass, and the encoder rebinds the curve after every batch
-cbuffer Blur : register(b0) {
+// direction of the pass. It rides the Round BUFFER at its own
+// register — the two never share a pass, and the encoder rebinds the
+// curve after every batch
+cbuffer Blur : register(b2) {
     float4 blur_mode;
     float4 blur_step;
 };
@@ -958,12 +965,15 @@ static const float GLASS_VIBRANT_GAIN = 1.45;
 static const float GLASS_VIBRANT_BIAS = 0.05;
 static const float GLASS_GRAD_RADIUS_FACTOR = 1.5;
 
+// the abs() is a no-op on the colours these ever see (non-negative by
+// construction) — it is there because pow(f, e) is undefined for a
+// negative f and the compiler says so (X3571) on every build otherwise
 float3 srgb_to_linear3(float3 c) {
-    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+    return c <= 0.04045 ? c / 12.92 : pow(abs(c + 0.055) / 1.055, 2.4);
 }
 
 float3 linear_to_srgb3(float3 c) {
-    return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+    return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(abs(c), 1.0 / 2.4) - 0.055;
 }
 
 float4 blur_tap(float2 uv) {
@@ -1480,11 +1490,17 @@ impl D3dStack {
                 return;
             }
             // argument bindings persist across pipeline swaps — the
-            // constant buffers bind once
+            // constant buffers bind once. The pixel stage takes Frame
+            // too (glass reads the viewport), Round at its own slot,
+            // and the blur's numbers ride the SAME allocation at b2 —
+            // each register belongs to one cbuffer now, which is what
+            // the stricter compilers demand (X4578)
             let frame_cb = self.frame_cb.as_ptr();
             let round_cb = self.round_cb.as_ptr();
             (vtbl.vs_set_constant_buffers)(context, 0, 1, &frame_cb);
-            (vtbl.ps_set_constant_buffers)(context, 0, 1, &round_cb);
+            (vtbl.ps_set_constant_buffers)(context, 0, 1, &frame_cb);
+            (vtbl.ps_set_constant_buffers)(context, 1, 1, &round_cb);
+            (vtbl.ps_set_constant_buffers)(context, 2, 1, &round_cb);
             let mut bound: Option<RunKind> = None;
             let mut bound_round: Option<u32> = None;
             for run in runs {
@@ -1617,8 +1633,9 @@ impl D3dStack {
                     };
                     (vtbl.rs_set_viewports)(context, 1, &port);
                     (vtbl.ps_set_shader_resources)(context, 1, 1, &from);
-                    // the blur's numbers ride the Round slot: the two
-                    // never share a pass
+                    // the blur's numbers ride the Round BUFFER (bound
+                    // again at the Blur register): the two never share
+                    // a pass, and the run loop rewrites the curve after
                     let mut bytes = [0u8; 32];
                     bytes[0..4].copy_from_slice(&from_level.to_ne_bytes());
                     bytes[4..8].copy_from_slice(&decoding.to_ne_bytes());
@@ -2710,7 +2727,11 @@ const GLASS_MAX_LEVEL: u32 = 3;
 // LINEAR light for free, which is the difference between glass and a
 // grey halo.
 const FORMAT_RGBA8_SRGB: u32 = 29;
-const RTV_DIMENSION_TEXTURE2D: u32 = 3;
+/// `D3D11_RTV_DIMENSION_TEXTURE2D` — 4, not 3: 3 is TEXTURE1DARRAY,
+/// and a desc wearing it makes every per-mip view refuse E_INVALIDARG
+/// (found live: the pyramid never stood, so the GPU road silently
+/// painted every glass scene without its panes).
+const RTV_DIMENSION_TEXTURE2D: u32 = 4;
 
 /// `D3D11_RENDER_TARGET_VIEW_DESC` with the union flattened — the
 /// texture-2D variant uses the first word of it, the rest stay zero.
@@ -3686,6 +3707,12 @@ impl OffscreenD3d {
         }
         if !self.batches.glass.is_empty() && self.glass.is_none() {
             self.glass = unsafe { GlassTargets::new(device, (self.width, self.height)) };
+            if self.glass.is_none() {
+                // the window road says this out loud; a parity harness
+                // deserves the same honesty — a silent skip here reads
+                // as a 25% mismatch with no story
+                eprintln!("bunny_ui d3d: no scene texture — the frame paints without its panes");
+            }
         }
         let index = acquire_slot(&mut self.slots, &mut self.cursor, context);
         if !upload_frame(&mut self.slots[index], device, context, &self.batches) {
@@ -4542,7 +4569,13 @@ mod tests {
             let root = glass_scene(glass, radius);
             let (gpu, cpu) =
                 scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, Color::CANVAS);
-            assert_glass_close(&gpu, &cpu, 3, 0.005, label);
+            // 4-and-0.75%: the mac tier measured 3-and-0.5%, and the first
+            // adapter to ever RUN this gate on windows (the pyramid stood
+            // only after the RTV dimension fix) needs one more step on the
+            // deepest level — a software or virtual rasterizer's bilinear
+            // at mip 3 rounds differently. The gate still stands a mile
+            // from the failure it was built to catch.
+            assert_glass_close(&gpu, &cpu, 4, 0.0075, label);
         }
     }
 
