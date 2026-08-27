@@ -449,6 +449,19 @@ struct Unknown {
     vtbl: *const UnknownVtbl,
 }
 
+/// One QueryInterface — `None` is a refusal (an older runtime).
+pub(crate) unsafe fn com_query(pointer: *mut c_void, iid: &Guid) -> Option<*mut c_void> {
+    unsafe {
+        let vtbl = *(pointer as *mut *const UnknownVtbl);
+        let mut out: *mut c_void = std::ptr::null_mut();
+        if com_ok(((*vtbl).query_interface)(pointer, iid, &mut out)) && !out.is_null() {
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
 /// A retained COM interface — released on Drop through the IUnknown
 /// prefix (the owner pattern, the mac's `OwnedFont` translated).
 pub(crate) struct Com<T>(std::ptr::NonNull<T>);

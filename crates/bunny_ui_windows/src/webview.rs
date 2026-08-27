@@ -31,7 +31,7 @@ use std::rc::Rc;
 use bunny_ui::action::Modifiers;
 use bunny_ui::host::{HostSpec, MouseButton, WebviewCapability, WebviewInput};
 
-use crate::ffi::{Guid, Hresult, Hwnd, Rect, UnknownVtbl, com_init, com_ok, wide};
+use crate::ffi::{Guid, Hresult, Hwnd, Rect, UnknownVtbl, com_init, com_ok, com_query, wide};
 
 /// What this backend serves, as the value the app reads
 /// (`docs/webview.md` — the capability table's WebView2 column):
@@ -997,19 +997,6 @@ unsafe fn com_add_ref(pointer: *mut c_void) {
     unsafe {
         let vtbl = *(pointer as *mut *const UnknownVtbl);
         ((*vtbl).add_ref)(pointer);
-    }
-}
-
-/// One QueryInterface — `None` is a refusal (an older runtime).
-unsafe fn com_query(pointer: *mut c_void, iid: &Guid) -> Option<*mut c_void> {
-    unsafe {
-        let vtbl = *(pointer as *mut *const UnknownVtbl);
-        let mut out: *mut c_void = std::ptr::null_mut();
-        if com_ok(((*vtbl).query_interface)(pointer, iid, &mut out)) && !out.is_null() {
-            Some(out)
-        } else {
-            None
-        }
     }
 }
 

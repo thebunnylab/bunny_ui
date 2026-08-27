@@ -22,6 +22,14 @@
 //! platform refuses the factories entirely, the engine degrades to
 //! the house pixel font with one line on stderr — it never fails to
 //! open.
+//!
+//! The app can also [`DirectWriteEngine::register_font`] its own
+//! faces from bytes — the twin of CoreText's in-process registration,
+//! behind `IDWriteFactory5`'s in-memory loader. A registered family
+//! outranks the machine's own: a product that ships a face measures
+//! in that face on every platform, which is the difference between a
+//! port that matches and one that is pixel-correct in every colour
+//! and still wrong (a different face is a different height).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -33,7 +41,7 @@ use bunny_ui::text_engine::{
 };
 
 use crate::ffi::{
-    CLSCTX_INPROC_SERVER, CoCreateInstance, Com, Guid, Hresult, com_init, com_ok, wide,
+    CLSCTX_INPROC_SERVER, CoCreateInstance, Com, Guid, Hresult, com_init, com_ok, com_query, wide,
 };
 
 // MARK: - The platform border
@@ -64,6 +72,13 @@ const IID_IDWRITE_FACTORY: Guid = Guid {
     d2: 0xD838,
     d3: 0x4B5B,
     d4: [0xA2, 0xE8, 0x1A, 0xDC, 0x7D, 0x93, 0xDB, 0x48],
+};
+// IID_IDWriteFactory5 {958DB99A-BE2A-4F09-AF7D-65189803D1D3}
+const IID_IDWRITE_FACTORY5: Guid = Guid {
+    d1: 0x958D_B99A,
+    d2: 0xBE2A,
+    d3: 0x4F09,
+    d4: [0xAF, 0x7D, 0x65, 0x18, 0x98, 0x03, 0xD1, 0xD3],
 };
 // IID_ID2D1Factory {06152247-6F50-465A-9245-118BFD3B6007}
 const IID_ID2D1_FACTORY: Guid = Guid {
@@ -125,9 +140,10 @@ struct DwriteFontMetrics {
     strikethrough_thickness: u16,
 }
 
-// slots 0-2 IUnknown; 3 GetSystemFontCollection; 4..=14 loaders and
-// custom collections; 15 CreateTextFormat; 16 CreateTypography,
-// 17 GetGdiInterop; 18 CreateTextLayout; the rest unused.
+// slots 0-2 IUnknown; 3 GetSystemFontCollection; 4..=12 loaders and
+// custom collections; 13 RegisterFontFileLoader; 14 its unregister;
+// 15 CreateTextFormat; 16 CreateTypography, 17 GetGdiInterop;
+// 18 CreateTextLayout; the rest unused.
 #[repr(C)]
 struct IDWriteFactoryVtbl {
     unknown: crate::ffi::UnknownVtbl,
@@ -136,7 +152,10 @@ struct IDWriteFactoryVtbl {
         *mut *mut IDWriteFontCollection,
         i32,
     ) -> Hresult,
-    _pad_4_14: [usize; 11],
+    _pad_4_12: [usize; 9],
+    register_font_file_loader:
+        unsafe extern "system" fn(*mut IDWriteFactory, *mut c_void) -> Hresult,
+    _pad_14: [usize; 1],
     create_text_format: unsafe extern "system" fn(
         *mut IDWriteFactory,
         *const u16,
@@ -162,6 +181,96 @@ struct IDWriteFactoryVtbl {
 #[repr(C)]
 struct IDWriteFactory {
     vtbl: *const IDWriteFactoryVtbl,
+}
+
+// The factory5 chain (dwrite_3.h), reached by QueryInterface — the
+// in-memory registration road (Windows 10 1703+). Slot arithmetic
+// against the headers: IDWriteFactory 3..=23, Factory1 24..=25,
+// Factory2 26..=30, Factory3 31..=39, Factory4 40..=42,
+// Factory5 43..=47.
+#[repr(C)]
+struct IDWriteFactory5Vtbl {
+    unknown: crate::ffi::UnknownVtbl,
+    _pad_3_36: [usize; 34],
+    /// 37 `CreateFontCollectionFromFontSet` (IDWriteFactory3). The
+    /// answer is an `IDWriteFontCollection1`, held here by its base —
+    /// the prefix this module resolves through.
+    create_font_collection_from_font_set: unsafe extern "system" fn(
+        *mut IDWriteFactory5,
+        *mut IDWriteFontSet,
+        *mut *mut IDWriteFontCollection,
+    ) -> Hresult,
+    _pad_38_42: [usize; 5],
+    /// 43 `CreateFontSetBuilder` — Factory5's own, the Builder1 shape.
+    create_font_set_builder1: unsafe extern "system" fn(
+        *mut IDWriteFactory5,
+        *mut *mut IDWriteFontSetBuilder1,
+    ) -> Hresult,
+    /// 44 `CreateInMemoryFontFileLoader`.
+    create_in_memory_font_file_loader: unsafe extern "system" fn(
+        *mut IDWriteFactory5,
+        *mut *mut IDWriteInMemoryFontFileLoader,
+    ) -> Hresult,
+    _pad_45_47: [usize; 3],
+}
+#[repr(C)]
+struct IDWriteFactory5 {
+    vtbl: *const IDWriteFactory5Vtbl,
+}
+
+// slots 0-2 IUnknown; 3 CreateStreamFromKey (the base loader);
+// 4 CreateInMemoryFontFileReference; 5 GetFileCount.
+#[repr(C)]
+struct IDWriteInMemoryFontFileLoaderVtbl {
+    unknown: crate::ffi::UnknownVtbl,
+    _pad_3: [usize; 1],
+    /// A NULL owner asks the engine to COPY the bytes.
+    create_in_memory_font_file_reference: unsafe extern "system" fn(
+        *mut IDWriteInMemoryFontFileLoader,
+        *mut IDWriteFactory,
+        *const u8,
+        u32,
+        *mut c_void,
+        *mut *mut IDWriteFontFile,
+    ) -> Hresult,
+    /// Returns the count itself, not an HRESULT.
+    get_file_count: unsafe extern "system" fn(*mut IDWriteInMemoryFontFileLoader) -> u32,
+}
+#[repr(C)]
+struct IDWriteInMemoryFontFileLoader {
+    vtbl: *const IDWriteInMemoryFontFileLoaderVtbl,
+}
+
+// slots 0-2 IUnknown; 3-4 AddFontFaceReference (two shapes);
+// 5 AddFontSet; 6 CreateFontSet; 7 AddFontFile (Builder1's own —
+// the one that PARSES, so it is the one that refuses bad bytes).
+#[repr(C)]
+struct IDWriteFontSetBuilder1Vtbl {
+    unknown: crate::ffi::UnknownVtbl,
+    _pad_3_5: [usize; 3],
+    create_font_set: unsafe extern "system" fn(
+        *mut IDWriteFontSetBuilder1,
+        *mut *mut IDWriteFontSet,
+    ) -> Hresult,
+    add_font_file: unsafe extern "system" fn(
+        *mut IDWriteFontSetBuilder1,
+        *mut IDWriteFontFile,
+    ) -> Hresult,
+}
+#[repr(C)]
+struct IDWriteFontSetBuilder1 {
+    vtbl: *const IDWriteFontSetBuilder1Vtbl,
+}
+
+/// Opaque through this module — created, handed across, released.
+#[repr(C)]
+struct IDWriteFontSet {
+    _vtbl: *const c_void,
+}
+/// Opaque through this module — created, handed across, released.
+#[repr(C)]
+struct IDWriteFontFile {
+    _vtbl: *const c_void,
 }
 
 // slots 0-2 IUnknown; 3 GetFontFamilyCount; 4 GetFontFamily;
@@ -445,10 +554,22 @@ struct Factories {
     locale: Vec<u16>,
 }
 
+/// The faces the APP registered, in-memory: the loader (created and
+/// registered with the factory once, held for its lifetime), every
+/// file it referenced, and the collection built from them all —
+/// consulted before the system's, so a shipped face outranks the
+/// machine's own.
+struct CustomFaces {
+    loader: Option<Com<IDWriteInMemoryFontFileLoader>>,
+    files: Vec<Com<IDWriteFontFile>>,
+    collection: Option<Com<IDWriteFontCollection>>,
+}
+
 /// The Windows text engine. Single-thread, like the rest of the shell.
 pub struct DirectWriteEngine {
     factories: Option<Factories>,
     fonts: RefCell<HashMap<FontKey, FontSlot>>,
+    custom: RefCell<CustomFaces>,
     fallback: PixelFont,
 }
 
@@ -534,8 +655,131 @@ impl DirectWriteEngine {
         DirectWriteEngine {
             factories: create_factories(),
             fonts: RefCell::new(HashMap::new()),
+            custom: RefCell::new(CustomFaces {
+                loader: None,
+                files: Vec::new(),
+                collection: None,
+            }),
             fallback: PixelFont,
         }
+    }
+
+    /// Registers a face from bytes — the twin of CoreText's in-process
+    /// registration. `false` is a refusal: an engine predating the
+    /// in-memory road (pre-1703 Windows 10), or bytes DirectWrite does
+    /// not read as a font. Every acceptance rebuilds the custom
+    /// collection and clears the resolved-slot cache — a face
+    /// registered after something asked for its family would otherwise
+    /// stay invisible until the cache turned over.
+    pub fn register_font(&self, bytes: &[u8]) -> bool {
+        let Some(factories) = self.factories.as_ref() else {
+            return false;
+        };
+        let mut custom = self.custom.borrow_mut();
+        let dwrite = factories.dwrite.as_ptr();
+        unsafe {
+            // the factory5 door — a refusal is an engine too old for
+            // in-memory fonts, and the caller's list says which faces
+            // stayed outside
+            let Some(five) = com_query(dwrite as *mut c_void, &IID_IDWRITE_FACTORY5)
+                .and_then(|raw| Com::from_raw(raw as *mut IDWriteFactory5))
+            else {
+                eprintln!("bunny_ui dwrite: no IDWriteFactory5 — in-memory faces refused");
+                return false;
+            };
+            // the loader: created and REGISTERED once; the factory
+            // holds the registration for the life of the process
+            if custom.loader.is_none() {
+                let mut loader: *mut IDWriteInMemoryFontFileLoader = std::ptr::null_mut();
+                let hr = ((*(*five.as_ptr()).vtbl).create_in_memory_font_file_loader)(
+                    five.as_ptr(),
+                    &mut loader,
+                );
+                if !com_ok(hr) {
+                    return false;
+                }
+                let Some(loader) = Com::from_raw(loader) else {
+                    return false;
+                };
+                let hr = ((*(*dwrite).vtbl).register_font_file_loader)(
+                    dwrite,
+                    loader.as_ptr() as *mut c_void,
+                );
+                if !com_ok(hr) {
+                    return false;
+                }
+                custom.loader = Some(loader);
+            }
+            let loader = custom.loader.as_ref().expect("installed above").as_ptr();
+            // the reference: a NULL owner asks the engine to COPY the
+            // bytes, so the caller owes nothing after this call
+            let mut file: *mut IDWriteFontFile = std::ptr::null_mut();
+            let hr = ((*(*loader).vtbl).create_in_memory_font_file_reference)(
+                loader,
+                dwrite,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+                std::ptr::null_mut(),
+                &mut file,
+            );
+            if !com_ok(hr) {
+                return false;
+            }
+            let Some(file) = Com::from_raw(file) else {
+                return false;
+            };
+            // the set rebuilt whole — every face that stood, plus this
+            // one. AddFontFile is the call that PARSES: the new face
+            // failing it refuses the registration and the standing
+            // collection stays.
+            let mut builder: *mut IDWriteFontSetBuilder1 = std::ptr::null_mut();
+            let hr = ((*(*five.as_ptr()).vtbl).create_font_set_builder1)(
+                five.as_ptr(),
+                &mut builder,
+            );
+            if !com_ok(hr) {
+                return false;
+            }
+            let Some(builder) = Com::from_raw(builder) else {
+                return false;
+            };
+            for standing in &custom.files {
+                let _ = ((*(*builder.as_ptr()).vtbl).add_font_file)(
+                    builder.as_ptr(),
+                    standing.as_ptr(),
+                );
+            }
+            let hr =
+                ((*(*builder.as_ptr()).vtbl).add_font_file)(builder.as_ptr(), file.as_ptr());
+            if !com_ok(hr) {
+                return false;
+            }
+            let mut set: *mut IDWriteFontSet = std::ptr::null_mut();
+            let hr = ((*(*builder.as_ptr()).vtbl).create_font_set)(builder.as_ptr(), &mut set);
+            if !com_ok(hr) {
+                return false;
+            }
+            let Some(set) = Com::from_raw(set) else {
+                return false;
+            };
+            let mut collection: *mut IDWriteFontCollection = std::ptr::null_mut();
+            let hr = ((*(*five.as_ptr()).vtbl).create_font_collection_from_font_set)(
+                five.as_ptr(),
+                set.as_ptr(),
+                &mut collection,
+            );
+            if !com_ok(hr) {
+                return false;
+            }
+            let Some(collection) = Com::from_raw(collection) else {
+                return false;
+            };
+            custom.files.push(file);
+            custom.collection = Some(collection);
+        }
+        // the cache resolved against the old world
+        self.fonts.borrow_mut().clear();
+        true
     }
 
     /// Resolves (once) and answers the slot for a spec. `None` only
@@ -546,7 +790,9 @@ impl DirectWriteEngine {
         if let Some(slot) = self.fonts.borrow().get(&key) {
             return Some(read(slot));
         }
-        let slot = create_slot(factories, spec)?;
+        let custom = self.custom.borrow();
+        let slot = create_slot(factories, custom.collection.as_ref(), spec)?;
+        drop(custom);
         let answer = read(&slot);
         self.fonts.borrow_mut().insert(key, slot);
         Some(answer)
@@ -555,7 +801,11 @@ impl DirectWriteEngine {
 
 /// The slot: a no-wrap text format pinned to the font-box line, plus
 /// the box itself. An unknown family degrades to the system font.
-fn create_slot(factories: &Factories, spec: &FontSpec) -> Option<FontSlot> {
+fn create_slot(
+    factories: &Factories,
+    custom: Option<&Com<IDWriteFontCollection>>,
+    spec: &FontSpec,
+) -> Option<FontSlot> {
     unsafe {
         let dwrite = factories.dwrite.as_ptr();
         // a family the app NAMED is the most specific thing anyone said
@@ -574,36 +824,35 @@ fn create_slot(factories: &Factories, spec: &FontSpec) -> Option<FontSlot> {
             eprintln!("bunny_ui dwrite: no system font collection (0x{:08X})", hr as u32);
             return None;
         }
-        let collection = Com::from_raw(collection)?;
-        let mut index = 0u32;
-        let mut exists = 0i32;
-        let name = wide(family);
-        ((*(*collection.as_ptr()).vtbl).find_family_name)(
-            collection.as_ptr(),
-            name.as_ptr(),
-            &mut index,
-            &mut exists,
-        );
-        if exists == 0 {
-            // an unknown family degrades, never fails
-            family = "Segoe UI";
+        let system = Com::from_raw(collection)?;
+        let find = |collection: *mut IDWriteFontCollection, family: &str| -> Option<u32> {
+            let mut index = 0u32;
+            let mut exists = 0i32;
             let name = wide(family);
-            ((*(*collection.as_ptr()).vtbl).find_family_name)(
-                collection.as_ptr(),
+            ((*(*collection).vtbl).find_family_name)(
+                collection,
                 name.as_ptr(),
                 &mut index,
                 &mut exists,
             );
-            if exists == 0 {
-                return None;
-            }
-        }
+            (exists != 0).then_some(index)
+        };
+        // the custom collection speaks first — a face the app
+        // registered outranks the machine's own; the system collection
+        // is the world an unknown name degrades into
+        let (collection, index, from_custom) = if let Some((registered, index)) =
+            custom.and_then(|c| find(c.as_ptr(), family).map(|index| (c.as_ptr(), index)))
+        {
+            (registered, index, true)
+        } else if let Some(index) = find(system.as_ptr(), family) {
+            (system.as_ptr(), index, false)
+        } else {
+            // an unknown family degrades, never fails
+            family = "Segoe UI";
+            (system.as_ptr(), find(system.as_ptr(), family)?, false)
+        };
         let mut family_object: *mut IDWriteFontFamily = std::ptr::null_mut();
-        let hr = ((*(*collection.as_ptr()).vtbl).get_font_family)(
-            collection.as_ptr(),
-            index,
-            &mut family_object,
-        );
+        let hr = ((*(*collection).vtbl).get_font_family)(collection, index, &mut family_object);
         if !com_ok(hr) {
             return None;
         }
@@ -641,10 +890,14 @@ fn create_slot(factories: &Factories, spec: &FontSpec) -> Option<FontSlot> {
 
         let family_name = wide(family);
         let mut format: *mut IDWriteTextFormat = std::ptr::null_mut();
+        // the format resolves the name in the SAME collection the
+        // metrics came from — null names the system's
+        let format_collection: *mut c_void =
+            if from_custom { collection as *mut c_void } else { std::ptr::null_mut() };
         let hr = ((*(*dwrite).vtbl).create_text_format)(
             dwrite,
             family_name.as_ptr(),
-            std::ptr::null_mut(),
+            format_collection,
             weight_of(spec.weight),
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
@@ -699,6 +952,60 @@ fn create_layout(
     }
 }
 
+/// Every family name a collection holds, appended to the roster.
+unsafe fn push_family_names(
+    collection: *mut IDWriteFontCollection,
+    names: &mut Vec<std::sync::Arc<str>>,
+) {
+    unsafe {
+        let count = ((*(*collection).vtbl).get_font_family_count)(collection);
+        for index in 0..count {
+            let mut family: *mut IDWriteFontFamily = std::ptr::null_mut();
+            if !com_ok(((*(*collection).vtbl).get_font_family)(collection, index, &mut family)) {
+                continue;
+            }
+            let Some(family) = Com::from_raw(family) else {
+                continue;
+            };
+            let mut strings: *mut IDWriteLocalizedStrings = std::ptr::null_mut();
+            if !com_ok(((*(*family.as_ptr()).vtbl).get_family_names)(
+                family.as_ptr(),
+                &mut strings,
+            )) {
+                continue;
+            }
+            let Some(strings) = Com::from_raw(strings) else {
+                continue;
+            };
+            // the first locale is the family's own name — a roster
+            // is a list of names, not a translation table
+            if ((*(*strings.as_ptr()).vtbl).get_count)(strings.as_ptr()) == 0 {
+                continue;
+            }
+            let mut length = 0u32;
+            if !com_ok(((*(*strings.as_ptr()).vtbl).get_string_length)(
+                strings.as_ptr(),
+                0,
+                &mut length,
+            )) {
+                continue;
+            }
+            // the length leaves the terminator out; the buffer holds it
+            let mut buffer = vec![0u16; length as usize + 1];
+            if !com_ok(((*(*strings.as_ptr()).vtbl).get_string)(
+                strings.as_ptr(),
+                0,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            )) {
+                continue;
+            }
+            buffer.truncate(length as usize);
+            names.push(std::sync::Arc::from(String::from_utf16_lossy(&buffer).as_str()));
+        }
+    }
+}
+
 impl Default for DirectWriteEngine {
     fn default() -> Self {
         Self::new()
@@ -710,75 +1017,28 @@ impl TextEngine for DirectWriteEngine {
         let Some(factories) = self.factories.as_ref() else {
             return Vec::new();
         };
+        let mut names: Vec<std::sync::Arc<str>> = Vec::new();
+        // the registered faces belong on the roster beside the
+        // machine's own
+        if let Some(custom) = self.custom.borrow().collection.as_ref() {
+            unsafe { push_family_names(custom.as_ptr(), &mut names) };
+        }
         unsafe {
             let dwrite = factories.dwrite.as_ptr();
             let mut collection: *mut IDWriteFontCollection = std::ptr::null_mut();
-            if !com_ok(((*(*dwrite).vtbl).get_system_font_collection)(
+            if com_ok(((*(*dwrite).vtbl).get_system_font_collection)(
                 dwrite,
                 &mut collection,
                 0,
             )) {
-                return Vec::new();
+                if let Some(collection) = Com::from_raw(collection) {
+                    push_family_names(collection.as_ptr(), &mut names);
+                }
             }
-            let Some(collection) = Com::from_raw(collection) else {
-                return Vec::new();
-            };
-            let count = ((*(*collection.as_ptr()).vtbl).get_font_family_count)(
-                collection.as_ptr(),
-            );
-            let mut names: Vec<std::sync::Arc<str>> = Vec::new();
-            for index in 0..count {
-                let mut family: *mut IDWriteFontFamily = std::ptr::null_mut();
-                if !com_ok(((*(*collection.as_ptr()).vtbl).get_font_family)(
-                    collection.as_ptr(),
-                    index,
-                    &mut family,
-                )) {
-                    continue;
-                }
-                let Some(family) = Com::from_raw(family) else {
-                    continue;
-                };
-                let mut strings: *mut IDWriteLocalizedStrings = std::ptr::null_mut();
-                if !com_ok(((*(*family.as_ptr()).vtbl).get_family_names)(
-                    family.as_ptr(),
-                    &mut strings,
-                )) {
-                    continue;
-                }
-                let Some(strings) = Com::from_raw(strings) else {
-                    continue;
-                };
-                // the first locale is the family's own name — a roster
-                // is a list of names, not a translation table
-                if ((*(*strings.as_ptr()).vtbl).get_count)(strings.as_ptr()) == 0 {
-                    continue;
-                }
-                let mut length = 0u32;
-                if !com_ok(((*(*strings.as_ptr()).vtbl).get_string_length)(
-                    strings.as_ptr(),
-                    0,
-                    &mut length,
-                )) {
-                    continue;
-                }
-                // the length leaves the terminator out; the buffer holds it
-                let mut buffer = vec![0u16; length as usize + 1];
-                if !com_ok(((*(*strings.as_ptr()).vtbl).get_string)(
-                    strings.as_ptr(),
-                    0,
-                    buffer.as_mut_ptr(),
-                    buffer.len() as u32,
-                )) {
-                    continue;
-                }
-                buffer.truncate(length as usize);
-                names.push(std::sync::Arc::from(String::from_utf16_lossy(&buffer).as_str()));
-            }
-            names.sort();
-            names.dedup();
-            names
         }
+        names.sort();
+        names.dedup();
+        names
     }
 
     fn measure_line(&self, text: &str, font: &FontSpec) -> LineMetrics {
@@ -952,6 +1212,44 @@ impl TextEngine for DirectWriteEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The house guard against a mis-numbered hand-written vtable —
+    /// every struct must hold EXACTLY the slots its header declares.
+    #[test]
+    fn the_registration_vtables_hold_exactly_the_slots_their_headers_declare() {
+        let slot = std::mem::size_of::<usize>();
+        assert_eq!(std::mem::size_of::<IDWriteFactoryVtbl>(), 19 * slot);
+        assert_eq!(std::mem::size_of::<IDWriteFactory5Vtbl>(), 48 * slot);
+        assert_eq!(std::mem::size_of::<IDWriteInMemoryFontFileLoaderVtbl>(), 6 * slot);
+        assert_eq!(std::mem::size_of::<IDWriteFontSetBuilder1Vtbl>(), 8 * slot);
+    }
+
+    #[test]
+    fn bytes_that_are_not_a_font_are_refused() {
+        let engine = DirectWriteEngine::new();
+        assert!(
+            !engine.register_font(b"the engine reads fonts, not prose"),
+            "AddFontFile parses, and a parse that fails refuses the registration"
+        );
+    }
+
+    #[test]
+    fn a_real_face_registers_and_joins_the_roster() {
+        // every Windows ships Arial; the BYTES road must take it even
+        // though the machine already installed it — the custom
+        // collection simply outranks the system's for the name
+        let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\arial.ttf") else {
+            return;
+        };
+        let engine = DirectWriteEngine::new();
+        assert!(engine.register_font(&bytes), "a real face registers");
+        assert!(
+            engine.families().iter().any(|name| &**name == "Arial"),
+            "the registered family stands on the roster"
+        );
+        // a second face rides the same loader and rebuilds the set
+        assert!(engine.register_font(&bytes), "the road holds for the next face");
+    }
 
     #[test]
     fn direct_write_measures_and_rasters() {
