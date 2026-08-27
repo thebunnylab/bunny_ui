@@ -260,16 +260,25 @@ pub fn run_window_chrome(
             let placed =
                 runtime.last_viewport().map_or(height, |viewport| viewport.height);
             for host in &hosts {
-                let bunny_ui::host::HostSpec::Webview { url, scripts, console, requests } =
-                    &host.spec;
+                let bunny_ui::host::HostSpec::Webview {
+                    url,
+                    scripts,
+                    console,
+                    requests,
+                    full_motion,
+                } = &host.spec;
                 // the stamp fingerprints the whole spec: a changed
                 // url, script set or declared hook re-instructs; the
                 // separators are control characters no url or script
-                // spells
+                // spells. `full_motion` rides for symmetry — this
+                // backend does not serve MediaEmulation (WKWebView
+                // offers no public override), but the stamp must not
+                // lie about what the spec says
                 let mut stamp = String::from(&**url);
                 stamp.push('\u{2}');
                 stamp.push(if *console { 'c' } else { '-' });
                 stamp.push(if *requests { 'r' } else { '-' });
+                stamp.push(if *full_motion { 'm' } else { '-' });
                 for script in scripts.iter() {
                     stamp.push('\u{1}');
                     stamp.push_str(script);

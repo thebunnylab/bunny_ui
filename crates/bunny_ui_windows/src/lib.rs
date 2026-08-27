@@ -175,15 +175,21 @@ pub fn run_window_chrome(
             // platform has (no throttles: the mac deleted its own)
             let hosts = runtime.hosts();
             for host in &hosts {
-                let bunny_ui::host::HostSpec::Webview { url, scripts, console, requests } =
-                    &host.spec;
+                let bunny_ui::host::HostSpec::Webview {
+                    url,
+                    scripts,
+                    console,
+                    requests,
+                    full_motion,
+                } = &host.spec;
                 // the stamp fingerprints the whole spec — a change
                 // re-instructs the mounted view, never re-creates it
-                let mut stamp = String::with_capacity(url.len() + 4);
+                let mut stamp = String::with_capacity(url.len() + 5);
                 stamp.push_str(url);
                 stamp.push('\u{2}');
                 stamp.push(if *console { 'c' } else { '-' });
                 stamp.push(if *requests { 'r' } else { '-' });
+                stamp.push(if *full_motion { 'm' } else { '-' });
                 for script in scripts.iter() {
                     stamp.push('\u{1}');
                     stamp.push_str(script);

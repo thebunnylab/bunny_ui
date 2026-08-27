@@ -6476,6 +6476,7 @@ mod tests {
                 let (spoke, fetched) = (self.spoke, self.fetched);
                 webview("https://example.test/")
                     .user_script("window.early = true")
+                    .full_motion()
                     .on_navigate(move |url| landed.set(url.to_string()))
                     .on_message(move |body| heard.set(body.to_string()))
                     .on_console(move |line| spoke.set(line.to_string()))
@@ -6494,12 +6495,13 @@ mod tests {
             .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
         let hosts = runtime.hosts();
         let path = hosts[0].path.clone();
-        let HostSpec::Webview { scripts, console, requests, .. } = &hosts[0].spec;
+        let HostSpec::Webview { scripts, console, requests, full_motion, .. } = &hosts[0].spec;
         assert_eq!(scripts.len(), 1, "the user script rides in the spec");
         assert!(
             *console && *requests,
             "the declared hooks ride in the spec — the shell only injects what is watched"
         );
+        assert!(*full_motion, "the visitor's motion rides in the spec");
 
         assert!(runtime.webview_navigated(&path, "https://example.test/docs"));
         assert_eq!(page.landed.get(), "https://example.test/docs");

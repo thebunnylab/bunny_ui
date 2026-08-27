@@ -50,7 +50,10 @@
 //!   forward walk the engine's own history;
 //! - hide the pane: the subtree goes and the view goes with it; show
 //!   it again and a fresh one mounts;
-//! - resize the window: the pane follows the layout, the page reflows.
+//! - resize the window: the pane follows the layout, the page reflows;
+//! - the widget declares `.full_motion()`, so `--drive`'s first line
+//!   is the motion probe answering `reduce=false` — even on a machine
+//!   whose OS asks for calm, the page sees the visitor's default.
 
 #![cfg_attr(not(target_os = "windows"), allow(dead_code, unused_imports))]
 
@@ -320,6 +323,9 @@ impl Component for Browser {
         let pane = webview(PAGES[page.get()].1)
             .user_script(REPORTER)
             .user_script(PROBE)
+            // the testing surface shows the site as visitors meet it —
+            // the tester's OS calm stays on the OS
+            .full_motion()
             .on_navigate(move |url| {
                 address.set(url.to_string());
                 // `--drive`: the hand needs a page under it, and a
@@ -443,6 +449,16 @@ fn drive_the_page(handle: &WebviewHandle) {
     // detached on purpose: the hand outlives the click that asked for
     // it, and a dropped handle would cancel it mid-sequence
     task::spawn(async move {
+        // first, the emulation oracle: with `.full_motion()` on the
+        // widget the answer is `false` even on a machine whose OS asks
+        // for calm — the visitor's truth, not the tester's
+        handle.eval("matchMedia('(prefers-reduced-motion: reduce)').matches", |answer| {
+            match answer {
+                Ok(value) => println!("[{}] motion probe: reduce={value}", stamp()),
+                Err(error) => println!("[{}] motion probe threw: {error}", stamp()),
+            }
+        });
+        beat().await;
         let (x, y) = TARGET;
         handle.hover(x, y);
         beat().await;

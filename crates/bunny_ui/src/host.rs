@@ -50,6 +50,11 @@ pub enum HostSpec {
         /// injected wrap sees `fetch` and XHR, never subresources; a
         /// backend with native capture sees everything.
         requests: bool,
+        /// The page sees `prefers-reduced-motion: no-preference` even
+        /// where the OS asks for calm — a testing surface shows the
+        /// site as most visitors meet it. Off, the OS preference
+        /// passes through, like any browser's.
+        full_motion: bool,
     },
 }
 
@@ -68,6 +73,10 @@ pub enum WebviewCapability {
     NetworkBodies,
     /// Input can be synthesized into the page.
     SyntheticInput,
+    /// The page's media environment can be emulated — `full_motion`
+    /// holds where this is declared; elsewhere the OS preference is
+    /// the only truth the engine will tell.
+    MediaEmulation,
 }
 
 /// What the page sends back through the one return channel. The engine
@@ -321,6 +330,7 @@ pub struct WebviewView {
     on_console: Option<crate::reconciler::WebviewReport>,
     on_request: Option<crate::reconciler::WebviewReport>,
     handle: Option<WebviewHandle>,
+    full_motion: bool,
 }
 
 impl WebviewView {
@@ -394,6 +404,17 @@ impl WebviewView {
         self.handle = Some(handle.clone());
         self
     }
+
+    /// The page sees `prefers-reduced-motion: no-preference` even
+    /// where the OS asks for calm — a TESTING surface shows the site
+    /// as most visitors meet it, not as the tester's accessibility
+    /// settings ask. Served where the backend declares
+    /// [`WebviewCapability::MediaEmulation`]; elsewhere the OS
+    /// preference stays the only truth the engine will tell.
+    pub fn full_motion(mut self) -> WebviewView {
+        self.full_motion = true;
+        self
+    }
 }
 
 impl View for WebviewView {
@@ -438,6 +459,7 @@ impl View for WebviewView {
                 scripts: self.scripts.clone().into(),
                 console: self.on_console.is_some(),
                 requests: self.on_request.is_some(),
+                full_motion: self.full_motion,
             },
         });
     }
@@ -464,5 +486,6 @@ pub fn webview(url: impl Into<Rc<str>>) -> WebviewView {
         on_console: None,
         on_request: None,
         handle: None,
+        full_motion: false,
     }
 }

@@ -44,6 +44,7 @@ pub fn capabilities() -> &'static [WebviewCapability] {
         WebviewCapability::ConsoleMessages,
         WebviewCapability::NetworkRequests,
         WebviewCapability::SyntheticInput,
+        WebviewCapability::MediaEmulation,
     ]
 }
 
@@ -1061,16 +1062,18 @@ struct SpecCopy {
     scripts: Rc<[Rc<str>]>,
     console: bool,
     requests: bool,
+    full_motion: bool,
 }
 
 impl SpecCopy {
     fn of(spec: &HostSpec) -> SpecCopy {
-        let HostSpec::Webview { url, scripts, console, requests } = spec;
+        let HostSpec::Webview { url, scripts, console, requests, full_motion } = spec;
         SpecCopy {
             url: Rc::clone(url),
             scripts: Rc::clone(scripts),
             console: *console,
             requests: *requests,
+            full_motion: *full_motion,
         }
     }
 }
@@ -1103,6 +1106,10 @@ struct Live {
     /// The requests registration — `Some` once wired (or once refused
     /// by name, so the refusal speaks exactly once).
     requests_token: Option<i64>,
+    /// Whether the standing engine currently emulates the visitor's
+    /// motion (`Emulation.setEmulatedMedia`) — the flag `update`
+    /// compares against, so a mid-session toggle re-instructs.
+    full_motion: bool,
 }
 
 enum Mount {
@@ -1457,6 +1464,13 @@ fn controller_landed(path: &str, generation: u64, hr: Hresult, controller: *mut 
             Rect { left: bounds.0, top: bounds.1, right: bounds.0 + bounds.2, bottom: bounds.1 + bounds.3 },
         );
         let _ = ((*(*controller).vtbl).put_is_visible)(controller, shown as i32);
+        // the visitor's motion stands BEFORE the first navigation
+        // departs — the page never consults the tester's OS first —
+        // and is re-armed on every commit (the emulation is the
+        // session's, and a renderer swap must not shed it)
+        if spec.full_motion {
+            cdp(core, "Emulation.setEmulatedMedia", &emulated_media_params(true));
+        }
         navigate_core(core, &spec.url);
     }
 
@@ -1489,6 +1503,7 @@ fn controller_landed(path: &str, generation: u64, hr: Hresult, controller: *mut 
                 nav_targets: HashMap::new(),
                 console_wired,
                 requests_token,
+                full_motion: spec.full_motion,
             });
         }
     });
@@ -1865,6 +1880,18 @@ fn content_loading(path: &str, sender: *mut WebView2, args: *mut c_void) {
             return;
         }
     }
+    // the visitor's motion is re-armed on every commit — the
+    // emulation is the session's, and a renderer swap must not shed it
+    let armed = VIEWS.with(|views| {
+        let views = views.borrow();
+        matches!(
+            views.get(path).map(|slot| &slot.state),
+            Some(Mount::Live(live)) if live.full_motion
+        )
+    });
+    if armed {
+        unsafe { cdp(sender, "Emulation.setEmulatedMedia", &emulated_media_params(true)) };
+    }
     let url = unsafe { source_of(sender) };
     if url.is_empty() || url == "about:blank" {
         return;
@@ -2078,6 +2105,10 @@ pub(crate) fn update(path: &str, spec: &HostSpec) {
         ids: Vec<(u64, String)>,
         want_console: bool,
         want_requests: bool,
+        /// `Some(now)` when the motion emulation must flip — unlike
+        /// the ears, this door swings BOTH ways (an empty value hands
+        /// the media feature back to the OS).
+        retune_motion: Option<bool>,
     }
     let step = VIEWS.with(|views| {
         let mut views = views.borrow_mut();
@@ -2097,6 +2128,8 @@ pub(crate) fn update(path: &str, spec: &HostSpec) {
                     ids: std::mem::take(&mut slot.script_ids),
                     want_console: copied.console && !live.console_wired,
                     want_requests: copied.requests && live.requests_token.is_none(),
+                    retune_motion: (copied.full_motion != live.full_motion)
+                        .then_some(copied.full_motion),
                 })
             }
             _ => None,
@@ -2114,13 +2147,19 @@ pub(crate) fn update(path: &str, spec: &HostSpec) {
     apply_scripts(step.core, path, step.generation, &copied);
     let console_wired = step.want_console && wire_console(step.core, path);
     let requests_token = if step.want_requests { Some(wire_requests(step.core2, path)) } else { None };
-    if console_wired || requests_token.is_some() {
+    if let Some(now) = step.retune_motion {
+        unsafe { cdp(step.core, "Emulation.setEmulatedMedia", &emulated_media_params(now)) };
+    }
+    if console_wired || requests_token.is_some() || step.retune_motion.is_some() {
         VIEWS.with(|views| {
             let mut views = views.borrow_mut();
             if let Some(Mount::Live(live)) = views.get_mut(path).map(|slot| &mut slot.state) {
                 live.console_wired |= console_wired;
                 if requests_token.is_some() {
                     live.requests_token = requests_token;
+                }
+                if let Some(now) = step.retune_motion {
+                    live.full_motion = now;
                 }
             }
         });
@@ -2523,6 +2562,15 @@ unsafe fn send_key(core: *mut WebView2, key: &str) {
             );
         }
     }
+}
+
+/// The media emulation's one sentence to the protocol: on, the page
+/// sees `prefers-reduced-motion: no-preference`; off, the EMPTY value
+/// hands the feature back to the OS — the protocol's own way to say
+/// "no override", never a guessed preference.
+fn emulated_media_params(full: bool) -> String {
+    let value = if full { "no-preference" } else { "" };
+    format!("{{\"features\":[{{\"name\":\"prefers-reduced-motion\",\"value\":\"{value}\"}}]}}")
 }
 
 /// One protocol call whose answer nobody reads — the input door is
@@ -3072,6 +3120,20 @@ mod tests {
         assert_eq!(
             main_frame_only("var x = 1;"),
             "if (self === top) { var x = 1; }"
+        );
+    }
+
+    #[test]
+    fn the_motion_emulation_spells_what_the_protocol_expects() {
+        // on: the visitor's answer; off: the EMPTY value, the
+        // protocol's own "no override" — never a guessed preference
+        assert_eq!(
+            emulated_media_params(true),
+            r#"{"features":[{"name":"prefers-reduced-motion","value":"no-preference"}]}"#
+        );
+        assert_eq!(
+            emulated_media_params(false),
+            r#"{"features":[{"name":"prefers-reduced-motion","value":""}]}"#
         );
     }
 

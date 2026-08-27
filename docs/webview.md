@@ -68,6 +68,7 @@ Built on the host. The declarative half is a view like any other:
 ```rust
 webview("https://docs.example.dev")
     .user_script(src)   // document-start, every navigation
+    .full_motion()      // the page sees prefers-reduced-motion: no-preference
     .on_navigate(move |url| history.update(|h| h.push(url.into())))
     .on_navigate_failed(move |url, why| status.set(format!("{url} — {why}")))
     .on_message(move |body| bus.send(body))   // window.bunny.post(…) in the page
@@ -84,6 +85,14 @@ failure — the one that replaced it reports for both.
 The two hooks are capability-gated (the table below), and a backend
 that serves them by injection only pays when they are declared —
 nothing is captured for a page nobody watches.
+
+`.full_motion()` is for the TESTING surface: an embedded browser whose
+job is to show a site as most visitors meet it must not inherit the
+tester's OS accessibility settings — a developer who keeps reduced
+motion on their machine still needs to see the product move. Off (the
+default), the OS preference passes through, like any browser's.
+Capability-gated as `MediaEmulation`; where the backend cannot serve
+it, the OS stays the only truth the engine will tell.
 
 The imperative half is a handle, because a page is a document with a
 navigation stack, not a view tree, and a declarative API pretending
@@ -156,12 +165,18 @@ like a quiet page.
 | network: requests observed | injected wrap (fetch/XHR) | native | native |
 | network: response bodies | no | yes¹ | yes |
 | synthetic input | NSEvent, trusted | native | open question |
+| media emulation (full motion) | no² | CDP `Emulation.setEmulatedMedia` | open question |
 | devtools | external inspector | built in | embeddable |
 
 ¹ Engine-ready, core door open: the engine can hand a response body
 over, but no hook of this API carries bytes yet — so the backend does
 not DECLARE `NetworkBodies`, because a declared capability nothing can
 ask through would be an empty answer with a checkmark on it.
+
+² WKWebView offers no public override — a document-start `matchMedia`
+shim could lie to scripts but never to a CSS `@media` block, and a
+half-truth is worse than the honest cell. On the mac the OS setting is
+the only lever.
 
 The table is the design's honest centre. An app that needs full
 network capture on every OS needs a proxy or its own engine; this

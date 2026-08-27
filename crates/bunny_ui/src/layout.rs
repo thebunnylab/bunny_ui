@@ -6833,6 +6833,7 @@ mod tests {
                 scripts: Vec::new().into(),
                 console: false,
                 requests: false,
+                full_motion: false,
             },
         }
     }
