@@ -189,6 +189,19 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// The box takes what its CONTENT needs vertically, never more
+    /// than the room — width still fills the offer. The honest shape
+    /// for a row's field: `frame_max` with a finite ceiling caps the
+    /// FRAME but places the child at its own size, so a child taller
+    /// than the ceiling quietly overflows it; a hug cannot, because
+    /// the content's answer IS the frame.
+    fn hug_height(self) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::HugHeight,
+        }
+    }
+
     /// `.navigationTitle("…")`
     fn navigation_title(self, title: impl Into<String>) -> Modified<Self> {
         Modified {

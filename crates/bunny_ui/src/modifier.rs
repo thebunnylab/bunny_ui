@@ -43,6 +43,7 @@ pub enum Modifier {
     FrameWidth(f64),
     FrameHeight(f64),
     FrameMax(f64, f64, Alignment),
+    HugHeight,
     NavigationTitle(String),
     NavigationBarTitle(String),
     ListStyle(ListStyle),
@@ -208,6 +209,7 @@ impl Modifier {
             Modifier::FrameMax(max_width, max_height, alignment) => format!(
                 " [.frame(maxWidth: {max_width:?}, maxHeight: {max_height}, alignment: {alignment})]"
             ),
+            Modifier::HugHeight => " [.hugHeight]".into(),
             Modifier::NavigationTitle(title) => format!(" [.navigationTitle({title:?})]"),
             Modifier::NavigationBarTitle(title) => format!(" [.navigationBarTitle({title:?})]"),
             Modifier::ListStyle(style) => format!(" [.listStyle({style})]"),
@@ -1010,6 +1012,12 @@ fn apply(
                 max_width,
                 max_height,
                 align,
+                child: Box::new(node),
+            });
+        }
+        Modifier::HugHeight => {
+            out.wrap_layout_from(mark, |node| LayoutNode::Hug {
+                axis: crate::layout::Axis::Vertical,
                 child: Box::new(node),
             });
         }

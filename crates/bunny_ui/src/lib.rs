@@ -6514,6 +6514,41 @@ mod tests {
         assert!(!runtime.webview_navigated("nobody/here", "x"), "no writer, no lie");
     }
 
+    #[test]
+    fn a_hugged_field_wears_its_own_height_inside_the_row() {
+        use crate::layout::{Proposal, Size};
+
+        // the 22-cap lesson: a finite `frame_max` caps the FRAME but
+        // places the child at its own size, so a field whose face
+        // measures taller pokes out the bottom of its row — a
+        // platform-dependent overlap, because the face is the one
+        // input layout takes from the machine. The hug cannot
+        // overflow: the content's answer IS the frame.
+        #[derive(Clone)]
+        struct Page {
+            url: State<String>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                hstack!(text_field("where to", self.url.binding()).hug_height())
+                    .alignment(VerticalAlignment::Center)
+                    .frame_height(30.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { url: State::new(String::new()) };
+        let result = runtime
+            .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let field = &result.fields[0];
+        assert!(field.frame.size.height > 0.0, "the field has a box");
+        let bottom = field.frame.origin.y + field.frame.size.height;
+        assert!(
+            bottom <= 30.0 + 1e-6,
+            "the field ends inside its 30pt row on EVERY face: bottom {bottom}"
+        );
+    }
+
     /// A handle's commands drain addressed to the bound page, an eval
     /// gets a token, and the answer finds its way back to the app's
     /// own callback — the whole imperative loop, headless.
