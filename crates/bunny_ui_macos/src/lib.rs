@@ -207,6 +207,17 @@ pub fn run_window_chrome(
     // the open popovers' child panels, pooled by identity path
     let panels: Rc<RefCell<std::collections::HashMap<String, ffi::WindowHandle>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
+    // the open DIALOGS' real windows, pooled the same way — a closed
+    // dialog's window stays reusable-dead like a panel, and reopening
+    // re-adopts it
+    let dialogs: Rc<RefCell<std::collections::HashMap<String, ffi::WindowHandle>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
+    // each dialog's retained surface — the main CPU road's discipline
+    // (damage only), so hover inside a dialog repaints a row, never
+    // the whole card
+    type DialogSurface = (bunny_ui::raster::Surface, usize, bunny_ui::layout::Color);
+    let dialog_surfaces: Rc<RefCell<std::collections::HashMap<String, DialogSurface>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
     // The scene a popover's MATERIAL samples, kept per panel beside the base
     // commands it was rasterized from. A card that scrolls its own text does
     // not move the window behind it, and re-rasterizing that window every
@@ -228,6 +239,8 @@ pub fn run_window_chrome(
     let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList, trace::Origin)> = Rc::new({
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
+        let dialogs = Rc::clone(&dialogs);
+        let dialog_surfaces = Rc::clone(&dialog_surfaces);
         let segments_kept = Rc::clone(&segments_kept);
         let beneaths = Rc::clone(&beneaths);
         move |runtime: &Runtime,
@@ -380,7 +393,130 @@ pub fn run_window_chrome(
                     }
                     beneaths.borrow_mut().remove(&path);
                 }
+                // the dialogs' own sweep, AFTER the panels': a dropdown
+                // inside a closing dialog detaches from the dialog
+                // first. The window stays pooled reusable-dead like a
+                // panel; the ceremony runs under `lend_hand` — the
+                // key-travel notifications AppKit fires synchronously
+                // must not re-enter the handler mid-present.
+                let mut dialog_store = dialogs.borrow_mut();
+                let dead_dialogs: Vec<String> = dialog_store
+                    .iter()
+                    .filter(|(path, dialog)| {
+                        dialog.is_visible()
+                            && !overlays.iter().any(|overlay| &overlay.path == *path)
+                    })
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                for path in dead_dialogs {
+                    if let Some(dialog) = dialog_store.get(&path) {
+                        ffi::lend_hand(|| {
+                            // the flag drops FIRST: the make-key below
+                            // asks the parent `canBecomeKeyWindow`, and
+                            // the answer has to already be yes. Safe
+                            // over a fullscreen parent too — its space
+                            // is the one on screen, so re-keying it
+                            // switches nothing.
+                            ffi::end_window_modal(&window);
+                            dialog.close_panel(&window);
+                            window.make_key_with_view();
+                        });
+                    }
+                    dialog_surfaces.borrow_mut().remove(&path);
+                }
                 for overlay in &overlays {
+                    // a dialog overlay presents on a REAL window, not a
+                    // panel — raised on first sight, held to the frame
+                    // layout answered (which is the frame the window
+                    // itself reported through `Runtime::set_dialog_frame`,
+                    // so a steady frame is a no-op under the ε guard)
+                    if let bunny_ui::layout::OverlaySurface::Window(spec) = &overlay.surface {
+                        let x = overlay.frame.origin.x;
+                        let y = overlay.frame.origin.y;
+                        let w = overlay.frame.size.width;
+                        let h = overlay.frame.size.height;
+                        let created = !dialog_store.contains_key(&overlay.path);
+                        let dialog =
+                            *dialog_store.entry(overlay.path.clone()).or_insert_with(|| {
+                                ffi::lend_hand(|| {
+                                    ffi::create_dialog(
+                                        &window,
+                                        spec.title.as_ref(),
+                                        w,
+                                        h,
+                                        spec.min.width,
+                                        spec.min.height,
+                                    )
+                                })
+                            });
+                        let opening = created || !dialog.is_visible();
+                        ffi::lend_hand(|| {
+                            if opening && !created {
+                                // a pooled window lost its child tie on
+                                // close — re-adopt before it fronts
+                                dialog.attach_to(&window);
+                            }
+                            dialog.set_content_frame_screen(
+                                window.layout_rect_to_screen(x, y, w, h),
+                            );
+                            if opening {
+                                // the modal ceremony: the parent's
+                                // lights go dark, its key is refused,
+                                // and the keyboard moves into the
+                                // dialog
+                                ffi::begin_window_modal(&window);
+                                dialog.make_key_with_view();
+                            }
+                        });
+                        dialog.set_scene_origin(x, y);
+                        if opening {
+                            // the hover painted at open time froze over
+                            // a parent that is now inert — clear it
+                            let _ = runtime.pointer_exited();
+                        }
+                        // the slice presents by the main CPU road's
+                        // discipline: a retained surface, damage only.
+                        // No BLEED and no backdrop sampling — the
+                        // chrome and the shadow are the system's own.
+                        let slice = full_display.translated_slice(overlay.display, -x, -y);
+                        let physical =
+                            ((w.round() as usize) * scale, (h.round() as usize) * scale);
+                        let mut kept = dialog_surfaces.borrow_mut();
+                        let stale = match kept.get(&overlay.path) {
+                            Some((retained, retained_scale, retained_canvas)) => {
+                                retained.bitmap().width() != physical.0
+                                    || retained.bitmap().height() != physical.1
+                                    || *retained_scale != scale
+                                    || *retained_canvas != canvas
+                            }
+                            None => true,
+                        };
+                        if stale {
+                            kept.insert(
+                                overlay.path.clone(),
+                                (
+                                    bunny_ui::raster::Surface::new(
+                                        physical.0, physical.1, scale, canvas,
+                                    ),
+                                    scale,
+                                    canvas,
+                                ),
+                            );
+                        }
+                        let (retained, _, _) =
+                            kept.get_mut(&overlay.path).expect("surface for the dialog");
+                        let damage =
+                            retained.frame(slice, &*runtime.text(), &*runtime.images());
+                        if !damage.is_empty() {
+                            dialog.blit_partial(
+                                physical.0,
+                                physical.1,
+                                retained.rgba(),
+                                &damage,
+                            );
+                        }
+                        continue;
+                    }
                     // the panel is BLED around the frame so the card's
                     // own shadow has room — the same pixels every
                     // target paints, no system shadow involved
@@ -389,9 +525,19 @@ pub fn run_window_chrome(
                     let y = overlay.frame.origin.y - BLEED;
                     let w = overlay.frame.size.width + 2.0 * BLEED;
                     let h = overlay.frame.size.height + 2.0 * BLEED;
+                    // a popover born inside a dialog is the DIALOG's
+                    // child: it stacks above the dialog and rides its
+                    // moves — the identity path says whose it is
+                    let host = dialog_store
+                        .iter()
+                        .find(|(dialog_path, dialog)| {
+                            dialog.is_visible()
+                                && overlay.path.starts_with(dialog_path.as_str())
+                        })
+                        .map_or(window, |(_, dialog)| *dialog);
                     let panel = store
                         .entry(overlay.path.clone())
-                        .or_insert_with(|| ffi::create_panel(&window, w, h));
+                        .or_insert_with(|| ffi::create_panel(&host, w, h));
                     panel.set_frame_screen(window.layout_rect_to_screen(x, y, w, h));
                     panel.set_scene_origin(x, y);
                     let slice = full_display.translated_slice(overlay.display, -x, -y);
@@ -667,6 +813,7 @@ pub fn run_window_chrome(
     });
     let blit = {
         let present = Rc::clone(&present);
+        let dialogs = Rc::clone(&dialogs);
         move |runtime: &Runtime, root: &_, via: trace::Origin| {
             // the handles' commands are spent BEFORE the frame
             // renders: the state an expired eval writes lands in this
@@ -731,6 +878,23 @@ pub fn run_window_chrome(
                     size: Size { width: w, height: h },
                 },
             ));
+            // an open dialog's WINDOW is the truth of its frame: pull
+            // it into the runtime before the pass, so this very layout
+            // follows the user's drag, resize or zoom — the mirror
+            // discipline `sync_ime` already keeps, in the other
+            // direction
+            for (path, dialog) in dialogs.borrow().iter() {
+                if dialog.is_visible() {
+                    let (x, y, w, h) = dialog.content_rect_in_layout(&window);
+                    runtime.set_dialog_frame(
+                        path,
+                        bunny_ui::layout::Rect {
+                            origin: bunny_ui::layout::Point { x, y },
+                            size: Size { width: w, height: h },
+                        },
+                    );
+                }
+            }
             let display = runtime.display_frame(root, Size { width, height });
             present(runtime, display, via);
         let interaction = runtime.interaction();
@@ -961,11 +1125,34 @@ pub fn run_window_chrome(
     let handler_runtime = Rc::clone(&runtime);
     let handler_root = Rc::clone(&root);
     let handler_present = Rc::clone(&present);
+    let handler_dialogs = Rc::clone(&dialogs);
     ffi::set_handler(Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
+        // mid-drag of a DIALOG the resize steps are the only presenter,
+        // the same law the main window's drag already enforces below
+        let dialog_resizing = || {
+            handler_dialogs
+                .borrow()
+                .values()
+                .any(|dialog| dialog.is_visible() && dialog.in_live_resize())
+        };
         match event {
         AppEvent::Redraw => blit(runtime, root, trace::Origin::Redraw),
+        AppEvent::DialogClose { window: which } => {
+            // the red button: the window did NOT close (the delegate
+            // answered NO) — the overlay's dismissal flips the app's
+            // binding, and the frame this blit draws takes the window
+            // down through the ordinary sweep
+            let path = handler_dialogs.borrow().iter().find_map(|(path, dialog)| {
+                (dialog.raw_window() == which).then(|| path.clone())
+            });
+            if let Some(path) = path
+                && runtime.dismiss_overlay(&path)
+            {
+                blit(runtime, root, trace::Origin::Input);
+            }
+        }
         AppEvent::Wake => {
             // Mid-drag there is exactly ONE presenter — the law the
             // tick path already obeys below. A worker's wake used to
@@ -976,7 +1163,7 @@ pub fn run_window_chrome(
             // back: the tasks are polled and their state lands; the
             // next step of the resize (or the end-of-gesture Redraw)
             // presents what they moved. Only the present yields.
-            if window.in_live_resize() {
+            if window.in_live_resize() || dialog_resizing() {
                 runtime.poll_tasks();
             } else {
                 blit(runtime, root, trace::Origin::Wake);
@@ -1099,7 +1286,10 @@ pub fn run_window_chrome(
             // phase on the step that lands — and the RESIZE path itself
             // must never be gated: holding it back leaves the compositor
             // stretching a stale drawable through the whole drag.
-            if (blinked || explained || chorded) && !window.in_live_resize() {
+            if (blinked || explained || chorded)
+                && !window.in_live_resize()
+                && !dialog_resizing()
+            {
                 blit(runtime, root, trace::Origin::Blink);
             }
         }
@@ -1120,7 +1310,7 @@ pub fn run_window_chrome(
             // clocks still advanced; the next step carries what they
             // moved, and a hand held still mid-drag parks the scene
             // until it moves — the same stillness every step ends in.
-            if window.in_live_resize() {
+            if window.in_live_resize() || dialog_resizing() {
             } else if moved.scene {
                 let (width, height) = window.content_size();
                 let display = runtime.animation_frame(root, Size { width, height });
