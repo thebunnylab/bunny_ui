@@ -154,6 +154,10 @@ unsafe extern "C" {
     fn msg_void_rect_bool(obj: Id, sel: Sel, rect: CGRect, flag: i8);
     #[link_name = "objc_msgSend"]
     fn msg_void_i64(obj: Id, sel: Sel, a: i64);
+    #[link_name = "objc_msgSend"]
+    fn msg_void_u64(obj: Id, sel: Sel, a: u64);
+    #[link_name = "objc_msgSend"]
+    fn msg_void_size(obj: Id, sel: Sel, size: CGSize);
 }
 
 // AppKit/QuartzCore come in via the ObjC runtime; the link guarantees the
@@ -291,6 +295,16 @@ pub enum AppEvent {
     ResignKey,
     /// The window is key again — a frozen decoration resumes.
     BecomeKey,
+    /// A DIALOG window's close button was pressed. The window itself
+    /// has not closed and will not close itself: the shell answers by
+    /// running the overlay's dismissal, and the flipped binding is
+    /// what takes the window down — one road out, the same one the
+    /// app's own Escape takes.
+    DialogClose {
+        /// The dialog's `NSWindow`, as an address — the shell finds
+        /// the overlay path in its pool by it.
+        window: usize,
+    },
     /// A task woke from somewhere else — a worker thread finished a
     /// step. The frame the shell already knows how to draw drains the
     /// queue on its way.
@@ -717,7 +731,13 @@ extern "C" fn bunny_character_index(this: Id, _sel: Sel, point: CGPoint) -> u64 
         }
         let in_window = msg_point_point(window, sel("convertPointFromScreen:"), point);
         let bounds = msg_rect(this, sel("bounds"));
-        let (x, y) = (in_window.x, bounds.size.height - in_window.y);
+        // a panel (or dialog) view answers in SCENE coordinates, like
+        // every other event it delivers — the same translation
+        // `event_layout_point` applies
+        let (dx, dy) = PANEL_ORIGINS
+            .with(|origins| origins.borrow().get(&(this as usize)).copied())
+            .unwrap_or((0.0, 0.0));
+        let (x, y) = (in_window.x + dx, bounds.size.height - in_window.y + dy);
         IME_INDEX
             .with(|slot| slot.borrow().as_ref().and_then(|resolve| resolve(x, y)))
             .unwrap_or(NS_NOT_FOUND)
@@ -1169,6 +1189,83 @@ pub fn place_traffic_lights(window: Id) {
     }
 }
 
+thread_local! {
+    /// True while a dialog holds the app window-modal: the MAIN window
+    /// answers `canBecomeKeyWindow` with NO, so a click on it cannot
+    /// pull the keyboard out of the dialog — the JetBrains manner.
+    static MODAL_BLOCKED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `BunnyWindow`'s answer to "may I become key" — YES, a titled
+/// window's own answer, until a dialog holds the app modal. The
+/// subclass exists for this one question.
+extern "C" fn bunny_window_can_become_key(_this: Id, _sel: Sel) -> i8 {
+    i8::from(!MODAL_BLOCKED.with(Cell::get))
+}
+
+/// Holds the app window-modal under a dialog: the parent's three
+/// traffic lights go dark (disabled, not hidden — the JetBrains bar)
+/// and the parent refuses key. No nested run loop is involved; the
+/// scene's own modal floor already swallows the parent's input.
+pub fn begin_window_modal(parent: &WindowHandle) {
+    MODAL_BLOCKED.with(|blocked| blocked.set(true));
+    set_standard_buttons_enabled(parent, false);
+}
+
+/// The reverse, on the dialog's way out. It runs BEFORE the parent is
+/// made key again — the make-key asks `canBecomeKeyWindow`, and the
+/// answer has to already be yes.
+pub fn end_window_modal(parent: &WindowHandle) {
+    MODAL_BLOCKED.with(|blocked| blocked.set(false));
+    set_standard_buttons_enabled(parent, true);
+}
+
+/// Enables or disables the window's three standard buttons. The
+/// placement loop above only ever moves frames, so a disabled button
+/// stays disabled through every re-place.
+fn set_standard_buttons_enabled(window: &WindowHandle, enabled: bool) {
+    unsafe {
+        for kind in WINDOW_BUTTONS {
+            let button = msg_id_u64(window.window, sel("standardWindowButton:"), kind);
+            if !button.is_null() {
+                msg_void_bool(button, sel("setEnabled:"), i8::from(enabled));
+            }
+        }
+    }
+}
+
+// MARK: - The dialog delegate
+
+/// `windowShouldClose:` on a dialog — the red button. The answer is
+/// always NO: the window never closes itself; the shell hears the
+/// event, runs the overlay's dismissal, and the flipped binding is
+/// what takes the window down (the same road the app's Escape takes).
+extern "C" fn bunny_dialog_should_close(_this: Id, _sel: Sel, sender: Id) -> i8 {
+    dispatch(AppEvent::DialogClose { window: sender as usize });
+    0
+}
+
+/// A dialog's frame moved — a user drag, a resize step, the zoom
+/// button. One Redraw: the blit pulls the window's rect into the
+/// runtime and the pass re-lays the dialog's content inside it.
+/// Deliberately NOT `window_frame_changed`: that road re-places the
+/// PARENT's traffic lights by the scene's offsets, and a dialog wears
+/// the system's own.
+extern "C" fn bunny_dialog_frame_changed(_this: Id, _sel: Sel, _note: Id) {
+    dispatch(AppEvent::Redraw);
+}
+
+/// Key travels on a dialog like on the main window — cmd-tab away
+/// pauses the decorations and closes the dialog's own popovers (the
+/// dialog itself stands: it is a window).
+extern "C" fn bunny_dialog_did_resign_key(_this: Id, _sel: Sel, _note: Id) {
+    dispatch(AppEvent::ResignKey);
+}
+
+extern "C" fn bunny_dialog_did_become_key(_this: Id, _sel: Sel, _note: Id) {
+    dispatch(AppEvent::BecomeKey);
+}
+
 extern "C" fn bunny_blink(_this: Id, _sel: Sel, _timer: Id) {
     dispatch(AppEvent::Blink);
 }
@@ -1529,6 +1626,76 @@ unsafe fn register_classes() {
             types.as_ptr(),
         );
         objc_registerClassPair(delegate);
+
+        // the MAIN window's subclass — one question answered, nothing
+        // else touched: under a dialog it refuses to become key
+        let bare_bool = CString::new("c@:").expect("type encoding");
+        let window = objc_allocateClassPair(
+            class("NSWindow"),
+            CString::new("BunnyWindow").expect("name").as_ptr(),
+            0,
+        );
+        class_addMethod(
+            window,
+            sel("canBecomeKeyWindow"),
+            bunny_window_can_become_key as *const c_void,
+            bare_bool.as_ptr(),
+        );
+        class_addMethod(
+            window,
+            sel("canBecomeMainWindow"),
+            bunny_window_can_become_key as *const c_void,
+            bare_bool.as_ptr(),
+        );
+        objc_registerClassPair(window);
+
+        // the DIALOG's own delegate — the shared one would terminate
+        // the app on close and re-place the parent's traffic lights on
+        // every dialog resize
+        let sender_bool = CString::new("c@:@").expect("type encoding");
+        let dialog = objc_allocateClassPair(
+            class("NSObject"),
+            CString::new("BunnyDialogDelegate").expect("name").as_ptr(),
+            0,
+        );
+        class_addMethod(
+            dialog,
+            sel("windowShouldClose:"),
+            bunny_dialog_should_close as *const c_void,
+            sender_bool.as_ptr(),
+        );
+        class_addMethod(
+            dialog,
+            sel("windowDidResize:"),
+            bunny_dialog_frame_changed as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            dialog,
+            sel("windowDidMove:"),
+            bunny_dialog_frame_changed as *const c_void,
+            types.as_ptr(),
+        );
+        // the exact final frame, once the hand lets go
+        class_addMethod(
+            dialog,
+            sel("windowDidEndLiveResize:"),
+            bunny_dialog_frame_changed as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            dialog,
+            sel("windowDidResignKey:"),
+            bunny_dialog_did_resign_key as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            dialog,
+            sel("windowDidBecomeKey:"),
+            bunny_dialog_did_become_key as *const c_void,
+            types.as_ptr(),
+        );
+        objc_registerClassPair(dialog);
     });
 }
 
@@ -1917,6 +2084,79 @@ impl WindowHandle {
             };
             msg_rect_rect(self.window, sel("convertRectToScreen:"), window_rect)
         }
+    }
+
+    /// A SCREEN rect (AppKit, y-up) in this window's LAYOUT
+    /// coordinates — the exact inverse of [`Self::layout_rect_to_screen`].
+    pub fn screen_rect_to_layout(&self, rect: CGRect) -> (f64, f64, f64, f64) {
+        unsafe {
+            let in_window = msg_rect_rect(self.window, sel("convertRectFromScreen:"), rect);
+            let bounds = msg_rect(self.view, sel("bounds"));
+            (
+                in_window.origin.x,
+                bounds.size.height - in_window.origin.y - in_window.size.height,
+                in_window.size.width,
+                in_window.size.height,
+            )
+        }
+    }
+
+    /// Places a DIALOG so its CONTENT box lands on the given screen
+    /// rect — the frame grows the title bar around it. ε-guarded:
+    /// layout hands the same rect back every frame, and re-setting it
+    /// would fight the very drag it was pulled from.
+    pub fn set_content_frame_screen(&self, content: CGRect) {
+        unsafe {
+            let frame =
+                msg_rect_rect(self.window, sel("frameRectForContentRect:"), content);
+            let current = msg_rect(self.window, sel("frame"));
+            let same = (frame.origin.x - current.origin.x).abs() < 0.5
+                && (frame.origin.y - current.origin.y).abs() < 0.5
+                && (frame.size.width - current.size.width).abs() < 0.5
+                && (frame.size.height - current.size.height).abs() < 0.5;
+            if !same {
+                msg_void_rect_bool(self.window, sel("setFrame:display:"), frame, 1);
+            }
+        }
+    }
+
+    /// The dialog's CONTENT box in `main`'s layout coordinates — what
+    /// the shell reports to the runtime every frame, so layout follows
+    /// the window wherever the user takes it.
+    pub fn content_rect_in_layout(&self, main: &WindowHandle) -> (f64, f64, f64, f64) {
+        unsafe {
+            let frame = msg_rect(self.window, sel("frame"));
+            let content =
+                msg_rect_rect(self.window, sel("contentRectForFrameRect:"), frame);
+            main.screen_rect_to_layout(content)
+        }
+    }
+
+    /// Is the window on screen (ordered in)?
+    pub fn is_visible(&self) -> bool {
+        unsafe { msg_bool(self.window, sel("isVisible")) != 0 }
+    }
+
+    /// Re-adopts a pooled dialog on reopen — the child tie was cut
+    /// when it closed.
+    pub fn attach_to(&self, parent: &WindowHandle) {
+        unsafe {
+            msg_void_id_i64(parent.window, sel("addChildWindow:ordered:"), self.window, 1);
+        }
+    }
+
+    /// Fronts the window and hands the keyboard to its event view.
+    pub fn make_key_with_view(&self) {
+        unsafe {
+            msg_void_id(self.window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
+            msg_void_id(self.window, sel("makeFirstResponder:"), self.view);
+        }
+    }
+
+    /// The `NSWindow` as an address — what a delegate callback names
+    /// so the shell can find this handle in a pool.
+    pub fn raw_window(&self) -> usize {
+        self.window as usize
     }
 
     /// The pointer's outfit over the scene. Direct `set` — no cursor
@@ -2424,7 +2664,9 @@ pub fn create_window(
         } else {
             1 | 2 | 4 | 8
         };
-        let window = msg_id(class("NSWindow"), sel("alloc"));
+        // the subclass answers ONE question (key, under a dialog) and
+        // inherits everything else
+        let window = msg_id(class("BunnyWindow"), sel("alloc"));
         let window = msg_init_window(
             window,
             sel("initWithContentRect:styleMask:backing:defer:"),
@@ -2626,6 +2868,109 @@ pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHan
     }
 }
 
+/// Creates a DIALOG window over `parent` — the real titled window an
+/// overlay with `OverlaySurface::Window` asked for. Sized by its
+/// CONTENT rect; the caller places it with
+/// [`WindowHandle::set_content_frame_screen`].
+///
+/// The dialog manners, each pinned to its AppKit lever:
+/// - titled | closable | resizable and NO miniaturizable — the yellow
+///   button renders disabled, the JetBrains dialog's own bar;
+/// - `NSWindowCollectionBehaviorFullScreenAuxiliary` — strips the
+///   implicit fullscreen-primary every resizable window gets, so the
+///   green button ZOOMS in place instead of going fullscreen, and lets
+///   the window join a fullscreen parent's space instead of switching
+///   away from it;
+/// - a child of `parent` (`addChildWindow:ordered:` above) — floats
+///   over it and rides its moves;
+/// - its own delegate (`BunnyDialogDelegate`) — closing flips the
+///   app's binding, never terminates, and a dialog resize never
+///   re-places the PARENT's traffic lights;
+/// - no timer, no display link, no Metal graft — the parent drives
+///   every frame and the content arrives by CPU blit, the child
+///   panel's own discipline.
+pub fn create_dialog(
+    parent: &WindowHandle,
+    title: &str,
+    width: f64,
+    height: f64,
+    min_width: f64,
+    min_height: f64,
+) -> WindowHandle {
+    unsafe {
+        let pool = objc_autoreleasePoolPush();
+        register_classes();
+
+        let rect = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize { width, height },
+        };
+        // titled | closable | resizable — miniaturizable stays OFF, so
+        // the yellow light is born disabled
+        let style: u64 = 1 | 2 | 8;
+        let window = msg_id(class("NSWindow"), sel("alloc"));
+        let window = msg_init_window(
+            window,
+            sel("initWithContentRect:styleMask:backing:defer:"),
+            rect,
+            style,
+            2, // buffered
+            0,
+        );
+        // NSWindowCollectionBehaviorFullScreenAuxiliary (1 << 8)
+        msg_void_u64(window, sel("setCollectionBehavior:"), 1 << 8);
+        msg_void_size(
+            window,
+            sel("setContentMinSize:"),
+            CGSize { width: min_width, height: min_height },
+        );
+        let title = CString::new(title).expect("title without NUL");
+        let ns_title = msg_id_cstr(
+            class("NSString"),
+            sel("stringWithUTF8String:"),
+            title.as_ptr(),
+        );
+        msg_void_id(window, sel("setTitle:"), ns_title);
+        // the store manages the lifetime — never AppKit's release
+        msg_void_bool(window, sel("setReleasedWhenClosed:"), 0);
+
+        let view = msg_id(class("BunnyView"), sel("alloc"));
+        let view = msg_init_rect(view, sel("initWithFrame:"), rect);
+        // CPU present only: no metal graft, like the panels
+        msg_void_bool(view, sel("setWantsLayer:"), 1);
+        msg_void_id(window, sel("setContentView:"), view);
+
+        // hover must work while EITHER of our windows is key — the
+        // panel's reasoning, spelled out above `PANEL_STYLE`. 0x243 =
+        // MouseEnteredAndExited | MouseMoved | ActiveInActiveApp |
+        // InVisibleRect.
+        let area = msg_id(class("NSTrackingArea"), sel("alloc"));
+        let area = msg_init_tracking(
+            area,
+            sel("initWithRect:options:owner:userInfo:"),
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize { width: 0.0, height: 0.0 },
+            },
+            0x243,
+            view,
+            std::ptr::null_mut(),
+        );
+        msg_void_id(view, sel("addTrackingArea:"), area);
+
+        let delegate = msg_id(msg_id(class("BunnyDialogDelegate"), sel("alloc")), sel("init"));
+        msg_void_id(window, sel("setDelegate:"), delegate);
+
+        // the child contract: floats above the parent, rides its
+        // moves, and joins the space the parent is on — a fullscreen
+        // space included
+        msg_void_id_i64(parent.window, sel("addChildWindow:ordered:"), window, 1);
+
+        objc_autoreleasePoolPop(pool);
+        WindowHandle { window, view }
+    }
+}
+
 impl WindowHandle {
     /// Places the panel at a SCREEN rect (AppKit coordinates, y-up) —
     /// the parent's `layout_rect_to_screen` produces it.
@@ -2646,7 +2991,12 @@ impl WindowHandle {
     /// goes) — panels are few and pooled by path.
     pub fn close_panel(&self, parent: &WindowHandle) {
         unsafe {
-            msg_void_id(parent.window, sel("removeChildWindow:"), self.window);
+            // the ACTUAL holder, not the caller's guess: a dropdown
+            // born inside a dialog is the DIALOG's child, and the
+            // dialog itself is the main window's
+            let holder = msg_id(self.window, sel("parentWindow"));
+            let holder = if holder.is_null() { parent.window } else { holder };
+            msg_void_id(holder, sel("removeChildWindow:"), self.window);
             msg_void_id(self.window, sel("orderOut:"), std::ptr::null_mut());
         }
         PANEL_ORIGINS.with(|origins| {
@@ -2796,6 +3146,37 @@ mod tests {
                 sel("standardWindowButton:"),
             );
             assert_ne!(responds, 0, "NSWindow has no standardWindowButton:");
+        }
+    }
+
+    #[test]
+    fn appkit_still_speaks_the_dialogs_selectors() {
+        // every selector the dialog window rides on, pinned — the same
+        // alarm the window buttons keep above
+        unsafe {
+            for name in [
+                "setCollectionBehavior:",
+                "setContentMinSize:",
+                "frameRectForContentRect:",
+                "contentRectForFrameRect:",
+                "convertRectFromScreen:",
+                "parentWindow",
+                "isVisible",
+            ] {
+                let responds = msg_bool_sel(
+                    class("NSWindow"),
+                    sel("instancesRespondToSelector:"),
+                    sel(name),
+                );
+                assert_ne!(responds, 0, "NSWindow has no {name}");
+            }
+            // the parent's lights go dark through the button itself
+            let responds = msg_bool_sel(
+                class("NSButton"),
+                sel("instancesRespondToSelector:"),
+                sel("setEnabled:"),
+            );
+            assert_ne!(responds, 0, "NSButton has no setEnabled:");
         }
     }
 
