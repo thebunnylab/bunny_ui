@@ -377,6 +377,17 @@ const WM_DPICHANGED: u32 = 0x02E0;
 const WM_APP_FRAME: u32 = 0x8000 + 1;
 /// A task woke from another thread (posted by the wake hook).
 const WM_APP_WAKE: u32 = 0x8000 + 2;
+/// The window's on-screen content is gone and a fresh present must
+/// re-mint it — posted instead of dispatched because the ask can come
+/// from INSIDE a dispatch (the demotion) or a paint.
+const WM_APP_REPRESENT: u32 = 0x8000 + 3;
+/// The compositor restarted (a driver reset restarts it) — every
+/// window's redirection content was discarded.
+const WM_DWMCOMPOSITIONCHANGED: u32 = 0x031E;
+const WM_POWERBROADCAST: u32 = 0x0218;
+/// The two resume shapes — either can reveal a discarded surface.
+const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+const PBT_APMRESUMESUSPEND: usize = 0x0007;
 // virtual keys the shell reads directly
 const VK_SHIFT: i32 = 0x10;
 const VK_CONTROL: i32 = 0x11;
@@ -1095,6 +1106,19 @@ fn post_wake_to(hwnd: Hwnd) {
     }
 }
 
+/// Asks the window for a fresh present, from anywhere — a POST, never
+/// a dispatch, so the demotion (which runs inside one) and a paint
+/// (which must not re-enter the handler) can both ask safely. The
+/// overnight lesson: a discarded surface plus an idle app is a black
+/// window forever, because nothing ever asks.
+pub(crate) fn ask_represent(hwnd: Hwnd) {
+    if hwnd != 0 {
+        unsafe {
+            PostMessageW(hwnd, WM_APP_REPRESENT, 0, 0);
+        }
+    }
+}
+
 thread_local! {
     static HANDLER: RefCell<Option<Box<dyn FnMut(AppEvent)>>> = const { RefCell::new(None) };
 }
@@ -1565,12 +1589,14 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 reserved: [0; 32],
             };
             let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
+            let mut blitted = false;
             BACKING.with(|stores| {
                 let stores = stores.borrow();
                 let Some(backing) = stores.get(&hwnd) else { return };
                 if backing.dc == 0 {
                     return;
                 }
+                blitted = true;
                 let metrics = metrics_of(hwnd);
                 let raster = (backing.width as i32, backing.height as i32);
                 let client = (metrics.client_px.0 as i32, metrics.client_px.1 as i32);
@@ -1603,6 +1629,13 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             });
             unsafe {
                 EndPaint(hwnd, &paint);
+            }
+            if !blitted {
+                // no backing to answer with (the GPU road keeps none):
+                // the validated region would stay whatever the screen
+                // held — ask the road for a real present instead of
+                // leaving a possibly-discarded surface standing
+                ask_represent(hwnd);
             }
             0
         }
@@ -1975,6 +2008,39 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
         WM_APP_WAKE => {
             dispatch(AppEvent::Wake);
             0
+        }
+        WM_APP_REPRESENT => {
+            // the screen's copy is gone: forget every "already shown"
+            // ledger, then present — the GPU road would otherwise skip
+            // an unchanged frame the compositor no longer has
+            crate::d3d::remint();
+            // only the CPU road heals through a GDI paint; inviting
+            // one on the GPU road would reach the no-backing arm,
+            // which asks here again — forever
+            let has_backing = BACKING.with(|stores| {
+                stores.borrow().get(&hwnd).is_some_and(|backing| backing.dc != 0)
+            });
+            if has_backing {
+                unsafe {
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+            }
+            dispatch(AppEvent::Redraw);
+            0
+        }
+        WM_DWMCOMPOSITIONCHANGED => {
+            // the compositor restarted (a driver reset restarts it):
+            // every window's on-screen content was discarded, and no
+            // paint is coming on its own — ask for one
+            ask_represent(hwnd);
+            0
+        }
+        WM_POWERBROADCAST => {
+            if wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND {
+                // a resume can reveal a discarded surface the same way
+                ask_represent(hwnd);
+            }
+            1
         }
         WM_ENTERSIZEMOVE => {
             IN_SIZE_MOVE.with(|cell| cell.set(true));

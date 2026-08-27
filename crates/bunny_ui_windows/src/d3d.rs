@@ -3567,6 +3567,21 @@ pub(crate) fn present_window(
         }
     }
     eprintln!("bunny_ui d3d: the device is lost — presenting by cpu");
+    // the frame in hand died with the device, and an idle app never
+    // asks again on its own — the demotion itself asks, so the CPU
+    // road's first frame arrives now, not at the next keystroke
+    crate::ffi::ask_represent(hwnd);
+}
+
+/// Forgets the retained frame so the next present re-encodes in full —
+/// for the moments the SCREEN's copy died (a compositor restart, a
+/// resume) while ours still says "already shown".
+pub(crate) fn remint() {
+    PRESENTER.with(|slot| {
+        if let Some(presenter) = slot.borrow_mut().as_mut() {
+            presenter.retained = None;
+        }
+    });
 }
 
 /// Releases the presenter before the window dies (the swapchain must
