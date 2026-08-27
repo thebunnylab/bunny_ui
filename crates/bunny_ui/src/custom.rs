@@ -216,21 +216,31 @@ pub trait CustomElement: 'static {
 /// The app's element inside the layout tree — a cheap handle (one `Rc`
 /// clone) that keeps the tree `Debug` without asking the app for it.
 #[derive(Clone)]
-pub struct Custom(Rc<dyn CustomElement>);
+pub struct Custom {
+    element: Rc<dyn CustomElement>,
+    /// The focus beat the app last stamped on this box, if any — see
+    /// [`CustomView::auto_focus`].
+    auto_focus: Option<u64>,
+}
 
 impl Custom {
     pub fn new(element: impl CustomElement) -> Custom {
-        Custom(Rc::new(element))
+        Custom { element: Rc::new(element), auto_focus: None }
     }
 
     pub fn element(&self) -> &dyn CustomElement {
-        &*self.0
+        &*self.element
+    }
+
+    /// The beat riding this box, for the runtime's focus pass.
+    pub(crate) fn auto_focus_beat(&self) -> Option<u64> {
+        self.auto_focus
     }
 }
 
 impl std::fmt::Debug for Custom {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "custom({})", self.0.name())
+        write!(f, "custom({})", self.element.name())
     }
 }
 
@@ -771,6 +781,23 @@ impl EventCtx<'_> {
 #[derive(Clone)]
 pub struct CustomView {
     element: Custom,
+}
+
+impl CustomView {
+    /// Hand this box the keyboard when `beat` moves — the app's door for
+    /// "opening X focuses Y": opening a file must put the keyboard in the
+    /// editor, and no pointer gesture is there to do it.
+    ///
+    /// Each distinct `(box, beat)` fires ONCE, and unlike a field's
+    /// [`auto_focus`](crate::ext::ViewExt::auto_focus) it TAKES the
+    /// keyboard from whoever holds it: the beat only moves on an explicit
+    /// app intent, and the tree row that opened the file is exactly who
+    /// must lose the keys. A box that never calls this never asks.
+    #[must_use]
+    pub fn auto_focus(mut self, beat: u64) -> Self {
+        self.element.auto_focus = Some(beat);
+        self
+    }
 }
 
 impl View for CustomView {
