@@ -164,6 +164,15 @@ pub enum Modifier {
         is_presented: Binding<bool>,
         content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
     },
+    /// `.dialog(…)`: a sheet that asks the shell for a REAL window —
+    /// titled, resizable, key while it is up — where the shell has
+    /// one, and presents as the sheet it is everywhere else. The
+    /// window's close button flips the binding; it never terminates.
+    Dialog {
+        is_presented: Binding<bool>,
+        spec: crate::layout::DialogSpec,
+        content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
+    },
     /// An anchored popover: the modified view is the ANCHOR, `side`
     /// the preferred edge. Closes on Escape and on a press outside;
     /// `on_dismiss` runs after any of the framework's dismissal doors
@@ -311,6 +320,9 @@ impl Modifier {
             Modifier::OnTapGesture(_) => " [.onTapGesture()]".into(),
             Modifier::Effect { name, detail, .. } => format!(" [.{name}{detail}]"),
             Modifier::Sheet { .. } => " [.sheet(isPresented: $…)]".into(),
+            Modifier::Dialog { spec, .. } => {
+                format!(" [.dialog(isPresented: $…, {:?})]", spec.title)
+            }
             Modifier::Popover { side, .. } => format!(" [.popover(.{side:?})]"),
             Modifier::EnvSet { name, detail, .. } => format!(" [.{name}{detail}]"),
             Modifier::Custom(custom) => format!(" [.modifier({})]", custom.name()),
@@ -898,11 +910,62 @@ fn apply(
                     path: path.clone(),
                     content: Rc::new(wrap_layout(sheet_layouts.clone())),
                     child: Box::new(base),
+                    surface: crate::layout::OverlaySurface::Layer,
                 }),
                 None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                     align: CrossAlign::Center,
                     modal: true,
                     children: vec![base, wrap_layout(sheet_layouts.clone())],
+                }),
+            }
+        }
+        Modifier::Dialog {
+            is_presented,
+            spec,
+            content,
+        } if is_presented.get() => {
+            let mut dialog_nodes = NodeList::new();
+            let path;
+            {
+                // its own identity sub-root, exactly the sheet's: what
+                // the closure builds anchors here and dies on close
+                let _frame = motor::identity::enter("dialog");
+                path = motor::identity::cursor_scope();
+                content(ctx).render_into(ctx, &mut dialog_nodes);
+            }
+            let (dialog_prints, dialog_layouts) = dialog_nodes.into_parts();
+            if let Some(node) = out.last_mut() {
+                node.children
+                    .push(RenderNode::branch("Dialog", dialog_prints));
+            }
+            if let Some(path) = &path {
+                // the window's own close button lands here (the shell
+                // fires the dismissal, `Runtime::dismiss_overlay`) and
+                // the BINDING closes the window — one road out, the
+                // same one the app's own Escape takes. Deliberately no
+                // `OVERLAY_DISMISS` handler: a dialog is not a
+                // popover, and Escape stays the app's to bind.
+                let is_presented = is_presented.clone();
+                crate::reconciler::attribute_action(
+                    format!("{path}/#dismiss"),
+                    Rc::new(move |_| is_presented.set(false)),
+                );
+            }
+            // the sheet's own lowering — same centring, same capture —
+            // asking the shell for a real WINDOW; without a pass there
+            // is no identity for a surface to key on, so it stays the
+            // plain modal pile, like the sheet above.
+            match path {
+                Some(path) => out.wrap_layout_from(mark, |base| LayoutNode::Sheet {
+                    path: path.clone(),
+                    content: Rc::new(wrap_layout(dialog_layouts.clone())),
+                    child: Box::new(base),
+                    surface: crate::layout::OverlaySurface::Window(spec.clone()),
+                }),
+                None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
+                    align: CrossAlign::Center,
+                    modal: true,
+                    children: vec![base, wrap_layout(dialog_layouts.clone())],
                 }),
             }
         }

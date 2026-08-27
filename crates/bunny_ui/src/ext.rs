@@ -1196,6 +1196,36 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.dialog(isPresented: $flag, spec) { … }` — a modal layer that,
+    /// on a shell with real windows, IS one: a titled, resizable
+    /// window with dialog manners (on macOS: minimize disabled, the
+    /// green button a plain zoom, floating over its parent — a
+    /// fullscreen parent included — with the parent's traffic lights
+    /// out and its content inert). Everywhere else it presents exactly
+    /// like [`ViewExt::sheet`].
+    ///
+    /// The window's close button flips the binding — it never
+    /// terminates. Escape stays the app's to bind, and a press on the
+    /// parent does NOTHING: a dialog is not a popover, outside is not
+    /// dismissal. The dialog opens centered at `spec.min` and the
+    /// shell remembers where the user leaves it for as long as the
+    /// runtime lives.
+    fn dialog(
+        self,
+        is_presented: Binding<bool>,
+        spec: crate::layout::DialogSpec,
+        content: impl Fn(&Context) -> Erased + 'static,
+    ) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Dialog {
+                is_presented,
+                spec,
+                content: Rc::new(content),
+            },
+        }
+    }
+
     /// Marks THIS view as a window-drag handle: on a chrome-less
     /// desktop window (`Chrome::Scene`), pressing it where no button
     /// wins drags the window — the scene's own title bar. Shells

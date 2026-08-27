@@ -285,6 +285,13 @@ pub struct Runtime {
     /// viewport; the desktop shell sets the SCREEN — overflow becomes
     /// plain geometry.
     overlay_bounds: Cell<Option<Rect>>,
+    /// Where the shell is holding each open DIALOG's window, by
+    /// overlay path — a `.dialog(…)` presented as a real window
+    /// reports the window's travels here and the next pass lays its
+    /// content out inside them. Entries survive a close on purpose:
+    /// reopening lands where the reader left the window (the session's
+    /// memory — a fresh runtime starts centered again).
+    dialog_frames: RefCell<HashMap<String, Rect>>,
     /// How many PHYSICAL pixels one layout point is worth on this
     /// screen. The shell installs it; everyone else keeps `1.0`.
     device_scale: Cell<Px>,
@@ -367,6 +374,23 @@ impl Runtime {
         self.overlay_bounds.set(bounds);
     }
 
+    /// Where the shell is holding an open dialog's WINDOW — content
+    /// origin and size, in layout coordinates. The next pass lays the
+    /// dialog's content out inside exactly this frame: the window
+    /// drives, the content follows. The entry survives a close, so a
+    /// reopen lands where the reader left it.
+    pub fn set_dialog_frame(&self, path: &str, frame: Rect) {
+        self.dialog_frames.borrow_mut().insert(path.to_string(), frame);
+    }
+
+    /// Runs ONE overlay's dismissal — the road a dialog window's own
+    /// close button arrives by (the shell hears `windowShouldClose`,
+    /// fires this, and the flipped binding is what closes the window).
+    /// `true` = the overlay answered and the shell repaints.
+    pub fn dismiss_overlay(&self, path: &str) -> bool {
+        reconciler::run_action(&format!("{path}/#dismiss"), 1)
+    }
+
     /// How many PHYSICAL pixels one layout point covers — what the
     /// shell reads from the screen (`2.0` on a retina display). It
     /// reaches the app through [`crate::custom::PaintCtx::scale`], so
@@ -390,6 +414,13 @@ impl Runtime {
             .borrow()
             .iter()
             .rev()
+            // a dialog is a WINDOW, and windows survive an app switch
+            // (its own popovers still close) — without this skip the
+            // dialog would dismiss itself on the very key-swap that
+            // opens it
+            .filter(|overlay| {
+                matches!(overlay.surface, crate::layout::OverlaySurface::Layer)
+            })
             .map(|overlay| overlay.path.clone())
             .collect();
         let mut closed = false;
@@ -811,6 +842,7 @@ impl Runtime {
             last_drag_regions: RefCell::new(Vec::new()),
             last_control_regions: RefCell::new(Vec::new()),
             overlay_bounds: Cell::new(None),
+            dialog_frames: RefCell::new(HashMap::default()),
             device_scale: Cell::new(1.0),
             dom: RefCell::new(crate::dom::DomLowering::default()),
             root_is_boundary: Cell::new(false),
@@ -1472,6 +1504,10 @@ impl Runtime {
                 .find(|top| {
                     top.path != crate::layout::TOOLTIP_PATH
                         && top.path != crate::layout::DRAG_LABEL_PATH
+                        // a dialog WINDOW never dismisses from outside:
+                        // outside is the inert parent, and a press
+                        // there answers to the modal floor (nothing)
+                        && matches!(top.surface, crate::layout::OverlaySurface::Layer)
                 })
                 .filter(|top| !top.frame.contains(x, y))
                 .map(|top| top.path.clone())
@@ -2915,6 +2951,7 @@ impl Runtime {
         self.cache.begin_frame();
         self.last_proposal.set(Some(crate::layout::Proposal::exact(size)));
         let offsets = self.scroll_offsets.borrow();
+        let dialogs = self.dialog_frames.borrow();
         let env = LayoutEnv {
             text: &*self.text,
             images: &*self.images,
@@ -2929,6 +2966,7 @@ impl Runtime {
             scale: self.device_scale.get(),
             anim: None,
             overlay_bounds: self.overlay_bounds.get(),
+            dialog_frames: Some(&dialogs),
         };
         let no_promises = std::collections::HashSet::new();
         let boxes = self.island_boxes.borrow();
@@ -3026,6 +3064,7 @@ impl Runtime {
         self.cache.begin_frame();
         self.last_proposal.set(Some(crate::layout::Proposal::exact(size)));
         let offsets = self.scroll_offsets.borrow();
+        let dialogs = self.dialog_frames.borrow();
         let env = LayoutEnv {
             text: &*self.text,
             images: &*self.images,
@@ -3040,6 +3079,7 @@ impl Runtime {
             scale: self.device_scale.get(),
             anim: None,
             overlay_bounds: self.overlay_bounds.get(),
+            dialog_frames: Some(&dialogs),
         };
         let changed: Vec<String> = Vec::new();
         let no_promises = std::collections::HashSet::new();
@@ -4264,6 +4304,7 @@ impl Runtime {
             animator.set_snap_retargets(resized);
         }
         let offsets = self.scroll_offsets.borrow();
+        let dialogs = self.dialog_frames.borrow();
         let env = LayoutEnv {
             text: &*self.text,
             images: &*self.images,
@@ -4277,6 +4318,7 @@ impl Runtime {
             anim: None,
             live: None,
             overlay_bounds: self.overlay_bounds.get(),
+            dialog_frames: Some(&dialogs),
             scale: self.device_scale.get(),
         };
         let stage = if dom {
@@ -4295,6 +4337,7 @@ impl Runtime {
         });
         crate::stats::note_display(result.display.len());
         drop(offsets);
+        drop(dialogs);
         drop(carets);
         *self.last_hits.borrow_mut() = result.hits.clone();
         *self.last_scrolls.borrow_mut() = result.scrolls.clone();

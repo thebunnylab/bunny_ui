@@ -128,8 +128,8 @@ pub mod prelude {
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
-        Color, CrossAlign, Fraction, Glass, Gradient, Point, Proposal, Px, Rect, Rendering, Side,
-        Size, Truncation, UnitPoint, VisualProps,
+        Color, CrossAlign, DialogSpec, Fraction, Glass, Gradient, OverlaySurface, Point, Proposal,
+        Px, Rect, Rendering, Side, Size, Truncation, UnitPoint, VisualProps,
     };
     pub use crate::theme::{self, Theme};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
@@ -7472,6 +7472,271 @@ mod tests {
         runtime.pointer_released(20.0, 20.0);
         runtime.render_stable(&stage);
         assert!(stage.open.get(), "the sheet is still up");
+        assert_eq!(stage.behind.get(), 0, "and the press reached nothing behind it");
+    }
+
+    /// A `.dialog` is the sheet's lowering asking for a real WINDOW:
+    /// same centring, same capture, and the placement carries the spec
+    /// a shell raises the window from.
+    #[test]
+    fn a_dialog_asks_for_a_real_window_and_opens_centered_at_its_minimum() {
+        use crate::layout::{DialogSpec, OverlaySurface, Proposal, Size};
+
+        const WINDOW: Size = Size { width: 800.0, height: 600.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            open: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("the page under it").frame(WINDOW.width, WINDOW.height).dialog(
+                    self.open.binding(),
+                    DialogSpec::titled("Settings").min_size(300.0, 200.0),
+                    |_| erased(text("the settings")),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { open: State::new(true) };
+        let result = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+
+        assert_eq!(result.overlays.len(), 1, "the dialog is presented on its own");
+        let dialog = &result.overlays[0];
+        match &dialog.surface {
+            OverlaySurface::Window(spec) => {
+                assert_eq!(&*spec.title, "Settings", "the bar wears the app's title");
+                assert_eq!(spec.min, Size { width: 300.0, height: 200.0 });
+            }
+            OverlaySurface::Layer => panic!("a dialog asks for a window, not a layer"),
+        }
+        assert_eq!(
+            dialog.frame.size,
+            Size { width: 300.0, height: 200.0 },
+            "it opens at its minimum",
+        );
+        assert_eq!(
+            (dialog.frame.origin.x, dialog.frame.origin.y),
+            (250.0, 200.0),
+            "centred over the parent, like the sheet it degrades to",
+        );
+    }
+
+    /// The window drives, the content follows: the frame the shell
+    /// reports (`set_dialog_frame`) is the frame the dialog lays out
+    /// in — and it never goes under the spec's minimum, because the
+    /// window itself refuses to.
+    #[test]
+    fn the_shell_drives_a_dialogs_frame_and_the_content_follows() {
+        use crate::layout::{DialogSpec, Point, Proposal, Rect, Size};
+
+        const WINDOW: Size = Size { width: 800.0, height: 600.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            open: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("the page").frame(WINDOW.width, WINDOW.height).dialog(
+                    self.open.binding(),
+                    DialogSpec::titled("Settings").min_size(300.0, 200.0),
+                    |_| erased(text("the settings")),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { open: State::new(true) };
+        let first = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let path = first.overlays[0].path.clone();
+
+        // the reader dragged and grew the window
+        let held = Rect {
+            origin: Point { x: 40.0, y: 50.0 },
+            size: Size { width: 500.0, height: 400.0 },
+        };
+        runtime.set_dialog_frame(&path, held);
+        let moved = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(moved.overlays[0].frame, held, "layout follows the window");
+
+        // a frame under the minimum floors at it — the origin is
+        // still the window's own
+        runtime.set_dialog_frame(
+            &path,
+            Rect { origin: Point { x: 40.0, y: 50.0 }, size: Size { width: 100.0, height: 80.0 } },
+        );
+        let floored = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(
+            floored.overlays[0].frame.size,
+            Size { width: 300.0, height: 200.0 },
+            "never under the spec's minimum",
+        );
+        assert_eq!(
+            (floored.overlays[0].frame.origin.x, floored.overlays[0].frame.origin.y),
+            (40.0, 50.0),
+        );
+    }
+
+    /// Closing a dialog does not forget where the reader left it: the
+    /// runtime holds the frame for as long as it lives, so a reopen
+    /// lands on the same spot — the session's memory, no disk.
+    #[test]
+    fn a_closed_dialog_reopens_where_the_reader_left_it() {
+        use crate::layout::{DialogSpec, Point, Proposal, Rect, Size};
+
+        const WINDOW: Size = Size { width: 800.0, height: 600.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            open: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("the page").frame(WINDOW.width, WINDOW.height).dialog(
+                    self.open.binding(),
+                    DialogSpec::titled("Settings").min_size(300.0, 200.0),
+                    |_| erased(text("the settings")),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { open: State::new(true) };
+        let first = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let path = first.overlays[0].path.clone();
+
+        let held = Rect {
+            origin: Point { x: 120.0, y: 90.0 },
+            size: Size { width: 460.0, height: 340.0 },
+        };
+        runtime.set_dialog_frame(&path, held);
+
+        page.open.set(false);
+        let shut = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert!(shut.overlays.is_empty(), "closed is closed");
+
+        page.open.set(true);
+        let reopened = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(reopened.overlays[0].frame, held, "the reopen lands where it left");
+    }
+
+    /// An app switch closes popovers — that is what `ResignKey` means —
+    /// but a dialog is a WINDOW, and windows survive it. Its own
+    /// popovers still close. Without the skip the dialog would dismiss
+    /// itself on the very key-swap that opens it.
+    #[test]
+    fn an_app_switch_leaves_a_dialog_standing_and_closes_its_popovers() {
+        use crate::layout::{DialogSpec, Proposal, Side, Size};
+
+        const WINDOW: Size = Size { width: 800.0, height: 600.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            open: State<bool>,
+            menu: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let menu = self.menu;
+                text("the page").frame(WINDOW.width, WINDOW.height).dialog(
+                    self.open.binding(),
+                    DialogSpec::titled("Settings").min_size(300.0, 200.0),
+                    move |_| {
+                        erased(text("Theme").frame(80.0, 24.0).popover(
+                            menu.binding(),
+                            Side::Bottom,
+                            |_| erased(text("Islands Dark").frame(120.0, 60.0)),
+                        ))
+                    },
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { open: State::new(true), menu: State::new(true) };
+        let both = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(both.overlays.len(), 2, "the dialog, then its dropdown above it");
+
+        assert!(runtime.dismiss_all_overlays(), "something closed");
+        runtime.render_stable(&page);
+        assert!(!page.menu.get(), "the dropdown went with the switch");
+        assert!(page.open.get(), "the dialog is a window, and it stands");
+    }
+
+    /// The red button's road: the shell hears `windowShouldClose`,
+    /// fires the overlay's dismissal, and the flipped BINDING is what
+    /// closes the window — one door out, never a terminate.
+    #[test]
+    fn the_red_button_road_flips_the_binding() {
+        use crate::layout::{DialogSpec, Proposal, Size};
+
+        const WINDOW: Size = Size { width: 800.0, height: 600.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            open: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("the page").frame(WINDOW.width, WINDOW.height).dialog(
+                    self.open.binding(),
+                    DialogSpec::titled("Settings").min_size(300.0, 200.0),
+                    |_| erased(text("the settings")),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { open: State::new(true) };
+        let result = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let path = result.overlays[0].path.clone();
+
+        assert!(runtime.dismiss_overlay(&path), "the dismissal answered");
+        runtime.render_stable(&page);
+        assert!(!page.open.get(), "the binding closed");
+        let after = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert!(after.overlays.is_empty(), "and the dialog is gone");
+    }
+
+    /// A press beside a dialog closes nothing and reaches nothing: the
+    /// parent underneath is inert (the modal floor), and outside is
+    /// not dismissal — a dialog is not a popover, even though it
+    /// registers the same `#dismiss` road for its own close button.
+    #[test]
+    fn a_press_beside_a_dialog_does_not_close_it_or_reach_the_page() {
+        use crate::layout::{DialogSpec, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Stage {
+            open: State<bool>,
+            behind: State<i32>,
+        }
+        impl Component for Stage {
+            fn body(self, _ctx: &Context) -> impl View {
+                let behind = self.behind;
+                text("the page behind")
+                    .frame(400.0, 300.0)
+                    .on_click(move || behind.add(1))
+                    .dialog(
+                        self.open.binding(),
+                        DialogSpec::titled("Settings").min_size(120.0, 80.0),
+                        |_| erased(text("panel")),
+                    )
+            }
+        }
+
+        let stage = Stage { open: State::new(true), behind: State::new(0) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&stage);
+        let _ = runtime.layout(&stage, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+
+        // the far corner: outside the dialog, on the inert parent
+        runtime.pointer_pressed(20.0, 20.0);
+        runtime.pointer_released(20.0, 20.0);
+        runtime.render_stable(&stage);
+        assert!(stage.open.get(), "the dialog is still up");
         assert_eq!(stage.behind.get(), 0, "and the press reached nothing behind it");
     }
 

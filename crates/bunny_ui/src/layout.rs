@@ -355,6 +355,11 @@ pub struct LayoutEnv<'a> {
     /// a popover then overflows the window by plain geometry, and the
     /// whole policy stays testable headless.
     pub overlay_bounds: Option<Rect>,
+    /// The frames the SHELL is holding open dialogs at, by overlay
+    /// path — a real window the user dragged, resized or zoomed. `None`
+    /// (and a missing entry) = the dialog opens centered at its
+    /// minimum; an entry makes layout follow the window.
+    pub dialog_frames: Option<&'a HashMap<String, Rect>>,
     /// How many PHYSICAL pixels one point covers. It only reaches a
     /// custom box's paint — the geometry never consults it, so layout
     /// stays resolution independent by construction.
@@ -700,6 +705,11 @@ pub enum LayoutNode {
         path: String,
         content: Rc<LayoutNode>,
         child: Box<LayoutNode>,
+        /// The surface the layer asks for — a `.sheet(…)` is a
+        /// `Layer`; a `.dialog(…)` asks for a real `Window` on the
+        /// shells that have one, and degrades to the same layer
+        /// everywhere else.
+        surface: OverlaySurface,
     },
     Anchored {
         /// The popover's identity (dismiss registrations key on it).
@@ -1929,6 +1939,53 @@ pub struct ScrollRegion {
     pub row_offsets: Option<Rc<Vec<Px>>>,
 }
 
+/// What SURFACE a modal layer asks the shell for.
+///
+/// Every popover, menu and sheet is a `Layer`: an in-scene slice the
+/// desktop shell lifts onto a borderless child panel that never takes
+/// key. A `Window` is the other thing entirely — a REAL titled window
+/// with dialog manners (the settings dialog every IDE opens): its own
+/// bar, its own resize, the keyboard while it is up, the parent inert
+/// underneath. A shell without real windows presents it exactly like a
+/// sheet, and loses nothing but the chrome.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OverlaySurface {
+    /// The in-scene layer — the road every popover and sheet rides.
+    Layer,
+    /// A real titled window, wearing the spec.
+    Window(DialogSpec),
+}
+
+/// What the shell needs to raise a dialog's window: the title on its
+/// bar and the smallest content it may shrink to — which is also the
+/// size it OPENS at, centered over the parent. Where the user then
+/// drags or resizes it to is the shell's to report back
+/// (`Runtime::set_dialog_frame`); layout follows the window, never the
+/// other way around.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DialogSpec {
+    pub title: Arc<str>,
+    pub min: Size,
+}
+
+impl DialogSpec {
+    /// A dialog named for its bar, at the house floor size — grow it
+    /// with [`DialogSpec::min_size`].
+    pub fn titled(title: impl Into<Arc<str>>) -> Self {
+        Self {
+            title: title.into(),
+            min: Size { width: 320.0, height: 240.0 },
+        }
+    }
+
+    /// The smallest content the window may shrink to — and the size
+    /// the dialog opens at.
+    pub fn min_size(mut self, width: Px, height: Px) -> Self {
+        self.min = Size { width, height };
+        self
+    }
+}
+
 /// One placed overlay: its identity, the anchor it hangs from, the
 /// resolved frame, and its slice `[start, end)` of the display list —
 /// a shell that wants the popover on its own surface (the mac child
@@ -1942,6 +1999,9 @@ pub struct OverlayPlacement {
     /// The anchor still intersects its clip — a popover whose anchor
     /// scrolled away dismisses on the follow-up.
     pub anchor_visible: bool,
+    /// The surface this overlay asked for — the shell presents a
+    /// `Layer` on the panel road and a `Window` on a real one.
+    pub surface: OverlaySurface,
 }
 
 /// One `.tooltip(…)` region of the placed scene — the anchor the
@@ -2111,6 +2171,8 @@ struct QueuedOverlay {
     /// which on a desktop is the whole screen. A sheet is modal to the
     /// window it belongs to and has no business outside it.
     side: Option<Side>,
+    /// The surface the layer asked for — carried into the placement.
+    surface: OverlaySurface,
     node: Rc<LayoutNode>,
     anchor: Rect,
     anchor_visible: bool,
@@ -2527,6 +2589,7 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
             anim: None,
             live: None,
             overlay_bounds: None,
+            dialog_frames: None,
             scale: 1.0,
         },
     )
@@ -2975,17 +3038,59 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
             Some(_) => container,
             None => viewport,
         };
-        let proposal = match queued.side {
-            Some(_) => proposal,
-            None => Proposal {
+        // a dialog rides the frame its WINDOW is at: the shell holds
+        // it (`Runtime::set_dialog_frame`) and the user drags, resizes
+        // or zooms it there. On the first open nothing is held and it
+        // centres at its minimum, exactly the sheet it degrades to on
+        // shells without windows. Its content is measured with the
+        // frame's OWN proposal — the window drives, the content
+        // follows — never the other way around.
+        let window_frame = match (&queued.side, &queued.surface) {
+            (None, OverlaySurface::Window(spec)) => {
+                let held = env
+                    .dialog_frames
+                    .and_then(|frames| frames.get(&queued.path));
+                Some(match held {
+                    Some(frame) => Rect {
+                        origin: frame.origin,
+                        size: Size {
+                            width: frame.size.width.max(spec.min.width),
+                            height: frame.size.height.max(spec.min.height),
+                        },
+                    },
+                    None => Rect {
+                        origin: Point {
+                            x: room.origin.x
+                                + align_offset(room.size.width, spec.min.width, CrossAlign::Center),
+                            y: room.origin.y
+                                + align_offset(
+                                    room.size.height,
+                                    spec.min.height,
+                                    CrossAlign::Center,
+                                ),
+                        },
+                        size: spec.min,
+                    },
+                })
+            }
+            _ => None,
+        };
+        let proposal = match (&window_frame, queued.side) {
+            (Some(frame), _) => Proposal {
+                width: Some(frame.size.width),
+                height: Some(frame.size.height),
+            },
+            (None, Some(_)) => proposal,
+            (None, None) => Proposal {
                 width: Some(room.size.width),
                 height: Some(room.size.height),
             },
         };
         let (size, fit) = queued.node.measure(proposal, env);
-        let frame = match queued.side {
-            Some(side) => anchored_frame(queued.anchor, side, size, container),
-            None => Rect {
+        let frame = match (&window_frame, queued.side) {
+            (Some(frame), _) => *frame,
+            (None, Some(side)) => anchored_frame(queued.anchor, side, size, container),
+            (None, None) => Rect {
                 origin: Point {
                     x: room.origin.x + align_offset(room.size.width, size.width, CrossAlign::Center),
                     y: room.origin.y
@@ -3003,6 +3108,7 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
             frame,
             display: (start, end),
             anchor_visible: queued.anchor_visible,
+            surface: queued.surface,
         });
     }
     // the menu lands above every popover — the runtime opened it, the
@@ -3033,6 +3139,7 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
             frame,
             display: (start, end),
             anchor_visible: true,
+            surface: OverlaySurface::Layer,
         });
     }
     // the drag label rides the cursor — the same bubble the tooltip
@@ -3071,6 +3178,7 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
             frame,
             display: (start, end),
             anchor_visible: true,
+            surface: OverlaySurface::Layer,
         });
     }
     // the tooltip lands LAST — above every popover, outside every
@@ -3092,6 +3200,7 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
             frame,
             display: (start, end),
             anchor_visible: true,
+            surface: OverlaySurface::Layer,
         });
     }
 }
@@ -4214,7 +4323,7 @@ impl LayoutNode {
                 // platform composites the view above it
             }
 
-            (LayoutNode::Sheet { path, content, child }, Fit::Wrapped(_, fit)) => {
+            (LayoutNode::Sheet { path, content, child, surface }, Fit::Wrapped(_, fit)) => {
                 child.place(frame, *fit, env, out);
                 // the line the modal draws: everything recorded from
                 // here on is ABOVE it, and the walk back stops at the
@@ -4231,6 +4340,7 @@ impl LayoutNode {
                 out.overlay_queue.push(QueuedOverlay {
                     path: path.clone(),
                     side: None,
+                    surface: surface.clone(),
                     node: Rc::clone(content),
                     anchor: frame,
                     anchor_visible: true,
@@ -4256,6 +4366,7 @@ impl LayoutNode {
                 out.overlay_queue.push(QueuedOverlay {
                     path: path.clone(),
                     side: Some(*side),
+                    surface: OverlaySurface::Layer,
                     node: Rc::clone(overlay),
                     anchor,
                     anchor_visible,
@@ -6622,6 +6733,7 @@ mod tests {
             anim: None,
             live: None,
             overlay_bounds: None,
+            dialog_frames: None,
             scale: 1.0,
         };
         node.measure(proposal, env).0
@@ -6655,6 +6767,7 @@ mod tests {
                 anim: None,
                 live: None,
                 overlay_bounds: None,
+                dialog_frames: None,
                 scale: 1.0,
             },
         )
@@ -6918,6 +7031,7 @@ mod tests {
             anim: None,
             live: None,
             overlay_bounds: None,
+            dialog_frames: None,
             scale: 1.0,
         };
         let region = || LayoutNode::Scroll {
@@ -6989,6 +7103,7 @@ mod tests {
             anim: None,
             live: None,
             overlay_bounds: None,
+            dialog_frames: None,
             scale: 1.0,
         };
 
