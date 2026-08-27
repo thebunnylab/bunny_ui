@@ -4058,7 +4058,17 @@ impl Runtime {
         // the retains below would have thrown both away
         self.follow_named_inputs();
         self.carets.borrow_mut().retain(|path, _| reconciler::has_editor(path));
-        self.auto_focused.borrow_mut().retain(|path| reconciler::has_editor(path));
+        self.auto_focused.borrow_mut().retain(|key| {
+            // a custom box's once-per-beat memory is keyed `path#beat`:
+            // keep it while the BOX lives — sweeping it would re-arm the
+            // beat every pass and the box would steal focus forever
+            match key.rsplit_once('#') {
+                Some((path, beat)) if beat.bytes().all(|b| b.is_ascii_digit()) => {
+                    reconciler::has_custom(path)
+                }
+                _ => reconciler::has_editor(key),
+            }
+        });
         // the app's own box counts as a live input too: it registers
         // itself every pass it renders, exactly like a field's editor
         let focus_died = self
@@ -4147,6 +4157,26 @@ impl Runtime {
             self.auto_focused.borrow_mut().insert(field.path.clone());
             if self.focus.borrow().is_none() {
                 self.focus(&field.path);
+                return true;
+            }
+        }
+        // A custom box's auto-focus is KEYED: each new beat is one explicit
+        // app intent — "opening a file hands the editor the keyboard" — so
+        // unlike a field's it TAKES the keyboard from whoever holds it (the
+        // tree row that opened the file is exactly who must lose the keys).
+        // Each (box, beat) fires once, so the user can focus away and stay
+        // away until the app beats again.
+        for placement in &result.customs {
+            let Some(beat) = placement.element.auto_focus_beat() else {
+                continue;
+            };
+            let key = format!("{}#{beat}", placement.path);
+            if self.auto_focused.borrow().contains(&key) {
+                continue;
+            }
+            self.auto_focused.borrow_mut().insert(key);
+            if self.focus.borrow().as_deref() != Some(placement.path.as_str()) {
+                self.focus(&placement.path);
                 return true;
             }
         }
