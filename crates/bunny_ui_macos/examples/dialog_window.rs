@@ -55,10 +55,25 @@ impl Component for Page {
         .padding()
         .dialog(
             self.open.binding(),
-            DialogSpec::titled("Settings").min_size(480.0, 320.0),
+            DialogSpec::titled("Settings")
+                .min_size(480.0, 320.0)
+                // the dialog's own header owns the top edge; the
+                // native lights sit in it, at the main window's x
+                .scene_lights(16.0, 13.0),
             move |_| {
                 erased(
                     vstack!(
+                        // the header: drag handle for a bar-less
+                        // window, with the lights' corner left alone
+                        hstack!(
+                            text("Settings").bold(),
+                            spacer(),
+                        )
+                        .padding_edge(Edge::Leading, 84.0)
+                        .padding_edge(Edge::Trailing, 12.0)
+                        .frame_height(40.0)
+                        .frame_max(f64::INFINITY, 40.0, Alignment::Leading)
+                        .window_drag_region(),
                         text("A real window with dialog manners").font(Font::Title),
                         text_field(
                             "type here — the keyboard is the dialog's",

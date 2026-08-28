@@ -1051,16 +1051,34 @@ fn window_frame_changed(note: Id, kind: &str) {
 thread_local! {
     /// Where the app asked for the native buttons, in points from the
     /// window's TOP-LEFT corner. `None` = wherever macOS puts them.
+    /// Consumed by the next window BUILT — the main window's road,
+    /// armed before it exists.
     static TRAFFIC_LIGHTS: Cell<Option<(f64, f64, Option<f64>)>> = const { Cell::new(None) };
-    /// The window that carries them, so the frame tick can put them
-    /// back without being handed anything.
-    static LIGHTS_WINDOW: Cell<Id> = const { Cell::new(std::ptr::null_mut()) };
+    /// Every window whose buttons the app placed — the main window's
+    /// scene bar, each scene-chrome DIALOG's header — with where it
+    /// asked them. The frame tick walks them all, and a frame-changed
+    /// notification looks its own window up here.
+    static PLACED_LIGHTS: RefCell<Vec<(Id, (f64, f64, Option<f64>))>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// The app's answer to "where do the buttons sit", set once before the
 /// window is built.
 pub fn set_traffic_lights(at: Option<(f64, f64, Option<f64>)>) {
     TRAFFIC_LIGHTS.with(|slot| slot.set(at));
+}
+
+/// Registers one window's placement and applies it once — the window
+/// is known here, unlike [`set_traffic_lights`]'s pre-build moment.
+fn adopt_traffic_lights(window: Id, at: (f64, f64, Option<f64>)) {
+    PLACED_LIGHTS.with(|slot| {
+        let mut placed = slot.borrow_mut();
+        match placed.iter_mut().find(|(held, _)| *held == window) {
+            Some(entry) => entry.1 = at,
+            None => placed.push((window, at)),
+        }
+    });
+    place_traffic_lights(window);
 }
 
 /// Puts the buttons back if AppKit moved them — cheap enough to ask
@@ -1070,10 +1088,11 @@ pub fn set_traffic_lights(at: Option<(f64, f64, Option<f64>)>) {
 /// container, and so does a resize, a trip through full screen, and
 /// every other thing that touches the window's chrome; there is no
 /// notification for "the container laid out". Three frame reads and a
-/// comparison is cheaper than being wrong.
+/// comparison per window is cheaper than being wrong.
 pub fn keep_traffic_lights() {
-    let window = LIGHTS_WINDOW.with(|slot| slot.get());
-    if !window.is_null() {
+    let windows: Vec<Id> =
+        PLACED_LIGHTS.with(|slot| slot.borrow().iter().map(|(window, _)| *window).collect());
+    for window in windows {
         place_traffic_lights(window);
     }
 }
@@ -1153,12 +1172,16 @@ fn light_frame(
 /// here, once. The horizontal spacing between the three is the
 /// system's own — only the group moves.
 pub fn place_traffic_lights(window: Id) {
-    let Some((x, y, size)) = TRAFFIC_LIGHTS.with(|slot| slot.get()) else {
-        return;
-    };
     if window.is_null() {
         return;
     }
+    // the window's own ask — a window nobody registered keeps the
+    // system's placement (a Native-chrome dialog, a plain window)
+    let Some((x, y, size)) = PLACED_LIGHTS.with(|slot| {
+        slot.borrow().iter().find(|(held, _)| *held == window).map(|(_, at)| *at)
+    }) else {
+        return;
+    };
     unsafe {
         for (index, kind) in WINDOW_BUTTONS.into_iter().enumerate() {
             let button = msg_id_u64(window, sel("standardWindowButton:"), kind);
@@ -1246,12 +1269,15 @@ extern "C" fn bunny_dialog_should_close(_this: Id, _sel: Sel, sender: Id) -> i8 
 }
 
 /// A dialog's frame moved — a user drag, a resize step, the zoom
-/// button. One Redraw: the blit pulls the window's rect into the
-/// runtime and the pass re-lays the dialog's content inside it.
-/// Deliberately NOT `window_frame_changed`: that road re-places the
-/// PARENT's traffic lights by the scene's offsets, and a dialog wears
-/// the system's own.
-extern "C" fn bunny_dialog_frame_changed(_this: Id, _sel: Sel, _note: Id) {
+/// button. The dialog's OWN lights go back (AppKit re-lays the
+/// titlebar container on every resize, and a scene-chrome dialog
+/// placed them in its header; the registry answers per window, so a
+/// Native-chrome dialog is a no-op here), then one Redraw: the blit
+/// pulls the window's rect into the runtime and the pass re-lays the
+/// dialog's content inside it.
+extern "C" fn bunny_dialog_frame_changed(_this: Id, _sel: Sel, note: Id) {
+    let window = unsafe { msg_id(note, sel("object")) };
+    place_traffic_lights(window);
     dispatch(AppEvent::Redraw);
 }
 
@@ -2782,8 +2808,9 @@ pub fn create_window(
         // LAST: the traffic lights are placed after everything that
         // touches the chrome. `setTitle:` alone puts them back where
         // the system wants them, and it runs above.
-        LIGHTS_WINDOW.with(|slot| slot.set(window));
-        place_traffic_lights(window);
+        if let Some(at) = TRAFFIC_LIGHTS.with(Cell::get) {
+            adopt_traffic_lights(window, at);
+        }
         objc_autoreleasePoolPop(pool);
 
         WindowHandle { window, view }
@@ -2889,6 +2916,12 @@ pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHan
 /// - no timer, no display link, no Metal graft — the parent drives
 ///   every frame and the content arrives by CPU blit, the child
 ///   panel's own discipline.
+///
+/// `lights` = scene chrome: no system bar (full-size content, a
+/// transparent titlebar, the title hidden but still naming the window
+/// to the OS), and the native traffic lights placed at that point
+/// from the window's top-left — the app's own header carries them,
+/// the main window's `Chrome::SceneAt` road for a dialog.
 pub fn create_dialog(
     parent: &WindowHandle,
     title: &str,
@@ -2896,6 +2929,7 @@ pub fn create_dialog(
     height: f64,
     min_width: f64,
     min_height: f64,
+    lights: Option<(f64, f64)>,
 ) -> WindowHandle {
     unsafe {
         let pool = objc_autoreleasePoolPush();
@@ -2906,8 +2940,9 @@ pub fn create_dialog(
             size: CGSize { width, height },
         };
         // titled | closable | resizable — miniaturizable stays OFF, so
-        // the yellow light is born disabled
-        let style: u64 = 1 | 2 | 8;
+        // the yellow light is born disabled (+ full-size content when
+        // the dialog's own header owns the top edge)
+        let style: u64 = if lights.is_some() { 1 | 2 | 8 | (1 << 15) } else { 1 | 2 | 8 };
         let window = msg_id(class("NSWindow"), sel("alloc"));
         let window = msg_init_window(
             window,
@@ -2917,6 +2952,12 @@ pub fn create_dialog(
             2, // buffered
             0,
         );
+        if lights.is_some() {
+            msg_void_bool(window, sel("setTitlebarAppearsTransparent:"), 1);
+            // NSWindowTitleHidden = 1 — the title still names the
+            // window in Mission Control
+            msg_void_i64(window, sel("setTitleVisibility:"), 1);
+        }
         // NSWindowCollectionBehaviorFullScreenAuxiliary (1 << 8)
         msg_void_u64(window, sel("setCollectionBehavior:"), 1 << 8);
         msg_void_size(
@@ -2965,6 +3006,12 @@ pub fn create_dialog(
         // moves, and joins the space the parent is on — a fullscreen
         // space included
         msg_void_id_i64(parent.window, sel("addChildWindow:ordered:"), window, 1);
+
+        // LAST, the main window's own discipline: the lights are
+        // placed after everything that touches the chrome
+        if let Some((x, y)) = lights {
+            adopt_traffic_lights(window, (x, y, None));
+        }
 
         objc_autoreleasePoolPop(pool);
         WindowHandle { window, view }

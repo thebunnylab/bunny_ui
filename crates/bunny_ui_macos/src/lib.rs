@@ -436,6 +436,14 @@ pub fn run_window_chrome(
                         let w = overlay.frame.size.width;
                         let h = overlay.frame.size.height;
                         let created = !dialog_store.contains_key(&overlay.path);
+                        // scene chrome: the header owns the top edge and
+                        // the native lights sit where the spec says
+                        let lights = match &spec.chrome {
+                            bunny_ui::layout::DialogChrome::Native => None,
+                            bunny_ui::layout::DialogChrome::Scene { lights } => {
+                                Some((lights.x, lights.y))
+                            }
+                        };
                         let dialog =
                             *dialog_store.entry(overlay.path.clone()).or_insert_with(|| {
                                 ffi::lend_hand(|| {
@@ -446,6 +454,7 @@ pub fn run_window_chrome(
                                         h,
                                         spec.min.width,
                                         spec.min.height,
+                                        lights,
                                     )
                                 })
                             });
