@@ -1956,16 +1956,42 @@ pub enum OverlaySurface {
     Window(DialogSpec),
 }
 
-/// What the shell needs to raise a dialog's window: the title on its
-/// bar and the smallest content it may shrink to — which is also the
-/// size it OPENS at, centered over the parent. Where the user then
-/// drags or resizes it to is the shell's to report back
-/// (`Runtime::set_dialog_frame`); layout follows the window, never the
-/// other way around.
+/// Who draws a dialog's top edge.
+///
+/// The vocabulary is the window's own, said platform-neutrally: on
+/// `Scene` the CONTENT owns the whole frame and the shell keeps the
+/// window's controls alive inside it — macOS places the native
+/// traffic lights at `lights` (points from the window's top-left);
+/// a shell that draws its controls in the scene (windows, linux)
+/// honors the content's own `.window_control(…)` regions instead,
+/// exactly as it does for the main window. The title is still given
+/// to the OS either way — Mission Control and the taskbar name the
+/// window by it — it just is not drawn on `Scene`. Shells that
+/// present the dialog as a sheet have no top edge to argue about.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DialogChrome {
+    /// The system's own title bar, wearing the title.
+    Native,
+    /// The content owns the top edge; the window's controls sit where
+    /// the app's own header puts them.
+    Scene {
+        /// Where macOS puts the traffic lights, in points from the
+        /// window's top-left corner.
+        lights: Point,
+    },
+}
+
+/// What the shell needs to raise a dialog's window: the title, who
+/// draws its top edge, and the smallest content it may shrink to —
+/// which is also the size it OPENS at, centered over the parent.
+/// Where the user then drags or resizes it to is the shell's to
+/// report back (`Runtime::set_dialog_frame`); layout follows the
+/// window, never the other way around.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DialogSpec {
     pub title: Arc<str>,
     pub min: Size,
+    pub chrome: DialogChrome,
 }
 
 impl DialogSpec {
@@ -1975,6 +2001,7 @@ impl DialogSpec {
         Self {
             title: title.into(),
             min: Size { width: 320.0, height: 240.0 },
+            chrome: DialogChrome::Native,
         }
     }
 
@@ -1982,6 +2009,14 @@ impl DialogSpec {
     /// the dialog opens at.
     pub fn min_size(mut self, width: Px, height: Px) -> Self {
         self.min = Size { width, height };
+        self
+    }
+
+    /// The content owns the top edge ([`DialogChrome::Scene`]): no
+    /// system bar — the app's own header carries the window's
+    /// controls, and macOS places the native lights at `(x, y)`.
+    pub fn scene_lights(mut self, x: Px, y: Px) -> Self {
+        self.chrome = DialogChrome::Scene { lights: Point { x, y } };
         self
     }
 }

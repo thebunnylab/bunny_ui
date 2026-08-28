@@ -128,8 +128,8 @@ pub mod prelude {
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
-        Color, CrossAlign, DialogSpec, Fraction, Glass, Gradient, OverlaySurface, Point, Proposal,
-        Px, Rect, Rendering, Side, Size, Truncation, UnitPoint, VisualProps,
+        Color, CrossAlign, DialogChrome, DialogSpec, Fraction, Glass, Gradient, OverlaySurface,
+        Point, Proposal, Px, Rect, Rendering, Side, Size, Truncation, UnitPoint, VisualProps,
     };
     pub use crate::theme::{self, Theme};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
