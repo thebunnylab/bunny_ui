@@ -386,6 +386,33 @@ impl Default for Manners {
     }
 }
 
+/// Drops everything keyed by a window that is going away.
+///
+/// While the app died with its only window, a stale entry here was
+/// unreachable: nothing ticked after the close. Now windows close and the
+/// app lives, so a registry that outlives its key is a pointer to a freed
+/// object — and the traffic-light registry is walked by the DISPLAY LINK,
+/// which is to say on the very next frame. That crash is what this
+/// function exists to have already prevented.
+fn forget_window(window: usize) {
+    let view = WINDOWS.with(|windows| {
+        windows
+            .borrow()
+            .iter()
+            .find(|(open, _, _)| *open == window)
+            .map(|(_, view, _)| *view as usize)
+    });
+    PLACED_LIGHTS.with(|slot| slot.borrow_mut().retain(|(open, _)| *open as usize != window));
+    // NOT `NATURAL_LIGHTS`: that is the SYSTEM's own geometry, read once on
+    // purpose. Clearing it would let the next window read a frame we had
+    // already moved, which is the compounding this file's oldest comment
+    // about the lights exists to prevent.
+    if let Some(view) = view {
+        BACKING.with(|store| store.borrow_mut().remove(&view));
+        PANEL_ORIGINS.with(|origins| origins.borrow_mut().remove(&view));
+    }
+}
+
 /// Closes a top-level window. AppKit runs the delegate, which is where
 /// the app's own bookkeeping (and the last-window rule) happens.
 pub fn close_top_level(window: usize) {
@@ -1496,6 +1523,11 @@ extern "C" fn bunny_frame(_this: Id, _sel: Sel, link: Id) {
 extern "C" fn bunny_window_will_close(_this: Id, _sel: Sel, note: Id) {
     unsafe {
         let closing = msg_id(note, sel("object")) as usize;
+        // Everything this window is the key to goes with it, and it goes
+        // FIRST. A closed window's pointer is a freed object, and the
+        // registries here are walked by the frame beat — which keeps
+        // ticking now that closing a window no longer ends the app.
+        forget_window(closing);
         let survivor = WINDOWS.with(|windows| {
             let mut windows = windows.borrow_mut();
             windows.retain(|(window, _, _)| *window != closing);
