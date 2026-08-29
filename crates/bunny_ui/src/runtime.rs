@@ -424,11 +424,20 @@ impl Runtime {
         }
     }
 
-    /// Rebuilds the flattened tables the input doors read (actions,
-    /// handlers, editors, splits, scrolls, measures, webviews, customs,
-    /// contexts, effects) from the retention under `root`.
+    /// Rebuilds everything a finished pass leaves standing: the tables the
+    /// input doors read, and the effect queue.
     fn assemble_scene(&self, root: &str) {
+        // The effect queue belongs to the PASS that produced it, and only to
+        // it: `pump` TAKES the queue and runs what is in it, so refilling it
+        // outside a pass re-arms every `.task` under the root — a fresh
+        // thread each, on every refill. Which is why `enter_scene` rebuilds
+        // the input tables and never this.
         effects::set_queue(reconciler::assemble_effects(root));
+        self.assemble_input(root);
+    }
+
+    /// Rebuilds only the tables the input doors read.
+    fn assemble_input(&self, root: &str) {
         reconciler::assemble_actions(root);
         reconciler::assemble_editors(root);
         reconciler::assemble_splits(root);
@@ -440,6 +449,8 @@ impl Runtime {
         reconciler::assemble_contexts(root);
         reconciler::set_assembled_root(root);
     }
+
+
 
     /// Makes THIS scene the one the thread's assembled tables answer for.
     ///
@@ -457,7 +468,11 @@ impl Runtime {
         if reconciler::assembled_root().as_deref() == Some(root.as_str()) {
             return;
         }
-        self.assemble_scene(&root);
+        // The INPUT tables only. The effect queue is the pass's, not the
+        // door's: refilling it here re-arms every task under this root, and a
+        // thread with it — which two windows alternating frames turn into
+        // thousands within seconds.
+        self.assemble_input(&root);
     }
 
     /// The popovers of the last layout, in paint order — a shell that

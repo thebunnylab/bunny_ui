@@ -7543,6 +7543,72 @@ mod tests {
         assert_eq!(label(&second), "count 0", "and never crossed over");
     }
 
+    /// A scene that becomes current again re-arms NOTHING.
+    ///
+    /// `pump` TAKES the effect queue and runs what is in it, so the queue
+    /// belongs to the pass that produced it. When the scene guard rebuilt the
+    /// whole assembly — the effect queue with it — every input event on a
+    /// scene that was not the last to render re-armed every `.task` under it,
+    /// and a task is a thread. Two windows alternating frames turned that into
+    /// thousands of threads in about four seconds, and the process died on
+    /// `failed to spawn thread`.
+    #[test]
+    fn a_scene_that_becomes_current_again_re_arms_nothing() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use crate::layout::{Proposal, Size};
+
+        const VIEWPORT: Size = Size { width: 200.0, height: 60.0 };
+
+        #[derive(Clone)]
+        struct Pane {
+            arms: Rc<Cell<u32>>,
+        }
+        impl Component for Pane {
+            fn body(self, _ctx: &Context) -> impl View {
+                let arms = Rc::clone(&self.arms);
+                button(text("press"), || {}).frame(VIEWPORT.width, VIEWPORT.height).task_id(
+                    "work",
+                    move || {
+                        arms.set(arms.get() + 1);
+                        async {}
+                    },
+                )
+            }
+        }
+
+        let first = Runtime::scene("w0");
+        let second = Runtime::scene("w1");
+        let one = Pane { arms: Rc::new(Cell::new(0)) };
+        let two = Pane { arms: Rc::new(Cell::new(0)) };
+
+        let settle = |runtime: &Runtime, pane: &Pane| {
+            let _ = runtime.settled_layout(pane, Proposal::exact(VIEWPORT));
+            runtime.pump();
+            runtime.poll_tasks();
+        };
+
+        settle(&first, &one);
+        settle(&second, &two);
+        assert_eq!((one.arms.get(), two.arms.get()), (1, 1), "each armed once");
+
+        // …and now the hand goes back to the FIRST window, over and over,
+        // while the second is the one that rendered last. Every one of these
+        // makes the first scene current again.
+        for _ in 0..20 {
+            first.pointer_pressed(100.0, 30.0);
+            first.pointer_released(100.0, 30.0);
+            first.pump();
+            first.poll_tasks();
+        }
+        assert_eq!(
+            (one.arms.get(), two.arms.get()),
+            (1, 1),
+            "becoming current is not a pass, and re-arms nothing",
+        );
+    }
+
     /// A secret field draws bullets, keeps the string the app holds,
     /// and refuses to hand it to the platform.
     ///
