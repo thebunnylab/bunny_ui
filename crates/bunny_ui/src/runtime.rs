@@ -92,6 +92,12 @@ struct Chord {
 
 pub struct Runtime {
     ctx: Context,
+    /// The scene this runtime renders, when the thread has more than
+    /// one — pushed as the FIRST identity segment of every pass, so two
+    /// windows showing the same root view are two trees and not one.
+    /// `None` is the single-window world every app and every probe has
+    /// had, where the root view's own name is the root of the pass.
+    scene: Option<Rc<str>>,
     /// The root of the last pass — scopes `take_dirty` so it does not
     /// drain dirt from another tree mounted on the same thread.
     last_root: RefCell<Option<String>>,
@@ -340,6 +346,24 @@ impl Runtime {
         Self::with_parts(ctx, Rc::new(PixelFont))
     }
 
+    /// A runtime that renders ONE NAMED SCENE of a thread that holds
+    /// several — the window road.
+    ///
+    /// [`Runtime::new`] opens its world by closing every other: a second
+    /// runtime on the thread inherits nothing, which is right when it
+    /// REPLACES the first and fatal when it stands beside it. A named
+    /// scene keeps the same promise inside its own subtree and leaves the
+    /// neighbours alone: `name` becomes the first segment of every
+    /// identity under it (`w1/Workbench/…`), so the sweep, the dirty set
+    /// and the retention — all already scoped by root — separate on their
+    /// own, and only this scene's world is reset when the runtime is born.
+    ///
+    /// The name must be unique on the thread for as long as the runtime
+    /// lives; the shell mints `w0`, `w1`, … per window.
+    pub fn scene(name: impl Into<Rc<str>>) -> Self {
+        Self::scene_with_parts(name.into(), Context::default(), Rc::new(PixelFont))
+    }
+
     /// Swaps the text engine (builder — composes with `with_environment`):
     /// `Runtime::new().text_engine(Rc::new(CoreTextEngine::new()))`.
     pub fn text_engine(mut self, engine: Rc<dyn TextEngine>) -> Self {
@@ -357,6 +381,56 @@ impl Runtime {
     /// (the GPU atlas and the CPU surface resolve pixels through it).
     pub fn images(&self) -> Rc<dyn ImageEngine> {
         Rc::clone(&self.images)
+    }
+
+    /// The identity path `rel` has inside this scene — what an app hands
+    /// [`Runtime::focus`] when it wants a field by name and the window's
+    /// own prefix is not its to guess.
+    ///
+    /// ```ignore
+    /// runtime.focus(&runtime.scene_path("Gate/password"));
+    /// ```
+    pub fn scene_path(&self, rel: &str) -> String {
+        match &self.scene {
+            Some(name) => format!("{name}/{rel}"),
+            None => rel.to_string(),
+        }
+    }
+
+    /// Rebuilds the flattened tables the input doors read (actions,
+    /// handlers, editors, splits, scrolls, measures, webviews, customs,
+    /// contexts, effects) from the retention under `root`.
+    fn assemble_scene(&self, root: &str) {
+        effects::set_queue(reconciler::assemble_effects(root));
+        reconciler::assemble_actions(root);
+        reconciler::assemble_editors(root);
+        reconciler::assemble_splits(root);
+        reconciler::assemble_scrolls(root);
+        reconciler::assemble_measures(root);
+        reconciler::assemble_webviews(root);
+        reconciler::assemble_customs(root);
+        reconciler::assemble_handlers(root);
+        reconciler::assemble_contexts(root);
+        reconciler::set_assembled_root(root);
+    }
+
+    /// Makes THIS scene the one the thread's assembled tables answer for.
+    ///
+    /// A window's event arrives long after its frame, and on a thread
+    /// with two windows the frame in between may have been the other
+    /// one's — which would leave the click map, the handlers and the
+    /// editors belonging to the window the hand is NOT in. The retention
+    /// holds every scene at once, so the fix is to rebuild this root's
+    /// view of it; a single-window app never pays, because the marker
+    /// already names its root.
+    fn enter_scene(&self) {
+        let Some(root) = self.last_root.borrow().clone() else {
+            return;
+        };
+        if reconciler::assembled_root().as_deref() == Some(root.as_str()) {
+            return;
+        }
+        self.assemble_scene(&root);
     }
 
     /// The popovers of the last layout, in paint order — a shell that
@@ -474,6 +548,7 @@ impl Runtime {
     /// pointer. A press outside every region closes whatever is open.
     /// `true` = repaint.
     pub fn context_click(&self, x: Px, y: Px) -> bool {
+        self.enter_scene();
         let was_open = self.close_menu();
         let cleared = self.clear_tooltip();
         let menus = self.last_menus.borrow();
@@ -786,8 +861,22 @@ impl Runtime {
         crate::effects::reset();
         crate::viewport::reset();
         motor::identity::reset_world();
+        Self::assembled(None, ctx, text)
+    }
+
+    /// [`Self::with_parts`] for a named scene: the same fresh world, cut
+    /// to this scene's own subtree so the thread's other windows keep
+    /// theirs.
+    fn scene_with_parts(name: Rc<str>, ctx: Context, text: Rc<dyn TextEngine>) -> Self {
+        crate::reconciler::forget_under(&name);
+        motor::identity::reset_scene(&name);
+        Self::assembled(Some(name), ctx, text)
+    }
+
+    fn assembled(scene: Option<Rc<str>>, ctx: Context, text: Rc<dyn TextEngine>) -> Self {
         let runtime = Runtime {
             ctx,
+            scene,
             last_root: RefCell::new(None),
             last_hits: RefCell::new(Vec::new()),
             hosted_handlers: RefCell::new(HashMap::default()),
@@ -928,7 +1017,12 @@ impl Runtime {
         motor::identity::begin_pass();
 
         let mut nodes = NodeList::new();
-        root.render_into(&self.ctx, &mut nodes);
+        {
+            // the scene's own segment goes down FIRST, so it is the root
+            // the sweep, the dirty drain and the retention all scope by
+            let _scene = self.scene.as_ref().map(|name| motor::identity::enter(&**name));
+            root.render_into(&self.ctx, &mut nodes);
+        }
 
         let pass_root = motor::identity::current_pass_root();
         if let Some(pass_root) = &pass_root {
@@ -943,16 +1037,7 @@ impl Runtime {
         }
 
         if let Some(pass_root) = &pass_root {
-            effects::set_queue(reconciler::assemble_effects(pass_root));
-            reconciler::assemble_actions(pass_root);
-            reconciler::assemble_editors(pass_root);
-            reconciler::assemble_splits(pass_root);
-            reconciler::assemble_scrolls(pass_root);
-            reconciler::assemble_measures(pass_root);
-            reconciler::assemble_webviews(pass_root);
-            reconciler::assemble_customs(pass_root);
-            reconciler::assemble_handlers(pass_root);
-            reconciler::assemble_contexts(pass_root);
+            self.assemble_scene(pass_root);
             // with the editors of THIS pass assembled, dead fields
             // release their carets, auto-focus memory and the focus
             self.release_dead_input();
@@ -974,6 +1059,7 @@ impl Runtime {
     /// press that arrived through [`Runtime::pointer_clicked`] hands
     /// the app.
     pub fn activate_clicks(&self, path: &str, clicks: u8) -> bool {
+        self.enter_scene();
         reconciler::run_action(path, clicks)
     }
 
@@ -1058,6 +1144,7 @@ impl Runtime {
     /// layout — content sliding under a still hand — replays the move
     /// the way it really was.
     pub fn pointer_moved(&self, x: Px, y: Px, modifiers: impl Into<crate::action::Modifiers>) -> bool {
+        self.enter_scene();
         let modifiers = modifiers.into();
         self.pointer_modifiers.set(modifiers);
         let (repaint, told) = self.watching_hover(|| self.pointer_moved_road(x, y, modifiers));
@@ -1380,6 +1467,7 @@ impl Runtime {
         &self,
         stroke: impl Into<crate::action::Stroke>,
     ) -> crate::custom::Response {
+        self.enter_scene();
         let stroke = stroke.into();
         let pattern = &stroke.pattern;
         // an open menu takes Escape before anyone — its owner is the
@@ -1416,6 +1504,7 @@ impl Runtime {
     /// action fires here (up-inside is button semantics). `true` =
     /// repaint.
     pub fn pointer_pressed(&self, x: Px, y: Px) -> bool {
+        self.enter_scene();
         self.pointer_clicked(x, y, 1, false)
     }
 
@@ -1440,6 +1529,7 @@ impl Runtime {
         clicks: u8,
         modifiers: impl Into<crate::action::Modifiers>,
     ) -> bool {
+        self.enter_scene();
         let modifiers = modifiers.into();
         let (repaint, told) = self.watching_hover(|| self.pointer_clicked_road(x, y, clicks, modifiers));
         repaint || told
@@ -1595,6 +1685,7 @@ impl Runtime {
     /// click). Returns the fired/focused path; the pressed visual
     /// always clears.
     pub fn pointer_released(&self, x: Px, y: Px) -> Option<String> {
+        self.enter_scene();
         self.watching_hover(|| self.pointer_released_road(x, y)).0
     }
 
@@ -1759,6 +1850,7 @@ impl Runtime {
     /// The pointer left the window: clears hover (an in-flight press
     /// already had its visual dropped by the drag's `pointer_moved`).
     pub fn pointer_exited(&self) -> bool {
+        self.enter_scene();
         let (repaint, told) = self.watching_hover(|| self.pointer_exited_road());
         repaint || told
     }
@@ -1795,6 +1887,7 @@ impl Runtime {
     /// — the offset shrinks. `true` = something changed and the shell
     /// repaints (no render: zero bodies).
     pub fn wheel(&self, x: Px, y: Px, dx: Px, dy: Px) -> bool {
+        self.enter_scene();
         // the content is about to slide under a still pointer — the
         // explanation dies and so does the menu, rather than pointing
         // at the wrong row
@@ -2032,6 +2125,7 @@ impl Runtime {
     /// [`Runtime::chord_tick`].
     pub fn chord(&self, stroke: impl Into<crate::action::Stroke>) -> crate::action::KeyMatch {
         use crate::action::KeyMatch;
+        self.enter_scene();
         let stroke = stroke.into();
         let pattern = &stroke.pattern;
         let held = !self.pending.borrow().is_empty();
@@ -2171,6 +2265,7 @@ impl Runtime {
     /// The tree answers first, whatever depth it is at, and the host's
     /// table is the floor beneath it.
     pub fn dispatch_action(&self, id: ActionId) -> bool {
+        self.enter_scene();
         if reconciler::run_handler(id) {
             return true;
         }
@@ -2244,6 +2339,7 @@ impl Runtime {
     /// stamp's clamp resolves the `usize::MAX`); refocusing restores
     /// the retained position.
     pub fn focus(&self, path: &str) {
+        self.enter_scene();
         self.caret_visible.set(true);
         *self.focus.borrow_mut() = Some(path.to_string());
         self.carets
@@ -2687,6 +2783,7 @@ impl Runtime {
     /// Applies an edit command to the focused field. The binding write
     /// already dirtied whoever reads; typing returns the caret to solid.
     pub fn key(&self, command: EditCommand) -> Edited {
+        self.enter_scene();
         let Some(path) = self.focus.borrow().clone() else {
             return Edited { applied: false, output: None };
         };

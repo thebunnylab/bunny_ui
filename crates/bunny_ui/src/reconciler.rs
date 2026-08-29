@@ -985,6 +985,49 @@ pub(crate) fn run_editor(
 }
 
 /// Identities swept by `end_pass`: their entries fall with them.
+thread_local! {
+    /// Whose scene the assembled tables below currently answer for.
+    ///
+    /// The retention is keyed by PATH and holds every scene at once, but
+    /// the tables the input doors read (`ACTIONS`, `HANDLERS`, `EDITORS`,
+    /// …) are the flattened view of ONE root, rebuilt at the end of its
+    /// pass. On a thread with a single window that is the whole story. On
+    /// a thread with two, the window that rendered last would otherwise
+    /// answer for the window the hand is actually in — so a runtime
+    /// checks this before it reads them, and rebuilds its own if another
+    /// scene left theirs standing.
+    static ASSEMBLED_ROOT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Whose scene the assembled tables answer for right now.
+pub(crate) fn assembled_root() -> Option<String> {
+    ASSEMBLED_ROOT.with(|root| root.borrow().clone())
+}
+
+/// Records that the tables now answer for `root` — the runtime calls
+/// this as the last step of assembling them.
+pub(crate) fn set_assembled_root(root: &str) {
+    ASSEMBLED_ROOT.with(|slot| *slot.borrow_mut() = Some(root.to_string()));
+}
+
+/// Drops every retained entry under `root` — the retention half of a
+/// SCENE reset (`motor::identity::reset_scene` is the other half). The
+/// other scenes on this thread keep theirs.
+pub(crate) fn forget_under(root: &str) {
+    let prefix = format!("{root}/");
+    RETAINED.with(|retained| {
+        retained
+            .borrow_mut()
+            .retain(|path, _| path != root && !path.starts_with(&prefix));
+    });
+    ASSEMBLED_ROOT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_deref() == Some(root) {
+            *slot = None;
+        }
+    });
+}
+
 pub(crate) fn forget(dead: &[String]) {
     RETAINED.with(|retained| {
         let mut retained = retained.borrow_mut();
@@ -1032,6 +1075,7 @@ pub(crate) fn clear() {
 /// `motor::identity::reset_world` for the other half of the contract.
 pub(crate) fn reset_world() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
+    ASSEMBLED_ROOT.with(|root| *root.borrow_mut() = None);
     PASS.with(|pass| *pass.borrow_mut() = PassState::default());
     LAST_BODY_RUNS.with(|last| last.borrow_mut().clear());
     FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().clear());

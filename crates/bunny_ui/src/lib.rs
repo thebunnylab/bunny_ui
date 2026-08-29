@@ -7475,6 +7475,82 @@ mod tests {
         assert_eq!(stage.behind.get(), 0, "and the press reached nothing behind it");
     }
 
+    /// Two windows on one thread are two SCENES, and a scene owns its
+    /// world.
+    ///
+    /// The trees here are IDENTICAL — same view, same paths under it —
+    /// which is exactly the case a second window of the same app is.
+    /// Three things have to hold at once: the state anchored inside a
+    /// body belongs to its own scene, a pass by one scene does not sweep
+    /// the other's, and a click lands in the window the hand is in even
+    /// when the last frame drawn on this thread was the other one's.
+    #[test]
+    fn two_scenes_on_one_thread_keep_their_own_state_and_their_own_buttons() {
+        use crate::layout::Size;
+
+        const VIEWPORT: Size = Size { width: 200.0, height: 60.0 };
+
+        #[derive(Clone, Copy)]
+        struct Pane;
+        impl Component for Pane {
+            fn body(self, _ctx: &Context) -> impl View {
+                // anchored INSIDE the body: this is the state a sweep
+                // from the wrong root would free
+                let count = State::new(0u32);
+                button(text(format!("count {}", count.get())), move || {
+                    count.set(count.get() + 1);
+                })
+                .frame(VIEWPORT.width, VIEWPORT.height)
+            }
+        }
+
+        fn label(runtime: &Runtime) -> String {
+            runtime
+                .display_frame(&Pane, VIEWPORT)
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { content, .. } => {
+                        Some(content.as_ref().to_string())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default()
+        }
+
+        fn press(runtime: &Runtime) {
+            runtime.pointer_pressed(100.0, 30.0);
+            runtime.pointer_released(100.0, 30.0);
+        }
+
+        let first = Runtime::scene("w0");
+        let second = Runtime::scene("w1");
+
+        assert_eq!(label(&first), "count 0");
+        press(&first);
+        assert_eq!(label(&first), "count 1", "the press reached its own scene");
+
+        // the second window's first frame: its own anchor, its own zero
+        assert_eq!(label(&second), "count 0", "a new scene starts from nothing");
+
+        // and the first window did not lose its world to it
+        assert_eq!(label(&first), "count 1", "the neighbour's pass swept nothing here");
+
+        // the last frame on this thread was the SECOND window's — the
+        // press still belongs to the first
+        assert_eq!(label(&second), "count 0");
+        press(&first);
+        assert_eq!(label(&first), "count 2", "the click map followed the hand, not the frame");
+        assert_eq!(label(&second), "count 0", "and never crossed over");
+    }
+
+    /// A scene names its own paths, so an app can ask for one by name
+    /// without guessing the window's prefix.
+    #[test]
+    fn a_scene_spells_the_path_of_what_lives_under_it() {
+        assert_eq!(Runtime::scene("w3").scene_path("Gate/password"), "w3/Gate/password");
+        assert_eq!(Runtime::new().scene_path("Gate/password"), "Gate/password");
+    }
+
     /// A `.dialog` is the sheet's lowering asking for a real WINDOW:
     /// same centring, same capture, and the placement carries the spec
     /// a shell raises the window from.

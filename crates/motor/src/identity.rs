@@ -464,6 +464,45 @@ pub fn reset_world() {
     });
 }
 
+/// Opens a new world for ONE SCENE — the multi-window twin of
+/// [`reset_world`].
+///
+/// A thread with several windows has several trees, each rooted at its
+/// own first segment, and a newborn runtime there must not take the
+/// others' worlds down with it: it drops only what lives under its own
+/// root. The rule the whole-world reset states still holds inside that
+/// subtree — path identity means nothing across two runtimes, so the
+/// anchors, their state slots, the effect cells (and with them their
+/// task handles) and the read graph under `root` all die here.
+pub fn reset_scene(root: &str) {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        let prefix = format!("{root}/");
+        let doomed: Vec<String> = registry
+            .owners
+            .keys()
+            .filter(|owner| *owner == root || owner.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for owner in doomed {
+            let Some(record) = registry.owners.remove(&owner) else {
+                continue;
+            };
+            for (type_id, index) in record.slots {
+                crate::state::free_slot(type_id, index);
+            }
+            for key in record.anchors {
+                registry.anchors.remove(&key);
+            }
+            for site in record.effect_sites {
+                registry.effect_cells.remove(&site);
+            }
+            clear_view_reads(&mut registry, &owner);
+            registry.dirty.remove(&owner);
+        }
+    });
+}
+
 // MARK: - State anchors
 
 /// What `State::new` gets back when declaring state.
