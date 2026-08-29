@@ -123,6 +123,7 @@ unsafe extern "C" {
 
 /// What the page sent back over the bridge — delivered to the shell's
 /// dispatch, on the main thread, from WebKit's own runloop callbacks.
+#[derive(Clone)]
 pub(crate) enum WebviewEvent {
     /// The engine committed a navigation — link clicks included.
     Navigated { view: Id, url: String },

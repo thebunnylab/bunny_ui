@@ -984,7 +984,6 @@ pub(crate) fn run_editor(
     editor.map(|editor| editor(command, state))
 }
 
-/// Identities swept by `end_pass`: their entries fall with them.
 thread_local! {
     /// Whose scene the assembled tables below currently answer for.
     ///
@@ -1028,6 +1027,7 @@ pub(crate) fn forget_under(root: &str) {
     });
 }
 
+/// Identities swept by `end_pass`: their entries fall with them.
 pub(crate) fn forget(dead: &[String]) {
     RETAINED.with(|retained| {
         let mut retained = retained.borrow_mut();

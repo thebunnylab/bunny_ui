@@ -256,6 +256,10 @@ pub(crate) unsafe fn sel(name: &str) -> Sel {
 /// What the platform delivers to the Rust world. Positions in LAYOUT
 /// coordinates (origin at top-left, logical points) — the AppKit flip
 /// already happened.
+///
+/// `Clone` because an app with several windows fans the beats out: one
+/// display-link tick reaches every window that wants it.
+#[derive(Clone)]
 pub enum AppEvent {
     MouseDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     /// The right button (or a two-finger tap): the context-menu press.
@@ -305,6 +309,11 @@ pub enum AppEvent {
         /// the overlay path in its pool by it.
         window: usize,
     },
+    /// This window is going away, and it is not the last — the app
+    /// stays up, and the shell drops what it kept for it. (The last
+    /// window's close terminates the app instead, so this never
+    /// arrives for it.)
+    WindowClosed,
     /// A task woke from somewhere else — a worker thread finished a
     /// step. The frame the shell already knows how to draw drains the
     /// queue on its way.
@@ -338,19 +347,162 @@ pub fn set_handler(handler: Box<dyn FnMut(AppEvent)>) {
     HANDLER.with(|slot| *slot.borrow_mut() = Some(handler));
 }
 
-/// Delivers an event to the handler — used by the callbacks and by the
-/// first frame.
-pub fn dispatch(event: AppEvent) {
+thread_local! {
+    /// Which window the event now in the handler belongs to — `0` for
+    /// the beats every window shares (the frame tick, the caret blink,
+    /// a worker's wake).
+    static SOURCE: Cell<usize> = const { Cell::new(0) };
+    /// Every top-level window the app has open, in the order they were
+    /// created, with the view and delegate that came with it. The app
+    /// quits when the LAST one closes — with one window that is the old
+    /// contract, word for word.
+    static WINDOWS: RefCell<Vec<(usize, Id, Id)>> = const { RefCell::new(Vec::new()) };
+    /// Which window carries the app's BEAT — the caret blink and the
+    /// display link are one per app, and they hang off the view of
+    /// whichever window was there first. When that window closes with
+    /// others still open, the beat moves house.
+    static BEAT_OWNER: Cell<usize> = const { Cell::new(0) };
+}
+
+/// What the OS gives a window besides its content.
+///
+/// A door has one size: the sign-in window is not resizable and not
+/// minimizable, and neither is expressible any other way — the style
+/// mask is set once, when the window is born.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Manners {
+    pub resizable: bool,
+    pub minimizable: bool,
+}
+
+impl Default for Manners {
+    /// The workbench's: it resizes and it minimizes.
+    fn default() -> Self {
+        Manners { resizable: true, minimizable: true }
+    }
+}
+
+/// Closes a top-level window. AppKit runs the delegate, which is where
+/// the app's own bookkeeping (and the last-window rule) happens.
+pub fn close_top_level(window: usize) {
+    unsafe { msg_void(window as Id, sel("close")) };
+}
+
+/// Starts the app's beat on this window: the caret's blink half-period
+/// and the display link that paces animation, both delivered by
+/// selector to the window's own delegate on the main run loop.
+///
+/// One per APP, not one per window: a second link would tick the same
+/// vsync twice and pay for every frame twice. The window it hangs off
+/// is an implementation detail the close path repairs.
+unsafe fn start_beat(window: Id, view: Id, delegate: Id) {
+    unsafe {
+        BEAT_OWNER.with(|owner| owner.set(window as usize));
+        // the caret blink half-period — the run loop retains the timer
+        let _ = msg_timer(
+            class("NSTimer"),
+            sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+            0.5,
+            delegate,
+            sel("bunnyBlink:"),
+            std::ptr::null_mut(),
+            1,
+        );
+
+        // the frame driver: a display link owned by the view, delivered
+        // by SELECTOR on the main run loop (macOS 14+) — no blocks, no
+        // extra thread. Born PAUSED: events repaint by themselves; the
+        // link runs only while something animates. An older system
+        // skips it and animations snap to their target.
+        if msg_bool_sel(view, sel("respondsToSelector:"), sel("displayLinkWithTarget:selector:"))
+            != 0
+        {
+            let link = msg_id_id_sel(
+                view,
+                sel("displayLinkWithTarget:selector:"),
+                delegate,
+                sel("bunnyFrame:"),
+            );
+            if !link.is_null() {
+                msg_void_bool(link, sel("setPaused:"), 1);
+                // the link arrives unscheduled — common modes keep the
+                // ticks coming during event tracking (live resize)
+                msg_void_id_id(
+                    link,
+                    sel("addToRunLoop:forMode:"),
+                    msg_id(class("NSRunLoop"), sel("mainRunLoop")),
+                    NSRunLoopCommonModes,
+                );
+                LINK.with(|slot| slot.set(link));
+            }
+        } else {
+            eprintln!("bunny_ui: this macOS has no view display link; animations snap");
+        }
+    }
+}
+
+/// The window the event being handled came from, or `0` when it came
+/// from the app itself. An app with one window never asks.
+pub fn event_source() -> usize {
+    SOURCE.with(Cell::get)
+}
+
+/// The window an event ANSWERS to: itself, or — for a dialog or a
+/// popover panel, which hang off the window they belong to — the window
+/// they hang from. A dialog's key change is its parent scene's news.
+fn owning_window(window: Id) -> usize {
+    let mut window = window;
+    for _ in 0..8 {
+        if window.is_null() {
+            return 0;
+        }
+        let parent = unsafe { msg_id(window, sel("parentWindow")) };
+        if parent.is_null() {
+            return window as usize;
+        }
+        window = parent;
+    }
+    window as usize
+}
+
+/// Delivers an event that belongs to ONE window — the callbacks that
+/// know which (a resize, a key change, a dialog's own news).
+pub fn dispatch_to(window: Id, event: AppEvent) {
+    dispatch_from(owning_window(window), event);
+}
+
+/// Delivers a beat every window shares — the frame tick, the blink, a
+/// worker's wake. The app fans it out.
+pub fn dispatch_all(event: AppEvent) {
+    dispatch_from(0, event);
+}
+
+fn dispatch_from(source: usize, event: AppEvent) {
     if LENDING.with(Cell::get) {
         // the page declined it and the chain walked it back here —
         // see `lend_hand`
         return;
     }
+    let previous = SOURCE.replace(source);
     HANDLER.with(|slot| {
         if let Some(handler) = slot.borrow_mut().as_mut() {
             handler(event);
         }
     });
+    SOURCE.set(previous);
+}
+
+/// Delivers an event to the handler — used by the callbacks and by the
+/// first frame. The window is the one holding the keyboard, which is
+/// the window every INPUT event comes from: a press makes its window
+/// key before AppKit sends it, and the tracking area is armed
+/// `ActiveInKeyWindow`, so a hover in a background window never fires.
+pub fn dispatch(event: AppEvent) {
+    let key = unsafe {
+        let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+        msg_id(app, sel("keyWindow"))
+    };
+    dispatch_from(owning_window(key), event);
 }
 
 /// The run loop source a background thread knocks on. It lives in a
@@ -360,7 +512,7 @@ pub fn dispatch(event: AppEvent) {
 static WAKE_SOURCE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 extern "C" fn perform_wake(_info: *mut c_void) {
-    dispatch(AppEvent::Wake);
+    dispatch_all(AppEvent::Wake);
 }
 
 /// Opens that door. Called once, on the main thread, while the window
@@ -927,28 +1079,28 @@ extern "C" fn bunny_window_will_start_live_resize(_this: Id, _sel: Sel, _note: I
     crate::metal::arm_transaction(true);
 }
 
-extern "C" fn bunny_window_did_end_live_resize(_this: Id, _sel: Sel, _note: Id) {
+extern "C" fn bunny_window_did_end_live_resize(_this: Id, _sel: Sel, note: Id) {
     crate::metal::arm_transaction(false);
     // the hand let go: one more frame NOW, so everything that held
     // back during the drag — a hosted engine's throttled size, the
     // live layers coming home — lands exact without waiting for the
     // next pointer wiggle
-    dispatch(AppEvent::Redraw);
+    dispatch_to(unsafe { msg_id(note, sel("object")) }, AppEvent::Redraw);
 }
 
-extern "C" fn bunny_window_did_resign_key(_this: Id, _sel: Sel, _note: Id) {
-    dispatch(AppEvent::ResignKey);
+extern "C" fn bunny_window_did_resign_key(_this: Id, _sel: Sel, note: Id) {
+    dispatch_to(unsafe { msg_id(note, sel("object")) }, AppEvent::ResignKey);
 }
 
-extern "C" fn bunny_window_did_become_key(_this: Id, _sel: Sel, _note: Id) {
-    dispatch(AppEvent::BecomeKey);
+extern "C" fn bunny_window_did_become_key(_this: Id, _sel: Sel, note: Id) {
+    dispatch_to(unsafe { msg_id(note, sel("object")) }, AppEvent::BecomeKey);
 }
 
 extern "C" fn bunny_slow(_this: Id, _sel: Sel, _timer: Id) {
     // the slow beat covers exactly one interval — the clocks advance by
     // the step they were promised, with no wall clock in the path
     let dt = SLOW.with(|slot| slot.get().1);
-    dispatch(AppEvent::Frame { dt });
+    dispatch_all(AppEvent::Frame { dt });
 }
 
 /// A data provider that OWNS a copy of the bytes. A layer's contents
@@ -1045,7 +1197,7 @@ fn window_frame_changed(note: Id, kind: &str) {
         }
     }
     place_traffic_lights(window);
-    dispatch(AppEvent::Redraw);
+    dispatch_to(window, AppEvent::Redraw);
 }
 
 thread_local! {
@@ -1264,7 +1416,7 @@ fn set_standard_buttons_enabled(window: &WindowHandle, enabled: bool) {
 /// event, runs the overlay's dismissal, and the flipped binding is
 /// what takes the window down (the same road the app's Escape takes).
 extern "C" fn bunny_dialog_should_close(_this: Id, _sel: Sel, sender: Id) -> i8 {
-    dispatch(AppEvent::DialogClose { window: sender as usize });
+    dispatch_to(sender, AppEvent::DialogClose { window: sender as usize });
     0
 }
 
@@ -1278,22 +1430,22 @@ extern "C" fn bunny_dialog_should_close(_this: Id, _sel: Sel, sender: Id) -> i8 
 extern "C" fn bunny_dialog_frame_changed(_this: Id, _sel: Sel, note: Id) {
     let window = unsafe { msg_id(note, sel("object")) };
     place_traffic_lights(window);
-    dispatch(AppEvent::Redraw);
+    dispatch_to(window, AppEvent::Redraw);
 }
 
 /// Key travels on a dialog like on the main window — cmd-tab away
 /// pauses the decorations and closes the dialog's own popovers (the
 /// dialog itself stands: it is a window).
-extern "C" fn bunny_dialog_did_resign_key(_this: Id, _sel: Sel, _note: Id) {
-    dispatch(AppEvent::ResignKey);
+extern "C" fn bunny_dialog_did_resign_key(_this: Id, _sel: Sel, note: Id) {
+    dispatch_to(unsafe { msg_id(note, sel("object")) }, AppEvent::ResignKey);
 }
 
-extern "C" fn bunny_dialog_did_become_key(_this: Id, _sel: Sel, _note: Id) {
-    dispatch(AppEvent::BecomeKey);
+extern "C" fn bunny_dialog_did_become_key(_this: Id, _sel: Sel, note: Id) {
+    dispatch_to(unsafe { msg_id(note, sel("object")) }, AppEvent::BecomeKey);
 }
 
 extern "C" fn bunny_blink(_this: Id, _sel: Sel, _timer: Id) {
-    dispatch(AppEvent::Blink);
+    dispatch_all(AppEvent::Blink);
 }
 
 extern "C" fn bunny_frame(_this: Id, _sel: Sel, link: Id) {
@@ -1308,11 +1460,39 @@ extern "C" fn bunny_frame(_this: Id, _sel: Sel, link: Id) {
         // teleporting them
         (next - last).clamp(0.0, 1.0 / 30.0)
     };
-    dispatch(AppEvent::Frame { dt });
+    dispatch_all(AppEvent::Frame { dt });
 }
 
-extern "C" fn bunny_window_will_close(_this: Id, _sel: Sel, _note: Id) {
+extern "C" fn bunny_window_will_close(_this: Id, _sel: Sel, note: Id) {
     unsafe {
+        let closing = msg_id(note, sel("object")) as usize;
+        let survivor = WINDOWS.with(|windows| {
+            let mut windows = windows.borrow_mut();
+            windows.retain(|(window, _, _)| *window != closing);
+            windows.first().copied()
+        });
+        // the beat hangs off a window's view: when that window is the
+        // one leaving, it moves to a survivor — otherwise the app that
+        // opened the door and closed it would animate no more
+        if let Some((window, view, delegate)) = survivor
+            && BEAT_OWNER.with(Cell::get) == closing
+        {
+            LINK.with(|slot| {
+                let link = slot.replace(std::ptr::null_mut());
+                if !link.is_null() {
+                    msg_void(link, sel("invalidate"));
+                }
+            });
+            start_beat(window as Id, view, delegate);
+        }
+        let last = survivor.is_none();
+        // the app goes down with its LAST window, not with any window:
+        // a second Trinity closing is a window closing, and the one
+        // still open keeps the process.
+        if !last {
+            dispatch_to(msg_id(note, sel("object")), AppEvent::WindowClosed);
+            return;
+        }
         // the link retains its target (the delegate) — break the tie
         // before the app goes down
         LINK.with(|slot| {
@@ -2670,6 +2850,7 @@ pub fn create_window(
     width: f64,
     height: f64,
     scene_chrome: bool,
+    manners: Manners,
 ) -> WindowHandle {
     unsafe {
         let pool = objc_autoreleasePoolPush();
@@ -2683,13 +2864,20 @@ pub fn create_window(
             origin: CGPoint { x: 0.0, y: 0.0 },
             size: CGSize { width, height },
         };
-        // titled | closable | miniaturizable | resizable
-        // (+ full-size content when the scene owns the chrome)
-        let style: u64 = if scene_chrome {
-            1 | 2 | 4 | 8 | (1 << 15)
-        } else {
-            1 | 2 | 4 | 8
-        };
+        // titled | closable (+ miniaturizable, + resizable, + full-size
+        // content when the scene owns the chrome). A mask without
+        // Miniaturizable draws the yellow light dead, which is exactly
+        // what a door that may not be put away should look like.
+        let mut style: u64 = 1 | 2;
+        if manners.minimizable {
+            style |= 4;
+        }
+        if manners.resizable {
+            style |= 8;
+        }
+        if scene_chrome {
+            style |= 1 << 15;
+        }
         // the subclass answers ONE question (key, under a dialog) and
         // inherits everything else
         let window = msg_id(class("BunnyWindow"), sel("alloc"));
@@ -2751,54 +2939,19 @@ pub fn create_window(
         );
         msg_void_id(view, sel("addTrackingArea:"), area);
 
-        // delegate: resize repaints, closing quits
+        // delegate: resize repaints, and the last one out quits
         let delegate = msg_id(msg_id(class("BunnyDelegate"), sel("alloc")), sel("init"));
         msg_void_id(window, sel("setDelegate:"), delegate);
         // the slow frame beat fires at the delegate too
         DELEGATE.with(|slot| slot.set(delegate));
 
-        // the caret blink half-period — the run loop retains the timer
-        let _ = msg_timer(
-            class("NSTimer"),
-            sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
-            0.5,
-            delegate,
-            sel("bunnyBlink:"),
-            std::ptr::null_mut(),
-            1,
-        );
-
-        // the frame driver: a display link owned by the view, delivered
-        // by SELECTOR on the main run loop (macOS 14+) — no blocks, no
-        // extra thread. Born PAUSED: events repaint by themselves; the
-        // link runs only while something animates. An older system
-        // skips it and animations snap to their target.
-        if msg_bool_sel(
-            view,
-            sel("respondsToSelector:"),
-            sel("displayLinkWithTarget:selector:"),
-        ) != 0
-        {
-            let link = msg_id_id_sel(
-                view,
-                sel("displayLinkWithTarget:selector:"),
-                delegate,
-                sel("bunnyFrame:"),
-            );
-            if !link.is_null() {
-                msg_void_bool(link, sel("setPaused:"), 1);
-                // the link arrives unscheduled — common modes keep the
-                // ticks coming during event tracking (live resize)
-                msg_void_id_id(
-                    link,
-                    sel("addToRunLoop:forMode:"),
-                    msg_id(class("NSRunLoop"), sel("mainRunLoop")),
-                    NSRunLoopCommonModes,
-                );
-                LINK.with(|slot| slot.set(link));
-            }
-        } else {
-            eprintln!("bunny_ui: this macOS has no view display link; animations snap");
+        let first = WINDOWS.with(|windows| {
+            let mut windows = windows.borrow_mut();
+            windows.push((window as usize, view, delegate));
+            windows.len() == 1
+        });
+        if first {
+            start_beat(window, view, delegate);
         }
 
         msg_void_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
