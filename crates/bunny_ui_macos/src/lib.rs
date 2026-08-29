@@ -323,10 +323,14 @@ impl App {
     pub fn open(&self, spec: WindowSpec, runtime: Rc<Runtime>, root: impl View) -> WindowId {
         let slot = mount(&spec, runtime, root);
         let id = WindowId(slot.window);
-        self.inner.slots.borrow_mut().push(slot);
+        self.inner.slots.borrow_mut().push(slot.clone());
         self.inner.clone().route();
-        // its own first frame, before anything else can ask for one
-        ffi::dispatch_to(id.0 as ffi::Id, AppEvent::Redraw);
+        // Its own first frame, through its OWN handler and not the global
+        // road: a window is very often opened from inside an event (a
+        // sign-in that raises the workbench), and the road is busy carrying
+        // that event. This is a direct call to a handler nobody is inside,
+        // which is what "paint this window now" actually means.
+        (slot.handler.borrow_mut())(AppEvent::Redraw);
         id
     }
 

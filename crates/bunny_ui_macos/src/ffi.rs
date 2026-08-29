@@ -352,6 +352,10 @@ thread_local! {
     /// the beats every window shares (the frame tick, the caret blink,
     /// a worker's wake).
     static SOURCE: Cell<usize> = const { Cell::new(0) };
+    /// A handler is running: anything raised from inside it queues.
+    static DISPATCHING: Cell<bool> = const { Cell::new(false) };
+    /// What was raised while a handler ran, in the order it was raised.
+    static PENDING: RefCell<Vec<(usize, AppEvent)>> = const { RefCell::new(Vec::new()) };
     /// Every top-level window the app has open, in the order they were
     /// created, with the view and delegate that came with it. The app
     /// quits when the LAST one closes — with one window that is the old
@@ -483,6 +487,21 @@ fn dispatch_from(source: usize, event: AppEvent) {
         // see `lend_hand`
         return;
     }
+    // An event raised from INSIDE a handler waits its turn instead of
+    // re-entering one. The handler is borrowed for as long as it runs, and
+    // this is an `extern "C"` frame: a borrow panic here cannot unwind, so
+    // it aborts the process rather than failing a call. It happens for real
+    // — a worker's Wake paints, the paint completes a sign-in, and the
+    // sign-in opens the window that replaces the one being painted.
+    //
+    // Queued, not dropped: the second event still arrives, after the first
+    // finishes, in the order it was raised. Dropping it would trade an abort
+    // for a window that never draws.
+    if DISPATCHING.with(Cell::get) {
+        PENDING.with(|queue| queue.borrow_mut().push((source, event)));
+        return;
+    }
+    DISPATCHING.with(|flag| flag.set(true));
     let previous = SOURCE.replace(source);
     HANDLER.with(|slot| {
         if let Some(handler) = slot.borrow_mut().as_mut() {
@@ -490,6 +509,17 @@ fn dispatch_from(source: usize, event: AppEvent) {
         }
     });
     SOURCE.set(previous);
+    DISPATCHING.with(|flag| flag.set(false));
+    // …and whatever the handler raised while it ran, in order. Each one is a
+    // full dispatch, so an event raised by one of THOSE queues behind it.
+    loop {
+        let next = PENDING.with(|queue| {
+            let mut queue = queue.borrow_mut();
+            if queue.is_empty() { None } else { Some(queue.remove(0)) }
+        });
+        let Some((source, event)) = next else { break };
+        dispatch_from(source, event);
+    }
 }
 
 /// Delivers an event to the handler — used by the callbacks and by the
@@ -3271,6 +3301,55 @@ pub fn clipboard_read() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An event raised from INSIDE a handler waits its turn.
+    ///
+    /// This aborted a running app, and the shape it aborted in is the app's
+    /// own: a worker's `Wake` paints a window, the paint completes a sign-in,
+    /// and the sign-in opens the window that replaces the one being painted.
+    /// The handler is borrowed for as long as it runs and this is an
+    /// `extern "C"` frame, so the borrow panic could not unwind — it took the
+    /// process with it.
+    ///
+    /// Queued, and never dropped: dropping would trade the abort for a window
+    /// that silently never draws.
+    #[test]
+    fn an_event_raised_inside_a_handler_waits_its_turn() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        fn name(event: &AppEvent) -> &'static str {
+            match event {
+                AppEvent::Redraw => "redraw",
+                AppEvent::Wake => "wake",
+                AppEvent::Blink => "blink",
+                _ => "other",
+            }
+        }
+
+        let seen: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let armed = Rc::new(std::cell::Cell::new(true));
+        set_handler(Box::new({
+            let (seen, armed) = (Rc::clone(&seen), Rc::clone(&armed));
+            move |event| {
+                seen.borrow_mut().push(name(&event));
+                // the re-entrant raise, once — the sign-in's own move
+                if matches!(event, AppEvent::Wake) && armed.replace(false) {
+                    dispatch_all(AppEvent::Redraw);
+                    // …and it has NOT run yet: the queue holds it until this
+                    // handler returns, so the order stays the order
+                    seen.borrow_mut().push("still inside");
+                }
+            }
+        }));
+
+        dispatch_all(AppEvent::Wake);
+        assert_eq!(
+            *seen.borrow(),
+            vec!["wake", "still inside", "redraw"],
+            "the raised event arrives AFTER the handler that raised it, and it arrives",
+        );
+    }
 
     /// The selector pain 34's fix stands on. `charactersIgnoringModifiers`
     /// only ignores command and option — it APPLIES shift, so a chord on
