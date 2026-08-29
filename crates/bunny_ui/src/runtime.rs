@@ -383,6 +383,33 @@ impl Runtime {
         Rc::clone(&self.images)
     }
 
+    /// Moves the keyboard to the field the app NAMED with `.id(…)`.
+    ///
+    /// A field's identity path is structural — the scene's prefix, then every
+    /// wrapper down to it — so an app that wants to put the caret somewhere
+    /// (a form's Tab walk, a screen that opens with one box already live)
+    /// would have to spell a path it does not own. It owns the NAME, and this
+    /// resolves it against the last layout's fields.
+    ///
+    /// `false` when nothing laid out under that name — before the first
+    /// frame there are no fields to reach.
+    pub fn focus_named(&self, id: &str) -> bool {
+        let tail = format!("[{id}]");
+        let path = self
+            .last_fields
+            .borrow()
+            .iter()
+            .find(|field| field.path.ends_with(&tail))
+            .map(|field| field.path.clone());
+        match path {
+            Some(path) => {
+                self.focus(&path);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The identity path `rel` has inside this scene — what an app hands
     /// [`Runtime::focus`] when it wants a field by name and the window's
     /// own prefix is not its to guess.

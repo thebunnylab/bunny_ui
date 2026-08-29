@@ -7637,6 +7637,42 @@ mod tests {
         );
     }
 
+    /// An app that named a field can put the keyboard in it — a form's Tab
+    /// walk owns the NAME and never the structural path.
+    #[test]
+    fn a_named_field_can_be_focused_without_spelling_its_path() {
+        use crate::layout::{Proposal, Size};
+
+        const VIEWPORT: Size = Size { width: 300.0, height: 120.0 };
+
+        #[derive(Clone, Copy)]
+        struct Form {
+            first: State<String>,
+            second: State<String>,
+        }
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text_field("one", self.first.binding()).id("one"),
+                    text_field("two", self.second.binding()).id("two"),
+                )
+            }
+        }
+
+        let form = Form { first: State::new(String::new()), second: State::new(String::new()) };
+        let runtime = Runtime::scene("w9");
+        // before the first layout there is nothing laid out to reach
+        assert!(!runtime.focus_named("two"), "no frame, no field");
+
+        let _ = runtime.settled_layout(&form, Proposal::exact(VIEWPORT));
+        assert!(runtime.focus_named("two"), "the name resolved");
+        let focused = runtime.focused().expect("something holds the keyboard");
+        assert!(focused.contains("[two]"), "and it is the one asked for: {focused}");
+        assert!(focused.starts_with("w9/"), "under its own scene: {focused}");
+
+        assert!(!runtime.focus_named("third"), "a name nothing wears is refused");
+    }
+
     /// A scene names its own paths, so an app can ask for one by name
     /// without guessing the window's prefix.
     #[test]
