@@ -426,6 +426,7 @@ struct FieldParts {
     auto_focus: bool,
     bare: bool,
     highlights: Option<TextHighlight>,
+    secret: bool,
 }
 
 impl FieldParts {
@@ -438,6 +439,7 @@ impl FieldParts {
             auto_focus: self.auto_focus,
             bare: self.bare,
             highlights: self.highlights,
+            secret: self.secret,
         }
     }
 }
@@ -455,6 +457,7 @@ fn rewrite_field_node(
             auto_focus,
             bare,
             highlights,
+            secret,
         } => rewrite(FieldParts {
             path,
             content,
@@ -463,6 +466,7 @@ fn rewrite_field_node(
             auto_focus,
             bare,
             highlights,
+            secret,
         }),
         LayoutNode::Styled { props, child } => LayoutNode::Styled {
             props,

@@ -460,6 +460,7 @@ impl Walk<'_> {
                 // caret, the native selection and the composition. The
                 // record is honoured on the pixel path and ignored here.
                 highlights: _,
+                secret,
             } => {
                 self.fields.push((path.clone(), *auto_focus));
                 let theme = crate::theme::current();
@@ -467,6 +468,7 @@ impl Walk<'_> {
                     path: path.clone(),
                     content: content.clone(),
                     placeholder: placeholder.clone(),
+                    secret: *secret,
                     font: self.font,
                     color: self.current_ink(),
                     multiline: *multiline,

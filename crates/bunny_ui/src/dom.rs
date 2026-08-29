@@ -348,6 +348,10 @@ pub struct DomField {
     /// Many lines: the glue builds a `<textarea>` instead of an
     /// `<input>`, and the browser wraps and scrolls it at home.
     pub multiline: bool,
+    /// The field must not show what it holds: the glue builds
+    /// `type="password"`, and the browser masks, refuses the copy and
+    /// keeps its own caret — the platform's own job, done natively.
+    pub secret: bool,
 }
 
 /// A captured scene node: kind + parent-relative frame + style +

@@ -7543,6 +7543,100 @@ mod tests {
         assert_eq!(label(&second), "count 0", "and never crossed over");
     }
 
+    /// A secret field draws bullets, keeps the string the app holds,
+    /// and refuses to hand it to the platform.
+    ///
+    /// The password is deliberately NOT ASCII: the mask has one bullet
+    /// per character and three bytes per bullet, so every index that
+    /// crosses between the two — the caret, the selection, the click —
+    /// is wrong the moment it is treated as a byte offset into the
+    /// other string.
+    #[test]
+    fn a_secret_field_shows_bullets_and_refuses_to_hand_them_over() {
+        use crate::layout::{DrawCommand, Proposal, Size};
+        use crate::text_input::EditCommand;
+
+        const SECRET: &str = "senh\u{e3}o";
+        const VIEWPORT: Size = Size { width: 240.0, height: 60.0 };
+
+        #[derive(Clone, Copy)]
+        struct Form {
+            password: State<String>,
+            revealed: State<bool>,
+        }
+
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                text_field("password", self.password.binding())
+                    .secret(!self.revealed.get())
+                    .frame_width(200.0)
+            }
+        }
+
+        fn runs(runtime: &Runtime, form: &Form) -> Vec<String> {
+            runtime
+                .settled_layout(form, Proposal::exact(VIEWPORT))
+                .display
+                .iter()
+                .filter_map(|command| match command {
+                    DrawCommand::TextLine { content, .. } => {
+                        Some(content.as_ref().to_string())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let form = Form { password: State::new(String::new()), revealed: State::new(false) };
+        let runtime = Runtime::new();
+        let _ = runs(&runtime, &form);
+
+        // the press takes the keyboard, and the typing lands
+        runtime.pointer_pressed(60.0, 20.0);
+        runtime.pointer_released(60.0, 20.0);
+        assert!(runtime.focused().is_some(), "the press took the keyboard");
+        assert!(runtime.key(EditCommand::Insert(SECRET.into())).applied);
+
+        let painted = runs(&runtime, &form);
+        assert!(
+            !painted.iter().any(|run| run.contains("senh")),
+            "the scene must not carry the secret: {painted:?}",
+        );
+        assert!(
+            painted.iter().any(|run| run.chars().all(|glyph| glyph == '\u{2022}')
+                && run.chars().count() == SECRET.chars().count()),
+            "one bullet per character: {painted:?}",
+        );
+        assert_eq!(form.password.get(), SECRET, "the app still holds the real thing");
+
+        // a click at the very start of the run puts the caret at the
+        // front of the STRING — the mask is measured, the answer is
+        // carried home
+        runtime.pointer_pressed(10.0, 20.0);
+        runtime.pointer_released(10.0, 20.0);
+        assert!(runtime.key(EditCommand::Insert("+".into())).applied);
+        assert_eq!(form.password.get(), format!("+{SECRET}"), "the caret landed at the front");
+
+        // the two commands that would carry it out are refused, and a
+        // refused cut deletes nothing
+        assert!(runtime.key(EditCommand::SelectAll).applied);
+        assert_eq!(runtime.key(EditCommand::Copy).output, None, "no copy");
+        assert_eq!(runtime.key(EditCommand::Cut).output, None, "no cut");
+        assert_eq!(
+            form.password.get(),
+            format!("+{SECRET}"),
+            "half a cut is worse than none",
+        );
+
+        // the reveal is the same field with the flag off
+        form.revealed.set(true);
+        let painted = runs(&runtime, &form);
+        assert!(
+            painted.iter().any(|run| run.contains(SECRET)),
+            "revealed, it reads: {painted:?}",
+        );
+    }
+
     /// A scene names its own paths, so an app can ask for one by name
     /// without guessing the window's prefix.
     #[test]

@@ -184,6 +184,7 @@ pub struct TextField {
     multiline: bool,
     submit: Option<Rc<dyn Fn()>>,
     bare: bool,
+    secret: bool,
 }
 
 impl TextField {
@@ -214,6 +215,25 @@ impl TextField {
     /// gate.
     pub fn bare(mut self) -> Self {
         self.bare = true;
+        self
+    }
+
+    /// The field must not SHOW what it holds — a password box.
+    ///
+    /// Every character draws as a bullet and the platform is refused a
+    /// copy (a cut takes nothing and deletes nothing); a paste still
+    /// lands, because the secret is what leaves the box, never what
+    /// enters it. The app keeps the real string in its binding and the
+    /// caret still walks it character by character, so a click, a
+    /// selection and an arrow all land where the eye says.
+    ///
+    /// The reveal a password box offers is this flag, off:
+    ///
+    /// ```ignore
+    /// text_field("", password).secret(!revealed.get())
+    /// ```
+    pub fn secret(mut self, secret: bool) -> Self {
+        self.secret = secret;
         self
     }
 }
@@ -277,6 +297,7 @@ impl View for TextField {
                     placeholder: self.placeholder.clone(),
                     multiline: self.multiline,
                     auto_focus: false,
+                    secret: self.secret,
                 });
             }
             // outside a pass (decorative use): the value becomes plain text
@@ -492,6 +513,7 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
         multiline: false,
         submit: None,
         bare: false,
+        secret: false,
     }
 }
 
@@ -512,6 +534,7 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         multiline: true,
         submit: None,
         bare: false,
+        secret: false,
     }
 }
 

@@ -650,6 +650,15 @@ pub enum LayoutNode {
         /// The ranges index the content, so a field showing its
         /// PLACEHOLDER ignores them.
         highlights: Option<TextHighlight>,
+        /// The field must not SHOW what it holds: every character is
+        /// drawn as a bullet, and the platform is refused a copy.
+        ///
+        /// It is paint and refusal, never storage — the app owns the
+        /// real string through its binding, exactly as it always did,
+        /// and the caret, the selection and the click still speak in
+        /// characters of it. The reveal a password box offers is the
+        /// app flipping this back off.
+        secret: bool,
     },
     /// View boundary (`Component`): records the frame at the identity
     /// path — the address for tests and, later on, for hit-testing.
@@ -2233,6 +2242,10 @@ pub struct FieldPlacement {
     pub font: FontSpec,
     /// The field asked for focus on first appearance.
     pub auto_focus: bool,
+    /// The field shows bullets, not what it holds — so the runtime
+    /// measures the MASK when it turns a click into a caret, and
+    /// refuses the platform a copy.
+    pub secret: bool,
 }
 
 /// Which visual line owns a byte: the FIRST whose end reaches it, so a
@@ -3485,7 +3498,14 @@ impl LayoutNode {
                 (size, Fit::Leaf)
             }
 
-            LayoutNode::Field { content, placeholder, multiline, .. } => {
+            LayoutNode::Field { content, placeholder, multiline, secret, .. } => {
+                let shown;
+                let content: &str = if *secret {
+                    shown = crate::text_input::masked(content);
+                    &shown
+                } else {
+                    content
+                };
                 let sample: &str = if content.is_empty() { placeholder } else { content };
                 let metrics = env.cache.get_or_measure(sample, &env.font, env.text);
                 let natural = metrics.width + 2.0 * FIELD_PAD_H;
@@ -3948,10 +3968,27 @@ impl LayoutNode {
                     auto_focus,
                     bare,
                     highlights,
+                    secret,
                 },
                 Fit::Leaf,
             ) => {
                 let multiline = *multiline;
+                let secret = *secret;
+                // Everything below draws and measures the string the
+                // field SHOWS. For a secret field that is the mask —
+                // same character count, so the caret and the selection
+                // land on the same character; only their byte offsets
+                // move, and `masked_index` is what moves them. The real
+                // string never reaches the scene.
+                let held = content;
+                let masked;
+                let content: &Arc<str> = if secret {
+                    masked = Arc::from(crate::text_input::masked(held));
+                    &masked
+                } else {
+                    held
+                };
+                let highlights = if secret { &None } else { highlights };
                 if out.dom.is_some() {
                     // the browser's input owns focus, caret and
                     // composition — the record carries what to SHOW,
@@ -3972,6 +4009,7 @@ impl LayoutNode {
                                 font: env.font,
                                 color,
                                 multiline,
+                                secret,
                             }),
                             frame,
                             // a bare field carries no ground, no edge
@@ -3996,7 +4034,17 @@ impl LayoutNode {
                 let focused = env.stamp.focus == Some(path.as_str());
                 let state =
                     env.stamp.carets.get(path.as_str()).copied().unwrap_or_default();
-                let clamp = |index: usize| crate::text_input::clamp_index(content, index);
+                // the caret and the selection index the string the app
+                // HOLDS; what is drawn is the string the field SHOWS.
+                // The two agree character by character, and this is the
+                // step between them.
+                let clamp = |index: usize| {
+                    if secret {
+                        crate::text_input::masked_index(held, index)
+                    } else {
+                        crate::text_input::clamp_index(held, index)
+                    }
+                };
                 let caret = (focused && env.stamp.caret_visible).then(|| clamp(state.caret));
                 let selection = focused
                     .then(|| state.selection())
@@ -4192,6 +4240,7 @@ impl LayoutNode {
                     line_height: line_h,
                     multiline,
                     auto_focus: *auto_focus,
+                    secret,
                 });
             }
 

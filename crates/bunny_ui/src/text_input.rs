@@ -311,6 +311,38 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
     None
 }
 
+// MARK: - The mask (a field that must not show what it holds)
+
+/// What a secret field draws in place of every character it holds.
+pub const BULLET: char = '\u{2022}';
+
+/// The masked twin of `text`: one [`BULLET`] per CHARACTER.
+///
+/// Same character count, deliberately — the caret, the selection and
+/// the click all speak in characters, so a caret at the third character
+/// is at the third bullet, whatever the original characters cost in
+/// bytes. What differs is the byte length, and that is what
+/// [`masked_index`] and [`unmasked_index`] are for.
+pub fn masked(text: &str) -> String {
+    let mut mask = String::with_capacity(text.chars().count() * BULLET.len_utf8());
+    for _ in text.chars() {
+        mask.push(BULLET);
+    }
+    mask
+}
+
+/// Where `byte` of `text` lands in [`masked`] of it.
+pub fn masked_index(text: &str, byte: usize) -> usize {
+    let byte = clamp_to_boundary(text, byte);
+    text[..byte].chars().count() * BULLET.len_utf8()
+}
+
+/// The way back: where `byte` of [`masked`] of `text` lands in `text`.
+pub fn unmasked_index(text: &str, byte: usize) -> usize {
+    let characters = byte / BULLET.len_utf8();
+    text.char_indices().nth(characters).map_or(text.len(), |(index, _)| index)
+}
+
 // MARK: - The UTF-16 boundary (IME and platforms speak UTF-16; we speak bytes)
 
 pub fn utf16_to_byte(text: &str, utf16: usize) -> usize {

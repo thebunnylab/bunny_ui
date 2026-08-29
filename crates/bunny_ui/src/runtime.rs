@@ -2425,26 +2425,43 @@ impl Runtime {
     fn caret_under(&self, path: &str, x: Px, y: Px) -> Option<(String, usize, (usize, usize))> {
         let mut probe = CaretState::default();
         let text = reconciler::run_editor(path, EditCommand::Read, &mut probe)??;
-        let whole = (0, text.len());
         let placement = self.field_at(path);
+        // a secret field draws bullets, and a bullet is not as wide as
+        // the character it stands for: the pointer has to be resolved
+        // against what the eye sees, then carried back to the string
+        // the app holds. Same character, both ways.
+        let secret = placement.as_ref().is_some_and(|field| field.secret);
+        let shown =
+            if secret { crate::text_input::masked(&text) } else { String::new() };
+        let seen: &str = if secret { &shown } else { &text };
+        let home = |index: usize| {
+            if secret { crate::text_input::unmasked_index(&text, index) } else { index }
+        };
+        let whole = (0, text.len());
         let (caret, line) = match placement {
             Some(field) if field.multiline => {
-                let lines = self.wrap(&text, &field);
+                let lines = self.wrap(seen, &field);
                 let row = ((y - field.text_origin.y) / field.line_height).floor();
                 let row = (row.max(0.0) as usize).min(lines.len().saturating_sub(1));
                 let (start, end) = lines[row];
                 let caret = start
                     + caret_from_x(
-                        &text[start..end],
+                        &seen[start..end],
                         x - field.text_origin.x,
                         &field.font,
                         &*self.text,
                         &self.cache,
                     );
-                (caret, (start, end))
+                (home(caret), (home(start), home(end)))
             }
             Some(field) => (
-                caret_from_x(&text, x - field.text_origin.x, &field.font, &*self.text, &self.cache),
+                home(caret_from_x(
+                    seen,
+                    x - field.text_origin.x,
+                    &field.font,
+                    &*self.text,
+                    &self.cache,
+                )),
                 whole,
             ),
             // before the first layout there is no run to measure
@@ -2487,6 +2504,18 @@ impl Runtime {
         };
         let caret = self.carets.borrow().get(path).map(|state| state.caret).unwrap_or(0);
         let caret = crate::text_input::clamp_index(&text, caret);
+        // what scrolls is what is drawn: bullets for a secret field
+        let shown = if field.secret {
+            crate::text_input::masked(&text)
+        } else {
+            String::new()
+        };
+        let (text, caret) = if field.secret {
+            let caret = crate::text_input::masked_index(&text, caret);
+            (shown.as_str(), caret)
+        } else {
+            (text.as_str(), caret)
+        };
         let mut offset =
             self.scroll_offsets.borrow().get(path).copied().unwrap_or_default();
         // the caret leaving through one edge pulls the run back; through
@@ -2504,7 +2533,7 @@ impl Runtime {
             at_offset.clamp(0.0, (full - box_extent).max(0.0))
         };
         if field.multiline {
-            let lines = self.wrap(&text, &field);
+            let lines = self.wrap(text, &field);
             let row = crate::layout::line_of(&lines, caret);
             offset.x = 0.0;
             offset.y = follow(
@@ -2517,7 +2546,7 @@ impl Runtime {
         } else {
             let caret_x =
                 self.cache.get_or_measure(&text[..caret], &field.font, &*self.text).width;
-            let full = self.cache.get_or_measure(&text, &field.font, &*self.text).width;
+            let full = self.cache.get_or_measure(text, &field.font, &*self.text).width;
             offset.x = follow(
                 caret_x,
                 offset.x,
@@ -2787,6 +2816,16 @@ impl Runtime {
         let Some(path) = self.focus.borrow().clone() else {
             return Edited { applied: false, output: None };
         };
+        // a secret field is refused the two commands that would carry
+        // what it holds out of it. A cut is refused WHOLE — it does not
+        // take a copy and it does not delete, because half a cut is
+        // worse than none. A paste is untouched: the secret is what
+        // leaves the box, never what enters it.
+        if matches!(command, EditCommand::Copy | EditCommand::Cut)
+            && self.field_at(&path).is_some_and(|field| field.secret)
+        {
+            return Edited { applied: false, output: None };
+        }
         // three commands a headless model cannot answer: they need the
         // wrap, and the wrap is geometry. A field that declines lets
         // the stroke through to the app, which is the whole point of
