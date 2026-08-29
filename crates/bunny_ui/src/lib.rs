@@ -7607,6 +7607,19 @@ mod tests {
             (1, 1),
             "becoming current is not a pass, and re-arms nothing",
         );
+
+        // …and the same holds for the case a running app actually lives in:
+        // two windows drawing, turn and turn about, for as long as they are
+        // both open.
+        for _ in 0..10 {
+            settle(&first, &one);
+            settle(&second, &two);
+        }
+        assert_eq!(
+            (one.arms.get(), two.arms.get()),
+            (1, 1),
+            "a frame is not a re-arm, whoever drew the one before it",
+        );
     }
 
     /// A secret field draws bullets, keeps the string the app holds,

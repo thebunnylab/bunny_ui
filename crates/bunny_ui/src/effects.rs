@@ -18,9 +18,11 @@ use motor::state::{Context, EffectFn};
 
 thread_local! {
     static EFFECTS: RefCell<Vec<EffectFn>> = RefCell::new(Vec::new());
-    /// Every `.task` slot ever opened on this thread, weakly: the
-    /// identity owns the cell, this list only watches it.
-    static TASK_CELLS: RefCell<Vec<Weak<RefCell<Option<TaskSlot>>>>> =
+    /// Every `.task` slot ever opened on this thread, weakly, WITH the
+    /// identity scope it was opened under: the identity owns the cell,
+    /// this list only watches it — and the scope is what tells one
+    /// scene's tasks from another's when the sweep comes round.
+    static TASK_CELLS: RefCell<Vec<(Weak<RefCell<Option<TaskSlot>>>, String)>> =
         RefCell::new(Vec::new());
     /// The pass counter the sweep compares against.
     static GENERATION: Cell<u64> = const { Cell::new(1) };
@@ -110,7 +112,9 @@ where
     Fut: std::future::Future<Output = ()> + 'static,
 {
     let cell = scoped_effect_slot::<TaskSlot>(site);
-    watch_task(&cell);
+    // the scope is read HERE, during the pass, because that is the only
+    // moment the identity cursor exists — the sweep runs long after
+    watch_task(&cell, motor::identity::cursor_scope().unwrap_or_default());
     Rc::new(move |_ctx: &Context| {
         let generation = GENERATION.with(Cell::get);
         let running = matches!(
@@ -138,36 +142,49 @@ where
 
 /// Starts watching a task slot (once per cell — the modifier is rebuilt
 /// on every render and hands back the same one).
-fn watch_task(cell: &Rc<RefCell<Option<TaskSlot>>>) {
+fn watch_task(cell: &Rc<RefCell<Option<TaskSlot>>>, scope: String) {
     TASK_CELLS.with(|cells| {
         let mut cells = cells.borrow_mut();
         let known = cells
             .iter()
-            .any(|weak| weak.upgrade().is_some_and(|other| Rc::ptr_eq(&other, cell)));
+            .any(|(weak, _)| weak.upgrade().is_some_and(|other| Rc::ptr_eq(&other, cell)));
         if !known {
-            cells.push(Rc::downgrade(cell));
+            cells.push((Rc::downgrade(cell), scope));
         }
     });
 }
 
-/// Cancels the tasks the pass did NOT declare. A view that left the
-/// tree stops pushing its effect, so its slot keeps an older pass
-/// number — and a subprocess never outlives the panel that asked for
-/// it. A skipped subtree still declares (the reconciler reassembles its
-/// effects from the retention), so skipping never cancels anything.
-pub(crate) fn sweep_tasks() {
+/// Cancels the tasks the pass did NOT declare, **under the root that
+/// just ran**. A view that left the tree stops pushing its effect, so
+/// its slot keeps an older pass number — and a subprocess never
+/// outlives the panel that asked for it. A skipped subtree still
+/// declares (the reconciler reassembles its effects from the
+/// retention), so skipping never cancels anything.
+///
+/// The root is the whole reason this takes an argument. The generation
+/// is one counter for the thread, and a thread can hold several scenes:
+/// without the scope, every frame one window drew would cancel every
+/// task the OTHER window owns, which the other window would then
+/// re-arm on its next frame — and a task is a thread. Two windows
+/// alternating frames turned that into thousands of threads in seconds.
+pub(crate) fn sweep_tasks(root: &str) {
     if !DECLARED.with(Cell::get) {
         // no queue was assembled: this pass declared nothing, and
         // "nothing declared" is not the same as "everything died"
         return;
     }
     let generation = GENERATION.with(Cell::get);
+    let prefix = format!("{root}/");
     TASK_CELLS.with(|cells| {
         let mut cells = cells.borrow_mut();
-        cells.retain(|weak| {
+        cells.retain(|(weak, scope)| {
             // the cell is gone = the identity swept it, and the handle
             // it held cancelled on the way out
             let Some(cell) = weak.upgrade() else { return false };
+            // another scene's task is not this pass's to judge
+            if !(scope.as_str() == root || scope.starts_with(&prefix)) {
+                return true;
+            }
             let stale = matches!(
                 cell.borrow().as_ref(),
                 Some((_, _, seen)) if *seen != generation
