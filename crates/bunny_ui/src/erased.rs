@@ -1,9 +1,12 @@
 //! The erased boundary — where the dynamism is real.
 //!
-//! `Erased` is this layer's `AnyView`, but it exists in exactly two
+//! `Erased` is this layer's `AnyView`, but it exists in exactly three
 //! places: the content of a `.sheet` (a closure that mounts the view
-//! only when presented — `Fn() -> impl View` cannot be written) and the
-//! `content:` of a [`CustomModifier`]. All the rest of the tree is typed.
+//! only when presented — `Fn() -> impl View` cannot be written), the
+//! `content:` of a [`CustomModifier`], and the band a
+//! [`table`](crate::views::table) hands its row wrapper — a closure the
+//! app writes and the table stores, which is the same shape again. All
+//! the rest of the tree is typed.
 
 use std::rc::Rc;
 

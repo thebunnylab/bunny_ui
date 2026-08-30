@@ -30,11 +30,12 @@ use motor::view::RenderNode;
 use motor::views::NavigationPath;
 
 use crate::layout::{
-    Axis, Corners, CrossAlign, Edges, Fraction, LayoutNode, SeamUnit, Size as LayoutSize,
+    Axis, Color, Corners, CrossAlign, Edges, Fraction, LayoutNode, SeamUnit, Size as LayoutSize,
     VisualProps,
 };
 use crate::state_ext::BindingExt;
-use crate::view::{NodeList, Single, View, render_line};
+use crate::erased::{Erased, erased};
+use crate::view::{Either, NodeList, Single, View, render_line};
 
 /// Several layout nodes becoming ONE (composite labels, sections, explicit
 /// tuples): one child passes straight through; several stack vertically.
@@ -707,39 +708,75 @@ impl View for Icon {
 
 use crate::ext::ViewExt as _;
 
-/// One column of a [`table`]: its header and its width in points.
+/// One column of a [`table`]: its header, its width and the edge its
+/// content reads from.
 #[derive(Clone)]
 pub struct TableColumn {
     pub title: Arc<str>,
-    pub width: f64,
+    /// Points, or `None` for the lane that takes the slack.
+    pub width: Option<f64>,
+    /// Which edge the cell reads from — leading for a name, trailing
+    /// for a number, whose decimal point is the reason the column is a
+    /// column.
+    pub align: Alignment,
 }
 
-/// A table column. Width is points; the header paints it bold over a
-/// hairline.
+impl TableColumn {
+    /// The edge this column's cells read from. A number column says
+    /// `Trailing`, and every value in it ends on the same x.
+    #[must_use]
+    pub fn aligned(mut self, align: Alignment) -> Self {
+        self.align = align;
+        self
+    }
+}
+
+/// A table column of an exact width, reading from the leading edge.
 pub fn column(title: impl Into<Arc<str>>, width: f64) -> TableColumn {
-    TableColumn { title: title.into(), width }
+    TableColumn { title: title.into(), width: Some(width), align: Alignment::Leading }
+}
+
+/// The column that takes the SLACK — what is left of the pane after the
+/// fixed ones. A table that has one does not scroll sideways: the slack
+/// is exactly what a travelling axis does not have.
+pub fn column_flex(title: impl Into<Arc<str>>) -> TableColumn {
+    TableColumn { title: title.into(), width: None, align: Alignment::Leading }
 }
 
 /// The row band of a [`table`] — one shared height keeps the virtual
-/// window honest and the sheet scannable.
+/// window honest and the sheet scannable. `.row_height(…)` moves it.
 const TABLE_ROW_H: f64 = 26.0;
 const TABLE_CELL_PAD: f64 = 8.0;
 
-/// A table: fixed columns across, virtual rows down, and BOTH axes
-/// scroll — the header stays put vertically and slides with its
-/// columns horizontally, because it lives inside the sideways region
-/// and outside the vertical one. Rows come by INDEX (ten thousand
-/// exist, a screenful materializes); `cell(row, column)` builds one
-/// cell, clipped to its lane.
+/// A table: columns across, virtual rows down, and the ROW as the unit
+/// — `cell(row, column)` fills a lane, and `.row(…)` dresses the band
+/// the lanes sit in.
+///
+/// The header stays put vertically and slides with its columns
+/// horizontally, because it lives inside the sideways region and
+/// outside the vertical one. Rows come by INDEX: ten thousand exist, a
+/// screenful materializes.
 ///
 /// ```ignore
 /// table(
-///     vec![column("Name", 220.0), column("Kind", 90.0), column("Size", 80.0)],
+///     vec![column("Name", 220.0), column("Size", 80.0).aligned(Alignment::Trailing)],
 ///     files.len(),
 ///     |row| files[row].id.clone(),
 ///     move |row, col| text(files[row].field(col)),
 /// )
+/// .row_height(32.0)
+/// .row(move |row, band| {
+///     band.background_color(if selected(row) { theme::selection() } else { Color::CLEAR })
+///         .background_hovered(theme::hover())
+///         .on_click(move || open(row))
+/// })
 /// ```
+///
+/// The band the wrapper receives is the WHOLE row — as wide as the
+/// table and exactly `row_height` tall — so an ink painted on it is one
+/// unbroken band. Painting per cell is what stripes it: every lane is
+/// framed and padded on its own, and the padding is a gap the ink never
+/// covers.
 ///
 /// What v1 leaves out, on purpose: the COLUMNS all materialize (the
 /// rows are the axis that reaches ten thousand; a sheet of very many
@@ -750,52 +787,247 @@ pub fn table<I, F, R>(
     count: usize,
     id: I,
     cell: F,
-) -> impl View<Arity = crate::view::Single>
+) -> Table<I, F>
 where
     I: Fn(usize) -> String + Clone + 'static,
     F: Fn(usize, usize) -> R + Clone + 'static,
-    R: View<Arity = crate::view::Single>,
+    R: View<Arity = Single>,
 {
-    let theme = crate::theme::current();
-    let widths: Vec<f64> = columns.iter().map(|column| column.width).collect();
-    let header = for_each(
-        columns,
-        |column| column.title.to_string(),
-        |column| {
-            text(column.title.clone())
-                .bold()
-                .padding_edge(motor::views::Edge::Leading, TABLE_CELL_PAD)
-                .frame(column.width, TABLE_ROW_H)
-        },
-    )
-    .horizontal();
-    let body = {
-        let widths = widths.clone();
-        virtual_list(count, id, move |row| {
-            let cell = cell.clone();
-            let widths = widths.clone();
-            for_each(
-                widths.iter().copied().enumerate().collect::<Vec<_>>(),
-                |(col, _)| col.to_string(),
-                move |(col, width)| {
-                    cell(row, *col)
-                        .padding_edge(motor::views::Edge::Leading, TABLE_CELL_PAD)
-                        .frame(*width, TABLE_ROW_H)
-                        .clipped()
-                },
-            )
-            .horizontal()
-        })
-    };
-    scroll(
-        crate::vstack!(
-            header
-                .background_color(theme.panel)
-                .border(theme.border, 1.0),
-            body,
-        ),
-    )
-    .horizontal()
+    Table {
+        columns: Rc::new(columns),
+        count,
+        id,
+        cell,
+        row_h: TABLE_ROW_H,
+        header_h: TABLE_ROW_H,
+        edge: 0.0,
+        divider: None,
+        row: None,
+        header: None,
+    }
+}
+
+/// The band of one row, or the header strip, as the app receives it:
+/// the whole width of the table, the exact height of the row.
+type Band = Rc<dyn Fn(usize, Erased) -> Erased>;
+type Strip = Rc<dyn Fn(Erased) -> Erased>;
+
+/// The table built by [`table`].
+#[derive(Clone)]
+pub struct Table<I, F> {
+    columns: Rc<Vec<TableColumn>>,
+    count: usize,
+    id: I,
+    cell: F,
+    row_h: f64,
+    header_h: f64,
+    edge: f64,
+    divider: Option<Color>,
+    row: Option<Band>,
+    header: Option<Strip>,
+}
+
+impl<I, F> Table<I, F> {
+    /// The band every row occupies, hairline included. One number for
+    /// the whole table: the virtual window counts rows by it, and a row
+    /// that measured something else would walk the viewport off by its
+    /// own difference, once per row.
+    #[must_use]
+    pub fn row_height(mut self, height: f64) -> Self {
+        self.row_h = height;
+        self
+    }
+
+    /// The header strip, which is not the row band said again — a
+    /// table of 32pt rows under a 28pt strip is an ordinary table.
+    /// Without this it follows the rows.
+    #[must_use]
+    pub fn header_height(mut self, height: f64) -> Self {
+        self.header_h = height;
+        self
+    }
+
+    /// The inset between the table's own edges and its first and last
+    /// lane. It rides INSIDE the band, so the ink an app paints still
+    /// reaches both edges of the table.
+    #[must_use]
+    pub fn edge_inset(mut self, inset: f64) -> Self {
+        self.edge = inset;
+        self
+    }
+
+    /// The rule under every row, drawn INSIDE the band: a row stays
+    /// exactly `row_height` tall, so fifty rows below it do not each
+    /// drift a point.
+    #[must_use]
+    pub fn row_divider(mut self, color: Color) -> Self {
+        self.divider = Some(color);
+        self
+    }
+
+    /// Dress the band of row `index`: the selection ink, the hover
+    /// wash, an accent bar over its leading edge, and ONE click for the
+    /// whole row.
+    ///
+    /// This is what a table has that a list of cells does not. The band
+    /// arrives whole — full width, exact height — so a background is a
+    /// band and not a row of stripes, and a click is one closure and
+    /// not one per column.
+    #[must_use]
+    pub fn row<V>(mut self, wrap: impl Fn(usize, Erased) -> V + 'static) -> Self
+    where
+        V: View<Arity = Single>,
+    {
+        self.row = Some(Rc::new(move |index, band| erased(wrap(index, band))));
+        self
+    }
+
+    /// Dress the header strip — its own ink and size, its background,
+    /// the rule under it. The strip arrives as the bare lanes, so a
+    /// `.font_size(10).bold().foreground_color(…)` on it reaches every
+    /// header cell by inheritance and none of the rows.
+    ///
+    /// Without it the strip wears the theme's panel and border, which
+    /// is what a table drawn by nobody in particular should look like.
+    #[must_use]
+    pub fn header<V>(mut self, wrap: impl Fn(Erased) -> V + 'static) -> Self
+    where
+        V: View<Arity = Single>,
+    {
+        self.header = Some(Rc::new(move |strip| erased(wrap(strip))));
+        self
+    }
+}
+
+impl<I, F, R> Table<I, F>
+where
+    I: Fn(usize) -> String + Clone + 'static,
+    F: Fn(usize, usize) -> R + Clone + 'static,
+    R: View<Arity = Single>,
+{
+    /// A lane: the exact box of its column, the content on the edge the
+    /// column reads from, clipped to what it was given. A value too wide
+    /// for its lane ends where the lane does; it never pushes the next
+    /// one along.
+    fn lane<C: View<Arity = Single>>(
+        column: &TableColumn,
+        height: f64,
+        content: C,
+    ) -> impl View<Arity = Single> + use<C, I, F, R> {
+        let content = content
+            .padding_edge(motor::views::Edge::Leading, TABLE_CELL_PAD)
+            .padding_edge(motor::views::Edge::Trailing, TABLE_CELL_PAD);
+        match column.width {
+            Some(width) => Either::First(
+                content.frame_aligned(width, height, column.align).clipped(),
+            ),
+            // the lane that takes the slack: ∞ is FILL what was proposed,
+            // and a table that has one never travels sideways
+            None => Either::Second(
+                content
+                    .frame_max(f64::INFINITY, height, column.align)
+                    .frame_height(height)
+                    .clipped(),
+            ),
+        }
+    }
+
+    /// The lanes of one row, dressed as a band: full width, exact
+    /// height, the rule inside it.
+    fn band<C: View<Arity = Single>>(
+        &self,
+        cells: C,
+    ) -> impl View<Arity = Single> + use<C, I, F, R> {
+        let body_h = self.row_h - self.divider.map_or(0.0, |_| 1.0);
+        let body = cells
+            .padding_edge(motor::views::Edge::Leading, self.edge)
+            .padding_edge(motor::views::Edge::Trailing, self.edge)
+            // fill the width, pin the height: the ceiling gives back
+            // what a short row does not use, and the band must not
+            .frame_max(f64::INFINITY, body_h, Alignment::Leading)
+            .frame_height(body_h);
+        let divider = self.divider.map(|color| {
+            spacer()
+                .frame_max(f64::INFINITY, 1.0, Alignment::Center)
+                .background_color(color)
+        });
+        crate::vstack!(body, divider).spacing(0.0).frame_height(self.row_h)
+    }
+
+    fn compose(&self) -> impl View<Arity = Single> + use<I, F, R> {
+        let theme = crate::theme::current();
+        let columns = Rc::clone(&self.columns);
+        let header_h = self.header_h;
+        let strip = for_each(
+            (*self.columns).clone(),
+            |column: &TableColumn| column.title.to_string(),
+            move |column: &TableColumn| Self::lane(column, header_h, text(column.title.clone())),
+        )
+        .horizontal()
+        .spacing(0.0)
+        .padding_edge(motor::views::Edge::Leading, self.edge)
+        .padding_edge(motor::views::Edge::Trailing, self.edge)
+        .frame_max(f64::INFINITY, header_h, Alignment::Leading)
+        .frame_height(header_h);
+        let header = match &self.header {
+            Some(wrap) => Either::First(wrap(erased(strip))),
+            None => Either::Second(
+                strip.bold().background_color(theme.panel).border(theme.border, 1.0),
+            ),
+        };
+
+        let body = {
+            let cell = self.cell.clone();
+            let columns = Rc::clone(&columns);
+            // the shape rides into every row of the window: the widths,
+            // the heights and the two wrappers, all behind an Rc
+            let table = self.clone();
+            virtual_list(self.count, self.id.clone(), move |row| {
+                let cell = cell.clone();
+                let columns = Rc::clone(&columns);
+                let height = table.row_h;
+                let cells = for_each(
+                    (0..columns.len()).collect::<Vec<_>>(),
+                    |col| col.to_string(),
+                    move |col| Self::lane(&columns[*col], height, cell(row, *col)),
+                )
+                .horizontal()
+                .spacing(0.0);
+                let band = table.band(cells);
+                match &table.row {
+                    Some(wrap) => {
+                        Either::First(wrap(row, erased(band)))
+                    }
+                    None => Either::Second(band),
+                }
+            })
+            .row_height(self.row_h)
+        };
+
+        let sheet = crate::vstack!(header, body).spacing(0.0);
+        if self.columns.iter().all(|column| column.width.is_some()) {
+            // every lane is a number: the row can be wider than the
+            // pane, and the wheel travels through it
+            Either::First(scroll(sheet).horizontal())
+        } else {
+            // a lane takes the slack, so there is no slack to travel
+            // through — the table spans its pane and stays there
+            Either::Second(sheet)
+        }
+    }
+}
+
+impl<I, F, R> View for Table<I, F>
+where
+    I: Fn(usize) -> String + Clone + 'static,
+    F: Fn(usize, usize) -> R + Clone + 'static,
+    R: View<Arity = Single>,
+{
+    type Arity = Single;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        self.compose().render_into(ctx, out);
+    }
 }
 
 /// A scroll region of one's own — a vertical viewport by default. The

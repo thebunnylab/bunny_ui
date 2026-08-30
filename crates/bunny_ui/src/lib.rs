@@ -620,6 +620,218 @@ mod tests {
         assert!(rect.size.height > 0.0);
     }
 
+    /// PAIN-87: the band is the unit. An ink painted through the row
+    /// hook is ONE box per row — as wide as the table, exactly the row's
+    /// height — and never one box per cell with the padding showing
+    /// through between them.
+    #[test]
+    fn a_table_row_is_one_band_and_not_a_row_of_stripes() {
+        const BAND: Color = Color::hex(0xFF0000);
+
+        #[derive(Clone, Copy)]
+        struct Sheet;
+
+        impl Component for Sheet {
+            fn body(self, _ctx: &Context) -> impl View {
+                table(
+                    vec![column("Name", 100.0), column("Size", 60.0)],
+                    3,
+                    |row| row.to_string(),
+                    |row, col| text(format!("r{row}c{col}")),
+                )
+                .row_height(32.0)
+                .header_height(28.0)
+                .row(|_, band| band.background_color(BAND))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let frame = runtime
+            .display_frame(&Sheet, crate::layout::Size { width: 300.0, height: 200.0 });
+        let bands: Vec<crate::layout::Rect> = frame
+            .iter()
+            .filter_map(|command| match command {
+                crate::layout::DrawCommand::FillRect { rect, color, .. } if *color == BAND => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(bands.len(), 3, "one band per row, not one per cell: {bands:?}");
+        for (index, band) in bands.iter().enumerate() {
+            assert_eq!(band.size.width, 160.0, "the band is as wide as the table");
+            assert_eq!(band.size.height, 32.0, "and exactly the row's own height");
+            assert_eq!(band.origin.x, 0.0, "no gap at the head of the first column");
+            assert_eq!(
+                band.origin.y,
+                28.0 + index as f64 * 32.0,
+                "the rows step by the height they declared, under the header's own",
+            );
+        }
+    }
+
+    /// The header wears its own ink and size, and neither reaches the
+    /// rows: one wrapper over the strip, and inheritance does the rest.
+    #[test]
+    fn the_header_strip_dresses_itself_and_leaves_the_rows_alone() {
+        const HEAD: Color = Color::hex(0x808080);
+
+        #[derive(Clone, Copy)]
+        struct Sheet;
+
+        impl Component for Sheet {
+            fn body(self, _ctx: &Context) -> impl View {
+                table(
+                    vec![column("Name", 100.0)],
+                    2,
+                    |row| row.to_string(),
+                    |row, _| text(format!("row{row}")),
+                )
+                .row_height(32.0)
+                .header_height(28.0)
+                .header(|strip| strip.font_size(10.0).foreground_color(HEAD))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let frame = runtime
+            .display_frame(&Sheet, crate::layout::Size { width: 300.0, height: 200.0 });
+        let run = |needle: &str| {
+            frame
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { content, color, font, .. }
+                        if content.as_ref() == needle =>
+                    {
+                        Some((*color, font.size))
+                    }
+                    _ => None,
+                })
+                .expect("the run paints")
+        };
+
+        assert_eq!(run("Name"), (HEAD, 10.0), "the strip's own ink and size");
+        assert_ne!(run("row0").0, HEAD, "and the rows keep the scene's");
+        assert_ne!(run("row0").1, 10.0);
+    }
+
+    /// A lane that takes the slack spans the pane, and a table that has
+    /// one does not travel sideways — the slack is exactly what a
+    /// travelling axis does not have. And the rule under a row rides
+    /// INSIDE its band, so the rows below it do not drift.
+    #[test]
+    fn a_flexible_lane_takes_the_slack_and_the_rule_rides_inside() {
+        const BAND: Color = Color::hex(0xFF0000);
+        const RULE: Color = Color::hex(0x00FF00);
+
+        #[derive(Clone, Copy)]
+        struct Sheet(bool);
+
+        impl Component for Sheet {
+            fn body(self, _ctx: &Context) -> impl View {
+                let columns = if self.0 {
+                    vec![column("Name", 100.0), column_flex("Notes")]
+                } else {
+                    vec![column("Name", 100.0), column("Notes", 60.0)]
+                };
+                table(columns, 2, |row| row.to_string(), |row, col| text(format!("r{row}c{col}")))
+                    .row_height(32.0)
+                    .header_height(28.0)
+                    .row_divider(RULE)
+                    .row(|_, band| band.background_color(BAND))
+            }
+        }
+
+        let boxes = |sheet: Sheet, ink: Color| {
+            let runtime = Runtime::new();
+            runtime
+                .display_frame(&sheet, crate::layout::Size { width: 300.0, height: 200.0 })
+                .iter()
+                .filter_map(|command| match command {
+                    crate::layout::DrawCommand::FillRect { rect, color, .. } if *color == ink => {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let fixed = boxes(Sheet(false), BAND);
+        assert_eq!(fixed[0].size.width, 160.0, "every lane is a number: the table is its columns");
+
+        let flexible = boxes(Sheet(true), BAND);
+        assert_eq!(flexible[0].size.width, 300.0, "the slack lane fills the pane");
+        assert_eq!(flexible[1].origin.y - flexible[0].origin.y, 32.0, "rows still step by 32");
+
+        // the rule is a hairline at the FOOT of each band, inside it
+        let rules = boxes(Sheet(true), RULE);
+        assert_eq!(rules.len(), 2);
+        for (band, rule) in flexible.iter().zip(&rules) {
+            assert_eq!(rule.size.height, 1.0);
+            assert_eq!(rule.origin.y + rule.size.height, band.origin.y + band.size.height);
+        }
+    }
+
+    /// The other half of the same pain: ONE click for the row, and a
+    /// column that reads from the trailing edge.
+    #[test]
+    fn a_table_row_takes_one_click_and_a_column_picks_its_edge() {
+        #[derive(Clone)]
+        struct Sheet {
+            opened: Rc<RefCell<Vec<usize>>>,
+        }
+
+        impl Component for Sheet {
+            fn body(self, _ctx: &Context) -> impl View {
+                let opened = Rc::clone(&self.opened);
+                table(
+                    vec![
+                        column("Name", 100.0),
+                        column("Size", 60.0).aligned(Alignment::Trailing),
+                    ],
+                    3,
+                    |row| row.to_string(),
+                    |row, col| text(if col == 0 { format!("name{row}") } else { "9".into() }),
+                )
+                .row_height(32.0)
+                .header_height(28.0)
+                .row(move |index, band| {
+                    let opened = Rc::clone(&opened);
+                    band.on_click(move || opened.borrow_mut().push(index))
+                })
+            }
+        }
+
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let runtime = Runtime::new();
+        let sheet = Sheet { opened: Rc::clone(&opened) };
+        let size = crate::layout::Size { width: 300.0, height: 200.0 };
+        let frame = runtime.display_frame(&sheet, size);
+
+        // the trailing column ends on its lane's edge, one padding in:
+        // lane 100..160, the run of one character 8 wide, 8 of padding
+        let nine = frame
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { origin, content, .. }
+                    if content.as_ref() == "9" =>
+                {
+                    Some(origin.x)
+                }
+                _ => None,
+            })
+            .expect("the number paints");
+        assert_eq!(nine + 8.0, 152.0, "the number reads from the trailing edge");
+
+        // a press in the SECOND column still opens the row: the click is
+        // the band's, not the cell's
+        let (x, y) = (130.0, 28.0 + 32.0 + 16.0);
+        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_released(x, y);
+        assert_eq!(&*opened.borrow(), &[1], "one closure, one row, wherever it was pressed");
+    }
+
     #[test]
     fn tracking_closes_a_line_the_column_could_not_hold() {
         // PAIN-92's own arithmetic, in the house font: 21 characters at
