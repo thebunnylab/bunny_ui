@@ -15,6 +15,11 @@
 //! and type (composition included); Backspace erases, Escape drops the
 //! keyboard, and the ink clears with Delete.
 //!
+//! Command-press anywhere on the well and the box opens a MENU at that
+//! point — the scene's own menu, asked for from inside the box's own
+//! event, because a painted scene has no views to hang one on and the
+//! choice is always about the point the hand touched.
+//!
 //! ```sh
 //! cargo run -p bunny-ui-macos --example sketch_window
 //! ```
@@ -56,6 +61,14 @@ impl Sketch {
     fn clear(&self) {
         self.strokes.set(Rc::new(Vec::new()));
         self.live.set(Rc::new(Vec::new()));
+    }
+
+    /// A single mark, where the menu was asked for — the one item that
+    /// is about the POINT and not about the box.
+    fn dab(&self, at: Point) {
+        let mut strokes = (*self.strokes.get()).clone();
+        strokes.push(vec![at]);
+        self.strokes.set(Rc::new(strokes));
     }
 
     fn extend(&self, at: Point) {
@@ -202,8 +215,25 @@ impl CustomElement for Sketch {
         );
     }
 
-    fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
+    fn event(&self, event: &ElementEvent, ctx: &EventCtx) -> Response {
         match event {
+            // the menu the framework cannot anchor for us: there is no
+            // view under this point, only paint, so the box asks
+            ElementEvent::PointerDown { at, modifiers, .. } if modifiers.command => {
+                let (here, sketch) = (*at, *self);
+                ctx.open_menu(
+                    here,
+                    vec![
+                        menu_item("Dab here", move || sketch.dab(here)),
+                        menu_divider(),
+                        menu_item("Fine brush", move || sketch.brush.set(3.0)),
+                        menu_item("Broad brush", move || sketch.brush.set(18.0)),
+                        menu_divider(),
+                        menu_item("Clear", move || sketch.clear()),
+                    ],
+                );
+                Response::handled()
+            }
             ElementEvent::PointerDown { at, .. } => {
                 self.pointer.set(Some(*at));
                 self.extend(*at);

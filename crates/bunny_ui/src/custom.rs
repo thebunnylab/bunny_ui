@@ -28,6 +28,7 @@
 //! have been views loses the browser's text selection, its accessibility
 //! and its zero-patch hover.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -754,7 +755,8 @@ impl Response {
     }
 }
 
-/// What the app reads while it answers an event.
+/// What the app reads while it answers an event — and the one thing it
+/// can ASK for while it is there.
 pub struct EventCtx<'a> {
     /// The box, in LAYOUT coordinates — its size is what measure
     /// answered.
@@ -767,11 +769,40 @@ pub struct EventCtx<'a> {
     pub visible: Rect,
     /// Text measurement, cached: how a click becomes a column.
     pub metrics: Metrics<'a>,
+    /// Where an [`EventCtx::open_menu`] lands. The runtime reads it
+    /// AFTER the box has answered — nothing of the scene is borrowed
+    /// while the app is talking, which is the rule every door into a
+    /// box already lives by.
+    pub(crate) menu: &'a RefCell<Option<(Point, Rc<[crate::views::MenuItem]>)>>,
 }
 
 impl EventCtx<'_> {
     pub fn size(&self) -> Size {
         self.frame.size
+    }
+
+    /// Open a menu at a POINT of this box — `at` in the same local
+    /// coordinates the event arrived in, so `ev.position` goes straight
+    /// through.
+    ///
+    /// `.context_menu(…)` anchors on the VIEW, because a view is the
+    /// unit it can find. A painted scene has no views inside it: a
+    /// canvas is ONE box that draws its own cards and does its own
+    /// hit-testing, and there is nothing in there to hang a menu on.
+    /// Yet the choice a canvas asks for is always about a POINT — what
+    /// to mint HERE, what to link THIS to, what to do with the card
+    /// under the pointer — and the only place that question can appear
+    /// is where the hand touched.
+    ///
+    /// The menu that opens is the scene's own: the same rows, the same
+    /// press-outside-to-close, the same row firing on the down. The
+    /// items' actions run after the menu is gone, so one can open
+    /// another.
+    ///
+    /// Asked twice while answering one event, the last one wins — a box
+    /// opens one menu per gesture, as a hand does.
+    pub fn open_menu(&self, at: Point, items: Vec<crate::views::MenuItem>) {
+        *self.menu.borrow_mut() = Some((at, items.into()));
     }
 }
 
@@ -1271,6 +1302,122 @@ mod tests {
         );
         runtime.pointer_exited();
         assert_eq!(log.borrow().last(), Some(&ElementEvent::PointerExited));
+    }
+
+    /// PAIN-88: a painted scene has no views inside it, and the choice
+    /// it asks for is always about a POINT. The box opens the menu
+    /// itself, in its own coordinates, and what opens is the scene's
+    /// own menu — same rows, same dismiss, same row firing on the down.
+    #[test]
+    fn a_painted_box_opens_a_menu_at_the_point_it_was_touched() {
+        #[derive(Clone)]
+        struct Canvas {
+            minted: Rc<std::cell::RefCell<Vec<&'static str>>>,
+        }
+
+        impl CustomElement for Canvas {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+
+            fn name(&self) -> &str {
+                "canvas"
+            }
+
+            fn event(&self, event: &ElementEvent, ctx: &EventCtx) -> Response {
+                let ElementEvent::PointerDown { at, .. } = event else {
+                    return Response::ignored();
+                };
+                let concept = Rc::clone(&self.minted);
+                let instance = Rc::clone(&self.minted);
+                ctx.open_menu(
+                    *at,
+                    vec![
+                        crate::views::menu_item("Concept", move || {
+                            concept.borrow_mut().push("concept")
+                        }),
+                        crate::views::menu_divider(),
+                        crate::views::menu_item("Instance", move || {
+                            instance.borrow_mut().push("instance")
+                        }),
+                    ],
+                );
+                Response::handled()
+            }
+        }
+
+        #[derive(Clone)]
+        struct Screen {
+            minted: Rc<std::cell::RefCell<Vec<&'static str>>>,
+        }
+
+        impl Component for Screen {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                // inset, so the box's own point is NOT the scene's
+                use crate::ext::ViewExt as _;
+                custom(Canvas { minted: Rc::clone(&self.minted) }).padding_length(20.0)
+            }
+        }
+
+        let minted = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let screen = Screen { minted: Rc::clone(&minted) };
+        let size = Size { width: 300.0, height: 200.0 };
+        let runtime = Runtime::new();
+        let rows = |display: &crate::layout::DisplayList| {
+            display
+                .iter()
+                .filter_map(|command| match command {
+                    DrawCommand::TextLine { content, origin, .. } => {
+                        Some((content.to_string(), *origin))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert!(rows(&runtime.display_frame(&screen, size)).is_empty(), "nothing is open");
+
+        // a press at (50, 40) of the scene is (30, 20) of the box
+        runtime.pointer_clicked(50.0, 40.0, 1, false);
+        runtime.pointer_released(50.0, 40.0);
+        let open = rows(&runtime.display_frame(&screen, size));
+        let first = open
+            .iter()
+            .find(|(label, _)| label == "Concept")
+            .expect("the menu paints its rows")
+            .1;
+        assert!(open.iter().any(|(label, _)| label == "Instance"));
+        assert!(
+            first.x > 50.0 && first.y > 40.0,
+            "the rows sit inside a menu that begins at the point: {first:?}",
+        );
+
+        // a press ANYWHERE while it is open closes it, and the box under
+        // it never hears that press — AppKit's own manners
+        runtime.pointer_clicked(250.0, 170.0, 1, false);
+        runtime.pointer_released(250.0, 170.0);
+        assert!(rows(&runtime.display_frame(&screen, size)).is_empty(), "closed");
+        assert!(minted.borrow().is_empty(), "and nothing fired");
+
+        // the same gesture 30pt to the right opens the menu 30pt to the
+        // right: the point the box handed over was its OWN, and it
+        // landed where the hand was in the SCENE
+        runtime.pointer_clicked(80.0, 40.0, 1, false);
+        runtime.pointer_released(80.0, 40.0);
+        let moved = rows(&runtime.display_frame(&screen, size));
+        let second = moved
+            .iter()
+            .find(|(label, _)| label == "Concept")
+            .expect("the second menu paints")
+            .1;
+        assert_eq!(second.x - first.x, 30.0);
+        assert_eq!(second.y, first.y);
+
+        // a press on the row fires it — on the DOWN, as a menu does
+        runtime.pointer_clicked(second.x + 2.0, second.y + 2.0, 1, false);
+        assert_eq!(&*minted.borrow(), &["concept"]);
+        assert!(
+            rows(&runtime.display_frame(&screen, size)).is_empty(),
+            "and the menu is gone with it",
+        );
     }
 
     /// The pointer's fourth sentence: over a grid of cells it is the fat

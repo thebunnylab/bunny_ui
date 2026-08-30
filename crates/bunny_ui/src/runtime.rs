@@ -611,21 +611,26 @@ impl Runtime {
             handler.0(Point { x, y });
             return true;
         }
-        let entries: Vec<Option<std::sync::Arc<str>>> = region
-            .items
+        self.open_menu(Point { x, y }, region.items);
+        true
+    }
+
+    /// Opens `items` AT a point of the scene — the one road, whether the
+    /// right press found a `.context_menu(…)` region or the app's own
+    /// box asked from inside an event ([`crate::custom::EventCtx::open_menu`]).
+    /// One road, so the dismiss, the outside press and the row that
+    /// fires on the down are the same for both.
+    fn open_menu(&self, at: Point, items: std::rc::Rc<[crate::views::MenuItem]>) {
+        let entries: Vec<Option<std::sync::Arc<str>>> = items
             .iter()
             .map(|item| match item {
                 crate::views::MenuItem::Action { label, .. } => Some(label.clone()),
                 crate::views::MenuItem::Divider => None,
             })
             .collect();
-        *self.menu_items.borrow_mut() = Some(region.items);
-        self.interaction.borrow_mut().menu = Some(crate::layout::MenuOpen {
-            at: Point { x, y },
-            entries,
-            hovered: None,
-        });
-        true
+        *self.menu_items.borrow_mut() = Some(items);
+        self.interaction.borrow_mut().menu =
+            Some(crate::layout::MenuOpen { at, entries, hovered: None });
     }
 
     /// Closes the open menu without firing anything. `true` = one was
@@ -1454,12 +1459,26 @@ impl Runtime {
         placement: &crate::layout::CustomPlacement,
         event: crate::custom::ElementEvent,
     ) -> crate::custom::Response {
+        // the box may ASK for a menu while it answers; nothing of the
+        // scene is borrowed while it talks, so the ask parks here and
+        // is read once the box is done
+        let asked = std::cell::RefCell::new(None);
         let ctx = crate::custom::EventCtx {
             frame: placement.frame,
             visible: placement.visible,
             metrics: crate::custom::Metrics::new(&*self.text, &self.cache, placement.font),
+            menu: &asked,
         };
-        placement.element.element().event(&event, &ctx)
+        let answer = placement.element.element().event(&event, &ctx);
+        if let Some((at, items)) = asked.into_inner() {
+            // the point is the box's own, and a menu lives in the scene
+            let at = Point {
+                x: at.x + placement.frame.origin.x,
+                y: at.y + placement.frame.origin.y,
+            };
+            self.open_menu(at, items);
+        }
+        answer
     }
 
     /// A rect of the box's own coordinates, in the scene's.
