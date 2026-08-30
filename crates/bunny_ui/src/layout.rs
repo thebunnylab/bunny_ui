@@ -292,6 +292,14 @@ pub enum Cursor {
     Text,
     /// The hand: this does something when pressed.
     Pointing,
+    /// The fat cross: a rectangle of CONTENT is selected here.
+    ///
+    /// The fourth sentence, and it is not the I-beam said again — there is
+    /// no caret until a press ENTERS a cell — nor the arrow, which claims
+    /// chrome over the most emphatically content-bearing surface a sheet
+    /// has. Every platform names it: `NSCursor.crosshair`, `IDC_CROSS`,
+    /// and `cell`/`crosshair` in CSS.
+    Cell,
 }
 
 /// Padding insets, per edge.

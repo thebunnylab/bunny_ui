@@ -2442,6 +2442,7 @@ impl WindowHandle {
             Cursor::Arrow => "arrowCursor",
             Cursor::Text => "IBeamCursor",
             Cursor::Pointing => "pointingHandCursor",
+            Cursor::Cell => "crosshairCursor",
             Cursor::ResizeLeftRight => "resizeLeftRightCursor",
             Cursor::ResizeUpDown => "resizeUpDownCursor",
         };
@@ -2460,6 +2461,8 @@ pub enum Cursor {
     /// The I-beam, for text a press puts a caret in.
     Text,
     Pointing,
+    /// The crosshair, for a grid of cells a press selects a rectangle of.
+    Cell,
     ResizeLeftRight,
     ResizeUpDown,
 }

@@ -1273,6 +1273,48 @@ mod tests {
         assert_eq!(log.borrow().last(), Some(&ElementEvent::PointerExited));
     }
 
+    /// The pointer's fourth sentence: over a grid of cells it is the fat
+    /// cross, and one box is still several surfaces — the sheet's own
+    /// gutter is not its cells.
+    #[test]
+    fn a_grid_of_cells_answers_the_cross_and_its_gutter_the_arrow() {
+        struct Sheet;
+        impl CustomElement for Sheet {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn name(&self) -> &str {
+                "sheet"
+            }
+            fn cursor(&self, at: Point, _visible: Rect) -> Option<crate::layout::Cursor> {
+                Some(if at.x < 40.0 {
+                    crate::layout::Cursor::Arrow
+                } else {
+                    crate::layout::Cursor::Cell
+                })
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Screen;
+        impl Component for Screen {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                custom(Sheet)
+            }
+        }
+
+        let runtime = Runtime::new();
+        runtime.layout(&Screen, Proposal { width: Some(200.0), height: Some(100.0) });
+
+        runtime.pointer_moved(120.0, 50.0, false);
+        assert_eq!(runtime.hovered_cursor(), Some(crate::layout::Cursor::Cell));
+
+        runtime.pointer_moved(12.0, 50.0, false);
+        assert_eq!(
+            runtime.hovered_cursor(),
+            Some(crate::layout::Cursor::Arrow),
+            "the row numbers are chrome, and they are in the same box",
+        );
+    }
+
     /// A move says what the hand HOLDS, so a box can offer before the
     /// hand commits: a symbol under a held command underlines, and the
     /// reader learns the word is a door before pressing it.

@@ -1195,6 +1195,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             None => match runtime.hovered_cursor() {
                 Some(bunny_ui::layout::Cursor::Text) => ffi::Cursor::Text,
                 Some(bunny_ui::layout::Cursor::Pointing) => ffi::Cursor::Pointing,
+                Some(bunny_ui::layout::Cursor::Cell) => ffi::Cursor::Cell,
                 Some(bunny_ui::layout::Cursor::Arrow) => ffi::Cursor::Arrow,
                 None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
                 None => ffi::Cursor::Arrow,
