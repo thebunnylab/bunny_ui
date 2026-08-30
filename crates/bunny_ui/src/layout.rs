@@ -521,7 +521,18 @@ pub enum LayoutNode {
     },
     Padding { edges: Edges, child: Box<LayoutNode> },
     /// `.frame(width:height:)` — `Some` axes override proposal and answer.
-    Frame { width: Option<Px>, height: Option<Px>, child: Box<LayoutNode> },
+    ///
+    /// `align` places the child INSIDE that answer on the horizontal axis:
+    /// an exact box centres by default, as SwiftUI does, and a column of a
+    /// grid says `Start` so every cell has the same reading edge. The
+    /// vertical axis centres always — the port's `Alignment` names the
+    /// horizontal edge and nothing else.
+    Frame {
+        width: Option<Px>,
+        height: Option<Px>,
+        align: CrossAlign,
+        child: Box<LayoutNode>,
+    },
     /// `.frame(maxWidth:maxHeight:)` — `∞` = "fill what was proposed".
     MaxFrame { max_width: Px, max_height: Px, align: CrossAlign, child: Box<LayoutNode> },
     /// Vertical scroll region: answers what it was offered, measures the
@@ -2940,6 +2951,7 @@ fn menu_node(open: &MenuOpen, env: LayoutEnv) -> LayoutNode {
                     child: Box::new(LayoutNode::Frame {
                         width: None,
                         height: Some(MENU_ROW_H),
+                        align: CrossAlign::Center,
                         child: Box::new(LayoutNode::Stack {
                             axis: Axis::Horizontal,
                             spacing: 0.0,
@@ -2969,6 +2981,7 @@ fn menu_node(open: &MenuOpen, env: LayoutEnv) -> LayoutNode {
                 rows.push(LayoutNode::Frame {
                     width: None,
                     height: Some(MENU_DIVIDER_H),
+                    align: CrossAlign::Center,
                     child: Box::new(LayoutNode::Padding {
                         edges: Edges {
                             top: 4.0,
@@ -3323,7 +3336,7 @@ impl LayoutNode {
                     max_height.is_infinite() || child.is_flexible(axis, enclosing_main)
                 }
             },
-            LayoutNode::Frame { width, height, child } => match axis {
+            LayoutNode::Frame { width, height, child, .. } => match axis {
                 Axis::Horizontal => width.is_none() && child.is_flexible(axis, enclosing_main),
                 Axis::Vertical => height.is_none() && child.is_flexible(axis, enclosing_main),
             },
@@ -3732,7 +3745,7 @@ impl LayoutNode {
                 (size, Fit::Wrapped(child_size, Box::new(fit)))
             }
 
-            LayoutNode::Frame { width, height, child } => {
+            LayoutNode::Frame { width, height, child, .. } => {
                 let (child_size, fit) = child.measure(
                     Proposal {
                         width: width.or(proposal.width),
@@ -4837,10 +4850,10 @@ impl LayoutNode {
                 child.place(Rect { origin, size: child_size }, *fit, env, out);
             }
 
-            (LayoutNode::Frame { child, .. }, Fit::Wrapped(child_size, fit)) => {
+            (LayoutNode::Frame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
                 let origin = Point {
                     x: frame.origin.x
-                        + align_offset(frame.size.width, child_size.width, CrossAlign::Center),
+                        + align_offset(frame.size.width, child_size.width, *align),
                     y: frame.origin.y
                         + align_offset(frame.size.height, child_size.height, CrossAlign::Center),
                 };
@@ -6251,6 +6264,7 @@ mod tests {
             LayoutNode::Frame {
                 width: Some(48.0),
                 height: Some(280.0),
+                align: CrossAlign::Center,
                 child: Box::new(LayoutNode::Spacer),
             },
         );
@@ -6287,6 +6301,7 @@ mod tests {
             LayoutNode::Frame {
                 width: None,
                 height: Some(40.0),
+                align: CrossAlign::Center,
                 child: Box::new(LayoutNode::Fill),
             },
         );
@@ -6295,6 +6310,7 @@ mod tests {
             LayoutNode::Frame {
                 width: Some(948.0),
                 height: None,
+                align: CrossAlign::Center,
                 child: Box::new(LayoutNode::Spacer),
             },
         );
@@ -6329,6 +6345,7 @@ mod tests {
                     LayoutNode::Frame {
                         width: None,
                         height: Some(372.0),
+                        align: CrossAlign::Center,
                         child: Box::new(LayoutNode::Spacer),
                     },
                 ),
@@ -6402,6 +6419,7 @@ mod tests {
                     LayoutNode::Frame {
                         width: Some(1.0),
                         height: None,
+                        align: CrossAlign::Center,
                         child: Box::new(LayoutNode::Spacer),
                     },
                 ),
@@ -6467,6 +6485,7 @@ mod tests {
         let framed = row(LayoutNode::Frame {
             width: None,
             height: Some(0.0),
+            align: CrossAlign::Center,
             child: Box::new(LayoutNode::Spacer),
         });
         assert!(!framed.is_flexible(Axis::Vertical, None));
@@ -6501,6 +6520,7 @@ mod tests {
                 LayoutNode::Frame {
                     width: Some(1.0),
                     height: None,
+                    align: CrossAlign::Center,
                     child: Box::new(LayoutNode::Spacer),
                 },
                 boundary("b", LayoutNode::Spacer),
@@ -6553,6 +6573,7 @@ mod tests {
                         LayoutNode::Frame {
                             width: Some(1.0),
                             height: None,
+                            align: CrossAlign::Center,
                             child: Box::new(LayoutNode::Spacer),
                         },
                         boundary("b", LayoutNode::Spacer),
@@ -6610,6 +6631,7 @@ mod tests {
                         LayoutNode::Frame {
                             width: Some(1.0),
                             height: None,
+                            align: CrossAlign::Center,
                             child: Box::new(LayoutNode::Spacer),
                         },
                         boundary("b", LayoutNode::Spacer),
@@ -6659,6 +6681,7 @@ mod tests {
                 LayoutNode::Frame {
                     width: None,
                     height: Some(1.0),
+                    align: CrossAlign::Center,
                     child: Box::new(LayoutNode::Spacer),
                 },
                 boundary("bottom", LayoutNode::Spacer),
@@ -6685,6 +6708,7 @@ mod tests {
         let root = LayoutNode::Frame {
             width: None,
             height: Some(22.0),
+            align: CrossAlign::Center,
             child: Box::new(boundary("row", LayoutNode::Spacer)),
         };
         let result = layout(&root, Proposal { width: Some(300.0), height: Some(600.0) });
@@ -6692,6 +6716,77 @@ mod tests {
         assert_eq!(result.size.height, 22.0);
         assert_eq!(result.size.width, 300.0);
         assert_eq!(result.frames.get("row").unwrap().size.height, 22.0);
+    }
+
+    #[test]
+    fn an_exact_frame_places_its_child_on_the_edge_it_was_given() {
+        // A column of a grid, twice: two values of DIFFERENT widths in the
+        // same 132pt lane. On the leading edge they start at the same x —
+        // which is what a reading edge IS — and centred they start 24pt
+        // apart, one per pair of characters they differ by.
+        let lane = |path: &str, chars: usize, align: CrossAlign| LayoutNode::Frame {
+            width: Some(132.0),
+            height: Some(30.0),
+            align,
+            child: Box::new(boundary(path, text(chars))),
+        };
+        let read = |node: LayoutNode, path: &str| {
+            layout(&node, Proposal::unspecified()).frames.get(path).unwrap().origin.x
+        };
+
+        assert_eq!(read(lane("short", 4, CrossAlign::Start), "short"), 0.0);
+        assert_eq!(read(lane("long", 10, CrossAlign::Start), "long"), 0.0);
+
+        assert_eq!(read(lane("short", 4, CrossAlign::Center), "short"), 50.0);
+        assert_eq!(read(lane("long", 10, CrossAlign::Center), "long"), 26.0);
+
+        // and the trailing edge is the number column: the last character
+        // lands on the lane's right edge whatever the value measures
+        let right = |chars: usize| {
+            read(lane("n", chars, CrossAlign::End), "n") + chars as f64 * 8.0
+        };
+        assert_eq!(right(3), 132.0);
+        assert_eq!(right(7), 132.0);
+    }
+
+    #[test]
+    fn a_frame_still_centres_when_no_edge_is_named() {
+        // The default is SwiftUI's, and the alignment is the only thing
+        // the new form changes: same box, same answer, same centre.
+        let root = LayoutNode::Frame {
+            width: Some(100.0),
+            height: Some(40.0),
+            align: CrossAlign::Center,
+            child: Box::new(boundary("inner", text(5))),
+        };
+        let result = layout(&root, Proposal::unspecified());
+
+        assert_eq!(result.size, Size { width: 100.0, height: 40.0 });
+        let inner = result.frames.get("inner").unwrap();
+        assert_eq!(inner.origin, Point { x: 30.0, y: 12.0 });
+    }
+
+    #[test]
+    fn a_frame_that_aligns_still_answers_the_exact_size() {
+        // The difference from `MaxFrame`, which is why the alignment could
+        // not simply be asked of it: a ceiling hands back what the content
+        // does not use, and in a grid the returned slack is the next
+        // column's misalignment. The exact box keeps it.
+        let exact = LayoutNode::Frame {
+            width: Some(132.0),
+            height: Some(30.0),
+            align: CrossAlign::Start,
+            child: Box::new(text(4)),
+        };
+        let ceiling = LayoutNode::MaxFrame {
+            max_width: 132.0,
+            max_height: 30.0,
+            align: CrossAlign::Start,
+            child: Box::new(text(4)),
+        };
+
+        assert_eq!(layout(&exact, Proposal::unspecified()).size.width, 132.0);
+        assert_eq!(layout(&ceiling, Proposal::unspecified()).size.width, 32.0);
     }
 
     #[test]
@@ -6753,6 +6848,7 @@ mod tests {
         let root = LayoutNode::Frame {
             width: Some(100.0),
             height: None,
+            align: CrossAlign::Center,
             child: Box::new(text(5)),
         };
         let result = layout(&root, Proposal::unspecified());
@@ -7521,6 +7617,7 @@ mod tests {
         let node = LayoutNode::Frame {
             width: Some(24.0),
             height: Some(24.0),
+            align: CrossAlign::Center,
             child: Box::new(icon_node(true)),
         };
         assert_eq!(
@@ -7579,6 +7676,7 @@ mod tests {
         let node = LayoutNode::Frame {
             width: Some(40.0),
             height: Some(20.0),
+            align: CrossAlign::Center,
             child: Box::new(icon_node(true)),
         };
         let result = layout(&node, Proposal::unspecified());

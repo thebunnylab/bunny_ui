@@ -39,8 +39,8 @@ pub enum Modifier {
     Padding,
     PaddingLength(f64),
     PaddingEdge(Edge, f64),
-    FrameWH(f64, f64),
-    FrameWidth(f64),
+    FrameWH(f64, f64, Alignment),
+    FrameWidth(f64, Alignment),
     FrameHeight(f64),
     FrameMax(f64, f64, Alignment),
     HugHeight,
@@ -210,10 +210,18 @@ impl Modifier {
             Modifier::Padding => " [.padding()]".into(),
             Modifier::PaddingLength(length) => format!(" [.padding({length})]"),
             Modifier::PaddingEdge(edge, length) => format!(" [.padding({edge}, {length})]"),
-            Modifier::FrameWH(width, height) => {
+            Modifier::FrameWH(width, height, Alignment::Center) => {
                 format!(" [.frame(width: {width}, height: {height})]")
             }
-            Modifier::FrameWidth(width) => format!(" [.frame(width: {width})]"),
+            Modifier::FrameWH(width, height, alignment) => {
+                format!(" [.frame(width: {width}, height: {height}, alignment: {alignment})]")
+            }
+            Modifier::FrameWidth(width, Alignment::Center) => {
+                format!(" [.frame(width: {width})]")
+            }
+            Modifier::FrameWidth(width, alignment) => {
+                format!(" [.frame(width: {width}, alignment: {alignment})]")
+            }
             Modifier::FrameHeight(height) => format!(" [.frame(height: {height})]"),
             Modifier::FrameMax(max_width, max_height, alignment) => format!(
                 " [.frame(maxWidth: {max_width:?}, maxHeight: {max_height}, alignment: {alignment})]"
@@ -398,9 +406,10 @@ fn rewrite_scroll_node(
             edges,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
-        LayoutNode::Frame { width, height, child } => LayoutNode::Frame {
+        LayoutNode::Frame { width, height, align, child } => LayoutNode::Frame {
             width,
             height,
+            align,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
         LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
@@ -497,9 +506,10 @@ fn rewrite_field_node(
             edges,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
-        LayoutNode::Frame { width, height, child } => LayoutNode::Frame {
+        LayoutNode::Frame { width, height, align, child } => LayoutNode::Frame {
             width,
             height,
+            align,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
         LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
@@ -558,9 +568,10 @@ fn rewrite_pixel_node(
             edges,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
-        LayoutNode::Frame { width, height, child } => LayoutNode::Frame {
+        LayoutNode::Frame { width, height, align, child } => LayoutNode::Frame {
             width,
             height,
+            align,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
         LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
@@ -1048,19 +1059,23 @@ fn apply(
             }
             wrap_padding(out, mark, edges);
         }
-        Modifier::FrameWH(width, height) => {
+        Modifier::FrameWH(width, height, alignment) => {
             let (width, height) = (Some(*width), Some(*height));
+            let align = crate::views::cross_align(*alignment);
             out.wrap_layout_from(mark, |node| LayoutNode::Frame {
                 width,
                 height,
+                align,
                 child: Box::new(node),
             });
         }
-        Modifier::FrameWidth(width) => {
+        Modifier::FrameWidth(width, alignment) => {
             let width = Some(*width);
+            let align = crate::views::cross_align(*alignment);
             out.wrap_layout_from(mark, |node| LayoutNode::Frame {
                 width,
                 height: None,
+                align,
                 child: Box::new(node),
             });
         }
@@ -1069,6 +1084,9 @@ fn apply(
             out.wrap_layout_from(mark, |node| LayoutNode::Frame {
                 width: None,
                 height,
+                // the width is the child's own answer, so there is no room
+                // to place it in: the horizontal edge has nothing to say
+                align: crate::layout::CrossAlign::Center,
                 child: Box::new(node),
             });
         }

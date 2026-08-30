@@ -621,6 +621,79 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_frame_hands_a_column_its_reading_edge() {
+        // The grid's case, measured the way the photograph measured it: a
+        // fixed lane needs the exact box AND the value on the reading
+        // edge. Centred, two values of different lengths start at two
+        // different x — a column with no edge to read from.
+        #[derive(Clone, Copy)]
+        struct Lane(Alignment);
+
+        impl Component for Lane {
+            fn body(self, _ctx: &Context) -> impl View {
+                let cell = move |value: &'static str| {
+                    text(value).frame_width_aligned(132.0, self.0)
+                };
+                vstack!(cell("Ada"), cell("Augusta Ada King"))
+            }
+        }
+
+        // and the modifier that reads like the answer and is not: it
+        // aligns a run's LINES among themselves, so a one-line cell comes
+        // out where it started
+        #[derive(Clone, Copy)]
+        struct Multiline;
+
+        impl Component for Multiline {
+            fn body(self, _ctx: &Context) -> impl View {
+                let cell = |value: &'static str| {
+                    text(value)
+                        .frame_width(132.0)
+                        .multiline_text_alignment(TextAlignment::Leading)
+                };
+                vstack!(cell("Ada"), cell("Augusta Ada King"))
+            }
+        }
+
+        let size = crate::layout::Size { width: 400.0, height: 100.0 };
+        // a Runtime memoizes its root: one per component VALUE, or the
+        // second alignment reads the first one's tree
+        let text_x = |component: &dyn Fn(&Runtime) -> crate::layout::DisplayList,
+                      needle: &str| {
+            let runtime = Runtime::new();
+            component(&runtime)
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { origin, content, .. }
+                        if content.as_ref() == needle =>
+                    {
+                        Some(origin.x)
+                    }
+                    _ => None,
+                })
+                .expect("the cell paints")
+        };
+        let lane = |align: Alignment| {
+            move |runtime: &Runtime| runtime.display_frame(&Lane(align), size)
+        };
+        let multiline = move |runtime: &Runtime| runtime.display_frame(&Multiline, size);
+
+        // one edge, every row — a 3-character value and a 16-character
+        // one begin at the same x
+        assert_eq!(text_x(&lane(Alignment::Leading), "Ada"), 0.0);
+        assert_eq!(text_x(&lane(Alignment::Leading), "Augusta Ada King"), 0.0);
+
+        // centred, the lane has no reading edge: the two rows begin 52pt
+        // apart, one per pair of characters they differ by
+        assert_eq!(text_x(&lane(Alignment::Center), "Ada"), 54.0);
+        assert_eq!(text_x(&lane(Alignment::Center), "Augusta Ada King"), 2.0);
+
+        // and the modifier that reads like the answer leaves them there
+        assert_eq!(text_x(&multiline, "Ada"), 54.0);
+        assert_eq!(text_x(&multiline, "Augusta Ada King"), 2.0);
+    }
+
+    #[test]
     fn rows_share_a_first_baseline_and_boxes_sit_on_their_bottom() {
         #[derive(Clone, Copy)]
         struct Rowline;
@@ -9445,6 +9518,7 @@ mod tests {
         let node = LayoutNode::Frame {
             width: Some(20.0),
             height: Some(40.0),
+            align: CrossAlign::Center,
             child: Box::new(LayoutNode::Image {
                 source: Some(source),
                 resizable: true,
@@ -11170,3 +11244,4 @@ mod tests {
         );
     }
 }
+

@@ -154,11 +154,12 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
-    /// `.frame(width: 120, height: 80)`
+    /// `.frame(width: 120, height: 80)` — the box is exact and the
+    /// content CENTRES in it, as SwiftUI's does.
     fn frame(self, width: f64, height: f64) -> Modified<Self> {
         Modified {
             base: self,
-            modifier: Modifier::FrameWH(width, height),
+            modifier: Modifier::FrameWH(width, height, Alignment::Center),
         }
     }
 
@@ -169,7 +170,37 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     fn frame_width(self, width: f64) -> Modified<Self> {
         Modified {
             base: self,
-            modifier: Modifier::FrameWidth(width),
+            modifier: Modifier::FrameWidth(width, Alignment::Center),
+        }
+    }
+
+    /// `.frame(width: 132, height: 30, alignment: .leading)` — the exact
+    /// box of [`ViewExt::frame`], with the content placed in it.
+    ///
+    /// A column of a grid needs BOTH halves at once: the box is exact, or
+    /// the header slides off its own column by a point per column crossed;
+    /// and the content sits on the reading edge, or a name column has no
+    /// margin to read from and a number column loses the aligned decimal
+    /// point that is the reason the column exists.
+    ///
+    /// The modifier that reads like the answer is not: `.multiline_text_alignment`
+    /// is SwiftUI's `multilineTextAlignment`, which aligns a run's lines
+    /// AMONG THEMSELVES and never moves the block inside its frame — a
+    /// one-line cell comes out identical with it and without it. What
+    /// places the block is this, the `alignment:` of the frame itself.
+    fn frame_aligned(self, width: f64, height: f64, alignment: Alignment) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::FrameWH(width, height, alignment),
+        }
+    }
+
+    /// `.frame(width: 132, alignment: .leading)` — the single-axis twin of
+    /// [`ViewExt::frame_aligned`], for the lane whose height is the row's.
+    fn frame_width_aligned(self, width: f64, alignment: Alignment) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::FrameWidth(width, alignment),
         }
     }
 

@@ -304,7 +304,7 @@ impl Walk<'_> {
                 Self::inherit_stretch(&mut container);
                 out.push(container);
             }
-            LayoutNode::Frame { width, height, child } => {
+            LayoutNode::Frame { width, height, align, child } => {
                 let outer_slot = self.slot;
                 self.slot = (*width, *height);
                 let mut container = node(DomKind::FlexColumn);
@@ -312,11 +312,11 @@ impl Walk<'_> {
                     let layout = container.layout.as_mut().expect("flow node");
                     layout.width = *width;
                     layout.height = *height;
-                    // a frame CENTERS its child — the cross axis obeys
-                    // align, the main one the browser's default; v1
-                    // concedes exact centring to the flow (Exact
-                    // restores it)
-                    layout.align = Some(align_code(CrossAlign::Center));
+                    // a frame places its child on the edge it was given —
+                    // the cross axis obeys align, the main one the
+                    // browser's default; v1 concedes exact centring to
+                    // the flow (Exact restores it)
+                    layout.align = Some(align_code(*align));
                 }
                 self.lower_into(child, &mut container.children);
                 self.slot = outer_slot;
@@ -1041,6 +1041,28 @@ mod tests {
             highlights: None,
             truncation: None,
         }
+    }
+
+    /// The exact box says WHERE on the second road too: the browser
+    /// places the child with the same edge the scene does, so a column
+    /// of a grid reads the same in both.
+    #[test]
+    fn an_exact_frame_carries_its_edge_to_the_flow() {
+        let lane = |align: CrossAlign| LayoutNode::Frame {
+            width: Some(132.0),
+            height: Some(30.0),
+            align,
+            child: Box::new(text_node("Ada")),
+        };
+        let offsets = HashMap::default();
+        let code = |align: CrossAlign| {
+            let scene = lower(&lane(align), &env_fixture(&offsets)).scene;
+            scene.children[0].layout.as_ref().expect("flow").align
+        };
+
+        assert_eq!(code(CrossAlign::Start), Some(align_code(CrossAlign::Start)));
+        assert_eq!(code(CrossAlign::Center), Some(align_code(CrossAlign::Center)));
+        assert_eq!(code(CrossAlign::End), Some(align_code(CrossAlign::End)));
     }
 
     /// The native host lowers to the browser's own island: an iframe

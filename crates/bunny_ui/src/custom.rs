@@ -959,6 +959,7 @@ mod tests {
                 LayoutNode::Frame {
                     width: None,
                     height: Some(30.0),
+                    align: CrossAlign::Center,
                     child: Box::new(LayoutNode::Spacer),
                 },
                 node(bar),
@@ -1016,6 +1017,7 @@ mod tests {
             child: Box::new(LayoutNode::Frame {
                 width: None,
                 height: Some(400.0),
+                align: CrossAlign::Center,
                 child: Box::new(node(bar)),
             }),
         };
