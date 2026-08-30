@@ -85,6 +85,10 @@ unsafe extern "C" {
     fn CTFontCopyFamilyName(font: CTFontRef) -> CFStringRef;
     static kCTFontAttributeName: CFStringRef;
     static kCTForegroundColorFromContextAttributeName: CFStringRef;
+    /// The extra advance after each character of the range — CoreText's
+    /// name for what the design calls tracking and CSS calls
+    /// `letter-spacing`.
+    static kCTKernAttributeName: CFStringRef;
     /// Add a face to THIS PROCESS's font list. Nothing outside the app
     /// sees it, and it goes away with the app.
     fn CTFontManagerRegisterGraphicsFont(font: *mut c_void, error: *mut *const c_void) -> bool;
@@ -139,7 +143,15 @@ unsafe extern "C" {
         value: *const c_void,
     );
     static kCFBooleanTrue: *const c_void;
+    fn CFNumberCreate(
+        allocator: *const c_void,
+        number_type: isize,
+        value: *const c_void,
+    ) -> *const c_void;
 }
+
+/// `kCFNumberDoubleType` — the f64 the kern attribute reads.
+const CF_NUMBER_DOUBLE: isize = 13;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -294,9 +306,9 @@ unsafe fn create_upright(spec: &FontSpec) -> CTFontRef {
 }
 
 /// The text's CTLine with the font + context color (the color enters as
-/// fill color at draw time — no CGColor created). The caller releases the
-/// line.
-unsafe fn make_line(text: &str, font: CTFontRef) -> CTLineRef {
+/// fill color at draw time — no CGColor created), and the tracking the
+/// run asked for. The caller releases the line.
+unsafe fn make_line(text: &str, font: CTFontRef, tracking: f64) -> CTLineRef {
     unsafe {
         let string = cf_string(text);
         let attributed = CFAttributedStringCreateMutable(std::ptr::null(), 0);
@@ -313,6 +325,18 @@ unsafe fn make_line(text: &str, font: CTFontRef) -> CTLineRef {
             kCTForegroundColorFromContextAttributeName,
             kCFBooleanTrue,
         );
+        // a kern of zero is kerning TURNED OFF, not "no extra space" —
+        // so the attribute is set only when the run asked for spacing,
+        // and every other line keeps the face's own pairs
+        if tracking != 0.0 {
+            let kern = CFNumberCreate(
+                std::ptr::null(),
+                CF_NUMBER_DOUBLE,
+                std::ptr::from_ref(&tracking).cast(),
+            );
+            CFAttributedStringSetAttribute(attributed, range, kCTKernAttributeName, kern);
+            CFRelease(kern);
+        }
         let line = CTLineCreateWithAttributedString(attributed as *const c_void);
         CFRelease(attributed as *const c_void);
         CFRelease(string);
@@ -456,7 +480,7 @@ impl TextEngine for CoreTextEngine {
                 // line height preserved without creating a CTLine
                 return LineMetrics { width: 0.0, ascent, descent };
             }
-            let line = make_line(text, ct_font);
+            let line = make_line(text, ct_font, font.tracking);
             let width = CTLineGetTypographicBounds(
                 line,
                 std::ptr::null_mut(),
@@ -488,7 +512,9 @@ impl TextEngine for CoreTextEngine {
         let ct_font = self.font(font);
         let mut rgba = vec![0u8; width * height * 4];
         unsafe {
-            let line = make_line(text, ct_font);
+            // the SAME line the measurement built: what is drawn is what
+            // was measured, tracking included
+            let line = make_line(text, ct_font, font.tracking);
             let space = CGColorSpaceCreateDeviceRGB();
             let context = CGBitmapContextCreate(
                 rgba.as_mut_ptr() as *mut c_void,
@@ -612,6 +638,38 @@ mod tests {
         for (start, end) in lines.iter() {
             assert!(text.is_char_boundary(*start) && text.is_char_boundary(*end));
         }
+    }
+
+    #[test]
+    fn core_text_measures_the_tracking_it_is_given() {
+        let engine = CoreTextEngine::new();
+        let text = "No server in between.";
+        let plain = FontSpec { size: 40.0, ..FontSpec::DEFAULT };
+        let closed = FontSpec { tracking: -1.2, ..plain };
+        let opened = FontSpec { tracking: 1.2, ..plain };
+
+        let loose = engine.measure_line(text, &plain).width;
+        let tight = engine.measure_line(text, &closed).width;
+        let wide = engine.measure_line(text, &opened).width;
+
+        // 21 characters at 1.2pt each — the trailing one included, which
+        // is what SwiftUI's `.tracking` does
+        let step = text.chars().count() as f64 * 1.2;
+        assert!(
+            (loose - tight - step).abs() < 0.5,
+            "closing by 1.2 takes {step} off the line: {loose} → {tight}",
+        );
+        assert!(
+            (wide - loose - step).abs() < 0.5,
+            "and opening by 1.2 adds the same: {loose} → {wide}",
+        );
+
+        // the raster follows the measure, or the line would be drawn
+        // into a box of the wrong width
+        let raster = engine
+            .raster_line(text, &closed, Color::hex(0xFFFFFF), 1)
+            .expect("the line paints");
+        assert_eq!(raster.width, tight.ceil() as usize);
     }
 
     #[test]

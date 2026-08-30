@@ -132,7 +132,7 @@ pub mod prelude {
         Point, Proposal, Px, Rect, Rendering, Side, Size, Truncation, UnitPoint, VisualProps,
     };
     pub use crate::theme::{self, Theme};
-    pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
+    pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Tracking, Weight};
     pub use crate::text_input::{CaretState, EditCommand};
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
     pub use crate::runtime::{Edited, ImeSnapshot, LiveBlit, Runtime};
@@ -618,6 +618,71 @@ mod tests {
         let rect = runtime.ime_rect_for(2).expect("focused field answers");
         assert_eq!(rect.origin.x, field.text_origin.x + 16.0);
         assert!(rect.size.height > 0.0);
+    }
+
+    #[test]
+    fn tracking_closes_a_line_the_column_could_not_hold() {
+        // PAIN-92's own arithmetic, in the house font: 21 characters at
+        // 8pt measure 168, and a column of 160 cannot hold them. Closed
+        // by -0.5 per character the same run measures 157.5 and fits —
+        // one line, where without it there would be two.
+        #[derive(Clone, Copy)]
+        struct Headline(bool);
+
+        impl Component for Headline {
+            fn body(self, _ctx: &Context) -> impl View {
+                let run = text("No server in between.");
+                if self.0 {
+                    Either::First(run.tracking(-0.5))
+                } else {
+                    Either::Second(run)
+                }
+            }
+        }
+
+        let wide = Runtime::new()
+            .layout(&Headline(false), crate::layout::Proposal::unspecified())
+            .size;
+        let closed = Runtime::new()
+            .layout(&Headline(true), crate::layout::Proposal::unspecified())
+            .size;
+
+        assert_eq!(wide.width, 168.0);
+        assert_eq!(closed.width, 157.5, "21 characters, half a point closer each");
+
+        // and in a 160pt column the loose one takes a second line while
+        // the closed one stays on the first — which is the whole case
+        let column = crate::layout::Proposal { width: Some(160.0), height: None };
+        let loose_h = Runtime::new().layout(&Headline(false), column).size.height;
+        let closed_h = Runtime::new().layout(&Headline(true), column).size.height;
+        assert!(loose_h > closed_h, "{loose_h} > {closed_h}: the loose run wraps");
+    }
+
+    #[test]
+    fn tracking_in_em_resolves_against_the_size_it_lands_on() {
+        // The design token is `.22em`, not "8.8pt": it must follow the
+        // size wherever the run is used, and it must not care whether
+        // the size was named before or after it.
+        let base = FontSpec { size: 40.0, ..FontSpec::DEFAULT };
+        let em = crate::text_engine::FontPatch {
+            tracking: Some(Tracking::Em(0.22)),
+            ..crate::text_engine::FontPatch::default()
+        };
+        assert_eq!(em.apply_over(base).tracking, 8.8);
+
+        // named together with a size, the em resolves against THAT size
+        let resized = crate::text_engine::FontPatch {
+            size: Some(10.0),
+            tracking: Some(Tracking::Em(0.22)),
+            ..crate::text_engine::FontPatch::default()
+        };
+        assert_eq!(resized.apply_over(base).tracking, 2.2);
+
+        // and two trackings are two cache entries, or the second run
+        // would be drawn with the first one's raster
+        let loose = FontSpec { tracking: 1.0, ..base };
+        let tight = FontSpec { tracking: -1.0, ..base };
+        assert_ne!(loose.key(), tight.key());
     }
 
     #[test]

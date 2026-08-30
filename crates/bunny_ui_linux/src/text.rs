@@ -329,7 +329,9 @@ impl FreeTypeEngine {
     /// "does the primary face cover this char" (charmap probe); the
     /// uncovered runs shape with a fontconfig-charset fallback face —
     /// basic per-run fallback, the documented v1 scope.
-    fn shape(&self, text: &str, key: &FaceKey) -> Option<(Vec<Shaped>, i64)> {
+    /// `tracking` is 26.6 units of extra advance after EVERY glyph, in
+    /// the same scale as the key's face — what the design calls tracking.
+    fn shape(&self, text: &str, key: &FaceKey, tracking: i64) -> Option<(Vec<Shaped>, i64)> {
         let primary = self.face(key)?;
         let mut runs: Vec<(Face, std::ops::Range<usize>)> = Vec::new();
         let mut run_start = 0;
@@ -389,7 +391,7 @@ impl FreeTypeEngine {
                         x: pen + position.x_offset as i64,
                         y: position.y_offset as i64,
                     });
-                    pen += position.x_advance as i64;
+                    pen += position.x_advance as i64 + tracking;
                 }
                 hb_buffer_destroy(buffer);
             }
@@ -421,6 +423,11 @@ impl FreeTypeEngine {
             (ascent, descent + gap)
         }
     }
+}
+
+/// Points as FreeType's 26.6 fixed point.
+fn fixed_26_6(points: f64) -> i64 {
+    (points * 64.0).round() as i64
 }
 
 #[derive(Clone, Copy)]
@@ -475,8 +482,8 @@ impl TextEngine for FreeTypeEngine {
         let (ascent, descent) = self.line_box(primary);
         // width includes trailing whitespace — the caret_from_x law
         let width = self
-            .shape(text, &key)
-            .map(|(_, advance)| advance as f64 / 64.0)
+            .shape(text, &key, fixed_26_6(font.tracking))
+            .map(|(_, advance)| (advance as f64 / 64.0).max(0.0))
             .unwrap_or(0.0);
         LineMetrics { width, ascent, descent }
     }
@@ -492,7 +499,8 @@ impl TextEngine for FreeTypeEngine {
         let key = Self::key(font, scale);
         let primary = self.face(&key)?;
         let (ascent, descent) = self.line_box(primary);
-        let (shaped, advance) = self.shape(text, &key)?;
+        // the face is built at `scale`, so the spacing is too
+        let (shaped, advance) = self.shape(text, &key, fixed_26_6(font.tracking * scale as f64))?;
         let width = (advance as f64 / 64.0).ceil() as usize;
         let baseline = ascent.ceil() as usize;
         let height = baseline + descent.ceil() as usize;

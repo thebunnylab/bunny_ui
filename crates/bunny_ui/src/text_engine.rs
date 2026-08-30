@@ -108,6 +108,20 @@ impl Family {
     }
 }
 
+/// How far apart the letters of a run sit, said the way a design system
+/// says it: in POINTS, or in EM of the size that ends up resolved.
+///
+/// The em form is the one a design token is written in — a wordmark at
+/// `.22em`, a display headline at `-.03em` — and it survives a change of
+/// size, which the multiplication at the call site does not.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Tracking {
+    /// Points, straight through.
+    Points(Px),
+    /// A fraction of the resolved size — `.22em` is `Em(0.22)`.
+    Em(Px),
+}
+
 /// A resolved font — what the layout carries and the engine consumes.
 /// `size` is fractional by contract (10.5px is a real dense-UI case).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -118,6 +132,10 @@ pub struct FontSpec {
     pub slant: Slant,
     /// The family the app named, or the system's own.
     pub family: Family,
+    /// Extra advance after every character, in POINTS — SwiftUI's
+    /// `.tracking`, the CSS `letter-spacing`. Already resolved: an em
+    /// became points against this spec's own size.
+    pub tracking: Px,
 }
 
 impl FontSpec {
@@ -127,6 +145,7 @@ impl FontSpec {
         design: FontDesign::Default,
         slant: Slant::Upright,
         family: Family::SYSTEM,
+        tracking: 0.0,
     };
 
     /// The API text styles, in desktop metrics.
@@ -149,6 +168,7 @@ impl FontSpec {
             design: FontDesign::Default,
             slant: Slant::Upright,
             family: Family::SYSTEM,
+            tracking: 0.0,
         }
     }
 
@@ -167,6 +187,7 @@ impl FontSpec {
             design: self.design,
             family: self.family,
             slant: self.slant,
+            tracking_milli: (self.tracking * 1000.0).round() as i32,
         }
     }
 }
@@ -182,6 +203,10 @@ pub struct FontKey {
     /// In the KEY as well: an upright and a leaning line are two
     /// rasters, and one cache entry must never answer for the other.
     slant: Slant,
+    /// And so are two trackings — the same string at two spacings is
+    /// two widths and two rasters. Signed: tracking closes a line as
+    /// often as it opens one.
+    tracking_milli: i32,
 }
 
 /// A partial font patch for inheritance: `.font(…)` sets all three
@@ -194,6 +219,9 @@ pub struct FontPatch {
     pub design: Option<FontDesign>,
     pub slant: Option<Slant>,
     pub family: Option<Family>,
+    /// Unresolved on purpose: an em only becomes points once the size
+    /// it rides on is known, which is here and not at the call site.
+    pub tracking: Option<Tracking>,
 }
 
 impl FontPatch {
@@ -208,16 +236,26 @@ impl FontPatch {
             design: self.design.or(outer.design),
             slant: self.slant.or(outer.slant),
             family: self.family.or(outer.family),
+            tracking: self.tracking.or(outer.tracking),
         }
     }
 
     pub fn apply_over(&self, base: FontSpec) -> FontSpec {
+        let size = self.size.unwrap_or(base.size);
         FontSpec {
-            size: self.size.unwrap_or(base.size),
+            size,
             weight: self.weight.unwrap_or(base.weight),
             design: self.design.unwrap_or(base.design),
             slant: self.slant.unwrap_or(base.slant),
             family: self.family.unwrap_or(base.family),
+            // an em resolves against the size THIS patch lands on, so
+            // `.tracking_em(.22).font_size(40)` and the two written the
+            // other way round mean the same thing
+            tracking: match self.tracking {
+                Some(Tracking::Points(points)) => points,
+                Some(Tracking::Em(em)) => em * size,
+                None => base.tracking,
+            },
         }
     }
 }
@@ -289,9 +327,12 @@ const PIXEL_DESCENT: Px = 3.0;
 const PIXEL_ADVANCE: Px = 8.0;
 
 impl TextEngine for PixelFont {
-    fn measure_line(&self, text: &str, _font: &FontSpec) -> LineMetrics {
+    fn measure_line(&self, text: &str, font: &FontSpec) -> LineMetrics {
+        // the cell is fixed and the SPACING is not: tracking is a
+        // measure the layout asked for, so the house font answers it
+        // even though it ignores size, weight and design
         LineMetrics {
-            width: text.chars().count() as Px * PIXEL_ADVANCE,
+            width: (text.chars().count() as Px * (PIXEL_ADVANCE + font.tracking)).max(0.0),
             ascent: PIXEL_ASCENT,
             descent: PIXEL_DESCENT,
         }
@@ -300,7 +341,7 @@ impl TextEngine for PixelFont {
     fn raster_line(
         &self,
         text: &str,
-        _font: &FontSpec,
+        font: &FontSpec,
         color: Color,
         scale: usize,
     ) -> Option<TextRaster> {
@@ -308,10 +349,20 @@ impl TextEngine for PixelFont {
         if chars.is_empty() {
             return None;
         }
-        let width = chars.len() * 8 * scale;
+        let advance = PIXEL_ADVANCE + font.tracking;
+        let width = (chars.len() as Px * advance * scale as Px).round().max(0.0) as usize;
+        if width == 0 {
+            return None;
+        }
         let height = 16 * scale;
         let mut rgba = vec![0u8; width * height * 4];
         let mut set = |x: usize, y: usize| {
+            // a closed-up line overlaps its own cells, and the last one
+            // can reach past the raster: what falls outside the box is
+            // dropped, never wrapped onto the next row
+            if x >= width {
+                return;
+            }
             let index = (y * width + x) * 4;
             rgba[index] = color.r;
             rgba[index + 1] = color.g;
@@ -324,7 +375,8 @@ impl TextEngine for PixelFont {
         let block = 2 * scale;
         for (index, ch) in chars.iter().enumerate() {
             let Some(rows) = glyph(*ch) else { continue };
-            let cell_x = (index * 8 + 1) * scale;
+            let pen = (index as Px * advance).round().max(0.0) as usize;
+            let cell_x = (pen + 1) * scale;
             let cell_y = 3 * scale;
             for row in 0..5usize {
                 for col in 0..3usize {

@@ -27,6 +27,7 @@ use crate::effects;
 use crate::erased::Erased;
 use crate::layout::Color;
 use crate::modifier::{DropTargetView, Modified, Modifier};
+use crate::text_engine::Tracking;
 use crate::view::{Single, View, short_type_name};
 use crate::views::Alignment;
 use motor::views::{ContentMode, Edge, Font, ListStyle, ProgressViewStyle, TextAlignment};
@@ -51,6 +52,45 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified {
             base: self,
             modifier: Modifier::FontSize(size),
+        }
+    }
+
+    /// `.tracking(-1.2)` — the space after every character, in points:
+    /// SwiftUI's `.tracking`, the CSS `letter-spacing`.
+    ///
+    /// It is a MEASURE, not a decoration. A display headline the design
+    /// closes by `-.03em` is a headline that fits its column; without the
+    /// tracking the same face measures wider, the line breaks, and the
+    /// block below it moves. So the value travels with the font — it is
+    /// in the cache key, the engine measures with it, and what is drawn
+    /// is what was measured.
+    ///
+    /// Added after EVERY character, the last one included, which is what
+    /// SwiftUI's `.tracking` does (its `.kerning` is the other one, and
+    /// this port has no such form yet).
+    ///
+    /// Where it lands: the house pixel font, CoreText on the mac and
+    /// FreeType on Linux. DirectWrite and the browser's own text ignore
+    /// it for now — they measure and draw the same run they always did,
+    /// which is a run without the spacing, never a run that measures one
+    /// way and paints another.
+    fn tracking(self, points: f64) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Tracking(Tracking::Points(points)),
+        }
+    }
+
+    /// `.tracking_em(0.22)` — the same measure said in EM of the size
+    /// that ends up resolved, which is how a design system writes it.
+    ///
+    /// The em resolves against the font the run actually gets, so a
+    /// wordmark keeps its letterspacing when the size changes and the
+    /// call site never multiplies anything.
+    fn tracking_em(self, em: f64) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Tracking(Tracking::Em(em)),
         }
     }
 

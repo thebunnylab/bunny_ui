@@ -22,7 +22,7 @@ use motor::view::RenderNode;
 
 use crate::erased::CustomModifier;
 use crate::layout::{Color, CrossAlign, Edges, LayoutNode, TextHighlight, Truncation, VisualProps};
-use crate::text_engine::{FontDesign, FontPatch, FontSpec, Weight};
+use crate::text_engine::{FontDesign, FontPatch, FontSpec, Tracking, Weight};
 use crate::state_ext::BindingExt;
 use crate::view::{NodeList, Single, View};
 use crate::views::{Alignment, wrap_layout};
@@ -42,6 +42,7 @@ pub enum Modifier {
     FrameWH(f64, f64, Alignment),
     FrameWidth(f64, Alignment),
     FrameHeight(f64),
+    Tracking(Tracking),
     FrameMax(f64, f64, Alignment),
     HugHeight,
     NavigationTitle(String),
@@ -223,6 +224,8 @@ impl Modifier {
                 format!(" [.frame(width: {width}, alignment: {alignment})]")
             }
             Modifier::FrameHeight(height) => format!(" [.frame(height: {height})]"),
+            Modifier::Tracking(Tracking::Points(points)) => format!(" [.tracking({points})]"),
+            Modifier::Tracking(Tracking::Em(em)) => format!(" [.tracking({em}em)]"),
             Modifier::FrameMax(max_width, max_height, alignment) => format!(
                 " [.frame(maxWidth: {max_width:?}, maxHeight: {max_height}, alignment: {alignment})]"
             ),
@@ -1245,6 +1248,14 @@ fn apply(
             mark,
             VisualProps {
                 font: FontPatch { size: Some(*size), ..FontPatch::default() },
+                ..VisualProps::default()
+            },
+        ),
+        Modifier::Tracking(tracking) => wrap_styled(
+            out,
+            mark,
+            VisualProps {
+                font: FontPatch { tracking: Some(*tracking), ..FontPatch::default() },
                 ..VisualProps::default()
             },
         ),
