@@ -2450,11 +2450,16 @@ impl Placement {
         }
     }
 
-    /// The command carries this node's OWN box; the stack keeps the
-    /// intersection, because a hit consults the stack. Snapping and
-    /// intersecting commute (round is monotone), so the consumers'
-    /// own stacks land on the same integers the old pre-intersected
-    /// command did — byte for byte.
+    /// The command carries the INTERSECTED window, the same rect the
+    /// stack keeps. It used to carry this node's own box on the theory
+    /// that every consumer rebuilds the stack and re-intersects — but the
+    /// island carve deliberately does not (it re-wraps a lifted command
+    /// in the clip commands that governed it where it stood), so a raw
+    /// box wider than its scroll viewport let a lifted command paint far
+    /// outside the region a reader ever saw it in. Intersection is
+    /// idempotent and associative, so consumers that DO re-intersect land
+    /// on the same integers either way; emitting the intersection is
+    /// strictly narrowing, never a second semantics.
     fn push_clip(&mut self, rect: Rect, corner_radius: impl Into<Corners>) {
         let clipped = match self.clip.last() {
             Some(top) => rect
@@ -2462,7 +2467,10 @@ impl Placement {
                 .unwrap_or(Rect { origin: rect.origin, size: Size::default() }),
             None => rect,
         };
-        self.draw(DrawCommand::PushClip { rect, corner_radius: corner_radius.into() });
+        self.draw(DrawCommand::PushClip {
+            rect: clipped,
+            corner_radius: corner_radius.into(),
+        });
         self.clip.push(clipped);
     }
 
