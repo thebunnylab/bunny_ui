@@ -2610,7 +2610,15 @@ fn frame_repeats(
 }
 
 thread_local! {
+    /// The main window's presenter.
     static PRESENTER: RefCell<Option<MetalPresenter>> = const { RefCell::new(None) };
+    /// One presenter per grafted DIALOG view (D127: a dialog is a real
+    /// window, and a real window resizes on the GPU road like the main
+    /// one — a CPU raster of a whole 1220×820 dialog on every step of a
+    /// drag was the difference between a fluid workbench and a dialog
+    /// that lagged its own corner).
+    static VIEW_PRESENTERS: RefCell<HashMap<usize, MetalPresenter>> =
+        RefCell::new(HashMap::new());
 }
 
 impl MetalPresenter {
@@ -2805,18 +2813,45 @@ impl MetalPresenter {
 /// compile) prints one line and falls back — a window never fails to
 /// open because of Metal.
 pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool {
-    if std::env::var("BUNNY_PRESENT").ok().as_deref() == Some("cpu") {
-        return false;
+    match graft(view, scale, width, height) {
+        Some(presenter) => {
+            PRESENTER.with(|slot| *slot.borrow_mut() = Some(presenter));
+            true
+        }
+        None => false,
     }
-    let Some(stack) = MetalStack::create(PIXEL_FORMAT_BGRA8) else {
-        return false;
-    };
+}
+
+/// The same graft on a DIALOG's view — a window of its own, presented
+/// by its own layer and its own presenter, keyed by the view (a dialog
+/// is pooled reusable-dead and never re-grafted). False leaves the view
+/// on the CPU road, exactly as before.
+pub(crate) fn try_install_view(view: Id, scale: f64, width: f64, height: f64) -> bool {
+    match graft(view, scale, width, height) {
+        Some(presenter) => {
+            VIEW_PRESENTERS.with(|slot| {
+                slot.borrow_mut().insert(view as usize, presenter);
+            });
+            true
+        }
+        None => false,
+    }
+}
+
+/// Builds a presenter over a fresh CAMetalLayer on `view`, or answers
+/// `None` when the GPU road is refused (`BUNNY_PRESENT=cpu`) or cannot
+/// come up. Touches nothing on `None`.
+fn graft(view: Id, scale: f64, width: f64, height: f64) -> Option<MetalPresenter> {
+    if std::env::var("BUNNY_PRESENT").ok().as_deref() == Some("cpu") {
+        return None;
+    }
+    let stack = MetalStack::create(PIXEL_FORMAT_BGRA8)?;
     unsafe {
         let pool = objc_autoreleasePoolPush();
         let layer = msg_id(msg_id(class("CAMetalLayer"), sel("alloc")), sel("init"));
         if layer.is_null() {
             objc_autoreleasePoolPop(pool);
-            return false;
+            return None;
         }
         let scale = scale.round().max(1.0);
         msg_void_id(layer, sel("setDevice:"), stack.device);
@@ -2860,9 +2895,8 @@ pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool
             &bunny_ui::text_engine::PixelFont,
             &bunny_ui::image_engine::RawImages::default(),
         );
-        PRESENTER.with(|slot| *slot.borrow_mut() = Some(presenter));
         objc_autoreleasePoolPop(pool);
-        true
+        Some(presenter)
     }
 }
 
@@ -2870,6 +2904,37 @@ pub(crate) fn try_install(view: Id, scale: f64, width: f64, height: f64) -> bool
 /// frame on this, never mid-flight.
 pub(crate) fn active() -> bool {
     PRESENTER.with(|slot| slot.borrow().is_some())
+}
+
+/// Presents one frame on a grafted DIALOG view. False when the view was
+/// never grafted, and the caller takes the CPU road for it.
+pub(crate) fn present_view(
+    view: Id,
+    display: &DisplayList,
+    size: Size,
+    scale: usize,
+    canvas: Color,
+    text: &dyn TextEngine,
+    images: &dyn ImageEngine,
+) -> bool {
+    VIEW_PRESENTERS.with(|slot| {
+        let mut presenters = slot.borrow_mut();
+        let Some(presenter) = presenters.get_mut(&(view as usize)) else {
+            return false;
+        };
+        presenter.present(display, size, scale, canvas, text, images);
+        true
+    })
+}
+
+/// [`arm_transaction`] for a grafted dialog view — the dialog's own
+/// delegate speaks for its own drag. A view on the CPU road is a no-op.
+pub(crate) fn arm_transaction_view(view: Id, live: bool) {
+    VIEW_PRESENTERS.with(|slot| {
+        if let Some(presenter) = slot.borrow_mut().get_mut(&(view as usize)) {
+            presenter.set_transactional(live);
+        }
+    });
 }
 
 /// Arms (or disarms) the layer's transactional present, from AppKit's

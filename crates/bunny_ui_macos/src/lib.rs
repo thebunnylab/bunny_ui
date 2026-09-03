@@ -763,6 +763,21 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         // No BLEED and no backdrop sampling — the
                         // chrome and the shadow are the system's own.
                         let slice = full_display.translated_slice(overlay.display, -x, -y);
+                        // the GPU road first: a grafted dialog presents
+                        // its slice on its own layer, and pays no
+                        // Surface, no RGBA mirror and no blit — which is
+                        // the whole of what a resize step used to cost
+                        if metal::present_view(
+                            dialog.view(),
+                            &slice,
+                            Size { width: w, height: h },
+                            scale,
+                            canvas,
+                            &*runtime.text(),
+                            &*runtime.images(),
+                        ) {
+                            continue;
+                        }
                         let physical =
                             ((w.round() as usize) * scale, (h.round() as usize) * scale);
                         let mut kept = dialog_surfaces.borrow_mut();

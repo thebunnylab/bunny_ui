@@ -1991,15 +1991,20 @@ pub enum DialogChrome {
 }
 
 /// What the shell needs to raise a dialog's window: the title, who
-/// draws its top edge, and the smallest content it may shrink to —
-/// which is also the size it OPENS at, centered over the parent.
-/// Where the user then drags or resizes it to is the shell's to
-/// report back (`Runtime::set_dialog_frame`); layout follows the
-/// window, never the other way around.
+/// draws its top edge, the smallest content it may shrink to, and the
+/// size it OPENS at, centered over the parent — the floor unless
+/// [`DialogSpec::opens_at`] says otherwise. Where the user then drags
+/// or resizes it to is the shell's to report back
+/// (`Runtime::set_dialog_frame`); layout follows the window, never the
+/// other way around.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DialogSpec {
     pub title: Arc<str>,
     pub min: Size,
+    /// The size the dialog opens at, when it is not the floor. Read it
+    /// through [`DialogSpec::opening_size`], which never answers under
+    /// the floor.
+    pub open: Option<Size>,
     pub chrome: DialogChrome,
 }
 
@@ -2010,15 +2015,34 @@ impl DialogSpec {
         Self {
             title: title.into(),
             min: Size { width: 320.0, height: 240.0 },
+            open: None,
             chrome: DialogChrome::Native,
         }
     }
 
-    /// The smallest content the window may shrink to — and the size
-    /// the dialog opens at.
+    /// The smallest content the window may shrink to — and, unless
+    /// [`DialogSpec::opens_at`] says otherwise, the size it opens at.
     pub fn min_size(mut self, width: Px, height: Px) -> Self {
         self.min = Size { width, height };
         self
+    }
+
+    /// The size the dialog opens at, over the floor: a window designed
+    /// at 1220×820 that may still be dragged down to 720×480. A size
+    /// under the floor opens at the floor.
+    pub fn opens_at(mut self, width: Px, height: Px) -> Self {
+        self.open = Some(Size { width, height });
+        self
+    }
+
+    /// The size the dialog opens at — the floor, or what `opens_at`
+    /// said, whichever is larger on each axis.
+    #[must_use]
+    pub fn opening_size(&self) -> Size {
+        self.open.map_or(self.min, |open| Size {
+            width: open.width.max(self.min.width),
+            height: open.height.max(self.min.height),
+        })
     }
 
     /// The content owns the top edge ([`DialogChrome::Scene`]): no
@@ -3097,7 +3121,8 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
         // a dialog rides the frame its WINDOW is at: the shell holds
         // it (`Runtime::set_dialog_frame`) and the user drags, resizes
         // or zooms it there. On the first open nothing is held and it
-        // centres at its minimum, exactly the sheet it degrades to on
+        // centres at its opening size — the floor, unless the spec
+        // names a larger one — exactly the sheet it degrades to on
         // shells without windows. Its content is measured with the
         // frame's OWN proposal — the window drives, the content
         // follows — never the other way around.
@@ -3114,19 +3139,22 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
                             height: frame.size.height.max(spec.min.height),
                         },
                     },
-                    None => Rect {
-                        origin: Point {
-                            x: room.origin.x
-                                + align_offset(room.size.width, spec.min.width, CrossAlign::Center),
-                            y: room.origin.y
-                                + align_offset(
-                                    room.size.height,
-                                    spec.min.height,
-                                    CrossAlign::Center,
-                                ),
-                        },
-                        size: spec.min,
-                    },
+                    None => {
+                        let open = spec.opening_size();
+                        Rect {
+                            origin: Point {
+                                x: room.origin.x
+                                    + align_offset(room.size.width, open.width, CrossAlign::Center),
+                                y: room.origin.y
+                                    + align_offset(
+                                        room.size.height,
+                                        open.height,
+                                        CrossAlign::Center,
+                                    ),
+                            },
+                            size: open,
+                        }
+                    }
                 })
             }
             _ => None,

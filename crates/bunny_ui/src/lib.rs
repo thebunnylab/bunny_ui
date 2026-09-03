@@ -7808,6 +7808,63 @@ mod tests {
         );
     }
 
+    /// A dialog designed at one size and dragged down to another: it
+    /// OPENS at what `opens_at` names, centred, and the floor stays the
+    /// smaller number the window may shrink to — two facts, not one.
+    #[test]
+    fn a_dialog_opens_at_its_named_size_over_a_smaller_floor() {
+        use crate::layout::{DialogSpec, Point, Proposal, Rect, Size};
+
+        const WINDOW: Size = Size { width: 1400.0, height: 1000.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            open: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("the page").frame(WINDOW.width, WINDOW.height).dialog(
+                    self.open.binding(),
+                    DialogSpec::titled("Settings").min_size(300.0, 200.0).opens_at(900.0, 600.0),
+                    |_| erased(text("the settings")),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { open: State::new(true) };
+        let first = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let dialog = &first.overlays[0];
+        assert_eq!(dialog.frame.size, Size { width: 900.0, height: 600.0 }, "opens at the named size");
+        assert_eq!(
+            (dialog.frame.origin.x, dialog.frame.origin.y),
+            (250.0, 200.0),
+            "centred at THAT size, not the floor's",
+        );
+        let OverlaySurface::Window(spec) = &dialog.surface else {
+            panic!("a dialog asks for a window")
+        };
+        assert_eq!(spec.min, Size { width: 300.0, height: 200.0 }, "the floor is still the floor");
+
+        // the reader shrank it under the opening size but over the floor
+        let path = dialog.path.clone();
+        runtime.set_dialog_frame(
+            &path,
+            Rect { origin: Point { x: 10.0, y: 10.0 }, size: Size { width: 400.0, height: 300.0 } },
+        );
+        let shrunk = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(
+            shrunk.overlays[0].frame.size,
+            Size { width: 400.0, height: 300.0 },
+            "the opening size is not a cage",
+        );
+
+        // and an opening size under the floor is the floor
+        let spec = DialogSpec::titled("x").min_size(300.0, 200.0).opens_at(100.0, 500.0);
+        assert_eq!(spec.opening_size(), Size { width: 300.0, height: 500.0 });
+        assert_eq!(DialogSpec::titled("x").opening_size(), Size { width: 320.0, height: 240.0 });
+    }
+
     /// The window drives, the content follows: the frame the shell
     /// reports (`set_dialog_frame`) is the frame the dialog lays out
     /// in — and it never goes under the spec's minimum, because the

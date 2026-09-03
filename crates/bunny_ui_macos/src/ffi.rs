@@ -1490,6 +1490,25 @@ extern "C" fn bunny_dialog_frame_changed(_this: Id, _sel: Sel, note: Id) {
     dispatch_to(window, AppEvent::Redraw);
 }
 
+/// The dialog's own word that a drag is starting — its presenter arms
+/// its transaction here, for the reason the main window's does
+/// ([`bunny_window_will_start_live_resize`]): the first resized frame
+/// has to already run under the contract.
+extern "C" fn bunny_dialog_will_start_live_resize(_this: Id, _sel: Sel, note: Id) {
+    let window = unsafe { msg_id(note, sel("object")) };
+    let view = unsafe { msg_id(window, sel("contentView")) };
+    crate::metal::arm_transaction_view(view, true);
+}
+
+/// The hand let go of a dialog: the contract comes off and one exact
+/// frame lands, like the main window's own end-of-drag.
+extern "C" fn bunny_dialog_did_end_live_resize(this: Id, sel_: Sel, note: Id) {
+    let window = unsafe { msg_id(note, sel("object")) };
+    let view = unsafe { msg_id(window, sel("contentView")) };
+    crate::metal::arm_transaction_view(view, false);
+    bunny_dialog_frame_changed(this, sel_, note);
+}
+
 /// Key travels on a dialog like on the main window — cmd-tab away
 /// pauses the decorations and closes the dialog's own popovers (the
 /// dialog itself stands: it is a window).
@@ -1944,11 +1963,18 @@ unsafe fn register_classes() {
             bunny_dialog_frame_changed as *const c_void,
             types.as_ptr(),
         );
-        // the exact final frame, once the hand lets go
+        // the drag's two ends: the presenter's contract goes on before
+        // the first resized frame and comes off with the exact final one
+        class_addMethod(
+            dialog,
+            sel("windowWillStartLiveResize:"),
+            bunny_dialog_will_start_live_resize as *const c_void,
+            types.as_ptr(),
+        );
         class_addMethod(
             dialog,
             sel("windowDidEndLiveResize:"),
-            bunny_dialog_frame_changed as *const c_void,
+            bunny_dialog_did_end_live_resize as *const c_void,
             types.as_ptr(),
         );
         class_addMethod(
@@ -1978,6 +2004,11 @@ pub struct WindowHandle {
 }
 
 impl WindowHandle {
+    /// The content view — the key a grafted presenter is filed under.
+    pub(crate) fn view(&self) -> Id {
+        self.view
+    }
+
     /// Logical size of the content area (the layout viewport).
     pub fn content_size(&self) -> (f64, f64) {
         unsafe {
@@ -3192,7 +3223,17 @@ pub fn create_dialog(
 
         let view = msg_id(class("BunnyView"), sel("alloc"));
         let view = msg_init_rect(view, sel("initWithFrame:"), rect);
-        // CPU present only: no metal graft, like the panels
+        // the GPU graft, BEFORE setWantsLayer: — the main window's own
+        // discipline. A dialog is a real window that the reader
+        // resizes, and a CPU raster of its whole content on every step
+        // of the drag is what made one lag its own corner. Refused or
+        // failed, the view stays on the CPU road (blit_partial).
+        let _ = crate::metal::try_install_view(
+            view,
+            msg_f64(parent.window, sel("backingScaleFactor")),
+            width,
+            height,
+        );
         msg_void_bool(view, sel("setWantsLayer:"), 1);
         msg_void_id(window, sel("setContentView:"), view);
 
