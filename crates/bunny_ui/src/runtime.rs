@@ -219,6 +219,15 @@ pub struct Runtime {
     /// drops it — the tooltip's own idiom, and the reason `cmd-k` can
     /// never hold the keyboard for good.
     pending_aged: Cell<bool>,
+    /// Who hears the sequence move — a which-key panel's door. Called
+    /// with the strokes in the air after every change: a stroke that
+    /// opened or lengthened a sequence, and the end of one, however it
+    /// ended (an action, a dead end, Escape, the slow tick).
+    chord_sink: RefCell<Option<Rc<dyn Fn(&[KeyPattern])>>>,
+    /// Whether the sink has heard the sequence now in the air — so its
+    /// end is announced exactly when its start was, and a plain stroke
+    /// (pushed and resolved in one breath) says nothing at all.
+    chord_announced: Cell<bool>,
     /// The size last HANDED to each measurement probe. A probe fires on
     /// change and only on change: a view at rest costs nothing, and a
     /// handler that writes state cannot spin against its own report.
@@ -950,6 +959,8 @@ impl Runtime {
             scoped_keymap: RefCell::new(HashMap::default()),
             chords: RefCell::new(Vec::new()),
             pending: RefCell::new(Vec::new()),
+            chord_sink: RefCell::new(None),
+            chord_announced: Cell::new(false),
             pending_aged: Cell::new(false),
             measures: RefCell::new(HashMap::default()),
             scroll_commands: RefCell::new(HashMap::default()),
@@ -2201,7 +2212,11 @@ impl Runtime {
                 (None, false) => Some(KeyMatch::None),
             }
         };
-        let Some(answer) = answer else { return KeyMatch::Pending };
+        let Some(answer) = answer else {
+            // the sequence is in the air: a which-key panel hears it now
+            self.announce_chord();
+            return KeyMatch::Pending;
+        };
         // whatever it was, the sequence is over
         let strokes = self.pending.borrow().len();
         self.cancel_chord();
@@ -2238,10 +2253,32 @@ impl Runtime {
     /// Drops a sequence in the air. `true` = one was held.
     pub fn cancel_chord(&self) -> bool {
         self.pending_aged.set(false);
-        let mut pending = self.pending.borrow_mut();
-        let held = !pending.is_empty();
-        pending.clear();
+        let held = {
+            let mut pending = self.pending.borrow_mut();
+            let held = !pending.is_empty();
+            pending.clear();
+            held
+        };
+        if self.chord_announced.replace(false) {
+            self.announce_chord();
+        }
         held
+    }
+
+    /// Installs who hears the sequence move: the sink is called with the
+    /// strokes in the air after every change — the door a which-key panel
+    /// reads through, since the app's bodies never see a stroke. One sink;
+    /// installing another replaces it.
+    pub fn observe_chord(&self, sink: impl Fn(&[KeyPattern]) + 'static) {
+        *self.chord_sink.borrow_mut() = Some(Rc::new(sink));
+    }
+
+    fn announce_chord(&self) {
+        let sink = self.chord_sink.borrow().clone();
+        let Some(sink) = sink else { return };
+        let pending = self.pending.borrow().clone();
+        self.chord_announced.set(!pending.is_empty());
+        sink(&pending);
     }
 
     /// The slow clock, aging a pending prefix: the SECOND tick drops

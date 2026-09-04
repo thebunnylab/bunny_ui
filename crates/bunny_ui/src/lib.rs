@@ -8748,6 +8748,47 @@ mod tests {
         assert!(runtime.pending_chord().is_empty());
     }
 
+    /// The sink hears every move of the sequence: the stroke that opens
+    /// it, the one that ends it (an action or a dead end), Escape, and the
+    /// slow tick — and hears nothing about a plain stroke that started
+    /// nothing.
+    #[test]
+    fn a_chord_sink_hears_every_change_of_the_sequence() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use crate::action::KeyMatch;
+        const KEYMAP: ActionId = ActionId("open keymap");
+        const SAVE: ActionId = ActionId("save");
+        let runtime = Runtime::new();
+        let k = KeyPattern::command(Key::Char('k'));
+        let s_key = KeyPattern::command(Key::Char('s'));
+        let x = KeyPattern::command(Key::Char('x'));
+        runtime.bind_sequence(&[k, s_key], KEYMAP);
+        runtime.bind(s_key, SAVE);
+        let heard: Rc<RefCell<Vec<Vec<KeyPattern>>>> = Rc::default();
+        let sink = Rc::clone(&heard);
+        runtime.observe_chord(move |pending| sink.borrow_mut().push(pending.to_vec()));
+
+        assert_eq!(runtime.chord(&s_key), KeyMatch::Action(SAVE));
+        assert!(heard.borrow().is_empty(), "a plain stroke opens nothing, and says nothing");
+
+        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(heard.borrow().as_slice(), [vec![k]], "the opener is heard");
+        assert_eq!(runtime.chord(&s_key), KeyMatch::Action(KEYMAP));
+        assert_eq!(heard.borrow().last().map(Vec::len), Some(0), "the end is heard as empty");
+
+        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(&x), KeyMatch::None);
+        assert_eq!(heard.borrow().last().map(Vec::len), Some(0), "a dead end too");
+
+        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        let _ = runtime.chord_tick();
+        assert_eq!(heard.borrow().last(), Some(&vec![k]), "one tick keeps it");
+        assert!(runtime.chord_tick());
+        assert_eq!(heard.borrow().last().map(Vec::len), Some(0), "the second lets go, and says so");
+    }
+
     #[test]
     fn the_key_table_can_be_emptied_so_a_cascade_re_installs() {
         use crate::layout::{Proposal, Size};
