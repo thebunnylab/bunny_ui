@@ -808,8 +808,16 @@ impl Walk<'_> {
             // "native view" is an iframe, and the island contract is
             // the one the DOM already enforces
             LayoutNode::Host { spec, .. } => {
-                let crate::host::HostSpec::Webview { url, .. } = spec;
-                let mut frame = node(DomKind::Iframe { src: std::rc::Rc::clone(url) });
+                let crate::host::HostSpec::Webview { url, document, .. } = spec;
+                // a document rides SEALED: the browser's sandbox with no
+                // powers holds it as `srcdoc`, its policy at its head —
+                // never the url, which the policy forbade
+                let mut frame = node(match document {
+                    Some(document) => {
+                        DomKind::Iframe { src: std::rc::Rc::clone(&document.html), sealed: true }
+                    }
+                    None => DomKind::Iframe { src: std::rc::Rc::clone(url), sealed: false },
+                });
                 let layout = frame.layout.as_mut().expect("flow node");
                 // a page is a filler on both axes by construction — it
                 // grows along the stack and stretches across it; a
@@ -1057,6 +1065,7 @@ mod tests {
                 LayoutNode::Host {
                     path: "pane".into(),
                     spec: crate::host::HostSpec::Webview {
+                        document: None,
                         url: "https://example.test/docs".into(),
                         scripts: Vec::new().into(),
                         console: false,
@@ -1071,13 +1080,50 @@ mod tests {
         let row = &scene.children[0];
         let pane = &row.children[1];
         assert!(
-            matches!(&pane.kind, DomKind::Iframe { src } if &**src == "https://example.test/docs"),
+            matches!(
+                &pane.kind,
+                DomKind::Iframe { src, sealed: false } if &**src == "https://example.test/docs"
+            ),
             "the host is an iframe with its url: {:?}",
             pane.kind
         );
         let layout = pane.layout.as_ref().expect("flow");
         assert!(layout.grow, "the page takes the leftover");
         assert!(layout.stretch, "and follows the cross axis");
+    }
+
+    /// A DOCUMENT lowers to the same iframe, sealed: the page rides
+    /// as the frame's own document — never its url, which the policy
+    /// forbade — and the seal stands at its head.
+    #[test]
+    fn a_document_lowers_to_a_sealed_iframe() {
+        let document = crate::host::Document::new(
+            "<p>a letter</p>",
+            "https://mail.test/",
+            crate::host::NetworkPolicy::Deny,
+        );
+        let tree = LayoutNode::Host {
+            path: "letter".into(),
+            spec: crate::host::HostSpec::Webview {
+                url: "about:blank".into(),
+                document: Some(document.clone()),
+                scripts: Vec::new().into(),
+                console: false,
+                requests: false,
+                full_motion: false,
+            },
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let pane = &scene.children[0];
+        match &pane.kind {
+            DomKind::Iframe { src, sealed: true } => {
+                assert_eq!(**src, *document.html);
+                assert!(src.starts_with("<meta http-equiv=\"Content-Security-Policy\""));
+                assert!(!src.contains("about:blank"), "never the url the policy forbade");
+            }
+            other => panic!("the document is a sealed iframe: {other:?}"),
+        }
     }
 
     /// The dream mapping: a vstack with spacing IS a flex column with

@@ -3533,6 +3533,13 @@ impl Runtime {
         segments
     }
 
+    /// The shell reports: a link in a DOCUMENT was activated — the
+    /// engine did not follow it. Routed to the retained `on_link`;
+    /// `false` = nothing listening, and the link goes nowhere.
+    pub fn webview_linked(&self, path: &str, url: &str) -> bool {
+        reconciler::run_webview_linked(path, url)
+    }
+
     /// The shell reports: the engine committed a navigation. Routed to
     /// the page's retained `on_navigate`; `false` = nothing listening.
     pub fn webview_navigated(&self, path: &str, url: &str) -> bool {

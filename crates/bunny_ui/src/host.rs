@@ -16,11 +16,22 @@
 //! webview("https://docs.example.dev")
 //! ```
 //!
+//! The same engine also shows a document the app already HOLDS — a
+//! letter, a rendered preview — from memory, under a network policy
+//! the engine enforces on every fetch, with its links handed to the
+//! app instead of followed:
+//!
+//! ```ignore
+//! webview_html(&letter, "https://mail.example/", NetworkPolicy::Deny)
+//!     .on_link(move |url| open_in_browser(url))
+//! ```
+//!
 //! This is a different door from `canvas` and `custom`, which paint
 //! with the framework's own commands and clip like everything else.
 //! The host is for content that arrives with its own renderer.
 
 use std::cell::RefCell;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use motor::state::Context;
@@ -40,7 +51,15 @@ pub enum HostSpec {
     /// injected at document start, on every navigation, so a page
     /// never renders before the instrumentation is in place.
     Webview {
+        /// Where the engine is pointed — or `about:blank` while a
+        /// `document` rides, so a backend that does not serve
+        /// documents shows an empty page rather than a network load
+        /// the policy forbade.
         url: Rc<str>,
+        /// A page from MEMORY, sealed under its network policy — the
+        /// engine loads it instead of `url`, and follows none of its
+        /// links (they report through `on_link`).
+        document: Option<Document>,
         scripts: Rc<[Rc<str>]>,
         /// The app listens to the page's console — a backend that
         /// serves it by injected hook only pays the hook when this is
@@ -56,6 +75,122 @@ pub enum HostSpec {
         /// passes through, like any browser's.
         full_motion: bool,
     },
+}
+
+/// What a document shown from memory may reach over the network —
+/// the policy [`webview_html`] takes. It is enforced by the ENGINE, on
+/// every fetch, before a byte leaves the machine: the policy rides at
+/// the document's head as its Content-Security-Policy, which every
+/// engine this framework hosts honours for images, stylesheets, fonts,
+/// frames, media, scripts and the fetches a script would make. A
+/// document under a policy runs no script of its own; the app's user
+/// scripts, injected by the engine, still run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NetworkPolicy {
+    /// Nothing leaves the machine. What the document carries inline —
+    /// a `data:` image, its own styles — still shows. The default,
+    /// and the one a letter from a stranger deserves.
+    #[default]
+    Deny,
+    /// Remote IMAGES load, over http and https; everything else stays
+    /// denied. The "load remote content" switch a mail reader flips
+    /// per message or per sender.
+    RemoteImages,
+}
+
+impl NetworkPolicy {
+    /// The policy as the Content-Security-Policy the engine enforces.
+    /// `form-action 'none'` rides along: a document is read, not
+    /// filled in and sent.
+    pub fn csp(self) -> &'static str {
+        match self {
+            NetworkPolicy::Deny => {
+                "default-src 'none'; img-src data:; media-src data:; font-src data:; \
+                 style-src 'unsafe-inline'; form-action 'none'"
+            }
+            NetworkPolicy::RemoteImages => {
+                "default-src 'none'; img-src data: http: https:; media-src data:; \
+                 font-src data:; style-src 'unsafe-inline'; form-action 'none'"
+            }
+        }
+    }
+
+    /// Seals `html` under this policy: the policy's CSP, then `base`
+    /// (when there is one), stand at the document's head, AHEAD of
+    /// anything the document brought — so no element of the document
+    /// is parsed before the policy is. A leading doctype keeps its
+    /// place (standards mode stays the document's to choose; the
+    /// tokenizer ends a doctype at the first `>`, so nothing that
+    /// loads can hide in one). A byte-order mark is dropped. The
+    /// document's own CSP, if it carries one, can only tighten this
+    /// one — policies combine, they never loosen.
+    pub fn seal(self, html: &str, base: &str) -> String {
+        let html = html.strip_prefix('\u{feff}').unwrap_or(html);
+        let mut head = String::from("<meta http-equiv=\"Content-Security-Policy\" content=\"");
+        head.push_str(self.csp());
+        head.push_str("\">");
+        if !base.is_empty() {
+            head.push_str("<base href=\"");
+            for character in base.chars() {
+                match character {
+                    '&' => head.push_str("&amp;"),
+                    '"' => head.push_str("&quot;"),
+                    '<' => head.push_str("&lt;"),
+                    '>' => head.push_str("&gt;"),
+                    other => head.push(other),
+                }
+            }
+            head.push_str("\">");
+        }
+        let split = leading_doctype_end(html);
+        let mut sealed = String::with_capacity(head.len() + html.len());
+        sealed.push_str(&html[..split]);
+        sealed.push_str(&head);
+        sealed.push_str(&html[split..]);
+        sealed
+    }
+}
+
+/// Where a doctype that opens `html` ends — the byte after its `>` —
+/// or 0 when the document does not open with one. Whitespace before
+/// it is the document's, and stays.
+fn leading_doctype_end(html: &str) -> usize {
+    let trimmed = html.trim_start_matches(['\t', '\n', '\x0C', '\r', ' ']);
+    let lead = html.len() - trimmed.len();
+    let opens = trimmed.get(..9).is_some_and(|open| open.eq_ignore_ascii_case("<!doctype"));
+    match trimmed.find('>') {
+        Some(close) if opens => lead + close + 1,
+        _ => 0,
+    }
+}
+
+/// A page shown from MEMORY — what [`webview_html`] puts in the spec.
+/// Built once, at the view; the shells load it verbatim.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Document {
+    /// The html, sealed under `policy` — see [`NetworkPolicy::seal`].
+    /// What every engine loads, verbatim.
+    pub html: Rc<str>,
+    /// Where the document's relative references resolve; empty for
+    /// none. Sealed into the head as well, for the engine that has no
+    /// door of its own for a base.
+    pub base: Rc<str>,
+    pub policy: NetworkPolicy,
+    /// A fingerprint of the sealed html — what a shell's stamp
+    /// compares, so a body that runs again with the same letter never
+    /// reloads it, and a changed letter always does.
+    pub digest: u64,
+}
+
+impl Document {
+    /// Seals `html` under `policy` and fingerprints the result.
+    pub fn new(html: &str, base: impl Into<Rc<str>>, policy: NetworkPolicy) -> Document {
+        let base = base.into();
+        let sealed = policy.seal(html, &base);
+        let mut hasher = DefaultHasher::new();
+        sealed.hash(&mut hasher);
+        Document { html: Rc::from(sealed), base, policy, digest: hasher.finish() }
+    }
 }
 
 /// What a webview backend can serve — the capability table of
@@ -323,7 +458,9 @@ impl WebviewHandle {
 #[derive(Clone)]
 pub struct WebviewView {
     url: Rc<str>,
+    document: Option<Document>,
     scripts: Vec<Rc<str>>,
+    on_link: Option<crate::reconciler::WebviewReport>,
     on_navigate: Option<crate::reconciler::WebviewReport>,
     on_navigate_failed: Option<crate::reconciler::WebviewFailure>,
     on_message: Option<crate::reconciler::WebviewReport>,
@@ -342,9 +479,26 @@ impl WebviewView {
         self
     }
 
+    /// A link in a DOCUMENT was activated — see [`webview_html`]. The
+    /// document never follows it: the click lands here, with the
+    /// link's url, and the app decides (open it in the browser, look
+    /// at it first, refuse it). A `target="_blank"` link lands here
+    /// too. Without this hook a link in a document does nothing. A
+    /// page shown by url follows its own links, and this never fires.
+    ///
+    /// ```ignore
+    /// webview_html(&letter, base, NetworkPolicy::Deny)
+    ///     .on_link(move |url| open_in_browser(url))
+    /// ```
+    pub fn on_link(mut self, action: impl Fn(&str) + 'static) -> WebviewView {
+        self.on_link = Some(Rc::new(action));
+        self
+    }
+
     /// The page moved: fires with the committed url — the engine's own
     /// navigations included (a link click is a navigation the app
-    /// never asked for, and history wants it anyway).
+    /// never asked for, and history wants it anyway). A document
+    /// commits once, at its base.
     pub fn on_navigate(mut self, action: impl Fn(&str) + 'static) -> WebviewView {
         self.on_navigate = Some(Rc::new(action));
         self
@@ -430,7 +584,8 @@ impl View for WebviewView {
         // key the platform view by — the box still holds its space, it
         // just mounts nothing
         let path = motor::identity::cursor_scope().unwrap_or_default();
-        let listening = self.on_navigate.is_some()
+        let listening = self.on_link.is_some()
+            || self.on_navigate.is_some()
             || self.on_navigate_failed.is_some()
             || self.on_message.is_some()
             || self.on_console.is_some()
@@ -443,6 +598,7 @@ impl View for WebviewView {
             crate::reconciler::attribute_webview(
                 path.clone(),
                 crate::reconciler::WebviewHooks {
+                    linked: self.on_link.clone(),
                     navigated: self.on_navigate.clone(),
                     failed: self.on_navigate_failed.clone(),
                     posted: self.on_message.clone(),
@@ -456,6 +612,7 @@ impl View for WebviewView {
             path,
             spec: HostSpec::Webview {
                 url: self.url.clone(),
+                document: self.document.clone(),
                 scripts: self.scripts.clone().into(),
                 console: self.on_console.is_some(),
                 requests: self.on_request.is_some(),
@@ -479,7 +636,9 @@ impl View for WebviewView {
 pub fn webview(url: impl Into<Rc<str>>) -> WebviewView {
     WebviewView {
         url: url.into(),
+        document: None,
         scripts: Vec::new(),
+        on_link: None,
         on_navigate: None,
         on_navigate_failed: None,
         on_message: None,
@@ -487,5 +646,103 @@ pub fn webview(url: impl Into<Rc<str>>) -> WebviewView {
         on_request: None,
         handle: None,
         full_motion: false,
+    }
+}
+
+/// A document the app already holds, shown from MEMORY by the OS's
+/// own engine — no file written, no url fetched — under a network
+/// policy the engine enforces on every fetch. The document is an
+/// island: it runs no script of its own, sends no form, and follows
+/// none of its links — a link reports through
+/// [`WebviewView::on_link`] and the app decides. `base` is where its
+/// relative references resolve (empty for none). The reader of a
+/// letter from a stranger:
+///
+/// ```ignore
+/// webview_html(&message.html, &message.base, NetworkPolicy::Deny)
+///     .on_link(move |url| app.open(url))
+/// ```
+///
+/// A message from a trusted sender loads its remote images with
+/// `NetworkPolicy::RemoteImages` — the app's call, per message. Every
+/// other door of the widget serves the document too: user scripts,
+/// the bus, eval, the snapshot, the hand.
+pub fn webview_html(
+    html: impl AsRef<str>,
+    base: impl Into<Rc<str>>,
+    policy: NetworkPolicy,
+) -> WebviewView {
+    let mut view = webview("about:blank");
+    view.document = Some(Document::new(html.as_ref(), base, policy));
+    view
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seal stands AHEAD of the document: nothing the document
+    /// brought is parsed before the policy is, and a doctype that
+    /// opens it keeps its place.
+    #[test]
+    fn a_sealed_document_opens_with_its_policy() {
+        let sealed = NetworkPolicy::Deny.seal("<p>hi</p>", "");
+        assert!(sealed.starts_with("<meta http-equiv=\"Content-Security-Policy\" content=\""));
+        assert!(sealed.ends_with("\"><p>hi</p>"), "{sealed}");
+        assert!(!sealed.contains("<base"), "no base, no base tag");
+
+        let sealed =
+            NetworkPolicy::Deny.seal("  <!DOCTYPE html>\n<html>", "https://a.test/?x=1&y=\"2\"");
+        assert!(
+            sealed.starts_with("  <!DOCTYPE html><meta http-equiv="),
+            "the doctype keeps its place, the seal follows it: {sealed}"
+        );
+        assert!(
+            sealed.contains("<base href=\"https://a.test/?x=1&amp;y=&quot;2&quot;\">\n<html>"),
+            "the base is escaped and stands before the document: {sealed}"
+        );
+
+        // a byte-order mark is dropped; a doctype that never closes is
+        // the whole document, and the seal goes first
+        assert!(NetworkPolicy::Deny.seal("\u{feff}<b>", "").starts_with("<meta"));
+        assert!(NetworkPolicy::Deny.seal("<!doctype html", "").starts_with("<meta"));
+        // a comment before the doctype is not a doctype: the seal
+        // goes first, ahead of it
+        assert!(NetworkPolicy::Deny.seal("<!-- x --><!DOCTYPE html>", "").starts_with("<meta"));
+    }
+
+    /// Deny lets nothing out; RemoteImages opens exactly the image
+    /// sources over the web, and nothing else.
+    #[test]
+    fn the_policy_names_what_may_leave() {
+        let deny = NetworkPolicy::Deny.csp();
+        assert!(deny.starts_with("default-src 'none'"));
+        assert!(deny.contains("img-src data:;"), "inline images stay: {deny}");
+        assert!(!deny.contains("http"), "nothing over the web: {deny}");
+        assert!(deny.contains("form-action 'none'"));
+
+        let images = NetworkPolicy::RemoteImages.csp();
+        assert!(images.contains("img-src data: http: https:;"), "{images}");
+        assert_eq!(
+            images.matches("http").count(),
+            2,
+            "only the image source names the web: {images}"
+        );
+        assert_eq!(NetworkPolicy::default(), NetworkPolicy::Deny);
+    }
+
+    /// The fingerprint follows the letter, not the allocation: the
+    /// same letter built twice stamps the same, a changed one differs.
+    #[test]
+    fn a_document_is_fingerprinted_by_its_letter() {
+        let one = Document::new("<p>a</p>", "https://a.test/", NetworkPolicy::Deny);
+        let two = Document::new("<p>a</p>", "https://a.test/", NetworkPolicy::Deny);
+        assert_eq!(one.digest, two.digest);
+        assert_eq!(one, two);
+        let other = Document::new("<p>b</p>", "https://a.test/", NetworkPolicy::Deny);
+        assert_ne!(one.digest, other.digest);
+        let looser = Document::new("<p>a</p>", "https://a.test/", NetworkPolicy::RemoteImages);
+        assert_ne!(one.digest, looser.digest, "the policy is part of the letter");
+        assert!(one.html.contains("<base href=\"https://a.test/\">"));
     }
 }

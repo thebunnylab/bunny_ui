@@ -15,7 +15,12 @@ and the response-received event, richer than the injected wraps),
 synthetic input by protocol with `isTrusted` true, and the sandwich
 riding owned per-pixel-alpha popups;
 `cargo run -p bunny-ui-windows --example browser_window` is that
-proof, `--drive` its witness. WebKitGTK is open.*
+proof, `--drive` its witness. A document from MEMORY under a network
+policy — `webview_html`, the reader of a letter from a stranger —
+stands on both engines and in the web lowering;
+`cargo run -p bunny-ui-macos --example letter_window -- --drive` is
+its proof, measured against a witness on the loopback. WebKitGTK is
+open.*
 
 An app sometimes has to show a web page — the preview of the thing it
 is building, a documentation site, an OAuth dance. Bundling a browser
@@ -152,6 +157,58 @@ discipline `.task` already uses: the page posts, the app receives —
 and everything the page sends back rides that one channel, the eval
 answers included.
 
+## A document from memory
+
+The same box shows a page the app already HOLDS — a letter, a
+rendered preview — from memory, with no file written and no url
+fetched:
+
+```rust
+webview_html(&letter, "https://mail.example/", NetworkPolicy::Deny)
+    .on_link(move |url| open_in_browser(url))
+```
+
+Three things the url door does not promise, and this one does.
+
+The document is under a **network policy** the engine enforces on
+every fetch, before a byte leaves the machine. `Deny` lets nothing
+out — no image, stylesheet, font, frame, media or script of the
+document's own — while what it carries inline (a `data:` image, its
+own styles) still shows. `RemoteImages` opens exactly the remote
+images, over http and https, and nothing else: the "load remote
+content" switch a mail reader flips per message or per sender. The
+policy rides at the document's head as its Content-Security-Policy,
+which every engine this framework hosts honours, ahead of anything
+the document brought; a policy the document carries of its own can
+only tighten it. A document runs no script of its own and sends no
+form. The app's user scripts, injected by the engine, still run — and
+so do eval, the bus, the snapshot and the hand.
+
+The document **never moves**. A link the person activates — a
+`target="_blank"` one included — is cancelled and reported through
+`on_link` with its url, and the app decides; a refresh the document
+wrote, a form, a subframe, the engine's own reload (which would fetch
+the base) are cancelled without a word. `base` is where the
+document's relative references resolve; `on_navigate` reports it
+once, at the commit. A body that runs again with the same letter
+never reloads it — the spec carries a fingerprint, not a comparison
+of pages — and a changed letter always does.
+
+One thing stays honestly outside. The policy governs fetches; a hint
+that is not one — a DNS prefetch — is the sanitizer's to strip before
+the letter arrives here. A reader shows a stranger's html sanitized,
+and the policy is the belt under it.
+
+On macOS the document loads by `loadHTMLString:baseURL:`, and the
+navigation delegate answers the engine's every ask with the rule
+above. On Windows it loads by `NavigateToString` — a two-megabyte
+door; a larger letter is refused by name on `on_navigate_failed` —
+with the base sealed into its head, the starting leg cancelling what
+the rule forbids and the new-window ask handled. In the web lowering
+the frame holds the document as `srcdoc` inside a sandbox with no
+powers, where a link is inert: the web leg has no road to hand it
+back, and says so here rather than opening it in the pane.
+
 ## Capabilities
 
 The three engines do not offer the same instrumentation, and the API
@@ -167,6 +224,7 @@ like a quiet page.
 | synthetic input | NSEvent, trusted | native | open question |
 | media emulation (full motion) | no² | CDP `Emulation.setEmulatedMedia` | open question |
 | devtools | external inspector | built in | embeddable |
+| a document under a policy | `loadHTMLString`, CSP | `NavigateToString`, CSP | open |
 
 ¹ Engine-ready, core door open: the engine can hand a response body
 over, but no hook of this API carries bytes yet — so the backend does

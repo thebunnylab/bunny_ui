@@ -292,9 +292,19 @@ impl Tree {
                         .insert("transform", format!("translate({}, {})", px(*x), px(*y)));
                 }
             }
-            DomPatch::SetIframe { id, src } => {
+            DomPatch::SetIframe { id, src, sealed } => {
                 if let Some(element) = self.elements.get_mut(id) {
-                    element.attrs.insert("src", src.to_string());
+                    if *sealed {
+                        // a document: the sandbox with no powers, and
+                        // the page itself instead of a url
+                        element.attrs.remove("src");
+                        element.attrs.insert("sandbox", String::new());
+                        element.attrs.insert("srcdoc", src.to_string());
+                    } else {
+                        element.attrs.remove("sandbox");
+                        element.attrs.remove("srcdoc");
+                        element.attrs.insert("src", src.to_string());
+                    }
                 }
             }
             DomPatch::SetSize { id, width, height } => {

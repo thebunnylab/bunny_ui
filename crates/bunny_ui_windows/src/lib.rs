@@ -177,15 +177,23 @@ pub fn run_window_chrome(
             for host in &hosts {
                 let bunny_ui::host::HostSpec::Webview {
                     url,
+                    document,
                     scripts,
                     console,
                     requests,
                     full_motion,
                 } = &host.spec;
                 // the stamp fingerprints the whole spec — a change
-                // re-instructs the mounted view, never re-creates it
-                let mut stamp = String::with_capacity(url.len() + 5);
+                // re-instructs the mounted view, never re-creates it.
+                // A document stamps by its fingerprint, never by its
+                // pages: the letter is the app's to hold, not the
+                // stamp's to copy every frame
+                let mut stamp = String::with_capacity(url.len() + 22);
                 stamp.push_str(url);
+                if let Some(document) = document {
+                    stamp.push('\u{3}');
+                    stamp.push_str(&format!("{:016x}", document.digest));
+                }
                 stamp.push('\u{2}');
                 stamp.push(if *console { 'c' } else { '-' });
                 stamp.push(if *requests { 'r' } else { '-' });
@@ -622,6 +630,7 @@ pub fn run_window_chrome(
                 webview::WebviewEvent::Navigated { path, url } => {
                     runtime.webview_navigated(&path, &url)
                 }
+                webview::WebviewEvent::Linked { path, url } => runtime.webview_linked(&path, &url),
                 webview::WebviewEvent::NavigationFailed { path, url, why } => {
                     runtime.webview_navigate_failed(&path, &url, &why)
                 }

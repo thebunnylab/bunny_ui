@@ -7062,6 +7062,7 @@ mod tests {
         LayoutNode::Host {
             path: path.into(),
             spec: crate::host::HostSpec::Webview {
+                document: None,
                 url: "https://example.test/".into(),
                 scripts: Vec::new().into(),
                 console: false,

@@ -20,7 +20,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 7;
+const EXPECTED_ABI = 8;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -945,10 +945,25 @@ function applyPatches(view, length) {
       }
     } else if (op === 16) {
       // the iframe navigates: the diff only ships a CHANGED src, so
-      // the write is the navigation (the same one would reload)
+      // the write is the navigation (the same one would reload).
+      // Sealed, the frame holds a DOCUMENT instead of a url: the
+      // browser's sandbox with no powers, the page's own policy at
+      // its head, and the page itself as `srcdoc` — the sandbox is
+      // set before the document lands, because it is read at the load
+      const sealed = u8() === 1;
       const src = text(u32());
       const el = elements.get(id);
-      if (el) el.src = src;
+      if (el) {
+        if (sealed) {
+          el.setAttribute("sandbox", "");
+          el.removeAttribute("src");
+          el.srcdoc = src;
+        } else {
+          el.removeAttribute("sandbox");
+          el.removeAttribute("srcdoc");
+          el.src = src;
+        }
+      }
     } else if (op === 14) {
       // the popover's anchor relation — position now, and again
       // whenever anything scrolls or the window resizes

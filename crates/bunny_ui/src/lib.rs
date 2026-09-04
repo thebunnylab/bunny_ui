@@ -119,7 +119,7 @@ pub mod prelude {
     #[cfg(feature = "canvas")]
     pub use crate::custom::{canvas, custom};
     pub use crate::erased::{CustomModifier, Erased, erased};
-    pub use crate::host::{HostSpec, WebviewHandle, webview};
+    pub use crate::host::{HostSpec, NetworkPolicy, WebviewHandle, webview, webview_html};
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
     pub use crate::icon::house as symbol;

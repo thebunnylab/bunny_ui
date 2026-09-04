@@ -77,6 +77,9 @@ pub(crate) type HandlerEntry = (String, crate::action::ActionId, HandlerFn);
 /// its handle keeps commanding.
 #[derive(Clone)]
 pub(crate) struct WebviewHooks {
+    /// A link in a document was activated — fires with its url; the
+    /// document itself never moves.
+    pub linked: Option<WebviewReport>,
     /// The page moved — fires with the committed url.
     pub navigated: Option<WebviewReport>,
     /// The page did NOT move — fires with the url and the reason.
@@ -797,6 +800,11 @@ fn run_webview_report(
         }
         None => false,
     }
+}
+
+/// An activated link, to the document's `on_link`.
+pub(crate) fn run_webview_linked(path: &str, url: &str) -> bool {
+    run_webview_report(path, |hooks| hooks.linked.clone(), url)
 }
 
 /// A committed navigation, to the page's `on_navigate`.

@@ -88,7 +88,10 @@ pub enum DomKind {
     /// own island, holding a page the way the desktop shells hold the
     /// OS webview. The island contract is the one the DOM already
     /// enforces; a changed `src` navigates, it never re-mounts.
-    Iframe { src: std::rc::Rc<str> },
+    /// `src` is the url — or, `sealed`, the DOCUMENT itself: a page
+    /// from memory under its network policy, held as `srcdoc` inside
+    /// the browser's sandbox with no powers (`docs/webview.md`).
+    Iframe { src: std::rc::Rc<str>, sealed: bool },
     /// A flow container: `display:flex; flex-direction:column`. Two
     /// variants instead of a payload so the keyed match's discriminant
     /// tells the axes apart — an axis change recreates the element.
@@ -835,7 +838,7 @@ pub enum DomPatch {
     /// The iframe navigates — the diff only ships a CHANGED src, so
     /// the write is the navigation (writing the same one would
     /// reload).
-    SetIframe { id: u32, src: std::rc::Rc<str> },
+    SetIframe { id: u32, src: std::rc::Rc<str>, sealed: bool },
     /// The FULL flow record — the glue resets and applies, the exact
     /// twin of `SetStyle` for the other half of an element's truth.
     SetLayout { id: u32, layout: DomLayout },
@@ -1313,8 +1316,8 @@ fn create_subtree(
         DomKind::Icon(icon) => {
             patches.push(DomPatch::SetIcon { id, icon: *icon });
         }
-        DomKind::Iframe { src } => {
-            patches.push(DomPatch::SetIframe { id, src: std::rc::Rc::clone(src) });
+        DomKind::Iframe { src, sealed } => {
+            patches.push(DomPatch::SetIframe { id, src: std::rc::Rc::clone(src), sealed: *sealed });
         }
         _ => {}
     }
@@ -1429,10 +1432,11 @@ fn diff_node(
         (DomKind::Icon(before), DomKind::Icon(after)) if before != after => {
             patches.push(DomPatch::SetIcon { id, icon: *after });
         }
-        (DomKind::Iframe { src: before }, DomKind::Iframe { src: after })
-            if before != after =>
-        {
-            patches.push(DomPatch::SetIframe { id, src: std::rc::Rc::clone(after) });
+        (
+            DomKind::Iframe { src: before, sealed: was },
+            DomKind::Iframe { src: after, sealed: is },
+        ) if before != after || was != is => {
+            patches.push(DomPatch::SetIframe { id, src: std::rc::Rc::clone(after), sealed: *is });
         }
         _ => {}
     }
@@ -1748,7 +1752,7 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 ///
 /// A test pins the glue to this number: bump one side alone and the
 /// suite goes red before the browser ever gets the chance to.
-pub const ABI_VERSION: u32 = 7;
+pub const ABI_VERSION: u32 = 8;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -1860,6 +1864,9 @@ pub const ABI_VERSION: u32 = 7;
 ///  15 set hints     two hint strings (u8 len + utf8 each: class, id)
 ///                   — the LIVE half of the hints, re-attributed in
 ///                   place. The tag never changes without a recreation
+///  16 set iframe    u8 sealed, u32 len + utf8 — the url the frame
+///                   navigates to, or (sealed) the DOCUMENT it holds
+///                   as `srcdoc` inside a sandbox with no powers
 /// ```
 pub fn encode(patches: &[DomPatch]) -> Vec<u8> {
     crate::stats::time(crate::stats::Stage::Encode, || {
@@ -2019,9 +2026,10 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                     push_bytes_u32(&mut out, crate::icon::to_svg_path(draw.path).as_bytes());
                 }
             }
-            DomPatch::SetIframe { id, src } => {
+            DomPatch::SetIframe { id, src, sealed } => {
                 out.push(16);
                 push_u32(&mut out, *id);
+                out.push(u8::from(*sealed));
                 push_bytes_u32(&mut out, src.as_bytes());
             }
             DomPatch::SetLayout { id, layout } => {
@@ -4071,7 +4079,7 @@ mod tests {
         let display = crate::layout::DisplayList::default();
         let page = |src: &str| {
             flow_root(vec![DomNode {
-                kind: DomKind::Iframe { src: std::rc::Rc::from(src) },
+                kind: DomKind::Iframe { src: std::rc::Rc::from(src), sealed: false },
                 x: 0.0,
                 y: 0.0,
                 width: 0.0,
@@ -4114,6 +4122,56 @@ mod tests {
         ));
         // and the wire carries it without complaint
         assert!(!encode(&moved).is_empty());
+    }
+
+    /// A DOCUMENT rides sealed: the patch carries the seal so the glue
+    /// can put the sandbox up before the page lands, sealing an open
+    /// frame is a patch like a navigation, and the wire spells the
+    /// seal as one byte ahead of the page.
+    #[test]
+    fn a_document_seals_its_iframe() {
+        let mut lowering = DomLowering::default();
+        let display = crate::layout::DisplayList::default();
+        let page = |src: &str, sealed: bool| {
+            flow_root(vec![DomNode {
+                kind: DomKind::Iframe { src: std::rc::Rc::from(src), sealed },
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+                style: DomStyle::default(),
+                layout: Some(DomLayout {
+                    grow: true,
+                    stretch: true,
+                    ..DomLayout::default()
+                }),
+                hints: DomHints::default(),
+                children: Vec::new(),
+            }])
+        };
+
+        let mount = lowering.lower(&page("<meta><p>a letter</p>", true), &display);
+        assert!(
+            mount.iter().any(|patch| matches!(
+                patch,
+                DomPatch::SetIframe { src, sealed: true, .. } if &**src == "<meta><p>a letter</p>"
+            )),
+            "the document rides the mount, sealed: {mount:#?}"
+        );
+
+        // the same page, unsealed: ONE patch, the seal flipped — the
+        // element survives, its powers change
+        let opened = lowering.lower(&page("<meta><p>a letter</p>", false), &display);
+        assert_eq!(opened.len(), 1, "{opened:#?}");
+        assert!(matches!(&opened[0], DomPatch::SetIframe { sealed: false, .. }));
+
+        // the wire: op, id, the seal byte, then the page
+        let wire = encode(&[DomPatch::SetIframe {
+            id: 7,
+            src: std::rc::Rc::from("<p>"),
+            sealed: true,
+        }]);
+        assert_eq!(&wire[4..], &[16, 7, 0, 0, 0, 1, 3, 0, 0, 0, b'<', b'p', b'>']);
     }
 
     /// A mid-list insert lands `before` its real next sibling — zero

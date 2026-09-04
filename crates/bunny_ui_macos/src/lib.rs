@@ -550,6 +550,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             for host in &hosts {
                 let bunny_ui::host::HostSpec::Webview {
                     url,
+                    document,
                     scripts,
                     console,
                     requests,
@@ -563,6 +564,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // offers no public override), but the stamp must not
                 // lie about what the spec says
                 let mut stamp = String::from(&**url);
+                // a document stamps by its fingerprint, never by its
+                // pages — the letter is the app's to hold, not the
+                // stamp's to copy every frame
+                if let Some(document) = document {
+                    stamp.push('\u{3}');
+                    stamp.push_str(&format!("{:016x}", document.digest));
+                }
                 stamp.push('\u{2}');
                 stamp.push(if *console { 'c' } else { '-' });
                 stamp.push(if *requests { 'r' } else { '-' });
@@ -587,13 +595,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         host.visible.size.height,
                     ),
                     placed,
-                    || webview::create(&host.spec),
-                    |child, _stamp| webview::update(child, &host.spec),
+                    || webview::create(&host.path, &host.spec),
+                    |child, _stamp| webview::update(&host.path, child, &host.spec),
                 );
             }
-            window.host_sweep(
-                &hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>(),
-            );
+            let alive = hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>();
+            window.host_sweep(&alive);
+            webview::sweep(&alive);
             traced.stage("H", format_args!("hosts={}", hosts.len()));
             let overlays = runtime.overlays();
             let display = match overlays.first() {
@@ -1372,6 +1380,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 webview::WebviewEvent::Navigated { view, url } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_navigated(&path, &url)
+                    {
+                        blit(&runtime, root, trace::Origin::Web);
+                    }
+                }
+                webview::WebviewEvent::Linked { view, url } => {
+                    if let Some(path) = ffi::host_key_of_child(view)
+                        && runtime.webview_linked(&path, &url)
                     {
                         blit(&runtime, root, trace::Origin::Web);
                     }
