@@ -46,6 +46,7 @@ pub mod effects;
 pub mod erased;
 pub mod ext;
 pub mod glass;
+pub mod app;
 pub mod host;
 pub mod icon;
 pub mod image_engine;

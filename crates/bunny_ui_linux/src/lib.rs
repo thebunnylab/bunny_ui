@@ -13,6 +13,7 @@ pub mod dialog;
 mod ffi;
 mod gl;
 mod image;
+mod life;
 mod text;
 mod vk;
 mod x11;
@@ -125,6 +126,8 @@ pub fn run_window_chrome(
     // a task that lands on a worker thread asks the pump for one more
     // turn; the frame it takes drains the queue on its way
     runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
+    // the app's life outside its window: the bus thread, the notifier
+    life::install();
     // two owners: the keyboard gate and the event handler
     let runtime = Rc::new(runtime);
     let root = Rc::new(root);

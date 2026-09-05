@@ -11,6 +11,7 @@ pub mod credentials;
 pub mod dialog;
 mod ffi;
 mod image;
+mod life;
 mod metal;
 mod text;
 pub mod webview;
@@ -298,6 +299,9 @@ impl Default for App {
 impl App {
     /// An app with no windows yet.
     pub fn new() -> App {
+        // the app's life outside its windows opens with the app: the
+        // delegate, the workspace's sleep and wake, the notifier
+        life::install();
         App {
             inner: Rc::new(AppInner {
                 slots: RefCell::new(Vec::new()),

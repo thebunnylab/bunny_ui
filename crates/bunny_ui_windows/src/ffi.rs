@@ -388,6 +388,7 @@ const WM_POWERBROADCAST: u32 = 0x0218;
 /// The two resume shapes — either can reveal a discarded surface.
 const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
 const PBT_APMRESUMESUSPEND: usize = 0x0007;
+const PBT_APMSUSPEND: usize = 0x0004;
 // virtual keys the shell reads directly
 const VK_SHIFT: i32 = 0x10;
 const VK_CONTROL: i32 = 0x11;
@@ -2039,6 +2040,14 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             if wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND {
                 // a resume can reveal a discarded surface the same way
                 ask_represent(hwnd);
+            }
+            // the app's life: the automatic resume comes on every wake
+            // (the user-triggered one follows it, and is not a second
+            // wake), the suspend comes once
+            if wparam == PBT_APMSUSPEND {
+                bunny_ui::app::emit(bunny_ui::app::AppEvent::WillSleep);
+            } else if wparam == PBT_APMRESUMEAUTOMATIC {
+                bunny_ui::app::emit(bunny_ui::app::AppEvent::DidWake);
             }
             1
         }
