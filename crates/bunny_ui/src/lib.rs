@@ -119,7 +119,9 @@ pub mod prelude {
     #[cfg(feature = "canvas")]
     pub use crate::custom::{canvas, custom};
     pub use crate::erased::{CustomModifier, Erased, erased};
-    pub use crate::host::{HostSpec, NetworkPolicy, WebviewHandle, webview, webview_html};
+    pub use crate::host::{
+        ColorScheme, EditorCommand, HostSpec, NetworkPolicy, WebviewHandle, webview, webview_html,
+    };
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
     pub use crate::icon::house as symbol;
@@ -6514,6 +6516,80 @@ mod tests {
         assert!(!runtime.webview_navigated("nobody/here", "x"), "no writer, no lie");
     }
 
+    /// An editable document rides its asks in the spec, its reports
+    /// reach the retained writers, and the handle's editor doors queue
+    /// as the ops the shell spends — the allowlist's script, and the
+    /// raw eval the html comes back through.
+    #[test]
+    fn an_editable_document_reports_and_is_commanded() {
+        use crate::host::{
+            ColorScheme, EditorAction, EditorCommand, HostSpec, NetworkPolicy, WebviewHandle,
+            WebviewOp, webview_html,
+        };
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Composer {
+            handle: WebviewHandle,
+            body: State<String>,
+            pasted: State<String>,
+        }
+        impl Component for Composer {
+            fn body(self, _ctx: &Context) -> impl View {
+                let (body, pasted) = (self.body, self.pasted);
+                webview_html("<p>dear</p>", "", NetworkPolicy::Deny)
+                    .editable()
+                    .focus_on_appear()
+                    .color_scheme(ColorScheme::Dark)
+                    .on_html_change(move |html| body.set(html.to_string()))
+                    .on_paste(move |html, text| pasted.set(format!("{html}|{text}")))
+                    .handle(&self.handle)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let composer = Composer {
+            handle: WebviewHandle::new(),
+            body: State::new(String::new()),
+            pasted: State::new(String::new()),
+        };
+        let _ = runtime
+            .settled_layout(&composer, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let hosts = runtime.hosts();
+        let path = hosts[0].path.clone();
+        let HostSpec::Webview { url, document, .. } = &hosts[0].spec;
+        assert_eq!(&**url, "about:blank", "a document never carries a url to fetch");
+        let document = document.as_ref().expect("the document rides");
+        assert!(document.editable && document.paste && document.focus);
+        assert_eq!(document.scheme, Some(ColorScheme::Dark));
+        assert!(document.sealed().contains("color-scheme:dark"));
+
+        assert!(runtime.webview_changed(&path, "<p>dear reader</p>"));
+        assert_eq!(composer.body.get(), "<p>dear reader</p>");
+        assert!(runtime.webview_pasted(&path, "<b>x</b>", "x"));
+        assert_eq!(composer.pasted.get(), "<b>x</b>|x");
+        assert!(!runtime.webview_changed("nobody/here", "x"), "no writer, no lie");
+
+        composer.handle.exec(EditorCommand::Bold);
+        composer.handle.exec_link("https://a.test/");
+        composer.handle.get_html(|_| {});
+        let ops = runtime.webview_commands();
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(
+            &ops[0],
+            WebviewOp::Edit { path: at, action: EditorAction::Exec(EditorCommand::Bold) }
+                if *at == path
+        ));
+        assert!(matches!(
+            &ops[1],
+            WebviewOp::Edit { action: EditorAction::Link(url), .. } if &**url == "https://a.test/"
+        ));
+        assert!(matches!(
+            &ops[2],
+            WebviewOp::Eval { raw: true, js, .. } if &**js == "document.body.innerHTML"
+        ));
+    }
+
     #[test]
     fn a_hugged_field_wears_its_own_height_inside_the_row() {
         use crate::layout::{Proposal, Size};
@@ -6586,7 +6662,7 @@ mod tests {
             matches!(&ops[0], WebviewOp::Navigate { path: at, url }
                 if *at == path && &**url == "https://example.test/next")
         );
-        let WebviewOp::Eval { path: at, token, js } = &ops[1] else {
+        let WebviewOp::Eval { path: at, token, js, raw: false } = &ops[1] else {
             panic!("the second op is the eval");
         };
         assert_eq!(*at, path);

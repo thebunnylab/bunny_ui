@@ -3540,6 +3540,20 @@ impl Runtime {
         reconciler::run_webview_linked(path, url)
     }
 
+    /// The shell reports: an editable document's body changed under
+    /// the person's hand. Routed to the retained `on_html_change`;
+    /// `false` = nothing listening.
+    pub fn webview_changed(&self, path: &str, html: &str) -> bool {
+        reconciler::run_webview_changed(path, html)
+    }
+
+    /// The shell reports: a paste the app owns arrived, as the
+    /// clipboard's html and text. Routed to the retained `on_paste`;
+    /// `false` = nothing listening (and nothing was inserted).
+    pub fn webview_pasted(&self, path: &str, html: &str, text: &str) -> bool {
+        reconciler::run_webview_pasted(path, html, text)
+    }
+
     /// The shell reports: the engine committed a navigation. Routed to
     /// the page's retained `on_navigate`; `false` = nothing listening.
     pub fn webview_navigated(&self, path: &str, url: &str) -> bool {
@@ -3589,11 +3603,14 @@ impl Runtime {
                     }
                     WebviewCommand::Back => WebviewOp::Back { path: path.clone() },
                     WebviewCommand::Forward => WebviewOp::Forward { path: path.clone() },
-                    WebviewCommand::Eval { js, then } => {
+                    WebviewCommand::Eval { js, raw, then } => {
                         let token = self.webview_eval_next.get();
                         self.webview_eval_next.set(token + 1);
                         self.webview_evals.borrow_mut().insert(token, then);
-                        WebviewOp::Eval { path: path.clone(), token, js }
+                        WebviewOp::Eval { path: path.clone(), token, js, raw }
+                    }
+                    WebviewCommand::Edit(action) => {
+                        WebviewOp::Edit { path: path.clone(), action }
                     }
                     WebviewCommand::Snapshot { then } => {
                         let token = self.webview_eval_next.get();

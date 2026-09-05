@@ -1146,8 +1146,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     }
                     // an eval with no page answers NOW, with a name —
                     // never silence that looks like a slow page
-                    WebviewOp::Eval { path, token, js } => match ffi::host_child(&path) {
-                        Some(child) => webview::eval(child, token, &js),
+                    WebviewOp::Eval { path, token, js, raw } => match ffi::host_child(&path) {
+                        Some(child) => webview::eval(child, token, &js, raw),
                         None => {
                             let _ = runtime.webview_eval_done(
                                 token,
@@ -1164,6 +1164,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                             );
                         }
                     },
+                    // an edit on a document that left is spent on
+                    // nothing, like the hand
+                    WebviewOp::Edit { path, action } => {
+                        if let Some(child) = ffi::host_child(&path) {
+                            webview::edit(child, &action);
+                        }
+                    }
                     // a hand over a page that left is a hand over
                     // nothing: there is no answer to refuse in
                     WebviewOp::Input { path, event } => {
@@ -1387,6 +1394,20 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 webview::WebviewEvent::Linked { view, url } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_linked(&path, &url)
+                    {
+                        blit(&runtime, root, trace::Origin::Web);
+                    }
+                }
+                webview::WebviewEvent::Changed { view, html } => {
+                    if let Some(path) = ffi::host_key_of_child(view)
+                        && runtime.webview_changed(&path, &html)
+                    {
+                        blit(&runtime, root, trace::Origin::Web);
+                    }
+                }
+                webview::WebviewEvent::Pasted { view, html, text } => {
+                    if let Some(path) = ffi::host_key_of_child(view)
+                        && runtime.webview_pasted(&path, &html, &text)
                     {
                         blit(&runtime, root, trace::Origin::Web);
                     }

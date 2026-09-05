@@ -814,7 +814,7 @@ impl Walk<'_> {
                 // never the url, which the policy forbade
                 let mut frame = node(match document {
                     Some(document) => {
-                        DomKind::Iframe { src: std::rc::Rc::clone(&document.html), sealed: true }
+                        DomKind::Iframe { src: std::rc::Rc::from(document.sealed()), sealed: true }
                     }
                     None => DomKind::Iframe { src: std::rc::Rc::clone(url), sealed: false },
                 });
@@ -1118,7 +1118,7 @@ mod tests {
         let pane = &scene.children[0];
         match &pane.kind {
             DomKind::Iframe { src, sealed: true } => {
-                assert_eq!(**src, *document.html);
+                assert_eq!(**src, document.sealed());
                 assert!(src.starts_with("<meta http-equiv=\"Content-Security-Policy\""));
                 assert!(!src.contains("about:blank"), "never the url the policy forbade");
             }

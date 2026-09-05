@@ -20,7 +20,10 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::null_mut;
 
 use bunny_ui::action::Modifiers;
-use bunny_ui::host::{Document, HostSpec, MouseButton, WebviewInput};
+use bunny_ui::host::{
+    Document, EDITOR_SCRIPT, EditorAction, EditorReport, HostSpec, MouseButton, WebviewInput,
+    editor_report,
+};
 
 use crate::ffi::{CGPoint, CGRect, CGSize, Id, NS_NOT_FOUND, NSRange, Sel, class, sel};
 
@@ -139,6 +142,11 @@ pub(crate) enum WebviewEvent {
     /// A link in a DOCUMENT was activated. The engine did not follow
     /// it: the document stays, and the app hears the url.
     Linked { view: Id, url: String },
+    /// An editable document's body changed under the person's hand.
+    Changed { view: Id, html: String },
+    /// A paste the app owns: the clipboard's html and text, nothing
+    /// inserted.
+    Pasted { view: Id, html: String, text: String },
     /// The engine REFUSED one: the url it tried, and why — the other
     /// leg of the same pair, so no load ends in silence.
     NavigationFailed { view: Id, url: String, why: String },
@@ -179,6 +187,10 @@ struct Letter {
     /// again at the commit — whichever the engine says first — so a
     /// refresh the document asks for later finds the door shut.
     expected: bool,
+    /// The editor takes the keyboard at the commit — once. The view
+    /// has no window at its creation (the host adds it after), so the
+    /// commit is the first beat the keyboard can be taken at.
+    focus: bool,
 }
 
 /// `WKNavigationActionPolicy` — what the delegate answers with.
@@ -287,6 +299,18 @@ extern "C" fn bridge_message(_this: Id, _sel: Sel, _controller: Id, message: Id)
                 let view = msg_id(message, sel("webView"));
                 dispatch(WebviewEvent::Requested { view, line: body });
             }
+            "bunnyEdit" => {
+                let view = msg_id(message, sel("webView"));
+                match editor_report(&body) {
+                    Some(EditorReport::Changed(html)) => {
+                        dispatch(WebviewEvent::Changed { view, html });
+                    }
+                    Some(EditorReport::Pasted { html, text }) => {
+                        dispatch(WebviewEvent::Pasted { view, html, text });
+                    }
+                    None => {}
+                }
+            }
             "bunnyEval" => {
                 let mut parts = body.splitn(3, '\t');
                 let (Some(token), Some(verdict), Some(payload)) =
@@ -313,11 +337,17 @@ extern "C" fn bridge_message(_this: Id, _sel: Sel, _controller: Id, message: Id)
 /// from here on nothing the document asks for moves it.
 extern "C" fn bridge_committed(_this: Id, _sel: Sel, view: Id, _navigation: Id) {
     if let Some(path) = crate::ffi::host_key_of_child(view) {
-        LETTERS.with(|letters| {
-            if let Some(letter) = letters.borrow_mut().get_mut(&path) {
-                letter.expected = false;
-            }
+        let wants_keyboard = LETTERS.with(|letters| {
+            let mut letters = letters.borrow_mut();
+            let Some(letter) = letters.get_mut(&path) else {
+                return false;
+            };
+            letter.expected = false;
+            std::mem::replace(&mut letter.focus, false)
         });
+        if wants_keyboard {
+            unsafe { take_keyboard(view) };
+        }
     }
     unsafe {
         let url = msg_id(view, sel("URL"));
@@ -602,12 +632,53 @@ fn load_document(path: &str, view: Id, document: &Document) {
     LETTERS.with(|letters| {
         letters.borrow_mut().insert(
             path.to_string(),
-            Letter { digest: document.digest, expected: true },
+            Letter { digest: document.digest, expected: true, focus: document.focus },
         );
     });
     unsafe {
         let base = if document.base.is_empty() { null_mut() } else { ns_url(&document.base) };
-        let _ = msg_id_id_id(view, sel("loadHTMLString:baseURL:"), ns(&document.html), base);
+        let _ = msg_id_id_id(
+            view,
+            sel("loadHTMLString:baseURL:"),
+            ns(&document.sealed()),
+            base,
+        );
+    }
+}
+
+/// The view becomes the window's first responder — the keyboard is
+/// the page's. A view with no window yet takes nothing.
+unsafe fn take_keyboard(view: Id) {
+    unsafe {
+        let window = msg_id(view, sel("window"));
+        if !window.is_null() {
+            let _ = msg_bool_id(window, sel("makeFirstResponder:"), view);
+        }
+    }
+}
+
+/// One editing action on the document — the allowlist's script, run
+/// on the engine. The editor takes the keyboard back first (a toolbar
+/// click took it), except for the app's own write of the whole body,
+/// which needs no selection. Fire-and-forget, like the hand.
+pub(crate) fn edit(view: Id, action: &EditorAction) {
+    let script = action.script();
+    if script.is_empty() {
+        return;
+    }
+    unsafe {
+        if !matches!(action, EditorAction::SetHtml(_)) {
+            take_keyboard(view);
+        }
+        run_script(view, &script);
+    }
+}
+
+/// Runs `js` on the page, answer discarded — the completion handler
+/// stays nil, so no block crosses this border.
+unsafe fn run_script(view: Id, js: &str) {
+    unsafe {
+        msg_void_id_id(view, sel("evaluateJavaScript:completionHandler:"), ns(js), null_mut());
     }
 }
 
@@ -624,7 +695,7 @@ pub(crate) fn sweep(alive: &[String]) {
 unsafe fn install_bridge(controller: Id, spec: &bunny_ui::host::HostSpec) {
     unsafe {
         let bridge = bridge();
-        for channel in ["bunny", "bunnyConsole", "bunnyNet", "bunnyEval"] {
+        for channel in ["bunny", "bunnyConsole", "bunnyNet", "bunnyEval", "bunnyEdit"] {
             msg_void_id_id(
                 controller,
                 sel("addScriptMessageHandler:name:"),
@@ -638,10 +709,11 @@ unsafe fn install_bridge(controller: Id, spec: &bunny_ui::host::HostSpec) {
 
 /// The document-start set, in a fixed order: the bus first (a user
 /// script may want to post), then the hooks the app DECLARED — a page
-/// nobody watches pays for no capture — then the app's own scripts,
-/// in declaration order.
-unsafe fn apply_scripts(controller: Id, spec: &bunny_ui::host::HostSpec) {
-    let bunny_ui::host::HostSpec::Webview { scripts, console, requests, .. } = spec;
+/// nobody watches pays for no capture — then the editor for an
+/// editable document (its transport first, the framework's script
+/// after), then the app's own scripts, in declaration order.
+unsafe fn apply_scripts(controller: Id, spec: &HostSpec) {
+    let HostSpec::Webview { scripts, console, requests, document, .. } = spec;
     unsafe {
         add_script(controller, BOOT);
         if *console {
@@ -650,10 +722,26 @@ unsafe fn apply_scripts(controller: Id, spec: &bunny_ui::host::HostSpec) {
         if *requests {
             add_script(controller, NET_WRAP);
         }
+        if let Some(document) = document
+            && document.editable
+        {
+            add_script(controller, &editor_prelude(document));
+            add_script(controller, EDITOR_SCRIPT);
+        }
         for script in scripts.iter() {
             add_script(controller, script);
         }
     }
+}
+
+/// What the editor script expects to find: the document's asks, and
+/// this backend's road for a report line — the `bunnyEdit` channel.
+fn editor_prelude(document: &Document) -> String {
+    format!(
+        "window.__bunnyEditor = {{ paste: {}, focus: {}, send: function(line) {{ \
+         window.webkit.messageHandlers.bunnyEdit.postMessage(line); }} }};",
+        document.paste, document.focus
+    )
 }
 
 /// One WKUserScript at document start, main frame only.
@@ -736,6 +824,7 @@ pub fn capabilities() -> &'static [bunny_ui::host::WebviewCapability] {
         WebviewCapability::ConsoleMessages,
         WebviewCapability::NetworkRequests,
         WebviewCapability::SyntheticInput,
+        WebviewCapability::HtmlEditor,
     ]
 }
 
@@ -783,12 +872,18 @@ pub(crate) fn forward(view: Id) {
 
 /// Evaluates `js` as an EXPRESSION in the page. The answer rides the
 /// bridge (`bunnyEval`, by token) — the completion handler stays nil,
-/// so no block ever crosses this border.
-pub(crate) fn eval(view: Id, token: u64, js: &str) {
+/// so no block ever crosses this border. `raw` hands the value back as
+/// the string it is (a null answers empty); otherwise it rides as JSON.
+pub(crate) fn eval(view: Id, token: u64, js: &str, raw: bool) {
+    let serialize = if raw {
+        "(__v === undefined || __v === null) ? \"\" : String(__v)"
+    } else {
+        "JSON.stringify(__v)"
+    };
     let wrapped = format!(
         "(function() {{ try {{ \
            var __v = (function() {{ return ( {js} ); }})(); \
-           var __s = JSON.stringify(__v); \
+           var __s = {serialize}; \
            window.webkit.messageHandlers.bunnyEval.postMessage(\
              \"{token}\\tok\\t\" + (__s === undefined ? \"null\" : __s)); \
          }} catch (e) {{ \
@@ -796,14 +891,7 @@ pub(crate) fn eval(view: Id, token: u64, js: &str) {
              \"{token}\\terr\\t\" + String(e)); \
          }} }})();"
     );
-    unsafe {
-        msg_void_id_id(
-            view,
-            sel("evaluateJavaScript:completionHandler:"),
-            ns(&wrapped),
-            null_mut(),
-        );
-    }
+    unsafe { run_script(view, &wrapped) }
 }
 
 // The event types AppKit numbers, and the modifier bits it reads.

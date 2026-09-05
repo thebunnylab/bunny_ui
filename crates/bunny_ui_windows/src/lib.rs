@@ -441,8 +441,9 @@ pub fn run_window_chrome(
                     WebviewOp::Back { path } => webview::back(&path),
                     WebviewOp::Forward { path } => webview::forward(&path),
                     WebviewOp::Input { path, event } => webview::input(&path, &event),
-                    WebviewOp::Eval { path, token, js } => {
-                        if let Err(why) = webview::eval(&path, token, &js) {
+                    WebviewOp::Edit { path, action } => webview::edit(&path, &action),
+                    WebviewOp::Eval { path, token, js, raw } => {
+                        if let Err(why) = webview::eval(&path, token, &js, raw) {
                             let _ = runtime.webview_eval_done(token, Err(why));
                         }
                     }
@@ -631,6 +632,12 @@ pub fn run_window_chrome(
                     runtime.webview_navigated(&path, &url)
                 }
                 webview::WebviewEvent::Linked { path, url } => runtime.webview_linked(&path, &url),
+                webview::WebviewEvent::Changed { path, html } => {
+                    runtime.webview_changed(&path, &html)
+                }
+                webview::WebviewEvent::Pasted { path, html, text } => {
+                    runtime.webview_pasted(&path, &html, &text)
+                }
                 webview::WebviewEvent::NavigationFailed { path, url, why } => {
                     runtime.webview_navigate_failed(&path, &url, &why)
                 }
