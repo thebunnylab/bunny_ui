@@ -288,6 +288,36 @@ fn clear_spool(spool: &Path) {
 mod tests {
     use super::*;
 
+    /// One poll of the receiver, on this thread — what a task's
+    /// `.recv().await` does in one turn.
+    fn poll_once(receiver: &crate::task::Receiver<AppEvent>) -> Option<AppEvent> {
+        let mut task = std::pin::pin!(async { receiver.recv().await });
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        match task.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(event) => event,
+            std::task::Poll::Pending => None,
+        }
+    }
+
+    /// The tests of this module share one process and ONE subscriber
+    /// list: every subscriber hears every test's events. A test waits
+    /// for ITS event and lets the others pass.
+    fn wait_for(
+        receiver: &crate::task::Receiver<AppEvent>,
+        wanted: impl Fn(&AppEvent) -> bool,
+    ) -> Option<AppEvent> {
+        for _ in 0..60 {
+            while let Some(event) = poll_once(receiver) {
+                if wanted(&event) {
+                    return Some(event);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+
     /// A subscriber hears what the shell emits; one whose receiver is
     /// gone is dropped on the next emit, not kept as a quiet listener.
     #[test]
@@ -300,13 +330,7 @@ mod tests {
         let heard = emit(AppEvent::DidWake);
         assert!(heard >= 1, "the live subscriber counted");
         // the receiver reads it on its own turn
-        let mut got = None;
-        let mut task = std::pin::pin!(async { receiver.recv().await });
-        let waker = std::task::Waker::noop();
-        let mut context = std::task::Context::from_waker(waker);
-        if let std::task::Poll::Ready(event) = task.as_mut().poll(&mut context) {
-            got = event;
-        }
+        let got = wait_for(&receiver, |event| *event == AppEvent::DidWake);
         assert_eq!(got, Some(AppEvent::DidWake));
     }
 
@@ -339,17 +363,8 @@ mod tests {
         // the lock is concerned: the file is held, the arguments cross
         let arguments = vec![String::from("mail://thread/7"), String::from("with\nnewline")];
         assert_eq!(instance_in(&dir, &arguments), Instance::Secondary);
-        let mut heard = None;
-        for _ in 0..40 {
-            let mut task = std::pin::pin!(async { receiver.recv().await });
-            let waker = std::task::Waker::noop();
-            let mut context = std::task::Context::from_waker(waker);
-            if let std::task::Poll::Ready(event) = task.as_mut().poll(&mut context) {
-                heard = event;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        let heard =
+            wait_for(&receiver, |event| matches!(event, AppEvent::Reopened { .. }));
         assert_eq!(heard, Some(AppEvent::Reopened { arguments }));
         assert!(take_spool(&dir.join("spool")).is_empty(), "the mailbox was emptied");
         // an empty launch is an empty list, not one empty argument
