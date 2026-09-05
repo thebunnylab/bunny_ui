@@ -99,7 +99,151 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
     run_window_chrome(title, size, Chrome::Native, runtime, root)
 }
 
+// =============================================================================
+// The app, and the window it holds
+// =============================================================================
+
+/// What a window is before it exists: its bar, its size and who draws
+/// its top edge — the twin of the other two shells' spec.
+#[derive(Clone, Debug)]
+pub struct WindowSpec {
+    title: Rc<str>,
+    size: Size,
+    chrome: Chrome,
+}
+
+impl WindowSpec {
+    /// A window named for its bar, at the house size.
+    pub fn titled(title: impl Into<Rc<str>>) -> WindowSpec {
+        WindowSpec {
+            title: title.into(),
+            size: Size { width: 1024.0, height: 640.0 },
+            chrome: Chrome::Native,
+        }
+    }
+
+    /// The content size the window opens at.
+    pub fn size(mut self, width: f64, height: f64) -> WindowSpec {
+        self.size = Size { width, height };
+        self
+    }
+
+    /// Who draws the top edge — see [`Chrome`].
+    pub fn chrome(mut self, chrome: Chrome) -> WindowSpec {
+        self.chrome = chrome;
+        self
+    }
+}
+
+/// A window's handle in an [`App`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct WindowId(usize);
+
+/// This shell holds ONE window. Both desktops here — X11 and
+/// Wayland — are answered by a single surface with its own event
+/// road, and a second document window is not built: an app that opens
+/// one on the other two platforms asks this constant first and keeps
+/// its second view INSIDE the window here.
+///
+/// ```ignore
+/// if bunny_ui_linux::MANY_WINDOWS {
+///     app.open(composer_spec, runtime, composer);
+/// } else {
+///     shell.detach_inside(composer);   // a pane, not a window
+/// }
+/// ```
+pub const MANY_WINDOWS: bool = false;
+
+/// The application: the event road, and the window on it.
+///
+/// The same shape the other two shells carry, so an app writes one
+/// boot for three platforms — but this one holds a SINGLE window
+/// ([`MANY_WINDOWS`] is false). Opening a second one is refused by
+/// name rather than half-served: ask the constant before you ask for
+/// the window.
+///
+/// ```ignore
+/// let app = App::new();
+/// let runtime = app.runtime().text_engine(Rc::new(FreeTypeEngine::new()));
+/// app.open(WindowSpec::titled("Trinity Mail").size(1080.0, 720.0), Rc::new(runtime), mail);
+/// app.run();
+/// ```
+#[derive(Clone)]
+pub struct App {
+    inner: Rc<AppInner>,
+}
+
+struct AppInner {
+    open: RefCell<Vec<WindowId>>,
+    scenes: std::cell::Cell<usize>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl App {
+    /// An app with no window yet.
+    pub fn new() -> App {
+        // the app's life outside its window: the bus thread, the
+        // notifier
+        life::install();
+        App {
+            inner: Rc::new(AppInner {
+                open: RefCell::new(Vec::new()),
+                scenes: std::cell::Cell::new(0),
+            }),
+        }
+    }
+
+    /// A runtime for the window — named for its own scene.
+    pub fn runtime(&self) -> Runtime {
+        let seq = self.inner.scenes.get();
+        self.inner.scenes.set(seq + 1);
+        Runtime::scene(format!("w{seq}"))
+    }
+
+    /// Raises the window on `runtime`, showing `root`.
+    ///
+    /// # Panics
+    ///
+    /// A SECOND window: this shell holds one ([`MANY_WINDOWS`]), and a
+    /// silent half-window would be worse than the refusal.
+    pub fn open(&self, spec: WindowSpec, runtime: Rc<Runtime>, root: impl View) -> WindowId {
+        assert!(
+            self.inner.open.borrow().is_empty(),
+            "this shell holds ONE window (bunny_ui_linux::MANY_WINDOWS is false) — \
+             ask the constant before opening a second"
+        );
+        let window = mount(&spec, runtime, root);
+        let id = WindowId(window);
+        self.inner.open.borrow_mut().push(id);
+        id
+    }
+
+    /// Closes the window — which, being the last, quits the app.
+    pub fn close(&self, id: WindowId) {
+        self.inner.open.borrow_mut().retain(|open| *open != id);
+        ffi::close_window();
+    }
+
+    /// The windows the app has open.
+    pub fn windows(&self) -> Vec<WindowId> {
+        self.inner.open.borrow().clone()
+    }
+
+    /// Enters the event road. Returns when the window closes.
+    pub fn run(&self) {
+        ffi::run();
+    }
+}
+
 /// Like [`run_window_with`], choosing who draws the window's top edge.
+///
+/// One window, and the road: the sugar over [`App`] every single-window
+/// app is.
 pub fn run_window_chrome(
     title: &str,
     size: Size,
@@ -107,7 +251,25 @@ pub fn run_window_chrome(
     runtime: Runtime,
     root: impl View,
 ) {
-    let window = ffi::create_window(title, size.width, size.height, chrome == Chrome::Scene);
+    let app = App::new();
+    app.open(
+        WindowSpec::titled(title).size(size.width, size.height).chrome(chrome),
+        Rc::new(runtime),
+        root,
+    );
+    app.run();
+}
+
+/// Raises the window `spec` asks for and wires everything that lives
+/// as long as it does — the frame path, the pools, the gates and the
+/// event handler. Answers the window's own address.
+fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
+    let window = ffi::create_window(
+        &spec.title,
+        spec.size.width,
+        spec.size.height,
+        spec.chrome == Chrome::Scene,
+    );
     // the present backend, chosen ONCE: the GPU by default, the CPU
     // raster on refusal — and the window is still unmapped, so the
     // first frame (whichever road) IS the reveal
@@ -126,10 +288,7 @@ pub fn run_window_chrome(
     // a task that lands on a worker thread asks the pump for one more
     // turn; the frame it takes drains the queue on its way
     runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
-    // the app's life outside its window: the bus thread, the notifier
-    life::install();
     // two owners: the keyboard gate and the event handler
-    let runtime = Rc::new(runtime);
     let root = Rc::new(root);
 
     // one frame: the Runtime settles, lays out, retains the hits for
@@ -552,12 +711,12 @@ pub fn run_window_chrome(
         }
     }));
 
-    // first frame into the unmapped window, then the pump — on wayland
-    // the first presenting commit IS the reveal, so the window never
-    // flashes unpainted
+    // first frame into the unmapped window, then the reveal — on
+    // wayland the first presenting commit IS the reveal, so the window
+    // never flashes unpainted; the app's `run` takes the road from here
     ffi::dispatch(AppEvent::Redraw);
     ffi::show_window(window);
-    ffi::run();
+    window.raw_window()
 }
 
 #[cfg(test)]

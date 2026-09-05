@@ -3124,7 +3124,10 @@ fn frame_repeats(
 }
 
 thread_local! {
-    static PRESENTER: RefCell<Option<D3dPresenter>> = const { RefCell::new(None) };
+    /// One presenter per WINDOW — a swapchain belongs to the HWND it
+    /// was made for, and an app with two windows presents two.
+    static PRESENTER: RefCell<std::collections::HashMap<Hwnd, D3dPresenter>> =
+        RefCell::new(std::collections::HashMap::new());
     /// The one silent recreate a lost device is allowed.
     static RECREATE_SPENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -3523,14 +3526,16 @@ pub(crate) fn try_install(hwnd: Hwnd) -> bool {
         &bunny_ui::text_engine::PixelFont,
         &bunny_ui::image_engine::RawImages::default(),
     );
-    PRESENTER.with(|slot| *slot.borrow_mut() = Some(presenter));
+    PRESENTER.with(|slot| {
+        slot.borrow_mut().insert(hwnd, presenter);
+    });
     true
 }
 
 /// True when this window presents by GPU — the shell branches per frame
 /// on this (a lost device may hand the window back to the CPU).
-pub(crate) fn active() -> bool {
-    PRESENTER.with(|slot| slot.borrow().is_some())
+pub(crate) fn active(hwnd: Hwnd) -> bool {
+    PRESENTER.with(|slot| slot.borrow().contains_key(&hwnd))
 }
 
 /// The GPU twin of the Surface + blit path: same display list in, one
@@ -3541,6 +3546,7 @@ pub(crate) fn active() -> bool {
 /// in silence and re-presents; lost again, the window presents by CPU
 /// for the rest of its life with one line on stderr.
 pub(crate) fn present_window(
+    hwnd: Hwnd,
     display: &DisplayList,
     size: Size,
     scale: usize,
@@ -3550,19 +3556,19 @@ pub(crate) fn present_window(
 ) {
     let outcome = PRESENTER.with(|slot| {
         slot.borrow_mut()
-            .as_mut()
+            .get_mut(&hwnd)
             .map(|presenter| presenter.present(display, size, scale, canvas, text, images))
     });
     if outcome != Some(Presented::DeviceLost) {
         return;
     }
-    let hwnd = PRESENTER.with(|slot| slot.borrow().as_ref().map(|p| p.hwnd));
-    let Some(hwnd) = hwnd else { return };
-    PRESENTER.with(|slot| *slot.borrow_mut() = None);
+    PRESENTER.with(|slot| slot.borrow_mut().remove(&hwnd));
     if !RECREATE_SPENT.with(|spent| spent.replace(true)) {
         if let Some(mut presenter) = install(hwnd) {
             presenter.present(display, size, scale, canvas, text, images);
-            PRESENTER.with(|slot| *slot.borrow_mut() = Some(presenter));
+            PRESENTER.with(|slot| {
+                slot.borrow_mut().insert(hwnd, presenter);
+            });
             return;
         }
     }
@@ -3578,16 +3584,18 @@ pub(crate) fn present_window(
 /// resume) while ours still says "already shown".
 pub(crate) fn remint() {
     PRESENTER.with(|slot| {
-        if let Some(presenter) = slot.borrow_mut().as_mut() {
+        for presenter in slot.borrow_mut().values_mut() {
             presenter.retained = None;
         }
     });
 }
 
-/// Releases the presenter before the window dies (the swapchain must
-/// not outlive its HWND).
-pub(crate) fn teardown() {
-    PRESENTER.with(|slot| *slot.borrow_mut() = None);
+/// Releases a window's presenter before the window dies (the
+/// swapchain must not outlive its HWND).
+pub(crate) fn teardown(hwnd: Hwnd) {
+    PRESENTER.with(|slot| {
+        slot.borrow_mut().remove(&hwnd);
+    });
 }
 
 // MARK: - Offscreen target (parity tests and the bench)

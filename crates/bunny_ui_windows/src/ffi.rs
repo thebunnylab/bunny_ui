@@ -9,7 +9,7 @@
 //! there is no y-flip on this platform.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -139,6 +139,9 @@ unsafe extern "system" {
     fn PostQuitMessage(code: i32);
     fn PostMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> i32;
     fn DestroyWindow(hwnd: Hwnd) -> i32;
+    /// `GW_OWNER` is 4 — a panel's owner is the window it hangs from.
+    fn GetWindow(hwnd: Hwnd, relation: u32) -> Hwnd;
+    fn GetParent(hwnd: Hwnd) -> Hwnd;
     fn ShowWindow(hwnd: Hwnd, cmd: i32) -> i32;
     fn UpdateWindow(hwnd: Hwnd) -> i32;
     fn InvalidateRect(hwnd: Hwnd, rect: *const Rect, erase: i32) -> i32;
@@ -534,6 +537,9 @@ pub(crate) fn com_init() {
 
 /// The shell's event vocabulary — the Windows twin of the mac AppEvent.
 /// Positions are LAYOUT coordinates (top-left origin, logical points).
+/// Clone because an app with more than one window offers the shared
+/// beats to each of them.
+#[derive(Clone)]
 pub enum AppEvent {
     MouseDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     /// The right button: the context-menu press.
@@ -574,6 +580,9 @@ pub enum AppEvent {
     /// step. The frame the shell already knows how to draw drains the
     /// queue on its way.
     Wake,
+    /// This window is gone — the app buries what it held. The LAST one
+    /// quits the app on its way out.
+    WindowClosed,
 }
 
 // MARK: - Keyboard
@@ -852,8 +861,9 @@ pub enum ControlHit {
 }
 
 thread_local! {
-    /// Whether the MAIN window wears scene chrome.
-    static SCENE_CHROME: Cell<bool> = const { Cell::new(false) };
+    /// Which top-level windows wear scene chrome — a window's own
+    /// answer, because two windows of one app need not dress alike.
+    static SCENE_CHROME: RefCell<HashSet<Hwnd>> = RefCell::new(HashSet::new());
     /// Which caption button the press went down on — the release only
     /// fires over the same one.
     static PRESSED_CONTROL: Cell<isize> = const { Cell::new(0) };
@@ -917,7 +927,7 @@ fn scene_hit_test(hwnd: Hwnd, screen_x: i32, screen_y: i32) -> isize {
     unsafe {
         ScreenToClient(hwnd, &mut point);
     }
-    let factor = shared_factor();
+    let factor = shared_factor_for(hwnd);
     let (x, y) = (point.x as f64 / factor, point.y as f64 / factor);
     let control = CONTROL_GATE
         .with(|slot| slot.borrow().as_ref().and_then(|gate| gate(x, y)));
@@ -1005,7 +1015,14 @@ pub fn set_ime_rect_resolver(
 /// context association honest: no field focused = the IME detached,
 /// keys arrive as clean strokes for the keymap.
 pub fn sync_ime(state: Option<(bool, usize, (f64, f64, f64, f64))>) {
-    let hwnd = MAIN_HWND.load(Ordering::Acquire);
+    // the input context belongs to the window that holds the keyboard,
+    // which with two windows open is not always the first one
+    let focused = unsafe { GetFocus() };
+    let hwnd = if is_top_level(focused) {
+        focused
+    } else {
+        MAIN_HWND.load(Ordering::Acquire)
+    };
     let mirror = match state {
         Some((marked, marked_start, caret)) => {
             ImeMirror { enabled: true, marked, marked_start, caret }
@@ -1079,10 +1096,130 @@ fn composition_string(himc: isize, kind: u32) -> Option<String> {
 
 // MARK: - Cross-thread wake
 
-/// The main window every cross-thread knock lands on. An atomic (not
-/// a thread-local) because the signal comes from ANY thread —
-/// `PostMessageW` is the thread-safe half of the pump.
+/// The window every cross-thread knock lands on, and the one a system
+/// panel hangs from: the app's FIRST window, and after it closes
+/// whichever is left. An atomic (not a thread-local) because the
+/// signal comes from ANY thread — `PostMessageW` is the thread-safe
+/// half of the pump.
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+thread_local! {
+    /// Every TOP-LEVEL window this shell raised, oldest first. A
+    /// panel, a segment surface and a host's container are not in
+    /// it — they belong to the window they hang from.
+    static TOP_LEVEL: RefCell<Vec<Hwnd>> = RefCell::new(Vec::new());
+    /// The window whose message is being answered — 0 for a beat every
+    /// window shares (the frame tick, the blink, a worker's wake).
+    static SOURCE: Cell<Hwnd> = const { Cell::new(0) };
+}
+
+/// Does this window's own SCENE draw its top edge?
+fn wears_scene_chrome(hwnd: Hwnd) -> bool {
+    SCENE_CHROME.with(|windows| windows.borrow().contains(&hwnd))
+}
+
+/// Is this one of the app's own top-level windows?
+pub(crate) fn is_top_level(hwnd: Hwnd) -> bool {
+    TOP_LEVEL.with(|windows| windows.borrow().contains(&hwnd))
+}
+
+/// The top-level window an event on `hwnd` belongs to: itself, or the
+/// window a panel hangs from (a popover's click is the owner scene's),
+/// or the parent a child surface lives in (a segment over an island).
+/// Zero when the trail leads nowhere — a window already buried.
+pub(crate) fn scene_owner(hwnd: Hwnd) -> Hwnd {
+    const GW_OWNER: u32 = 4;
+    let mut walk = hwnd;
+    for _ in 0..4 {
+        if walk == 0 || is_top_level(walk) {
+            return walk;
+        }
+        let up = unsafe {
+            let owner = GetWindow(walk, GW_OWNER);
+            if owner != 0 { owner } else { GetParent(walk) }
+        };
+        if up == walk {
+            break;
+        }
+        walk = up;
+    }
+    0
+}
+
+/// The window the event now being answered belongs to — what an app
+/// with more than one window routes by. Zero is a beat everyone
+/// shares.
+pub fn event_source() -> usize {
+    SOURCE.with(Cell::get) as usize
+}
+
+/// Delivers an event ADDRESSED to the window it happened in — the
+/// source is the top-level window the message's own window belongs
+/// to, so a click on a popover reaches the scene that opened it.
+fn dispatch_at(hwnd: Hwnd, event: AppEvent) {
+    let owner = scene_owner(hwnd);
+    let held = SOURCE.with(|source| source.replace(owner));
+    dispatch(event);
+    SOURCE.with(|source| source.set(held));
+}
+
+/// Takes a window into the registry, and hands the app's roles — the
+/// cross-thread knock, the frame beat, the slow clock — to it when
+/// nobody holds them yet.
+fn register_top_level(hwnd: Hwnd, scene_chrome: bool) {
+    TOP_LEVEL.with(|windows| windows.borrow_mut().push(hwnd));
+    if scene_chrome {
+        SCENE_CHROME.with(|windows| {
+            windows.borrow_mut().insert(hwnd);
+        });
+    }
+    if MAIN_HWND.load(Ordering::Acquire) == 0 {
+        MAIN_HWND.store(hwnd, Ordering::Release);
+        driver().hwnd.store(hwnd, Ordering::Release);
+        unsafe {
+            // the slow clock: caret blink and the tooltip's wait — ONE
+            // per app, like the frame beat, and every window hears it
+            SetTimer(hwnd, TIMER_BLINK, 500, std::ptr::null());
+        }
+    }
+}
+
+/// Buries a window and, if it held the app's roles, moves them house.
+/// Answers how many top-level windows are left.
+fn unregister_top_level(hwnd: Hwnd) -> usize {
+    let left = TOP_LEVEL.with(|windows| {
+        let mut windows = windows.borrow_mut();
+        windows.retain(|open| *open != hwnd);
+        windows.first().copied()
+    });
+    SCENE_CHROME.with(|windows| {
+        windows.borrow_mut().remove(&hwnd);
+    });
+    let heir = left.unwrap_or(0);
+    if MAIN_HWND.load(Ordering::Acquire) == hwnd {
+        MAIN_HWND.store(heir, Ordering::Release);
+        if heir != 0 {
+            unsafe {
+                SetTimer(heir, TIMER_BLINK, 500, std::ptr::null());
+            }
+        }
+    }
+    if driver().hwnd.load(Ordering::Acquire) == hwnd {
+        driver().hwnd.store(heir, Ordering::Release);
+    }
+    TOP_LEVEL.with(|windows| windows.borrow().len())
+}
+
+/// Asks the platform to close a top-level window — the app's own
+/// `close`. The destroy road does the burying.
+pub fn close_top_level(window: usize) {
+    let hwnd = window as Hwnd;
+    if hwnd != 0 && is_top_level(hwnd) {
+        unsafe {
+            DestroyWindow(hwnd);
+        }
+    }
+}
 
 /// The window a system panel hangs from — a modal with no owner is a
 /// window of its own on the taskbar, and the app behind it stays
@@ -1418,6 +1555,25 @@ fn driver() -> &'static Driver {
 
 /// Parks or resumes the frame driver. Born paused; the shell resumes it
 /// only while an animation (or a sleeping task) needs the clock.
+pub fn want_frames(window: usize, wants: bool) {
+    let none = WANTS_FRAMES.with(|windows| {
+        let mut windows = windows.borrow_mut();
+        if wants {
+            windows.insert(window as Hwnd);
+        } else {
+            windows.remove(&(window as Hwnd));
+        }
+        windows.is_empty()
+    });
+    set_frame_driver_paused(none);
+}
+
+thread_local! {
+    /// Which windows are animating — the beat is the APP's, and it
+    /// runs while any one of them wants a frame.
+    static WANTS_FRAMES: RefCell<HashSet<Hwnd>> = RefCell::new(HashSet::new());
+}
+
 pub fn set_frame_driver_paused(paused: bool) {
     let driver = driver();
     let mut running = driver.running.lock().expect("driver lock");
@@ -1499,11 +1655,19 @@ thread_local! {
     static PANEL_ORIGINS: RefCell<HashMap<Hwnd, (f64, f64)>> = RefCell::new(HashMap::new());
 }
 
-/// The scale every surface shares — panels ride the OWNER's metrics.
-fn shared_factor() -> f64 {
-    let main = MAIN_HWND.load(Ordering::Acquire);
-    let factor = metrics_of(main).factor;
+/// The scale a surface shares with the window it belongs to — a panel
+/// and a segment ride the OWNER's metrics, so a second window on a
+/// second monitor places its own popovers by its own scale.
+fn shared_factor_for(hwnd: Hwnd) -> f64 {
+    let owner = scene_owner(hwnd);
+    let factor = metrics_of(if owner != 0 { owner } else { MAIN_HWND.load(Ordering::Acquire) })
+        .factor;
     if factor > 0.0 { factor } else { 1.0 }
+}
+
+/// The scale where no window is in hand — the app's first window's.
+fn shared_factor() -> f64 {
+    shared_factor_for(MAIN_HWND.load(Ordering::Acquire))
 }
 
 fn scene_origin(hwnd: Hwnd) -> (f64, f64) {
@@ -1513,7 +1677,7 @@ fn scene_origin(hwnd: Hwnd) -> (f64, f64) {
 fn layout_point(hwnd: Hwnd, lparam: isize) -> (f64, f64) {
     let x = (lparam & 0xFFFF) as u16 as i16 as i32;
     let y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
-    let factor = shared_factor();
+    let factor = shared_factor_for(hwnd);
     let (dx, dy) = scene_origin(hwnd);
     (x as f64 / factor + dx, y as f64 / factor + dy)
 }
@@ -1539,22 +1703,22 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
     match msg {
         WM_CREATE => 0,
         WM_SIZE => {
-            // ONLY the main window has a size of its own: a panel is
+            // ONLY a top-level window has a size of its own: a panel is
             // sized by the present that created it, and its birth
             // arrives here SYNCHRONOUSLY from inside that present — a
             // dispatch would re-enter the handler mid-frame
-            if hwnd != MAIN_HWND.load(Ordering::Acquire) || wparam == SIZE_MINIMIZED {
+            if !is_top_level(hwnd) || wparam == SIZE_MINIMIZED {
                 return 0;
             }
             refresh_metrics(hwnd);
             // present synchronously before returning: content and size
             // land in the same composition — the resize never shows a
             // stretched stale frame
-            dispatch(AppEvent::Redraw);
+            dispatch_at(hwnd, AppEvent::Redraw);
             0
         }
         WM_DPICHANGED => {
-            if hwnd != MAIN_HWND.load(Ordering::Acquire) {
+            if !is_top_level(hwnd) {
                 // layered panels are raw screen pixels — the owner's
                 // funnel rescales them on its next present
                 return 0;
@@ -1577,7 +1741,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 }
             }
             refresh_metrics(hwnd);
-            dispatch(AppEvent::Redraw);
+            dispatch_at(hwnd, AppEvent::Redraw);
             0
         }
         WM_PAINT => {
@@ -1641,8 +1805,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_NCCALCSIZE => {
-            let main = hwnd == MAIN_HWND.load(Ordering::Acquire);
-            if !main || !SCENE_CHROME.with(|cell| cell.get()) || wparam == 0 {
+            if !wears_scene_chrome(hwnd) || wparam == 0 {
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             }
             // the scene eats the frame: the client rect IS the window
@@ -1662,8 +1825,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_NCHITTEST => {
-            let main = hwnd == MAIN_HWND.load(Ordering::Acquire);
-            if !main || !SCENE_CHROME.with(|cell| cell.get()) {
+            if !wears_scene_chrome(hwnd) {
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             }
             let x = (lparam & 0xFFFF) as u16 as i16 as i32;
@@ -1673,8 +1835,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
         WM_NCMOUSEMOVE => {
             // the bar lives in non-client territory now — its hover
             // still belongs to the scene
-            if hwnd == MAIN_HWND.load(Ordering::Acquire) && SCENE_CHROME.with(|cell| cell.get())
-            {
+            if wears_scene_chrome(hwnd) {
                 let mut point = Point {
                     x: (lparam & 0xFFFF) as u16 as i16 as i32,
                     y: ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32,
@@ -1682,8 +1843,8 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 unsafe {
                     ScreenToClient(hwnd, &mut point);
                 }
-                let factor = shared_factor();
-                dispatch(AppEvent::MouseMoved {
+                let factor = shared_factor_for(hwnd);
+                dispatch_at(hwnd, AppEvent::MouseMoved {
                     x: point.x as f64 / factor,
                     y: point.y as f64 / factor,
                     modifiers: held_modifiers_now(),
@@ -1694,7 +1855,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
         WM_NCMOUSELEAVE => {
             // the pointer left through the bar: the hover unsticks the
             // same way it does from the client side
-            dispatch(AppEvent::MouseExited);
+            dispatch_at(hwnd, AppEvent::MouseExited);
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_NCLBUTTONDOWN => {
@@ -1761,12 +1922,12 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             let (x, y) = layout_point(hwnd, lparam);
             // `WM_MOUSEMOVE` carries the same modifier word the button
             // messages do, so the move reads it the same way
-            dispatch(AppEvent::MouseMoved { x, y, modifiers: held_modifiers(wparam) });
+            dispatch_at(hwnd, AppEvent::MouseMoved { x, y, modifiers: held_modifiers(wparam) });
             0
         }
         WM_MOUSELEAVE => {
             LEAVE_ARMED.with(|armed| armed.borrow_mut().remove(&hwnd));
-            dispatch(AppEvent::MouseExited);
+            dispatch_at(hwnd, AppEvent::MouseExited);
             0
         }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
@@ -1779,7 +1940,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             unsafe {
                 ScreenToClient(hwnd, &mut point);
             }
-            let factor = shared_factor();
+            let factor = shared_factor_for(hwnd);
             let (ox, oy) = scene_origin(hwnd);
             let x = point.x as f64 / factor + ox;
             let y = point.y as f64 / factor + oy;
@@ -1789,11 +1950,11 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // content above); the tilt wheel flips, like the web's dx
             let (dx, dy) =
                 if msg == WM_MOUSEWHEEL { (0.0, px) } else { (-px, 0.0) };
-            dispatch(AppEvent::Wheel { x, y, dx, dy });
+            dispatch_at(hwnd, AppEvent::Wheel { x, y, dx, dy });
             0
         }
         WM_MOUSEACTIVATE => {
-            if hwnd != MAIN_HWND.load(Ordering::Acquire) {
+            if !is_top_level(hwnd) {
                 let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
                 if style & WS_CHILD == 0 {
                     // a panel never takes the keyboard — the second belt
@@ -1806,14 +1967,14 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOVE => {
-            if hwnd == MAIN_HWND.load(Ordering::Acquire) {
+            if is_top_level(hwnd) {
                 // the engine repositions its own popups — a select
                 // dropdown, autofill — after the parent's move lands
                 crate::webview::nudge_all();
                 // owned panels do not ride the owner on their own —
                 // the present repositions them, so a caption drag asks
                 // for one
-                dispatch(AppEvent::Redraw);
+                dispatch_at(hwnd, AppEvent::Redraw);
             }
             0
         }
@@ -1832,7 +1993,12 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             let raw_y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
             let clicks = count_click(raw_x, raw_y);
             let (x, y) = layout_point(hwnd, lparam);
-            dispatch(AppEvent::MouseDown { x, y, clicks, modifiers: held_modifiers(wparam) });
+            dispatch_at(hwnd, AppEvent::MouseDown {
+                x,
+                y,
+                clicks,
+                modifiers: held_modifiers(wparam),
+            });
             0
         }
         WM_LBUTTONUP => {
@@ -1840,7 +2006,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 ReleaseCapture();
             }
             let (x, y) = layout_point(hwnd, lparam);
-            dispatch(AppEvent::MouseUp { x, y });
+            dispatch_at(hwnd, AppEvent::MouseUp { x, y });
             0
         }
         WM_RBUTTONDOWN => {
@@ -1848,7 +2014,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // still the scene's click
             reclaim_keyboard();
             let (x, y) = layout_point(hwnd, lparam);
-            dispatch(AppEvent::RightMouseDown { x, y });
+            dispatch_at(hwnd, AppEvent::RightMouseDown { x, y });
             0
         }
         WM_KEYDOWN => {
@@ -1861,7 +2027,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // arrives here is the editing vocabulary and the Ctrl chords
             let shift = unsafe { GetKeyState(VK_SHIFT) } as u16 & 0x8000 != 0;
             let control = unsafe { GetKeyState(VK_CONTROL) } as u16 & 0x8000 != 0;
-            dispatch(AppEvent::Key { vk: wparam as u32, shift, command: control });
+            dispatch_at(hwnd, AppEvent::Key { vk: wparam as u32, shift, command: control });
             0
         }
         WM_IME_SETCONTEXT => {
@@ -1892,7 +2058,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             if (lparam as u32) & GCS_RESULTSTR != 0 {
                 if let Some(text) = composition_string(himc, GCS_RESULTSTR) {
                     if !text.is_empty() {
-                        dispatch(AppEvent::Text(text));
+                        dispatch_at(hwnd, AppEvent::Text(text));
                     }
                 }
             }
@@ -1900,7 +2066,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 if let Some(text) = composition_string(himc, GCS_COMPSTR) {
                     let caret =
                         unsafe { ImmGetCompositionStringW(himc, GCS_CURSORPOS, std::ptr::null_mut(), 0) };
-                    dispatch(AppEvent::ImeMark { text, caret: caret.max(0) as usize });
+                    dispatch_at(hwnd, AppEvent::ImeMark { text, caret: caret.max(0) as usize });
                     place_candidate_window(himc);
                 }
             }
@@ -1915,12 +2081,14 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // a commit the result already cleared it, and a second
             // clearing would erase real input
             if ime_composing() {
-                dispatch(AppEvent::ImeUnmark);
+                dispatch_at(hwnd, AppEvent::ImeUnmark);
             }
             0
         }
         WM_SETTINGCHANGE => {
-            if hwnd == MAIN_HWND.load(Ordering::Acquire) {
+            // the season changed for the whole app: one window asks and
+            // every window hears it
+            if MAIN_HWND.load(Ordering::Acquire) == hwnd {
                 dispatch(AppEvent::SettingsChanged);
             }
             0
@@ -1953,7 +2121,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 0xDC00..=0xDFFF => {
                     if let Some(high) = PENDING_HIGH.with(|cell| cell.take()) {
                         let text = String::from_utf16_lossy(&[high, unit]);
-                        dispatch(AppEvent::Text(text));
+                        dispatch_at(hwnd, AppEvent::Text(text));
                     }
                     // a lone low half drops — it spells nothing
                 }
@@ -1961,7 +2129,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                     PENDING_HIGH.with(|cell| cell.take());
                     // control characters take the Key road, never this one
                     if unit >= 0x20 && unit != 0x7F {
-                        dispatch(AppEvent::Text(
+                        dispatch_at(hwnd, AppEvent::Text(
                             char::from_u32(unit as u32).map(String::from).unwrap_or_default(),
                         ));
                     }
@@ -1977,7 +2145,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             }
             if let Some(text) = char::from_u32(wparam as u32) {
                 if !text.is_control() {
-                    dispatch(AppEvent::Text(text.to_string()));
+                    dispatch_at(hwnd, AppEvent::Text(text.to_string()));
                 }
             }
             0
@@ -2026,7 +2194,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
             }
-            dispatch(AppEvent::Redraw);
+            dispatch_at(hwnd, AppEvent::Redraw);
             0
         }
         WM_DWMCOMPOSITIONCHANGED => {
@@ -2065,12 +2233,12 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             }
             // the end-of-gesture redraw mints the segments back — for
             // the length of the drag they came home to the drawable
-            dispatch(AppEvent::Redraw);
+            dispatch_at(hwnd, AppEvent::Redraw);
             0
         }
         WM_ACTIVATE => {
             if (wparam & 0xFFFF) == WA_INACTIVE {
-                dispatch(AppEvent::ResignKey);
+                dispatch_at(hwnd, AppEvent::ResignKey);
             }
             0
         }
@@ -2088,15 +2256,23 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             });
             PANEL_ORIGINS.with(|origins| origins.borrow_mut().remove(&hwnd));
             LEAVE_ARMED.with(|armed| armed.borrow_mut().remove(&hwnd));
-            // closing the MAIN window quits — a panel dies in silence
-            if hwnd == MAIN_HWND.load(Ordering::Acquire) {
-                // the tenants close before the windows they parent
-                // into (the swapchain law, extended)
-                crate::webview::teardown_all();
+            // a panel dies in silence; a top-level window leaves the
+            // registry, and the LAST one out quits the app — the
+            // single-window contract said again
+            if is_top_level(hwnd) {
                 // the swapchain must not outlive its window
-                crate::d3d::teardown();
-                unsafe {
-                    PostQuitMessage(0);
+                crate::d3d::teardown(hwnd);
+                want_frames(hwnd as usize, false);
+                // reported while the window can still be ADDRESSED: the
+                // app buries the slot the source names
+                dispatch_at(hwnd, AppEvent::WindowClosed);
+                if unregister_top_level(hwnd) == 0 {
+                    // the tenants close before the windows they parent
+                    // into (the swapchain law, extended)
+                    crate::webview::teardown_all();
+                    unsafe {
+                        PostQuitMessage(0);
+                    }
                 }
             }
             0
@@ -2167,7 +2343,6 @@ fn register_class() -> Vec<u16> {
 /// own drag handle and buttons, and resize borders survive.
 pub fn create_window(title: &str, width: f64, height: f64, scene_chrome: bool) -> WindowHandle {
     install_dpi_awareness();
-    SCENE_CHROME.with(|cell| cell.set(scene_chrome));
     let class_name = register_class();
     let title = wide(title);
     // WS_CLIPCHILDREN: the CPU road's GDI paint excludes the native
@@ -2191,10 +2366,10 @@ pub fn create_window(title: &str, width: f64, height: f64, scene_chrome: bool) -
         )
     };
     assert!(hwnd != 0, "the platform refused the window");
-    // the frame conversation needs to know who the main window is
-    // BEFORE the resize below re-runs it
-    driver().hwnd.store(hwnd, Ordering::Release);
-    MAIN_HWND.store(hwnd, Ordering::Release);
+    // the frame conversation needs to know the window BEFORE the
+    // resize below re-runs it — and the first window takes the app's
+    // roles: the cross-thread knock, the frame beat, the slow clock
+    register_top_level(hwnd, scene_chrome);
     if scene_chrome {
         // a frameless window keeps the system's rounded corners — the
         // compositor cuts and antialiases them, the platform's own
@@ -2234,8 +2409,6 @@ pub fn create_window(title: &str, width: f64, height: f64, scene_chrome: bool) -
             rect.bottom - rect.top,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_FRAMECHANGED,
         );
-        // the slow clock: caret blink and the tooltip's wait
-        SetTimer(hwnd, TIMER_BLINK, 500, std::ptr::null());
     }
     refresh_metrics(hwnd);
     WindowHandle { hwnd }
@@ -2333,6 +2506,12 @@ pub struct WindowHandle {
 }
 
 impl WindowHandle {
+    /// The window as an address — what an event's source is compared
+    /// against, and the app's own handle for it.
+    pub fn raw_window(&self) -> usize {
+        self.hwnd as usize
+    }
+
     /// Logical size of the content area (the layout viewport). Under a
     /// fractional DPI the size is fractional — layout takes f64.
     pub fn content_size(&self) -> (f64, f64) {
@@ -2423,7 +2602,7 @@ impl WindowHandle {
     /// A rect in LAYOUT coordinates converted to SCREEN pixels — where
     /// a panel (and one day the IME candidate window) lands.
     pub fn layout_rect_to_screen(&self, x: f64, y: f64, width: f64, height: f64) -> Rect {
-        let factor = shared_factor();
+        let factor = shared_factor_for(self.hwnd);
         let mut origin = Point { x: 0, y: 0 };
         unsafe {
             ClientToScreen(self.hwnd, &mut origin);
@@ -2442,7 +2621,7 @@ impl WindowHandle {
     /// layout coordinates — left of or above the window comes out
     /// negative. What popovers clamp against.
     pub fn screen_bounds_in_layout(&self) -> Option<(f64, f64, f64, f64)> {
-        let factor = shared_factor();
+        let factor = shared_factor_for(self.hwnd);
         unsafe {
             let monitor = MonitorFromWindow(self.hwnd, MONITOR_DEFAULT_TO_NEAREST);
             if monitor == 0 {
@@ -2683,7 +2862,7 @@ impl WindowHandle {
         // the TRUE fractional factor: the tenant's bounds are physical
         // pixels, and the ceil'd raster scale would misplace the island
         // by up to 60% on a 125% monitor
-        let factor = shared_factor();
+        let factor = shared_factor_for(self.hwnd);
         let px = |v: f64| (v * factor).round() as i32;
         let (x, y, w, h) = frame;
         let (vx, vy, vw, vh) = visible;

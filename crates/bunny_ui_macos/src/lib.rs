@@ -234,6 +234,11 @@ impl WindowSpec {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct WindowId(usize);
 
+/// This shell holds MORE THAN ONE window — the detachable composer,
+/// the second workbench. The three shells answer this differently and
+/// an app that must run on all of them asks before it detaches.
+pub const MANY_WINDOWS: bool = true;
+
 /// Everything one window owns for as long as it is open. The app holds
 /// these and routes every event to the one it belongs to.
 struct Slot {

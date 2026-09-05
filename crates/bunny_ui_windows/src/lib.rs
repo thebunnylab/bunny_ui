@@ -103,7 +103,241 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
     run_window_chrome(title, size, Chrome::Native, runtime, root)
 }
 
+// =============================================================================
+// The app, and the windows it holds
+// =============================================================================
+
+/// What a window is before it exists: its bar, its size and who draws
+/// its top edge — the Windows twin of the mac's spec.
+///
+/// ```ignore
+/// WindowSpec::titled("Trinity Mail").size(1080.0, 720.0)
+/// WindowSpec::titled("New message").size(720.0, 560.0)
+/// ```
+#[derive(Clone, Debug)]
+pub struct WindowSpec {
+    title: Rc<str>,
+    size: Size,
+    chrome: Chrome,
+}
+
+impl WindowSpec {
+    /// A window named for its bar, at the house size.
+    pub fn titled(title: impl Into<Rc<str>>) -> WindowSpec {
+        WindowSpec {
+            title: title.into(),
+            size: Size { width: 1024.0, height: 640.0 },
+            chrome: Chrome::Native,
+        }
+    }
+
+    /// The content size the window opens at.
+    pub fn size(mut self, width: f64, height: f64) -> WindowSpec {
+        self.size = Size { width, height };
+        self
+    }
+
+    /// Who draws the top edge — see [`Chrome`].
+    pub fn chrome(mut self, chrome: Chrome) -> WindowSpec {
+        self.chrome = chrome;
+        self
+    }
+}
+
+/// A window's handle in an [`App`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct WindowId(usize);
+
+/// Everything one window owns for as long as it is open. The app holds
+/// these and routes every event to the one it belongs to.
+struct Slot {
+    /// The `HWND` as an address — what an event's source is compared
+    /// against.
+    window: usize,
+    handle: ffi::WindowHandle,
+    handler: RefCell<Box<dyn FnMut(AppEvent)>>,
+    key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,
+    drag_gate: Box<dyn Fn(f64, f64) -> bool>,
+    control_gate: Box<dyn Fn(f64, f64) -> Option<ffi::ControlHit>>,
+    ime_rect: Box<dyn Fn(usize) -> Option<(f64, f64, f64, f64)>>,
+    on_web: Box<dyn Fn(webview::WebviewEvent)>,
+}
+
+/// This shell holds MORE THAN ONE window — the detachable composer,
+/// the second workbench. The three shells answer this differently and
+/// an app that must run on all of them asks before it detaches.
+pub const MANY_WINDOWS: bool = true;
+
+/// The application: the message pump, and the windows on it.
+///
+/// [`run_window_chrome`] is one window and this is several — a
+/// detached composer beside the mail, a second workbench. Every window
+/// has its own [`Runtime`] (its own scene, its own keymap, its own
+/// focus) and the app routes each message to the window it arrived at:
+/// a click on a popover is the scene's that opened it, and the shared
+/// beats — the frame tick, the caret blink, a worker's wake — reach
+/// every window.
+///
+/// ```ignore
+/// let app = App::new();
+/// let runtime = app.runtime().text_engine(Rc::new(DirectWriteEngine::new()));
+/// app.open(WindowSpec::titled("Trinity Mail").size(1080.0, 720.0), Rc::new(runtime), mail);
+/// app.run();
+/// ```
+///
+/// The app quits when its LAST window closes, which is the
+/// single-window contract said again.
+#[derive(Clone)]
+pub struct App {
+    inner: Rc<AppInner>,
+}
+
+/// The half the platform gates hold: they outlive any borrow of the
+/// app, so what they capture is a handle and never a reference.
+struct AppInner {
+    slots: RefCell<Vec<Rc<Slot>>>,
+    routed: std::cell::Cell<bool>,
+    scenes: std::cell::Cell<usize>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl App {
+    /// An app with no windows yet.
+    pub fn new() -> App {
+        // the app's life outside its windows opens with the app: the
+        // desktop learns this process's name, and the notifier opens
+        life::install();
+        App {
+            inner: Rc::new(AppInner {
+                slots: RefCell::new(Vec::new()),
+                routed: std::cell::Cell::new(false),
+                scenes: std::cell::Cell::new(0),
+            }),
+        }
+    }
+
+    /// A runtime for the next window — named for its own scene, so two
+    /// windows showing the same view are two trees and not one.
+    ///
+    /// Dress it before handing it back ([`Runtime::text_engine`], the
+    /// keymap, the host's action handlers): the app never touches it
+    /// again.
+    pub fn runtime(&self) -> Runtime {
+        let seq = self.inner.scenes.get();
+        self.inner.scenes.set(seq + 1);
+        Runtime::scene(format!("w{seq}"))
+    }
+
+    /// Raises a window on `runtime`, showing `root`.
+    pub fn open(&self, spec: WindowSpec, runtime: Rc<Runtime>, root: impl View) -> WindowId {
+        let slot = mount(&spec, runtime, root);
+        let id = WindowId(slot.window);
+        self.inner.slots.borrow_mut().push(Rc::clone(&slot));
+        Rc::clone(&self.inner).route();
+        // its own first frame, through its OWN handler and not the
+        // global road: a window is very often opened from inside an
+        // event, and the road is busy carrying that event
+        (slot.handler.borrow_mut())(AppEvent::Redraw);
+        // painted, then shown — a window never flashes unpainted
+        ffi::show_window(slot.handle);
+        id
+    }
+
+    /// Closes a window. The app stays up unless it was the last.
+    pub fn close(&self, id: WindowId) {
+        ffi::close_top_level(id.0);
+    }
+
+    /// The windows the app has open, oldest first.
+    pub fn windows(&self) -> Vec<WindowId> {
+        self.inner.slots.borrow().iter().map(|slot| WindowId(slot.window)).collect()
+    }
+
+    /// Enters the message pump. Returns when the last window closes.
+    pub fn run(&self) {
+        ffi::run();
+    }
+}
+
+impl AppInner {
+    /// Installs the one set of platform gates, routing each to the
+    /// window the message arrived at. Idempotent — the first `open`
+    /// arms it and the rest ride it.
+    fn route(self: Rc<Self>) {
+        if self.routed.replace(true) {
+            return;
+        }
+        let app = Rc::clone(&self);
+        ffi::set_handler(Box::new(move |event| {
+            let source = ffi::event_source();
+            let gone = matches!(event, AppEvent::WindowClosed);
+            for slot in app.live() {
+                // source 0 is a beat every window shares
+                if source == 0 || slot.window == source {
+                    let mut handler = slot.handler.borrow_mut();
+                    handler(event.clone());
+                }
+            }
+            if gone {
+                app.buried(source);
+            }
+        }));
+        let app = Rc::clone(&self);
+        ffi::set_key_gate(Box::new(move |stroke| {
+            app.addressed().is_some_and(|slot| (slot.key_gate.borrow_mut())(stroke))
+        }));
+        let drag_app = Rc::clone(&self);
+        let control_app = Rc::clone(&self);
+        ffi::set_chrome_gates(
+            Box::new(move |x, y| {
+                drag_app.addressed().is_some_and(|slot| (slot.drag_gate)(x, y))
+            }),
+            Box::new(move |x, y| {
+                control_app.addressed().and_then(|slot| (slot.control_gate)(x, y))
+            }),
+        );
+        let app = Rc::clone(&self);
+        ffi::set_ime_rect_resolver(Box::new(move |utf16| {
+            app.addressed().and_then(|slot| (slot.ime_rect)(utf16))
+        }));
+        let app = Rc::clone(&self);
+        webview::set_dispatch(move |event| {
+            // a page belongs to ONE window and every other answers
+            // "not mine" — the walk is the routing
+            for slot in app.live() {
+                (slot.on_web)(event.clone());
+            }
+        });
+    }
+
+    /// A snapshot of the open slots — taken before any handler runs, so
+    /// a window that opens or closes inside one does not disturb the
+    /// walk.
+    fn live(&self) -> Vec<Rc<Slot>> {
+        self.slots.borrow().clone()
+    }
+
+    /// The window the message now being answered arrived at.
+    fn addressed(&self) -> Option<Rc<Slot>> {
+        let source = ffi::event_source();
+        self.live().into_iter().find(|slot| source == 0 || slot.window == source)
+    }
+
+    /// Drops the slot of a window that has gone.
+    fn buried(&self, window: usize) {
+        self.slots.borrow_mut().retain(|slot| slot.window != window);
+    }
+}
+
 /// Like [`run_window_with`], choosing who draws the window's top edge.
+///
+/// One window, and the pump: the sugar over [`App`] every
+/// single-window app is.
 pub fn run_window_chrome(
     title: &str,
     size: Size,
@@ -111,7 +345,25 @@ pub fn run_window_chrome(
     runtime: Runtime,
     root: impl View,
 ) {
-    let window = ffi::create_window(title, size.width, size.height, chrome == Chrome::Scene);
+    let app = App::new();
+    app.open(
+        WindowSpec::titled(title).size(size.width, size.height).chrome(chrome),
+        Rc::new(runtime),
+        root,
+    );
+    app.run();
+}
+
+/// Raises the window `spec` asks for and wires everything that lives as
+/// long as it does — the frame path, the pools, the gates and the event
+/// handler — into a slot the [`App`] holds and routes to.
+fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
+    let window = ffi::create_window(
+        &spec.title,
+        spec.size.width,
+        spec.size.height,
+        spec.chrome == Chrome::Scene,
+    );
     // the present backend, chosen ONCE: the GPU by default, the CPU
     // raster on refusal — and the window has not shown yet, so the
     // first frame (whichever road) lands before anyone looks
@@ -128,11 +380,7 @@ pub fn run_window_chrome(
     // a task that lands on a worker thread asks the pump for one more
     // turn; the frame it takes drains the queue on its way
     runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
-    // the app's life outside its window: the desktop learns this
-    // process's name, and the notifier opens
-    life::install();
     // two owners: the keyboard gate and the event handler
-    let runtime = Rc::new(runtime);
     let root = Rc::new(root);
 
     // one frame: the Runtime settles, lays out, retains the hits for
@@ -391,10 +639,11 @@ pub fn run_window_chrome(
             } else {
                 display.without_slices(&segment_ranges)
             };
-            if d3d::active() {
+            if d3d::active(window.raw_window() as ffi::Hwnd) {
                 // GPU present: the same display list, no Surface in the
                 // path — the swapchain is the frame
                 d3d::present_window(
+                    window.raw_window() as ffi::Hwnd,
                     &display,
                     Size { width, height },
                     scale,
@@ -514,7 +763,7 @@ pub fn run_window_chrome(
             }));
             // wake or park the frame driver — the event may have
             // started (or finished) an animation
-            ffi::set_frame_driver_paused(!runtime.wants_frame());
+            ffi::want_frames(window.raw_window(), runtime.wants_frame());
         }
     };
 
@@ -522,12 +771,11 @@ pub fn run_window_chrome(
     // (with no interactive target above) moves the window; a
     // `.window_control(…)` answers as the window's own button — the
     // platform closes, minimizes, maximizes and offers its snap flyout
-    ffi::set_chrome_gates(
-        Box::new({
-            let runtime = Rc::clone(&runtime);
-            move |x, y| runtime.window_drag_at(x, y)
-        }),
-        Box::new({
+    let drag_gate: Box<dyn Fn(f64, f64) -> bool> = Box::new({
+        let runtime = Rc::clone(&runtime);
+        move |x, y| runtime.window_drag_at(x, y)
+    });
+    let control_gate: Box<dyn Fn(f64, f64) -> Option<ffi::ControlHit>> = Box::new({
             let runtime = Rc::clone(&runtime);
             move |x, y| {
                 runtime.window_control_at(x, y).map(|control| match control {
@@ -535,20 +783,19 @@ pub fn run_window_chrome(
                     bunny_ui::layout::WindowControl::Minimize => ffi::ControlHit::Minimize,
                     bunny_ui::layout::WindowControl::Maximize => ffi::ControlHit::Maximize,
                 })
-            }
-        }),
-    );
+        }
+    });
 
     // the candidate window's anchor: the rect at the composition's
     // start, answered live by the runtime in layout points
-    ffi::set_ime_rect_resolver(Box::new({
+    let ime_rect: Box<dyn Fn(usize) -> Option<(f64, f64, f64, f64)>> = Box::new({
         let runtime = Rc::clone(&runtime);
         move |utf16| {
             runtime.ime_rect_for(utf16).map(|rect| {
                 (rect.origin.x, rect.origin.y, rect.size.width, rect.size.height)
             })
         }
-    }));
+    });
 
     // the gate: keymap BEFORE the input system — bare chars pass
     // straight through to whoever holds the keyboard AND is taking
@@ -557,7 +804,7 @@ pub fn run_window_chrome(
     // mounted does not consume (the palette-less screen types fine);
     // an AltGr chord that types IS text and never enters. The
     // composition-first step arrives with the IME phase.
-    ffi::set_key_gate(Box::new({
+    let key_gate: Box<dyn FnMut(&ffi::KeyStroke) -> bool> = Box::new({
         let runtime = Rc::clone(&runtime);
         let root = Rc::clone(&root);
         let blit = blit.clone();
@@ -620,13 +867,13 @@ pub fn run_window_chrome(
                 false
             }
         }
-    }));
+    });
 
     // everything a page reports lands here and runs the matching
     // runtime door; a door that ran a retained writer re-presents —
     // but never mid-drag (the state is written; the resize's own
     // presenter shows it, the one-presenter law)
-    webview::set_dispatch({
+    let on_web: Box<dyn Fn(webview::WebviewEvent)> = Box::new({
         let runtime = Rc::clone(&runtime);
         let root = Rc::clone(&root);
         let blit = blit.clone();
@@ -679,7 +926,7 @@ pub fn run_window_chrome(
     let handler_runtime = Rc::clone(&runtime);
     let handler_root = Rc::clone(&root);
     let handler_present = Rc::clone(&present);
-    ffi::set_handler(Box::new(move |event| {
+    let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
         match event {
@@ -836,16 +1083,24 @@ pub fn run_window_chrome(
                     let display = runtime.animation_frame(root, Size { width, height });
                     handler_present(runtime, display);
                 }
-                ffi::set_frame_driver_paused(!runtime.wants_frame());
+                ffi::want_frames(window.raw_window(), runtime.wants_frame());
             }
+            // the app buries the slot by the source; the window itself
+            // has nothing left to draw
+            AppEvent::WindowClosed => {}
         }
-    }));
+    });
 
-    // first frame into the hidden window, then the reveal — the window
-    // never flashes unpainted — and the pump takes over
-    ffi::dispatch(AppEvent::Redraw);
-    ffi::show_window(window);
-    ffi::run();
+    Rc::new(Slot {
+        window: window.raw_window(),
+        handle: window,
+        handler: RefCell::new(handler),
+        key_gate: RefCell::new(key_gate),
+        drag_gate,
+        control_gate,
+        ime_rect,
+        on_web,
+    })
 }
 
 #[cfg(test)]

@@ -1,6 +1,10 @@
 # The app's life
 
-*Status: the doors are standing in `bunny_ui::app` — the events
+*Status: a second document window stands on macOS and Windows (the
+`App`, one `Runtime` per window, the pump routing each message to the
+window it arrived at) and is refused by name on Linux, which holds
+one; `cargo run -p bunny-ui-macos --example two_windows -- --drive` is
+the proof. The doors are standing in `bunny_ui::app` — the events
 (sleep, wake, a notification activated, a second launch with its
 arguments), the notifier, and the single instance — and each shell
 answers them: macOS by the application delegate, the workspace's
@@ -71,6 +75,54 @@ app with the url as an argument, and the argument crosses over.
 Registering the url scheme is the platform's own configuration (the
 bundle's `Info.plist`, the registry, a `.desktop` file), and stays
 the app's to write.
+
+## More than one window
+
+A mail client detaches its composer; a workbench opens a second
+project. That is not a popover and not a sheet: it is another
+top-level window, with its own scene, its own keymap, its own focus —
+and the app is still one process with one event road.
+
+```rust
+let app = App::new();                       // the shell's own App
+let runtime = app.runtime().text_engine(…); // a scene of its own
+let main = app.open(WindowSpec::titled("Trinity Mail").size(1080.0, 720.0),
+                    Rc::new(runtime), mail);
+// …later, from a "detach" action:
+if MANY_WINDOWS {
+    app.open(WindowSpec::titled("New message").size(720.0, 560.0),
+             Rc::new(app.runtime().text_engine(…)), composer);
+}
+app.close(main);                            // the app stays up unless it was the last
+app.run();                                  // returns when the last window closes
+```
+
+Every window has a `Runtime` of its own, so two windows showing the
+SAME view are two trees and not one — the identity paths under them
+are identical, and a click must not land in whichever window rendered
+last. The shell routes by the window a message ARRIVED at: a click on
+a popover belongs to the scene that opened it, a key to the window
+holding the keyboard, and the shared beats — the frame tick, the caret
+blink, a worker's wake — reach every window. What a window holds goes
+with it when it closes: its swapchain, its backing, its panels, its
+place in the frame beat, which moves house if it lived there. The app
+quits when the LAST window closes, which is the single-window contract
+said again.
+
+`MANY_WINDOWS` is the shell's own answer, and an app that must run on
+the three platforms asks it before it detaches:
+
+| | macOS | Windows | Linux |
+| -- | -- | -- | -- |
+| `MANY_WINDOWS` | true | true | **false** |
+| the road | AppKit's run loop, one `NSWindow` each | one pump, one `HWND` each, a swapchain each | one surface, one road |
+
+On Linux both desktops — X11 and Wayland — are answered here by a
+single surface with its own event road, and a second document window
+is not built: `App::open` refuses the second by name rather than
+half-serving it, and an app keeps its second view INSIDE the window
+(a pane, a sheet). The refusal is loud on purpose: a silent
+half-window would be worse.
 
 ## What each platform answers
 

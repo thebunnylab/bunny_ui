@@ -82,6 +82,9 @@ unsafe extern "system" {
 /// the main thread, from the pump's own turns. The mac twin carries
 /// the view; here every handler is authored by us and carries its
 /// placement path instead, so no pointer scan exists.
+/// Clone because an app with more than one window offers a page's news
+/// to each of them — the one that owns the page answers.
+#[derive(Clone)]
 pub(crate) enum WebviewEvent {
     /// The engine committed a navigation — link clicks included.
     Navigated { path: String, url: String },

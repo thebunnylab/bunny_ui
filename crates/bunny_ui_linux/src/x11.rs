@@ -1637,6 +1637,11 @@ pub(crate) fn show_window() {
     });
 }
 
+/// Asks the road to end — the app's `close` on the one window.
+pub(crate) fn ask_quit() {
+    with_x(|client| client.quit = true);
+}
+
 pub(crate) fn content_size() -> (f64, f64) {
     with_x(|client| client.win.as_ref().map(|w| w.logical).unwrap_or((0.0, 0.0)))
 }
