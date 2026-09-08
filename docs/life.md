@@ -112,27 +112,29 @@ said again.
 `MANY_WINDOWS` is the shell's own answer, and an app that must run on
 the three platforms asks it before it detaches:
 
-| | macOS | Windows | Linux |
-| -- | -- | -- | -- |
-| `MANY_WINDOWS` | true | true | **false** |
-| the road | AppKit's run loop, one `NSWindow` each | one pump, one `HWND` each, a swapchain each | one surface, one road |
+| | macOS | Windows | Linux | iOS |
+| -- | -- | -- | -- | -- |
+| `MANY_WINDOWS` | true | true | **false** | **false** |
+| the road | AppKit's run loop, one `NSWindow` each | one pump, one `HWND` each, a swapchain each | one surface, one road | UIKit's run loop, the screen |
 
 On Linux both desktops — X11 and Wayland — are answered here by a
 single surface with its own event road, and a second document window
 is not built: `App::open` refuses the second by name rather than
 half-serving it, and an app keeps its second view INSIDE the window
 (a pane, a sheet). The refusal is loud on purpose: a silent
-half-window would be worse.
+half-window would be worse. The phone answers the same: the screen is
+the window, `open` records the scene and `run` hands the process to
+UIKit, which never returns.
 
 ## What each platform answers
 
-| | macOS | Windows | Linux |
-| -- | -- | -- | -- |
-| sleep, wake | `NSWorkspace` will-sleep / did-wake | `WM_POWERBROADCAST` suspend / automatic resume | logind `PrepareForSleep` |
-| notification | UserNotifications, a category per button set | a WinRT toast under the process's AppUserModelID | `org.freedesktop.Notifications` `Notify` |
-| activation | the center's delegate, while running or launched by the click | the toast's `Activated` event, while running | `ActionInvoked` on the session bus |
-| second launch | the spool; a BUNDLED app reopens through the delegate instead | the spool | the spool |
-| a url handed over | `application:openURLs:` → `Reopened` | an argument → the spool | an argument → the spool |
+| | macOS | Windows | Linux | iOS |
+| -- | -- | -- | -- | -- |
+| sleep, wake | `NSWorkspace` will-sleep / did-wake | `WM_POWERBROADCAST` suspend / automatic resume | logind `PrepareForSleep` | the app entering and leaving the background |
+| notification | UserNotifications, a category per button set | a WinRT toast under the process's AppUserModelID | `org.freedesktop.Notifications` `Notify` | not yet — `notify` refuses by name |
+| activation | the center's delegate, while running or launched by the click | the toast's `Activated` event, while running | `ActionInvoked` on the session bus | — |
+| second launch | the spool; a BUNDLED app reopens through the delegate instead | the spool | the spool | the system's own: one process by construction |
+| a url handed over | `application:openURLs:` → `Reopened` | an argument → the spool | an argument → the spool | `application:openURL:options:` → `Reopened` |
 
 Three honest edges. macOS shows notifications for a BUNDLE, never a
 bare binary — the system's own center raises for a process with no

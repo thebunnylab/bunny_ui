@@ -176,9 +176,10 @@ cargo run -p bunny-ui-macos --example git_window
 cargo run -p bunny-ui-macos --example sketch_window
 cargo run -p bunny-ui-macos --example icon_window
 cargo run -p countries-pure
+crates/bunny_ui_ios/simulator/run-sim.sh touch_window_ios
 ```
 
-The first demo prints a small interface to the terminal. The second opens a native macOS window. The third reads this repository's own `git log` from a worker thread and fills the window while it scrolls. The fourth is one box the application owns: it draws its own ink with the pointer, sizes its brush with the wheel, and types into a caption of its own — composition included. The fifth shows the sixteen house glyphs across fonts and inks. The sixth prints a full sample application.
+The first demo prints a small interface to the terminal. The second opens a native macOS window. The third reads this repository's own `git log` from a worker thread and fills the window while it scrolls. The fourth is one box the application owns: it draws its own ink with the pointer, sizes its brush with the wheel, and types into a caption of its own — composition included. The fifth shows the sixteen house glyphs across fonts and inks. The sixth prints a full sample application. The last one runs on the iOS Simulator: a list that pans and flings, a field that raises the keyboard, a canvas that draws under one finger and zooms under two (`docs/ios.md`).
 
 ## Design rules
 

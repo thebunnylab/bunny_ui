@@ -275,16 +275,16 @@ does not pretend they do. A backend declares what it serves; asking
 for more is an error with a name, never an empty answer that looks
 like a quiet page.
 
-| | WKWebView | WebView2 | WebKitGTK |
-| -- | -- | -- | -- |
-| console messages | injected hook | native | native |
-| network: requests observed | injected wrap (fetch/XHR) | native | native |
-| network: response bodies | no | yes¹ | yes |
-| synthetic input | NSEvent, trusted | native | open question |
-| media emulation (full motion) | no² | CDP `Emulation.setEmulatedMedia` | open question |
-| devtools | external inspector | built in | embeddable |
-| a document under a policy | `loadHTMLString`, CSP | `NavigateToString`, CSP | open |
-| html editor (`.editable()`) | editor script | editor script | no³ |
+| | WKWebView (macOS) | WKWebView (iOS) | WebView2 | WebKitGTK |
+| -- | -- | -- | -- | -- |
+| console messages | injected hook | injected hook | native | native |
+| network: requests observed | injected wrap (fetch/XHR) | injected wrap (fetch/XHR) | native | native |
+| network: response bodies | no | no | yes¹ | yes |
+| synthetic input | NSEvent, trusted | no⁴ | native | open question |
+| media emulation (full motion) | no² | no² | CDP `Emulation.setEmulatedMedia` | open question |
+| devtools | external inspector | external inspector | built in | embeddable |
+| a document under a policy | `loadHTMLString`, CSP | `loadHTMLString`, CSP | `NavigateToString`, CSP | open |
+| html editor (`.editable()`) | editor script | editor script | editor script | no³ |
 
 ¹ Engine-ready, core door open: the engine can hand a response body
 over, but no hook of this API carries bytes yet — so the backend does
@@ -299,16 +299,22 @@ the only lever.
 ³ The sandbox that holds a document runs no script, the editor's
 included: an editable document is shown there, read-only.
 
+⁴ The phone has no event constructor a page trusts — a synthetic DOM
+event is what real sites refuse — so the cell is not claimed. The two
+WKWebView columns are ONE tenant (`bunny_ui_apple::webview`); only the
+keyboard's door, the snapshot's image and this cell differ.
+
 The table is the design's honest centre. An app that needs full
 network capture on every OS needs a proxy or its own engine; this
 widget is for showing the web and observing what an app's own pages
 do — a dev tool watching the server it just started, a test harness
 reading the console of the page it drives.
 
-The declared set is a value the app can read — on macOS,
-`bunny_ui_macos::webview::capabilities()` — so a feature that needs a
+The declared set is a value the app can read —
+`bunny_ui_macos::webview::capabilities()`,
+`bunny_ui_ios::webview::capabilities()` — so a feature that needs a
 capability can decide its own shape per platform instead of
-half-working on two of three.
+half-working on two of four.
 
 ## What this is not
 
