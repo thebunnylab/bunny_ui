@@ -281,6 +281,9 @@ pub struct Runtime {
     /// time, so the number needs no key: it belongs to whatever
     /// `interaction.pressed` names, and the release takes it.
     pressed_clicks: Cell<u8>,
+    /// The finger's state machine — what a touch means is decided here
+    /// and performed through the pointer's own doors ([`crate::touch`]).
+    touch: RefCell<crate::touch::Recognizer>,
     /// The lifted drag's VALUE — the stamp carries only label and
     /// geometry; the typed value stays here and lands on the drop.
     drag_value: RefCell<Option<std::rc::Rc<dyn std::any::Any>>>,
@@ -978,6 +981,7 @@ impl Runtime {
             last_drop_rings: RefCell::new(Vec::new()),
             drag_armed: RefCell::new(None),
             pressed_clicks: Cell::new(1),
+            touch: RefCell::new(crate::touch::Recognizer::new()),
             drag_value: RefCell::new(None),
             drag_preview: RefCell::new(None),
             tooltip: RefCell::new(TooltipLife::default()),
@@ -1930,6 +1934,150 @@ impl Runtime {
         self.interaction.borrow().clone()
     }
 
+    // MARK: - Touch (the finger speaks the pointer's vocabulary)
+
+    /// A finger landed. `id` names the finger for its lifetime (the
+    /// platform's touch object is a fine name), `taps` is the platform's
+    /// own count for it — the click count a press will carry. `true` =
+    /// repaint. What the touch MEANS is decided by [`crate::touch`] and
+    /// performed through the pointer's own doors; the shell only
+    /// forwards.
+    pub fn touch_began(&self, id: u64, x: Px, y: Px, taps: u8) -> bool {
+        let gestures = self.touch.borrow_mut().began(id, Point { x, y }, taps, self);
+        self.perform_touch(gestures).0
+    }
+
+    /// A finger moved.
+    pub fn touch_moved(&self, id: u64, x: Px, y: Px) -> bool {
+        let gestures = self.touch.borrow_mut().moved(id, Point { x, y });
+        self.perform_touch(gestures).0
+    }
+
+    /// A finger lifted.
+    pub fn touch_ended(&self, id: u64, x: Px, y: Px) -> bool {
+        let gestures = self.touch.borrow_mut().ended(id, Point { x, y });
+        self.perform_touch(gestures).0
+    }
+
+    /// The system took the finger: a press in flight is cancelled and
+    /// fires nothing, a pan never flings.
+    pub fn touch_cancelled(&self, id: u64) -> bool {
+        let gestures = self.touch.borrow_mut().cancelled(id);
+        self.perform_touch(gestures).0
+    }
+
+    /// Performs what the recognizer said, with the recognizer
+    /// UNBORROWED: a press runs the app's closure, and the app may come
+    /// straight back in through any door. Answers (repaint, input) —
+    /// `input` says a gesture reached the app and a settled frame is due.
+    fn perform_touch(&self, gestures: Vec<crate::touch::Gesture>) -> (bool, bool) {
+        use crate::touch::Gesture;
+        let mut repaint = false;
+        let mut input = false;
+        for gesture in gestures {
+            match gesture {
+                Gesture::Press { at, taps } => {
+                    repaint |=
+                        self.pointer_clicked(at.x, at.y, taps, crate::action::Modifiers::NONE);
+                    input = true;
+                }
+                Gesture::Move { at } => {
+                    repaint |= self.pointer_moved(at.x, at.y, crate::action::Modifiers::NONE);
+                }
+                Gesture::Release { at } => {
+                    self.pointer_released(at.x, at.y);
+                    // a lifted finger is not still there: nothing hovers
+                    // between gestures on a touch surface
+                    self.pointer_exited();
+                    repaint = true;
+                    input = true;
+                }
+                Gesture::Menu { at } => {
+                    repaint |= self.context_click(at.x, at.y);
+                    input = true;
+                }
+                Gesture::Scroll { anchor, dx, dy } => {
+                    // the wheel's road, whole: the tooltip and the menu die
+                    // the same way, and the region under the ANCHOR takes
+                    // the whole gesture
+                    let moved = self.wheel(anchor.x, anchor.y, dx, dy);
+                    repaint |= moved;
+                    if !moved {
+                        // the content hit its edge: a fling dies here
+                        self.touch.borrow_mut().stop_fling();
+                    }
+                }
+                Gesture::Cancel => repaint |= self.pointer_cancelled(),
+                Gesture::Magnify { at, scale } => repaint |= self.magnify(at.x, at.y, scale),
+            }
+        }
+        (repaint, input)
+    }
+
+    /// A press that ends without a release — the system took the
+    /// pointer (a touch the OS claimed, a window that lost the hand).
+    /// The pressed visual clears, a drag in flight goes home, a grabbed
+    /// box hears the pointer go up; nothing fires and the focus stays.
+    /// `true` = repaint.
+    pub fn pointer_cancelled(&self) -> bool {
+        self.enter_scene();
+        let (repaint, told) = self.watching_hover(|| self.pointer_cancelled_road());
+        repaint || told
+    }
+
+    fn pointer_cancelled_road(&self) -> bool {
+        self.pressed_clicks.set(1);
+        self.drag_armed.borrow_mut().take();
+        let dragged = self.drag_value.borrow_mut().take().is_some();
+        if dragged {
+            self.interaction.borrow_mut().drag = None;
+            self.clear_drag_preview();
+        }
+        let (grabbed, at, changed) = {
+            let mut interaction = self.interaction.borrow_mut();
+            let changed = interaction.pressed.take().is_some()
+                | interaction.split_drag.take().is_some()
+                | interaction.thumb_drag.take().is_some()
+                | interaction.field_drag.take().is_some()
+                | interaction.hovered.take().is_some();
+            let at = interaction.pointer.take().unwrap_or(Point::ZERO);
+            (interaction.element_grab.take(), at, changed)
+        };
+        if let Some(placement) = grabbed.as_deref().and_then(|path| self.custom_at(path)) {
+            let at = Self::local(&placement, at.x, at.y);
+            self.deliver(&placement, crate::custom::ElementEvent::PointerUp { at });
+        }
+        changed || dragged || grabbed.is_some()
+    }
+
+    /// Two fingers — or a trackpad — changed their distance over the
+    /// scene: the app's box under the point hears
+    /// [`crate::custom::ElementEvent::Magnify`] with the ratio of this
+    /// step. Nothing else zooms; `true` = the box took it.
+    pub fn magnify(&self, x: Px, y: Px, scale: f64) -> bool {
+        self.enter_scene();
+        let over = self.hover_target(x, y).and_then(|path| self.custom_at(&path));
+        let Some(placement) = over else {
+            return false;
+        };
+        let at = Self::local(&placement, x, y);
+        self.deliver(&placement, crate::custom::ElementEvent::Magnify { at, scale }).handled
+    }
+
+    /// The scroll regions under a point with travel, per axis —
+    /// `wheel`'s routing question asked without the wheel's answer.
+    fn scroll_travel_at(&self, x: Px, y: Px) -> (bool, bool) {
+        let scrolls = self.last_scrolls.borrow();
+        let reachable = self.reachable(&scrolls, |floor| floor.scrolls);
+        let mut travels = (false, false);
+        for region in reachable.iter().filter(|region| region.frame.contains(x, y)) {
+            let (max_x, max_y) = scroll_travel(region);
+            travels.0 |= max_x > 0.0;
+            travels.1 |= max_y > 0.0;
+        }
+        travels
+    }
+
     // MARK: - Scrolling (offset is ENGINE state: no view invalidates)
 
     /// Routes the wheel to the region that paints LAST among those
@@ -1962,13 +2110,6 @@ impl Runtime {
             }
         }
         let scrolls = self.last_scrolls.borrow();
-        let travel = |region: &ScrollRegion| {
-            let max_x =
-                (region.content.width.round() - region.frame.size.width.round()).max(0.0);
-            let max_y =
-                (region.content.height.round() - region.frame.size.height.round()).max(0.0);
-            (max_x, max_y)
-        };
         // each AXIS routes to the region that paints LAST among those
         // under the point that travel that way — the pointer's own
         // rule, walking the list back. A child paints over its parent
@@ -1985,7 +2126,7 @@ impl Runtime {
         let reachable = self.reachable(&scrolls, |floor| floor.scrolls);
         let topmost = |axis: fn((Px, Px)) -> Px| {
             reachable.iter().rev().find(|region| {
-                region.frame.contains(x, y) && axis(travel(region)) > 0.0
+                region.frame.contains(x, y) && axis(scroll_travel(region)) > 0.0
             })
         };
         let region_y = (dy != 0.0).then(|| topmost(|(_, y)| y)).flatten();
@@ -1996,7 +2137,7 @@ impl Runtime {
         let mut moved = false;
         let mut offsets = self.scroll_offsets.borrow_mut();
         let mut apply = |region: &ScrollRegion, dx: Px, dy: Px| {
-            let (max_x, max_y) = travel(region);
+            let (max_x, max_y) = scroll_travel(region);
             // the wheel is sovereign: a reveal in flight dies here
             self.animator.borrow_mut().cancel_scroll(&region.path);
             let current = offsets.get(&region.path).copied().unwrap_or_default();
@@ -3022,6 +3163,15 @@ impl Runtime {
                 .borrow_mut()
                 .insert(path.as_ref().to_string(), Point { x, y });
         }
+        // the finger's clock: a hold ages into a menu or a press, a
+        // fling slides the content one more step
+        let gestures = self.touch.borrow_mut().tick(dt, self);
+        let mut moved = moved;
+        if !gestures.is_empty() {
+            let (repaint, input) = self.perform_touch(gestures);
+            moved.scene |= repaint;
+            moved.input |= input;
+        }
         moved
     }
 
@@ -3029,8 +3179,11 @@ impl Runtime {
     /// frame driver (display link, rAF) with this after every present.
     pub fn wants_frame(&self) -> bool {
         // a sleeping task needs the clock to keep moving, and the
-        // clock is the frame tick — the shell's driver stays awake
-        self.animator.borrow().wants_frame() || motor::task::has_timers()
+        // clock is the frame tick — the shell's driver stays awake; so
+        // does a finger whose meaning the clock decides, and a fling
+        self.animator.borrow().wants_frame()
+            || motor::task::has_timers()
+            || self.touch.borrow().alive()
     }
 
     /// The frame rate the moment deserves. A shell with a slow timer
@@ -3040,7 +3193,9 @@ impl Runtime {
     /// ride the frame clock.
     pub fn frame_pace(&self) -> crate::anim::FramePace {
         let pace = self.animator.borrow().pace();
-        if motor::task::has_timers() && pace != crate::anim::FramePace::Display {
+        if (motor::task::has_timers() || self.touch.borrow().alive())
+            && pace != crate::anim::FramePace::Display
+        {
             return crate::anim::FramePace::Display;
         }
         pace
@@ -4747,5 +4902,41 @@ impl Runtime {
             Some(root) => motor::identity::has_dirty_matching(root),
             None => false,
         }
+    }
+}
+
+/// How far a region can scroll on each axis — its content past its
+/// frame, in whole points, never negative.
+fn scroll_travel(region: &ScrollRegion) -> (Px, Px) {
+    let max_x = (region.content.width.round() - region.frame.size.width.round()).max(0.0);
+    let max_y = (region.content.height.round() - region.frame.size.height.round()).max(0.0);
+    (max_x, max_y)
+}
+
+/// The scene the finger asks: the tables of the last layout answer,
+/// under the same modal line the pointer stops at.
+impl crate::touch::TouchScene for Runtime {
+    fn pans_at(&self, at: Point) -> bool {
+        let (horizontal, vertical) = self.scroll_travel_at(at.x, at.y);
+        horizontal
+            || vertical
+            || self.hover_target(at.x, at.y).and_then(|path| self.custom_at(&path)).is_some()
+    }
+
+    fn grabs_at(&self, at: Point) -> bool {
+        let Some(target) = self.hover_target(at.x, at.y) else {
+            return false;
+        };
+        if target.ends_with("/#split") || self.grab_thumb(&target, at.x, at.y).is_some() {
+            return true;
+        }
+        self.custom_at(&target).is_some_and(|placement| placement.element.element().takes_drag())
+    }
+
+    fn menu_at(&self, at: Point) -> bool {
+        let menus = self.last_menus.borrow();
+        self.reachable(&menus, |floor| floor.menus)
+            .iter()
+            .any(|region| region.rect.contains(at.x, at.y))
     }
 }

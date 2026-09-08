@@ -186,6 +186,9 @@ pub enum AppEvent {
     /// momentum; the legacy wheel is converted from lines to points on
     /// arrival).
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
+    /// The trackpad's pinch over the view: `scale` is the ratio of this
+    /// step (1.0 = nothing), at the pointer.
+    Magnify { x: f64, y: f64, scale: f64 },
     /// RAW key — only arrives here when the focused field is NOT in the
     /// path (no focus, or cmd held): shortcuts and function keys. With
     /// focus, the event enters the input system (`interpretKeyEvents:`)
@@ -964,6 +967,17 @@ extern "C" fn bunny_scroll_wheel(this: Id, _sel: Sel, event: Id) {
     }
 }
 
+/// The trackpad pinch. AppKit hands `magnification` as the CHANGE of
+/// this step (0 = nothing, 0.5 = half again as far apart); the runtime
+/// speaks in ratios, so one is added here, once.
+extern "C" fn bunny_magnify(this: Id, _sel: Sel, event: Id) {
+    unsafe {
+        let (x, y) = event_layout_point(this, event);
+        let scale = 1.0 + msg_f64(event, sel("magnification"));
+        dispatch(AppEvent::Magnify { x, y, scale });
+    }
+}
+
 /// AppKit's word that a drag is about to move the window's frame. It
 /// comes before the first resized frame, and that is the point: the
 /// presenter arms its transaction here, so the whole drag runs under
@@ -1515,6 +1529,12 @@ unsafe fn register_classes() {
             view,
             sel("scrollWheel:"),
             bunny_scroll_wheel as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            view,
+            sel("magnifyWithEvent:"),
+            bunny_magnify as *const c_void,
             types.as_ptr(),
         );
         class_addMethod(

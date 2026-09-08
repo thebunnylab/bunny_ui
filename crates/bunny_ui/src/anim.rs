@@ -138,6 +138,12 @@ pub struct Ticked {
     pub scene: bool,
     /// A loop clock crossed into a new step — repaint its boxes.
     pub islands: bool,
+    /// A touch reached the app from the clock — a long press opened a
+    /// menu or armed a press. State may have moved: run a SETTLED frame
+    /// (`display_frame`), not the animation frame. `tick` promises to
+    /// move values and never state; a finger held on the clock is the
+    /// one exception, and this is where it says so.
+    pub input: bool,
 }
 
 impl Ticked {

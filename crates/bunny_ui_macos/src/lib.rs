@@ -1571,6 +1571,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 blit(runtime, root, trace::Origin::Input);
             }
         }
+        AppEvent::Magnify { x, y, scale } => {
+            // the box under the pointer zooms; nothing else does
+            if runtime.magnify(x, y, scale) {
+                blit(runtime, root, trace::Origin::Input);
+            }
+        }
         AppEvent::Key { code, shift, command, chars } => {
             // printable keys become Insert; PUA F700–F8FF are AppKit
             // function keys — never text

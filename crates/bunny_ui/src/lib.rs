@@ -65,6 +65,7 @@ pub mod stats;
 pub mod text_engine;
 pub mod text_input;
 pub mod theme;
+pub mod touch;
 pub mod view;
 pub(crate) mod viewport;
 pub mod views;
@@ -113,6 +114,7 @@ pub mod task {
 pub mod prelude {
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
+    pub use crate::touch::{Gesture, TouchScene};
     pub use crate::custom::{
         Custom, CustomElement, ElementEvent, EventCtx, ImeContext, Metrics, PaintCtx, Painter,
         Response,
@@ -11343,5 +11345,477 @@ mod tests {
             KeyPattern::command_shift(Key::Char('g')),
             KeyPattern::command_shift(Key::Char('G'.to_ascii_lowercase()))
         );
+    }
+
+    // MARK: - Touch: the finger speaks the pointer's vocabulary
+
+    /// A static screen: the finger lands on a button and lifts. The
+    /// press shows at once (nothing under it can pan), the lift fires,
+    /// and afterwards NOTHING hovers — a lifted finger is not there.
+    #[test]
+    fn a_tap_fires_the_button_and_leaves_nothing_hovered() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Tapper {
+            count: State<usize>,
+        }
+        impl Component for Tapper {
+            fn body(self, _ctx: &Context) -> impl View {
+                let count = self.count;
+                vstack!(button(text("tap"), move || count.add(1)), spacer())
+            }
+        }
+
+        let view = Tapper { count: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 100.0 };
+        let _ = runtime.display_frame(&view, size);
+        let (_, rect) = runtime
+            .layout(&view, Proposal::exact(size))
+            .hits
+            .first()
+            .cloned()
+            .expect("the button is a target");
+        let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+
+        assert!(runtime.touch_began(1, x, y, 1), "the press paints at once");
+        assert!(runtime.interaction().pressed.is_some(), "nothing here pans: the press is sure");
+        assert!(!runtime.wants_frame(), "a sure press needs no clock");
+        runtime.touch_ended(1, x, y);
+        assert_eq!(view.count.get(), 1, "the lift fired");
+        let after = runtime.interaction();
+        assert_eq!(after.pressed, None);
+        assert_eq!(after.hovered, None, "a lifted finger hovers nothing");
+        assert_eq!(after.pointer, None);
+    }
+
+    /// A finger over a list: within the slop nothing is said; past it
+    /// the content slides with the finger, and the row under the finger
+    /// never fires — the press it waited with is never sent.
+    #[test]
+    fn a_pan_over_a_list_scrolls_and_the_row_never_fires() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Rows {
+            fired: State<usize>,
+        }
+        impl Component for Rows {
+            fn body(self, _ctx: &Context) -> impl View {
+                let fired = self.fired;
+                list((0..100).collect::<Vec<usize>>(), |row| format!("row{row}"), move |row| {
+                    button(text(format!("item {row}")), move || fired.add(1))
+                })
+            }
+        }
+
+        let view = Rows { fired: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 100.0 };
+        let _ = runtime.display_frame(&view, size);
+        let region = runtime
+            .layout(&view, Proposal::exact(size))
+            .scrolls
+            .first()
+            .expect("the list is a region")
+            .path
+            .clone();
+
+        assert!(!runtime.touch_began(1, 10.0, 80.0, 1), "over a list the press waits");
+        assert!(runtime.wants_frame(), "the hold is on the clock");
+        assert!(!runtime.touch_moved(1, 10.0, 78.0), "inside the slop nothing moves");
+        assert_eq!(runtime.scroll_offset(&region).y, 0.0);
+        assert!(runtime.touch_moved(1, 10.0, 60.0), "past the slop the content slides");
+        assert_eq!(runtime.scroll_offset(&region).y, 20.0, "the whole excursion, not the rest of it");
+        runtime.touch_ended(1, 10.0, 60.0);
+        assert_eq!(view.fired.get(), 0, "the row never fired");
+        assert_eq!(runtime.interaction().pressed, None);
+        assert_eq!(runtime.frame_pace(), FramePace::Idle, "a slow lift has no fling");
+    }
+
+    /// A finger that lands on a button OUTSIDE every region presses at
+    /// once; a drag on that press is the pointer's drag, and the list
+    /// below never scrolls for it.
+    #[test]
+    fn a_press_drag_over_a_button_outside_a_region_does_not_scroll() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Page {
+            fired: State<usize>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let fired = self.fired;
+                vstack!(
+                    button(text("go"), move || fired.add(1)).frame(200.0, 30.0),
+                    list((0..100).collect::<Vec<usize>>(), |row| format!("row{row}"), |row| {
+                        text(format!("item {row}"))
+                    }),
+                )
+            }
+        }
+
+        let view = Page { fired: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 200.0 };
+        let _ = runtime.display_frame(&view, size);
+        let result = runtime.layout(&view, Proposal::exact(size));
+        let region = result.scrolls.first().expect("the list is a region").path.clone();
+        let (_, rect) = result.hits.first().cloned().expect("the button is a target");
+        let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+
+        assert!(runtime.touch_began(1, x, y, 1));
+        assert!(runtime.interaction().pressed.is_some(), "no region under the button: sure press");
+        // a drag well past the slop, ending inside the button's own box
+        let edge = rect.origin.x + rect.size.width - 1.0;
+        runtime.touch_moved(1, x + 300.0, y + 300.0);
+        assert_eq!(runtime.interaction().hovered, None, "dragged out: the pressed paint drops");
+        runtime.touch_moved(1, edge, y);
+        runtime.touch_ended(1, edge, y);
+        assert_eq!(view.fired.get(), 1, "released inside: the button fires once");
+        assert_eq!(runtime.scroll_offset(&region), Point::ZERO, "the list below never moved");
+    }
+
+    /// A finger held still over a row with a context menu: half a second
+    /// on the clock opens the menu, the lift after it changes nothing,
+    /// and the next tap picks a row.
+    #[test]
+    fn a_long_press_opens_the_context_menu_and_the_lift_keeps_it() {
+        use crate::layout::{MENU_PATH, Proposal, Size};
+
+        #[derive(Clone)]
+        struct Row {
+            opened: State<usize>,
+        }
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                let opened = self.opened;
+                scroll(vstack!(
+                    text("file_0001.rs").context_menu(vec![
+                        menu_item("Open", move || opened.set(opened.get() + 1)),
+                        menu_item("Delete", || {}),
+                    ]),
+                    text("tall").frame_height(1000.0),
+                ))
+            }
+        }
+
+        let view = Row { opened: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.display_frame(&view, size);
+
+        assert!(!runtime.touch_began(1, 30.0, 8.0, 1), "over a scroll the press waits");
+        let early = runtime.tick(0.3);
+        assert!(!early.input, "not yet");
+        assert!(runtime.interaction().menu.is_none());
+        let held = runtime.tick(0.3);
+        assert!(held.input, "the clock reached the app: a settled frame is due");
+        assert!(runtime.interaction().menu.is_some(), "the menu opened where the finger holds");
+        runtime.touch_ended(1, 30.0, 8.0);
+        assert!(runtime.interaction().menu.is_some(), "the lift after a menu is spent");
+        assert_eq!(view.opened.get(), 0);
+
+        // the next tap picks the first row
+        let result = runtime.layout(&view, Proposal::exact(size));
+        let menu = result
+            .overlays
+            .iter()
+            .find(|overlay| overlay.path == MENU_PATH)
+            .expect("the menu is an overlay");
+        let (x, y) = (menu.frame.origin.x + 20.0, menu.frame.origin.y + 5.0 + 12.0);
+        runtime.touch_began(2, x, y, 1);
+        runtime.touch_ended(2, x, y);
+        assert_eq!(view.opened.get(), 1, "the row fired");
+        assert!(runtime.interaction().menu.is_none(), "and the menu closed");
+    }
+
+    /// A finger held still where no menu answers becomes a press — mouse
+    /// mode: on a field the press focuses it and opens the sweep, so the
+    /// drag that follows selects.
+    #[test]
+    fn a_long_press_without_a_menu_becomes_a_press() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Form {
+            value: State<String>,
+        }
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(vstack!(
+                    text_field("type…", self.value.binding()),
+                    text("tall").frame_height(1000.0),
+                ))
+            }
+        }
+
+        let view = Form { value: State::new("hello world".into()) };
+        let runtime = Runtime::new();
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.display_frame(&view, size);
+        let field = runtime
+            .layout(&view, Proposal::exact(size))
+            .fields
+            .first()
+            .expect("the field is placed")
+            .frame;
+        let (x, y) = (field.origin.x + 10.0, field.origin.y + field.size.height / 2.0);
+
+        runtime.touch_began(1, x, y, 1);
+        assert_eq!(runtime.focused(), None, "a finger that may pan focuses nothing yet");
+        let _ = runtime.tick(0.3);
+        let held = runtime.tick(0.3);
+        assert!(held.input);
+        assert!(runtime.focused().is_some(), "the hold pressed: the field took the keyboard");
+        assert!(runtime.interaction().field_drag.is_some(), "and the sweep is open");
+        runtime.touch_ended(1, x, y);
+        assert!(runtime.focused().is_some(), "the lift keeps the focus");
+    }
+
+    /// Runs a fast pan on a list of `rows` and lifts; the fling then
+    /// runs on the clock until it rests. Returns (offset at the lift,
+    /// offset at rest).
+    fn fling(rows: usize) -> (f64, f64) {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Rows {
+            rows: usize,
+        }
+        impl Component for Rows {
+            fn body(self, _ctx: &Context) -> impl View {
+                list((0..self.rows).collect::<Vec<usize>>(), |row| format!("row{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+            }
+        }
+
+        let view = Rows { rows };
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 100.0 };
+        let _ = runtime.display_frame(&view, size);
+        let region = runtime
+            .layout(&view, Proposal::exact(size))
+            .scrolls
+            .first()
+            .expect("the list is a region")
+            .path
+            .clone();
+
+        runtime.touch_began(1, 10.0, 90.0, 1);
+        let mut y = 90.0;
+        for _ in 0..3 {
+            y -= 20.0;
+            runtime.touch_moved(1, 10.0, y);
+            let _ = runtime.tick(1.0 / 60.0);
+        }
+        runtime.touch_ended(1, 10.0, y);
+        let lifted = runtime.scroll_offset(&region).y;
+        assert!(runtime.wants_frame(), "a fast lift flings");
+        assert_eq!(runtime.frame_pace(), FramePace::Display);
+
+        let mut last = lifted;
+        let mut ticks = 0;
+        while runtime.wants_frame() {
+            let _ = runtime.tick(1.0 / 60.0);
+            let now = runtime.scroll_offset(&region).y;
+            assert!(now >= last, "a fling never turns back");
+            last = now;
+            ticks += 1;
+            assert!(ticks < 600, "a fling comes to rest");
+        }
+        assert_eq!(runtime.frame_pace(), FramePace::Idle);
+        (lifted, last)
+    }
+
+    #[test]
+    fn a_fling_continues_after_the_lift_and_decays_to_rest() {
+        let (lifted, rested) = fling(300);
+        assert_eq!(lifted, 60.0, "three moves of twenty");
+        assert!(rested > lifted + 100.0, "the content kept sliding after the lift: {rested}");
+        assert!(rested < 300.0 * 16.0 - 100.0, "and stopped short of the end");
+    }
+
+    #[test]
+    fn a_fling_stops_at_the_edge() {
+        // ten rows of sixteen in a hundred: sixty points of travel
+        let (_, rested) = fling(10);
+        assert_eq!(rested, 60.0, "the clamp is where the fling dies");
+    }
+
+    /// The system takes the finger mid-press: nothing fires, the
+    /// pressed paint clears, and the field that had the keyboard keeps it.
+    #[test]
+    fn a_cancelled_press_fires_nothing_and_keeps_the_focus() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Form {
+            value: State<String>,
+            count: State<usize>,
+        }
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                let count = self.count;
+                vstack!(
+                    text_field("type…", self.value.binding()),
+                    button(text("go"), move || count.add(1)).frame(200.0, 30.0),
+                    spacer(),
+                )
+            }
+        }
+
+        let view = Form { value: State::new("hi".into()), count: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 200.0 };
+        let _ = runtime.display_frame(&view, size);
+        let result = runtime.layout(&view, Proposal::exact(size));
+        let placed = result.fields.first().expect("the field is placed");
+        let field = placed.path.clone();
+        runtime.focus(&field);
+        let (_, rect) = result
+            .hits
+            .iter()
+            .find(|(_, rect)| rect.origin.y >= placed.frame.origin.y + placed.frame.size.height)
+            .cloned()
+            .expect("the button is a target below the field");
+        let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+
+        assert!(runtime.touch_began(1, x, y, 1));
+        assert!(runtime.interaction().pressed.is_some());
+        assert!(runtime.touch_cancelled(1), "the pressed paint clears");
+        assert_eq!(runtime.interaction().pressed, None);
+        assert_eq!(view.count.get(), 0, "nothing fired");
+        assert_eq!(runtime.focused().as_deref(), Some(field.as_str()), "the focus stayed");
+    }
+
+    /// Two fingers over an app's box: the change of their distance
+    /// reaches the box as a ratio at the point between them — and so
+    /// does a trackpad, through the same door.
+    #[test]
+    fn magnify_reaches_the_box_under_the_fingers() {
+        use crate::layout::Size;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Zoomable {
+            scale: Rc<Cell<f64>>,
+            at: Rc<Cell<Point>>,
+        }
+        impl CustomElement for Zoomable {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
+                if let ElementEvent::Magnify { at, scale } = event {
+                    self.scale.set(self.scale.get() * scale);
+                    self.at.set(*at);
+                    return Response { handled: true, ..Response::default() };
+                }
+                Response::default()
+            }
+        }
+
+        #[derive(Clone)]
+        struct Map {
+            scale: Rc<Cell<f64>>,
+            at: Rc<Cell<Point>>,
+        }
+        impl Component for Map {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Zoomable { scale: self.scale.clone(), at: self.at.clone() })
+            }
+        }
+
+        let scale = Rc::new(Cell::new(1.0));
+        let at = Rc::new(Cell::new(Point::ZERO));
+        let view = Map { scale: scale.clone(), at: at.clone() };
+        let runtime = Runtime::new();
+        let size = Size { width: 400.0, height: 300.0 };
+        let _ = runtime.display_frame(&view, size);
+
+        // two fingers a hundred apart spread to two hundred: twice
+        runtime.touch_began(1, 100.0, 100.0, 1);
+        runtime.touch_began(2, 200.0, 100.0, 1);
+        assert!(runtime.touch_moved(2, 300.0, 100.0), "the box took the zoom");
+        assert_eq!(scale.get(), 2.0);
+        assert_eq!(at.get(), Point { x: 200.0, y: 100.0 }, "at the point between the fingers");
+        runtime.touch_ended(1, 100.0, 100.0);
+        runtime.touch_ended(2, 300.0, 100.0);
+
+        // the trackpad speaks the same door
+        assert!(runtime.magnify(150.0, 150.0, 1.5));
+        assert_eq!(scale.get(), 3.0);
+        // and nothing zooms where no box listens
+        assert!(!Runtime::new().magnify(10.0, 10.0, 2.0));
+    }
+
+    /// A box that takes the drag, inside a scroll region: the finger is
+    /// a hand on the box at once — the box hears the press and every
+    /// move, and the region around it never scrolls.
+    #[test]
+    fn a_box_that_takes_the_drag_presses_at_once_inside_a_scroll() {
+        use crate::layout::{Proposal, Size};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Canvas {
+            downs: Rc<Cell<usize>>,
+            drags: Rc<Cell<usize>>,
+        }
+        impl CustomElement for Canvas {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn takes_drag(&self) -> bool {
+                true
+            }
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
+                match event {
+                    ElementEvent::PointerDown { .. } => self.downs.set(self.downs.get() + 1),
+                    ElementEvent::PointerMoved { pressed: true, .. } => {
+                        self.drags.set(self.drags.get() + 1)
+                    }
+                    _ => {}
+                }
+                Response { handled: true, ..Response::default() }
+            }
+        }
+
+        #[derive(Clone)]
+        struct Sketch {
+            downs: Rc<Cell<usize>>,
+            drags: Rc<Cell<usize>>,
+        }
+        impl Component for Sketch {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(vstack!(
+                    custom(Canvas { downs: self.downs.clone(), drags: self.drags.clone() })
+                        .frame(200.0, 150.0),
+                    text("tall").frame_height(1000.0),
+                ))
+            }
+        }
+
+        let downs = Rc::new(Cell::new(0));
+        let drags = Rc::new(Cell::new(0));
+        let view = Sketch { downs: downs.clone(), drags: drags.clone() };
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 200.0 };
+        let _ = runtime.display_frame(&view, size);
+        let region = runtime
+            .layout(&view, Proposal::exact(size))
+            .scrolls
+            .first()
+            .expect("the scroll is a region")
+            .path
+            .clone();
+
+        runtime.touch_began(1, 50.0, 50.0, 1);
+        assert_eq!(downs.get(), 1, "the box heard the press at once");
+        runtime.touch_moved(1, 50.0, 80.0);
+        runtime.touch_moved(1, 50.0, 120.0);
+        assert_eq!(drags.get(), 2, "and every move, pressed");
+        assert_eq!(runtime.scroll_offset(&region), Point::ZERO, "the region never scrolled");
+        runtime.touch_ended(1, 50.0, 120.0);
     }
 }
