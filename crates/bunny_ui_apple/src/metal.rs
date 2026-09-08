@@ -33,14 +33,17 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::hash::{Hash, Hasher};
 use std::ptr::null_mut;
 
-use bunny_ui::gpu::walk::ShelfPacker;
-use bunny_ui::image_engine::{ImageEngine, ImageRaster, ImageSource, raster_source};
-use bunny_ui::layout::{Color, Corners, DisplayList, DrawCommand, Rect, Size};
-use bunny_ui::raster::physical_extent;
-use bunny_ui::text_engine::{FontKey, FontSpec, TextEngine};
+use bunny_ui::gpu::walk::{
+    AtlasFull, AtlasGround, DrawRun, FrameBatches, GLASS_MAX_LEVEL, GlassInstance, RectInstance,
+    RoundClip, RunAtlas, RunKind, SpriteInstance, build_frame,
+};
+use bunny_ui::image_engine::ImageEngine;
+#[cfg(test)]
+use bunny_ui::image_engine::ImageSource;
+use bunny_ui::layout::{Color, DisplayList, Size};
+use bunny_ui::text_engine::TextEngine;
 
 use crate::ffi::{CGSize, Id, Sel, class, error_message, kill_layer_actions, ns_string, sel};
 
@@ -158,9 +161,6 @@ const STATUS_COMPLETED: u64 = 4; // MTLCommandBufferStatus: Completed=4, Error=5
 // cannot show). Overflow drains the in-flight frames, resets the whole
 // atlas and re-inserts the current frame — a copying collector, not a
 // per-tile free list.
-const ATLAS_CHUNK_WIDTH: u32 = 1024;
-const ATLAS_INITIAL_SIZE: u32 = 2048;
-const ATLAS_MAX_SIZE: u32 = 4096;
 
 #[repr(C)]
 struct MTLClearColor {
@@ -192,60 +192,9 @@ struct MTLRegion {
 
 // MARK: - The wire format shared with the shaders
 
-/// One rect primitive: fill, stroke ring or shadow, selected by
-/// `params[2]`. Everything is snapped device pixels resolved on the CPU
-/// in f64 — the shader is a pure coverage evaluator.
-///
-/// The struct crosses to the GPU as raw bytes; the MSL source declares
-/// the same layout textually and the asserts below are the ONLY defense
-/// against drift.
-#[repr(C)]
-#[derive(Clone, Copy)]
-#[allow(dead_code)] // written whole, read by the GPU — never field by field
-struct RectInstance {
-    rect: [f32; 4],   // x0, y0, x1, y1 (the shadow ships its EXPANDED box)
-    clip: [f32; 4],   // the snapped clip-stack top
-    params: [f32; 4], // aspect (the ellipse only), thickness/reach/first, kind, expansion/second
-    color: [u8; 4],   // straight RGBA
-    // A gradient's second half rides here: the far color plus one
-    // point (centre for the rings, end for the line). The ramp fits
-    // the twelve bytes that were padding.
-    pad: [u8; 12],
-    // The four corners, clockwise from the top left, CLAMPED in device
-    // px — the shader only picks the one its quadrant owns.
-    radii: [f32; 4],
-}
-
-/// One text run (or chunk of one): a rectangle of atlas texels copied
-/// 1:1 to the destination — no sampler, no resampling, exact bytes.
-#[repr(C)]
-#[derive(Clone, Copy)]
-#[allow(dead_code)] // written whole, read by the GPU — never field by field
-struct SpriteInstance {
-    dest: [f32; 4], // x0, y0, x1, y1 in device px
-    tex: [f32; 4],  // atlas texel origin + the same extent
-    clip: [f32; 4],
-}
-
-/// One pane of liquid glass. Everything is snapped device pixels
-/// resolved on the CPU in f64, like every other instance here — the
-/// shader only evaluates the material.
-#[repr(C)]
-#[derive(Clone, Copy)]
-#[allow(dead_code)] // written whole, read by the GPU — never field by field
-struct GlassInstance {
-    rect: [f32; 4],   // x0, y0, x1, y1
-    clip: [f32; 4],   // the snapped clip-stack top
-    radii: [f32; 4],  // the four corners, clamped
-    lens: [f32; 4],   // blur, refraction band, refraction amount, chromatic
-    finish: [f32; 4], // highlight band, highlight intensity, saturation, brightness
-    touch: [f32; 4],  // sheen, spot x, spot y, spot radius
-    tint: [u8; 4],    // straight RGBA
-    highlight: [u8; 4],
-    spot_alpha: f32,
-    pad: f32,
-}
-
+// The instance structs are the walk's (`bunny_ui::gpu::walk`) — every
+// tier reads the same bytes. The shaders below spell them textually,
+// and the asserts here pin the two spellings to one layout.
 const _: () = {
     assert!(std::mem::size_of::<GlassInstance>() == 112);
     assert!(std::mem::offset_of!(GlassInstance, rect) == 0);
@@ -1270,10 +1219,6 @@ struct EncodeFrame<'a> {
     pyramid: Option<&'a GlassTextures>,
 }
 
-/// The deepest level of the blur pyramid — four levels in all, mirroring
-/// `bunny_ui::glass::MAX_LEVEL`.
-const GLASS_MAX_LEVEL: u32 = 3;
-
 /// The textures liquid glass needs: the ping and pong of the blur
 /// pyramid, and the offscreen scene a window frame renders into because
 /// its drawable cannot be read.
@@ -1420,396 +1365,41 @@ unsafe fn build_pipeline(
     }
 }
 
-// MARK: - The walk (display list → instances, all policy in f64)
+// MARK: - The ground (where the walk's tiles land)
 
-/// A snapped box in device pixels, `[x0, y0, x1, y1)` — the same tuple
-/// the Surface uses for damage and clips.
-type Box4 = (i64, i64, i64, i64);
-
-fn box_intersect(a: Box4, b: Box4) -> Option<Box4> {
-    let rect = (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3));
-    (rect.0 < rect.2 && rect.1 < rect.3).then_some(rect)
-}
-
-/// The mirror of `snap(scale_rect(rect, factor))` — scale origin and
-/// size separately, then round each edge on its own. The operation order
-/// matters: it is what makes neighbors close without a seam, and parity
-/// is byte-level.
-fn snap_scaled(rect: Rect, factor: f64) -> Box4 {
-    let sx = rect.origin.x * factor;
-    let sy = rect.origin.y * factor;
-    let sw = rect.size.width * factor;
-    let sh = rect.size.height * factor;
-    (
-        sx.round() as i64,
-        sy.round() as i64,
-        (sx + sw).round() as i64,
-        (sy + sh).round() as i64,
-    )
-}
-
-/// The CPU's radius clamp, verbatim — the same `Corners::clamped` the
-/// raster runs, against the SNAPPED extent.
-fn corner_clamp(scaled: Corners, snapped: Box4) -> Corners {
-    scaled.clamped((snapped.2 - snapped.0) as f64, (snapped.3 - snapped.1) as f64)
-}
-
-/// The curve a run is cut by, as the shaders see it — ONE per draw
-/// run, bound as 32 bytes of fragment constants, never per instance:
-/// the 64-byte rect wire and the 48-byte sprite wire stay untouched.
-/// `radius == 0` is the straight rectangle every clip has been until
-/// now — and multiplying coverage by 1.0 is exact, so a frame without
-/// a curve leaves both shaders bit for bit as they were.
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq)]
-struct RoundClip {
-    /// The rounded clip's OWN snapped box in device px — the cut can
-    /// be smaller without the corner moving.
-    box4: [f32; 4],
-    /// The four corners. They fit the three floats MSL was already
-    /// padding this struct out to, so the cut carries four for the
-    /// price of one.
-    radii: [f32; 4],
-}
-
-const _: () = {
-    assert!(std::mem::size_of::<RoundClip>() == 32);
-    assert!(std::mem::offset_of!(RoundClip, box4) == 0);
-    assert!(std::mem::offset_of!(RoundClip, radii) == 16);
-};
-
-/// Slot zero of every frame — the cut that never bends.
-const NO_ROUND: RoundClip = RoundClip { box4: [0.0; 4], radii: [0.0; 4] };
-
-const KIND_FILL: f32 = 0.0;
-const KIND_STROKE: f32 = 1.0;
-const KIND_SHADOW: f32 = 2.0;
-const KIND_RADIAL: f32 = 3.0;
-const KIND_LINEAR: f32 = 4.0;
-/// The elliptical rings: the ASPECT rides params.x (the corner slot —
-/// an elliptical ramp ignores the box corner; a rounded wash clips
-/// through `.clipped()`), start and end radii stay in params.y/.w.
-const KIND_ELLIPTIC: f32 = 5.0;
-
-// MARK: - The run atlas (text tiles, append-only shelves)
-
-/// One rectangle of atlas texels.
-#[derive(Clone, Copy)]
-struct Tile {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-}
-
-
-/// The atlas is full — the caller drains the in-flight frames, resets
-/// (growing once to the cap) and walks the frame again.
-struct AtlasFull;
-
-/// One cached run: the engine's raster uploaded as chunk tiles. The
-/// color sits IN the key — the engine bakes it, which keeps emoji true
-/// and byte parity possible; a theme flip mints new tiles and the old
-/// ones fall with the next reset.
-struct RunEntry {
-    font: FontKey,
-    color: u32,
-    scale: u32,
-    content: String,
-    tiles: Vec<Tile>,
-    width: u32,
-    height: u32,
-}
-
-fn packed_color(color: Color) -> u32 {
-    ((color.r as u32) << 24) | ((color.g as u32) << 16) | ((color.b as u32) << 8) | color.a as u32
-}
-
-/// The lookup hash — computed WITHOUT allocating (typing must never pay
-/// a String per warm frame); collisions resolve by comparing the entry.
-fn run_hash(font: FontKey, color: u32, scale: u32, content: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    font.hash(&mut hasher);
-    color.hash(&mut hasher);
-    scale.hash(&mut hasher);
-    content.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// The text side of the GPU frame: one shared RGBA texture of run
-/// tiles, keyed by (font, color, scale, content).
-///
-/// The append-only INVARIANT: tiles are only ever written into virgin
-/// space, so a frame still riding the GPU never sees its texels change.
-/// The only operation that reuses space is `reset`, and reset requires
-/// the caller to DRAIN in-flight frames first.
-struct RunAtlas {
+/// The Metal side of the atlas seam. The walk (`bunny_ui::gpu::walk`)
+/// keeps every allocation decision — shelves, chunks, the dedicated cap,
+/// the collector; this only mints textures and moves bytes into them,
+/// and answers a handle the batches carry until the encode binds it.
+struct MetalGround {
     device: Id,
-    texture: Id,
-    size: u32,
-    packer: ShelfPacker,
-    entries: HashMap<u64, Vec<RunEntry>>,
-    /// Resampled images riding the SHARED texture, keyed by
-    /// (source key, physical width, physical height) — icons and
-    /// thumbnails, the many and the hot.
-    images: HashMap<(u64, u32, u32), ImageEntry>,
-    /// Images too big for a shelf get a texture of their own (a shelf
-    /// eats its full height across the atlas width, and anything larger
-    /// than the atlas would LIVELOCK the reset-retry). Capped; overflow
-    /// rides the same reset the atlas already does — but only while the
-    /// map holds a texture the walk in progress did not read. After a
-    /// reset the map holds exactly what the walk minted, and a frame
-    /// that needs more than the cap keeps every one: asking the
-    /// collector again would be the livelock the cap was written
-    /// against (the Atrium floor at scale 2 — dozens of painted paths
-    /// taller than a shelf, on ONE frame).
-    dedicated: HashMap<(u64, u32, u32), Dedicated>,
-    /// The walk in progress: `build_frame` opens one per attempt, and
-    /// every dedicated read stamps its texture with it.
-    walk: u64,
-    /// The walk the last reset closed — `fresh` reads the pair.
-    reset_walk: u64,
+    /// The shared atlas texture, or null until the first tile asks.
+    shared: Id,
+    /// The dedicated textures by the handle the walk was given.
+    textures: HashMap<u64, Id>,
+    next: u64,
 }
 
-/// One dedicated texture and the last walk that read it — the question
-/// the collector is asked before it is called.
-struct Dedicated {
-    texture: Id,
-    walk: u64,
-}
-
-/// One cached image on the shared atlas: its chunk tiles at one
-/// physical size.
-struct ImageEntry {
-    tiles: Vec<Tile>,
-}
-
-/// What `resolve_image` hands the frame walk: shared tiles, or one
-/// whole dedicated texture.
-enum ResolvedImage<'a> {
-    Tiles(&'a ImageEntry),
-    Dedicated(Id, u32, u32),
-}
-
-/// The shelf ceiling: taller goes dedicated (uniform shelf heights
-/// pack well; one tall image would burn a whole shelf band)…
-const DEDICATED_HEIGHT: u32 = 256;
-/// …and so does anything larger than this area, atlas-budget-wise.
-const DEDICATED_AREA: u32 = 512 * 512;
-/// Dedicated textures retained before a stale one asks the collector.
-/// A frame that reads more keeps them all: the collector can only take
-/// a texture no walk needs.
-const DEDICATED_KEEP: usize = 8;
-
-impl RunAtlas {
-    fn new(device: Id) -> RunAtlas {
-        RunAtlas {
-            device,
-            texture: null_mut(),
-            size: ATLAS_INITIAL_SIZE,
-            packer: ShelfPacker::new(ATLAS_INITIAL_SIZE, ATLAS_INITIAL_SIZE),
-            entries: HashMap::new(),
-            images: HashMap::new(),
-            dedicated: HashMap::new(),
-            walk: 0,
-            reset_walk: 0,
-        }
+impl MetalGround {
+    fn new(device: Id) -> MetalGround {
+        MetalGround { device, shared: null_mut(), textures: HashMap::new(), next: 1 }
     }
 
-    /// True while a reset would give nothing back: the first walk after
-    /// one, on the grown texture, holds only its own tiles. A shelf that
-    /// refuses a tile then is the frame's own size, not garbage.
-    fn fresh(&self) -> bool {
-        self.size == ATLAS_MAX_SIZE && self.walk == self.reset_walk.wrapping_add(1)
+    /// The texture behind a handle the walk handed out — null when the
+    /// collector already took it (a frame never binds one of those).
+    fn texture_of(&self, id: u64) -> Id {
+        self.textures.get(&id).copied().unwrap_or(null_mut())
     }
 
-    /// Opens a walk: the stamp every dedicated texture the frame reads
-    /// takes. `build_frame` calls it first, on every attempt.
-    fn begin_walk(&mut self) {
-        self.walk = self.walk.wrapping_add(1);
+    /// The frame's dedicated textures in the order the runs index them.
+    fn bound(&self, handles: &[u64]) -> Vec<Id> {
+        handles.iter().map(|id| self.texture_of(*id)).collect()
     }
 
-    /// Drops every entry and every shelf. `grow` doubles the texture
-    /// once (2048 → 4096); the texture itself is re-made lazily. The
-    /// caller MUST have drained in-flight frames — this is the one
-    /// moment texel space is reused.
-    fn reset(&mut self, grow: bool) {
-        if grow && self.size < ATLAS_MAX_SIZE {
-            self.size = ATLAS_MAX_SIZE;
-            unsafe {
-                if !self.texture.is_null() {
-                    msg_void(self.texture, sel("release"));
-                    self.texture = null_mut();
-                }
-            }
-            self.packer = ShelfPacker::new(self.size, self.size);
-        } else {
-            self.packer.reset();
-        }
-        self.entries.clear();
-        self.images.clear();
-        // the dedicated textures ride the same collector: the caller
-        // drained the GPU before any reset, so releasing here is safe
-        for (_, entry) in self.dedicated.drain() {
-            unsafe { msg_void(entry.texture, sel("release")) };
-        }
-        self.reset_walk = self.walk;
-    }
-
-    unsafe fn ensure_texture(&mut self) -> bool {
+    /// A shared-storage RGBA texture the CPU writes into directly (the
+    /// Apple-Silicon premise of the module), read by the sprite pass.
+    unsafe fn make_texture(&self, width: u32, height: u32) -> Id {
         unsafe {
-            if !self.texture.is_null() {
-                return true;
-            }
-            let descriptor = msg_id_u64_u64_u64_bool(
-                class("MTLTextureDescriptor"),
-                sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
-                PIXEL_FORMAT_RGBA8,
-                self.size as u64,
-                self.size as u64,
-                0,
-            );
-            msg_void_u64(descriptor, sel("setUsage:"), TEXTURE_USAGE_SHADER_READ);
-            msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_SHARED);
-            self.texture = msg_id_arg(self.device, sel("newTextureWithDescriptor:"), descriptor);
-            !self.texture.is_null()
-        }
-    }
-
-    /// The tiles for one run — warm from the map, or rasterized by the
-    /// engine, chunked and uploaded. `Ok(None)` means the engine had
-    /// nothing to paint (the CPU path skips those too).
-    fn resolve(
-        &mut self,
-        slice: &str,
-        font: &FontSpec,
-        color: Color,
-        scale: usize,
-        engine: &dyn TextEngine,
-    ) -> Result<Option<&RunEntry>, AtlasFull> {
-        let key = font.key();
-        let packed = packed_color(color);
-        let hash = run_hash(key, packed, scale as u32, slice);
-        let warm = self.entries.get(&hash).is_some_and(|bucket| {
-            bucket.iter().any(|entry| {
-                entry.font == key
-                    && entry.color == packed
-                    && entry.scale == scale as u32
-                    && entry.content == slice
-            })
-        });
-        if !warm {
-            let Some(raster) = engine.raster_line(slice, font, color, scale) else {
-                return Ok(None);
-            };
-            unsafe {
-                if !self.ensure_texture() {
-                    return Err(AtlasFull);
-                }
-            }
-            let width = raster.width as u32;
-            let height = raster.height as u32;
-            let mut tiles = Vec::new();
-            let mut chunk_x: u32 = 0;
-            while chunk_x < width {
-                let chunk_width = (width - chunk_x).min(ATLAS_CHUNK_WIDTH);
-                let Some((x, y)) = self.packer.place(chunk_width, height) else {
-                    return Err(AtlasFull);
-                };
-                unsafe {
-                    msg_void_region_u64_ptr_u64(
-                        self.texture,
-                        sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
-                        MTLRegion {
-                            origin: MTLOrigin { x: x as u64, y: y as u64, z: 0 },
-                            size: MTLSize {
-                                width: chunk_width as u64,
-                                height: height as u64,
-                                depth: 1,
-                            },
-                        },
-                        0,
-                        raster.rgba.as_ptr().add(chunk_x as usize * 4) as *const c_void,
-                        (raster.width * 4) as u64,
-                    );
-                }
-                tiles.push(Tile { x, y, width: chunk_width, height });
-                chunk_x += chunk_width;
-            }
-            self.entries.entry(hash).or_default().push(RunEntry {
-                font: key,
-                color: packed,
-                scale: scale as u32,
-                content: slice.to_string(),
-                tiles,
-                width,
-                height,
-            });
-        }
-        let entry = self
-            .entries
-            .get(&hash)
-            .and_then(|bucket| {
-                bucket.iter().find(|entry| {
-                    entry.font == key
-                        && entry.color == packed
-                        && entry.scale == scale as u32
-                        && entry.content == slice
-                })
-            })
-            .expect("a run just resolved lives in the atlas");
-        Ok(Some(entry))
-    }
-
-    /// The texels for one image at one physical size — warm from a map,
-    /// or resampled by the engine and uploaded: small rides the shared
-    /// atlas in chunk tiles, big claims a dedicated texture. `Ok(None)`
-    /// = the engine has nothing yet (async decode, broken bytes).
-    fn resolve_image(
-        &mut self,
-        source: &ImageSource,
-        width: u32,
-        height: u32,
-        engine: &dyn ImageEngine,
-    ) -> Result<Option<ResolvedImage<'_>>, AtlasFull> {
-        let cache_key = (source.key(), width, height);
-        let walk = self.walk;
-        if let Some(entry) = self.dedicated.get_mut(&cache_key) {
-            entry.walk = walk;
-            return Ok(Some(ResolvedImage::Dedicated(entry.texture, width, height)));
-        }
-        let shelf_size = height <= DEDICATED_HEIGHT && width * height <= DEDICATED_AREA;
-        if shelf_size && self.images.contains_key(&cache_key) {
-            return Ok(self.images.get(&cache_key).map(ResolvedImage::Tiles));
-        }
-        let Some(raster) = raster_source(engine, source, width as usize, height as usize) else {
-            return Ok(None);
-        };
-        if shelf_size {
-            match self.shelve(&raster, width, height) {
-                Ok(tiles) => {
-                    self.images.insert(cache_key, ImageEntry { tiles });
-                    return Ok(self.images.get(&cache_key).map(ResolvedImage::Tiles));
-                }
-                // the shelves hold nothing but this walk's own tiles: a
-                // reset would give nothing back, so the image takes a
-                // texture of its own instead of failing the frame
-                Err(AtlasFull) if self.fresh() => {}
-                Err(full) => return Err(full),
-            }
-        }
-
-        // dedicated: over the cap, the frame asks for the collector —
-        // but only when the collector has something to take. A texture
-        // this walk read is not garbage; after the drain+reset the map
-        // holds nothing else, and the walk that re-runs keeps what it
-        // needs instead of running into the same wall
-        if self.dedicated.len() >= DEDICATED_KEEP
-            && self.dedicated.values().any(|entry| entry.walk != walk)
-        {
-            return Err(AtlasFull);
-        }
-        let texture = unsafe {
             let descriptor = msg_id_u64_u64_u64_bool(
                 class("MTLTextureDescriptor"),
                 sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
@@ -1820,592 +1410,68 @@ impl RunAtlas {
             );
             msg_void_u64(descriptor, sel("setUsage:"), TEXTURE_USAGE_SHADER_READ);
             msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_SHARED);
-            let texture = msg_id_arg(self.device, sel("newTextureWithDescriptor:"), descriptor);
-            if texture.is_null() {
-                return Err(AtlasFull);
-            }
+            msg_id_arg(self.device, sel("newTextureWithDescriptor:"), descriptor)
+        }
+    }
+
+    /// One tile of straight-RGBA rows into a texture: `bytes` starts at
+    /// the tile's first texel and the rows are `pitch_px` apart.
+    unsafe fn upload(texture: Id, x: u32, y: u32, w: u32, h: u32, bytes: &[u8], pitch_px: u32) {
+        unsafe {
             msg_void_region_u64_ptr_u64(
                 texture,
                 sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
                 MTLRegion {
-                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
-                    size: MTLSize { width: width as u64, height: height as u64, depth: 1 },
+                    origin: MTLOrigin { x: x as u64, y: y as u64, z: 0 },
+                    size: MTLSize { width: w as u64, height: h as u64, depth: 1 },
                 },
                 0,
-                raster.rgba.as_ptr() as *const c_void,
-                (raster.width * 4) as u64,
+                bytes.as_ptr() as *const c_void,
+                (pitch_px * 4) as u64,
             );
-            texture
-        };
-        self.dedicated.insert(cache_key, Dedicated { texture, walk });
-        Ok(Some(ResolvedImage::Dedicated(texture, width, height)))
-    }
-
-    /// Cuts one raster into chunk tiles on the shared shelves and
-    /// uploads them. `Err` = a chunk found no shelf; the chunks already
-    /// cut stay where they lie and fall with the next reset.
-    fn shelve(
-        &mut self,
-        raster: &ImageRaster,
-        width: u32,
-        height: u32,
-    ) -> Result<Vec<Tile>, AtlasFull> {
-        unsafe {
-            if !self.ensure_texture() {
-                return Err(AtlasFull);
-            }
-        }
-        let mut tiles = Vec::new();
-        let mut chunk_x: u32 = 0;
-        while chunk_x < width {
-            let chunk_width = (width - chunk_x).min(ATLAS_CHUNK_WIDTH);
-            let Some((x, y)) = self.packer.place(chunk_width, height) else {
-                return Err(AtlasFull);
-            };
-            unsafe {
-                msg_void_region_u64_ptr_u64(
-                    self.texture,
-                    sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
-                    MTLRegion {
-                        origin: MTLOrigin { x: x as u64, y: y as u64, z: 0 },
-                        size: MTLSize {
-                            width: chunk_width as u64,
-                            height: height as u64,
-                            depth: 1,
-                        },
-                    },
-                    0,
-                    raster.rgba.as_ptr().add(chunk_x as usize * 4) as *const c_void,
-                    (raster.width * 4) as u64,
-                );
-            }
-            tiles.push(Tile { x, y, width: chunk_width, height });
-            chunk_x += chunk_width;
-        }
-        Ok(tiles)
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_rect(
-    out: &mut Vec<RectInstance>,
-    quad: Box4,
-    clip: Box4,
-    color: Color,
-    radii: Corners,
-    extra: f64,
-    kind: f32,
-    expansion: f64,
-) {
-    out.push(RectInstance {
-        rect: [quad.0 as f32, quad.1 as f32, quad.2 as f32, quad.3 as f32],
-        clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
-        params: [0.0, extra as f32, kind, expansion as f32],
-        color: [color.r, color.g, color.b, color.a],
-        pad: [0; 12],
-        radii: wire_radii(radii),
-    });
-}
-
-/// The four corners as the shader reads them, clockwise from the top
-/// left — the ONE place the field order is spoken.
-fn wire_radii(radii: Corners) -> [f32; 4] {
-    [
-        radii.top_left as f32,
-        radii.top_right as f32,
-        radii.bottom_right as f32,
-        radii.bottom_left as f32,
-    ]
-}
-
-/// One gradient instance: the fill's quad and corner, plus the second
-/// half of the ramp packed into the bytes the struct already had.
-#[allow(clippy::too_many_arguments)]
-fn push_gradient(
-    out: &mut Vec<RectInstance>,
-    quad: Box4,
-    clip: Box4,
-    near: Color,
-    far: Color,
-    radii: Corners,
-    aspect: f64,
-    first: f64,
-    second: f64,
-    point: (f64, f64),
-    kind: f32,
-) {
-    let mut pad = [0u8; 12];
-    pad[0..4].copy_from_slice(&[far.r, far.g, far.b, far.a]);
-    pad[4..8].copy_from_slice(&(point.0 as f32).to_ne_bytes());
-    pad[8..12].copy_from_slice(&(point.1 as f32).to_ne_bytes());
-    out.push(RectInstance {
-        rect: [quad.0 as f32, quad.1 as f32, quad.2 as f32, quad.3 as f32],
-        clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
-        params: [aspect as f32, first as f32, kind, second as f32],
-        color: [near.r, near.g, near.b, near.a],
-        pad,
-        radii: wire_radii(radii),
-    });
-}
-
-/// A maximal run of one instance kind, in paint order — the draw-call
-/// unit. Batches break only where rects and text alternate.
-#[derive(Clone, Copy, PartialEq)]
-enum RunKind {
-    Rects,
-    /// A batch of liquid-glass panes. It carries its own pass: the
-    /// scene has to be blurred into the pyramid BEFORE the panes read
-    /// it, and a pass boundary is what orders the two.
-    Glass,
-    Sprites,
-    /// Sprites read from a DEDICATED texture (an image too big for the
-    /// shared atlas) — the index points into the frame's texture list.
-    Texture(u16),
-}
-
-#[derive(Clone, Copy)]
-struct DrawRun {
-    kind: RunKind,
-    base: u32,
-    count: u32,
-    /// Glass only: how deep the pyramid must go for this batch — the
-    /// deepest blur any pane in it asked for.
-    levels: u32,
-    /// Index into the frame's interned curves — a `u32` compare keeps
-    /// run coalescing cheap, and the run only breaks when the SHAPE of
-    /// the cut changes, which no scene of today ever does.
-    round: u32,
-}
-
-fn note_run(runs: &mut Vec<DrawRun>, kind: RunKind, round: u32, index: usize) {
-    match runs.last_mut() {
-        Some(run) if run.kind == kind && run.round == round => run.count += 1,
-        _ => runs.push(DrawRun { kind, base: index as u32, count: 1, round, levels: 0 }),
-    }
-}
-
-fn box_union(a: Box4, b: Box4) -> Box4 {
-    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
-}
-
-/// A pane joins the batch in front of it only if it does not TOUCH any
-/// pane already in it. One batch reads one capture of the scene, so two
-/// panes that overlap must not share it: the upper one would sample a
-/// blur taken before the lower one existed, and stacked glass would
-/// show nothing of the glass beneath it.
-fn note_glass(
-    runs: &mut Vec<DrawRun>,
-    round: u32,
-    index: usize,
-    bounds: Box4,
-    levels: u32,
-    batch: &mut Option<Box4>,
-) {
-    let joins = matches!(runs.last(), Some(run) if run.kind == RunKind::Glass && run.round == round)
-        && batch.is_some_and(|acc| box_intersect(acc, bounds).is_none());
-    if joins {
-        let run = runs.last_mut().expect("the run the match found");
-        run.count += 1;
-        run.levels = run.levels.max(levels);
-        *batch = batch.map(|acc| box_union(acc, bounds));
-    } else {
-        runs.push(DrawRun { kind: RunKind::Glass, base: index as u32, count: 1, round, levels });
-        *batch = Some(bounds);
-    }
-}
-
-/// The instance lists of one frame, retained so their capacity survives
-/// across frames.
-#[derive(Default)]
-struct FrameBatches {
-    rects: Vec<RectInstance>,
-    sprites: Vec<SpriteInstance>,
-    glass: Vec<GlassInstance>,
-    runs: Vec<DrawRun>,
-    /// The frame's interned curves — slot 0 is always [`NO_ROUND`], so
-    /// a frame with no rounded clip binds once and moves on.
-    rounds: Vec<RoundClip>,
-    /// Dedicated textures this frame reads (borrowed from the atlas's
-    /// cache — the atlas owns and releases them).
-    textures: Vec<Id>,
-}
-
-/// Walks the display list in paint order and fills the frame batches.
-/// The clip stack mirrors `Surface::walk_clips`: snapped, intersected in
-/// integers, an empty intersection degenerating to a zero-area box.
-/// `Err(AtlasFull)` asks the caller to drain, reset the atlas and walk
-/// again.
-fn build_frame(
-    display: &DisplayList,
-    scale: usize,
-    target: (usize, usize),
-    engine: &dyn TextEngine,
-    images: &dyn ImageEngine,
-    atlas: &mut RunAtlas,
-    batches: &mut FrameBatches,
-) -> Result<(), AtlasFull> {
-    atlas.begin_walk();
-    batches.rects.clear();
-    batches.sprites.clear();
-    batches.glass.clear();
-    batches.runs.clear();
-    batches.textures.clear();
-    batches.rounds.clear();
-    batches.rounds.push(NO_ROUND);
-    let out = &mut batches.rects;
-    let factor = scale as f64;
-    let whole: Box4 = (0, 0, target.0 as i64, target.1 as i64);
-    // each entry: the hard cut, plus the index of the curve it lives
-    // under (the CPU's inheritance rule, spoken in indices)
-    let mut clips: Vec<(Box4, u32)> = Vec::new();
-    // the boxes the open glass batch already holds — a pane that
-    // touches one of them starts a batch of its own
-    let mut glass_batch: Option<Box4> = None;
-    for command in display.iter() {
-        match command {
-            DrawCommand::FillRect { rect, color, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
-                let snapped = snap_scaled(*rect, factor);
-                if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
-                    continue;
-                }
-                if box_intersect(snapped, clip).is_none() {
-                    continue;
-                }
-                let radii = corner_clamp(corner_radius * factor, snapped);
-                push_rect(out, snapped, clip, *color, radii, 0.0, KIND_FILL, 0.0);
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
-            }
-            DrawCommand::Backdrop { rect, glass, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
-                let snapped = snap_scaled(*rect, factor);
-                if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
-                    continue;
-                }
-                if box_intersect(snapped, clip).is_none() {
-                    continue;
-                }
-                let radii = corner_clamp(corner_radius * factor, snapped);
-                let paint = glass.scaled(factor);
-                batches.glass.push(GlassInstance {
-                    rect: [snapped.0 as f32, snapped.1 as f32, snapped.2 as f32, snapped.3 as f32],
-                    clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
-                    radii: wire_radii(radii),
-                    lens: [
-                        paint.blur as f32,
-                        paint.refraction_band as f32,
-                        paint.refraction_amount as f32,
-                        paint.chromatic as f32,
-                    ],
-                    finish: [
-                        paint.highlight_band as f32,
-                        paint.highlight_intensity as f32,
-                        paint.saturation as f32,
-                        paint.brightness as f32,
-                    ],
-                    touch: [
-                        paint.sheen as f32,
-                        paint.spot_center.x as f32,
-                        paint.spot_center.y as f32,
-                        paint.spot_radius as f32,
-                    ],
-                    tint: [paint.tint.r, paint.tint.g, paint.tint.b, paint.tint.a],
-                    highlight: [
-                        paint.highlight.r,
-                        paint.highlight.g,
-                        paint.highlight.b,
-                        paint.highlight.a,
-                    ],
-                    spot_alpha: paint.spot_alpha as f32,
-                    pad: 0.0,
-                });
-                note_glass(
-                    &mut batches.runs,
-                    round_of(&clips),
-                    batches.glass.len() - 1,
-                    snapped,
-                    bunny_ui::glass::levels_for(paint.blur) as u32,
-                    &mut glass_batch,
-                );
-            }
-            DrawCommand::Gradient { rect, paint, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
-                let snapped = snap_scaled(*rect, factor);
-                if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
-                    continue;
-                }
-                if box_intersect(snapped, clip).is_none() {
-                    continue;
-                }
-                let radii = corner_clamp(corner_radius * factor, snapped);
-                match paint.scaled(factor) {
-                    bunny_ui::layout::GradientPaint::Radial {
-                        center,
-                        start,
-                        end,
-                        aspect,
-                        inner,
-                        outer,
-                    } => {
-                        // the circle keeps its kind (and its corners)
-                        // byte for byte; the ellipse drops the corners
-                        // and takes the aspect slot instead
-                        let (kind, corners) = if aspect == 1.0 {
-                            (KIND_RADIAL, radii)
-                        } else {
-                            (KIND_ELLIPTIC, Corners::ZERO)
-                        };
-                        push_gradient(
-                            out,
-                            snapped,
-                            clip,
-                            inner,
-                            outer,
-                            corners,
-                            aspect,
-                            start,
-                            end,
-                            (center.x, center.y),
-                            kind,
-                        )
-                    }
-                    // the line's two ends fill the four numbers the
-                    // struct still had: its start in the params, its
-                    // end in the point — the quad stays the box
-                    bunny_ui::layout::GradientPaint::Linear { start, end, from, to } => {
-                        push_gradient(
-                            out,
-                            snapped,
-                            clip,
-                            from,
-                            to,
-                            radii,
-                            0.0,
-                            start.x,
-                            start.y,
-                            (end.x, end.y),
-                            KIND_LINEAR,
-                        )
-                    }
-                }
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
-            }
-            DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
-                let snapped = snap_scaled(*rect, factor);
-                if snapped.2 <= snapped.0 || snapped.3 <= snapped.1 {
-                    continue;
-                }
-                if box_intersect(snapped, clip).is_none() {
-                    continue;
-                }
-                // the cpu's integer thickness, resolved here: at least
-                // one device pixel, rounded once
-                let thickness = (width * factor).max(1.0).round();
-                let radii = corner_clamp(corner_radius * factor, snapped);
-                push_rect(out, snapped, clip, *color, radii, thickness, KIND_STROKE, 0.0);
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
-            }
-            DrawCommand::Shadow { rect, radius, color, corner_radius } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
-                let snapped = snap_scaled(*rect, factor);
-                // reach stays unrounded for the falloff; its rounding
-                // only sizes the quad (the cpu loop bound) — any pixel
-                // beyond it computes coverage zero anyway
-                let reach = (radius * factor).max(1.0);
-                let reach_px = reach.round() as i64;
-                let corner = corner_clamp(corner_radius * factor, snapped);
-                let expanded = (
-                    snapped.0 - reach_px,
-                    snapped.1 - reach_px,
-                    snapped.2 + reach_px,
-                    snapped.3 + reach_px,
-                );
-                if box_intersect(expanded, clip).is_none() {
-                    continue;
-                }
-                push_rect(out, expanded, clip, *color, corner, reach, KIND_SHADOW, reach_px as f64);
-                note_run(&mut batches.runs, RunKind::Rects, round_of(&clips), out.len() - 1);
-            }
-            DrawCommand::TextLine { origin, content, range, color, font } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
-                let slice = &content[range.0..range.1];
-                let Some(entry) = atlas.resolve(slice, font, *color, scale, engine)? else {
-                    continue;
-                };
-                // the composite_text mirror: one snap of the logical
-                // origin, texels copied 1:1 from there
-                let base_x = (origin.x * factor).round() as i64;
-                let base_y = (origin.y * factor).round() as i64;
-                let dest = (base_x, base_y, base_x + entry.width as i64, base_y + entry.height as i64);
-                if box_intersect(dest, clip).is_none() {
-                    continue;
-                }
-                let mut chunk_x: i64 = 0;
-                for tile in &entry.tiles {
-                    let chunk = (
-                        base_x + chunk_x,
-                        base_y,
-                        base_x + chunk_x + tile.width as i64,
-                        base_y + tile.height as i64,
-                    );
-                    chunk_x += tile.width as i64;
-                    if box_intersect(chunk, clip).is_none() {
-                        continue;
-                    }
-                    batches.sprites.push(SpriteInstance {
-                        dest: [chunk.0 as f32, chunk.1 as f32, chunk.2 as f32, chunk.3 as f32],
-                        tex: [
-                            tile.x as f32,
-                            tile.y as f32,
-                            (tile.x + tile.width) as f32,
-                            (tile.y + tile.height) as f32,
-                        ],
-                        clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
-                    });
-                    note_run(&mut batches.runs, RunKind::Sprites, round_of(&clips), batches.sprites.len() - 1);
-                }
-            }
-            DrawCommand::Image { rect, source } => {
-                let Some(clip) = effective_clip(&clips, whole) else { continue };
-                let width = physical_extent(rect.size.width, scale) as u32;
-                let height = physical_extent(rect.size.height, scale) as u32;
-                if width == 0 || height == 0 {
-                    continue;
-                }
-                // the composite_rgba mirror: one snap of the logical
-                // origin, texels pasted 1:1 from there
-                let base_x = (rect.origin.x * factor).round() as i64;
-                let base_y = (rect.origin.y * factor).round() as i64;
-                let dest =
-                    (base_x, base_y, base_x + width as i64, base_y + height as i64);
-                if box_intersect(dest, clip).is_none() {
-                    continue;
-                }
-                match atlas.resolve_image(source, width, height, images)? {
-                    None => {}
-                    Some(ResolvedImage::Tiles(entry)) => {
-                        let mut chunk_x: i64 = 0;
-                        for tile in &entry.tiles {
-                            let chunk = (
-                                base_x + chunk_x,
-                                base_y,
-                                base_x + chunk_x + tile.width as i64,
-                                base_y + tile.height as i64,
-                            );
-                            chunk_x += tile.width as i64;
-                            if box_intersect(chunk, clip).is_none() {
-                                continue;
-                            }
-                            batches.sprites.push(SpriteInstance {
-                                dest: [
-                                    chunk.0 as f32,
-                                    chunk.1 as f32,
-                                    chunk.2 as f32,
-                                    chunk.3 as f32,
-                                ],
-                                tex: [
-                                    tile.x as f32,
-                                    tile.y as f32,
-                                    (tile.x + tile.width) as f32,
-                                    (tile.y + tile.height) as f32,
-                                ],
-                                clip: [
-                                    clip.0 as f32,
-                                    clip.1 as f32,
-                                    clip.2 as f32,
-                                    clip.3 as f32,
-                                ],
-                            });
-                            note_run(
-                                &mut batches.runs,
-                                RunKind::Sprites,
-                                round_of(&clips),
-                                batches.sprites.len() - 1,
-                            );
-                        }
-                    }
-                    Some(ResolvedImage::Dedicated(texture, tex_w, tex_h)) => {
-                        let index = match batches.textures.iter().position(|t| *t == texture)
-                        {
-                            Some(index) => index,
-                            None => {
-                                batches.textures.push(texture);
-                                batches.textures.len() - 1
-                            }
-                        };
-                        batches.sprites.push(SpriteInstance {
-                            dest: [dest.0 as f32, dest.1 as f32, dest.2 as f32, dest.3 as f32],
-                            tex: [0.0, 0.0, tex_w as f32, tex_h as f32],
-                            clip: [
-                                clip.0 as f32,
-                                clip.1 as f32,
-                                clip.2 as f32,
-                                clip.3 as f32,
-                            ],
-                        });
-                        note_run(
-                            &mut batches.runs,
-                            RunKind::Texture(index as u16),
-                            round_of(&clips),
-                            batches.sprites.len() - 1,
-                        );
-                    }
-                }
-            }
-            DrawCommand::PushClip { rect, corner_radius } => {
-                let snapped = snap_scaled(*rect, factor);
-                let cut = match clips.last().copied() {
-                    Some((top, _)) => box_intersect(snapped, top)
-                        .unwrap_or((snapped.0, snapped.1, snapped.0, snapped.1)),
-                    None => snapped,
-                };
-                // the same clamp and the same half-pixel door the CPU
-                // keeps — below it, the clip INHERITS the open curve
-                let radii = corner_clamp(corner_radius * factor, snapped);
-                let round = if !radii.is_zero() {
-                    let entry = RoundClip {
-                        box4: [
-                            snapped.0 as f32,
-                            snapped.1 as f32,
-                            snapped.2 as f32,
-                            snapped.3 as f32,
-                        ],
-                        radii: wire_radii(radii),
-                    };
-                    match batches.rounds.iter().position(|r| *r == entry) {
-                        Some(index) => index as u32,
-                        None => {
-                            batches.rounds.push(entry);
-                            (batches.rounds.len() - 1) as u32
-                        }
-                    }
-                } else {
-                    clips.last().map_or(0, |(_, round)| *round)
-                };
-                clips.push((cut, round));
-            }
-            DrawCommand::PopClip => {
-                clips.pop();
-            }
         }
     }
-    Ok(())
 }
 
-/// The clip a primitive paints under: the stack top intersected with the
-/// target — `None` means nothing under it can paint (the CPU's clamped
-/// loops collapse to nothing there).
-fn effective_clip(clips: &[(Box4, u32)], whole: Box4) -> Option<Box4> {
-    match clips.last().copied() {
-        Some((top, _)) => box_intersect(top, whole),
-        None => Some(whole),
+impl AtlasGround for MetalGround {
+    fn ensure_shared(&mut self, size: u32) -> bool {
+        if !self.shared.is_null() {
+            return true;
+        }
+        self.shared = unsafe { self.make_texture(size, size) };
+        !self.shared.is_null()
     }
-}
 
-/// The curve index the open clip lives under — slot 0 when none.
-fn round_of(clips: &[(Box4, u32)]) -> u32 {
-    clips.last().map_or(0, |(_, round)| *round)
+    fn upload_shared(&mut self, x: u32, y: u32, w: u32, h: u32, bytes: &[u8], pitch_px: u32) {
+        if !self.shared.is_null() {
+            unsafe { MetalGround::upload(self.shared, x, y, w, h, bytes, pitch_px) };
+        }
+    }
+
+    fn drop_shared(&mut self) {
+        if !self.shared.is_null() {
+            unsafe { msg_void(self.shared, sel("release")) };
+            self.shared = null_mut();
+        }
+    }
+
+    fn make_dedicated(&mut self, w: u32, h: u32, bytes: &[u8], pitch_px: u32) -> Option<u64> {
+        let texture = unsafe { self.make_texture(w, h) };
+        if texture.is_null() {
+            return None;
+        }
+        unsafe { MetalGround::upload(texture, 0, 0, w, h, bytes, pitch_px) };
+        let id = self.next;
+        self.next += 1;
+        self.textures.insert(id, texture);
+        Some(id)
+    }
+
+    fn drop_dedicated(&mut self, id: u64) {
+        if let Some(texture) = self.textures.remove(&id) {
+            unsafe { msg_void(texture, sel("release")) };
+        }
+    }
 }
 
 // MARK: - Instance buffers (a fixed ring, recycled by polling)
@@ -2530,6 +1596,7 @@ pub struct MetalPresenter {
     scale: usize,
     slots: [FrameSlot; 3],
     cursor: usize,
+    ground: MetalGround,
     atlas: RunAtlas,
     batches: FrameBatches,
     /// The last presented frame's key — an identical frame skips the
@@ -2636,6 +1703,7 @@ impl MetalPresenter {
     ) {
         for attempt in 0..3 {
             match build_frame(
+                &mut self.ground,
                 display,
                 scale,
                 physical,
@@ -2654,7 +1722,7 @@ impl MetalPresenter {
                     }
                     crate::trace::mark("X", format_args!("what=atlas-drain"));
                     self.drain_slots();
-                    self.atlas.reset(true);
+                    self.atlas.reset(&mut self.ground, true);
                 }
             }
         }
@@ -2739,6 +1807,7 @@ impl MetalPresenter {
                 Some(textures) => (textures.scene, drawable_texture),
                 None => (drawable_texture, null_mut()),
             };
+            let textures = self.ground.bound(&self.batches.textures);
             let command = self.stack.encode_frame(EncodeFrame {
                 target,
                 present_to,
@@ -2749,8 +1818,8 @@ impl MetalPresenter {
                 glass_offset,
                 runs: &self.batches.runs,
                 rounds: &self.batches.rounds,
-                atlas_texture: self.atlas.texture,
-                textures: &self.batches.textures,
+                atlas_texture: self.ground.shared,
+                textures: &textures,
                 pyramid,
             });
             // live resize presents INSIDE the CATransaction: commit,
@@ -2820,7 +1889,8 @@ impl MetalPresenter {
             scale: 0,
             slots: [FrameSlot::empty(); 3],
             cursor: 0,
-            atlas: RunAtlas::new(device),
+            ground: MetalGround::new(device),
+            atlas: RunAtlas::new(),
             batches: FrameBatches::default(),
             retained: None,
             transactional: false,
@@ -2858,6 +1928,7 @@ pub struct OffscreenGpu {
     height: usize,
     slots: [FrameSlot; 3],
     cursor: usize,
+    ground: MetalGround,
     atlas: RunAtlas,
     batches: FrameBatches,
 }
@@ -2902,7 +1973,8 @@ impl OffscreenGpu {
                 height,
                 slots: [FrameSlot::empty(); 3],
                 cursor: 0,
-                atlas: RunAtlas::new(device),
+                ground: MetalGround::new(device),
+                atlas: RunAtlas::new(),
                 batches: FrameBatches::default(),
             })
         }
@@ -2933,6 +2005,7 @@ impl OffscreenGpu {
             let pool = objc_autoreleasePoolPush();
             for attempt in 0..3 {
                 match build_frame(
+                    &mut self.ground,
                     display,
                     scale,
                     (self.width, self.height),
@@ -2948,7 +2021,7 @@ impl OffscreenGpu {
                             break;
                         }
                         self.drain();
-                        self.atlas.reset(true);
+                        self.atlas.reset(&mut self.ground, true);
                     }
                 }
             }
@@ -2970,6 +2043,7 @@ impl OffscreenGpu {
                 );
             }
             let pyramid = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
+            let textures = self.ground.bound(&self.batches.textures);
             let command = self.stack.encode_frame(EncodeFrame {
                 target: self.target,
                 present_to: null_mut(),
@@ -2980,8 +2054,8 @@ impl OffscreenGpu {
                 glass_offset,
                 runs: &self.batches.runs,
                 rounds: &self.batches.rounds,
-                atlas_texture: self.atlas.texture,
-                textures: &self.batches.textures,
+                atlas_texture: self.ground.shared,
+                textures: &textures,
                 pyramid,
             });
             msg_void(command, self.stack.sels.commit);
@@ -3026,11 +2100,7 @@ impl OffscreenGpu {
     /// upload reuse with it.
     #[cfg(test)]
     fn atlas_footprint(&self) -> (usize, u32) {
-        let entries: usize = self.atlas.entries.values().map(Vec::len).sum();
-        (
-            entries + self.atlas.images.len() + self.atlas.dedicated.len(),
-            self.atlas.packer.next_y,
-        )
+        self.atlas.footprint()
     }
 
     /// The rendered bytes, R,G,B,A per pixel — the same order as the
@@ -4007,26 +3077,5 @@ mod tests {
         // a pane over a pane compounds: the upper one samples a scene
         // that already carries the lower one's own difference
         assert_glass_close(&gpu, &cpu, 6, 0.015, "stacked panes");
-    }
-
-    #[test]
-    fn overlapping_panes_break_the_batch_and_apart_ones_share_it() {
-        // the walk's own rule, without a device: two panes that touch
-        // take two batches, two that do not take one
-        let batch = |first: Box4, second: Box4| {
-            let mut runs: Vec<DrawRun> = Vec::new();
-            let mut open: Option<Box4> = None;
-            note_glass(&mut runs, 0, 0, first, 1, &mut open);
-            note_glass(&mut runs, 0, 1, second, 2, &mut open);
-            runs
-        };
-        let apart = batch((0, 0, 10, 10), (20, 20, 30, 30));
-        assert_eq!(apart.len(), 1, "panes that never meet share one capture");
-        assert_eq!(apart[0].count, 2);
-        assert_eq!(apart[0].levels, 2, "the batch digs as deep as its deepest pane");
-
-        let over = batch((0, 0, 20, 20), (10, 10, 30, 30));
-        assert_eq!(over.len(), 2, "glass over glass takes a capture of its own");
-        assert_eq!(over[1].levels, 2);
     }
 }
