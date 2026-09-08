@@ -349,6 +349,22 @@ impl Walk<'_> {
                 Self::inherit_stretch(&mut container);
                 out.push(container);
             }
+            // The flex frame on the web flow: a growing box. Its FLOOR is not
+            // honoured here yet — the flow layout carries no minimum, so a
+            // pane narrower than a table's floors squeezes the lanes on the
+            // web where the desktop scrolls them. Recorded, not hidden.
+            LayoutNode::FlexFrame { align, child, .. } => {
+                let mut container = node(DomKind::FlexColumn);
+                {
+                    let layout = container.layout.as_mut().expect("flow node");
+                    layout.grow = true;
+                    layout.align = Some(align_code(*align));
+                }
+                self.lower_into(child, &mut container.children);
+                Self::stamp_fill(child, &mut container.children);
+                Self::inherit_stretch(&mut container);
+                out.push(container);
+            }
             LayoutNode::Spacer => {
                 let mut spacer = node(DomKind::Box);
                 spacer.layout.as_mut().expect("flow node").grow = true;

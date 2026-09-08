@@ -189,6 +189,22 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// A flexible box with a floor: it fills what it is proposed, never
+    /// less than the floor — and unproposed on an axis it IS the floor,
+    /// not its content. A floor of zero hugs the content on that axis.
+    ///
+    /// That last clause is what a table's lane needs and `frame_max` cannot
+    /// give: under a sideways scroll a lane is proposed nothing, and a lane
+    /// that answered its longest text would be a different width on every
+    /// row. Floored, every row's lane is the same width; proposed a pane
+    /// wider than the floors, the lanes share it.
+    fn frame_flex(self, min_width: f64, min_height: f64, alignment: Alignment) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::FrameFlex(min_width, min_height, alignment),
+        }
+    }
+
     /// The box takes what its CONTENT needs vertically, never more
     /// than the room — width still fills the offer. The honest shape
     /// for a row's field: `frame_max` with a finite ceiling caps the
