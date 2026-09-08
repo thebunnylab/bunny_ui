@@ -33,8 +33,8 @@ pub(crate) use bunny_ui_apple::ffi::{
     CGContextSetInterpolationQuality, CGImageRelease, CGPoint, CGRect, CGSize, Id, NS_NOT_FOUND,
     NSRange, NSRunLoopCommonModes, ObjcSuper, Sel, class, class_addMethod, class_addProtocol,
     kill_layer_actions, modifiers_of, objc_allocateClassPair, objc_autoreleasePoolPop,
-    objc_autoreleasePoolPush, objc_getProtocol, objc_registerClassPair, sel, sel_getName,
-    text_argument_to_string, wake_from_any_thread,
+    objc_autoreleasePoolPush, objc_getProtocol, objc_registerClassPair, owned_provider, sel,
+    sel_getName, text_argument_to_string, wake_from_any_thread,
 };
 
 // Re-declaring `objc_msgSend` with the concrete signature of each message
@@ -139,7 +139,6 @@ unsafe extern "C" {
         size: usize,
         release: *const c_void,
     ) -> *mut c_void;
-    fn CGDataProviderCreateWithCFData(data: *const c_void) -> *mut c_void;
     fn CGDataProviderRelease(provider: *mut c_void);
     fn CGContextSaveGState(context: Id);
     fn CGContextRestoreGState(context: Id);
@@ -161,7 +160,6 @@ unsafe extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
-    fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
 }
 
 // MARK: - Events
@@ -1008,24 +1006,6 @@ extern "C" fn bunny_slow(_this: Id, _sel: Sel, _timer: Id) {
     // the step they were promised, with no wall clock in the path
     let dt = SLOW.with(|slot| slot.get().1);
     dispatch_all(AppEvent::Frame { dt });
-}
-
-/// A data provider that OWNS a copy of the bytes. A layer's contents
-/// are read by the render server AFTER the transaction closes: a
-/// provider that only borrows the shell's buffer paints a small image
-/// — the commit copies it inline — and silently paints NOTHING once
-/// the image is big enough to be mapped instead of copied. An
-/// island-sized segment was invisible while a toast-sized one showed,
-/// with identical calls. CFData owns the copy, the provider retains
-/// the CFData, the image retains the provider: the pixels stay
-/// truthful for as long as the layer shows them.
-unsafe fn owned_provider(bytes: *const u8, length: usize) -> *mut c_void {
-    unsafe {
-        let data = CFDataCreate(std::ptr::null(), bytes, length as isize);
-        let provider = CGDataProviderCreateWithCFData(data);
-        CFRelease(data);
-        provider
-    }
 }
 
 extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, note: Id) {
@@ -2356,19 +2336,6 @@ struct HostSlot {
 /// command is spent.
 pub(crate) fn host_child(key: &str) -> Option<Id> {
     HOST_VIEWS.with(|hosts| hosts.borrow().get(key).map(|slot| slot.child))
-}
-
-/// The key a tenant's view is mounted under — how a report that
-/// arrives holding the VIEW (a navigation, a posted message) finds
-/// its box's identity.
-pub(crate) fn host_key_of_child(child: Id) -> Option<String> {
-    HOST_VIEWS.with(|hosts| {
-        hosts
-            .borrow()
-            .iter()
-            .find(|(_, slot)| std::ptr::eq(slot.child, child))
-            .map(|(key, _)| key.clone())
-    })
 }
 
 /// One segment surface: the scene's commands that painted ABOVE a

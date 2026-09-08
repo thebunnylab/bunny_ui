@@ -16,8 +16,11 @@
 //! or a chrome to choose, a cursor, a live resize, a CPU road
 //! (`BUNNY_PRESENT=cpu` leaves the view blank and says so), an IME
 //! mirror for marked text (the keyboard types through `UIKeyInput`; a
-//! composition arrives committed), native hosts, and notifications
-//! (`bunny_ui::app::notify` answers by name that this shell has none).
+//! composition arrives committed), synthetic input into a hosted page
+//! (the phone has no event constructor a page trusts — the capability
+//! is not claimed), and notifications (`bunny_ui::app::notify` answers
+//! by name that this shell has none). Native hosts it HAS: a webview
+//! rides the shared tenant, under the same sandwich the desktops keep.
 //!
 //! The project's `unsafe` lives ONLY in the shell crates (here, the
 //! [`ffi`] FFI), wrapped in this safe API. The core and the facade
@@ -36,6 +39,7 @@ use bunny_ui::prelude::{EditCommand, Runtime, SizeClass};
 use bunny_ui::view::View;
 
 pub use bunny_ui_apple::credentials;
+pub use bunny_ui_apple::webview;
 pub use bunny_ui_apple::{CoreGraphicsImageEngine, CoreTextEngine, OffscreenGpu};
 use ffi::AppEvent;
 
@@ -301,26 +305,234 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
     // two owners: the keyboard gate and the event handler
     let root = Rc::new(root);
 
+    // the commands each host SEGMENT was last rasterized from, with
+    // the box and scale that held them — unchanged means re-placed,
+    // never re-rastered
+    type SegmentKept = std::collections::HashMap<
+        String,
+        (Vec<bunny_ui::layout::DrawCommand>, (f64, f64, f64, f64), usize),
+    >;
+    let segments_kept: Rc<RefCell<SegmentKept>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
     // present takes a READY display list to the screen — the tick path
     // reuses it without paying settle or effects
-    let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> =
-        Rc::new(move |runtime: &Runtime, display: bunny_ui::layout::DisplayList| {
+    let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
+        let segments_kept = Rc::clone(&segments_kept);
+        move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
             let (width, height) = ffi::view_size();
             if width <= 0.0 || height <= 0.0 {
                 return;
             }
+            let scale = ffi::view_scale();
+            // the native hosts FIRST — before the drawable's present: a
+            // hosted engine renders OUT of process, and the sooner it
+            // holds its frame the sooner its relayout runs. Mounted on
+            // first sight, placed every frame, swept when the subtree
+            // goes.
+            let hosts = runtime.hosts();
+            for host in &hosts {
+                let bunny_ui::host::HostSpec::Webview {
+                    url,
+                    document,
+                    scripts,
+                    console,
+                    requests,
+                    full_motion,
+                } = &host.spec;
+                // the stamp fingerprints the whole spec — a change
+                // re-instructs the mounted view, never re-creates it; a
+                // document stamps by its fingerprint, never by its pages
+                let mut stamp = String::with_capacity(url.len() + 22);
+                stamp.push_str(url);
+                if let Some(document) = document {
+                    stamp.push('\u{3}');
+                    stamp.push_str(&format!("{:016x}", document.digest));
+                }
+                stamp.push('\u{2}');
+                stamp.push(if *console { 'c' } else { '-' });
+                stamp.push(if *requests { 'r' } else { '-' });
+                stamp.push(if *full_motion { 'm' } else { '-' });
+                for script in scripts.iter() {
+                    stamp.push('\u{1}');
+                    stamp.push_str(script);
+                }
+                ffi::host_place(
+                    &host.path,
+                    &stamp,
+                    (
+                        host.frame.origin.x,
+                        host.frame.origin.y,
+                        host.frame.size.width,
+                        host.frame.size.height,
+                    ),
+                    (
+                        host.visible.origin.x,
+                        host.visible.origin.y,
+                        host.visible.size.width,
+                        host.visible.size.height,
+                    ),
+                    || webview::create(&host.path, &host.spec),
+                    |child, _stamp| webview::update(&host.path, child, &host.spec),
+                );
+            }
+            let alive: Vec<String> = hosts.iter().map(|host| host.path.clone()).collect();
+            ffi::host_sweep(&alive);
+            webview::sweep(&alive);
+            // the sandwich: what painted ABOVE a host leaves the
+            // drawable's present and composites on a segment surface
+            // over the island (the desktops' law, without the drag they
+            // wrote it for — the phone never resizes under a hand)
+            let mut segment_ranges: Vec<(usize, usize)> = Vec::new();
+            let segments: Vec<(String, bunny_ui::layout::DisplayList)> = runtime
+                .host_segments(full_display.len())
+                .into_iter()
+                .filter_map(|(path, range)| {
+                    let host = hosts.iter().find(|host| {
+                        host.path == path
+                            && host.visible.size.width > 0.0
+                            && host.visible.size.height > 0.0
+                    })?;
+                    let island = bunny_ui::layout::Rect {
+                        origin: bunny_ui::layout::Point {
+                            x: host.frame.origin.x + host.visible.origin.x,
+                            y: host.frame.origin.y + host.visible.origin.y,
+                        },
+                        size: host.visible.size,
+                    };
+                    let (carves, lifted) =
+                        bunny_ui::raster::carve_covering(&full_display, range, island)?;
+                    segment_ranges.extend(carves);
+                    Some((path, lifted))
+                })
+                .collect();
+            {
+                let mut kept = segments_kept.borrow_mut();
+                let mut standing: Vec<String> = Vec::new();
+                for (host, slice) in &segments {
+                    // the surface is the CONTENT's box, never the window
+                    let Some(bounds) = bunny_ui::raster::list_bounds(slice, &*runtime.text())
+                    else {
+                        continue; // nothing paints — nothing to lift
+                    };
+                    let pad = 2.0;
+                    let x0 = (bounds.origin.x - pad).max(0.0);
+                    let y0 = (bounds.origin.y - pad).max(0.0);
+                    let x1 = (bounds.origin.x + bounds.size.width + pad).min(width);
+                    let y1 = (bounds.origin.y + bounds.size.height + pad).min(height);
+                    if x1 <= x0 || y1 <= y0 {
+                        continue;
+                    }
+                    standing.push(host.clone());
+                    let frame = (x0, y0, x1 - x0, y1 - y0);
+                    let commands: Vec<_> = slice.iter().cloned().collect();
+                    let stale = kept.get(host).is_none_or(|(was, box_, at)| {
+                        *was != commands || *box_ != frame || *at != scale
+                    });
+                    if !stale {
+                        ffi::segment_place(host, frame);
+                        continue;
+                    }
+                    let box_physical = (
+                        ((x1 - x0) * scale as f64).round().max(1.0) as usize,
+                        ((y1 - y0) * scale as f64).round().max(1.0) as usize,
+                    );
+                    let local = slice.translated_slice((0, slice.len()), -x0, -y0);
+                    let bitmap = bunny_ui::raster::rasterize_over(
+                        &local,
+                        box_physical.0,
+                        box_physical.1,
+                        scale,
+                        bunny_ui::layout::Color { r: 0, g: 0, b: 0, a: 0 },
+                        &*runtime.text(),
+                        &*runtime.images(),
+                        None,
+                    );
+                    ffi::segment_blit(
+                        host,
+                        host,
+                        &bitmap.to_rgba_bytes(),
+                        frame,
+                        scale,
+                        box_physical.0,
+                        box_physical.1,
+                    );
+                    kept.insert(host.clone(), (commands, frame, scale));
+                }
+                kept.retain(|key, _| standing.iter().any(|host| host == key));
+                ffi::segment_sweep(&standing);
+            }
+            // the drawable presents everything ELSE — the lifted ranges
+            // ride the segments now, and the ranges index the original
+            let display = if segment_ranges.is_empty() {
+                full_display
+            } else {
+                full_display.without_slices(&segment_ranges)
+            };
             ffi::present(
                 &display,
                 Size { width, height },
-                ffi::view_scale(),
+                scale,
                 bunny_ui::theme::canvas(),
                 &*runtime.text(),
                 &*runtime.images(),
             );
-        });
+        }
+    });
     let blit = {
         let present = Rc::clone(&present);
         move |runtime: &Runtime, root: &_| {
+            // the webview commands are spent BEFORE the frame renders,
+            // so the state an expired eval writes lands in THIS layout.
+            // An op whose page is not mounted answers immediately —
+            // never silence that looks like a slow page.
+            for op in runtime.webview_commands() {
+                use bunny_ui::host::WebviewOp;
+                let child = |path: &str| ffi::host_child(path);
+                match op {
+                    WebviewOp::Navigate { path, url } => {
+                        if let Some(child) = child(&path) {
+                            webview::navigate(child, &url);
+                        }
+                    }
+                    WebviewOp::Back { path } => {
+                        if let Some(child) = child(&path) {
+                            webview::back(child);
+                        }
+                    }
+                    WebviewOp::Forward { path } => {
+                        if let Some(child) = child(&path) {
+                            webview::forward(child);
+                        }
+                    }
+                    // the phone types nothing into a page: the
+                    // capability is not claimed, and the op is dropped
+                    // by name rather than half-served
+                    WebviewOp::Input { .. } => {}
+                    WebviewOp::Edit { path, action } => {
+                        if let Some(child) = child(&path) {
+                            webview::edit(child, &action);
+                        }
+                    }
+                    WebviewOp::Eval { path, token, js, raw } => match child(&path) {
+                        Some(child) => webview::eval(child, token, &js, raw),
+                        None => {
+                            let _ = runtime.webview_eval_done(
+                                token,
+                                Err(format!("no page is mounted at {path}")),
+                            );
+                        }
+                    },
+                    WebviewOp::Snapshot { path, token } => match child(&path) {
+                        Some(child) => webview::snapshot(child, token),
+                        None => {
+                            let _ = runtime.webview_snapshot_done(
+                                token,
+                                Err(format!("no page is mounted at {path}")),
+                            );
+                        }
+                    },
+                }
+            }
             let (width, height) = ffi::view_size();
             // a box that draws parts which TOUCH puts the shared edge
             // on a whole PIXEL — it needs the screen's scale
@@ -393,6 +605,43 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                 true
             } else {
                 false
+            }
+        }
+    });
+
+    // everything a page reports lands here and runs the matching
+    // runtime door; a door that ran a retained writer re-presents
+    webview::set_dispatch({
+        let runtime = Rc::clone(&runtime);
+        let root = Rc::clone(&root);
+        let blit = blit.clone();
+        move |event| {
+            use webview::WebviewEvent;
+            let woke = match event {
+                WebviewEvent::Navigated { path, url } => runtime.webview_navigated(&path, &url),
+                WebviewEvent::Linked { path, url } => runtime.webview_linked(&path, &url),
+                WebviewEvent::Changed { path, html } => runtime.webview_changed(&path, &html),
+                WebviewEvent::Pasted { path, html, text } => {
+                    runtime.webview_pasted(&path, &html, &text)
+                }
+                WebviewEvent::NavigationFailed { path, url, why } => {
+                    runtime.webview_navigate_failed(&path, &url, &why)
+                }
+                WebviewEvent::Posted { path, body } => runtime.webview_posted(&path, &body),
+                WebviewEvent::Console { path, line } => runtime.webview_console(&path, &line),
+                WebviewEvent::Requested { path, line } => runtime.webview_requested(&path, &line),
+                WebviewEvent::EvalDone { token, result } => runtime.webview_eval_done(token, result),
+                WebviewEvent::SnapshotDone { token, result } => runtime.webview_snapshot_done(
+                    token,
+                    result.map(|(width, height, rgba)| bunny_ui::host::WebviewSnapshot {
+                        width,
+                        height,
+                        rgba,
+                    }),
+                ),
+            };
+            if woke {
+                blit(&runtime, &*root);
             }
         }
     });

@@ -94,6 +94,10 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_init_rect(obj: Id, sel: Sel, rect: CGRect) -> Id;
     #[link_name = "objc_msgSend"]
+    fn msg_void_rect(obj: Id, sel: Sel, rect: CGRect);
+    #[link_name = "objc_msgSend"]
+    fn msg_void_f64(obj: Id, sel: Sel, a: f64);
+    #[link_name = "objc_msgSend"]
     fn msg_id_id(obj: Id, sel: Sel, a: Id) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_id_u64(obj: Id, sel: Sel, a: u64) -> Id;
@@ -971,4 +975,363 @@ unsafe fn register_classes() {
         }
         objc_registerClassPair(delegate);
     });
+}
+
+// MARK: - Native hosts (a platform view in the hole the layout keeps)
+
+use std::collections::HashMap;
+
+use bunny_ui_apple::ffi::{
+    ALPHA_PREMULTIPLIED_LAST, CGColorSpaceCreateDeviceRGB, CGColorSpaceRelease,
+    CGDataProviderRelease, CGImageCreate, CGImageRelease, CGSize, kill_layer_actions,
+    owned_provider,
+};
+
+/// One mounted native host: the clipping container (ours), the
+/// tenant's view inside it, and the stamp the tenant last applied — a
+/// changed spec re-instructs the view, it never re-mounts it.
+struct HostSlot {
+    container: Id,
+    child: Id,
+    stamp: String,
+}
+
+/// One segment surface: the scene's commands that painted ABOVE a
+/// host, composited over the platform view — the sandwich that keeps
+/// paint order the truth. The straight RGBA stays here because the hit
+/// test reads it: a painted pixel claims the finger, a clear one lets
+/// it fall through to the page below.
+struct SegmentSlot {
+    view: Id,
+    rgba: Vec<u8>,
+    width: usize,
+    height: usize,
+    scale: usize,
+}
+
+thread_local! {
+    /// One platform view per HOST box, keyed by identity.
+    static HOST_VIEWS: RefCell<HashMap<String, HostSlot>> = RefCell::new(HashMap::new());
+    static SEGMENTS: RefCell<HashMap<String, SegmentSlot>> = RefCell::new(HashMap::new());
+}
+
+/// Mounts (once) and places a native host under `key`: a clipping
+/// container of ours at the VISIBLE cut of the box, the tenant's view
+/// inside it at the WHOLE box, so the cut shows through and the
+/// content never rewraps. `frame` and `window` are the box and its
+/// visible part in layout points — UIKit's own coordinates, no flip.
+/// An empty window hides the view instead of unmounting it: a page
+/// keeps its state while it is scrolled off.
+///
+/// `make` runs once, when the key first appears, and returns the
+/// tenant's view with ONE retain that [`host_sweep`] releases. `update`
+/// runs when `stamp` changed — how a navigation lands without a
+/// re-mount.
+pub fn host_place(
+    key: &str,
+    stamp: &str,
+    frame: (f64, f64, f64, f64),
+    window: (f64, f64, f64, f64),
+    make: impl FnOnce() -> Id,
+    update: impl FnOnce(Id, &str),
+) {
+    let scene = VIEW.with(Cell::get);
+    if scene.is_null() {
+        return;
+    }
+    // the make runs OUTSIDE the table's borrow: a tenant may report on
+    // creation, and a report reads nothing here but a borrow held
+    // across it is a habit that aborts elsewhere
+    let known = HOST_VIEWS.with(|hosts| hosts.borrow().contains_key(key));
+    if !known {
+        let (container, child) = unsafe {
+            let container = msg_init_rect(
+                msg_id(class("UIView"), sel("alloc")),
+                sel("initWithFrame:"),
+                CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 0.0, height: 0.0 } },
+            );
+            // the container is the CLIP: whatever the tenant draws
+            // stays inside the window the layout granted
+            msg_void_bool(container, sel("setClipsToBounds:"), 1);
+            let child = make();
+            msg_void_id(container, sel("addSubview:"), child);
+            msg_void_id(scene, sel("addSubview:"), container);
+            (container, child)
+        };
+        HOST_VIEWS.with(|hosts| {
+            hosts.borrow_mut().insert(
+                key.to_string(),
+                HostSlot { container, child, stamp: stamp.to_string() },
+            );
+        });
+    }
+    let (container, child, stale) = HOST_VIEWS.with(|hosts| {
+        let mut hosts = hosts.borrow_mut();
+        let slot = hosts.get_mut(key).expect("the slot was just made");
+        let stale = slot.stamp != stamp;
+        if stale {
+            slot.stamp = stamp.to_string();
+        }
+        (slot.container, slot.child, stale)
+    });
+    let (x, y, w, h) = frame;
+    let (vx, vy, vw, vh) = window;
+    unsafe {
+        if vw <= 0.0 || vh <= 0.0 {
+            msg_void_bool(container, sel("setHidden:"), 1);
+        } else {
+            msg_void_bool(container, sel("setHidden:"), 0);
+            msg_void_rect(
+                container,
+                sel("setFrame:"),
+                CGRect { origin: CGPoint { x: x + vx, y: y + vy }, size: CGSize { width: vw, height: vh } },
+            );
+            msg_void_rect(
+                child,
+                sel("setFrame:"),
+                CGRect { origin: CGPoint { x: -vx, y: -vy }, size: CGSize { width: w, height: h } },
+            );
+        }
+    }
+    if stale {
+        update(child, stamp);
+    }
+}
+
+/// Removes the hosts that left the scene — the subtree went, the
+/// platform view goes with it. Releases the two holds [`host_place`]
+/// took: the container's alloc and the tenant's `make`.
+pub fn host_sweep(alive: &[String]) {
+    let dead: Vec<(Id, Id)> = HOST_VIEWS.with(|hosts| {
+        let mut hosts = hosts.borrow_mut();
+        let mut dead = Vec::new();
+        hosts.retain(|key, slot| {
+            if alive.iter().any(|path| path == key) {
+                return true;
+            }
+            dead.push((slot.container, slot.child));
+            false
+        });
+        dead
+    });
+    for (container, child) in dead {
+        unsafe {
+            msg_void(container, sel("removeFromSuperview"));
+            msg_void(child, sel("release"));
+            msg_void(container, sel("release"));
+        }
+    }
+}
+
+/// The tenant's view mounted under `key`, if any — where a drained
+/// command is spent.
+pub fn host_child(key: &str) -> Option<Id> {
+    HOST_VIEWS.with(|hosts| hosts.borrow().get(key).map(|slot| slot.child))
+}
+
+fn host_container(key: &str) -> Option<Id> {
+    HOST_VIEWS.with(|hosts| hosts.borrow().get(key).map(|slot| slot.container))
+}
+
+/// The segment view's whole hit policy, in one answer: a painted pixel
+/// claims the finger, a clear one lets it fall through to the page.
+/// `point` arrives in the view's OWN coordinates, top-left.
+extern "C" fn bunny_segment_inside(this: Id, _sel: Sel, point: CGPoint, _event: Id) -> i8 {
+    SEGMENTS.with(|segments| {
+        // UIKit asks re-entrantly from a frame change; while the table
+        // is being written the answer is "not mine" for one event
+        let Ok(segments) = segments.try_borrow() else {
+            return 0;
+        };
+        let Some(slot) = segments.values().find(|slot| std::ptr::eq(slot.view, this)) else {
+            return 0;
+        };
+        let bounds = unsafe { msg_rect(this, sel("bounds")) };
+        if point.x < 0.0 || point.y < 0.0 || point.x >= bounds.size.width || point.y >= bounds.size.height {
+            return 0;
+        }
+        let column = ((point.x * slot.scale as f64) as usize).min(slot.width.saturating_sub(1));
+        let row = ((point.y * slot.scale as f64) as usize).min(slot.height.saturating_sub(1));
+        let index = (row * slot.width + column) * 4 + 3;
+        match slot.rgba.get(index) {
+            Some(alpha) if *alpha > 8 => 1,
+            _ => 0,
+        }
+    })
+}
+
+/// Every touch the segment view claims goes to the scene's view
+/// unchanged — the touches still answer `locationInView:` for any
+/// view, so the shell's own handlers resolve them like any other.
+extern "C" fn bunny_segment_forward(this: Id, cmd: Sel, touches: Id, event: Id) {
+    unsafe {
+        let superview = msg_id(this, sel("superview"));
+        if !superview.is_null() {
+            msg_void_id_id(superview, cmd, touches, event);
+        }
+    }
+}
+
+static REGISTER_SEGMENT: Once = Once::new();
+
+unsafe fn register_segment_class() {
+    REGISTER_SEGMENT.call_once(|| unsafe {
+        let name = CString::new("BunnySegmentView").expect("class name");
+        let segment = objc_allocateClassPair(class("UIView"), name.as_ptr(), 0);
+        let inside_types = CString::new("c@:{CGPoint=dd}@").expect("type encoding");
+        class_addMethod(
+            segment,
+            sel("pointInside:withEvent:"),
+            bunny_segment_inside as *const c_void,
+            inside_types.as_ptr(),
+        );
+        let forward_types = CString::new("v@:@@").expect("type encoding");
+        for verb in [
+            "touchesBegan:withEvent:",
+            "touchesMoved:withEvent:",
+            "touchesEnded:withEvent:",
+            "touchesCancelled:withEvent:",
+        ] {
+            class_addMethod(
+                segment,
+                sel(verb),
+                bunny_segment_forward as *const c_void,
+                forward_types.as_ptr(),
+            );
+        }
+        objc_registerClassPair(segment);
+    });
+}
+
+/// Presents one segment — the commands that painted above `host_key`,
+/// rasterized by the caller into straight RGBA sized to the CONTENT's
+/// box, never the window. The surface mounts DIRECTLY ABOVE the host's
+/// container, so content between two hosts lands between their pages.
+/// `frame` is the content box in layout points.
+pub fn segment_blit(
+    key: &str,
+    host_key: &str,
+    rgba: &[u8],
+    frame: (f64, f64, f64, f64),
+    scale: usize,
+    px_width: usize,
+    px_height: usize,
+) {
+    let scene = VIEW.with(Cell::get);
+    if scene.is_null() {
+        return;
+    }
+    unsafe { register_segment_class() };
+    // NOTHING Objective-C runs while the table is borrowed: UIKit asks
+    // the hit question re-entrantly, and the answer reads this table
+    let known = SEGMENTS.with(|segments| segments.borrow().get(key).map(|slot| slot.view));
+    let view = match known {
+        Some(view) => view,
+        None => unsafe {
+            let view = msg_init_rect(
+                msg_id(class("BunnySegmentView"), sel("alloc")),
+                sel("initWithFrame:"),
+                CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 0.0, height: 0.0 } },
+            );
+            // the layer is OURS: its implicit actions die at birth
+            kill_layer_actions(msg_id(view, sel("layer")));
+            match host_container(host_key) {
+                Some(container) => {
+                    msg_void_id_id(scene, sel("insertSubview:aboveSubview:"), view, container)
+                }
+                None => msg_void_id(scene, sel("addSubview:"), view),
+            }
+            SEGMENTS.with(|segments| {
+                segments.borrow_mut().insert(
+                    key.to_string(),
+                    SegmentSlot { view, rgba: Vec::new(), width: 0, height: 0, scale },
+                );
+            });
+            view
+        },
+    };
+    let (pointer, length) = SEGMENTS.with(|segments| {
+        let mut segments = segments.borrow_mut();
+        let slot = segments.get_mut(key).expect("the slot was just made");
+        // the bytes arrive ALREADY premultiplied: a raster onto a
+        // transparent ground leaves rgb = colour × coverage
+        slot.rgba.clear();
+        slot.rgba.extend_from_slice(rgba);
+        slot.width = px_width;
+        slot.height = px_height;
+        slot.scale = scale;
+        (slot.rgba.as_ptr(), slot.rgba.len())
+    });
+    let (x, y, w, h) = frame;
+    unsafe {
+        let provider = owned_provider(pointer, length);
+        let space = CGColorSpaceCreateDeviceRGB();
+        let image = CGImageCreate(
+            px_width,
+            px_height,
+            8,
+            32,
+            px_width * 4,
+            space,
+            ALPHA_PREMULTIPLIED_LAST,
+            provider,
+            std::ptr::null(),
+            false,
+            0,
+        );
+        msg_void_rect(
+            view,
+            sel("setFrame:"),
+            CGRect { origin: CGPoint { x, y }, size: CGSize { width: w, height: h } },
+        );
+        let layer = msg_id(view, sel("layer"));
+        if !layer.is_null() {
+            msg_void_f64(layer, sel("setContentsScale:"), scale as f64);
+            msg_void_id(layer, sel("setContents:"), image);
+        }
+        CGImageRelease(image);
+        CGColorSpaceRelease(space);
+        CGDataProviderRelease(provider);
+    }
+}
+
+/// Re-places one segment without touching its pixels. A segment with
+/// no surface yet is a no-op.
+pub fn segment_place(key: &str, frame: (f64, f64, f64, f64)) {
+    let Some(view) = SEGMENTS.with(|segments| segments.borrow().get(key).map(|slot| slot.view))
+    else {
+        return;
+    };
+    let (x, y, w, h) = frame;
+    unsafe {
+        msg_void_rect(
+            view,
+            sel("setFrame:"),
+            CGRect { origin: CGPoint { x, y }, size: CGSize { width: w, height: h } },
+        );
+    }
+}
+
+/// Removes the segments that left the scene — nothing painted above
+/// the host this frame, so nothing covers it. The dead leave the table
+/// FIRST and their views after: removal asks the hit question too.
+pub fn segment_sweep(alive: &[String]) {
+    let dead: Vec<Id> = SEGMENTS.with(|segments| {
+        let mut segments = segments.borrow_mut();
+        let mut dead = Vec::new();
+        segments.retain(|key, slot| {
+            if alive.iter().any(|path| path == key) {
+                return true;
+            }
+            dead.push(slot.view);
+            false
+        });
+        dead
+    });
+    for view in dead {
+        unsafe {
+            msg_void(view, sel("removeFromSuperview"));
+            msg_void(view, sel("release"));
+        }
+    }
 }

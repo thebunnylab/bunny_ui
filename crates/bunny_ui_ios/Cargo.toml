@@ -29,3 +29,7 @@ path = "examples/countries_window.rs"
 [[example]]
 name = "touch_window_ios"
 path = "examples/touch_window.rs"
+
+[[example]]
+name = "letter_window_ios"
+path = "examples/letter_window.rs"

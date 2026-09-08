@@ -114,11 +114,32 @@ unsafe extern "C" {
     pub fn CGContextDrawImage(context: Id, rect: CGRect, image: Id);
     pub fn CGContextSetInterpolationQuality(context: Id, quality: i32);
     pub fn CGImageRelease(image: Id);
+    pub fn CGDataProviderCreateWithCFData(data: *const c_void) -> *mut c_void;
+    pub fn CGDataProviderRelease(provider: *mut c_void);
+    #[allow(clippy::too_many_arguments)]
+    pub fn CGImageCreate(
+        width: usize,
+        height: usize,
+        bits_per_component: usize,
+        bits_per_pixel: usize,
+        bytes_per_row: usize,
+        space: *mut c_void,
+        bitmap_info: u32,
+        provider: *mut c_void,
+        decode: *const f64,
+        should_interpolate: bool,
+        intent: i32,
+    ) -> Id;
 }
+
+/// `kCGImageAlphaPremultipliedLast` — the RGBA layout a layer's
+/// contents and a drawing context agree on.
+pub const ALPHA_PREMULTIPLIED_LAST: u32 = 1;
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     pub fn CFRelease(cf: *const c_void);
+    pub fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
     fn CFRunLoopGetMain() -> Id;
     fn CFRunLoopSourceCreate(
         allocator: Id,
@@ -210,6 +231,23 @@ pub fn modifiers_of(flags: u64) -> bunny_ui::action::Modifiers {
         control: flags & (1 << 18) != 0,
         option: flags & (1 << 19) != 0,
         command: flags & (1 << 20) != 0,
+    }
+}
+
+/// A data provider that OWNS a copy of the bytes. A layer's contents
+/// are read by the render server after the transaction — a provider
+/// that only borrows the shell's buffer paints a small image (the
+/// commit copies it inline) and silently paints NOTHING once the
+/// image is big enough to be mapped instead of copied. CFData owns the
+/// copy, the provider retains the CFData, the image retains the
+/// provider: the pixels stay truthful for as long as the layer shows
+/// them.
+pub unsafe fn owned_provider(bytes: *const u8, length: usize) -> *mut c_void {
+    unsafe {
+        let data = CFDataCreate(std::ptr::null(), bytes, length as isize);
+        let provider = CGDataProviderCreateWithCFData(data);
+        CFRelease(data);
+        provider
     }
 }
 

@@ -1394,59 +1394,43 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         move |event| {
             let root = &*root;
             match event {
-                webview::WebviewEvent::Navigated { view, url } => {
-                    if let Some(path) = ffi::host_key_of_child(view)
-                        && runtime.webview_navigated(&path, &url)
-                    {
+                webview::WebviewEvent::Navigated { path, url } => {
+                    if runtime.webview_navigated(&path, &url) {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
-                webview::WebviewEvent::Linked { view, url } => {
-                    if let Some(path) = ffi::host_key_of_child(view)
-                        && runtime.webview_linked(&path, &url)
-                    {
+                webview::WebviewEvent::Linked { path, url } => {
+                    if runtime.webview_linked(&path, &url) {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
-                webview::WebviewEvent::Changed { view, html } => {
-                    if let Some(path) = ffi::host_key_of_child(view)
-                        && runtime.webview_changed(&path, &html)
-                    {
+                webview::WebviewEvent::Changed { path, html } => {
+                    if runtime.webview_changed(&path, &html) {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
-                webview::WebviewEvent::Pasted { view, html, text } => {
-                    if let Some(path) = ffi::host_key_of_child(view)
-                        && runtime.webview_pasted(&path, &html, &text)
-                    {
+                webview::WebviewEvent::Pasted { path, html, text } => {
+                    if runtime.webview_pasted(&path, &html, &text) {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
-                webview::WebviewEvent::NavigationFailed { view, url, why } => {
-                    if let Some(path) = ffi::host_key_of_child(view)
-                        && runtime.webview_navigate_failed(&path, &url, &why)
-                    {
+                webview::WebviewEvent::NavigationFailed { path, url, why } => {
+                    if runtime.webview_navigate_failed(&path, &url, &why) {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
-                webview::WebviewEvent::Posted { view, body } => {
-                    if let Some(path) = ffi::host_key_of_child(view)
-                        && runtime.webview_posted(&path, &body)
-                    {
+                webview::WebviewEvent::Posted { path, body } => {
+                    if runtime.webview_posted(&path, &body) {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
-                webview::WebviewEvent::Console { view, line } => {
-                    if let Some(path) = ffi::host_key_of_child(view)
-                        && runtime.webview_console(&path, &line)
-                    {
+                webview::WebviewEvent::Console { path, line } => {
+                    if runtime.webview_console(&path, &line) {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
-                webview::WebviewEvent::Requested { view, line } => {
-                    if let Some(path) = ffi::host_key_of_child(view)
-                        && runtime.webview_requested(&path, &line)
-                    {
+                webview::WebviewEvent::Requested { path, line } => {
+                    if runtime.webview_requested(&path, &line) {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }

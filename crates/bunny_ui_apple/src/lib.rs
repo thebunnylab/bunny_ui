@@ -19,6 +19,7 @@ pub mod image;
 pub mod metal;
 pub mod text;
 pub mod trace;
+pub mod webview;
 
 pub use image::CoreGraphicsImageEngine;
 pub use metal::{MetalPresenter, OffscreenGpu};
