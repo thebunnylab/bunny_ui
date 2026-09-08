@@ -1,4 +1,4 @@
-//! ImageIO through the house FFI — the Mac's image engine.
+//! ImageIO through the house FFI — the Apple image engine.
 //!
 //! Implements the bunny-ui [`ImageEngine`] border: the platform decodes
 //! (PNG, JPEG, everything ImageIO speaks) and resamples with high
@@ -25,9 +25,10 @@ use bunny_ui::image_engine::{FILE_ICON_SIZE, ImageEngine, ImageRaster, ImageSour
 
 use crate::ffi::{
     CFRelease, CGColorSpaceCreateDeviceRGB, CGColorSpaceRelease, CGContextDrawImage,
-    CGContextSetInterpolationQuality, CGImageRelease, CGPoint, CGRect, CGSize, Id, Sel, class,
-    sel,
+    CGContextSetInterpolationQuality, CGImageRelease, CGPoint, CGRect, CGSize, Id,
 };
+#[cfg(target_os = "macos")]
+use crate::ffi::{Sel, class, sel};
 
 type CFDataRef = *const c_void;
 type CGImageSourceRef = *const c_void;
@@ -84,8 +85,17 @@ impl Drop for OwnedImage {
     }
 }
 
+// The workspace is AppKit's, and the class is found at runtime: the
+// link guarantees the framework is in the process even when this crate
+// is the only one asking (the tests are).
+#[cfg(target_os = "macos")]
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {}
+
 // The workspace bridge (file icons) — msgSend casts in the house
-// pattern, local to the messages this module sends.
+// pattern, local to the messages this module sends. The workspace is
+// the Mac's: no other Apple platform shows a file's icon.
+#[cfg(target_os = "macos")]
 #[allow(clashing_extern_declarations)]
 #[link(name = "objc", kind = "dylib")]
 unsafe extern "C" {
@@ -154,6 +164,7 @@ fn unpremultiply(rgba: &mut [u8]) {
 /// workspace picks the sharpest representation for the box (16 stays
 /// crisp, 64 stays crisp, no upscaled thumbnail). Everything here is
 /// autoreleased, so the drawing happens inside the pool.
+#[cfg(target_os = "macos")]
 unsafe fn icon_rgba(path: &str, width: usize, height: usize) -> Option<Vec<u8>> {
     unsafe {
         let pool = objc_autoreleasePoolPush();
@@ -195,6 +206,13 @@ unsafe fn icon_rgba(path: &str, width: usize, height: usize) -> Option<Vec<u8>> 
     }
 }
 
+/// A file icon off the Mac: there is no workspace to ask, so the box
+/// paints nothing — the same answer as a broken image, never a wrong one.
+#[cfg(not(target_os = "macos"))]
+unsafe fn icon_rgba(_path: &str, _width: usize, _height: usize) -> Option<Vec<u8>> {
+    None
+}
+
 /// Decodes the platform-encoded bytes once. Null = the platform could
 /// not read them (cached as a permanent failure by the caller).
 unsafe fn decode(bytes: &[u8]) -> Id {
@@ -215,7 +233,7 @@ unsafe fn decode(bytes: &[u8]) -> Id {
     }
 }
 
-/// The Mac image engine. Single-thread, like the rest of the shell.
+/// The Apple image engine. Single-thread, like the rest of the shell.
 pub struct CoreGraphicsImageEngine {
     /// Decoded images by identity — `None` is a remembered failure
     /// (broken bytes never reach the decoder twice).
@@ -229,6 +247,15 @@ impl CoreGraphicsImageEngine {
             decoded: RefCell::new(HashMap::new()),
             rasters: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Lets go of every decoded image and every resampled rectangle.
+    /// The next frame decodes again what it still shows. The door a
+    /// memory warning opens: the caches are a convenience, and a phone
+    /// that asks for its memory back gets it before it takes the app.
+    pub fn drop_caches(&self) {
+        self.decoded.borrow_mut().clear();
+        self.rasters.borrow_mut().clear();
     }
 
     /// The retained CGImage for the source, decoding on the first ask.
@@ -266,8 +293,9 @@ impl ImageEngine for CoreGraphicsImageEngine {
     fn intrinsic(&self, source: &ImageSource) -> Option<(u32, u32)> {
         if let ImageSource::FileIcon { .. } = source {
             // system icons are multi-representation; the fixed contract
-            // stands in — the normal use is `.resizable()` plus a frame
-            return Some((FILE_ICON_SIZE, FILE_ICON_SIZE));
+            // stands in — the normal use is `.resizable()` plus a frame.
+            // Only the Mac has a workspace to draw one.
+            return cfg!(target_os = "macos").then_some((FILE_ICON_SIZE, FILE_ICON_SIZE));
         }
         let image = self.image(source);
         if image.is_null() {

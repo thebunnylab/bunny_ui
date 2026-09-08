@@ -4,7 +4,7 @@
 //! the reader opens in a tab and commits to a repository, and a key
 //! that reaches a paid service must never live there. The platform
 //! already keeps a store for exactly this, guarded by the reader's own
-//! login, and this module is the door to the Mac's.
+//! login, and this module is the door to the platform's.
 //!
 //! An item is named by a PAIR: the service it belongs to and the
 //! account inside it — the same pair Keychain Access shows in its two

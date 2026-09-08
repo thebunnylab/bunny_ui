@@ -6,6 +6,7 @@ description = "bunny-ui macOS shell — native window and bitmap blit, dependenc
 
 [dependencies]
 bunny-ui = { workspace = true, features = ["canvas", "gpu"] }
+bunny-ui-apple.workspace = true
 
 [dev-dependencies]
 # examples only (the real countries app in a native window)

@@ -1,4 +1,4 @@
-//! CoreText through the house FFI — the Mac's text engine.
+//! CoreText through the house FFI — the Apple text engine.
 //!
 //! Implements the bunny-ui [`TextEngine`] border: measuring by the FONT's
 //! metrics (stable — the line's metrics jump when a glyph fallback kicks
