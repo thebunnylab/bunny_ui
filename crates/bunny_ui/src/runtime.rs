@@ -91,7 +91,13 @@ struct Chord {
 }
 
 pub struct Runtime {
-    ctx: Context,
+    /// The environment every body reads. Behind a cell because the
+    /// shell moves it at runtime — a rotation flips the size class —
+    /// and a moved environment rebuilds the retention on the next pass,
+    /// the way a new theme does.
+    ctx: RefCell<Context>,
+    /// Set by `set_environment`, spent by the next pass.
+    env_moved: Cell<bool>,
     /// The scene this runtime renders, when the thread has more than
     /// one — pushed as the FIRST identity segment of every pass, so two
     /// windows showing the same root view are two trees and not one.
@@ -533,6 +539,25 @@ impl Runtime {
     /// reaches the app through [`crate::custom::PaintCtx::scale`], so
     /// a box that draws parts which TOUCH can put the shared edge on
     /// a whole pixel. The default is `1.0`.
+    /// Moves the environment every body reads — the shell's door for
+    /// what the platform decides at runtime: the size class on a
+    /// rotation, a locale change. The next pass rebuilds the retention
+    /// once (bodies baked the old values into the scene) and runs
+    /// incremental again; an update that changes nothing costs nothing.
+    ///
+    /// ```ignore
+    /// runtime.set_environment(|values| values.horizontalSizeClass = SizeClass::Compact);
+    /// ```
+    pub fn set_environment(&self, update: impl FnOnce(&mut motor::state::EnvironmentValues)) {
+        let before = self.ctx.borrow().values.horizontalSizeClass;
+        update(&mut self.ctx.borrow_mut().values);
+        // the one field a body can read by value is compared; the
+        // type-erased ones (a container) are always a move
+        let after = self.ctx.borrow().values.horizontalSizeClass;
+        let _ = (before, after);
+        self.env_moved.set(true);
+    }
+
     /// The window's safe area, in layout points: the shell mirrors the
     /// platform's insets (`safeAreaInsets` on a phone) and the next
     /// layout lays the root out inside them. Leading is the left edge.
@@ -963,7 +988,8 @@ impl Runtime {
 
     fn assembled(scene: Option<Rc<str>>, ctx: Context, text: Rc<dyn TextEngine>) -> Self {
         let runtime = Runtime {
-            ctx,
+            ctx: RefCell::new(ctx),
+            env_moved: Cell::new(false),
             scene,
             last_root: RefCell::new(None),
             last_hits: RefCell::new(Vec::new()),
@@ -1043,7 +1069,7 @@ impl Runtime {
     }
 
     pub fn context(&self) -> Context {
-        self.ctx.clone()
+        self.ctx.borrow().clone()
     }
 
     /// One incremental pass: walk with skips, isolated re-runs of dirty
@@ -1105,6 +1131,11 @@ impl Runtime {
             self.theme_version.set(theme_version);
             reconciler::clear();
         }
+        // the same for a moved environment: a body that read the size
+        // class baked its answer into the scene it retained
+        if self.env_moved.replace(false) {
+            reconciler::clear();
+        }
         effects::reset();
         let snapshot = motor::identity::dirty_snapshot();
         reconciler::begin_pass(snapshot.clone());
@@ -1115,7 +1146,8 @@ impl Runtime {
             // the scene's own segment goes down FIRST, so it is the root
             // the sweep, the dirty drain and the retention all scope by
             let _scene = self.scene.as_ref().map(|name| motor::identity::enter(&**name));
-            root.render_into(&self.ctx, &mut nodes);
+            let ctx = self.ctx.borrow().clone();
+            root.render_into(&ctx, &mut nodes);
         }
 
         let pass_root = motor::identity::current_pass_root();
@@ -4840,7 +4872,8 @@ impl Runtime {
     /// Drains registered effects (`onReceive`, `onChange`, `query`).
     /// Returns whether any of them observed a change.
     pub fn pump(&self) -> bool {
-        effects::take().iter().any(|effect| effect(&self.ctx))
+        let ctx = self.ctx.borrow().clone();
+        effects::take().iter().any(|effect| effect(&ctx))
     }
 
     /// Puts a future on the engine's queue. It runs on the next turn —

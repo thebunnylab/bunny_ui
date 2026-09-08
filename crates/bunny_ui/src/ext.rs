@@ -1341,6 +1341,20 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.environment(\.key, value)` — one closure writes the value the
+    /// subtree reads. A preview forces a phone's size class on a desktop
+    /// this way; the shell's own report reaches the whole tree through
+    /// `Runtime::set_environment` instead.
+    fn environment(
+        self,
+        set: impl Fn(&mut motor::state::EnvironmentValues) + 'static,
+    ) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::EnvSet { name: "environment", detail: "(…)".into(), set: Rc::new(set) },
+        }
+    }
+
     /// `.modelContainer(container)`
     fn model_container<T: ProvidesQueries + 'static>(self, container: Rc<T>) -> Modified<Self> {
         let source = container.querySource();

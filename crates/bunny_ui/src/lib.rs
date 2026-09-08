@@ -155,7 +155,7 @@ pub mod prelude {
     pub use motor::runtime::Site;
     pub use motor::state::{
         Binding, Context, Environment, EnvironmentValues, FromEnvironment, Locale, ProvidesQueries,
-        State,
+        SizeClass, State,
     };
     pub use motor::views::{
         ContentMode, Edge, Font, ListStyle, NavigationPath, ProgressViewStyle, Query,
@@ -12046,5 +12046,60 @@ mod tests {
         assert_eq!(header.size.height, 59.0 + 40.0, "and keeps its own height below it");
         let body = rect_of(Color::hex(0x0000FF));
         assert_eq!(body.origin.y, 59.0 + 40.0, "the body stays where the root put it");
+    }
+
+    // MARK: - The environment moves at runtime
+
+    /// The size class reaches a body through the environment; the shell
+    /// moving it re-runs the bodies that read it — once — and a pass with
+    /// nothing moved runs none. A subtree can force its own class.
+    #[test]
+    fn the_size_class_reaches_the_body_and_a_change_reruns_it() {
+        #[derive(Clone, Copy)]
+        struct Adaptive;
+        impl Component for Adaptive {
+            fn body(self, ctx: &Context) -> impl View {
+                let label = match ctx.environment::<SizeClass>() {
+                    SizeClass::Compact => "narrow",
+                    SizeClass::Regular => "wide",
+                };
+                vstack!(text(label), spacer())
+            }
+        }
+        fn first_line(display: &crate::layout::DisplayList) -> String {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { content, .. } => {
+                        Some(content.to_string())
+                    }
+                    _ => None,
+                })
+                .expect("a line paints")
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        assert_eq!(first_line(&runtime.display_frame(&Adaptive, size)), "wide", "regular by default");
+        // a still frame runs no body
+        let _ = runtime.display_frame(&Adaptive, size);
+        assert!(runtime.body_runs().is_empty(), "nothing moved, nothing ran");
+
+        // the move rebuilds the retention: the body that read the class
+        // runs again inside the settle, and the scene says so
+        runtime.set_environment(|values| values.horizontalSizeClass = SizeClass::Compact);
+        assert_eq!(first_line(&runtime.display_frame(&Adaptive, size)), "narrow");
+        let _ = runtime.display_frame(&Adaptive, size);
+        assert!(runtime.body_runs().is_empty(), "and settled");
+
+        // a subtree forces its own answer
+        #[derive(Clone, Copy)]
+        struct Preview;
+        impl Component for Preview {
+            fn body(self, _ctx: &Context) -> impl View {
+                Adaptive.environment(|values| values.horizontalSizeClass = SizeClass::Compact)
+            }
+        }
+        assert_eq!(first_line(&Runtime::new().display_frame(&Preview, size)), "narrow");
     }
 }

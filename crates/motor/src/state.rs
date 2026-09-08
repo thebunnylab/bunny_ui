@@ -35,12 +35,25 @@ impl Default for Locale {
     }
 }
 
+/// `\.horizontalSizeClass` — how wide the window is, in the two words
+/// a layout adapts to: a phone in portrait is `Compact`, everything from
+/// a tablet up is `Regular`. The shell reports it and a body that reads
+/// it re-runs when it changes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SizeClass {
+    Compact,
+    #[default]
+    Regular,
+}
+
 /// Everything `@Environment(\.key)` can read. App-specific values (the DI
 /// container, the SwiftData model container) ride along type-erased, exactly
 /// like `@Entry` extensions do in real SwiftUI.
 #[derive(Clone, Default)]
 pub struct EnvironmentValues {
     pub locale: Locale,
+    /// `\.horizontalSizeClass`.
+    pub horizontalSizeClass: SizeClass,
     /// `\.injected` — `Rc<DIContainer>` in the app.
     pub injected: Option<Rc<dyn Any>>,
     /// `\.modelContext` stand-in: resolves `Query<T>` sources by type name.
@@ -68,6 +81,12 @@ pub trait FromEnvironment: Clone + 'static {
 impl FromEnvironment for Locale {
     fn from_environment(values: &EnvironmentValues) -> Self {
         values.locale.clone()
+    }
+}
+
+impl FromEnvironment for SizeClass {
+    fn from_environment(values: &EnvironmentValues) -> Self {
+        values.horizontalSizeClass
     }
 }
 
