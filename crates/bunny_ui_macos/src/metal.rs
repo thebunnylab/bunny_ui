@@ -1639,8 +1639,24 @@ struct RunAtlas {
     /// Images too big for a shelf get a texture of their own (a shelf
     /// eats its full height across the atlas width, and anything larger
     /// than the atlas would LIVELOCK the reset-retry). Capped; overflow
-    /// rides the same reset the atlas already does.
-    dedicated: HashMap<(u64, u32, u32), Id>,
+    /// rides the same reset the atlas already does — but only while the
+    /// map holds a texture the walk in progress did not read. After a
+    /// reset the map holds exactly what the walk minted, and a frame
+    /// that needs more than the cap keeps every one: asking the
+    /// collector again would be the livelock the cap was written
+    /// against (the Atrium floor at scale 2 — dozens of painted paths
+    /// taller than a shelf, on ONE frame).
+    dedicated: HashMap<(u64, u32, u32), Dedicated>,
+    /// The walk in progress: `build_frame` opens one per attempt, and
+    /// every dedicated read stamps its texture with it.
+    walk: u64,
+}
+
+/// One dedicated texture and the last walk that read it — the question
+/// the collector is asked before it is called.
+struct Dedicated {
+    texture: Id,
+    walk: u64,
 }
 
 /// One cached image on the shared atlas: its chunk tiles at one
@@ -1661,7 +1677,9 @@ enum ResolvedImage<'a> {
 const DEDICATED_HEIGHT: u32 = 256;
 /// …and so does anything larger than this area, atlas-budget-wise.
 const DEDICATED_AREA: u32 = 512 * 512;
-/// Dedicated textures retained before the reset collects them.
+/// Dedicated textures retained before a stale one asks the collector.
+/// A frame that reads more keeps them all: the collector can only take
+/// a texture no walk needs.
 const DEDICATED_KEEP: usize = 8;
 
 impl RunAtlas {
@@ -1674,7 +1692,14 @@ impl RunAtlas {
             entries: HashMap::new(),
             images: HashMap::new(),
             dedicated: HashMap::new(),
+            walk: 0,
         }
+    }
+
+    /// Opens a walk: the stamp every dedicated texture the frame reads
+    /// takes. `build_frame` calls it first, on every attempt.
+    fn begin_walk(&mut self) {
+        self.walk = self.walk.wrapping_add(1);
     }
 
     /// Drops every entry and every shelf. `grow` doubles the texture
@@ -1698,8 +1723,8 @@ impl RunAtlas {
         self.images.clear();
         // the dedicated textures ride the same collector: the caller
         // drained the GPU before any reset, so releasing here is safe
-        for (_, texture) in self.dedicated.drain() {
-            unsafe { msg_void(texture, sel("release")) };
+        for (_, entry) in self.dedicated.drain() {
+            unsafe { msg_void(entry.texture, sel("release")) };
         }
     }
 
@@ -1820,8 +1845,10 @@ impl RunAtlas {
         engine: &dyn ImageEngine,
     ) -> Result<Option<ResolvedImage<'_>>, AtlasFull> {
         let cache_key = (source.key(), width, height);
-        if let Some(texture) = self.dedicated.get(&cache_key) {
-            return Ok(Some(ResolvedImage::Dedicated(*texture, width, height)));
+        let walk = self.walk;
+        if let Some(entry) = self.dedicated.get_mut(&cache_key) {
+            entry.walk = walk;
+            return Ok(Some(ResolvedImage::Dedicated(entry.texture, width, height)));
         }
         let shared = height <= DEDICATED_HEIGHT && width * height <= DEDICATED_AREA;
         if shared && !self.images.contains_key(&cache_key) {
@@ -1870,8 +1897,13 @@ impl RunAtlas {
         }
 
         // dedicated: over the cap, the frame asks for the collector —
-        // after the drain+reset the map is empty and the walk re-runs
-        if self.dedicated.len() >= DEDICATED_KEEP {
+        // but only when the collector has something to take. A texture
+        // this walk read is not garbage; after the drain+reset the map
+        // holds nothing else, and the walk that re-runs keeps what it
+        // needs instead of running into the same wall
+        if self.dedicated.len() >= DEDICATED_KEEP
+            && self.dedicated.values().any(|entry| entry.walk != self.walk)
+        {
             return Err(AtlasFull);
         }
         let Some(raster) = raster_source(engine, source, width as usize, height as usize) else {
@@ -1905,7 +1937,7 @@ impl RunAtlas {
             );
             texture
         };
-        self.dedicated.insert(cache_key, texture);
+        self.dedicated.insert(cache_key, Dedicated { texture, walk });
         Ok(Some(ResolvedImage::Dedicated(texture, width, height)))
     }
 }
@@ -2068,6 +2100,7 @@ fn build_frame(
     atlas: &mut RunAtlas,
     batches: &mut FrameBatches,
 ) -> Result<(), AtlasFull> {
+    atlas.begin_walk();
     batches.rects.clear();
     batches.sprites.clear();
     batches.glass.clear();
@@ -3771,6 +3804,55 @@ mod tests {
         assert!(first.0 >= 3, "atlas icon + cover + dedicated photo: {first:?}");
         gpu.present_wait(&display, 2, Color::CANVAS, &PixelFont, &engine);
         assert_eq!(first, gpu.atlas_footprint(), "a warm frame re-uploads nothing");
+    }
+
+    /// Twelve photos of 40×130pt — 80×260 physical at scale 2, each
+    /// taller than a shelf: twelve dedicated textures on ONE frame,
+    /// past the retention cap.
+    fn crowd_scene(first_key: u64) -> impl View {
+        let photos: Vec<_> = (0..12)
+            .map(|i| image(gradient_source(first_key + i)).resizable().frame(40.0, 130.0))
+            .collect();
+        hstack(photos)
+    }
+
+    #[test]
+    fn a_frame_of_more_big_images_than_the_cap_keeps_every_one() {
+        if !device_present() {
+            return;
+        }
+        // the cap is a retention budget between frames, not a limit on
+        // a frame: the ninth image asked for the collector, the reset
+        // emptied the map, the walk ran into the same wall twice and
+        // the frame went out without its last four images (the Atrium
+        // floor at scale 2 — dozens of painted paths taller than a shelf)
+        let (gpu, cpu) =
+            scene_bytes(&crowd_scene(10), Size { width: 640.0, height: 140.0 }, 2, Color::CANVAS);
+        assert!(
+            gpu == cpu,
+            "crowd scene diverged (max channel delta {})",
+            max_channel_delta(&gpu, &cpu)
+        );
+    }
+
+    #[test]
+    fn the_collector_takes_only_textures_no_walk_reads() {
+        if !device_present() {
+            return;
+        }
+        let logical = Size { width: 640.0, height: 140.0 };
+        let engine = RawImages::default();
+        let mut gpu = OffscreenGpu::new(1280, 280).expect("offscreen gpu");
+        let first = Runtime::new().display_frame(&crowd_scene(10), logical);
+        gpu.present_wait(&first, 2, Color::CANVAS, &PixelFont, &engine);
+        assert_eq!(gpu.atlas.dedicated.len(), 12, "every photo of the frame keeps its texture");
+        gpu.present_wait(&first, 2, Color::CANVAS, &PixelFont, &engine);
+        assert_eq!(gpu.atlas.dedicated.len(), 12, "a warm frame past the cap asks no collector");
+        // twelve OTHER photos: the first twelve are stale, the cap asks
+        // for the collector, and the map holds only what this frame reads
+        let second = Runtime::new().display_frame(&crowd_scene(50), logical);
+        gpu.present_wait(&second, 2, Color::CANVAS, &PixelFont, &engine);
+        assert_eq!(gpu.atlas.dedicated.len(), 12, "the collector took the stale textures");
     }
 
     // MARK: - Icons
