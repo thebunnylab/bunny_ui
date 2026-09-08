@@ -1621,7 +1621,23 @@ pub fn show_window(_window: WindowHandle) {
 #[derive(Clone, Copy)]
 pub struct WindowHandle(usize);
 
+/// Asks the road to end — what the app's `close` spends on the one
+/// window this shell holds. The pump leaves on its next turn, and the
+/// process returns from `run`.
+pub fn close_window() {
+    if is_x11() {
+        crate::x11::ask_quit();
+        return;
+    }
+    with_client(|client| client.quit = true);
+}
+
 impl WindowHandle {
+    /// The window as an address — the app's own handle for it.
+    pub fn raw_window(&self) -> usize {
+        self.0
+    }
+
     /// Logical size of the content area (the layout viewport).
     pub fn content_size(&self) -> (f64, f64) {
         if is_x11() {

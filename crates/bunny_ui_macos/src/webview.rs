@@ -6,14 +6,24 @@
 //! points it at a url, moves the box, and holds ONE return channel:
 //! the script message bridge. Everything the page sends back rides
 //! it — the app's bus (`window.bunny.post`) and the eval answers —
-//! so there is no Objective-C block ABI anywhere in this crate.
+//! so the only Objective-C block this crate AUTHORS is the snapshot's.
+//!
+//! A DOCUMENT (`webview_html`) rides the same view by
+//! `loadHTMLString:baseURL:`, sealed under its policy; the navigation
+//! delegate then answers every question the engine asks with the
+//! document's one rule — the app's own load goes through, a link
+//! reports to the app, and nothing else moves.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::null_mut;
 
 use bunny_ui::action::Modifiers;
-use bunny_ui::host::{MouseButton, WebviewInput};
+use bunny_ui::host::{
+    Document, EDITOR_SCRIPT, EditorAction, EditorReport, HostSpec, MouseButton, WebviewInput,
+    editor_report,
+};
 
 use crate::ffi::{CGPoint, CGRect, CGSize, Id, NS_NOT_FOUND, NSRange, Sel, class, sel};
 
@@ -47,6 +57,8 @@ unsafe extern "C" {
     fn msg_id(obj: Id, sel: Sel) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_id_id(obj: Id, sel: Sel, a: Id) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_id_id_id(obj: Id, sel: Sel, a: Id, b: Id) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_id_cstr(obj: Id, sel: Sel, a: *const c_char) -> Id;
     #[link_name = "objc_msgSend"]
@@ -127,6 +139,14 @@ unsafe extern "C" {
 pub(crate) enum WebviewEvent {
     /// The engine committed a navigation — link clicks included.
     Navigated { view: Id, url: String },
+    /// A link in a DOCUMENT was activated. The engine did not follow
+    /// it: the document stays, and the app hears the url.
+    Linked { view: Id, url: String },
+    /// An editable document's body changed under the person's hand.
+    Changed { view: Id, html: String },
+    /// A paste the app owns: the clipboard's html and text, nothing
+    /// inserted.
+    Pasted { view: Id, html: String, text: String },
     /// The engine REFUSED one: the url it tried, and why — the other
     /// leg of the same pair, so no load ends in silence.
     NavigationFailed { view: Id, url: String, why: String },
@@ -151,7 +171,33 @@ thread_local! {
     /// delegate for every webview in the window (the events carry the
     /// view, so one listener serves all).
     static BRIDGE: Cell<Id> = const { Cell::new(null_mut()) };
+    /// The DOCUMENTS mounted, by host path — what the policy delegate
+    /// reads when the engine asks whether it may move. A page shown by
+    /// url has no entry, and follows its own links.
+    static LETTERS: RefCell<HashMap<String, Letter>> = RefCell::new(HashMap::new());
 }
+
+/// A mounted document's standing.
+struct Letter {
+    /// The fingerprint of what is loaded — `update` compares, so the
+    /// same letter never reloads and a changed one always does.
+    digest: u64,
+    /// The app's own load is in flight: the ONE navigation the
+    /// delegate lets through. Cleared when the delegate saw it, and
+    /// again at the commit — whichever the engine says first — so a
+    /// refresh the document asks for later finds the door shut.
+    expected: bool,
+    /// The editor takes the keyboard at the commit — once. The view
+    /// has no window at its creation (the host adds it after), so the
+    /// commit is the first beat the keyboard can be taken at.
+    focus: bool,
+}
+
+/// `WKNavigationActionPolicy` — what the delegate answers with.
+const POLICY_CANCEL: i64 = 0;
+const POLICY_ALLOW: i64 = 1;
+/// `WKNavigationTypeLinkActivated` — a link the person activated.
+const NAVIGATION_LINK: i64 = 0;
 
 /// The shell installs the landing spot for everything a page reports.
 pub(crate) fn set_dispatch(dispatch: impl Fn(WebviewEvent) + 'static) {
@@ -253,6 +299,18 @@ extern "C" fn bridge_message(_this: Id, _sel: Sel, _controller: Id, message: Id)
                 let view = msg_id(message, sel("webView"));
                 dispatch(WebviewEvent::Requested { view, line: body });
             }
+            "bunnyEdit" => {
+                let view = msg_id(message, sel("webView"));
+                match editor_report(&body) {
+                    Some(EditorReport::Changed(html)) => {
+                        dispatch(WebviewEvent::Changed { view, html });
+                    }
+                    Some(EditorReport::Pasted { html, text }) => {
+                        dispatch(WebviewEvent::Pasted { view, html, text });
+                    }
+                    None => {}
+                }
+            }
             "bunnyEval" => {
                 let mut parts = body.splitn(3, '\t');
                 let (Some(token), Some(verdict), Some(payload)) =
@@ -274,8 +332,23 @@ extern "C" fn bridge_message(_this: Id, _sel: Sel, _controller: Id, message: Id)
     }
 }
 
-/// `webView:didCommitNavigation:` — the url is real from here on.
+/// `webView:didCommitNavigation:` — the url is real from here on. A
+/// document's commit also shuts the door its own load came through:
+/// from here on nothing the document asks for moves it.
 extern "C" fn bridge_committed(_this: Id, _sel: Sel, view: Id, _navigation: Id) {
+    if let Some(path) = crate::ffi::host_key_of_child(view) {
+        let wants_keyboard = LETTERS.with(|letters| {
+            let mut letters = letters.borrow_mut();
+            let Some(letter) = letters.get_mut(&path) else {
+                return false;
+            };
+            letter.expected = false;
+            std::mem::replace(&mut letter.focus, false)
+        });
+        if wants_keyboard {
+            unsafe { take_keyboard(view) };
+        }
+    }
     unsafe {
         let url = msg_id(view, sel("URL"));
         if url.is_null() {
@@ -283,6 +356,101 @@ extern "C" fn bridge_committed(_this: Id, _sel: Sel, view: Id, _navigation: Id) 
         }
         let url = to_string(msg_id(url, sel("absoluteString")));
         dispatch(WebviewEvent::Navigated { view, url });
+    }
+}
+
+/// The block the engine hands a policy delegate: called once, with
+/// the answer. This crate never AUTHORS one of these — it only reads
+/// the runtime's layout far enough to find `invoke` and call it.
+#[repr(C)]
+struct PolicyBlock {
+    isa: *const c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: unsafe extern "C" fn(*mut PolicyBlock, i64),
+}
+
+/// `webView:decidePolicyForNavigationAction:decisionHandler:` — the
+/// engine asks before it moves. A page shown by url is answered yes,
+/// always: it follows its own links, as it did before this method
+/// existed. A DOCUMENT is answered by its one rule: the app's own
+/// load goes through, a link the person activated is CANCELLED and
+/// reported to the app (the document never follows it), and every
+/// other ask — a refresh the document wrote, a form, a subframe, the
+/// engine's own reload (which would fetch the base url) — is
+/// cancelled without a word. The handler is called exactly once, on
+/// every road out: the engine throws when it is not.
+extern "C" fn bridge_decide(_this: Id, _sel: Sel, view: Id, action: Id, handler: Id) {
+    let policy = unsafe { decide(view, action) };
+    unsafe {
+        let block = handler as *mut PolicyBlock;
+        if !block.is_null() {
+            ((*block).invoke)(block, policy);
+        }
+    }
+}
+
+unsafe fn decide(view: Id, action: Id) -> i64 {
+    let Some(path) = crate::ffi::host_key_of_child(view) else {
+        return POLICY_ALLOW;
+    };
+    let expected = LETTERS.with(|letters| {
+        letters
+            .borrow_mut()
+            .get_mut(&path)
+            .map(|letter| std::mem::replace(&mut letter.expected, false))
+    });
+    let Some(expected) = expected else {
+        // a page by url: its own business
+        return POLICY_ALLOW;
+    };
+    unsafe {
+        if msg_i64(action, sel("navigationType")) == NAVIGATION_LINK {
+            report_link(view, action);
+            return POLICY_CANCEL;
+        }
+    }
+    if expected { POLICY_ALLOW } else { POLICY_CANCEL }
+}
+
+/// `webView:createWebViewWithConfiguration:forNavigationAction:
+/// windowFeatures:` — a link that asks for a NEW window
+/// (`target="_blank"`). No view is ever created here: a document's
+/// link reports to the app like any other, and a page by url gets
+/// what it always got from a window nobody opens — nothing.
+extern "C" fn bridge_create_view(
+    _this: Id,
+    _sel: Sel,
+    view: Id,
+    _configuration: Id,
+    action: Id,
+    _features: Id,
+) -> Id {
+    let sealed = crate::ffi::host_key_of_child(view)
+        .is_some_and(|path| LETTERS.with(|letters| letters.borrow().contains_key(&path)));
+    if sealed {
+        unsafe { report_link(view, action) };
+    }
+    null_mut()
+}
+
+/// The url a navigation action aims at, to the app — unless it is a
+/// `javascript:` link, which is not a place and runs nowhere.
+unsafe fn report_link(view: Id, action: Id) {
+    unsafe {
+        let request = msg_id(action, sel("request"));
+        let url = if request.is_null() { null_mut() } else { msg_id(request, sel("URL")) };
+        if url.is_null() {
+            return;
+        }
+        let scheme = to_string(msg_id(url, sel("scheme")));
+        if scheme.eq_ignore_ascii_case("javascript") {
+            return;
+        }
+        let url = to_string(msg_id(url, sel("absoluteString")));
+        if !url.is_empty() {
+            dispatch(WebviewEvent::Linked { view, url });
+        }
     }
 }
 
@@ -382,7 +550,23 @@ fn bridge() -> Id {
                     failure_types.as_ptr(),
                 );
             }
-            for protocol in ["WKScriptMessageHandler", "WKNavigationDelegate"] {
+            // the policy ask: three objects, the last a block (`@?`)
+            let decide_types = CString::new("v@:@@@?").expect("type encoding");
+            class_addMethod(
+                bridge,
+                sel("webView:decidePolicyForNavigationAction:decisionHandler:"),
+                bridge_decide as *const c_void,
+                decide_types.as_ptr(),
+            );
+            // the new-window ask answers with a view — or nil
+            let create_types = CString::new("@@:@@@@").expect("type encoding");
+            class_addMethod(
+                bridge,
+                sel("webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:"),
+                bridge_create_view as *const c_void,
+                create_types.as_ptr(),
+            );
+            for protocol in ["WKScriptMessageHandler", "WKNavigationDelegate", "WKUIDelegate"] {
                 let protocol = CString::new(protocol).expect("protocol name");
                 let protocol = objc_getProtocol(protocol.as_ptr());
                 if !protocol.is_null() {
@@ -398,10 +582,12 @@ fn bridge() -> Id {
 }
 
 /// Creates the engine's view, already instrumented and navigating to
-/// the spec's url. The reference comes back with ONE retain — the
-/// host's sweep releases it when the box leaves the scene.
-pub(crate) fn create(spec: &bunny_ui::host::HostSpec) -> Id {
-    let bunny_ui::host::HostSpec::Webview { url, .. } = spec;
+/// the spec's url — or loading its document. The reference comes back
+/// with ONE retain — the host's sweep releases it when the box leaves
+/// the scene. `path` is the host's identity, what a document is filed
+/// under for the delegate to find.
+pub(crate) fn create(path: &str, spec: &HostSpec) -> Id {
+    let HostSpec::Webview { url, document, .. } = spec;
     unsafe {
         let config =
             msg_id(msg_id(class("WKWebViewConfiguration"), sel("alloc")), sel("init"));
@@ -419,17 +605,87 @@ pub(crate) fn create(spec: &bunny_ui::host::HostSpec) -> Id {
         // the view copied what it needed from the configuration
         msg_void(config, sel("release"));
         // navigation reports come through the bridge (the delegate
-        // reference is weak; the bridge outlives every view)
+        // reference is weak; the bridge outlives every view), and so
+        // does the ask a new-window link makes
         msg_void_id(view, sel("setNavigationDelegate:"), bridge());
+        msg_void_id(view, sel("setUIDelegate:"), bridge());
         // the engine's own inspector, where the OS offers the switch
         // (13.3+) — a webview here is a dev's window into a page, and
         // a devtool that cannot open is a quiet page with no name
         if msg_bool_sel(view, sel("respondsToSelector:"), sel("setInspectable:")) != 0 {
             msg_void_bool(view, sel("setInspectable:"), 1);
         }
-        navigate(view, url);
+        match document {
+            Some(document) => load_document(path, view, document),
+            None => navigate(view, url),
+        }
         view
     }
+}
+
+/// Loads a document from MEMORY — `loadHTMLString:baseURL:`, the
+/// sealed html the spec holds, the base the engine resolves relative
+/// references by (nil for none). Filed first, loaded second: the
+/// delegate is asked about this load, and must find the letter
+/// expecting it.
+fn load_document(path: &str, view: Id, document: &Document) {
+    LETTERS.with(|letters| {
+        letters.borrow_mut().insert(
+            path.to_string(),
+            Letter { digest: document.digest, expected: true, focus: document.focus },
+        );
+    });
+    unsafe {
+        let base = if document.base.is_empty() { null_mut() } else { ns_url(&document.base) };
+        let _ = msg_id_id_id(
+            view,
+            sel("loadHTMLString:baseURL:"),
+            ns(&document.sealed()),
+            base,
+        );
+    }
+}
+
+/// The view becomes the window's first responder — the keyboard is
+/// the page's. A view with no window yet takes nothing.
+unsafe fn take_keyboard(view: Id) {
+    unsafe {
+        let window = msg_id(view, sel("window"));
+        if !window.is_null() {
+            let _ = msg_bool_id(window, sel("makeFirstResponder:"), view);
+        }
+    }
+}
+
+/// One editing action on the document — the allowlist's script, run
+/// on the engine. The editor takes the keyboard back first (a toolbar
+/// click took it), except for the app's own write of the whole body,
+/// which needs no selection. Fire-and-forget, like the hand.
+pub(crate) fn edit(view: Id, action: &EditorAction) {
+    let script = action.script();
+    if script.is_empty() {
+        return;
+    }
+    unsafe {
+        if !matches!(action, EditorAction::SetHtml(_)) {
+            take_keyboard(view);
+        }
+        run_script(view, &script);
+    }
+}
+
+/// Runs `js` on the page, answer discarded — the completion handler
+/// stays nil, so no block crosses this border.
+unsafe fn run_script(view: Id, js: &str) {
+    unsafe {
+        msg_void_id_id(view, sel("evaluateJavaScript:completionHandler:"), ns(js), null_mut());
+    }
+}
+
+/// Forgets the documents whose hosts left the scene — called beside
+/// the host sweep, with the paths still standing.
+pub(crate) fn sweep(alive: &[String]) {
+    LETTERS.with(|letters| letters.borrow_mut().retain(|path, _| alive.contains(path)));
 }
 
 /// Hands the controller the bridge and the document-start scripts.
@@ -439,7 +695,7 @@ pub(crate) fn create(spec: &bunny_ui::host::HostSpec) -> Id {
 unsafe fn install_bridge(controller: Id, spec: &bunny_ui::host::HostSpec) {
     unsafe {
         let bridge = bridge();
-        for channel in ["bunny", "bunnyConsole", "bunnyNet", "bunnyEval"] {
+        for channel in ["bunny", "bunnyConsole", "bunnyNet", "bunnyEval", "bunnyEdit"] {
             msg_void_id_id(
                 controller,
                 sel("addScriptMessageHandler:name:"),
@@ -453,10 +709,11 @@ unsafe fn install_bridge(controller: Id, spec: &bunny_ui::host::HostSpec) {
 
 /// The document-start set, in a fixed order: the bus first (a user
 /// script may want to post), then the hooks the app DECLARED — a page
-/// nobody watches pays for no capture — then the app's own scripts,
-/// in declaration order.
-unsafe fn apply_scripts(controller: Id, spec: &bunny_ui::host::HostSpec) {
-    let bunny_ui::host::HostSpec::Webview { scripts, console, requests, .. } = spec;
+/// nobody watches pays for no capture — then the editor for an
+/// editable document (its transport first, the framework's script
+/// after), then the app's own scripts, in declaration order.
+unsafe fn apply_scripts(controller: Id, spec: &HostSpec) {
+    let HostSpec::Webview { scripts, console, requests, document, .. } = spec;
     unsafe {
         add_script(controller, BOOT);
         if *console {
@@ -465,10 +722,26 @@ unsafe fn apply_scripts(controller: Id, spec: &bunny_ui::host::HostSpec) {
         if *requests {
             add_script(controller, NET_WRAP);
         }
+        if let Some(document) = document
+            && document.editable
+        {
+            add_script(controller, &editor_prelude(document));
+            add_script(controller, EDITOR_SCRIPT);
+        }
         for script in scripts.iter() {
             add_script(controller, script);
         }
     }
+}
+
+/// What the editor script expects to find: the document's asks, and
+/// this backend's road for a report line — the `bunnyEdit` channel.
+fn editor_prelude(document: &Document) -> String {
+    format!(
+        "window.__bunnyEditor = {{ paste: {}, focus: {}, send: function(line) {{ \
+         window.webkit.messageHandlers.bunnyEdit.postMessage(line); }} }};",
+        document.paste, document.focus
+    )
 }
 
 /// One WKUserScript at document start, main frame only.
@@ -497,15 +770,32 @@ unsafe fn add_script(controller: Id, source: &str) {
 /// remount boards at the real page. The imperative
 /// `WebviewHandle::navigate` never compares — asking again for the
 /// page you are on is a reload, like the browser button it is.
-pub(crate) fn update(view: Id, spec: &bunny_ui::host::HostSpec) {
-    let bunny_ui::host::HostSpec::Webview { url, .. } = spec;
+///
+/// A document compares by its fingerprint: the same letter under a
+/// re-run body never reloads, a changed one always does. A view that
+/// goes from a document back to a url closes the letter — the page
+/// follows its own links again.
+pub(crate) fn update(path: &str, view: Id, spec: &HostSpec) {
+    let HostSpec::Webview { url, document, .. } = spec;
     unsafe {
         let config = msg_id(view, sel("configuration"));
         let controller = msg_id(config, sel("userContentController"));
         msg_void(controller, sel("removeAllUserScripts"));
         apply_scripts(controller, spec);
-        if current_url(view).as_deref() != Some(&**url) {
-            navigate(view, url);
+        match document {
+            Some(document) => {
+                let loaded = LETTERS
+                    .with(|letters| letters.borrow().get(path).map(|letter| letter.digest));
+                if loaded != Some(document.digest) {
+                    load_document(path, view, document);
+                }
+            }
+            None => {
+                LETTERS.with(|letters| letters.borrow_mut().remove(path));
+                if current_url(view).as_deref() != Some(&**url) {
+                    navigate(view, url);
+                }
+            }
         }
     }
 }
@@ -534,20 +824,15 @@ pub fn capabilities() -> &'static [bunny_ui::host::WebviewCapability] {
         WebviewCapability::ConsoleMessages,
         WebviewCapability::NetworkRequests,
         WebviewCapability::SyntheticInput,
+        WebviewCapability::HtmlEditor,
     ]
 }
 
 /// Points the engine at `url` — the load is the engine's own affair,
 /// asynchronous and cancellable by the next call.
 pub(crate) fn navigate(view: Id, url: &str) {
-    let Ok(url) = CString::new(url) else {
-        // a NUL inside a url is not a url; nothing to load
-        return;
-    };
     unsafe {
-        let string =
-            msg_id_cstr(class("NSString"), sel("stringWithUTF8String:"), url.as_ptr());
-        let url = msg_id_id(class("NSURL"), sel("URLWithString:"), string);
+        let url = ns_url(url);
         if url.is_null() {
             // NSURL said no — an unparseable url loads nothing rather
             // than crashing the request builder
@@ -555,6 +840,18 @@ pub(crate) fn navigate(view: Id, url: &str) {
         }
         let request = msg_id_id(class("NSURLRequest"), sel("requestWithURL:"), url);
         let _ = msg_id_id(view, sel("loadRequest:"), request);
+    }
+}
+
+/// An NSURL for `text` (autoreleased), or nil when it is not one — a
+/// NUL inside is not a url, and NSURL has its own refusals.
+unsafe fn ns_url(text: &str) -> Id {
+    let Ok(text) = CString::new(text) else {
+        return null_mut();
+    };
+    unsafe {
+        let string = msg_id_cstr(class("NSString"), sel("stringWithUTF8String:"), text.as_ptr());
+        msg_id_id(class("NSURL"), sel("URLWithString:"), string)
     }
 }
 
@@ -575,12 +872,18 @@ pub(crate) fn forward(view: Id) {
 
 /// Evaluates `js` as an EXPRESSION in the page. The answer rides the
 /// bridge (`bunnyEval`, by token) — the completion handler stays nil,
-/// so no block ever crosses this border.
-pub(crate) fn eval(view: Id, token: u64, js: &str) {
+/// so no block ever crosses this border. `raw` hands the value back as
+/// the string it is (a null answers empty); otherwise it rides as JSON.
+pub(crate) fn eval(view: Id, token: u64, js: &str, raw: bool) {
+    let serialize = if raw {
+        "(__v === undefined || __v === null) ? \"\" : String(__v)"
+    } else {
+        "JSON.stringify(__v)"
+    };
     let wrapped = format!(
         "(function() {{ try {{ \
            var __v = (function() {{ return ( {js} ); }})(); \
-           var __s = JSON.stringify(__v); \
+           var __s = {serialize}; \
            window.webkit.messageHandlers.bunnyEval.postMessage(\
              \"{token}\\tok\\t\" + (__s === undefined ? \"null\" : __s)); \
          }} catch (e) {{ \
@@ -588,14 +891,7 @@ pub(crate) fn eval(view: Id, token: u64, js: &str) {
              \"{token}\\terr\\t\" + String(e)); \
          }} }})();"
     );
-    unsafe {
-        msg_void_id_id(
-            view,
-            sel("evaluateJavaScript:completionHandler:"),
-            ns(&wrapped),
-            null_mut(),
-        );
-    }
+    unsafe { run_script(view, &wrapped) }
 }
 
 // The event types AppKit numbers, and the modifier bits it reads.

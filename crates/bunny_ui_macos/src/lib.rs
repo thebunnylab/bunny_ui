@@ -11,6 +11,7 @@ pub mod credentials;
 pub mod dialog;
 mod ffi;
 mod image;
+mod life;
 mod metal;
 mod text;
 pub mod webview;
@@ -233,6 +234,11 @@ impl WindowSpec {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct WindowId(usize);
 
+/// This shell holds MORE THAN ONE window — the detachable composer,
+/// the second workbench. The three shells answer this differently and
+/// an app that must run on all of them asks before it detaches.
+pub const MANY_WINDOWS: bool = true;
+
 /// Everything one window owns for as long as it is open. The app holds
 /// these and routes every event to the one it belongs to.
 struct Slot {
@@ -298,6 +304,9 @@ impl Default for App {
 impl App {
     /// An app with no windows yet.
     pub fn new() -> App {
+        // the app's life outside its windows opens with the app: the
+        // delegate, the workspace's sleep and wake, the notifier
+        life::install();
         App {
             inner: Rc::new(AppInner {
                 slots: RefCell::new(Vec::new()),
@@ -550,6 +559,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             for host in &hosts {
                 let bunny_ui::host::HostSpec::Webview {
                     url,
+                    document,
                     scripts,
                     console,
                     requests,
@@ -563,6 +573,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // offers no public override), but the stamp must not
                 // lie about what the spec says
                 let mut stamp = String::from(&**url);
+                // a document stamps by its fingerprint, never by its
+                // pages — the letter is the app's to hold, not the
+                // stamp's to copy every frame
+                if let Some(document) = document {
+                    stamp.push('\u{3}');
+                    stamp.push_str(&format!("{:016x}", document.digest));
+                }
                 stamp.push('\u{2}');
                 stamp.push(if *console { 'c' } else { '-' });
                 stamp.push(if *requests { 'r' } else { '-' });
@@ -587,13 +604,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         host.visible.size.height,
                     ),
                     placed,
-                    || webview::create(&host.spec),
-                    |child, _stamp| webview::update(child, &host.spec),
+                    || webview::create(&host.path, &host.spec),
+                    |child, _stamp| webview::update(&host.path, child, &host.spec),
                 );
             }
-            window.host_sweep(
-                &hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>(),
-            );
+            let alive = hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>();
+            window.host_sweep(&alive);
+            webview::sweep(&alive);
             traced.stage("H", format_args!("hosts={}", hosts.len()));
             let overlays = runtime.overlays();
             let display = match overlays.first() {
@@ -1138,8 +1155,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     }
                     // an eval with no page answers NOW, with a name —
                     // never silence that looks like a slow page
-                    WebviewOp::Eval { path, token, js } => match ffi::host_child(&path) {
-                        Some(child) => webview::eval(child, token, &js),
+                    WebviewOp::Eval { path, token, js, raw } => match ffi::host_child(&path) {
+                        Some(child) => webview::eval(child, token, &js, raw),
                         None => {
                             let _ = runtime.webview_eval_done(
                                 token,
@@ -1156,6 +1173,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                             );
                         }
                     },
+                    // an edit on a document that left is spent on
+                    // nothing, like the hand
+                    WebviewOp::Edit { path, action } => {
+                        if let Some(child) = ffi::host_child(&path) {
+                            webview::edit(child, &action);
+                        }
+                    }
                     // a hand over a page that left is a hand over
                     // nothing: there is no answer to refuse in
                     WebviewOp::Input { path, event } => {
@@ -1372,6 +1396,27 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 webview::WebviewEvent::Navigated { view, url } => {
                     if let Some(path) = ffi::host_key_of_child(view)
                         && runtime.webview_navigated(&path, &url)
+                    {
+                        blit(&runtime, root, trace::Origin::Web);
+                    }
+                }
+                webview::WebviewEvent::Linked { view, url } => {
+                    if let Some(path) = ffi::host_key_of_child(view)
+                        && runtime.webview_linked(&path, &url)
+                    {
+                        blit(&runtime, root, trace::Origin::Web);
+                    }
+                }
+                webview::WebviewEvent::Changed { view, html } => {
+                    if let Some(path) = ffi::host_key_of_child(view)
+                        && runtime.webview_changed(&path, &html)
+                    {
+                        blit(&runtime, root, trace::Origin::Web);
+                    }
+                }
+                webview::WebviewEvent::Pasted { view, html, text } => {
+                    if let Some(path) = ffi::host_key_of_child(view)
+                        && runtime.webview_pasted(&path, &html, &text)
                     {
                         blit(&runtime, root, trace::Origin::Web);
                     }

@@ -15,7 +15,16 @@ and the response-received event, richer than the injected wraps),
 synthetic input by protocol with `isTrusted` true, and the sandwich
 riding owned per-pixel-alpha popups;
 `cargo run -p bunny-ui-windows --example browser_window` is that
-proof, `--drive` its witness. WebKitGTK is open.*
+proof, `--drive` its witness. A document from MEMORY under a network
+policy — `webview_html`, the reader of a letter from a stranger —
+stands on both engines and in the web lowering;
+`cargo run -p bunny-ui-macos --example letter_window -- --drive` is
+its proof, measured against a witness on the loopback. The same
+document EDITS in place — the composer: the engine's own editing, an
+allowlist of commands, every change reported, the paste the app's to
+own, the policy holding throughout;
+`cargo run -p bunny-ui-macos --example compose_window -- --drive` is
+that proof. WebKitGTK is open.*
 
 An app sometimes has to show a web page — the preview of the thing it
 is building, a documentation site, an OAuth dance. Bundling a browser
@@ -152,6 +161,113 @@ discipline `.task` already uses: the page posts, the app receives —
 and everything the page sends back rides that one channel, the eval
 answers included.
 
+## A document from memory
+
+The same box shows a page the app already HOLDS — a letter, a
+rendered preview — from memory, with no file written and no url
+fetched:
+
+```rust
+webview_html(&letter, "https://mail.example/", NetworkPolicy::Deny)
+    .on_link(move |url| open_in_browser(url))
+```
+
+Three things the url door does not promise, and this one does.
+
+The document is under a **network policy** the engine enforces on
+every fetch, before a byte leaves the machine. `Deny` lets nothing
+out — no image, stylesheet, font, frame, media or script of the
+document's own — while what it carries inline (a `data:` image, its
+own styles) still shows. `RemoteImages` opens exactly the remote
+images, over http and https, and nothing else: the "load remote
+content" switch a mail reader flips per message or per sender. The
+policy rides at the document's head as its Content-Security-Policy,
+which every engine this framework hosts honours, ahead of anything
+the document brought; a policy the document carries of its own can
+only tighten it. A document runs no script of its own and sends no
+form. The app's user scripts, injected by the engine, still run — and
+so do eval, the bus, the snapshot and the hand.
+
+The document **never moves**. A link the person activates — a
+`target="_blank"` one included — is cancelled and reported through
+`on_link` with its url, and the app decides; a refresh the document
+wrote, a form, a subframe, the engine's own reload (which would fetch
+the base) are cancelled without a word. `base` is where the
+document's relative references resolve; `on_navigate` reports it
+once, at the commit. A body that runs again with the same letter
+never reloads it — the spec carries a fingerprint, not a comparison
+of pages — and a changed letter always does.
+
+One thing stays honestly outside. The policy governs fetches; a hint
+that is not one — a DNS prefetch — is the sanitizer's to strip before
+the letter arrives here. A reader shows a stranger's html sanitized,
+and the policy is the belt under it.
+
+A document is shown in the app's colours with `.color_scheme(…)` —
+sealed into its head as the page's own `color-scheme`, so its default
+text and canvas follow the theme instead of the engine's white; a
+document that styles itself keeps its styles.
+
+On macOS the document loads by `loadHTMLString:baseURL:`, and the
+navigation delegate answers the engine's every ask with the rule
+above. On Windows it loads by `NavigateToString` — a two-megabyte
+door; a larger letter is refused by name on `on_navigate_failed` —
+with the base sealed into its head, the starting leg cancelling what
+the rule forbids and the new-window ask handled. In the web lowering
+the frame holds the document as `srcdoc` inside a sandbox with no
+powers, where a link is inert: the web leg has no road to hand it
+back, and says so here rather than opening it in the pane.
+
+## Editing a document
+
+The composer of a mail client is the same document, edited in place:
+
+```rust
+webview_html(&draft, "", NetworkPolicy::Deny)
+    .editable()
+    .focus_on_appear()
+    .color_scheme(ColorScheme::Dark)
+    .on_html_change(move |html| body.set(html.into()))   // the body, once per turn
+    .on_paste(move |html, text| { /* the app decides, then inserts */ })
+    .handle(&editor)
+
+editor.exec(EditorCommand::Bold);      // the allowlist, on the selection
+editor.exec_link(url);                 // the app asked in its own dialog
+editor.set_html(quoted);               // the app's own write — not reported back
+editor.insert_html(clean);             // lands at the caret — reported, as the change it is
+editor.get_html(move |answer| { /* the body, as html */ });
+editor.focus();
+```
+
+The engine's own editing works the body — the caret, the selection,
+typing, undo — and the framework's editor script, injected at
+document start, reports every change as the body's html, once per
+turn (a burst of keys is one report). The commands are an
+**allowlist**, `EditorCommand`, each one the engine's own editing
+command composed by the framework with the app's strings as literals:
+the only JavaScript that ever reaches the engine is the framework's
+own, and an app never hands it any. A link is a place; a
+`javascript:` url is not one, and composes to nothing.
+
+The paste is the app's to own. Declared, `on_paste` intercepts a
+paste and hands the app what the clipboard held — as html and as
+text — and nothing lands until the app says what, through
+`insert_html`: the app's sanitizer meets the clipboard before the
+document does. Undeclared, the engine pastes as any browser would,
+under the policy. And the policy holds while editing: an image
+inserted or pasted from the web stays blocked under `Deny`.
+
+`focus_on_appear` takes the keyboard for the editor as soon as the
+document commits — a composer that opens ready to type into — and
+every command takes it back first, so a toolbar click that took the
+keyboard away still finds the selection. The app's own write of the
+whole body needs no selection and takes nothing.
+
+Capability-gated as `HtmlEditor`. macOS and Windows serve it by the
+same script over their own wires (a `bunnyEdit` channel; the one wire,
+tagged `edit`); the web lowering does not — the sandbox that holds a
+document runs no script — and shows an editable document read-only.
+
 ## Capabilities
 
 The three engines do not offer the same instrumentation, and the API
@@ -167,6 +283,8 @@ like a quiet page.
 | synthetic input | NSEvent, trusted | native | open question |
 | media emulation (full motion) | no² | CDP `Emulation.setEmulatedMedia` | open question |
 | devtools | external inspector | built in | embeddable |
+| a document under a policy | `loadHTMLString`, CSP | `NavigateToString`, CSP | open |
+| html editor (`.editable()`) | editor script | editor script | no³ |
 
 ¹ Engine-ready, core door open: the engine can hand a response body
 over, but no hook of this API carries bytes yet — so the backend does
@@ -177,6 +295,9 @@ ask through would be an empty answer with a checkmark on it.
 shim could lie to scripts but never to a CSS `@media` block, and a
 half-truth is worse than the honest cell. On the mac the OS setting is
 the only lever.
+
+³ The sandbox that holds a document runs no script, the editor's
+included: an editable document is shown there, read-only.
 
 The table is the design's honest centre. An app that needs full
 network capture on every OS needs a proxy or its own engine; this
