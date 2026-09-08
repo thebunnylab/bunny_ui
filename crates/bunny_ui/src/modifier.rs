@@ -1120,6 +1120,11 @@ fn apply(
                 child: Box::new(node),
             });
         }
+        Modifier::IgnoresSafeArea => {
+            out.wrap_layout_from(mark, |node| LayoutNode::IgnoresSafeArea {
+                child: Box::new(node),
+            });
+        }
         Modifier::BackgroundColor(color) => wrap_styled(
             out,
             mark,

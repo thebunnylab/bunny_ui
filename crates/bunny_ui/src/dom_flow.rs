@@ -780,6 +780,10 @@ impl Walk<'_> {
                 // a window drag region means nothing in a browser tab
                 self.lower_into(child, out);
             }
+            LayoutNode::IgnoresSafeArea { child } => {
+                // the browser keeps its own safe area outside the tab
+                self.lower_into(child, out);
+            }
             LayoutNode::Hinted { tag, class, dom_id, child } => {
                 // the hint stamps whatever the child lowered to — one
                 // node in practice (a hinted stack, text, or box)

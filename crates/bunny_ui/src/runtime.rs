@@ -313,6 +313,15 @@ pub struct Runtime {
     /// How many PHYSICAL pixels one layout point is worth on this
     /// screen. The shell installs it; everyone else keeps `1.0`.
     device_scale: Cell<Px>,
+    /// The window's safe area, in layout points — the bands a phone's
+    /// notch, home indicator and rounded corners take. The root lays out
+    /// inside it; `.ignores_safe_area()` reclaims it. Zero on a desktop.
+    safe_area: Cell<crate::layout::Edges>,
+    /// The software keyboard's height over the window, 0 when hidden.
+    /// It joins the bottom inset: content shrinks above the keys.
+    keyboard_inset: Cell<Px>,
+    /// The insets of the last layout — an inset change is a resize.
+    last_insets: Cell<crate::layout::Edges>,
     /// The Dom mode's retained scene — [`Runtime::dom_frame`] diffs
     /// each new capture against it. Empty (and free) in every other
     /// mode.
@@ -524,6 +533,31 @@ impl Runtime {
     /// reaches the app through [`crate::custom::PaintCtx::scale`], so
     /// a box that draws parts which TOUCH can put the shared edge on
     /// a whole pixel. The default is `1.0`.
+    /// The window's safe area, in layout points: the shell mirrors the
+    /// platform's insets (`safeAreaInsets` on a phone) and the next
+    /// layout lays the root out inside them. Leading is the left edge.
+    pub fn set_safe_area(&self, insets: crate::layout::Edges) {
+        self.safe_area.set(insets);
+    }
+
+    pub fn safe_area(&self) -> crate::layout::Edges {
+        self.safe_area.get()
+    }
+
+    /// The software keyboard's height over the window, 0 when it hides.
+    /// The bottom inset becomes the larger of the safe area's and this,
+    /// so the content stands above the keys instead of under them.
+    pub fn set_keyboard_inset(&self, bottom: Px) {
+        self.keyboard_inset.set(bottom.max(0.0));
+    }
+
+    /// The four insets the next layout lays the root inside.
+    fn frame_insets(&self) -> crate::layout::Edges {
+        let mut insets = self.safe_area.get();
+        insets.bottom = insets.bottom.max(self.keyboard_inset.get());
+        insets
+    }
+
     pub fn set_device_scale(&self, scale: Px) {
         self.device_scale.set(scale.max(1.0));
     }
@@ -990,6 +1024,9 @@ impl Runtime {
             overlay_bounds: Cell::new(None),
             dialog_frames: RefCell::new(HashMap::default()),
             device_scale: Cell::new(1.0),
+            safe_area: Cell::new(crate::layout::Edges::ZERO),
+            keyboard_inset: Cell::new(0.0),
+            last_insets: Cell::new(crate::layout::Edges::ZERO),
             dom: RefCell::new(crate::dom::DomLowering::default()),
             root_is_boundary: Cell::new(false),
             printless: Cell::new(false),
@@ -4690,8 +4727,13 @@ impl Runtime {
         // pass's touches mark who is still mounted. A pass whose
         // proposal CHANGED is a resize: geometry moved because the
         // window did, and that is not an animation — retargets snap.
-        let resized = self.last_proposal.get() != Some(proposal);
+        // an inset change is a resize too: the keyboard rising moves
+        // geometry because the window did, and nothing wobbles for it
+        let insets = self.frame_insets();
+        let resized = self.last_proposal.get() != Some(proposal)
+            || self.last_insets.get() != insets;
         self.last_proposal.set(Some(proposal));
+        self.last_insets.set(insets);
         {
             let mut animator = self.animator.borrow_mut();
             animator.note_place();
@@ -4726,7 +4768,7 @@ impl Runtime {
                     crate::layout::layout_dom(&tree, proposal, env, collect_display);
                 (result, Some(scene))
             } else {
-                (crate::layout::layout_with(&tree, proposal, env), None)
+                (crate::layout::layout_with_insets(&tree, proposal, env, insets), None)
             }
         });
         crate::stats::note_display(result.display.len());

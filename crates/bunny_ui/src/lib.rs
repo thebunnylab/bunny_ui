@@ -133,8 +133,9 @@ pub mod prelude {
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
-        Color, CrossAlign, DialogChrome, DialogSpec, Fraction, Glass, Gradient, OverlaySurface,
-        Point, Proposal, Px, Rect, Rendering, Side, Size, Truncation, UnitPoint, VisualProps,
+        Color, CrossAlign, DialogChrome, DialogSpec, Edges, Fraction, Glass, Gradient,
+        OverlaySurface, Point, Proposal, Px, Rect, Rendering, Side, Size, Truncation, UnitPoint,
+        VisualProps,
     };
     pub use crate::theme::{self, Theme};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Weight};
@@ -11817,5 +11818,233 @@ mod tests {
         assert_eq!(drags.get(), 2, "and every move, pressed");
         assert_eq!(runtime.scroll_offset(&region), Point::ZERO, "the region never scrolled");
         runtime.touch_ended(1, 50.0, 120.0);
+    }
+
+    // MARK: - The safe area: the root lays out inside it
+
+    /// A phone's insets: the notch above, the home indicator below. The
+    /// root lays out between them, and every table the pass records stays
+    /// in window coordinates — the first line of text starts at the
+    /// safe area's top, and the background paints the safe rect.
+    #[test]
+    fn the_root_lays_out_inside_the_safe_area() {
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("hello"), spacer()).background_color(Color::hex(0xFF0000))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
+        let display = runtime.display_frame(&Page, size);
+        let fill = display
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::FillRect { rect, color, .. } if *color == Color::hex(0xFF0000) => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .expect("the background paints");
+        assert_eq!(fill.origin, Point { x: 0.0, y: 59.0 });
+        assert_eq!(fill.size, Size { width: 390.0, height: 844.0 - 59.0 - 34.0 });
+        let line = display
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { origin, .. } => Some(*origin),
+                _ => None,
+            })
+            .expect("the text paints");
+        assert_eq!(line.y, 59.0, "the first line starts at the safe area's top");
+    }
+
+    /// The root wearing `.ignores_safe_area()` reclaims the whole window:
+    /// its background reaches every edge, and its content starts at zero.
+    #[test]
+    fn ignores_safe_area_on_the_root_reclaims_the_window() {
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("hello"), spacer())
+                    .background_color(Color::hex(0xFF0000))
+                    .ignores_safe_area()
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
+        let display = runtime.display_frame(&Page, size);
+        let fill = display
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::FillRect { rect, color, .. } if *color == Color::hex(0xFF0000) => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .expect("the background paints");
+        assert_eq!(fill, Rect { origin: Point::ZERO, size });
+        let line = display
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { origin, .. } => Some(*origin),
+                _ => None,
+            })
+            .expect("the text paints");
+        assert_eq!(line.y, 0.0, "the content reaches the window's own top");
+    }
+
+    /// No insets: three walks are one walk. The runtime that never heard
+    /// of a safe area, the one told it is zero, and the root wearing
+    /// `.ignores_safe_area()` under zero insets all paint the same bytes
+    /// — every desktop golden stands on this.
+    #[test]
+    fn zero_insets_are_byte_stable() {
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("hello"), text("world"), spacer())
+                    .background_color(Color::hex(0x336699))
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Reclaiming;
+        impl Component for Reclaiming {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("hello"), text("world"), spacer())
+                    .background_color(Color::hex(0x336699))
+                    .ignores_safe_area()
+            }
+        }
+
+        let size = Size { width: 300.0, height: 200.0 };
+        let untouched = Runtime::new().display_frame(&Page, size);
+        let told = Runtime::new();
+        told.set_safe_area(Edges::ZERO);
+        let told = told.display_frame(&Page, size);
+        let reclaiming = Runtime::new().display_frame(&Reclaiming, size);
+        assert_eq!(untouched.as_slice(), told.as_slice());
+        assert_eq!(untouched.as_slice(), reclaiming.as_slice());
+    }
+
+    /// The keyboard rises: its height joins the bottom inset and the
+    /// content shrinks above the keys; it hides, and the room comes back.
+    #[test]
+    fn the_keyboard_inset_takes_the_bottom_and_gives_it_back() {
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("hello"), spacer()).background_color(Color::hex(0xFF0000))
+            }
+        }
+        fn height_of(display: &crate::layout::DisplayList) -> f64 {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::FillRect { rect, color, .. }
+                        if *color == Color::hex(0xFF0000) =>
+                    {
+                        Some(rect.size.height)
+                    }
+                    _ => None,
+                })
+                .expect("the background paints")
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
+        assert_eq!(height_of(&runtime.display_frame(&Page, size)), 751.0);
+        runtime.set_keyboard_inset(336.0);
+        assert_eq!(height_of(&runtime.display_frame(&Page, size)), 844.0 - 59.0 - 336.0);
+        // a keyboard shorter than the home indicator changes nothing
+        runtime.set_keyboard_inset(20.0);
+        assert_eq!(height_of(&runtime.display_frame(&Page, size)), 751.0);
+        runtime.set_keyboard_inset(0.0);
+        assert_eq!(height_of(&runtime.display_frame(&Page, size)), 751.0);
+    }
+
+    /// The tables are in window coordinates: a button first in the root
+    /// answers a press at the safe area's top, and not at the window's.
+    #[test]
+    fn hits_follow_the_inset_root() {
+        #[derive(Clone)]
+        struct Page {
+            count: State<usize>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let count = self.count;
+                vstack!(button(text("tap"), move || count.add(1)), spacer())
+            }
+        }
+
+        let view = Page { count: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
+        let _ = runtime.display_frame(&view, size);
+        let (_, rect) = runtime
+            .layout(&view, crate::layout::Proposal::exact(size))
+            .hits
+            .first()
+            .cloned()
+            .expect("the button is a target");
+        assert_eq!(rect.origin.y, 59.0, "the button's hit sits under the safe area's top");
+        runtime.pointer_pressed(10.0, 30.0);
+        runtime.pointer_released(10.0, 30.0);
+        assert_eq!(view.count.get(), 0, "a press in the notch's band reaches nothing");
+        let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        assert_eq!(view.count.get(), 1, "a press on the button fires");
+    }
+
+    /// A header wearing `.ignores_safe_area()` at the top of the root
+    /// reclaims the band above it and nothing else: its background
+    /// starts at zero, the body below it stays where the root put it.
+    #[test]
+    fn a_nested_ignores_safe_area_extends_only_where_it_touches() {
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text("header")
+                        .frame(390.0, 40.0)
+                        .background_color(Color::hex(0x00FF00))
+                        .ignores_safe_area(),
+                    text("body").frame(390.0, 100.0).background_color(Color::hex(0x0000FF)),
+                    spacer(),
+                )
+                .spacing(0.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
+        let display = runtime.display_frame(&Page, size);
+        let rect_of = |wanted: Color| {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::FillRect { rect, color, .. } if *color == wanted => Some(*rect),
+                    _ => None,
+                })
+                .expect("the box paints")
+        };
+        let header = rect_of(Color::hex(0x00FF00));
+        assert_eq!(header.origin.y, 0.0, "the header reclaims the band above it");
+        assert_eq!(header.size.height, 59.0 + 40.0, "and keeps its own height below it");
+        let body = rect_of(Color::hex(0x0000FF));
+        assert_eq!(body.origin.y, 59.0 + 40.0, "the body stays where the root put it");
     }
 }

@@ -304,8 +304,24 @@ pub struct Edges {
 }
 
 impl Edges {
+    /// No inset on any edge.
+    pub const ZERO: Edges = Edges { top: 0.0, trailing: 0.0, bottom: 0.0, leading: 0.0 };
+
     pub fn uniform(amount: Px) -> Self {
         Edges { top: amount, trailing: amount, bottom: amount, leading: amount }
+    }
+
+    /// The rect inside these insets — leading is the left edge (no
+    /// right-to-left flip yet). An inset larger than the rect answers a
+    /// zero side, never a negative one.
+    pub fn inset(self, rect: Rect) -> Rect {
+        Rect {
+            origin: Point { x: rect.origin.x + self.leading, y: rect.origin.y + self.top },
+            size: Size {
+                width: (rect.size.width - self.horizontal()).max(0.0),
+                height: (rect.size.height - self.vertical()).max(0.0),
+            },
+        }
     }
 
     fn horizontal(&self) -> Px {
@@ -739,6 +755,15 @@ pub enum LayoutNode {
     /// title bar on a chrome-less window. Transparent to geometry;
     /// shells without windows ignore it honestly.
     DragRegion { child: Box<LayoutNode> },
+    /// `.ignores_safe_area()`: the child reclaims the safe-area bands
+    /// its frame touches. The ROOT lays out inside the window's safe
+    /// area (a phone's notch, its home indicator, the keyboard); a
+    /// subtree wearing this grows back out to the window's edge on
+    /// every side where it already meets the safe area's edge — the
+    /// root reclaims the whole window, a header at the top reclaims the
+    /// band above it. Transparent to geometry when there is no inset,
+    /// which is every desktop and every headless test.
+    IgnoresSafeArea { child: Box<LayoutNode> },
     /// `.window_control(…)`: the child IS one of the window's own
     /// buttons on a scene-drawn title bar. The region wins by design —
     /// the platform activates it, so a press never reaches the scene.
@@ -2377,6 +2402,10 @@ pub struct Placement {
     /// runtime re-runs the pass collected — an island's birth costs
     /// one extra walk; a steady frame costs none.
     saw_island: bool,
+    /// The window and its safe area, when the pass has insets at all —
+    /// `None` on every desktop, so the zero-inset walk is today's walk
+    /// byte for byte. [`LayoutNode::IgnoresSafeArea`] reads it.
+    pub(crate) safe: Option<SafeFrame>,
     pub hits: Vec<(String, Rect)>,
     pub scrolls: Vec<ScrollRegion>,
     pub fields: Vec<FieldPlacement>,
@@ -2684,14 +2713,75 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
 
 /// Runs both phases with the frame's environment.
 pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> LayoutResult {
-    let (size, fit) = root.measure(proposal, env);
+    layout_with_insets(root, proposal, env, Edges::ZERO)
+}
+
+/// The window and the rect inside its safe area, for one pass.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct SafeFrame {
+    pub(crate) window: Rect,
+    pub(crate) safe: Rect,
+}
+
+impl SafeFrame {
+    /// The frame grown back out to the window on every side where it
+    /// meets the safe area's edge — the rule of `.ignores_safe_area()`.
+    fn reclaim(self, frame: Rect) -> Rect {
+        let touches = |a: Px, b: Px| (a - b).abs() < 0.5;
+        let (left, top) = (frame.origin.x, frame.origin.y);
+        let (right, bottom) = (left + frame.size.width, top + frame.size.height);
+        let (safe_left, safe_top) = (self.safe.origin.x, self.safe.origin.y);
+        let safe_right = safe_left + self.safe.size.width;
+        let safe_bottom = safe_top + self.safe.size.height;
+        let (window_left, window_top) = (self.window.origin.x, self.window.origin.y);
+        let window_right = window_left + self.window.size.width;
+        let window_bottom = window_top + self.window.size.height;
+        let left = if touches(left, safe_left) { window_left } else { left };
+        let top = if touches(top, safe_top) { window_top } else { top };
+        let right = if touches(right, safe_right) { window_right } else { right };
+        let bottom = if touches(bottom, safe_bottom) { window_bottom } else { bottom };
+        Rect {
+            origin: Point { x: left, y: top },
+            size: Size { width: (right - left).max(0.0), height: (bottom - top).max(0.0) },
+        }
+    }
+}
+
+/// Both phases, with the window's insets: the root lays out INSIDE the
+/// safe area — the proposal shrinks by the insets and the placement
+/// starts at their corner — and every table the pass records stays in
+/// window coordinates, so a hit-test needs no translation. Overlays
+/// position inside the safe rect too. With [`Edges::ZERO`] this is
+/// [`layout_with`], byte for byte.
+pub fn layout_with_insets(
+    root: &LayoutNode,
+    proposal: Proposal,
+    env: LayoutEnv,
+    insets: Edges,
+) -> LayoutResult {
+    let inner = Proposal {
+        width: proposal.width.map(|width| (width - insets.horizontal()).max(0.0)),
+        height: proposal.height.map(|height| (height - insets.vertical()).max(0.0)),
+    };
+    let (size, fit) = root.measure(inner, env);
+    let safe = Rect { origin: Point { x: insets.leading, y: insets.top }, size };
+    // the window: the proposal where it was proposed, the root's answer
+    // plus the insets where it was open
+    let window = Rect {
+        origin: Point::default(),
+        size: Size {
+            width: proposal.width.unwrap_or(size.width + insets.horizontal()),
+            height: proposal.height.unwrap_or(size.height + insets.vertical()),
+        },
+    };
     let mut out = Placement::default();
-    root.place(Rect { origin: Point::default(), size }, fit, env, &mut out);
+    out.safe = (insets != Edges::ZERO).then_some(SafeFrame { window, safe });
+    root.place(safe, fit, env, &mut out);
     // popovers place AFTER the root: painted on top, hit first, free
-    // of every scroll clip. Their default container is the WINDOW (the
-    // proposal), never the root's answer — a small scene must not
-    // shrink the room a popover positions in.
-    place_overlays(window_bounds(proposal, size), env, &mut out);
+    // of every scroll clip. Their default container is the WINDOW's
+    // safe rect (the proposal), never the root's answer — a small scene
+    // must not shrink the room a popover positions in.
+    place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, env, &mut out);
     LayoutResult {
         size,
         frames: out.frames,
@@ -3385,6 +3475,7 @@ impl LayoutNode {
             | LayoutNode::Sheet { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
+            | LayoutNode::IgnoresSafeArea { child }
             | LayoutNode::ControlRegion { child, .. }
             | LayoutNode::Tooltip { child, .. }
             | LayoutNode::ContextSource { child, .. }
@@ -3462,6 +3553,7 @@ impl LayoutNode {
             | LayoutNode::Sheet { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
+            | LayoutNode::IgnoresSafeArea { child }
             | LayoutNode::ControlRegion { child, .. }
             | LayoutNode::Tooltip { child, .. }
             | LayoutNode::ContextSource { child, .. }
@@ -3622,6 +3714,11 @@ impl LayoutNode {
             }
 
             LayoutNode::DragRegion { child } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            LayoutNode::IgnoresSafeArea { child } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -4549,6 +4646,25 @@ impl LayoutNode {
 
             (LayoutNode::ExactLayout { child }, Fit::Wrapped(_, fit)) => {
                 child.place(frame, *fit, env, out);
+            }
+
+            (LayoutNode::IgnoresSafeArea { child }, Fit::Wrapped(_, fit)) => {
+                let Some(safe) = out.safe else {
+                    // no inset anywhere: the node is glass
+                    child.place(frame, *fit, env, out);
+                    return;
+                };
+                let grown = safe.reclaim(frame);
+                if grown == frame {
+                    child.place(frame, *fit, env, out);
+                    return;
+                }
+                // the child is measured once more, at the size it
+                // reclaimed; nothing below it reclaims again
+                let (_, fit) = child.measure(Proposal::exact(grown.size), env);
+                let kept = out.safe.take();
+                child.place(grown, fit, env, out);
+                out.safe = kept;
             }
 
             (LayoutNode::DragRegion { child }, Fit::Wrapped(_, fit)) => {
