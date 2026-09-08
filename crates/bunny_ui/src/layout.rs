@@ -524,6 +524,13 @@ pub enum LayoutNode {
     Frame { width: Option<Px>, height: Option<Px>, child: Box<LayoutNode> },
     /// `.frame(maxWidth:maxHeight:)` — `∞` = "fill what was proposed".
     MaxFrame { max_width: Px, max_height: Px, align: CrossAlign, child: Box<LayoutNode> },
+    /// A flexible box with a floor: it fills what it is proposed, never
+    /// less than the floor — and unproposed on an axis it IS the floor,
+    /// not its content, which is what lets a table's lane stay one width
+    /// on every row under a sideways scroll (proposed nothing) and still
+    /// share a pane that is wider. A floor of zero hugs the content on
+    /// that axis.
+    FlexFrame { min_width: Px, min_height: Px, align: CrossAlign, child: Box<LayoutNode> },
     /// Vertical scroll region: answers what it was offered, measures the
     /// content without restriction and keeps the excess to itself (the
     /// shrink contract). `path` is the region's structural identity — the
@@ -3359,6 +3366,8 @@ impl LayoutNode {
                     max_height.is_infinite() || child.is_flexible(axis, enclosing_main)
                 }
             },
+            // it fills what it is proposed — flexible by definition
+            LayoutNode::FlexFrame { .. } => true,
             LayoutNode::Frame { width, height, child } => match axis {
                 Axis::Horizontal => width.is_none() && child.is_flexible(axis, enclosing_main),
                 Axis::Vertical => height.is_none() && child.is_flexible(axis, enclosing_main),
@@ -3460,6 +3469,7 @@ impl LayoutNode {
             | LayoutNode::DropTarget { child, .. }
             | LayoutNode::Hinted { child, .. }
             | LayoutNode::Frame { child, .. }
+            | LayoutNode::FlexFrame { child, .. }
             | LayoutNode::Hug { child, .. } => child.first_baseline(env),
             // lane A leads the seam — its text sets the shared line
             LayoutNode::Split { children, .. } => {
@@ -3811,6 +3821,26 @@ impl LayoutNode {
                 (size, Fit::Wrapped(child_size, Box::new(fit)))
             }
 
+            LayoutNode::FlexFrame { min_width, min_height, child, .. } => {
+                // proposed: the proposal, floored; unproposed: the floor
+                // itself — a zero floor hugs the content on that axis
+                let floor = |proposed: Option<Px>, min: Px| match proposed {
+                    Some(length) => Some(length.max(min)),
+                    None if min > 0.0 => Some(min),
+                    None => None,
+                };
+                let offer = Proposal {
+                    width: floor(proposal.width, *min_width),
+                    height: floor(proposal.height, *min_height),
+                };
+                let (child_size, fit) = child.measure(offer, env);
+                let size = Size {
+                    width: offer.width.unwrap_or(child_size.width),
+                    height: offer.height.unwrap_or(child_size.height),
+                };
+                (size, Fit::Wrapped(child_size, Box::new(fit)))
+            }
+
             LayoutNode::Hug { axis, child } => {
                 let vertical = matches!(axis, Axis::Vertical);
                 let (child_size, fit) = child.measure(
@@ -3851,6 +3881,24 @@ impl LayoutNode {
                 let size = Size {
                     width: proposal.width.unwrap_or(content.width),
                     height: proposal.height.unwrap_or(content.height),
+                };
+                // Filling re-measures a SHORTER content at the region on
+                // the axes it travels, so flexible content lays itself out
+                // across the glass instead of merely being placed under it:
+                // a table's lanes share a wide pane, and under a narrow one
+                // they keep their floors and travel.
+                let (content, fit) = if *fill
+                    && ((axes.horizontal() && content.width < size.width)
+                        || (axes.vertical() && content.height < size.height))
+                {
+                    let again = Proposal {
+                        width: if axes.horizontal() { Some(content.width.max(size.width)) } else { proposal.width },
+                        height: if axes.vertical() { Some(content.height.max(size.height)) } else { proposal.height },
+                    };
+                    let (grown, fit) = child.measure(again, env);
+                    (Size { width: grown.width.max(content.width), height: grown.height.max(content.height) }, fit)
+                } else {
+                    (content, fit)
                 };
                 // The lane the child is PLACED in, which is not always the
                 // extent it answered — the same asymmetry a split's lanes
@@ -4889,7 +4937,8 @@ impl LayoutNode {
                 child.place(frame, *fit, env, out);
             }
 
-            (LayoutNode::MaxFrame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
+            (LayoutNode::MaxFrame { align, child, .. }, Fit::Wrapped(child_size, fit))
+            | (LayoutNode::FlexFrame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
                 let x = frame.origin.x
                     + align_offset(frame.size.width, child_size.width, *align);
                 let y = frame.origin.y
@@ -6904,6 +6953,69 @@ mod tests {
         let size =
             measure_with_defaults(&fill, Proposal { width: Some(300.0), height: Some(500.0) });
         assert_eq!(size, Size { width: 300.0, height: LINE_H });
+    }
+
+    #[test]
+    fn a_flex_frame_fills_the_proposal_and_stands_at_its_floor_unproposed() {
+        let lane = LayoutNode::FlexFrame {
+            min_width: 150.0,
+            min_height: 0.0,
+            align: CrossAlign::Start,
+            child: Box::new(text(5)),
+        };
+        let wide = measure_with_defaults(&lane, Proposal { width: Some(300.0), height: Some(50.0) });
+        assert_eq!(wide.width, 300.0, "fills what is proposed");
+        let narrow = measure_with_defaults(&lane, Proposal { width: Some(100.0), height: Some(50.0) });
+        assert_eq!(narrow.width, 150.0, "never below the floor");
+        let open = measure_with_defaults(&lane, Proposal { width: None, height: None });
+        assert_eq!(open.width, 150.0, "unproposed, it IS the floor — not its content");
+        assert_eq!(open.height, LINE_H, "a zero floor hugs the content on that axis");
+    }
+
+    #[test]
+    fn a_filling_region_lays_its_content_out_at_the_region() {
+        let engine = PixelFont;
+        let images = RawImages::default();
+        let cache = MeasureCache::default();
+        let offsets = HashMap::default();
+        let interaction = Interaction::default();
+        let carets = HashMap::default();
+        let env = || LayoutEnv {
+            text: &engine,
+            images: &images,
+            cache: &cache,
+            scroll_offsets: &offsets,
+            font: FontSpec::DEFAULT,
+            line_height: None,
+            text_align: None,
+            stamp: FrameStamp::idle(&interaction, &carets),
+            animator: None,
+            anim: None,
+            live: None,
+            overlay_bounds: None,
+            dialog_frames: None,
+            scale: 1.0,
+        };
+        let region = |width: Px| LayoutNode::Scroll {
+            commanded: None,
+            axes: crate::layout::ScrollAxes::Horizontal,
+            fill: true,
+            path: Some("table".to_string()),
+            target: None,
+            child: Box::new(LayoutNode::FlexFrame {
+                min_width: 100.0,
+                min_height: 0.0,
+                align: CrossAlign::Start,
+                child: Box::new(text(5)),
+            }),
+        }
+        .measure(Proposal { width: Some(width), height: Some(50.0) }, env());
+        let (_, fit) = region(300.0);
+        let Fit::ScrollContent(content, _) = fit else { panic!("a region's fit") };
+        assert_eq!(content.width, 300.0, "the content was laid out AT the region, not merely placed under it");
+        let (_, fit) = region(60.0);
+        let Fit::ScrollContent(content, _) = fit else { panic!("a region's fit") };
+        assert_eq!(content.width, 100.0, "narrower than the floor, the content keeps its floor and travels");
     }
 
     #[test]
