@@ -549,12 +549,7 @@ impl Runtime {
     /// runtime.set_environment(|values| values.horizontalSizeClass = SizeClass::Compact);
     /// ```
     pub fn set_environment(&self, update: impl FnOnce(&mut motor::state::EnvironmentValues)) {
-        let before = self.ctx.borrow().values.horizontalSizeClass;
         update(&mut self.ctx.borrow_mut().values);
-        // the one field a body can read by value is compared; the
-        // type-erased ones (a container) are always a move
-        let after = self.ctx.borrow().values.horizontalSizeClass;
-        let _ = (before, after);
         self.env_moved.set(true);
     }
 

@@ -95,8 +95,10 @@ enum Phase {
     /// A finger is down over something that may pan: the press waits,
     /// because a press has effects a pan must never cause.
     Undecided { start: Point, taps: u8, held: f64 },
-    /// The press went down — every move is the pointer's.
-    Pressing,
+    /// The press went down — every move is the pointer's. A press that
+    /// holds STILL is still listened to: half a second over a menu, and
+    /// the press is taken back for the menu.
+    Pressing { start: Point, held: f64, still: bool },
     /// The finger slides content.
     Panning { start: Point },
     /// A long press opened a menu: the rest of this touch is spent.
@@ -147,10 +149,8 @@ impl Recognizer {
         if self.fingers.len() >= 2 {
             // a second finger: whatever the first was doing ends, and
             // the pair is a zoom from here
-            match self.phase {
-                Phase::Pressing => out.push(Gesture::Cancel),
-                Phase::Pinching { .. } => {}
-                _ => {}
+            if let Phase::Pressing { .. } = self.phase {
+                out.push(Gesture::Cancel);
             }
             self.samples.clear();
             self.pending = (0.0, 0.0);
@@ -166,7 +166,7 @@ impl Recognizer {
         if scene.grabs_at(at) || !scene.pans_at(at) {
             // nothing under the finger can slide: the press is
             // unambiguous, and the pressed paint shows at once
-            self.phase = Phase::Pressing;
+            self.phase = Phase::Pressing { start: at, held: 0.0, still: true };
             out.push(Gesture::Press { at, taps });
         } else {
             self.phase = Phase::Undecided { start: at, taps, held: 0.0 };
@@ -197,7 +197,13 @@ impl Recognizer {
         self.pending.0 += at.x - was.x;
         self.pending.1 += at.y - was.y;
         match self.phase {
-            Phase::Pressing => out.push(Gesture::Move { at }),
+            Phase::Pressing { start, held, still } => {
+                // a press that travels is a drag, and a drag is never a
+                // long press
+                let still = still && (at.x - start.x).hypot(at.y - start.y) <= SLOP;
+                self.phase = Phase::Pressing { start, held, still };
+                out.push(Gesture::Move { at });
+            }
             Phase::Panning { start } => {
                 out.push(Gesture::Scroll { anchor: start, dx: at.x - was.x, dy: at.y - was.y });
             }
@@ -232,7 +238,7 @@ impl Recognizer {
             return out;
         }
         match self.phase {
-            Phase::Pressing => out.push(Gesture::Release { at }),
+            Phase::Pressing { .. } => out.push(Gesture::Release { at }),
             Phase::Undecided { start, taps, .. } => {
                 // a still finger: the press it waited with, then the lift
                 out.push(Gesture::Press { at: start, taps });
@@ -267,7 +273,7 @@ impl Recognizer {
         if index != 0 {
             return out;
         }
-        if let Phase::Pressing = self.phase {
+        if let Phase::Pressing { .. } = self.phase {
             out.push(Gesture::Cancel);
         }
         self.phase = Phase::Idle;
@@ -290,8 +296,9 @@ impl Recognizer {
                         self.phase = Phase::Swallowed;
                         out.push(Gesture::Menu { at: start });
                     } else {
-                        // mouse mode: the following drag sweeps or drags
-                        self.phase = Phase::Pressing;
+                        // mouse mode: the following drag sweeps or drags;
+                        // the hold is spent, so no menu asks again
+                        self.phase = Phase::Pressing { start, held, still: false };
                         out.push(Gesture::Press { at: start, taps: taps.max(1) });
                     }
                 } else {
@@ -325,7 +332,27 @@ impl Recognizer {
                     self.phase = Phase::Flinging { anchor, velocity };
                 }
             }
-            Phase::Idle | Phase::Pressing | Phase::Swallowed | Phase::Pinching { .. } => {}
+            Phase::Pressing { start, held, still: true } => {
+                // a press held still over a menu is taken back for the
+                // menu: the row was pressed, and the hold is the second
+                // click. Nothing under it has fired — a button fires on
+                // the lift — so the cancel costs no one anything
+                let held = held + dt;
+                if held < LONG_PRESS {
+                    self.phase = Phase::Pressing { start, held, still: true };
+                } else if scene.menu_at(start) {
+                    self.phase = Phase::Swallowed;
+                    out.push(Gesture::Cancel);
+                    out.push(Gesture::Menu { at: start });
+                } else {
+                    // no menu here: the hold is spent and the clock rests
+                    self.phase = Phase::Pressing { start, held, still: false };
+                }
+            }
+            Phase::Idle
+            | Phase::Pressing { still: false, .. }
+            | Phase::Swallowed
+            | Phase::Pinching { .. } => {}
         }
         out
     }
@@ -340,7 +367,12 @@ impl Recognizer {
     /// Does the recognizer need the clock? A hold that may become a
     /// menu, a pan whose speed is being read, a fling in flight.
     pub fn alive(&self) -> bool {
-        matches!(self.phase, Phase::Undecided { .. } | Phase::Panning { .. } | Phase::Flinging { .. })
+        match self.phase {
+            Phase::Undecided { .. } | Phase::Panning { .. } | Phase::Flinging { .. } => true,
+            // a still press listens for the menu until the hold is spent
+            Phase::Pressing { held, still: true, .. } => held < LONG_PRESS,
+            Phase::Idle | Phase::Pressing { .. } | Phase::Swallowed | Phase::Pinching { .. } => false,
+        }
     }
 
     /// The pan's speed at the lift, in points per second, read from the
@@ -459,6 +491,33 @@ mod tests {
         assert_eq!(out, vec![Gesture::Scroll { anchor: p(10.0, 100.0), dx: 0.0, dy: -10.0 }]);
         assert!(touch.ended(1, p(10.0, 70.0)).is_empty(), "a lift with no speed fires nothing");
         assert!(!touch.alive());
+    }
+
+    #[test]
+    fn a_hold_on_a_flat_menu_row_takes_the_press_back_for_the_menu() {
+        let mut touch = Recognizer::new();
+        let row = Fake { pans: false, grabs: false, menu: true };
+        assert_eq!(touch.began(1, p(10.0, 10.0), 1, &row), vec![Gesture::Press { at: p(10.0, 10.0), taps: 1 }]);
+        assert!(touch.alive(), "a still press listens for the menu");
+        assert!(touch.tick(0.3, &row).is_empty());
+        assert_eq!(touch.tick(0.3, &row), vec![Gesture::Cancel, Gesture::Menu { at: p(10.0, 10.0) }]);
+        assert!(touch.ended(1, p(10.0, 10.0)).is_empty(), "the lift after a menu is spent");
+
+        // a flat surface with no menu: the hold spends itself and the
+        // clock rests, the press stands
+        let mut touch = Recognizer::new();
+        touch.began(1, p(10.0, 10.0), 1, &FLAT);
+        touch.tick(0.3, &FLAT);
+        assert!(touch.tick(0.3, &FLAT).is_empty());
+        assert!(!touch.alive(), "nothing left to decide on the clock");
+        assert_eq!(touch.ended(1, p(10.0, 10.0)), vec![Gesture::Release { at: p(10.0, 10.0) }]);
+
+        // a press that travelled is a drag: no menu, however long
+        let mut touch = Recognizer::new();
+        touch.began(1, p(10.0, 10.0), 1, &row);
+        touch.moved(1, p(40.0, 10.0));
+        touch.tick(0.6, &row);
+        assert_eq!(touch.ended(1, p(40.0, 10.0)), vec![Gesture::Release { at: p(40.0, 10.0) }]);
     }
 
     #[test]

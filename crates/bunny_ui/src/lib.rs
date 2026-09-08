@@ -11382,13 +11382,14 @@ mod tests {
 
         assert!(runtime.touch_began(1, x, y, 1), "the press paints at once");
         assert!(runtime.interaction().pressed.is_some(), "nothing here pans: the press is sure");
-        assert!(!runtime.wants_frame(), "a sure press needs no clock");
+        assert!(runtime.wants_frame(), "a still press listens for a menu until the hold is spent");
         runtime.touch_ended(1, x, y);
         assert_eq!(view.count.get(), 1, "the lift fired");
         let after = runtime.interaction();
         assert_eq!(after.pressed, None);
         assert_eq!(after.hovered, None, "a lifted finger hovers nothing");
         assert_eq!(after.pointer, None);
+        assert!(!runtime.wants_frame(), "and the clock rests after the lift");
     }
 
     /// A finger over a list: within the slop nothing is said; past it
@@ -12101,5 +12102,95 @@ mod tests {
             }
         }
         assert_eq!(first_line(&Runtime::new().display_frame(&Preview, size)), "narrow");
+    }
+
+    /// The same hold on a row OUTSIDE any scroll: the press went down at
+    /// once (nothing here pans), and half a second later it is taken
+    /// back for the menu — the row never fired, the menu is open, and
+    /// the lift keeps it.
+    #[test]
+    fn a_long_press_on_a_flat_row_opens_the_menu() {
+        use crate::layout::Size;
+
+        #[derive(Clone)]
+        struct Row {
+            opened: State<usize>,
+        }
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                let opened = self.opened;
+                vstack!(
+                    text("file_0001.rs").context_menu(vec![
+                        menu_item("Open", move || opened.set(opened.get() + 1)),
+                    ]),
+                    text("below"),
+                )
+            }
+        }
+
+        let view = Row { opened: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.display_frame(&view, size);
+
+        runtime.touch_began(1, 30.0, 8.0, 1);
+        assert!(runtime.wants_frame(), "a still press listens for the menu on the clock");
+        let _ = runtime.tick(0.3);
+        assert!(runtime.interaction().menu.is_none());
+        let held = runtime.tick(0.3);
+        assert!(held.input, "the clock reached the app");
+        assert!(runtime.interaction().menu.is_some(), "the menu opened under the finger");
+        assert_eq!(runtime.interaction().pressed, None, "the press was taken back");
+        runtime.touch_ended(1, 30.0, 8.0);
+        assert!(runtime.interaction().menu.is_some(), "the lift after a menu is spent");
+        assert_eq!(view.opened.get(), 0);
+    }
+
+    /// The playground's bands: a stack of two fixed bands around a spacer,
+    /// wearing `.ignores_safe_area()` INSIDE a zstack with the content.
+    /// The stack fills the safe rect, so it touches every edge and
+    /// reclaims the window — the top band paints at zero, the bottom one
+    /// ends at the window's bottom.
+    #[test]
+    fn bands_in_a_zstack_reclaim_the_window() {
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let band = |color: u32, height: f64| {
+                    // a height of its own, then the whole width: `frame_max` caps
+                    // and grows only toward an infinite edge
+                    empty()
+                        .frame_height(height)
+                        .frame_max(f64::INFINITY, height, Alignment::Center)
+                        .background_color(Color::hex_a(color))
+                };
+                zstack!(
+                    vstack!(text("content"), spacer()),
+                    vstack!(band(0xFF3B3080, 44.0), spacer(), band(0x34C75980, 20.0))
+                        .ignores_safe_area(),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 402.0, height: 874.0 };
+        runtime.set_safe_area(Edges { top: 62.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
+        let display = runtime.display_frame(&Page, size);
+        let rect_of = |wanted: Color| {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::FillRect { rect, color, .. } if *color == wanted => {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+        };
+        let top = rect_of(Color::hex_a(0xFF3B3080)).expect("the top band paints");
+        assert_eq!(top, Rect { origin: Point::ZERO, size: Size { width: 402.0, height: 44.0 } });
+        let bottom = rect_of(Color::hex_a(0x34C75980)).expect("the bottom band paints");
+        assert_eq!(bottom.origin.y, 874.0 - 20.0);
+        assert_eq!(bottom.size.width, 402.0);
     }
 }
