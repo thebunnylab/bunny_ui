@@ -1365,6 +1365,8 @@ struct VkStack {
     fns: VkFns,
     /// Present only when the instance enabled the surface extensions.
     wsi: Option<WsiFns>,
+    /// The door the surface stands in front of; `None` offscreen.
+    door: Option<Door>,
     /// The window's surface — 0 offscreen, and while detached. It dies
     /// just before the instance.
     surface: SurfaceKHR,
@@ -1816,6 +1818,10 @@ impl VkStack {
             let mut stack = VkStack {
                 fns,
                 wsi,
+                door: match target {
+                    VkTarget::Window(door) => Some(door),
+                    VkTarget::Offscreen => None,
+                },
                 surface,
                 max_image_2d,
                 instance,
@@ -3604,7 +3610,12 @@ fn build_swapchain(
             .into_iter()
             .find(|mode| modes.contains(mode))
             .unwrap_or(PRESENT_MODE_FIFO);
-        let extent = if capabilities.current_extent[0] != u32::MAX {
+        // the phone's surface answers the size it had at the last query,
+        // which a rotation leaves behind; the shell read the window
+        // itself, and its word wins there
+        let extent = if capabilities.current_extent[0] != u32::MAX
+            && stack.door != Some(Door::Android)
+        {
             (capabilities.current_extent[0], capabilities.current_extent[1])
         } else {
             (
@@ -3828,15 +3839,22 @@ impl VkPresenter {
                 &mut self.atlas,
                 &mut self.batches,
             );
-            match walked {
-                Ok(()) if !self.ground.overflow => break,
-                Ok(()) => {
-                    let needed = self.ground.staging_capacity * 2;
-                    drain_all(&self.stack, &mut self.slots);
-                    if !self.slots[index].grow_staging(&self.stack, needed) {
-                        return Presented::DeviceLost;
-                    }
+            if self.ground.overflow {
+                // the arena refused an upload — a run, or a dedicated
+                // texture the walk then reported as AtlasFull: the arena
+                // grows, and every entry goes, since the refused ones sit
+                // in the atlas as if uploaded; the retry stages them all
+                let needed = self.ground.staging_capacity * 2;
+                drain_all(&self.stack, &mut self.slots);
+                if !self.slots[index].grow_staging(&self.stack, needed) {
+                    return Presented::DeviceLost;
                 }
+                let mut view = VkGroundView { stack: &self.stack, ground: &mut self.ground };
+                self.atlas.reset(&mut view, false);
+                continue;
+            }
+            match walked {
+                Ok(()) => break,
                 Err(AtlasFull) => {
                     if attempt == 3 {
                         eprintln!("bunny_ui vk: atlas overflow survived the resets");
@@ -3984,6 +4002,11 @@ impl VkPresenter {
     /// Whether the surface's extent moved away from the swapchain's —
     /// the one `SUBOPTIMAL` that means a rebuild.
     fn extent_stale(&self) -> bool {
+        // on the phone the shell says when the window moved (`resize`),
+        // and the surface's own answer lags a rotation
+        if self.stack.door == Some(Door::Android) {
+            return false;
+        }
         let Some(swapchain) = self.swapchain.as_ref() else { return false };
         let Some(wsi) = self.stack.wsi.as_ref() else { return false };
         let mut capabilities = unsafe { std::mem::zeroed::<SurfaceCapabilities>() };
@@ -4359,15 +4382,20 @@ impl OffscreenVk {
                 &mut self.atlas,
                 &mut self.batches,
             );
-            match walked {
-                Ok(()) if !self.ground.overflow => break,
-                Ok(()) => {
-                    let needed = self.ground.staging_capacity * 2;
-                    drain_all(&self.stack, &mut self.slots);
-                    if !self.slots[index].grow_staging(&self.stack, needed) {
-                        return;
-                    }
+            if self.ground.overflow {
+                // the same law as the window's: the arena grows and every
+                // entry goes, whatever the walk answered
+                let needed = self.ground.staging_capacity * 2;
+                drain_all(&self.stack, &mut self.slots);
+                if !self.slots[index].grow_staging(&self.stack, needed) {
+                    return;
                 }
+                let mut view = VkGroundView { stack: &self.stack, ground: &mut self.ground };
+                self.atlas.reset(&mut view, false);
+                continue;
+            }
+            match walked {
+                Ok(()) => break,
                 Err(AtlasFull) => {
                     if attempt == 3 {
                         eprintln!("bunny_ui vk: atlas overflow survived the resets");
@@ -5124,6 +5152,57 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Push, quad), 16);
         assert_eq!(std::mem::offset_of!(Push, round_radii), 32);
         assert_eq!(std::mem::offset_of!(Push, viewport), 48);
+    }
+
+    /// A frame with more new text than the staging arena holds: the
+    /// arena grows and the walk runs again — and every run the first
+    /// walk placed in the atlas must be uploaded by the second, or the
+    /// text is a hole. Twelve long runs at 3× are 6.6 MB against 4.
+    #[test]
+    fn a_frame_past_the_staging_arena_still_paints_every_run() {
+        if !device_present() {
+            return;
+        }
+        let line = "abcdefghij".repeat(12);
+        let rows: Vec<String> = (0..12).map(|index| format!("{index}{line}")).collect();
+        let root = vstack!(for_each(rows, |row: &String| row.clone(), |row| text(row.clone())))
+            .padding_length(4.0)
+            .background_color(Color::hex(0xFFFFFF));
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: 1000.0, height: 260.0 }, 3, Color::CANVAS);
+        assert!(
+            gpu == cpu,
+            "text past the staging arena diverged (max channel delta {})",
+            max_channel_delta(&gpu, &cpu)
+        );
+    }
+
+    /// A picture larger than the staging arena: the walk cannot stage
+    /// its dedicated texture and says so as `AtlasFull` — which is the
+    /// ARENA's fault, and the arena must grow, or the picture is a hole
+    /// after four resets. 1200×900 RGBA is 4.3 MB against 4.
+    #[test]
+    fn a_picture_past_the_staging_arena_still_paints() {
+        if !device_present() {
+            return;
+        }
+        let (width, height) = (1200u32, 900u32);
+        let rgba: Vec<u8> = (0..width * height)
+            .flat_map(|index| {
+                let x = (index % width) as u8;
+                let y = (index / width) as u8;
+                [x, y, x ^ y, 255]
+            })
+            .collect();
+        let picture = ImageSource::rgba(77, (width, height), rgba);
+        let root = image(picture).resizable().frame(width as f64, height as f64);
+        let (gpu, cpu) =
+            scene_bytes(&root, Size { width: width as f64, height: height as f64 }, 1, Color::CANVAS);
+        assert!(
+            gpu == cpu,
+            "a picture past the staging arena diverged (max channel delta {})",
+            max_channel_delta(&gpu, &cpu)
+        );
     }
 
     // MARK: - Liquid glass
