@@ -39,6 +39,7 @@ name = "bunny-ui-linux"
 version = "0.1.0"
 dependencies = [
  "bunny-ui",
+ "bunny-ui-vulkan",
  "countries-core",
  "countries-pure",
 ]
@@ -51,6 +52,13 @@ dependencies = [
  "bunny-ui-apple",
  "countries-core",
  "countries-pure",
+]
+
+[[package]]
+name = "bunny-ui-vulkan"
+version = "0.1.0"
+dependencies = [
+ "bunny-ui",
 ]
 
 [[package]]

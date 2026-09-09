@@ -9,6 +9,7 @@ autoexamples = false
 
 [dependencies]
 bunny-ui = { workspace = true, features = ["canvas", "gpu"] }
+bunny-ui-vulkan.workspace = true
 
 [dev-dependencies]
 countries-core.workspace = true
