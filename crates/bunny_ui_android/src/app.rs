@@ -35,8 +35,15 @@ fn sync_frame_driver(runtime: &Runtime) {
 ///
 /// [`activity!`]: crate::activity
 pub fn run_window(title: &str, size: Size, root: impl View) {
-    let runtime = Runtime::new();
+    // real text and real images: the platform engines take the place
+    // of the house defaults
+    let images = Rc::new(crate::image::AndroidImageEngine::new());
+    let runtime = Runtime::new()
+        .text_engine(Rc::new(crate::text::AndroidTextEngine::new()))
+        .image_engine(Rc::clone(&images) as Rc<dyn bunny_ui::image_engine::ImageEngine>);
     let app = App::new();
+    // the system asks for memory back: the caches are the first to go
+    app.on_memory_warning(move || images.drop_caches());
     app.open(WindowSpec::titled(title).size(size.width, size.height), Rc::new(runtime), root);
     app.run();
 }

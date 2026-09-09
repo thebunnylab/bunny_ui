@@ -1,6 +1,5 @@
-//! The real CountriesSwiftUI on the phone — a list with real scrolling,
-//! under the finger (the pixel font stands in until the platform text
-//! engine lands):
+//! The real CountriesSwiftUI on the phone — a list with platform text
+//! and real scrolling, under the finger:
 //!
 //! ```sh
 //! crates/bunny_ui_android/android/run-emu.sh countries_window_android
@@ -12,8 +11,12 @@
 
 #![cfg_attr(not(target_os = "android"), allow(dead_code, unused_imports, unused_variables))]
 
+use std::rc::Rc;
+
 use bunny_ui::layout::Size;
 use bunny_ui::prelude::*;
+#[cfg(target_os = "android")]
+use bunny_ui_android::AndroidTextEngine;
 use countries_core::DependencyInjection::AppEnvironment::AppEnvironment;
 use countries_pure::root_view;
 
@@ -22,6 +25,10 @@ fn main() {
     let app = AppEnvironment::bootstrap();
     let mut environment = EnvironmentValues::default();
     environment.locale = Locale::new("en");
+    #[cfg(target_os = "android")]
+    let runtime =
+        Runtime::with_environment(environment).text_engine(Rc::new(AndroidTextEngine::new()));
+    #[cfg(not(target_os = "android"))]
     let runtime = Runtime::with_environment(environment);
     let ctx = runtime.context();
     let root = root_view(&app, &ctx);

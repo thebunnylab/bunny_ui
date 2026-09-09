@@ -1341,3 +1341,17 @@ fn blit(width: usize, height: usize, rgba: &[u8]) {
         dispatch(AppEvent::Redraw);
     }
 }
+
+/// The activity's private files directory — where a registered face is
+/// written for the platform to read back.
+pub fn internal_data_path() -> Option<String> {
+    let activity = ACTIVITY.with(Cell::get);
+    if activity.is_null() {
+        return None;
+    }
+    let path = unsafe { (*activity).internal_data_path };
+    if path.is_null() {
+        return None;
+    }
+    Some(unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy().into_owned())
+}

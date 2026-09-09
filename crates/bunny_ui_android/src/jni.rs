@@ -170,6 +170,11 @@ impl Env {
         ACTIVITY.with(Cell::get)
     }
 
+    /// The `JNIEnv*` itself, for the platform's C functions that take one.
+    pub fn raw(&self) -> *mut c_void {
+        self.raw.cast()
+    }
+
     fn table(&self) -> &JniNativeInterface {
         unsafe { &**self.raw }
     }

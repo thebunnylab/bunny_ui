@@ -31,6 +31,8 @@
 //! keep `#![forbid(unsafe_code)]`.
 
 pub mod keys;
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+mod face;
 
 #[cfg(target_os = "android")]
 #[macro_use]
@@ -40,10 +42,18 @@ mod jni;
 #[cfg(target_os = "android")]
 mod ffi;
 #[cfg(target_os = "android")]
+mod image;
+#[cfg(target_os = "android")]
+mod text;
+#[cfg(target_os = "android")]
 mod app;
 
 #[cfg(target_os = "android")]
 pub use app::{run_window, run_window_with, App, WindowId, WindowSpec, MANY_WINDOWS};
+#[cfg(target_os = "android")]
+pub use image::AndroidImageEngine;
+#[cfg(target_os = "android")]
+pub use text::AndroidTextEngine;
 
 /// Exports the entry point the system looks for — `ANativeActivity_onCreate`
 /// — from the app's own shared object, and hands it `$main`: the
