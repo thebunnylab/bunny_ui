@@ -77,6 +77,13 @@ pub(crate) type HandlerEntry = (String, crate::action::ActionId, HandlerFn);
 /// its handle keeps commanding.
 #[derive(Clone)]
 pub(crate) struct WebviewHooks {
+    /// A link in a document was activated — fires with its url; the
+    /// document itself never moves.
+    pub linked: Option<WebviewReport>,
+    /// An editable document changed — fires with the body's html.
+    pub changed: Option<WebviewReport>,
+    /// A paste the app owns — fires with the clipboard's html and text.
+    pub pasted: Option<WebviewPaste>,
     /// The page moved — fires with the committed url.
     pub navigated: Option<WebviewReport>,
     /// The page did NOT move — fires with the url and the reason.
@@ -98,6 +105,9 @@ pub(crate) type WebviewReport = Rc<dyn Fn(&str)>;
 /// arrived. Two strings because a failure that hides either half
 /// tells the app nothing it can act on.
 pub(crate) type WebviewFailure = Rc<dyn Fn(&str, &str)>;
+/// A paste's writer — the clipboard's html and its text, both handed
+/// over because the app decides which it wants.
+pub(crate) type WebviewPaste = Rc<dyn Fn(&str, &str)>;
 pub(crate) type WebviewEntry = (String, WebviewHooks);
 
 pub(crate) struct Entry {
@@ -793,6 +803,29 @@ fn run_webview_report(
     match report {
         Some(report) => {
             report(line);
+            true
+        }
+        None => false,
+    }
+}
+
+/// An activated link, to the document's `on_link`.
+pub(crate) fn run_webview_linked(path: &str, url: &str) -> bool {
+    run_webview_report(path, |hooks| hooks.linked.clone(), url)
+}
+
+/// A changed body, to the document's `on_html_change`.
+pub(crate) fn run_webview_changed(path: &str, html: &str) -> bool {
+    run_webview_report(path, |hooks| hooks.changed.clone(), html)
+}
+
+/// A paste the app owns, to the document's `on_paste`.
+pub(crate) fn run_webview_pasted(path: &str, html: &str, text: &str) -> bool {
+    let report = WEBVIEWS
+        .with(|webviews| webviews.borrow().get(path).and_then(|hooks| hooks.pasted.clone()));
+    match report {
+        Some(report) => {
+            report(html, text);
             true
         }
         None => false,

@@ -18,10 +18,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "bunny-ui-android"
+version = "0.1.0"
+dependencies = [
+ "bunny-ui",
+ "bunny-ui-vulkan",
+ "countries-core",
+ "countries-pure",
+]
+
+[[package]]
+name = "bunny-ui-apple"
+version = "0.1.0"
+dependencies = [
+ "bunny-ui",
+]
+
+[[package]]
+name = "bunny-ui-ios"
+version = "0.1.0"
+dependencies = [
+ "bunny-ui",
+ "bunny-ui-apple",
+ "countries-core",
+ "countries-pure",
+]
+
+[[package]]
 name = "bunny-ui-linux"
 version = "0.1.0"
 dependencies = [
  "bunny-ui",
+ "bunny-ui-vulkan",
  "countries-core",
  "countries-pure",
 ]
@@ -31,8 +59,16 @@ name = "bunny-ui-macos"
 version = "0.1.0"
 dependencies = [
  "bunny-ui",
+ "bunny-ui-apple",
  "countries-core",
  "countries-pure",
+]
+
+[[package]]
+name = "bunny-ui-vulkan"
+version = "0.1.0"
+dependencies = [
+ "bunny-ui",
 ]
 
 [[package]]

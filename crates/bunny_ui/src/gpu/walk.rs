@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use crate::image_engine::{ImageEngine, ImageSource, raster_source};
+use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, raster_source};
 use crate::layout::{Color, Corners, DisplayList, DrawCommand, Rect};
 use crate::raster::physical_extent;
 use crate::text_engine::{FontKey, FontSpec, TextEngine};
@@ -225,10 +225,20 @@ struct Shelf {
     cursor: u32,
 }
 
-/// Append-only shelf packing: a run lands on the first shelf of exactly
-/// its height with room, or opens a new shelf below. There is no
-/// per-tile free list — reclamation is the atlas RESET (drain, clear,
-/// re-insert the live frame), a copying collector in one move.
+/// A shelf takes a tile down to two thirds of its own height, and a
+/// new shelf opens a quarter taller than the tile that opens it. One
+/// shelf per exact height was the Atrium floor's overflow: hundreds of
+/// painted paths of nearly as many heights at scale 2 wanted 6209 rows
+/// of the 4096 the atlas has, and the same tiles pack in a third of it.
+/// The rows under a short tile are the price.
+fn shelf_takes(shelf: u32, tile: u32) -> bool {
+    shelf >= tile && shelf - tile <= tile / 2
+}
+
+/// Append-only shelf packing: a tile lands on the lowest shelf that
+/// takes it with room, or opens a shelf below. There is no per-tile
+/// free list — reclamation is the atlas RESET (drain, clear, re-insert
+/// the live frame), a copying collector in one move.
 pub struct ShelfPacker {
     width: u32,
     height: u32,
@@ -245,17 +255,28 @@ impl ShelfPacker {
         if width > self.width || height == 0 || width == 0 {
             return None;
         }
-        for shelf in &mut self.shelves {
-            if shelf.height == height && shelf.cursor + width <= self.width {
-                let x = shelf.cursor;
-                shelf.cursor += width;
-                return Some((x, shelf.y));
+        // the lowest taker, so a tall shelf keeps its rows for tall tiles
+        let mut best: Option<usize> = None;
+        for (index, shelf) in self.shelves.iter().enumerate() {
+            if shelf_takes(shelf.height, height)
+                && shelf.cursor + width <= self.width
+                && best.is_none_or(|found| self.shelves[found].height > shelf.height)
+            {
+                best = Some(index);
             }
         }
-        if self.next_y + height <= self.height {
+        if let Some(index) = best {
+            let shelf = &mut self.shelves[index];
+            let x = shelf.cursor;
+            shelf.cursor += width;
+            return Some((x, shelf.y));
+        }
+        let room = self.height - self.next_y;
+        if height <= room {
             let y = self.next_y;
-            self.next_y += height;
-            self.shelves.push(Shelf { y, height, cursor: width });
+            let tall = (height + height / 4).min(room);
+            self.next_y += tall;
+            self.shelves.push(Shelf { y, height: tall, cursor: width });
             return Some((0, y));
         }
         None
@@ -319,7 +340,9 @@ pub enum ResolvedImage<'a> {
 const DEDICATED_HEIGHT: u32 = 256;
 /// …and so does anything larger than this area, atlas-budget-wise.
 const DEDICATED_AREA: u32 = 512 * 512;
-/// Dedicated textures retained before the reset collects them.
+/// Dedicated textures retained before a stale one asks the collector.
+/// A frame that reads more keeps them all: the collector can only take
+/// a texture no walk needs.
 const DEDICATED_KEEP: usize = 8;
 
 /// The text-and-image side of the GPU frame: the DATA of one shared
@@ -335,7 +358,28 @@ pub struct RunAtlas {
     pub packer: ShelfPacker,
     pub entries: HashMap<u64, Vec<RunEntry>>,
     pub images: HashMap<(u64, u32, u32), ImageEntry>,
-    pub dedicated: HashMap<(u64, u32, u32), (u64, u32, u32)>,
+    /// Images too big for a shelf get a texture of their own. Capped;
+    /// overflow rides the same reset the atlas already does — but only
+    /// while the map holds a texture the walk in progress did not read.
+    /// After a reset the map holds exactly what the walk minted, and a
+    /// frame that needs more than the cap keeps every one: asking the
+    /// collector again would be a livelock.
+    pub dedicated: HashMap<(u64, u32, u32), Dedicated>,
+    /// The walk in progress: `build_frame` opens one per attempt, and
+    /// every dedicated read stamps its texture with it.
+    pub walk: u64,
+    /// The walk the last reset closed — `fresh` reads the pair.
+    pub reset_walk: u64,
+}
+
+/// One dedicated texture — the ground's handle, its size — and the
+/// last walk that read it: the question the collector is asked before
+/// it is called.
+pub struct Dedicated {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub walk: u64,
 }
 
 impl RunAtlas {
@@ -346,7 +390,22 @@ impl RunAtlas {
             entries: HashMap::new(),
             images: HashMap::new(),
             dedicated: HashMap::new(),
+            walk: 0,
+            reset_walk: 0,
         }
+    }
+
+    /// Opens a walk: the stamp every dedicated texture the frame reads
+    /// takes. `build_frame` calls it first, on every attempt.
+    pub fn begin_walk(&mut self) {
+        self.walk = self.walk.wrapping_add(1);
+    }
+
+    /// True while a reset would give nothing back: the first walk after
+    /// one, on the grown texture, holds only its own tiles. A shelf that
+    /// refuses a tile then is the frame's own size, not garbage.
+    fn fresh(&self) -> bool {
+        self.size == ATLAS_MAX_SIZE && self.walk == self.reset_walk.wrapping_add(1)
     }
 
     /// Drops every entry and every shelf. `grow` doubles the texture
@@ -363,10 +422,11 @@ impl RunAtlas {
         }
         self.entries.clear();
         self.images.clear();
-        for (id, _, _) in self.dedicated.values() {
-            ground.drop_dedicated(*id);
+        for entry in self.dedicated.values() {
+            ground.drop_dedicated(entry.id);
         }
         self.dedicated.clear();
+        self.reset_walk = self.walk;
     }
 
     /// The tiles for one run — warm from the map, or rasterized by the
@@ -457,57 +517,82 @@ impl RunAtlas {
         engine: &dyn ImageEngine,
     ) -> Result<Option<ResolvedImage<'_>>, AtlasFull> {
         let cache_key = (source.key(), width, height);
-        if let Some(&(id, w, h)) = self.dedicated.get(&cache_key) {
-            return Ok(Some(ResolvedImage::Dedicated(id, w, h)));
+        let walk = self.walk;
+        if let Some(entry) = self.dedicated.get_mut(&cache_key) {
+            entry.walk = walk;
+            return Ok(Some(ResolvedImage::Dedicated(entry.id, entry.width, entry.height)));
         }
-        let shared = height <= DEDICATED_HEIGHT && width * height <= DEDICATED_AREA;
-        if shared && !self.images.contains_key(&cache_key) {
-            let Some(raster) = raster_source(engine, source, width as usize, height as usize)
-            else {
-                return Ok(None);
-            };
-            if !ground.ensure_shared(self.size) {
-                return Err(AtlasFull);
-            }
-            let mut tiles = Vec::new();
-            let mut chunk_x: u32 = 0;
-            while chunk_x < width {
-                let chunk_width = (width - chunk_x).min(ATLAS_CHUNK_WIDTH);
-                let Some((x, y)) = self.packer.place(chunk_width, height) else {
-                    return Err(AtlasFull);
-                };
-                ground.upload_shared(
-                    x,
-                    y,
-                    chunk_width,
-                    height,
-                    &raster.rgba[chunk_x as usize * 4..],
-                    raster.width as u32,
-                );
-                tiles.push(Tile { x, y, width: chunk_width, height });
-                chunk_x += chunk_width;
-            }
-            self.images.insert(cache_key, ImageEntry { tiles });
-        }
-        if shared {
+        let shelf_size = height <= DEDICATED_HEIGHT && width * height <= DEDICATED_AREA;
+        if shelf_size && self.images.contains_key(&cache_key) {
             return Ok(self.images.get(&cache_key).map(ResolvedImage::Tiles));
-        }
-
-        // dedicated: over the cap, the frame asks for the collector —
-        // after the drain+reset the map is empty and the walk re-runs
-        if self.dedicated.len() >= DEDICATED_KEEP {
-            return Err(AtlasFull);
         }
         let Some(raster) = raster_source(engine, source, width as usize, height as usize) else {
             return Ok(None);
         };
-        let Some(id) =
-            ground.make_dedicated(width, height, &raster.rgba, raster.width as u32)
+        if shelf_size {
+            match self.shelve(ground, &raster, width, height) {
+                Ok(tiles) => {
+                    self.images.insert(cache_key, ImageEntry { tiles });
+                    return Ok(self.images.get(&cache_key).map(ResolvedImage::Tiles));
+                }
+                // the shelves hold nothing but this walk's own tiles: a
+                // reset would give nothing back, so the image takes a
+                // texture of its own instead of failing the frame
+                Err(AtlasFull) if self.fresh() => {}
+                Err(full) => return Err(full),
+            }
+        }
+
+        // dedicated: over the cap, the frame asks for the collector —
+        // but only when the collector has something to take. A texture
+        // this walk read is not garbage; after the drain+reset the map
+        // holds nothing else, and the walk that re-runs keeps what it
+        // needs instead of running into the same wall
+        if self.dedicated.len() >= DEDICATED_KEEP
+            && self.dedicated.values().any(|entry| entry.walk != walk)
+        {
+            return Err(AtlasFull);
+        }
+        let Some(id) = ground.make_dedicated(width, height, &raster.rgba, raster.width as u32)
         else {
             return Err(AtlasFull);
         };
-        let entry = self.dedicated.entry(cache_key).or_insert((id, width, height));
-        Ok(Some(ResolvedImage::Dedicated(entry.0, entry.1, entry.2)))
+        self.dedicated.insert(cache_key, Dedicated { id, width, height, walk });
+        Ok(Some(ResolvedImage::Dedicated(id, width, height)))
+    }
+
+    /// Cuts one raster into chunk tiles on the shared shelves and hands
+    /// them to the ground. `Err` = a chunk found no shelf; the chunks
+    /// already cut stay where they lie and fall with the next reset.
+    fn shelve(
+        &mut self,
+        ground: &mut dyn AtlasGround,
+        raster: &ImageRaster,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<Tile>, AtlasFull> {
+        if !ground.ensure_shared(self.size) {
+            return Err(AtlasFull);
+        }
+        let mut tiles = Vec::new();
+        let mut chunk_x: u32 = 0;
+        while chunk_x < width {
+            let chunk_width = (width - chunk_x).min(ATLAS_CHUNK_WIDTH);
+            let Some((x, y)) = self.packer.place(chunk_width, height) else {
+                return Err(AtlasFull);
+            };
+            ground.upload_shared(
+                x,
+                y,
+                chunk_width,
+                height,
+                &raster.rgba[chunk_x as usize * 4..],
+                raster.width as u32,
+            );
+            tiles.push(Tile { x, y, width: chunk_width, height });
+            chunk_x += chunk_width;
+        }
+        Ok(tiles)
     }
 
     /// The atlas footprint — cached runs + images + dedicated, and the
@@ -672,6 +757,7 @@ pub fn build_frame(
     atlas: &mut RunAtlas,
     batches: &mut FrameBatches,
 ) -> Result<(), AtlasFull> {
+    atlas.begin_walk();
     batches.rects.clear();
     batches.sprites.clear();
     batches.glass.clear();
@@ -1133,6 +1219,7 @@ impl FrameBatches {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_engine::RawImages;
 
     /// The scene the golden walks: one of every shape the tiers answer,
     /// in paint order, with a rounded clip around the middle of it.
@@ -1282,17 +1369,126 @@ mod tests {
 
     #[test]
     fn shelves_place_reset_and_reuse() {
-        // the pure allocator: exact-height reuse, new shelves below,
-        // refusal at the brim, a clean slate after reset
-        let mut packer = ShelfPacker::new(64, 32);
-        assert_eq!(packer.place(40, 10), Some((0, 0)));
-        assert_eq!(packer.place(30, 10), Some((0, 10)), "no room on the first shelf");
-        assert_eq!(packer.place(10, 10), Some((40, 0)), "exact height reuses shelf one");
-        assert_eq!(packer.place(64, 12), Some((0, 20)));
-        assert_eq!(packer.place(1, 1), None, "the atlas is full below");
+        // the pure allocator: a shelf opens a quarter taller than its
+        // first tile, takes tiles down to two thirds of its height, the
+        // lowest taker wins, refusal at the brim, a clean slate after reset
+        let mut packer = ShelfPacker::new(64, 64);
+        assert_eq!(packer.place(20, 12), Some((0, 0)), "the first shelf: 15 rows for a 12");
+        assert_eq!(packer.place(20, 10), Some((20, 0)), "a 10 rides the 15 shelf");
+        assert_eq!(packer.place(20, 9), Some((0, 15)), "a 9 is under two thirds of 15: a new shelf");
+        assert_eq!(packer.place(20, 15), Some((40, 0)), "exact height still exact");
+        assert_eq!(packer.place(20, 11), Some((20, 15)), "an 11 rides the 11 shelf");
+        assert_eq!(packer.place(20, 12), Some((0, 26)), "no room left on the 15 shelf: a new one");
+        assert_eq!(packer.place(20, 10), Some((40, 15)), "the lowest taker wins: the 11, not the 15");
         assert_eq!(packer.place(65, 1), None, "wider than the atlas never fits");
         packer.reset();
-        assert_eq!(packer.place(64, 32), Some((0, 0)), "reset reclaims everything");
+        assert_eq!(packer.place(64, 64), Some((0, 0)), "reset reclaims everything; headroom stops at the brim");
+        assert_eq!(packer.place(1, 1), None, "the atlas is full below");
+    }
+
+    #[test]
+    fn a_hundred_heights_share_a_dozen_shelves() {
+        // the Atrium floor at scale 2 cuts hundreds of tiles of nearly as
+        // many heights — and ascending is the order a shelf likes least,
+        // every tile taller than every shelf so far
+        let mut packer = ShelfPacker::new(ATLAS_MAX_SIZE, ATLAS_MAX_SIZE);
+        let mut shelves = 0;
+        for height in (20..=218).step_by(2) {
+            let before = packer.next_y;
+            assert!(packer.place(40, height).is_some(), "a {height}-row tile found no shelf");
+            shelves += usize::from(packer.next_y != before);
+        }
+        assert!(
+            shelves <= 12 && packer.next_y <= 1200,
+            "{shelves} shelves over {} rows for a hundred heights",
+            packer.next_y
+        );
+    }
+
+    /// A 32×32 gradient in the house raw format, under `key`.
+    fn photo(key: u64) -> ImageSource {
+        let mut rgba = Vec::with_capacity(32 * 32 * 4);
+        for y in 0..32u32 {
+            for x in 0..32u32 {
+                rgba.extend_from_slice(&[(x * 8) as u8, (y * 8) as u8, 128, 255]);
+            }
+        }
+        ImageSource::bytes_keyed(key, RawImages::encode(32, 32, &rgba))
+    }
+
+    /// `count` photos of one logical size, keys from `first_key`, all at
+    /// the origin — the atlas sees every one, the target need not.
+    fn photos(count: u64, first_key: u64, size: (f64, f64)) -> DisplayList {
+        let mut display = DisplayList::default();
+        for key in first_key..first_key + count {
+            display.push(DrawCommand::Image {
+                rect: crate::layout::Rect {
+                    origin: crate::layout::Point { x: 0.0, y: 0.0 },
+                    size: crate::layout::Size { width: size.0, height: size.1 },
+                },
+                source: photo(key),
+            });
+        }
+        display
+    }
+
+    /// The tiers' retry loop: walk; on overflow reset (growing once) and
+    /// walk again, twice. `false` = the frame never walked whole.
+    fn present(ground: &mut RecordingGround, atlas: &mut RunAtlas, display: &DisplayList) -> bool {
+        let mut batches = FrameBatches::default();
+        for attempt in 0..3 {
+            let walked = build_frame(
+                ground,
+                display,
+                2,
+                (1000, 250),
+                &crate::text_engine::PixelFont,
+                &RawImages::default(),
+                atlas,
+                &mut batches,
+            );
+            match walked {
+                Ok(()) => return true,
+                Err(AtlasFull) if attempt < 2 => atlas.reset(ground, true),
+                Err(AtlasFull) => return false,
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn a_frame_of_more_big_images_than_the_cap_keeps_every_one() {
+        // twelve 40×130pt photos: 80×260 physical, each taller than a
+        // shelf, more of them than the cap. The cap is a retention budget
+        // between frames, not a limit on a frame
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let crowd = photos(12, 10, (40.0, 130.0));
+        assert!(present(&mut ground, &mut atlas, &crowd), "the frame walked whole");
+        assert_eq!(atlas.dedicated.len(), 12, "every photo keeps its texture");
+        let minted = ground.dedicated.len();
+        assert!(present(&mut ground, &mut atlas, &crowd));
+        assert_eq!(ground.dedicated.len(), minted, "a warm frame past the cap mints nothing");
+        // twelve OTHER photos: the first twelve are stale, the collector runs
+        assert!(present(&mut ground, &mut atlas, &photos(12, 50, (40.0, 130.0))));
+        assert_eq!(atlas.dedicated.len(), 12, "the collector took the stale textures");
+        assert_eq!(ground.dedicated.len(), 12, "and the ground dropped them");
+    }
+
+    #[test]
+    fn a_full_shelf_on_a_fresh_walk_sends_the_image_to_its_own_texture() {
+        // seventy 500×125pt photos: 1000×250 physical, shelf-sized every
+        // one, and more of them than 4096 rows of shelves hold
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        assert!(
+            present(&mut ground, &mut atlas, &photos(70, 100, (500.0, 125.0))),
+            "the frame walked whole"
+        );
+        assert_eq!(atlas.size, ATLAS_MAX_SIZE, "the atlas grew once");
+        assert_eq!(atlas.images.len() + atlas.dedicated.len(), 70, "every photo is somewhere");
+        assert!(!atlas.dedicated.is_empty(), "the overflow took textures of its own");
+        assert!(atlas.images.len() >= 40, "the shelves took their share: {}", atlas.images.len());
     }
 
 

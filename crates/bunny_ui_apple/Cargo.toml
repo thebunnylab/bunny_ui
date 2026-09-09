@@ -1,0 +1,8 @@
+[package]
+name = "bunny-ui-apple"
+version = "0.1.0"
+edition.workspace = true
+description = "bunny-ui Apple half — CoreText, ImageIO, Security and Metal through dependency-free Objective-C FFI, shared by the macOS and iOS shells"
+
+[dependencies]
+bunny-ui = { workspace = true, features = ["canvas", "gpu"] }

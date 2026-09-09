@@ -91,7 +91,13 @@ struct Chord {
 }
 
 pub struct Runtime {
-    ctx: Context,
+    /// The environment every body reads. Behind a cell because the
+    /// shell moves it at runtime — a rotation flips the size class —
+    /// and a moved environment rebuilds the retention on the next pass,
+    /// the way a new theme does.
+    ctx: RefCell<Context>,
+    /// Set by `set_environment`, spent by the next pass.
+    env_moved: Cell<bool>,
     /// The scene this runtime renders, when the thread has more than
     /// one — pushed as the FIRST identity segment of every pass, so two
     /// windows showing the same root view are two trees and not one.
@@ -219,6 +225,15 @@ pub struct Runtime {
     /// drops it — the tooltip's own idiom, and the reason `cmd-k` can
     /// never hold the keyboard for good.
     pending_aged: Cell<bool>,
+    /// Who hears the sequence move — a which-key panel's door. Called
+    /// with the strokes in the air after every change: a stroke that
+    /// opened or lengthened a sequence, and the end of one, however it
+    /// ended (an action, a dead end, Escape, the slow tick).
+    chord_sink: RefCell<Option<Rc<dyn Fn(&[KeyPattern])>>>,
+    /// Whether the sink has heard the sequence now in the air — so its
+    /// end is announced exactly when its start was, and a plain stroke
+    /// (pushed and resolved in one breath) says nothing at all.
+    chord_announced: Cell<bool>,
     /// The size last HANDED to each measurement probe. A probe fires on
     /// change and only on change: a view at rest costs nothing, and a
     /// handler that writes state cannot spin against its own report.
@@ -272,6 +287,9 @@ pub struct Runtime {
     /// time, so the number needs no key: it belongs to whatever
     /// `interaction.pressed` names, and the release takes it.
     pressed_clicks: Cell<u8>,
+    /// The finger's state machine — what a touch means is decided here
+    /// and performed through the pointer's own doors ([`crate::touch`]).
+    touch: RefCell<crate::touch::Recognizer>,
     /// The lifted drag's VALUE — the stamp carries only label and
     /// geometry; the typed value stays here and lands on the drop.
     drag_value: RefCell<Option<std::rc::Rc<dyn std::any::Any>>>,
@@ -301,6 +319,15 @@ pub struct Runtime {
     /// How many PHYSICAL pixels one layout point is worth on this
     /// screen. The shell installs it; everyone else keeps `1.0`.
     device_scale: Cell<Px>,
+    /// The window's safe area, in layout points — the bands a phone's
+    /// notch, home indicator and rounded corners take. The root lays out
+    /// inside it; `.ignores_safe_area()` reclaims it. Zero on a desktop.
+    safe_area: Cell<crate::layout::Edges>,
+    /// The software keyboard's height over the window, 0 when hidden.
+    /// It joins the bottom inset: content shrinks above the keys.
+    keyboard_inset: Cell<Px>,
+    /// The insets of the last layout — an inset change is a resize.
+    last_insets: Cell<crate::layout::Edges>,
     /// The Dom mode's retained scene — [`Runtime::dom_frame`] diffs
     /// each new capture against it. Empty (and free) in every other
     /// mode.
@@ -512,6 +539,45 @@ impl Runtime {
     /// reaches the app through [`crate::custom::PaintCtx::scale`], so
     /// a box that draws parts which TOUCH can put the shared edge on
     /// a whole pixel. The default is `1.0`.
+    /// Moves the environment every body reads — the shell's door for
+    /// what the platform decides at runtime: the size class on a
+    /// rotation, a locale change. The next pass rebuilds the retention
+    /// once (bodies baked the old values into the scene) and runs
+    /// incremental again; an update that changes nothing costs nothing.
+    ///
+    /// ```ignore
+    /// runtime.set_environment(|values| values.horizontalSizeClass = SizeClass::Compact);
+    /// ```
+    pub fn set_environment(&self, update: impl FnOnce(&mut motor::state::EnvironmentValues)) {
+        update(&mut self.ctx.borrow_mut().values);
+        self.env_moved.set(true);
+    }
+
+    /// The window's safe area, in layout points: the shell mirrors the
+    /// platform's insets (`safeAreaInsets` on a phone) and the next
+    /// layout lays the root out inside them. Leading is the left edge.
+    pub fn set_safe_area(&self, insets: crate::layout::Edges) {
+        self.safe_area.set(insets);
+    }
+
+    pub fn safe_area(&self) -> crate::layout::Edges {
+        self.safe_area.get()
+    }
+
+    /// The software keyboard's height over the window, 0 when it hides.
+    /// The bottom inset becomes the larger of the safe area's and this,
+    /// so the content stands above the keys instead of under them.
+    pub fn set_keyboard_inset(&self, bottom: Px) {
+        self.keyboard_inset.set(bottom.max(0.0));
+    }
+
+    /// The four insets the next layout lays the root inside.
+    fn frame_insets(&self) -> crate::layout::Edges {
+        let mut insets = self.safe_area.get();
+        insets.bottom = insets.bottom.max(self.keyboard_inset.get());
+        insets
+    }
+
     pub fn set_device_scale(&self, scale: Px) {
         self.device_scale.set(scale.max(1.0));
     }
@@ -922,7 +988,8 @@ impl Runtime {
 
     fn assembled(scene: Option<Rc<str>>, ctx: Context, text: Rc<dyn TextEngine>) -> Self {
         let runtime = Runtime {
-            ctx,
+            ctx: RefCell::new(ctx),
+            env_moved: Cell::new(false),
             scene,
             last_root: RefCell::new(None),
             last_hits: RefCell::new(Vec::new()),
@@ -955,6 +1022,8 @@ impl Runtime {
             scoped_keymap: RefCell::new(HashMap::default()),
             chords: RefCell::new(Vec::new()),
             pending: RefCell::new(Vec::new()),
+            chord_sink: RefCell::new(None),
+            chord_announced: Cell::new(false),
             pending_aged: Cell::new(false),
             measures: RefCell::new(HashMap::default()),
             scroll_commands: RefCell::new(HashMap::default()),
@@ -972,6 +1041,7 @@ impl Runtime {
             last_drop_rings: RefCell::new(Vec::new()),
             drag_armed: RefCell::new(None),
             pressed_clicks: Cell::new(1),
+            touch: RefCell::new(crate::touch::Recognizer::new()),
             drag_value: RefCell::new(None),
             drag_preview: RefCell::new(None),
             tooltip: RefCell::new(TooltipLife::default()),
@@ -980,6 +1050,9 @@ impl Runtime {
             overlay_bounds: Cell::new(None),
             dialog_frames: RefCell::new(HashMap::default()),
             device_scale: Cell::new(1.0),
+            safe_area: Cell::new(crate::layout::Edges::ZERO),
+            keyboard_inset: Cell::new(0.0),
+            last_insets: Cell::new(crate::layout::Edges::ZERO),
             dom: RefCell::new(crate::dom::DomLowering::default()),
             root_is_boundary: Cell::new(false),
             printless: Cell::new(false),
@@ -996,7 +1069,7 @@ impl Runtime {
     }
 
     pub fn context(&self) -> Context {
-        self.ctx.clone()
+        self.ctx.borrow().clone()
     }
 
     /// One incremental pass: walk with skips, isolated re-runs of dirty
@@ -1058,6 +1131,11 @@ impl Runtime {
             self.theme_version.set(theme_version);
             reconciler::clear();
         }
+        // the same for a moved environment: a body that read the size
+        // class baked its answer into the scene it retained
+        if self.env_moved.replace(false) {
+            reconciler::clear();
+        }
         effects::reset();
         let snapshot = motor::identity::dirty_snapshot();
         reconciler::begin_pass(snapshot.clone());
@@ -1068,7 +1146,8 @@ impl Runtime {
             // the scene's own segment goes down FIRST, so it is the root
             // the sweep, the dirty drain and the retention all scope by
             let _scene = self.scene.as_ref().map(|name| motor::identity::enter(&**name));
-            root.render_into(&self.ctx, &mut nodes);
+            let ctx = self.ctx.borrow().clone();
+            root.render_into(&ctx, &mut nodes);
         }
 
         let pass_root = motor::identity::current_pass_root();
@@ -1938,6 +2017,150 @@ impl Runtime {
         self.interaction.borrow().clone()
     }
 
+    // MARK: - Touch (the finger speaks the pointer's vocabulary)
+
+    /// A finger landed. `id` names the finger for its lifetime (the
+    /// platform's touch object is a fine name), `taps` is the platform's
+    /// own count for it — the click count a press will carry. `true` =
+    /// repaint. What the touch MEANS is decided by [`crate::touch`] and
+    /// performed through the pointer's own doors; the shell only
+    /// forwards.
+    pub fn touch_began(&self, id: u64, x: Px, y: Px, taps: u8) -> bool {
+        let gestures = self.touch.borrow_mut().began(id, Point { x, y }, taps, self);
+        self.perform_touch(gestures).0
+    }
+
+    /// A finger moved.
+    pub fn touch_moved(&self, id: u64, x: Px, y: Px) -> bool {
+        let gestures = self.touch.borrow_mut().moved(id, Point { x, y });
+        self.perform_touch(gestures).0
+    }
+
+    /// A finger lifted.
+    pub fn touch_ended(&self, id: u64, x: Px, y: Px) -> bool {
+        let gestures = self.touch.borrow_mut().ended(id, Point { x, y });
+        self.perform_touch(gestures).0
+    }
+
+    /// The system took the finger: a press in flight is cancelled and
+    /// fires nothing, a pan never flings.
+    pub fn touch_cancelled(&self, id: u64) -> bool {
+        let gestures = self.touch.borrow_mut().cancelled(id);
+        self.perform_touch(gestures).0
+    }
+
+    /// Performs what the recognizer said, with the recognizer
+    /// UNBORROWED: a press runs the app's closure, and the app may come
+    /// straight back in through any door. Answers (repaint, input) —
+    /// `input` says a gesture reached the app and a settled frame is due.
+    fn perform_touch(&self, gestures: Vec<crate::touch::Gesture>) -> (bool, bool) {
+        use crate::touch::Gesture;
+        let mut repaint = false;
+        let mut input = false;
+        for gesture in gestures {
+            match gesture {
+                Gesture::Press { at, taps } => {
+                    repaint |=
+                        self.pointer_clicked(at.x, at.y, taps, crate::action::Modifiers::NONE);
+                    input = true;
+                }
+                Gesture::Move { at } => {
+                    repaint |= self.pointer_moved(at.x, at.y, crate::action::Modifiers::NONE);
+                }
+                Gesture::Release { at } => {
+                    self.pointer_released(at.x, at.y);
+                    // a lifted finger is not still there: nothing hovers
+                    // between gestures on a touch surface
+                    self.pointer_exited();
+                    repaint = true;
+                    input = true;
+                }
+                Gesture::Menu { at } => {
+                    repaint |= self.context_click(at.x, at.y);
+                    input = true;
+                }
+                Gesture::Scroll { anchor, dx, dy } => {
+                    // the wheel's road, whole: the tooltip and the menu die
+                    // the same way, and the region under the ANCHOR takes
+                    // the whole gesture
+                    let moved = self.wheel(anchor.x, anchor.y, dx, dy);
+                    repaint |= moved;
+                    if !moved {
+                        // the content hit its edge: a fling dies here
+                        self.touch.borrow_mut().stop_fling();
+                    }
+                }
+                Gesture::Cancel => repaint |= self.pointer_cancelled(),
+                Gesture::Magnify { at, scale } => repaint |= self.magnify(at.x, at.y, scale),
+            }
+        }
+        (repaint, input)
+    }
+
+    /// A press that ends without a release — the system took the
+    /// pointer (a touch the OS claimed, a window that lost the hand).
+    /// The pressed visual clears, a drag in flight goes home, a grabbed
+    /// box hears the pointer go up; nothing fires and the focus stays.
+    /// `true` = repaint.
+    pub fn pointer_cancelled(&self) -> bool {
+        self.enter_scene();
+        let (repaint, told) = self.watching_hover(|| self.pointer_cancelled_road());
+        repaint || told
+    }
+
+    fn pointer_cancelled_road(&self) -> bool {
+        self.pressed_clicks.set(1);
+        self.drag_armed.borrow_mut().take();
+        let dragged = self.drag_value.borrow_mut().take().is_some();
+        if dragged {
+            self.interaction.borrow_mut().drag = None;
+            self.clear_drag_preview();
+        }
+        let (grabbed, at, changed) = {
+            let mut interaction = self.interaction.borrow_mut();
+            let changed = interaction.pressed.take().is_some()
+                | interaction.split_drag.take().is_some()
+                | interaction.thumb_drag.take().is_some()
+                | interaction.field_drag.take().is_some()
+                | interaction.hovered.take().is_some();
+            let at = interaction.pointer.take().unwrap_or(Point::ZERO);
+            (interaction.element_grab.take(), at, changed)
+        };
+        if let Some(placement) = grabbed.as_deref().and_then(|path| self.custom_at(path)) {
+            let at = Self::local(&placement, at.x, at.y);
+            self.deliver(&placement, crate::custom::ElementEvent::PointerUp { at });
+        }
+        changed || dragged || grabbed.is_some()
+    }
+
+    /// Two fingers — or a trackpad — changed their distance over the
+    /// scene: the app's box under the point hears
+    /// [`crate::custom::ElementEvent::Magnify`] with the ratio of this
+    /// step. Nothing else zooms; `true` = the box took it.
+    pub fn magnify(&self, x: Px, y: Px, scale: f64) -> bool {
+        self.enter_scene();
+        let over = self.hover_target(x, y).and_then(|path| self.custom_at(&path));
+        let Some(placement) = over else {
+            return false;
+        };
+        let at = Self::local(&placement, x, y);
+        self.deliver(&placement, crate::custom::ElementEvent::Magnify { at, scale }).handled
+    }
+
+    /// The scroll regions under a point with travel, per axis —
+    /// `wheel`'s routing question asked without the wheel's answer.
+    fn scroll_travel_at(&self, x: Px, y: Px) -> (bool, bool) {
+        let scrolls = self.last_scrolls.borrow();
+        let reachable = self.reachable(&scrolls, |floor| floor.scrolls);
+        let mut travels = (false, false);
+        for region in reachable.iter().filter(|region| region.frame.contains(x, y)) {
+            let (max_x, max_y) = scroll_travel(region);
+            travels.0 |= max_x > 0.0;
+            travels.1 |= max_y > 0.0;
+        }
+        travels
+    }
+
     // MARK: - Scrolling (offset is ENGINE state: no view invalidates)
 
     /// Routes the wheel to the region that paints LAST among those
@@ -1970,13 +2193,6 @@ impl Runtime {
             }
         }
         let scrolls = self.last_scrolls.borrow();
-        let travel = |region: &ScrollRegion| {
-            let max_x =
-                (region.content.width.round() - region.frame.size.width.round()).max(0.0);
-            let max_y =
-                (region.content.height.round() - region.frame.size.height.round()).max(0.0);
-            (max_x, max_y)
-        };
         // each AXIS routes to the region that paints LAST among those
         // under the point that travel that way — the pointer's own
         // rule, walking the list back. A child paints over its parent
@@ -1993,7 +2209,7 @@ impl Runtime {
         let reachable = self.reachable(&scrolls, |floor| floor.scrolls);
         let topmost = |axis: fn((Px, Px)) -> Px| {
             reachable.iter().rev().find(|region| {
-                region.frame.contains(x, y) && axis(travel(region)) > 0.0
+                region.frame.contains(x, y) && axis(scroll_travel(region)) > 0.0
             })
         };
         let region_y = (dy != 0.0).then(|| topmost(|(_, y)| y)).flatten();
@@ -2004,7 +2220,7 @@ impl Runtime {
         let mut moved = false;
         let mut offsets = self.scroll_offsets.borrow_mut();
         let mut apply = |region: &ScrollRegion, dx: Px, dy: Px| {
-            let (max_x, max_y) = travel(region);
+            let (max_x, max_y) = scroll_travel(region);
             // the wheel is sovereign: a reveal in flight dies here
             self.animator.borrow_mut().cancel_scroll(&region.path);
             let current = offsets.get(&region.path).copied().unwrap_or_default();
@@ -2220,7 +2436,11 @@ impl Runtime {
                 (None, false) => Some(KeyMatch::None),
             }
         };
-        let Some(answer) = answer else { return KeyMatch::Pending };
+        let Some(answer) = answer else {
+            // the sequence is in the air: a which-key panel hears it now
+            self.announce_chord();
+            return KeyMatch::Pending;
+        };
         // whatever it was, the sequence is over
         let strokes = self.pending.borrow().len();
         self.cancel_chord();
@@ -2257,10 +2477,32 @@ impl Runtime {
     /// Drops a sequence in the air. `true` = one was held.
     pub fn cancel_chord(&self) -> bool {
         self.pending_aged.set(false);
-        let mut pending = self.pending.borrow_mut();
-        let held = !pending.is_empty();
-        pending.clear();
+        let held = {
+            let mut pending = self.pending.borrow_mut();
+            let held = !pending.is_empty();
+            pending.clear();
+            held
+        };
+        if self.chord_announced.replace(false) {
+            self.announce_chord();
+        }
         held
+    }
+
+    /// Installs who hears the sequence move: the sink is called with the
+    /// strokes in the air after every change — the door a which-key panel
+    /// reads through, since the app's bodies never see a stroke. One sink;
+    /// installing another replaces it.
+    pub fn observe_chord(&self, sink: impl Fn(&[KeyPattern]) + 'static) {
+        *self.chord_sink.borrow_mut() = Some(Rc::new(sink));
+    }
+
+    fn announce_chord(&self) {
+        let sink = self.chord_sink.borrow().clone();
+        let Some(sink) = sink else { return };
+        let pending = self.pending.borrow().clone();
+        self.chord_announced.set(!pending.is_empty());
+        sink(&pending);
     }
 
     /// The slow clock, aging a pending prefix: the SECOND tick drops
@@ -3004,6 +3246,15 @@ impl Runtime {
                 .borrow_mut()
                 .insert(path.as_ref().to_string(), Point { x, y });
         }
+        // the finger's clock: a hold ages into a menu or a press, a
+        // fling slides the content one more step
+        let gestures = self.touch.borrow_mut().tick(dt, self);
+        let mut moved = moved;
+        if !gestures.is_empty() {
+            let (repaint, input) = self.perform_touch(gestures);
+            moved.scene |= repaint;
+            moved.input |= input;
+        }
         moved
     }
 
@@ -3011,8 +3262,11 @@ impl Runtime {
     /// frame driver (display link, rAF) with this after every present.
     pub fn wants_frame(&self) -> bool {
         // a sleeping task needs the clock to keep moving, and the
-        // clock is the frame tick — the shell's driver stays awake
-        self.animator.borrow().wants_frame() || motor::task::has_timers()
+        // clock is the frame tick — the shell's driver stays awake; so
+        // does a finger whose meaning the clock decides, and a fling
+        self.animator.borrow().wants_frame()
+            || motor::task::has_timers()
+            || self.touch.borrow().alive()
     }
 
     /// The frame rate the moment deserves. A shell with a slow timer
@@ -3022,7 +3276,9 @@ impl Runtime {
     /// ride the frame clock.
     pub fn frame_pace(&self) -> crate::anim::FramePace {
         let pace = self.animator.borrow().pace();
-        if motor::task::has_timers() && pace != crate::anim::FramePace::Display {
+        if (motor::task::has_timers() || self.touch.borrow().alive())
+            && pace != crate::anim::FramePace::Display
+        {
             return crate::anim::FramePace::Display;
         }
         pace
@@ -3515,6 +3771,27 @@ impl Runtime {
         segments
     }
 
+    /// The shell reports: a link in a DOCUMENT was activated — the
+    /// engine did not follow it. Routed to the retained `on_link`;
+    /// `false` = nothing listening, and the link goes nowhere.
+    pub fn webview_linked(&self, path: &str, url: &str) -> bool {
+        reconciler::run_webview_linked(path, url)
+    }
+
+    /// The shell reports: an editable document's body changed under
+    /// the person's hand. Routed to the retained `on_html_change`;
+    /// `false` = nothing listening.
+    pub fn webview_changed(&self, path: &str, html: &str) -> bool {
+        reconciler::run_webview_changed(path, html)
+    }
+
+    /// The shell reports: a paste the app owns arrived, as the
+    /// clipboard's html and text. Routed to the retained `on_paste`;
+    /// `false` = nothing listening (and nothing was inserted).
+    pub fn webview_pasted(&self, path: &str, html: &str, text: &str) -> bool {
+        reconciler::run_webview_pasted(path, html, text)
+    }
+
     /// The shell reports: the engine committed a navigation. Routed to
     /// the page's retained `on_navigate`; `false` = nothing listening.
     pub fn webview_navigated(&self, path: &str, url: &str) -> bool {
@@ -3564,11 +3841,14 @@ impl Runtime {
                     }
                     WebviewCommand::Back => WebviewOp::Back { path: path.clone() },
                     WebviewCommand::Forward => WebviewOp::Forward { path: path.clone() },
-                    WebviewCommand::Eval { js, then } => {
+                    WebviewCommand::Eval { js, raw, then } => {
                         let token = self.webview_eval_next.get();
                         self.webview_eval_next.set(token + 1);
                         self.webview_evals.borrow_mut().insert(token, then);
-                        WebviewOp::Eval { path: path.clone(), token, js }
+                        WebviewOp::Eval { path: path.clone(), token, js, raw }
+                    }
+                    WebviewCommand::Edit(action) => {
+                        WebviewOp::Edit { path: path.clone(), action }
                     }
                     WebviewCommand::Snapshot { then } => {
                         let token = self.webview_eval_next.get();
@@ -4493,8 +4773,13 @@ impl Runtime {
         // pass's touches mark who is still mounted. A pass whose
         // proposal CHANGED is a resize: geometry moved because the
         // window did, and that is not an animation — retargets snap.
-        let resized = self.last_proposal.get() != Some(proposal);
+        // an inset change is a resize too: the keyboard rising moves
+        // geometry because the window did, and nothing wobbles for it
+        let insets = self.frame_insets();
+        let resized = self.last_proposal.get() != Some(proposal)
+            || self.last_insets.get() != insets;
         self.last_proposal.set(Some(proposal));
+        self.last_insets.set(insets);
         {
             let mut animator = self.animator.borrow_mut();
             animator.note_place();
@@ -4529,7 +4814,7 @@ impl Runtime {
                     crate::layout::layout_dom(&tree, proposal, env, collect_display);
                 (result, Some(scene))
             } else {
-                (crate::layout::layout_with(&tree, proposal, env), None)
+                (crate::layout::layout_with_insets(&tree, proposal, env, insets), None)
             }
         });
         crate::stats::note_display(result.display.len());
@@ -4601,7 +4886,8 @@ impl Runtime {
     /// Drains registered effects (`onReceive`, `onChange`, `query`).
     /// Returns whether any of them observed a change.
     pub fn pump(&self) -> bool {
-        effects::take().iter().any(|effect| effect(&self.ctx))
+        let ctx = self.ctx.borrow().clone();
+        effects::take().iter().any(|effect| effect(&ctx))
     }
 
     /// Puts a future on the engine's queue. It runs on the next turn —
@@ -4705,5 +4991,41 @@ impl Runtime {
             Some(root) => motor::identity::has_dirty_matching(root),
             None => false,
         }
+    }
+}
+
+/// How far a region can scroll on each axis — its content past its
+/// frame, in whole points, never negative.
+fn scroll_travel(region: &ScrollRegion) -> (Px, Px) {
+    let max_x = (region.content.width.round() - region.frame.size.width.round()).max(0.0);
+    let max_y = (region.content.height.round() - region.frame.size.height.round()).max(0.0);
+    (max_x, max_y)
+}
+
+/// The scene the finger asks: the tables of the last layout answer,
+/// under the same modal line the pointer stops at.
+impl crate::touch::TouchScene for Runtime {
+    fn pans_at(&self, at: Point) -> bool {
+        let (horizontal, vertical) = self.scroll_travel_at(at.x, at.y);
+        horizontal
+            || vertical
+            || self.hover_target(at.x, at.y).and_then(|path| self.custom_at(&path)).is_some()
+    }
+
+    fn grabs_at(&self, at: Point) -> bool {
+        let Some(target) = self.hover_target(at.x, at.y) else {
+            return false;
+        };
+        if target.ends_with("/#split") || self.grab_thumb(&target, at.x, at.y).is_some() {
+            return true;
+        }
+        self.custom_at(&target).is_some_and(|placement| placement.element.element().takes_drag())
+    }
+
+    fn menu_at(&self, at: Point) -> bool {
+        let menus = self.last_menus.borrow();
+        self.reachable(&menus, |floor| floor.menus)
+            .iter()
+            .any(|region| region.rect.contains(at.x, at.y))
     }
 }

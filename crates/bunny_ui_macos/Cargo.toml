@@ -5,7 +5,8 @@ edition.workspace = true
 description = "bunny-ui macOS shell — native window and bitmap blit, dependency-free Objective-C FFI"
 
 [dependencies]
-bunny-ui = { workspace = true, features = ["canvas"] }
+bunny-ui = { workspace = true, features = ["canvas", "gpu"] }
+bunny-ui-apple.workspace = true
 
 [dev-dependencies]
 # examples only (the real countries app in a native window)

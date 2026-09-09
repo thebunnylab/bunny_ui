@@ -29,7 +29,10 @@ use std::ffi::c_void;
 use std::rc::Rc;
 
 use bunny_ui::action::Modifiers;
-use bunny_ui::host::{HostSpec, MouseButton, WebviewCapability, WebviewInput};
+use bunny_ui::host::{
+    Document, EDITOR_SCRIPT, EditorAction, EditorReport, HostSpec, MouseButton, WebviewCapability,
+    WebviewInput, editor_report,
+};
 
 use crate::ffi::{Guid, Hresult, Hwnd, Rect, UnknownVtbl, com_init, com_ok, com_query, wide};
 
@@ -45,6 +48,7 @@ pub fn capabilities() -> &'static [WebviewCapability] {
         WebviewCapability::NetworkRequests,
         WebviewCapability::SyntheticInput,
         WebviewCapability::MediaEmulation,
+        WebviewCapability::HtmlEditor,
     ]
 }
 
@@ -78,9 +82,20 @@ unsafe extern "system" {
 /// the main thread, from the pump's own turns. The mac twin carries
 /// the view; here every handler is authored by us and carries its
 /// placement path instead, so no pointer scan exists.
+/// Clone because an app with more than one window offers a page's news
+/// to each of them — the one that owns the page answers.
+#[derive(Clone)]
 pub(crate) enum WebviewEvent {
     /// The engine committed a navigation — link clicks included.
     Navigated { path: String, url: String },
+    /// A link in a DOCUMENT was activated. The engine did not follow
+    /// it: the document stays, and the app hears the url.
+    Linked { path: String, url: String },
+    /// An editable document's body changed under the person's hand.
+    Changed { path: String, html: String },
+    /// A paste the app owns: the clipboard's html and text, nothing
+    /// inserted.
+    Pasted { path: String, html: String, text: String },
     /// The engine REFUSED one: the url it tried, and why — the other
     /// leg of the same pair, so no load ends in silence.
     NavigationFailed { path: String, url: String, why: String },
@@ -476,6 +491,14 @@ const IID_CONTEXT_MENU: Guid = Guid {
     d3: 0x42fb,
     d4: [0xa8, 0x98, 0xda, 0x24, 0x1d, 0x35, 0xb6, 0x3c],
 };
+/// `ICoreWebView2NewWindowRequestedEventHandler`
+/// {D4C185FE-C81C-4989-97AF-2D3FA7AB5651} — a `target="_blank"` link.
+const IID_NEW_WINDOW: Guid = Guid {
+    d1: 0xd4c185fe,
+    d2: 0xc81c,
+    d3: 0x4989,
+    d4: [0x97, 0xaf, 0x2d, 0x3f, 0xa7, 0xab, 0x56, 0x51],
+};
 
 // MARK: - Consumed vtables (header order, indexes cited, runs padded)
 
@@ -508,9 +531,12 @@ struct ControllerVtbl {
     /// prohibition is struct RETURNS.
     put_bounds: unsafe extern "system" fn(*mut Controller, Rect) -> Hresult,
     /// 7-8 get/put_ZoomFactor; 9-10 add/remove_ZoomFactorChanged;
-    /// 11 SetBoundsAndZoomFactor; 12 MoveFocus;
+    /// 11 SetBoundsAndZoomFactor.
+    _pad_7_11: [usize; 5],
+    /// 12 `MoveFocus(reason)` — the keyboard is the page's.
+    move_focus: unsafe extern "system" fn(*mut Controller, i32) -> Hresult,
     /// 13-14 add/remove_MoveFocusRequested.
-    _pad_7_14: [usize; 8],
+    _pad_13_14: [usize; 2],
     /// 15 `add_GotFocus(handler, *token)`.
     add_got_focus:
         unsafe extern "system" fn(*mut Controller, *mut c_void, *mut i64) -> Hresult,
@@ -546,8 +572,9 @@ struct WebView2Vtbl {
     get_source: unsafe extern "system" fn(*mut WebView2, *mut *mut u16) -> Hresult,
     /// 5 `Navigate(uri)`.
     navigate: unsafe extern "system" fn(*mut WebView2, *const u16) -> Hresult,
-    /// 6 NavigateToString.
-    _pad_6: [usize; 1],
+    /// 6 `NavigateToString(html)` — a document from memory; the
+    /// engine's door takes two megabytes at most.
+    navigate_to_string: unsafe extern "system" fn(*mut WebView2, *const u16) -> Hresult,
     /// 7 `add_NavigationStarting(handler, *token)`.
     add_navigation_starting:
         unsafe extern "system" fn(*mut WebView2, *mut c_void, *mut i64) -> Hresult,
@@ -598,7 +625,13 @@ struct WebView2Vtbl {
     /// 42 `GetDevToolsProtocolEventReceiver(eventName, **receiver)`.
     get_devtools_receiver:
         unsafe extern "system" fn(*mut WebView2, *const u16, *mut *mut DevToolsReceiver) -> Hresult,
-    /// 43 Stop; 44-45 add/remove_NewWindowRequested;
+    /// 43 Stop.
+    _pad_43: [usize; 1],
+    /// 44 `add_NewWindowRequested(handler, *token)` — the ask a
+    /// `target="_blank"` link makes.
+    add_new_window_requested:
+        unsafe extern "system" fn(*mut WebView2, *mut c_void, *mut i64) -> Hresult,
+    /// 45 remove_NewWindowRequested;
     /// 46-47 add/remove_DocumentTitleChanged; 48 get_DocumentTitle;
     /// 49 AddHostObjectToScript; 50 RemoveHostObjectFromScript;
     /// 51 OpenDevToolsWindow;
@@ -608,7 +641,7 @@ struct WebView2Vtbl {
     /// 57 AddWebResourceRequestedFilter;
     /// 58 RemoveWebResourceRequestedFilter;
     /// 59-60 add/remove_WindowCloseRequested.
-    _pad_43_60: [usize; 18],
+    _pad_45_60: [usize; 16],
 }
 #[repr(C)]
 struct WebView2 {
@@ -674,11 +707,29 @@ struct NavStartingArgsVtbl {
     unknown: UnknownVtbl, // 0-2
     /// 3 `get_Uri(**uri)` — where this navigation is AIMING.
     get_uri: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> Hresult,
-    /// 4 get_IsUserInitiated; 5 get_IsRedirected; 6 get_RequestHeaders;
-    /// 7 get_Cancel; 8 put_Cancel.
-    _pad_4_8: [usize; 5],
+    /// 4 `get_IsUserInitiated(*bool)` — a gesture, not a script.
+    get_is_user_initiated: unsafe extern "system" fn(*mut c_void, *mut i32) -> Hresult,
+    /// 5 get_IsRedirected; 6 get_RequestHeaders; 7 get_Cancel.
+    _pad_5_7: [usize; 3],
+    /// 8 `put_Cancel(bool)` — the navigation does not happen.
+    put_cancel: unsafe extern "system" fn(*mut c_void, i32) -> Hresult,
     /// 9 `get_NavigationId(*id)`.
     get_navigation_id: unsafe extern "system" fn(*mut c_void, *mut u64) -> Hresult,
+}
+
+/// `ICoreWebView2NewWindowRequestedEventArgs` — 11 slots.
+#[repr(C)]
+struct NewWindowArgsVtbl {
+    unknown: UnknownVtbl, // 0-2
+    /// 3 `get_Uri(**uri)` — where the new window would go.
+    get_uri: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> Hresult,
+    /// 4 put_NewWindow; 5 get_NewWindow.
+    _pad_4_5: [usize; 2],
+    /// 6 `put_Handled(bool)` — handled means NO window opens.
+    put_handled: unsafe extern "system" fn(*mut c_void, i32) -> Hresult,
+    /// 7 get_Handled; 8 get_IsUserInitiated; 9 GetDeferral;
+    /// 10 get_WindowFeatures.
+    _pad_7_10: [usize; 4],
 }
 
 /// `ICoreWebView2ContentLoadingEventArgs` — 5 slots.
@@ -1046,6 +1097,8 @@ enum EnvState {
 #[derive(Clone)]
 struct SpecCopy {
     url: Rc<str>,
+    /// A page from memory, sealed — loaded instead of `url`.
+    document: Option<Document>,
     scripts: Rc<[Rc<str>]>,
     console: bool,
     requests: bool,
@@ -1054,9 +1107,10 @@ struct SpecCopy {
 
 impl SpecCopy {
     fn of(spec: &HostSpec) -> SpecCopy {
-        let HostSpec::Webview { url, scripts, console, requests, full_motion } = spec;
+        let HostSpec::Webview { url, document, scripts, console, requests, full_motion } = spec;
         SpecCopy {
             url: Rc::clone(url),
+            document: document.clone(),
             scripts: Rc::clone(scripts),
             console: *console,
             requests: *requests,
@@ -1071,9 +1125,10 @@ enum Queued {
     Navigate(Rc<str>),
     Back,
     Forward,
-    Eval { token: u64, js: Rc<str> },
+    Eval { token: u64, js: Rc<str>, raw: bool },
     Snapshot { token: u64 },
     Input(WebviewInput),
+    Edit(EditorAction),
 }
 
 /// The engine half of a Live mount — raw pointers, each holding ONE
@@ -1097,6 +1152,18 @@ struct Live {
     /// motion (`Emulation.setEmulatedMedia`) — the flag `update`
     /// compares against, so a mid-session toggle re-instructs.
     full_motion: bool,
+    /// The DOCUMENT loaded, if one is: its fingerprint (what `update`
+    /// compares) and whether the app's own load is still the one
+    /// navigation the starting leg lets through.
+    letter: Option<Letter>,
+}
+
+/// A loaded document's standing — the mac's, verbatim.
+struct Letter {
+    digest: u64,
+    expected: bool,
+    /// The editor takes the keyboard at the commit — once.
+    focus: bool,
 }
 
 enum Mount {
@@ -1397,6 +1464,16 @@ fn controller_landed(path: &str, generation: u64, hr: Hresult, controller: *mut 
         let _ = ((*(*core).vtbl).add_navigation_completed)(core, on_completed, &mut token);
         com_release(on_completed);
 
+        let on_new_window = {
+            let path = path.to_string();
+            handler2(IID_NEW_WINDOW, move |_sender, args| {
+                new_window_requested(&path, args as *mut c_void);
+                0
+            })
+        };
+        let _ = ((*(*core).vtbl).add_new_window_requested)(core, on_new_window, &mut token);
+        com_release(on_new_window);
+
         let on_focus = handler2(IID_FOCUS_CHANGED, move |_sender, _args| {
             dispatch(WebviewEvent::FocusTaken);
             0
@@ -1458,7 +1535,34 @@ fn controller_landed(path: &str, generation: u64, hr: Hresult, controller: *mut 
         if spec.full_motion {
             cdp(core, "Emulation.setEmulatedMedia", &emulated_media_params(true));
         }
-        navigate_core(core, &spec.url);
+    }
+    // the letter is filed BEFORE its load departs: the starting leg is
+    // asked about that load, and must find the letter expecting it
+    let letter = spec.document.as_ref().map(|document| Letter {
+        digest: document.digest,
+        expected: true,
+        focus: document.focus,
+    });
+    VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        if let Some(slot) = views.get_mut(path) {
+            slot.state = Mount::Live(Live {
+                controller,
+                core,
+                core2,
+                nav_targets: HashMap::new(),
+                console_wired: false,
+                requests_token: None,
+                full_motion: spec.full_motion,
+                letter,
+            });
+        }
+    });
+    unsafe {
+        match &spec.document {
+            Some(document) => load_document(core, path, document),
+            None => navigate_core(core, &spec.url),
+        }
     }
 
     // the declared ears open on the standing engine
@@ -1474,24 +1578,18 @@ fn controller_landed(path: &str, generation: u64, hr: Hresult, controller: *mut 
             Queued::Forward => unsafe {
                 let _ = ((*(*core).vtbl).go_forward)(core);
             },
-            Queued::Eval { token, js } => unsafe { eval_core(core, token, &js) },
+            Queued::Eval { token, js, raw } => unsafe { eval_core(core, token, &js, raw) },
             Queued::Snapshot { token } => unsafe { snapshot_core(core, token) },
             Queued::Input(event) => unsafe { send_input(core, &event) },
+            Queued::Edit(action) => unsafe { edit_core(controller, core, &action) },
         }
     }
 
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        if let Some(slot) = views.get_mut(path) {
-            slot.state = Mount::Live(Live {
-                controller,
-                core,
-                core2,
-                nav_targets: HashMap::new(),
-                console_wired,
-                requests_token,
-                full_motion: spec.full_motion,
-            });
+        if let Some(Mount::Live(live)) = views.get_mut(path).map(|slot| &mut slot.state) {
+            live.console_wired = console_wired;
+            live.requests_token = requests_token;
         }
     });
 }
@@ -1521,6 +1619,16 @@ fn main_frame_only(script: &str) -> String {
 /// generation that asked; a stale arrival removes itself.
 fn apply_scripts(core: *mut WebView2, path: &str, generation: u64, spec: &SpecCopy) {
     let mut sources = vec![BOOT.to_string()];
+    // the editor for an editable document: its transport first (the
+    // one wire, tagged `edit`), the framework's script after
+    if let Some(document) = spec.document.as_ref().filter(|document| document.editable) {
+        sources.push(format!(
+            "window.__bunnyEditor = {{ paste: {}, focus: {}, send: function(line) {{ \
+             window.chrome.webview.postMessage('edit\\t' + line); }} }};",
+            document.paste, document.focus
+        ));
+        sources.push(EDITOR_SCRIPT.to_string());
+    }
     sources.extend(spec.scripts.iter().map(|script| script.to_string()));
     for source in sources {
         let wrapped = wide(&main_frame_only(&source));
@@ -1789,6 +1897,7 @@ fn parse_message(text: &str) -> Option<Parsed> {
     let (tag, rest) = text.split_once('\t')?;
     match tag {
         "bunny" => Some(Parsed::Posted(rest.to_string())),
+        "edit" => Some(Parsed::Edited(rest.to_string())),
         "eval" => {
             let mut parts = rest.splitn(3, '\t');
             let token = parts.next()?.parse::<u64>().ok()?;
@@ -1807,6 +1916,8 @@ fn parse_message(text: &str) -> Option<Parsed> {
 
 enum Parsed {
     Posted(String),
+    /// The editor's line, still to decode (`bunny_ui::host::editor_report`).
+    Edited(String),
     EvalDone { token: u64, result: Result<String, String> },
 }
 
@@ -1828,30 +1939,112 @@ fn message_received(path: &str, args: *mut c_void) {
         Some(Parsed::EvalDone { token, result }) => {
             dispatch(WebviewEvent::EvalDone { token, result });
         }
+        Some(Parsed::Edited(line)) => match editor_report(&line) {
+            Some(EditorReport::Changed(html)) => {
+                dispatch(WebviewEvent::Changed { path: path.to_string(), html });
+            }
+            Some(EditorReport::Pasted { html, text }) => {
+                dispatch(WebviewEvent::Pasted { path: path.to_string(), html, text });
+            }
+            None => {}
+        },
         None => {}
     }
 }
 
+/// The starting leg. A page by url records where each navigation
+/// aims (the failure leg's answer) and lets it go. A DOCUMENT is
+/// answered by its one rule, the mac's verbatim: the app's own load
+/// goes through, a navigation the PERSON started — a link — is
+/// cancelled and reported to the app (the document never follows
+/// it), and every other ask — a refresh the document wrote, a form,
+/// the engine's own reload (which would fetch the base) — is
+/// cancelled without a word.
 fn navigation_starting(path: &str, args: *mut c_void) {
-    let (id, uri) = unsafe {
+    let (id, uri, by_hand) = unsafe {
         let vtbl = *(args as *mut *const NavStartingArgsVtbl);
         let mut uri: *mut u16 = std::ptr::null_mut();
         let mut id = 0u64;
+        let mut by_hand = 0i32;
         let _ = ((*vtbl).get_uri)(args, &mut uri);
         let _ = ((*vtbl).get_navigation_id)(args, &mut id);
-        (id, take_ws(uri))
+        let _ = ((*vtbl).get_is_user_initiated)(args, &mut by_hand);
+        (id, take_ws(uri), by_hand != 0)
     };
-    VIEWS.with(|views| {
+    enum Verdict {
+        Page,
+        Load,
+        Link,
+        Shut,
+    }
+    let verdict = VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        if let Some(Mount::Live(live)) = views.get_mut(path).map(|slot| &mut slot.state) {
+        let Some(Mount::Live(live)) = views.get_mut(path).map(|slot| &mut slot.state) else {
+            return Verdict::Page;
+        };
+        let Some(letter) = live.letter.as_mut() else {
             // a redirect re-fires the same id with the new aim; the
             // insert overwrites, which is the truth
             if live.nav_targets.len() >= 32 {
                 live.nav_targets.clear();
             }
-            live.nav_targets.insert(id, uri);
+            live.nav_targets.insert(id, uri.clone());
+            return Verdict::Page;
+        };
+        let expected = std::mem::replace(&mut letter.expected, false);
+        if by_hand {
+            Verdict::Link
+        } else if expected {
+            Verdict::Load
+        } else {
+            Verdict::Shut
         }
     });
+    match verdict {
+        Verdict::Page | Verdict::Load => {}
+        Verdict::Link | Verdict::Shut => {
+            unsafe {
+                let vtbl = *(args as *mut *const NavStartingArgsVtbl);
+                let _ = ((*vtbl).put_cancel)(args, 1);
+            }
+            if matches!(verdict, Verdict::Link) {
+                report_link(path, uri);
+            }
+        }
+    }
+}
+
+/// A `target="_blank"` link asked for a window. A document's link
+/// reports to the app and the ask is HANDLED — no window opens; a
+/// page by url keeps what it had: the engine's own popup.
+fn new_window_requested(path: &str, args: *mut c_void) {
+    let sealed = VIEWS.with(|views| {
+        matches!(
+            views.borrow().get(path).map(|slot| &slot.state),
+            Some(Mount::Live(live)) if live.letter.is_some()
+        )
+    });
+    if !sealed {
+        return;
+    }
+    let uri = unsafe {
+        let vtbl = *(args as *mut *const NewWindowArgsVtbl);
+        let mut uri: *mut u16 = std::ptr::null_mut();
+        let _ = ((*vtbl).get_uri)(args, &mut uri);
+        let _ = ((*vtbl).put_handled)(args, 1);
+        take_ws(uri)
+    };
+    report_link(path, uri);
+}
+
+/// A document's link, to the app — unless it is a `javascript:` link,
+/// which is not a place and runs nowhere.
+fn report_link(path: &str, url: String) {
+    let scheme = url.split(':').next().unwrap_or_default();
+    if url.is_empty() || scheme.eq_ignore_ascii_case("javascript") {
+        return;
+    }
+    dispatch(WebviewEvent::Linked { path: path.to_string(), url });
 }
 
 /// The commit leg — the engine's own committed url, redirects
@@ -1879,8 +2072,29 @@ fn content_loading(path: &str, sender: *mut WebView2, args: *mut c_void) {
     if armed {
         unsafe { cdp(sender, "Emulation.setEmulatedMedia", &emulated_media_params(true)) };
     }
+    // a document's commit also shuts the door its own load came
+    // through: from here on nothing the document asks for moves it
+    let base = VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        let slot = views.get_mut(path)?;
+        let Mount::Live(live) = &mut slot.state else {
+            return None;
+        };
+        let letter = live.letter.as_mut()?;
+        letter.expected = false;
+        if std::mem::replace(&mut letter.focus, false) {
+            unsafe { move_focus(live.controller) };
+        }
+        slot.spec.document.as_ref().map(|document| document.base.to_string())
+    });
     let url = unsafe { source_of(sender) };
     if url.is_empty() || url == "about:blank" {
+        // a document from memory stands on the engine's empty stage:
+        // its commit reports the base it resolves by, the mac's very
+        // string, so the two shells say the same thing
+        if let Some(base) = base.filter(|base| !base.is_empty()) {
+            dispatch(WebviewEvent::Navigated { path: path.to_string(), url: base });
+        }
         return;
     }
     dispatch(WebviewEvent::Navigated { path: path.to_string(), url });
@@ -1971,16 +2185,87 @@ unsafe fn navigate_core(core: *mut WebView2, url: &str) {
     }
 }
 
+/// Loads a document from MEMORY — `NavigateToString`, the sealed html
+/// the spec holds (the base rides in its head: this engine has no
+/// door of its own for one). The engine's door takes two megabytes;
+/// a larger letter is refused BY NAME on the failure leg, never
+/// truncated into a quiet half-page.
+unsafe fn load_document(core: *mut WebView2, path: &str, document: &Document) {
+    const DOOR: usize = 2 * 1024 * 1024;
+    let sealed = document.sealed();
+    if sealed.len() > DOOR {
+        VIEWS.with(|views| {
+            if let Some(Mount::Live(live)) =
+                views.borrow_mut().get_mut(path).map(|slot| &mut slot.state)
+            {
+                if let Some(letter) = live.letter.as_mut() {
+                    letter.expected = false;
+                }
+            }
+        });
+        dispatch(WebviewEvent::NavigationFailed {
+            path: path.to_string(),
+            url: document.base.to_string(),
+            why: String::from("the document is larger than the engine's two-megabyte door"),
+        });
+        return;
+    }
+    let html = wide(&sealed);
+    unsafe {
+        let _ = ((*(*core).vtbl).navigate_to_string)(core, html.as_ptr());
+    }
+}
+
+/// The keyboard becomes the page's — `MoveFocus`, programmatic.
+unsafe fn move_focus(controller: *mut Controller) {
+    const PROGRAMMATIC: i32 = 0;
+    unsafe {
+        let _ = ((*(*controller).vtbl).move_focus)(controller, PROGRAMMATIC);
+    }
+}
+
+/// One editing action on the document — the allowlist's script, run
+/// on the engine. The editor takes the keyboard back first (a toolbar
+/// click took it), except for the app's own write of the whole body.
+unsafe fn edit_core(controller: *mut Controller, core: *mut WebView2, action: &EditorAction) {
+    let script = action.script();
+    if script.is_empty() {
+        return;
+    }
+    unsafe {
+        if !matches!(action, EditorAction::SetHtml(_)) {
+            move_focus(controller);
+        }
+        run_script(core, &script);
+    }
+}
+
+/// Runs `js` on the page, answer discarded — the shared no-op handler
+/// takes the completion.
+unsafe fn run_script(core: *mut WebView2, js: &str) {
+    let js = wide(js);
+    let completed = handler2(IID_EXECUTE_SCRIPT, |_hr, _json| 0);
+    unsafe {
+        let _ = ((*(*core).vtbl).execute_script)(core, js.as_ptr(), completed);
+        com_release(completed);
+    }
+}
+
 /// Evaluates `js` as an EXPRESSION in the page; the answer rides the
 /// bus by token — the mac wrapper verbatim with the door swapped.
 /// `ExecuteScript`'s own callback cannot serve the contract (a thrown
 /// script answers `null` with a success code), so it gets a shared
 /// no-op handler and the wrapper does the reporting.
-unsafe fn eval_core(core: *mut WebView2, token: u64, js: &str) {
+unsafe fn eval_core(core: *mut WebView2, token: u64, js: &str, raw: bool) {
+    let serialize = if raw {
+        "(__v === undefined || __v === null) ? \"\" : String(__v)"
+    } else {
+        "JSON.stringify(__v)"
+    };
     let wrapped = format!(
         "(function() {{ try {{ \
            var __v = (function() {{ return ( {js} ); }})(); \
-           var __s = JSON.stringify(__v); \
+           var __s = {serialize}; \
            window.chrome.webview.postMessage(\
              \"eval\\t{token}\\tok\\t\" + (__s === undefined ? \"null\" : __s)); \
          }} catch (e) {{ \
@@ -1988,12 +2273,7 @@ unsafe fn eval_core(core: *mut WebView2, token: u64, js: &str) {
              \"eval\\t{token}\\terr\\t\" + String(e)); \
          }} }})();"
     );
-    let wrapped = wide(&wrapped);
-    let completed = handler2(IID_EXECUTE_SCRIPT, |_hr, _json| 0);
-    unsafe {
-        let _ = ((*(*core).vtbl).execute_script)(core, wrapped.as_ptr(), completed);
-        com_release(completed);
-    }
+    unsafe { run_script(core, &wrapped) }
 }
 
 /// `COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG`.
@@ -2151,9 +2431,44 @@ pub(crate) fn update(path: &str, spec: &HostSpec) {
             }
         });
     }
-    unsafe {
-        if source_of(step.core) != *copied.url {
-            navigate_core(step.core, &copied.url);
+    match &copied.document {
+        Some(document) => {
+            // the same letter never reloads; a changed one always does
+            let stale = VIEWS.with(|views| {
+                let mut views = views.borrow_mut();
+                let Some(Mount::Live(live)) = views.get_mut(path).map(|slot| &mut slot.state)
+                else {
+                    return false;
+                };
+                if live.letter.as_ref().is_some_and(|letter| letter.digest == document.digest) {
+                    return false;
+                }
+                live.letter = Some(Letter {
+                    digest: document.digest,
+                    expected: true,
+                    focus: document.focus,
+                });
+                true
+            });
+            if stale {
+                unsafe { load_document(step.core, path, document) };
+            }
+        }
+        None => {
+            // a view that goes from a document back to a url closes
+            // the letter: the page follows its own links again
+            VIEWS.with(|views| {
+                if let Some(Mount::Live(live)) =
+                    views.borrow_mut().get_mut(path).map(|slot| &mut slot.state)
+                {
+                    live.letter = None;
+                }
+            });
+            unsafe {
+                if source_of(step.core) != *copied.url {
+                    navigate_core(step.core, &copied.url);
+                }
+            }
         }
     }
 }
@@ -2312,10 +2627,10 @@ pub(crate) fn forward(path: &str) {
 
 /// `Ok` = asked (or queued); `Err` = answer the token NOW with this
 /// sentence — the drain speaks it so no token is ever silenced.
-pub(crate) fn eval(path: &str, token: u64, js: &str) -> Result<(), String> {
+pub(crate) fn eval(path: &str, token: u64, js: &str, raw: bool) -> Result<(), String> {
     let js: Rc<str> = Rc::from(js);
-    match ask(path, Queued::Eval { token, js: Rc::clone(&js) }) {
-        Asked::Live(core) => unsafe { eval_core(core, token, &js) },
+    match ask(path, Queued::Eval { token, js: Rc::clone(&js), raw }) {
+        Asked::Live(core) => unsafe { eval_core(core, token, &js, raw) },
         Asked::Refused(why) => return Err(why.to_string()),
         Asked::Unknown => return Err(String::from("the webview is not mounted")),
         Asked::Queued => {}
@@ -2350,6 +2665,21 @@ pub(crate) fn snapshot(path: &str, token: u64) -> Result<(), String> {
 /// procedure, and a key the page declines stays declined (a child of
 /// another process does not bubble; the one road back is the
 /// accelerator, which a synthetic event never rides).
+/// One editing action on the document — spent now on a standing
+/// engine (with its controller, for the keyboard), parked while the
+/// mount assembles, dropped for a mount that never came: the door is
+/// fire-and-forget, and there is no answer to refuse in.
+pub(crate) fn edit(path: &str, action: &EditorAction) {
+    let controller = VIEWS.with(|views| match views.borrow().get(path).map(|slot| &slot.state) {
+        Some(Mount::Live(live)) => Some(live.controller),
+        _ => None,
+    });
+    let asked = ask(path, Queued::Edit(action.clone()));
+    if let (Asked::Live(core), Some(controller)) = (asked, controller) {
+        unsafe { edit_core(controller, core, action) };
+    }
+}
+
 pub(crate) fn input(path: &str, event: &WebviewInput) {
     if let Asked::Live(core) = ask(path, Queued::Input(event.clone())) {
         unsafe { send_input(core, event) }
@@ -3000,6 +3330,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<SettingsVtbl>(), 21 * slot);
         assert_eq!(std::mem::size_of::<MessageArgsVtbl>(), 6 * slot);
         assert_eq!(std::mem::size_of::<NavStartingArgsVtbl>(), 10 * slot);
+        assert_eq!(std::mem::size_of::<NewWindowArgsVtbl>(), 11 * slot);
         assert_eq!(std::mem::size_of::<ContentLoadingArgsVtbl>(), 5 * slot);
         assert_eq!(std::mem::size_of::<NavCompletedArgsVtbl>(), 6 * slot);
         assert_eq!(std::mem::size_of::<DevToolsReceiverVtbl>(), 5 * slot);

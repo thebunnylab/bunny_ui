@@ -312,8 +312,24 @@ pub struct Edges {
 }
 
 impl Edges {
+    /// No inset on any edge.
+    pub const ZERO: Edges = Edges { top: 0.0, trailing: 0.0, bottom: 0.0, leading: 0.0 };
+
     pub fn uniform(amount: Px) -> Self {
         Edges { top: amount, trailing: amount, bottom: amount, leading: amount }
+    }
+
+    /// The rect inside these insets — leading is the left edge (no
+    /// right-to-left flip yet). An inset larger than the rect answers a
+    /// zero side, never a negative one.
+    pub fn inset(self, rect: Rect) -> Rect {
+        Rect {
+            origin: Point { x: rect.origin.x + self.leading, y: rect.origin.y + self.top },
+            size: Size {
+                width: (rect.size.width - self.horizontal()).max(0.0),
+                height: (rect.size.height - self.vertical()).max(0.0),
+            },
+        }
     }
 
     fn horizontal(&self) -> Px {
@@ -543,6 +559,13 @@ pub enum LayoutNode {
     },
     /// `.frame(maxWidth:maxHeight:)` — `∞` = "fill what was proposed".
     MaxFrame { max_width: Px, max_height: Px, align: CrossAlign, child: Box<LayoutNode> },
+    /// A flexible box with a floor: it fills what it is proposed, never
+    /// less than the floor — and unproposed on an axis it IS the floor,
+    /// not its content, which is what lets a table's lane stay one width
+    /// on every row under a sideways scroll (proposed nothing) and still
+    /// share a pane that is wider. A floor of zero hugs the content on
+    /// that axis.
+    FlexFrame { min_width: Px, min_height: Px, align: CrossAlign, child: Box<LayoutNode> },
     /// Vertical scroll region: answers what it was offered, measures the
     /// content without restriction and keeps the excess to itself (the
     /// shrink contract). `path` is the region's structural identity — the
@@ -751,6 +774,15 @@ pub enum LayoutNode {
     /// title bar on a chrome-less window. Transparent to geometry;
     /// shells without windows ignore it honestly.
     DragRegion { child: Box<LayoutNode> },
+    /// `.ignores_safe_area()`: the child reclaims the safe-area bands
+    /// its frame touches. The ROOT lays out inside the window's safe
+    /// area (a phone's notch, its home indicator, the keyboard); a
+    /// subtree wearing this grows back out to the window's edge on
+    /// every side where it already meets the safe area's edge — the
+    /// root reclaims the whole window, a header at the top reclaims the
+    /// band above it. Transparent to geometry when there is no inset,
+    /// which is every desktop and every headless test.
+    IgnoresSafeArea { child: Box<LayoutNode> },
     /// `.window_control(…)`: the child IS one of the window's own
     /// buttons on a scene-drawn title bar. The region wins by design —
     /// the platform activates it, so a press never reaches the scene.
@@ -2010,15 +2042,20 @@ pub enum DialogChrome {
 }
 
 /// What the shell needs to raise a dialog's window: the title, who
-/// draws its top edge, and the smallest content it may shrink to —
-/// which is also the size it OPENS at, centered over the parent.
-/// Where the user then drags or resizes it to is the shell's to
-/// report back (`Runtime::set_dialog_frame`); layout follows the
-/// window, never the other way around.
+/// draws its top edge, the smallest content it may shrink to, and the
+/// size it OPENS at, centered over the parent — the floor unless
+/// [`DialogSpec::opens_at`] says otherwise. Where the user then drags
+/// or resizes it to is the shell's to report back
+/// (`Runtime::set_dialog_frame`); layout follows the window, never the
+/// other way around.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DialogSpec {
     pub title: Arc<str>,
     pub min: Size,
+    /// The size the dialog opens at, when it is not the floor. Read it
+    /// through [`DialogSpec::opening_size`], which never answers under
+    /// the floor.
+    pub open: Option<Size>,
     pub chrome: DialogChrome,
 }
 
@@ -2029,15 +2066,34 @@ impl DialogSpec {
         Self {
             title: title.into(),
             min: Size { width: 320.0, height: 240.0 },
+            open: None,
             chrome: DialogChrome::Native,
         }
     }
 
-    /// The smallest content the window may shrink to — and the size
-    /// the dialog opens at.
+    /// The smallest content the window may shrink to — and, unless
+    /// [`DialogSpec::opens_at`] says otherwise, the size it opens at.
     pub fn min_size(mut self, width: Px, height: Px) -> Self {
         self.min = Size { width, height };
         self
+    }
+
+    /// The size the dialog opens at, over the floor: a window designed
+    /// at 1220×820 that may still be dragged down to 720×480. A size
+    /// under the floor opens at the floor.
+    pub fn opens_at(mut self, width: Px, height: Px) -> Self {
+        self.open = Some(Size { width, height });
+        self
+    }
+
+    /// The size the dialog opens at — the floor, or what `opens_at`
+    /// said, whichever is larger on each axis.
+    #[must_use]
+    pub fn opening_size(&self) -> Size {
+        self.open.map_or(self.min, |open| Size {
+            width: open.width.max(self.min.width),
+            height: open.height.max(self.min.height),
+        })
     }
 
     /// The content owns the top edge ([`DialogChrome::Scene`]): no
@@ -2365,6 +2421,10 @@ pub struct Placement {
     /// runtime re-runs the pass collected — an island's birth costs
     /// one extra walk; a steady frame costs none.
     saw_island: bool,
+    /// The window and its safe area, when the pass has insets at all —
+    /// `None` on every desktop, so the zero-inset walk is today's walk
+    /// byte for byte. [`LayoutNode::IgnoresSafeArea`] reads it.
+    pub(crate) safe: Option<SafeFrame>,
     pub hits: Vec<(String, Rect)>,
     pub scrolls: Vec<ScrollRegion>,
     pub fields: Vec<FieldPlacement>,
@@ -2672,14 +2732,75 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
 
 /// Runs both phases with the frame's environment.
 pub fn layout_with(root: &LayoutNode, proposal: Proposal, env: LayoutEnv) -> LayoutResult {
-    let (size, fit) = root.measure(proposal, env);
+    layout_with_insets(root, proposal, env, Edges::ZERO)
+}
+
+/// The window and the rect inside its safe area, for one pass.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct SafeFrame {
+    pub(crate) window: Rect,
+    pub(crate) safe: Rect,
+}
+
+impl SafeFrame {
+    /// The frame grown back out to the window on every side where it
+    /// meets the safe area's edge — the rule of `.ignores_safe_area()`.
+    fn reclaim(self, frame: Rect) -> Rect {
+        let touches = |a: Px, b: Px| (a - b).abs() < 0.5;
+        let (left, top) = (frame.origin.x, frame.origin.y);
+        let (right, bottom) = (left + frame.size.width, top + frame.size.height);
+        let (safe_left, safe_top) = (self.safe.origin.x, self.safe.origin.y);
+        let safe_right = safe_left + self.safe.size.width;
+        let safe_bottom = safe_top + self.safe.size.height;
+        let (window_left, window_top) = (self.window.origin.x, self.window.origin.y);
+        let window_right = window_left + self.window.size.width;
+        let window_bottom = window_top + self.window.size.height;
+        let left = if touches(left, safe_left) { window_left } else { left };
+        let top = if touches(top, safe_top) { window_top } else { top };
+        let right = if touches(right, safe_right) { window_right } else { right };
+        let bottom = if touches(bottom, safe_bottom) { window_bottom } else { bottom };
+        Rect {
+            origin: Point { x: left, y: top },
+            size: Size { width: (right - left).max(0.0), height: (bottom - top).max(0.0) },
+        }
+    }
+}
+
+/// Both phases, with the window's insets: the root lays out INSIDE the
+/// safe area — the proposal shrinks by the insets and the placement
+/// starts at their corner — and every table the pass records stays in
+/// window coordinates, so a hit-test needs no translation. Overlays
+/// position inside the safe rect too. With [`Edges::ZERO`] this is
+/// [`layout_with`], byte for byte.
+pub fn layout_with_insets(
+    root: &LayoutNode,
+    proposal: Proposal,
+    env: LayoutEnv,
+    insets: Edges,
+) -> LayoutResult {
+    let inner = Proposal {
+        width: proposal.width.map(|width| (width - insets.horizontal()).max(0.0)),
+        height: proposal.height.map(|height| (height - insets.vertical()).max(0.0)),
+    };
+    let (size, fit) = root.measure(inner, env);
+    let safe = Rect { origin: Point { x: insets.leading, y: insets.top }, size };
+    // the window: the proposal where it was proposed, the root's answer
+    // plus the insets where it was open
+    let window = Rect {
+        origin: Point::default(),
+        size: Size {
+            width: proposal.width.unwrap_or(size.width + insets.horizontal()),
+            height: proposal.height.unwrap_or(size.height + insets.vertical()),
+        },
+    };
     let mut out = Placement::default();
-    root.place(Rect { origin: Point::default(), size }, fit, env, &mut out);
+    out.safe = (insets != Edges::ZERO).then_some(SafeFrame { window, safe });
+    root.place(safe, fit, env, &mut out);
     // popovers place AFTER the root: painted on top, hit first, free
-    // of every scroll clip. Their default container is the WINDOW (the
-    // proposal), never the root's answer — a small scene must not
-    // shrink the room a popover positions in.
-    place_overlays(window_bounds(proposal, size), env, &mut out);
+    // of every scroll clip. Their default container is the WINDOW's
+    // safe rect (the proposal), never the root's answer — a small scene
+    // must not shrink the room a popover positions in.
+    place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, env, &mut out);
     LayoutResult {
         size,
         frames: out.frames,
@@ -3118,7 +3239,8 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
         // a dialog rides the frame its WINDOW is at: the shell holds
         // it (`Runtime::set_dialog_frame`) and the user drags, resizes
         // or zooms it there. On the first open nothing is held and it
-        // centres at its minimum, exactly the sheet it degrades to on
+        // centres at its opening size — the floor, unless the spec
+        // names a larger one — exactly the sheet it degrades to on
         // shells without windows. Its content is measured with the
         // frame's OWN proposal — the window drives, the content
         // follows — never the other way around.
@@ -3135,19 +3257,22 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
                             height: frame.size.height.max(spec.min.height),
                         },
                     },
-                    None => Rect {
-                        origin: Point {
-                            x: room.origin.x
-                                + align_offset(room.size.width, spec.min.width, CrossAlign::Center),
-                            y: room.origin.y
-                                + align_offset(
-                                    room.size.height,
-                                    spec.min.height,
-                                    CrossAlign::Center,
-                                ),
-                        },
-                        size: spec.min,
-                    },
+                    None => {
+                        let open = spec.opening_size();
+                        Rect {
+                            origin: Point {
+                                x: room.origin.x
+                                    + align_offset(room.size.width, open.width, CrossAlign::Center),
+                                y: room.origin.y
+                                    + align_offset(
+                                        room.size.height,
+                                        open.height,
+                                        CrossAlign::Center,
+                                    ),
+                            },
+                            size: open,
+                        }
+                    }
                 })
             }
             _ => None,
@@ -3352,6 +3477,8 @@ impl LayoutNode {
                     max_height.is_infinite() || child.is_flexible(axis, enclosing_main)
                 }
             },
+            // it fills what it is proposed — flexible by definition
+            LayoutNode::FlexFrame { .. } => true,
             LayoutNode::Frame { width, height, child, .. } => match axis {
                 Axis::Horizontal => width.is_none() && child.is_flexible(axis, enclosing_main),
                 Axis::Vertical => height.is_none() && child.is_flexible(axis, enclosing_main),
@@ -3369,6 +3496,7 @@ impl LayoutNode {
             | LayoutNode::Sheet { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
+            | LayoutNode::IgnoresSafeArea { child }
             | LayoutNode::ControlRegion { child, .. }
             | LayoutNode::Tooltip { child, .. }
             | LayoutNode::ContextSource { child, .. }
@@ -3446,6 +3574,7 @@ impl LayoutNode {
             | LayoutNode::Sheet { child, .. }
             | LayoutNode::Anchored { child, .. }
             | LayoutNode::DragRegion { child }
+            | LayoutNode::IgnoresSafeArea { child }
             | LayoutNode::ControlRegion { child, .. }
             | LayoutNode::Tooltip { child, .. }
             | LayoutNode::ContextSource { child, .. }
@@ -3453,6 +3582,7 @@ impl LayoutNode {
             | LayoutNode::DropTarget { child, .. }
             | LayoutNode::Hinted { child, .. }
             | LayoutNode::Frame { child, .. }
+            | LayoutNode::FlexFrame { child, .. }
             | LayoutNode::Hug { child, .. } => child.first_baseline(env),
             // lane A leads the seam — its text sets the shared line
             LayoutNode::Split { children, .. } => {
@@ -3605,6 +3735,11 @@ impl LayoutNode {
             }
 
             LayoutNode::DragRegion { child } => {
+                let (size, fit) = child.measure(proposal, env);
+                (size, Fit::Wrapped(size, Box::new(fit)))
+            }
+
+            LayoutNode::IgnoresSafeArea { child } => {
                 let (size, fit) = child.measure(proposal, env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
@@ -3804,6 +3939,26 @@ impl LayoutNode {
                 (size, Fit::Wrapped(child_size, Box::new(fit)))
             }
 
+            LayoutNode::FlexFrame { min_width, min_height, child, .. } => {
+                // proposed: the proposal, floored; unproposed: the floor
+                // itself — a zero floor hugs the content on that axis
+                let floor = |proposed: Option<Px>, min: Px| match proposed {
+                    Some(length) => Some(length.max(min)),
+                    None if min > 0.0 => Some(min),
+                    None => None,
+                };
+                let offer = Proposal {
+                    width: floor(proposal.width, *min_width),
+                    height: floor(proposal.height, *min_height),
+                };
+                let (child_size, fit) = child.measure(offer, env);
+                let size = Size {
+                    width: offer.width.unwrap_or(child_size.width),
+                    height: offer.height.unwrap_or(child_size.height),
+                };
+                (size, Fit::Wrapped(child_size, Box::new(fit)))
+            }
+
             LayoutNode::Hug { axis, child } => {
                 let vertical = matches!(axis, Axis::Vertical);
                 let (child_size, fit) = child.measure(
@@ -3844,6 +3999,24 @@ impl LayoutNode {
                 let size = Size {
                     width: proposal.width.unwrap_or(content.width),
                     height: proposal.height.unwrap_or(content.height),
+                };
+                // Filling re-measures a SHORTER content at the region on
+                // the axes it travels, so flexible content lays itself out
+                // across the glass instead of merely being placed under it:
+                // a table's lanes share a wide pane, and under a narrow one
+                // they keep their floors and travel.
+                let (content, fit) = if *fill
+                    && ((axes.horizontal() && content.width < size.width)
+                        || (axes.vertical() && content.height < size.height))
+                {
+                    let again = Proposal {
+                        width: if axes.horizontal() { Some(content.width.max(size.width)) } else { proposal.width },
+                        height: if axes.vertical() { Some(content.height.max(size.height)) } else { proposal.height },
+                    };
+                    let (grown, fit) = child.measure(again, env);
+                    (Size { width: grown.width.max(content.width), height: grown.height.max(content.height) }, fit)
+                } else {
+                    (content, fit)
                 };
                 // The lane the child is PLACED in, which is not always the
                 // extent it answered — the same asymmetry a split's lanes
@@ -4496,6 +4669,25 @@ impl LayoutNode {
                 child.place(frame, *fit, env, out);
             }
 
+            (LayoutNode::IgnoresSafeArea { child }, Fit::Wrapped(_, fit)) => {
+                let Some(safe) = out.safe else {
+                    // no inset anywhere: the node is glass
+                    child.place(frame, *fit, env, out);
+                    return;
+                };
+                let grown = safe.reclaim(frame);
+                if grown == frame {
+                    child.place(frame, *fit, env, out);
+                    return;
+                }
+                // the child is measured once more, at the size it
+                // reclaimed; nothing below it reclaims again
+                let (_, fit) = child.measure(Proposal::exact(grown.size), env);
+                let kept = out.safe.take();
+                child.place(grown, fit, env, out);
+                out.safe = kept;
+            }
+
             (LayoutNode::DragRegion { child }, Fit::Wrapped(_, fit)) => {
                 child.place(frame, *fit, env, out);
                 // clipped like a hit: what is not visible cannot drag
@@ -4882,7 +5074,8 @@ impl LayoutNode {
                 child.place(frame, *fit, env, out);
             }
 
-            (LayoutNode::MaxFrame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
+            (LayoutNode::MaxFrame { align, child, .. }, Fit::Wrapped(child_size, fit))
+            | (LayoutNode::FlexFrame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
                 let x = frame.origin.x
                     + align_offset(frame.size.width, child_size.width, *align);
                 let y = frame.origin.y
@@ -6983,6 +7176,69 @@ mod tests {
     }
 
     #[test]
+    fn a_flex_frame_fills_the_proposal_and_stands_at_its_floor_unproposed() {
+        let lane = LayoutNode::FlexFrame {
+            min_width: 150.0,
+            min_height: 0.0,
+            align: CrossAlign::Start,
+            child: Box::new(text(5)),
+        };
+        let wide = measure_with_defaults(&lane, Proposal { width: Some(300.0), height: Some(50.0) });
+        assert_eq!(wide.width, 300.0, "fills what is proposed");
+        let narrow = measure_with_defaults(&lane, Proposal { width: Some(100.0), height: Some(50.0) });
+        assert_eq!(narrow.width, 150.0, "never below the floor");
+        let open = measure_with_defaults(&lane, Proposal { width: None, height: None });
+        assert_eq!(open.width, 150.0, "unproposed, it IS the floor — not its content");
+        assert_eq!(open.height, LINE_H, "a zero floor hugs the content on that axis");
+    }
+
+    #[test]
+    fn a_filling_region_lays_its_content_out_at_the_region() {
+        let engine = PixelFont;
+        let images = RawImages::default();
+        let cache = MeasureCache::default();
+        let offsets = HashMap::default();
+        let interaction = Interaction::default();
+        let carets = HashMap::default();
+        let env = || LayoutEnv {
+            text: &engine,
+            images: &images,
+            cache: &cache,
+            scroll_offsets: &offsets,
+            font: FontSpec::DEFAULT,
+            line_height: None,
+            text_align: None,
+            stamp: FrameStamp::idle(&interaction, &carets),
+            animator: None,
+            anim: None,
+            live: None,
+            overlay_bounds: None,
+            dialog_frames: None,
+            scale: 1.0,
+        };
+        let region = |width: Px| LayoutNode::Scroll {
+            commanded: None,
+            axes: crate::layout::ScrollAxes::Horizontal,
+            fill: true,
+            path: Some("table".to_string()),
+            target: None,
+            child: Box::new(LayoutNode::FlexFrame {
+                min_width: 100.0,
+                min_height: 0.0,
+                align: CrossAlign::Start,
+                child: Box::new(text(5)),
+            }),
+        }
+        .measure(Proposal { width: Some(width), height: Some(50.0) }, env());
+        let (_, fit) = region(300.0);
+        let Fit::ScrollContent(content, _) = fit else { panic!("a region's fit") };
+        assert_eq!(content.width, 300.0, "the content was laid out AT the region, not merely placed under it");
+        let (_, fit) = region(60.0);
+        let Fit::ScrollContent(content, _) = fit else { panic!("a region's fit") };
+        assert_eq!(content.width, 100.0, "narrower than the floor, the content keeps its floor and travels");
+    }
+
+    #[test]
     fn text_wraps_against_the_proposed_width() {
         let size =
             measure_with_defaults(&text(100), Proposal { width: Some(100.0), height: None });
@@ -7138,6 +7394,7 @@ mod tests {
         LayoutNode::Host {
             path: path.into(),
             spec: crate::host::HostSpec::Webview {
+                document: None,
                 url: "https://example.test/".into(),
                 scripts: Vec::new().into(),
                 console: false,

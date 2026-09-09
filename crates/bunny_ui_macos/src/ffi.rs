@@ -23,43 +23,19 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
 use std::sync::Once;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
-pub type Id = *mut c_void;
-pub type Sel = *const c_void;
-
-/// `NSRange` — (location, length) in UTF-16 units, the vocabulary of the
-/// input system.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct NSRange {
-    pub location: u64,
-    pub length: u64,
-}
-
-/// `NSNotFound` (NSIntegerMax) — AppKit's "no range".
-pub const NS_NOT_FOUND: u64 = i64::MAX as u64;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct CGPoint {
-    pub x: f64,
-    pub y: f64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct CGSize {
-    pub width: f64,
-    pub height: f64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct CGRect {
-    pub origin: CGPoint,
-    pub size: CGSize,
-}
+// The Objective-C vocabulary both Apple shells speak — types, the
+// runtime, the CoreFoundation wake source — lives in the shared half;
+// this shell re-exports it under its own `ffi` so every module keeps
+// one path to it.
+pub(crate) use bunny_ui_apple::ffi::{
+    CFRelease, CGColorSpaceCreateDeviceRGB, CGColorSpaceRelease, CGContextDrawImage,
+    CGContextSetInterpolationQuality, CGImageRelease, CGPoint, CGRect, CGSize, Id, NS_NOT_FOUND,
+    NSRange, NSRunLoopCommonModes, ObjcSuper, Sel, class, class_addMethod, class_addProtocol,
+    kill_layer_actions, modifiers_of, objc_allocateClassPair, objc_autoreleasePoolPop,
+    objc_autoreleasePoolPush, objc_getProtocol, objc_registerClassPair, owned_provider, sel,
+    sel_getName, text_argument_to_string, wake_from_any_thread,
+};
 
 // Re-declaring `objc_msgSend` with the concrete signature of each message
 // is the runtime's designed usage (the symbol is a trampoline that
@@ -67,17 +43,6 @@ pub struct CGRect {
 #[allow(clashing_extern_declarations)]
 #[link(name = "objc", kind = "dylib")]
 unsafe extern "C" {
-    fn objc_getClass(name: *const c_char) -> Id;
-    fn sel_registerName(name: *const c_char) -> Sel;
-    fn objc_autoreleasePoolPush() -> *mut c_void;
-    fn objc_autoreleasePoolPop(pool: *mut c_void);
-    fn objc_allocateClassPair(superclass: Id, name: *const c_char, extra: usize) -> Id;
-    fn objc_registerClassPair(class: Id);
-    fn class_addMethod(class: Id, sel: Sel, imp: *const c_void, types: *const c_char) -> i8;
-    fn objc_getProtocol(name: *const c_char) -> Id;
-    fn class_addProtocol(class: Id, protocol: Id) -> i8;
-    fn sel_getName(sel: Sel) -> *const c_char;
-
     #[link_name = "objc_msgSend"]
     fn msg_id(obj: Id, sel: Sel) -> Id;
     #[link_name = "objc_msgSend"]
@@ -160,36 +125,21 @@ unsafe extern "C" {
     fn msg_void_size(obj: Id, sel: Sel, size: CGSize);
 }
 
-// AppKit/QuartzCore come in via the ObjC runtime; the link guarantees the
-// classes.
+// AppKit comes in via the ObjC runtime; the link guarantees the classes.
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {
     /// The pasteboard string type (`public.utf8-plain-text`).
     static NSPasteboardTypeString: Id;
 }
-#[link(name = "Foundation", kind = "framework")]
-unsafe extern "C" {
-    /// The run-loop mode set that keeps a callback alive during event
-    /// tracking (live resize, menus) — the display link schedules here.
-    static NSRunLoopCommonModes: Id;
-}
-#[link(name = "QuartzCore", kind = "framework")]
-unsafe extern "C" {}
-
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
-    pub(crate) fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
-    pub(crate) fn CGColorSpaceRelease(space: *mut c_void);
     fn CGDataProviderCreateWithData(
         info: *mut c_void,
         data: *const u8,
         size: usize,
         release: *const c_void,
     ) -> *mut c_void;
-    fn CGDataProviderCreateWithCFData(data: *const c_void) -> *mut c_void;
     fn CGDataProviderRelease(provider: *mut c_void);
-    pub(crate) fn CGContextDrawImage(context: Id, rect: CGRect, image: Id);
-    pub(crate) fn CGContextSetInterpolationQuality(context: Id, quality: i32);
     fn CGContextSaveGState(context: Id);
     fn CGContextRestoreGState(context: Id);
     #[allow(clippy::too_many_arguments)]
@@ -206,49 +156,10 @@ unsafe extern "C" {
         should_interpolate: bool,
         intent: i32,
     ) -> Id;
-    pub(crate) fn CGImageRelease(image: Id);
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
-    pub(crate) fn CFRelease(cf: *const c_void);
-    fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
-    fn CFRunLoopGetMain() -> Id;
-    fn CFRunLoopSourceCreate(
-        allocator: Id,
-        order: isize,
-        context: *mut CFRunLoopSourceContext,
-    ) -> Id;
-    fn CFRunLoopAddSource(loop_: Id, source: Id, mode: Id);
-    fn CFRunLoopSourceSignal(source: Id);
-    fn CFRunLoopWakeUp(loop_: Id);
-    static kCFRunLoopCommonModes: Id;
-}
-
-/// The version-0 source context. Only `perform` matters here: the
-/// source carries no state of its own, so every other hook stays null.
-#[repr(C)]
-struct CFRunLoopSourceContext {
-    version: isize,
-    info: *mut c_void,
-    retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
-    release: Option<extern "C" fn(*const c_void)>,
-    copy_description: Option<extern "C" fn(*const c_void) -> Id>,
-    equal: Option<extern "C" fn(*const c_void, *const c_void) -> u8>,
-    hash: Option<extern "C" fn(*const c_void) -> usize>,
-    schedule: Option<extern "C" fn(*mut c_void, Id, Id)>,
-    cancel: Option<extern "C" fn(*mut c_void, Id, Id)>,
-    perform: Option<extern "C" fn(*mut c_void)>,
-}
-
-pub(crate) unsafe fn class(name: &str) -> Id {
-    let name = CString::new(name).expect("class name without NUL");
-    unsafe { objc_getClass(name.as_ptr()) }
-}
-
-pub(crate) unsafe fn sel(name: &str) -> Sel {
-    let name = CString::new(name).expect("selector without NUL");
-    unsafe { sel_registerName(name.as_ptr()) }
 }
 
 // MARK: - Events
@@ -273,6 +184,9 @@ pub enum AppEvent {
     /// momentum; the legacy wheel is converted from lines to points on
     /// arrival).
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
+    /// The trackpad's pinch over the view: `scale` is the ratio of this
+    /// step (1.0 = nothing), at the pointer.
+    Magnify { x: f64, y: f64, scale: f64 },
     /// RAW key — only arrives here when the focused field is NOT in the
     /// path (no focus, or cmd held): shortcuts and function keys. With
     /// focus, the event enters the input system (`interpretKeyEvents:`)
@@ -562,55 +476,16 @@ pub fn dispatch(event: AppEvent) {
     dispatch_from(owning_window(key), event);
 }
 
-/// The run loop source a background thread knocks on. It lives in a
-/// static (not a thread-local) because the signal comes from ANY
-/// thread — `CFRunLoopSourceSignal` and `CFRunLoopWakeUp` are the
-/// thread-safe half of CoreFoundation.
-static WAKE_SOURCE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-
+/// A knock from another thread lands here, on the main thread, as one
+/// more beat for every window.
 extern "C" fn perform_wake(_info: *mut c_void) {
     dispatch_all(AppEvent::Wake);
 }
 
-/// Opens that door. Called once, on the main thread, while the window
-/// is being built.
+/// Opens the run-loop door a background thread knocks on. Called once,
+/// on the main thread, while the window is being built.
 pub fn install_wake_source() {
-    if !WAKE_SOURCE.load(Ordering::SeqCst).is_null() {
-        return;
-    }
-    unsafe {
-        let mut context = CFRunLoopSourceContext {
-            version: 0,
-            info: std::ptr::null_mut(),
-            retain: None,
-            release: None,
-            copy_description: None,
-            equal: None,
-            hash: None,
-            schedule: None,
-            cancel: None,
-            perform: Some(perform_wake),
-        };
-        let source = CFRunLoopSourceCreate(std::ptr::null_mut(), 0, &mut context);
-        // COMMON modes: a live resize or a tracking loop must not
-        // silence a task that just landed
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
-        WAKE_SOURCE.store(source, Ordering::SeqCst);
-    }
-}
-
-/// Asks the main run loop for one more turn. Safe from any thread, and
-/// never re-entrant: a signal raised DURING a frame lands on the next
-/// turn instead of nesting inside this one.
-pub fn wake_from_any_thread() {
-    let source = WAKE_SOURCE.load(Ordering::SeqCst);
-    if source.is_null() {
-        return;
-    }
-    unsafe {
-        CFRunLoopSourceSignal(source);
-        CFRunLoopWakeUp(CFRunLoopGetMain());
-    }
+    bunny_ui_apple::ffi::install_wake_source(perform_wake);
 }
 
 thread_local! {
@@ -651,17 +526,6 @@ pub fn set_drag_gate(gate: Box<dyn Fn(f64, f64) -> bool>) {
 extern "C" fn bunny_right_mouse_down(this: Id, _sel: Sel, event: Id) {
     let (x, y) = unsafe { event_layout_point(this, event) };
     dispatch(AppEvent::RightMouseDown { x, y });
-}
-
-/// The four the keymap names, out of one AppKit bitfield — the same
-/// bits the key road reads, in one place so the two cannot drift.
-fn modifiers_of(flags: u64) -> bunny_ui::action::Modifiers {
-    bunny_ui::action::Modifiers {
-        shift: flags & (1 << 17) != 0,
-        control: flags & (1 << 18) != 0,
-        option: flags & (1 << 19) != 0,
-        command: flags & (1 << 20) != 0,
-    }
 }
 
 extern "C" fn bunny_mouse_down(this: Id, _sel: Sel, event: Id) {
@@ -807,25 +671,6 @@ pub fn sync_ime(state: Option<(std::rc::Rc<str>, NSRange, Option<NSRange>, CGRec
 
 fn ime_mirror() -> Option<ImeMirror> {
     IME.with(|ime| ime.borrow().clone())
-}
-
-/// NSString OR NSAttributedString → Rust (the input system sends both).
-unsafe fn text_argument_to_string(object: Id) -> String {
-    unsafe {
-        if object.is_null() {
-            return String::new();
-        }
-        let plain = if msg_bool_sel(object, sel("respondsToSelector:"), sel("string")) != 0 {
-            msg_id(object, sel("string"))
-        } else {
-            object
-        };
-        let utf8 = msg_id(plain, sel("UTF8String")) as *const c_char;
-        if utf8.is_null() {
-            return String::new();
-        }
-        std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
-    }
 }
 
 extern "C" fn bunny_insert_text(_this: Id, _sel: Sel, string: Id, _replacement: NSRange) {
@@ -1014,14 +859,6 @@ unsafe fn typed_character(event: Id, flags: u64) -> Option<char> {
     }
 }
 
-/// The receiver-and-class pair `objc_msgSendSuper` walks up from —
-/// how an added method still reaches the implementation it shadowed.
-#[repr(C)]
-pub(crate) struct ObjcSuper {
-    receiver: Id,
-    class: Id,
-}
-
 /// NSView's own `performKeyEquivalent:` — the walk into the subviews
 /// this override would otherwise swallow (the page's ⌘C in a form
 /// lives down there).
@@ -1128,6 +965,17 @@ extern "C" fn bunny_scroll_wheel(this: Id, _sel: Sel, event: Id) {
     }
 }
 
+/// The trackpad pinch. AppKit hands `magnification` as the CHANGE of
+/// this step (0 = nothing, 0.5 = half again as far apart); the runtime
+/// speaks in ratios, so one is added here, once.
+extern "C" fn bunny_magnify(this: Id, _sel: Sel, event: Id) {
+    unsafe {
+        let (x, y) = event_layout_point(this, event);
+        let scale = 1.0 + msg_f64(event, sel("magnification"));
+        dispatch(AppEvent::Magnify { x, y, scale });
+    }
+}
+
 /// AppKit's word that a drag is about to move the window's frame. It
 /// comes before the first resized frame, and that is the point: the
 /// presenter arms its transaction here, so the whole drag runs under
@@ -1158,59 +1006,6 @@ extern "C" fn bunny_slow(_this: Id, _sel: Sel, _timer: Id) {
     // the step they were promised, with no wall clock in the path
     let dt = SLOW.with(|slot| slot.get().1);
     dispatch_all(AppEvent::Frame { dt });
-}
-
-/// A data provider that OWNS a copy of the bytes. A layer's contents
-/// are read by the render server AFTER the transaction closes: a
-/// provider that only borrows the shell's buffer paints a small image
-/// — the commit copies it inline — and silently paints NOTHING once
-/// the image is big enough to be mapped instead of copied. An
-/// island-sized segment was invisible while a toast-sized one showed,
-/// with identical calls. CFData owns the copy, the provider retains
-/// the CFData, the image retains the provider: the pixels stay
-/// truthful for as long as the layer shows them.
-unsafe fn owned_provider(bytes: *const u8, length: usize) -> *mut c_void {
-    unsafe {
-        let data = CFDataCreate(std::ptr::null(), bytes, length as isize);
-        let provider = CGDataProviderCreateWithCFData(data);
-        CFRelease(data);
-        provider
-    }
-}
-
-/// Removes CoreAnimation's implicit animations from a layer the shell
-/// created. AppKit turns them off for the backing layers IT makes; a
-/// layer handed to `setLayer:` — or added as a raw sublayer — keeps
-/// the default quarter-second actions, and the first abrupt step of a
-/// live resize then CROSSFADES the old content over the new: the
-/// whole window reads double-exposed until the animation lands, which
-/// no native window does. Per-mutation `setDisableActions:` cannot
-/// cover this — the resize mutates the layer from APPKIT's own
-/// transaction. The dictionary answers at the layer, for every
-/// transaction; NSNull is CoreAnimation's own word for "no action".
-pub(crate) unsafe fn kill_layer_actions(layer: Id) {
-    unsafe {
-        let null = msg_id(class("NSNull"), sel("null"));
-        let actions = msg_id(class("NSMutableDictionary"), sel("dictionary"));
-        for key in [
-            "bounds",
-            "position",
-            "frame",
-            "contents",
-            "contentsScale",
-            "hidden",
-            "sublayers",
-            "onOrderIn",
-            "onOrderOut",
-            "transform",
-        ] {
-            let key = CString::new(key).expect("action key");
-            let key =
-                msg_id_cstr(class("NSString"), sel("stringWithUTF8String:"), key.as_ptr());
-            msg_void_id_id(actions, sel("setObject:forKey:"), null, key);
-        }
-        msg_void_id(layer, sel("setActions:"), actions);
-    }
 }
 
 extern "C" fn bunny_window_did_resize(_this: Id, _sel: Sel, note: Id) {
@@ -1490,6 +1285,25 @@ extern "C" fn bunny_dialog_frame_changed(_this: Id, _sel: Sel, note: Id) {
     dispatch_to(window, AppEvent::Redraw);
 }
 
+/// The dialog's own word that a drag is starting — its presenter arms
+/// its transaction here, for the reason the main window's does
+/// ([`bunny_window_will_start_live_resize`]): the first resized frame
+/// has to already run under the contract.
+extern "C" fn bunny_dialog_will_start_live_resize(_this: Id, _sel: Sel, note: Id) {
+    let window = unsafe { msg_id(note, sel("object")) };
+    let view = unsafe { msg_id(window, sel("contentView")) };
+    crate::metal::arm_transaction_view(view, true);
+}
+
+/// The hand let go of a dialog: the contract comes off and one exact
+/// frame lands, like the main window's own end-of-drag.
+extern "C" fn bunny_dialog_did_end_live_resize(this: Id, sel_: Sel, note: Id) {
+    let window = unsafe { msg_id(note, sel("object")) };
+    let view = unsafe { msg_id(window, sel("contentView")) };
+    crate::metal::arm_transaction_view(view, false);
+    bunny_dialog_frame_changed(this, sel_, note);
+}
+
 /// Key travels on a dialog like on the main window — cmd-tab away
 /// pauses the decorations and closes the dialog's own popovers (the
 /// dialog itself stands: it is a window).
@@ -1695,6 +1509,12 @@ unsafe fn register_classes() {
             view,
             sel("scrollWheel:"),
             bunny_scroll_wheel as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            view,
+            sel("magnifyWithEvent:"),
+            bunny_magnify as *const c_void,
             types.as_ptr(),
         );
         class_addMethod(
@@ -1944,11 +1764,18 @@ unsafe fn register_classes() {
             bunny_dialog_frame_changed as *const c_void,
             types.as_ptr(),
         );
-        // the exact final frame, once the hand lets go
+        // the drag's two ends: the presenter's contract goes on before
+        // the first resized frame and comes off with the exact final one
+        class_addMethod(
+            dialog,
+            sel("windowWillStartLiveResize:"),
+            bunny_dialog_will_start_live_resize as *const c_void,
+            types.as_ptr(),
+        );
         class_addMethod(
             dialog,
             sel("windowDidEndLiveResize:"),
-            bunny_dialog_frame_changed as *const c_void,
+            bunny_dialog_did_end_live_resize as *const c_void,
             types.as_ptr(),
         );
         class_addMethod(
@@ -1978,6 +1805,11 @@ pub struct WindowHandle {
 }
 
 impl WindowHandle {
+    /// The content view — the key a grafted presenter is filed under.
+    pub(crate) fn view(&self) -> Id {
+        self.view
+    }
+
     /// Logical size of the content area (the layout viewport).
     pub fn content_size(&self) -> (f64, f64) {
         unsafe {
@@ -2507,19 +2339,6 @@ struct HostSlot {
 /// command is spent.
 pub(crate) fn host_child(key: &str) -> Option<Id> {
     HOST_VIEWS.with(|hosts| hosts.borrow().get(key).map(|slot| slot.child))
-}
-
-/// The key a tenant's view is mounted under — how a report that
-/// arrives holding the VIEW (a navigation, a posted message) finds
-/// its box's identity.
-pub(crate) fn host_key_of_child(child: Id) -> Option<String> {
-    HOST_VIEWS.with(|hosts| {
-        hosts
-            .borrow()
-            .iter()
-            .find(|(_, slot)| std::ptr::eq(slot.child, child))
-            .map(|(key, _)| key.clone())
-    })
 }
 
 /// One segment surface: the scene's commands that painted ABOVE a
@@ -3195,7 +3014,17 @@ pub fn create_dialog(
 
         let view = msg_id(class("BunnyView"), sel("alloc"));
         let view = msg_init_rect(view, sel("initWithFrame:"), rect);
-        // CPU present only: no metal graft, like the panels
+        // the GPU graft, BEFORE setWantsLayer: — the main window's own
+        // discipline. A dialog is a real window that the reader
+        // resizes, and a CPU raster of its whole content on every step
+        // of the drag is what made one lag its own corner. Refused or
+        // failed, the view stays on the CPU road (blit_partial).
+        let _ = crate::metal::try_install_view(
+            view,
+            msg_f64(parent.window, sel("backingScaleFactor")),
+            width,
+            height,
+        );
         msg_void_bool(view, sel("setWantsLayer:"), 1);
         msg_void_id(window, sel("setContentView:"), view);
 

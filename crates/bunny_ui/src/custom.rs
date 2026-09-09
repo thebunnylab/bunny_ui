@@ -139,6 +139,17 @@ pub trait CustomElement: 'static {
         false
     }
 
+    /// Does the box want the DRAG on a touch surface? `true` makes a
+    /// finger that lands on the box a press at once — `PointerDown`,
+    /// then `PointerMoved { pressed: true }` for every move — even
+    /// inside a scroll region: a sketch canvas, a map. The default is
+    /// `false`: a finger dragged over the box scrolls the region around
+    /// it, and a tap still reaches the box as a click. A mouse never
+    /// asks; only a finger has to choose.
+    fn takes_drag(&self) -> bool {
+        false
+    }
+
     /// Is the box taking TEXT right now? The default is yes — the
     /// answer a field gives, and the one a box that types wants.
     ///
@@ -698,6 +709,11 @@ pub enum ElementEvent {
     Cut,
     /// The box took the keyboard (or lost it).
     Focused(bool),
+    /// Two fingers (or a trackpad) changed their distance over the box:
+    /// `scale` is the RATIO of this step — 1.0 for none, 2.0 for twice
+    /// as far apart — at the point between them, in LOCAL coordinates.
+    /// A map zooms around `at`; ignore it and nothing else zooms.
+    Magnify { at: Point, scale: f64 },
 }
 
 /// What the platform's input system reads from a focused box.

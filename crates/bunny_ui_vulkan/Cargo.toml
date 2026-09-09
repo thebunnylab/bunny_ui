@@ -1,0 +1,8 @@
+[package]
+name = "bunny-ui-vulkan"
+version = "0.1.0"
+edition.workspace = true
+description = "bunny-ui Vulkan tier — the swapchain presenter and the offscreen oracle over a dlopen'd loader, shared by the Linux and Android shells"
+
+[dependencies]
+bunny-ui = { workspace = true, features = ["canvas", "gpu"] }

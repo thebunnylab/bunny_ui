@@ -46,6 +46,7 @@ pub mod effects;
 pub mod erased;
 pub mod ext;
 pub mod glass;
+pub mod app;
 pub mod host;
 pub mod icon;
 pub mod image_engine;
@@ -64,6 +65,7 @@ pub mod stats;
 pub mod text_engine;
 pub mod text_input;
 pub mod theme;
+pub mod touch;
 pub mod view;
 pub(crate) mod viewport;
 pub mod views;
@@ -112,6 +114,7 @@ pub mod task {
 pub mod prelude {
     pub use crate::action::{ActionId, Key, KeyPattern};
     pub use crate::anim::{FramePace, Loop, Spring, Ticked};
+    pub use crate::touch::{Gesture, TouchScene};
     pub use crate::custom::{
         Custom, CustomElement, ElementEvent, EventCtx, ImeContext, Metrics, PaintCtx, Painter,
         Response,
@@ -119,7 +122,9 @@ pub mod prelude {
     #[cfg(feature = "canvas")]
     pub use crate::custom::{canvas, custom};
     pub use crate::erased::{CustomModifier, Erased, erased};
-    pub use crate::host::{HostSpec, WebviewHandle, webview};
+    pub use crate::host::{
+        ColorScheme, EditorCommand, HostSpec, NetworkPolicy, WebviewHandle, webview, webview_html,
+    };
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
     pub use crate::icon::house as symbol;
@@ -128,8 +133,9 @@ pub mod prelude {
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
-        Color, CrossAlign, DialogChrome, DialogSpec, Fraction, Glass, Gradient, OverlaySurface,
-        Point, Proposal, Px, Rect, Rendering, Side, Size, Truncation, UnitPoint, VisualProps,
+        Color, CrossAlign, DialogChrome, DialogSpec, Edges, Fraction, Glass, Gradient,
+        OverlaySurface, Point, Proposal, Px, Rect, Rendering, Side, Size, Truncation, UnitPoint,
+        VisualProps,
     };
     pub use crate::theme::{self, Theme};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Tracking, Weight};
@@ -149,7 +155,7 @@ pub mod prelude {
     pub use motor::runtime::Site;
     pub use motor::state::{
         Binding, Context, Environment, EnvironmentValues, FromEnvironment, Locale, ProvidesQueries,
-        State,
+        SizeClass, State,
     };
     pub use motor::views::{
         ContentMode, Edge, Font, ListStyle, NavigationPath, ProgressViewStyle, Query,
@@ -6864,6 +6870,80 @@ mod tests {
         assert!(!runtime.webview_navigated("nobody/here", "x"), "no writer, no lie");
     }
 
+    /// An editable document rides its asks in the spec, its reports
+    /// reach the retained writers, and the handle's editor doors queue
+    /// as the ops the shell spends — the allowlist's script, and the
+    /// raw eval the html comes back through.
+    #[test]
+    fn an_editable_document_reports_and_is_commanded() {
+        use crate::host::{
+            ColorScheme, EditorAction, EditorCommand, HostSpec, NetworkPolicy, WebviewHandle,
+            WebviewOp, webview_html,
+        };
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Composer {
+            handle: WebviewHandle,
+            body: State<String>,
+            pasted: State<String>,
+        }
+        impl Component for Composer {
+            fn body(self, _ctx: &Context) -> impl View {
+                let (body, pasted) = (self.body, self.pasted);
+                webview_html("<p>dear</p>", "", NetworkPolicy::Deny)
+                    .editable()
+                    .focus_on_appear()
+                    .color_scheme(ColorScheme::Dark)
+                    .on_html_change(move |html| body.set(html.to_string()))
+                    .on_paste(move |html, text| pasted.set(format!("{html}|{text}")))
+                    .handle(&self.handle)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let composer = Composer {
+            handle: WebviewHandle::new(),
+            body: State::new(String::new()),
+            pasted: State::new(String::new()),
+        };
+        let _ = runtime
+            .settled_layout(&composer, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let hosts = runtime.hosts();
+        let path = hosts[0].path.clone();
+        let HostSpec::Webview { url, document, .. } = &hosts[0].spec;
+        assert_eq!(&**url, "about:blank", "a document never carries a url to fetch");
+        let document = document.as_ref().expect("the document rides");
+        assert!(document.editable && document.paste && document.focus);
+        assert_eq!(document.scheme, Some(ColorScheme::Dark));
+        assert!(document.sealed().contains("color-scheme:dark"));
+
+        assert!(runtime.webview_changed(&path, "<p>dear reader</p>"));
+        assert_eq!(composer.body.get(), "<p>dear reader</p>");
+        assert!(runtime.webview_pasted(&path, "<b>x</b>", "x"));
+        assert_eq!(composer.pasted.get(), "<b>x</b>|x");
+        assert!(!runtime.webview_changed("nobody/here", "x"), "no writer, no lie");
+
+        composer.handle.exec(EditorCommand::Bold);
+        composer.handle.exec_link("https://a.test/");
+        composer.handle.get_html(|_| {});
+        let ops = runtime.webview_commands();
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(
+            &ops[0],
+            WebviewOp::Edit { path: at, action: EditorAction::Exec(EditorCommand::Bold) }
+                if *at == path
+        ));
+        assert!(matches!(
+            &ops[1],
+            WebviewOp::Edit { action: EditorAction::Link(url), .. } if &**url == "https://a.test/"
+        ));
+        assert!(matches!(
+            &ops[2],
+            WebviewOp::Eval { raw: true, js, .. } if &**js == "document.body.innerHTML"
+        ));
+    }
+
     #[test]
     fn a_hugged_field_wears_its_own_height_inside_the_row() {
         use crate::layout::{Proposal, Size};
@@ -6936,7 +7016,7 @@ mod tests {
             matches!(&ops[0], WebviewOp::Navigate { path: at, url }
                 if *at == path && &**url == "https://example.test/next")
         );
-        let WebviewOp::Eval { path: at, token, js } = &ops[1] else {
+        let WebviewOp::Eval { path: at, token, js, raw: false } = &ops[1] else {
             panic!("the second op is the eval");
         };
         assert_eq!(*at, path);
@@ -8158,6 +8238,63 @@ mod tests {
         );
     }
 
+    /// A dialog designed at one size and dragged down to another: it
+    /// OPENS at what `opens_at` names, centred, and the floor stays the
+    /// smaller number the window may shrink to — two facts, not one.
+    #[test]
+    fn a_dialog_opens_at_its_named_size_over_a_smaller_floor() {
+        use crate::layout::{DialogSpec, Point, Proposal, Rect, Size};
+
+        const WINDOW: Size = Size { width: 1400.0, height: 1000.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            open: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("the page").frame(WINDOW.width, WINDOW.height).dialog(
+                    self.open.binding(),
+                    DialogSpec::titled("Settings").min_size(300.0, 200.0).opens_at(900.0, 600.0),
+                    |_| erased(text("the settings")),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { open: State::new(true) };
+        let first = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let dialog = &first.overlays[0];
+        assert_eq!(dialog.frame.size, Size { width: 900.0, height: 600.0 }, "opens at the named size");
+        assert_eq!(
+            (dialog.frame.origin.x, dialog.frame.origin.y),
+            (250.0, 200.0),
+            "centred at THAT size, not the floor's",
+        );
+        let OverlaySurface::Window(spec) = &dialog.surface else {
+            panic!("a dialog asks for a window")
+        };
+        assert_eq!(spec.min, Size { width: 300.0, height: 200.0 }, "the floor is still the floor");
+
+        // the reader shrank it under the opening size but over the floor
+        let path = dialog.path.clone();
+        runtime.set_dialog_frame(
+            &path,
+            Rect { origin: Point { x: 10.0, y: 10.0 }, size: Size { width: 400.0, height: 300.0 } },
+        );
+        let shrunk = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(
+            shrunk.overlays[0].frame.size,
+            Size { width: 400.0, height: 300.0 },
+            "the opening size is not a cage",
+        );
+
+        // and an opening size under the floor is the floor
+        let spec = DialogSpec::titled("x").min_size(300.0, 200.0).opens_at(100.0, 500.0);
+        assert_eq!(spec.opening_size(), Size { width: 300.0, height: 500.0 });
+        assert_eq!(DialogSpec::titled("x").opening_size(), Size { width: 320.0, height: 240.0 });
+    }
+
     /// The window drives, the content follows: the frame the shell
     /// reports (`set_dialog_frame`) is the frame the dialog lays out
     /// in — and it never goes under the spec's minimum, because the
@@ -9039,6 +9176,47 @@ mod tests {
         runtime.clear_bindings();
         assert_eq!(runtime.chord(&k), KeyMatch::None, "no prefix left to hold");
         assert!(runtime.pending_chord().is_empty());
+    }
+
+    /// The sink hears every move of the sequence: the stroke that opens
+    /// it, the one that ends it (an action or a dead end), Escape, and the
+    /// slow tick — and hears nothing about a plain stroke that started
+    /// nothing.
+    #[test]
+    fn a_chord_sink_hears_every_change_of_the_sequence() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use crate::action::KeyMatch;
+        const KEYMAP: ActionId = ActionId("open keymap");
+        const SAVE: ActionId = ActionId("save");
+        let runtime = Runtime::new();
+        let k = KeyPattern::command(Key::Char('k'));
+        let s_key = KeyPattern::command(Key::Char('s'));
+        let x = KeyPattern::command(Key::Char('x'));
+        runtime.bind_sequence(&[k, s_key], KEYMAP);
+        runtime.bind(s_key, SAVE);
+        let heard: Rc<RefCell<Vec<Vec<KeyPattern>>>> = Rc::default();
+        let sink = Rc::clone(&heard);
+        runtime.observe_chord(move |pending| sink.borrow_mut().push(pending.to_vec()));
+
+        assert_eq!(runtime.chord(&s_key), KeyMatch::Action(SAVE));
+        assert!(heard.borrow().is_empty(), "a plain stroke opens nothing, and says nothing");
+
+        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(heard.borrow().as_slice(), [vec![k]], "the opener is heard");
+        assert_eq!(runtime.chord(&s_key), KeyMatch::Action(KEYMAP));
+        assert_eq!(heard.borrow().last().map(Vec::len), Some(0), "the end is heard as empty");
+
+        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        assert_eq!(runtime.chord(&x), KeyMatch::None);
+        assert_eq!(heard.borrow().last().map(Vec::len), Some(0), "a dead end too");
+
+        assert_eq!(runtime.chord(&k), KeyMatch::Pending);
+        let _ = runtime.chord_tick();
+        assert_eq!(heard.borrow().last(), Some(&vec![k]), "one tick keeps it");
+        assert!(runtime.chord_tick());
+        assert_eq!(heard.borrow().last().map(Vec::len), Some(0), "the second lets go, and says so");
     }
 
     #[test]
@@ -11519,6 +11697,852 @@ mod tests {
             KeyPattern::command_shift(Key::Char('g')),
             KeyPattern::command_shift(Key::Char('G'.to_ascii_lowercase()))
         );
+    }
+
+    // MARK: - Touch: the finger speaks the pointer's vocabulary
+
+    /// A static screen: the finger lands on a button and lifts. The
+    /// press shows at once (nothing under it can pan), the lift fires,
+    /// and afterwards NOTHING hovers — a lifted finger is not there.
+    #[test]
+    fn a_tap_fires_the_button_and_leaves_nothing_hovered() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Tapper {
+            count: State<usize>,
+        }
+        impl Component for Tapper {
+            fn body(self, _ctx: &Context) -> impl View {
+                let count = self.count;
+                vstack!(button(text("tap"), move || count.add(1)), spacer())
+            }
+        }
+
+        let view = Tapper { count: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 100.0 };
+        let _ = runtime.display_frame(&view, size);
+        let (_, rect) = runtime
+            .layout(&view, Proposal::exact(size))
+            .hits
+            .first()
+            .cloned()
+            .expect("the button is a target");
+        let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+
+        assert!(runtime.touch_began(1, x, y, 1), "the press paints at once");
+        assert!(runtime.interaction().pressed.is_some(), "nothing here pans: the press is sure");
+        assert!(runtime.wants_frame(), "a still press listens for a menu until the hold is spent");
+        runtime.touch_ended(1, x, y);
+        assert_eq!(view.count.get(), 1, "the lift fired");
+        let after = runtime.interaction();
+        assert_eq!(after.pressed, None);
+        assert_eq!(after.hovered, None, "a lifted finger hovers nothing");
+        assert_eq!(after.pointer, None);
+        assert!(!runtime.wants_frame(), "and the clock rests after the lift");
+    }
+
+    /// A finger over a list: within the slop nothing is said; past it
+    /// the content slides with the finger, and the row under the finger
+    /// never fires — the press it waited with is never sent.
+    #[test]
+    fn a_pan_over_a_list_scrolls_and_the_row_never_fires() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Rows {
+            fired: State<usize>,
+        }
+        impl Component for Rows {
+            fn body(self, _ctx: &Context) -> impl View {
+                let fired = self.fired;
+                list((0..100).collect::<Vec<usize>>(), |row| format!("row{row}"), move |row| {
+                    button(text(format!("item {row}")), move || fired.add(1))
+                })
+            }
+        }
+
+        let view = Rows { fired: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 100.0 };
+        let _ = runtime.display_frame(&view, size);
+        let region = runtime
+            .layout(&view, Proposal::exact(size))
+            .scrolls
+            .first()
+            .expect("the list is a region")
+            .path
+            .clone();
+
+        assert!(!runtime.touch_began(1, 10.0, 80.0, 1), "over a list the press waits");
+        assert!(runtime.wants_frame(), "the hold is on the clock");
+        assert!(!runtime.touch_moved(1, 10.0, 78.0), "inside the slop nothing moves");
+        assert_eq!(runtime.scroll_offset(&region).y, 0.0);
+        assert!(runtime.touch_moved(1, 10.0, 60.0), "past the slop the content slides");
+        assert_eq!(runtime.scroll_offset(&region).y, 20.0, "the whole excursion, not the rest of it");
+        runtime.touch_ended(1, 10.0, 60.0);
+        assert_eq!(view.fired.get(), 0, "the row never fired");
+        assert_eq!(runtime.interaction().pressed, None);
+        assert_eq!(runtime.frame_pace(), FramePace::Idle, "a slow lift has no fling");
+    }
+
+    /// A finger that lands on a button OUTSIDE every region presses at
+    /// once; a drag on that press is the pointer's drag, and the list
+    /// below never scrolls for it.
+    #[test]
+    fn a_press_drag_over_a_button_outside_a_region_does_not_scroll() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Page {
+            fired: State<usize>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let fired = self.fired;
+                vstack!(
+                    button(text("go"), move || fired.add(1)).frame(200.0, 30.0),
+                    list((0..100).collect::<Vec<usize>>(), |row| format!("row{row}"), |row| {
+                        text(format!("item {row}"))
+                    }),
+                )
+            }
+        }
+
+        let view = Page { fired: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 200.0 };
+        let _ = runtime.display_frame(&view, size);
+        let result = runtime.layout(&view, Proposal::exact(size));
+        let region = result.scrolls.first().expect("the list is a region").path.clone();
+        let (_, rect) = result.hits.first().cloned().expect("the button is a target");
+        let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+
+        assert!(runtime.touch_began(1, x, y, 1));
+        assert!(runtime.interaction().pressed.is_some(), "no region under the button: sure press");
+        // a drag well past the slop, ending inside the button's own box
+        let edge = rect.origin.x + rect.size.width - 1.0;
+        runtime.touch_moved(1, x + 300.0, y + 300.0);
+        assert_eq!(runtime.interaction().hovered, None, "dragged out: the pressed paint drops");
+        runtime.touch_moved(1, edge, y);
+        runtime.touch_ended(1, edge, y);
+        assert_eq!(view.fired.get(), 1, "released inside: the button fires once");
+        assert_eq!(runtime.scroll_offset(&region), Point::ZERO, "the list below never moved");
+    }
+
+    /// A finger held still over a row with a context menu: half a second
+    /// on the clock opens the menu, the lift after it changes nothing,
+    /// and the next tap picks a row.
+    #[test]
+    fn a_long_press_opens_the_context_menu_and_the_lift_keeps_it() {
+        use crate::layout::{MENU_PATH, Proposal, Size};
+
+        #[derive(Clone)]
+        struct Row {
+            opened: State<usize>,
+        }
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                let opened = self.opened;
+                scroll(vstack!(
+                    text("file_0001.rs").context_menu(vec![
+                        menu_item("Open", move || opened.set(opened.get() + 1)),
+                        menu_item("Delete", || {}),
+                    ]),
+                    text("tall").frame_height(1000.0),
+                ))
+            }
+        }
+
+        let view = Row { opened: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.display_frame(&view, size);
+
+        assert!(!runtime.touch_began(1, 30.0, 8.0, 1), "over a scroll the press waits");
+        let early = runtime.tick(0.3);
+        assert!(!early.input, "not yet");
+        assert!(runtime.interaction().menu.is_none());
+        let held = runtime.tick(0.3);
+        assert!(held.input, "the clock reached the app: a settled frame is due");
+        assert!(runtime.interaction().menu.is_some(), "the menu opened where the finger holds");
+        runtime.touch_ended(1, 30.0, 8.0);
+        assert!(runtime.interaction().menu.is_some(), "the lift after a menu is spent");
+        assert_eq!(view.opened.get(), 0);
+
+        // the next tap picks the first row
+        let result = runtime.layout(&view, Proposal::exact(size));
+        let menu = result
+            .overlays
+            .iter()
+            .find(|overlay| overlay.path == MENU_PATH)
+            .expect("the menu is an overlay");
+        let (x, y) = (menu.frame.origin.x + 20.0, menu.frame.origin.y + 5.0 + 12.0);
+        runtime.touch_began(2, x, y, 1);
+        runtime.touch_ended(2, x, y);
+        assert_eq!(view.opened.get(), 1, "the row fired");
+        assert!(runtime.interaction().menu.is_none(), "and the menu closed");
+    }
+
+    /// A finger held still where no menu answers becomes a press — mouse
+    /// mode: on a field the press focuses it and opens the sweep, so the
+    /// drag that follows selects.
+    #[test]
+    fn a_long_press_without_a_menu_becomes_a_press() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Form {
+            value: State<String>,
+        }
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(vstack!(
+                    text_field("type…", self.value.binding()),
+                    text("tall").frame_height(1000.0),
+                ))
+            }
+        }
+
+        let view = Form { value: State::new("hello world".into()) };
+        let runtime = Runtime::new();
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.display_frame(&view, size);
+        let field = runtime
+            .layout(&view, Proposal::exact(size))
+            .fields
+            .first()
+            .expect("the field is placed")
+            .frame;
+        let (x, y) = (field.origin.x + 10.0, field.origin.y + field.size.height / 2.0);
+
+        runtime.touch_began(1, x, y, 1);
+        assert_eq!(runtime.focused(), None, "a finger that may pan focuses nothing yet");
+        let _ = runtime.tick(0.3);
+        let held = runtime.tick(0.3);
+        assert!(held.input);
+        assert!(runtime.focused().is_some(), "the hold pressed: the field took the keyboard");
+        assert!(runtime.interaction().field_drag.is_some(), "and the sweep is open");
+        runtime.touch_ended(1, x, y);
+        assert!(runtime.focused().is_some(), "the lift keeps the focus");
+    }
+
+    /// Runs a fast pan on a list of `rows` and lifts; the fling then
+    /// runs on the clock until it rests. Returns (offset at the lift,
+    /// offset at rest).
+    fn fling(rows: usize) -> (f64, f64) {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Rows {
+            rows: usize,
+        }
+        impl Component for Rows {
+            fn body(self, _ctx: &Context) -> impl View {
+                list((0..self.rows).collect::<Vec<usize>>(), |row| format!("row{row}"), |row| {
+                    text(format!("item {row}"))
+                })
+            }
+        }
+
+        let view = Rows { rows };
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 100.0 };
+        let _ = runtime.display_frame(&view, size);
+        let region = runtime
+            .layout(&view, Proposal::exact(size))
+            .scrolls
+            .first()
+            .expect("the list is a region")
+            .path
+            .clone();
+
+        runtime.touch_began(1, 10.0, 90.0, 1);
+        let mut y = 90.0;
+        for _ in 0..3 {
+            y -= 20.0;
+            runtime.touch_moved(1, 10.0, y);
+            let _ = runtime.tick(1.0 / 60.0);
+        }
+        runtime.touch_ended(1, 10.0, y);
+        let lifted = runtime.scroll_offset(&region).y;
+        assert!(runtime.wants_frame(), "a fast lift flings");
+        assert_eq!(runtime.frame_pace(), FramePace::Display);
+
+        let mut last = lifted;
+        let mut ticks = 0;
+        while runtime.wants_frame() {
+            let _ = runtime.tick(1.0 / 60.0);
+            let now = runtime.scroll_offset(&region).y;
+            assert!(now >= last, "a fling never turns back");
+            last = now;
+            ticks += 1;
+            assert!(ticks < 600, "a fling comes to rest");
+        }
+        assert_eq!(runtime.frame_pace(), FramePace::Idle);
+        (lifted, last)
+    }
+
+    #[test]
+    fn a_fling_continues_after_the_lift_and_decays_to_rest() {
+        let (lifted, rested) = fling(300);
+        assert_eq!(lifted, 60.0, "three moves of twenty");
+        assert!(rested > lifted + 100.0, "the content kept sliding after the lift: {rested}");
+        assert!(rested < 300.0 * 16.0 - 100.0, "and stopped short of the end");
+    }
+
+    #[test]
+    fn a_fling_stops_at_the_edge() {
+        // ten rows of sixteen in a hundred: sixty points of travel
+        let (_, rested) = fling(10);
+        assert_eq!(rested, 60.0, "the clamp is where the fling dies");
+    }
+
+    /// The system takes the finger mid-press: nothing fires, the
+    /// pressed paint clears, and the field that had the keyboard keeps it.
+    #[test]
+    fn a_cancelled_press_fires_nothing_and_keeps_the_focus() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone)]
+        struct Form {
+            value: State<String>,
+            count: State<usize>,
+        }
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                let count = self.count;
+                vstack!(
+                    text_field("type…", self.value.binding()),
+                    button(text("go"), move || count.add(1)).frame(200.0, 30.0),
+                    spacer(),
+                )
+            }
+        }
+
+        let view = Form { value: State::new("hi".into()), count: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 200.0 };
+        let _ = runtime.display_frame(&view, size);
+        let result = runtime.layout(&view, Proposal::exact(size));
+        let placed = result.fields.first().expect("the field is placed");
+        let field = placed.path.clone();
+        runtime.focus(&field);
+        let (_, rect) = result
+            .hits
+            .iter()
+            .find(|(_, rect)| rect.origin.y >= placed.frame.origin.y + placed.frame.size.height)
+            .cloned()
+            .expect("the button is a target below the field");
+        let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+
+        assert!(runtime.touch_began(1, x, y, 1));
+        assert!(runtime.interaction().pressed.is_some());
+        assert!(runtime.touch_cancelled(1), "the pressed paint clears");
+        assert_eq!(runtime.interaction().pressed, None);
+        assert_eq!(view.count.get(), 0, "nothing fired");
+        assert_eq!(runtime.focused().as_deref(), Some(field.as_str()), "the focus stayed");
+    }
+
+    /// Two fingers over an app's box: the change of their distance
+    /// reaches the box as a ratio at the point between them — and so
+    /// does a trackpad, through the same door.
+    #[test]
+    fn magnify_reaches_the_box_under_the_fingers() {
+        use crate::layout::Size;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Zoomable {
+            scale: Rc<Cell<f64>>,
+            at: Rc<Cell<Point>>,
+        }
+        impl CustomElement for Zoomable {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
+                if let ElementEvent::Magnify { at, scale } = event {
+                    self.scale.set(self.scale.get() * scale);
+                    self.at.set(*at);
+                    return Response { handled: true, ..Response::default() };
+                }
+                Response::default()
+            }
+        }
+
+        #[derive(Clone)]
+        struct Map {
+            scale: Rc<Cell<f64>>,
+            at: Rc<Cell<Point>>,
+        }
+        impl Component for Map {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Zoomable { scale: self.scale.clone(), at: self.at.clone() })
+            }
+        }
+
+        let scale = Rc::new(Cell::new(1.0));
+        let at = Rc::new(Cell::new(Point::ZERO));
+        let view = Map { scale: scale.clone(), at: at.clone() };
+        let runtime = Runtime::new();
+        let size = Size { width: 400.0, height: 300.0 };
+        let _ = runtime.display_frame(&view, size);
+
+        // two fingers a hundred apart spread to two hundred: twice
+        runtime.touch_began(1, 100.0, 100.0, 1);
+        runtime.touch_began(2, 200.0, 100.0, 1);
+        assert!(runtime.touch_moved(2, 300.0, 100.0), "the box took the zoom");
+        assert_eq!(scale.get(), 2.0);
+        assert_eq!(at.get(), Point { x: 200.0, y: 100.0 }, "at the point between the fingers");
+        runtime.touch_ended(1, 100.0, 100.0);
+        runtime.touch_ended(2, 300.0, 100.0);
+
+        // the trackpad speaks the same door
+        assert!(runtime.magnify(150.0, 150.0, 1.5));
+        assert_eq!(scale.get(), 3.0);
+        // and nothing zooms where no box listens
+        assert!(!Runtime::new().magnify(10.0, 10.0, 2.0));
+    }
+
+    /// A box that takes the drag, inside a scroll region: the finger is
+    /// a hand on the box at once — the box hears the press and every
+    /// move, and the region around it never scrolls.
+    #[test]
+    fn a_box_that_takes_the_drag_presses_at_once_inside_a_scroll() {
+        use crate::layout::{Proposal, Size};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Canvas {
+            downs: Rc<Cell<usize>>,
+            drags: Rc<Cell<usize>>,
+        }
+        impl CustomElement for Canvas {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn takes_drag(&self) -> bool {
+                true
+            }
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
+                match event {
+                    ElementEvent::PointerDown { .. } => self.downs.set(self.downs.get() + 1),
+                    ElementEvent::PointerMoved { pressed: true, .. } => {
+                        self.drags.set(self.drags.get() + 1)
+                    }
+                    _ => {}
+                }
+                Response { handled: true, ..Response::default() }
+            }
+        }
+
+        #[derive(Clone)]
+        struct Sketch {
+            downs: Rc<Cell<usize>>,
+            drags: Rc<Cell<usize>>,
+        }
+        impl Component for Sketch {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(vstack!(
+                    custom(Canvas { downs: self.downs.clone(), drags: self.drags.clone() })
+                        .frame(200.0, 150.0),
+                    text("tall").frame_height(1000.0),
+                ))
+            }
+        }
+
+        let downs = Rc::new(Cell::new(0));
+        let drags = Rc::new(Cell::new(0));
+        let view = Sketch { downs: downs.clone(), drags: drags.clone() };
+        let runtime = Runtime::new();
+        let size = Size { width: 200.0, height: 200.0 };
+        let _ = runtime.display_frame(&view, size);
+        let region = runtime
+            .layout(&view, Proposal::exact(size))
+            .scrolls
+            .first()
+            .expect("the scroll is a region")
+            .path
+            .clone();
+
+        runtime.touch_began(1, 50.0, 50.0, 1);
+        assert_eq!(downs.get(), 1, "the box heard the press at once");
+        runtime.touch_moved(1, 50.0, 80.0);
+        runtime.touch_moved(1, 50.0, 120.0);
+        assert_eq!(drags.get(), 2, "and every move, pressed");
+        assert_eq!(runtime.scroll_offset(&region), Point::ZERO, "the region never scrolled");
+        runtime.touch_ended(1, 50.0, 120.0);
+    }
+
+    // MARK: - The safe area: the root lays out inside it
+
+    /// A phone's insets: the notch above, the home indicator below. The
+    /// root lays out between them, and every table the pass records stays
+    /// in window coordinates — the first line of text starts at the
+    /// safe area's top, and the background paints the safe rect.
+    #[test]
+    fn the_root_lays_out_inside_the_safe_area() {
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("hello"), spacer()).background_color(Color::hex(0xFF0000))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
+        let display = runtime.display_frame(&Page, size);
+        let fill = display
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::FillRect { rect, color, .. } if *color == Color::hex(0xFF0000) => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .expect("the background paints");
+        assert_eq!(fill.origin, Point { x: 0.0, y: 59.0 });
+        assert_eq!(fill.size, Size { width: 390.0, height: 844.0 - 59.0 - 34.0 });
+        let line = display
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { origin, .. } => Some(*origin),
+                _ => None,
+            })
+            .expect("the text paints");
+        assert_eq!(line.y, 59.0, "the first line starts at the safe area's top");
+    }
+
+    /// The root wearing `.ignores_safe_area()` reclaims the whole window:
+    /// its background reaches every edge, and its content starts at zero.
+    #[test]
+    fn ignores_safe_area_on_the_root_reclaims_the_window() {
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("hello"), spacer())
+                    .background_color(Color::hex(0xFF0000))
+                    .ignores_safe_area()
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
+        let display = runtime.display_frame(&Page, size);
+        let fill = display
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::FillRect { rect, color, .. } if *color == Color::hex(0xFF0000) => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .expect("the background paints");
+        assert_eq!(fill, Rect { origin: Point::ZERO, size });
+        let line = display
+            .iter()
+            .find_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { origin, .. } => Some(*origin),
+                _ => None,
+            })
+            .expect("the text paints");
+        assert_eq!(line.y, 0.0, "the content reaches the window's own top");
+    }
+
+    /// No insets: three walks are one walk. The runtime that never heard
+    /// of a safe area, the one told it is zero, and the root wearing
+    /// `.ignores_safe_area()` under zero insets all paint the same bytes
+    /// — every desktop golden stands on this.
+    #[test]
+    fn zero_insets_are_byte_stable() {
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("hello"), text("world"), spacer())
+                    .background_color(Color::hex(0x336699))
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Reclaiming;
+        impl Component for Reclaiming {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("hello"), text("world"), spacer())
+                    .background_color(Color::hex(0x336699))
+                    .ignores_safe_area()
+            }
+        }
+
+        let size = Size { width: 300.0, height: 200.0 };
+        let untouched = Runtime::new().display_frame(&Page, size);
+        let told = Runtime::new();
+        told.set_safe_area(Edges::ZERO);
+        let told = told.display_frame(&Page, size);
+        let reclaiming = Runtime::new().display_frame(&Reclaiming, size);
+        assert_eq!(untouched.as_slice(), told.as_slice());
+        assert_eq!(untouched.as_slice(), reclaiming.as_slice());
+    }
+
+    /// The keyboard rises: its height joins the bottom inset and the
+    /// content shrinks above the keys; it hides, and the room comes back.
+    #[test]
+    fn the_keyboard_inset_takes_the_bottom_and_gives_it_back() {
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("hello"), spacer()).background_color(Color::hex(0xFF0000))
+            }
+        }
+        fn height_of(display: &crate::layout::DisplayList) -> f64 {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::FillRect { rect, color, .. }
+                        if *color == Color::hex(0xFF0000) =>
+                    {
+                        Some(rect.size.height)
+                    }
+                    _ => None,
+                })
+                .expect("the background paints")
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
+        assert_eq!(height_of(&runtime.display_frame(&Page, size)), 751.0);
+        runtime.set_keyboard_inset(336.0);
+        assert_eq!(height_of(&runtime.display_frame(&Page, size)), 844.0 - 59.0 - 336.0);
+        // a keyboard shorter than the home indicator changes nothing
+        runtime.set_keyboard_inset(20.0);
+        assert_eq!(height_of(&runtime.display_frame(&Page, size)), 751.0);
+        runtime.set_keyboard_inset(0.0);
+        assert_eq!(height_of(&runtime.display_frame(&Page, size)), 751.0);
+    }
+
+    /// The tables are in window coordinates: a button first in the root
+    /// answers a press at the safe area's top, and not at the window's.
+    #[test]
+    fn hits_follow_the_inset_root() {
+        #[derive(Clone)]
+        struct Page {
+            count: State<usize>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let count = self.count;
+                vstack!(button(text("tap"), move || count.add(1)), spacer())
+            }
+        }
+
+        let view = Page { count: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
+        let _ = runtime.display_frame(&view, size);
+        let (_, rect) = runtime
+            .layout(&view, crate::layout::Proposal::exact(size))
+            .hits
+            .first()
+            .cloned()
+            .expect("the button is a target");
+        assert_eq!(rect.origin.y, 59.0, "the button's hit sits under the safe area's top");
+        runtime.pointer_pressed(10.0, 30.0);
+        runtime.pointer_released(10.0, 30.0);
+        assert_eq!(view.count.get(), 0, "a press in the notch's band reaches nothing");
+        let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        assert_eq!(view.count.get(), 1, "a press on the button fires");
+    }
+
+    /// A header wearing `.ignores_safe_area()` at the top of the root
+    /// reclaims the band above it and nothing else: its background
+    /// starts at zero, the body below it stays where the root put it.
+    #[test]
+    fn a_nested_ignores_safe_area_extends_only_where_it_touches() {
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text("header")
+                        .frame(390.0, 40.0)
+                        .background_color(Color::hex(0x00FF00))
+                        .ignores_safe_area(),
+                    text("body").frame(390.0, 100.0).background_color(Color::hex(0x0000FF)),
+                    spacer(),
+                )
+                .spacing(0.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        runtime.set_safe_area(Edges { top: 59.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
+        let display = runtime.display_frame(&Page, size);
+        let rect_of = |wanted: Color| {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::FillRect { rect, color, .. } if *color == wanted => Some(*rect),
+                    _ => None,
+                })
+                .expect("the box paints")
+        };
+        let header = rect_of(Color::hex(0x00FF00));
+        assert_eq!(header.origin.y, 0.0, "the header reclaims the band above it");
+        assert_eq!(header.size.height, 59.0 + 40.0, "and keeps its own height below it");
+        let body = rect_of(Color::hex(0x0000FF));
+        assert_eq!(body.origin.y, 59.0 + 40.0, "the body stays where the root put it");
+    }
+
+    // MARK: - The environment moves at runtime
+
+    /// The size class reaches a body through the environment; the shell
+    /// moving it re-runs the bodies that read it — once — and a pass with
+    /// nothing moved runs none. A subtree can force its own class.
+    #[test]
+    fn the_size_class_reaches_the_body_and_a_change_reruns_it() {
+        #[derive(Clone, Copy)]
+        struct Adaptive;
+        impl Component for Adaptive {
+            fn body(self, ctx: &Context) -> impl View {
+                let label = match ctx.environment::<SizeClass>() {
+                    SizeClass::Compact => "narrow",
+                    SizeClass::Regular => "wide",
+                };
+                vstack!(text(label), spacer())
+            }
+        }
+        fn first_line(display: &crate::layout::DisplayList) -> String {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { content, .. } => {
+                        Some(content.to_string())
+                    }
+                    _ => None,
+                })
+                .expect("a line paints")
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        assert_eq!(first_line(&runtime.display_frame(&Adaptive, size)), "wide", "regular by default");
+        // a still frame runs no body
+        let _ = runtime.display_frame(&Adaptive, size);
+        assert!(runtime.body_runs().is_empty(), "nothing moved, nothing ran");
+
+        // the move rebuilds the retention: the body that read the class
+        // runs again inside the settle, and the scene says so
+        runtime.set_environment(|values| values.horizontalSizeClass = SizeClass::Compact);
+        assert_eq!(first_line(&runtime.display_frame(&Adaptive, size)), "narrow");
+        let _ = runtime.display_frame(&Adaptive, size);
+        assert!(runtime.body_runs().is_empty(), "and settled");
+
+        // a subtree forces its own answer
+        #[derive(Clone, Copy)]
+        struct Preview;
+        impl Component for Preview {
+            fn body(self, _ctx: &Context) -> impl View {
+                Adaptive.environment(|values| values.horizontalSizeClass = SizeClass::Compact)
+            }
+        }
+        assert_eq!(first_line(&Runtime::new().display_frame(&Preview, size)), "narrow");
+    }
+
+    /// The same hold on a row OUTSIDE any scroll: the press went down at
+    /// once (nothing here pans), and half a second later it is taken
+    /// back for the menu — the row never fired, the menu is open, and
+    /// the lift keeps it.
+    #[test]
+    fn a_long_press_on_a_flat_row_opens_the_menu() {
+        use crate::layout::Size;
+
+        #[derive(Clone)]
+        struct Row {
+            opened: State<usize>,
+        }
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                let opened = self.opened;
+                vstack!(
+                    text("file_0001.rs").context_menu(vec![
+                        menu_item("Open", move || opened.set(opened.get() + 1)),
+                    ]),
+                    text("below"),
+                )
+            }
+        }
+
+        let view = Row { opened: State::new(0) };
+        let runtime = Runtime::new();
+        let size = Size { width: 300.0, height: 200.0 };
+        let _ = runtime.display_frame(&view, size);
+
+        runtime.touch_began(1, 30.0, 8.0, 1);
+        assert!(runtime.wants_frame(), "a still press listens for the menu on the clock");
+        let _ = runtime.tick(0.3);
+        assert!(runtime.interaction().menu.is_none());
+        let held = runtime.tick(0.3);
+        assert!(held.input, "the clock reached the app");
+        assert!(runtime.interaction().menu.is_some(), "the menu opened under the finger");
+        assert_eq!(runtime.interaction().pressed, None, "the press was taken back");
+        runtime.touch_ended(1, 30.0, 8.0);
+        assert!(runtime.interaction().menu.is_some(), "the lift after a menu is spent");
+        assert_eq!(view.opened.get(), 0);
+    }
+
+    /// The playground's bands: a stack of two fixed bands around a spacer,
+    /// wearing `.ignores_safe_area()` INSIDE a zstack with the content.
+    /// The stack fills the safe rect, so it touches every edge and
+    /// reclaims the window — the top band paints at zero, the bottom one
+    /// ends at the window's bottom.
+    #[test]
+    fn bands_in_a_zstack_reclaim_the_window() {
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let band = |color: u32, height: f64| {
+                    // a height of its own, then the whole width: `frame_max` caps
+                    // and grows only toward an infinite edge
+                    empty()
+                        .frame_height(height)
+                        .frame_max(f64::INFINITY, height, Alignment::Center)
+                        .background_color(Color::hex_a(color))
+                };
+                zstack!(
+                    vstack!(text("content"), spacer()),
+                    vstack!(band(0xFF3B3080, 44.0), spacer(), band(0x34C75980, 20.0))
+                        .ignores_safe_area(),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 402.0, height: 874.0 };
+        runtime.set_safe_area(Edges { top: 62.0, bottom: 34.0, leading: 0.0, trailing: 0.0 });
+        let display = runtime.display_frame(&Page, size);
+        let rect_of = |wanted: Color| {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::FillRect { rect, color, .. } if *color == wanted => {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+        };
+        let top = rect_of(Color::hex_a(0xFF3B3080)).expect("the top band paints");
+        assert_eq!(top, Rect { origin: Point::ZERO, size: Size { width: 402.0, height: 44.0 } });
+        let bottom = rect_of(Color::hex_a(0x34C75980)).expect("the bottom band paints");
+        assert_eq!(bottom.origin.y, 874.0 - 20.0);
+        assert_eq!(bottom.size.width, 402.0);
     }
 }
 

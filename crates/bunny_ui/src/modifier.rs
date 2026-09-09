@@ -44,6 +44,7 @@ pub enum Modifier {
     FrameHeight(f64),
     Tracking(Tracking),
     FrameMax(f64, f64, Alignment),
+    FrameFlex(f64, f64, Alignment),
     HugHeight,
     NavigationTitle(String),
     NavigationBarTitle(String),
@@ -228,6 +229,9 @@ impl Modifier {
             Modifier::Tracking(Tracking::Em(em)) => format!(" [.tracking({em}em)]"),
             Modifier::FrameMax(max_width, max_height, alignment) => format!(
                 " [.frame(maxWidth: {max_width:?}, maxHeight: {max_height}, alignment: {alignment})]"
+            ),
+            Modifier::FrameFlex(min_width, min_height, alignment) => format!(
+                " [.frame(flex, minWidth: {min_width}, minHeight: {min_height}, alignment: {alignment})]"
             ),
             Modifier::HugHeight => " [.hugHeight]".into(),
             Modifier::NavigationTitle(title) => format!(" [.navigationTitle({title:?})]"),
@@ -421,6 +425,12 @@ fn rewrite_scroll_node(
             align,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
         },
+        LayoutNode::FlexFrame { min_width, min_height, align, child } => LayoutNode::FlexFrame {
+            min_width,
+            min_height,
+            align,
+            child: Box::new(rewrite_scroll_node(*child, rewrite)),
+        },
         other => other,
     }
 }
@@ -521,6 +531,12 @@ fn rewrite_field_node(
             align,
             child: Box::new(rewrite_field_node(*child, rewrite)),
         },
+        LayoutNode::FlexFrame { min_width, min_height, align, child } => LayoutNode::FlexFrame {
+            min_width,
+            min_height,
+            align,
+            child: Box::new(rewrite_field_node(*child, rewrite)),
+        },
         other => other,
     }
 }
@@ -580,6 +596,12 @@ fn rewrite_pixel_node(
         LayoutNode::MaxFrame { max_width, max_height, align, child } => LayoutNode::MaxFrame {
             max_width,
             max_height,
+            align,
+            child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
+        },
+        LayoutNode::FlexFrame { min_width, min_height, align, child } => LayoutNode::FlexFrame {
+            min_width,
+            min_height,
             align,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
         },
@@ -1103,9 +1125,24 @@ fn apply(
                 child: Box::new(node),
             });
         }
+        Modifier::FrameFlex(min_width, min_height, alignment) => {
+            let (min_width, min_height) = (*min_width, *min_height);
+            let align = crate::views::cross_align(*alignment);
+            out.wrap_layout_from(mark, |node| LayoutNode::FlexFrame {
+                min_width,
+                min_height,
+                align,
+                child: Box::new(node),
+            });
+        }
         Modifier::HugHeight => {
             out.wrap_layout_from(mark, |node| LayoutNode::Hug {
                 axis: crate::layout::Axis::Vertical,
+                child: Box::new(node),
+            });
+        }
+        Modifier::IgnoresSafeArea => {
+            out.wrap_layout_from(mark, |node| LayoutNode::IgnoresSafeArea {
                 child: Box::new(node),
             });
         }

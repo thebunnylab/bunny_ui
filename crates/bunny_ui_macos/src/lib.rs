@@ -7,12 +7,12 @@
 
 #![cfg(target_os = "macos")]
 
-pub mod credentials;
+pub use bunny_ui_apple::credentials;
+use bunny_ui_apple::trace;
 pub mod dialog;
 mod ffi;
-mod image;
+mod life;
 mod metal;
-mod text;
 pub mod webview;
 
 use std::cell::RefCell;
@@ -24,9 +24,8 @@ use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::View;
 
 use ffi::AppEvent;
-pub use image::CoreGraphicsImageEngine;
+pub use bunny_ui_apple::{CoreGraphicsImageEngine, CoreTextEngine};
 pub use metal::OffscreenGpu;
-pub use text::CoreTextEngine;
 
 /// Points the shell's frame driver at the pace the runtime asks for:
 /// the display link for springs, one timer beat per step for loop
@@ -233,6 +232,11 @@ impl WindowSpec {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct WindowId(usize);
 
+/// This shell holds MORE THAN ONE window — the detachable composer,
+/// the second workbench. The three shells answer this differently and
+/// an app that must run on all of them asks before it detaches.
+pub const MANY_WINDOWS: bool = true;
+
 /// Everything one window owns for as long as it is open. The app holds
 /// these and routes every event to the one it belongs to.
 struct Slot {
@@ -298,6 +302,9 @@ impl Default for App {
 impl App {
     /// An app with no windows yet.
     pub fn new() -> App {
+        // the app's life outside its windows opens with the app: the
+        // delegate, the workspace's sleep and wake, the notifier
+        life::install();
         App {
             inner: Rc::new(AppInner {
                 slots: RefCell::new(Vec::new()),
@@ -550,6 +557,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             for host in &hosts {
                 let bunny_ui::host::HostSpec::Webview {
                     url,
+                    document,
                     scripts,
                     console,
                     requests,
@@ -563,6 +571,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // offers no public override), but the stamp must not
                 // lie about what the spec says
                 let mut stamp = String::from(&**url);
+                // a document stamps by its fingerprint, never by its
+                // pages — the letter is the app's to hold, not the
+                // stamp's to copy every frame
+                if let Some(document) = document {
+                    stamp.push('\u{3}');
+                    stamp.push_str(&format!("{:016x}", document.digest));
+                }
                 stamp.push('\u{2}');
                 stamp.push(if *console { 'c' } else { '-' });
                 stamp.push(if *requests { 'r' } else { '-' });
@@ -587,13 +602,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         host.visible.size.height,
                     ),
                     placed,
-                    || webview::create(&host.spec),
-                    |child, _stamp| webview::update(child, &host.spec),
+                    || webview::create(&host.path, &host.spec),
+                    |child, _stamp| webview::update(&host.path, child, &host.spec),
                 );
             }
-            window.host_sweep(
-                &hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>(),
-            );
+            let alive = hosts.iter().map(|host| host.path.clone()).collect::<Vec<_>>();
+            window.host_sweep(&alive);
+            webview::sweep(&alive);
             traced.stage("H", format_args!("hosts={}", hosts.len()));
             let overlays = runtime.overlays();
             let display = match overlays.first() {
@@ -763,6 +778,22 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         // No BLEED and no backdrop sampling — the
                         // chrome and the shadow are the system's own.
                         let slice = full_display.translated_slice(overlay.display, -x, -y);
+                        // the GPU road first: a grafted dialog presents
+                        // its slice on its own layer, and pays no
+                        // Surface, no RGBA mirror and no blit — which is
+                        // the whole of what a resize step used to cost
+                        if metal::present_view(
+                            dialog.view(),
+                            &slice,
+                            Size { width: w, height: h },
+                            scale,
+                            canvas,
+                            &*runtime.text(),
+                            &*runtime.images(),
+                            dialog.in_live_resize(),
+                        ) {
+                            continue;
+                        }
                         let physical =
                             ((w.round() as usize) * scale, (h.round() as usize) * scale);
                         let mut kept = dialog_surfaces.borrow_mut();
@@ -933,6 +964,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         canvas,
                         &*runtime.text(),
                         &*runtime.images(),
+                        live_resize,
                     );
                 } else {
                     metal::present_window(
@@ -942,6 +974,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         canvas,
                         &*runtime.text(),
                         &*runtime.images(),
+                        live_resize,
                     );
                     // an ordinary frame repaints only the live boxes
                     // whose picture changed OR whose size did (the
@@ -1123,8 +1156,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     }
                     // an eval with no page answers NOW, with a name —
                     // never silence that looks like a slow page
-                    WebviewOp::Eval { path, token, js } => match ffi::host_child(&path) {
-                        Some(child) => webview::eval(child, token, &js),
+                    WebviewOp::Eval { path, token, js, raw } => match ffi::host_child(&path) {
+                        Some(child) => webview::eval(child, token, &js, raw),
                         None => {
                             let _ = runtime.webview_eval_done(
                                 token,
@@ -1141,6 +1174,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                             );
                         }
                     },
+                    // an edit on a document that left is spent on
+                    // nothing, like the hand
+                    WebviewOp::Edit { path, action } => {
+                        if let Some(child) = ffi::host_child(&path) {
+                            webview::edit(child, &action);
+                        }
+                    }
                     // a hand over a page that left is a hand over
                     // nothing: there is no answer to refuse in
                     WebviewOp::Input { path, event } => {
@@ -1355,38 +1395,43 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         move |event| {
             let root = &*root;
             match event {
-                webview::WebviewEvent::Navigated { view, url } => {
-                    if let Some(path) = ffi::host_key_of_child(view)
-                        && runtime.webview_navigated(&path, &url)
-                    {
+                webview::WebviewEvent::Navigated { path, url } => {
+                    if runtime.webview_navigated(&path, &url) {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
-                webview::WebviewEvent::NavigationFailed { view, url, why } => {
-                    if let Some(path) = ffi::host_key_of_child(view)
-                        && runtime.webview_navigate_failed(&path, &url, &why)
-                    {
+                webview::WebviewEvent::Linked { path, url } => {
+                    if runtime.webview_linked(&path, &url) {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
-                webview::WebviewEvent::Posted { view, body } => {
-                    if let Some(path) = ffi::host_key_of_child(view)
-                        && runtime.webview_posted(&path, &body)
-                    {
+                webview::WebviewEvent::Changed { path, html } => {
+                    if runtime.webview_changed(&path, &html) {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
-                webview::WebviewEvent::Console { view, line } => {
-                    if let Some(path) = ffi::host_key_of_child(view)
-                        && runtime.webview_console(&path, &line)
-                    {
+                webview::WebviewEvent::Pasted { path, html, text } => {
+                    if runtime.webview_pasted(&path, &html, &text) {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
-                webview::WebviewEvent::Requested { view, line } => {
-                    if let Some(path) = ffi::host_key_of_child(view)
-                        && runtime.webview_requested(&path, &line)
-                    {
+                webview::WebviewEvent::NavigationFailed { path, url, why } => {
+                    if runtime.webview_navigate_failed(&path, &url, &why) {
+                        blit(&runtime, root, trace::Origin::Web);
+                    }
+                }
+                webview::WebviewEvent::Posted { path, body } => {
+                    if runtime.webview_posted(&path, &body) {
+                        blit(&runtime, root, trace::Origin::Web);
+                    }
+                }
+                webview::WebviewEvent::Console { path, line } => {
+                    if runtime.webview_console(&path, &line) {
+                        blit(&runtime, root, trace::Origin::Web);
+                    }
+                }
+                webview::WebviewEvent::Requested { path, line } => {
+                    if runtime.webview_requested(&path, &line) {
                         blit(&runtime, root, trace::Origin::Web);
                     }
                 }
@@ -1508,6 +1553,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         AppEvent::Wheel { x, y, dx, dy } => {
             // offset is engine state: repaint without render (zero bodies)
             if runtime.wheel(x, y, dx, dy) {
+                blit(runtime, root, trace::Origin::Input);
+            }
+        }
+        AppEvent::Magnify { x, y, scale } => {
+            // the box under the pointer zooms; nothing else does
+            if runtime.magnify(x, y, scale) {
                 blit(runtime, root, trace::Origin::Input);
             }
         }
@@ -1727,164 +1778,3 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
 // =============================================================================
 // BUNNY_PRESENT_TRACE — the tape a trembling present is diagnosed from
 // =============================================================================
-
-/// The present tape. `BUNNY_PRESENT_TRACE=1` writes one file per
-/// process — `/tmp/bunny-present.<pid>.trace`, truncated on start, so
-/// two processes never interleave on one tape. Any other value is used
-/// as the path, with a literal `{pid}` replaced by the process id.
-/// `BUNNY_TRACE_TAG` stamps the header with free text (a build or an
-/// experiment name). Off, each mark costs one branch.
-///
-/// One event per line. Times are milliseconds from the first mark of
-/// the process:
-///
-/// ```text
-/// # bunny-trace v2 pid=<pid> t0=<unix_ms> tag=<tag>
-/// R <ms> <w>x<h> kind=<resize|move|backing> live=<0|1>
-/// P <ms> <w>x<h> live=<0|1> cmds=<n> via=<origin>
-/// H <ms> dur=<ms> hosts=<n>
-/// O <ms> dur=<ms> panels=<n>
-/// M <ms> dur=<ms> sync=<0|1>
-/// S <ms> dur=<ms> n=<alive> raster=<n> px=<n>
-/// E <ms> dur=<ms>
-/// X <ms> what=<name>
-/// ```
-///
-/// `R` is a window callback (which notification asked, and at what
-/// size). `P` opens a present; `H` (host pass), `O` (overlay panels),
-/// `M` (scene presented, `sync` = inside the resize transaction) and
-/// `S` (segments: mounted, rasterized, pixels) each carry the time
-/// since the previous mark of the same present; `E` closes it with the
-/// total. `X` names a one-time cost (`sync-on`, `sync-off`,
-/// `buffer-grow`, `atlas-drain`, `segment-class`). `via` names the
-/// code path that asked for the present: `redraw` (a window callback),
-/// `wake` (a worker), `input` (an event), `frame` (the animation
-/// tick), `web` (a page report), `blink` (the slow clock).
-mod trace {
-    use std::io::Write as _;
-
-    /// The code path that asked for a present.
-    #[derive(Clone, Copy)]
-    pub(crate) enum Origin {
-        Redraw,
-        Wake,
-        Input,
-        Frame,
-        Web,
-        Blink,
-    }
-
-    impl Origin {
-        fn name(self) -> &'static str {
-            match self {
-                Origin::Redraw => "redraw",
-                Origin::Wake => "wake",
-                Origin::Input => "input",
-                Origin::Frame => "frame",
-                Origin::Web => "web",
-                Origin::Blink => "blink",
-            }
-        }
-    }
-
-    /// The tape, opened once — truncated, headed, and kept. Opening
-    /// per line was measurable inside the present it was measuring.
-    fn out() -> Option<&'static std::sync::Mutex<std::fs::File>> {
-        static OUT: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
-            std::sync::OnceLock::new();
-        OUT.get_or_init(|| {
-            let value = std::env::var("BUNNY_PRESENT_TRACE").ok()?;
-            let pid = std::process::id();
-            let path = if value == "1" || value.is_empty() {
-                format!("/tmp/bunny-present.{pid}.trace")
-            } else {
-                value.replace("{pid}", &pid.to_string())
-            };
-            let mut file = std::fs::File::create(path).ok()?;
-            let t0 = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |t| t.as_millis());
-            let tag = std::env::var("BUNNY_TRACE_TAG").unwrap_or_default();
-            let _ = writeln!(file, "# bunny-trace v2 pid={pid} t0={t0} tag={tag}");
-            Some(std::sync::Mutex::new(file))
-        })
-        .as_ref()
-    }
-
-    /// True when the tape is on — the gate a caller checks before
-    /// paying for anything a mark would need.
-    pub(crate) fn active() -> bool {
-        out().is_some()
-    }
-
-    fn ms() -> f64 {
-        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
-    }
-
-    fn line(args: std::fmt::Arguments<'_>) {
-        if let Some(file) = out()
-            && let Ok(mut file) = file.lock()
-        {
-            let _ = writeln!(file, "{args}");
-        }
-    }
-
-    /// One line outside a present — the window callbacks (`R`) and the
-    /// one-time costs (`X`).
-    pub(crate) fn mark(kind: &str, args: std::fmt::Arguments<'_>) {
-        if !active() {
-            return;
-        }
-        line(format_args!("{kind} {:.1} {args}", ms()));
-    }
-
-    /// The marks of one present: `P` on begin, one line per stage, and
-    /// `E` with the total on drop — so every exit answers with its
-    /// duration.
-    pub(crate) struct Traced(Option<Stages>);
-
-    struct Stages {
-        start: std::time::Instant,
-        last: std::time::Instant,
-    }
-
-    impl Traced {
-        /// Closes one stage: the line carries the time since the
-        /// previous mark of this present.
-        pub(crate) fn stage(&mut self, kind: &str, args: std::fmt::Arguments<'_>) {
-            if let Some(stages) = &mut self.0 {
-                let now = std::time::Instant::now();
-                let dur = now.duration_since(stages.last).as_secs_f64() * 1000.0;
-                line(format_args!("{kind} {:.1} dur={dur:.1} {args}", ms()));
-                stages.last = now;
-            }
-        }
-    }
-
-    impl Drop for Traced {
-        fn drop(&mut self) {
-            if let Some(stages) = &self.0 {
-                line(format_args!(
-                    "E {:.1} dur={:.1}",
-                    ms(),
-                    stages.start.elapsed().as_secs_f64() * 1000.0
-                ));
-            }
-        }
-    }
-
-    pub(crate) fn begin(w: f64, h: f64, live: bool, cmds: usize, via: Origin) -> Traced {
-        if !active() {
-            return Traced(None);
-        }
-        line(format_args!(
-            "P {:.1} {w:.0}x{h:.0} live={} cmds={cmds} via={}",
-            ms(),
-            u8::from(live),
-            via.name()
-        ));
-        let now = std::time::Instant::now();
-        Traced(Some(Stages { start: now, last: now }))
-    }
-}
