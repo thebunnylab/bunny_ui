@@ -18,6 +18,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bunny-ui-android"
+version = "0.1.0"
+dependencies = [
+ "bunny-ui",
+ "bunny-ui-vulkan",
+ "countries-core",
+ "countries-pure",
+]
+
+[[package]]
 name = "bunny-ui-apple"
 version = "0.1.0"
 dependencies = [

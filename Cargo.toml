@@ -5,6 +5,7 @@ members = [
     "crates/bunny_ui",
     "crates/bunny_ui_apple",
     "crates/bunny_ui_vulkan",
+    "crates/bunny_ui_android",
     "crates/bunny_ui_macos",
     "crates/bunny_ui_ios",
     "crates/bunny_ui_windows",
