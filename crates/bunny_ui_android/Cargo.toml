@@ -33,3 +33,8 @@ crate-type = ["cdylib"]
 name = "touch_window_android"
 path = "examples/touch_window.rs"
 crate-type = ["cdylib"]
+
+[[example]]
+name = "image_window_android"
+path = "examples/image_window.rs"
+crate-type = ["cdylib"]

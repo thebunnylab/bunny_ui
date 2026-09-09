@@ -580,3 +580,62 @@ pub fn clipboard_read() -> Option<String> {
     let string = env.call_object(text, to_string, &[])?;
     env.to_string(string)
 }
+
+/// Asks the input method for the keyboard, or to take it back. The
+/// platform serves the keyboard to the window's FOCUSED view (the decor
+/// view when nothing else holds the focus), so the ask names that view
+/// — the activity's own content view is not the one served, and an ask
+/// in its name is refused. `false` = the platform said no.
+pub fn keyboard(show: bool) -> bool {
+    let Some(env) = Env::current() else { return false };
+    let Some(_frame) = Frame::new(env, 12) else { return false };
+    let ask = || -> Option<bool> {
+        let decor = decor_view(env)?;
+        let view_class = env.class(c"android/view/View")?;
+        let activity = env.activity();
+        let context_class = env.class(c"android/content/Context")?;
+        let get_service =
+            env.method(context_class, c"getSystemService", c"(Ljava/lang/String;)Ljava/lang/Object;")?;
+        let name = env.string("input_method")?;
+        let manager = env.call_object(activity, get_service, &[object(name)])?;
+        let manager_class = env.class(c"android/view/inputmethod/InputMethodManager")?;
+        if show {
+            let find_focus = env.method(view_class, c"findFocus", c"()Landroid/view/View;")?;
+            let target = env.call_object(decor, find_focus, &[]).unwrap_or(decor);
+            let show_soft = env.method(manager_class, c"showSoftInput", c"(Landroid/view/View;I)Z")?;
+            // SHOW_FORCED: the served view is no text editor in the
+            // platform's eyes, and an implicit ask is refused for it
+            env.call_bool(manager, show_soft, &[object(target), int(2)])
+        } else {
+            let token_of = env.method(view_class, c"getWindowToken", c"()Landroid/os/IBinder;")?;
+            let token = env.call_object(decor, token_of, &[])?;
+            let hide = env.method(manager_class, c"hideSoftInputFromWindow", c"(Landroid/os/IBinder;I)Z")?;
+            env.call_bool(manager, hide, &[object(token), int(0)])
+        }
+    };
+    ask().unwrap_or(false)
+}
+
+/// The configuration the activity's resources hold right now: the
+/// `uiMode` bits, the width in dp and the density in dpi. The native
+/// `AConfiguration` road answers a rotation or a night switch late —
+/// the resources are what the framework updated before it called.
+pub fn configuration() -> Option<(i32, i32, i32)> {
+    let env = Env::current()?;
+    let _frame = Frame::new(env, 8)?;
+    let activity = env.activity();
+    let context_class = env.class(c"android/content/Context")?;
+    let get_resources =
+        env.method(context_class, c"getResources", c"()Landroid/content/res/Resources;")?;
+    let resources = env.call_object(activity, get_resources, &[])?;
+    let resources_class = env.class(c"android/content/res/Resources")?;
+    let get_configuration = env.method(
+        resources_class,
+        c"getConfiguration",
+        c"()Landroid/content/res/Configuration;",
+    )?;
+    let configuration = env.call_object(resources, get_configuration, &[])?;
+    let configuration_class = env.class(c"android/content/res/Configuration")?;
+    let read = |name: &CStr| env.int_field(configuration, env.field(configuration_class, name, c"I")?);
+    Some((read(c"uiMode")?, read(c"screenWidthDp")?, read(c"densityDpi")?))
+}

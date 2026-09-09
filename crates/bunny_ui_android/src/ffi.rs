@@ -222,6 +222,9 @@ const AMOTION_EVENT_ACTION_POINTER_UP: i32 = 6;
 const AKEY_EVENT_ACTION_DOWN: i32 = 0;
 const AKEY_EVENT_ACTION_UP: i32 = 1;
 
+// android/native_activity.h
+const ANATIVEACTIVITY_SHOW_SOFT_INPUT_FORCED: u32 = 0x2;
+
 // android/native_window.h
 const WINDOW_FORMAT_RGBA_8888: i32 = 1;
 const WINDOW_FORMAT_RGBX_8888: i32 = 2;
@@ -467,6 +470,8 @@ pub unsafe fn on_create(activity: *mut ANativeActivity, boot: fn()) {
     if crate::log::trace() {
         let sdk = unsafe { (*activity).sdk_version };
         alog!("create: sdk {sdk}, scale {scale}");
+        // the pump's own proof: this line must come back as a WARN
+        eprintln!("bunny_ui android: stderr reaches logcat");
     }
     boot();
 }
@@ -708,6 +713,12 @@ unsafe extern "C" fn on_wake(fd: c_int, _events: c_int, _data: *mut c_void) -> c
 unsafe extern "C" fn on_blink(fd: c_int, _events: c_int, _data: *mut c_void) -> c_int {
     let mut count = 0u64;
     unsafe { read(fd, (&raw mut count).cast(), 8) };
+    // the keyboard can leave on its own (the back key, which the input
+    // method keeps) and no callback says so: while it is up, or was,
+    // the slow clock asks the window
+    if KEYBOARD_WANTED.with(Cell::get) || IME_SEEN.with(Cell::get) {
+        refresh_insets();
+    }
     dispatch(AppEvent::Blink);
     1
 }
@@ -996,6 +1007,19 @@ pub fn view_scale() -> usize {
 /// The configuration: dark or light (`None` when the system says
 /// neither), whether the width is compact, and the scale.
 pub fn config() -> (Option<bool>, bool, usize) {
+    // the resources first: they hold what the framework updated before
+    // it called; the native configuration answers a rotation or a night
+    // switch late
+    if let Some((ui_mode, width_dp, density_dpi)) = crate::jni::configuration() {
+        // Configuration.UI_MODE_NIGHT_MASK 0x30: NO 0x10, YES 0x20
+        let dark = match ui_mode & 0x30 {
+            0x20 => Some(true),
+            0x10 => Some(false),
+            _ => None,
+        };
+        let scale = ((density_dpi.max(1) as f64) / 160.0).round().max(1.0) as usize;
+        return (dark, width_dp < 600, scale);
+    }
     let activity = ACTIVITY.with(Cell::get);
     if activity.is_null() {
         return (None, false, 1);
@@ -1121,15 +1145,21 @@ pub fn want_keyboard(wanted: bool) {
     if KEYBOARD_WANTED.with(|slot| slot.replace(wanted)) == wanted {
         return;
     }
-    let activity = ACTIVITY.with(Cell::get);
-    if activity.is_null() {
-        return;
-    }
-    unsafe {
-        if wanted {
-            ANativeActivity_showSoftInput(activity, 0);
-        } else {
-            ANativeActivity_hideSoftInput(activity, 0);
+    // the input method is asked in the name of the view it serves; the
+    // activity's own door is the fallback, and a refusal is not
+    // remembered — the next frame asks again
+    if !crate::jni::keyboard(wanted) {
+        let activity = ACTIVITY.with(Cell::get);
+        if activity.is_null() {
+            KEYBOARD_WANTED.with(|slot| slot.set(!wanted));
+            return;
+        }
+        unsafe {
+            if wanted {
+                ANativeActivity_showSoftInput(activity, ANATIVEACTIVITY_SHOW_SOFT_INPUT_FORCED);
+            } else {
+                ANativeActivity_hideSoftInput(activity, 0);
+            }
         }
     }
     arm_insets_retry();
