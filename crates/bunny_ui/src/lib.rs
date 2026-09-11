@@ -154,8 +154,8 @@ pub mod prelude {
     pub use motor::loadable::{Loadable, LoadableSubject, LoadError};
     pub use motor::runtime::Site;
     pub use motor::state::{
-        Binding, Context, Environment, EnvironmentValues, FromEnvironment, Locale, ProvidesQueries,
-        SizeClass, State,
+        Binding, Context, Environment, EnvironmentValues, FromEnvironment, KeyboardInset, Locale,
+        ProvidesQueries, SafeAreaInsets, SizeClass, State,
     };
     pub use motor::views::{
         ContentMode, Edge, Font, ListStyle, NavigationPath, ProgressViewStyle, Query,
@@ -12499,6 +12499,68 @@ mod tests {
             }
         }
         assert_eq!(first_line(&Runtime::new().display_frame(&Preview, size)), "narrow");
+    }
+
+    /// The shell's insets reach a BODY, and the keyboard's band stays its
+    /// own number.
+    ///
+    /// The root is laid out inside them either way; what needs to read them
+    /// is a view that paints THROUGH a band and holds its content clear by
+    /// hand. And the two are separate because they mean opposite things to
+    /// such a view: the keyboard covers what cannot be used, while the home
+    /// indicator's band is a place a surface may paint.
+    #[test]
+    fn the_insets_reach_the_body_and_the_keyboard_keeps_its_own_band() {
+        use crate::layout::{Edges, Size};
+        use motor::state::{KeyboardInset, SafeAreaInsets};
+
+        #[derive(Clone, Copy)]
+        struct Reader;
+        impl Component for Reader {
+            fn body(self, ctx: &Context) -> impl View {
+                let safe = ctx.environment::<SafeAreaInsets>();
+                let keys = ctx.environment::<KeyboardInset>();
+                vstack!(text(format!("{} {} {}", safe.top, safe.bottom, keys.0)), spacer())
+            }
+        }
+        fn first_line(display: &crate::layout::DisplayList) -> String {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { content, .. } => {
+                        Some(content.to_string())
+                    }
+                    _ => None,
+                })
+                .expect("a line paints")
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        assert_eq!(first_line(&runtime.display_frame(&Reader, size)), "0 0 0", "a desktop has none");
+
+        runtime.set_safe_area(Edges { top: 59.0, trailing: 0.0, bottom: 34.0, leading: 0.0 });
+        assert_eq!(
+            first_line(&runtime.display_frame(&Reader, size)),
+            "59 34 0",
+            "the phone's bands reach the body",
+        );
+        let _ = runtime.display_frame(&Reader, size);
+        assert!(runtime.body_runs().is_empty(), "and settle");
+
+        // The keyboard rises: its own number moves and the safe area's does
+        // not — the merger the layout uses is `frame_insets`, and a body that
+        // needed the merged number could compute it and a body that needs
+        // them apart could not recover them.
+        runtime.set_keyboard_inset(291.0);
+        assert_eq!(first_line(&runtime.display_frame(&Reader, size)), "59 34 291");
+
+        // An unchanged value costs nothing: no environment move, no re-run.
+        let _ = runtime.display_frame(&Reader, size);
+        runtime.set_safe_area(Edges { top: 59.0, trailing: 0.0, bottom: 34.0, leading: 0.0 });
+        runtime.set_keyboard_inset(291.0);
+        let _ = runtime.display_frame(&Reader, size);
+        assert!(runtime.body_runs().is_empty(), "nothing moved, nothing ran");
     }
 
     /// The same hold on a row OUTSIDE any scroll: the press went down at

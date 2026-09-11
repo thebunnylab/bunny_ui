@@ -557,7 +557,24 @@ impl Runtime {
     /// platform's insets (`safeAreaInsets` on a phone) and the next
     /// layout lays the root out inside them. Leading is the left edge.
     pub fn set_safe_area(&self, insets: crate::layout::Edges) {
+        if self.safe_area.get() == insets {
+            return;
+        }
         self.safe_area.set(insets);
+        // …and into the environment, so a body can READ them. The root is
+        // laid out inside them either way; what needs the numbers is a view
+        // that paints THROUGH the band and holds its own content clear — an
+        // ambient wash under the status bar, a sheet whose foot lands on the
+        // display's own edge. Mirrored rather than exposed only on the
+        // runtime because a body has a `Context` and no runtime.
+        self.set_environment(|values| {
+            values.safeAreaInsets = motor::state::SafeAreaInsets {
+                top: insets.top,
+                trailing: insets.trailing,
+                bottom: insets.bottom,
+                leading: insets.leading,
+            };
+        });
     }
 
     pub fn safe_area(&self) -> crate::layout::Edges {
@@ -568,7 +585,15 @@ impl Runtime {
     /// The bottom inset becomes the larger of the safe area's and this,
     /// so the content stands above the keys instead of under them.
     pub fn set_keyboard_inset(&self, bottom: Px) {
-        self.keyboard_inset.set(bottom.max(0.0));
+        let bottom = bottom.max(0.0);
+        if self.keyboard_inset.get() == bottom {
+            return;
+        }
+        self.keyboard_inset.set(bottom);
+        // Its own environment value, and NOT folded into the safe area's:
+        // the two bands mean opposite things to a surface that reaches the
+        // screen's edge (see `motor::state::KeyboardInset`).
+        self.set_environment(|values| values.keyboardInset = motor::state::KeyboardInset(bottom));
     }
 
     /// The four insets the next layout lays the root inside.
