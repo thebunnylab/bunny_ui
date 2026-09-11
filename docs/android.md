@@ -109,6 +109,7 @@ Java, and do not arrive — the honest ceiling of a `NativeActivity`.
 | dark, size class | the configuration (`uiMode`, the width in dp), mirrored into the theme (while the app has not chosen one) and `SizeClass`; a change is an event, not a new activity |
 | text, images | `android.graphics` and `AImageDecoder`; a face the app ships goes through `register_font`, which reads the family out of the file |
 | the clipboard, reduce motion | the system's, through JNI |
+| a directory to write | `data_dir()` — the activity's private files directory, which nothing in the environment names |
 | hosts | none: a web view is Java |
 | a chrome, a cursor, a live resize | none: the phone has no window frame and no pointer |
 | an IME road | keys only — see above |
