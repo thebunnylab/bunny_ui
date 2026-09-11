@@ -3036,14 +3036,36 @@ impl Runtime {
     /// The frame rate the moment deserves. A shell with a slow timer
     /// serves a loop-only scene with one frame per step instead of a
     /// display-rate driver — the difference between a decoration and a
-    /// busy app. Tasks in flight keep the display pace: their wakers
-    /// ride the frame clock.
+    /// busy app. A sleeping task is a step like any other: its waker
+    /// rides the frame clock, so the driver beats at the sleeper's own
+    /// deadline and a poll every 33 ms costs its own 30 frames instead
+    /// of the display's 120. A sleeper nearer than one display frame
+    /// keeps the link, which is the one thing the link does better.
     pub fn frame_pace(&self) -> crate::anim::FramePace {
+        use crate::anim::FramePace;
+
+        /// One frame of a 60 Hz screen: the floor under a timer's beat.
+        /// A task that waits less than this asks for nothing the
+        /// display link does not already give it.
+        const DISPLAY_STEP: f64 = 1.0 / 60.0;
+
         let pace = self.animator.borrow().pace();
-        if motor::task::has_timers() && pace != crate::anim::FramePace::Display {
-            return crate::anim::FramePace::Display;
+        if pace == FramePace::Display {
+            return pace;
         }
-        pace
+        let Some(left) = motor::task::next_timer_in() else {
+            return pace;
+        };
+        if left < DISPLAY_STEP {
+            return FramePace::Display;
+        }
+        // two clocks, and the shortest step is the one both are served
+        // by: a loop that draws every 250 ms and a task that wakes in
+        // 33 ms need 33 ms
+        FramePace::Slow(match pace {
+            FramePace::Slow(step) => step.min(left),
+            FramePace::Display | FramePace::Idle => left,
+        })
     }
 
     /// Freezes (or resumes) the loop clocks — the shell calls it when
