@@ -1924,6 +1924,47 @@ mod tests {
     }
 
     #[test]
+    fn the_driver_beats_at_the_sleepers_pace_and_not_the_displays() {
+        use crate::anim::FramePace;
+
+        #[derive(Clone, Copy)]
+        struct Polling {
+            millis: State<u64>,
+        }
+
+        impl Component for Polling {
+            fn body(self, _ctx: &Context) -> impl View {
+                let millis = self.millis;
+                // the shape every poll loop has: wake, look, wait again
+                text("polling").task_id(millis.get(), move || async move {
+                    loop {
+                        task::sleep(std::time::Duration::from_millis(millis.get())).await;
+                    }
+                })
+            }
+        }
+
+        let runtime = Runtime::new();
+        let view = Polling { millis: State::new(33) };
+        runtime.render_stable(&view);
+        assert!(runtime.wants_frame(), "a sleeper keeps the clock moving");
+        let FramePace::Slow(step) = runtime.frame_pace() else {
+            panic!("a sleeper alone never asks for the display link")
+        };
+        assert!((step - 0.033).abs() < 1e-6, "the beat is the sleeper's own deadline: {step}");
+
+        // the id that changes throws the old wait away and starts a
+        // shorter one the display link already outruns
+        view.millis.set(5);
+        runtime.render_stable(&view);
+        assert_eq!(
+            runtime.frame_pace(),
+            FramePace::Display,
+            "under one display frame the link is the better driver"
+        );
+    }
+
+    #[test]
     fn an_empty_virtual_list_asks_for_no_row() {
         use crate::layout::{Proposal, Size};
         use std::cell::Cell;
@@ -11777,6 +11818,11 @@ mod tests {
 
         assert!(!runtime.touch_began(1, 10.0, 80.0, 1), "over a list the press waits");
         assert!(runtime.wants_frame(), "the hold is on the clock");
+        assert_eq!(
+            runtime.frame_pace(),
+            FramePace::Display,
+            "and on the LINK: nothing animates and nothing sleeps, but the clock is what              decides what this touch turns out to be — a hold, a drag, a fling — and a beat              of its own would decide it late"
+        );
         assert!(!runtime.touch_moved(1, 10.0, 78.0), "inside the slop nothing moves");
         assert_eq!(runtime.scroll_offset(&region).y, 0.0);
         assert!(runtime.touch_moved(1, 10.0, 60.0), "past the slop the content slides");

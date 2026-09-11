@@ -314,6 +314,19 @@ pub fn has_timers() -> bool {
     EXECUTOR.with(|executor| !executor.borrow().timers.is_empty())
 }
 
+/// How long the earliest sleeper still waits, in seconds — `None`
+/// when nobody sleeps. Awake is not the same as fast: the shell reads
+/// this to beat its driver at the sleeper's own pace instead of at
+/// the display's. [`advance`] takes every ripe timer with it, so what
+/// stays in the map is always still ahead of the clock.
+pub fn next_timer_in() -> Option<f64> {
+    EXECUTOR.with(|executor| {
+        let executor = executor.borrow();
+        let clock = executor.clock;
+        executor.timers.values().map(|(deadline, _)| deadline - clock).min_by(f64::total_cmp)
+    })
+}
+
 // MARK: - The channel: one value or a whole stream
 
 struct Chan<T> {
@@ -453,13 +466,37 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Every test shares the thread-local queue — this clears what an
-    /// earlier one left behind.
+    /// earlier one left behind, the clock and its sleepers included.
     fn fresh() {
         EXECUTOR.with(|executor| {
             let mut executor = executor.borrow_mut();
             executor.tasks.clear();
+            executor.timers.clear();
+            executor.clock = 0.0;
             executor.shared = Arc::default();
         });
+    }
+
+    #[test]
+    fn the_nearest_sleeper_is_the_one_the_driver_hears() {
+        fresh();
+        assert_eq!(next_timer_in(), None, "nobody sleeps");
+
+        let long = spawn(async { sleep(std::time::Duration::from_millis(250)).await });
+        let short = spawn(async { sleep(std::time::Duration::from_millis(33)).await });
+        poll_ready();
+
+        let left = next_timer_in().expect("two sleepers");
+        assert!((left - 0.033).abs() < 1e-9, "the nearest deadline, not the first: {left}");
+
+        advance(0.033);
+        let left = next_timer_in().expect("the long one waits on");
+        assert!((left - 0.217).abs() < 1e-9, "the clock moved under the one that stayed: {left}");
+
+        advance(0.217);
+        assert_eq!(next_timer_in(), None, "a ripe timer leaves with the clock");
+        long.detach();
+        short.detach();
     }
 
     #[test]
