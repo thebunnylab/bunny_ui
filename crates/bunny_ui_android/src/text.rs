@@ -66,11 +66,25 @@ struct Face {
 
 /// The Android text engine. Single-thread, like the rest of the shell:
 /// it holds the UI thread's env, and is asked on that thread only.
+/// One face the app ships: what the FILE said about itself, and the
+/// typeface the platform read out of it (a global reference).
+struct Shipped {
+    /// `usWeightClass`, 100..=900.
+    weight: u16,
+    italic: bool,
+    typeface: JObject,
+}
+
 pub struct AndroidTextEngine {
     faces: RefCell<HashMap<FontKey, Face>>,
-    /// The faces the app ships, by the family name their file declares
-    /// (lowercased) — global references.
-    registered: RefCell<HashMap<String, JObject>>,
+    /// The faces the app ships, by the family name their files declare
+    /// (lowercased). A family is a LIST: the platform reads each file as
+    /// an unnamed typeface and can neither un-slant nor un-bold one, so
+    /// the face a spec asks for has to be chosen here — keyed by one
+    /// name, four files that all say "Geist" answered with whichever was
+    /// registered last, and a product that ships an italic rendered
+    /// every word of itself oblique.
+    registered: RefCell<HashMap<String, Vec<Shipped>>>,
 }
 
 impl AndroidTextEngine {
@@ -116,10 +130,20 @@ impl AndroidTextEngine {
             env.global(typeface)
         })();
         let Some(typeface) = typeface else { return false };
+        // What the file says about itself decides which asks it answers.
+        // A face with no `OS/2` table is an upright 400 — the same thing
+        // the platform would assume, said once here.
+        let (weight, italic) = crate::face::style(bytes).unwrap_or((400, false));
         // a spec that missed before this call cached the fallback it got
         self.drop_faces();
-        if let Some(old) = self.registered.borrow_mut().insert(family.to_lowercase(), typeface) {
-            env.delete_global(old);
+        let mut registered = self.registered.borrow_mut();
+        let family = registered.entry(family.to_lowercase()).or_default();
+        let shipped = Shipped { weight, italic, typeface };
+        match family.iter_mut().find(|face| face.weight == weight && face.italic == italic) {
+            Some(slot) => {
+                env.delete_global(std::mem::replace(slot, shipped).typeface);
+            }
+            None => family.push(shipped),
         }
         true
     }
@@ -140,8 +164,32 @@ impl AndroidTextEngine {
         let italic = spec.slant == Slant::Italic;
         // Typeface.NORMAL 0, BOLD 1, ITALIC 2, BOLD_ITALIC 3
         let style = (bold as i32) | ((italic as i32) << 1);
+        // the weight the spec asks for, in the platform's own scale
+        let weight = match spec.weight {
+            Weight::Regular => 400u16,
+            Weight::Medium => 500,
+            Weight::Semibold => 600,
+            Weight::Bold => 700,
+            Weight::ExtraBold => 800,
+            Weight::Black => 900,
+        };
         let named = spec.family.name().and_then(|name| {
-            self.registered.borrow().get(&name.to_lowercase()).copied()
+            let registered = self.registered.borrow();
+            let family = registered.get(&name.to_lowercase())?;
+            // The slant is categorical — an upright face asked to lean
+            // can be synthesised and a leaning one cannot be
+            // straightened — so it is matched FIRST, and the weight is
+            // then the nearest the family actually ships. A family with
+            // no face on the asked side answers with its nearest by
+            // weight anyway: the platform's synthetic slant is a better
+            // answer than somebody else's typeface.
+            let want = i32::from(weight);
+            family
+                .iter()
+                .min_by_key(|face| {
+                    (face.italic != italic, (i32::from(face.weight) - want).abs())
+                })
+                .map(|face| face.typeface)
         });
         let base = match named {
             Some(registered) => registered,
@@ -167,20 +215,16 @@ impl AndroidTextEngine {
         };
         // the weight, finely: the platform picks the nearest face the
         // family has (API 28)
-        let weight = match spec.weight {
-            Weight::Regular => 400,
-            Weight::Medium => 500,
-            Weight::Semibold => 600,
-            Weight::Bold => 700,
-            Weight::ExtraBold => 800,
-            Weight::Black => 900,
-        };
         let refine = env.static_method(
             typeface_class,
             c"create",
             c"(Landroid/graphics/Typeface;IZ)Landroid/graphics/Typeface;",
         )?;
-        env.call_static_object(typeface_class, refine, &[object(base), int(weight), boolean(italic)])
+        env.call_static_object(
+            typeface_class,
+            refine,
+            &[object(base), int(i32::from(weight)), boolean(italic)],
+        )
     }
 
     /// The paint for a spec, made once per key.
@@ -231,8 +275,8 @@ impl Drop for AndroidTextEngine {
     fn drop(&mut self) {
         self.drop_faces();
         if let Some(env) = Env::current() {
-            for (_, typeface) in self.registered.borrow_mut().drain() {
-                env.delete_global(typeface);
+            for face in self.registered.borrow_mut().drain().flat_map(|(_, faces)| faces) {
+                env.delete_global(face.typeface);
             }
         }
     }

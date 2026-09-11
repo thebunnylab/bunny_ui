@@ -9,9 +9,31 @@ pub fn fnv64(bytes: &[u8]) -> u64 {
     })
 }
 
-/// The family name (`nameID` 1) out of a TrueType or OpenType face's
-/// `name` table; a collection answers its first face's.
-pub fn family_name(bytes: &[u8]) -> Option<String> {
+/// The weight class and the slant a face declares about ITSELF, out of
+/// its `OS/2` table — `usWeightClass` (100..=900) and bit 0 of
+/// `fsSelection`.
+///
+/// A family is several files, and the platform reads each one as an
+/// unnamed typeface: without this, four files that all say "Geist" are
+/// one entry and the last one registered answers for every weight and
+/// every slant. The product ships Regular, Medium, SemiBold and Italic
+/// under that one family, so the last one was the ITALIC, and the whole
+/// workbench rendered oblique on a phone.
+///
+/// `None` when the table is missing (a face without `OS/2` is answered
+/// as an upright 400, by the caller).
+pub fn style(bytes: &[u8]) -> Option<(u16, bool)> {
+    let table = table(bytes, b"OS/2")?;
+    let u16_at = |at: usize| Some(u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]));
+    let weight = u16_at(table + 4)?;
+    // fsSelection lives at offset 62 in every version of the table
+    let italic = u16_at(table + 62)? & 0x0001 != 0;
+    Some((weight, italic))
+}
+
+/// Where a table starts, by its four-byte tag — a collection answers
+/// out of its first face's directory.
+fn table(bytes: &[u8], tag: &[u8; 4]) -> Option<usize> {
     let u16_at = |at: usize| Some(u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]));
     let u32_at = |at: usize| {
         Some(u32::from_be_bytes([
@@ -21,18 +43,19 @@ pub fn family_name(bytes: &[u8]) -> Option<String> {
             *bytes.get(at + 3)?,
         ]))
     };
-    // a collection carries its first face's table directory at an offset
     let directory = if bytes.starts_with(b"ttcf") { u32_at(12)? as usize } else { 0 };
-    let table_count = u16_at(directory + 4)? as usize;
-    let mut name_table = None;
-    for index in 0..table_count {
+    let count = u16_at(directory + 4)? as usize;
+    (0..count).find_map(|index| {
         let record = directory + 12 + index * 16;
-        if bytes.get(record..record + 4)? == b"name" {
-            name_table = Some(u32_at(record + 8)? as usize);
-            break;
-        }
-    }
-    let table = name_table?;
+        (bytes.get(record..record + 4)? == tag).then(|| u32_at(record + 8).map(|at| at as usize))?
+    })
+}
+
+/// The family name (`nameID` 1) out of a TrueType or OpenType face's
+/// `name` table; a collection answers its first face's.
+pub fn family_name(bytes: &[u8]) -> Option<String> {
+    let u16_at = |at: usize| Some(u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]));
+    let table = table(bytes, b"name")?;
     let count = u16_at(table + 2)? as usize;
     let strings = table + u16_at(table + 4)? as usize;
     let mut fallback = None;
@@ -121,6 +144,50 @@ mod tests {
         moved[12 + 8..12 + 12].copy_from_slice(&table_offset.to_be_bytes());
         collection.extend_from_slice(&moved);
         assert_eq!(family_name(&collection).as_deref(), Some("Bunny Sans"));
+    }
+
+    /// A face carrying an `OS/2` table beside its `name` one: the two
+    /// tables a shipped face is read for.
+    fn face_with_style(weight: u16, italic: bool) -> Vec<u8> {
+        let plain = face_with_names();
+        // the `name` table's own bytes, which move by one table record
+        let name = &plain[28..];
+        let mut os2 = vec![0u8; 78];
+        os2[0..2].copy_from_slice(&5u16.to_be_bytes()); // version
+        os2[4..6].copy_from_slice(&weight.to_be_bytes()); // usWeightClass
+        os2[62..64].copy_from_slice(&u16::from(italic).to_be_bytes()); // fsSelection
+        let directory = 12 + 2 * 16;
+        let mut face = Vec::new();
+        face.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        face.extend_from_slice(&2u16.to_be_bytes()); // two tables
+        face.extend_from_slice(&[0u8; 6]);
+        // the records are sorted by tag, as a real face's are
+        face.extend_from_slice(b"OS/2");
+        face.extend_from_slice(&0u32.to_be_bytes());
+        face.extend_from_slice(&(directory as u32).to_be_bytes());
+        face.extend_from_slice(&(os2.len() as u32).to_be_bytes());
+        face.extend_from_slice(b"name");
+        face.extend_from_slice(&0u32.to_be_bytes());
+        face.extend_from_slice(&((directory + os2.len()) as u32).to_be_bytes());
+        face.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        face.append(&mut os2);
+        face.extend_from_slice(name);
+        face
+    }
+
+    /// The whole reason the style is read: four files of one family, and
+    /// the italic among them must not answer for the other three.
+    #[test]
+    fn a_face_says_its_weight_and_its_slant() {
+        assert_eq!(style(&face_with_style(400, false)), Some((400, false)));
+        assert_eq!(style(&face_with_style(600, false)), Some((600, false)));
+        assert_eq!(style(&face_with_style(400, true)), Some((400, true)));
+        // the family still reads, with a second table in the directory
+        assert_eq!(family_name(&face_with_style(400, true)).as_deref(), Some("Bunny Sans"));
+        // a face without the table says nothing, and the caller assumes
+        // the upright 400 the platform would
+        assert_eq!(style(&face_with_names()), None);
+        assert_eq!(style(b"not a face"), None);
     }
 
     #[test]
