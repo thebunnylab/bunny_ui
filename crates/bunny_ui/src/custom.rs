@@ -145,6 +145,21 @@ pub trait CustomElement: 'static {
     /// inside a scroll region: a sketch canvas, a map. The default is
     /// `false`: a finger dragged over the box scrolls the region around
     /// it, and a tap still reaches the box as a click. A mouse never
+    /// Does a finger landing HERE take the drag at once, when
+    /// [`CustomElement::takes_drag`] answers for the box as a whole?
+    ///
+    /// A box that scrolls AND carries handles needs both answers: the
+    /// editor pans under a finger everywhere except the squares of its
+    /// selection pins, where the finger is on a handle and a pan would
+    /// take the gesture away from it. `at` is the box's own point, like
+    /// every other point a box is given.
+    ///
+    /// The default is the box's one answer, so a box with no handles
+    /// says nothing new.
+    fn grabs_at(&self, _at: crate::layout::Point) -> bool {
+        self.takes_drag()
+    }
+
     /// asks; only a finger has to choose.
     fn takes_drag(&self) -> bool {
         false

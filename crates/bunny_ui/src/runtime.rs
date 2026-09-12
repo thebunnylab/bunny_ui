@@ -5130,7 +5130,14 @@ impl crate::touch::TouchScene for Runtime {
         if target.ends_with("/#split") || self.grab_thumb(&target, at.x, at.y).is_some() {
             return true;
         }
-        self.custom_at(&target).is_some_and(|placement| placement.element.element().takes_drag())
+        // the box's OWN point: a handle's square is where the box drew it
+        self.custom_at(&target).is_some_and(|placement| {
+            let local = Point {
+                x: at.x - placement.frame.origin.x,
+                y: at.y - placement.frame.origin.y,
+            };
+            placement.element.element().grabs_at(local)
+        })
     }
 
     fn menu_at(&self, at: Point) -> bool {
