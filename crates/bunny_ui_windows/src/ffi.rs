@@ -100,6 +100,16 @@ struct TrackMouseEventArgs {
     hover_time: u32,
 }
 
+/// `WM_GETMINMAXINFO`'s payload — only `min_track` is ours to answer.
+#[repr(C)]
+struct MinMaxInfo {
+    reserved: Point,
+    max_size: Point,
+    max_position: Point,
+    min_track: Point,
+    max_track: Point,
+}
+
 #[link(name = "user32", kind = "raw-dylib")]
 unsafe extern "system" {
     fn GetKeyState(vk: i32) -> i16;
@@ -294,6 +304,11 @@ const DWMWCP_ROUND: u32 = 2;
 
 // window styles
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
+/// The three bits a door drops: the resize border, the zoom box, the
+/// minimize box.
+const WS_THICKFRAME: u32 = 0x0004_0000;
+const WS_MAXIMIZEBOX: u32 = 0x0001_0000;
+const WS_MINIMIZEBOX: u32 = 0x0002_0000;
 // SetWindowPos flags
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
@@ -307,6 +322,12 @@ const WM_SIZE: u32 = 0x0005;
 const WM_ACTIVATE: u32 = 0x0006;
 const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
+const WM_GETMINMAXINFO: u32 = 0x0024;
+/// `GetWindow`: the window that OWNS this one (0 when it owns itself).
+const GW_OWNER: u32 = 4;
+/// The caption follows the app, not the system: a dark scene under a white
+/// title bar is two applications sharing one frame.
+const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_SETCURSOR: u32 = 0x0020;
 const WM_TIMER: u32 = 0x0113;
@@ -929,6 +950,12 @@ fn scene_hit_test(hwnd: Hwnd, screen_x: i32, screen_y: i32) -> isize {
     }
     let factor = shared_factor_for(hwnd);
     let (x, y) = (point.x as f64 / factor, point.y as f64 / factor);
+    // A dialog answers for itself: its content was laid out in the owner's
+    // scene, but its surface is its own, so the window's gates would answer
+    // about the wrong picture.
+    if let Some(answer) = dialog_hit(hwnd, x, y) {
+        return answer;
+    }
     let control = CONTROL_GATE
         .with(|slot| slot.borrow().as_ref().and_then(|gate| gate(x, y)));
     if let Some(control) = control {
@@ -1267,12 +1294,30 @@ pub fn set_handler(handler: Box<dyn FnMut(AppEvent)>) {
 }
 
 /// Delivers an event to the handler — used by the window procedure and
-/// by the first frame. Never called from a paint: `WM_PAINT` reads the
-/// backing directly, so a synchronous present inside a dispatch cannot
-/// re-enter this borrow.
+/// by the first frame. `WM_PAINT` never comes through here: it reads the
+/// backing directly, so a present cannot re-enter this borrow.
+///
+/// **A frame runs UNDER this borrow, and a frame now moves windows.** Raising
+/// or retiring a DIALOG calls into the platform, and the platform answers with
+/// `WM_DESTROY`, `WM_ACTIVATE`, `WM_KILLFOCUS` and friends SYNCHRONOUSLY —
+/// arriving here while the handler that asked for them is still running.
+/// Borrowing again would panic and take the app with it, so a re-entrant ask
+/// is POSTED instead, on the road `ask_represent` already exists for. The
+/// frame in flight is already drawing, so a redraw ask loses nothing; anything
+/// else says so on stderr rather than disappearing, because an input event
+/// cannot legitimately arrive from inside our own window call.
 pub fn dispatch(event: AppEvent) {
     HANDLER.with(|slot| {
-        if let Some(handler) = slot.borrow_mut().as_mut() {
+        let Ok(mut held) = slot.try_borrow_mut() else {
+            if !matches!(event, AppEvent::Redraw) {
+                eprintln!(
+                    "bunny_ui windows: an event arrived while a frame held the                      handler — posted as a repaint instead of delivered"
+                );
+            }
+            ask_represent(MAIN_HWND.load(Ordering::Acquire));
+            return;
+        };
+        if let Some(handler) = held.as_mut() {
             handler(event);
         }
     });
@@ -1707,6 +1752,17 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // sized by the present that created it, and its birth
             // arrives here SYNCHRONOUSLY from inside that present — a
             // dispatch would re-enter the handler mid-frame
+            // ...and a DIALOG, which owns its size the same way: the reader
+            // drags its frame, and the blit that answers is sized from these
+            // metrics. Its birth is not handled here (see `create_dialog`),
+            // and its redraw is POSTED — `set_dialog_client_frame` delivers
+            // this message synchronously from inside the present that placed
+            // it, and a dispatch would re-enter the handler running it.
+            if is_dialog(hwnd) {
+                refresh_metrics(hwnd);
+                ask_represent(owner_of(hwnd));
+                return 0;
+            }
             if !is_top_level(hwnd) || wparam == SIZE_MINIMIZED {
                 return 0;
             }
@@ -2242,7 +2298,43 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             }
             0
         }
+        WM_GETMINMAXINFO => {
+            let Some((min_width, min_height)) =
+                DIALOG_MINS.with(|mins| mins.borrow().get(&hwnd).copied())
+            else {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            };
+            // the floor is the CONTENT's, in layout points; under scene chrome
+            // there is no frame to grow around it
+            let dpi = unsafe { GetDpiForWindow(hwnd) };
+            let factor = shared_factor_for(hwnd);
+            let mut rect = Rect {
+                left: 0,
+                top: 0,
+                right: (min_width * factor).round() as i32,
+                bottom: (min_height * factor).round() as i32,
+            };
+            unsafe {
+                if !wears_scene_chrome(hwnd) {
+                    AdjustWindowRectExForDpi(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0, dpi);
+                }
+                let info = lparam as *mut MinMaxInfo;
+                (*info).min_track =
+                    Point { x: rect.right - rect.left, y: rect.bottom - rect.top };
+            }
+            0
+        }
         WM_CLOSE => {
+            // A dialog's frame belongs to the platform, but its EXISTENCE
+            // belongs to the scene: closing the window here would leave the
+            // app holding a binding that still says open. Queue the overlay
+            // and let the shell dismiss it; the scene closes the window.
+            let dialog = DIALOG_PATHS.with(|paths| paths.borrow().get(&hwnd).cloned());
+            if let Some(path) = dialog {
+                DIALOG_CLOSED.with(|closed| closed.borrow_mut().push(path));
+                ask_represent(owner_of(hwnd));
+                return 0;
+            }
             unsafe {
                 DestroyWindow(hwnd);
             }
@@ -2256,6 +2348,10 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             });
             PANEL_ORIGINS.with(|origins| origins.borrow_mut().remove(&hwnd));
             LEAVE_ARMED.with(|armed| armed.borrow_mut().remove(&hwnd));
+            // A dialog's answers die WITH its window, and not a moment
+            // earlier — dropping them on `WM_MOUSELEAVE` once left the
+            // header undraggable the first time the pointer wandered off.
+            forget_dialog(hwnd);
             // a panel dies in silence; a top-level window leaves the
             // registry, and the LAST one out quits the app — the
             // single-window contract said again
@@ -2341,13 +2437,29 @@ fn register_class() -> Vec<u16> {
 /// never flashes unpainted. With `scene_chrome`, the frame belongs to
 /// the scene: the non-client conversation answers with the scene's
 /// own drag handle and buttons, and resize borders survive.
-pub fn create_window(title: &str, width: f64, height: f64, scene_chrome: bool) -> WindowHandle {
+pub fn create_window(
+    title: &str,
+    width: f64,
+    height: f64,
+    scene_chrome: bool,
+    resizable: bool,
+    minimizable: bool,
+) -> WindowHandle {
     install_dpi_awareness();
     let class_name = register_class();
     let title = wide(title);
     // WS_CLIPCHILDREN: the CPU road's GDI paint excludes the native
     // hosts' rects, so nothing ever flashes under an island
-    let style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+    let mut style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+    // A door has ONE size and cannot be put away: dropping the bits is what
+    // makes the PLATFORM refuse the gesture, rather than the scene catching it
+    // after the reader already saw it happen.
+    if !resizable {
+        style &= !(WS_THICKFRAME | WS_MAXIMIZEBOX);
+    }
+    if !minimizable {
+        style &= !WS_MINIMIZEBOX;
+    }
     const CW_USEDEFAULT: i32 = i32::MIN; // 0x80000000
     let hwnd = unsafe {
         CreateWindowExW(
@@ -2745,6 +2857,270 @@ pub fn create_panel(owner: &WindowHandle) -> WindowHandle {
     };
     assert!(hwnd != 0, "the platform refused the panel");
     WindowHandle { hwnd }
+}
+
+// MARK: - Dialogs (the overlay that asked to BE a window)
+//
+// `OverlaySurface::Window` is the scene saying "this is not a card over my
+// content, it is a window of its own" — Settings, an org page, an account
+// desk. The mac answers it with a real `NSWindow`; here the answer is a real
+// HWND, and it costs little: `WM_NCCALCSIZE` and `WM_NCHITTEST` already ask
+// `wears_scene_chrome`, so a dialog that joins that set keeps the platform's
+// own frame or sheds it, exactly as a window does.
+//
+// **The close button dismisses the OVERLAY, never the window.** The scene owns
+// whether the dialog exists; a `DestroyWindow` behind its back would leave the
+// app holding a binding that says "open" over nothing.
+
+thread_local! {
+    /// A dialog's floor in layout points — the answer `WM_GETMINMAXINFO`
+    /// gives, so the frame cannot be dragged under the content's minimum.
+    static DIALOG_MINS: RefCell<HashMap<Hwnd, (f64, f64)>> = RefCell::new(HashMap::new());
+    /// Which overlay each dialog window stands for.
+    static DIALOG_PATHS: RefCell<HashMap<Hwnd, String>> = RefCell::new(HashMap::new());
+    /// Dialogs whose close button was pressed, waiting for the shell.
+    static DIALOG_CLOSED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// The caption appearance each was last given — a steady theme must not
+    /// spend a DWM call per frame.
+    static DIALOG_DARK: RefCell<HashMap<Hwnd, bool>> = RefCell::new(HashMap::new());
+    /// Each dialog's own answers for the hit-test. Keyed, unlike the window
+    /// gates: a dialog is a second surface over the same scene, and the two
+    /// cannot share one pair.
+    static DIALOG_GATES: RefCell<HashMap<Hwnd, DialogGates>> = RefCell::new(HashMap::new());
+}
+
+/// One dialog's answers for the platform's hit-test.
+struct DialogGates {
+    drag: Box<dyn Fn(f64, f64) -> bool>,
+    control: Box<dyn Fn(f64, f64) -> Option<ControlHit>>,
+}
+
+/// A real titled window for an overlay that asked to be one. Shares the window
+/// class — and so the pointer road and the frame driver — with its owner.
+///
+/// `min_width`/`min_height` are the CONTENT's floor in layout points.
+pub fn create_dialog(
+    owner: &WindowHandle,
+    title: &str,
+    min_width: f64,
+    min_height: f64,
+    scene_chrome: bool,
+) -> WindowHandle {
+    const CW_USEDEFAULT: i32 = i32::MIN;
+    let class_name = register_class();
+    let wide_title = wide(title);
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            wide_title.as_ptr(),
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            owner.hwnd,
+            0,
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null(),
+        )
+    };
+    assert!(hwnd != 0, "the platform refused the dialog");
+    DIALOG_MINS.with(|mins| {
+        mins.borrow_mut().insert(hwnd, (min_width, min_height));
+    });
+    if scene_chrome {
+        SCENE_CHROME.with(|windows| {
+            windows.borrow_mut().insert(hwnd);
+        });
+        // the frame is the scene's, so the window keeps only the compositor's
+        // rounded corners — the same cut a scene-chrome window takes
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &DWMWCP_ROUND as *const u32 as *const c_void,
+                4,
+            );
+        }
+    }
+    // A dialog blits through `WM_PAINT`, which sizes the destination from
+    // `metrics_of` — and a window with no entry there answers a 0x0 client,
+    // which stretches the frame onto nothing and leaves the window blank. The
+    // birth records them here rather than from `WM_SIZE`: that message arrives
+    // DURING `CreateWindowExW`, before this window is known to be a dialog.
+    refresh_metrics(hwnd);
+    WindowHandle { hwnd }
+}
+
+/// Is this window one of the app's dialogs?
+fn is_dialog(hwnd: Hwnd) -> bool {
+    DIALOG_MINS.with(|mins| mins.borrow().contains_key(&hwnd))
+}
+
+/// The top-level window a dialog belongs to, or the window itself.
+fn owner_of(hwnd: Hwnd) -> Hwnd {
+    let owner = unsafe { GetWindow(hwnd, GW_OWNER) };
+    if owner != 0 { owner } else { hwnd }
+}
+
+/// The paths of every dialog closed since the last ask, emptying the queue.
+pub fn take_closed_dialogs() -> Vec<String> {
+    DIALOG_CLOSED.with(|closed| std::mem::take(&mut *closed.borrow_mut()))
+}
+
+/// A dialog's own hit-test answer, if it has one.
+fn dialog_hit(hwnd: Hwnd, x: f64, y: f64) -> Option<isize> {
+    DIALOG_GATES.with(|gates| {
+        let gates = gates.borrow();
+        let gates = gates.get(&hwnd)?;
+        if let Some(control) = (gates.control)(x, y) {
+            return Some(match control {
+                ControlHit::Close => HTCLOSE,
+                ControlHit::Minimize => HTMINBUTTON,
+                ControlHit::Maximize => HTMAXBUTTON,
+            });
+        }
+        (gates.drag)(x, y).then_some(HTCAPTION)
+    })
+}
+
+/// Everything a dialog leaves behind.
+fn forget_dialog(hwnd: Hwnd) {
+    DIALOG_MINS.with(|mins| {
+        mins.borrow_mut().remove(&hwnd);
+    });
+    DIALOG_PATHS.with(|paths| {
+        paths.borrow_mut().remove(&hwnd);
+    });
+    DIALOG_DARK.with(|seen| {
+        seen.borrow_mut().remove(&hwnd);
+    });
+    DIALOG_GATES.with(|gates| {
+        gates.borrow_mut().remove(&hwnd);
+    });
+    SCENE_CHROME.with(|windows| {
+        windows.borrow_mut().remove(&hwnd);
+    });
+}
+
+impl WindowHandle {
+    /// Names the overlay this dialog stands for, so its close button can
+    /// dismiss the right one.
+    pub fn stands_for(&self, path: &str) {
+        DIALOG_PATHS.with(|paths| {
+            paths.borrow_mut().insert(self.hwnd, path.to_owned());
+        });
+    }
+
+    /// Installs this dialog's answers for the platform's hit-test.
+    ///
+    /// A dialog had none for one build, and `scene_hit_test` said `HTCLIENT`
+    /// over every point of it — so its header could not be dragged and its
+    /// buttons could not be pressed, which are the same refusal seen twice.
+    pub fn answers_the_hit_test(
+        &self,
+        drag: Box<dyn Fn(f64, f64) -> bool>,
+        control: Box<dyn Fn(f64, f64) -> Option<ControlHit>>,
+    ) {
+        DIALOG_GATES.with(|gates| {
+            gates.borrow_mut().insert(self.hwnd, DialogGates { drag, control });
+        });
+    }
+
+    /// Places the dialog so its CLIENT area lands on the given screen
+    /// rectangle. Under scene chrome the client IS the window, so there is no
+    /// frame to grow around it.
+    pub fn set_dialog_client_frame(&self, client: Rect) {
+        let dpi = unsafe { GetDpiForWindow(self.hwnd) };
+        let mut rect = client;
+        unsafe {
+            if !wears_scene_chrome(self.hwnd) {
+                AdjustWindowRectExForDpi(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0, dpi);
+            }
+            SetWindowPos(
+                self.hwnd,
+                0,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// Shows the dialog and gives it the keyboard — a window the reader asked
+    /// for takes focus, unlike a panel.
+    pub fn show_dialog(&self) {
+        unsafe {
+            ShowWindow(self.hwnd, SW_SHOW);
+        }
+    }
+
+    /// Paints the platform's own caption to match the scene beneath it.
+    /// `DialogChrome::Native` asks for the system's bar, not for the system's
+    /// COLOURS: a dark workbench under a white caption reads as two
+    /// applications sharing one frame.
+    pub fn set_dark_caption(&self, dark: bool) {
+        let changed =
+            DIALOG_DARK.with(|seen| seen.borrow_mut().insert(self.hwnd, dark) != Some(dark));
+        if !changed {
+            return;
+        }
+        // An older system answers with an error and a light bar, honestly.
+        let value: i32 = i32::from(dark);
+        unsafe {
+            DwmSetWindowAttribute(
+                self.hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                std::ptr::addr_of!(value).cast::<c_void>(),
+                4,
+            );
+        }
+    }
+
+    /// The inverse of [`WindowHandle::layout_rect_to_screen`]: where a dialog
+    /// the reader dragged now sits, said in the layout's own terms.
+    pub fn screen_rect_to_layout(&self, screen: Rect) -> (f64, f64, f64, f64) {
+        let factor = shared_factor_for(self.hwnd);
+        let mut origin = Point { x: 0, y: 0 };
+        unsafe {
+            ClientToScreen(self.hwnd, &mut origin);
+        }
+        (
+            f64::from(screen.left - origin.x) / factor,
+            f64::from(screen.top - origin.y) / factor,
+            f64::from(screen.right - screen.left) / factor,
+            f64::from(screen.bottom - screen.top) / factor,
+        )
+    }
+
+    /// This window's CLIENT area in screen pixels — the frame a dialog
+    /// actually occupies after the reader moved or resized it.
+    pub fn client_rect_screen(&self) -> Rect {
+        let mut origin = Point { x: 0, y: 0 };
+        let mut client = Rect::default();
+        unsafe {
+            ClientToScreen(self.hwnd, &mut origin);
+            GetClientRect(self.hwnd, &mut client);
+        }
+        Rect {
+            left: origin.x,
+            top: origin.y,
+            right: origin.x + (client.right - client.left),
+            bottom: origin.y + (client.bottom - client.top),
+        }
+    }
+
+    /// Retires a dialog: hidden, forgotten, destroyed.
+    pub fn close_dialog(&self) {
+        forget_dialog(self.hwnd);
+        unsafe {
+            ShowWindow(self.hwnd, SW_HIDE);
+            DestroyWindow(self.hwnd);
+        }
+    }
 }
 
 // MARK: - Native hosts
@@ -3193,7 +3569,7 @@ mod tests {
     fn a_window_registers_creates_and_dies() {
         // headless smoke: the class registers and a real window is
         // born and destroyed without a pump
-        let window = create_window("bunny test", 120.0, 90.0, false);
+        let window = create_window("bunny test", 120.0, 90.0, false, true, true);
         let (width, height) = window.content_size();
         assert!(width > 0.0 && height > 0.0);
         assert!(window.scale() >= 1);
@@ -3215,7 +3591,7 @@ mod tests {
 
     #[test]
     fn a_layout_rect_lands_on_screen_and_comes_back() {
-        let window = create_window("bunny screen", 200.0, 150.0, false);
+        let window = create_window("bunny screen", 200.0, 150.0, false, true, true);
         MAIN_HWND.store(window.hwnd, Ordering::Release);
         let factor = shared_factor();
         let rect = window.layout_rect_to_screen(10.0, 20.0, 30.0, 40.0);
@@ -3231,7 +3607,7 @@ mod tests {
 
     #[test]
     fn a_panel_translates_its_events_into_the_scene() {
-        let window = create_window("bunny panel", 100.0, 80.0, false);
+        let window = create_window("bunny panel", 100.0, 80.0, false, true, true);
         MAIN_HWND.store(window.hwnd, Ordering::Release);
         let panel = create_panel(&window);
         panel.set_scene_origin(300.0, -20.0);
@@ -3250,7 +3626,7 @@ mod tests {
     #[test]
     fn a_host_mounts_places_and_sweeps() {
         use std::cell::Cell;
-        let window = create_window("bunny host", 200.0, 150.0, false);
+        let window = create_window("bunny host", 200.0, 150.0, false, true, true);
         MAIN_HWND.store(window.hwnd, Ordering::Release);
         let factor = shared_factor();
         let px = |v: f64| (v * factor).round() as i32;
@@ -3353,7 +3729,7 @@ mod tests {
 
     #[test]
     fn the_layered_copy_premultiplies_into_bgra() {
-        let window = create_window("bunny layered", 60.0, 40.0, false);
+        let window = create_window("bunny layered", 60.0, 40.0, false, true, true);
         let panel = create_panel(&window);
         // one half-transparent red pixel: premultiplied BGRA
         panel.present_layered(
@@ -3388,7 +3764,7 @@ mod tests {
 
     #[test]
     fn a_wake_crosses_threads_into_the_pump() {
-        let window = create_window("bunny wake", 80.0, 60.0, false);
+        let window = create_window("bunny wake", 80.0, 60.0, false, true, true);
         let hwnd = window.hwnd;
         let handle = std::thread::spawn(move || {
             // the thread-safe half of the pump, from another thread
@@ -3415,7 +3791,7 @@ mod tests {
     #[test]
     fn the_backing_holds_the_swizzled_rows()
     {
-        let window = create_window("bunny backing", 64.0, 64.0, false);
+        let window = create_window("bunny backing", 64.0, 64.0, false, true, true);
         let width = 8usize;
         let height = 4usize;
         let mut rgba = vec![0u8; width * height * 4];
