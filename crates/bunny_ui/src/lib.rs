@@ -11837,6 +11837,104 @@ mod tests {
         runtime.touch_ended(2, 50.0, 50.0);
     }
 
+    /// **A frame does not speak for the hand.** A finger is down and a
+    /// box has it; the frame the press asked for must not announce that a
+    /// mouse arrived, and the gesture must survive the frame.
+    ///
+    /// A frame re-reads the pointer so hover stays honest when content
+    /// moves under a STILL MOUSE. Entered on a touch surface that re-read
+    /// is a lie — `note_pointer_source` reads any pointer door outside a
+    /// touch spend as a mouse — and the lie is expensive: a view that
+    /// shapes itself on the modality (pins for a finger, a menu region for
+    /// a cursor) rebuilds mid-gesture, the grabbed box lands at another
+    /// path, and the drag dies in the air with the finger still on the
+    /// glass. That is what it did to the phone's selection pins
+    /// (owner-reported 2026-09-12: *"ela fica piscando quando puxo mas nao
+    /// muda de lugar"*).
+    #[test]
+    fn a_frame_does_not_speak_for_the_hand() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        /// A box that takes the finger at any point and counts the moves
+        /// it hears while it holds it.
+        struct Held {
+            moves: Rc<Cell<usize>>,
+        }
+
+        impl crate::custom::CustomElement for Held {
+            fn name(&self) -> &'static str {
+                "held"
+            }
+
+            fn measure(
+                &self,
+                proposal: crate::layout::Proposal,
+                _metrics: &crate::custom::Metrics<'_>,
+            ) -> Size {
+                Size {
+                    width: proposal.width.unwrap_or(40.0),
+                    height: proposal.height.unwrap_or(40.0),
+                }
+            }
+
+            fn grabs_at(&self, _at: crate::layout::Point) -> bool {
+                true
+            }
+
+            fn event(
+                &self,
+                event: &crate::custom::ElementEvent,
+                _ctx: &crate::custom::EventCtx<'_>,
+            ) -> crate::custom::Response {
+                if matches!(event, crate::custom::ElementEvent::PointerMoved { .. }) {
+                    self.moves.set(self.moves.get() + 1);
+                }
+                crate::custom::Response::handled()
+            }
+
+            fn paint(
+                &self,
+                _ctx: &crate::custom::PaintCtx<'_>,
+                _painter: &mut crate::custom::Painter<'_>,
+            ) {
+            }
+        }
+
+        #[derive(Clone)]
+        struct Board {
+            moves: Rc<Cell<usize>>,
+        }
+
+        impl Component for Board {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Held { moves: self.moves })
+            }
+        }
+
+        let moves = Rc::new(Cell::new(0));
+        let view = Board { moves: Rc::clone(&moves) };
+        let runtime = Runtime::new();
+        let size = Size { width: 100.0, height: 100.0 };
+        let _ = runtime.display_frame(&view, size);
+
+        runtime.touch_began(1, 50.0, 50.0, 1);
+        assert!(runtime.last_input_was_touch(), "the finger is on the glass");
+
+        // every step of a drag paints, and the paint is where this broke
+        let _ = runtime.display_frame(&view, size);
+        assert!(
+            runtime.last_input_was_touch(),
+            "a frame is not an input: the hand is still the one that pressed",
+        );
+
+        runtime.touch_moved(1, 40.0, 50.0);
+        let _ = runtime.display_frame(&view, size);
+        runtime.touch_moved(1, 30.0, 50.0);
+        assert_eq!(moves.get(), 2, "and the box that took the press hears every move");
+        runtime.touch_ended(1, 30.0, 50.0);
+    }
+
     #[test]
     fn a_tap_fires_the_button_and_leaves_nothing_hovered() {
         use crate::layout::{Proposal, Size};

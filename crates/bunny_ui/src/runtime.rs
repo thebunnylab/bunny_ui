@@ -3328,13 +3328,35 @@ impl Runtime {
     ) -> crate::layout::DisplayList {
         self.settle(root);
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
-        let pointer = self.interaction.borrow().pointer;
-        if let Some(point) = pointer
+        if let Some(point) = self.hover_reread()
             && self.pointer_moved(point.x, point.y, self.pointer_modifiers.get())
         {
             result = self.layout(root, crate::layout::Proposal::exact(size));
         }
         result.display
+    }
+
+    /// The point a frame re-reads to keep hover honest — `None` when the
+    /// hand on the machine is a finger.
+    ///
+    /// A frame re-reads the pointer because content can move under a STILL
+    /// MOUSE: an action inserted a row, and the thing under the cursor is
+    /// no longer the thing that is lit. A finger has no part in that. It
+    /// does not hover (this framework's first rule about touch), and it is
+    /// never still while it matters — every point it visits arrives as its
+    /// own gesture.
+    ///
+    /// Entering the pointer's door here on a touch surface is not merely
+    /// pointless, it is a LIE: `note_pointer_source` reads a pointer door
+    /// entered outside a touch spend as a mouse arriving, so the frame that
+    /// followed a finger's press would announce a mouse. Everything a box
+    /// paints for the hand then changes under a gesture that is still
+    /// running — the selection pins, the action bar — and a view that
+    /// reshapes on the modality moves the box the press GRABBED to another
+    /// path, which ends the drag mid-air (the phone's selection pins,
+    /// owner-reported 2026-09-12).
+    fn hover_reread(&self) -> Option<Point> {
+        self.interaction.borrow().pointer.filter(|_| !self.touch_modality.get())
     }
 
     /// Advances the retained animations by `dt` seconds and says what
@@ -3452,8 +3474,7 @@ impl Runtime {
         size: crate::layout::Size,
     ) -> crate::layout::DisplayList {
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
-        let pointer = self.interaction.borrow().pointer;
-        if let Some(point) = pointer
+        if let Some(point) = self.hover_reread()
             && self.pointer_moved(point.x, point.y, self.pointer_modifiers.get())
         {
             result = self.layout(root, crate::layout::Proposal::exact(size));
