@@ -7,8 +7,8 @@ swapchain presenter, the atlas, the parity oracle — with the Linux
 shell through `bunny-ui-vulkan`. What is Android's alone lives here:
 the activity's callbacks, the main looper the clocks and the input
 queue ride, the window a frame presents into, the text engine
-(`android.graphics`), the image engine (`AImageDecoder`), the insets
-and the soft keyboard.
+(`android.graphics`), the image engine (`AImageDecoder`), the insets,
+the soft keyboard and the secret store.
 
 ## Run it
 
@@ -96,6 +96,41 @@ open before it leaves the app. A composed character, a script the
 table does not know, an emoji need an `InputConnection`, which is
 Java, and do not arrive — the honest ceiling of a `NativeActivity`.
 
+## The secret store
+
+Android has no keychain that a native app can open by that name. It has
+the two halves one is made of, and `credentials` puts them together.
+
+`AndroidKeyStore` mints an AES key under an alias. The key stays in the
+secure element where the phone has one, and the app receives a handle
+that can encrypt and decrypt but cannot read the key. The ciphertext
+goes to `SharedPreferences`, a file under the app's own uid. A secret is
+named by a pair, the service and the account, like on every other shell.
+
+```rust
+bunny_ui_android::credentials::write("api.example.com", "default", token);
+let found = bunny_ui_android::credentials::read("api.example.com", "default");
+bunny_ui_android::credentials::delete("api.example.com", "default");
+```
+
+This is what `EncryptedSharedPreferences` is under its own cover, without
+the AndroidX dependency. The example shows the one thing a store must
+prove, which is that a secret survives the app:
+
+```sh
+crates/bunny_ui_android/android/run-emu.sh credentials_window_android
+crates/bunny_ui_android/android/run-emu.sh credentials_window_android
+```
+
+**CAUTION: a refusal is never a plaintext fallback.** If the keystore
+refuses a key, or a cipher refuses to run, `write` answers `false` and
+stores nothing. The app must then tell the person that the secret is
+lost at the end of the run.
+
+The key belongs to the app's data. Erasing the app's storage, or an
+uninstall, erases the alias. Every secret is then unreadable, `read`
+answers nothing, and the app asks again.
+
 ## What the shell answers
 
 | | Android |
@@ -109,6 +144,7 @@ Java, and do not arrive — the honest ceiling of a `NativeActivity`.
 | dark, size class | the configuration (`uiMode`, the width in dp), mirrored into the theme (while the app has not chosen one) and `SizeClass`; a change is an event, not a new activity |
 | text, images | `android.graphics` and `AImageDecoder`; a face the app ships goes through `register_font`, which reads the family out of the file |
 | the clipboard, reduce motion | the system's, through JNI |
+| the secret store | `AndroidKeyStore` for the key, `SharedPreferences` for the ciphertext — see above |
 | a directory to write | `data_dir()` — the activity's private files directory, which nothing in the environment names |
 | hosts | none: a web view is Java |
 | a chrome, a cursor, a live resize | none: the phone has no window frame and no pointer |

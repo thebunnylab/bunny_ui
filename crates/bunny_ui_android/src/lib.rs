@@ -47,6 +47,8 @@ mod image;
 mod text;
 #[cfg(target_os = "android")]
 mod app;
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub mod credentials;
 
 #[cfg(target_os = "android")]
 pub use app::{run_window, run_window_with, App, WindowId, WindowSpec, MANY_WINDOWS};
