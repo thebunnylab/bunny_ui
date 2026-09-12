@@ -312,6 +312,13 @@ pub struct PaintCtx<'a> {
     pub metrics: Metrics<'a>,
     /// Does the box hold the keyboard right now?
     pub focused: bool,
+    /// Did the last pointer input come from a FINGER?
+    ///
+    /// The chrome a modality wants, and nothing else: selection pins a
+    /// thumb can grab, a bar of actions over them, an affordance that a
+    /// hover would otherwise reveal to a pointer that never hovers. A
+    /// box that paints the same under both hands never reads it.
+    pub touch: bool,
     /// The blink phase the caret follows — the box paints its own
     /// caret, the runtime only says when it shows.
     pub caret_visible: bool,
@@ -785,6 +792,11 @@ pub struct EventCtx<'a> {
     pub visible: Rect,
     /// Text measurement, cached: how a click becomes a column.
     pub metrics: Metrics<'a>,
+    /// Did THIS event come from a finger? A box answers a tap and a
+    /// click differently where the two mean different things — a tap
+    /// that lands on a selection pin grabs it, a click at the same
+    /// point puts the caret there.
+    pub touch: bool,
     /// Where an [`EventCtx::open_menu`] lands. The runtime reads it
     /// AFTER the box has answered — nothing of the scene is borrowed
     /// while the app is talking, which is the rule every door into a

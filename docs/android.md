@@ -144,6 +144,7 @@ answers nothing, and the app asks again.
 | dark, size class | the configuration (`uiMode`, the width in dp), mirrored into the theme (while the app has not chosen one) and `SizeClass`; a change is an event, not a new activity |
 | text, images | `android.graphics` and `AImageDecoder`; a face the app ships goes through `register_font`, which reads the family out of the file |
 | the clipboard, reduce motion | the system's, through JNI |
+| the modality | every gesture sets it: `Runtime::last_input_was_touch`, and `touch` on a custom box's event and paint |
 | the secret store | `AndroidKeyStore` for the key, `SharedPreferences` for the ciphertext — see above |
 | a directory to write | `data_dir()` — the activity's private files directory, which nothing in the environment names |
 | hosts | none: a web view is Java |

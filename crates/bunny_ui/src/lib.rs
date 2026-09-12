@@ -8886,6 +8886,7 @@ mod tests {
             caret_visible: false,
             phase: 0.0,
             scale: 2.0,
+            touch: false,
         };
 
         // the product's own line, `(v * scale).round() / scale`
@@ -11745,6 +11746,97 @@ mod tests {
     /// A static screen: the finger lands on a button and lifts. The
     /// press shows at once (nothing under it can pan), the lift fires,
     /// and afterwards NOTHING hovers — a lifted finger is not there.
+    /// **The chrome follows the hand, not the machine.** A box that
+    /// paints selection pins a thumb can grab, or a bar of actions over
+    /// them, must not paint them for a cursor — and one device is a
+    /// mouse this minute and a finger the next, so the question is what
+    /// the LAST input was.
+    ///
+    /// The answer has to be right from inside the app's own handler,
+    /// which is the moment a box asks it; the touch road spends its
+    /// gestures through the pointer's own doors, so the naive reading
+    /// would be a mouse every time.
+    #[test]
+    fn the_modality_follows_the_last_hand_on_the_machine() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Asking {
+            saw: Rc<Cell<Option<bool>>>,
+        }
+
+        impl crate::custom::CustomElement for Asking {
+            fn name(&self) -> &'static str {
+                "asking"
+            }
+
+            fn measure(
+                &self,
+                proposal: crate::layout::Proposal,
+                _metrics: &crate::custom::Metrics<'_>,
+            ) -> Size {
+                Size {
+                    width: proposal.width.unwrap_or(40.0),
+                    height: proposal.height.unwrap_or(40.0),
+                }
+            }
+
+            fn event(
+                &self,
+                event: &crate::custom::ElementEvent,
+                ctx: &crate::custom::EventCtx<'_>,
+            ) -> crate::custom::Response {
+                if matches!(event, crate::custom::ElementEvent::PointerDown { .. }) {
+                    // asked from INSIDE the event, which is the only
+                    // moment the answer decides anything
+                    self.saw.set(Some(ctx.touch));
+                }
+                crate::custom::Response::handled()
+            }
+
+            fn paint(
+                &self,
+                _ctx: &crate::custom::PaintCtx<'_>,
+                _painter: &mut crate::custom::Painter<'_>,
+            ) {
+            }
+        }
+
+        #[derive(Clone)]
+        struct Board {
+            saw: Rc<Cell<Option<bool>>>,
+        }
+
+        impl Component for Board {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Asking { saw: self.saw })
+            }
+        }
+
+        let saw = Rc::new(Cell::new(None));
+        let view = Board { saw: Rc::clone(&saw) };
+        let runtime = Runtime::new();
+        let size = Size { width: 100.0, height: 100.0 };
+        let _ = runtime.display_frame(&view, size);
+
+        assert!(!runtime.last_input_was_touch(), "a runtime nobody has touched reads as a mouse");
+
+        runtime.touch_began(1, 50.0, 50.0, 1);
+        runtime.touch_ended(1, 50.0, 50.0);
+        assert_eq!(saw.get(), Some(true), "the finger's press says so to the box");
+        assert!(runtime.last_input_was_touch(), "and the modality outlives the gesture");
+
+        saw.set(None);
+        runtime.pointer_clicked(50.0, 50.0, 1, crate::action::Modifiers::NONE);
+        assert_eq!(saw.get(), Some(false), "a mouse click is a mouse");
+        assert!(!runtime.last_input_was_touch(), "the hand changed and the chrome follows");
+
+        // …and back, because the machine did not change — the hand did
+        runtime.touch_began(2, 50.0, 50.0, 1);
+        assert!(runtime.last_input_was_touch());
+        runtime.touch_ended(2, 50.0, 50.0);
+    }
+
     #[test]
     fn a_tap_fires_the_button_and_leaves_nothing_hovered() {
         use crate::layout::{Proposal, Size};

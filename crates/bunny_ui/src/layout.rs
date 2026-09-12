@@ -388,6 +388,12 @@ pub struct LayoutEnv<'a> {
     /// custom box's paint — the geometry never consults it, so layout
     /// stays resolution independent by construction.
     pub scale: Px,
+    /// Did the last pointer input come from a finger
+    /// ([`crate::runtime::Runtime::last_input_was_touch`])? Rides here
+    /// for the same reason `scale` does: it reaches a custom box's
+    /// PAINT and nothing else, because a modality decides chrome and
+    /// never geometry.
+    pub touch: bool,
 }
 
 /// An open animation scope, walking down with the placement. The
@@ -2726,6 +2732,7 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
             overlay_bounds: None,
             dialog_frames: None,
             scale: 1.0,
+            touch: false,
         },
     )
 }
@@ -4553,6 +4560,7 @@ impl LayoutNode {
                     caret_visible: focused && env.stamp.caret_visible,
                     phase,
                     scale: env.scale,
+                    touch: env.touch,
                 };
                 let ink = out.foreground.last().copied().unwrap_or(Color::BLACK);
                 let mut painter =
@@ -7124,6 +7132,7 @@ mod tests {
             overlay_bounds: None,
             dialog_frames: None,
             scale: 1.0,
+            touch: false,
         };
         node.measure(proposal, env).0
     }
@@ -7158,6 +7167,7 @@ mod tests {
                 overlay_bounds: None,
                 dialog_frames: None,
                 scale: 1.0,
+                touch: false,
             },
         )
     }
@@ -7215,6 +7225,7 @@ mod tests {
             overlay_bounds: None,
             dialog_frames: None,
             scale: 1.0,
+            touch: false,
         };
         let region = |width: Px| LayoutNode::Scroll {
             commanded: None,
@@ -7486,6 +7497,7 @@ mod tests {
             overlay_bounds: None,
             dialog_frames: None,
             scale: 1.0,
+            touch: false,
         };
         let region = || LayoutNode::Scroll {
             commanded: None,
@@ -7558,6 +7570,7 @@ mod tests {
             overlay_bounds: None,
             dialog_frames: None,
             scale: 1.0,
+            touch: false,
         };
 
         let root = LayoutNode::Scroll {

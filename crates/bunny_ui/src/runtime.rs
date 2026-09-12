@@ -290,6 +290,22 @@ pub struct Runtime {
     /// The finger's state machine — what a touch means is decided here
     /// and performed through the pointer's own doors ([`crate::touch`]).
     touch: RefCell<crate::touch::Recognizer>,
+    /// Did the last pointer input come from a FINGER?
+    ///
+    /// A touch surface and a mouse want different chrome for the same
+    /// state: a selection under a finger needs pins big enough to grab
+    /// and a bar of actions, and the same pins under a cursor are two
+    /// dots nobody asked for. The recognizer already speaks the
+    /// pointer's vocabulary so that a box never has two roads to
+    /// maintain — this is the one thing a box still has to ask.
+    ///
+    /// It is the LAST input and not the device: a tablet with a
+    /// keyboard, a phone with a mouse and a laptop with a touch screen
+    /// are all one machine that answers differently minute to minute.
+    touch_modality: Cell<bool>,
+    /// Set while [`Runtime::perform_touch`] is spending a gesture, so
+    /// the pointer doors it calls do not read as a mouse.
+    in_touch: Cell<bool>,
     /// The lifted drag's VALUE — the stamp carries only label and
     /// geometry; the typed value stays here and lands on the drop.
     drag_value: RefCell<Option<std::rc::Rc<dyn std::any::Any>>>,
@@ -682,6 +698,7 @@ impl Runtime {
     /// `true` = repaint.
     pub fn context_click(&self, x: Px, y: Px) -> bool {
         self.enter_scene();
+        self.note_pointer_source();
         let was_open = self.close_menu();
         let cleared = self.clear_tooltip();
         let menus = self.last_menus.borrow();
@@ -1067,6 +1084,8 @@ impl Runtime {
             drag_armed: RefCell::new(None),
             pressed_clicks: Cell::new(1),
             touch: RefCell::new(crate::touch::Recognizer::new()),
+            touch_modality: Cell::new(false),
+            in_touch: Cell::new(false),
             drag_value: RefCell::new(None),
             drag_preview: RefCell::new(None),
             tooltip: RefCell::new(TooltipLife::default()),
@@ -1296,6 +1315,7 @@ impl Runtime {
     /// the way it really was.
     pub fn pointer_moved(&self, x: Px, y: Px, modifiers: impl Into<crate::action::Modifiers>) -> bool {
         self.enter_scene();
+        self.note_pointer_source();
         let modifiers = modifiers.into();
         self.pointer_modifiers.set(modifiers);
         let (repaint, told) = self.watching_hover(|| self.pointer_moved_road(x, y, modifiers));
@@ -1572,6 +1592,7 @@ impl Runtime {
             visible: placement.visible,
             metrics: crate::custom::Metrics::new(&*self.text, &self.cache, placement.font),
             menu: &asked,
+            touch: self.touch_modality.get(),
         };
         let answer = placement.element.element().event(&event, &ctx);
         if let Some((at, items)) = asked.into_inner() {
@@ -1695,6 +1716,7 @@ impl Runtime {
         modifiers: impl Into<crate::action::Modifiers>,
     ) -> bool {
         self.enter_scene();
+        self.note_pointer_source();
         let modifiers = modifiers.into();
         let (repaint, told) = self.watching_hover(|| self.pointer_clicked_road(x, y, clicks, modifiers));
         repaint || told
@@ -2042,6 +2064,26 @@ impl Runtime {
         self.interaction.borrow().clone()
     }
 
+    /// Did the last pointer input come from a finger?
+    ///
+    /// A box asks this to choose the chrome a modality wants — selection
+    /// pins big enough to grab, a bar of actions, a hover affordance that
+    /// a touch surface can never reveal. The answer is the LAST input's
+    /// and not the machine's: one device is a mouse this minute and a
+    /// finger the next, and the chrome follows the hand.
+    #[must_use]
+    pub fn last_input_was_touch(&self) -> bool {
+        self.touch_modality.get()
+    }
+
+    /// A pointer door was entered from OUTSIDE a touch spend, so the
+    /// hand on the machine is a mouse.
+    fn note_pointer_source(&self) {
+        if !self.in_touch.get() {
+            self.touch_modality.set(false);
+        }
+    }
+
     // MARK: - Touch (the finger speaks the pointer's vocabulary)
 
     /// A finger landed. `id` names the finger for its lifetime (the
@@ -2078,7 +2120,22 @@ impl Runtime {
     /// UNBORROWED: a press runs the app's closure, and the app may come
     /// straight back in through any door. Answers (repaint, input) —
     /// `input` says a gesture reached the app and a settled frame is due.
+    ///
+    /// The modality is set for the whole spend, BEFORE the app's own
+    /// closure runs: a box asks "was this a finger?" from inside the
+    /// event it is handling, which is the one moment the answer has to
+    /// be right. The guard is what keeps the pointer doors below from
+    /// reading their own call as a mouse.
     fn perform_touch(&self, gestures: Vec<crate::touch::Gesture>) -> (bool, bool) {
+        use crate::touch::Gesture;
+        self.touch_modality.set(true);
+        self.in_touch.set(true);
+        let answer = self.perform_touch_inner(gestures);
+        self.in_touch.set(false);
+        answer
+    }
+
+    fn perform_touch_inner(&self, gestures: Vec<crate::touch::Gesture>) -> (bool, bool) {
         use crate::touch::Gesture;
         let mut repaint = false;
         let mut input = false;
@@ -3467,6 +3524,7 @@ impl Runtime {
             animator: Some(&self.animator),
             live: None,
             scale: self.device_scale.get(),
+            touch: self.touch_modality.get(),
             anim: None,
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
@@ -3580,6 +3638,7 @@ impl Runtime {
             animator: Some(&self.animator),
             live: None,
             scale: self.device_scale.get(),
+            touch: self.touch_modality.get(),
             anim: None,
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
@@ -3981,6 +4040,7 @@ impl Runtime {
                 caret_visible: focused && self.caret_visible.get(),
                 phase,
                 scale: self.device_scale.get(),
+                touch: self.touch_modality.get(),
             };
             let origin = crate::layout::Point {
                 x: -placement.visible.origin.x,
@@ -4852,6 +4912,7 @@ impl Runtime {
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
             scale: self.device_scale.get(),
+            touch: self.touch_modality.get(),
         };
         let stage = if dom {
             crate::stats::Stage::Capture
