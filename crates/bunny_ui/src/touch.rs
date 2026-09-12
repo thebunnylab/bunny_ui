@@ -63,7 +63,14 @@ pub trait TouchScene {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Gesture {
     /// The pointer went down here — `pointer_clicked(at, taps)`.
-    Press { at: Point, taps: u8 },
+    ///
+    /// `held` is how long the finger had already been down when this
+    /// press was DECIDED, in seconds. A press over something that pans
+    /// waits to see whether the finger meant to scroll, so the press a
+    /// box receives can be the lift of a finger that was down for half
+    /// a second — and a box that answers a hold differently from a tap
+    /// (a text surface does) has no other way to tell them apart.
+    Press { at: Point, taps: u8, held: f64 },
     /// The pressed pointer moved — `pointer_moved(at)`.
     Move { at: Point },
     /// The pointer came up — `pointer_released(at)`, then it is gone.
@@ -167,7 +174,7 @@ impl Recognizer {
             // nothing under the finger can slide: the press is
             // unambiguous, and the pressed paint shows at once
             self.phase = Phase::Pressing { start: at, held: 0.0, still: true };
-            out.push(Gesture::Press { at, taps });
+            out.push(Gesture::Press { at, taps, held: 0.0 });
         } else {
             self.phase = Phase::Undecided { start: at, taps, held: 0.0 };
         }
@@ -239,9 +246,11 @@ impl Recognizer {
         }
         match self.phase {
             Phase::Pressing { .. } => out.push(Gesture::Release { at }),
-            Phase::Undecided { start, taps, .. } => {
-                // a still finger: the press it waited with, then the lift
-                out.push(Gesture::Press { at: start, taps });
+            Phase::Undecided { start, taps, held } => {
+                // a still finger: the press it waited with, then the lift —
+                // and the wait travels with it, because a box that answers a
+                // hold differently has only this to tell it from a tap
+                out.push(Gesture::Press { at: start, taps, held });
                 out.push(Gesture::Release { at });
             }
             Phase::Panning { start } => {
@@ -299,7 +308,7 @@ impl Recognizer {
                         // mouse mode: the following drag sweeps or drags;
                         // the hold is spent, so no menu asks again
                         self.phase = Phase::Pressing { start, held, still: false };
-                        out.push(Gesture::Press { at: start, taps: taps.max(1) });
+                        out.push(Gesture::Press { at: start, taps: taps.max(1), held });
                     }
                 } else {
                     self.phase = Phase::Undecided { start, taps, held };
@@ -475,7 +484,7 @@ mod tests {
         let out = touch.ended(1, p(12.0, 11.0));
         assert_eq!(
             out,
-            vec![Gesture::Press { at: p(10.0, 10.0), taps: 1 }, Gesture::Release { at: p(12.0, 11.0) }]
+            vec![Gesture::Press { at: p(10.0, 10.0), taps: 1, held: 0.0 }, Gesture::Release { at: p(12.0, 11.0) }]
         );
         assert!(!touch.alive());
     }
@@ -497,7 +506,7 @@ mod tests {
     fn a_hold_on_a_flat_menu_row_takes_the_press_back_for_the_menu() {
         let mut touch = Recognizer::new();
         let row = Fake { pans: false, grabs: false, menu: true };
-        assert_eq!(touch.began(1, p(10.0, 10.0), 1, &row), vec![Gesture::Press { at: p(10.0, 10.0), taps: 1 }]);
+        assert_eq!(touch.began(1, p(10.0, 10.0), 1, &row), vec![Gesture::Press { at: p(10.0, 10.0), taps: 1, held: 0.0 }]);
         assert!(touch.alive(), "a still press listens for the menu");
         assert!(touch.tick(0.3, &row).is_empty());
         assert_eq!(touch.tick(0.3, &row), vec![Gesture::Cancel, Gesture::Menu { at: p(10.0, 10.0) }]);
@@ -524,7 +533,7 @@ mod tests {
     fn a_surface_that_cannot_pan_presses_at_once() {
         let mut touch = Recognizer::new();
         let out = touch.began(1, p(5.0, 5.0), 2, &FLAT);
-        assert_eq!(out, vec![Gesture::Press { at: p(5.0, 5.0), taps: 2 }]);
+        assert_eq!(out, vec![Gesture::Press { at: p(5.0, 5.0), taps: 2, held: 0.0 }]);
         assert_eq!(touch.moved(1, p(30.0, 30.0)), vec![Gesture::Move { at: p(30.0, 30.0) }]);
         assert_eq!(touch.ended(1, p(30.0, 30.0)), vec![Gesture::Release { at: p(30.0, 30.0) }]);
     }
@@ -534,7 +543,7 @@ mod tests {
         let mut touch = Recognizer::new();
         let canvas = Fake { pans: true, grabs: true, menu: false };
         let out = touch.began(1, p(5.0, 5.0), 1, &canvas);
-        assert_eq!(out, vec![Gesture::Press { at: p(5.0, 5.0), taps: 1 }]);
+        assert_eq!(out, vec![Gesture::Press { at: p(5.0, 5.0), taps: 1, held: 0.0 }]);
     }
 
     #[test]
@@ -549,7 +558,7 @@ mod tests {
         let mut touch = Recognizer::new();
         touch.began(1, p(10.0, 10.0), 1, &LIST);
         touch.tick(0.3, &LIST);
-        assert_eq!(touch.tick(0.3, &LIST), vec![Gesture::Press { at: p(10.0, 10.0), taps: 1 }]);
+        assert_eq!(touch.tick(0.3, &LIST), vec![Gesture::Press { at: p(10.0, 10.0), taps: 1, held: 0.6 }]);
         assert_eq!(touch.moved(1, p(40.0, 10.0)), vec![Gesture::Move { at: p(40.0, 10.0) }]);
     }
 
@@ -613,7 +622,7 @@ mod tests {
     #[test]
     fn a_second_finger_turns_a_press_into_a_zoom_and_cancels_it() {
         let mut touch = Recognizer::new();
-        assert_eq!(touch.began(1, p(100.0, 100.0), 1, &FLAT), vec![Gesture::Press { at: p(100.0, 100.0), taps: 1 }]);
+        assert_eq!(touch.began(1, p(100.0, 100.0), 1, &FLAT), vec![Gesture::Press { at: p(100.0, 100.0), taps: 1, held: 0.0 }]);
         assert_eq!(touch.began(2, p(200.0, 100.0), 1, &FLAT), vec![Gesture::Cancel]);
         // the fingers spread: 100 apart → 200 apart is a scale of 2 at
         // the point between them

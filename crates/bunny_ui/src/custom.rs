@@ -812,6 +812,14 @@ pub struct EventCtx<'a> {
     /// that lands on a selection pin grabs it, a click at the same
     /// point puts the caret there.
     pub touch: bool,
+    /// How long the press being spent had been held when it was decided,
+    /// in milliseconds — [`crate::runtime::Runtime::press_held_ms`].
+    ///
+    /// A press over something that pans waits to see whether the finger
+    /// meant to scroll, so the press a box receives can be the lift of a
+    /// finger that was down for half a second. A box that answers a HOLD
+    /// differently from a tap has only this to tell them apart.
+    pub held_ms: u128,
     /// Where an [`EventCtx::open_menu`] lands. The runtime reads it
     /// AFTER the box has answered — nothing of the scene is borrowed
     /// while the app is talking, which is the rule every door into a

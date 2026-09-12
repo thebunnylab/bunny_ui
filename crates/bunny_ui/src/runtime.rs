@@ -306,6 +306,10 @@ pub struct Runtime {
     /// Set while [`Runtime::perform_touch`] is spending a gesture, so
     /// the pointer doors it calls do not read as a mouse.
     in_touch: Cell<bool>,
+    /// How long the finger of the press being spent had been down when
+    /// the press was DECIDED, in seconds — see
+    /// [`crate::touch::Gesture::Press`]. Zero for a mouse.
+    press_held: Cell<f64>,
     /// The lifted drag's VALUE — the stamp carries only label and
     /// geometry; the typed value stays here and lands on the drop.
     drag_value: RefCell<Option<std::rc::Rc<dyn std::any::Any>>>,
@@ -1086,6 +1090,7 @@ impl Runtime {
             touch: RefCell::new(crate::touch::Recognizer::new()),
             touch_modality: Cell::new(false),
             in_touch: Cell::new(false),
+            press_held: Cell::new(0.0),
             drag_value: RefCell::new(None),
             drag_preview: RefCell::new(None),
             tooltip: RefCell::new(TooltipLife::default()),
@@ -1593,6 +1598,7 @@ impl Runtime {
             metrics: crate::custom::Metrics::new(&*self.text, &self.cache, placement.font),
             menu: &asked,
             touch: self.touch_modality.get(),
+            held_ms: self.press_held_ms(),
         };
         let answer = placement.element.element().event(&event, &ctx);
         if let Some((at, items)) = asked.into_inner() {
@@ -2081,6 +2087,26 @@ impl Runtime {
     fn note_pointer_source(&self) {
         if !self.in_touch.get() {
             self.touch_modality.set(false);
+            self.press_held.set(0.0);
+        }
+    }
+
+    /// How long the press being delivered had been held when it was
+    /// decided, in MILLISECONDS.
+    ///
+    /// A press over something that pans waits to see whether the finger
+    /// meant to scroll, so a box can receive the press of a finger that
+    /// was down for half a second. Zero for a mouse, and for a press
+    /// nothing had to wait on.
+    #[must_use]
+    pub fn press_held_ms(&self) -> u128 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a hold is seconds, small and non-negative; the millis fit a u128 far past that"
+        )]
+        {
+            (self.press_held.get() * 1000.0) as u128
         }
     }
 
@@ -2141,7 +2167,8 @@ impl Runtime {
         let mut input = false;
         for gesture in gestures {
             match gesture {
-                Gesture::Press { at, taps } => {
+                Gesture::Press { at, taps, held } => {
+                    self.press_held.set(held);
                     repaint |=
                         self.pointer_clicked(at.x, at.y, taps, crate::action::Modifiers::NONE);
                     input = true;
