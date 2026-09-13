@@ -7,7 +7,7 @@
 //! points it at a url, moves the box, and holds ONE return channel:
 //! the script message bridge. Everything the page sends back rides
 //! it — the app's bus (`window.bunny.post`) and the eval answers —
-//! so the only Objective-C block this crate AUTHORS is the snapshot's.
+//! so the only Objective-C block this module AUTHORS is the snapshot's.
 //!
 //! The pages are filed here by the host's path, so a report that
 //! arrives holding the VIEW finds its box's identity without asking
@@ -884,7 +884,7 @@ pub fn eval(view: Id, token: u64, js: &str, raw: bool) {
     unsafe { run_script(view, &wrapped) }
 }
 
-/// The ONE Objective-C block in this crate. `takeSnapshotWithConfiguration:`
+/// The ONE Objective-C block in this module. `takeSnapshotWithConfiguration:`
 /// has no other door — there is no message-bus detour for pixels the
 /// way there is for an eval's value — so the block literal is written
 /// by hand: the layout the runtime documents, a POD capture (the

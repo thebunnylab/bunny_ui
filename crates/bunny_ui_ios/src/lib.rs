@@ -4,10 +4,10 @@
 //!
 //! The shared Apple half ([`bunny_ui_apple`]) brings the text engine
 //! (CoreText), the image engine (ImageIO), the credentials (the
-//! keychain) and the Metal presenter; this crate is what only UIKit
-//! knows — the application delegate, the view whose layer is the
-//! drawable, the touches, the responder the keyboard types into, the
-//! safe area and the traits. The core hears touches through its own
+//! keychain), the notifications (UserNotifications) and the Metal
+//! presenter; this crate is what only UIKit knows — the application
+//! delegate, the view whose layer is the drawable, the touches, the
+//! responder the keyboard types into, the safe area and the traits. The core hears touches through its own
 //! touch doors and lays the root out inside the safe area; the shell
 //! only forwards.
 //!
@@ -16,11 +16,12 @@
 //! or a chrome to choose, a cursor, a live resize, a CPU road
 //! (`BUNNY_PRESENT=cpu` leaves the view blank and says so), an IME
 //! mirror for marked text (the keyboard types through `UIKeyInput`; a
-//! composition arrives committed), synthetic input into a hosted page
-//! (the phone has no event constructor a page trusts — the capability
-//! is not claimed), and notifications (`bunny_ui::app::notify` answers
-//! by name that this shell has none). Native hosts it HAS: a webview
-//! rides the shared tenant, under the same sandwich the desktops keep.
+//! composition arrives committed), and synthetic input into a hosted
+//! page (the phone has no event constructor a page trusts — the
+//! capability is not claimed). Native hosts it HAS: a webview rides
+//! the shared tenant, under the same sandwich the desktops keep; and
+//! a notification posts through the shared half, with the system
+//! asking the person once.
 //!
 //! The project's `unsafe` lives ONLY in the shell crates (here, the
 //! [`ffi`] FFI), wrapped in this safe API. The core and the facade
@@ -208,11 +209,9 @@ impl Default for App {
 impl App {
     /// An app with no window yet.
     pub fn new() -> App {
-        // the app's life outside its window: the phone has no
-        // notification center this shell speaks yet, and says so by name
-        bunny_ui::app::install_notifier(|_| {
-            Err("bunny_ui ios: notifications are not served on this shell yet".to_string())
-        });
+        // the app's life outside its window: the notifier is the shared
+        // half's, installed on the main thread — the one UIKit runs on
+        bunny_ui::app::install_notifier(bunny_ui_apple::notifications::notify);
         App {
             inner: Rc::new(AppInner {
                 pending: RefCell::new(None),
