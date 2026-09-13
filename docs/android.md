@@ -112,7 +112,7 @@ Java, and do not arrive — the honest ceiling of a `NativeActivity`.
 | hosts | none: a web view is Java |
 | a chrome, a cursor, a live resize | none: the phone has no window frame and no pointer |
 | an IME road | keys only — see above |
-| notifications | not yet: `bunny_ui::app::notify` refuses by name |
+| notifications | the manager over JNI: one channel, a button per action, the person asked once (API 33+, the first post refuses by name and the next posts); a tap comes back as `AppEvent::NotificationActivated` from the activity RE-CREATED with the intent — a `NativeActivity` hears no new one |
 | a url handed over | not yet: a `NativeActivity` hears no new intent |
 | background, foreground | `AppEvent::WillSleep` / `DidWake` on pause and resume, and the loop clocks rest |
 

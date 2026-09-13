@@ -6,6 +6,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-feature android:name="android.hardware.vulkan.level" android:required="false" />
 
+    <!-- the shell asks the person at the first post (API 33+); this
+         line is what lets it ask -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="false"
         android:hasCode="false"

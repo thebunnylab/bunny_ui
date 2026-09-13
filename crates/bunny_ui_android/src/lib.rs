@@ -20,11 +20,13 @@
 //! or a chrome to choose, a cursor, an IME road for composed text (a
 //! `NativeActivity` receives KEYS, and the keys of a latin layout are
 //! all that type; a composition, a script the table does not know, an
-//! emoji need an `InputConnection`, which is Java), a hosted web view
-//! (also Java), and notifications (`bunny_ui::app::notify` answers by
-//! name that this shell has none). The scale is a whole number: the
-//! density over 160, rounded — a 420 dpi phone lays out at 3× and 360
-//! points wide.
+//! emoji need an `InputConnection`, which is Java), and a hosted web
+//! view (also Java). Notifications it HAS: the manager's, over JNI — a
+//! channel, a button per action, the person asked once — and a tap on
+//! one comes back as `AppEvent::NotificationActivated` from an activity
+//! RE-CREATED with the intent, since a `NativeActivity` hears no new
+//! one. The scale is a whole number: the density over 160, rounded — a
+//! 420 dpi phone lays out at 3× and 360 points wide.
 //!
 //! The project's `unsafe` lives ONLY in the shell crates (here, the
 //! FFI and the JNI), wrapped in this safe API. The core and the facade
@@ -47,6 +49,8 @@ mod image;
 mod text;
 #[cfg(target_os = "android")]
 mod app;
+#[cfg(target_os = "android")]
+mod notify;
 
 #[cfg(target_os = "android")]
 pub use app::{run_window, run_window_with, App, WindowId, WindowSpec, MANY_WINDOWS};
@@ -78,9 +82,9 @@ macro_rules! activity {
         pub unsafe extern "C" fn ANativeActivity_onCreate(
             activity: *mut ::core::ffi::c_void,
             _saved_state: *mut ::core::ffi::c_void,
-            _saved_state_size: usize,
+            saved_state_size: usize,
         ) {
-            unsafe { $crate::on_create(activity, $main) }
+            unsafe { $crate::on_create(activity, saved_state_size, $main) }
         }
     };
 }
@@ -92,6 +96,14 @@ macro_rules! activity {
 /// `activity` is the `ANativeActivity` the system handed the entry.
 #[cfg(target_os = "android")]
 #[doc(hidden)]
-pub unsafe fn on_create(activity: *mut ::core::ffi::c_void, main: fn()) {
-    unsafe { ffi::on_create(activity.cast(), main) }
+pub unsafe fn on_create(activity: *mut ::core::ffi::c_void, saved_state_size: usize, main: fn()) {
+    unsafe { ffi::on_create(activity.cast(), saved_state_size, main) }
+}
+
+/// A switch the app has no environment for: the system property `name`
+/// (`adb shell setprop debug.bunny.<switch> 1`), or `None` when it is
+/// not set. Read each time — a property set after the launch counts.
+pub fn property(name: &str) -> Option<String> {
+    let name = std::ffi::CString::new(name).ok()?;
+    log::property(&name)
 }
