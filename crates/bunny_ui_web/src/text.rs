@@ -26,7 +26,7 @@ use bunny_ui::text_engine::{
     FontDesign, FontKey, FontSpec, LineMetrics, TextEngine, TextRaster, Weight,
 };
 
-#[link(wasm_import_module = "bunny")]
+#[link(wasm_import_module = "./bunny.js")]
 unsafe extern "C" {
     /// Writes THREE f64 at `out` — width, ascent, descent — in logical
     /// px. Ascent and descent come from the font, not the string's ink.
