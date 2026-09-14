@@ -11,6 +11,16 @@
 //!
 //! One frame driver: the glue's `requestAnimationFrame` plays the role
 //! of the display link — armed only while an animation wants frames.
+//!
+//! Two glues speak this border. `glue/glue.js` instantiates the wasm
+//! itself and IS the platform layer of a page we own whole. `glue/esm/`
+//! is the same border as ES modules, for a page whose LOADER is someone
+//! else's — wasm-bindgen's, say — and resolves an import module it does
+//! not own as `import * as m from "<name>"`. That is why the modules
+//! below are named as RELATIVE specifiers (`./bunny.js`, `./bunny_gpu.js`):
+//! a bare name needs an import map, which a Web Worker never sees; a
+//! relative one resolves beside the generated JS wherever the module is
+//! evaluated, the workers a threaded build spawns included.
 #![cfg(target_arch = "wasm32")]
 
 #[cfg(feature = "gpu")]
@@ -46,10 +56,18 @@ use bunny_ui::text_input::EditCommand;
 pub use image::CanvasImageEngine;
 pub use text::CanvasTextEngine;
 
-#[link(wasm_import_module = "bunny")]
+#[link(wasm_import_module = "./bunny.js")]
 unsafe extern "C" {
     /// The glue paints this RGBA buffer onto the canvas, whole.
     fn js_blit(pointer: *const u8, width: u32, height: u32);
+    /// The focused box copied: the text goes to the platform's clipboard
+    /// (`navigator.clipboard.writeText`, inside the stroke's own user
+    /// gesture — the one moment a page may write it).
+    fn js_clipboard_write(pointer: *const u8, len: usize);
+    /// The cursor the scene wants under the pointer, told after every
+    /// move: 0 arrow, 1 text, 2 pointing, 3 cell, 4 resize left-right,
+    /// 5 resize up-down — the mac shell's table, in the order it asks.
+    fn js_set_cursor(kind: u32);
     /// The glue schedules ONE requestAnimationFrame that calls
     /// `bunny_frame` back — the browser's display link.
     fn js_request_frame();
@@ -130,7 +148,13 @@ fn pattern(key: bunny_ui::action::Key, mods: u32) -> KeyPattern {
 /// = something changed and the frame is worth presenting.
 fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
     use bunny_ui::action::Key;
-    if runtime.key_stroke(&pattern).handled {
+    let taken = runtime.key_stroke(&pattern);
+    if taken.handled {
+        // a copy hands the text back for the platform's clipboard — the
+        // mac shell's rule, on the road the browser allows it
+        if let Some(text) = taken.text {
+            clipboard_write(&text);
+        }
         return true;
     }
     // a field of MANY lines owns the bare break and the bare vertical
@@ -172,6 +196,25 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
         Key::Home => Some(EditCommand::Home(pattern.shift)),
         Key::End => Some(EditCommand::End(pattern.shift)),
         Key::Char('a') if pattern.command => Some(EditCommand::SelectAll),
+        // cmd-c / cmd-x: the field's output goes to the platform
+        Key::Char('c') if pattern.command => {
+            if let Some(text) = runtime.key(EditCommand::Copy).output {
+                clipboard_write(&text);
+            }
+            return false;
+        }
+        Key::Char('x') if pattern.command => {
+            let cut = runtime.key(EditCommand::Cut);
+            if let Some(text) = &cut.output {
+                clipboard_write(text);
+            }
+            return cut.output.is_some();
+        }
+        // cmd-v is NOT an edit here: a page cannot read the clipboard on a
+        // keystroke, so the text arrives through the browser's own `paste`
+        // event (the glue forwards it as text) — the stroke is spent
+        // without inserting, or a paste would land twice
+        Key::Char('v') if pattern.command => return false,
         Key::Escape => return runtime.blur(),
         _ => None,
     };
@@ -179,6 +222,50 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
         Some(edit) => runtime.key(edit).applied,
         None => false,
     }
+}
+
+/// Hands a copied text to the page's clipboard.
+fn clipboard_write(text: &str) {
+    unsafe { js_clipboard_write(text.as_ptr(), text.len()) };
+}
+
+/// The cursor the scene wants under the pointer, told to the page after
+/// every move — the mac shell's order: a split seam being dragged first,
+/// then the box under the pointer, then the hand over anything hoverable,
+/// then the arrow.
+fn point_cursor(runtime: &Runtime) {
+    use bunny_ui::layout::{Axis, Cursor};
+    let kind = match runtime.seam_axis() {
+        Some(Axis::Horizontal) => 4,
+        Some(Axis::Vertical) => 5,
+        None => match runtime.hovered_cursor() {
+            Some(Cursor::Text) => 1,
+            Some(Cursor::Pointing) => 2,
+            Some(Cursor::Cell) => 3,
+            Some(Cursor::Arrow) => 0,
+            None if runtime.interaction().hovered.is_some() => 2,
+            None => 0,
+        },
+    };
+    unsafe { js_set_cursor(kind) };
+}
+
+thread_local! {
+    /// Frames that reached the page — the tier's drawable or the canvas
+    /// blit — since boot.
+    static FRAMES_PRESENTED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Frames that reached the page since boot: the tier's drawable, or a
+/// canvas blit with damage. A harness's paint proof reads this — a frame
+/// the engine built but never presented does not count, and a blank
+/// canvas presents none.
+pub fn frames_presented() -> u32 {
+    FRAMES_PRESENTED.with(|count| count.get())
+}
+
+fn note_presented() {
+    FRAMES_PRESENTED.with(|count| count.set(count.get().saturating_add(1)));
 }
 
 /// What the exports feed the shell — the web twin of the mac AppEvent.
@@ -281,10 +368,29 @@ fn dispatch(event: Event) {
 /// from its exported `start`; everything after travels through events.
 #[cfg(feature = "canvas")]
 pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
-    install_panic_hook();
     let runtime = Runtime::new()
         .text_engine(Rc::new(CanvasTextEngine::new()))
         .image_engine(Rc::new(CanvasImageEngine::new()));
+    start_with(width, height, scale, Rc::new(runtime), root);
+}
+
+/// [`start`] with the `Runtime` assembled by the caller — the door for an
+/// app with an environment of its own (a keymap, host handlers, engines it
+/// seeded), the twin of the desktop shells' `run_window_with`. Shared,
+/// because such an app holds the runtime weakly for doors of its own, and
+/// a weak handle to an allocation the shell did not take over would never
+/// upgrade again. The engines are the caller's responsibility; the
+/// [`CanvasTextEngine`] and [`CanvasImageEngine`] are what this page can
+/// shape and decode with.
+#[cfg(feature = "canvas")]
+pub fn start_with(
+    width: f64,
+    height: f64,
+    scale: f64,
+    runtime: Rc<Runtime>,
+    root: impl View + 'static,
+) {
+    install_panic_hook();
     // a task that woke asks the page for one turn — the browser's
     // answer to the desktop's run loop source
     runtime.set_wake_hook(std::sync::Arc::new(|| unsafe { js_request_wake() }));
@@ -328,6 +434,7 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 &*runtime.text(),
                 &*runtime.images(),
             );
+            note_presented();
             if runtime.wants_frame() {
                 unsafe { js_request_frame() };
             }
@@ -351,6 +458,7 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
             let (width, height) = (retained.bitmap().width(), retained.bitmap().height());
             let rgba = retained.rgba();
             unsafe { js_blit(rgba.as_ptr(), width as u32, height as u32) };
+            note_presented();
         }
         if runtime.wants_frame() {
             unsafe { js_request_frame() };
@@ -367,6 +475,7 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 if runtime.pointer_moved(x, y, modifiers) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
+                point_cursor(&runtime);
             }
             Event::PointerDown { x, y, clicks, modifiers } => {
                 if runtime.pointer_clicked(x, y, clicks, modifiers) {

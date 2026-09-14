@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use bunny_ui::image_engine::{ImageEngine, ImageRaster, ImageSource};
 
-#[link(wasm_import_module = "bunny")]
+#[link(wasm_import_module = "./bunny.js")]
 unsafe extern "C" {
     /// Hands the platform-encoded bytes to the glue (borrowed for the
     /// call — the glue copies into a Blob). The glue decodes and calls

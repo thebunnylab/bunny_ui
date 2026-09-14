@@ -32,7 +32,7 @@ use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
 
-#[link(wasm_import_module = "bunny_gpu")]
+#[link(wasm_import_module = "./bunny_gpu.js")]
 unsafe extern "C" {
     /// `kind` 0 is the page's own surface, 1 the islands' backing
     /// canvas. Zero back is a refusal — no WebGL2, a shader that would

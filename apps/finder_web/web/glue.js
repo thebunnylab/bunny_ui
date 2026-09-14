@@ -20,7 +20,7 @@ function painter() {
 // the key table, the modifier bits, the import/export surface. The
 // wasm exports its own number; boot compares the two and refuses a
 // pairing this mirror was not written for.
-const EXPECTED_ABI = 8;
+const EXPECTED_ABI = 9;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default.
@@ -139,10 +139,27 @@ const GPU_VERBS = [
   "gl_draw_arrays", "gl_draw_arrays_instanced", "gl_read_pixels",
 ];
 
+// The import modules are named as RELATIVE specifiers (`./bunny.js`,
+// `./bunny_gpu.js`): this file instantiates the wasm itself and the
+// names are just keys here, but a page whose loader is someone else's
+// (wasm-bindgen's) resolves them as ES modules beside the generated JS —
+// `glue/esm/` is that road, and the two must agree on the names.
 const imports = {
-  bunny_gpu:
+  "./bunny_gpu.js":
     typeof bunnyGlImports === "object" ? bunnyGlImports : bunnyGlStubsOrNothing(),
-  bunny: {
+  "./bunny.js": {
+    // The focused box copied: the text goes to the platform's clipboard.
+    // Called inside the stroke's own keydown, which is the user gesture
+    // the browser wants; a refusal (no permission, no focus) is silent.
+    js_clipboard_write(pointer, length) {
+      const text = decoder.decode(new Uint8Array(wasm.memory.buffer, pointer, length));
+      if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+    },
+    // The cursor the scene wants under the pointer — the shell's table:
+    // 0 arrow, 1 text, 2 pointing, 3 cell, 4 resize left-right, 5 up-down.
+    js_set_cursor(kind) {
+      host.style.cursor = CURSORS[kind >>> 0] || "default";
+    },
     js_blit(pointer, width, height) {
       const context = painter();
       if (paintCanvas.width !== width || paintCanvas.height !== height) {
@@ -304,6 +321,8 @@ const imports = {
   },
 };
 
+const CURSORS = ["default", "text", "pointer", "cell", "col-resize", "row-resize"];
+
 function sendText(text) {
   const bytes = new TextEncoder().encode(text);
   const pointer = wasm.bunny_alloc(bytes.length);
@@ -429,7 +448,10 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         return;
       }
       if (event.key.length !== 1) return;
-      event.preventDefault();
+      // the paste chord keeps its default: the `paste` event below IS the
+      // clipboard read, and a prevented keydown never fires it
+      const paste = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v";
+      if (!paste) event.preventDefault();
       // a command stroke is a stroke; a bare character is TEXT, so
       // typing takes the same road a paste and a composition take
       if (event.metaKey || event.ctrlKey) {
@@ -437,6 +459,14 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       } else {
         sendText(event.key);
       }
+    });
+    // The paste road: a page cannot read the clipboard on a keystroke,
+    // so cmd-v is let through above and the browser's own `paste` event
+    // carries the text — through the same door typing takes.
+    window.addEventListener("paste", (event) => {
+      const text = event.clipboardData ? event.clipboardData.getData("text/plain") : "";
+      event.preventDefault();
+      if (text) sendText(text);
     });
   },
 );
