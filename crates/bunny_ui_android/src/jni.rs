@@ -114,7 +114,8 @@ pub struct JniNativeInterface {
     get_string_utf_chars: Fn2<JString, *mut JBoolean, *const c_char>, // 169
     release_string_utf_chars: Fn2<JString, *const c_char, ()>,        // 170
     get_array_length: Fn1<JObject, JInt>,                             // 171
-    slots_172_175: [*const c_void; 4],
+    new_object_array: Fn3<JInt, JClass, JObject, JObject>, // 172
+    slots_173_175: [*const c_void; 3],
     new_byte_array: Fn1<JInt, JObject>, // 176
     slots_177_180: [*const c_void; 4],
     new_float_array: Fn1<JInt, JObject>, // 181
@@ -357,6 +358,13 @@ impl Env {
     pub fn array_length(&self, array: JObject) -> Option<i32> {
         let length = unsafe { (self.table().get_array_length)(self.raw, array) };
         self.check().then_some(length)
+    }
+
+    /// An object array of `length`, every slot holding `fill` — a
+    /// `null` fill is allowed, and an array of one IS its fill.
+    pub fn new_object_array(&self, class: JClass, length: i32, fill: JObject) -> Option<JObject> {
+        let array = unsafe { (self.table().new_object_array)(self.raw, length, class, fill) };
+        (self.check() && !array.is_null()).then_some(array)
     }
 
     pub fn new_byte_array(&self, bytes: &[u8]) -> Option<JObject> {

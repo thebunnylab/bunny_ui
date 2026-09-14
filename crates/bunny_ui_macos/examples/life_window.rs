@@ -145,6 +145,9 @@ fn drive_the_hand(log: State<Vec<String>>, answer: State<String>) {
         answer.set(format!("{posted:?}"));
         if bundled {
             check("inside a bundle the notification posts", posted.is_ok());
+            // a letter posted before the person answered is held for
+            // the answer: two seconds is the room for it to land
+            task::sleep(std::time::Duration::from_millis(2000)).await;
         } else {
             check(
                 "a bare binary is refused by name, never dropped quietly",

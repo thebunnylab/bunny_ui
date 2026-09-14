@@ -190,6 +190,7 @@ unsafe extern "C" {
     fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
     fn write(fd: c_int, buffer: *const c_void, count: usize) -> isize;
     fn close(fd: c_int) -> c_int;
+    fn malloc(size: usize) -> *mut c_void;
     fn timerfd_create(clock: c_int, flags: c_int) -> c_int;
     fn timerfd_settime(
         fd: c_int,
@@ -426,7 +427,7 @@ pub fn take_key() {
 /// `ANativeActivity_onCreate`, on the UI thread: the callback table,
 /// the looper, the clocks, then `boot` — which builds the app and
 /// registers its window. The mount waits for the first window.
-pub unsafe fn on_create(activity: *mut ANativeActivity, boot: fn()) {
+pub unsafe fn on_create(activity: *mut ANativeActivity, saved_state_size: usize, boot: fn()) {
     crate::log::install();
     unsafe {
         let callbacks = &mut *(*activity).callbacks;
@@ -447,7 +448,13 @@ pub unsafe fn on_create(activity: *mut ANativeActivity, boot: fn()) {
         callbacks.on_configuration_changed = Some(on_configuration_changed);
         callbacks.on_low_memory = Some(on_low_memory);
     }
-    // the process may host one activity after another: a fresh start
+    // the process may host one activity after another — and the next
+    // is born BEFORE the last one dies when a tap on a notification
+    // re-creates it: what the last one still holds is retired now, and
+    // its late callbacks find a stranger in `ACTIVITY` and leave
+    if !ACTIVITY.with(Cell::get).is_null() {
+        retire();
+    }
     ACTIVITY.with(|slot| slot.set(activity));
     unsafe { crate::jni::install((*activity).env, (*activity).clazz) };
     crate::jni::edge_to_edge();
@@ -474,6 +481,16 @@ pub unsafe fn on_create(activity: *mut ANativeActivity, boot: fn()) {
         eprintln!("bunny_ui android: stderr reaches logcat");
     }
     boot();
+    // a tap on a notification is what created this activity: the
+    // intent says which, and the app's own thread hears it once the
+    // mount runs. A RESTORED activity carries its saved state, and the
+    // system's own copy of that intent with it — not this one's to
+    // replay
+    if saved_state_size == 0
+        && let Some((id, action)) = crate::notify::launch_activation()
+    {
+        bunny_ui::app::emit(bunny_ui::app::AppEvent::NotificationActivated { id, action });
+    }
 }
 
 /// Keeps the mount for the first window — or runs it now, if a window
@@ -495,11 +512,17 @@ fn trace_line(what: &str) {
 
 // MARK: - The activity's callbacks (all on the UI thread)
 
-unsafe extern "C" fn on_start(_activity: *mut ANativeActivity) {
+unsafe extern "C" fn on_start(activity: *mut ANativeActivity) {
+    if stale(activity, "start") {
+        return;
+    }
     trace_line("start");
 }
 
-unsafe extern "C" fn on_resume(_activity: *mut ANativeActivity) {
+unsafe extern "C" fn on_resume(activity: *mut ANativeActivity) {
+    if stale(activity, "resume") {
+        return;
+    }
     trace_line("resume");
     if BACKGROUNDED.with(|slot| slot.replace(false)) {
         bunny_ui::app::emit(bunny_ui::app::AppEvent::DidWake);
@@ -508,15 +531,25 @@ unsafe extern "C" fn on_resume(_activity: *mut ANativeActivity) {
 }
 
 unsafe extern "C" fn on_save_instance_state(
-    _activity: *mut ANativeActivity,
+    activity: *mut ANativeActivity,
     out_size: *mut usize,
 ) -> *mut c_void {
-    // nothing is saved: the scene is rebuilt from the app's own state
-    unsafe { *out_size = 0 };
-    null_mut()
+    if stale(activity, "save instance state") {
+        return null_mut();
+    }
+    // one byte, so a RESTORED activity can tell itself from a created
+    // one: the scene is rebuilt from the app's own state either way,
+    // but the intent that created the first is not replayed by the
+    // second. The system frees it.
+    let byte = unsafe { malloc(1) };
+    unsafe { *out_size = if byte.is_null() { 0 } else { 1 } };
+    byte
 }
 
-unsafe extern "C" fn on_pause(_activity: *mut ANativeActivity) {
+unsafe extern "C" fn on_pause(activity: *mut ANativeActivity) {
+    if stale(activity, "pause") {
+        return;
+    }
     trace_line("pause");
     if !BACKGROUNDED.with(|slot| slot.replace(true)) {
         // parked before the callback returns: no frame may be posted
@@ -527,15 +560,48 @@ unsafe extern "C" fn on_pause(_activity: *mut ANativeActivity) {
     }
 }
 
-unsafe extern "C" fn on_stop(_activity: *mut ANativeActivity) {
+unsafe extern "C" fn on_stop(activity: *mut ANativeActivity) {
+    if stale(activity, "stop") {
+        return;
+    }
     trace_line("stop");
 }
 
-unsafe extern "C" fn on_destroy(_activity: *mut ANativeActivity) {
+unsafe extern "C" fn on_destroy(activity: *mut ANativeActivity) {
+    if stale(activity, "destroy") {
+        return;
+    }
     trace_line("destroy");
+    retire();
+}
+
+/// The callback is a RETIRED activity's — the last one, whose late
+/// callbacks arrive after the next took the shell. Nothing of it is
+/// left to touch.
+fn stale(activity: *mut ANativeActivity, what: &str) -> bool {
+    if activity == ACTIVITY.with(Cell::get) {
+        return false;
+    }
+    if crate::log::trace() {
+        alog!("stale {what}");
+    }
+    true
+}
+
+/// Everything the current activity holds, let go: the presenter, the
+/// window, the mount waiting for one, the looper's clocks and wake,
+/// the input queue, the handler. Its own destroy calls it — or the
+/// NEXT activity's create, when this one still stands, paused and
+/// finishing, on the same thread.
+fn retire() {
     set_frame_driver(DriverPace::Off);
     PRESENTER.with(|slot| drop(slot.borrow_mut().take()));
     CPU.with(|slot| drop(slot.borrow_mut().take()));
+    let window = WINDOW.with(|slot| slot.replace(null_mut()));
+    if !window.is_null() {
+        unsafe { ANativeWindow_release(window) };
+    }
+    MOUNT.with(|slot| drop(slot.borrow_mut().take()));
     let looper = LOOPER.with(|slot| slot.replace(null_mut()));
     let queue = QUEUE.with(|slot| slot.replace(null_mut()));
     if !queue.is_null() {
@@ -564,7 +630,10 @@ unsafe extern "C" fn on_destroy(_activity: *mut ANativeActivity) {
     ACTIVITY.with(|slot| slot.set(null_mut()));
 }
 
-unsafe extern "C" fn on_window_focus_changed(_activity: *mut ANativeActivity, has_focus: c_int) {
+unsafe extern "C" fn on_window_focus_changed(activity: *mut ANativeActivity, has_focus: c_int) {
+    if stale(activity, "window focus changed") {
+        return;
+    }
     if crate::log::trace() {
         alog!("focus {}", has_focus != 0);
     }
@@ -572,9 +641,12 @@ unsafe extern "C" fn on_window_focus_changed(_activity: *mut ANativeActivity, ha
 }
 
 unsafe extern "C" fn on_native_window_created(
-    _activity: *mut ANativeActivity,
+    activity: *mut ANativeActivity,
     window: *mut ANativeWindow,
 ) {
+    if stale(activity, "native window created") {
+        return;
+    }
     unsafe { ANativeWindow_acquire(window) };
     WINDOW.with(|slot| slot.set(window));
     let (_, _, scale) = config();
@@ -610,9 +682,12 @@ unsafe extern "C" fn on_native_window_created(
 }
 
 unsafe extern "C" fn on_native_window_resized(
-    _activity: *mut ANativeActivity,
+    activity: *mut ANativeActivity,
     _window: *mut ANativeWindow,
 ) {
+    if stale(activity, "native window resized") {
+        return;
+    }
     let physical = window_physical();
     if crate::log::trace() {
         alog!("window resized: {}×{} px", physical.0, physical.1);
@@ -630,18 +705,24 @@ unsafe extern "C" fn on_native_window_resized(
 }
 
 unsafe extern "C" fn on_native_window_redraw_needed(
-    _activity: *mut ANativeActivity,
+    activity: *mut ANativeActivity,
     _window: *mut ANativeWindow,
 ) {
+    if stale(activity, "native window redraw needed") {
+        return;
+    }
     // the system waits for a frame before it returns — and gets one,
     // because the handler runs here and now
     dispatch(AppEvent::Redraw);
 }
 
 unsafe extern "C" fn on_native_window_destroyed(
-    _activity: *mut ANativeActivity,
+    activity: *mut ANativeActivity,
     window: *mut ANativeWindow,
 ) {
+    if stale(activity, "native window destroyed") {
+        return;
+    }
     trace_line("window destroyed");
     // the surface and the swapchain die INSIDE the callback: after it
     // returns the window is no more
@@ -658,9 +739,12 @@ unsafe extern "C" fn on_native_window_destroyed(
 }
 
 unsafe extern "C" fn on_input_queue_created(
-    _activity: *mut ANativeActivity,
+    activity: *mut ANativeActivity,
     queue: *mut AInputQueue,
 ) {
+    if stale(activity, "input queue created") {
+        return;
+    }
     let looper = LOOPER.with(Cell::get);
     if looper.is_null() {
         return;
@@ -670,17 +754,23 @@ unsafe extern "C" fn on_input_queue_created(
 }
 
 unsafe extern "C" fn on_input_queue_destroyed(
-    _activity: *mut ANativeActivity,
+    activity: *mut ANativeActivity,
     queue: *mut AInputQueue,
 ) {
+    if stale(activity, "input queue destroyed") {
+        return;
+    }
     unsafe { AInputQueue_detachLooper(queue) };
     QUEUE.with(|slot| slot.set(null_mut()));
 }
 
 unsafe extern "C" fn on_content_rect_changed(
-    _activity: *mut ANativeActivity,
+    activity: *mut ANativeActivity,
     rect: *const ARect,
 ) {
+    if stale(activity, "content rect changed") {
+        return;
+    }
     if crate::log::trace() && !rect.is_null() {
         let rect = unsafe { &*rect };
         alog!("content rect: {} {} {} {}", rect.left, rect.top, rect.right, rect.bottom);
@@ -688,14 +778,20 @@ unsafe extern "C" fn on_content_rect_changed(
     refresh_insets();
 }
 
-unsafe extern "C" fn on_configuration_changed(_activity: *mut ANativeActivity) {
+unsafe extern "C" fn on_configuration_changed(activity: *mut ANativeActivity) {
+    if stale(activity, "configuration changed") {
+        return;
+    }
     let (dark, compact, scale) = config();
     SCALE.with(|slot| slot.set(scale));
     dispatch(AppEvent::Config { dark, compact, scale });
     refresh_insets();
 }
 
-unsafe extern "C" fn on_low_memory(_activity: *mut ANativeActivity) {
+unsafe extern "C" fn on_low_memory(activity: *mut ANativeActivity) {
+    if stale(activity, "low memory") {
+        return;
+    }
     dispatch(AppEvent::LowMemory);
 }
 
@@ -1370,6 +1466,13 @@ fn blit(width: usize, height: usize, rgba: &[u8]) {
         CPU.with(|slot| drop(slot.borrow_mut().take()));
         dispatch(AppEvent::Redraw);
     }
+}
+
+/// The platform's API level, as the activity was handed it — 0 with
+/// no activity standing.
+pub fn sdk_version() -> i32 {
+    let activity = ACTIVITY.with(Cell::get);
+    if activity.is_null() { 0 } else { unsafe { (*activity).sdk_version } }
 }
 
 /// The activity's private files directory — where a registered face is

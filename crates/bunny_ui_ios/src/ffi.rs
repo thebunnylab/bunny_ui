@@ -301,6 +301,10 @@ extern "C" fn bunny_did_finish_launching(this: Id, _sel: Sel, _app: Id, _options
         WINDOW.with(|slot| slot.set(window));
         VIEW.with(|slot| slot.set(view));
         DELEGATE.with(|slot| slot.set(this));
+        // the center learns its delegate BEFORE the launch returns: a
+        // tap on a notification can be the very thing that launched
+        // the process, and the response arrives the moment this returns
+        bunny_ui_apple::notifications::install_delegate(this);
         bunny_ui_apple::ffi::install_wake_source(perform_wake);
         start_beat(this);
         // the keyboard's own word on where it is
@@ -973,6 +977,10 @@ unsafe fn register_classes() {
         ] {
             class_addMethod(delegate, sel(name), imp, v_id.as_ptr());
         }
+        // the notification center's doors and its protocol come from
+        // the shared half — the class is still open, so they land on
+        // the very object UIKit hands the launch to
+        bunny_ui_apple::notifications::add_delegate_methods(delegate);
         objc_registerClassPair(delegate);
     });
 }
