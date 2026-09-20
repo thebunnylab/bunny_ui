@@ -7790,6 +7790,88 @@ mod tests {
     }
 
     #[test]
+    fn a_region_that_slides_under_the_pointer_does_not_take_the_wheel() {
+        use crate::layout::{Point, Proposal, Size};
+
+        // a dashboard: a tall page, and a chart's legend down the page
+        // that scrolls too
+        #[derive(Clone, Copy)]
+        struct Dashboard;
+
+        impl Component for Dashboard {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(vstack!(
+                    text("charts").frame(400.0, 200.0),
+                    scroll(text("legend").frame(400.0, 900.0)).id("legend").frame(400.0, 100.0),
+                    text("more charts").frame(400.0, 3000.0),
+                ))
+                .id("page")
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 400.0, height: 300.0 };
+        let layout = || runtime.layout(&Dashboard, Proposal::exact(size));
+        runtime.render_stable(&Dashboard);
+        let result = layout();
+        let path = |suffix: &str| {
+            let region = result.scrolls.iter().find(|region| region.path.ends_with(suffix));
+            region.unwrap_or_else(|| panic!("{suffix} is a region")).path.clone()
+        };
+        let (page, legend) = (path("[page]"), path("[legend]"));
+        let legend_frame = || {
+            let result = layout();
+            result.scrolls.iter().find(|region| region.path == legend).expect("legend").frame
+        };
+
+        // the pointer rests over the page, above the legend; the page
+        // scrolls until the legend is under it
+        let (x, y) = (200.0, 50.0);
+        assert!(!legend_frame().contains(x, y));
+        assert!(runtime.wheel(x, y, 0.0, -200.0));
+        assert!(legend_frame().contains(x, y), "the legend slid under the pointer");
+
+        // the same gesture goes on: the page has it, the legend is quiet
+        assert!(runtime.wheel(x, y, 0.0, -30.0));
+        assert_eq!(runtime.scroll_offset(&page).y, 230.0, "the page keeps the wheel");
+        assert_eq!(runtime.scroll_offset(&legend), Point::ZERO, "the legend did not take it");
+
+        // a hand that turns a wheel moves the mouse a little, and one
+        // slow tick is not the end of a gesture
+        runtime.wheel_tick();
+        assert!(runtime.wheel(x + 4.0, y - 3.0, 0.0, -10.0));
+        assert_eq!(runtime.scroll_offset(&page).y, 240.0);
+        assert_eq!(runtime.scroll_offset(&legend), Point::ZERO);
+
+        // two slow ticks with no wheel: the gesture is over, and the
+        // next wheel is for what is under the pointer NOW
+        runtime.wheel_tick();
+        runtime.wheel_tick();
+        layout();
+        assert!(legend_frame().contains(x, y));
+        assert!(runtime.wheel(x, y, 0.0, -40.0));
+        assert_eq!(runtime.scroll_offset(&legend).y, 40.0, "the legend answers a new gesture");
+        assert_eq!(runtime.scroll_offset(&page).y, 240.0);
+
+        // a pointer that moves away starts a new gesture with no wait
+        assert!(runtime.wheel(x, y + 150.0, 0.0, -25.0));
+        assert_eq!(runtime.scroll_offset(&page).y, 265.0, "beside the legend the page answers");
+        assert_eq!(runtime.scroll_offset(&legend).y, 40.0);
+
+        // ...and so does a press: the page has the latch, the press
+        // lets it go, and the legend under the pointer answers
+        runtime.set_scroll_offset(&page, Point { x: 0.0, y: 0.0 });
+        layout();
+        assert!(runtime.wheel(x, y, 0.0, -200.0));
+        layout();
+        runtime.pointer_clicked(x, y, 1, crate::action::Modifiers::NONE);
+        runtime.pointer_released(x, y);
+        assert!(runtime.wheel(x, y, 0.0, -10.0));
+        assert_eq!(runtime.scroll_offset(&legend).y, 50.0, "a press ends the gesture");
+        assert_eq!(runtime.scroll_offset(&page).y, 200.0);
+    }
+
+    #[test]
     fn a_sheet_owns_what_it_covers() {
         use crate::layout::{Point, Proposal, Size};
 

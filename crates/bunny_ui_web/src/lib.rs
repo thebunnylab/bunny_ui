@@ -418,7 +418,9 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
             }
             Event::TooltipTick => {
                 // the same slow beat ages a sequence in the air: two
-                // ticks and `cmd-k` lets the keyboard go
+                // ticks and `cmd-k` lets the keyboard go — and the
+                // wheel's latch: two ticks with no wheel end the gesture
+                runtime.wheel_tick();
                 if runtime.tooltip_tick() | runtime.chord_tick() {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
@@ -613,7 +615,9 @@ fn start_dom_with(
             }
             Event::TooltipTick => {
                 // the same slow beat ages a sequence in the air: two
-                // ticks and `cmd-k` lets the keyboard go
+                // ticks and `cmd-k` lets the keyboard go — and the
+                // wheel's latch: two ticks with no wheel end the gesture
+                runtime.wheel_tick();
                 if runtime.tooltip_tick() | runtime.chord_tick() {
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
@@ -738,8 +742,9 @@ pub extern "C" fn bunny_pointer_move(x: f64, y: f64, mods: u32) {
 }
 
 /// One beat of the glue's slow clock: the tooltip ages, then shows.
-/// The glue arms two of these after a pointer settles — the runtime
-/// no-ops the strays.
+/// The glue arms two of these after a pointer settles, and after a
+/// wheel (the second one ends the scroll gesture) — the runtime no-ops
+/// the strays.
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_tooltip_tick() {
     dispatch(Event::TooltipTick);

@@ -693,6 +693,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                 // the same slow beat ages a sequence in the air: two
                 // ticks and `cmd-k` lets the keyboard go
                 let chorded = runtime.chord_tick();
+                // and the wheel's latch: two ticks with no wheel end
+                // the scroll gesture
+                runtime.wheel_tick();
                 if blinked || explained || chorded {
                     blit(runtime, root);
                 }

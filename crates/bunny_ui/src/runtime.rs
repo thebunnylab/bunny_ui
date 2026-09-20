@@ -82,6 +82,25 @@ struct TooltipLife {
     aged: bool,
 }
 
+/// The wheel's latch: the regions that took a scroll gesture, one per
+/// axis, and the point the gesture started at. While it holds, the
+/// wheel goes to these regions and not to what slid under the pointer.
+struct WheelLatch {
+    anchor: Point,
+    x: Option<String>,
+    y: Option<String>,
+    /// The app's box that had the first turn of the gesture and let it
+    /// go. It was under the pointer from the start, so it keeps its
+    /// turn: a chart that pans sideways and ignores the rest still pans.
+    offered: Option<String>,
+    /// One slow tick went by with no wheel. The second one releases.
+    aged: bool,
+}
+
+/// How far the pointer can move before the wheel is a new gesture. A
+/// hand that turns a mouse wheel moves the mouse a little.
+const WHEEL_LATCH_SLOP: Px = 10.0;
+
 /// One binding that takes a sequence of strokes. `context` is `None`
 /// for the global layer — the same two shelves single strokes have.
 struct Chord {
@@ -225,6 +244,12 @@ pub struct Runtime {
     /// drops it — the tooltip's own idiom, and the reason `cmd-k` can
     /// never hold the keyboard for good.
     pending_aged: Cell<bool>,
+    /// The scroll gesture in flight. A page that scrolls moves its
+    /// inner regions under a pointer that did not move; without the
+    /// latch each of them takes the wheel when it arrives, and the
+    /// page stops. CLOCKLESS, the tooltip's own idiom: the wheel arms
+    /// it and the second slow tick releases it.
+    wheel_latch: RefCell<Option<WheelLatch>>,
     /// Who hears the sequence move — a which-key panel's door. Called
     /// with the strokes in the air after every change: a stroke that
     /// opened or lengthened a sequence, and the end of one, however it
@@ -1025,6 +1050,7 @@ impl Runtime {
             chord_sink: RefCell::new(None),
             chord_announced: Cell::new(false),
             pending_aged: Cell::new(false),
+            wheel_latch: RefCell::new(None),
             measures: RefCell::new(HashMap::default()),
             scroll_commands: RefCell::new(HashMap::default()),
             scroll_targets: RefCell::new(HashMap::default()),
@@ -1670,6 +1696,8 @@ impl Runtime {
         modifiers: impl Into<crate::action::Modifiers>,
     ) -> bool {
         self.enter_scene();
+        // a press is a new intent: the scroll gesture is over
+        self.wheel_latch.borrow_mut().take();
         let modifiers = modifiers.into();
         let (repaint, told) = self.watching_hover(|| self.pointer_clicked_road(x, y, clicks, modifiers));
         repaint || told
@@ -2026,6 +2054,9 @@ impl Runtime {
     /// performed through the pointer's own doors; the shell only
     /// forwards.
     pub fn touch_began(&self, id: u64, x: Px, y: Px, taps: u8) -> bool {
+        // a new finger is a new gesture: the pan asks again what is
+        // under its anchor
+        self.wheel_latch.borrow_mut().take();
         let gestures = self.touch.borrow_mut().began(id, Point { x, y }, taps, self);
         self.perform_touch(gestures).0
     }
@@ -2170,6 +2201,14 @@ impl Runtime {
     /// answer. AppKit convention: positive delta reveals content above
     /// — the offset shrinks. `true` = something changed and the shell
     /// repaints (no render: zero bodies).
+    ///
+    /// The answer LATCHES: the region that took the first step of a
+    /// gesture takes the rest of it. A page that scrolls moves a legend
+    /// under a pointer that did not move, and the legend must not take
+    /// the wheel from the page. A new gesture starts when the pointer
+    /// moves away from where the wheel started, when a press or a
+    /// finger lands, or when [`Runtime::wheel_tick`] has aged the latch
+    /// out.
     pub fn wheel(&self, x: Px, y: Px, dx: Px, dy: Px) -> bool {
         self.enter_scene();
         // the content is about to slide under a still pointer — the
@@ -2180,12 +2219,27 @@ impl Runtime {
         // the screen, and a shell told "nothing happened" leaves it
         // painted over a scene that no longer explains it
         let explained = self.clear_tooltip() | self.close_menu();
+        // the latch comes OUT of its cell: the app's box runs a closure,
+        // and the app may come straight back in through any door
+        let latch = self.wheel_latch.borrow_mut().take().filter(|latch| {
+            (latch.anchor.x - x).abs() <= WHEEL_LATCH_SLOP
+                && (latch.anchor.y - y).abs() <= WHEEL_LATCH_SLOP
+        });
         // the app's box gets the turn first: an editor scrolls itself.
-        // What it ignores falls through to the region around it.
-        let over = self
-            .hover_target(x, y)
-            .and_then(|path| self.custom_at(&path));
-        if let Some(placement) = over {
+        // What it ignores falls through to the region around it. A
+        // gesture in flight asks only the box it asked first: one that
+        // slid under the pointer is a legend by another name.
+        let over = match &latch {
+            Some(WheelLatch { offered: None, .. }) => None,
+            Some(WheelLatch { offered, .. }) => {
+                self.hover_target(x, y).filter(|path| Some(path) == offered.as_ref())
+            }
+            None => self.hover_target(x, y),
+        };
+        let over = over.and_then(|path| Some((self.custom_at(&path)?, path)));
+        let mut offered = None;
+        if let Some((placement, path)) = over {
+            offered = Some(path);
             let at = Self::local(&placement, x, y);
             let event = crate::custom::ElementEvent::Wheel { at, dx, dy };
             if self.deliver(&placement, event).handled {
@@ -2212,8 +2266,39 @@ impl Runtime {
                 region.frame.contains(x, y) && axis(scroll_travel(region)) > 0.0
             })
         };
-        let region_y = (dy != 0.0).then(|| topmost(|(_, y)| y)).flatten();
-        let region_x = (dx != 0.0).then(|| topmost(|(x, _)| x)).flatten();
+        // the latched region answers while it is in reach and still
+        // travels; a region that left the scene lets its axis go
+        let pick = |held: Option<&str>, axis: fn((Px, Px)) -> Px| {
+            held.and_then(|path| {
+                reachable
+                    .iter()
+                    .find(|region| region.path == path && axis(scroll_travel(region)) > 0.0)
+            })
+            .or_else(|| topmost(axis))
+        };
+        let (held_x, held_y) = match &latch {
+            Some(latch) => (latch.x.as_deref(), latch.y.as_deref()),
+            None => (None, None),
+        };
+        let region_y = (dy != 0.0).then(|| pick(held_y, |(_, y)| y)).flatten();
+        let region_x = (dx != 0.0).then(|| pick(held_x, |(x, _)| x)).flatten();
+        // an axis that said nothing in this step keeps its region, and
+        // a path that did not change is not cloned: a gesture in flight
+        // allocates nothing
+        let keep = |held: Option<String>, region: Option<&ScrollRegion>| match (held, region) {
+            (Some(path), Some(region)) if path == region.path => Some(path),
+            (held, None) => held,
+            (_, Some(region)) => Some(region.path.clone()),
+        };
+        let (anchor, held_x, held_y, offered) = match latch {
+            Some(latch) => (latch.anchor, latch.x, latch.y, latch.offered),
+            None => (Point { x, y }, None, None, offered),
+        };
+        let (held_x, held_y) = (keep(held_x, region_x), keep(held_y, region_y));
+        if held_x.is_some() || held_y.is_some() {
+            *self.wheel_latch.borrow_mut() =
+                Some(WheelLatch { anchor, x: held_x, y: held_y, offered, aged: false });
+        }
         if region_x.is_none() && region_y.is_none() {
             return explained;
         }
@@ -2245,6 +2330,18 @@ impl Runtime {
             }
         }
         moved || explained
+    }
+
+    /// The slow clock, aging the wheel's latch: the SECOND tick with no
+    /// wheel between releases it, and the next wheel asks again what is
+    /// under the pointer. The tooltip's own idiom. Nothing on screen
+    /// changes, so there is no answer.
+    pub fn wheel_tick(&self) {
+        let mut latch = self.wheel_latch.borrow_mut();
+        match latch.as_mut() {
+            Some(held) if !held.aged => held.aged = true,
+            _ => *latch = None,
+        }
     }
 
     /// Programmatic scrolling — the NEXT layout (same frame) already
