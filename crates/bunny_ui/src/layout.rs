@@ -2789,7 +2789,7 @@ pub fn layout_with_insets(
         width: proposal.width.map(|width| (width - insets.horizontal()).max(0.0)),
         height: proposal.height.map(|height| (height - insets.vertical()).max(0.0)),
     };
-    let (size, fit) = root.measure(inner, env);
+    let (size, fit) = crate::stats::time(crate::stats::Stage::Measure, || root.measure(inner, env));
     let safe = Rect { origin: Point { x: insets.leading, y: insets.top }, size };
     // the window: the proposal where it was proposed, the root's answer
     // plus the insets where it was open
@@ -2802,7 +2802,7 @@ pub fn layout_with_insets(
     };
     let mut out = Placement::default();
     out.safe = (insets != Edges::ZERO).then_some(SafeFrame { window, safe });
-    root.place(safe, fit, env, &mut out);
+    crate::stats::time(crate::stats::Stage::Place, || root.place(safe, fit, env, &mut out));
     // popovers place AFTER the root: painted on top, hit first, free
     // of every scroll clip. Their default container is the WINDOW's
     // safe rect (the proposal), never the root's answer — a small scene
@@ -4565,6 +4565,7 @@ impl LayoutNode {
                 let ink = out.foreground.last().copied().unwrap_or(Color::BLACK);
                 let mut painter =
                     crate::custom::Painter::new(&mut out.display, frame.origin, env.font, ink);
+                crate::stats::note_paint();
                 element.element().paint(&ctx, &mut painter);
                 out.pop_clip();
                 let end = out.display.len();

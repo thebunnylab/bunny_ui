@@ -504,8 +504,11 @@ impl Runtime {
         // outside a pass re-arms every `.task` under the root — a fresh
         // thread each, on every refill. Which is why `enter_scene` rebuilds
         // the input tables and never this.
-        effects::set_queue(reconciler::assemble_effects(root));
-        self.assemble_input(root);
+        crate::stats::note_assembly();
+        crate::stats::time(crate::stats::Stage::Assemble, || {
+            effects::set_queue(reconciler::assemble_effects(root));
+            self.assemble_input(root);
+        });
     }
 
     /// Rebuilds only the tables the input doors read.
@@ -3425,12 +3428,27 @@ impl Runtime {
     ) -> crate::layout::DisplayList {
         self.settle(root);
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
-        if let Some(point) = self.hover_reread()
-            && self.pointer_moved(point.x, point.y, self.pointer_modifiers.get())
-        {
-            result = self.layout(root, crate::layout::Proposal::exact(size));
+        if let Some(again) = self.reread_hover(root, size) {
+            result = again;
         }
         result.display
+    }
+
+    /// The pointer re-read of a frame, and the second layout when the
+    /// re-read asks for one.
+    fn reread_hover(
+        &self,
+        root: &impl View,
+        size: crate::layout::Size,
+    ) -> Option<crate::layout::LayoutResult> {
+        crate::stats::time(crate::stats::Stage::Hover, || {
+            let point = self.hover_reread()?;
+            if !self.pointer_moved(point.x, point.y, self.pointer_modifiers.get()) {
+                return None;
+            }
+            crate::stats::note_hover_relayout();
+            Some(self.layout(root, crate::layout::Proposal::exact(size)))
+        })
     }
 
     /// The point a frame re-reads to keep hover honest — `None` when the
@@ -3571,10 +3589,8 @@ impl Runtime {
         size: crate::layout::Size,
     ) -> crate::layout::DisplayList {
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
-        if let Some(point) = self.hover_reread()
-            && self.pointer_moved(point.x, point.y, self.pointer_modifiers.get())
-        {
-            result = self.layout(root, crate::layout::Proposal::exact(size));
+        if let Some(again) = self.reread_hover(root, size) {
+            result = again;
         }
         result.display
     }
@@ -4714,7 +4730,7 @@ impl Runtime {
         crate::stats::note_body_pass();
         crate::view::set_print(false);
         self.printless.set(true);
-        let nodes = self.render_pass(root);
+        let nodes = crate::stats::time(crate::stats::Stage::Pass, || self.render_pass(root));
         crate::view::set_print(true);
         nodes
     }
