@@ -45,6 +45,24 @@ pub enum Origin {
 }
 
 impl Origin {
+    /// The origin as a small number — what a frame pacer files an ask under.
+    pub fn index(self) -> u8 {
+        self as u8
+    }
+
+    /// The origins a folded frame carried, from the pacer's bit set:
+    /// `wake+input`.
+    pub fn names(bits: u32) -> String {
+        const ALL: [Origin; 6] =
+            [Origin::Redraw, Origin::Wake, Origin::Input, Origin::Frame, Origin::Web, Origin::Blink];
+        let named: Vec<&str> = ALL
+            .iter()
+            .filter(|origin| bits & (1u32 << origin.index()) != 0)
+            .map(|origin| origin.name())
+            .collect();
+        if named.is_empty() { "-".to_string() } else { named.join("+") }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Origin::Redraw => "redraw",

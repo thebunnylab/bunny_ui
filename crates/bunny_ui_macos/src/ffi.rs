@@ -309,6 +309,8 @@ impl Default for Manners {
 /// which is to say on the very next frame. That crash is what this
 /// function exists to have already prevented.
 fn forget_window(window: usize) {
+    // a window that closed wants no beat
+    BEAT_WANTS.with(|wants| wants.borrow_mut().retain(|(open, _)| *open != window));
     let view = WINDOWS.with(|windows| {
         windows
             .borrow()
@@ -1405,6 +1407,45 @@ pub enum DriverPace {
     Slow(f64),
     /// Nothing moves.
     Off,
+}
+
+impl DriverPace {
+    /// The pace that serves both: the link serves everything, and of two
+    /// slow beats the shorter step serves both clocks.
+    fn faster(self, other: DriverPace) -> DriverPace {
+        match (self, other) {
+            (DriverPace::Full, _) | (_, DriverPace::Full) => DriverPace::Full,
+            (DriverPace::Slow(a), DriverPace::Slow(b)) => DriverPace::Slow(a.min(b)),
+            (DriverPace::Slow(step), DriverPace::Off) | (DriverPace::Off, DriverPace::Slow(step)) => {
+                DriverPace::Slow(step)
+            }
+            (DriverPace::Off, DriverPace::Off) => DriverPace::Off,
+        }
+    }
+}
+
+thread_local! {
+    /// The pace EACH window wants. The driver is one for the app, and every
+    /// window's handler says its own pace at the tail of every event: with
+    /// one slot, the last window to speak decided — an idle window paused
+    /// the link under another window's spring, and would pause it under
+    /// another window's pending frames.
+    static BEAT_WANTS: RefCell<Vec<(usize, DriverPace)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// One window says the pace it wants; the driver runs at the fastest pace
+/// any window wants. `true` = the display link runs now.
+pub fn want_beat(window: usize, pace: DriverPace) -> bool {
+    let effective = BEAT_WANTS.with(|wants| {
+        let mut wants = wants.borrow_mut();
+        match wants.iter_mut().find(|(open, _)| *open == window) {
+            Some(entry) => entry.1 = pace,
+            None => wants.push((window, pace)),
+        }
+        wants.iter().fold(DriverPace::Off, |pace, (_, wanted)| pace.faster(*wanted))
+    });
+    set_frame_driver(effective);
+    effective == DriverPace::Full
 }
 
 /// Points the frame driver at the pace the moment deserves. Without a

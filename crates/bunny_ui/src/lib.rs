@@ -57,6 +57,7 @@ pub mod one_of;
 pub mod gpu;
 #[cfg(feature = "canvas")]
 pub mod raster;
+pub mod pacing;
 mod paranoid;
 mod reconciler;
 pub mod runtime;
