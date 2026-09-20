@@ -1609,6 +1609,8 @@ pub struct MetalPresenter {
     /// that carries glass and remade whenever the drawable resizes. A
     /// window that never shows glass never allocates them.
     glass: Option<GlassTextures>,
+    /// How long the last present waited for a drawable, in milliseconds.
+    drawable_wait_ms: f64,
 }
 
 impl MetalPresenter {
@@ -1752,6 +1754,7 @@ impl MetalPresenter {
                 (size.width.round().max(0.0) as usize) * scale,
                 (size.height.round().max(0.0) as usize) * scale,
             );
+            self.drawable_wait_ms = 0.0;
             if physical.0 == 0 || physical.1 == 0 {
                 // a zero drawable is an abort, not a frame
                 objc_autoreleasePoolPop(pool);
@@ -1791,7 +1794,9 @@ impl MetalPresenter {
                 &self.stack.sels,
                 &self.batches,
             );
+            let asked = crate::trace::clock_ms();
             let drawable = msg_id(self.layer, self.stack.sels.next_drawable);
+            self.drawable_wait_ms = crate::trace::clock_ms() - asked;
             if drawable.is_null() {
                 objc_autoreleasePoolPop(pool);
                 return;
@@ -1895,7 +1900,23 @@ impl MetalPresenter {
             retained: None,
             transactional: false,
             glass: None,
+            drawable_wait_ms: 0.0,
         })
+    }
+
+    /// How long the last present waited for a drawable, in milliseconds —
+    /// zero for a frame that was skipped.
+    ///
+    /// A layer holds three drawables: one on the glass, two that wait for
+    /// their refresh. A frame that misses its refresh takes the next one,
+    /// which the frame after it wanted; from there every present finds all
+    /// three taken and waits for the display to free one — most of a beat,
+    /// inside the handler, and every frame shown is a refresh older than it
+    /// had to be. One frame a beat never drains that line. A shell reads
+    /// this after a present and holds ONE beat when the wait says the line
+    /// is full (`FramePacer::congested`): the line drains and stays short.
+    pub fn drawable_wait_ms(&self) -> f64 {
+        self.drawable_wait_ms
     }
 
     /// The anti-flash frame: one clear at the size the surface will

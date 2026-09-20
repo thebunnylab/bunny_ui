@@ -29,6 +29,12 @@
 //! - During a LIVE resize the resize step is the one presenter: an event
 //!   that can wait is dropped on the floor (the next step shows what it
 //!   changed), and a beat holds.
+//! - A present that WAITED for the display ([`FramePacer::congested`]) means
+//!   the line of frames in front of the display is full: a frame missed its
+//!   refresh and took the next one. One frame a beat never drains that line
+//!   — every present after it waits most of a beat inside its handler, and
+//!   shows a refresh late. The pacer holds ONE beat, the line drains, and
+//!   what waited is drawn on the beat after.
 
 use std::cell::Cell;
 
@@ -81,6 +87,8 @@ pub struct FramePacer {
     /// Beats with nothing to draw since the last deferred draw.
     quiet: Cell<u32>,
     pending: Cell<Asked>,
+    /// Beats to hold so the line of frames in front of the display drains.
+    owed: Cell<u32>,
 }
 
 impl Default for FramePacer {
@@ -90,6 +98,7 @@ impl Default for FramePacer {
             // born cold: no warm period is open
             quiet: Cell::new(Self::QUIET_BEATS),
             pending: Cell::new(Asked::default()),
+            owed: Cell::new(0),
         }
     }
 }
@@ -100,6 +109,10 @@ impl FramePacer {
     /// through its gaps, and the notches of a mouse wheel — 30 to 100 ms
     /// apart — are each drawn at once, which is right for them.
     pub const QUIET_BEATS: u32 = 3;
+
+    /// Frames that can wait in front of the display: the most beats a
+    /// pacer ever owes.
+    pub const LINE: u32 = 2;
 
     pub fn new() -> FramePacer {
         FramePacer::default()
@@ -144,9 +157,23 @@ impl FramePacer {
         self.pending.replace(Asked::default())
     }
 
+    /// The present that just went up WAITED for the display: the line of
+    /// frames in front of it is full. The next beat holds, and the line
+    /// drains by one. Two waits in a row owe two beats and no more — the
+    /// line is never longer than that.
+    pub fn congested(&self) {
+        self.owed.set((self.owed.get() + 1).min(Self::LINE));
+    }
+
     /// One display beat.
     pub fn beat(&self, live: bool) -> Beat {
         if live {
+            return Beat::Hold;
+        }
+        if self.owed.get() > 0 {
+            // a held beat is not a quiet one: what waits is still owed its
+            // frame, and the warm period must not end under it
+            self.owed.set(self.owed.get() - 1);
             return Beat::Hold;
         }
         if self.pending.get().count > 0 {
@@ -160,7 +187,7 @@ impl FramePacer {
     /// Is a warm period open? While it is, the shell keeps the display
     /// beat running for this window.
     pub fn warm(&self) -> bool {
-        self.pending.get().count > 0 || self.quiet.get() < Self::QUIET_BEATS
+        self.pending.get().count > 0 || self.owed.get() > 0 || self.quiet.get() < Self::QUIET_BEATS
     }
 
     /// The shell says whether a display-rate beat is running — for this
@@ -254,6 +281,33 @@ mod tests {
         assert_eq!(typing.ask(KEY, Urgency::Now, false), Verdict::Draw);
         typing.drew();
         assert!(!typing.warm(), "a frame that could not wait opens no warm period");
+    }
+
+    #[test]
+    fn a_present_that_waited_holds_one_beat_and_loses_nothing() {
+        let pacer = FramePacer::new();
+        pacer.ask(WHEEL, Urgency::Soon, false);
+        pacer.drew();
+        pacer.set_beating(true);
+        pacer.ask(WHEEL, Urgency::Soon, false);
+        assert_eq!(pacer.beat(false), Beat::Draw);
+        pacer.drew();
+        // that present waited for the display: the line in front of it is full
+        pacer.congested();
+        pacer.ask(WHEEL, Urgency::Soon, false);
+        assert_eq!(pacer.beat(false), Beat::Hold, "one beat is held, and the line drains");
+        assert_eq!(pacer.pending().count, 1, "what waited is still owed its frame");
+        assert!(pacer.warm(), "and the beat keeps running for it");
+        assert_eq!(pacer.beat(false), Beat::Draw, "the beat after draws it");
+        pacer.drew();
+
+        // the line is two frames long: no pacer owes more than two beats
+        for _ in 0..5 {
+            pacer.congested();
+        }
+        assert_eq!(pacer.beat(false), Beat::Hold);
+        assert_eq!(pacer.beat(false), Beat::Hold);
+        assert_eq!(pacer.beat(false), Beat::Quiet);
     }
 
     #[test]

@@ -1839,6 +1839,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // ONE settled frame for every wheel, move and wake since the
             // last beat. It carries the tick too, so the springs lose
             // nothing.
+            // a present that waited for the display found the line of
+            // frames in front of it full: this beat is held, and it drains
+            if metal::take_congested() && !unpaced {
+                handler_pacer.congested();
+            }
             let beat = handler_pacer.beat(handler_resizing());
             if beat == Beat::Hold {
             } else if beat == Beat::Draw {
