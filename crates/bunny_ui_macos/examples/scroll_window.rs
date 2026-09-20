@@ -20,6 +20,15 @@
 //! wheel, a second of rest, then the process ends. On the tape, the wheel
 //! must read as ONE present for each display beat, however many steps
 //! arrived between two beats; the rests must read as no present at all.
+//!
+//! `--swap` is the other script: the page changes between the board and
+//! the table, eight times, with a rest between two changes. Each change
+//! mounts a page the window has not drawn yet — or has, the second time —
+//! so the tape reads what a change of page costs with a real face: the
+//! measures of text never seen, and its first raster.
+//!
+//! `--kept` makes every chart keep its picture (`.cached`), under either
+//! script: the same tape, with the paints of a still chart gone from it.
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 
@@ -38,6 +47,9 @@ const STEPS_PER_SECOND: u64 = 240;
 const REST_BEFORE: Duration = Duration::from_secs(2);
 const WHEEL_FOR: Duration = Duration::from_secs(3);
 const REST_AFTER: Duration = Duration::from_secs(1);
+/// Page changes in the `--swap` script, and the rest between two of them.
+const SWAPS: usize = 8;
+const REST_BETWEEN: Duration = Duration::from_millis(600);
 /// A point over the board's first chart, in layout points. The board hugs
 /// its panels, and with a real face they are narrower than the window: the
 /// point stays near the board's leading edge.
@@ -46,20 +58,30 @@ const OVER_BOARD: (f64, f64) = (400.0, 140.0);
 /// One step of the script, from the worker's clock to the main thread.
 enum Step {
     Wheel(f64),
+    Swap,
     Done,
+}
+
+/// Which script the window runs, if any.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Script {
+    None,
+    Wheel,
+    Swap,
 }
 
 #[derive(Clone)]
 struct Driven {
     scene: Workbench,
-    drive: bool,
+    script: Script,
 }
 
 impl Component for Driven {
     fn body(self, _ctx: &Context) -> impl View {
-        let drive = self.drive;
+        let script = self.script;
+        let mode = self.scene.mode;
         self.scene.task(move || async move {
-            if !drive {
+            if script == Script::None {
                 return;
             }
             let (sender, receiver) = task::channel::<Step>();
@@ -68,6 +90,16 @@ impl Component for Driven {
             // by the very thing it measures
             std::thread::spawn(move || {
                 std::thread::sleep(REST_BEFORE);
+                if script == Script::Swap {
+                    for _ in 0..SWAPS {
+                        if sender.send(Step::Swap).is_err() {
+                            return;
+                        }
+                        std::thread::sleep(REST_BETWEEN);
+                    }
+                    let _ = sender.send(Step::Done);
+                    return;
+                }
                 let steps = WHEEL_FOR.as_millis() as u64 * STEPS_PER_SECOND / 1000;
                 let pause = Duration::from_micros(1_000_000 / STEPS_PER_SECOND);
                 for step in 0..steps {
@@ -89,6 +121,13 @@ impl Component for Driven {
                     }
                     #[cfg(not(target_os = "macos"))]
                     Step::Wheel(_) => {}
+                    Step::Swap => mode.update(|mode| {
+                        *mode = if *mode == dashboard::Mode::Board {
+                            dashboard::Mode::Table
+                        } else {
+                            dashboard::Mode::Board
+                        };
+                    }),
                     Step::Done => std::process::exit(0),
                 }
             }
@@ -98,11 +137,22 @@ impl Component for Driven {
 
 #[cfg(target_os = "macos")]
 fn main() {
-    let drive = std::env::args().any(|arg| arg == "--drive");
+    let script = if std::env::args().any(|arg| arg == "--drive") {
+        Script::Wheel
+    } else if std::env::args().any(|arg| arg == "--swap") {
+        Script::Swap
+    } else {
+        Script::None
+    };
+    let scene = if std::env::args().any(|arg| arg == "--kept") {
+        Workbench::new(60).keeping_pictures()
+    } else {
+        Workbench::new(60)
+    };
     bunny_ui_macos::run_window(
         "bunny_ui — a dashboard that scrolls",
         Size { width: VIEWPORT.width, height: VIEWPORT.height },
-        Driven { scene: Workbench::new(60), drive },
+        Driven { scene, script },
     );
 }
 
