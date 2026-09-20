@@ -185,6 +185,16 @@ impl NodeList {
         std::mem::take(&mut self.layout)
     }
 
+    /// The path of the root boundary, when the pass produced exactly ONE
+    /// boundary at its root.
+    pub(crate) fn root_boundary(&self) -> Option<&str> {
+        match self.layout.as_slice() {
+            [crate::layout::LayoutNode::Boundary { path, .. }]
+            | [crate::layout::LayoutNode::BoundaryRef { path }] => Some(path),
+            _ => None,
+        }
+    }
+
     pub(crate) fn nodes(&self) -> &[RenderNode] {
         &self.nodes
     }

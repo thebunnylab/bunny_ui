@@ -2816,6 +2816,69 @@ mod tests {
     }
 
     #[test]
+    fn a_named_scene_takes_the_stable_frame() {
+        // every window of a shell is a NAMED scene: the pass root is the
+        // scene's own segment, and the boundary is one level below it.
+        // The stable frame must find that boundary, or a wheel, a hover
+        // and a tick all pay a whole pass in every real window.
+        #[derive(Clone, Copy)]
+        struct Page {
+            count: State<usize>,
+        }
+
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                text(format!("count {}", self.count.get()))
+            }
+        }
+
+        let page = Page { count: State::new(0) };
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        for runtime in [Runtime::new(), Runtime::scene("w0")] {
+            let mounted = runtime.display_frame(&page, size);
+            let _ = crate::stats::take();
+            let again = runtime.animation_frame(&page, size);
+            let stats = crate::stats::take();
+            assert_eq!(stats.body_passes, 0, "a stable frame runs no pass");
+            assert_eq!(stats.assemblies, 0, "and rebuilds no table");
+            assert_eq!(again.as_slice(), mounted.as_slice(), "the same pixels");
+
+            // a change still gets its pass, and the picture follows
+            page.count.set(page.count.get() + 1);
+            let changed = runtime.display_frame(&page, size);
+            assert_ne!(changed.as_slice(), mounted.as_slice(), "the new count is on screen");
+        }
+    }
+
+    #[test]
+    fn a_runtime_handed_another_root_forgets_the_old_boundary() {
+        #[derive(Clone, Copy)]
+        struct First;
+        #[derive(Clone, Copy)]
+        struct Second;
+
+        impl Component for First {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("first")
+            }
+        }
+        impl Component for Second {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("second, and wider")
+            }
+        }
+
+        let runtime = Runtime::scene("w0");
+        let size = crate::layout::Size { width: 300.0, height: 100.0 };
+        let first = runtime.display_frame(&First, size);
+        // the stable frame of the NEW root must not answer with the old
+        // boundary, which the retention still holds
+        runtime.render_stable(&Second);
+        let second = runtime.animation_frame(&Second, size);
+        assert_ne!(second.as_slice(), first.as_slice(), "the second root is what is laid out");
+    }
+
+    #[test]
     fn store_reads_in_the_body_are_dependencies_too() {
         // Object granularity: whoever read `store.value()` in the body depends
         // on the whole store — `send` re-runs the view, even with no State in

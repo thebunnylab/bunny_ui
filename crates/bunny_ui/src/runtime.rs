@@ -377,11 +377,16 @@ pub struct Runtime {
     /// each new capture against it. Empty (and free) in every other
     /// mode.
     dom: RefCell<crate::dom::DomLowering>,
-    /// Did the last pass see the root become ONE boundary
-    /// (`Boundary`/ref)? Only then can the stable frame synthesize the
+    /// The path of the ONE boundary the last pass saw at the root
+    /// (`Boundary`/ref). Only then can the stable frame synthesize the
     /// reference without a pass — a boundary-less root comes fresh
     /// from the walk on every frame.
-    root_is_boundary: Cell<bool>,
+    ///
+    /// It is not `last_root`. Under a named scene the pass root is the
+    /// scene's own segment (`w0`), which no boundary ever is; the
+    /// boundary is below it (`w0/Workbench`). `last_root` scopes the
+    /// dirt, this names what the stable frame lays out.
+    root_boundary: RefCell<Option<String>>,
     /// The retention can hold entries WITHOUT print lines (built on the
     /// frame path, which does not format) — printing again rebuilds
     /// once, and the full == incremental oracle stays byte-for-byte.
@@ -1132,7 +1137,7 @@ impl Runtime {
             keyboard_inset: Cell::new(0.0),
             last_insets: Cell::new(crate::layout::Edges::ZERO),
             dom: RefCell::new(crate::dom::DomLowering::default()),
-            root_is_boundary: Cell::new(false),
+            root_boundary: RefCell::new(None),
             printless: Cell::new(false),
         };
         // Escape closes the innermost popover — pre-bound in the
@@ -1249,6 +1254,10 @@ impl Runtime {
             *self.last_root.borrow_mut() = Some(pass_root.clone());
         }
         reconciler::end_pass();
+        // every pass teaches the stable frame its boundary — a print, a
+        // settle and a frame pass alike, and a runtime handed another
+        // root view learns the new one here
+        *self.root_boundary.borrow_mut() = nodes.root_boundary().map(str::to_string);
         nodes
     }
 
@@ -3626,13 +3635,7 @@ impl Runtime {
         let rings = self.drop_rings();
         let rings_held = *self.last_drop_rings.borrow() == rings;
         *self.last_drop_rings.borrow_mut() = rings.clone();
-        let stable_root = (self.root_is_boundary.get()
-            && crate::theme::version() == self.theme_version.get()
-            && rings_held
-            && !self.has_pending_dirty())
-        .then(|| self.last_root.borrow().clone())
-        .flatten()
-        .filter(|path| reconciler::is_retained(path));
+        let stable_root = rings_held.then(|| self.stable_boundary()).flatten();
         let tree = match stable_root {
             Some(path) => {
                 reconciler::note_stable_frame();
@@ -3641,11 +3644,6 @@ impl Runtime {
             None => {
                 let mut nodes = self.frame_pass(root);
                 let mut roots = nodes.take_layout();
-                self.root_is_boundary.set(matches!(
-                    roots.as_slice(),
-                    [crate::layout::LayoutNode::Boundary { .. }]
-                        | [crate::layout::LayoutNode::BoundaryRef { .. }]
-                ));
                 if roots.len() == 1 {
                     roots.remove(0)
                 } else {
@@ -3742,13 +3740,7 @@ impl Runtime {
         let rings = self.drop_rings();
         let rings_held = *self.last_drop_rings.borrow() == rings;
         *self.last_drop_rings.borrow_mut() = rings.clone();
-        let stable_root = (self.root_is_boundary.get()
-            && crate::theme::version() == self.theme_version.get()
-            && rings_held
-            && !self.has_pending_dirty())
-        .then(|| self.last_root.borrow().clone())
-        .flatten()
-        .filter(|path| reconciler::is_retained(path));
+        let stable_root = rings_held.then(|| self.stable_boundary()).flatten();
         let tree = match stable_root {
             Some(path) => {
                 reconciler::note_stable_frame();
@@ -3757,11 +3749,6 @@ impl Runtime {
             None => {
                 let mut nodes = self.frame_pass(root);
                 let mut roots = nodes.take_layout();
-                self.root_is_boundary.set(matches!(
-                    roots.as_slice(),
-                    [crate::layout::LayoutNode::Boundary { .. }]
-                        | [crate::layout::LayoutNode::BoundaryRef { .. }]
-                ));
                 if roots.len() == 1 {
                     roots.remove(0)
                 } else {
@@ -4995,12 +4982,7 @@ impl Runtime {
         // root — the walk would be all-skip and emit exactly ONE
         // reference; synthesize the reference and skip the whole pass.
         // Any other situation walks the real pass.
-        let stable_root = (self.root_is_boundary.get()
-            && crate::theme::version() == self.theme_version.get()
-            && !self.has_pending_dirty())
-        .then(|| self.last_root.borrow().clone())
-        .flatten()
-        .filter(|path| reconciler::is_retained(path));
+        let stable_root = self.stable_boundary();
         let tree = match stable_root {
             Some(path) => {
                 // the observable contract holds: THIS frame ran zero bodies
@@ -5010,11 +4992,6 @@ impl Runtime {
             None => {
                 let mut nodes = self.frame_pass(root);
                 let mut roots = nodes.take_layout();
-                self.root_is_boundary.set(matches!(
-                    roots.as_slice(),
-                    [crate::layout::LayoutNode::Boundary { .. }]
-                        | [crate::layout::LayoutNode::BoundaryRef { .. }]
-                ));
                 if roots.len() == 1 {
                     roots.remove(0)
                 } else {
@@ -5256,6 +5233,19 @@ impl Runtime {
                 }
             }
         })
+    }
+
+    /// The boundary a stable frame lays out with no pass: nothing is
+    /// dirty, the theme and the environment did not move, and the root
+    /// boundary of the last pass is still retained. Such a pass would
+    /// skip the root, run no body and produce exactly this reference.
+    fn stable_boundary(&self) -> Option<String> {
+        (crate::theme::version() == self.theme_version.get()
+            && !self.env_moved.get()
+            && !self.has_pending_dirty())
+        .then(|| self.root_boundary.borrow().clone())
+        .flatten()
+        .filter(|path| reconciler::is_retained(path))
     }
 
     fn has_pending_dirty(&self) -> bool {
