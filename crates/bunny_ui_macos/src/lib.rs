@@ -489,6 +489,9 @@ fn why(need: bunny_ui::runtime::FrameNeed) -> String {
 }
 
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
+    // a shell presents the list and never reads it: what no pixel can show
+    // is not drawn
+    runtime.drop_unseen();
     let title: &str = &spec.title;
     let size = spec.size;
     let chrome = spec.chrome;

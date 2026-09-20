@@ -224,6 +224,9 @@ impl App {
 /// the window, the mirrors, the gates and the event handler — once the
 /// system has handed the activity its first window.
 fn mount(runtime: Rc<Runtime>, root: impl View, app: Rc<AppInner>) {
+    // a shell presents the list and never reads it: what no pixel can show
+    // is not drawn
+    runtime.drop_unseen();
     // the road, chosen ONCE per window: the GPU, or the floor
     ffi::install_gpu();
     // the season's mirrors: reduce-motion always follows the system

@@ -391,6 +391,10 @@ pub fn start_with(
     root: impl View + 'static,
 ) {
     install_panic_hook();
+    // the pixel lowering presents the list and never reads it: what no pixel
+    // can show is not drawn. The element lowering keeps every command
+    // whatever this says — a browser scrolls what was lowered by itself
+    runtime.drop_unseen();
     // a task that woke asks the page for one turn — the browser's
     // answer to the desktop's run loop source
     runtime.set_wake_hook(std::sync::Arc::new(|| unsafe { js_request_wake() }));

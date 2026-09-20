@@ -138,6 +138,8 @@ pub struct Runtime {
     /// What the last pointer move did besides changing the hovered
     /// target: a box used it, a tooltip moved. A frame's re-read asks.
     hover_move_had_more: Cell<bool>,
+    /// Drop the draw commands no pixel can show ([`Runtime::drop_unseen`]).
+    drops_unseen: Cell<bool>,
     /// Handlers the HOST mounted, outside any view. The tree's own
     /// handlers are the reconciler's and are rebuilt every pass; these
     /// stand until the host takes them down, and they are the OUTERMOST
@@ -1135,6 +1137,7 @@ impl Runtime {
             last_hover_sensitive: RefCell::new(Vec::new()),
             last_sensitive_groups: RefCell::new(Vec::new()),
             hover_move_had_more: Cell::new(false),
+            drops_unseen: Cell::new(false),
             hosted_handlers: RefCell::new(HashMap::default()),
             interaction: RefCell::new(Interaction::default()),
             pointer_modifiers: std::cell::Cell::new(crate::action::Modifiers::NONE),
@@ -5225,7 +5228,9 @@ impl Runtime {
                     crate::layout::layout_dom(&tree, proposal, env, collect_display);
                 (result, Some(scene))
             } else {
-                (crate::layout::layout_with_insets(&tree, proposal, env, insets), None)
+                // the paranoid check needs the cut on to have a claim to check
+                let drop = self.drops_unseen.get() || crate::paranoid::on(crate::paranoid::SEEN);
+                (crate::layout::layout_placing(&tree, proposal, env, insets, !drop), None)
             }
         });
         crate::stats::note_display(result.display.len());
@@ -5343,6 +5348,26 @@ impl Runtime {
             Some(root) => motor::identity::take_dirty_matching(root),
             None => motor::identity::take_dirty(),
         }
+    }
+
+    /// Drop the draw commands no pixel can show — what a SHELL asks for.
+    ///
+    /// A page that scrolls places every row it holds, and a list of two
+    /// hundred rows shows ten. With this on, a command outside the clip it
+    /// stands under is not drawn: the list holds what the glass can show,
+    /// and the rows under the fold stay in the geometry
+    /// ([`LayoutResult::scrolls`], [`LayoutResult::frames`]). A shell
+    /// presents the list and never reads it, so every shell of the house
+    /// turns this on for the runtime it mounts.
+    ///
+    /// Off — the default — the list holds every command. That is what a
+    /// PROBE wants: a test that asks "does this page say X" reads the words
+    /// off the list, whatever the height of the window it laid out in.
+    ///
+    /// [`LayoutResult::scrolls`]: crate::layout::LayoutResult::scrolls
+    /// [`LayoutResult::frames`]: crate::layout::LayoutResult::frames
+    pub fn drop_unseen(&self) {
+        self.drops_unseen.set(true);
     }
 
     /// Instrumentation: the bodies the last [`Runtime::render`] ran —

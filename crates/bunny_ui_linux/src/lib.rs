@@ -264,6 +264,9 @@ pub fn run_window_chrome(
 /// as long as it does — the frame path, the pools, the gates and the
 /// event handler. Answers the window's own address.
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
+    // a shell presents the list and never reads it: what no pixel can show
+    // is not drawn
+    runtime.drop_unseen();
     let window = ffi::create_window(
         &spec.title,
         spec.size.width,

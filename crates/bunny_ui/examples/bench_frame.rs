@@ -10,6 +10,9 @@
 //! shape of a product screen (see `support/dashboard.rs`), in a NAMED
 //! scene, because that is what every window of a shell is.
 //!
+//! `-- --soak wheel` (or `swap`) holds ONE scenario for ten seconds and
+//! prints nothing but its rate: a loop a profiler can take a sample of.
+//!
 //! It prints wall time and allocations for each scenario, then the stage
 //! table from [`bunny_ui::stats`] in a separate pass, so the timers never
 //! pay into the wall numbers. Text metrics come from the `PixelFont`:
@@ -57,6 +60,8 @@ impl Bench {
     }
 
     fn with(root: Workbench, runtime: Runtime) -> Bench {
+        // as a shell mounts it: what no pixel can show is not drawn
+        runtime.drop_unseen();
         let bench = Bench { root, runtime };
         // the mount, and the second pass the legends' probes ask for
         bench.frame();
@@ -181,7 +186,46 @@ fn scenarios(tag: &str, scene: bool, legend_rows: usize, full: bool) -> (Vec<har
     (reports, rows)
 }
 
+/// One scenario, held for ten seconds: a loop a profiler can sample.
+fn soak(which: &str) {
+    let held = std::time::Duration::from_secs(10);
+    let started = std::time::Instant::now();
+    let mut frames = 0u64;
+    match which {
+        "wheel" => {
+            let bench = Bench::new(Runtime::scene("w0"), 240);
+            let mut turn = 0usize;
+            while started.elapsed() < held {
+                turn += 1;
+                bench.runtime.wheel(OVER_CHART.0, OVER_CHART.1, 0.0, travel(turn));
+                frames += bench.frame() as u64 & 1 | 1;
+            }
+        }
+        "swap" => {
+            let bench = Bench::new(Runtime::scene("w0"), 60);
+            while started.elapsed() < held {
+                bench.root.mode.set(Mode::Table);
+                bench.frame();
+                bench.root.mode.set(Mode::Board);
+                bench.frame();
+                bench.frame();
+                frames += 3;
+            }
+        }
+        other => {
+            eprintln!("--soak takes `wheel` or `swap`, not `{other}`");
+            std::process::exit(2);
+        }
+    }
+    println!("{which}: {frames} frames in {:.1} s", started.elapsed().as_secs_f64());
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(at) = args.iter().position(|arg| arg == "--soak") {
+        soak(args.get(at + 1).map_or("wheel", String::as_str));
+        return;
+    }
     let (reports, rows) = scenarios("scene", true, 60, true);
     print_reports("named scene (what a shell runs), 8 panels × 60 legend rows", &reports);
     print_stages("stages", &rows);

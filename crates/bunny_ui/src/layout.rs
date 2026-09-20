@@ -1842,6 +1842,38 @@ pub enum DrawCommand {
 
 /// The draw list of one frame.
 impl DrawCommand {
+    /// Can this command put ink inside `clip`? A SUPERSET test, free of
+    /// the text engine — the reach each raster already trusts when it asks
+    /// whether a command touches a damaged rectangle: a stroke reaches half
+    /// its width out, a shadow its radius, and a line of text runs from its
+    /// origin to the right without end and three sizes down. A clip pair
+    /// always answers yes: it is structure, not ink.
+    pub(crate) fn may_reach(&self, clip: Rect) -> bool {
+        let (x0, y0) = (clip.origin.x, clip.origin.y);
+        let (x1, y1) = (x0 + clip.size.width, y0 + clip.size.height);
+        let hits = |bx0: Px, by0: Px, bx1: Px, by1: Px| bx0 < x1 && bx1 > x0 && by0 < y1 && by1 > y0;
+        let around = |rect: &Rect, reach: Px| {
+            hits(
+                rect.origin.x - reach,
+                rect.origin.y - reach,
+                rect.origin.x + rect.size.width + reach,
+                rect.origin.y + rect.size.height + reach,
+            )
+        };
+        match self {
+            DrawCommand::FillRect { rect, .. }
+            | DrawCommand::Gradient { rect, .. }
+            | DrawCommand::Backdrop { rect, .. }
+            | DrawCommand::Image { rect, .. } => around(rect, 0.0),
+            DrawCommand::StrokeRect { rect, width, .. } => around(rect, (width / 2.0).max(1.0)),
+            DrawCommand::Shadow { rect, radius, .. } => around(rect, radius.max(1.0)),
+            DrawCommand::TextLine { origin, font, .. } => {
+                hits(origin.x - 1.0, origin.y - 1.0, Px::INFINITY, origin.y + font.size * 3.0)
+            }
+            DrawCommand::PushClip { .. } | DrawCommand::PopClip => true,
+        }
+    }
+
     /// The same command `by` further right and down — how a kept picture
     /// is replayed at a box's new place. `None` for a command whose paint
     /// was resolved against absolute geometry (a gradient, a glass pane):
@@ -1929,6 +1961,83 @@ pub struct DisplayList {
 }
 
 impl DisplayList {
+    /// This list with what no pixel can show taken out — the rule the
+    /// placement applies while it walks ([`Placement::draw`]), as a pure
+    /// function of a finished list: a command that cannot reach the clip it
+    /// stands under goes, and so does everything under an empty clip, the
+    /// clip's own pair included. The paranoid check compares the two.
+    /// [`Self::seen_only`] for the TAIL of a list under construction: the
+    /// commands from `from` on, which stand under `clip`. What an app's box
+    /// painted goes through here, because a painter writes to the list and
+    /// not through the placement.
+    pub(crate) fn cut_unseen_from(&mut self, from: usize, clip: Option<Rect>) {
+        let Some(clip) = clip else { return };
+        let mut clips: Vec<Rect> = vec![clip];
+        let mut muted = 0u32;
+        let mut kept = from;
+        for index in from..self.commands.len() {
+            let keep = match &self.commands[index] {
+                DrawCommand::PushClip { rect, .. } => {
+                    let rect = *rect;
+                    let shown = !rect.is_empty();
+                    if !shown {
+                        muted += 1;
+                    }
+                    clips.push(rect);
+                    shown && muted == 0
+                }
+                DrawCommand::PopClip => {
+                    if clips.len() > 1 && clips.pop().is_some_and(|clip| clip.is_empty()) {
+                        muted = muted.saturating_sub(1);
+                        false
+                    } else {
+                        muted == 0
+                    }
+                }
+                command => muted == 0 && clips.last().is_none_or(|clip| command.may_reach(*clip)),
+            };
+            if keep {
+                self.commands.swap(kept, index);
+                kept += 1;
+            } else {
+                crate::stats::note_unseen();
+            }
+        }
+        self.commands.truncate(kept);
+    }
+
+    pub(crate) fn seen_only(&self) -> DisplayList {
+        let mut kept = DisplayList::default();
+        let mut clips: Vec<Rect> = Vec::new();
+        let mut muted = 0u32;
+        for command in &self.commands {
+            match command {
+                DrawCommand::PushClip { rect, .. } => {
+                    if rect.is_empty() {
+                        muted += 1;
+                    } else if muted == 0 {
+                        kept.commands.push(command.clone());
+                    }
+                    clips.push(*rect);
+                }
+                DrawCommand::PopClip => {
+                    if clips.pop().is_some_and(|clip| clip.is_empty()) {
+                        muted = muted.saturating_sub(1);
+                    } else if muted == 0 {
+                        kept.commands.push(command.clone());
+                    }
+                }
+                command => {
+                    let reaches = clips.last().is_none_or(|clip| command.may_reach(*clip));
+                    if muted == 0 && reaches {
+                        kept.commands.push(command.clone());
+                    }
+                }
+            }
+        }
+        kept
+    }
+
     pub(crate) fn push(&mut self, command: DrawCommand) {
         self.commands.push(command);
     }
@@ -2677,6 +2786,18 @@ pub struct Placement {
     /// placement braços feed it the SEMANTIC scene while they walk.
     /// `None` costs one branch per hook and nothing else.
     pub(crate) dom: Option<crate::dom::DomCapture>,
+    /// How many EMPTY clips are open. Nothing drawn under an empty clip
+    /// reaches a pixel, so nothing under one joins the list — not even the
+    /// clip's own two commands, which keeps the list balanced.
+    muted: u32,
+    /// Keep every command, seen or not: the control of the cut below
+    /// ([`Placement::draw`]). The Dom lowering places with it, because a
+    /// browser scrolls what was lowered without asking for a new layout.
+    keep_unseen: bool,
+    /// Where a box that nobody can see paints: the app may read its own
+    /// `paint` as "this frame happened", so the call is made and the
+    /// commands go nowhere.
+    unseen: DisplayList,
 }
 
 impl Placement {
@@ -2693,6 +2814,7 @@ impl Placement {
         Placement {
             foreground: vec![ink],
             dom: Some(crate::dom::DomCapture::new(size)),
+            keep_unseen: true,
             ..Placement::default()
         }
     }
@@ -2705,11 +2827,47 @@ impl Placement {
     /// A draw command joins the display list — unless this pass skips
     /// collection (a Dom frame with no live island: nothing consumes
     /// the list, so nothing pays for it).
+    ///
+    /// And unless NO PIXEL can show it. A page that scrolls places every
+    /// row it holds, on every frame, and a legend of two hundred rows shows
+    /// ten: the other hundred and ninety were drawn, carried to the
+    /// presenter, walked there, and clipped away one by one. A command is
+    /// tested against the clip it stands under with the reach the rasters
+    /// already trust for damage ([`DrawCommand::may_reach`]) — a superset of
+    /// its ink — so what is dropped is exactly what the clip would have
+    /// erased.
     #[inline]
     fn draw(&mut self, command: DrawCommand) {
-        if !self.skip_display {
-            self.display.push(command);
+        if self.skip_display || self.muted > 0 {
+            return;
         }
+        if !self.keep_unseen
+            && let Some(clip) = self.clip.last()
+            && !command.may_reach(*clip)
+        {
+            crate::stats::note_unseen();
+            return;
+        }
+        self.display.push(command);
+    }
+
+    /// Can nothing drawn between these two heights show? A text asks
+    /// BEFORE it measures and breaks its lines: the rows of a long list
+    /// that are off the glass pay for neither.
+    fn hides_band(&self, top: Px, bottom: Px) -> bool {
+        if self.skip_display || self.muted > 0 {
+            return true;
+        }
+        if self.keep_unseen {
+            return false;
+        }
+        let hidden = self.clip.last().is_some_and(|clip| {
+            bottom <= clip.origin.y || top >= clip.origin.y + clip.size.height
+        });
+        if hidden {
+            crate::stats::note_unseen();
+        }
+        hidden
     }
 
     /// The command carries the INTERSECTED window, the same rect the
@@ -2729,16 +2887,31 @@ impl Placement {
                 .unwrap_or(Rect { origin: rect.origin, size: Size::default() }),
             None => rect,
         };
-        self.draw(DrawCommand::PushClip {
-            rect: clipped,
-            corner_radius: corner_radius.into(),
-        });
+        // an EMPTY clip shows nothing, and says so once: everything under
+        // it is muted, its own pair of commands included
+        if !self.keep_unseen && clipped.is_empty() {
+            self.muted += 1;
+            self.clip.push(clipped);
+            return;
+        }
+        if !self.skip_display && self.muted == 0 {
+            self.display.push(DrawCommand::PushClip {
+                rect: clipped,
+                corner_radius: corner_radius.into(),
+            });
+        }
         self.clip.push(clipped);
     }
 
     fn pop_clip(&mut self) {
-        self.draw(DrawCommand::PopClip);
-        self.clip.pop();
+        let closed = self.clip.pop();
+        if !self.keep_unseen && closed.is_some_and(|clip| clip.is_empty()) {
+            self.muted = self.muted.saturating_sub(1);
+            return;
+        }
+        if !self.skip_display && self.muted == 0 {
+            self.display.push(DrawCommand::PopClip);
+        }
     }
 
     fn current_clip(&self) -> Option<Rect> {
@@ -2747,6 +2920,11 @@ impl Placement {
 }
 
 impl Rect {
+    /// No area: nothing drawn under this clip reaches a pixel.
+    pub fn is_empty(&self) -> bool {
+        self.size.width <= 0.0 || self.size.height <= 0.0
+    }
+
     pub fn contains(&self, x: Px, y: Px) -> bool {
         x >= self.origin.x
             && y >= self.origin.y
@@ -2968,6 +3146,20 @@ pub fn layout_with_insets(
     env: LayoutEnv,
     insets: Edges,
 ) -> LayoutResult {
+    layout_placing(root, proposal, env, insets, true)
+}
+
+/// [`layout_with_insets`], and the choice of what the list keeps:
+/// `keep_unseen` holds every draw command, what no pixel can show included
+/// — a probe reads a page's words off the list. A shell's runtime drops
+/// them (`Runtime::drop_unseen`).
+pub(crate) fn layout_placing(
+    root: &LayoutNode,
+    proposal: Proposal,
+    env: LayoutEnv,
+    insets: Edges,
+    keep_unseen: bool,
+) -> LayoutResult {
     let inner = Proposal {
         width: proposal.width.map(|width| (width - insets.horizontal()).max(0.0)),
         height: proposal.height.map(|height| (height - insets.vertical()).max(0.0)),
@@ -2983,7 +3175,7 @@ pub fn layout_with_insets(
             height: proposal.height.unwrap_or(size.height + insets.vertical()),
         },
     };
-    let mut out = Placement::default();
+    let mut out = Placement { keep_unseen, ..Placement::default() };
     out.safe = (insets != Edges::ZERO).then_some(SafeFrame { window, safe });
     crate::stats::time(crate::stats::Stage::Place, || root.place(safe, &fit, env, &mut out));
     // popovers place AFTER the root: painted on top, hit first, free
@@ -2991,6 +3183,41 @@ pub fn layout_with_insets(
     // safe rect (the proposal), never the root's answer — a small scene
     // must not shrink the room a popover positions in.
     place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, env, &mut out);
+    if !keep_unseen && crate::paranoid::on(crate::paranoid::SEEN) {
+        // the claim of the cut: the list is the FULL list with what no
+        // pixel can show taken out, and nothing else in the placement
+        // moved. The scene is placed again with the cut off, filtered by
+        // the same rule as a pure function of the list, and compared.
+        let mut full = Placement { keep_unseen: true, safe: out.safe, ..Placement::default() };
+        root.place(safe, &fit, env, &mut full);
+        place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, env, &mut full);
+        let seen = full.display.seen_only();
+        assert!(
+            seen.as_slice() == out.display.as_slice(),
+            "paranoid(seen): the placement's cut and the filter of the full list differ — {} commands against {} (the full list holds {})",
+            out.display.len(),
+            seen.len(),
+            full.display.len(),
+        );
+        assert!(
+            full.hits == out.hits
+                && full.frames.entries == out.frames.entries
+                && full.scrolls.len() == out.scrolls.len()
+                && full.fields.len() == out.fields.len()
+                && full.customs.len() == out.customs.len()
+                && full.hosts.len() == out.hosts.len()
+                && full.tooltips.len() == out.tooltips.len()
+                && full.menus.len() == out.menus.len()
+                && full.drag_sources.len() == out.drag_sources.len()
+                && full.drops.len() == out.drops.len()
+                && full.overlays.len() == out.overlays.len()
+                && full.misses == out.misses
+                && full.drag_regions == out.drag_regions
+                && full.hover_sensitive == out.hover_sensitive
+                && full.sensitive_groups == out.sensitive_groups,
+            "paranoid(seen): the cut moved something other than the draw list",
+        );
+    }
     LayoutResult {
         size,
         frames: out.frames,
@@ -3029,6 +3256,7 @@ pub fn layout_dom(
     let mut out = Placement {
         dom: Some(crate::dom::DomCapture::new(size)),
         skip_display: !collect_display,
+        keep_unseen: true,
         ..Placement::default()
     };
     root.place(Rect { origin: Point::default(), size }, &fit, env, &mut out);
@@ -4774,7 +5002,16 @@ impl LayoutNode {
                 let kept = element
                     .cached_version()
                     .filter(|_| env.live.is_none() && !focused && out.dom.is_none() && !path.is_empty());
-                let replayed = kept.is_some_and(|version| {
+                // a box NO PIXEL can show — its clip came out empty. One that
+                // keeps its picture promised that its paint is only a
+                // picture, so there is nothing to do. Any other box may read
+                // `paint` as "this frame happened" (a sensor posts its size
+                // from it, a tail follows its end), so the call is still
+                // made — into a list nobody reads.
+                let unseen = out.muted > 0;
+                let painted_from = out.display.len();
+                let replayed = unseen && kept.is_some();
+                let replayed = replayed || kept.is_some_and(|version| {
                     let theme = crate::theme::version();
                     let fresh = |picture: &Picture| {
                         picture.version == version
@@ -4855,10 +5092,22 @@ impl LayoutNode {
                     }
                 });
                 if !replayed {
-                    let mut painter =
-                        crate::custom::Painter::new(&mut out.display, frame.origin, env.font, ink);
+                    let mut scratch = std::mem::take(&mut out.unseen);
+                    let target = if unseen { &mut scratch } else { &mut out.display };
+                    let mut painter = crate::custom::Painter::new(target, frame.origin, env.font, ink);
                     crate::stats::note_paint();
                     element.element().paint(&ctx, &mut painter);
+                    scratch.commands.clear();
+                    out.unseen = scratch;
+                }
+                // a box paints through its own painter, not through `draw`:
+                // what it painted — or replayed — outside the clip it stands
+                // under goes the same way every other command does. An editor
+                // paints a line past each edge of its window, and a chart half
+                // under the fold replays all of itself
+                if !out.keep_unseen && !out.skip_display {
+                    let clip = out.clip.last().copied();
+                    out.display.cut_unseen_from(painted_from, clip);
                 }
                 out.pop_clip();
                 let end = out.display.len();
@@ -6299,6 +6548,16 @@ fn place_text(
     out: &mut Placement,
 ) {
     if content.is_empty() {
+        return;
+    }
+    // the rows of a long list that are off the glass neither measure nor
+    // break their lines: the band is the one every line below is drawn in,
+    // with the reach a line of text is given everywhere (three sizes down,
+    // and one up for a line height tighter than the face)
+    if out.hides_band(
+        frame.origin.y - env.font.size,
+        frame.origin.y + frame.size.height + env.font.size * 3.0,
+    ) {
         return;
     }
     let metrics = env.cache.get_or_measure(content, &env.font, env.text);

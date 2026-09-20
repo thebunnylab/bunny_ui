@@ -284,6 +284,9 @@ impl App {
 /// the mirrors, the gates and the event handler — once UIKit has built
 /// the window.
 fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
+    // a shell presents the list and never reads it: what no pixel can show
+    // is not drawn
+    runtime.drop_unseen();
     // the present backend, chosen ONCE: the GPU, or nothing
     ffi::install_gpu();
     // the season's mirrors: reduce-motion always follows the system

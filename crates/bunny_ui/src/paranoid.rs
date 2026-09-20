@@ -26,9 +26,16 @@ pub(crate) const SETTLE: u32 = 1 << 1;
 pub(crate) const HOVER: u32 = 1 << 2;
 /// The measure of a retained boundary that is answered from what was kept.
 pub(crate) const MEMO: u32 = 1 << 3;
+/// The draw commands a placement drops because no pixel can show them.
+pub(crate) const SEEN: u32 = 1 << 4;
 
-const NAMES: [(&str, u32); 4] =
-    [("assemble", ASSEMBLE), ("settle", SETTLE), ("hover", HOVER), ("memo", MEMO)];
+const NAMES: [(&str, u32); 5] = [
+    ("assemble", ASSEMBLE),
+    ("settle", SETTLE),
+    ("hover", HOVER),
+    ("memo", MEMO),
+    ("seen", SEEN),
+];
 
 thread_local! {
     /// A test's own switch, over the environment's.
@@ -53,7 +60,7 @@ fn from_environment() -> u32 {
                     .map(|(_, flag)| *flag)
                     .unwrap_or_else(|| {
                         // a name nobody knows would check nothing, in silence
-                        panic!("BUNNY_PARANOID: `{name}` is not a check (known: all, assemble, settle, hover, memo)")
+                        panic!("BUNNY_PARANOID: `{name}` is not a check (known: all, assemble, settle, hover, memo, seen)")
                     }),
             })
             .fold(0, |flags, flag| flags | flag)

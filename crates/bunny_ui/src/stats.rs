@@ -78,6 +78,9 @@ pub struct FrameStats {
     pub paints: u32,
     /// App boxes whose kept picture was replayed instead of painted.
     pub pictures_replayed: u32,
+    /// Draw commands the placement dropped because no pixel could show
+    /// them: outside the clip they stood under.
+    pub commands_unseen: u32,
     /// Retained boundaries whose measure was answered from what was kept.
     pub measures_kept: u32,
     /// Retained boundaries that were measured.
@@ -108,6 +111,7 @@ thread_local! {
     static HOVER_RELAYOUTS: Cell<u32> = const { Cell::new(0) };
     static PAINTS: Cell<u32> = const { Cell::new(0) };
     static PICTURES_REPLAYED: Cell<u32> = const { Cell::new(0) };
+    static COMMANDS_UNSEEN: Cell<u32> = const { Cell::new(0) };
     static MEASURES_KEPT: Cell<u32> = const { Cell::new(0) };
     static MEASURES_MADE: Cell<u32> = const { Cell::new(0) };
     static STAGE_MS: Cell<[f64; STAGES]> = const { Cell::new([0.0; STAGES]) };
@@ -139,6 +143,7 @@ pub fn take() -> FrameStats {
         hover_relayouts: HOVER_RELAYOUTS.with(|c| c.replace(0)),
         paints: PAINTS.with(|c| c.replace(0)),
         pictures_replayed: PICTURES_REPLAYED.with(|c| c.replace(0)),
+        commands_unseen: COMMANDS_UNSEEN.with(|c| c.replace(0)),
         measures_kept: MEASURES_KEPT.with(|c| c.replace(0)),
         measures_made: MEASURES_MADE.with(|c| c.replace(0)),
         stage_ms: STAGE_MS.with(|c| c.replace([0.0; STAGES])),
@@ -222,6 +227,11 @@ pub(crate) fn note_paint() {
 #[inline]
 pub(crate) fn note_picture_replayed() {
     bump(&PICTURES_REPLAYED, 1);
+}
+
+#[inline]
+pub(crate) fn note_unseen() {
+    bump(&COMMANDS_UNSEEN, 1);
 }
 
 #[inline]

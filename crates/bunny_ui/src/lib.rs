@@ -5418,6 +5418,8 @@ mod tests {
 
         let rows = Rows { flip: State::new(false) };
         let runtime = Runtime::new();
+        // as a shell mounts it: the list holds what the glass can show
+        runtime.drop_unseen();
         runtime.render_stable(&rows);
         let viewport = Proposal::exact(Size { width: 120.0, height: 100.0 });
         let result = runtime.layout(&rows, viewport);
@@ -5434,17 +5436,18 @@ mod tests {
         assert!(!runtime.wheel(10.0, 10.0, 0.0, -1.0), "no repaint at the end of travel");
         assert!(!runtime.wheel(500.0, 500.0, 0.0, -10.0), "outside any region");
 
-        // the offset applies in layout: the first text line moves up 60
+        // the offset applies in layout: every row moved up 60 — row 5 sits
+        // where row 1.25 sat — and the rows that left the window left the
+        // list with it
         let scrolled = runtime.layout(&rows, viewport);
-        let first_line_y = scrolled
-            .display
-            .iter()
-            .find_map(|command| match command {
-                DrawCommand::TextLine { origin, .. } => Some(origin.y),
+        let line_y = |wanted: &str| {
+            scrolled.display.iter().find_map(|command| match command {
+                DrawCommand::TextLine { origin, content, .. } if &**content == wanted => Some(origin.y),
                 _ => None,
             })
-            .unwrap();
-        assert_eq!(first_line_y, -60.0);
+        };
+        assert_eq!(line_y("row 5"), Some(5.0 * 16.0 - 60.0));
+        assert_eq!(line_y("row 0"), None, "a row above the window is not drawn");
 
         // invalidation and re-render do NOT lose the position — restoration
         // by structural identity
@@ -5452,15 +5455,11 @@ mod tests {
         runtime.render_stable(&rows);
         let after = runtime.layout(&rows, viewport);
         assert_eq!(runtime.scroll_offset(&path).y, 60.0);
-        let line_y = after
-            .display
-            .iter()
-            .find_map(|command| match command {
-                DrawCommand::TextLine { origin, .. } => Some(origin.y),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(line_y, -60.0);
+        let row_5 = after.display.iter().find_map(|command| match command {
+            DrawCommand::TextLine { origin, content, .. } if &**content == "row 5" => Some(origin.y),
+            _ => None,
+        });
+        assert_eq!(row_5, Some(5.0 * 16.0 - 60.0));
 
         // programmatic scrolling counts in the SAME frame
         runtime.set_scroll_offset(&path, crate::layout::Point { x: 0.0, y: 8.0 });
@@ -6929,6 +6928,105 @@ mod tests {
         );
     }
 
+    /// What the placement drops is what the clip would have erased: the
+    /// SAME pixels, byte for byte.
+    ///
+    /// The scene is the hard one for a cut — rows with a shadow that
+    /// reaches past their box, a border that straddles its edge, a rounded
+    /// fill, a line of text that starts inside the window and one that
+    /// starts outside it, a sideways region inside the vertical one — at
+    /// offsets that leave a row half under each edge, whole points and
+    /// fractions of one. One runtime places with the cut and one keeps
+    /// every command; both lists go through the same raster, at 1× and 2×.
+    #[test]
+    fn what_the_placement_drops_is_what_the_clip_would_have_erased() {
+        use crate::layout::{Color, Point, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let rows: Vec<_> = (0..40)
+                    .map(|row| {
+                        let chips: Vec<_> = (0..12)
+                            .map(|chip| {
+                                erased(
+                                    text(format!("chip {row}.{chip}"))
+                                        .padding_length(4.0)
+                                        .background_color(Color::rgba(40, 90, 160, 255))
+                                        .corner_radius(6.0),
+                                )
+                            })
+                            .collect();
+                        erased(
+                            vstack!(
+                                text(format!("row {row} — a line of text that is wider than the card it sits in"))
+                                    .truncation_mode(Truncation::End),
+                                scroll(hstack!(chips).spacing(6.0)).horizontal().frame_height(28.0),
+                            )
+                            .spacing(4.0)
+                            .alignment(HorizontalAlignment::Leading)
+                            .padding_length(8.0)
+                            .background_color(Color::rgba(30, 30, 36, 255))
+                            .corner_radius(8.0)
+                            .border(Color::rgba(200, 80, 80, 255), 3.0)
+                            .shadow(9.0)
+                            .id(format!("row-{row}")),
+                        )
+                    })
+                    .collect();
+                vstack!(
+                    text("a header that does not scroll"),
+                    scroll(vstack!(rows).spacing(10.0).alignment(HorizontalAlignment::Leading)).id("rows"),
+                )
+                .spacing(6.0)
+                .alignment(HorizontalAlignment::Leading)
+                .padding_length(12.0)
+            }
+        }
+
+        // the paranoid check turns the cut on for EVERY runtime, so there is
+        // no control to raster against — and it compares the two lists of
+        // every layout of the suite on its own
+        if crate::paranoid::on(crate::paranoid::SEEN) {
+            return;
+        }
+        let size = Size { width: 300.0, height: 220.0 };
+        let (cut, whole) = (Runtime::new(), Runtime::new());
+        cut.drop_unseen();
+        let mut dropped = 0usize;
+        for offset in [0.0, 7.0, 33.5, 120.25, 611.0, 100_000.0] {
+            let mut lists = Vec::new();
+            for runtime in [&cut, &whole] {
+                let first = runtime.settled_layout(&Page, Proposal::exact(size));
+                let region = first
+                    .scrolls
+                    .iter()
+                    .find(|region| region.path.ends_with("[rows]"))
+                    .expect("the rows scroll")
+                    .path
+                    .clone();
+                runtime.set_scroll_offset(&region, Point { x: 0.0, y: offset });
+                lists.push(runtime.settled_layout(&Page, Proposal::exact(size)).display);
+            }
+            assert!(lists[0].len() < lists[1].len(), "offset {offset}: the cut dropped nothing");
+            dropped += lists[1].len() - lists[0].len();
+            for scale in [1usize, 2] {
+                let (width, height) = (size.width as usize * scale, size.height as usize * scale);
+                let ground = Color::rgba(12, 12, 14, 255);
+                let seen = crate::raster::rasterize_scaled(&lists[0], width, height, scale, ground);
+                let all = crate::raster::rasterize_scaled(&lists[1], width, height, scale, ground);
+                assert!(
+                    seen.pixels() == all.pixels(),
+                    "offset {offset} at {scale}×: the cut changed a pixel ({} commands against {})",
+                    lists[0].len(),
+                    lists[1].len(),
+                );
+            }
+        }
+        assert!(dropped > 1000, "forty rows behind two hundred points of glass: {dropped} dropped");
+    }
+
     /// Proposed no height, a paragraph still answers every line.
     ///
     /// That is not a small room — it is the question not asked, and it is
@@ -6950,14 +7048,35 @@ mod tests {
         }
 
         let runtime = Runtime::new();
+        // as a shell mounts it: the list holds what the glass can show
+        runtime.drop_unseen();
         let result =
             runtime.settled_layout(&Page, Proposal::exact(Size { width: 200.0, height: 36.0 }));
-        let lines = result
-            .display
-            .iter()
-            .filter(|command| matches!(command, DrawCommand::TextLine { .. }))
-            .count();
-        assert!(lines >= 6, "the whole paragraph is there to scroll through, got {lines}");
+        // the paragraph is there to scroll through: the region's extent is
+        // every line of it. The LIST holds the lines its window shows and
+        // no more — what no pixel can show is not drawn
+        let extent = result.scrolls[0].content.height;
+        assert!(extent >= 6.0 * 16.0, "the whole paragraph is there to scroll through, got {extent}");
+        let lines = |result: &crate::layout::LayoutResult| {
+            result
+                .display
+                .iter()
+                .filter(|command| matches!(command, DrawCommand::TextLine { .. }))
+                .count()
+        };
+        let shown = lines(&result);
+        assert!((1..6).contains(&shown), "a window of 36 points shows a few lines, got {shown}");
+        // …and the lines further down are drawn when the wheel brings them
+        assert!(runtime.wheel(100.0, 18.0, 0.0, -48.0));
+        let scrolled =
+            runtime.settled_layout(&Page, Proposal::exact(Size { width: 200.0, height: 36.0 }));
+        let first = |result: &crate::layout::LayoutResult| {
+            result.display.iter().find_map(|command| match command {
+                DrawCommand::TextLine { content, range, .. } => Some(content[range.0..range.1].to_string()),
+                _ => None,
+            })
+        };
+        assert_ne!(first(&result), first(&scrolled), "the wheel showed other lines");
     }
 
     /// The same row, too NARROW for the content. The hug still takes
@@ -11708,6 +11827,8 @@ mod tests {
         }
 
         let runtime = Runtime::new();
+        // as a shell mounts it: the list holds what the glass can show
+        runtime.drop_unseen();
         let size = Size { width: 280.0, height: 140.0 };
         let result = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
 
@@ -11736,16 +11857,25 @@ mod tests {
             })
             .count();
         assert!(cells < 200, "the window stays a screenful: {cells}");
-        // the header paints its four titles
-        let headers = result
-            .display
-            .iter()
-            .filter(|command| {
-                matches!(command, crate::layout::DrawCommand::TextLine { content, .. }
-                    if ["Name", "Kind", "Size", "Modified"].contains(&&**content))
-            })
-            .count();
-        assert_eq!(headers, 4);
+        // the header paints the titles its window shows: the sheet is 510
+        // points of columns behind 260 of glass, so `Name` and the near
+        // edge of `Kind` — the other two are geometry until a wheel
+        // brings them
+        let headers = |result: &crate::layout::LayoutResult| {
+            result
+                .display
+                .iter()
+                .filter_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { content, .. }
+                        if ["Name", "Kind", "Size", "Modified"].contains(&&**content) =>
+                    {
+                        Some(content.to_string())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(headers(&result), ["Name", "Kind"]);
 
         // a vertical wheel moves the rows and leaves the header put
         assert!(runtime.wheel(100.0, 80.0, 0.0, -52.0));
@@ -11810,6 +11940,7 @@ mod tests {
         let slid = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
         assert_eq!(name_x(&slid), before.0 - 60.0, "the header slid with its columns");
         assert_eq!(cell_x(&slid), before.1 - 60.0, "and the rows slid in step");
+        assert_eq!(headers(&slid), ["Name", "Kind", "Size"], "and the wheel brought a third title");
     }
 
     #[derive(Clone, Copy, PartialEq, Debug)]
