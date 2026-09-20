@@ -207,7 +207,10 @@ thread_local! {
 /// of a placement. A reference holds its boundary's slot instead. The slot
 /// is as old as the PATH, not as the entry: a re-run fills it again
 /// ([`finish_entry`]), and an entry that leaves the retention empties it.
-pub(crate) struct Slot {
+///
+/// Public in name only — a layout node mentions it, and a layout node is
+/// public. An app has no door to one and nothing to do with one.
+pub struct Slot {
     held: RefCell<Option<Rc<Held>>>,
 }
 
