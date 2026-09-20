@@ -1106,9 +1106,23 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // frame. A worker's wake mid-drag polls on the next turn
             // instead of racing the one presenter (the mac's law).
             AppEvent::Redraw => blit(runtime, root),
+            // The work always lands: the tasks are polled. The FRAME is for a
+            // turn that changed something. Most wakes change nothing — a poll
+            // that found no news, a sleeper that went back to sleep — and a
+            // window with a few of those mounted drew whole frames of what
+            // was already on screen, dozens of times a second, at rest. A
+            // change the engine cannot see asks by hand
+            // (`bunny_ui::request_frame`).
+            // Mid-drag the resize step is the one presenter: the work
+            // still lands, and the next step shows what it moved.
             AppEvent::Wake => {
-                if !ffi::in_size_move() {
+                runtime.poll_tasks();
+                if runtime.needs_frame() && !ffi::in_size_move() {
                     blit(runtime, root);
+                } else {
+                    // no frame — but a task may have gone to sleep with a
+                    // new deadline, and the driver follows it
+                    ffi::want_frames(window.raw_window(), runtime.wants_frame());
                 }
             }
             AppEvent::SettingsChanged => {

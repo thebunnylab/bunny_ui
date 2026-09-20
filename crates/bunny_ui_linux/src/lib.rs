@@ -577,7 +577,24 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
         let runtime = &handler_runtime;
         let root = &*handler_root;
         match event {
-            AppEvent::Redraw | AppEvent::Wake => blit(runtime, root),
+            AppEvent::Redraw => blit(runtime, root),
+            // The work always lands: the tasks are polled. The FRAME is for a
+            // turn that changed something. Most wakes change nothing — a poll
+            // that found no news, a sleeper that went back to sleep — and a
+            // window with a few of those mounted drew whole frames of what
+            // was already on screen, dozens of times a second, at rest. A
+            // change the engine cannot see asks by hand
+            // (`bunny_ui::request_frame`).
+            AppEvent::Wake => {
+                runtime.poll_tasks();
+                if runtime.needs_frame() {
+                    blit(runtime, root);
+                } else {
+                    // no frame — but a task may have gone to sleep with a
+                    // new deadline, and the driver follows it
+                    ffi::set_frame_driver_paused(!runtime.wants_frame());
+                }
+            }
             AppEvent::ResignKey => {
                 // the user switched away: popovers close like the
                 // platform's own
