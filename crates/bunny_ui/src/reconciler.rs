@@ -355,18 +355,6 @@ fn clear_measures_above(path: &str) {
     });
 }
 
-/// A boundary's retained layout tree, borrowed in place — measure and
-/// place resolve `BoundaryRef` through here, WITHOUT stitching an
-/// expanded copy. Borrows nest (ref inside ref = shared borrows of the
-/// same RefCell); no body runs during layout, so no mutable re-borrow
-/// is possible.
-pub(crate) fn with_retained_layout<R>(
-    path: &str,
-    reader: impl FnOnce(Option<&LayoutNode>) -> R,
-) -> R {
-    slot_of(path).with_layout(reader)
-}
-
 /// Is the boundary retained? (The guard for the `Runtime` stable frame.)
 pub(crate) fn is_retained(path: &str) -> bool {
     RETAINED.with(|retained| retained.borrow().contains_key(path))
