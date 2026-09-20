@@ -160,8 +160,10 @@ impl NodeList {
     /// expands against the reconciler.
     pub(crate) fn push_view_ref(&mut self, path: &str) {
         self.nodes.push(RenderNode::leaf(crate::reconciler::ref_line(path)));
-        self.layout
-            .push(crate::layout::LayoutNode::BoundaryRef { path: path.to_string() });
+        self.layout.push(crate::layout::LayoutNode::BoundaryRef {
+            path: path.to_string(),
+            slot: crate::reconciler::slot_of(path),
+        });
     }
 
     pub(crate) fn last_mut(&mut self) -> Option<&mut RenderNode> {
@@ -190,7 +192,7 @@ impl NodeList {
     pub(crate) fn root_boundary(&self) -> Option<&str> {
         match self.layout.as_slice() {
             [crate::layout::LayoutNode::Boundary { path, .. }]
-            | [crate::layout::LayoutNode::BoundaryRef { path }] => Some(path),
+            | [crate::layout::LayoutNode::BoundaryRef { path, .. }] => Some(path),
             _ => None,
         }
     }

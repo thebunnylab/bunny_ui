@@ -670,11 +670,11 @@ impl Walk<'_> {
                 self.pending_boundary_class = outer_pending;
                 out.push(group);
             }
-            LayoutNode::BoundaryRef { path } => {
+            LayoutNode::BoundaryRef { path, slot } => {
                 // resolves through the retention IN PLACE, the same
                 // door the placement walk uses — a missing entry keeps
                 // the identity anchor so the diff can match later
-                let lowered = crate::reconciler::with_retained_layout(path, |tree| {
+                let lowered = slot.with_layout(|tree| {
                     tree.map(|tree| {
                         let mut nodes = Vec::new();
                         self.lower_into(tree, &mut nodes);

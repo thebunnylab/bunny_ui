@@ -115,14 +115,12 @@ pub(crate) struct Entry {
     pub ctx: Context,
     pub node: RenderNode,
     /// The body's layout tree — retained along with the print (the two
-    /// outputs of the same body-eval).
-    pub layout: LayoutNode,
-    /// The measures of that tree that were kept: the question, and the
-    /// size and fit it answered. A few, because one tree is asked a few
-    /// questions in a frame (a stack measures a flexible child twice).
-    /// The entry is replaced when its body re-runs, and the list with
-    /// it; a body that re-runs BELOW clears it ([`finish_entry`]).
-    pub measures_kept: RefCell<Vec<KeptMeasure>>,
+    /// outputs of the same body-eval) — and the measures of it that were
+    /// kept, behind the SLOT a `BoundaryRef` holds: the layout reaches
+    /// both without asking the retention for a path. The slot outlives
+    /// the entry it was made for: a body that re-runs fills the same one,
+    /// so a parent that did NOT re-run still refers to the tree of today.
+    pub slot: Rc<Slot>,
     pub effects: Vec<EffectFn>,
     /// The body's interactive actions — retained like the effects: a
     /// skipped view's button stays clickable.
@@ -200,6 +198,72 @@ thread_local! {
     static FRAME_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
+/// A boundary's place in the retention, as a node of the layout tree
+/// holds it ([`LayoutNode::BoundaryRef`]).
+///
+/// The retention is keyed by path, and a path is long: every boundary of
+/// a frame — every row of every list — was looked up twice in a tree of
+/// strings, and the compare of those strings stood second in the profile
+/// of a placement. A reference holds its boundary's slot instead. The slot
+/// is as old as the PATH, not as the entry: a re-run fills it again
+/// ([`finish_entry`]), and an entry that leaves the retention empties it.
+pub(crate) struct Slot {
+    held: RefCell<Option<Rc<Held>>>,
+}
+
+/// What a slot holds while its boundary is retained.
+struct Held {
+    layout: LayoutNode,
+    /// The measures of that tree that were kept: the question, and the
+    /// size and fit it answered. A few, because one tree is asked a few
+    /// questions in a frame (a stack measures a flexible child twice).
+    /// A re-run replaces the whole `Held`, and the list with it; a body
+    /// that re-runs BELOW clears it ([`finish_entry`]).
+    measures_kept: RefCell<Vec<KeptMeasure>>,
+}
+
+impl std::fmt::Debug for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.held.borrow().is_some() { "Slot(held)" } else { "Slot(empty)" })
+    }
+}
+
+impl Slot {
+    fn empty() -> Rc<Slot> {
+        Rc::new(Slot { held: RefCell::new(None) })
+    }
+
+    fn held(&self) -> Option<Rc<Held>> {
+        self.held.borrow().clone()
+    }
+
+    /// The boundary's layout tree, borrowed in place — measure and place
+    /// resolve a `BoundaryRef` through here, WITHOUT stitching an expanded
+    /// copy. `None` = the boundary left the retention.
+    pub(crate) fn with_layout<R>(&self, reader: impl FnOnce(Option<&LayoutNode>) -> R) -> R {
+        let held = self.held();
+        reader(held.as_deref().map(|held| &held.layout))
+    }
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        // the entry left the retention: what refers to it finds nothing.
+        // A re-run takes the old entry out BEFORE it fills the slot again
+        // ([`finish_entry`]), so this never empties a fresh one.
+        self.slot.held.replace(None);
+    }
+}
+
+/// The slot of the boundary at `path` — what a new `BoundaryRef` holds.
+/// A path nothing retains answers an empty slot: the reference measures
+/// zero and places nothing, as it always did.
+pub(crate) fn slot_of(path: &str) -> Rc<Slot> {
+    RETAINED.with(|retained| {
+        retained.borrow().get(path).map_or_else(Slot::empty, |entry| Rc::clone(&entry.slot))
+    })
+}
+
 /// One kept answer of a retained tree's measure.
 pub(crate) struct KeptMeasure {
     key: crate::layout::MeasureKey,
@@ -215,50 +279,48 @@ const KEPT_MEASURES: usize = 4;
 /// `measure` runs on a miss, and its answer is kept — unless something
 /// inside said it is not a function of the key (the poison count moved).
 pub(crate) fn measure_retained(
+    slot: &Slot,
     path: &str,
     key: crate::layout::MeasureKey,
     measure: impl FnOnce(&LayoutNode) -> (crate::layout::Size, crate::layout::Fit),
 ) -> (crate::layout::Size, crate::layout::Fit) {
     use crate::layout::Fit;
 
-    RETAINED.with(|retained| {
-        let retained = retained.borrow();
-        let Some(entry) = retained.get(path) else {
-            debug_assert!(false, "layout reference without retention: {path}");
-            return (crate::layout::Size::default(), Fit::Leaf);
-        };
-        let kept = entry
-            .measures_kept
-            .borrow()
-            .iter()
-            .find(|kept| kept.key == key)
-            .map(|kept| (kept.size, Rc::clone(&kept.fit)));
-        if let Some((size, fit)) = kept {
-            crate::stats::note_measure_kept(true);
-            if crate::paranoid::on(crate::paranoid::MEMO) {
-                let (fresh_size, fresh_fit) = measure(&entry.layout);
-                assert!(
-                    fresh_size == size && fresh_fit.same_as(&fit),
-                    "a kept measure of `{path}` is stale: kept {size:?}, fresh {fresh_size:?}"
-                );
-            }
-            return (size, Fit::Shared(fit));
+    let Some(held) = slot.held() else {
+        debug_assert!(false, "layout reference without retention: {path}");
+        return (crate::layout::Size::default(), Fit::Leaf);
+    };
+    let kept = held
+        .measures_kept
+        .borrow()
+        .iter()
+        .find(|kept| kept.key == key)
+        .map(|kept| (kept.size, Rc::clone(&kept.fit)));
+    if let Some((size, fit)) = kept {
+        crate::stats::note_measure_kept(true);
+        if crate::paranoid::on(crate::paranoid::MEMO) {
+            let (fresh_size, fresh_fit) = measure(&held.layout);
+            assert!(
+                fresh_size == size && fresh_fit.same_as(&fit),
+                "a kept measure of `{path}` is stale: kept {size:?}, fresh {fresh_size:?}"
+            );
         }
-        crate::stats::note_measure_kept(false);
-        let poison = crate::layout::measure_poison();
-        let (size, fit) = measure(&entry.layout);
-        if crate::layout::measure_poison() != poison {
-            // something below answers by its own rules: ask again next frame
-            return (size, fit);
-        }
-        let fit = Rc::new(fit);
-        let mut kept = entry.measures_kept.borrow_mut();
-        if kept.len() == KEPT_MEASURES {
-            kept.remove(0);
-        }
-        kept.push(KeptMeasure { key, size, fit: Rc::clone(&fit) });
-        (size, Fit::Shared(fit))
-    })
+        return (size, Fit::Shared(fit));
+    }
+    crate::stats::note_measure_kept(false);
+    let poison = crate::layout::measure_poison();
+    let (size, fit) = measure(&held.layout);
+    if crate::layout::measure_poison() != poison {
+        // something below answers by its own rules: ask again next frame
+        return (size, fit);
+    }
+    let fit = Rc::new(fit);
+    let mut kept = held.measures_kept.borrow_mut();
+    if kept.len() == KEPT_MEASURES {
+        kept.remove(0);
+    }
+    kept.push(KeptMeasure { key, size, fit: Rc::clone(&fit) });
+    (size, Fit::Shared(fit))
 }
 
 /// A body re-ran at `path`: the boundaries above it may size themselves
@@ -269,8 +331,8 @@ fn clear_measures_above(path: &str) {
     RETAINED.with(|retained| {
         let retained = retained.borrow();
         for (at, _) in path.match_indices('/') {
-            if let Some(entry) = retained.get(&path[..at]) {
-                entry.measures_kept.borrow_mut().clear();
+            if let Some(held) = retained.get(&path[..at]).and_then(|entry| entry.slot.held()) {
+                held.measures_kept.borrow_mut().clear();
             }
         }
     });
@@ -285,10 +347,7 @@ pub(crate) fn with_retained_layout<R>(
     path: &str,
     reader: impl FnOnce(Option<&LayoutNode>) -> R,
 ) -> R {
-    RETAINED.with(|retained| {
-        let retained = retained.borrow();
-        reader(retained.get(path).map(|entry| &entry.layout))
-    })
+    slot_of(path).with_layout(reader)
 }
 
 /// Is the boundary retained? (The guard for the `Runtime` stable frame.)
@@ -399,14 +458,22 @@ pub(crate) fn finish_entry(
         .map(|(_, parents)| parents.to_vec())
         .unwrap_or_default();
     RETAINED.with(|retained| {
-        retained.borrow_mut().insert(
+        let mut retained = retained.borrow_mut();
+        // the slot is as old as the path: the entry of the last run goes
+        // FIRST (its drop empties the slot), then the slot is filled again,
+        // so a parent that did not re-run refers to the tree of today
+        let slot = match retained.remove(path) {
+            Some(old) => Rc::clone(&old.slot),
+            None => Slot::empty(),
+        };
+        slot.held.replace(Some(Rc::new(Held { layout, measures_kept: RefCell::new(Vec::new()) })));
+        retained.insert(
             path.to_string(),
             Entry {
                 value,
                 ctx,
                 node,
-                layout,
-                measures_kept: RefCell::new(Vec::new()),
+                slot,
                 effects,
                 actions,
                 editors,

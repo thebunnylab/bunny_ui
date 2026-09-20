@@ -3804,7 +3804,10 @@ impl Runtime {
         let tree = match stable_root {
             Some(path) => {
                 reconciler::note_stable_frame();
-                crate::layout::LayoutNode::BoundaryRef { path }
+{
+                    let slot = reconciler::slot_of(&path);
+                    crate::layout::LayoutNode::BoundaryRef { path, slot }
+                }
             }
             None => {
                 let mut nodes = self.frame_pass(root);
@@ -3909,7 +3912,10 @@ impl Runtime {
         let tree = match stable_root {
             Some(path) => {
                 reconciler::note_stable_frame();
-                crate::layout::LayoutNode::BoundaryRef { path }
+{
+                    let slot = reconciler::slot_of(&path);
+                    crate::layout::LayoutNode::BoundaryRef { path, slot }
+                }
             }
             None => {
                 let mut nodes = self.frame_pass(root);
@@ -5152,7 +5158,10 @@ impl Runtime {
             Some(path) => {
                 // the observable contract holds: THIS frame ran zero bodies
                 reconciler::note_stable_frame();
-                crate::layout::LayoutNode::BoundaryRef { path }
+{
+                    let slot = reconciler::slot_of(&path);
+                    crate::layout::LayoutNode::BoundaryRef { path, slot }
+                }
             }
             None => {
                 let mut nodes = self.frame_pass(root);

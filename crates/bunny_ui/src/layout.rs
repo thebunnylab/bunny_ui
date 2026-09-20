@@ -726,7 +726,7 @@ pub enum LayoutNode {
     /// Reference to a retained boundary (skipped by the reconciler);
     /// measure and place resolve ON-THE-FLY against the retention — the
     /// frame's tree is never stitched into a copy.
-    BoundaryRef { path: String },
+    BoundaryRef { path: String, slot: Rc<crate::reconciler::Slot> },
     /// `.rendering(Gpu)`: this subtree insists on the pixel pipeline.
     /// Transparent to geometry everywhere; in Dom mode it becomes a
     /// CANVAS ISLAND — an element our layout positions, filled with the
@@ -3952,12 +3952,9 @@ impl LayoutNode {
             // `.frame(…)` around it pins it
             LayoutNode::Host { .. } => true,
             // skipped boundary: the flexibility is the retained tree's
-            LayoutNode::BoundaryRef { path } => crate::reconciler::with_retained_layout(
-                path,
-                |layout| {
-                    layout.map(|node| node.is_flexible(axis, enclosing_main)).unwrap_or(false)
-                },
-            ),
+            LayoutNode::BoundaryRef { slot, .. } => slot.with_layout(|layout| {
+                layout.map(|node| node.is_flexible(axis, enclosing_main)).unwrap_or(false)
+            }),
             _ => false,
         }
     }
@@ -4020,10 +4017,9 @@ impl LayoutNode {
                 children.first().and_then(|child| child.first_baseline(env))
             }
             LayoutNode::Measured { child, .. } => child.first_baseline(env),
-            LayoutNode::BoundaryRef { path } => crate::reconciler::with_retained_layout(
-                path,
-                |layout| layout.and_then(|node| node.first_baseline(env)),
-            ),
+            LayoutNode::BoundaryRef { slot, .. } => {
+                slot.with_layout(|layout| layout.and_then(|node| node.first_baseline(env)))
+            }
             _ => None,
         }
     }
@@ -4542,9 +4538,9 @@ impl LayoutNode {
             // the same question every frame. A body that re-runs makes a
             // new entry (no kept answer), and clears the answers of the
             // boundaries above it, whose size may hang on its own.
-            LayoutNode::BoundaryRef { path } => {
+            LayoutNode::BoundaryRef { path, slot } => {
                 let key = MeasureKey { proposal, font: env.font, line_height: env.line_height };
-                crate::reconciler::measure_retained(path, key, |node| node.measure(proposal, env))
+                crate::reconciler::measure_retained(slot, path, key, |node| node.measure(proposal, env))
             }
         }
     }
@@ -6166,8 +6162,8 @@ impl LayoutNode {
             // skipped boundary: places the RETAINED tree in its place
             // (measure's pair — both phases resolve the SAME retention,
             // the Fit mirrors by construction)
-            (LayoutNode::BoundaryRef { path }, fit) => {
-                crate::reconciler::with_retained_layout(path, |layout| {
+            (LayoutNode::BoundaryRef { slot, .. }, fit) => {
+                slot.with_layout(|layout| {
                     if let Some(node) = layout {
                         node.place(frame, fit, env, out);
                     }
