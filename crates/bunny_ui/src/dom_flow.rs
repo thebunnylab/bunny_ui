@@ -630,7 +630,7 @@ impl Walk<'_> {
             // number at all.
             LayoutNode::Measured { child, .. } => self.lower_into(child, out),
 
-            LayoutNode::Boundary { path, children } => {
+            LayoutNode::Boundary { path, children, .. } => {
                 // a CLEAN boundary is a promise, not a walk: no body
                 // under it ran, the retained group still holds, and
                 // the diff keeps it wholesale — O(change), by absence

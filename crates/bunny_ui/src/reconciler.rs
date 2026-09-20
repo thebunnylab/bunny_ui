@@ -220,6 +220,9 @@ struct Held {
     /// A re-run replaces the whole `Held`, and the list with it; a body
     /// that re-runs BELOW clears it ([`finish_entry`]).
     measures_kept: RefCell<Vec<KeptMeasure>>,
+    /// Is the tree only paint? Asked when the boundary sits far off the
+    /// glass, answered once for this tree ([`crate::layout::Quiet`]).
+    quiet: std::cell::OnceCell<crate::layout::Quiet>,
 }
 
 impl std::fmt::Debug for Slot {
@@ -235,6 +238,16 @@ impl Slot {
 
     fn held(&self) -> Option<Rc<Held>> {
         self.held.borrow().clone()
+    }
+
+    /// Is the boundary's tree quiet NOW ([`crate::layout::Quiet`])? A
+    /// boundary that left the retention places nothing, which is quiet.
+    pub(crate) fn quiet_now(&self) -> bool {
+        self.held().is_none_or(|held| {
+            held.quiet
+                .get_or_init(|| crate::layout::Quiet::of_all(std::slice::from_ref(&held.layout)))
+                .holds()
+        })
     }
 
     /// The boundary's layout tree, borrowed in place — measure and place
@@ -466,7 +479,11 @@ pub(crate) fn finish_entry(
             Some(old) => Rc::clone(&old.slot),
             None => Slot::empty(),
         };
-        slot.held.replace(Some(Rc::new(Held { layout, measures_kept: RefCell::new(Vec::new()) })));
+        slot.held.replace(Some(Rc::new(Held {
+            layout,
+            measures_kept: RefCell::new(Vec::new()),
+            quiet: std::cell::OnceCell::new(),
+        })));
         retained.insert(
             path.to_string(),
             Entry {

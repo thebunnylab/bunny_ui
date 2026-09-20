@@ -1590,6 +1590,7 @@ where
                     Some(path) => LayoutNode::Boundary {
                         path: path.into(),
                         children: vec![wrap_layout(layouts)],
+                        quiet: Default::default(),
                     },
                     None => wrap_layout(layouts),
                 };
@@ -1873,6 +1874,7 @@ where
                     Some(path) => LayoutNode::Boundary {
                         path: path.into(),
                         children: vec![wrap_layout(layouts)],
+                        quiet: Default::default(),
                     },
                     None => wrap_layout(layouts),
                 };

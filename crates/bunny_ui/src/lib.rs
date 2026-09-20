@@ -7027,6 +7027,92 @@ mod tests {
         assert!(dropped > 1000, "forty rows behind two hundred points of glass: {dropped} dropped");
     }
 
+    /// A row that is only paint is left UNPLACED while it sits far off the
+    /// glass — and everything a placement owes is still paid.
+    ///
+    /// Three hundred rows behind two hundred points of glass. The far ones
+    /// are not walked; their frames are still in the table, so a scroll-to
+    /// finds row 250 and the wheel brings it. One row holds an app's box, and
+    /// an app may read its own `paint` as "this frame happened": that row is
+    /// placed on every frame however far away it sits, because a row with
+    /// more than paint in it is not quiet.
+    #[test]
+    fn a_quiet_row_far_off_the_glass_is_left_unplaced() {
+        use crate::layout::{Proposal, Size};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        #[derive(Clone, Copy)]
+        struct Row(usize);
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                hstack!(rectangle().frame(8.0, 8.0), text(format!("row {}", self.0)), spacer())
+                    .on_click(|| {})
+                    .tooltip(format!("row {}", self.0))
+            }
+        }
+
+        #[derive(Clone)]
+        struct Page {
+            target: State<String>,
+            painted: Rc<Cell<usize>>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let painted = Rc::clone(&self.painted);
+                list(
+                    (0..300usize).collect(),
+                    |row| format!("row-{row}"),
+                    move |row| {
+                        if *row == 280 {
+                            let painted = Rc::clone(&painted);
+                            erased(canvas(move |_, _| painted.set(painted.get() + 1)).frame(40.0, 16.0))
+                        } else {
+                            erased(Row(*row))
+                        }
+                    },
+                )
+                .scroll_target(self.target.get())
+            }
+        }
+
+        let page = Page { target: State::new("row-0".to_string()), painted: Rc::new(Cell::new(0)) };
+        let runtime = Runtime::new();
+        runtime.drop_unseen();
+        let size = Proposal::exact(Size { width: 240.0, height: 200.0 });
+        let _ = runtime.settled_layout(&page, size);
+        let _ = crate::stats::take();
+        let before = page.painted.get();
+        let result = runtime.settled_layout(&page, size);
+        let stats = crate::stats::take();
+        if !crate::paranoid::on(crate::paranoid::SEEN) {
+            // (the paranoid check places every scene a second time, whole)
+            assert!(stats.children_unplaced > 250, "{} rows left unplaced", stats.children_unplaced);
+            assert_eq!(page.painted.get(), before + 1, "the app's box, far off the glass, was painted");
+        }
+        // a row far away still says where it is…
+        let far = result.frames.find("[row-250]").expect("row 250 has a frame");
+        assert!(far.origin.y > 3000.0, "{far:?}");
+        // …so a scroll-to finds it, and the wheel's region brings it
+        page.target.set("row-250".to_string());
+        let revealed = runtime.settled_layout(&page, size);
+        let shown = revealed.frames.find("[row-250]").expect("row 250 has a frame");
+        assert!(
+            shown.origin.y >= 0.0 && shown.origin.y + shown.size.height <= 200.0,
+            "row 250 was not revealed: {shown:?}"
+        );
+        let words: Vec<&str> = revealed
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { content, .. } => Some(&**content),
+                _ => None,
+            })
+            .collect();
+        assert!(words.contains(&"row 250"), "{words:?}");
+        assert!(!words.contains(&"row 0"), "a row above the window was drawn");
+    }
+
     /// Proposed no height, a paragraph still answers every line.
     ///
     /// That is not a small room — it is the question not asked, and it is

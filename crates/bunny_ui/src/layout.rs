@@ -710,7 +710,14 @@ pub enum LayoutNode {
     },
     /// View boundary (`Component`): records the frame at the identity
     /// path — the address for tests and, later on, for hit-testing.
-    Boundary { path: Rc<str>, children: Vec<LayoutNode> },
+    Boundary {
+        path: Rc<str>,
+        children: Vec<LayoutNode>,
+        /// Is everything under this boundary only paint? Asked when the
+        /// boundary sits far off the glass, answered once for the tree
+        /// ([`Quiet`]).
+        quiet: std::cell::OnceCell<Quiet>,
+    },
     /// Interaction target (Button): the frame enters the hit-test list
     /// with the path that indexes the action registered in the
     /// reconciler. Hover and pressed do NOT live here — placement
@@ -1840,6 +1847,142 @@ pub enum DrawCommand {
     PopClip,
 }
 
+/// Can a subtree be LEFT UNPLACED while it sits far off the glass?
+///
+/// A placement does more than draw: it records the regions a wheel finds,
+/// the fields a key reaches, the frames a probe reads; it keeps a flight
+/// alive; it calls an app's `paint`, which the app may read as "this frame
+/// happened". A subtree is QUIET when it holds none of that — text, fills,
+/// images, stacks and frames, targets and tooltips (which exist only where
+/// they are visible anyway) — so that leaving it unplaced changes nothing
+/// but the work. The rows of a long list are quiet, and only ten of two
+/// hundred are on the glass.
+///
+/// The answer is a property of a TREE, so it is kept where a tree has a
+/// memory: in a [`LayoutNode::Boundary`] and in the slot of a retained one.
+/// A retained boundary inside the tree can re-run on its own, so a tree that
+/// holds any answers "as long as they all are", and they are asked each time.
+#[derive(Clone, Debug)]
+pub enum Quiet {
+    No,
+    Yes,
+    While(Rc<[Rc<crate::reconciler::Slot>]>),
+}
+
+impl Quiet {
+    /// Is the subtree quiet NOW?
+    pub(crate) fn holds(&self) -> bool {
+        match self {
+            Quiet::No => false,
+            Quiet::Yes => true,
+            Quiet::While(slots) => slots.iter().all(|slot| slot.quiet_now()),
+        }
+    }
+
+    /// The answer for a run of sibling trees.
+    pub(crate) fn of_all(nodes: &[LayoutNode]) -> Quiet {
+        let mut held = Vec::new();
+        if nodes.iter().all(|node| node.collect_quiet(&mut held)) {
+            if held.is_empty() { Quiet::Yes } else { Quiet::While(held.into()) }
+        } else {
+            Quiet::No
+        }
+    }
+}
+
+impl LayoutNode {
+    /// Walks the tree once: `false` = something under here is more than
+    /// paint. The retained boundaries met on the way are collected — their
+    /// own trees are asked through their slots, each time.
+    fn collect_quiet(&self, held: &mut Vec<Rc<crate::reconciler::Slot>>) -> bool {
+        match self {
+            LayoutNode::Text { .. }
+            | LayoutNode::Spacer
+            | LayoutNode::Leaf { .. }
+            | LayoutNode::Image { .. }
+            | LayoutNode::Icon { .. }
+            | LayoutNode::Fill
+            | LayoutNode::BoundaryHint { .. } => true,
+            LayoutNode::Stack { children, .. } | LayoutNode::Boundary { children, .. } => {
+                children.iter().all(|child| child.collect_quiet(held))
+            }
+            // a modal pile draws the line no pointer crosses: not paint
+            LayoutNode::Layered { modal, children, .. } => {
+                !modal && children.iter().all(|child| child.collect_quiet(held))
+            }
+            LayoutNode::Overlay { layer, child, .. } => {
+                layer.collect_quiet(held) && child.collect_quiet(held)
+            }
+            LayoutNode::Padding { child, .. }
+            | LayoutNode::Frame { child, .. }
+            | LayoutNode::MaxFrame { child, .. }
+            | LayoutNode::FlexFrame { child, .. }
+            | LayoutNode::Hug { child, .. }
+            | LayoutNode::Styled { child, .. }
+            // a target, a tooltip, a menu, a drag and a drop exist only
+            // where a pointer can reach them: off the glass they are
+            // not recorded at all
+            | LayoutNode::Interactive { child, .. }
+            | LayoutNode::HoverGroup { child, .. }
+            | LayoutNode::Tooltip { child, .. }
+            | LayoutNode::ContextSource { child, .. }
+            | LayoutNode::DragSource { child, .. }
+            | LayoutNode::DropTarget { child, .. }
+            | LayoutNode::Hinted { child, .. } => child.collect_quiet(held),
+            LayoutNode::BoundaryRef { slot, .. } => {
+                held.push(Rc::clone(slot));
+                true
+            }
+            // a record, a region, a field, a flight, an app's paint, a
+            // platform view, a layer of its own: a placement is owed
+            _ => false,
+        }
+    }
+
+    /// Is this CHILD OF A STACK quiet now? Only a node with a memory
+    /// answers yes: a boundary, or a reference to a retained one. Anything
+    /// else would be walked to find out, which is the work being saved.
+    fn quiet_now(&self) -> bool {
+        match self {
+            LayoutNode::Boundary { children, quiet, .. } => {
+                quiet.get_or_init(|| Quiet::of_all(children)).holds()
+            }
+            LayoutNode::BoundaryRef { slot, .. } => slot.quiet_now(),
+            _ => false,
+        }
+    }
+
+    /// A quiet child left unplaced still answers WHERE it is: the frame of
+    /// each boundary on its way down, through single children — the address
+    /// a scroll-to reveals a row by is the row's own boundary.
+    fn record_unplaced(&self, frame: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
+        match self {
+            LayoutNode::Boundary { path, children, .. } => {
+                let real = match env.anim {
+                    Some(scope) => Rect {
+                        origin: Point {
+                            x: frame.origin.x - scope.shift.0,
+                            y: frame.origin.y - scope.shift.1,
+                        },
+                        size: frame.size,
+                    },
+                    None => frame,
+                };
+                out.frames.record(path, real);
+                if let [only] = children.as_slice() {
+                    only.record_unplaced(frame, env, out);
+                }
+            }
+            LayoutNode::BoundaryRef { slot, .. } => slot.with_layout(|layout| {
+                if let Some(node) = layout {
+                    node.record_unplaced(frame, env, out);
+                }
+            }),
+            _ => {}
+        }
+    }
+}
+
 /// The draw list of one frame.
 impl DrawCommand {
     /// Can this command put ink inside `clip`? A SUPERSET test, free of
@@ -2851,6 +2994,25 @@ impl Placement {
         self.display.push(command);
     }
 
+    /// Is this box FAR off the glass — a whole window away from the clip
+    /// it stands under, and never less than 64 points? A quiet child of a
+    /// stack that far out is left unplaced ([`Quiet`]). The distance is for
+    /// what a box draws outside itself — a shadow, a badge hung on a corner,
+    /// a child wider than its parent: the clip erases all of it, and a window
+    /// away nothing of it could have reached.
+    fn leaves_unplaced(&self, frame: Rect) -> bool {
+        if self.keep_unseen || self.skip_display || self.dom.is_some() {
+            return false;
+        }
+        self.clip.last().is_some_and(|clip| {
+            let (far_x, far_y) = (clip.size.width.max(64.0), clip.size.height.max(64.0));
+            frame.origin.x + frame.size.width < clip.origin.x - far_x
+                || frame.origin.x > clip.origin.x + clip.size.width + far_x
+                || frame.origin.y + frame.size.height < clip.origin.y - far_y
+                || frame.origin.y > clip.origin.y + clip.size.height + far_y
+        })
+    }
+
     /// Can nothing drawn between these two heights show? A text asks
     /// BEFORE it measures and breaks its lines: the rows of a long list
     /// that are off the glass pay for neither.
@@ -3206,9 +3368,18 @@ pub(crate) fn layout_placing(
             seen.len(),
             full.display.len(),
         );
+        // a quiet child left unplaced records its own boundaries and not the
+        // ones nested in it: the cut's frames are the full placement's, in
+        // order, with some left out — never one moved, never one invented
+        let mut all = full.frames.entries.iter();
+        let frames_agree = out.frames.entries.iter().all(|kept| all.any(|entry| entry == kept));
+        // …and a hover group off the glass is not asked whether it paints a
+        // hover nobody can give it
+        let groups_agree = out.sensitive_groups.iter().all(|group| full.sensitive_groups.contains(group));
         assert!(
             full.hits == out.hits
-                && full.frames.entries == out.frames.entries
+                && frames_agree
+                && groups_agree
                 && full.scrolls.len() == out.scrolls.len()
                 && full.fields.len() == out.fields.len()
                 && full.customs.len() == out.customs.len()
@@ -3220,8 +3391,7 @@ pub(crate) fn layout_placing(
                 && full.overlays.len() == out.overlays.len()
                 && full.misses == out.misses
                 && full.drag_regions == out.drag_regions
-                && full.hover_sensitive == out.hover_sensitive
-                && full.sensitive_groups == out.sensitive_groups,
+                && full.hover_sensitive == out.hover_sensitive,
             "paranoid(seen): the cut moved something other than the draw list",
         );
     }
@@ -6118,7 +6288,7 @@ impl LayoutNode {
                 }
             }
 
-            (LayoutNode::Boundary { path, children }, Fit::Children(fits)) => {
+            (LayoutNode::Boundary { path, children, .. }, Fit::Children(fits)) => {
                 // the recorded frame is the REAL target: a flight in
                 // progress above un-shifts here, so scroll-to and tests
                 // never chase a moving row. crossing the boundary also
@@ -6146,9 +6316,18 @@ impl LayoutNode {
                         real.origin,
                     );
                 }
-                let env = LayoutEnv { anim: None, ..*env };
+                // a scope is rarely open: the environment is only rebuilt
+                // to close one
+                let closed;
+                let env = match env.anim {
+                    Some(_) => {
+                        closed = LayoutEnv { anim: None, ..*env };
+                        &closed
+                    }
+                    None => env,
+                };
                 if children.len() == 1 {
-                    children[0].place(frame, &fits[0].1, &env, out);
+                    children[0].place(frame, &fits[0].1, env, out);
                 } else {
                     place_stack(
                         Axis::Vertical,
@@ -6157,7 +6336,7 @@ impl LayoutNode {
                         children,
                         frame,
                         fits,
-                        &env,
+                        env,
                         out,
                     );
                 }
@@ -6996,7 +7175,13 @@ fn place_stack(
                 y: frame.origin.y + cross_offset(frame.size.height, size.height),
             },
         };
-        child.place(Rect { origin, size: *size }, fit, env, out);
+        let at = Rect { origin, size: *size };
+        if out.leaves_unplaced(at) && child.quiet_now() {
+            child.record_unplaced(at, env, out);
+            crate::stats::note_unplaced();
+        } else {
+            child.place(at, fit, env, out);
+        }
         cursor += match axis {
             Axis::Vertical => size.height,
             Axis::Horizontal => size.width,
@@ -7013,7 +7198,7 @@ mod tests {
     }
 
     fn boundary(path: &str, child: LayoutNode) -> LayoutNode {
-        LayoutNode::Boundary { path: Rc::from(path), children: vec![child] }
+        LayoutNode::Boundary { path: Rc::from(path), children: vec![child], quiet: Default::default() }
     }
 
     #[test]

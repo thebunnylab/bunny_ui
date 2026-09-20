@@ -260,6 +260,7 @@ fn retain_entry<T: Component>(view: &T, ctx: &Context, path: &str, body: NodeLis
         crate::layout::LayoutNode::Boundary {
             path: std::rc::Rc::from(path),
             children: layout_children,
+            quiet: Default::default(),
         },
     );
 }
@@ -277,6 +278,7 @@ fn close_loose<T: Component>(body: NodeList, out: &mut NodeList) {
     out.push_layout(crate::layout::LayoutNode::Boundary {
         path: std::rc::Rc::from(short_type_name::<T>()),
         children: layout_children,
+        quiet: Default::default(),
     });
 }
 
