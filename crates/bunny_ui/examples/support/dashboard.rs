@@ -54,6 +54,9 @@ pub struct Workbench {
     pub flags: Rc<Vec<State<bool>>>,
     /// The status dot's colour index. A change starts a colour flight.
     pub pulse: State<usize>,
+    /// Do the charts keep their pictures (`.cached`)? A product's chart
+    /// draws from data with a revision, so it can; the ruler measures both.
+    pub kept_pictures: bool,
 }
 
 impl Workbench {
@@ -63,14 +66,21 @@ impl Workbench {
             legend_rows,
             flags: Rc::new((0..PANELS).map(|_| State::new(false)).collect()),
             pulse: State::new(0),
+            kept_pictures: false,
         }
+    }
+
+    /// The same scene, with every chart keeping its picture.
+    pub fn keeping_pictures(mut self) -> Workbench {
+        self.kept_pictures = true;
+        self
     }
 }
 
 impl Component for Workbench {
     fn body(self, _ctx: &Context) -> impl View {
         let page = match self.mode.get() {
-            Mode::Board => erased(board(self.legend_rows, &self.flags)),
+            Mode::Board => erased(board(self.legend_rows, &self.flags, self.kept_pictures)),
             Mode::Table => erased(table()),
         };
         vstack!(
@@ -166,9 +176,18 @@ impl Component for StatusBar {
 
 // MARK: - The board
 
-fn board(legend_rows: usize, flags: &Rc<Vec<State<bool>>>) -> impl View<Arity = Single> {
+fn board(
+    legend_rows: usize,
+    flags: &Rc<Vec<State<bool>>>,
+    kept_pictures: bool,
+) -> impl View<Arity = Single> {
     let panels: Vec<_> = (0..PANELS)
-        .map(|index| erased(Panel { index, legend_rows, flag: flags[index] }.id(format!("panel-{index}"))))
+        .map(|index| {
+            erased(
+                Panel { index, legend_rows, flag: flags[index], kept_pictures }
+                    .id(format!("panel-{index}")),
+            )
+        })
         .collect();
     scroll(vstack!(panels).spacing(12.0).alignment(HorizontalAlignment::Leading).padding_length(12.0))
         .id("board")
@@ -179,6 +198,7 @@ struct Panel {
     index: usize,
     legend_rows: usize,
     flag: State<bool>,
+    kept_pictures: bool,
 }
 
 impl Component for Panel {
@@ -189,8 +209,10 @@ impl Component for Panel {
         let measured = State::new(Size { width: 480.0, height: 300.0 });
         let side = measured.get().width > 700.0;
         let index = self.index;
-        let plot = canvas(move |ctx, painter| chart(index, ctx, painter))
-            .frame_max(f64::INFINITY, f64::INFINITY, Alignment::Center);
+        let plot = canvas(move |ctx, painter| chart(index, ctx, painter));
+        // the fixture's data never moves, so one version says it all
+        let plot = if self.kept_pictures { plot.cached(1) } else { plot };
+        let plot = plot.frame_max(f64::INFINITY, f64::INFINITY, Alignment::Center);
         let legend = legend(index, self.legend_rows, self.flag);
         let content = if side {
             erased(hstack!(plot, legend.frame_width(260.0)).spacing(12.0))

@@ -3211,6 +3211,82 @@ mod tests {
     }
 
     #[test]
+    fn a_box_that_keeps_its_picture_is_painted_once_for_each_version() {
+        use std::cell::Cell;
+
+        // a chart's paint is not small, and a page that scrolls places it
+        // again on every frame with the same data at the same size. A box
+        // that asks keeps its picture: painted once for each version and
+        // size, replayed at each new place — the same commands, moved.
+        #[derive(Clone)]
+        struct Page {
+            version: State<u64>,
+            painted: Rc<Cell<u32>>,
+            kept: bool,
+        }
+
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let painted = Rc::clone(&self.painted);
+                let chart = canvas(move |ctx, painter| {
+                    painted.set(painted.get() + 1);
+                    let size = ctx.size();
+                    painter.fill(
+                        Rect { origin: Point { x: 4.0, y: 4.0 }, size: Size { width: size.width - 8.0, height: 20.0 } },
+                        Color::rgba(200, 40, 40, 255),
+                    );
+                    painter.text(Point { x: 6.0, y: 30.0 }, "a label", Color::rgba(240, 240, 240, 255));
+                })
+                .frame(180.0, 60.0);
+                let chart = if self.kept { chart_kept(self.version.get(), self.painted.clone()) } else { erased(chart) };
+                scroll(vstack!(text("above").frame(180.0, 100.0), chart, text("below").frame(180.0, 600.0)))
+                    .id("page")
+            }
+        }
+
+        fn chart_kept(version: u64, painted: Rc<Cell<u32>>) -> Erased {
+            erased(
+                canvas(move |ctx, painter| {
+                    painted.set(painted.get() + 1);
+                    let size = ctx.size();
+                    painter.fill(
+                        Rect { origin: Point { x: 4.0, y: 4.0 }, size: Size { width: size.width - 8.0, height: 20.0 } },
+                        Color::rgba(200, 40, 40, 255),
+                    );
+                    painter.text(Point { x: 6.0, y: 30.0 }, "a label", Color::rgba(240, 240, 240, 255));
+                })
+                .cached(version)
+                .frame(180.0, 60.0),
+            )
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 300.0 };
+        let frames = |kept: bool| {
+            let page = Page { version: State::new(1), painted: Rc::new(Cell::new(0)), kept };
+            let runtime = Runtime::scene(if kept { "kept" } else { "plain" });
+            let mut pictures = vec![runtime.display_frame(&page, size)];
+            for _ in 0..4 {
+                assert!(runtime.wheel(100.0, 150.0, 0.0, -10.0));
+                pictures.push(runtime.display_frame(&page, size));
+            }
+            let painted_while_scrolling = page.painted.get();
+            // the data moved: the app says so with a new version
+            page.version.set(2);
+            pictures.push(runtime.display_frame(&page, size));
+            (pictures, painted_while_scrolling, page.painted.get())
+        };
+
+        let (plain, plain_scrolling, _) = frames(false);
+        let (kept, kept_scrolling, kept_after_a_new_version) = frames(true);
+        assert!(plain_scrolling >= 5, "painted on every frame: {plain_scrolling}");
+        assert_eq!(kept_scrolling, 1, "kept: painted once, replayed four times");
+        assert_eq!(kept_after_a_new_version, 2, "a new version is a new picture");
+        for (index, (plain, kept)) in plain.iter().zip(&kept).enumerate() {
+            assert_eq!(plain.as_slice(), kept.as_slice(), "frame {index}: the replay is the same picture");
+        }
+    }
+
+    #[test]
     fn a_runtime_handed_another_root_forgets_the_old_boundary() {
         #[derive(Clone, Copy)]
         struct First;

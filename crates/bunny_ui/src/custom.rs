@@ -262,11 +262,19 @@ pub struct Custom {
     /// The focus beat the app last stamped on this box, if any — see
     /// [`CustomView::auto_focus`].
     auto_focus: Option<u64>,
+    /// The version of the picture the app vouches for, if any — see
+    /// [`CustomView::cached`].
+    cached: Option<u64>,
 }
 
 impl Custom {
     pub fn new(element: impl CustomElement) -> Custom {
-        Custom { element: Rc::new(element), auto_focus: None }
+        Custom { element: Rc::new(element), auto_focus: None, cached: None }
+    }
+
+    /// The picture's version, when the app asked for it to be kept.
+    pub(crate) fn cached_version(&self) -> Option<u64> {
+        self.cached
     }
 
     pub fn element(&self) -> &dyn CustomElement {
@@ -892,6 +900,37 @@ impl CustomView {
     #[must_use]
     pub fn auto_focus(mut self, beat: u64) -> Self {
         self.element.auto_focus = Some(beat);
+        self
+    }
+
+    /// Keep this box's picture, and paint it again only when it CHANGES.
+    ///
+    /// A box is painted on every frame it is placed, and a chart's paint
+    /// is not small: it walks its data, builds its paths, and the house
+    /// hashes every one of them to find the raster it already has. A page
+    /// that scrolls places every box again on every frame, with the same
+    /// data at the same size.
+    ///
+    /// With `cached`, `paint` runs ONCE for each distinct set of: this
+    /// `version`, the size of the box, the screen scale, the inherited
+    /// font and ink, the theme, and the input modality. The frames between
+    /// replay the recorded commands at the box's new place. `version` is
+    /// the app's word for "what I draw from has not changed" — a hash of
+    /// the data, a revision counter.
+    ///
+    /// ```ignore
+    /// canvas(move |ctx, p| plot(&series, ctx, p)).cached(series_revision)
+    /// ```
+    ///
+    /// The promise the app makes: the picture depends on nothing else. A
+    /// box that reads `ctx.visible` to paint one screen of a long document
+    /// must not ask for this — a kept picture is painted whole. A box
+    /// under `.looping(…)`, a box that holds the keyboard, and a box that
+    /// paints a gradient or a glass pane are painted every frame as
+    /// before, whatever they ask.
+    #[must_use]
+    pub fn cached(mut self, version: u64) -> Self {
+        self.element.cached = Some(version);
         self
     }
 }

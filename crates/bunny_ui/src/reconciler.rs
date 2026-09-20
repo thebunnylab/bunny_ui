@@ -1351,6 +1351,7 @@ pub(crate) fn clear() {
 /// `motor::identity::reset_world` for the other half of the contract.
 pub(crate) fn reset_world() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
+    crate::layout::forget_pictures();
     bump_retention();
     ASSEMBLED_ROOT.with(|root| *root.borrow_mut() = None);
     ASSEMBLED_AT.with(|at| at.set(None));

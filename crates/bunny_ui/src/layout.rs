@@ -1841,6 +1841,88 @@ pub enum DrawCommand {
 }
 
 /// The draw list of one frame.
+impl DrawCommand {
+    /// The same command `by` further right and down — how a kept picture
+    /// is replayed at a box's new place. `None` for a command whose paint
+    /// was resolved against absolute geometry (a gradient, a glass pane):
+    /// moving its box would not move its ramp.
+    pub(crate) fn translated(&self, by: Point) -> Option<DrawCommand> {
+        let moved = |rect: &Rect| Rect {
+            origin: Point { x: rect.origin.x + by.x, y: rect.origin.y + by.y },
+            size: rect.size,
+        };
+        Some(match self {
+            DrawCommand::FillRect { rect, color, corner_radius } => DrawCommand::FillRect {
+                rect: moved(rect),
+                color: *color,
+                corner_radius: *corner_radius,
+            },
+            DrawCommand::Shadow { rect, radius, color, corner_radius } => DrawCommand::Shadow {
+                rect: moved(rect),
+                radius: *radius,
+                color: *color,
+                corner_radius: *corner_radius,
+            },
+            DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
+                DrawCommand::StrokeRect {
+                    rect: moved(rect),
+                    color: *color,
+                    width: *width,
+                    corner_radius: *corner_radius,
+                }
+            }
+            DrawCommand::TextLine { origin, content, range, color, font } => {
+                DrawCommand::TextLine {
+                    origin: Point { x: origin.x + by.x, y: origin.y + by.y },
+                    content: Arc::clone(content),
+                    range: *range,
+                    color: *color,
+                    font: *font,
+                }
+            }
+            DrawCommand::Image { rect, source } => {
+                DrawCommand::Image { rect: moved(rect), source: source.clone() }
+            }
+            DrawCommand::PushClip { rect, corner_radius } => {
+                DrawCommand::PushClip { rect: moved(rect), corner_radius: *corner_radius }
+            }
+            DrawCommand::PopClip => DrawCommand::PopClip,
+            DrawCommand::Gradient { .. } | DrawCommand::Backdrop { .. } => return None,
+        })
+    }
+}
+
+/// A box's kept picture ([`crate::custom::CustomView::cached`]): everything
+/// the paint was given, and the commands it answered, in the box's OWN
+/// coordinates. `None` = this version paints something that cannot be moved,
+/// so it is painted on every frame and never asked about again.
+struct Picture {
+    version: u64,
+    size: Size,
+    scale: Px,
+    font: FontSpec,
+    ink: Color,
+    theme: u64,
+    touch: bool,
+    commands: Option<Rc<[DrawCommand]>>,
+}
+
+/// More kept pictures than this, and the store starts again: a box that left
+/// the scene leaves its picture behind, and nothing else sweeps it.
+const KEPT_PICTURES: usize = 512;
+
+thread_local! {
+    /// Kept pictures, by the box's identity path (a path carries its scene,
+    /// so two windows on one thread never share an entry).
+    static PICTURES: std::cell::RefCell<HashMap<String, Picture>> =
+        std::cell::RefCell::new(HashMap::default());
+}
+
+/// Drops every kept picture — a newborn world starts with none.
+pub(crate) fn forget_pictures() {
+    PICTURES.with(|pictures| pictures.borrow_mut().clear());
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct DisplayList {
     commands: Vec<DrawCommand>,
@@ -4684,10 +4766,100 @@ impl LayoutNode {
                     touch: env.touch,
                 };
                 let ink = out.foreground.last().copied().unwrap_or(Color::BLACK);
-                let mut painter =
-                    crate::custom::Painter::new(&mut out.display, frame.origin, env.font, ink);
-                crate::stats::note_paint();
-                element.element().paint(&ctx, &mut painter);
+                // a box that asked to keep its picture is painted once for
+                // each version, size and look, in its OWN coordinates, and
+                // replayed at its place. Never a box that moves on its own:
+                // one under a loop, one that holds the keyboard, one on the
+                // element lowering.
+                let kept = element
+                    .cached_version()
+                    .filter(|_| env.live.is_none() && !focused && out.dom.is_none() && !path.is_empty());
+                let replayed = kept.is_some_and(|version| {
+                    let theme = crate::theme::version();
+                    let fresh = |picture: &Picture| {
+                        picture.version == version
+                            && picture.size == frame.size
+                            && picture.scale == env.scale
+                            && picture.font == env.font
+                            && picture.ink == ink
+                            && picture.theme == theme
+                            && picture.touch == env.touch
+                    };
+                    let known = PICTURES.with(|pictures| {
+                        pictures.borrow().get(path.as_str()).filter(|picture| fresh(picture)).map(
+                            |picture| picture.commands.clone(),
+                        )
+                    });
+                    let commands = match known {
+                        Some(commands) => commands,
+                        None => {
+                            // painted WHOLE, at the origin: the kept picture
+                            // serves every place the box is scrolled to
+                            let whole = crate::custom::PaintCtx {
+                                frame: Rect { origin: Point::ZERO, size: frame.size },
+                                visible: Rect { origin: Point::ZERO, size: frame.size },
+                                metrics: crate::custom::Metrics::new(env.text, env.cache, env.font),
+                                focused: false,
+                                caret_visible: false,
+                                phase: 0.0,
+                                scale: env.scale,
+                                touch: env.touch,
+                            };
+                            let mut recorded = DisplayList::default();
+                            let mut painter = crate::custom::Painter::new(
+                                &mut recorded,
+                                Point::ZERO,
+                                env.font,
+                                ink,
+                            );
+                            crate::stats::note_paint();
+                            element.element().paint(&whole, &mut painter);
+                            let movable =
+                                recorded.iter().all(|command| command.translated(Point::ZERO).is_some());
+                            let commands: Option<Rc<[DrawCommand]>> =
+                                movable.then(|| recorded.commands.into());
+                            PICTURES.with(|pictures| {
+                                let mut pictures = pictures.borrow_mut();
+                                if pictures.len() >= KEPT_PICTURES {
+                                    pictures.clear();
+                                }
+                                pictures.insert(
+                                    path.clone(),
+                                    Picture {
+                                        version,
+                                        size: frame.size,
+                                        scale: env.scale,
+                                        font: env.font,
+                                        ink,
+                                        theme,
+                                        touch: env.touch,
+                                        commands: commands.clone(),
+                                    },
+                                );
+                            });
+                            commands
+                        }
+                    };
+                    match commands {
+                        Some(commands) => {
+                            crate::stats::note_picture_replayed();
+                            for command in commands.iter() {
+                                if let Some(placed) = command.translated(frame.origin) {
+                                    out.display.push(placed);
+                                }
+                            }
+                            true
+                        }
+                        // it paints what cannot be moved: the old road
+                        None => false,
+                    }
+                });
+                if !replayed {
+                    let mut painter =
+                        crate::custom::Painter::new(&mut out.display, frame.origin, env.font, ink);
+                    crate::stats::note_paint();
+                    element.element().paint(&ctx, &mut painter);
+                }
                 out.pop_clip();
                 let end = out.display.len();
                 if let Some(dom) = out.dom.as_mut() {

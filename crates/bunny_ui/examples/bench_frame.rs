@@ -53,7 +53,11 @@ struct Bench {
 
 impl Bench {
     fn new(runtime: Runtime, legend_rows: usize) -> Bench {
-        let bench = Bench { root: Workbench::new(legend_rows), runtime };
+        Bench::with(Workbench::new(legend_rows), runtime)
+    }
+
+    fn with(root: Workbench, runtime: Runtime) -> Bench {
+        let bench = Bench { root, runtime };
         // the mount, and the second pass the legends' probes ask for
         bench.frame();
         bench.frame();
@@ -89,6 +93,19 @@ fn scenarios(tag: &str, scene: bool, legend_rows: usize, full: bool) -> (Vec<har
         };
         reports.push(measure(label("wheel, no pointer"), WARMUP, FRAMES, || (), &mut step));
         rows.push(stages(label("wheel, no pointer"), FRAMES, || (), &mut step));
+    }
+
+    // 2b. the same wheel, with every chart keeping its picture (`.cached`)
+    {
+        let bench = Bench::with(Workbench::new(legend_rows).keeping_pictures(), runtime());
+        let mut turn = 0usize;
+        let mut step = || {
+            turn += 1;
+            bench.runtime.wheel(OVER_CHART.0, OVER_CHART.1, 0.0, travel(turn));
+            bench.frame()
+        };
+        reports.push(measure(label("wheel, charts keep pictures"), WARMUP, FRAMES, || (), &mut step));
+        rows.push(stages(label("wheel, charts keep pictures"), FRAMES, || (), &mut step));
     }
 
     // 3. WHEEL with the pointer at rest: the frame re-reads the hover
