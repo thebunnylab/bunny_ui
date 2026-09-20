@@ -90,6 +90,20 @@ pub trait CustomElement: 'static {
         }
     }
 
+    /// Does [`CustomElement::measure`] depend only on what it is given —
+    /// the proposal and the metrics? The layout keeps the measure of a
+    /// boundary from one frame to the next, and a box whose answer can
+    /// move on its own (a document that grew, a measure that reads or
+    /// writes a state) stands in the way: nothing above it is kept.
+    ///
+    /// The default is `false`, which is always correct. Answer `true` for
+    /// a box that takes what it is proposed, or sizes itself from the
+    /// text metrics alone — and the boundaries above it stop being
+    /// measured on every frame.
+    fn stable_measure(&self) -> bool {
+        false
+    }
+
     /// One event, in LOCAL coordinates. The default ignores everything:
     /// a box that only paints answers nothing, and what it ignores goes
     /// back to the scene (an ignored wheel scrolls the region around
@@ -939,6 +953,11 @@ struct Painting<F>(F);
 impl<F: Fn(&PaintCtx, &mut Painter) + 'static> CustomElement for Painting<F> {
     fn paint(&self, ctx: &PaintCtx, painter: &mut Painter) {
         (self.0)(ctx, painter);
+    }
+
+    // a canvas has no measure of its own: it takes what it is proposed
+    fn stable_measure(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &str {

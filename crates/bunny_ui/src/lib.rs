@@ -3057,6 +3057,159 @@ mod tests {
     }
 
     #[test]
+    fn a_clean_frame_measures_nothing_and_a_rerun_below_is_measured_again() {
+        // a boundary that did not re-run holds the same tree, so the same
+        // question has the same answer: the measure is kept with the
+        // entry. A body that re-runs BELOW a kept boundary must clear what
+        // the boundaries above it kept — their size may hang on its own.
+        #[derive(Clone, Copy)]
+        struct Leaf {
+            wide: State<bool>,
+        }
+        impl Component for Leaf {
+            fn body(self, _ctx: &Context) -> impl View {
+                text(if self.wide.get() { "a much, much wider label" } else { "narrow" })
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Middle {
+            wide: State<bool>,
+        }
+        impl Component for Middle {
+            fn body(self, _ctx: &Context) -> impl View {
+                // hugs its child: its own size IS the leaf's
+                hstack!(Leaf { wide: self.wide }, text("|"))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            wide: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("title"), Middle { wide: self.wide })
+            }
+        }
+
+        let page = Page { wide: State::new(false) };
+        let size = crate::layout::Size { width: 600.0, height: 200.0 };
+        crate::paranoid::force(crate::paranoid::MEMO);
+        let runtime = Runtime::scene("w0");
+        let narrow = runtime.display_frame(&page, size);
+
+        // clean frames: one question at the root, answered from what was kept
+        let _ = crate::stats::take();
+        for _ in 0..3 {
+            let again = runtime.display_frame(&page, size);
+            assert_eq!(again.as_slice(), narrow.as_slice());
+        }
+        let stats = crate::stats::take();
+        assert_eq!(stats.measures_made, 0, "nothing re-ran: nothing is measured");
+        assert!(stats.measures_kept >= 3, "{stats:?}");
+
+        // ONLY the leaf re-runs (it alone reads the state). The page and
+        // the middle keep their entries — and must not keep their measures
+        page.wide.set(true);
+        let _ = crate::stats::take();
+        let wide = runtime.display_frame(&page, size);
+        let stats = crate::stats::take();
+        assert!(stats.measures_made >= 1, "the boundaries above the leaf were measured again: {stats:?}");
+        assert_ne!(wide.as_slice(), narrow.as_slice(), "the wider label moved the bar beside it");
+
+        // the bar sits right of the label: it moved by the label's growth
+        let bar_x = |display: &crate::layout::DisplayList| {
+            display
+                .as_slice()
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { origin, content, .. }
+                        if &**content == "|" =>
+                    {
+                        Some(origin.x)
+                    }
+                    _ => None,
+                })
+                .expect("the bar is drawn")
+        };
+        assert!(bar_x(&wide) > bar_x(&narrow) + 50.0, "{} vs {}", bar_x(&wide), bar_x(&narrow));
+        crate::paranoid::release();
+    }
+
+    #[test]
+    fn a_box_that_measures_itself_is_asked_every_frame() {
+        use std::cell::Cell;
+
+        // an app box can answer its measure from anything — a document
+        // that grew. Nothing above such a box is kept, unless the box says
+        // its answer depends on the question alone.
+        struct Growing {
+            height: Rc<Cell<f64>>,
+            asked: Rc<Cell<u32>>,
+            stable: bool,
+        }
+        impl CustomElement for Growing {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn measure(&self, proposal: Proposal, _metrics: &Metrics) -> Size {
+                self.asked.set(self.asked.get() + 1);
+                Size { width: proposal.width.unwrap_or(0.0), height: self.height.get() }
+            }
+            fn stable_measure(&self) -> bool {
+                self.stable
+            }
+        }
+
+        #[derive(Clone)]
+        struct Holder {
+            height: Rc<Cell<f64>>,
+            asked: Rc<Cell<u32>>,
+            stable: bool,
+        }
+        impl Component for Holder {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    custom(Growing {
+                        height: Rc::clone(&self.height),
+                        asked: Rc::clone(&self.asked),
+                        stable: self.stable,
+                    }),
+                    text("below"),
+                )
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 400.0 };
+        for stable in [false, true] {
+            let holder = Holder {
+                height: Rc::new(Cell::new(40.0)),
+                asked: Rc::new(Cell::new(0)),
+                stable,
+            };
+            let runtime = Runtime::scene("w0");
+            let first = runtime.display_frame(&holder, size);
+            let asked = holder.asked.get();
+            if stable {
+                // it promised its answer hangs on the question alone, and
+                // it keeps the promise: it is not asked again
+                let second = runtime.display_frame(&holder, size);
+                // (the paranoid check measures again on purpose: it is the
+                // one reader allowed to ask twice)
+                if !crate::paranoid::on(crate::paranoid::MEMO) {
+                    assert_eq!(holder.asked.get(), asked, "a stable box is not asked again");
+                }
+                assert_eq!(second.as_slice(), first.as_slice());
+            } else {
+                // the document grows with NO state write
+                holder.height.set(120.0);
+                let second = runtime.display_frame(&holder, size);
+                assert!(holder.asked.get() > asked, "its own measure: asked on every frame");
+                assert_ne!(second.as_slice(), first.as_slice(), "the label below moved down");
+            }
+        }
+    }
+
+    #[test]
     fn a_runtime_handed_another_root_forgets_the_old_boundary() {
         #[derive(Clone, Copy)]
         struct First;

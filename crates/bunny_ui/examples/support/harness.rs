@@ -133,6 +133,8 @@ fn add(total: &mut FrameStats, frame: &FrameStats) {
     total.assemblies += frame.assemblies;
     total.hover_relayouts += frame.hover_relayouts;
     total.paints += frame.paints;
+    total.measures_kept += frame.measures_kept;
+    total.measures_made += frame.measures_made;
     for (sum, part) in total.stage_ms.iter_mut().zip(frame.stage_ms) {
         *sum += part;
     }
@@ -165,7 +167,7 @@ pub fn print_reports(title: &str, reports: &[Report]) {
 pub fn print_stages(title: &str, rows: &[StageRow]) {
     println!("\n{title}");
     println!(
-        "{:<30} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} | {:>6} {:>7} {:>5} {:>6} {:>6}",
+        "{:<30} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} | {:>6} {:>7} {:>5} {:>6} {:>6} {:>6} {:>6}",
         "per frame, ms",
         "settle",
         "layout",
@@ -179,14 +181,16 @@ pub fn print_stages(title: &str, rows: &[StageRow]) {
         "asm#",
         "hover#",
         "paints",
+        "kept",
+        "made",
     );
-    println!("{}", "─".repeat(128));
+    println!("{}", "─".repeat(142));
     for row in rows {
         let frames = f64::from(row.frames);
         let ms = |stage: Stage| row.stats.ms(stage) / frames;
         let count = |total: u32| f64::from(total) / frames;
         println!(
-            "{:<30} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3} | {:>6.1} {:>7.1} {:>5.1} {:>6.1} {:>6.1}",
+            "{:<30} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3} | {:>6.1} {:>7.1} {:>5.1} {:>6.1} {:>6.1} {:>6.1} {:>6.1}",
             row.label,
             ms(Stage::Settle),
             ms(Stage::Layout),
@@ -200,8 +204,11 @@ pub fn print_stages(title: &str, rows: &[StageRow]) {
             count(row.stats.assemblies),
             count(row.stats.hover_relayouts),
             count(row.stats.paints),
+            count(row.stats.measures_kept),
+            count(row.stats.measures_made),
         );
     }
     println!("pass is inside settle or layout; asm is inside pass; measure and place are inside layout;");
     println!("hover holds its own second layout. Do not add the nested columns.");
+    println!("kept / made: retained boundaries whose measure was answered from a kept one / measured.");
 }

@@ -117,6 +117,12 @@ pub(crate) struct Entry {
     /// The body's layout tree — retained along with the print (the two
     /// outputs of the same body-eval).
     pub layout: LayoutNode,
+    /// The measures of that tree that were kept: the question, and the
+    /// size and fit it answered. A few, because one tree is asked a few
+    /// questions in a frame (a stack measures a flexible child twice).
+    /// The entry is replaced when its body re-runs, and the list with
+    /// it; a body that re-runs BELOW clears it ([`finish_entry`]).
+    pub measures_kept: RefCell<Vec<KeptMeasure>>,
     pub effects: Vec<EffectFn>,
     /// The body's interactive actions — retained like the effects: a
     /// skipped view's button stays clickable.
@@ -192,6 +198,82 @@ thread_local! {
     static PASS: RefCell<PassState> = RefCell::new(PassState::default());
     static LAST_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static FRAME_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// One kept answer of a retained tree's measure.
+pub(crate) struct KeptMeasure {
+    key: crate::layout::MeasureKey,
+    size: crate::layout::Size,
+    fit: Rc<crate::layout::Fit>,
+}
+
+/// How many questions one tree keeps the answer to.
+const KEPT_MEASURES: usize = 4;
+
+/// The measure of a retained boundary, kept from frame to frame.
+///
+/// `measure` runs on a miss, and its answer is kept — unless something
+/// inside said it is not a function of the key (the poison count moved).
+pub(crate) fn measure_retained(
+    path: &str,
+    key: crate::layout::MeasureKey,
+    measure: impl FnOnce(&LayoutNode) -> (crate::layout::Size, crate::layout::Fit),
+) -> (crate::layout::Size, crate::layout::Fit) {
+    use crate::layout::Fit;
+
+    RETAINED.with(|retained| {
+        let retained = retained.borrow();
+        let Some(entry) = retained.get(path) else {
+            debug_assert!(false, "layout reference without retention: {path}");
+            return (crate::layout::Size::default(), Fit::Leaf);
+        };
+        let kept = entry
+            .measures_kept
+            .borrow()
+            .iter()
+            .find(|kept| kept.key == key)
+            .map(|kept| (kept.size, Rc::clone(&kept.fit)));
+        if let Some((size, fit)) = kept {
+            crate::stats::note_measure_kept(true);
+            if crate::paranoid::on(crate::paranoid::MEMO) {
+                let (fresh_size, fresh_fit) = measure(&entry.layout);
+                assert!(
+                    fresh_size == size && fresh_fit.same_as(&fit),
+                    "a kept measure of `{path}` is stale: kept {size:?}, fresh {fresh_size:?}"
+                );
+            }
+            return (size, Fit::Shared(fit));
+        }
+        crate::stats::note_measure_kept(false);
+        let poison = crate::layout::measure_poison();
+        let (size, fit) = measure(&entry.layout);
+        if crate::layout::measure_poison() != poison {
+            // something below answers by its own rules: ask again next frame
+            return (size, fit);
+        }
+        let fit = Rc::new(fit);
+        let mut kept = entry.measures_kept.borrow_mut();
+        if kept.len() == KEPT_MEASURES {
+            kept.remove(0);
+        }
+        kept.push(KeptMeasure { key, size, fit: Rc::clone(&fit) });
+        (size, Fit::Shared(fit))
+    })
+}
+
+/// A body re-ran at `path`: the boundaries above it may size themselves
+/// by it, so what they kept is stale. Ancestors are prefixes of the path
+/// at a `/`. An id can hold a `/` of its own, so a prefix may name no
+/// entry — and then there is nothing to clear.
+fn clear_measures_above(path: &str) {
+    RETAINED.with(|retained| {
+        let retained = retained.borrow();
+        for (at, _) in path.match_indices('/') {
+            if let Some(entry) = retained.get(&path[..at]) {
+                entry.measures_kept.borrow_mut().clear();
+            }
+        }
+    });
 }
 
 /// A boundary's retained layout tree, borrowed in place — measure and
@@ -324,6 +406,7 @@ pub(crate) fn finish_entry(
                 ctx,
                 node,
                 layout,
+                measures_kept: RefCell::new(Vec::new()),
                 effects,
                 actions,
                 editors,
@@ -341,6 +424,13 @@ pub(crate) fn finish_entry(
     // a body ran and its registrations are new closures: the tables
     // built from the old entry are stale
     bump_retention();
+    // …and so is every measure kept ABOVE it. The outermost re-run of a
+    // pass does this once: the boundaries between it and the ones it
+    // re-ran below are new entries themselves.
+    let outermost = PASS.with(|pass| pass.borrow().building.is_empty());
+    if outermost {
+        clear_measures_above(path);
+    }
 }
 
 /// An effect registered during render: goes to the entry being built,

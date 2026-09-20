@@ -76,6 +76,10 @@ pub struct FrameStats {
     pub hover_relayouts: u32,
     /// Calls to an app box's `paint`.
     pub paints: u32,
+    /// Retained boundaries whose measure was answered from what was kept.
+    pub measures_kept: u32,
+    /// Retained boundaries that were measured.
+    pub measures_made: u32,
     /// Milliseconds per [`Stage`], all zero without a clock.
     pub stage_ms: [f64; STAGES],
 }
@@ -101,6 +105,8 @@ thread_local! {
     static ASSEMBLIES: Cell<u32> = const { Cell::new(0) };
     static HOVER_RELAYOUTS: Cell<u32> = const { Cell::new(0) };
     static PAINTS: Cell<u32> = const { Cell::new(0) };
+    static MEASURES_KEPT: Cell<u32> = const { Cell::new(0) };
+    static MEASURES_MADE: Cell<u32> = const { Cell::new(0) };
     static STAGE_MS: Cell<[f64; STAGES]> = const { Cell::new([0.0; STAGES]) };
     static CLOCK: Cell<Option<fn() -> f64>> = const { Cell::new(None) };
 }
@@ -129,6 +135,8 @@ pub fn take() -> FrameStats {
         assemblies: ASSEMBLIES.with(|c| c.replace(0)),
         hover_relayouts: HOVER_RELAYOUTS.with(|c| c.replace(0)),
         paints: PAINTS.with(|c| c.replace(0)),
+        measures_kept: MEASURES_KEPT.with(|c| c.replace(0)),
+        measures_made: MEASURES_MADE.with(|c| c.replace(0)),
         stage_ms: STAGE_MS.with(|c| c.replace([0.0; STAGES])),
     }
 }
@@ -205,6 +213,15 @@ pub(crate) fn note_hover_relayout() {
 #[inline]
 pub(crate) fn note_paint() {
     bump(&PAINTS, 1);
+}
+
+#[inline]
+pub(crate) fn note_measure_kept(kept: bool) {
+    if kept {
+        bump(&MEASURES_KEPT, 1);
+    } else {
+        bump(&MEASURES_MADE, 1);
+    }
 }
 
 #[inline]

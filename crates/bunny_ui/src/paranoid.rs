@@ -24,8 +24,11 @@ pub(crate) const SETTLE: u32 = 1 << 1;
 /// The second layout the pointer re-read skips when no box paints the
 /// hover that moved.
 pub(crate) const HOVER: u32 = 1 << 2;
+/// The measure of a retained boundary that is answered from what was kept.
+pub(crate) const MEMO: u32 = 1 << 3;
 
-const NAMES: [(&str, u32); 3] = [("assemble", ASSEMBLE), ("settle", SETTLE), ("hover", HOVER)];
+const NAMES: [(&str, u32); 4] =
+    [("assemble", ASSEMBLE), ("settle", SETTLE), ("hover", HOVER), ("memo", MEMO)];
 
 thread_local! {
     /// A test's own switch, over the environment's.
@@ -50,7 +53,7 @@ fn from_environment() -> u32 {
                     .map(|(_, flag)| *flag)
                     .unwrap_or_else(|| {
                         // a name nobody knows would check nothing, in silence
-                        panic!("BUNNY_PARANOID: `{name}` is not a check (known: all, assemble, settle, hover)")
+                        panic!("BUNNY_PARANOID: `{name}` is not a check (known: all, assemble, settle, hover, memo)")
                     }),
             })
             .fold(0, |flags, flag| flags | flag)

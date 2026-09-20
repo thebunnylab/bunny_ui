@@ -892,8 +892,9 @@ pub enum Rendering {
 }
 
 /// The handoff between the phases — the structural mirror of the
-/// [`LayoutNode`], consumed by value: no placing without measuring, and
-/// never twice.
+/// [`LayoutNode`]: no placing without measuring, and no measuring twice.
+/// Placement reads it; it does not consume it, so a boundary's fit can be
+/// kept from one frame to the next ([`Fit::Shared`]).
 #[derive(Debug)]
 pub enum Fit {
     Leaf,
@@ -912,6 +913,80 @@ pub enum Fit {
     Wrapped(Size, Box<Fit>),
     /// The real content size (it can exceed the frame — that is what scrolls).
     ScrollContent(Size, Box<Fit>),
+    /// A retained boundary's KEPT fit: measured on an earlier frame for
+    /// the same question, and handed back whole. Transparent everywhere —
+    /// [`Fit::unshared`] is what a reader looks through.
+    Shared(Rc<Fit>),
+}
+
+impl Fit {
+    /// The fit itself, through any number of [`Fit::Shared`] handles.
+    pub(crate) fn unshared(&self) -> &Fit {
+        let mut fit = self;
+        while let Fit::Shared(inner) = fit {
+            fit = inner;
+        }
+        fit
+    }
+
+    /// Structural equality, looking through shared handles on both sides.
+    /// The paranoid check of the measure memo asks it.
+    pub(crate) fn same_as(&self, other: &Fit) -> bool {
+        let pairs = |a: &[(Size, Fit)], b: &[(Size, Fit)]| {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|((sa, fa), (sb, fb))| sa == sb && fa.same_as(fb))
+        };
+        match (self.unshared(), other.unshared()) {
+            (Fit::Leaf, Fit::Leaf) => true,
+            (Fit::Children(a), Fit::Children(b)) => pairs(a, b),
+            (
+                Fit::Virtual { row_extent: ra, children: ca, offsets: oa },
+                Fit::Virtual { row_extent: rb, children: cb, offsets: ob },
+            ) => {
+                ra == rb
+                    && oa == ob
+                    && ca.len() == cb.len()
+                    && ca.iter().zip(cb).all(|((ia, sa, fa), (ib, sb, fb))| {
+                        ia == ib && sa == sb && fa.same_as(fb)
+                    })
+            }
+            (Fit::Wrapped(sa, fa), Fit::Wrapped(sb, fb))
+            | (Fit::ScrollContent(sa, fa), Fit::ScrollContent(sb, fb)) => {
+                sa == sb && fa.same_as(fb)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Everything a measure reads that is not the tree itself: the question
+/// (the proposal) and the inherited text settings. Two measures of one
+/// retained tree under the same key answer the same size — unless the
+/// tree holds a node whose measure is not a function of these, and such
+/// a node says so ([`poison_measure`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct MeasureKey {
+    pub proposal: Proposal,
+    pub font: FontSpec,
+    pub line_height: Option<Px>,
+}
+
+thread_local! {
+    /// Counts the measures that are NOT a function of the [`MeasureKey`]:
+    /// an app box with a measure of its own, an image whose size is not
+    /// known yet, a virtual run that asks the app for its row heights.
+    static MEASURE_POISON: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// This measure may answer differently next frame with the same key: no
+/// boundary above it keeps its fit.
+fn poison_measure() {
+    MEASURE_POISON.with(|count| count.set(count.get().wrapping_add(1)));
+}
+
+/// The poison count — a boundary reads it before and after it measures.
+pub(crate) fn measure_poison() -> u64 {
+    MEASURE_POISON.with(std::cell::Cell::get)
 }
 
 /// RGBA color, no drama. Real styling arrives with the visual modifiers;
@@ -3725,6 +3800,12 @@ impl LayoutNode {
             // the escape hatch measures itself, with the frame's text
             // metrics in hand
             LayoutNode::Custom { element, .. } => {
+                // the app's own measure can read anything — a document
+                // that grew, a state it writes. It is kept only when the
+                // box says its answer depends on the question alone.
+                if !element.element().stable_measure() {
+                    poison_measure();
+                }
                 let metrics = crate::custom::Metrics::new(env.text, env.cache, env.font);
                 (element.element().measure(proposal, &metrics), Fit::Leaf)
             }
@@ -3745,7 +3826,13 @@ impl LayoutNode {
                     // the print-parity stub keeps the old rigid box
                     None => Size { width: 40.0, height: 40.0 },
                     Some(source) => {
-                        image_size(intrinsic_of(&*env.images, source), *resizable, *fit, proposal)
+                        let intrinsic = intrinsic_of(&*env.images, source);
+                        // a size that is not known yet arrives later, with
+                        // no state write to announce it
+                        if intrinsic.is_none() {
+                            poison_measure();
+                        }
+                        image_size(intrinsic, *resizable, *fit, proposal)
                     }
                 };
                 (size, Fit::Leaf)
@@ -3836,6 +3923,8 @@ impl LayoutNode {
                     // offsets are prefix sums, the total is honest to
                     // every row that does not exist
                     Some(heights) => {
+                        // the app answers each row's height: not ours to keep
+                        poison_measure();
                         let mut offsets = Vec::with_capacity(*count + 1);
                         let mut total: Px = 0.0;
                         offsets.push(0.0);
@@ -4136,20 +4225,22 @@ impl LayoutNode {
             // skipped boundary: measures the RETAINED tree in its place —
             // no copy stitched anywhere (the frame's layout reads the
             // retention)
+            //
+            // …and the answer is KEPT with the entry. A boundary that did
+            // not re-run holds the same tree, so the same question has
+            // the same answer; a wheel, a hover, a blink and a tick ask
+            // the same question every frame. A body that re-runs makes a
+            // new entry (no kept answer), and clears the answers of the
+            // boundaries above it, whose size may hang on its own.
             LayoutNode::BoundaryRef { path } => {
-                crate::reconciler::with_retained_layout(path, |layout| match layout {
-                    Some(node) => node.measure(proposal, env),
-                    None => {
-                        debug_assert!(false, "layout reference without retention: {path}");
-                        (Size::default(), Fit::Leaf)
-                    }
-                })
+                let key = MeasureKey { proposal, font: env.font, line_height: env.line_height };
+                crate::reconciler::measure_retained(path, key, |node| node.measure(proposal, env))
             }
         }
     }
 
     pub(crate) fn place(&self, frame: Rect, fit: &Fit, env: LayoutEnv, out: &mut Placement) {
-        match (self, fit) {
+        match (self, fit.unshared()) {
             // visual leaves: the draw list is born here
             (LayoutNode::Text { content, highlights, truncation }, Fit::Leaf) => {
                 let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
@@ -5148,7 +5239,7 @@ impl LayoutNode {
                 out.anchors.push(content_origin);
                 // a virtual child reports misses against THIS region,
                 // and its measured geometry is snapshot material
-                let (row_extent, row_offsets) = match fit.as_ref() {
+                let (row_extent, row_offsets) = match fit.unshared() {
                     Fit::Virtual { row_extent, offsets, .. } => {
                         (Some(*row_extent), offsets.clone())
                     }
