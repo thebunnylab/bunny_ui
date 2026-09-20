@@ -45,6 +45,7 @@ use std::rc::Rc;
 
 use bunny_ui::layout::{Color, Size};
 use bunny_ui::action::KeyMatch;
+use bunny_ui::pacing::{Beat, FramePacer, Urgency, Verdict};
 use bunny_ui::prelude::*;
 #[cfg(feature = "canvas")]
 use bunny_ui::raster::Surface;
@@ -268,6 +269,11 @@ fn note_presented() {
     FRAMES_PRESENTED.with(|count| count.set(count.get().saturating_add(1)));
 }
 
+/// Who asked the pacer for a frame — small numbers, for a tape to name.
+const ORIGIN_POINTER: u8 = 1;
+const ORIGIN_WHEEL: u8 = 2;
+const ORIGIN_WAKE: u8 = 3;
+
 /// What the exports feed the shell — the web twin of the mac AppEvent.
 enum Event {
     PointerMove { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
@@ -416,11 +422,23 @@ pub fn start_with(
     // allocates the CPU bitmap at all
     let mut surface: Option<(Surface, usize, Color)> = None;
 
+    // WHEN the frame an event asked for is drawn ([`bunny_ui::pacing`]). A
+    // page hears as many wheel and pointer events as the device sends, and
+    // several can land between two animation frames: drawn in the handler,
+    // each one was a whole settle, layout and raster of a picture the next
+    // one replaced before the display showed it. The glue's ONE
+    // `requestAnimationFrame` is the display's beat here.
+    let pacer = FramePacer::new();
+    // Did this turn draw? `present` raises it; the turn's end tells the pacer.
+    let drew = Rc::new(std::cell::Cell::new(false));
+    let drawn = Rc::clone(&drew);
+
     let present = move |runtime: &Runtime,
                             root: &dyn Fn(&Runtime, Size) -> bunny_ui::layout::DisplayList,
                             size: Size,
                             scale: usize,
                             surface: &mut Option<(Surface, usize, Color)>| {
+        drawn.set(true);
         let canvas = bunny_ui::theme::canvas();
         let physical =
             ((size.width.round() as usize) * scale, (size.height.round() as usize) * scale);
@@ -475,8 +493,14 @@ pub fn start_with(
         let tick =
             |runtime: &Runtime, size: Size| runtime.animation_frame(&root, size);
         match event {
+            // A move and a wheel can WAIT for the beat: cold, the first one
+            // draws at once; warm, the beat draws ONE frame for every one
+            // since the last. A key, a press and a release cannot — they
+            // draw before the handler returns, as they always did.
             Event::PointerMove { x, y, modifiers } => {
-                if runtime.pointer_moved(x, y, modifiers) {
+                if runtime.pointer_moved(x, y, modifiers)
+                    && pacer.ask(ORIGIN_POINTER, Urgency::Soon, false) == Verdict::Draw
+                {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
                 point_cursor(&runtime);
@@ -494,7 +518,9 @@ pub fn start_with(
                 // browser deltas are the OPPOSITE of the engine's
                 // convention (positive reveals content above) — the
                 // sign flips here, once
-                if runtime.wheel(x, y, -dx, -dy) {
+                if runtime.wheel(x, y, -dx, -dy)
+                    && pacer.ask(ORIGIN_WHEEL, Urgency::Soon, false) == Verdict::Draw
+                {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
@@ -517,10 +543,15 @@ pub fn start_with(
                 }
             }
             Event::Frame { dt } => {
-                if runtime.tick(dt).any() {
+                // The beat is also where the events that could wait are
+                // drawn: ONE settled frame for every wheel, move and wake
+                // since the last beat. It carries the tick too, so the
+                // springs lose nothing.
+                let moved = runtime.tick(dt);
+                if pacer.beat(false) == Beat::Draw {
+                    present(&runtime, &full, size, scale, &mut surface);
+                } else if moved.any() {
                     present(&runtime, &tick, size, scale, &mut surface);
-                } else if runtime.wants_frame() {
-                    unsafe { js_request_frame() };
                 }
             }
             Event::Resize { width, height, scale: ratio } => {
@@ -551,11 +582,26 @@ pub fn start_with(
                     unsafe { js_request_frame() };
                 }
             }
-            Event::ImageReady | Event::Wake => {
-                // the layout reflows around the fresh intrinsic size
-                // (or around what a task just wrote) and the paint asks
-                // the engine again — one full frame, settle included
+            Event::ImageReady => {
+                // the layout reflows around the fresh intrinsic size and
+                // the paint asks the engine again — one full frame, settle
+                // included
                 present(&runtime, &full, size, scale, &mut surface);
+            }
+            Event::Wake => {
+                // The work always lands: the tasks are polled. The FRAME is
+                // for a turn that changed something. Most wakes change
+                // nothing — a poll that found no news, a sleeper that went
+                // back to sleep — and a page with a few of those mounted
+                // drew whole frames of what was already on screen. A turn
+                // that did change something folds into the beat like a
+                // wheel does: a stream of results is one frame a beat.
+                runtime.poll_tasks();
+                if runtime.needs_frame()
+                    && pacer.ask(ORIGIN_WAKE, Urgency::Soon, false) == Verdict::Draw
+                {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
             }
             // Dom-mode traffic — this shell rasterizes, nothing to do
             Event::DomScroll { .. }
@@ -565,6 +611,20 @@ pub fn start_with(
             | Event::Action { .. }
             | Event::Field { .. } => {}
         }
+        // A frame went up, whoever asked: the asks it carried are served.
+        if drew.replace(false) {
+            pacer.drew();
+        }
+        // The beat runs while a spring, a sleeper or a warm period wants it.
+        // `present` re-arms it for the first two; a turn that did not draw —
+        // an event that waits, a wake with no news — still has to, and the
+        // pacer hears whether a beat is coming at all: while one is, an
+        // event that can wait is never drawn cold.
+        let beating = pacer.warm() || runtime.wants_frame();
+        if beating {
+            unsafe { js_request_frame() };
+        }
+        pacer.set_beating(beating);
     });
     SHELL.with(|slot| {
         *slot.borrow_mut() = Some(Shell { handle });
