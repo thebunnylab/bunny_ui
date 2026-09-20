@@ -2828,7 +2828,7 @@ pub fn layout_with_insets(
     };
     let mut out = Placement::default();
     out.safe = (insets != Edges::ZERO).then_some(SafeFrame { window, safe });
-    crate::stats::time(crate::stats::Stage::Place, || root.place(safe, fit, env, &mut out));
+    crate::stats::time(crate::stats::Stage::Place, || root.place(safe, &fit, env, &mut out));
     // popovers place AFTER the root: painted on top, hit first, free
     // of every scroll clip. Their default container is the WINDOW's
     // safe rect (the proposal), never the root's answer — a small scene
@@ -2874,7 +2874,7 @@ pub fn layout_dom(
         skip_display: !collect_display,
         ..Placement::default()
     };
-    root.place(Rect { origin: Point::default(), size }, fit, env, &mut out);
+    root.place(Rect { origin: Point::default(), size }, &fit, env, &mut out);
     // the capture is still open at the root here, so every popover
     // mounts as the root's LAST child — outside every scroll element,
     // stacked on top by document order: the portal, by construction
@@ -3339,7 +3339,7 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
             },
         };
         let start = out.display.len();
-        queued.node.place(frame, fit, env, out);
+        queued.node.place(frame, &fit, env, out);
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: queued.path,
@@ -3370,7 +3370,7 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
         );
         let frame = menu_frame(open.at, size, container);
         let start = out.display.len();
-        node.place(frame, fit, env, out);
+        node.place(frame, &fit, env, out);
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: MENU_PATH.to_string(),
@@ -3409,7 +3409,7 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
             size,
         };
         let start = out.display.len();
-        node.place(frame, fit, env, out);
+        node.place(frame, &fit, env, out);
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: DRAG_LABEL_PATH.to_string(),
@@ -3431,7 +3431,7 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
         let (size, fit) = node.measure(proposal, env);
         let frame = anchored_frame(anchor, side, size, container);
         let start = out.display.len();
-        node.place(frame, fit, env, out);
+        node.place(frame, &fit, env, out);
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: TOOLTIP_PATH.to_string(),
@@ -4148,7 +4148,7 @@ impl LayoutNode {
         }
     }
 
-    pub(crate) fn place(&self, frame: Rect, fit: Fit, env: LayoutEnv, out: &mut Placement) {
+    pub(crate) fn place(&self, frame: Rect, fit: &Fit, env: LayoutEnv, out: &mut Placement) {
         match (self, fit) {
             // visual leaves: the draw list is born here
             (LayoutNode::Text { content, highlights, truncation }, Fit::Leaf) => {
@@ -4649,7 +4649,7 @@ impl LayoutNode {
             }
 
             (LayoutNode::Sheet { path, content, child, surface }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 // the line the modal draws: everything recorded from
                 // here on is ABOVE it, and the walk back stops at the
                 // mark instead of reaching under it
@@ -4673,7 +4673,7 @@ impl LayoutNode {
             }
 
             (LayoutNode::Anchored { path, side, overlay, child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 // the REAL anchor: un-shift the in-flight animation
                 // (the popover never chases a sliding row — the same
                 // contract as the retained boundary frames)
@@ -4699,36 +4699,36 @@ impl LayoutNode {
             }
 
             (LayoutNode::Hinted { child, .. }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
             }
 
             (LayoutNode::BoundaryHint { .. }, Fit::Leaf) => {}
 
             (LayoutNode::ExactLayout { child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
             }
 
             (LayoutNode::IgnoresSafeArea { child }, Fit::Wrapped(_, fit)) => {
                 let Some(safe) = out.safe else {
                     // no inset anywhere: the node is glass
-                    child.place(frame, *fit, env, out);
+                    child.place(frame, fit, env, out);
                     return;
                 };
                 let grown = safe.reclaim(frame);
                 if grown == frame {
-                    child.place(frame, *fit, env, out);
+                    child.place(frame, fit, env, out);
                     return;
                 }
                 // the child is measured once more, at the size it
                 // reclaimed; nothing below it reclaims again
                 let (_, fit) = child.measure(Proposal::exact(grown.size), env);
                 let kept = out.safe.take();
-                child.place(grown, fit, env, out);
+                child.place(grown, &fit, env, out);
                 out.safe = kept;
             }
 
             (LayoutNode::DragRegion { child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 // clipped like a hit: what is not visible cannot drag
                 let region = match out.current_clip() {
                     Some(clip) => frame.intersection(clip),
@@ -4740,7 +4740,7 @@ impl LayoutNode {
             }
 
             (LayoutNode::ControlRegion { control, child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 // clipped like a hit: what is not visible is no button
                 let region = match out.current_clip() {
                     Some(clip) => frame.intersection(clip),
@@ -4766,7 +4766,7 @@ impl LayoutNode {
                 if let Some(rect) = clip_of(out, frame) {
                     out.tooltips.push(TooltipRegion { text: text.clone(), side: *side, rect });
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
             }
 
             (LayoutNode::ContextSource { items, on_click, child }, Fit::Wrapped(_, fit)) => {
@@ -4778,7 +4778,7 @@ impl LayoutNode {
                         on_click: on_click.clone(),
                     });
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
             }
 
             (LayoutNode::DragSource { payload, child }, Fit::Wrapped(_, fit)) => {
@@ -4787,7 +4787,7 @@ impl LayoutNode {
                 if let Some(rect) = clip_of(out, frame) {
                     out.drag_sources.push(DragSourceRegion { payload: payload.clone(), rect });
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
             }
 
             (LayoutNode::DropTarget { accepts, action, over, child }, Fit::Wrapped(_, fit)) => {
@@ -4806,7 +4806,7 @@ impl LayoutNode {
                         frame,
                     });
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 // the RING is paint, and paint runs the other way: it
                 // has to cover the child in the draw list and be the
                 // later sibling in the element tree. Routing order and
@@ -5020,9 +5020,8 @@ impl LayoutNode {
             }
 
             (LayoutNode::Overlay { at, behind, layer, child }, Fit::Children(fits)) => {
-                let mut fits = fits;
-                let (base_size, base_fit) = fits.remove(0);
-                let (layer_size, layer_fit) = fits.remove(0);
+                let (base_size, base_fit) = (fits[0].0, &fits[0].1);
+                let (layer_size, layer_fit) = (fits[1].0, &fits[1].1);
                 // a layer that FILLED the measured box follows the real
                 // frame instead: the parent may have handed the base
                 // more room than it asked for, and a rule that crossed
@@ -5085,7 +5084,7 @@ impl LayoutNode {
                         y: frame.origin.y
                             + align_offset(frame.size.height, size.height, CrossAlign::Center),
                     };
-                    child.place(Rect { origin, size }, fit, env, out);
+                    child.place(Rect { origin, size: *size }, fit, env, out);
                 }
             }
 
@@ -5094,7 +5093,7 @@ impl LayoutNode {
                     x: frame.origin.x + edges.leading,
                     y: frame.origin.y + edges.top,
                 };
-                child.place(Rect { origin, size: child_size }, *fit, env, out);
+                child.place(Rect { origin, size: *child_size }, fit, env, out);
             }
 
             (LayoutNode::Frame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
@@ -5104,13 +5103,13 @@ impl LayoutNode {
                     y: frame.origin.y
                         + align_offset(frame.size.height, child_size.height, CrossAlign::Center),
                 };
-                child.place(Rect { origin, size: child_size }, *fit, env, out);
+                child.place(Rect { origin, size: *child_size }, fit, env, out);
             }
 
             (LayoutNode::Hug { child, .. }, Fit::Wrapped(_, fit)) => {
                 // The frame, never the child's measured size: a region placed
                 // smaller than what it measured is exactly what travels.
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
             }
 
             (LayoutNode::MaxFrame { align, child, .. }, Fit::Wrapped(child_size, fit))
@@ -5119,7 +5118,7 @@ impl LayoutNode {
                     + align_offset(frame.size.width, child_size.width, *align);
                 let y = frame.origin.y
                     + align_offset(frame.size.height, child_size.height, CrossAlign::Center);
-                child.place(Rect { origin: Point { x, y }, size: child_size }, *fit, env, out);
+                child.place(Rect { origin: Point { x, y }, size: *child_size }, fit, env, out);
             }
 
             (
@@ -5165,7 +5164,7 @@ impl LayoutNode {
                     out.scrolls.push(ScrollRegion {
                         path: path.clone(),
                         frame,
-                        content,
+                        content: *content,
                         target: target.clone(),
                         commanded: *commanded,
                         // a region inside an animation scope reveals its
@@ -5195,13 +5194,13 @@ impl LayoutNode {
                     );
                     dom.open(
                         crate::dom::DomKind::Content,
-                        Rect { origin: frame.origin, size: content },
+                        Rect { origin: frame.origin, size: *content },
                         content_origin,
                     );
                 }
                 child.place(
-                    Rect { origin: content_origin, size: content },
-                    *fit,
+                    Rect { origin: content_origin, size: *content },
+                    fit,
                     env,
                     out,
                 );
@@ -5351,7 +5350,7 @@ impl LayoutNode {
                 if props.clip {
                     out.push_clip(frame, props.corner_radius.unwrap_or_default());
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 if props.clip {
                     out.pop_clip();
                 }
@@ -5390,7 +5389,7 @@ impl LayoutNode {
             (LayoutNode::Animated { key, spec, child }, Fit::Wrapped(_, fit)) => {
                 // a keyless scope (built outside a pass) stays inert
                 let Some(key) = key else {
-                    child.place(frame, *fit, env, out);
+                    child.place(frame, fit, env, out);
                     return;
                 };
                 // the node flies its OWN origin, anchored to the scroll
@@ -5426,7 +5425,7 @@ impl LayoutNode {
                 }
                 child.place(
                     Rect { origin: painted, size: frame.size },
-                    *fit,
+                    fit,
                     env,
                     out,
                 );
@@ -5439,7 +5438,7 @@ impl LayoutNode {
                 // the clock opens for the subtree: the custom boxes
                 // below resolve their phase against it at paint time
                 let env = LayoutEnv { live: Some(*spec), ..env };
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
             }
 
             (LayoutNode::Island { child, .. }, Fit::Wrapped(_, fit)) => {
@@ -5453,13 +5452,13 @@ impl LayoutNode {
                     if let Some(dom) = out.dom.as_mut() {
                         dom.open_canvas(frame, start);
                     }
-                    child.place(frame, *fit, env, out);
+                    child.place(frame, fit, env, out);
                     let end = out.display.len();
                     if let Some(dom) = out.dom.as_mut() {
                         dom.close_canvas(end);
                     }
                 } else {
-                    child.place(frame, *fit, env, out);
+                    child.place(frame, fit, env, out);
                 }
             }
 
@@ -5485,7 +5484,7 @@ impl LayoutNode {
                     // an ancestor is the one thing a selector can name
                     dom.open_group(group_key(path), frame);
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 if let Some(dom) = out.dom.as_mut() {
                     dom.close_group();
                 }
@@ -5522,7 +5521,7 @@ impl LayoutNode {
                     // clicks with it and scopes `:hover` to the element
                     dom.arm_interactive(path);
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 if let Some(dom) = out.dom.as_mut() {
                     dom.disarm();
                 }
@@ -5542,13 +5541,13 @@ impl LayoutNode {
                 };
                 let mut materialized: Vec<usize> = Vec::with_capacity(fits.len());
                 for ((index, child), (fit_index, size, fit)) in children.iter().zip(fits) {
-                    debug_assert_eq!(*index, fit_index, "window and fit walk in step");
+                    debug_assert_eq!(*index, *fit_index, "window and fit walk in step");
                     materialized.push(*index);
                     let origin = Point {
                         x: frame.origin.x,
                         y: frame.origin.y + start_of(*index),
                     };
-                    child.place(Rect { origin, size }, fit, env, out);
+                    child.place(Rect { origin, size: *size }, fit, env, out);
                 }
                 // the window miss, both directions: a VISIBLE row that
                 // does not exist (the wheel outran the buffer), or a
@@ -5559,7 +5558,7 @@ impl LayoutNode {
                 // the 2× slack keeps the two window formulas from ever
                 // arguing (no thrash)
                 let geometry_known =
-                    row_extent > 0.0 || offsets.as_ref().is_some_and(|o| o.len() == count + 1);
+                    *row_extent > 0.0 || offsets.as_ref().is_some_and(|o| o.len() == count + 1);
                 if *count > 0
                     && geometry_known
                     && let Some(clip) = out.current_clip()
@@ -5599,9 +5598,7 @@ impl LayoutNode {
                 // the record is the whole job: the child is placed at
                 // exactly the frame this node was given
                 out.frames.record(path, frame);
-                let mut fits = fits;
-                if !fits.is_empty() {
-                    let (_, fit) = fits.remove(0);
+                if let Some((_, fit)) = fits.first() {
                     child.place(frame, fit, env, out);
                 }
             }
@@ -5636,10 +5633,7 @@ impl LayoutNode {
                 }
                 let env = LayoutEnv { anim: None, ..env };
                 if children.len() == 1 {
-                    let mut fits = fits;
-                    let (size, fit) = fits.remove(0);
-                    let _ = size;
-                    children[0].place(frame, fit, env, out);
+                    children[0].place(frame, &fits[0].1, env, out);
                 } else {
                     place_stack(
                         Axis::Vertical,
@@ -6428,7 +6422,7 @@ fn place_stack(
     align: CrossAlign,
     children: &[LayoutNode],
     frame: Rect,
-    fits: Vec<(Size, Fit)>,
+    fits: &[(Size, Fit)],
     env: LayoutEnv,
     out: &mut Placement,
 ) {
@@ -6445,7 +6439,7 @@ fn place_stack(
         .then(|| {
             children
                 .iter()
-                .zip(&fits)
+                .zip(fits)
                 .map(|(child, (size, _))| {
                     child.first_baseline(env).unwrap_or(size.height)
                 })
@@ -6477,7 +6471,7 @@ fn place_stack(
                 y: frame.origin.y + cross_offset(frame.size.height, size.height),
             },
         };
-        child.place(Rect { origin, size }, fit, env, out);
+        child.place(Rect { origin, size: *size }, fit, env, out);
         cursor += match axis {
             Axis::Vertical => size.height,
             Axis::Horizontal => size.width,
@@ -7587,7 +7581,7 @@ mod tests {
         let mut out = Placement::default();
         tall.place(
             Rect { origin: Point { x: 0.0, y: 0.0 }, size: capped },
-            fit,
+            &fit,
             env(),
             &mut out,
         );

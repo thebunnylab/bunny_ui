@@ -924,7 +924,7 @@ impl Walk<'_> {
         let mut placement = crate::layout::Placement::with_capture(size, self.current_ink());
         subtree.place(
             crate::layout::Rect { origin: Point::default(), size },
-            fit,
+            &fit,
             env,
             &mut placement,
         );
@@ -1007,7 +1007,7 @@ impl Walk<'_> {
         let mut placement = crate::layout::Placement::with_ink(self.current_ink());
         subtree.place(
             crate::layout::Rect { origin: Point::default(), size },
-            fit,
+            &fit,
             env,
             &mut placement,
         );
