@@ -436,6 +436,9 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         event.preventDefault();
         const [x, y] = point(event);
         wasm.bunny_wheel(x, y, event.deltaX, event.deltaY);
+        // the same two beats end the scroll gesture: the region that
+        // took the wheel keeps it until they land
+        armTooltip();
       },
       { passive: false },
     );

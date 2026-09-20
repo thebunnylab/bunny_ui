@@ -1328,6 +1328,48 @@ mod tests {
     }
 
     #[test]
+    fn a_box_that_slides_under_the_pointer_does_not_take_the_wheel() {
+        #[derive(Clone)]
+        struct Page {
+            log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                use crate::ext::ViewExt;
+                let log = self.log;
+                crate::views::scroll(crate::vstack!(
+                    crate::views::text("above").frame(60.0, 100.0),
+                    custom(Recorder { log, takes_wheel: Rc::new(Cell::new(true)) })
+                        .frame(60.0, 100.0),
+                    crate::views::text("below").frame(60.0, 1000.0),
+                ))
+            }
+        }
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let runtime = Runtime::new();
+        let view = Page { log: Rc::clone(&log) };
+        let proposal = Proposal { width: Some(60.0), height: Some(80.0) };
+        runtime.layout(&view, proposal);
+
+        // the page scrolls a box that takes the wheel under the pointer
+        assert!(runtime.wheel(30.0, 40.0, 0.0, -100.0));
+        runtime.layout(&view, proposal);
+        assert!(runtime.wheel(30.0, 40.0, 0.0, -20.0));
+        assert!(log.borrow().is_empty(), "the gesture is the page's: the box hears nothing");
+        assert_eq!(runtime.scroll_offset("Page").y, 120.0);
+
+        // the gesture ends, the page comes back, and the box under the
+        // pointer has the first turn again
+        runtime.wheel_tick();
+        runtime.wheel_tick();
+        runtime.set_scroll_offset("Page", Point { x: 0.0, y: 100.0 });
+        runtime.layout(&view, proposal);
+        assert!(runtime.wheel(30.0, 40.0, 0.0, -20.0));
+        assert!(matches!(log.borrow().last(), Some(ElementEvent::Wheel { .. })));
+        assert_eq!(runtime.scroll_offset("Page").y, 100.0, "the box took it");
+    }
+
+    #[test]
     fn a_free_move_reaches_the_box_unpressed() {
         #[derive(Clone)]
         struct Screen {

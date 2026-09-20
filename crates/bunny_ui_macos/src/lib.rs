@@ -1620,6 +1620,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // the same slow beat ages a sequence in the air: two ticks
             // and `cmd-k` lets the keyboard go
             let chorded = runtime.chord_tick();
+            // and the wheel's latch: two ticks with no wheel end
+            // the scroll gesture
+            runtime.wheel_tick();
             // …but never mid-drag: the resize steps are the only presenter
             // there. A caret blinking in a focused URL bar presented whole
             // frames between two steps and the two geometries composited

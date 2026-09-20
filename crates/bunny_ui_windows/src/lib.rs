@@ -1234,6 +1234,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // the same slow beat ages a sequence in the air: two
                 // ticks and `cmd-k` lets the keyboard go
                 let chorded = runtime.chord_tick();
+                // and the wheel's latch: two ticks with no wheel end
+                // the scroll gesture
+                runtime.wheel_tick();
                 if (blinked || explained || chorded) && !ffi::in_size_move() {
                     // mid-drag the clock yields: the WM_SIZE redraw is
                     // the one presenter
