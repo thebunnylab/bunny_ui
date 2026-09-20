@@ -710,7 +710,7 @@ pub enum LayoutNode {
     },
     /// View boundary (`Component`): records the frame at the identity
     /// path — the address for tests and, later on, for hit-testing.
-    Boundary { path: String, children: Vec<LayoutNode> },
+    Boundary { path: Rc<str>, children: Vec<LayoutNode> },
     /// Interaction target (Button): the frame enters the hit-test list
     /// with the path that indexes the action registered in the
     /// reconciler. Hover and pressed do NOT live here — placement
@@ -2962,12 +2962,19 @@ pub(crate) const MEASURE_SEGMENT: &str = "/#measure";
 /// identity path of the boundaries.
 #[derive(Default, Debug)]
 pub struct Frames {
-    entries: Vec<(String, Rect)>,
+    /// A boundary lends its own name: a frame recorded costs a count, not a
+    /// copy — every boundary of the page records one on every frame.
+    entries: Vec<(Rc<str>, Rect)>,
 }
 
 impl Frames {
-    fn record(&mut self, path: &str, frame: Rect) {
-        self.entries.push((path.to_string(), frame));
+    fn record(&mut self, path: &Rc<str>, frame: Rect) {
+        self.entries.push((Rc::clone(path), frame));
+    }
+
+    /// [`Self::record`] for a node whose name is not shared.
+    fn record_named(&mut self, path: &str, frame: Rect) {
+        self.entries.push((Rc::from(path), frame));
     }
 
     /// The probes' own frames — the entries a `Measured` node recorded,
@@ -2976,7 +2983,7 @@ impl Frames {
         self.entries
             .iter()
             .filter(|(path, _)| path.ends_with(MEASURE_SEGMENT))
-            .map(|(path, frame)| (path.as_str(), frame))
+            .map(|(path, frame)| (&**path, frame))
     }
 
 
@@ -2984,7 +2991,7 @@ impl Frames {
     pub fn get(&self, path: &str) -> Option<Rect> {
         self.entries
             .iter()
-            .find(|(entry, _)| entry == path)
+            .find(|(entry, _)| &**entry == path)
             .map(|(_, frame)| *frame)
     }
 
@@ -2998,7 +3005,7 @@ impl Frames {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, Rect)> {
-        self.entries.iter().map(|(path, frame)| (path.as_str(), *frame))
+        self.entries.iter().map(|(path, frame)| (&**path, *frame))
     }
 }
 
@@ -5142,7 +5149,7 @@ impl LayoutNode {
                 if !path.is_empty() {
                     // the box reports its rectangle — the app decides
                     // what may cross the island and what repositions
-                    out.frames.record(path, frame);
+                    out.frames.record_named(path, frame);
                     out.hosts.push(HostPlacement {
                         path: path.clone(),
                         frame,
@@ -6105,7 +6112,7 @@ impl LayoutNode {
             (LayoutNode::Measured { path, child }, Fit::Children(fits)) => {
                 // the record is the whole job: the child is placed at
                 // exactly the frame this node was given
-                out.frames.record(path, frame);
+                out.frames.record_named(path, frame);
                 if let Some((_, fit)) = fits.first() {
                     child.place(frame, fit, env, out);
                 }
@@ -6134,7 +6141,7 @@ impl LayoutNode {
                     // measure from the same origin, so a flight above
                     // never bends the captured interior
                     dom.open(
-                        crate::dom::DomKind::Group { path: std::rc::Rc::from(path.as_str()) },
+                        crate::dom::DomKind::Group { path: Rc::clone(path) },
                         real,
                         real.origin,
                     );
@@ -7006,7 +7013,7 @@ mod tests {
     }
 
     fn boundary(path: &str, child: LayoutNode) -> LayoutNode {
-        LayoutNode::Boundary { path: path.to_string(), children: vec![child] }
+        LayoutNode::Boundary { path: Rc::from(path), children: vec![child] }
     }
 
     #[test]

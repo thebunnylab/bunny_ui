@@ -191,8 +191,8 @@ impl NodeList {
     /// boundary at its root.
     pub(crate) fn root_boundary(&self) -> Option<&str> {
         match self.layout.as_slice() {
-            [crate::layout::LayoutNode::Boundary { path, .. }]
-            | [crate::layout::LayoutNode::BoundaryRef { path, .. }] => Some(path),
+            [crate::layout::LayoutNode::Boundary { path, .. }] => Some(path),
+            [crate::layout::LayoutNode::BoundaryRef { path, .. }] => Some(path),
             _ => None,
         }
     }
@@ -258,7 +258,7 @@ fn retain_entry<T: Component>(view: &T, ctx: &Context, path: &str, body: NodeLis
         ctx.clone(),
         RenderNode::branch(short_type_name::<T>(), print_children),
         crate::layout::LayoutNode::Boundary {
-            path: path.to_string(),
+            path: std::rc::Rc::from(path),
             children: layout_children,
         },
     );
@@ -275,7 +275,7 @@ fn close_loose<T: Component>(body: NodeList, out: &mut NodeList) {
     let (print_children, layout_children) = body.into_parts();
     out.push(RenderNode::branch(short_type_name::<T>(), print_children));
     out.push_layout(crate::layout::LayoutNode::Boundary {
-        path: short_type_name::<T>(),
+        path: std::rc::Rc::from(short_type_name::<T>()),
         children: layout_children,
     });
 }

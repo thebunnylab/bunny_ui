@@ -634,7 +634,7 @@ impl Walk<'_> {
                 // a CLEAN boundary is a promise, not a walk: no body
                 // under it ran, the retained group still holds, and
                 // the diff keeps it wholesale — O(change), by absence
-                if self.env.retained_groups.contains(path.as_str())
+                if self.env.retained_groups.contains(&**path)
                     && !self.env.changed.iter().any(|run| {
                         // related in EITHER direction dirties: a run
                         // below me changed my interior; a run above me
@@ -649,10 +649,10 @@ impl Walk<'_> {
                         related(run, path) || related(path, run)
                     })
                 {
-                    out.push(node(DomKind::Reuse { path: std::rc::Rc::from(path.as_str()) }));
+                    out.push(node(DomKind::Reuse { path: std::rc::Rc::clone(path) }));
                     return;
                 }
-                let mut group = node(DomKind::Group { path: std::rc::Rc::from(path.as_str()) });
+                let mut group = node(DomKind::Group { path: std::rc::Rc::clone(path) });
                 group.children.reserve_exact(children.len());
                 let outer_pending = self.pending_boundary_class.take();
                 for child in children {
