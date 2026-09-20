@@ -57,6 +57,7 @@ pub mod one_of;
 pub mod gpu;
 #[cfg(feature = "canvas")]
 pub mod raster;
+mod paranoid;
 mod reconciler;
 pub mod runtime;
 pub mod ssr;
@@ -2848,6 +2849,56 @@ mod tests {
             let changed = runtime.display_frame(&page, size);
             assert_ne!(changed.as_slice(), mounted.as_slice(), "the new count is on screen");
         }
+    }
+
+    #[test]
+    fn a_pass_with_no_body_assembles_nothing() {
+        use std::cell::Cell;
+
+        // the tables the input doors read come from the retention. A pass
+        // that ran no body and swept nothing left the retention as it
+        // was, and must not rebuild them — and a body that DID run must
+        // have its new closure answer the very same frame.
+        #[derive(Clone)]
+        struct Counter {
+            label: State<usize>,
+            pressed: Rc<Cell<usize>>,
+        }
+
+        impl Component for Counter {
+            fn body(self, _ctx: &Context) -> impl View {
+                let label = self.label.get();
+                let pressed = Rc::clone(&self.pressed);
+                // the closure captures what THIS body read: an old table
+                // would answer with the old number
+                button(text(format!("at {label}")), move || pressed.set(label)).frame(200.0, 60.0)
+            }
+        }
+
+        let counter = Counter { label: State::new(1), pressed: Rc::new(Cell::new(0)) };
+        let size = crate::layout::Size { width: 200.0, height: 60.0 };
+        crate::paranoid::force(crate::paranoid::ASSEMBLE);
+        for runtime in [Runtime::new(), Runtime::scene("w0")] {
+            counter.label.set(1);
+            let _ = runtime.display_frame(&counter, size);
+            let _ = crate::stats::take();
+            for _ in 0..3 {
+                let _ = runtime.display_frame(&counter, size);
+            }
+            assert_eq!(crate::stats::take().assemblies, 0, "three clean frames, no table rebuilt");
+
+            runtime.pointer_clicked(100.0, 30.0, 1, false);
+            runtime.pointer_released(100.0, 30.0);
+            assert_eq!(counter.pressed.get(), 1, "the kept table still answers");
+
+            counter.label.set(7);
+            let _ = runtime.display_frame(&counter, size);
+            assert!(crate::stats::take().assemblies >= 1, "a body ran: the tables follow it");
+            runtime.pointer_clicked(100.0, 30.0, 1, false);
+            runtime.pointer_released(100.0, 30.0);
+            assert_eq!(counter.pressed.get(), 7, "the new closure answers the same frame");
+        }
+        crate::paranoid::release();
     }
 
     #[test]

@@ -509,15 +509,35 @@ impl Runtime {
         // outside a pass re-arms every `.task` under the root — a fresh
         // thread each, on every refill. Which is why `enter_scene` rebuilds
         // the input tables and never this.
-        crate::stats::note_assembly();
         crate::stats::time(crate::stats::Stage::Assemble, || {
-            effects::set_queue(reconciler::assemble_effects(root));
-            self.assemble_input(root);
+            // a pass that ran no body and swept nothing left the
+            // retention as it was: the queue and the tables the last
+            // assembly built are still the truth. The queue is handed
+            // over again, because the pump TAKES it; the tables stay.
+            // Each has its own key — the tables are also rebuilt when a
+            // scene becomes current again, and that makes no queue.
+            let had_root_region = reconciler::pass_has_root_region();
+            let queue = match reconciler::assembled_effects(root) {
+                Some(queue) => queue,
+                None => {
+                    let queue: Rc<[motor::state::EffectFn]> =
+                        reconciler::assemble_effects(root).into();
+                    reconciler::keep_assembled_effects(root, &queue, had_root_region);
+                    queue
+                }
+            };
+            effects::set_queue(queue);
+            if !reconciler::assembly_is_current(root) {
+                crate::stats::note_assembly();
+                self.assemble_input(root, had_root_region);
+            } else if crate::paranoid::on(crate::paranoid::ASSEMBLE) {
+                self.assemble_input_again(root);
+            }
         });
     }
 
     /// Rebuilds only the tables the input doors read.
-    fn assemble_input(&self, root: &str) {
+    fn assemble_input(&self, root: &str, had_root_region: bool) {
         reconciler::assemble_actions(root);
         reconciler::assemble_editors(root);
         reconciler::assemble_splits(root);
@@ -527,7 +547,19 @@ impl Runtime {
         reconciler::assemble_customs(root);
         reconciler::assemble_handlers(root);
         reconciler::assemble_contexts(root);
-        reconciler::set_assembled_root(root);
+        reconciler::set_assembled_root(root, had_root_region);
+    }
+
+    /// The paranoid cross-check of a skipped assembly: build the tables
+    /// again and see that nothing in them moved.
+    fn assemble_input_again(&self, root: &str) {
+        let before = reconciler::input_fingerprint();
+        self.assemble_input(root, false);
+        assert_eq!(
+            before,
+            reconciler::input_fingerprint(),
+            "a skipped assembly left tables that a full one would have changed"
+        );
     }
 
 
@@ -552,7 +584,8 @@ impl Runtime {
         // door's: refilling it here re-arms every task under this root, and a
         // thread with it — which two windows alternating frames turn into
         // thousands within seconds.
-        self.assemble_input(&root);
+        crate::stats::note_assembly();
+        self.assemble_input(&root, false);
     }
 
     /// The popovers of the last layout, in paint order — a shell that

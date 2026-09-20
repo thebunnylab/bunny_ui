@@ -23,7 +23,7 @@
 //! accumulated modifier suffixes, and re-appends extra children (the
 //! `Sheet` node).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 use motor::hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -338,6 +338,9 @@ pub(crate) fn finish_entry(
             },
         );
     });
+    // a body ran and its registrations are new closures: the tables
+    // built from the old entry are stale
+    bump_retention();
 }
 
 /// An effect registered during render: goes to the entry being built,
@@ -1029,6 +1032,131 @@ thread_local! {
     /// checks this before it reads them, and rebuilds its own if another
     /// scene left theirs standing.
     static ASSEMBLED_ROOT: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Moves each time the retention is written: an entry closed, an
+    /// entry fell. A registration enters the retention only through a
+    /// body run, which closes an entry, and leaves it only through a
+    /// sweep — so tables assembled at one generation stay true until the
+    /// number moves.
+    static RETENTION_GEN: Cell<u64> = const { Cell::new(0) };
+    /// The generation the assembled tables were built at, and whether a
+    /// root region fed them. A root region is rebuilt by every pass (its
+    /// closures are new each time), so tables that hold one never stay.
+    static ASSEMBLED_AT: Cell<Option<(u64, bool)>> = const { Cell::new(None) };
+    /// The effect queue of the last FULL assembly, with the root and the
+    /// generation it was built for. It has its own key: the input tables
+    /// are also rebuilt outside a pass, when a scene becomes current
+    /// again, and that rebuild makes no queue.
+    static ASSEMBLED_EFFECTS: RefCell<Option<(String, u64, Rc<[EffectFn]>)>> =
+        const { RefCell::new(None) };
+}
+
+/// A number that moves when any assembled table moves: every key, and
+/// the identity of every closure behind it. It is the paranoid check's
+/// question, and nothing else asks it.
+pub(crate) fn input_fingerprint() -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    fn of_key(key: &str) -> u64 {
+        let mut hasher = motor::hash::FxHasher::default();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+    fn of_ptr<T: ?Sized>(shared: &Rc<T>) -> u64 {
+        Rc::as_ptr(shared) as *const () as usize as u64
+    }
+
+    let mut total = 0u64;
+    let mut mix = |part: u64| total = total.wrapping_mul(31).wrapping_add(part);
+    // order never matters inside a table: a sum is the same in any order
+    mix(ACTIONS.with(|map| {
+        map.borrow().iter().fold(0u64, |sum, (key, action)| sum.wrapping_add(of_key(key) ^ of_ptr(action)))
+    }));
+    mix(EDITORS.with(|map| {
+        map.borrow().iter().fold(0u64, |sum, (key, editor)| sum.wrapping_add(of_key(key) ^ of_ptr(editor)))
+    }));
+    mix(SPLITS.with(|map| {
+        map.borrow().iter().fold(0u64, |sum, (key, split)| sum.wrapping_add(of_key(key) ^ of_ptr(split)))
+    }));
+    mix(SCROLLS.with(|map| {
+        map.borrow().iter().fold(0u64, |sum, (key, scroll)| sum.wrapping_add(of_key(key) ^ of_ptr(scroll)))
+    }));
+    mix(MEASURES.with(|map| {
+        map.borrow().iter().fold(0u64, |sum, (key, measure)| sum.wrapping_add(of_key(key) ^ of_ptr(measure)))
+    }));
+    mix(HANDLERS.with(|map| {
+        map.borrow().values().fold(0u64, |sum, (depth, handler)| {
+            sum.wrapping_add((*depth as u64).wrapping_mul(0x9E37_79B9) ^ of_ptr(handler))
+        })
+    }));
+    mix(WEBVIEWS.with(|map| map.borrow().keys().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
+    mix(CUSTOMS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
+    mix(KEYED_CUSTOMS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
+    mix(ACTIVE_CONTEXTS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
+    total
+}
+
+fn bump_retention() {
+    RETENTION_GEN.with(|generation| generation.set(generation.get().wrapping_add(1)));
+}
+
+/// Is the root region of THIS pass empty? Registrations made outside
+/// every boundary live there, and only for one pass.
+fn root_region_is_empty() -> bool {
+    PASS.with(|pass| {
+        let pass = pass.borrow();
+        pass.root_effects.is_empty()
+            && pass.root_actions.is_empty()
+            && pass.root_editors.is_empty()
+            && pass.root_splits.is_empty()
+            && pass.root_scrolls.is_empty()
+            && pass.root_measures.is_empty()
+            && pass.root_webviews.is_empty()
+            && pass.root_customs.is_empty()
+            && pass.root_handlers.is_empty()
+            && pass.root_contexts.is_empty()
+    })
+}
+
+/// Do the assembled tables still answer for `root`? They do when they
+/// were built for it, the retention did not move since, and no root
+/// region fed them then or wants to feed them now.
+pub(crate) fn assembly_is_current(root: &str) -> bool {
+    let same_root = ASSEMBLED_ROOT.with(|slot| slot.borrow().as_deref() == Some(root));
+    same_root
+        && ASSEMBLED_AT.with(Cell::get) == Some((RETENTION_GEN.with(Cell::get), false))
+        && root_region_is_empty()
+}
+
+/// The effect queue this root's last full assembly built — `None` when
+/// the retention moved since, when another scene assembled after it, or
+/// when a root region wants to feed the queue now. The caller then
+/// assembles a new one.
+pub(crate) fn assembled_effects(root: &str) -> Option<Rc<[EffectFn]>> {
+    if !root_region_is_empty() {
+        return None;
+    }
+    let generation = RETENTION_GEN.with(Cell::get);
+    ASSEMBLED_EFFECTS.with(|slot| match slot.borrow().as_ref() {
+        Some((kept_root, kept_at, queue)) if kept_root == root && *kept_at == generation => {
+            Some(Rc::clone(queue))
+        }
+        _ => None,
+    })
+}
+
+/// Keeps the queue a full assembly built, for the passes that change
+/// nothing. A queue a root region fed is never kept: the region's
+/// closures are new on every pass.
+pub(crate) fn keep_assembled_effects(root: &str, queue: &Rc<[EffectFn]>, had_root_region: bool) {
+    ASSEMBLED_EFFECTS.with(|slot| {
+        *slot.borrow_mut() = (!had_root_region)
+            .then(|| (root.to_string(), RETENTION_GEN.with(Cell::get), Rc::clone(queue)));
+    });
+}
+
+/// Was a root region waiting when this pass reached its assembly?
+pub(crate) fn pass_has_root_region() -> bool {
+    !root_region_is_empty()
 }
 
 /// Whose scene the assembled tables answer for right now.
@@ -1038,8 +1166,9 @@ pub(crate) fn assembled_root() -> Option<String> {
 
 /// Records that the tables now answer for `root` — the runtime calls
 /// this as the last step of assembling them.
-pub(crate) fn set_assembled_root(root: &str) {
+pub(crate) fn set_assembled_root(root: &str, had_root_region: bool) {
     ASSEMBLED_ROOT.with(|slot| *slot.borrow_mut() = Some(root.to_string()));
+    ASSEMBLED_AT.with(|at| at.set(Some((RETENTION_GEN.with(Cell::get), had_root_region))));
 }
 
 /// Drops every retained entry under `root` — the retention half of a
@@ -1047,6 +1176,7 @@ pub(crate) fn set_assembled_root(root: &str) {
 /// other scenes on this thread keep theirs.
 pub(crate) fn forget_under(root: &str) {
     let prefix = format!("{root}/");
+    bump_retention();
     RETAINED.with(|retained| {
         retained
             .borrow_mut()
@@ -1062,12 +1192,17 @@ pub(crate) fn forget_under(root: &str) {
 
 /// Identities swept by `end_pass`: their entries fall with them.
 pub(crate) fn forget(dead: &[String]) {
-    RETAINED.with(|retained| {
+    let fell = RETAINED.with(|retained| {
         let mut retained = retained.borrow_mut();
+        let mut fell = false;
         for path in dead {
-            retained.remove(path);
+            fell |= retained.remove(path).is_some();
         }
+        fell
     });
+    if fell {
+        bump_retention();
+    }
 }
 
 /// The TWIN of the identity sweep, for views with NO state of their
@@ -1087,20 +1222,27 @@ pub(crate) fn sweep_stale(root: &str) {
             pass.skipped.clone(),
         )
     });
-    RETAINED.with(|retained| {
-        retained.borrow_mut().retain(|path, _| {
+    let fell = RETAINED.with(|retained| {
+        let mut retained = retained.borrow_mut();
+        let before = retained.len();
+        retained.retain(|path, _| {
             if !covers(root, path) {
                 return true; // another tree mounted on the same thread
             }
             runs.contains(path) || skipped.iter().any(|skip| covers(skip, path))
         });
+        retained.len() != before
     });
+    if fell {
+        bump_retention();
+    }
 }
 
 /// Drops the whole retention — the next pass runs every body (the
 /// tests' `render_full`; the state in the identity arenas stays).
 pub(crate) fn clear() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
+    bump_retention();
 }
 
 /// The world-reset twin of [`clear`]: the retention AND every per-pass
@@ -1108,7 +1250,10 @@ pub(crate) fn clear() {
 /// `motor::identity::reset_world` for the other half of the contract.
 pub(crate) fn reset_world() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
+    bump_retention();
     ASSEMBLED_ROOT.with(|root| *root.borrow_mut() = None);
+    ASSEMBLED_AT.with(|at| at.set(None));
+    ASSEMBLED_EFFECTS.with(|slot| *slot.borrow_mut() = None);
     PASS.with(|pass| *pass.borrow_mut() = PassState::default());
     LAST_BODY_RUNS.with(|last| last.borrow_mut().clear());
     FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().clear());
