@@ -61,9 +61,14 @@ struct Registry {
     /// Saved lengths of `joined`, one per open frame — the truncation
     /// points of the drops.
     joined_lens: Vec<usize>,
-    /// Only the view wrappers — the target of read-tracking.
-    views: Vec<String>,
-    touched: HashSet<String>,
+    /// Only the view wrappers — the target of read-tracking. Each one is a
+    /// LENGTH of `joined`: the path of an open view is a prefix of the
+    /// cursor's, so a view that opens costs a number, not a copy.
+    views: Vec<usize>,
+    /// The pass being run, counted. An owner's record carries the last pass
+    /// its scope was entered in: that is the alive mark, and it costs a
+    /// lookup where a set of every path of the pass cost a copy of each.
+    pass_no: u64,
     /// Boundaries the reconciler skipped this pass (clean cache): their
     /// subtree counts as alive in the sweep.
     skipped: HashSet<String>,
@@ -90,6 +95,8 @@ type AnchorKey = (String, TypeId, u32);
 
 #[derive(Default)]
 struct OwnerRecord {
+    /// The last pass this owner's scope was entered in ([`Registry::pass_no`]).
+    touched: u64,
     /// (type, index in the type's arena) — the sweep frees through the
     /// arena registry without knowing the type statically.
     slots: Vec<(TypeId, usize)>,
@@ -125,7 +132,7 @@ pub fn begin_pass() {
         registry.joined.clear();
         registry.joined_lens.clear();
         registry.views.clear();
-        registry.touched.clear();
+        registry.pass_no += 1;
         registry.skipped.clear();
         registry.reran.clear();
         registry.seqs.clear();
@@ -150,15 +157,16 @@ pub fn end_pass() -> Vec<String> {
         let prefix = format!("{root}/");
         let under_root =
             |owner: &str| owner == root || owner.starts_with(&prefix);
+        let pass_no = registry.pass_no;
         let dead: Vec<String> = registry
             .owners
-            .keys()
-            .filter(|owner| {
+            .iter()
+            .filter(|(owner, record)| {
                 under_root(owner)
-                    && !registry.touched.contains(*owner)
+                    && record.touched != pass_no
                     && !protected_by_skip(&registry, owner)
             })
-            .cloned()
+            .map(|(owner, _)| owner.clone())
             .collect();
         for owner in &dead {
             let Some(record) = registry.owners.remove(owner) else {
@@ -304,10 +312,52 @@ pub fn current_pass_root() -> Option<String> {
     REGISTRY.with(|registry| registry.borrow().pass_root.clone())
 }
 
-/// The cursor's segments right now — the retained entry stores the parent
-/// path to seed isolated re-runs.
+/// The cursor's segments right now.
 pub fn current_path_segments() -> Vec<String> {
     REGISTRY.with(|registry| registry.borrow().path.clone())
+}
+
+/// The cursor's PARENT segments, packed: what a retained entry keeps to
+/// seed an isolated re-run ([`seed_from`]).
+///
+/// Every boundary of a mount keeps one, and the path above a row is a dozen
+/// segments deep: a `Vec<String>` of them was a dozen allocations for each
+/// boundary, made twice. Packed, it is the segments end to end and where
+/// each one stops — two allocations, whatever the depth. The cut points are
+/// kept and not found again: a segment may hold a `/` of its own (a row's
+/// key is the app's string), so the joined path cannot be split back.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PathSeed {
+    text: String,
+    ends: Vec<u32>,
+}
+
+impl PathSeed {
+    fn segments(&self) -> impl Iterator<Item = &str> {
+        let mut from = 0usize;
+        self.ends.iter().map(move |end| {
+            let segment = &self.text[from..*end as usize];
+            from = *end as usize;
+            segment
+        })
+    }
+}
+
+/// [`PathSeed`] of the cursor right now: every segment but the last.
+pub fn parent_seed() -> PathSeed {
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        let parents = registry.path.split_last().map_or(&[][..], |(_, parents)| parents);
+        let mut seed = PathSeed {
+            text: String::with_capacity(parents.iter().map(String::len).sum()),
+            ends: Vec::with_capacity(parents.len()),
+        };
+        for segment in parents {
+            seed.text.push_str(segment);
+            seed.ends.push(seed.text.len() as u32);
+        }
+        seed
+    })
 }
 
 /// The cursor's full path right now (`None` outside a pass) — the key
@@ -395,12 +445,15 @@ fn push(segment: String, is_view: bool) -> Frame {
         }
         registry.joined.push_str(&segment);
         registry.path.push(segment);
-        let scope = registry.joined.clone();
+        // the alive mark: an identity that owns something and was entered
+        // this pass stays. One that owns nothing has no record to mark —
+        // and nothing to sweep
+        let registry = &mut *registry;
+        if let Some(record) = registry.owners.get_mut(registry.joined.as_str()) {
+            record.touched = registry.pass_no;
+        }
         if is_view {
-            registry.touched.insert(scope.clone());
-            registry.views.push(scope);
-        } else {
-            registry.touched.insert(scope);
+            registry.views.push(registry.joined.len());
         }
         Frame { pops_view: is_view, active: true }
     })
@@ -420,7 +473,10 @@ pub fn enter_view(name: impl Into<String>) -> Frame {
 
 /// The path of the innermost view being rendered — the reconciler's key.
 pub fn current_view_path() -> Option<String> {
-    REGISTRY.with(|registry| registry.borrow().views.last().cloned())
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        registry.views.last().map(|len| registry.joined[..*len].to_string())
+    })
 }
 
 /// Re-seeds the cursor with the PARENT path of a retained boundary, so the
@@ -429,6 +485,11 @@ pub fn current_view_path() -> Option<String> {
 /// drop.
 pub fn seed(segments: &[String]) -> Vec<Frame> {
     segments.iter().map(|segment| enter(segment.clone())).collect()
+}
+
+/// [`seed`], from the packed form a retained entry keeps.
+pub fn seed_from(parents: &PathSeed) -> Vec<Frame> {
+    parents.segments().map(enter).collect()
 }
 
 fn current_scope(registry: &Registry) -> String {
@@ -545,7 +606,10 @@ pub(crate) fn fulfill_anchor(token: AnchorToken, index: usize, generation: u32, 
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         registry.anchors.insert(key.clone(), (index, generation, dep));
+        let pass_no = registry.pass_no;
         let owner = registry.owners.entry(key.0.clone()).or_default();
+        // declared inside a scope this pass entered: alive
+        owner.touched = pass_no;
         owner.slots.push((key.1, index));
         owner.anchors.push(key);
     });
@@ -581,11 +645,10 @@ pub(crate) fn record_read(key: DepKey) {
         if !registry.pass_active {
             return;
         }
-        let view = registry
-            .views
-            .last()
-            .cloned()
-            .unwrap_or_else(|| ROOT_READER.to_string());
+        let view = match registry.views.last() {
+            Some(len) => registry.joined[..*len].to_string(),
+            None => ROOT_READER.to_string(),
+        };
         registry.reads_by_view.entry(view.clone()).or_default().insert(key);
         registry.readers.entry(key).or_default().insert(view);
     });
@@ -645,7 +708,10 @@ pub fn scoped_effect_slot<V: 'static>(site: impl Into<Site>) -> Rc<RefCell<Optio
         let cell: Rc<RefCell<Option<V>>> = Rc::new(RefCell::new(None));
         registry.effect_cells.insert(key.clone(), cell.clone());
         if scope != APP_SCOPE {
-            registry.owners.entry(scope).or_default().effect_sites.push(key);
+            let pass_no = registry.pass_no;
+            let owner = registry.owners.entry(scope).or_default();
+            owner.touched = pass_no;
+            owner.effect_sites.push(key);
         }
         cell
     })
@@ -653,6 +719,30 @@ pub fn scoped_effect_slot<V: 'static>(site: impl Into<Site>) -> Rc<RefCell<Optio
 
 #[cfg(test)]
 mod tests {
+    /// A packed seed re-enters the same segments — a row's key with a `/`
+    /// of its own included, which is why the cut points are kept and the
+    /// joined path is never split back.
+    #[test]
+    fn a_packed_seed_re_enters_the_segments_it_was_cut_from() {
+        use super::{begin_pass, current_path_segments, end_pass, enter, enter_view, parent_seed, seed_from};
+
+        begin_pass();
+        let seed = {
+            let _root = enter("Root");
+            let _row = enter("[a/b]");
+            let _stack = enter("#0");
+            let _leaf = enter_view("Leaf");
+            parent_seed()
+        };
+        let _ = end_pass();
+        assert_eq!(seed.segments().collect::<Vec<_>>(), ["Root", "[a/b]", "#0"]);
+        begin_pass();
+        let frames = seed_from(&seed);
+        assert_eq!(current_path_segments(), ["Root", "[a/b]", "#0"]);
+        drop(frames);
+        let _ = end_pass();
+    }
+
     use super::named_chain;
 
     #[test]

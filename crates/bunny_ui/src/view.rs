@@ -159,7 +159,14 @@ impl NodeList {
     /// print, the reference node in the layout) and the final assembly
     /// expands against the reconciler.
     pub(crate) fn push_view_ref(&mut self, path: &str) {
-        self.nodes.push(RenderNode::leaf(crate::reconciler::ref_line(path)));
+        // the marked line is what a PRINT expands; a frame's pass prints
+        // nothing, and a line for each boundary of the page was a string
+        // nobody read
+        self.nodes.push(RenderNode::leaf(if print_enabled() {
+            crate::reconciler::ref_line(path)
+        } else {
+            String::new()
+        }));
         self.layout.push(crate::layout::LayoutNode::BoundaryRef {
             path: path.to_string(),
             slot: crate::reconciler::slot_of(path),

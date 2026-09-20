@@ -146,8 +146,9 @@ pub(crate) struct Entry {
     /// Key contexts declared in the body (`.key_context(name)`) — a
     /// context is ACTIVE while a view declaring it stays mounted.
     pub contexts: Vec<&'static str>,
-    /// The PARENT's path segments — the cursor seed for an isolated re-run.
-    pub parent_segments: Vec<String>,
+    /// The PARENT's path segments, packed — the cursor seed for an isolated
+    /// re-run.
+    pub parent_segments: motor::identity::PathSeed,
 }
 
 #[derive(Default)]
@@ -469,10 +470,7 @@ pub(crate) fn finish_entry(
                 ),
             }
         });
-    let parent_segments = motor::identity::current_path_segments()
-        .split_last()
-        .map(|(_, parents)| parents.to_vec())
-        .unwrap_or_default();
+    let parent_segments = motor::identity::parent_seed();
     RETAINED.with(|retained| {
         let mut retained = retained.borrow_mut();
         // the slot is as old as the path: the entry of the last run goes
@@ -765,7 +763,7 @@ pub(crate) fn run_isolated(root: &str) {
         }) else {
             continue; // dirty but never mounted (or already swept): nothing to re-run
         };
-        let _frames = motor::identity::seed(&parents);
+        let _frames = motor::identity::seed_from(&parents);
         let mut scratch = crate::view::NodeList::new();
         use crate::view::View;
         // the retained value re-renders through the blanket's normal
