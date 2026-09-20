@@ -591,7 +591,23 @@ pub(crate) fn record_read(key: DepKey) {
     });
 }
 
+thread_local! {
+    /// Counts every write, read by a view or not.
+    static WRITE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A number that moves each time a `State` or a `Store` is written on
+/// this thread — whether a view read it or not. A shell asks it after a
+/// turn of tasks: the same number means no task wrote anything, so the
+/// scene cannot have changed through a write. A write that no view read
+/// still moves it, because an `on_change` or an `on_receive` may watch
+/// the value, and those read outside a pass.
+pub fn write_epoch() -> u64 {
+    WRITE_EPOCH.with(std::cell::Cell::get)
+}
+
 pub(crate) fn record_write(key: DepKey) {
+    WRITE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         let Some(readers) = registry.readers.get(&key).cloned() else {

@@ -391,6 +391,13 @@ pub struct Runtime {
     /// frame path, which does not format) — printing again rebuilds
     /// once, and the full == incremental oracle stays byte-for-byte.
     printless: Cell<bool>,
+    /// Something outside the read-tracking changed what the next frame
+    /// shows: a programmatic scroll, a focus move, a new overlay bound.
+    /// [`Runtime::settle`] lowers it; see [`Runtime::frame_need`].
+    frame_asked: Cell<bool>,
+    /// The write epoch the last settle saw. A different number now means
+    /// a `State` or a `Store` was written since.
+    settled_epoch: Cell<u64>,
 }
 
 impl Default for Runtime {
@@ -600,6 +607,11 @@ impl Runtime {
     /// above the window is negative); everyone else leaves the
     /// default — the viewport.
     pub fn set_overlay_bounds(&self, bounds: Option<Rect>) {
+        // the shell says this on every frame: only a NEW answer asks
+        // for one
+        if self.overlay_bounds.get() != bounds {
+            self.frame_asked.set(true);
+        }
         self.overlay_bounds.set(bounds);
     }
 
@@ -609,7 +621,10 @@ impl Runtime {
     /// drives, the content follows. The entry survives a close, so a
     /// reopen lands where the reader left it.
     pub fn set_dialog_frame(&self, path: &str, frame: Rect) {
-        self.dialog_frames.borrow_mut().insert(path.to_string(), frame);
+        let previous = self.dialog_frames.borrow_mut().insert(path.to_string(), frame);
+        if previous != Some(frame) {
+            self.frame_asked.set(true);
+        }
     }
 
     /// Runs ONE overlay's dismissal — the road a dialog window's own
@@ -690,7 +705,11 @@ impl Runtime {
     }
 
     pub fn set_device_scale(&self, scale: Px) {
-        self.device_scale.set(scale.max(1.0));
+        let scale = scale.max(1.0);
+        if self.device_scale.get() != scale {
+            self.frame_asked.set(true);
+        }
+        self.device_scale.set(scale);
     }
 
     /// The screen's scale, as the shell last told it.
@@ -1171,6 +1190,8 @@ impl Runtime {
             last_insets: Cell::new(crate::layout::Edges::ZERO),
             dom: RefCell::new(crate::dom::DomLowering::default()),
             root_boundary: RefCell::new(None),
+            frame_asked: Cell::new(true),
+            settled_epoch: Cell::new(u64::MAX),
             printless: Cell::new(false),
         };
         // Escape closes the innermost popover — pre-bound in the
@@ -2502,6 +2523,7 @@ impl Runtime {
     /// applies it, clamped at place.
     pub fn set_scroll_offset(&self, path: &str, offset: Point) {
         self.scroll_offsets.borrow_mut().insert(path.to_string(), offset);
+        self.frame_asked.set(true);
     }
 
     pub fn scroll_offset(&self, path: &str) -> Point {
@@ -2894,6 +2916,7 @@ impl Runtime {
     /// the retained position.
     pub fn focus(&self, path: &str) {
         self.enter_scene();
+        self.frame_asked.set(true);
         self.caret_visible.set(true);
         *self.focus.borrow_mut() = Some(path.to_string());
         self.carets
@@ -3208,6 +3231,9 @@ impl Runtime {
             self.deliver(&placement, crate::custom::ElementEvent::Focused(false));
             self.dirty_island_of(&placement.path);
         }
+        if dropped.is_some() {
+            self.frame_asked.set(true);
+        }
         dropped.is_some()
     }
 
@@ -3360,6 +3386,8 @@ impl Runtime {
         state.anchor = None;
         state.marked = None;
         self.carets.borrow_mut().insert(path.to_string(), state);
+        // the caret moved with no state write of its own
+        self.frame_asked.set(true);
         true
     }
 
@@ -3544,6 +3572,44 @@ impl Runtime {
             moved.input |= input;
         }
         moved
+    }
+
+    /// Why the scene needs a frame, reason by reason — the question a
+    /// shell asks after a turn of tasks (a wake from a worker, a timer
+    /// that fell due). Most wakes change nothing: a poll that found no
+    /// news, a sleeper that went back to sleep. A shell that draws for
+    /// each of them computes whole frames that show what is already on
+    /// screen, and with a few pollers mounted that is most of a core,
+    /// at rest.
+    ///
+    /// Every reason is something the engine can see. What it cannot see
+    /// is data outside the read-tracking — a shared cell a task changed
+    /// and an app box's `paint` reads. For that, the task says so:
+    /// [`crate::request_frame`].
+    ///
+    /// The tick road is not asked here. Springs, loops and flings answer
+    /// through [`Runtime::tick`] and [`Runtime::frame_pace`].
+    pub fn frame_need(&self) -> FrameNeed {
+        FrameNeed {
+            asked: self.frame_asked.get() || FRAME_REQUESTED.with(Cell::get),
+            dirty: self.has_pending_dirty(),
+            wrote: motor::identity::write_epoch() != self.settled_epoch.get(),
+            theme: crate::theme::version() != self.theme_version.get(),
+            environment: self.env_moved.get(),
+            insets: self.last_insets.get() != self.frame_insets(),
+            webview: reconciler::has_webview_commands(),
+        }
+    }
+
+    /// Does the scene need a frame? [`Runtime::frame_need`], folded.
+    pub fn needs_frame(&self) -> bool {
+        self.frame_need().any()
+    }
+
+    /// Asks for a frame by hand — the door for a change the engine
+    /// cannot see. The next settle lowers the flag.
+    pub fn request_frame(&self) {
+        self.frame_asked.set(true);
     }
 
     /// Does any animation still want a next frame? The shell syncs its
@@ -5254,7 +5320,14 @@ impl Runtime {
     /// consistent tree by definition; the next pass would be all-skip).
     pub fn settle(&self, root: &impl View) {
         crate::stats::time(crate::stats::Stage::Settle, || {
+            // the frame that was asked for is this one. A request made
+            // DURING the settle — a pump that scrolls, a task that asks —
+            // raises the flag again, and costs one more frame, never one
+            // less.
+            self.frame_asked.set(false);
+            FRAME_REQUESTED.with(|flag| flag.set(false));
             for _ in 0..8 {
+                self.settled_epoch.set(motor::identity::write_epoch());
                 // the same order as the print path: a task that resolved
                 // writes its state, then the pass reads it
                 self.poll_tasks();
@@ -5286,6 +5359,54 @@ impl Runtime {
             Some(root) => motor::identity::has_dirty_matching(root),
             None => false,
         }
+    }
+}
+
+thread_local! {
+    /// A task asked for a frame ([`request_frame`]). A task holds no
+    /// runtime, so the flag is the thread's; the next settle lowers it.
+    static FRAME_REQUESTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Asks the scene on this thread for a frame. A task calls it after it
+/// changed something the engine cannot see: data in a shared cell that an
+/// app box reads when it paints. A `State` or a `Store` write never needs
+/// it.
+pub fn request_frame() {
+    FRAME_REQUESTED.with(|flag| flag.set(true));
+}
+
+/// Why a scene needs a frame. See [`Runtime::frame_need`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameNeed {
+    /// [`Runtime::request_frame`], [`request_frame`], or an engine door
+    /// that moves what the frame shows: a programmatic scroll, a focus
+    /// move, new overlay bounds, a dialog frame, a device scale.
+    pub asked: bool,
+    /// A view read a value that was written.
+    pub dirty: bool,
+    /// A `State` or a `Store` was written, read by a view or not: an
+    /// `on_change` may watch it, and only a frame's pump finds out.
+    pub wrote: bool,
+    /// The theme moved.
+    pub theme: bool,
+    /// The environment moved.
+    pub environment: bool,
+    /// The safe area or the keyboard inset moved.
+    pub insets: bool,
+    /// A webview handle holds a command the shell did not spend.
+    pub webview: bool,
+}
+
+impl FrameNeed {
+    pub fn any(self) -> bool {
+        self.asked
+            || self.dirty
+            || self.wrote
+            || self.theme
+            || self.environment
+            || self.insets
+            || self.webview
     }
 }
 

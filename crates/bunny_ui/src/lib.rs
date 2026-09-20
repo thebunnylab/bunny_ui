@@ -71,6 +71,8 @@ pub mod view;
 pub(crate) mod viewport;
 pub mod views;
 
+pub use runtime::request_frame;
+
 /// `text!("Count: {}", self.count)` — the built-in `format!` of text.
 /// Displaying a `State` READS the value: the dependency registers itself.
 #[macro_export]
@@ -142,7 +144,7 @@ pub mod prelude {
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Tracking, Weight};
     pub use crate::text_input::{CaretState, EditCommand};
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
-    pub use crate::runtime::{Edited, ImeSnapshot, LiveBlit, Runtime};
+    pub use crate::runtime::{Edited, FrameNeed, ImeSnapshot, LiveBlit, Runtime};
     pub use crate::state_ext::{BindingExt, StateExt};
     pub use crate::task;
     pub use crate::view::{Component, Either, Many, Single, UnaryView, View};
@@ -2899,6 +2901,87 @@ mod tests {
             assert_eq!(counter.pressed.get(), 7, "the new closure answers the same frame");
         }
         crate::paranoid::release();
+    }
+
+    #[test]
+    fn a_wake_with_no_news_needs_no_frame() {
+        use std::cell::Cell;
+
+        // a shell asks `needs_frame` after a turn of tasks. A poll that
+        // found nothing must answer no; every way the scene can really
+        // change must answer yes, with its reason.
+        #[derive(Clone)]
+        struct Feed {
+            seen: State<usize>,
+            quiet: State<usize>,
+            heard: Rc<Cell<usize>>,
+        }
+
+        impl Component for Feed {
+            fn body(self, _ctx: &Context) -> impl View {
+                let quiet = self.quiet;
+                let heard = Rc::clone(&self.heard);
+                // `quiet` has NO reader in any view: only this watcher
+                text(format!("seen {}", self.seen.get()))
+                    .on_change(move || quiet.get(), false, move |_: &usize, now: &usize| heard.set(*now))
+            }
+        }
+
+        let feed = Feed { seen: State::new(0), quiet: State::new(0), heard: Rc::new(Cell::new(0)) };
+        let size = crate::layout::Size { width: 200.0, height: 60.0 };
+        let runtime = Runtime::scene("w0");
+        assert!(runtime.needs_frame(), "a newborn scene needs its first frame");
+        let _ = runtime.display_frame(&feed, size);
+
+        // a turn of tasks that wrote nothing
+        runtime.poll_tasks();
+        assert_eq!(runtime.frame_need(), crate::runtime::FrameNeed::default(), "no news, no frame");
+
+        // a write a view reads
+        feed.seen.set(1);
+        let need = runtime.frame_need();
+        assert!(need.dirty && need.wrote, "{need:?}");
+        let _ = runtime.display_frame(&feed, size);
+        assert!(!runtime.needs_frame(), "the frame served it");
+
+        // a write NO view reads, that an `on_change` watches: only a
+        // frame's pump can find out
+        feed.quiet.set(5);
+        let need = runtime.frame_need();
+        assert!(need.wrote && !need.dirty, "{need:?}");
+        let _ = runtime.display_frame(&feed, size);
+        assert_eq!(feed.heard.get(), 5, "the watcher fired on that frame");
+
+        // the engine doors that move what a frame shows
+        runtime.set_scroll_offset("w0/Feed", crate::layout::Point { x: 0.0, y: 4.0 });
+        assert!(runtime.frame_need().asked, "a programmatic scroll");
+        let _ = runtime.display_frame(&feed, size);
+        assert!(!runtime.needs_frame());
+
+        // …and the ones a shell calls on EVERY frame ask only when the
+        // answer is new, or a frame would always ask for the next
+        runtime.set_device_scale(2.0);
+        assert!(runtime.frame_need().asked);
+        let _ = runtime.display_frame(&feed, size);
+        runtime.set_device_scale(2.0);
+        runtime.set_overlay_bounds(None);
+        assert!(!runtime.needs_frame(), "the same answers ask for nothing");
+
+        // a task that changed data the engine cannot see says so
+        crate::request_frame();
+        assert!(runtime.frame_need().asked);
+        let _ = runtime.display_frame(&feed, size);
+        assert!(!runtime.needs_frame());
+
+        // the environment, the insets
+        runtime.set_environment(|_| {});
+        assert!(runtime.frame_need().environment);
+        let _ = runtime.display_frame(&feed, size);
+        runtime.set_keyboard_inset(120.0);
+        let need = runtime.frame_need();
+        assert!(need.insets || need.environment, "{need:?}");
+        let _ = runtime.display_frame(&feed, size);
+        assert!(!runtime.needs_frame());
     }
 
     #[test]

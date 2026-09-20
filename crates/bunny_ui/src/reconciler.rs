@@ -869,6 +869,17 @@ pub(crate) fn run_webview_requested(path: &str, line: &str) -> bool {
     run_webview_report(path, |hooks| hooks.requested.clone(), line)
 }
 
+/// Does any handle hold a command the shell did not spend yet? A peek:
+/// nothing is drained. A handle queues its commands with no state write,
+/// so this is how a shell learns that a frame is due for them.
+pub(crate) fn has_webview_commands() -> bool {
+    WEBVIEWS.with(|webviews| {
+        webviews.borrow().values().any(|hooks| {
+            hooks.commands.as_ref().is_some_and(|queue| !queue.borrow().is_empty())
+        })
+    })
+}
+
 /// Drains every handle's queued commands, paired with the path the
 /// handle is bound to — the runtime stamps eval tokens and the shell
 /// spends the rest.

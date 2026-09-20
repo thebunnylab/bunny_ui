@@ -15,7 +15,7 @@ mod life;
 mod metal;
 pub mod webview;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use bunny_ui::action::{Key, KeyMatch, KeyPattern, Stroke};
@@ -458,6 +458,22 @@ pub fn run_window_chrome(
 /// Raises the window `spec` asks for and wires everything that lives as
 /// long as it does — the frame path, the pools, the gates and the event
 /// handler — into a slot the [`App`] holds and routes to.
+/// The reasons a wake drew a frame, as one token for the tape: `dirty+wrote`,
+/// or `-` when there was none.
+fn why(need: bunny_ui::runtime::FrameNeed) -> String {
+    let reasons = [
+        (need.asked, "asked"),
+        (need.dirty, "dirty"),
+        (need.wrote, "wrote"),
+        (need.theme, "theme"),
+        (need.environment, "environment"),
+        (need.insets, "insets"),
+        (need.webview, "webview"),
+    ];
+    let named: Vec<&str> = reasons.iter().filter(|(on, _)| *on).map(|(_, name)| *name).collect();
+    if named.is_empty() { "-".to_string() } else { named.join("+") }
+}
+
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let title: &str = &spec.title;
     let size = spec.size;
@@ -1128,9 +1144,24 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
         }
     });
+    // `BUNNY_FRAME_AUDIT=1`: a wake the engine says needs no frame draws
+    // one anyway, and the two pictures are compared. A difference is a
+    // frame the gate would have lost — `X what=missed-frame` on the tape
+    // and a line on stderr. It is how the gate is proven on a real app.
+    let frame_audit = std::env::var_os("BUNNY_FRAME_AUDIT").is_some();
+    let audit_last: Rc<RefCell<Option<bunny_ui::layout::DisplayList>>> = Rc::new(RefCell::new(None));
+    let audit_expects_same = Rc::new(Cell::new(false));
+    // the engine's stage timers ride the tape's clock: an `F` line for
+    // each frame says where the time went BEFORE the present opened
+    let frame_stats = trace::active() || std::env::var_os("BUNNY_FRAME_STATS").is_some();
+    if frame_stats {
+        bunny_ui::stats::set_clock(Some(trace::clock_ms));
+    }
     let blit = {
         let present = Rc::clone(&present);
         let dialogs = Rc::clone(&dialogs);
+        let audit_last = Rc::clone(&audit_last);
+        let audit_expects_same = Rc::clone(&audit_expects_same);
         move |runtime: &Runtime, root: &_, via: trace::Origin| {
             // the handles' commands are spent BEFORE the frame
             // renders: the state an expired eval writes lands in this
@@ -1220,6 +1251,40 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 }
             }
             let display = runtime.display_frame(root, Size { width, height });
+            if frame_stats {
+                let stats = bunny_ui::stats::take();
+                let ms = |stage| stats.ms(stage);
+                use bunny_ui::stats::Stage;
+                trace::mark(
+                    "F",
+                    format_args!(
+                        "settle={:.2} layout={:.2} pass={:.2} asm={:.2} measure={:.2} place={:.2} hover={:.2} passes={} layouts={} asm#={} hover#={} paints={} cmds={}",
+                        ms(Stage::Settle),
+                        ms(Stage::Layout),
+                        ms(Stage::Pass),
+                        ms(Stage::Assemble),
+                        ms(Stage::Measure),
+                        ms(Stage::Place),
+                        ms(Stage::Hover),
+                        stats.body_passes,
+                        stats.layout_passes,
+                        stats.assemblies,
+                        stats.hover_relayouts,
+                        stats.paints,
+                        display.len(),
+                    ),
+                );
+            }
+            if frame_audit {
+                let mut last = audit_last.borrow_mut();
+                if audit_expects_same.replace(false)
+                    && last.as_ref().is_some_and(|last| last.as_slice() != display.as_slice())
+                {
+                    trace::mark("X", format_args!("what=missed-frame"));
+                    eprintln!("bunny_ui: FRAME AUDIT — a wake that asked for no frame changed the picture");
+                }
+                *last = Some(display.clone());
+            }
             present(runtime, display, via);
         let interaction = runtime.interaction();
         // a live divider drag keeps the resizer even while the pointer
@@ -1503,7 +1568,36 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             if window.in_live_resize() || dialog_resizing() {
                 runtime.poll_tasks();
             } else {
-                blit(runtime, root, trace::Origin::Wake);
+                // The work always lands: the tasks are polled. The FRAME is
+                // for a turn that changed something. Most wakes change
+                // nothing — a poll that found no news, a sleeper that went
+                // back to sleep — and a window with a few of those mounted
+                // drew whole frames of what was already on screen, dozens
+                // of times a second, at rest: measured on a product window
+                // as 97 % of the main thread, and no present at all.
+                let ran = runtime.poll_tasks();
+                let need = runtime.frame_need();
+                if trace::active() {
+                    trace::mark(
+                        "W",
+                        format_args!(
+                            "ran={} need={} why={}",
+                            u8::from(ran),
+                            u8::from(need.any()),
+                            why(need)
+                        ),
+                    );
+                }
+                if need.any() {
+                    blit(runtime, root, trace::Origin::Wake);
+                } else if frame_audit {
+                    audit_expects_same.set(true);
+                    blit(runtime, root, trace::Origin::Wake);
+                } else {
+                    // no frame — but a task may have gone to sleep with a
+                    // new deadline, and the driver's pace follows it
+                    sync_frame_driver(runtime);
+                }
             }
         }
         AppEvent::ResignKey => {

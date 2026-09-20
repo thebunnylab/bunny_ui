@@ -92,6 +92,13 @@ fn ms() -> f64 {
     T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
 }
 
+/// The tape's own clock, in milliseconds — the one a shell installs for
+/// the engine's stage timers, so an `F` line and a `P` line share a time
+/// base.
+pub fn clock_ms() -> f64 {
+    ms()
+}
+
 fn line(args: std::fmt::Arguments<'_>) {
     if let Some(file) = out()
         && let Ok(mut file) = file.lock()
