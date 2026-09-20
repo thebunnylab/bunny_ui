@@ -3164,7 +3164,7 @@ pub(crate) fn layout_placing(
         width: proposal.width.map(|width| (width - insets.horizontal()).max(0.0)),
         height: proposal.height.map(|height| (height - insets.vertical()).max(0.0)),
     };
-    let (size, fit) = crate::stats::time(crate::stats::Stage::Measure, || root.measure(inner, env));
+    let (size, fit) = crate::stats::time(crate::stats::Stage::Measure, || root.measure(inner, &env));
     let safe = Rect { origin: Point { x: insets.leading, y: insets.top }, size };
     // the window: the proposal where it was proposed, the root's answer
     // plus the insets where it was open
@@ -3177,20 +3177,20 @@ pub(crate) fn layout_placing(
     };
     let mut out = Placement { keep_unseen, ..Placement::default() };
     out.safe = (insets != Edges::ZERO).then_some(SafeFrame { window, safe });
-    crate::stats::time(crate::stats::Stage::Place, || root.place(safe, &fit, env, &mut out));
+    crate::stats::time(crate::stats::Stage::Place, || root.place(safe, &fit, &env, &mut out));
     // popovers place AFTER the root: painted on top, hit first, free
     // of every scroll clip. Their default container is the WINDOW's
     // safe rect (the proposal), never the root's answer — a small scene
     // must not shrink the room a popover positions in.
-    place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, env, &mut out);
+    place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, &env, &mut out);
     if !keep_unseen && crate::paranoid::on(crate::paranoid::SEEN) {
         // the claim of the cut: the list is the FULL list with what no
         // pixel can show taken out, and nothing else in the placement
         // moved. The scene is placed again with the cut off, filtered by
         // the same rule as a pure function of the list, and compared.
         let mut full = Placement { keep_unseen: true, safe: out.safe, ..Placement::default() };
-        root.place(safe, &fit, env, &mut full);
-        place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, env, &mut full);
+        root.place(safe, &fit, &env, &mut full);
+        place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, &env, &mut full);
         let seen = full.display.seen_only();
         assert!(
             seen.as_slice() == out.display.as_slice(),
@@ -3252,18 +3252,18 @@ pub fn layout_dom(
     env: LayoutEnv,
     collect_display: bool,
 ) -> (LayoutResult, crate::dom::DomNode) {
-    let (size, fit) = root.measure(proposal, env);
+    let (size, fit) = root.measure(proposal, &env);
     let mut out = Placement {
         dom: Some(crate::dom::DomCapture::new(size)),
         skip_display: !collect_display,
         keep_unseen: true,
         ..Placement::default()
     };
-    root.place(Rect { origin: Point::default(), size }, &fit, env, &mut out);
+    root.place(Rect { origin: Point::default(), size }, &fit, &env, &mut out);
     // the capture is still open at the root here, so every popover
     // mounts as the root's LAST child — outside every scroll element,
     // stacked on top by document order: the portal, by construction
-    place_overlays(window_bounds(proposal, size), env, &mut out);
+    place_overlays(window_bounds(proposal, size), &env, &mut out);
     let scene = out.dom.take().expect("the capture stays for the whole walk").finish();
     (
         LayoutResult {
@@ -3487,7 +3487,7 @@ pub(crate) fn menu_row_at(
 /// STAMP's (the runtime tracks it, so the pixel modes highlight), and
 /// each row also declares its CSS hover — the element mode gets the
 /// same highlight with zero patches, its own way.
-fn menu_node(open: &MenuOpen, env: LayoutEnv) -> LayoutNode {
+fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
     let theme = crate::theme::current();
     let mut rows: Vec<LayoutNode> = Vec::with_capacity(open.entries.len());
     for (index, entry) in open.entries.iter().enumerate() {
@@ -3643,7 +3643,7 @@ fn tooltip_node(text: Arc<str>) -> LayoutNode {
     }
 }
 
-fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
+fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
     let container = env.overlay_bounds.unwrap_or(viewport);
     let mut placed = 0;
     while !out.overlay_queue.is_empty() && placed < OVERLAY_CAP {
@@ -3969,7 +3969,7 @@ impl LayoutNode {
     /// the caller then uses the bottom edge (the rule for baselineless
     /// boxes). Only the baseline alignment walks this; everyone else
     /// pays nothing.
-    fn first_baseline(&self, env: LayoutEnv) -> Option<Px> {
+    fn first_baseline(&self, env: &LayoutEnv<'_>) -> Option<Px> {
         match self {
             LayoutNode::Text { content, .. } => {
                 Some(env.cache.get_or_measure(content, &env.font, env.text).ascent)
@@ -3983,9 +3983,9 @@ impl LayoutNode {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
                     text_align: props.text_align.or(env.text_align),
-                    ..env
+                    ..*env
                 };
-                child.first_baseline(env)
+                child.first_baseline(&env)
             }
             LayoutNode::Overlay { child, .. } => child.first_baseline(env),
             LayoutNode::Animated { child, .. }
@@ -4028,7 +4028,7 @@ impl LayoutNode {
         }
     }
 
-    pub(crate) fn measure(&self, proposal: Proposal, env: LayoutEnv) -> (Size, Fit) {
+    pub(crate) fn measure(&self, proposal: Proposal, env: &LayoutEnv<'_>) -> (Size, Fit) {
         match self {
             LayoutNode::Text { content, truncation, .. } => {
                 let metrics = env.cache.get_or_measure(content, &env.font, env.text);
@@ -4489,9 +4489,9 @@ impl LayoutNode {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
                     text_align: props.text_align.or(env.text_align),
-                    ..env
+                    ..*env
                 };
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, &env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
@@ -4549,7 +4549,7 @@ impl LayoutNode {
         }
     }
 
-    pub(crate) fn place(&self, frame: Rect, fit: &Fit, env: LayoutEnv, out: &mut Placement) {
+    pub(crate) fn place(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
         match (self, fit.unshared()) {
             // visual leaves: the draw list is born here
             (LayoutNode::Text { content, highlights, truncation }, Fit::Leaf) => {
@@ -5757,7 +5757,7 @@ impl LayoutNode {
                     line_height: props.line_height.or(env.line_height),
                     text_align: props.text_align.or(env.text_align),
                     anim: env.anim.map(|scope| AnimScope { colors: false, ..scope }),
-                    ..env
+                    ..*env
                 };
                 // the animator paints the value in flight, never the
                 // target — it seeds, retargets and snaps behind this
@@ -5862,7 +5862,7 @@ impl LayoutNode {
                 if props.clip {
                     out.push_clip(frame, props.corner_radius.unwrap_or_default());
                 }
-                child.place(frame, fit, env, out);
+                child.place(frame, fit, &env, out);
                 if props.clip {
                     out.pop_clip();
                 }
@@ -5928,7 +5928,7 @@ impl LayoutNode {
                         colors: true,
                         shift,
                     }),
-                    ..env
+                    ..*env
                 };
                 if let Some(dom) = out.dom.as_mut() {
                     // in Dom the browser animates: the spec lowers to a
@@ -5938,7 +5938,7 @@ impl LayoutNode {
                 child.place(
                     Rect { origin: painted, size: frame.size },
                     fit,
-                    env,
+                    &env,
                     out,
                 );
                 if let Some(dom) = out.dom.as_mut() {
@@ -5949,8 +5949,8 @@ impl LayoutNode {
             (LayoutNode::Live { spec, child }, Fit::Wrapped(_, fit)) => {
                 // the clock opens for the subtree: the custom boxes
                 // below resolve their phase against it at paint time
-                let env = LayoutEnv { live: Some(*spec), ..env };
-                child.place(frame, fit, env, out);
+                let env = LayoutEnv { live: Some(*spec), ..*env };
+                child.place(frame, fit, &env, out);
             }
 
             (LayoutNode::Island { child, .. }, Fit::Wrapped(_, fit)) => {
@@ -6143,9 +6143,9 @@ impl LayoutNode {
                         real.origin,
                     );
                 }
-                let env = LayoutEnv { anim: None, ..env };
+                let env = LayoutEnv { anim: None, ..*env };
                 if children.len() == 1 {
-                    children[0].place(frame, &fits[0].1, env, out);
+                    children[0].place(frame, &fits[0].1, &env, out);
                 } else {
                     place_stack(
                         Axis::Vertical,
@@ -6154,7 +6154,7 @@ impl LayoutNode {
                         children,
                         frame,
                         fits,
-                        env,
+                        &env,
                         out,
                     );
                 }
@@ -6260,7 +6260,7 @@ fn measure_split(
     trailing: bool,
     children: &[LayoutNode],
     proposal: Proposal,
-    env: LayoutEnv,
+    env: &LayoutEnv<'_>,
 ) -> (Size, Fit) {
     let lane = |main: Option<Px>| match axis {
         Axis::Horizontal => Proposal { width: main, height: proposal.height },
@@ -6364,7 +6364,7 @@ fn measure_stack(
     spacing: Px,
     children: &[LayoutNode],
     proposal: Proposal,
-    env: LayoutEnv,
+    env: &LayoutEnv<'_>,
 ) -> (Size, Fit) {
     let cross_proposal = |main: Option<Px>| match axis {
         Axis::Vertical => Proposal { width: proposal.width, height: main },
@@ -6544,7 +6544,7 @@ fn place_text(
     truncation: Option<Truncation>,
     frame: Rect,
     base_color: Color,
-    env: LayoutEnv,
+    env: &LayoutEnv<'_>,
     out: &mut Placement,
 ) {
     if content.is_empty() {
@@ -6660,7 +6660,7 @@ fn emit_text_runs(
     highlights: Option<&TextHighlight>,
     origin: Point,
     base_color: Color,
-    env: LayoutEnv,
+    env: &LayoutEnv<'_>,
     out: &mut Placement,
 ) {
     let (line_start, line_end) = line;
@@ -6760,7 +6760,7 @@ fn rows_that_fit(lines: usize, advance: Px, room: Option<Px>) -> usize {
     }
 }
 
-fn truncate_to_width(content: &str, mode: Truncation, width: Px, env: LayoutEnv) -> String {
+fn truncate_to_width(content: &str, mode: Truncation, width: Px, env: &LayoutEnv<'_>) -> String {
     let fits = |candidate: &str| {
         env.cache.get_or_measure(candidate, &env.font, env.text).width <= width
     };
@@ -6945,7 +6945,7 @@ fn place_stack(
     children: &[LayoutNode],
     frame: Rect,
     fits: &[(Size, Fit)],
-    env: LayoutEnv,
+    env: &LayoutEnv<'_>,
     out: &mut Placement,
 ) {
     let mut cursor = match axis {
@@ -7700,7 +7700,7 @@ mod tests {
             scale: 1.0,
             touch: false,
         };
-        node.measure(proposal, env).0
+        node.measure(proposal, &env).0
     }
 
     /// Full layout with a pointer stamped into the env — how tests drive
@@ -7806,7 +7806,7 @@ mod tests {
                 child: Box::new(text(5)),
             }),
         }
-        .measure(Proposal { width: Some(width), height: Some(50.0) }, env());
+        .measure(Proposal { width: Some(width), height: Some(50.0) }, &env());
         let (_, fit) = region(300.0);
         let Fit::ScrollContent(content, _) = fit else { panic!("a region's fit") };
         assert_eq!(content.width, 300.0, "the content was laid out AT the region, not merely placed under it");
@@ -8076,11 +8076,11 @@ mod tests {
         };
         let offer = Proposal { width: Some(100.0), height: Some(200.0) };
 
-        let (plain, _) = region().measure(offer, env());
+        let (plain, _) = region().measure(offer, &env());
         assert_eq!(plain.height, 200.0, "a plain region fills what it was offered");
 
         let hugging = LayoutNode::Hug { axis: Axis::Vertical, child: Box::new(region()) };
-        let (hugged, _) = hugging.measure(offer, env());
+        let (hugged, _) = hugging.measure(offer, &env());
         assert_eq!(hugged.height, 48.0, "a hugging one stops at its content");
 
         // …and past the offer it is the offer that wins, which is the cap.
@@ -8095,7 +8095,7 @@ mod tests {
                 child: Box::new(rows(40)),
             }),
         };
-        let (capped, fit) = tall.measure(offer, env());
+        let (capped, fit) = tall.measure(offer, &env());
         assert_eq!(capped.height, 200.0);
 
         // …and the region still travels, because it is PLACED at the cap
@@ -8104,7 +8104,7 @@ mod tests {
         tall.place(
             Rect { origin: Point { x: 0.0, y: 0.0 }, size: capped },
             &fit,
-            env(),
+            &env(),
             &mut out,
         );
         assert_eq!(out.scrolls.len(), 1);

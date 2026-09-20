@@ -920,12 +920,12 @@ impl Walk<'_> {
             width: self.slot.0,
             height: self.slot.1,
         };
-        let (size, fit) = subtree.measure(proposal, env);
+        let (size, fit) = subtree.measure(proposal, &env);
         let mut placement = crate::layout::Placement::with_capture(size, self.current_ink());
         subtree.place(
             crate::layout::Rect { origin: Point::default(), size },
             &fit,
-            env,
+            &env,
             &mut placement,
         );
         // the interior arrives ABSOLUTE (geometry on every node); the
@@ -971,7 +971,7 @@ impl Walk<'_> {
             width: reported.map(|(w, _)| w).or(self.slot.0),
             height: reported.map(|(_, h)| h).or(self.slot.1),
         };
-        let (measured, fit) = subtree.measure(proposal, env);
+        let (measured, fit) = subtree.measure(proposal, &env);
         // which axes FOLLOW the proposal? offer a different box and
         // watch what moves — a moved axis belongs to the browser:
         // `align-self: stretch`, no pinned size, and every resize
@@ -980,7 +980,7 @@ impl Walk<'_> {
             width: Some(proposal.width.unwrap_or(measured.width) + 97.0),
             height: Some(proposal.height.unwrap_or(measured.height) + 97.0),
         };
-        let (moved, _) = subtree.measure(shifted, env);
+        let (moved, _) = subtree.measure(shifted, &env);
         let hungry = (
             (moved.width - measured.width).abs() > 0.5,
             (moved.height - measured.height).abs() > 0.5,
@@ -1008,7 +1008,7 @@ impl Walk<'_> {
         subtree.place(
             crate::layout::Rect { origin: Point::default(), size },
             &fit,
-            env,
+            &env,
             &mut placement,
         );
         self.display.extend(placement.display);
