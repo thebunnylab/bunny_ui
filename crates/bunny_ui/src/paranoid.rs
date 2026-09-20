@@ -21,8 +21,11 @@ use std::sync::OnceLock;
 pub(crate) const ASSEMBLE: u32 = 1 << 0;
 /// The settle round that runs no pass over a clean tree.
 pub(crate) const SETTLE: u32 = 1 << 1;
+/// The second layout the pointer re-read skips when no box paints the
+/// hover that moved.
+pub(crate) const HOVER: u32 = 1 << 2;
 
-const NAMES: [(&str, u32); 2] = [("assemble", ASSEMBLE), ("settle", SETTLE)];
+const NAMES: [(&str, u32); 3] = [("assemble", ASSEMBLE), ("settle", SETTLE), ("hover", HOVER)];
 
 thread_local! {
     /// A test's own switch, over the environment's.
@@ -47,7 +50,7 @@ fn from_environment() -> u32 {
                     .map(|(_, flag)| *flag)
                     .unwrap_or_else(|| {
                         // a name nobody knows would check nothing, in silence
-                        panic!("BUNNY_PARANOID: `{name}` is not a check (known: all, assemble, settle)")
+                        panic!("BUNNY_PARANOID: `{name}` is not a check (known: all, assemble, settle, hover)")
                     }),
             })
             .fold(0, |flags, flag| flags | flag)

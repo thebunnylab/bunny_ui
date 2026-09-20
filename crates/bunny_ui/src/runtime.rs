@@ -130,6 +130,14 @@ pub struct Runtime {
     /// in paint order — the hit-test
     /// map for pointer events.
     last_hits: RefCell<Vec<(String, Rect)>>,
+    /// Which of those hits paint a pointer state (indices into
+    /// `last_hits`), and which hover groups do — the last layout's
+    /// answer to "would a hover HERE change the picture?".
+    last_hover_sensitive: RefCell<Vec<usize>>,
+    last_sensitive_groups: RefCell<Vec<String>>,
+    /// What the last pointer move did besides changing the hovered
+    /// target: a box used it, a tooltip moved. A frame's re-read asks.
+    hover_move_had_more: Cell<bool>,
     /// Handlers the HOST mounted, outside any view. The tree's own
     /// handlers are the reconciler's and are rebuilt every pass; these
     /// stand until the host takes them down, and they are the OUTERMOST
@@ -1124,6 +1132,9 @@ impl Runtime {
             scene,
             last_root: RefCell::new(None),
             last_hits: RefCell::new(Vec::new()),
+            last_hover_sensitive: RefCell::new(Vec::new()),
+            last_sensitive_groups: RefCell::new(Vec::new()),
+            hover_move_had_more: Cell::new(false),
             hosted_handlers: RefCell::new(HashMap::default()),
             interaction: RefCell::new(Interaction::default()),
             pointer_modifiers: std::cell::Cell::new(crate::action::Modifiers::NONE),
@@ -1494,6 +1505,7 @@ impl Runtime {
         // the tooltip's hover walks beside the interactive one and
         // never touches it — a region explains, it does not intercept
         let explained = self.note_tooltip_hover(x, y);
+        self.hover_move_had_more.set(used || explained);
         changed || used || explained
     }
 
@@ -3498,7 +3510,7 @@ impl Runtime {
     ) -> crate::layout::DisplayList {
         self.settle(root);
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
-        if let Some(again) = self.reread_hover(root, size) {
+        if let Some(again) = self.reread_hover(root, size, &result) {
             result = again;
         }
         result.display
@@ -3506,18 +3518,69 @@ impl Runtime {
 
     /// The pointer re-read of a frame, and the second layout when the
     /// re-read asks for one.
+    ///
+    /// Content can move under a still pointer, so a frame reads the
+    /// pointer again after its layout: the hovered target, the
+    /// `.on_hover` arrivals, the cursor, the tooltip and the app's box all
+    /// stay honest. A SECOND layout is for a new picture only. A hover
+    /// that moved between two targets that paint no pointer state changed
+    /// nothing a layout draws — and while a page scrolls under a pointer
+    /// at rest, that is nearly every frame.
     fn reread_hover(
         &self,
         root: &impl View,
         size: crate::layout::Size,
+        first: &crate::layout::LayoutResult,
     ) -> Option<crate::layout::LayoutResult> {
         crate::stats::time(crate::stats::Stage::Hover, || {
             let point = self.hover_reread()?;
-            if !self.pointer_moved(point.x, point.y, self.pointer_modifiers.get()) {
+            let before = self.interaction.borrow().hovered.clone();
+            self.hover_move_had_more.set(true);
+            let modifiers = self.pointer_modifiers.get();
+            // `pointer_moved`, with the two halves of its answer apart
+            self.enter_scene();
+            let (repaint, told) =
+                self.watching_hover(|| self.pointer_moved_road(point.x, point.y, modifiers));
+            if !repaint && !told {
+                return None;
+            }
+            // a box that used the move, a tooltip that moved, an
+            // `.on_hover` that fired, a road that never reached the hover
+            // at all (a drag, a menu): all of those are the old answer
+            let only_the_target_changed = !told && !self.hover_move_had_more.get();
+            let after = self.interaction.borrow().hovered.clone();
+            if only_the_target_changed
+                && !self.hover_paints(before.as_deref())
+                && !self.hover_paints(after.as_deref())
+            {
+                if crate::paranoid::on(crate::paranoid::HOVER) {
+                    let again = self.layout(root, crate::layout::Proposal::exact(size));
+                    assert!(
+                        again.display.as_slice() == first.display.as_slice(),
+                        "a hover that no box paints changed the picture: {before:?} -> {after:?}"
+                    );
+                }
                 return None;
             }
             crate::stats::note_hover_relayout();
-            Some(self.layout(root, crate::layout::Proposal::exact(size)))
+            let again = self.layout(root, crate::layout::Proposal::exact(size));
+            Some(again)
+        })
+    }
+
+    /// Would a hover on this target change the picture the last layout
+    /// drew? It does when a box under the target paints a pointer state,
+    /// or when the target sits in a hover group whose descendants do.
+    fn hover_paints(&self, target: Option<&str>) -> bool {
+        let Some(target) = target else { return false };
+        let hits = self.last_hits.borrow();
+        let sensitive = self.last_hover_sensitive.borrow();
+        if sensitive.iter().any(|index| hits.get(*index).is_some_and(|(path, _)| path == target)) {
+            return true;
+        }
+        self.last_sensitive_groups.borrow().iter().any(|group| {
+            target == group
+                || target.strip_prefix(group.as_str()).is_some_and(|rest| rest.starts_with('/'))
         })
     }
 
@@ -3697,7 +3760,7 @@ impl Runtime {
         size: crate::layout::Size,
     ) -> crate::layout::DisplayList {
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
-        if let Some(again) = self.reread_hover(root, size) {
+        if let Some(again) = self.reread_hover(root, size, &result) {
             result = again;
         }
         result.display
@@ -5169,20 +5232,24 @@ impl Runtime {
         drop(offsets);
         drop(dialogs);
         drop(carets);
-        *self.last_hits.borrow_mut() = result.hits.clone();
-        *self.last_scrolls.borrow_mut() = result.scrolls.clone();
+        // `clone_from`, not a fresh clone: the tables keep their capacity
+        // from frame to frame, and the paths inside keep their buffers
+        self.last_hits.borrow_mut().clone_from(&result.hits);
+        self.last_hover_sensitive.borrow_mut().clone_from(&result.hover_sensitive);
+        self.last_sensitive_groups.borrow_mut().clone_from(&result.sensitive_groups);
+        self.last_scrolls.borrow_mut().clone_from(&result.scrolls);
         self.last_modal_floor.set(result.modal_floor);
-        *self.last_fields.borrow_mut() = result.fields.clone();
-        *self.last_splits.borrow_mut() = result.splits.clone();
-        *self.last_customs.borrow_mut() = result.customs.clone();
-        *self.last_hosts.borrow_mut() = result.hosts.clone();
-        *self.last_overlays.borrow_mut() = result.overlays.clone();
-        *self.last_tooltips.borrow_mut() = result.tooltips.clone();
-        *self.last_menus.borrow_mut() = result.menus.clone();
-        *self.last_drag_sources.borrow_mut() = result.drag_sources.clone();
-        *self.last_drops.borrow_mut() = result.drops.clone();
-        *self.last_drag_regions.borrow_mut() = result.drag_regions.clone();
-        *self.last_control_regions.borrow_mut() = result.control_regions.clone();
+        self.last_fields.borrow_mut().clone_from(&result.fields);
+        self.last_splits.borrow_mut().clone_from(&result.splits);
+        self.last_customs.borrow_mut().clone_from(&result.customs);
+        self.last_hosts.borrow_mut().clone_from(&result.hosts);
+        self.last_overlays.borrow_mut().clone_from(&result.overlays);
+        self.last_tooltips.borrow_mut().clone_from(&result.tooltips);
+        self.last_menus.borrow_mut().clone_from(&result.menus);
+        self.last_drag_sources.borrow_mut().clone_from(&result.drag_sources);
+        self.last_drops.borrow_mut().clone_from(&result.drops);
+        self.last_drag_regions.borrow_mut().clone_from(&result.drag_regions);
+        self.last_control_regions.borrow_mut().clone_from(&result.control_regions);
         // an applied-target memory whose region left the scene goes
         // with it — live regions keep theirs (the wheel stays sovereign)
         self.scroll_targets

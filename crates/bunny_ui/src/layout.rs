@@ -1620,6 +1620,15 @@ pub struct VisualProps {
 }
 
 impl VisualProps {
+    /// Does this box paint another colour under the pointer? Only such a
+    /// box makes a change of hover a change of picture.
+    pub(crate) fn paints_pointer_state(&self) -> bool {
+        self.background_hovered.is_some()
+            || self.background_pressed.is_some()
+            || self.foreground_hovered.is_some()
+            || self.foreground_pressed.is_some()
+    }
+
     /// Merge of modifiers stacked on the same view: what is already set
     /// (CLOSEST to the view) wins; the outer one only fills what is
     /// missing.
@@ -2451,6 +2460,17 @@ pub struct Placement {
     /// this stack instead, so the pointer over a chip can light the
     /// mark inside it.
     groups: Vec<(bool, bool)>,
+    /// Stack of the nearest `Interactive`'s index in `hits` — `None` for
+    /// a target outside the clip, which no pointer can reach. A `Styled`
+    /// that paints a pointer state marks that hit as hover-sensitive.
+    pointer_hit: Vec<Option<usize>>,
+    /// One mark for each open `.hover_group()`: did a descendant paint by
+    /// the group's pointer state?
+    group_marks: Vec<bool>,
+    /// The hits whose hover changes the picture, as indices into `hits`.
+    pub(crate) hover_sensitive: Vec<usize>,
+    /// The groups whose hover changes the picture, by path.
+    pub(crate) sensitive_groups: Vec<String>,
     /// Stack of the current clip (intersections in logical coordinates) —
     /// whoever records a hit consults it; the raster redoes the cut in
     /// physical px.
@@ -2669,6 +2689,12 @@ pub struct LayoutResult {
     /// A canvas island placed while display collection was off — the
     /// runtime re-runs the pass collected.
     pub(crate) saw_island: bool,
+    /// The hits whose hover changes the picture (indices into `hits`),
+    /// and the groups whose hover does. A frame re-reads the pointer
+    /// after its layout; it lays out again only when the target the
+    /// pointer left, or the one it reached, is one of these.
+    pub(crate) hover_sensitive: Vec<usize>,
+    pub(crate) sensitive_groups: Vec<String>,
     /// The placed popovers, in paint order (last = topmost) — each one
     /// a suffix slice of `display`.
     pub overlays: Vec<OverlayPlacement>,
@@ -2820,6 +2846,8 @@ pub fn layout_with_insets(
         hosts: out.hosts,
         misses: out.misses,
         saw_island: out.saw_island,
+        hover_sensitive: out.hover_sensitive,
+        sensitive_groups: out.sensitive_groups,
         overlays: out.overlays,
         modal_floor: out.modal_floor,
         drag_regions: out.drag_regions,
@@ -2865,6 +2893,8 @@ pub fn layout_dom(
             hosts: out.hosts,
             misses: out.misses,
             saw_island: out.saw_island,
+            hover_sensitive: out.hover_sensitive,
+            sensitive_groups: out.sensitive_groups,
             overlays: out.overlays,
             modal_floor: out.modal_floor,
             drag_regions: out.drag_regions,
@@ -5263,6 +5293,18 @@ impl LayoutNode {
                 // inside a chip lights when the CHIP is hovered
                 let stack = if props.from_group { &out.groups } else { &out.pointer };
                 let (hovered, pressed) = stack.last().copied().unwrap_or((false, false));
+                // this box is WHY a hover there is a new picture: the
+                // frame's pointer re-read lays out again for such a
+                // target, and for no other
+                if props.paints_pointer_state() {
+                    if props.from_group {
+                        if let Some(mark) = out.group_marks.last_mut() {
+                            *mark = true;
+                        }
+                    } else if let Some(Some(index)) = out.pointer_hit.last() {
+                        out.hover_sensitive.push(*index);
+                    }
+                }
                 // pressed > hovered > normal; a state without its own
                 // background falls back to the base one — a button with
                 // no hover defined does not flicker
@@ -5436,6 +5478,7 @@ impl LayoutNode {
                 let hovered = under(&env.stamp.interaction.hovered);
                 let pressed = hovered && under(&env.stamp.interaction.pressed);
                 out.groups.push((hovered, pressed));
+                out.group_marks.push(false);
                 if let Some(dom) = out.dom.as_mut() {
                     // element mode gets a box of its OWN: the glue hangs
                     // the descendants' state rules off its selector, and
@@ -5445,6 +5488,9 @@ impl LayoutNode {
                 child.place(frame, *fit, env, out);
                 if let Some(dom) = out.dom.as_mut() {
                     dom.close_group();
+                }
+                if out.group_marks.pop() == Some(true) {
+                    out.sensitive_groups.push(path.clone());
                 }
                 out.groups.pop();
             }
@@ -5458,9 +5504,11 @@ impl LayoutNode {
                     Some(clip) => frame.intersection(clip),
                     None => Some(frame),
                 };
-                if let Some(visible) = visible {
+                let hit_index = visible.map(|visible| {
                     out.hits.push((path.clone(), visible));
-                }
+                    out.hits.len() - 1
+                });
+                out.pointer_hit.push(hit_index);
                 // hover/pressed from the env's STAMP; VISUAL pressed only
                 // with the pointer inside the target (AppKit semantics:
                 // dragging out releases, coming back re-arms)
@@ -5479,6 +5527,7 @@ impl LayoutNode {
                     dom.disarm();
                 }
                 out.pointer.pop();
+                out.pointer_hit.pop();
             }
 
             (

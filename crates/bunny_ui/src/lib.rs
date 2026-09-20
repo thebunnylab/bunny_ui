@@ -2985,6 +2985,78 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_lays_out_again_for_a_hover_only_when_a_box_paints_it() {
+        // a page that scrolls under a pointer at rest changes the hovered
+        // target on nearly every frame. The re-read keeps the target
+        // honest either way; the SECOND layout is for a new picture.
+        #[derive(Clone, Copy)]
+        struct Rows {
+            lit: bool,
+        }
+
+        impl Component for Rows {
+            fn body(self, _ctx: &Context) -> impl View {
+                let lit = self.lit;
+                let rows: Vec<_> = (0..40)
+                    .map(|row| {
+                        let label = text(format!("row {row}")).frame(200.0, 20.0);
+                        let label = if lit {
+                            erased(label.background_hovered(Color::rgba(255, 0, 0, 255)))
+                        } else {
+                            erased(label)
+                        };
+                        erased(label.on_click(|| {}).id(format!("row-{row}")))
+                    })
+                    .collect();
+                scroll(vstack!(rows).spacing(0.0)).id("rows")
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        let hot = crate::layout::DrawCommand::FillRect {
+            rect: crate::layout::Rect {
+                origin: crate::layout::Point { x: 0.0, y: 0.0 },
+                size: crate::layout::Size { width: 0.0, height: 0.0 },
+            },
+            color: Color::rgba(255, 0, 0, 255),
+            corner_radius: Default::default(),
+        };
+        let paints_hot = |display: &crate::layout::DisplayList| {
+            display.as_slice().iter().any(|command| {
+                matches!((command, &hot), (
+                    crate::layout::DrawCommand::FillRect { color, .. },
+                    crate::layout::DrawCommand::FillRect { color: wanted, .. },
+                ) if color == wanted)
+            })
+        };
+        crate::paranoid::force(crate::paranoid::HOVER);
+        for lit in [false, true] {
+            let rows = Rows { lit };
+            let runtime = Runtime::scene("w0");
+            let _ = runtime.display_frame(&rows, size);
+            runtime.pointer_moved(100.0, 50.0, false);
+            let first = runtime.display_frame(&rows, size);
+            assert_eq!(paints_hot(&first), lit, "the row under the pointer is lit only when it can be");
+            let before = runtime.interaction().hovered;
+
+            // one whole row of travel: another row is under the pointer
+            let _ = crate::stats::take();
+            assert!(runtime.wheel(100.0, 50.0, 0.0, -20.0));
+            let scrolled = runtime.display_frame(&rows, size);
+            let stats = crate::stats::take();
+            let after = runtime.interaction().hovered;
+            assert_ne!(before, after, "the target stays honest: the re-read always runs");
+            if lit {
+                assert_eq!(stats.hover_relayouts, 1, "a lit row is a new picture: laid out again");
+                assert!(paints_hot(&scrolled), "and the NEW row is the lit one");
+            } else {
+                assert_eq!(stats.hover_relayouts, 0, "no box paints the hover: one layout");
+            }
+        }
+        crate::paranoid::release();
+    }
+
+    #[test]
     fn a_runtime_handed_another_root_forgets_the_old_boundary() {
         #[derive(Clone, Copy)]
         struct First;
