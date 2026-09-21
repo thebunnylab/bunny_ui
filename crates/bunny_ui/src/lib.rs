@@ -6327,6 +6327,127 @@ mod tests {
     }
 
     #[test]
+    fn chat_enter_and_native_navigation_preserve_text_and_selection() {
+        use crate::action::{Key, KeyPattern};
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::EditCommand;
+        #[derive(Clone, Copy)]
+        struct Chat {
+            value: State<String>,
+            sends: State<i32>,
+        }
+        impl Component for Chat {
+            fn body(self, _: &Context) -> impl View {
+                text_editor("message", self.value.binding())
+                    .submit_on_enter()
+                    .on_submit(move || self.sends.add(1))
+                    .auto_focus()
+                    .frame(300.0, 100.0)
+            }
+        }
+        let chat = Chat {
+            value: State::new(String::new()),
+            sends: State::new(0),
+        };
+        let runtime = Runtime::new();
+        runtime.settled_layout(
+            &chat,
+            Proposal::exact(Size {
+                width: 300.0,
+                height: 100.0,
+            }),
+        );
+        runtime.key(EditCommand::Insert("one café\nlast line".into()));
+        assert!(runtime.key_stroke(KeyPattern::command(Key::Left)).handled);
+        let mut select_end = KeyPattern::command(Key::Right);
+        select_end.shift = true;
+        assert!(runtime.key_stroke(select_end).handled);
+        assert_eq!(
+            runtime.key(EditCommand::Copy).output.as_deref(),
+            Some("last line")
+        );
+        let mut word = KeyPattern::key(Key::Left);
+        word.option = true;
+        assert!(runtime.key_stroke(word).handled);
+        word.shift = true;
+        assert!(runtime.key_stroke(word).handled);
+        assert_eq!(
+            runtime.key(EditCommand::Copy).output.as_deref(),
+            Some("last ")
+        );
+        runtime.key_stroke(KeyPattern::command(Key::Up));
+        let mut word = KeyPattern::key(Key::Right);
+        word.option = true;
+        runtime.key_stroke(word);
+        word.shift = true;
+        runtime.key_stroke(word);
+        assert_eq!(
+            runtime.key(EditCommand::Copy).output.as_deref(),
+            Some(" café")
+        );
+        runtime.key_stroke(KeyPattern::command(Key::Down));
+        let mut newline = KeyPattern::key(Key::Enter);
+        newline.shift = true;
+        assert!(runtime.key_stroke(newline).handled);
+        assert_eq!(chat.value.get(), "one café\nlast line\n");
+        assert_eq!(chat.sends.get(), 0);
+        assert!(runtime.key_stroke(KeyPattern::key(Key::Enter)).handled);
+        assert_eq!(chat.sends.get(), 1);
+        assert_eq!(chat.value.get(), "one café\nlast line\n");
+        // Native input bridges can deliver the command rather than a stroke.
+        assert!(runtime.key(EditCommand::Newline).applied);
+        assert_eq!(chat.sends.get(), 2);
+    }
+
+    #[test]
+    fn command_arrows_keep_logical_line_boundaries_when_wrapped() {
+        use crate::action::{Key, KeyPattern};
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::EditCommand;
+        #[derive(Clone, Copy)]
+        struct Note(State<String>);
+        impl Component for Note {
+            fn body(self, _: &Context) -> impl View {
+                text_editor("", self.0.binding())
+                    .auto_focus()
+                    .frame(80.0, 200.0)
+            }
+        }
+        let note = Note(State::new(String::new()));
+        let runtime = Runtime::new();
+        runtime.settled_layout(
+            &note,
+            Proposal::exact(Size {
+                width: 80.0,
+                height: 200.0,
+            }),
+        );
+        runtime.key(EditCommand::Insert(
+            "first line\nsecond third fourth".into(),
+        ));
+        runtime.settled_layout(
+            &note,
+            Proposal::exact(Size {
+                width: 80.0,
+                height: 200.0,
+            }),
+        );
+        runtime.key_stroke(KeyPattern::command(Key::Left));
+        let mut end = KeyPattern::command(Key::Right);
+        end.shift = true;
+        runtime.key_stroke(end);
+        let selected = runtime
+            .key(EditCommand::Copy)
+            .output
+            .expect("last logical line");
+        assert_eq!(selected, "second third fourth");
+        assert!(
+            selected.len() < note.0.get().len(),
+            "line movement is not document movement"
+        );
+    }
+
+    #[test]
     fn a_field_answers_its_own_key_and_only_where_the_app_asked() {
         use crate::action::{Key, KeyPattern};
         use crate::layout::{Proposal, Size};

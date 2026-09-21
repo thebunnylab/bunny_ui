@@ -1950,16 +1950,24 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 "moveRight:" => Some(EditCommand::Right(false)),
                 "moveLeftAndModifySelection:" => Some(EditCommand::Left(true)),
                 "moveRightAndModifySelection:" => Some(EditCommand::Right(true)),
-                "moveToBeginningOfLine:" | "moveToLeftEndOfLine:" | "moveUp:" => {
-                    Some(EditCommand::Home(false))
-                }
+                "moveWordLeft:" | "moveWordBackward:" => Some(EditCommand::WordLeft(false)),
+                "moveWordRight:" | "moveWordForward:" => Some(EditCommand::WordRight(false)),
+                "moveWordLeftAndModifySelection:" | "moveWordBackwardAndModifySelection:" => Some(EditCommand::WordLeft(true)),
+                "moveWordRightAndModifySelection:" | "moveWordForwardAndModifySelection:" => Some(EditCommand::WordRight(true)),
+                "moveToBeginningOfLine:" | "moveToLeftEndOfLine:" => Some(EditCommand::LineStart(false)),
+                "moveUp:" => Some(EditCommand::Up(false)),
+                "moveDown:" => Some(EditCommand::Down(false)),
+                "moveToBeginningOfDocument:" => Some(EditCommand::Home(false)),
+                "moveToEndOfDocument:" => Some(EditCommand::End(false)),
+                "moveToBeginningOfDocumentAndModifySelection:" => Some(EditCommand::Home(true)),
+                "moveToEndOfDocumentAndModifySelection:" => Some(EditCommand::End(true)),
                 "moveToBeginningOfLineAndModifySelection:"
-                | "moveToLeftEndOfLineAndModifySelection:" => Some(EditCommand::Home(true)),
-                "moveToEndOfLine:" | "moveToRightEndOfLine:" | "moveDown:" => {
-                    Some(EditCommand::End(false))
+                | "moveToLeftEndOfLineAndModifySelection:" => Some(EditCommand::LineStart(true)),
+                "moveToEndOfLine:" | "moveToRightEndOfLine:" => {
+                    Some(EditCommand::LineEnd(false))
                 }
                 "moveToEndOfLineAndModifySelection:"
-                | "moveToRightEndOfLineAndModifySelection:" => Some(EditCommand::End(true)),
+                | "moveToRightEndOfLineAndModifySelection:" => Some(EditCommand::LineEnd(true)),
                 "selectAll:" => Some(EditCommand::SelectAll),
                 "cancelOperation:" => {
                     // esc releases focus

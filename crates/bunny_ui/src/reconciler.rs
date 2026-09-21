@@ -52,6 +52,7 @@ type EditFn = Rc<dyn Fn(EditCommand, &mut CaretState) -> Option<String>>;
 pub(crate) type FieldKeyFn = Rc<dyn Fn(&crate::action::Stroke, &mut CaretState) -> bool>;
 #[derive(Clone)]
 pub(crate) struct EditorFn {
+    pub submit_on_enter: bool,
     pub command: EditFn,
     pub key: Option<FieldKeyFn>,
     pub policy: Option<Rc<dyn crate::text_input::EditingStrategy>>,
@@ -1524,4 +1525,14 @@ pub(crate) fn field_key(
 pub(crate) fn field_takes_text(path: &str) -> bool {
     let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
     editor.is_some_and(|editor| editor.policy.as_ref().is_none_or(|policy| policy.takes_text()))
+}
+
+/// Whether this retained field opts into chat-style Enter submission.
+pub(crate) fn field_submits_on_enter(path: &str) -> bool {
+    EDITORS.with(|editors| {
+        editors
+            .borrow()
+            .get(path)
+            .is_some_and(|editor| editor.submit_on_enter)
+    })
 }

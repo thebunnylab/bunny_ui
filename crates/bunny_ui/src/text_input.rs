@@ -39,6 +39,11 @@ pub enum EditCommand {
     Delete,
     Left(bool),
     Right(bool),
+    WordLeft(bool),
+    WordRight(bool),
+    /// Start/end of the current logical line, preserving newline boundaries.
+    LineStart(bool),
+    LineEnd(bool),
     Home(bool),
     End(bool),
     SelectAll,
@@ -67,7 +72,10 @@ pub enum EditCommand {
     /// the composing text and keeps it MARKED (underlined, not
     /// committed). `caret_utf16` = (location, length) INSIDE the marked
     /// text — the platform's vocabulary.
-    SetMarked { text: String, caret_utf16: (usize, usize) },
+    SetMarked {
+        text: String,
+        caret_utf16: (usize, usize),
+    },
     /// Ends the composition, committing the marked text as it stands.
     Unmark,
 }
@@ -112,6 +120,43 @@ fn clamp_to_boundary(text: &str, index: usize) -> usize {
 /// Clamps a retained index against the current text — the stamp uses it.
 pub(crate) fn clamp_index(text: &str, index: usize) -> usize {
     clamp_to_boundary(text, index)
+}
+
+/// Word movement shares the field's double-click character classes.
+fn word_boundary(text: &str, index: usize, right: bool) -> usize {
+    let mut index = clamp_to_boundary(text, index);
+    let mut run = None;
+    loop {
+        let next = if right {
+            next_boundary(text, index)
+        } else {
+            previous_boundary(text, index)
+        };
+        if next == index {
+            return index;
+        }
+        let ch = if right {
+            text[index..next].chars().next()
+        } else {
+            text[next..index].chars().next()
+        };
+        let Some(ch) = ch else { return index };
+        let kind = if ch.is_whitespace() {
+            0
+        } else if ch.is_alphanumeric() || ch == '_' {
+            2
+        } else {
+            1
+        };
+        if let Some(wanted) = run {
+            if wanted != kind {
+                return index;
+            }
+        } else if kind != 0 {
+            run = Some(kind);
+        }
+        index = next;
+    }
 }
 
 /// What a second click takes: the run of same-kind chars around a byte
@@ -291,6 +336,22 @@ pub fn apply(text: &mut String, state: &mut CaretState, command: EditCommand) ->
             let target = next_boundary(text, state.caret);
             let collapse = state.selection().map(|(_, end)| end).unwrap_or(target);
             moved(state, select, target, collapse);
+        }
+        EditCommand::WordLeft(select) => {
+            let target = word_boundary(text, state.caret, false);
+            moved(state, select, target, target);
+        }
+        EditCommand::WordRight(select) => {
+            let target = word_boundary(text, state.caret, true);
+            moved(state, select, target, target);
+        }
+        EditCommand::LineStart(select) => {
+            let target = text[..state.caret].rfind('\n').map_or(0, |at| at + 1);
+            moved(state, select, target, target);
+        }
+        EditCommand::LineEnd(select) => {
+            let target = text[state.caret..].find('\n').map_or(text.len(), |at| state.caret + at);
+            moved(state, select, target, target);
         }
         EditCommand::Home(select) => moved(state, select, 0, 0),
         EditCommand::End(select) => {

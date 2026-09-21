@@ -1796,6 +1796,46 @@ impl Runtime {
                 return crate::custom::Response::handled();
             }
         }
+        if let Some(path) = self.focused()
+            && self.field_at(&path).is_some()
+        {
+            use crate::action::Key;
+            let edit = match pattern.key {
+                Key::Enter if pattern.is_plain() && pattern.shift => {
+                    Some(EditCommand::Insert("\n".into()))
+                }
+                Key::Enter if pattern.is_plain() && reconciler::field_submits_on_enter(&path) => {
+                    Some(EditCommand::Submit)
+                }
+                Key::Left if pattern.command && !pattern.control && !pattern.option => {
+                    Some(EditCommand::LineStart(pattern.shift))
+                }
+                Key::Right if pattern.command && !pattern.control && !pattern.option => {
+                    Some(EditCommand::LineEnd(pattern.shift))
+                }
+                Key::Up if pattern.command && !pattern.control && !pattern.option => {
+                    Some(EditCommand::Home(pattern.shift))
+                }
+                Key::Down if pattern.command && !pattern.control && !pattern.option => {
+                    Some(EditCommand::End(pattern.shift))
+                }
+                Key::Left if pattern.option && !pattern.command && !pattern.control => {
+                    Some(EditCommand::WordLeft(pattern.shift))
+                }
+                Key::Right if pattern.option && !pattern.command && !pattern.control => {
+                    Some(EditCommand::WordRight(pattern.shift))
+                }
+                _ => None,
+            };
+            if let Some(edit) = edit {
+                // A one-line field must not consume Shift+Enter as text.
+                let multiline = self.field_at(&path).is_some_and(|field| field.multiline);
+                if (!matches!(edit, EditCommand::Insert(_)) || multiline) && self.key(edit).applied
+                {
+                    return crate::custom::Response::handled();
+                }
+            }
+        }
         let Some(placement) = self.focused_custom() else {
             return crate::custom::Response::ignored();
         };
@@ -3161,6 +3201,9 @@ impl Runtime {
     /// as a break; a one-line one declines, and the stroke goes on to
     /// the app's bindings — which is why `⌘↵` still commits.
     fn insert_break(&self, path: &str) -> Edited {
+        if reconciler::field_submits_on_enter(path) {
+            return self.submit(path);
+        }
         match self.field_at(path).is_some_and(|field| field.multiline) {
             true => self.key(EditCommand::Insert("\n".into())),
             // a one-line field has no break to take, so the bare
@@ -3436,6 +3479,7 @@ impl Runtime {
         // Enter and of the vertical arrows
         match command {
             EditCommand::Newline => return self.insert_break(&path),
+            EditCommand::Submit => return self.submit(&path),
             EditCommand::Up(select) => return self.walk_line(&path, false, select),
             EditCommand::Down(select) => return self.walk_line(&path, true, select),
             // any other command is a fresh start for the walk's column

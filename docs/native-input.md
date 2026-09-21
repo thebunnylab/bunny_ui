@@ -23,3 +23,15 @@ file-drag adapters to the other platform shells.
 
 Regression coverage lives in the field-strategy and external-file tests in
 `crates/bunny_ui/src/lib.rs`. The application owns file classification and limits.
+
+A multiline field can opt into `.submit_on_enter()`: plain Enter calls its
+`on_submit` handler and Shift+Enter inserts a newline. Cmd+Enter remains an alias.
+The default multiline editor still uses Enter for a newline. Editing strategies
+receive the stroke before plain Enter submission, so Vim Normal mode can consume
+it without sending.
+
+Focused fields handle Option+Left/Right by word, Cmd+Left/Right by logical line,
+and Cmd+Up/Down by document; Shift extends the selection for each motion. Word
+movement uses the same Unicode character classes as double-click selection.
+Logical line edges remain stable under soft wrapping and stop before newlines.
+AppKit's corresponding text command selectors use the same edit commands.
