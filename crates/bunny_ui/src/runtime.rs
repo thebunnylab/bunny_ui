@@ -1762,10 +1762,7 @@ impl Runtime {
     /// `.on_submit` asked for. The answer's `text` is what a copy
     /// hands the platform's clipboard; `handled: false` sends the
     /// stroke on to the app's bindings.
-    pub fn key_stroke(
-        &self,
-        stroke: impl Into<crate::action::Stroke>,
-    ) -> crate::custom::Response {
+    pub fn key_stroke(&self, stroke: impl Into<crate::action::Stroke>) -> crate::custom::Response {
         self.enter_scene();
         let stroke = stroke.into();
         let pattern = &stroke.pattern;
@@ -1785,6 +1782,17 @@ impl Runtime {
                 && self.field_at(&path).is_some_and(|field| field.multiline)
                 && self.submit(&path).applied
             {
+                return crate::custom::Response::handled();
+            }
+        }
+        if let Some(path) = self.focused() {
+            let mut state = self.carets.borrow().get(&path).copied().unwrap_or_default();
+            if reconciler::field_key(&path, &stroke, &mut state) {
+                self.carets.borrow_mut().insert(path.clone(), state);
+                self.caret_visible.set(true);
+                self.frame_asked.set(true);
+                self.goal_column.set(None);
+                self.reveal_caret(&path);
                 return crate::custom::Response::handled();
             }
         }
@@ -2915,14 +2923,13 @@ impl Runtime {
     /// itself through [`crate::custom::CustomElement::takes_text`],
     /// which is how a modal editor keeps its command mode.
     pub fn focus_takes_text(&self) -> bool {
+        self.enter_scene();
         let Some(path) = self.focused() else {
             return false;
         };
         match self.custom_at(&path) {
             Some(placement) => placement.element.element().takes_text(),
-            // a field types, always — the box that is not the app's is
-            // the framework's own, and it has no mode
-            None => true,
+            None => reconciler::field_takes_text(&path),
         }
     }
 
@@ -5551,5 +5558,39 @@ impl crate::touch::TouchScene for Runtime {
         self.reachable(&menus, |floor| floor.menus)
             .iter()
             .any(|region| region.rect.contains(at.x, at.y))
+    }
+}
+
+/// Files offered by the operating system, distinct from an internal drag.
+#[derive(Clone, Debug)]
+pub struct ExternalPaths(pub Vec<std::path::PathBuf>);
+
+impl Runtime {
+    /// Preview a native file drag using the same clipped drop targets as an internal drag.
+    pub fn external_drag(&self, x: Px, y: Px, files: &ExternalPaths) -> bool {
+        self.enter_scene();
+        let region = self.drop_at(x, y, files);
+        self.note_drag_preview(region.as_ref(), x, y);
+        region.is_some() && !files.0.is_empty()
+    }
+
+    /// Deliver native files only to the accepting target under the pointer.
+    pub fn external_drop(&self, x: Px, y: Px, files: ExternalPaths) -> bool {
+        self.enter_scene();
+        let region = self.drop_at(x, y, &files);
+        self.note_drag_preview(None, x, y);
+        if files.0.is_empty() {
+            return false;
+        }
+        let Some(region) = region else { return false };
+        (region.action.0)(&files, Self::drop_point(&region, x, y));
+        self.frame_asked.set(true);
+        true
+    }
+
+    /// Clear a native drag preview when the pointer leaves the window.
+    pub fn external_drag_exited(&self) {
+        self.enter_scene();
+        self.note_drag_preview(None, 0.0, 0.0);
     }
 }

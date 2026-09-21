@@ -48,7 +48,14 @@ pub(crate) type ActionEntry = (String, ClickAction);
 /// A text field's editor: applies a command to the (binding, caret)
 /// pair and returns the output of `Read`/`Copy`/`Cut`. Retained like
 /// the actions — a skipped view's field still edits.
-pub(crate) type EditorFn = Rc<dyn Fn(EditCommand, &mut CaretState) -> Option<String>>;
+type EditFn = Rc<dyn Fn(EditCommand, &mut CaretState) -> Option<String>>;
+pub(crate) type FieldKeyFn = Rc<dyn Fn(&crate::action::Stroke, &mut CaretState) -> bool>;
+#[derive(Clone)]
+pub(crate) struct EditorFn {
+    pub command: EditFn,
+    pub key: Option<FieldKeyFn>,
+    pub policy: Option<Rc<dyn crate::text_input::EditingStrategy>>,
+}
 pub(crate) type EditorEntry = (String, EditorFn);
 
 /// A split divider's position writer: the drag hands it the new lane-A
@@ -1191,7 +1198,7 @@ pub(crate) fn run_editor(
     state: &mut CaretState,
 ) -> Option<Option<String>> {
     let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
-    editor.map(|editor| editor(command, state))
+    editor.map(|editor| (editor.command)(command, state))
 }
 
 thread_local! {
@@ -1246,7 +1253,7 @@ pub(crate) fn input_fingerprint() -> u64 {
         map.borrow().iter().fold(0u64, |sum, (key, action)| sum.wrapping_add(of_key(key) ^ of_ptr(action)))
     }));
     mix(EDITORS.with(|map| {
-        map.borrow().iter().fold(0u64, |sum, (key, editor)| sum.wrapping_add(of_key(key) ^ of_ptr(editor)))
+        map.borrow().iter().fold(0u64, |sum, (key, editor)| sum.wrapping_add(of_key(key) ^ of_ptr(&editor.command)))
     }));
     mix(SPLITS.with(|map| {
         map.borrow().iter().fold(0u64, |sum, (key, split)| sum.wrapping_add(of_key(key) ^ of_ptr(split)))
@@ -1502,4 +1509,19 @@ pub(crate) fn expand(node: &RenderNode) -> RenderNode {
             children: node.children.iter().map(expand).collect(),
         }
     }
+}
+
+/// Offer modal input through the same retained field identity as native edits.
+pub(crate) fn field_key(
+    path: &str,
+    stroke: &crate::action::Stroke,
+    state: &mut CaretState,
+) -> bool {
+    let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
+    editor.and_then(|editor| editor.key).is_some_and(|key| key(stroke, state))
+}
+
+pub(crate) fn field_takes_text(path: &str) -> bool {
+    let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
+    editor.is_some_and(|editor| editor.policy.as_ref().is_none_or(|policy| policy.takes_text()))
 }

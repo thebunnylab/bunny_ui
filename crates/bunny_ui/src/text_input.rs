@@ -360,6 +360,34 @@ pub fn byte_to_utf16(text: &str, byte: usize) -> usize {
     text[..clamp_to_boundary(text, byte)].chars().map(char::len_utf16).sum()
 }
 
+/// An optional editing policy for a native field. The field keeps its binding,
+/// layout, selection, IME and scrolling; the policy interprets keyboard input.
+/// Retain one policy per document, independently of the rendered view's lifetime.
+pub trait EditingStrategy {
+    /// Whether printable keyboard input should enter the platform's text/IME path.
+    fn takes_text(&self) -> bool;
+
+    /// Offer a physical stroke before application key bindings. Return true only
+    /// when consumed; declined strokes retain the platform's normal behavior.
+    fn key(
+        &self,
+        stroke: &crate::action::Stroke,
+        text: &mut String,
+        caret: &mut CaretState,
+    ) -> bool;
+
+    /// Apply native text, clipboard and composition commands. The default keeps
+    /// the native field's editing semantics; policies may extend this for history.
+    fn edit(
+        &self,
+        text: &mut String,
+        caret: &mut CaretState,
+        command: EditCommand,
+    ) -> Option<String> {
+        apply(text, caret, command)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

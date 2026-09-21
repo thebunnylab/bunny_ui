@@ -6222,6 +6222,111 @@ mod tests {
     }
 
     #[test]
+    fn a_field_strategy_retains_native_editing_and_owns_modal_strokes() {
+        use crate::action::{Key, KeyPattern, Stroke};
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::{CaretState, EditCommand, EditingStrategy};
+        use std::{cell::Cell, rc::Rc};
+        struct Modal(Cell<bool>);
+        impl EditingStrategy for Modal {
+            fn takes_text(&self) -> bool {
+                self.0.get()
+            }
+            fn key(&self, stroke: &Stroke, text: &mut String, caret: &mut CaretState) -> bool {
+                if stroke.pattern.key == Key::Escape {
+                    self.0.set(false);
+                    return true;
+                }
+                if !self.0.get() && stroke.typed == Some('x') {
+                    crate::text_input::apply(text, caret, EditCommand::Backspace);
+                    return true;
+                }
+                false
+            }
+        }
+        #[derive(Clone)]
+        struct Panel {
+            note: State<String>,
+            policy: Rc<Modal>,
+            sent: State<i32>,
+        }
+        impl Component for Panel {
+            fn body(self, _: &Context) -> impl View {
+                text_editor("note", self.note.binding())
+                    .editing_strategy(Some(self.policy.clone()))
+                    .on_submit(move || self.sent.add(1))
+                    .frame(200.0, 80.0)
+            }
+        }
+        let panel = Panel {
+            note: State::new(String::new()),
+            policy: Rc::new(Modal(Cell::new(true))),
+            sent: State::new(0),
+        };
+        let runtime = Runtime::new();
+        runtime.render_stable(&panel);
+        let layout = runtime.layout(
+            &panel,
+            Proposal::exact(Size {
+                width: 200.0,
+                height: 80.0,
+            }),
+        );
+        let path = &layout.hits.first().expect("field target").0;
+        runtime.focus(path);
+        assert!(runtime.focus_takes_text());
+        runtime.key(EditCommand::Insert("é🦀".into()));
+        assert!(runtime.key_stroke(KeyPattern::key(Key::Escape)).handled);
+        assert!(!runtime.focus_takes_text());
+        assert!(
+            runtime
+                .key_stroke(Stroke::new(KeyPattern::key(Key::Char('x')), Some('x')))
+                .handled
+        );
+        assert_eq!(panel.note.get(), "é");
+        runtime.render_stable(&panel);
+        assert!(!runtime.focus_takes_text(), "redraw retains the policy");
+        assert!(runtime.key_stroke(KeyPattern::command(Key::Enter)).handled);
+        assert_eq!(panel.sent.get(), 1);
+    }
+
+    #[test]
+    fn external_files_drop_only_inside_the_accepting_target() {
+        use crate::layout::{Proposal, Size};
+        use crate::runtime::ExternalPaths;
+        #[derive(Clone, Copy)]
+        struct Panel {
+            count: State<usize>,
+        }
+        impl Component for Panel {
+            fn body(self, _: &Context) -> impl View {
+                text("drop here")
+                    .frame(100.0, 40.0)
+                    .on_drop::<ExternalPaths>(move |files| self.count.set(files.0.len()))
+            }
+        }
+        let panel = Panel {
+            count: State::new(0),
+        };
+        let runtime = Runtime::new();
+        runtime.render_stable(&panel);
+        runtime.layout(
+            &panel,
+            Proposal::exact(Size {
+                width: 100.0,
+                height: 40.0,
+            }),
+        );
+        let files = ExternalPaths(vec!["/tmp/é.png".into(), "/tmp/note.txt".into()]);
+        assert!(runtime.external_drag(20.0, 20.0, &files));
+        assert_eq!(panel.count.get(), 0, "hover never attaches");
+        assert!(!runtime.external_drop(500.0, 20.0, files.clone()));
+        assert!(runtime.external_drop(20.0, 20.0, files));
+        assert_eq!(panel.count.get(), 2);
+        assert!(!runtime.external_drop(20.0, 20.0, ExternalPaths(vec![])));
+    }
+
+    #[test]
     fn a_field_answers_its_own_key_and_only_where_the_app_asked() {
         use crate::action::{Key, KeyPattern};
         use crate::layout::{Proposal, Size};
@@ -13641,4 +13746,3 @@ mod tests {
         assert_eq!(bottom.size.width, 402.0);
     }
 }
-
