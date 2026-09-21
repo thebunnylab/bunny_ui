@@ -1522,6 +1522,18 @@ pub(crate) fn field_key(
     editor.and_then(|editor| editor.key).is_some_and(|key| key(stroke, state))
 }
 
+pub(crate) fn field_caret_shape(path: &str) -> crate::text_input::CaretShape {
+    let policy = EDITORS.with(|editors| {
+        editors
+            .borrow()
+            .get(path)
+            .and_then(|editor| editor.policy.clone())
+    });
+    policy.map_or(crate::text_input::CaretShape::Bar, |policy| {
+        policy.caret_shape()
+    })
+}
+
 pub(crate) fn field_takes_text(path: &str) -> bool {
     let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
     editor.is_some_and(|editor| editor.policy.as_ref().is_none_or(|policy| policy.takes_text()))

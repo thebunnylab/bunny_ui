@@ -5006,19 +5006,50 @@ impl LayoutNode {
                 // It belongs to the EARLIER line at a break, so End on a
                 // wrapped line shows it where the typing is
                 if let Some(caret) = caret {
-                    let index = line_of(lines, caret);
-                    let (start, _) = lines[index];
+                    use crate::text_input::CaretShape;
+                    let shape = crate::reconciler::field_caret_shape(path);
+                    let mut index = line_of(lines, caret);
+                    // A block covers the next character. At a soft wrap that
+                    // character belongs to the following line; an insert bar
+                    // keeps the native earlier-line affinity.
+                    if shape != CaretShape::Bar
+                        && lines.get(index + 1).is_some_and(|&(start, _)| start == caret)
+                    {
+                        index += 1;
+                    }
+                    let (start, end) = lines[index];
+                    let next = content.get(caret..).and_then(|tail| tail.chars().next())
+                        .filter(|ch| *ch != '\n' && *ch != '\r')
+                        .map(|ch| caret + ch.len_utf8())
+                        .filter(|next| *next <= end);
+                    let width = if shape == CaretShape::Bar {
+                        FIELD_CARET_W
+                    } else {
+                        next.map_or_else(
+                            || env.cache.get_or_measure(" ", &env.font, env.text).width,
+                            |next| width_of(caret, next),
+                        ).max(FIELD_CARET_W)
+                    };
+                    let height = if shape == CaretShape::Underline { FIELD_CARET_W } else { line_h };
+                    let origin = Point {
+                        x: text_origin.x + width_of(start, caret.max(start)),
+                        y: text_origin.y + index as Px * line_h,
+                    };
                     out.draw(DrawCommand::FillRect {
                         rect: Rect {
-                            origin: Point {
-                                x: text_origin.x + width_of(start, caret.max(start)),
-                                y: text_origin.y + index as Px * line_h,
-                            },
-                            size: Size { width: FIELD_CARET_W, height: line_h },
+                            origin: Point { x: origin.x, y: origin.y + line_h - height },
+                            size: Size { width, height },
                         },
                         color: theme.caret,
-                        corner_radius: Corners::all(FIELD_CARET_W / 2.0),
+                        corner_radius: if shape == CaretShape::Bar {
+                            Corners::all(FIELD_CARET_W / 2.0)
+                        } else { Corners::ZERO },
                     });
+                    // Keep the covered character readable on a solid block.
+                    // Empty content must not borrow a glyph from the placeholder.
+                    if shape == CaretShape::Block && let Some(next) = next {
+                        emit_text_runs(content, (caret, next), None, origin, theme.field, env, out);
+                    }
                 }
                 out.pop_clip();
                 if !*bare {

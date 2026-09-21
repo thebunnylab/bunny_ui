@@ -6315,6 +6315,86 @@ mod tests {
     }
 
     #[test]
+    fn modal_caret_repaints_its_shape_without_changing_field_text() {
+        use crate::action::{Key, KeyPattern, Stroke};
+        use crate::layout::{DrawCommand, Proposal, Size};
+        use crate::text_input::{CaretShape, CaretState, EditingStrategy};
+        use std::{cell::Cell, rc::Rc};
+        struct Modal(Cell<CaretShape>);
+        impl EditingStrategy for Modal {
+            fn takes_text(&self) -> bool {
+                self.0.get() == CaretShape::Bar
+            }
+            fn caret_shape(&self) -> CaretShape {
+                self.0.get()
+            }
+            fn key(&self, stroke: &Stroke, _: &mut String, _: &mut CaretState) -> bool {
+                self.0.set(match stroke.pattern.key {
+                    Key::Escape => CaretShape::Block,
+                    Key::Char('R') => CaretShape::Underline,
+                    Key::Char('i') => CaretShape::Bar,
+                    _ => return false,
+                });
+                true
+            }
+        }
+        #[derive(Clone)]
+        struct Field {
+            note: State<String>,
+            policy: Rc<Modal>,
+        }
+        impl Component for Field {
+            fn body(self, _: &Context) -> impl View {
+                text_editor("placeholder", self.note.binding())
+                    .editing_strategy(Some(self.policy))
+                    .frame(200.0, 80.0)
+            }
+        }
+        for value in ["", "é🦀", "one\ntwo"] {
+            let note = State::new(value.to_string());
+            let view = Field {
+                note,
+                policy: Rc::new(Modal(Cell::new(CaretShape::Bar))),
+            };
+            let runtime = Runtime::new();
+            let proposal = Proposal::exact(Size {
+                width: 200.0,
+                height: 80.0,
+            });
+            let laid = runtime.settled_layout(&view, proposal);
+            runtime.focus(&laid.fields[0].path);
+            for (key, block, underline) in [
+                (Key::Char('i'), false, false),
+                (Key::Escape, true, false),
+                (Key::Char('R'), false, true),
+                (Key::Char('i'), false, false),
+            ] {
+                assert!(runtime.key_stroke(KeyPattern::key(key)).handled);
+                let laid = runtime.settled_layout(&view, proposal);
+                let rect = laid
+                    .display
+                    .iter()
+                    .find_map(|op| match op {
+                        DrawCommand::FillRect { rect, color, .. }
+                            if *color == crate::theme::current().caret =>
+                        {
+                            Some(rect)
+                        }
+                        _ => None,
+                    })
+                    .expect("focused caret is painted");
+                assert_eq!(
+                    rect.size.width > 2.0,
+                    block || underline,
+                    "{value:?}: {rect:?}"
+                );
+                assert_eq!(rect.size.height > 2.0, !underline, "{value:?}: {rect:?}");
+                assert_eq!(note.get(), value, "mode changes do not edit the draft");
+            }
+        }
+    }
+
+    #[test]
     fn external_files_drop_only_inside_the_accepting_target() {
         use crate::layout::{Proposal, Size};
         use crate::runtime::ExternalPaths;

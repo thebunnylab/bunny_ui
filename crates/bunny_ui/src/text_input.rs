@@ -421,10 +421,24 @@ pub fn byte_to_utf16(text: &str, byte: usize) -> usize {
     text[..clamp_to_boundary(text, byte)].chars().map(char::len_utf16).sum()
 }
 
+/// Appearance of the native caret, supplied by the retained editing policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaretShape {
+    #[default]
+    Bar,
+    Block,
+    Underline,
+}
+
 /// An optional editing policy for a native field. The field keeps its binding,
 /// layout, selection, IME and scrolling; the policy interprets keyboard input.
 /// Retain one policy per document, independently of the rendered view's lifetime.
 pub trait EditingStrategy {
+    /// Read at paint time, including when a mode change leaves the text unchanged.
+    fn caret_shape(&self) -> CaretShape {
+        CaretShape::Bar
+    }
+
     /// Whether printable keyboard input should enter the platform's text/IME path.
     fn takes_text(&self) -> bool;
 
