@@ -5730,9 +5730,33 @@ mod tests {
 
         // two clicks take the word under the pointer, three take the line
         runtime.pointer_clicked(at(8), y, 2, false);
+        runtime.pointer_moved(at(8) + 0.5, y, false);
+        assert_eq!(selected(), (6, 5), "held jitter preserves the entire word");
+        runtime.layout(&form, viewport);
+        assert_eq!(
+            selected(),
+            (6, 5),
+            "layout replay preserves the entire word"
+        );
+        runtime.pointer_moved(at(2), y, false);
+        assert_eq!(selected(), (0, 11), "backward drag takes whole words");
+        runtime.pointer_moved(at(8), y, false);
+        assert_eq!(
+            selected(),
+            (6, 5),
+            "returning to the original word restores it"
+        );
         runtime.pointer_released(at(8), y);
         assert_eq!(selected(), (6, 5), "the word `world`");
         runtime.pointer_clicked(at(8), y, 3, false);
+        runtime.pointer_moved(at(8) + 0.5, y, false);
+        assert_eq!(selected(), (0, 11), "held jitter preserves the entire line");
+        runtime.layout(&form, viewport);
+        assert_eq!(
+            selected(),
+            (0, 11),
+            "layout replay preserves the entire line"
+        );
         runtime.pointer_released(at(8), y);
         assert_eq!(selected(), (0, 11), "and a one-line field IS the line");
 
@@ -6324,6 +6348,62 @@ mod tests {
         assert!(runtime.external_drop(20.0, 20.0, files));
         assert_eq!(panel.count.get(), 2);
         assert!(!runtime.external_drop(20.0, 20.0, ExternalPaths(vec![])));
+    }
+
+    #[test]
+    fn multiline_multiclick_keeps_units_through_jitter_and_reverse_drag() {
+        use crate::layout::{Proposal, Size};
+        #[derive(Clone, Copy)]
+        struct Note(State<String>);
+        impl Component for Note {
+            fn body(self, _: &Context) -> impl View {
+                text_editor("note", self.0.binding()).frame(400.0, 100.0)
+            }
+        }
+        let note = Note(State::new("alpha café gamma\nsecond line\nlast".into()));
+        let runtime = Runtime::new();
+        let proposal = Proposal::exact(Size {
+            width: 400.0,
+            height: 100.0,
+        });
+        runtime.render_stable(&note);
+        let laid = runtime.layout(&note, proposal);
+        let (_, frame) = laid.hits.last().expect("field");
+        let x = frame.origin.x + 8.0;
+        let y = frame.origin.y + 9.0;
+        let selected = || runtime.ime_snapshot().expect("focused").selected;
+        // The previous caret is on another line, not at the selected word.
+        runtime.pointer_clicked(x + 24.0, y + 32.0, 1, false);
+        runtime.pointer_released(x + 24.0, y + 32.0);
+        runtime.pointer_clicked(x + 64.0, y, 2, false);
+        runtime.pointer_moved(x + 64.5, y, false);
+        runtime.layout(&note, proposal);
+        assert_eq!(selected(), (6, 4), "the entire accented word, in UTF-16");
+        runtime.pointer_moved(x + 96.0, y, false);
+        assert_eq!(selected(), (6, 10), "forward word drag");
+        runtime.pointer_moved(x + 16.0, y, false);
+        assert_eq!(
+            selected(),
+            (0, 10),
+            "reverse word drag keeps the original word"
+        );
+        runtime.pointer_released(x + 16.0, y);
+        runtime.pointer_clicked(x + 24.0, y + 16.0, 3, false);
+        runtime.pointer_moved(x + 24.5, y + 16.0, false);
+        runtime.layout(&note, proposal);
+        assert_eq!(selected(), (17, 11), "only the clicked line, in full");
+        runtime.pointer_moved(x + 8.0, y, false);
+        assert_eq!(selected(), (0, 28), "reverse drag keeps complete lines");
+        runtime.pointer_moved(x + 8.0, y + 32.0, false);
+        assert_eq!(selected(), (17, 16), "forward drag keeps complete lines");
+        runtime.pointer_cancelled();
+        runtime.pointer_clicked(x + 16.0, y, 1, false);
+        runtime.pointer_moved(x + 32.0, y, false);
+        assert_eq!(
+            selected(),
+            (2, 2),
+            "cancel clears the previous gesture unit"
+        );
     }
 
     #[test]

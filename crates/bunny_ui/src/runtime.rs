@@ -322,6 +322,9 @@ pub struct Runtime {
     /// time, so the number needs no key: it belongs to whatever
     /// `interaction.pressed` names, and the release takes it.
     pressed_clicks: Cell<u8>,
+    /// Original word/line selected by a field press. Held motion extends
+    /// from this entire unit, never from a partially swept caret.
+    field_unit_anchor: Cell<Option<(usize, usize)>>,
     /// The finger's state machine — what a touch means is decided here
     /// and performed through the pointer's own doors ([`crate::touch`]).
     touch: RefCell<crate::touch::Recognizer>,
@@ -1187,6 +1190,7 @@ impl Runtime {
             last_drop_rings: RefCell::new(Vec::new()),
             drag_armed: RefCell::new(None),
             pressed_clicks: Cell::new(1),
+            field_unit_anchor: Cell::new(None),
             touch: RefCell::new(crate::touch::Recognizer::new()),
             touch_modality: Cell::new(false),
             in_touch: Cell::new(false),
@@ -1960,6 +1964,7 @@ impl Runtime {
         // risen press of a box, the thumb, the seam and the ordinary
         // tail all take their count from here, and the release takes it
         self.pressed_clicks.set(clicks);
+        self.field_unit_anchor.set(None);
         let target = self.hover_target(x, y);
         // a press inside the app's box hands it the pointer: nothing
         // arms by default (a box has no up-inside action to mis-fire)
@@ -2044,6 +2049,7 @@ impl Runtime {
         // including the ones that end a drag, a grab, a seam or a thumb
         // and fire no action at all, so the next gesture starts at one
         let clicks = self.pressed_clicks.replace(1);
+        self.field_unit_anchor.set(None);
         // a live drag ends here: over a compatible target the value
         // lands (the drag clears FIRST — the action writes state into
         // a world without it); anywhere else it just goes home
@@ -2379,6 +2385,7 @@ impl Runtime {
 
     fn pointer_cancelled_road(&self) -> bool {
         self.pressed_clicks.set(1);
+        self.field_unit_anchor.set(None);
         self.drag_armed.borrow_mut().take();
         let dragged = self.drag_value.borrow_mut().take().is_some();
         if dragged {
@@ -3028,6 +3035,8 @@ impl Runtime {
             // selection at all, and the next move gives it width
             _ => CaretState { caret, anchor: Some(caret), marked: None },
         };
+        self.field_unit_anchor
+            .set((clicks >= 2).then_some((state.anchor.unwrap_or(state.caret), state.caret)));
         self.carets.borrow_mut().insert(path.to_string(), state);
         self.reveal_caret(path);
     }
@@ -3037,14 +3046,28 @@ impl Runtime {
     /// must repaint.
     fn sweep_to(&self, path: &str, x: Px, y: Px) -> bool {
         self.goal_column.set(None);
-        let Some((_, caret, _)) = self.caret_under(path, x, y) else { return false };
+        let Some((text, caret, line)) = self.caret_under(path, x, y) else {
+            return false;
+        };
         let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
-        if state.caret == caret {
+        let (anchor, caret) = if let Some((start, end)) = self.field_unit_anchor.get() {
+            let target = if self.pressed_clicks.get() == 2 {
+                word_around(&text, caret)
+            } else {
+                line
+            };
+            if target.0 < start {
+                (end, target.0)
+            } else {
+                (start, target.1.max(end))
+            }
+        } else {
+            (state.anchor.unwrap_or(state.caret), caret)
+        };
+        if state.caret == caret && state.anchor == Some(anchor) {
             return false;
         }
-        // a sweep that begins before the first layout has no anchor to
-        // sweep from — it drops one where it started
-        state.anchor = Some(state.anchor.unwrap_or(state.caret));
+        state.anchor = Some(anchor);
         state.caret = caret;
         self.carets.borrow_mut().insert(path.to_string(), state);
         self.caret_visible.set(true);
