@@ -2757,6 +2757,23 @@ pub fn line_of(lines: &[(usize, usize)], byte: usize) -> usize {
         .unwrap_or(lines.len().saturating_sub(1))
 }
 
+/// Block/underline carets cover the next glyph at a soft wrap. Keep this
+/// affinity shared with scroll reveal so painting never outruns the viewport.
+pub(crate) fn caret_line(
+    lines: &[(usize, usize)],
+    byte: usize,
+    shape: crate::text_input::CaretShape,
+) -> usize {
+    let row = line_of(lines, byte);
+    if shape != crate::text_input::CaretShape::Bar
+        && lines.get(row + 1).is_some_and(|&(start, _)| start == byte)
+    {
+        row + 1
+    } else {
+        row
+    }
+}
+
 /// A placed split — the geometry the runtime needs to route a divider
 /// drag back into layout coordinates (mirror of [`FieldPlacement`]).
 #[derive(Clone, Debug)]
@@ -5008,15 +5025,7 @@ impl LayoutNode {
                 if let Some(caret) = caret {
                     use crate::text_input::CaretShape;
                     let shape = crate::reconciler::field_caret_shape(path);
-                    let mut index = line_of(lines, caret);
-                    // A block covers the next character. At a soft wrap that
-                    // character belongs to the following line; an insert bar
-                    // keeps the native earlier-line affinity.
-                    if shape != CaretShape::Bar
-                        && lines.get(index + 1).is_some_and(|&(start, _)| start == caret)
-                    {
-                        index += 1;
-                    }
+                    let index = caret_line(lines, caret, shape);
                     let (start, end) = lines[index];
                     let next = content.get(caret..).and_then(|tail| tail.chars().next())
                         .filter(|ch| *ch != '\n' && *ch != '\r')

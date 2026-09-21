@@ -6347,10 +6347,10 @@ mod tests {
             fn body(self, _: &Context) -> impl View {
                 text_editor("placeholder", self.note.binding())
                     .editing_strategy(Some(self.policy))
-                    .frame(200.0, 80.0)
+                    .frame(40.0, 26.0)
             }
         }
-        for value in ["", "é🦀", "one\ntwo"] {
+        for value in ["", "é", "🦀", "one\ntwo", "abcdef"] {
             let note = State::new(value.to_string());
             let view = Field {
                 note,
@@ -6358,11 +6358,26 @@ mod tests {
             };
             let runtime = Runtime::new();
             let proposal = Proposal::exact(Size {
-                width: 200.0,
-                height: 80.0,
+                width: 40.0,
+                height: 26.0,
             });
             let laid = runtime.settled_layout(&view, proposal);
             runtime.focus(&laid.fields[0].path);
+            runtime.key(crate::text_input::EditCommand::Home(false));
+            if value == "abcdef" {
+                let field = &laid.fields[0];
+                let lines = crate::text_engine::break_lines(
+                    value,
+                    &field.font,
+                    field.run.size.width,
+                    &*runtime.text(),
+                    &crate::text_engine::MeasureCache::default(),
+                );
+                assert!(lines.len() > 1, "fixture must wrap: {field:?}");
+                for _ in 0..lines[1].0 {
+                    runtime.key(crate::text_input::EditCommand::Right(false));
+                }
+            }
             for (key, block, underline) in [
                 (Key::Char('i'), false, false),
                 (Key::Escape, true, false),
@@ -6389,6 +6404,9 @@ mod tests {
                     "{value:?}: {rect:?}"
                 );
                 assert_eq!(rect.size.height > 2.0, !underline, "{value:?}: {rect:?}");
+                let frame = laid.fields[0].frame;
+                assert!(rect.origin.y >= frame.origin.y && rect.origin.y + rect.size.height <= frame.origin.y + frame.size.height,
+                    "caret stays visible at the wrap: {value:?}: {rect:?}, {frame:?}");
                 assert_eq!(note.get(), value, "mode changes do not edit the draft");
             }
         }

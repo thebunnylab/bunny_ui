@@ -3196,7 +3196,7 @@ impl Runtime {
         };
         if field.multiline {
             let lines = self.wrap(text, &field);
-            let row = crate::layout::line_of(&lines, caret);
+            let row = crate::layout::caret_line(&lines, caret, reconciler::field_caret_shape(path));
             offset.x = 0.0;
             offset.y = follow(
                 row as Px * field.line_height,
