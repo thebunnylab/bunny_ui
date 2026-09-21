@@ -10,6 +10,8 @@
 
 pub mod credentials;
 pub mod dialog;
+#[doc(hidden)]
+pub mod drive;
 mod ffi;
 mod gl;
 mod image;

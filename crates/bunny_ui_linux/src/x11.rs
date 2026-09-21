@@ -2737,8 +2737,16 @@ pub(crate) fn run() {
         if frame_is_due {
             frame_due();
         }
+        // the hand of a --drive sheet, delivered outside any dispatch
+        crate::drive::drain();
     }
     teardown();
+}
+
+/// How many frames this window has presented — the drive sheet's
+/// witness that a turn reached the glass.
+pub(crate) fn presents() -> u64 {
+    with_x(|client| client.presents)
 }
 
 fn teardown() {

@@ -2979,7 +2979,7 @@ pub(crate) fn backend() -> Backend {
     })
 }
 
-fn is_x11() -> bool {
+pub(crate) fn is_x11() -> bool {
     backend() == Backend::X11
 }
 
@@ -3815,8 +3815,16 @@ pub fn run() {
         if blink_due {
             dispatch(AppEvent::Blink);
         }
+        // the hand of a --drive sheet, delivered outside any dispatch
+        crate::drive::drain();
     }
     teardown();
+}
+
+/// How many frames this window has presented — the drive sheet's
+/// witness that a turn reached the glass.
+pub(crate) fn presents() -> u64 {
+    with_client(|client| client.presents)
 }
 
 /// The repeat timer fired: if the key still holds under the same
