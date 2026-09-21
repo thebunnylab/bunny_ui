@@ -33,3 +33,7 @@ path = "examples/touch_window.rs"
 [[example]]
 name = "letter_window_ios"
 path = "examples/letter_window.rs"
+
+[[example]]
+name = "life_window_ios"
+path = "examples/life_window.rs"

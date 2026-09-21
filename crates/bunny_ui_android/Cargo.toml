@@ -43,3 +43,8 @@ crate-type = ["cdylib"]
 name = "credentials_window_android"
 path = "examples/credentials_window.rs"
 crate-type = ["cdylib"]
+
+[[example]]
+name = "life_window_android"
+path = "examples/life_window.rs"
+crate-type = ["cdylib"]

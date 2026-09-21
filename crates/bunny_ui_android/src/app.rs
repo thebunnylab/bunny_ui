@@ -147,11 +147,9 @@ impl Default for App {
 impl App {
     /// An app with no window yet.
     pub fn new() -> App {
-        // the app's life outside its window: the phone has no
-        // notification road this shell speaks yet, and says so by name
-        bunny_ui::app::install_notifier(|_| {
-            Err("bunny_ui android: notifications are not served on this shell yet".to_string())
-        });
+        // the app's life outside its window: the phone's notification
+        // manager, over JNI, on the UI thread the app runs on
+        bunny_ui::app::install_notifier(crate::notify::notify);
         App {
             inner: Rc::new(AppInner {
                 pending: RefCell::new(None),

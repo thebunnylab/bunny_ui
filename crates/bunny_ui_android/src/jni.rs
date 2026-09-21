@@ -364,6 +364,13 @@ impl Env {
         self.check().then_some(length)
     }
 
+    /// An object array of `length`, every slot holding `fill` — a
+    /// `null` fill is allowed, and an array of one IS its fill.
+    pub fn new_object_array(&self, class: JClass, length: i32, fill: JObject) -> Option<JObject> {
+        let array = unsafe { (self.table().new_object_array)(self.raw, length, class, fill) };
+        (self.check() && !array.is_null()).then_some(array)
+    }
+
     pub fn new_byte_array(&self, bytes: &[u8]) -> Option<JObject> {
         let array = unsafe { (self.table().new_byte_array)(self.raw, bytes.len() as JInt) };
         if !self.check() || array.is_null() {
