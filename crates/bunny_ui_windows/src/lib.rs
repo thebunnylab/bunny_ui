@@ -119,6 +119,8 @@ pub struct WindowSpec {
     title: Rc<str>,
     size: Size,
     chrome: Chrome,
+    resizable: bool,
+    minimizable: bool,
 }
 
 impl WindowSpec {
@@ -128,7 +130,24 @@ impl WindowSpec {
             title: title.into(),
             size: Size { width: 1024.0, height: 640.0 },
             chrome: Chrome::Native,
+            resizable: true,
+            minimizable: true,
         }
+    }
+
+    /// A door has ONE size: no resize border, no zoom box. The mac's spec has
+    /// said this since D113; here it had no way to.
+    #[must_use]
+    pub fn fixed(mut self) -> WindowSpec {
+        self.resizable = false;
+        self
+    }
+
+    /// ...and cannot be put away.
+    #[must_use]
+    pub fn no_minimize(mut self) -> WindowSpec {
+        self.minimizable = false;
+        self
     }
 
     /// The content size the window opens at.
@@ -358,11 +377,16 @@ pub fn run_window_chrome(
 /// long as it does — the frame path, the pools, the gates and the event
 /// handler — into a slot the [`App`] holds and routes to.
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
+    // a shell presents the list and never reads it: what no pixel can show
+    // is not drawn
+    runtime.drop_unseen();
     let window = ffi::create_window(
         &spec.title,
         spec.size.width,
         spec.size.height,
         spec.chrome == Chrome::Scene,
+        spec.resizable,
+        spec.minimizable,
     );
     // the present backend, chosen ONCE: the GPU by default, the CPU
     // raster on refusal — and the window has not shown yet, so the
@@ -393,6 +417,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // the open popovers' panels, pooled by identity path
     let panels: Rc<RefCell<std::collections::HashMap<String, ffi::WindowHandle>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
+    // the open dialogs' windows, pooled the same way — an overlay that asked
+    // to BE a window (`OverlaySurface::Window`) gets a real one
+    let dialogs: Rc<RefCell<std::collections::HashMap<String, ffi::WindowHandle>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
     // the commands each host SEGMENT was last rasterized from, with
     // the box and scale that held them — unchanged means re-placed,
     // never re-rastered
@@ -405,6 +433,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
+        let dialogs = Rc::clone(&dialogs);
+        // A dialog's hit-test answers must outlive the frame that raised it,
+        // so they hold the runtime itself and not this frame's borrow of it.
+        let scene = Rc::clone(&runtime);
         let segments_kept = Rc::clone(&segments_kept);
         move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
             let (width, height) = window.content_size();
@@ -575,9 +607,142 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // the window presents everything BEFORE the first overlay;
             // each overlay re-presents its own slice on an owned panel
             // in screen coordinates — that is how it leaves the window
-            let overlays = runtime.overlays();
-            let display = match overlays.first() {
-                Some(first) => full_display.translated_slice((0, first.display.0), 0.0, 0.0),
+            let all_overlays = runtime.overlays();
+            // An overlay that asked to BE a window takes a different road from
+            // one that rides a panel: the platform draws its frame, the reader
+            // moves it, and its own close button dismisses it.
+            let (window_overlays, overlays): (Vec<_>, Vec<_>) =
+                all_overlays.iter().cloned().partition(|overlay| {
+                    matches!(overlay.surface, bunny_ui::layout::OverlaySurface::Window(_))
+                });
+            // Where the window's OWN content ends. Every overlay — a panel's
+            // and a dialog's alike — is carried by its own surface, so the cut
+            // is taken across ALL of them before they are split: cutting at
+            // the first LAYER overlay would leave a dialog's commands in this
+            // window's present, and the scene would smear the dialog's pixels
+            // wherever it had been.
+            let overlay_cut = all_overlays.iter().map(|overlay| overlay.display.0).min();
+            {
+                let mut store = dialogs.borrow_mut();
+                let dead: Vec<String> = store
+                    .keys()
+                    .filter(|path| !window_overlays.iter().any(|o| &o.path == *path))
+                    .cloned()
+                    .collect();
+                for path in dead {
+                    if let Some(dialog) = store.remove(&path) {
+                        dialog.close_dialog();
+                    }
+                }
+                for overlay in &window_overlays {
+                    let bunny_ui::layout::OverlaySurface::Window(spec) = &overlay.surface else {
+                        continue;
+                    };
+                    let x = overlay.frame.origin.x;
+                    let y = overlay.frame.origin.y;
+                    let w = overlay.frame.size.width;
+                    let h = overlay.frame.size.height;
+                    // `DialogChrome::Scene` is the content saying it owns its
+                    // own top edge — the mac places the native lights inside
+                    // it; here there are none to place, and the scene draws
+                    // its own `.window_control(…)` regions instead.
+                    let scene_chrome =
+                        matches!(spec.chrome, bunny_ui::layout::DialogChrome::Scene { .. });
+                    let opening = !store.contains_key(&overlay.path);
+                    let dialog = store.entry(overlay.path.clone()).or_insert_with(|| {
+                        let dialog = ffi::create_dialog(
+                            &window,
+                            &spec.title,
+                            spec.min.width,
+                            spec.min.height,
+                            scene_chrome,
+                        );
+                        dialog.stands_for(&overlay.path);
+                        // Its own answers for the hit-test, from the OWNER's
+                        // runtime: the dialog's content was laid out in the
+                        // owner's scene, and `set_scene_origin` below carries
+                        // the point back there. Without these the header could
+                        // not be dragged and the buttons could not be pressed.
+                        dialog.answers_the_hit_test(
+                            Box::new({
+                                let scene = Rc::clone(&scene);
+                                move |x, y| scene.window_drag_at(x, y)
+                            }),
+                            Box::new({
+                                let scene = Rc::clone(&scene);
+                                move |x, y| {
+                                    scene.window_control_at(x, y).map(|control| match control {
+                                        bunny_ui::layout::WindowControl::Close => {
+                                            ffi::ControlHit::Close
+                                        }
+                                        bunny_ui::layout::WindowControl::Minimize => {
+                                            ffi::ControlHit::Minimize
+                                        }
+                                        bunny_ui::layout::WindowControl::Maximize => {
+                                            ffi::ControlHit::Maximize
+                                        }
+                                    })
+                                }
+                            }),
+                        );
+                        dialog
+                    });
+                    if !scene_chrome {
+                        // a system-drawn bar still wears the scene's
+                        // appearance: a dark workbench under a white caption
+                        // reads as two applications sharing one frame
+                        let luminance = 0.299 * f64::from(canvas.r)
+                            + 0.587 * f64::from(canvas.g)
+                            + 0.114 * f64::from(canvas.b);
+                        dialog.set_dark_caption(luminance < 128.0);
+                    }
+                    if opening {
+                        // the first frame places it where layout asked; after
+                        // that the WINDOW is the truth, so a dragged dialog is
+                        // not yanked back every frame
+                        dialog.set_dialog_client_frame(window.layout_rect_to_screen(x, y, w, h));
+                        dialog.show_dialog();
+                    }
+                    // layout follows the real window: the frame the reader
+                    // left it at is what the next pass lays out against
+                    let (rx, ry, rw, rh) = dialog.screen_rect_to_layout(dialog.client_rect_screen());
+                    runtime.set_dialog_frame(
+                        &overlay.path,
+                        bunny_ui::layout::Rect {
+                            origin: bunny_ui::layout::Point { x: rx, y: ry },
+                            size: Size { width: rw, height: rh },
+                        },
+                    );
+                    dialog.set_scene_origin(x, y);
+                    // opaque: the platform owns the frame and the shadow, so
+                    // there is no bleed and no per-pixel alpha here
+                    let slice = full_display.translated_slice(overlay.display, -x, -y);
+                    let physical = (
+                        (rw * scale as f64).round() as usize,
+                        (rh * scale as f64).round() as usize,
+                    );
+                    if physical.0 == 0 || physical.1 == 0 {
+                        continue;
+                    }
+                    let bitmap = bunny_ui::raster::rasterize_with(
+                        &slice,
+                        physical.0,
+                        physical.1,
+                        scale,
+                        canvas,
+                        &*runtime.text(),
+                        &*runtime.images(),
+                    );
+                    dialog.blit_partial(
+                        physical.0,
+                        physical.1,
+                        &bitmap.to_rgba_bytes(),
+                        &[(0, 0, physical.0 as i64, physical.1 as i64)],
+                    );
+                }
+            }
+            let display = match overlay_cut {
+                Some(cut) => full_display.translated_slice((0, cut), 0.0, 0.0),
                 None => full_display.clone(),
             };
             {
@@ -683,6 +848,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let blit = {
         let present = Rc::clone(&present);
         move |runtime: &Runtime, root: &_| {
+            // A dialog's close button is the reader asking the SCENE to close,
+            // not the window to die: spend those asks before the frame lays
+            // out, so this pass renders without the dialog.
+            for path in ffi::take_closed_dialogs() {
+                runtime.dismiss_overlay(&path);
+            }
             // the webview commands are spent BEFORE the frame renders,
             // so the state an expired eval writes lands in THIS layout.
             // An op whose page is not mounted answers immediately —
@@ -935,9 +1106,23 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // frame. A worker's wake mid-drag polls on the next turn
             // instead of racing the one presenter (the mac's law).
             AppEvent::Redraw => blit(runtime, root),
+            // The work always lands: the tasks are polled. The FRAME is for a
+            // turn that changed something. Most wakes change nothing — a poll
+            // that found no news, a sleeper that went back to sleep — and a
+            // window with a few of those mounted drew whole frames of what
+            // was already on screen, dozens of times a second, at rest. A
+            // change the engine cannot see asks by hand
+            // (`bunny_ui::request_frame`).
+            // Mid-drag the resize step is the one presenter: the work
+            // still lands, and the next step shows what it moved.
             AppEvent::Wake => {
-                if !ffi::in_size_move() {
+                runtime.poll_tasks();
+                if runtime.needs_frame() && !ffi::in_size_move() {
                     blit(runtime, root);
+                } else {
+                    // no frame — but a task may have gone to sleep with a
+                    // new deadline, and the driver follows it
+                    ffi::want_frames(window.raw_window(), runtime.wants_frame());
                 }
             }
             AppEvent::SettingsChanged => {
@@ -1066,6 +1251,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // the same slow beat ages a sequence in the air: two
                 // ticks and `cmd-k` lets the keyboard go
                 let chorded = runtime.chord_tick();
+                // and the wheel's latch: two ticks with no wheel end
+                // the scroll gesture
+                runtime.wheel_tick();
                 if (blinked || explained || chorded) && !ffi::in_size_move() {
                     // mid-drag the clock yields: the WM_SIZE redraw is
                     // the one presenter

@@ -6,3 +6,7 @@ description = "bunny-ui Apple half — CoreText, ImageIO, Security and Metal thr
 
 [dependencies]
 bunny-ui = { workspace = true, features = ["canvas", "gpu"] }
+
+[dev-dependencies]
+# the codecs of the house, so ImageIO can judge them (tests/codec_parity.rs)
+bunny-ui = { workspace = true, features = ["canvas", "gpu", "codec"] }

@@ -159,9 +159,18 @@ impl NodeList {
     /// print, the reference node in the layout) and the final assembly
     /// expands against the reconciler.
     pub(crate) fn push_view_ref(&mut self, path: &str) {
-        self.nodes.push(RenderNode::leaf(crate::reconciler::ref_line(path)));
-        self.layout
-            .push(crate::layout::LayoutNode::BoundaryRef { path: path.to_string() });
+        // the marked line is what a PRINT expands; a frame's pass prints
+        // nothing, and a line for each boundary of the page was a string
+        // nobody read
+        self.nodes.push(RenderNode::leaf(if print_enabled() {
+            crate::reconciler::ref_line(path)
+        } else {
+            String::new()
+        }));
+        self.layout.push(crate::layout::LayoutNode::BoundaryRef {
+            path: path.to_string(),
+            slot: crate::reconciler::slot_of(path),
+        });
     }
 
     pub(crate) fn last_mut(&mut self) -> Option<&mut RenderNode> {
@@ -183,6 +192,16 @@ impl NodeList {
 
     pub(crate) fn take_layout(&mut self) -> Vec<crate::layout::LayoutNode> {
         std::mem::take(&mut self.layout)
+    }
+
+    /// The path of the root boundary, when the pass produced exactly ONE
+    /// boundary at its root.
+    pub(crate) fn root_boundary(&self) -> Option<&str> {
+        match self.layout.as_slice() {
+            [crate::layout::LayoutNode::Boundary { path, .. }] => Some(path),
+            [crate::layout::LayoutNode::BoundaryRef { path, .. }] => Some(path),
+            _ => None,
+        }
     }
 
     pub(crate) fn nodes(&self) -> &[RenderNode] {
@@ -246,8 +265,9 @@ fn retain_entry<T: Component>(view: &T, ctx: &Context, path: &str, body: NodeLis
         ctx.clone(),
         RenderNode::branch(short_type_name::<T>(), print_children),
         crate::layout::LayoutNode::Boundary {
-            path: path.to_string(),
+            path: std::rc::Rc::from(path),
             children: layout_children,
+            quiet: Default::default(),
         },
     );
 }
@@ -263,8 +283,9 @@ fn close_loose<T: Component>(body: NodeList, out: &mut NodeList) {
     let (print_children, layout_children) = body.into_parts();
     out.push(RenderNode::branch(short_type_name::<T>(), print_children));
     out.push_layout(crate::layout::LayoutNode::Boundary {
-        path: short_type_name::<T>(),
+        path: std::rc::Rc::from(short_type_name::<T>()),
         children: layout_children,
+        quiet: Default::default(),
     });
 }
 

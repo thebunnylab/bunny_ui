@@ -283,6 +283,9 @@ impl App {
 /// the mirrors, the gates and the event handler — once UIKit has built
 /// the window.
 fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
+    // a shell presents the list and never reads it: what no pixel can show
+    // is not drawn
+    runtime.drop_unseen();
     // the present backend, chosen ONCE: the GPU, or nothing
     ffi::install_gpu();
     // the season's mirrors: reduce-motion always follows the system
@@ -658,7 +661,24 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
             eprintln!("bunny_ui ios: {event:?}");
         }
         match event {
-            AppEvent::Redraw | AppEvent::Wake => blit(runtime, root),
+            AppEvent::Redraw => blit(runtime, root),
+            // The work always lands: the tasks are polled. The FRAME is for a
+            // turn that changed something. Most wakes change nothing — a poll
+            // that found no news, a sleeper that went back to sleep — and a
+            // window with a few of those mounted drew whole frames of what
+            // was already on screen, dozens of times a second, at rest. A
+            // change the engine cannot see asks by hand
+            // (`bunny_ui::request_frame`).
+            AppEvent::Wake => {
+                runtime.poll_tasks();
+                if runtime.needs_frame() {
+                    blit(runtime, root);
+                } else {
+                    // no frame — but a task may have gone to sleep with a
+                    // new deadline, and the driver's pace follows it
+                    sync_frame_driver(runtime);
+                }
+            }
             AppEvent::Background => {
                 // off the screen the decorations rest, and nothing
                 // presents until the app is back
@@ -798,6 +818,9 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                 let blinked = runtime.blink();
                 let explained = runtime.tooltip_tick();
                 let chorded = runtime.chord_tick();
+                // and the wheel's latch: two ticks with no wheel end
+                // the scroll gesture
+                runtime.wheel_tick();
                 if blinked || explained || chorded {
                     blit(runtime, root);
                 }

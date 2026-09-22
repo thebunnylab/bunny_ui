@@ -1749,10 +1749,16 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 /// - the weight or truncation codes
 /// - the key table or the modifier bits (the shell's `named_key`)
 /// - the field padding the glue mirrors (`FIELD_PAD_V`/`FIELD_PAD_H`)
+/// - the import surface: the modules' names or the verbs in them (the
+///   glue's import object is keyed by those names)
 ///
 /// A test pins the glue to this number: bump one side alone and the
 /// suite goes red before the browser ever gets the chance to.
-pub const ABI_VERSION: u32 = 8;
+///
+/// 9 (2026-09-14): the import modules are named as relative specifiers
+/// (`./bunny.js`, `./bunny_gpu.js`) so a foreign ES-module loader resolves
+/// them, and the shell gained `js_clipboard_write` and `js_set_cursor`.
+pub const ABI_VERSION: u32 = 9;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -4472,6 +4478,73 @@ mod tests {
             canvas.contains(&pin),
             "glue.js expects a different ABI than the engine encodes"
         );
+        let module = include_str!("../../bunny_ui_web/glue/esm/bunny.js");
+        assert!(
+            module.contains(&pin),
+            "glue/esm/bunny.js expects a different ABI than the engine encodes"
+        );
+    }
+
+    /// The shell declares its imports in Rust (`#[link(wasm_import_module
+    /// = "./bunny.js")]` and `"./bunny_gpu.js"`); every glue must answer
+    /// each one, or the module fails to instantiate with a `LinkError`
+    /// that names a verb and nothing about which file forgot it. This
+    /// reads the names off the Rust sources and looks for each in the
+    /// three glues: a named export in the ES modules, a method in the
+    /// classic import objects.
+    #[test]
+    fn every_import_the_shell_declares_has_a_verb_in_every_glue() {
+        let sources = [
+            include_str!("../../bunny_ui_web/src/lib.rs"),
+            include_str!("../../bunny_ui_web/src/text.rs"),
+            include_str!("../../bunny_ui_web/src/image.rs"),
+            include_str!("../../bunny_ui_web/src/gpu.rs"),
+        ];
+        let mut names: Vec<&str> = Vec::new();
+        for source in sources {
+            for line in source.lines() {
+                // an extern declaration: `fn js_x(` / `fn gl_x(`, never a body
+                let Some(rest) = line.trim_start().strip_prefix("fn ").or_else(|| {
+                    line.trim_start().strip_prefix("pub(crate) fn ")
+                }) else {
+                    continue;
+                };
+                let name = rest.split('(').next().unwrap_or("");
+                if (name.starts_with("js_") || name.starts_with("gl_")) && !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        assert!(names.len() > 50, "the import scan found too few verbs: {names:?}");
+        let esm = [
+            include_str!("../../bunny_ui_web/glue/esm/bunny.js"),
+            include_str!("../../bunny_ui_web/glue/esm/bunny_gpu.js"),
+        ]
+        .concat();
+        let classic = [
+            include_str!("../../bunny_ui_web/glue/glue.js"),
+            include_str!("../../bunny_ui_web/glue/glue_gl.js"),
+        ]
+        .concat();
+        let element = [
+            include_str!("../../bunny_ui_web/glue/glue_dom.js"),
+            include_str!("../../bunny_ui_web/glue/glue_gl.js"),
+        ]
+        .concat();
+        for name in names {
+            assert!(
+                esm.contains(&format!("export function {name}(")),
+                "glue/esm does not export `{name}`"
+            );
+            assert!(
+                classic.contains(&format!("{name}(")),
+                "glue.js + glue_gl.js do not answer `{name}`"
+            );
+            assert!(
+                element.contains(&format!("{name}(")),
+                "glue_dom.js + glue_gl.js do not answer `{name}`"
+            );
+        }
     }
 
     /// The canonical glue lives beside the shell crate; every app

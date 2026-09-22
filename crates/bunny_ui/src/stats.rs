@@ -27,9 +27,24 @@ pub enum Stage {
     Diff,
     /// The patch list becoming wire bytes.
     Encode,
+    /// One render pass: the walk from the root, the isolated re-runs,
+    /// the sweeps and the assembly. A pass that starts inside a layout
+    /// call is timed here, and it is also inside that call's `Layout`.
+    Pass,
+    /// The tables a finished pass leaves for the input doors, and the
+    /// effect queue. It is INSIDE `Pass`: do not add it to `Pass`.
+    Assemble,
+    /// The measure half of a walk. It is INSIDE `Layout` or `Capture`:
+    /// do not add it to them.
+    Measure,
+    /// The place half of a walk. It is INSIDE `Layout` or `Capture`.
+    Place,
+    /// The pointer re-read after a frame's layout, with the second
+    /// layout when the re-read asks for one.
+    Hover,
 }
 
-const STAGES: usize = 5;
+const STAGES: usize = 10;
 
 /// One frame's worth of pipeline work, drained by [`take`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -55,6 +70,23 @@ pub struct FrameStats {
     pub measure_hits: u32,
     /// Text measurements that reached the text engine.
     pub measure_misses: u32,
+    /// Times a pass rebuilt the tables the input doors read.
+    pub assemblies: u32,
+    /// Second layouts the pointer re-read asked for.
+    pub hover_relayouts: u32,
+    /// Calls to an app box's `paint`.
+    pub paints: u32,
+    /// App boxes whose kept picture was replayed instead of painted.
+    pub pictures_replayed: u32,
+    /// Draw commands the placement dropped because no pixel could show
+    /// them: outside the clip they stood under.
+    pub commands_unseen: u32,
+    /// Quiet children of a stack left unplaced, far off the glass.
+    pub children_unplaced: u32,
+    /// Retained boundaries whose measure was answered from what was kept.
+    pub measures_kept: u32,
+    /// Retained boundaries that were measured.
+    pub measures_made: u32,
     /// Milliseconds per [`Stage`], all zero without a clock.
     pub stage_ms: [f64; STAGES],
 }
@@ -77,6 +109,14 @@ thread_local! {
     static ENCODE_BYTES: Cell<u32> = const { Cell::new(0) };
     static MEASURE_HITS: Cell<u32> = const { Cell::new(0) };
     static MEASURE_MISSES: Cell<u32> = const { Cell::new(0) };
+    static ASSEMBLIES: Cell<u32> = const { Cell::new(0) };
+    static HOVER_RELAYOUTS: Cell<u32> = const { Cell::new(0) };
+    static PAINTS: Cell<u32> = const { Cell::new(0) };
+    static PICTURES_REPLAYED: Cell<u32> = const { Cell::new(0) };
+    static COMMANDS_UNSEEN: Cell<u32> = const { Cell::new(0) };
+    static CHILDREN_UNPLACED: Cell<u32> = const { Cell::new(0) };
+    static MEASURES_KEPT: Cell<u32> = const { Cell::new(0) };
+    static MEASURES_MADE: Cell<u32> = const { Cell::new(0) };
     static STAGE_MS: Cell<[f64; STAGES]> = const { Cell::new([0.0; STAGES]) };
     static CLOCK: Cell<Option<fn() -> f64>> = const { Cell::new(None) };
 }
@@ -102,6 +142,14 @@ pub fn take() -> FrameStats {
         encode_bytes: ENCODE_BYTES.with(|c| c.replace(0)),
         measure_hits: MEASURE_HITS.with(|c| c.replace(0)),
         measure_misses: MEASURE_MISSES.with(|c| c.replace(0)),
+        assemblies: ASSEMBLIES.with(|c| c.replace(0)),
+        hover_relayouts: HOVER_RELAYOUTS.with(|c| c.replace(0)),
+        paints: PAINTS.with(|c| c.replace(0)),
+        pictures_replayed: PICTURES_REPLAYED.with(|c| c.replace(0)),
+        commands_unseen: COMMANDS_UNSEEN.with(|c| c.replace(0)),
+        children_unplaced: CHILDREN_UNPLACED.with(|c| c.replace(0)),
+        measures_kept: MEASURES_KEPT.with(|c| c.replace(0)),
+        measures_made: MEASURES_MADE.with(|c| c.replace(0)),
         stage_ms: STAGE_MS.with(|c| c.replace([0.0; STAGES])),
     }
 }
@@ -163,6 +211,45 @@ pub(crate) fn note_diff_reuse() {
 pub(crate) fn note_encode(patches: usize, bytes: usize) {
     bump(&PATCHES, patches as u32);
     bump(&ENCODE_BYTES, bytes as u32);
+}
+
+#[inline]
+pub(crate) fn note_assembly() {
+    bump(&ASSEMBLIES, 1);
+}
+
+#[inline]
+pub(crate) fn note_hover_relayout() {
+    bump(&HOVER_RELAYOUTS, 1);
+}
+
+#[inline]
+pub(crate) fn note_paint() {
+    bump(&PAINTS, 1);
+}
+
+#[inline]
+pub(crate) fn note_picture_replayed() {
+    bump(&PICTURES_REPLAYED, 1);
+}
+
+#[inline]
+pub(crate) fn note_unseen() {
+    bump(&COMMANDS_UNSEEN, 1);
+}
+
+#[inline]
+pub(crate) fn note_unplaced() {
+    bump(&CHILDREN_UNPLACED, 1);
+}
+
+#[inline]
+pub(crate) fn note_measure_kept(kept: bool) {
+    if kept {
+        bump(&MEASURES_KEPT, 1);
+    } else {
+        bump(&MEASURES_MADE, 1);
+    }
 }
 
 #[inline]

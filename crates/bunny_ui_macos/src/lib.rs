@@ -10,12 +10,15 @@
 pub use bunny_ui_apple::credentials;
 use bunny_ui_apple::trace;
 pub mod dialog;
+pub mod drive;
 mod ffi;
 mod life;
 mod metal;
 pub mod webview;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+
+use bunny_ui::pacing::{Beat, FramePacer, Urgency, Verdict};
 use std::rc::Rc;
 
 use bunny_ui::action::{Key, KeyMatch, KeyPattern, Stroke};
@@ -30,12 +33,23 @@ pub use metal::OffscreenGpu;
 /// Points the shell's frame driver at the pace the runtime asks for:
 /// the display link for springs, one timer beat per step for loop
 /// clocks alone, and nothing at all for a still scene.
-fn sync_frame_driver(runtime: &Runtime) {
-    ffi::set_frame_driver(match runtime.frame_pace() {
-        bunny_ui::anim::FramePace::Display => ffi::DriverPace::Full,
-        bunny_ui::anim::FramePace::Slow(interval) => ffi::DriverPace::Slow(interval),
-        bunny_ui::anim::FramePace::Idle => ffi::DriverPace::Off,
-    });
+///
+/// …and the display link for a WARM window: one that just drew for an event
+/// that could wait, and folds the events that follow into the link's beats
+/// ([`bunny_ui::pacing`]). The driver is one for the app, so this window says
+/// what it wants and the driver runs at the fastest pace any window wants;
+/// the pacer hears back whether a display beat runs at all.
+fn sync_frame_driver(runtime: &Runtime, pacer: &FramePacer, window: usize) {
+    let wanted = if pacer.warm() {
+        ffi::DriverPace::Full
+    } else {
+        match runtime.frame_pace() {
+            bunny_ui::anim::FramePace::Display => ffi::DriverPace::Full,
+            bunny_ui::anim::FramePace::Slow(interval) => ffi::DriverPace::Slow(interval),
+            bunny_ui::anim::FramePace::Idle => ffi::DriverPace::Off,
+        }
+    };
+    pacer.set_beating(ffi::want_beat(window, wanted));
 }
 
 /// AppKit keyCode → the keymap vocabulary. Named keys come from the
@@ -458,7 +472,26 @@ pub fn run_window_chrome(
 /// Raises the window `spec` asks for and wires everything that lives as
 /// long as it does — the frame path, the pools, the gates and the event
 /// handler — into a slot the [`App`] holds and routes to.
+/// The reasons a wake drew a frame, as one token for the tape: `dirty+wrote`,
+/// or `-` when there was none.
+fn why(need: bunny_ui::runtime::FrameNeed) -> String {
+    let reasons = [
+        (need.asked, "asked"),
+        (need.dirty, "dirty"),
+        (need.wrote, "wrote"),
+        (need.theme, "theme"),
+        (need.environment, "environment"),
+        (need.insets, "insets"),
+        (need.webview, "webview"),
+    ];
+    let named: Vec<&str> = reasons.iter().filter(|(on, _)| *on).map(|(_, name)| *name).collect();
+    if named.is_empty() { "-".to_string() } else { named.join("+") }
+}
+
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
+    // a shell presents the list and never reads it: what no pixel can show
+    // is not drawn
+    runtime.drop_unseen();
     let title: &str = &spec.title;
     let size = spec.size;
     let chrome = spec.chrome;
@@ -1128,9 +1161,40 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
         }
     });
+    // `BUNNY_FRAME_AUDIT=1`: a wake the engine says needs no frame draws
+    // one anyway, and the two pictures are compared. A difference is a
+    // frame the gate would have lost — `X what=missed-frame` on the tape
+    // and a line on stderr. It is how the gate is proven on a real app.
+    let frame_audit = std::env::var_os("BUNNY_FRAME_AUDIT").is_some();
+    let audit_last: Rc<RefCell<Option<bunny_ui::layout::DisplayList>>> = Rc::new(RefCell::new(None));
+    let audit_expects_same = Rc::new(Cell::new(false));
+    // the engine's stage timers ride the tape's clock: an `F` line for
+    // each frame says where the time went BEFORE the present opened
+    let frame_stats = trace::active() || std::env::var_os("BUNNY_FRAME_STATS").is_some();
+    if frame_stats {
+        bunny_ui::stats::set_clock(Some(trace::clock_ms));
+    }
+    // WHEN a frame is drawn. An event that can wait draws at once from rest
+    // and folds into the display link's beat while the link runs — a wheel
+    // burst is one present for each refresh, and nothing blocks inside
+    // `scrollWheel:`. See `bunny_ui::pacing`.
+    let pacer = Rc::new(FramePacer::new());
+    let window_id = window.raw_window();
+    // a live resize — the window's or a dialog's — has ONE presenter: its own
+    // step. The pacer hears it on every ask and every beat.
+    let resizing: Rc<dyn Fn() -> bool> = {
+        let dialogs = Rc::clone(&dialogs);
+        Rc::new(move || {
+            window.in_live_resize()
+                || dialogs.borrow().values().any(|dialog| dialog.is_visible() && dialog.in_live_resize())
+        })
+    };
     let blit = {
         let present = Rc::clone(&present);
         let dialogs = Rc::clone(&dialogs);
+        let audit_last = Rc::clone(&audit_last);
+        let audit_expects_same = Rc::clone(&audit_expects_same);
+        let pacer = Rc::clone(&pacer);
         move |runtime: &Runtime, root: &_, via: trace::Origin| {
             // the handles' commands are spent BEFORE the frame
             // renders: the state an expired eval writes lands in this
@@ -1220,6 +1284,48 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 }
             }
             let display = runtime.display_frame(root, Size { width, height });
+            if frame_stats {
+                let stats = bunny_ui::stats::take();
+                let ms = |stage| stats.ms(stage);
+                use bunny_ui::stats::Stage;
+                trace::mark(
+                    "F",
+                    format_args!(
+                        "settle={:.2} layout={:.2} pass={:.2} asm={:.2} measure={:.2} place={:.2} hover={:.2} passes={} layouts={} asm#={} hover#={} paints={} cmds={}",
+                        ms(Stage::Settle),
+                        ms(Stage::Layout),
+                        ms(Stage::Pass),
+                        ms(Stage::Assemble),
+                        ms(Stage::Measure),
+                        ms(Stage::Place),
+                        ms(Stage::Hover),
+                        stats.body_passes,
+                        stats.layout_passes,
+                        stats.assemblies,
+                        stats.hover_relayouts,
+                        stats.paints,
+                        display.len(),
+                    ),
+                );
+            }
+            if frame_audit {
+                let mut last = audit_last.borrow_mut();
+                if audit_expects_same.replace(false)
+                    && last.as_ref().is_some_and(|last| last.as_slice() != display.as_slice())
+                {
+                    trace::mark("X", format_args!("what=missed-frame"));
+                    eprintln!("bunny_ui: FRAME AUDIT — a wake that asked for no frame changed the picture");
+                }
+                *last = Some(display.clone());
+            }
+            // this frame carries every ask that waited for it
+            let asked = pacer.drew();
+            if asked.count > 1 && trace::active() {
+                trace::mark(
+                    "A",
+                    format_args!("asks={} also={}", asked.count, trace::Origin::names(asked.all)),
+                );
+            }
             present(runtime, display, via);
         let interaction = runtime.interaction();
         // a live divider drag keeps the resizer even while the pointer
@@ -1283,7 +1389,31 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         }));
         // wake or park the frame driver — the event may have started
         // (or finished) an animation
-        sync_frame_driver(runtime);
+        sync_frame_driver(runtime, &pacer, window_id);
+        }
+    };
+    // The door for an event that CAN wait for the display's next beat. From
+    // rest it draws at once; while a beat runs it leaves its name and the
+    // beat draws one frame for all of them; mid-resize it draws nothing, and
+    // the resize step shows what it changed.
+    // `BUNNY_PACING=off` draws for every event, as the shell did before it
+    // had a pacer: the control of an A/B on the tape. The resize law still
+    // holds — it is the same door.
+    let unpaced = std::env::var("BUNNY_PACING").is_ok_and(|value| value == "off");
+    let soon = {
+        let blit = blit.clone();
+        let pacer = Rc::clone(&pacer);
+        let resizing = Rc::clone(&resizing);
+        move |runtime: &Runtime, root: &_, via: trace::Origin| {
+            if unpaced && !resizing() {
+                blit(runtime, root, via);
+                return;
+            }
+            if pacer.ask(via.index(), Urgency::Soon, resizing()) == Verdict::Draw {
+                blit(runtime, root, via);
+            } else {
+                sync_frame_driver(runtime, &pacer, window_id);
+            }
         }
     };
 
@@ -1391,7 +1521,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let on_web: Box<dyn Fn(webview::WebviewEvent)> = Box::new({
         let runtime = Rc::clone(&runtime);
         let root = Rc::clone(&root);
-        let blit = blit.clone();
+        // a page reports in floods (a console, a request log): its frames
+        // can wait for the beat, and a flood folds into it
+        let blit = soon.clone();
         move |event| {
             let root = &*root;
             match event {
@@ -1456,6 +1588,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let handler_root = Rc::clone(&root);
     let handler_present = Rc::clone(&present);
     let handler_dialogs = Rc::clone(&dialogs);
+    let handler_pacer = Rc::clone(&pacer);
+    let handler_resizing = Rc::clone(&resizing);
+    let soon = soon.clone();
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
@@ -1503,7 +1638,38 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             if window.in_live_resize() || dialog_resizing() {
                 runtime.poll_tasks();
             } else {
-                blit(runtime, root, trace::Origin::Wake);
+                // The work always lands: the tasks are polled. The FRAME is
+                // for a turn that changed something. Most wakes change
+                // nothing — a poll that found no news, a sleeper that went
+                // back to sleep — and a window with a few of those mounted
+                // drew whole frames of what was already on screen, dozens
+                // of times a second, at rest: measured on a product window
+                // as 97 % of the main thread, and no present at all.
+                let ran = runtime.poll_tasks();
+                let need = runtime.frame_need();
+                if trace::active() {
+                    trace::mark(
+                        "W",
+                        format_args!(
+                            "ran={} need={} why={}",
+                            u8::from(ran),
+                            u8::from(need.any()),
+                            why(need)
+                        ),
+                    );
+                }
+                if need.any() {
+                    // a stream of results — an agent's tokens, a log — folds
+                    // into the beat like a wheel does
+                    soon(runtime, root, trace::Origin::Wake);
+                } else if frame_audit {
+                    audit_expects_same.set(true);
+                    blit(runtime, root, trace::Origin::Wake);
+                } else {
+                    // no frame — but a task may have gone to sleep with a
+                    // new deadline, and the driver's pace follows it
+                    sync_frame_driver(runtime, &handler_pacer, window_id);
+                }
             }
         }
         AppEvent::ResignKey => {
@@ -1515,17 +1681,19 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             if runtime.dismiss_all_overlays() {
                 blit(runtime, root, trace::Origin::Input);
             } else {
-                sync_frame_driver(runtime);
+                sync_frame_driver(runtime, &handler_pacer, window_id);
             }
         }
         AppEvent::BecomeKey => {
             // the front returns: a frozen loop resumes mid-phase
             runtime.set_loops_paused(false);
-            sync_frame_driver(runtime);
+            sync_frame_driver(runtime, &handler_pacer, window_id);
         }
         AppEvent::MouseMoved { x, y, modifiers } => {
+            // a move — and every drag is a stream of them — can wait for the
+            // beat; a press and a release cannot, and stay where they were
             if runtime.pointer_moved(x, y, modifiers) {
-                blit(runtime, root, trace::Origin::Input);
+                soon(runtime, root, trace::Origin::Input);
             }
         }
         AppEvent::RightMouseDown { x, y } => {
@@ -1547,19 +1715,24 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         }
         AppEvent::MouseExited => {
             if runtime.pointer_exited() {
-                blit(runtime, root, trace::Origin::Input);
+                soon(runtime, root, trace::Origin::Input);
             }
         }
         AppEvent::Wheel { x, y, dx, dy } => {
-            // offset is engine state: repaint without render (zero bodies)
+            // offset is engine state: repaint without render (zero bodies).
+            // The wheel speaks faster than the display shows — ninety to a
+            // hundred and twenty events a second, then momentum. The offsets
+            // accumulate in the runtime, so a frame on the next beat shows
+            // every one of them; a frame for each blocked inside this
+            // handler while the present waited for the display.
             if runtime.wheel(x, y, dx, dy) {
-                blit(runtime, root, trace::Origin::Input);
+                soon(runtime, root, trace::Origin::Input);
             }
         }
         AppEvent::Magnify { x, y, scale } => {
             // the box under the pointer zooms; nothing else does
             if runtime.magnify(x, y, scale) {
-                blit(runtime, root, trace::Origin::Input);
+                soon(runtime, root, trace::Origin::Input);
             }
         }
         AppEvent::Key { code, shift, command, chars } => {
@@ -1620,6 +1793,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // the same slow beat ages a sequence in the air: two ticks
             // and `cmd-k` lets the keyboard go
             let chorded = runtime.chord_tick();
+            // and the wheel's latch: two ticks with no wheel end
+            // the scroll gesture
+            runtime.wheel_tick();
             // …but never mid-drag: the resize steps are the only presenter
             // there. A caret blinking in a focused URL bar presented whole
             // frames between two steps and the two geometries composited
@@ -1629,10 +1805,18 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // phase on the step that lands — and the RESIZE path itself
             // must never be gated: holding it back leaves the compositor
             // stretching a stale drawable through the whole drag.
-            if (blinked || explained || chorded)
-                && !window.in_live_resize()
-                && !dialog_resizing()
-            {
+            //
+            // The waiting door holds that law now: mid-drag it draws
+            // nothing, and at rest the caret's frame is drawn at once.
+            if blinked || explained || chorded {
+                soon(runtime, root, trace::Origin::Blink);
+            }
+            // The net under the beat. The display link belongs to ONE view,
+            // and the system stops it while that view is hidden; asks that
+            // wait for a beat that does not come would wait for ever. This
+            // timer always runs: half a second later, at the worst, they
+            // are drawn here.
+            if handler_pacer.pending().count > 0 && !handler_resizing() {
                 blit(runtime, root, trace::Origin::Blink);
             }
         }
@@ -1653,7 +1837,20 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // clocks still advanced; the next step carries what they
             // moved, and a hand held still mid-drag parks the scene
             // until it moves — the same stillness every step ends in.
-            if window.in_live_resize() || dialog_resizing() {
+            //
+            // The beat is also where the events that could wait are drawn:
+            // ONE settled frame for every wheel, move and wake since the
+            // last beat. It carries the tick too, so the springs lose
+            // nothing.
+            // a present that waited for the display found the line of
+            // frames in front of it full: this beat is held, and it drains
+            if metal::take_congested() && !unpaced {
+                handler_pacer.congested();
+            }
+            let beat = handler_pacer.beat(handler_resizing());
+            if beat == Beat::Hold {
+            } else if beat == Beat::Draw {
+                blit(runtime, root, trace::Origin::Frame);
             } else if moved.scene {
                 let (width, height) = window.content_size();
                 let display = runtime.animation_frame(root, Size { width, height });
@@ -1695,7 +1892,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     handler_present(runtime, display, trace::Origin::Frame);
                 }
             }
-            sync_frame_driver(runtime);
+            sync_frame_driver(runtime, &handler_pacer, window_id);
         }
         AppEvent::ImeInsert { text } => {
             // the IME commit (or plain typing through the input system)
@@ -1761,7 +1958,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         // `blit` left the driver parked with a sleeper on the queue: the clock
         // is the frame tick, so the sleeper never woke, and the card it was
         // waiting for arrived on whatever unrelated click came next.
-        sync_frame_driver(runtime);
+        sync_frame_driver(runtime, &handler_pacer, window_id);
     });
 
     Rc::new(Slot {

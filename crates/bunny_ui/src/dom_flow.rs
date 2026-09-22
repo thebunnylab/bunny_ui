@@ -630,11 +630,11 @@ impl Walk<'_> {
             // number at all.
             LayoutNode::Measured { child, .. } => self.lower_into(child, out),
 
-            LayoutNode::Boundary { path, children } => {
+            LayoutNode::Boundary { path, children, .. } => {
                 // a CLEAN boundary is a promise, not a walk: no body
                 // under it ran, the retained group still holds, and
                 // the diff keeps it wholesale — O(change), by absence
-                if self.env.retained_groups.contains(path.as_str())
+                if self.env.retained_groups.contains(&**path)
                     && !self.env.changed.iter().any(|run| {
                         // related in EITHER direction dirties: a run
                         // below me changed my interior; a run above me
@@ -649,10 +649,10 @@ impl Walk<'_> {
                         related(run, path) || related(path, run)
                     })
                 {
-                    out.push(node(DomKind::Reuse { path: std::rc::Rc::from(path.as_str()) }));
+                    out.push(node(DomKind::Reuse { path: std::rc::Rc::clone(path) }));
                     return;
                 }
-                let mut group = node(DomKind::Group { path: std::rc::Rc::from(path.as_str()) });
+                let mut group = node(DomKind::Group { path: std::rc::Rc::clone(path) });
                 group.children.reserve_exact(children.len());
                 let outer_pending = self.pending_boundary_class.take();
                 for child in children {
@@ -670,11 +670,11 @@ impl Walk<'_> {
                 self.pending_boundary_class = outer_pending;
                 out.push(group);
             }
-            LayoutNode::BoundaryRef { path } => {
+            LayoutNode::BoundaryRef { path, slot } => {
                 // resolves through the retention IN PLACE, the same
                 // door the placement walk uses — a missing entry keeps
                 // the identity anchor so the diff can match later
-                let lowered = crate::reconciler::with_retained_layout(path, |tree| {
+                let lowered = slot.with_layout(|tree| {
                     tree.map(|tree| {
                         let mut nodes = Vec::new();
                         self.lower_into(tree, &mut nodes);
@@ -920,12 +920,12 @@ impl Walk<'_> {
             width: self.slot.0,
             height: self.slot.1,
         };
-        let (size, fit) = subtree.measure(proposal, env);
+        let (size, fit) = subtree.measure(proposal, &env);
         let mut placement = crate::layout::Placement::with_capture(size, self.current_ink());
         subtree.place(
             crate::layout::Rect { origin: Point::default(), size },
-            fit,
-            env,
+            &fit,
+            &env,
             &mut placement,
         );
         // the interior arrives ABSOLUTE (geometry on every node); the
@@ -971,7 +971,7 @@ impl Walk<'_> {
             width: reported.map(|(w, _)| w).or(self.slot.0),
             height: reported.map(|(_, h)| h).or(self.slot.1),
         };
-        let (measured, fit) = subtree.measure(proposal, env);
+        let (measured, fit) = subtree.measure(proposal, &env);
         // which axes FOLLOW the proposal? offer a different box and
         // watch what moves — a moved axis belongs to the browser:
         // `align-self: stretch`, no pinned size, and every resize
@@ -980,7 +980,7 @@ impl Walk<'_> {
             width: Some(proposal.width.unwrap_or(measured.width) + 97.0),
             height: Some(proposal.height.unwrap_or(measured.height) + 97.0),
         };
-        let (moved, _) = subtree.measure(shifted, env);
+        let (moved, _) = subtree.measure(shifted, &env);
         let hungry = (
             (moved.width - measured.width).abs() > 0.5,
             (moved.height - measured.height).abs() > 0.5,
@@ -1007,8 +1007,8 @@ impl Walk<'_> {
         let mut placement = crate::layout::Placement::with_ink(self.current_ink());
         subtree.place(
             crate::layout::Rect { origin: Point::default(), size },
-            fit,
-            env,
+            &fit,
+            &env,
             &mut placement,
         );
         self.display.extend(placement.display);

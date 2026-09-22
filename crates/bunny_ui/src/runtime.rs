@@ -82,6 +82,25 @@ struct TooltipLife {
     aged: bool,
 }
 
+/// The wheel's latch: the regions that took a scroll gesture, one per
+/// axis, and the point the gesture started at. While it holds, the
+/// wheel goes to these regions and not to what slid under the pointer.
+struct WheelLatch {
+    anchor: Point,
+    x: Option<String>,
+    y: Option<String>,
+    /// The app's box that had the first turn of the gesture and let it
+    /// go. It was under the pointer from the start, so it keeps its
+    /// turn: a chart that pans sideways and ignores the rest still pans.
+    offered: Option<String>,
+    /// One slow tick went by with no wheel. The second one releases.
+    aged: bool,
+}
+
+/// How far the pointer can move before the wheel is a new gesture. A
+/// hand that turns a mouse wheel moves the mouse a little.
+const WHEEL_LATCH_SLOP: Px = 10.0;
+
 /// One binding that takes a sequence of strokes. `context` is `None`
 /// for the global layer — the same two shelves single strokes have.
 struct Chord {
@@ -111,6 +130,16 @@ pub struct Runtime {
     /// in paint order — the hit-test
     /// map for pointer events.
     last_hits: RefCell<Vec<(String, Rect)>>,
+    /// Which of those hits paint a pointer state (indices into
+    /// `last_hits`), and which hover groups do — the last layout's
+    /// answer to "would a hover HERE change the picture?".
+    last_hover_sensitive: RefCell<Vec<usize>>,
+    last_sensitive_groups: RefCell<Vec<String>>,
+    /// What the last pointer move did besides changing the hovered
+    /// target: a box used it, a tooltip moved. A frame's re-read asks.
+    hover_move_had_more: Cell<bool>,
+    /// Drop the draw commands no pixel can show ([`Runtime::drop_unseen`]).
+    drops_unseen: Cell<bool>,
     /// Handlers the HOST mounted, outside any view. The tree's own
     /// handlers are the reconciler's and are rebuilt every pass; these
     /// stand until the host takes them down, and they are the OUTERMOST
@@ -225,6 +254,12 @@ pub struct Runtime {
     /// drops it — the tooltip's own idiom, and the reason `cmd-k` can
     /// never hold the keyboard for good.
     pending_aged: Cell<bool>,
+    /// The scroll gesture in flight. A page that scrolls moves its
+    /// inner regions under a pointer that did not move; without the
+    /// latch each of them takes the wheel when it arrives, and the
+    /// page stops. CLOCKLESS, the tooltip's own idiom: the wheel arms
+    /// it and the second slow tick releases it.
+    wheel_latch: RefCell<Option<WheelLatch>>,
     /// Who hears the sequence move — a which-key panel's door. Called
     /// with the strokes in the air after every change: a stroke that
     /// opened or lengthened a sequence, and the end of one, however it
@@ -290,6 +325,26 @@ pub struct Runtime {
     /// The finger's state machine — what a touch means is decided here
     /// and performed through the pointer's own doors ([`crate::touch`]).
     touch: RefCell<crate::touch::Recognizer>,
+    /// Did the last pointer input come from a FINGER?
+    ///
+    /// A touch surface and a mouse want different chrome for the same
+    /// state: a selection under a finger needs pins big enough to grab
+    /// and a bar of actions, and the same pins under a cursor are two
+    /// dots nobody asked for. The recognizer already speaks the
+    /// pointer's vocabulary so that a box never has two roads to
+    /// maintain — this is the one thing a box still has to ask.
+    ///
+    /// It is the LAST input and not the device: a tablet with a
+    /// keyboard, a phone with a mouse and a laptop with a touch screen
+    /// are all one machine that answers differently minute to minute.
+    touch_modality: Cell<bool>,
+    /// Set while [`Runtime::perform_touch`] is spending a gesture, so
+    /// the pointer doors it calls do not read as a mouse.
+    in_touch: Cell<bool>,
+    /// How long the finger of the press being spent had been down when
+    /// the press was DECIDED, in seconds — see
+    /// [`crate::touch::Gesture::Press`]. Zero for a mouse.
+    press_held: Cell<f64>,
     /// The lifted drag's VALUE — the stamp carries only label and
     /// geometry; the typed value stays here and lands on the drop.
     drag_value: RefCell<Option<std::rc::Rc<dyn std::any::Any>>>,
@@ -332,15 +387,27 @@ pub struct Runtime {
     /// each new capture against it. Empty (and free) in every other
     /// mode.
     dom: RefCell<crate::dom::DomLowering>,
-    /// Did the last pass see the root become ONE boundary
-    /// (`Boundary`/ref)? Only then can the stable frame synthesize the
+    /// The path of the ONE boundary the last pass saw at the root
+    /// (`Boundary`/ref). Only then can the stable frame synthesize the
     /// reference without a pass — a boundary-less root comes fresh
     /// from the walk on every frame.
-    root_is_boundary: Cell<bool>,
+    ///
+    /// It is not `last_root`. Under a named scene the pass root is the
+    /// scene's own segment (`w0`), which no boundary ever is; the
+    /// boundary is below it (`w0/Workbench`). `last_root` scopes the
+    /// dirt, this names what the stable frame lays out.
+    root_boundary: RefCell<Option<String>>,
     /// The retention can hold entries WITHOUT print lines (built on the
     /// frame path, which does not format) — printing again rebuilds
     /// once, and the full == incremental oracle stays byte-for-byte.
     printless: Cell<bool>,
+    /// Something outside the read-tracking changed what the next frame
+    /// shows: a programmatic scroll, a focus move, a new overlay bound.
+    /// [`Runtime::settle`] lowers it; see [`Runtime::frame_need`].
+    frame_asked: Cell<bool>,
+    /// The write epoch the last settle saw. A different number now means
+    /// a `State` or a `Store` was written since.
+    settled_epoch: Cell<u64>,
 }
 
 impl Default for Runtime {
@@ -459,12 +526,35 @@ impl Runtime {
         // outside a pass re-arms every `.task` under the root — a fresh
         // thread each, on every refill. Which is why `enter_scene` rebuilds
         // the input tables and never this.
-        effects::set_queue(reconciler::assemble_effects(root));
-        self.assemble_input(root);
+        crate::stats::time(crate::stats::Stage::Assemble, || {
+            // a pass that ran no body and swept nothing left the
+            // retention as it was: the queue and the tables the last
+            // assembly built are still the truth. The queue is handed
+            // over again, because the pump TAKES it; the tables stay.
+            // Each has its own key — the tables are also rebuilt when a
+            // scene becomes current again, and that makes no queue.
+            let had_root_region = reconciler::pass_has_root_region();
+            let queue = match reconciler::assembled_effects(root) {
+                Some(queue) => queue,
+                None => {
+                    let queue: Rc<[motor::state::EffectFn]> =
+                        reconciler::assemble_effects(root).into();
+                    reconciler::keep_assembled_effects(root, &queue, had_root_region);
+                    queue
+                }
+            };
+            effects::set_queue(queue);
+            if !reconciler::assembly_is_current(root) {
+                crate::stats::note_assembly();
+                self.assemble_input(root, had_root_region);
+            } else if crate::paranoid::on(crate::paranoid::ASSEMBLE) {
+                self.assemble_input_again(root);
+            }
+        });
     }
 
     /// Rebuilds only the tables the input doors read.
-    fn assemble_input(&self, root: &str) {
+    fn assemble_input(&self, root: &str, had_root_region: bool) {
         reconciler::assemble_actions(root);
         reconciler::assemble_editors(root);
         reconciler::assemble_splits(root);
@@ -474,7 +564,19 @@ impl Runtime {
         reconciler::assemble_customs(root);
         reconciler::assemble_handlers(root);
         reconciler::assemble_contexts(root);
-        reconciler::set_assembled_root(root);
+        reconciler::set_assembled_root(root, had_root_region);
+    }
+
+    /// The paranoid cross-check of a skipped assembly: build the tables
+    /// again and see that nothing in them moved.
+    fn assemble_input_again(&self, root: &str) {
+        let before = reconciler::input_fingerprint();
+        self.assemble_input(root, false);
+        assert_eq!(
+            before,
+            reconciler::input_fingerprint(),
+            "a skipped assembly left tables that a full one would have changed"
+        );
     }
 
 
@@ -499,7 +601,8 @@ impl Runtime {
         // door's: refilling it here re-arms every task under this root, and a
         // thread with it — which two windows alternating frames turn into
         // thousands within seconds.
-        self.assemble_input(&root);
+        crate::stats::note_assembly();
+        self.assemble_input(&root, false);
     }
 
     /// The popovers of the last layout, in paint order — a shell that
@@ -514,6 +617,11 @@ impl Runtime {
     /// above the window is negative); everyone else leaves the
     /// default — the viewport.
     pub fn set_overlay_bounds(&self, bounds: Option<Rect>) {
+        // the shell says this on every frame: only a NEW answer asks
+        // for one
+        if self.overlay_bounds.get() != bounds {
+            self.frame_asked.set(true);
+        }
         self.overlay_bounds.set(bounds);
     }
 
@@ -523,7 +631,10 @@ impl Runtime {
     /// drives, the content follows. The entry survives a close, so a
     /// reopen lands where the reader left it.
     pub fn set_dialog_frame(&self, path: &str, frame: Rect) {
-        self.dialog_frames.borrow_mut().insert(path.to_string(), frame);
+        let previous = self.dialog_frames.borrow_mut().insert(path.to_string(), frame);
+        if previous != Some(frame) {
+            self.frame_asked.set(true);
+        }
     }
 
     /// Runs ONE overlay's dismissal — the road a dialog window's own
@@ -557,7 +668,24 @@ impl Runtime {
     /// platform's insets (`safeAreaInsets` on a phone) and the next
     /// layout lays the root out inside them. Leading is the left edge.
     pub fn set_safe_area(&self, insets: crate::layout::Edges) {
+        if self.safe_area.get() == insets {
+            return;
+        }
         self.safe_area.set(insets);
+        // …and into the environment, so a body can READ them. The root is
+        // laid out inside them either way; what needs the numbers is a view
+        // that paints THROUGH the band and holds its own content clear — an
+        // ambient wash under the status bar, a sheet whose foot lands on the
+        // display's own edge. Mirrored rather than exposed only on the
+        // runtime because a body has a `Context` and no runtime.
+        self.set_environment(|values| {
+            values.safeAreaInsets = motor::state::SafeAreaInsets {
+                top: insets.top,
+                trailing: insets.trailing,
+                bottom: insets.bottom,
+                leading: insets.leading,
+            };
+        });
     }
 
     pub fn safe_area(&self) -> crate::layout::Edges {
@@ -568,7 +696,15 @@ impl Runtime {
     /// The bottom inset becomes the larger of the safe area's and this,
     /// so the content stands above the keys instead of under them.
     pub fn set_keyboard_inset(&self, bottom: Px) {
-        self.keyboard_inset.set(bottom.max(0.0));
+        let bottom = bottom.max(0.0);
+        if self.keyboard_inset.get() == bottom {
+            return;
+        }
+        self.keyboard_inset.set(bottom);
+        // Its own environment value, and NOT folded into the safe area's:
+        // the two bands mean opposite things to a surface that reaches the
+        // screen's edge (see `motor::state::KeyboardInset`).
+        self.set_environment(|values| values.keyboardInset = motor::state::KeyboardInset(bottom));
     }
 
     /// The four insets the next layout lays the root inside.
@@ -579,7 +715,11 @@ impl Runtime {
     }
 
     pub fn set_device_scale(&self, scale: Px) {
-        self.device_scale.set(scale.max(1.0));
+        let scale = scale.max(1.0);
+        if self.device_scale.get() != scale {
+            self.frame_asked.set(true);
+        }
+        self.device_scale.set(scale);
     }
 
     /// The screen's scale, as the shell last told it.
@@ -657,6 +797,7 @@ impl Runtime {
     /// `true` = repaint.
     pub fn context_click(&self, x: Px, y: Px) -> bool {
         self.enter_scene();
+        self.note_pointer_source();
         let was_open = self.close_menu();
         let cleared = self.clear_tooltip();
         let menus = self.last_menus.borrow();
@@ -952,6 +1093,39 @@ impl Runtime {
         self.last_drag_regions.borrow().iter().any(|region| region.contains(x, y))
     }
 
+    /// Which native host sits under this point — for a shell that OWNS
+    /// its page pixels and routes the hand to the page itself (the
+    /// Linux shell; a shell with platform views never asks, the view
+    /// takes the event on its own). The topmost host whose box, cut to
+    /// what its clip lets through, holds the point — unless an
+    /// interactive target wins there, the rule the drag handle keeps: a
+    /// button floating over a page still clicks. A host under a modal
+    /// is out of reach with everything else the floor covers.
+    pub fn host_at(&self, x: Px, y: Px) -> Option<String> {
+        let taken = {
+            let hits = self.last_hits.borrow();
+            crate::layout::hit_test(self.reachable(&hits, |floor| floor.hits), x, y).is_some()
+        };
+        if taken {
+            return None;
+        }
+        let hosts = self.last_hosts.borrow();
+        self.reachable(&hosts, |floor| floor.hosts)
+            .iter()
+            .rev()
+            .find(|host| {
+                let window = Rect {
+                    origin: Point {
+                        x: host.frame.origin.x + host.visible.origin.x,
+                        y: host.frame.origin.y + host.visible.origin.y,
+                    },
+                    size: host.visible.size,
+                };
+                window.contains(x, y)
+            })
+            .map(|host| host.path.clone())
+    }
+
     /// Which of the window's own buttons sits at this point, topmost
     /// first. Unlike the drag handle, the control WINS by design: it
     /// IS the button, and the platform (not the scene) activates it.
@@ -993,6 +1167,10 @@ impl Runtime {
             scene,
             last_root: RefCell::new(None),
             last_hits: RefCell::new(Vec::new()),
+            last_hover_sensitive: RefCell::new(Vec::new()),
+            last_sensitive_groups: RefCell::new(Vec::new()),
+            hover_move_had_more: Cell::new(false),
+            drops_unseen: Cell::new(false),
             hosted_handlers: RefCell::new(HashMap::default()),
             interaction: RefCell::new(Interaction::default()),
             pointer_modifiers: std::cell::Cell::new(crate::action::Modifiers::NONE),
@@ -1025,6 +1203,7 @@ impl Runtime {
             chord_sink: RefCell::new(None),
             chord_announced: Cell::new(false),
             pending_aged: Cell::new(false),
+            wheel_latch: RefCell::new(None),
             measures: RefCell::new(HashMap::default()),
             scroll_commands: RefCell::new(HashMap::default()),
             scroll_targets: RefCell::new(HashMap::default()),
@@ -1042,6 +1221,9 @@ impl Runtime {
             drag_armed: RefCell::new(None),
             pressed_clicks: Cell::new(1),
             touch: RefCell::new(crate::touch::Recognizer::new()),
+            touch_modality: Cell::new(false),
+            in_touch: Cell::new(false),
+            press_held: Cell::new(0.0),
             drag_value: RefCell::new(None),
             drag_preview: RefCell::new(None),
             tooltip: RefCell::new(TooltipLife::default()),
@@ -1054,7 +1236,9 @@ impl Runtime {
             keyboard_inset: Cell::new(0.0),
             last_insets: Cell::new(crate::layout::Edges::ZERO),
             dom: RefCell::new(crate::dom::DomLowering::default()),
-            root_is_boundary: Cell::new(false),
+            root_boundary: RefCell::new(None),
+            frame_asked: Cell::new(true),
+            settled_epoch: Cell::new(u64::MAX),
             printless: Cell::new(false),
         };
         // Escape closes the innermost popover — pre-bound in the
@@ -1171,6 +1355,10 @@ impl Runtime {
             *self.last_root.borrow_mut() = Some(pass_root.clone());
         }
         reconciler::end_pass();
+        // every pass teaches the stable frame its boundary — a print, a
+        // settle and a frame pass alike, and a runtime handed another
+        // root view learns the new one here
+        *self.root_boundary.borrow_mut() = nodes.root_boundary().map(str::to_string);
         nodes
     }
 
@@ -1271,6 +1459,7 @@ impl Runtime {
     /// the way it really was.
     pub fn pointer_moved(&self, x: Px, y: Px, modifiers: impl Into<crate::action::Modifiers>) -> bool {
         self.enter_scene();
+        self.note_pointer_source();
         let modifiers = modifiers.into();
         self.pointer_modifiers.set(modifiers);
         let (repaint, told) = self.watching_hover(|| self.pointer_moved_road(x, y, modifiers));
@@ -1352,6 +1541,7 @@ impl Runtime {
         // the tooltip's hover walks beside the interactive one and
         // never touches it — a region explains, it does not intercept
         let explained = self.note_tooltip_hover(x, y);
+        self.hover_move_had_more.set(used || explained);
         changed || used || explained
     }
 
@@ -1547,6 +1737,8 @@ impl Runtime {
             visible: placement.visible,
             metrics: crate::custom::Metrics::new(&*self.text, &self.cache, placement.font),
             menu: &asked,
+            touch: self.touch_modality.get(),
+            held_ms: self.press_held_ms(),
         };
         let answer = placement.element.element().event(&event, &ctx);
         if let Some((at, items)) = asked.into_inner() {
@@ -1670,6 +1862,9 @@ impl Runtime {
         modifiers: impl Into<crate::action::Modifiers>,
     ) -> bool {
         self.enter_scene();
+        self.note_pointer_source();
+        // a press is a new intent: the scroll gesture is over
+        self.wheel_latch.borrow_mut().take();
         let modifiers = modifiers.into();
         let (repaint, told) = self.watching_hover(|| self.pointer_clicked_road(x, y, clicks, modifiers));
         repaint || told
@@ -2017,6 +2212,46 @@ impl Runtime {
         self.interaction.borrow().clone()
     }
 
+    /// Did the last pointer input come from a finger?
+    ///
+    /// A box asks this to choose the chrome a modality wants — selection
+    /// pins big enough to grab, a bar of actions, a hover affordance that
+    /// a touch surface can never reveal. The answer is the LAST input's
+    /// and not the machine's: one device is a mouse this minute and a
+    /// finger the next, and the chrome follows the hand.
+    #[must_use]
+    pub fn last_input_was_touch(&self) -> bool {
+        self.touch_modality.get()
+    }
+
+    /// A pointer door was entered from OUTSIDE a touch spend, so the
+    /// hand on the machine is a mouse.
+    fn note_pointer_source(&self) {
+        if !self.in_touch.get() {
+            self.touch_modality.set(false);
+            self.press_held.set(0.0);
+        }
+    }
+
+    /// How long the press being delivered had been held when it was
+    /// decided, in MILLISECONDS.
+    ///
+    /// A press over something that pans waits to see whether the finger
+    /// meant to scroll, so a box can receive the press of a finger that
+    /// was down for half a second. Zero for a mouse, and for a press
+    /// nothing had to wait on.
+    #[must_use]
+    pub fn press_held_ms(&self) -> u128 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a hold is seconds, small and non-negative; the millis fit a u128 far past that"
+        )]
+        {
+            (self.press_held.get() * 1000.0) as u128
+        }
+    }
+
     // MARK: - Touch (the finger speaks the pointer's vocabulary)
 
     /// A finger landed. `id` names the finger for its lifetime (the
@@ -2026,6 +2261,9 @@ impl Runtime {
     /// performed through the pointer's own doors; the shell only
     /// forwards.
     pub fn touch_began(&self, id: u64, x: Px, y: Px, taps: u8) -> bool {
+        // a new finger is a new gesture: the pan asks again what is
+        // under its anchor
+        self.wheel_latch.borrow_mut().take();
         let gestures = self.touch.borrow_mut().began(id, Point { x, y }, taps, self);
         self.perform_touch(gestures).0
     }
@@ -2053,13 +2291,29 @@ impl Runtime {
     /// UNBORROWED: a press runs the app's closure, and the app may come
     /// straight back in through any door. Answers (repaint, input) —
     /// `input` says a gesture reached the app and a settled frame is due.
+    ///
+    /// The modality is set for the whole spend, BEFORE the app's own
+    /// closure runs: a box asks "was this a finger?" from inside the
+    /// event it is handling, which is the one moment the answer has to
+    /// be right. The guard is what keeps the pointer doors below from
+    /// reading their own call as a mouse.
     fn perform_touch(&self, gestures: Vec<crate::touch::Gesture>) -> (bool, bool) {
+        use crate::touch::Gesture;
+        self.touch_modality.set(true);
+        self.in_touch.set(true);
+        let answer = self.perform_touch_inner(gestures);
+        self.in_touch.set(false);
+        answer
+    }
+
+    fn perform_touch_inner(&self, gestures: Vec<crate::touch::Gesture>) -> (bool, bool) {
         use crate::touch::Gesture;
         let mut repaint = false;
         let mut input = false;
         for gesture in gestures {
             match gesture {
-                Gesture::Press { at, taps } => {
+                Gesture::Press { at, taps, held } => {
+                    self.press_held.set(held);
                     repaint |=
                         self.pointer_clicked(at.x, at.y, taps, crate::action::Modifiers::NONE);
                     input = true;
@@ -2170,6 +2424,14 @@ impl Runtime {
     /// answer. AppKit convention: positive delta reveals content above
     /// — the offset shrinks. `true` = something changed and the shell
     /// repaints (no render: zero bodies).
+    ///
+    /// The answer LATCHES: the region that took the first step of a
+    /// gesture takes the rest of it. A page that scrolls moves a legend
+    /// under a pointer that did not move, and the legend must not take
+    /// the wheel from the page. A new gesture starts when the pointer
+    /// moves away from where the wheel started, when a press or a
+    /// finger lands, or when [`Runtime::wheel_tick`] has aged the latch
+    /// out.
     pub fn wheel(&self, x: Px, y: Px, dx: Px, dy: Px) -> bool {
         self.enter_scene();
         // the content is about to slide under a still pointer — the
@@ -2180,12 +2442,27 @@ impl Runtime {
         // the screen, and a shell told "nothing happened" leaves it
         // painted over a scene that no longer explains it
         let explained = self.clear_tooltip() | self.close_menu();
+        // the latch comes OUT of its cell: the app's box runs a closure,
+        // and the app may come straight back in through any door
+        let latch = self.wheel_latch.borrow_mut().take().filter(|latch| {
+            (latch.anchor.x - x).abs() <= WHEEL_LATCH_SLOP
+                && (latch.anchor.y - y).abs() <= WHEEL_LATCH_SLOP
+        });
         // the app's box gets the turn first: an editor scrolls itself.
-        // What it ignores falls through to the region around it.
-        let over = self
-            .hover_target(x, y)
-            .and_then(|path| self.custom_at(&path));
-        if let Some(placement) = over {
+        // What it ignores falls through to the region around it. A
+        // gesture in flight asks only the box it asked first: one that
+        // slid under the pointer is a legend by another name.
+        let over = match &latch {
+            Some(WheelLatch { offered: None, .. }) => None,
+            Some(WheelLatch { offered, .. }) => {
+                self.hover_target(x, y).filter(|path| Some(path) == offered.as_ref())
+            }
+            None => self.hover_target(x, y),
+        };
+        let over = over.and_then(|path| Some((self.custom_at(&path)?, path)));
+        let mut offered = None;
+        if let Some((placement, path)) = over {
+            offered = Some(path);
             let at = Self::local(&placement, x, y);
             let event = crate::custom::ElementEvent::Wheel { at, dx, dy };
             if self.deliver(&placement, event).handled {
@@ -2212,8 +2489,39 @@ impl Runtime {
                 region.frame.contains(x, y) && axis(scroll_travel(region)) > 0.0
             })
         };
-        let region_y = (dy != 0.0).then(|| topmost(|(_, y)| y)).flatten();
-        let region_x = (dx != 0.0).then(|| topmost(|(x, _)| x)).flatten();
+        // the latched region answers while it is in reach and still
+        // travels; a region that left the scene lets its axis go
+        let pick = |held: Option<&str>, axis: fn((Px, Px)) -> Px| {
+            held.and_then(|path| {
+                reachable
+                    .iter()
+                    .find(|region| region.path == path && axis(scroll_travel(region)) > 0.0)
+            })
+            .or_else(|| topmost(axis))
+        };
+        let (held_x, held_y) = match &latch {
+            Some(latch) => (latch.x.as_deref(), latch.y.as_deref()),
+            None => (None, None),
+        };
+        let region_y = (dy != 0.0).then(|| pick(held_y, |(_, y)| y)).flatten();
+        let region_x = (dx != 0.0).then(|| pick(held_x, |(x, _)| x)).flatten();
+        // an axis that said nothing in this step keeps its region, and
+        // a path that did not change is not cloned: a gesture in flight
+        // allocates nothing
+        let keep = |held: Option<String>, region: Option<&ScrollRegion>| match (held, region) {
+            (Some(path), Some(region)) if path == region.path => Some(path),
+            (held, None) => held,
+            (_, Some(region)) => Some(region.path.clone()),
+        };
+        let (anchor, held_x, held_y, offered) = match latch {
+            Some(latch) => (latch.anchor, latch.x, latch.y, latch.offered),
+            None => (Point { x, y }, None, None, offered),
+        };
+        let (held_x, held_y) = (keep(held_x, region_x), keep(held_y, region_y));
+        if held_x.is_some() || held_y.is_some() {
+            *self.wheel_latch.borrow_mut() =
+                Some(WheelLatch { anchor, x: held_x, y: held_y, offered, aged: false });
+        }
         if region_x.is_none() && region_y.is_none() {
             return explained;
         }
@@ -2247,10 +2555,23 @@ impl Runtime {
         moved || explained
     }
 
+    /// The slow clock, aging the wheel's latch: the SECOND tick with no
+    /// wheel between releases it, and the next wheel asks again what is
+    /// under the pointer. The tooltip's own idiom. Nothing on screen
+    /// changes, so there is no answer.
+    pub fn wheel_tick(&self) {
+        let mut latch = self.wheel_latch.borrow_mut();
+        match latch.as_mut() {
+            Some(held) if !held.aged => held.aged = true,
+            _ => *latch = None,
+        }
+    }
+
     /// Programmatic scrolling — the NEXT layout (same frame) already
     /// applies it, clamped at place.
     pub fn set_scroll_offset(&self, path: &str, offset: Point) {
         self.scroll_offsets.borrow_mut().insert(path.to_string(), offset);
+        self.frame_asked.set(true);
     }
 
     pub fn scroll_offset(&self, path: &str) -> Point {
@@ -2643,6 +2964,7 @@ impl Runtime {
     /// the retained position.
     pub fn focus(&self, path: &str) {
         self.enter_scene();
+        self.frame_asked.set(true);
         self.caret_visible.set(true);
         *self.focus.borrow_mut() = Some(path.to_string());
         self.carets
@@ -2957,6 +3279,9 @@ impl Runtime {
             self.deliver(&placement, crate::custom::ElementEvent::Focused(false));
             self.dirty_island_of(&placement.path);
         }
+        if dropped.is_some() {
+            self.frame_asked.set(true);
+        }
         dropped.is_some()
     }
 
@@ -3109,6 +3434,8 @@ impl Runtime {
         state.anchor = None;
         state.marked = None;
         self.carets.borrow_mut().insert(path.to_string(), state);
+        // the caret moved with no state write of its own
+        self.frame_asked.set(true);
         true
     }
 
@@ -3219,13 +3546,101 @@ impl Runtime {
     ) -> crate::layout::DisplayList {
         self.settle(root);
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
-        let pointer = self.interaction.borrow().pointer;
-        if let Some(point) = pointer
-            && self.pointer_moved(point.x, point.y, self.pointer_modifiers.get())
-        {
-            result = self.layout(root, crate::layout::Proposal::exact(size));
+        if let Some(again) = self.reread_hover(root, size, &result) {
+            result = again;
         }
         result.display
+    }
+
+    /// The pointer re-read of a frame, and the second layout when the
+    /// re-read asks for one.
+    ///
+    /// Content can move under a still pointer, so a frame reads the
+    /// pointer again after its layout: the hovered target, the
+    /// `.on_hover` arrivals, the cursor, the tooltip and the app's box all
+    /// stay honest. A SECOND layout is for a new picture only. A hover
+    /// that moved between two targets that paint no pointer state changed
+    /// nothing a layout draws — and while a page scrolls under a pointer
+    /// at rest, that is nearly every frame.
+    fn reread_hover(
+        &self,
+        root: &impl View,
+        size: crate::layout::Size,
+        first: &crate::layout::LayoutResult,
+    ) -> Option<crate::layout::LayoutResult> {
+        crate::stats::time(crate::stats::Stage::Hover, || {
+            let point = self.hover_reread()?;
+            let before = self.interaction.borrow().hovered.clone();
+            self.hover_move_had_more.set(true);
+            let modifiers = self.pointer_modifiers.get();
+            // `pointer_moved`, with the two halves of its answer apart
+            self.enter_scene();
+            let (repaint, told) =
+                self.watching_hover(|| self.pointer_moved_road(point.x, point.y, modifiers));
+            if !repaint && !told {
+                return None;
+            }
+            // a box that used the move, a tooltip that moved, an
+            // `.on_hover` that fired, a road that never reached the hover
+            // at all (a drag, a menu): all of those are the old answer
+            let only_the_target_changed = !told && !self.hover_move_had_more.get();
+            let after = self.interaction.borrow().hovered.clone();
+            if only_the_target_changed
+                && !self.hover_paints(before.as_deref())
+                && !self.hover_paints(after.as_deref())
+            {
+                if crate::paranoid::on(crate::paranoid::HOVER) {
+                    let again = self.layout(root, crate::layout::Proposal::exact(size));
+                    assert!(
+                        again.display.as_slice() == first.display.as_slice(),
+                        "a hover that no box paints changed the picture: {before:?} -> {after:?}"
+                    );
+                }
+                return None;
+            }
+            crate::stats::note_hover_relayout();
+            let again = self.layout(root, crate::layout::Proposal::exact(size));
+            Some(again)
+        })
+    }
+
+    /// Would a hover on this target change the picture the last layout
+    /// drew? It does when a box under the target paints a pointer state,
+    /// or when the target sits in a hover group whose descendants do.
+    fn hover_paints(&self, target: Option<&str>) -> bool {
+        let Some(target) = target else { return false };
+        let hits = self.last_hits.borrow();
+        let sensitive = self.last_hover_sensitive.borrow();
+        if sensitive.iter().any(|index| hits.get(*index).is_some_and(|(path, _)| path == target)) {
+            return true;
+        }
+        self.last_sensitive_groups.borrow().iter().any(|group| {
+            target == group
+                || target.strip_prefix(group.as_str()).is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+
+    /// The point a frame re-reads to keep hover honest — `None` when the
+    /// hand on the machine is a finger.
+    ///
+    /// A frame re-reads the pointer because content can move under a STILL
+    /// MOUSE: an action inserted a row, and the thing under the cursor is
+    /// no longer the thing that is lit. A finger has no part in that. It
+    /// does not hover (this framework's first rule about touch), and it is
+    /// never still while it matters — every point it visits arrives as its
+    /// own gesture.
+    ///
+    /// Entering the pointer's door here on a touch surface is not merely
+    /// pointless, it is a LIE: `note_pointer_source` reads a pointer door
+    /// entered outside a touch spend as a mouse arriving, so the frame that
+    /// followed a finger's press would announce a mouse. Everything a box
+    /// paints for the hand then changes under a gesture that is still
+    /// running — the selection pins, the action bar — and a view that
+    /// reshapes on the modality moves the box the press GRABBED to another
+    /// path, which ends the drag mid-air (the phone's selection pins,
+    /// owner-reported 2026-09-12).
+    fn hover_reread(&self) -> Option<Point> {
+        self.interaction.borrow().pointer.filter(|_| !self.touch_modality.get())
     }
 
     /// Advances the retained animations by `dt` seconds and says what
@@ -3256,6 +3671,44 @@ impl Runtime {
             moved.input |= input;
         }
         moved
+    }
+
+    /// Why the scene needs a frame, reason by reason — the question a
+    /// shell asks after a turn of tasks (a wake from a worker, a timer
+    /// that fell due). Most wakes change nothing: a poll that found no
+    /// news, a sleeper that went back to sleep. A shell that draws for
+    /// each of them computes whole frames that show what is already on
+    /// screen, and with a few pollers mounted that is most of a core,
+    /// at rest.
+    ///
+    /// Every reason is something the engine can see. What it cannot see
+    /// is data outside the read-tracking — a shared cell a task changed
+    /// and an app box's `paint` reads. For that, the task says so:
+    /// [`crate::request_frame`].
+    ///
+    /// The tick road is not asked here. Springs, loops and flings answer
+    /// through [`Runtime::tick`] and [`Runtime::frame_pace`].
+    pub fn frame_need(&self) -> FrameNeed {
+        FrameNeed {
+            asked: self.frame_asked.get() || FRAME_REQUESTED.with(Cell::get),
+            dirty: self.has_pending_dirty(),
+            wrote: motor::identity::write_epoch() != self.settled_epoch.get(),
+            theme: crate::theme::version() != self.theme_version.get(),
+            environment: self.env_moved.get(),
+            insets: self.last_insets.get() != self.frame_insets(),
+            webview: reconciler::has_webview_commands(),
+        }
+    }
+
+    /// Does the scene need a frame? [`Runtime::frame_need`], folded.
+    pub fn needs_frame(&self) -> bool {
+        self.frame_need().any()
+    }
+
+    /// Asks for a frame by hand — the door for a change the engine
+    /// cannot see. The next settle lowers the flag.
+    pub fn request_frame(&self) {
+        self.frame_asked.set(true);
     }
 
     /// Does any animation still want a next frame? The shell syncs its
@@ -3343,11 +3796,8 @@ impl Runtime {
         size: crate::layout::Size,
     ) -> crate::layout::DisplayList {
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
-        let pointer = self.interaction.borrow().pointer;
-        if let Some(point) = pointer
-            && self.pointer_moved(point.x, point.y, self.pointer_modifiers.get())
-        {
-            result = self.layout(root, crate::layout::Proposal::exact(size));
+        if let Some(again) = self.reread_hover(root, size, &result) {
+            result = again;
         }
         result.display
     }
@@ -3383,26 +3833,18 @@ impl Runtime {
         let rings = self.drop_rings();
         let rings_held = *self.last_drop_rings.borrow() == rings;
         *self.last_drop_rings.borrow_mut() = rings.clone();
-        let stable_root = (self.root_is_boundary.get()
-            && crate::theme::version() == self.theme_version.get()
-            && rings_held
-            && !self.has_pending_dirty())
-        .then(|| self.last_root.borrow().clone())
-        .flatten()
-        .filter(|path| reconciler::is_retained(path));
+        let stable_root = rings_held.then(|| self.stable_boundary()).flatten();
         let tree = match stable_root {
             Some(path) => {
                 reconciler::note_stable_frame();
-                crate::layout::LayoutNode::BoundaryRef { path }
+{
+                    let slot = reconciler::slot_of(&path);
+                    crate::layout::LayoutNode::BoundaryRef { path, slot }
+                }
             }
             None => {
                 let mut nodes = self.frame_pass(root);
                 let mut roots = nodes.take_layout();
-                self.root_is_boundary.set(matches!(
-                    roots.as_slice(),
-                    [crate::layout::LayoutNode::Boundary { .. }]
-                        | [crate::layout::LayoutNode::BoundaryRef { .. }]
-                ));
                 if roots.len() == 1 {
                     roots.remove(0)
                 } else {
@@ -3442,6 +3884,7 @@ impl Runtime {
             animator: Some(&self.animator),
             live: None,
             scale: self.device_scale.get(),
+            touch: self.touch_modality.get(),
             anim: None,
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
@@ -3498,26 +3941,18 @@ impl Runtime {
         let rings = self.drop_rings();
         let rings_held = *self.last_drop_rings.borrow() == rings;
         *self.last_drop_rings.borrow_mut() = rings.clone();
-        let stable_root = (self.root_is_boundary.get()
-            && crate::theme::version() == self.theme_version.get()
-            && rings_held
-            && !self.has_pending_dirty())
-        .then(|| self.last_root.borrow().clone())
-        .flatten()
-        .filter(|path| reconciler::is_retained(path));
+        let stable_root = rings_held.then(|| self.stable_boundary()).flatten();
         let tree = match stable_root {
             Some(path) => {
                 reconciler::note_stable_frame();
-                crate::layout::LayoutNode::BoundaryRef { path }
+{
+                    let slot = reconciler::slot_of(&path);
+                    crate::layout::LayoutNode::BoundaryRef { path, slot }
+                }
             }
             None => {
                 let mut nodes = self.frame_pass(root);
                 let mut roots = nodes.take_layout();
-                self.root_is_boundary.set(matches!(
-                    roots.as_slice(),
-                    [crate::layout::LayoutNode::Boundary { .. }]
-                        | [crate::layout::LayoutNode::BoundaryRef { .. }]
-                ));
                 if roots.len() == 1 {
                     roots.remove(0)
                 } else {
@@ -3555,6 +3990,7 @@ impl Runtime {
             animator: Some(&self.animator),
             live: None,
             scale: self.device_scale.get(),
+            touch: self.touch_modality.get(),
             anim: None,
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
@@ -3956,6 +4392,7 @@ impl Runtime {
                 caret_visible: focused && self.caret_visible.get(),
                 phase,
                 scale: self.device_scale.get(),
+                touch: self.touch_modality.get(),
             };
             let origin = crate::layout::Point {
                 x: -placement.visible.origin.x,
@@ -4484,7 +4921,7 @@ impl Runtime {
         crate::stats::note_body_pass();
         crate::view::set_print(false);
         self.printless.set(true);
-        let nodes = self.render_pass(root);
+        let nodes = crate::stats::time(crate::stats::Stage::Pass, || self.render_pass(root));
         crate::view::set_print(true);
         nodes
     }
@@ -4749,26 +5186,19 @@ impl Runtime {
         // root — the walk would be all-skip and emit exactly ONE
         // reference; synthesize the reference and skip the whole pass.
         // Any other situation walks the real pass.
-        let stable_root = (self.root_is_boundary.get()
-            && crate::theme::version() == self.theme_version.get()
-            && !self.has_pending_dirty())
-        .then(|| self.last_root.borrow().clone())
-        .flatten()
-        .filter(|path| reconciler::is_retained(path));
+        let stable_root = self.stable_boundary();
         let tree = match stable_root {
             Some(path) => {
                 // the observable contract holds: THIS frame ran zero bodies
                 reconciler::note_stable_frame();
-                crate::layout::LayoutNode::BoundaryRef { path }
+{
+                    let slot = reconciler::slot_of(&path);
+                    crate::layout::LayoutNode::BoundaryRef { path, slot }
+                }
             }
             None => {
                 let mut nodes = self.frame_pass(root);
                 let mut roots = nodes.take_layout();
-                self.root_is_boundary.set(matches!(
-                    roots.as_slice(),
-                    [crate::layout::LayoutNode::Boundary { .. }]
-                        | [crate::layout::LayoutNode::BoundaryRef { .. }]
-                ));
                 if roots.len() == 1 {
                     roots.remove(0)
                 } else {
@@ -4827,6 +5257,7 @@ impl Runtime {
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
             scale: self.device_scale.get(),
+            touch: self.touch_modality.get(),
         };
         let stage = if dom {
             crate::stats::Stage::Capture
@@ -4839,27 +5270,33 @@ impl Runtime {
                     crate::layout::layout_dom(&tree, proposal, env, collect_display);
                 (result, Some(scene))
             } else {
-                (crate::layout::layout_with_insets(&tree, proposal, env, insets), None)
+                // the paranoid check needs the cut on to have a claim to check
+                let drop = self.drops_unseen.get() || crate::paranoid::on(crate::paranoid::SEEN);
+                (crate::layout::layout_placing(&tree, proposal, env, insets, !drop), None)
             }
         });
         crate::stats::note_display(result.display.len());
         drop(offsets);
         drop(dialogs);
         drop(carets);
-        *self.last_hits.borrow_mut() = result.hits.clone();
-        *self.last_scrolls.borrow_mut() = result.scrolls.clone();
+        // `clone_from`, not a fresh clone: the tables keep their capacity
+        // from frame to frame, and the paths inside keep their buffers
+        self.last_hits.borrow_mut().clone_from(&result.hits);
+        self.last_hover_sensitive.borrow_mut().clone_from(&result.hover_sensitive);
+        self.last_sensitive_groups.borrow_mut().clone_from(&result.sensitive_groups);
+        self.last_scrolls.borrow_mut().clone_from(&result.scrolls);
         self.last_modal_floor.set(result.modal_floor);
-        *self.last_fields.borrow_mut() = result.fields.clone();
-        *self.last_splits.borrow_mut() = result.splits.clone();
-        *self.last_customs.borrow_mut() = result.customs.clone();
-        *self.last_hosts.borrow_mut() = result.hosts.clone();
-        *self.last_overlays.borrow_mut() = result.overlays.clone();
-        *self.last_tooltips.borrow_mut() = result.tooltips.clone();
-        *self.last_menus.borrow_mut() = result.menus.clone();
-        *self.last_drag_sources.borrow_mut() = result.drag_sources.clone();
-        *self.last_drops.borrow_mut() = result.drops.clone();
-        *self.last_drag_regions.borrow_mut() = result.drag_regions.clone();
-        *self.last_control_regions.borrow_mut() = result.control_regions.clone();
+        self.last_fields.borrow_mut().clone_from(&result.fields);
+        self.last_splits.borrow_mut().clone_from(&result.splits);
+        self.last_customs.borrow_mut().clone_from(&result.customs);
+        self.last_hosts.borrow_mut().clone_from(&result.hosts);
+        self.last_overlays.borrow_mut().clone_from(&result.overlays);
+        self.last_tooltips.borrow_mut().clone_from(&result.tooltips);
+        self.last_menus.borrow_mut().clone_from(&result.menus);
+        self.last_drag_sources.borrow_mut().clone_from(&result.drag_sources);
+        self.last_drops.borrow_mut().clone_from(&result.drops);
+        self.last_drag_regions.borrow_mut().clone_from(&result.drag_regions);
+        self.last_control_regions.borrow_mut().clone_from(&result.control_regions);
         // an applied-target memory whose region left the scene goes
         // with it — live regions keep theirs (the wheel stays sovereign)
         self.scroll_targets
@@ -4955,6 +5392,26 @@ impl Runtime {
         }
     }
 
+    /// Drop the draw commands no pixel can show — what a SHELL asks for.
+    ///
+    /// A page that scrolls places every row it holds, and a list of two
+    /// hundred rows shows ten. With this on, a command outside the clip it
+    /// stands under is not drawn: the list holds what the glass can show,
+    /// and the rows under the fold stay in the geometry
+    /// ([`LayoutResult::scrolls`], [`LayoutResult::frames`]). A shell
+    /// presents the list and never reads it, so every shell of the house
+    /// turns this on for the runtime it mounts.
+    ///
+    /// Off — the default — the list holds every command. That is what a
+    /// PROBE wants: a test that asks "does this page say X" reads the words
+    /// off the list, whatever the height of the window it laid out in.
+    ///
+    /// [`LayoutResult::scrolls`]: crate::layout::LayoutResult::scrolls
+    /// [`LayoutResult::frames`]: crate::layout::LayoutResult::frames
+    pub fn drop_unseen(&self) {
+        self.drops_unseen.set(true);
+    }
+
     /// Instrumentation: the bodies the last [`Runtime::render`] ran —
     /// the proof of incrementality (the rest came from the cache).
     pub fn body_runs(&self) -> Vec<String> {
@@ -4997,7 +5454,14 @@ impl Runtime {
     /// consistent tree by definition; the next pass would be all-skip).
     pub fn settle(&self, root: &impl View) {
         crate::stats::time(crate::stats::Stage::Settle, || {
+            // the frame that was asked for is this one. A request made
+            // DURING the settle — a pump that scrolls, a task that asks —
+            // raises the flag again, and costs one more frame, never one
+            // less.
+            self.frame_asked.set(false);
+            FRAME_REQUESTED.with(|flag| flag.set(false));
             for _ in 0..8 {
+                self.settled_epoch.set(motor::identity::write_epoch());
                 // the same order as the print path: a task that resolved
                 // writes its state, then the pass reads it
                 self.poll_tasks();
@@ -5011,11 +5475,72 @@ impl Runtime {
         })
     }
 
+    /// The boundary a stable frame lays out with no pass: nothing is
+    /// dirty, the theme and the environment did not move, and the root
+    /// boundary of the last pass is still retained. Such a pass would
+    /// skip the root, run no body and produce exactly this reference.
+    fn stable_boundary(&self) -> Option<String> {
+        (crate::theme::version() == self.theme_version.get()
+            && !self.env_moved.get()
+            && !self.has_pending_dirty())
+        .then(|| self.root_boundary.borrow().clone())
+        .flatten()
+        .filter(|path| reconciler::is_retained(path))
+    }
+
     fn has_pending_dirty(&self) -> bool {
         match self.last_root.borrow().as_deref() {
             Some(root) => motor::identity::has_dirty_matching(root),
             None => false,
         }
+    }
+}
+
+thread_local! {
+    /// A task asked for a frame ([`request_frame`]). A task holds no
+    /// runtime, so the flag is the thread's; the next settle lowers it.
+    static FRAME_REQUESTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Asks the scene on this thread for a frame. A task calls it after it
+/// changed something the engine cannot see: data in a shared cell that an
+/// app box reads when it paints. A `State` or a `Store` write never needs
+/// it.
+pub fn request_frame() {
+    FRAME_REQUESTED.with(|flag| flag.set(true));
+}
+
+/// Why a scene needs a frame. See [`Runtime::frame_need`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameNeed {
+    /// [`Runtime::request_frame`], [`request_frame`], or an engine door
+    /// that moves what the frame shows: a programmatic scroll, a focus
+    /// move, new overlay bounds, a dialog frame, a device scale.
+    pub asked: bool,
+    /// A view read a value that was written.
+    pub dirty: bool,
+    /// A `State` or a `Store` was written, read by a view or not: an
+    /// `on_change` may watch it, and only a frame's pump finds out.
+    pub wrote: bool,
+    /// The theme moved.
+    pub theme: bool,
+    /// The environment moved.
+    pub environment: bool,
+    /// The safe area or the keyboard inset moved.
+    pub insets: bool,
+    /// A webview handle holds a command the shell did not spend.
+    pub webview: bool,
+}
+
+impl FrameNeed {
+    pub fn any(self) -> bool {
+        self.asked
+            || self.dirty
+            || self.wrote
+            || self.theme
+            || self.environment
+            || self.insets
+            || self.webview
     }
 }
 
@@ -5044,7 +5569,14 @@ impl crate::touch::TouchScene for Runtime {
         if target.ends_with("/#split") || self.grab_thumb(&target, at.x, at.y).is_some() {
             return true;
         }
-        self.custom_at(&target).is_some_and(|placement| placement.element.element().takes_drag())
+        // the box's OWN point: a handle's square is where the box drew it
+        self.custom_at(&target).is_some_and(|placement| {
+            let local = Point {
+                x: at.x - placement.frame.origin.x,
+                y: at.y - placement.frame.origin.y,
+            };
+            placement.element.element().grabs_at(local)
+        })
     }
 
     fn menu_at(&self, at: Point) -> bool {

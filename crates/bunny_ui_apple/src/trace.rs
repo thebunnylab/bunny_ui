@@ -45,6 +45,24 @@ pub enum Origin {
 }
 
 impl Origin {
+    /// The origin as a small number — what a frame pacer files an ask under.
+    pub fn index(self) -> u8 {
+        self as u8
+    }
+
+    /// The origins a folded frame carried, from the pacer's bit set:
+    /// `wake+input`.
+    pub fn names(bits: u32) -> String {
+        const ALL: [Origin; 6] =
+            [Origin::Redraw, Origin::Wake, Origin::Input, Origin::Frame, Origin::Web, Origin::Blink];
+        let named: Vec<&str> = ALL
+            .iter()
+            .filter(|origin| bits & (1u32 << origin.index()) != 0)
+            .map(|origin| origin.name())
+            .collect();
+        if named.is_empty() { "-".to_string() } else { named.join("+") }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Origin::Redraw => "redraw",
@@ -90,6 +108,13 @@ pub fn active() -> bool {
 fn ms() -> f64 {
     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
+/// The tape's own clock, in milliseconds — the one a shell installs for
+/// the engine's stage timers, so an `F` line and a `P` line share a time
+/// base.
+pub fn clock_ms() -> f64 {
+    ms()
 }
 
 fn line(args: std::fmt::Arguments<'_>) {

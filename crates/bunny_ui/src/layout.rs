@@ -388,6 +388,12 @@ pub struct LayoutEnv<'a> {
     /// custom box's paint — the geometry never consults it, so layout
     /// stays resolution independent by construction.
     pub scale: Px,
+    /// Did the last pointer input come from a finger
+    /// ([`crate::runtime::Runtime::last_input_was_touch`])? Rides here
+    /// for the same reason `scale` does: it reaches a custom box's
+    /// PAINT and nothing else, because a modality decides chrome and
+    /// never geometry.
+    pub touch: bool,
 }
 
 /// An open animation scope, walking down with the placement. The
@@ -704,7 +710,14 @@ pub enum LayoutNode {
     },
     /// View boundary (`Component`): records the frame at the identity
     /// path — the address for tests and, later on, for hit-testing.
-    Boundary { path: String, children: Vec<LayoutNode> },
+    Boundary {
+        path: Rc<str>,
+        children: Vec<LayoutNode>,
+        /// Is everything under this boundary only paint? Asked when the
+        /// boundary sits far off the glass, answered once for the tree
+        /// ([`Quiet`]).
+        quiet: std::cell::OnceCell<Quiet>,
+    },
     /// Interaction target (Button): the frame enters the hit-test list
     /// with the path that indexes the action registered in the
     /// reconciler. Hover and pressed do NOT live here — placement
@@ -720,7 +733,7 @@ pub enum LayoutNode {
     /// Reference to a retained boundary (skipped by the reconciler);
     /// measure and place resolve ON-THE-FLY against the retention — the
     /// frame's tree is never stitched into a copy.
-    BoundaryRef { path: String },
+    BoundaryRef { path: String, slot: Rc<crate::reconciler::Slot> },
     /// `.rendering(Gpu)`: this subtree insists on the pixel pipeline.
     /// Transparent to geometry everywhere; in Dom mode it becomes a
     /// CANVAS ISLAND — an element our layout positions, filled with the
@@ -886,8 +899,9 @@ pub enum Rendering {
 }
 
 /// The handoff between the phases — the structural mirror of the
-/// [`LayoutNode`], consumed by value: no placing without measuring, and
-/// never twice.
+/// [`LayoutNode`]: no placing without measuring, and no measuring twice.
+/// Placement reads it; it does not consume it, so a boundary's fit can be
+/// kept from one frame to the next ([`Fit::Shared`]).
 #[derive(Debug)]
 pub enum Fit {
     Leaf,
@@ -906,6 +920,80 @@ pub enum Fit {
     Wrapped(Size, Box<Fit>),
     /// The real content size (it can exceed the frame — that is what scrolls).
     ScrollContent(Size, Box<Fit>),
+    /// A retained boundary's KEPT fit: measured on an earlier frame for
+    /// the same question, and handed back whole. Transparent everywhere —
+    /// [`Fit::unshared`] is what a reader looks through.
+    Shared(Rc<Fit>),
+}
+
+impl Fit {
+    /// The fit itself, through any number of [`Fit::Shared`] handles.
+    pub(crate) fn unshared(&self) -> &Fit {
+        let mut fit = self;
+        while let Fit::Shared(inner) = fit {
+            fit = inner;
+        }
+        fit
+    }
+
+    /// Structural equality, looking through shared handles on both sides.
+    /// The paranoid check of the measure memo asks it.
+    pub(crate) fn same_as(&self, other: &Fit) -> bool {
+        let pairs = |a: &[(Size, Fit)], b: &[(Size, Fit)]| {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|((sa, fa), (sb, fb))| sa == sb && fa.same_as(fb))
+        };
+        match (self.unshared(), other.unshared()) {
+            (Fit::Leaf, Fit::Leaf) => true,
+            (Fit::Children(a), Fit::Children(b)) => pairs(a, b),
+            (
+                Fit::Virtual { row_extent: ra, children: ca, offsets: oa },
+                Fit::Virtual { row_extent: rb, children: cb, offsets: ob },
+            ) => {
+                ra == rb
+                    && oa == ob
+                    && ca.len() == cb.len()
+                    && ca.iter().zip(cb).all(|((ia, sa, fa), (ib, sb, fb))| {
+                        ia == ib && sa == sb && fa.same_as(fb)
+                    })
+            }
+            (Fit::Wrapped(sa, fa), Fit::Wrapped(sb, fb))
+            | (Fit::ScrollContent(sa, fa), Fit::ScrollContent(sb, fb)) => {
+                sa == sb && fa.same_as(fb)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Everything a measure reads that is not the tree itself: the question
+/// (the proposal) and the inherited text settings. Two measures of one
+/// retained tree under the same key answer the same size — unless the
+/// tree holds a node whose measure is not a function of these, and such
+/// a node says so ([`poison_measure`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct MeasureKey {
+    pub proposal: Proposal,
+    pub font: FontSpec,
+    pub line_height: Option<Px>,
+}
+
+thread_local! {
+    /// Counts the measures that are NOT a function of the [`MeasureKey`]:
+    /// an app box with a measure of its own, an image whose size is not
+    /// known yet, a virtual run that asks the app for its row heights.
+    static MEASURE_POISON: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// This measure may answer differently next frame with the same key: no
+/// boundary above it keeps its fit.
+fn poison_measure() {
+    MEASURE_POISON.with(|count| count.set(count.get().wrapping_add(1)));
+}
+
+/// The poison count — a boundary reads it before and after it measures.
+pub(crate) fn measure_poison() -> u64 {
+    MEASURE_POISON.with(std::cell::Cell::get)
 }
 
 /// RGBA color, no drama. Real styling arrives with the visual modifiers;
@@ -1614,6 +1702,15 @@ pub struct VisualProps {
 }
 
 impl VisualProps {
+    /// Does this box paint another colour under the pointer? Only such a
+    /// box makes a change of hover a change of picture.
+    pub(crate) fn paints_pointer_state(&self) -> bool {
+        self.background_hovered.is_some()
+            || self.background_pressed.is_some()
+            || self.foreground_hovered.is_some()
+            || self.foreground_pressed.is_some()
+    }
+
     /// Merge of modifiers stacked on the same view: what is already set
     /// (CLOSEST to the view) wins; the outer one only fills what is
     /// missing.
@@ -1750,13 +1847,340 @@ pub enum DrawCommand {
     PopClip,
 }
 
+/// Can a subtree be LEFT UNPLACED while it sits far off the glass?
+///
+/// A placement does more than draw: it records the regions a wheel finds,
+/// the fields a key reaches, the frames a probe reads; it keeps a flight
+/// alive; it calls an app's `paint`, which the app may read as "this frame
+/// happened". A subtree is QUIET when it holds none of that — text, fills,
+/// images, stacks and frames, targets and tooltips (which exist only where
+/// they are visible anyway) — so that leaving it unplaced changes nothing
+/// but the work. The rows of a long list are quiet, and only ten of two
+/// hundred are on the glass.
+///
+/// The answer is a property of a TREE, so it is kept where a tree has a
+/// memory: in a [`LayoutNode::Boundary`] and in the slot of a retained one.
+/// A retained boundary inside the tree can re-run on its own, so a tree that
+/// holds any answers "as long as they all are", and they are asked each time.
+#[derive(Clone, Debug)]
+pub enum Quiet {
+    No,
+    Yes,
+    While(Rc<[Rc<crate::reconciler::Slot>]>),
+}
+
+impl Quiet {
+    /// Is the subtree quiet NOW?
+    pub(crate) fn holds(&self) -> bool {
+        match self {
+            Quiet::No => false,
+            Quiet::Yes => true,
+            Quiet::While(slots) => slots.iter().all(|slot| slot.quiet_now()),
+        }
+    }
+
+    /// The answer for a run of sibling trees.
+    pub(crate) fn of_all(nodes: &[LayoutNode]) -> Quiet {
+        let mut held = Vec::new();
+        if nodes.iter().all(|node| node.collect_quiet(&mut held)) {
+            if held.is_empty() { Quiet::Yes } else { Quiet::While(held.into()) }
+        } else {
+            Quiet::No
+        }
+    }
+}
+
+impl LayoutNode {
+    /// Walks the tree once: `false` = something under here is more than
+    /// paint. The retained boundaries met on the way are collected — their
+    /// own trees are asked through their slots, each time.
+    fn collect_quiet(&self, held: &mut Vec<Rc<crate::reconciler::Slot>>) -> bool {
+        match self {
+            LayoutNode::Text { .. }
+            | LayoutNode::Spacer
+            | LayoutNode::Leaf { .. }
+            | LayoutNode::Image { .. }
+            | LayoutNode::Icon { .. }
+            | LayoutNode::Fill
+            | LayoutNode::BoundaryHint { .. } => true,
+            LayoutNode::Stack { children, .. } | LayoutNode::Boundary { children, .. } => {
+                children.iter().all(|child| child.collect_quiet(held))
+            }
+            // a modal pile draws the line no pointer crosses: not paint
+            LayoutNode::Layered { modal, children, .. } => {
+                !modal && children.iter().all(|child| child.collect_quiet(held))
+            }
+            LayoutNode::Overlay { layer, child, .. } => {
+                layer.collect_quiet(held) && child.collect_quiet(held)
+            }
+            LayoutNode::Padding { child, .. }
+            | LayoutNode::Frame { child, .. }
+            | LayoutNode::MaxFrame { child, .. }
+            | LayoutNode::FlexFrame { child, .. }
+            | LayoutNode::Hug { child, .. }
+            | LayoutNode::Styled { child, .. }
+            // a target, a tooltip, a menu, a drag and a drop exist only
+            // where a pointer can reach them: off the glass they are
+            // not recorded at all
+            | LayoutNode::Interactive { child, .. }
+            | LayoutNode::HoverGroup { child, .. }
+            | LayoutNode::Tooltip { child, .. }
+            | LayoutNode::ContextSource { child, .. }
+            | LayoutNode::DragSource { child, .. }
+            | LayoutNode::DropTarget { child, .. }
+            | LayoutNode::Hinted { child, .. } => child.collect_quiet(held),
+            LayoutNode::BoundaryRef { slot, .. } => {
+                held.push(Rc::clone(slot));
+                true
+            }
+            // a record, a region, a field, a flight, an app's paint, a
+            // platform view, a layer of its own: a placement is owed
+            _ => false,
+        }
+    }
+
+    /// Is this CHILD OF A STACK quiet now? Only a node with a memory
+    /// answers yes: a boundary, or a reference to a retained one. Anything
+    /// else would be walked to find out, which is the work being saved.
+    fn quiet_now(&self) -> bool {
+        match self {
+            LayoutNode::Boundary { children, quiet, .. } => {
+                quiet.get_or_init(|| Quiet::of_all(children)).holds()
+            }
+            LayoutNode::BoundaryRef { slot, .. } => slot.quiet_now(),
+            _ => false,
+        }
+    }
+
+    /// A quiet child left unplaced still answers WHERE it is: the frame of
+    /// each boundary on its way down, through single children — the address
+    /// a scroll-to reveals a row by is the row's own boundary.
+    fn record_unplaced(&self, frame: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
+        match self {
+            LayoutNode::Boundary { path, children, .. } => {
+                let real = match env.anim {
+                    Some(scope) => Rect {
+                        origin: Point {
+                            x: frame.origin.x - scope.shift.0,
+                            y: frame.origin.y - scope.shift.1,
+                        },
+                        size: frame.size,
+                    },
+                    None => frame,
+                };
+                out.frames.record(path, real);
+                if let [only] = children.as_slice() {
+                    only.record_unplaced(frame, env, out);
+                }
+            }
+            LayoutNode::BoundaryRef { slot, .. } => slot.with_layout(|layout| {
+                if let Some(node) = layout {
+                    node.record_unplaced(frame, env, out);
+                }
+            }),
+            _ => {}
+        }
+    }
+}
+
 /// The draw list of one frame.
+impl DrawCommand {
+    /// Can this command put ink inside `clip`? A SUPERSET test, free of
+    /// the text engine — the reach each raster already trusts when it asks
+    /// whether a command touches a damaged rectangle: a stroke reaches half
+    /// its width out, a shadow its radius, and a line of text runs from its
+    /// origin to the right without end and three sizes down. A clip pair
+    /// always answers yes: it is structure, not ink.
+    pub(crate) fn may_reach(&self, clip: Rect) -> bool {
+        let (x0, y0) = (clip.origin.x, clip.origin.y);
+        let (x1, y1) = (x0 + clip.size.width, y0 + clip.size.height);
+        let hits = |bx0: Px, by0: Px, bx1: Px, by1: Px| bx0 < x1 && bx1 > x0 && by0 < y1 && by1 > y0;
+        let around = |rect: &Rect, reach: Px| {
+            hits(
+                rect.origin.x - reach,
+                rect.origin.y - reach,
+                rect.origin.x + rect.size.width + reach,
+                rect.origin.y + rect.size.height + reach,
+            )
+        };
+        match self {
+            DrawCommand::FillRect { rect, .. }
+            | DrawCommand::Gradient { rect, .. }
+            | DrawCommand::Backdrop { rect, .. }
+            | DrawCommand::Image { rect, .. } => around(rect, 0.0),
+            DrawCommand::StrokeRect { rect, width, .. } => around(rect, (width / 2.0).max(1.0)),
+            DrawCommand::Shadow { rect, radius, .. } => around(rect, radius.max(1.0)),
+            DrawCommand::TextLine { origin, font, .. } => {
+                hits(origin.x - 1.0, origin.y - 1.0, Px::INFINITY, origin.y + font.size * 3.0)
+            }
+            DrawCommand::PushClip { .. } | DrawCommand::PopClip => true,
+        }
+    }
+
+    /// The same command `by` further right and down — how a kept picture
+    /// is replayed at a box's new place. `None` for a command whose paint
+    /// was resolved against absolute geometry (a gradient, a glass pane):
+    /// moving its box would not move its ramp.
+    pub(crate) fn translated(&self, by: Point) -> Option<DrawCommand> {
+        let moved = |rect: &Rect| Rect {
+            origin: Point { x: rect.origin.x + by.x, y: rect.origin.y + by.y },
+            size: rect.size,
+        };
+        Some(match self {
+            DrawCommand::FillRect { rect, color, corner_radius } => DrawCommand::FillRect {
+                rect: moved(rect),
+                color: *color,
+                corner_radius: *corner_radius,
+            },
+            DrawCommand::Shadow { rect, radius, color, corner_radius } => DrawCommand::Shadow {
+                rect: moved(rect),
+                radius: *radius,
+                color: *color,
+                corner_radius: *corner_radius,
+            },
+            DrawCommand::StrokeRect { rect, color, width, corner_radius } => {
+                DrawCommand::StrokeRect {
+                    rect: moved(rect),
+                    color: *color,
+                    width: *width,
+                    corner_radius: *corner_radius,
+                }
+            }
+            DrawCommand::TextLine { origin, content, range, color, font } => {
+                DrawCommand::TextLine {
+                    origin: Point { x: origin.x + by.x, y: origin.y + by.y },
+                    content: Arc::clone(content),
+                    range: *range,
+                    color: *color,
+                    font: *font,
+                }
+            }
+            DrawCommand::Image { rect, source } => {
+                DrawCommand::Image { rect: moved(rect), source: source.clone() }
+            }
+            DrawCommand::PushClip { rect, corner_radius } => {
+                DrawCommand::PushClip { rect: moved(rect), corner_radius: *corner_radius }
+            }
+            DrawCommand::PopClip => DrawCommand::PopClip,
+            DrawCommand::Gradient { .. } | DrawCommand::Backdrop { .. } => return None,
+        })
+    }
+}
+
+/// A box's kept picture ([`crate::custom::CustomView::cached`]): everything
+/// the paint was given, and the commands it answered, in the box's OWN
+/// coordinates. `None` = this version paints something that cannot be moved,
+/// so it is painted on every frame and never asked about again.
+struct Picture {
+    version: u64,
+    size: Size,
+    scale: Px,
+    font: FontSpec,
+    ink: Color,
+    theme: u64,
+    touch: bool,
+    commands: Option<Rc<[DrawCommand]>>,
+}
+
+/// More kept pictures than this, and the store starts again: a box that left
+/// the scene leaves its picture behind, and nothing else sweeps it.
+const KEPT_PICTURES: usize = 512;
+
+thread_local! {
+    /// Kept pictures, by the box's identity path (a path carries its scene,
+    /// so two windows on one thread never share an entry).
+    static PICTURES: std::cell::RefCell<HashMap<String, Picture>> =
+        std::cell::RefCell::new(HashMap::default());
+}
+
+/// Drops every kept picture — a newborn world starts with none.
+pub(crate) fn forget_pictures() {
+    PICTURES.with(|pictures| pictures.borrow_mut().clear());
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct DisplayList {
     commands: Vec<DrawCommand>,
 }
 
 impl DisplayList {
+    /// This list with what no pixel can show taken out — the rule the
+    /// placement applies while it walks ([`Placement::draw`]), as a pure
+    /// function of a finished list: a command that cannot reach the clip it
+    /// stands under goes, and so does everything under an empty clip, the
+    /// clip's own pair included. The paranoid check compares the two.
+    /// [`Self::seen_only`] for the TAIL of a list under construction: the
+    /// commands from `from` on, which stand under `clip`. What an app's box
+    /// painted goes through here, because a painter writes to the list and
+    /// not through the placement.
+    pub(crate) fn cut_unseen_from(&mut self, from: usize, clip: Option<Rect>) {
+        let Some(clip) = clip else { return };
+        let mut clips: Vec<Rect> = vec![clip];
+        let mut muted = 0u32;
+        let mut kept = from;
+        for index in from..self.commands.len() {
+            let keep = match &self.commands[index] {
+                DrawCommand::PushClip { rect, .. } => {
+                    let rect = *rect;
+                    let shown = !rect.is_empty();
+                    if !shown {
+                        muted += 1;
+                    }
+                    clips.push(rect);
+                    shown && muted == 0
+                }
+                DrawCommand::PopClip => {
+                    if clips.len() > 1 && clips.pop().is_some_and(|clip| clip.is_empty()) {
+                        muted = muted.saturating_sub(1);
+                        false
+                    } else {
+                        muted == 0
+                    }
+                }
+                command => muted == 0 && clips.last().is_none_or(|clip| command.may_reach(*clip)),
+            };
+            if keep {
+                self.commands.swap(kept, index);
+                kept += 1;
+            } else {
+                crate::stats::note_unseen();
+            }
+        }
+        self.commands.truncate(kept);
+    }
+
+    pub(crate) fn seen_only(&self) -> DisplayList {
+        let mut kept = DisplayList::default();
+        let mut clips: Vec<Rect> = Vec::new();
+        let mut muted = 0u32;
+        for command in &self.commands {
+            match command {
+                DrawCommand::PushClip { rect, .. } => {
+                    if rect.is_empty() {
+                        muted += 1;
+                    } else if muted == 0 {
+                        kept.commands.push(command.clone());
+                    }
+                    clips.push(*rect);
+                }
+                DrawCommand::PopClip => {
+                    if clips.pop().is_some_and(|clip| clip.is_empty()) {
+                        muted = muted.saturating_sub(1);
+                    } else if muted == 0 {
+                        kept.commands.push(command.clone());
+                    }
+                }
+                command => {
+                    let reaches = clips.last().is_none_or(|clip| command.may_reach(*clip));
+                    if muted == 0 && reaches {
+                        kept.commands.push(command.clone());
+                    }
+                }
+            }
+        }
+        kept
+    }
+
     pub(crate) fn push(&mut self, command: DrawCommand) {
         self.commands.push(command);
     }
@@ -1895,6 +2319,35 @@ impl DisplayList {
                 .collect(),
         }
     }
+
+    /// The list with a picture spliced in at each host's mark — for a
+    /// shell that OWNS its page pixels (the Linux shell) and paints
+    /// them as one [`DrawCommand::Image`] where the host stood, so
+    /// everything the scene painted after the mark stays above the
+    /// page by list order, on every tier, and the clip open at the
+    /// mark still cuts it (a page inside a scroll region is cut like
+    /// anything else there). Marks come in any order; one past the end
+    /// appends; the rect is the host's frame, in window coordinates.
+    pub fn with_host_pixels(&self, pictures: &[(usize, Rect, ImageSource)]) -> DisplayList {
+        let mut order: Vec<&(usize, Rect, ImageSource)> = pictures.iter().collect();
+        order.sort_by_key(|(mark, _, _)| *mark);
+        let mut next = order.into_iter().peekable();
+        let mut commands = Vec::with_capacity(self.commands.len() + pictures.len());
+        for (index, command) in self.commands.iter().enumerate() {
+            while let Some((mark, rect, source)) = next.peek().copied() {
+                if *mark > index {
+                    break;
+                }
+                commands.push(DrawCommand::Image { rect: *rect, source: source.clone() });
+                next.next();
+            }
+            commands.push(command.clone());
+        }
+        commands.extend(
+            next.map(|(_, rect, source)| DrawCommand::Image { rect: *rect, source: source.clone() }),
+        );
+        DisplayList { commands }
+    }
 }
 
 /// How a split's seam and its floors are measured.
@@ -1971,6 +2424,10 @@ pub struct ModalFloor {
     pub menus: usize,
     pub drag_sources: usize,
     pub drops: usize,
+    /// The native hosts placed before the line — a page under a sheet
+    /// is out of reach for a shell that routes the hand to its hosts
+    /// itself.
+    pub hosts: usize,
 }
 
 /// A placed scroll region — the wheel's map, in PAINT order (last =
@@ -2445,6 +2902,17 @@ pub struct Placement {
     /// this stack instead, so the pointer over a chip can light the
     /// mark inside it.
     groups: Vec<(bool, bool)>,
+    /// Stack of the nearest `Interactive`'s index in `hits` — `None` for
+    /// a target outside the clip, which no pointer can reach. A `Styled`
+    /// that paints a pointer state marks that hit as hover-sensitive.
+    pointer_hit: Vec<Option<usize>>,
+    /// One mark for each open `.hover_group()`: did a descendant paint by
+    /// the group's pointer state?
+    group_marks: Vec<bool>,
+    /// The hits whose hover changes the picture, as indices into `hits`.
+    pub(crate) hover_sensitive: Vec<usize>,
+    /// The groups whose hover changes the picture, by path.
+    pub(crate) sensitive_groups: Vec<String>,
     /// Stack of the current clip (intersections in logical coordinates) —
     /// whoever records a hit consults it; the raster redoes the cut in
     /// physical px.
@@ -2494,6 +2962,18 @@ pub struct Placement {
     /// placement braços feed it the SEMANTIC scene while they walk.
     /// `None` costs one branch per hook and nothing else.
     pub(crate) dom: Option<crate::dom::DomCapture>,
+    /// How many EMPTY clips are open. Nothing drawn under an empty clip
+    /// reaches a pixel, so nothing under one joins the list — not even the
+    /// clip's own two commands, which keeps the list balanced.
+    muted: u32,
+    /// Keep every command, seen or not: the control of the cut below
+    /// ([`Placement::draw`]). The Dom lowering places with it, because a
+    /// browser scrolls what was lowered without asking for a new layout.
+    keep_unseen: bool,
+    /// Where a box that nobody can see paints: the app may read its own
+    /// `paint` as "this frame happened", so the call is made and the
+    /// commands go nowhere.
+    unseen: DisplayList,
 }
 
 impl Placement {
@@ -2510,6 +2990,7 @@ impl Placement {
         Placement {
             foreground: vec![ink],
             dom: Some(crate::dom::DomCapture::new(size)),
+            keep_unseen: true,
             ..Placement::default()
         }
     }
@@ -2522,11 +3003,66 @@ impl Placement {
     /// A draw command joins the display list — unless this pass skips
     /// collection (a Dom frame with no live island: nothing consumes
     /// the list, so nothing pays for it).
+    ///
+    /// And unless NO PIXEL can show it. A page that scrolls places every
+    /// row it holds, on every frame, and a legend of two hundred rows shows
+    /// ten: the other hundred and ninety were drawn, carried to the
+    /// presenter, walked there, and clipped away one by one. A command is
+    /// tested against the clip it stands under with the reach the rasters
+    /// already trust for damage ([`DrawCommand::may_reach`]) — a superset of
+    /// its ink — so what is dropped is exactly what the clip would have
+    /// erased.
     #[inline]
     fn draw(&mut self, command: DrawCommand) {
-        if !self.skip_display {
-            self.display.push(command);
+        if self.skip_display || self.muted > 0 {
+            return;
         }
+        if !self.keep_unseen
+            && let Some(clip) = self.clip.last()
+            && !command.may_reach(*clip)
+        {
+            crate::stats::note_unseen();
+            return;
+        }
+        self.display.push(command);
+    }
+
+    /// Is this box FAR off the glass — a whole window away from the clip
+    /// it stands under, and never less than 64 points? A quiet child of a
+    /// stack that far out is left unplaced ([`Quiet`]). The distance is for
+    /// what a box draws outside itself — a shadow, a badge hung on a corner,
+    /// a child wider than its parent: the clip erases all of it, and a window
+    /// away nothing of it could have reached.
+    fn leaves_unplaced(&self, frame: Rect) -> bool {
+        if self.keep_unseen || self.skip_display || self.dom.is_some() {
+            return false;
+        }
+        self.clip.last().is_some_and(|clip| {
+            let (far_x, far_y) = (clip.size.width.max(64.0), clip.size.height.max(64.0));
+            frame.origin.x + frame.size.width < clip.origin.x - far_x
+                || frame.origin.x > clip.origin.x + clip.size.width + far_x
+                || frame.origin.y + frame.size.height < clip.origin.y - far_y
+                || frame.origin.y > clip.origin.y + clip.size.height + far_y
+        })
+    }
+
+    /// Can nothing drawn between these two heights show? A text asks
+    /// BEFORE it measures and breaks its lines: the rows of a long list
+    /// that are off the glass pay for neither.
+    fn hides_band(&self, top: Px, bottom: Px) -> bool {
+        if self.skip_display || self.muted > 0 {
+            return true;
+        }
+        if self.keep_unseen {
+            return false;
+        }
+        let hidden = self.clip.last().is_some_and(|clip| {
+            bottom <= clip.origin.y || top >= clip.origin.y + clip.size.height
+        });
+        if hidden {
+            crate::stats::note_unseen();
+        }
+        hidden
     }
 
     /// The command carries the INTERSECTED window, the same rect the
@@ -2546,16 +3082,31 @@ impl Placement {
                 .unwrap_or(Rect { origin: rect.origin, size: Size::default() }),
             None => rect,
         };
-        self.draw(DrawCommand::PushClip {
-            rect: clipped,
-            corner_radius: corner_radius.into(),
-        });
+        // an EMPTY clip shows nothing, and says so once: everything under
+        // it is muted, its own pair of commands included
+        if !self.keep_unseen && clipped.is_empty() {
+            self.muted += 1;
+            self.clip.push(clipped);
+            return;
+        }
+        if !self.skip_display && self.muted == 0 {
+            self.display.push(DrawCommand::PushClip {
+                rect: clipped,
+                corner_radius: corner_radius.into(),
+            });
+        }
         self.clip.push(clipped);
     }
 
     fn pop_clip(&mut self) {
-        self.draw(DrawCommand::PopClip);
-        self.clip.pop();
+        let closed = self.clip.pop();
+        if !self.keep_unseen && closed.is_some_and(|clip| clip.is_empty()) {
+            self.muted = self.muted.saturating_sub(1);
+            return;
+        }
+        if !self.skip_display && self.muted == 0 {
+            self.display.push(DrawCommand::PopClip);
+        }
     }
 
     fn current_clip(&self) -> Option<Rect> {
@@ -2564,6 +3115,11 @@ impl Placement {
 }
 
 impl Rect {
+    /// No area: nothing drawn under this clip reaches a pixel.
+    pub fn is_empty(&self) -> bool {
+        self.size.width <= 0.0 || self.size.height <= 0.0
+    }
+
     pub fn contains(&self, x: Px, y: Px) -> bool {
         x >= self.origin.x
             && y >= self.origin.y
@@ -2601,12 +3157,19 @@ pub(crate) const MEASURE_SEGMENT: &str = "/#measure";
 /// identity path of the boundaries.
 #[derive(Default, Debug)]
 pub struct Frames {
-    entries: Vec<(String, Rect)>,
+    /// A boundary lends its own name: a frame recorded costs a count, not a
+    /// copy — every boundary of the page records one on every frame.
+    entries: Vec<(Rc<str>, Rect)>,
 }
 
 impl Frames {
-    fn record(&mut self, path: &str, frame: Rect) {
-        self.entries.push((path.to_string(), frame));
+    fn record(&mut self, path: &Rc<str>, frame: Rect) {
+        self.entries.push((Rc::clone(path), frame));
+    }
+
+    /// [`Self::record`] for a node whose name is not shared.
+    fn record_named(&mut self, path: &str, frame: Rect) {
+        self.entries.push((Rc::from(path), frame));
     }
 
     /// The probes' own frames — the entries a `Measured` node recorded,
@@ -2615,7 +3178,7 @@ impl Frames {
         self.entries
             .iter()
             .filter(|(path, _)| path.ends_with(MEASURE_SEGMENT))
-            .map(|(path, frame)| (path.as_str(), frame))
+            .map(|(path, frame)| (&**path, frame))
     }
 
 
@@ -2623,7 +3186,7 @@ impl Frames {
     pub fn get(&self, path: &str) -> Option<Rect> {
         self.entries
             .iter()
-            .find(|(entry, _)| entry == path)
+            .find(|(entry, _)| &**entry == path)
             .map(|(_, frame)| *frame)
     }
 
@@ -2637,7 +3200,7 @@ impl Frames {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, Rect)> {
-        self.entries.iter().map(|(path, frame)| (path.as_str(), *frame))
+        self.entries.iter().map(|(path, frame)| (&**path, *frame))
     }
 }
 
@@ -2663,6 +3226,12 @@ pub struct LayoutResult {
     /// A canvas island placed while display collection was off — the
     /// runtime re-runs the pass collected.
     pub(crate) saw_island: bool,
+    /// The hits whose hover changes the picture (indices into `hits`),
+    /// and the groups whose hover does. A frame re-reads the pointer
+    /// after its layout; it lays out again only when the target the
+    /// pointer left, or the one it reached, is one of these.
+    pub(crate) hover_sensitive: Vec<usize>,
+    pub(crate) sensitive_groups: Vec<String>,
     /// The placed popovers, in paint order (last = topmost) — each one
     /// a suffix slice of `display`.
     pub overlays: Vec<OverlayPlacement>,
@@ -2726,6 +3295,7 @@ pub fn layout(root: &LayoutNode, proposal: Proposal) -> LayoutResult {
             overlay_bounds: None,
             dialog_frames: None,
             scale: 1.0,
+            touch: false,
         },
     )
 }
@@ -2778,11 +3348,25 @@ pub fn layout_with_insets(
     env: LayoutEnv,
     insets: Edges,
 ) -> LayoutResult {
+    layout_placing(root, proposal, env, insets, true)
+}
+
+/// [`layout_with_insets`], and the choice of what the list keeps:
+/// `keep_unseen` holds every draw command, what no pixel can show included
+/// — a probe reads a page's words off the list. A shell's runtime drops
+/// them (`Runtime::drop_unseen`).
+pub(crate) fn layout_placing(
+    root: &LayoutNode,
+    proposal: Proposal,
+    env: LayoutEnv,
+    insets: Edges,
+    keep_unseen: bool,
+) -> LayoutResult {
     let inner = Proposal {
         width: proposal.width.map(|width| (width - insets.horizontal()).max(0.0)),
         height: proposal.height.map(|height| (height - insets.vertical()).max(0.0)),
     };
-    let (size, fit) = root.measure(inner, env);
+    let (size, fit) = crate::stats::time(crate::stats::Stage::Measure, || root.measure(inner, &env));
     let safe = Rect { origin: Point { x: insets.leading, y: insets.top }, size };
     // the window: the proposal where it was proposed, the root's answer
     // plus the insets where it was open
@@ -2793,14 +3377,57 @@ pub fn layout_with_insets(
             height: proposal.height.unwrap_or(size.height + insets.vertical()),
         },
     };
-    let mut out = Placement::default();
+    let mut out = Placement { keep_unseen, ..Placement::default() };
     out.safe = (insets != Edges::ZERO).then_some(SafeFrame { window, safe });
-    root.place(safe, fit, env, &mut out);
+    crate::stats::time(crate::stats::Stage::Place, || root.place(safe, &fit, &env, &mut out));
     // popovers place AFTER the root: painted on top, hit first, free
     // of every scroll clip. Their default container is the WINDOW's
     // safe rect (the proposal), never the root's answer — a small scene
     // must not shrink the room a popover positions in.
-    place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, env, &mut out);
+    place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, &env, &mut out);
+    if !keep_unseen && crate::paranoid::on(crate::paranoid::SEEN) {
+        // the claim of the cut: the list is the FULL list with what no
+        // pixel can show taken out, and nothing else in the placement
+        // moved. The scene is placed again with the cut off, filtered by
+        // the same rule as a pure function of the list, and compared.
+        let mut full = Placement { keep_unseen: true, safe: out.safe, ..Placement::default() };
+        root.place(safe, &fit, &env, &mut full);
+        place_overlays(Rect { origin: safe.origin, size: insets.inset(window).size }, &env, &mut full);
+        let seen = full.display.seen_only();
+        assert!(
+            seen.as_slice() == out.display.as_slice(),
+            "paranoid(seen): the placement's cut and the filter of the full list differ — {} commands against {} (the full list holds {})",
+            out.display.len(),
+            seen.len(),
+            full.display.len(),
+        );
+        // a quiet child left unplaced records its own boundaries and not the
+        // ones nested in it: the cut's frames are the full placement's, in
+        // order, with some left out — never one moved, never one invented
+        let mut all = full.frames.entries.iter();
+        let frames_agree = out.frames.entries.iter().all(|kept| all.any(|entry| entry == kept));
+        // …and a hover group off the glass is not asked whether it paints a
+        // hover nobody can give it
+        let groups_agree = out.sensitive_groups.iter().all(|group| full.sensitive_groups.contains(group));
+        assert!(
+            full.hits == out.hits
+                && frames_agree
+                && groups_agree
+                && full.scrolls.len() == out.scrolls.len()
+                && full.fields.len() == out.fields.len()
+                && full.customs.len() == out.customs.len()
+                && full.hosts.len() == out.hosts.len()
+                && full.tooltips.len() == out.tooltips.len()
+                && full.menus.len() == out.menus.len()
+                && full.drag_sources.len() == out.drag_sources.len()
+                && full.drops.len() == out.drops.len()
+                && full.overlays.len() == out.overlays.len()
+                && full.misses == out.misses
+                && full.drag_regions == out.drag_regions
+                && full.hover_sensitive == out.hover_sensitive,
+            "paranoid(seen): the cut moved something other than the draw list",
+        );
+    }
     LayoutResult {
         size,
         frames: out.frames,
@@ -2813,6 +3440,8 @@ pub fn layout_with_insets(
         hosts: out.hosts,
         misses: out.misses,
         saw_island: out.saw_island,
+        hover_sensitive: out.hover_sensitive,
+        sensitive_groups: out.sensitive_groups,
         overlays: out.overlays,
         modal_floor: out.modal_floor,
         drag_regions: out.drag_regions,
@@ -2833,17 +3462,18 @@ pub fn layout_dom(
     env: LayoutEnv,
     collect_display: bool,
 ) -> (LayoutResult, crate::dom::DomNode) {
-    let (size, fit) = root.measure(proposal, env);
+    let (size, fit) = root.measure(proposal, &env);
     let mut out = Placement {
         dom: Some(crate::dom::DomCapture::new(size)),
         skip_display: !collect_display,
+        keep_unseen: true,
         ..Placement::default()
     };
-    root.place(Rect { origin: Point::default(), size }, fit, env, &mut out);
+    root.place(Rect { origin: Point::default(), size }, &fit, &env, &mut out);
     // the capture is still open at the root here, so every popover
     // mounts as the root's LAST child — outside every scroll element,
     // stacked on top by document order: the portal, by construction
-    place_overlays(window_bounds(proposal, size), env, &mut out);
+    place_overlays(window_bounds(proposal, size), &env, &mut out);
     let scene = out.dom.take().expect("the capture stays for the whole walk").finish();
     (
         LayoutResult {
@@ -2858,6 +3488,8 @@ pub fn layout_dom(
             hosts: out.hosts,
             misses: out.misses,
             saw_island: out.saw_island,
+            hover_sensitive: out.hover_sensitive,
+            sensitive_groups: out.sensitive_groups,
             overlays: out.overlays,
             modal_floor: out.modal_floor,
             drag_regions: out.drag_regions,
@@ -3065,7 +3697,7 @@ pub(crate) fn menu_row_at(
 /// STAMP's (the runtime tracks it, so the pixel modes highlight), and
 /// each row also declares its CSS hover — the element mode gets the
 /// same highlight with zero patches, its own way.
-fn menu_node(open: &MenuOpen, env: LayoutEnv) -> LayoutNode {
+fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
     let theme = crate::theme::current();
     let mut rows: Vec<LayoutNode> = Vec::with_capacity(open.entries.len());
     for (index, entry) in open.entries.iter().enumerate() {
@@ -3221,7 +3853,7 @@ fn tooltip_node(text: Arc<str>) -> LayoutNode {
     }
 }
 
-fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
+fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
     let container = env.overlay_bounds.unwrap_or(viewport);
     let mut placed = 0;
     while !out.overlay_queue.is_empty() && placed < OVERLAY_CAP {
@@ -3302,7 +3934,7 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
             },
         };
         let start = out.display.len();
-        queued.node.place(frame, fit, env, out);
+        queued.node.place(frame, &fit, env, out);
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: queued.path,
@@ -3333,7 +3965,7 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
         );
         let frame = menu_frame(open.at, size, container);
         let start = out.display.len();
-        node.place(frame, fit, env, out);
+        node.place(frame, &fit, env, out);
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: MENU_PATH.to_string(),
@@ -3372,7 +4004,7 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
             size,
         };
         let start = out.display.len();
-        node.place(frame, fit, env, out);
+        node.place(frame, &fit, env, out);
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: DRAG_LABEL_PATH.to_string(),
@@ -3394,7 +4026,7 @@ fn place_overlays(viewport: Rect, env: LayoutEnv, out: &mut Placement) {
         let (size, fit) = node.measure(proposal, env);
         let frame = anchored_frame(anchor, side, size, container);
         let start = out.display.len();
-        node.place(frame, fit, env, out);
+        node.place(frame, &fit, env, out);
         let end = out.display.len();
         out.overlays.push(OverlayPlacement {
             path: TOOLTIP_PATH.to_string(),
@@ -3530,12 +4162,9 @@ impl LayoutNode {
             // `.frame(…)` around it pins it
             LayoutNode::Host { .. } => true,
             // skipped boundary: the flexibility is the retained tree's
-            LayoutNode::BoundaryRef { path } => crate::reconciler::with_retained_layout(
-                path,
-                |layout| {
-                    layout.map(|node| node.is_flexible(axis, enclosing_main)).unwrap_or(false)
-                },
-            ),
+            LayoutNode::BoundaryRef { slot, .. } => slot.with_layout(|layout| {
+                layout.map(|node| node.is_flexible(axis, enclosing_main)).unwrap_or(false)
+            }),
             _ => false,
         }
     }
@@ -3547,7 +4176,7 @@ impl LayoutNode {
     /// the caller then uses the bottom edge (the rule for baselineless
     /// boxes). Only the baseline alignment walks this; everyone else
     /// pays nothing.
-    fn first_baseline(&self, env: LayoutEnv) -> Option<Px> {
+    fn first_baseline(&self, env: &LayoutEnv<'_>) -> Option<Px> {
         match self {
             LayoutNode::Text { content, .. } => {
                 Some(env.cache.get_or_measure(content, &env.font, env.text).ascent)
@@ -3561,9 +4190,9 @@ impl LayoutNode {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
                     text_align: props.text_align.or(env.text_align),
-                    ..env
+                    ..*env
                 };
-                child.first_baseline(env)
+                child.first_baseline(&env)
             }
             LayoutNode::Overlay { child, .. } => child.first_baseline(env),
             LayoutNode::Animated { child, .. }
@@ -3598,15 +4227,14 @@ impl LayoutNode {
                 children.first().and_then(|child| child.first_baseline(env))
             }
             LayoutNode::Measured { child, .. } => child.first_baseline(env),
-            LayoutNode::BoundaryRef { path } => crate::reconciler::with_retained_layout(
-                path,
-                |layout| layout.and_then(|node| node.first_baseline(env)),
-            ),
+            LayoutNode::BoundaryRef { slot, .. } => {
+                slot.with_layout(|layout| layout.and_then(|node| node.first_baseline(env)))
+            }
             _ => None,
         }
     }
 
-    pub(crate) fn measure(&self, proposal: Proposal, env: LayoutEnv) -> (Size, Fit) {
+    pub(crate) fn measure(&self, proposal: Proposal, env: &LayoutEnv<'_>) -> (Size, Fit) {
         match self {
             LayoutNode::Text { content, truncation, .. } => {
                 let metrics = env.cache.get_or_measure(content, &env.font, env.text);
@@ -3688,6 +4316,12 @@ impl LayoutNode {
             // the escape hatch measures itself, with the frame's text
             // metrics in hand
             LayoutNode::Custom { element, .. } => {
+                // the app's own measure can read anything — a document
+                // that grew, a state it writes. It is kept only when the
+                // box says its answer depends on the question alone.
+                if !element.element().stable_measure() {
+                    poison_measure();
+                }
                 let metrics = crate::custom::Metrics::new(env.text, env.cache, env.font);
                 (element.element().measure(proposal, &metrics), Fit::Leaf)
             }
@@ -3708,7 +4342,13 @@ impl LayoutNode {
                     // the print-parity stub keeps the old rigid box
                     None => Size { width: 40.0, height: 40.0 },
                     Some(source) => {
-                        image_size(intrinsic_of(&*env.images, source), *resizable, *fit, proposal)
+                        let intrinsic = intrinsic_of(&*env.images, source);
+                        // a size that is not known yet arrives later, with
+                        // no state write to announce it
+                        if intrinsic.is_none() {
+                            poison_measure();
+                        }
+                        image_size(intrinsic, *resizable, *fit, proposal)
                     }
                 };
                 (size, Fit::Leaf)
@@ -3799,6 +4439,8 @@ impl LayoutNode {
                     // offsets are prefix sums, the total is honest to
                     // every row that does not exist
                     Some(heights) => {
+                        // the app answers each row's height: not ours to keep
+                        poison_measure();
                         let mut offsets = Vec::with_capacity(*count + 1);
                         let mut total: Px = 0.0;
                         offsets.push(0.0);
@@ -4053,9 +4695,9 @@ impl LayoutNode {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
                     text_align: props.text_align.or(env.text_align),
-                    ..env
+                    ..*env
                 };
-                let (size, fit) = child.measure(proposal, env);
+                let (size, fit) = child.measure(proposal, &env);
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
@@ -4099,20 +4741,22 @@ impl LayoutNode {
             // skipped boundary: measures the RETAINED tree in its place —
             // no copy stitched anywhere (the frame's layout reads the
             // retention)
-            LayoutNode::BoundaryRef { path } => {
-                crate::reconciler::with_retained_layout(path, |layout| match layout {
-                    Some(node) => node.measure(proposal, env),
-                    None => {
-                        debug_assert!(false, "layout reference without retention: {path}");
-                        (Size::default(), Fit::Leaf)
-                    }
-                })
+            //
+            // …and the answer is KEPT with the entry. A boundary that did
+            // not re-run holds the same tree, so the same question has
+            // the same answer; a wheel, a hover, a blink and a tick ask
+            // the same question every frame. A body that re-runs makes a
+            // new entry (no kept answer), and clears the answers of the
+            // boundaries above it, whose size may hang on its own.
+            LayoutNode::BoundaryRef { path, slot } => {
+                let key = MeasureKey { proposal, font: env.font, line_height: env.line_height };
+                crate::reconciler::measure_retained(slot, path, key, |node| node.measure(proposal, env))
             }
         }
     }
 
-    pub(crate) fn place(&self, frame: Rect, fit: Fit, env: LayoutEnv, out: &mut Placement) {
-        match (self, fit) {
+    pub(crate) fn place(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
+        match (self, fit.unshared()) {
             // visual leaves: the draw list is born here
             (LayoutNode::Text { content, highlights, truncation }, Fit::Leaf) => {
                 let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
@@ -4553,11 +5197,124 @@ impl LayoutNode {
                     caret_visible: focused && env.stamp.caret_visible,
                     phase,
                     scale: env.scale,
+                    touch: env.touch,
                 };
                 let ink = out.foreground.last().copied().unwrap_or(Color::BLACK);
-                let mut painter =
-                    crate::custom::Painter::new(&mut out.display, frame.origin, env.font, ink);
-                element.element().paint(&ctx, &mut painter);
+                // a box that asked to keep its picture is painted once for
+                // each version, size and look, in its OWN coordinates, and
+                // replayed at its place. Never a box that moves on its own:
+                // one under a loop, one that holds the keyboard, one on the
+                // element lowering.
+                let kept = element
+                    .cached_version()
+                    .filter(|_| env.live.is_none() && !focused && out.dom.is_none() && !path.is_empty());
+                // a box NO PIXEL can show — its clip came out empty. One that
+                // keeps its picture promised that its paint is only a
+                // picture, so there is nothing to do. Any other box may read
+                // `paint` as "this frame happened" (a sensor posts its size
+                // from it, a tail follows its end), so the call is still
+                // made — into a list nobody reads.
+                let unseen = out.muted > 0;
+                let painted_from = out.display.len();
+                let replayed = unseen && kept.is_some();
+                let replayed = replayed || kept.is_some_and(|version| {
+                    let theme = crate::theme::version();
+                    let fresh = |picture: &Picture| {
+                        picture.version == version
+                            && picture.size == frame.size
+                            && picture.scale == env.scale
+                            && picture.font == env.font
+                            && picture.ink == ink
+                            && picture.theme == theme
+                            && picture.touch == env.touch
+                    };
+                    let known = PICTURES.with(|pictures| {
+                        pictures.borrow().get(path.as_str()).filter(|picture| fresh(picture)).map(
+                            |picture| picture.commands.clone(),
+                        )
+                    });
+                    let commands = match known {
+                        Some(commands) => commands,
+                        None => {
+                            // painted WHOLE, at the origin: the kept picture
+                            // serves every place the box is scrolled to
+                            let whole = crate::custom::PaintCtx {
+                                frame: Rect { origin: Point::ZERO, size: frame.size },
+                                visible: Rect { origin: Point::ZERO, size: frame.size },
+                                metrics: crate::custom::Metrics::new(env.text, env.cache, env.font),
+                                focused: false,
+                                caret_visible: false,
+                                phase: 0.0,
+                                scale: env.scale,
+                                touch: env.touch,
+                            };
+                            let mut recorded = DisplayList::default();
+                            let mut painter = crate::custom::Painter::new(
+                                &mut recorded,
+                                Point::ZERO,
+                                env.font,
+                                ink,
+                            );
+                            crate::stats::note_paint();
+                            element.element().paint(&whole, &mut painter);
+                            let movable =
+                                recorded.iter().all(|command| command.translated(Point::ZERO).is_some());
+                            let commands: Option<Rc<[DrawCommand]>> =
+                                movable.then(|| recorded.commands.into());
+                            PICTURES.with(|pictures| {
+                                let mut pictures = pictures.borrow_mut();
+                                if pictures.len() >= KEPT_PICTURES {
+                                    pictures.clear();
+                                }
+                                pictures.insert(
+                                    path.clone(),
+                                    Picture {
+                                        version,
+                                        size: frame.size,
+                                        scale: env.scale,
+                                        font: env.font,
+                                        ink,
+                                        theme,
+                                        touch: env.touch,
+                                        commands: commands.clone(),
+                                    },
+                                );
+                            });
+                            commands
+                        }
+                    };
+                    match commands {
+                        Some(commands) => {
+                            crate::stats::note_picture_replayed();
+                            for command in commands.iter() {
+                                if let Some(placed) = command.translated(frame.origin) {
+                                    out.display.push(placed);
+                                }
+                            }
+                            true
+                        }
+                        // it paints what cannot be moved: the old road
+                        None => false,
+                    }
+                });
+                if !replayed {
+                    let mut scratch = std::mem::take(&mut out.unseen);
+                    let target = if unseen { &mut scratch } else { &mut out.display };
+                    let mut painter = crate::custom::Painter::new(target, frame.origin, env.font, ink);
+                    crate::stats::note_paint();
+                    element.element().paint(&ctx, &mut painter);
+                    scratch.commands.clear();
+                    out.unseen = scratch;
+                }
+                // a box paints through its own painter, not through `draw`:
+                // what it painted — or replayed — outside the clip it stands
+                // under goes the same way every other command does. An editor
+                // paints a line past each edge of its window, and a chart half
+                // under the fold replays all of itself
+                if !out.keep_unseen && !out.skip_display {
+                    let clip = out.clip.last().copied();
+                    out.display.cut_unseen_from(painted_from, clip);
+                }
                 out.pop_clip();
                 let end = out.display.len();
                 if let Some(dom) = out.dom.as_mut() {
@@ -4595,7 +5352,7 @@ impl LayoutNode {
                 if !path.is_empty() {
                     // the box reports its rectangle — the app decides
                     // what may cross the island and what repositions
-                    out.frames.record(path, frame);
+                    out.frames.record_named(path, frame);
                     out.hosts.push(HostPlacement {
                         path: path.clone(),
                         frame,
@@ -4610,7 +5367,7 @@ impl LayoutNode {
             }
 
             (LayoutNode::Sheet { path, content, child, surface }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 // the line the modal draws: everything recorded from
                 // here on is ABOVE it, and the walk back stops at the
                 // mark instead of reaching under it
@@ -4621,6 +5378,7 @@ impl LayoutNode {
                     menus: out.menus.len(),
                     drag_sources: out.drag_sources.len(),
                     drops: out.drops.len(),
+                    hosts: out.hosts.len(),
                 });
                 // and out of the scene, on the popover's own road
                 out.overlay_queue.push(QueuedOverlay {
@@ -4634,7 +5392,7 @@ impl LayoutNode {
             }
 
             (LayoutNode::Anchored { path, side, overlay, child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 // the REAL anchor: un-shift the in-flight animation
                 // (the popover never chases a sliding row — the same
                 // contract as the retained boundary frames)
@@ -4660,36 +5418,36 @@ impl LayoutNode {
             }
 
             (LayoutNode::Hinted { child, .. }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
             }
 
             (LayoutNode::BoundaryHint { .. }, Fit::Leaf) => {}
 
             (LayoutNode::ExactLayout { child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
             }
 
             (LayoutNode::IgnoresSafeArea { child }, Fit::Wrapped(_, fit)) => {
                 let Some(safe) = out.safe else {
                     // no inset anywhere: the node is glass
-                    child.place(frame, *fit, env, out);
+                    child.place(frame, fit, env, out);
                     return;
                 };
                 let grown = safe.reclaim(frame);
                 if grown == frame {
-                    child.place(frame, *fit, env, out);
+                    child.place(frame, fit, env, out);
                     return;
                 }
                 // the child is measured once more, at the size it
                 // reclaimed; nothing below it reclaims again
                 let (_, fit) = child.measure(Proposal::exact(grown.size), env);
                 let kept = out.safe.take();
-                child.place(grown, fit, env, out);
+                child.place(grown, &fit, env, out);
                 out.safe = kept;
             }
 
             (LayoutNode::DragRegion { child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 // clipped like a hit: what is not visible cannot drag
                 let region = match out.current_clip() {
                     Some(clip) => frame.intersection(clip),
@@ -4701,7 +5459,7 @@ impl LayoutNode {
             }
 
             (LayoutNode::ControlRegion { control, child }, Fit::Wrapped(_, fit)) => {
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 // clipped like a hit: what is not visible is no button
                 let region = match out.current_clip() {
                     Some(clip) => frame.intersection(clip),
@@ -4727,7 +5485,7 @@ impl LayoutNode {
                 if let Some(rect) = clip_of(out, frame) {
                     out.tooltips.push(TooltipRegion { text: text.clone(), side: *side, rect });
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
             }
 
             (LayoutNode::ContextSource { items, on_click, child }, Fit::Wrapped(_, fit)) => {
@@ -4739,7 +5497,7 @@ impl LayoutNode {
                         on_click: on_click.clone(),
                     });
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
             }
 
             (LayoutNode::DragSource { payload, child }, Fit::Wrapped(_, fit)) => {
@@ -4748,7 +5506,7 @@ impl LayoutNode {
                 if let Some(rect) = clip_of(out, frame) {
                     out.drag_sources.push(DragSourceRegion { payload: payload.clone(), rect });
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
             }
 
             (LayoutNode::DropTarget { accepts, action, over, child }, Fit::Wrapped(_, fit)) => {
@@ -4767,7 +5525,7 @@ impl LayoutNode {
                         frame,
                     });
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 // the RING is paint, and paint runs the other way: it
                 // has to cover the child in the draw list and be the
                 // later sibling in the element tree. Routing order and
@@ -4981,9 +5739,8 @@ impl LayoutNode {
             }
 
             (LayoutNode::Overlay { at, behind, layer, child }, Fit::Children(fits)) => {
-                let mut fits = fits;
-                let (base_size, base_fit) = fits.remove(0);
-                let (layer_size, layer_fit) = fits.remove(0);
+                let (base_size, base_fit) = (fits[0].0, &fits[0].1);
+                let (layer_size, layer_fit) = (fits[1].0, &fits[1].1);
                 // a layer that FILLED the measured box follows the real
                 // frame instead: the parent may have handed the base
                 // more room than it asked for, and a rule that crossed
@@ -5036,6 +5793,7 @@ impl LayoutNode {
                             menus: out.menus.len(),
                             drag_sources: out.drag_sources.len(),
                             drops: out.drops.len(),
+                            hosts: out.hosts.len(),
                         });
                     }
                     // the alignment edge is horizontal — a 2pt accent bar
@@ -5046,7 +5804,7 @@ impl LayoutNode {
                         y: frame.origin.y
                             + align_offset(frame.size.height, size.height, CrossAlign::Center),
                     };
-                    child.place(Rect { origin, size }, fit, env, out);
+                    child.place(Rect { origin, size: *size }, fit, env, out);
                 }
             }
 
@@ -5055,7 +5813,7 @@ impl LayoutNode {
                     x: frame.origin.x + edges.leading,
                     y: frame.origin.y + edges.top,
                 };
-                child.place(Rect { origin, size: child_size }, *fit, env, out);
+                child.place(Rect { origin, size: *child_size }, fit, env, out);
             }
 
             (LayoutNode::Frame { align, child, .. }, Fit::Wrapped(child_size, fit)) => {
@@ -5065,13 +5823,13 @@ impl LayoutNode {
                     y: frame.origin.y
                         + align_offset(frame.size.height, child_size.height, CrossAlign::Center),
                 };
-                child.place(Rect { origin, size: child_size }, *fit, env, out);
+                child.place(Rect { origin, size: *child_size }, fit, env, out);
             }
 
             (LayoutNode::Hug { child, .. }, Fit::Wrapped(_, fit)) => {
                 // The frame, never the child's measured size: a region placed
                 // smaller than what it measured is exactly what travels.
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
             }
 
             (LayoutNode::MaxFrame { align, child, .. }, Fit::Wrapped(child_size, fit))
@@ -5080,7 +5838,7 @@ impl LayoutNode {
                     + align_offset(frame.size.width, child_size.width, *align);
                 let y = frame.origin.y
                     + align_offset(frame.size.height, child_size.height, CrossAlign::Center);
-                child.place(Rect { origin: Point { x, y }, size: child_size }, *fit, env, out);
+                child.place(Rect { origin: Point { x, y }, size: *child_size }, fit, env, out);
             }
 
             (
@@ -5110,7 +5868,7 @@ impl LayoutNode {
                 out.anchors.push(content_origin);
                 // a virtual child reports misses against THIS region,
                 // and its measured geometry is snapshot material
-                let (row_extent, row_offsets) = match fit.as_ref() {
+                let (row_extent, row_offsets) = match fit.unshared() {
                     Fit::Virtual { row_extent, offsets, .. } => {
                         (Some(*row_extent), offsets.clone())
                     }
@@ -5126,7 +5884,7 @@ impl LayoutNode {
                     out.scrolls.push(ScrollRegion {
                         path: path.clone(),
                         frame,
-                        content,
+                        content: *content,
                         target: target.clone(),
                         commanded: *commanded,
                         // a region inside an animation scope reveals its
@@ -5156,13 +5914,13 @@ impl LayoutNode {
                     );
                     dom.open(
                         crate::dom::DomKind::Content,
-                        Rect { origin: frame.origin, size: content },
+                        Rect { origin: frame.origin, size: *content },
                         content_origin,
                     );
                 }
                 child.place(
-                    Rect { origin: content_origin, size: content },
-                    *fit,
+                    Rect { origin: content_origin, size: *content },
+                    fit,
                     env,
                     out,
                 );
@@ -5207,7 +5965,7 @@ impl LayoutNode {
                     line_height: props.line_height.or(env.line_height),
                     text_align: props.text_align.or(env.text_align),
                     anim: env.anim.map(|scope| AnimScope { colors: false, ..scope }),
-                    ..env
+                    ..*env
                 };
                 // the animator paints the value in flight, never the
                 // target — it seeds, retargets and snaps behind this
@@ -5254,6 +6012,18 @@ impl LayoutNode {
                 // inside a chip lights when the CHIP is hovered
                 let stack = if props.from_group { &out.groups } else { &out.pointer };
                 let (hovered, pressed) = stack.last().copied().unwrap_or((false, false));
+                // this box is WHY a hover there is a new picture: the
+                // frame's pointer re-read lays out again for such a
+                // target, and for no other
+                if props.paints_pointer_state() {
+                    if props.from_group {
+                        if let Some(mark) = out.group_marks.last_mut() {
+                            *mark = true;
+                        }
+                    } else if let Some(Some(index)) = out.pointer_hit.last() {
+                        out.hover_sensitive.push(*index);
+                    }
+                }
                 // pressed > hovered > normal; a state without its own
                 // background falls back to the base one — a button with
                 // no hover defined does not flicker
@@ -5300,7 +6070,7 @@ impl LayoutNode {
                 if props.clip {
                     out.push_clip(frame, props.corner_radius.unwrap_or_default());
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, &env, out);
                 if props.clip {
                     out.pop_clip();
                 }
@@ -5339,7 +6109,7 @@ impl LayoutNode {
             (LayoutNode::Animated { key, spec, child }, Fit::Wrapped(_, fit)) => {
                 // a keyless scope (built outside a pass) stays inert
                 let Some(key) = key else {
-                    child.place(frame, *fit, env, out);
+                    child.place(frame, fit, env, out);
                     return;
                 };
                 // the node flies its OWN origin, anchored to the scroll
@@ -5366,7 +6136,7 @@ impl LayoutNode {
                         colors: true,
                         shift,
                     }),
-                    ..env
+                    ..*env
                 };
                 if let Some(dom) = out.dom.as_mut() {
                     // in Dom the browser animates: the spec lowers to a
@@ -5375,8 +6145,8 @@ impl LayoutNode {
                 }
                 child.place(
                     Rect { origin: painted, size: frame.size },
-                    *fit,
-                    env,
+                    fit,
+                    &env,
                     out,
                 );
                 if let Some(dom) = out.dom.as_mut() {
@@ -5387,8 +6157,8 @@ impl LayoutNode {
             (LayoutNode::Live { spec, child }, Fit::Wrapped(_, fit)) => {
                 // the clock opens for the subtree: the custom boxes
                 // below resolve their phase against it at paint time
-                let env = LayoutEnv { live: Some(*spec), ..env };
-                child.place(frame, *fit, env, out);
+                let env = LayoutEnv { live: Some(*spec), ..*env };
+                child.place(frame, fit, &env, out);
             }
 
             (LayoutNode::Island { child, .. }, Fit::Wrapped(_, fit)) => {
@@ -5402,13 +6172,13 @@ impl LayoutNode {
                     if let Some(dom) = out.dom.as_mut() {
                         dom.open_canvas(frame, start);
                     }
-                    child.place(frame, *fit, env, out);
+                    child.place(frame, fit, env, out);
                     let end = out.display.len();
                     if let Some(dom) = out.dom.as_mut() {
                         dom.close_canvas(end);
                     }
                 } else {
-                    child.place(frame, *fit, env, out);
+                    child.place(frame, fit, env, out);
                 }
             }
 
@@ -5427,15 +6197,19 @@ impl LayoutNode {
                 let hovered = under(&env.stamp.interaction.hovered);
                 let pressed = hovered && under(&env.stamp.interaction.pressed);
                 out.groups.push((hovered, pressed));
+                out.group_marks.push(false);
                 if let Some(dom) = out.dom.as_mut() {
                     // element mode gets a box of its OWN: the glue hangs
                     // the descendants' state rules off its selector, and
                     // an ancestor is the one thing a selector can name
                     dom.open_group(group_key(path), frame);
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 if let Some(dom) = out.dom.as_mut() {
                     dom.close_group();
+                }
+                if out.group_marks.pop() == Some(true) {
+                    out.sensitive_groups.push(path.clone());
                 }
                 out.groups.pop();
             }
@@ -5449,9 +6223,11 @@ impl LayoutNode {
                     Some(clip) => frame.intersection(clip),
                     None => Some(frame),
                 };
-                if let Some(visible) = visible {
+                let hit_index = visible.map(|visible| {
                     out.hits.push((path.clone(), visible));
-                }
+                    out.hits.len() - 1
+                });
+                out.pointer_hit.push(hit_index);
                 // hover/pressed from the env's STAMP; VISUAL pressed only
                 // with the pointer inside the target (AppKit semantics:
                 // dragging out releases, coming back re-arms)
@@ -5465,11 +6241,12 @@ impl LayoutNode {
                     // clicks with it and scopes `:hover` to the element
                     dom.arm_interactive(path);
                 }
-                child.place(frame, *fit, env, out);
+                child.place(frame, fit, env, out);
                 if let Some(dom) = out.dom.as_mut() {
                     dom.disarm();
                 }
                 out.pointer.pop();
+                out.pointer_hit.pop();
             }
 
             (
@@ -5484,13 +6261,13 @@ impl LayoutNode {
                 };
                 let mut materialized: Vec<usize> = Vec::with_capacity(fits.len());
                 for ((index, child), (fit_index, size, fit)) in children.iter().zip(fits) {
-                    debug_assert_eq!(*index, fit_index, "window and fit walk in step");
+                    debug_assert_eq!(*index, *fit_index, "window and fit walk in step");
                     materialized.push(*index);
                     let origin = Point {
                         x: frame.origin.x,
                         y: frame.origin.y + start_of(*index),
                     };
-                    child.place(Rect { origin, size }, fit, env, out);
+                    child.place(Rect { origin, size: *size }, fit, env, out);
                 }
                 // the window miss, both directions: a VISIBLE row that
                 // does not exist (the wheel outran the buffer), or a
@@ -5501,7 +6278,7 @@ impl LayoutNode {
                 // the 2× slack keeps the two window formulas from ever
                 // arguing (no thrash)
                 let geometry_known =
-                    row_extent > 0.0 || offsets.as_ref().is_some_and(|o| o.len() == count + 1);
+                    *row_extent > 0.0 || offsets.as_ref().is_some_and(|o| o.len() == count + 1);
                 if *count > 0
                     && geometry_known
                     && let Some(clip) = out.current_clip()
@@ -5540,15 +6317,13 @@ impl LayoutNode {
             (LayoutNode::Measured { path, child }, Fit::Children(fits)) => {
                 // the record is the whole job: the child is placed at
                 // exactly the frame this node was given
-                out.frames.record(path, frame);
-                let mut fits = fits;
-                if !fits.is_empty() {
-                    let (_, fit) = fits.remove(0);
+                out.frames.record_named(path, frame);
+                if let Some((_, fit)) = fits.first() {
                     child.place(frame, fit, env, out);
                 }
             }
 
-            (LayoutNode::Boundary { path, children }, Fit::Children(fits)) => {
+            (LayoutNode::Boundary { path, children, .. }, Fit::Children(fits)) => {
                 // the recorded frame is the REAL target: a flight in
                 // progress above un-shifts here, so scroll-to and tests
                 // never chase a moving row. crossing the boundary also
@@ -5571,17 +6346,23 @@ impl LayoutNode {
                     // measure from the same origin, so a flight above
                     // never bends the captured interior
                     dom.open(
-                        crate::dom::DomKind::Group { path: std::rc::Rc::from(path.as_str()) },
+                        crate::dom::DomKind::Group { path: Rc::clone(path) },
                         real,
                         real.origin,
                     );
                 }
-                let env = LayoutEnv { anim: None, ..env };
+                // a scope is rarely open: the environment is only rebuilt
+                // to close one
+                let closed;
+                let env = match env.anim {
+                    Some(_) => {
+                        closed = LayoutEnv { anim: None, ..*env };
+                        &closed
+                    }
+                    None => env,
+                };
                 if children.len() == 1 {
-                    let mut fits = fits;
-                    let (size, fit) = fits.remove(0);
-                    let _ = size;
-                    children[0].place(frame, fit, env, out);
+                    children[0].place(frame, &fits[0].1, env, out);
                 } else {
                     place_stack(
                         Axis::Vertical,
@@ -5602,8 +6383,8 @@ impl LayoutNode {
             // skipped boundary: places the RETAINED tree in its place
             // (measure's pair — both phases resolve the SAME retention,
             // the Fit mirrors by construction)
-            (LayoutNode::BoundaryRef { path }, fit) => {
-                crate::reconciler::with_retained_layout(path, |layout| {
+            (LayoutNode::BoundaryRef { slot, .. }, fit) => {
+                slot.with_layout(|layout| {
                     if let Some(node) = layout {
                         node.place(frame, fit, env, out);
                     }
@@ -5696,7 +6477,7 @@ fn measure_split(
     trailing: bool,
     children: &[LayoutNode],
     proposal: Proposal,
-    env: LayoutEnv,
+    env: &LayoutEnv<'_>,
 ) -> (Size, Fit) {
     let lane = |main: Option<Px>| match axis {
         Axis::Horizontal => Proposal { width: main, height: proposal.height },
@@ -5800,7 +6581,7 @@ fn measure_stack(
     spacing: Px,
     children: &[LayoutNode],
     proposal: Proposal,
-    env: LayoutEnv,
+    env: &LayoutEnv<'_>,
 ) -> (Size, Fit) {
     let cross_proposal = |main: Option<Px>| match axis {
         Axis::Vertical => Proposal { width: proposal.width, height: main },
@@ -5980,10 +6761,20 @@ fn place_text(
     truncation: Option<Truncation>,
     frame: Rect,
     base_color: Color,
-    env: LayoutEnv,
+    env: &LayoutEnv<'_>,
     out: &mut Placement,
 ) {
     if content.is_empty() {
+        return;
+    }
+    // the rows of a long list that are off the glass neither measure nor
+    // break their lines: the band is the one every line below is drawn in,
+    // with the reach a line of text is given everywhere (three sizes down,
+    // and one up for a line height tighter than the face)
+    if out.hides_band(
+        frame.origin.y - env.font.size,
+        frame.origin.y + frame.size.height + env.font.size * 3.0,
+    ) {
         return;
     }
     let metrics = env.cache.get_or_measure(content, &env.font, env.text);
@@ -6086,7 +6877,7 @@ fn emit_text_runs(
     highlights: Option<&TextHighlight>,
     origin: Point,
     base_color: Color,
-    env: LayoutEnv,
+    env: &LayoutEnv<'_>,
     out: &mut Placement,
 ) {
     let (line_start, line_end) = line;
@@ -6186,7 +6977,7 @@ fn rows_that_fit(lines: usize, advance: Px, room: Option<Px>) -> usize {
     }
 }
 
-fn truncate_to_width(content: &str, mode: Truncation, width: Px, env: LayoutEnv) -> String {
+fn truncate_to_width(content: &str, mode: Truncation, width: Px, env: &LayoutEnv<'_>) -> String {
     let fits = |candidate: &str| {
         env.cache.get_or_measure(candidate, &env.font, env.text).width <= width
     };
@@ -6370,8 +7161,8 @@ fn place_stack(
     align: CrossAlign,
     children: &[LayoutNode],
     frame: Rect,
-    fits: Vec<(Size, Fit)>,
-    env: LayoutEnv,
+    fits: &[(Size, Fit)],
+    env: &LayoutEnv<'_>,
     out: &mut Placement,
 ) {
     let mut cursor = match axis {
@@ -6387,7 +7178,7 @@ fn place_stack(
         .then(|| {
             children
                 .iter()
-                .zip(&fits)
+                .zip(fits)
                 .map(|(child, (size, _))| {
                     child.first_baseline(env).unwrap_or(size.height)
                 })
@@ -6419,7 +7210,13 @@ fn place_stack(
                 y: frame.origin.y + cross_offset(frame.size.height, size.height),
             },
         };
-        child.place(Rect { origin, size }, fit, env, out);
+        let at = Rect { origin, size: *size };
+        if out.leaves_unplaced(at) && child.quiet_now() {
+            child.record_unplaced(at, env, out);
+            crate::stats::note_unplaced();
+        } else {
+            child.place(at, fit, env, out);
+        }
         cursor += match axis {
             Axis::Vertical => size.height,
             Axis::Horizontal => size.width,
@@ -6436,7 +7233,7 @@ mod tests {
     }
 
     fn boundary(path: &str, child: LayoutNode) -> LayoutNode {
-        LayoutNode::Boundary { path: path.to_string(), children: vec![child] }
+        LayoutNode::Boundary { path: Rc::from(path), children: vec![child], quiet: Default::default() }
     }
 
     #[test]
@@ -7124,8 +7921,9 @@ mod tests {
             overlay_bounds: None,
             dialog_frames: None,
             scale: 1.0,
+            touch: false,
         };
-        node.measure(proposal, env).0
+        node.measure(proposal, &env).0
     }
 
     /// Full layout with a pointer stamped into the env — how tests drive
@@ -7158,6 +7956,7 @@ mod tests {
                 overlay_bounds: None,
                 dialog_frames: None,
                 scale: 1.0,
+                touch: false,
             },
         )
     }
@@ -7215,6 +8014,7 @@ mod tests {
             overlay_bounds: None,
             dialog_frames: None,
             scale: 1.0,
+            touch: false,
         };
         let region = |width: Px| LayoutNode::Scroll {
             commanded: None,
@@ -7229,7 +8029,7 @@ mod tests {
                 child: Box::new(text(5)),
             }),
         }
-        .measure(Proposal { width: Some(width), height: Some(50.0) }, env());
+        .measure(Proposal { width: Some(width), height: Some(50.0) }, &env());
         let (_, fit) = region(300.0);
         let Fit::ScrollContent(content, _) = fit else { panic!("a region's fit") };
         assert_eq!(content.width, 300.0, "the content was laid out AT the region, not merely placed under it");
@@ -7404,6 +8204,56 @@ mod tests {
         }
     }
 
+    /// A shell that owns its page pixels splices them in at the mark:
+    /// the picture lands inside the clip open there, in the order of
+    /// the marks whatever order it was given, and a mark past the end
+    /// appends.
+    #[test]
+    fn host_pixels_land_at_their_marks_inside_the_clip_open_there() {
+        let clip = Rect { origin: Point::ZERO, size: Size { width: 100.0, height: 100.0 } };
+        let mut list = DisplayList::default();
+        list.push(DrawCommand::PushClip { rect: clip, corner_radius: Corners::ZERO });
+        // a host stood here (mark 1): nothing of its own is painted
+        list.push(DrawCommand::PopClip);
+        list.push(DrawCommand::PushClip { rect: clip, corner_radius: Corners::ZERO });
+        // and another here (mark 3)
+        list.push(DrawCommand::PopClip);
+        let picture = |key: u64| ImageSource::Bytes { key, bytes: Rc::from(Vec::<u8>::new()) };
+        let spliced = list.with_host_pixels(&[
+            (9, clip, picture(3)),
+            (3, clip, picture(2)),
+            (1, clip, picture(1)),
+        ]);
+        let keys: Vec<Option<u64>> = spliced
+            .iter()
+            .map(|command| match command {
+                DrawCommand::Image { source: ImageSource::Bytes { key, .. }, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec![None, Some(1), None, None, Some(2), None, Some(3)]);
+        assert!(matches!(spliced.as_slice()[0], DrawCommand::PushClip { .. }));
+        assert!(matches!(spliced.as_slice()[2], DrawCommand::PopClip));
+    }
+
+    /// A host under a modal layer sits below the floor: "which host is
+    /// here" stops at the line, like every other walk back.
+    #[test]
+    fn a_host_under_a_modal_layer_sits_below_the_floor() {
+        let pile = LayoutNode::Layered {
+            modal: true,
+            align: CrossAlign::Center,
+            children: vec![
+                host("page"),
+                LayoutNode::Leaf { size: Size { width: 50.0, height: 50.0 } },
+            ],
+        };
+        let result = layout(&pile, Proposal { width: Some(300.0), height: Some(200.0) });
+        assert_eq!(result.hosts.len(), 1);
+        let floor = result.modal_floor.expect("a modal pile draws its line");
+        assert_eq!(floor.hosts, 1, "the page is below it");
+    }
+
     /// The host is a hole the scene keeps, not a paint: the placement
     /// carries its box to the shell, and the display list stays empty
     /// — the platform view composites above whatever the scene painted
@@ -7486,6 +8336,7 @@ mod tests {
             overlay_bounds: None,
             dialog_frames: None,
             scale: 1.0,
+            touch: false,
         };
         let region = || LayoutNode::Scroll {
             commanded: None,
@@ -7498,11 +8349,11 @@ mod tests {
         };
         let offer = Proposal { width: Some(100.0), height: Some(200.0) };
 
-        let (plain, _) = region().measure(offer, env());
+        let (plain, _) = region().measure(offer, &env());
         assert_eq!(plain.height, 200.0, "a plain region fills what it was offered");
 
         let hugging = LayoutNode::Hug { axis: Axis::Vertical, child: Box::new(region()) };
-        let (hugged, _) = hugging.measure(offer, env());
+        let (hugged, _) = hugging.measure(offer, &env());
         assert_eq!(hugged.height, 48.0, "a hugging one stops at its content");
 
         // …and past the offer it is the offer that wins, which is the cap.
@@ -7517,7 +8368,7 @@ mod tests {
                 child: Box::new(rows(40)),
             }),
         };
-        let (capped, fit) = tall.measure(offer, env());
+        let (capped, fit) = tall.measure(offer, &env());
         assert_eq!(capped.height, 200.0);
 
         // …and the region still travels, because it is PLACED at the cap
@@ -7525,8 +8376,8 @@ mod tests {
         let mut out = Placement::default();
         tall.place(
             Rect { origin: Point { x: 0.0, y: 0.0 }, size: capped },
-            fit,
-            env(),
+            &fit,
+            &env(),
             &mut out,
         );
         assert_eq!(out.scrolls.len(), 1);
@@ -7558,6 +8409,7 @@ mod tests {
             overlay_bounds: None,
             dialog_frames: None,
             scale: 1.0,
+            touch: false,
         };
 
         let root = LayoutNode::Scroll {

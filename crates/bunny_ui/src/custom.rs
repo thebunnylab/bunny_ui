@@ -90,6 +90,20 @@ pub trait CustomElement: 'static {
         }
     }
 
+    /// Does [`CustomElement::measure`] depend only on what it is given —
+    /// the proposal and the metrics? The layout keeps the measure of a
+    /// boundary from one frame to the next, and a box whose answer can
+    /// move on its own (a document that grew, a measure that reads or
+    /// writes a state) stands in the way: nothing above it is kept.
+    ///
+    /// The default is `false`, which is always correct. Answer `true` for
+    /// a box that takes what it is proposed, or sizes itself from the
+    /// text metrics alone — and the boundaries above it stop being
+    /// measured on every frame.
+    fn stable_measure(&self) -> bool {
+        false
+    }
+
     /// One event, in LOCAL coordinates. The default ignores everything:
     /// a box that only paints answers nothing, and what it ignores goes
     /// back to the scene (an ignored wheel scrolls the region around
@@ -145,6 +159,21 @@ pub trait CustomElement: 'static {
     /// inside a scroll region: a sketch canvas, a map. The default is
     /// `false`: a finger dragged over the box scrolls the region around
     /// it, and a tap still reaches the box as a click. A mouse never
+    /// Does a finger landing HERE take the drag at once, when
+    /// [`CustomElement::takes_drag`] answers for the box as a whole?
+    ///
+    /// A box that scrolls AND carries handles needs both answers: the
+    /// editor pans under a finger everywhere except the squares of its
+    /// selection pins, where the finger is on a handle and a pan would
+    /// take the gesture away from it. `at` is the box's own point, like
+    /// every other point a box is given.
+    ///
+    /// The default is the box's one answer, so a box with no handles
+    /// says nothing new.
+    fn grabs_at(&self, _at: crate::layout::Point) -> bool {
+        self.takes_drag()
+    }
+
     /// asks; only a finger has to choose.
     fn takes_drag(&self) -> bool {
         false
@@ -233,11 +262,19 @@ pub struct Custom {
     /// The focus beat the app last stamped on this box, if any — see
     /// [`CustomView::auto_focus`].
     auto_focus: Option<u64>,
+    /// The version of the picture the app vouches for, if any — see
+    /// [`CustomView::cached`].
+    cached: Option<u64>,
 }
 
 impl Custom {
     pub fn new(element: impl CustomElement) -> Custom {
-        Custom { element: Rc::new(element), auto_focus: None }
+        Custom { element: Rc::new(element), auto_focus: None, cached: None }
+    }
+
+    /// The picture's version, when the app asked for it to be kept.
+    pub(crate) fn cached_version(&self) -> Option<u64> {
+        self.cached
     }
 
     pub fn element(&self) -> &dyn CustomElement {
@@ -312,6 +349,13 @@ pub struct PaintCtx<'a> {
     pub metrics: Metrics<'a>,
     /// Does the box hold the keyboard right now?
     pub focused: bool,
+    /// Did the last pointer input come from a FINGER?
+    ///
+    /// The chrome a modality wants, and nothing else: selection pins a
+    /// thumb can grab, a bar of actions over them, an affordance that a
+    /// hover would otherwise reveal to a pointer that never hovers. A
+    /// box that paints the same under both hands never reads it.
+    pub touch: bool,
     /// The blink phase the caret follows — the box paints its own
     /// caret, the runtime only says when it shows.
     pub caret_visible: bool,
@@ -785,6 +829,19 @@ pub struct EventCtx<'a> {
     pub visible: Rect,
     /// Text measurement, cached: how a click becomes a column.
     pub metrics: Metrics<'a>,
+    /// Did THIS event come from a finger? A box answers a tap and a
+    /// click differently where the two mean different things — a tap
+    /// that lands on a selection pin grabs it, a click at the same
+    /// point puts the caret there.
+    pub touch: bool,
+    /// How long the press being spent had been held when it was decided,
+    /// in milliseconds — [`crate::runtime::Runtime::press_held_ms`].
+    ///
+    /// A press over something that pans waits to see whether the finger
+    /// meant to scroll, so the press a box receives can be the lift of a
+    /// finger that was down for half a second. A box that answers a HOLD
+    /// differently from a tap has only this to tell them apart.
+    pub held_ms: u128,
     /// Where an [`EventCtx::open_menu`] lands. The runtime reads it
     /// AFTER the box has answered — nothing of the scene is borrowed
     /// while the app is talking, which is the rule every door into a
@@ -843,6 +900,37 @@ impl CustomView {
     #[must_use]
     pub fn auto_focus(mut self, beat: u64) -> Self {
         self.element.auto_focus = Some(beat);
+        self
+    }
+
+    /// Keep this box's picture, and paint it again only when it CHANGES.
+    ///
+    /// A box is painted on every frame it is placed, and a chart's paint
+    /// is not small: it walks its data, builds its paths, and the house
+    /// hashes every one of them to find the raster it already has. A page
+    /// that scrolls places every box again on every frame, with the same
+    /// data at the same size.
+    ///
+    /// With `cached`, `paint` runs ONCE for each distinct set of: this
+    /// `version`, the size of the box, the screen scale, the inherited
+    /// font and ink, the theme, and the input modality. The frames between
+    /// replay the recorded commands at the box's new place. `version` is
+    /// the app's word for "what I draw from has not changed" — a hash of
+    /// the data, a revision counter.
+    ///
+    /// ```ignore
+    /// canvas(move |ctx, p| plot(&series, ctx, p)).cached(series_revision)
+    /// ```
+    ///
+    /// The promise the app makes: the picture depends on nothing else. A
+    /// box that reads `ctx.visible` to paint one screen of a long document
+    /// must not ask for this — a kept picture is painted whole. A box
+    /// under `.looping(…)`, a box that holds the keyboard, and a box that
+    /// paints a gradient or a glass pane are painted every frame as
+    /// before, whatever they ask.
+    #[must_use]
+    pub fn cached(mut self, version: u64) -> Self {
+        self.element.cached = Some(version);
         self
     }
 }
@@ -904,6 +992,11 @@ struct Painting<F>(F);
 impl<F: Fn(&PaintCtx, &mut Painter) + 'static> CustomElement for Painting<F> {
     fn paint(&self, ctx: &PaintCtx, painter: &mut Painter) {
         (self.0)(ctx, painter);
+    }
+
+    // a canvas has no measure of its own: it takes what it is proposed
+    fn stable_measure(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &str {
@@ -1290,6 +1383,48 @@ mod tests {
             20.0,
             "what the box takes never reaches the region"
         );
+    }
+
+    #[test]
+    fn a_box_that_slides_under_the_pointer_does_not_take_the_wheel() {
+        #[derive(Clone)]
+        struct Page {
+            log: Rc<std::cell::RefCell<Vec<ElementEvent>>>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                use crate::ext::ViewExt;
+                let log = self.log;
+                crate::views::scroll(crate::vstack!(
+                    crate::views::text("above").frame(60.0, 100.0),
+                    custom(Recorder { log, takes_wheel: Rc::new(Cell::new(true)) })
+                        .frame(60.0, 100.0),
+                    crate::views::text("below").frame(60.0, 1000.0),
+                ))
+            }
+        }
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let runtime = Runtime::new();
+        let view = Page { log: Rc::clone(&log) };
+        let proposal = Proposal { width: Some(60.0), height: Some(80.0) };
+        runtime.layout(&view, proposal);
+
+        // the page scrolls a box that takes the wheel under the pointer
+        assert!(runtime.wheel(30.0, 40.0, 0.0, -100.0));
+        runtime.layout(&view, proposal);
+        assert!(runtime.wheel(30.0, 40.0, 0.0, -20.0));
+        assert!(log.borrow().is_empty(), "the gesture is the page's: the box hears nothing");
+        assert_eq!(runtime.scroll_offset("Page").y, 120.0);
+
+        // the gesture ends, the page comes back, and the box under the
+        // pointer has the first turn again
+        runtime.wheel_tick();
+        runtime.wheel_tick();
+        runtime.set_scroll_offset("Page", Point { x: 0.0, y: 100.0 });
+        runtime.layout(&view, proposal);
+        assert!(runtime.wheel(30.0, 40.0, 0.0, -20.0));
+        assert!(matches!(log.borrow().last(), Some(ElementEvent::Wheel { .. })));
+        assert_eq!(runtime.scroll_offset("Page").y, 100.0, "the box took it");
     }
 
     #[test]

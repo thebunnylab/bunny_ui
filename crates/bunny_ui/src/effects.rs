@@ -17,7 +17,7 @@ use motor::runtime::Site;
 use motor::state::{Context, EffectFn};
 
 thread_local! {
-    static EFFECTS: RefCell<Vec<EffectFn>> = RefCell::new(Vec::new());
+    static EFFECTS: RefCell<Option<Rc<[EffectFn]>>> = const { RefCell::new(None) };
     /// Every `.task` slot ever opened on this thread, weakly, WITH the
     /// identity scope it was opened under: the identity owns the cell,
     /// this list only watches it — and the scope is what tells one
@@ -36,7 +36,7 @@ thread_local! {
 type TaskSlot = (Option<String>, motor::task::Spawned, u64);
 
 pub(crate) fn reset() {
-    EFFECTS.with(|effects| effects.borrow_mut().clear());
+    EFFECTS.with(|effects| *effects.borrow_mut() = None);
     DECLARED.with(|declared| declared.set(false));
 }
 
@@ -51,13 +51,16 @@ pub(crate) fn push(effect: EffectFn) {
 /// The pass's queue, reassembled by the runtime from the retention.
 /// Assembling it IS the declaration: what is not in here — a branch
 /// that closed, a row that left — no longer belongs to the scene.
-pub(crate) fn set_queue(effects: Vec<EffectFn>) {
-    EFFECTS.with(|queue| *queue.borrow_mut() = effects);
+///
+/// The queue is shared, not copied: a pass that changes nothing hands
+/// the pump the same list the last assembly built.
+pub(crate) fn set_queue(effects: Rc<[EffectFn]>) {
+    EFFECTS.with(|queue| *queue.borrow_mut() = Some(effects));
     DECLARED.with(|declared| declared.set(true));
 }
 
-pub(crate) fn take() -> Vec<EffectFn> {
-    EFFECTS.with(|effects| std::mem::take(&mut *effects.borrow_mut()))
+pub(crate) fn take() -> Rc<[EffectFn]> {
+    EFFECTS.with(|effects| effects.borrow_mut().take()).unwrap_or_else(|| Rc::from(Vec::new()))
 }
 
 /// `.onChange(of:initial:)` — the per-(site, identity) slot learns the

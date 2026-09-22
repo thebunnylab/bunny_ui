@@ -45,6 +45,7 @@ mod dom_flow;
 pub mod effects;
 pub mod erased;
 pub mod ext;
+pub mod font_file;
 pub mod glass;
 pub mod app;
 pub mod host;
@@ -55,8 +56,12 @@ pub mod modifier;
 pub mod one_of;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+#[cfg(feature = "codec")]
+pub mod codec;
 #[cfg(feature = "canvas")]
 pub mod raster;
+pub mod pacing;
+mod paranoid;
 mod reconciler;
 pub mod runtime;
 pub mod ssr;
@@ -69,6 +74,8 @@ pub mod touch;
 pub mod view;
 pub(crate) mod viewport;
 pub mod views;
+
+pub use runtime::request_frame;
 
 /// `text!("Count: {}", self.count)` — the built-in `format!` of text.
 /// Displaying a `State` READS the value: the dependency registers itself.
@@ -141,7 +148,7 @@ pub mod prelude {
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Tracking, Weight};
     pub use crate::text_input::{CaretState, EditCommand};
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
-    pub use crate::runtime::{Edited, ImeSnapshot, LiveBlit, Runtime};
+    pub use crate::runtime::{Edited, FrameNeed, ImeSnapshot, LiveBlit, Runtime};
     pub use crate::state_ext::{BindingExt, StateExt};
     pub use crate::task;
     pub use crate::view::{Component, Either, Many, Single, UnaryView, View};
@@ -154,8 +161,8 @@ pub mod prelude {
     pub use motor::loadable::{Loadable, LoadableSubject, LoadError};
     pub use motor::runtime::Site;
     pub use motor::state::{
-        Binding, Context, Environment, EnvironmentValues, FromEnvironment, Locale, ProvidesQueries,
-        SizeClass, State,
+        Binding, Context, Environment, EnvironmentValues, FromEnvironment, KeyboardInset, Locale,
+        ProvidesQueries, SafeAreaInsets, SizeClass, State,
     };
     pub use motor::views::{
         ContentMode, Edge, Font, ListStyle, NavigationPath, ProgressViewStyle, Query,
@@ -2816,6 +2823,501 @@ mod tests {
     }
 
     #[test]
+    fn a_named_scene_takes_the_stable_frame() {
+        // every window of a shell is a NAMED scene: the pass root is the
+        // scene's own segment, and the boundary is one level below it.
+        // The stable frame must find that boundary, or a wheel, a hover
+        // and a tick all pay a whole pass in every real window.
+        #[derive(Clone, Copy)]
+        struct Page {
+            count: State<usize>,
+        }
+
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                text(format!("count {}", self.count.get()))
+            }
+        }
+
+        let page = Page { count: State::new(0) };
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        for runtime in [Runtime::new(), Runtime::scene("w0")] {
+            let mounted = runtime.display_frame(&page, size);
+            let _ = crate::stats::take();
+            let again = runtime.animation_frame(&page, size);
+            let stats = crate::stats::take();
+            assert_eq!(stats.body_passes, 0, "a stable frame runs no pass");
+            assert_eq!(stats.assemblies, 0, "and rebuilds no table");
+            assert_eq!(again.as_slice(), mounted.as_slice(), "the same pixels");
+
+            // a change still gets its pass, and the picture follows
+            page.count.set(page.count.get() + 1);
+            let changed = runtime.display_frame(&page, size);
+            assert_ne!(changed.as_slice(), mounted.as_slice(), "the new count is on screen");
+        }
+    }
+
+    #[test]
+    fn a_pass_with_no_body_assembles_nothing() {
+        use std::cell::Cell;
+
+        // the tables the input doors read come from the retention. A pass
+        // that ran no body and swept nothing left the retention as it
+        // was, and must not rebuild them — and a body that DID run must
+        // have its new closure answer the very same frame.
+        #[derive(Clone)]
+        struct Counter {
+            label: State<usize>,
+            pressed: Rc<Cell<usize>>,
+        }
+
+        impl Component for Counter {
+            fn body(self, _ctx: &Context) -> impl View {
+                let label = self.label.get();
+                let pressed = Rc::clone(&self.pressed);
+                // the closure captures what THIS body read: an old table
+                // would answer with the old number
+                button(text(format!("at {label}")), move || pressed.set(label)).frame(200.0, 60.0)
+            }
+        }
+
+        let counter = Counter { label: State::new(1), pressed: Rc::new(Cell::new(0)) };
+        let size = crate::layout::Size { width: 200.0, height: 60.0 };
+        crate::paranoid::force(crate::paranoid::ASSEMBLE);
+        for runtime in [Runtime::new(), Runtime::scene("w0")] {
+            counter.label.set(1);
+            let _ = runtime.display_frame(&counter, size);
+            let _ = crate::stats::take();
+            for _ in 0..3 {
+                let _ = runtime.display_frame(&counter, size);
+            }
+            assert_eq!(crate::stats::take().assemblies, 0, "three clean frames, no table rebuilt");
+
+            runtime.pointer_clicked(100.0, 30.0, 1, false);
+            runtime.pointer_released(100.0, 30.0);
+            assert_eq!(counter.pressed.get(), 1, "the kept table still answers");
+
+            counter.label.set(7);
+            let _ = runtime.display_frame(&counter, size);
+            assert!(crate::stats::take().assemblies >= 1, "a body ran: the tables follow it");
+            runtime.pointer_clicked(100.0, 30.0, 1, false);
+            runtime.pointer_released(100.0, 30.0);
+            assert_eq!(counter.pressed.get(), 7, "the new closure answers the same frame");
+        }
+        crate::paranoid::release();
+    }
+
+    #[test]
+    fn a_wake_with_no_news_needs_no_frame() {
+        use std::cell::Cell;
+
+        // a shell asks `needs_frame` after a turn of tasks. A poll that
+        // found nothing must answer no; every way the scene can really
+        // change must answer yes, with its reason.
+        #[derive(Clone)]
+        struct Feed {
+            seen: State<usize>,
+            quiet: State<usize>,
+            heard: Rc<Cell<usize>>,
+        }
+
+        impl Component for Feed {
+            fn body(self, _ctx: &Context) -> impl View {
+                let quiet = self.quiet;
+                let heard = Rc::clone(&self.heard);
+                // `quiet` has NO reader in any view: only this watcher
+                text(format!("seen {}", self.seen.get()))
+                    .on_change(move || quiet.get(), false, move |_: &usize, now: &usize| heard.set(*now))
+            }
+        }
+
+        let feed = Feed { seen: State::new(0), quiet: State::new(0), heard: Rc::new(Cell::new(0)) };
+        let size = crate::layout::Size { width: 200.0, height: 60.0 };
+        let runtime = Runtime::scene("w0");
+        assert!(runtime.needs_frame(), "a newborn scene needs its first frame");
+        let _ = runtime.display_frame(&feed, size);
+
+        // a turn of tasks that wrote nothing
+        runtime.poll_tasks();
+        assert_eq!(runtime.frame_need(), crate::runtime::FrameNeed::default(), "no news, no frame");
+
+        // a write a view reads
+        feed.seen.set(1);
+        let need = runtime.frame_need();
+        assert!(need.dirty && need.wrote, "{need:?}");
+        let _ = runtime.display_frame(&feed, size);
+        assert!(!runtime.needs_frame(), "the frame served it");
+
+        // a write NO view reads, that an `on_change` watches: only a
+        // frame's pump can find out
+        feed.quiet.set(5);
+        let need = runtime.frame_need();
+        assert!(need.wrote && !need.dirty, "{need:?}");
+        let _ = runtime.display_frame(&feed, size);
+        assert_eq!(feed.heard.get(), 5, "the watcher fired on that frame");
+
+        // the engine doors that move what a frame shows
+        runtime.set_scroll_offset("w0/Feed", crate::layout::Point { x: 0.0, y: 4.0 });
+        assert!(runtime.frame_need().asked, "a programmatic scroll");
+        let _ = runtime.display_frame(&feed, size);
+        assert!(!runtime.needs_frame());
+
+        // …and the ones a shell calls on EVERY frame ask only when the
+        // answer is new, or a frame would always ask for the next
+        runtime.set_device_scale(2.0);
+        assert!(runtime.frame_need().asked);
+        let _ = runtime.display_frame(&feed, size);
+        runtime.set_device_scale(2.0);
+        runtime.set_overlay_bounds(None);
+        assert!(!runtime.needs_frame(), "the same answers ask for nothing");
+
+        // a task that changed data the engine cannot see says so
+        crate::request_frame();
+        assert!(runtime.frame_need().asked);
+        let _ = runtime.display_frame(&feed, size);
+        assert!(!runtime.needs_frame());
+
+        // the environment, the insets
+        runtime.set_environment(|_| {});
+        assert!(runtime.frame_need().environment);
+        let _ = runtime.display_frame(&feed, size);
+        runtime.set_keyboard_inset(120.0);
+        let need = runtime.frame_need();
+        assert!(need.insets || need.environment, "{need:?}");
+        let _ = runtime.display_frame(&feed, size);
+        assert!(!runtime.needs_frame());
+    }
+
+    #[test]
+    fn a_frame_lays_out_again_for_a_hover_only_when_a_box_paints_it() {
+        // a page that scrolls under a pointer at rest changes the hovered
+        // target on nearly every frame. The re-read keeps the target
+        // honest either way; the SECOND layout is for a new picture.
+        #[derive(Clone, Copy)]
+        struct Rows {
+            lit: bool,
+        }
+
+        impl Component for Rows {
+            fn body(self, _ctx: &Context) -> impl View {
+                let lit = self.lit;
+                let rows: Vec<_> = (0..40)
+                    .map(|row| {
+                        let label = text(format!("row {row}")).frame(200.0, 20.0);
+                        let label = if lit {
+                            erased(label.background_hovered(Color::rgba(255, 0, 0, 255)))
+                        } else {
+                            erased(label)
+                        };
+                        erased(label.on_click(|| {}).id(format!("row-{row}")))
+                    })
+                    .collect();
+                scroll(vstack!(rows).spacing(0.0)).id("rows")
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 100.0 };
+        let hot = crate::layout::DrawCommand::FillRect {
+            rect: crate::layout::Rect {
+                origin: crate::layout::Point { x: 0.0, y: 0.0 },
+                size: crate::layout::Size { width: 0.0, height: 0.0 },
+            },
+            color: Color::rgba(255, 0, 0, 255),
+            corner_radius: Default::default(),
+        };
+        let paints_hot = |display: &crate::layout::DisplayList| {
+            display.as_slice().iter().any(|command| {
+                matches!((command, &hot), (
+                    crate::layout::DrawCommand::FillRect { color, .. },
+                    crate::layout::DrawCommand::FillRect { color: wanted, .. },
+                ) if color == wanted)
+            })
+        };
+        crate::paranoid::force(crate::paranoid::HOVER);
+        for lit in [false, true] {
+            let rows = Rows { lit };
+            let runtime = Runtime::scene("w0");
+            let _ = runtime.display_frame(&rows, size);
+            runtime.pointer_moved(100.0, 50.0, false);
+            let first = runtime.display_frame(&rows, size);
+            assert_eq!(paints_hot(&first), lit, "the row under the pointer is lit only when it can be");
+            let before = runtime.interaction().hovered;
+
+            // one whole row of travel: another row is under the pointer
+            let _ = crate::stats::take();
+            assert!(runtime.wheel(100.0, 50.0, 0.0, -20.0));
+            let scrolled = runtime.display_frame(&rows, size);
+            let stats = crate::stats::take();
+            let after = runtime.interaction().hovered;
+            assert_ne!(before, after, "the target stays honest: the re-read always runs");
+            if lit {
+                assert_eq!(stats.hover_relayouts, 1, "a lit row is a new picture: laid out again");
+                assert!(paints_hot(&scrolled), "and the NEW row is the lit one");
+            } else {
+                assert_eq!(stats.hover_relayouts, 0, "no box paints the hover: one layout");
+            }
+        }
+        crate::paranoid::release();
+    }
+
+    #[test]
+    fn a_clean_frame_measures_nothing_and_a_rerun_below_is_measured_again() {
+        // a boundary that did not re-run holds the same tree, so the same
+        // question has the same answer: the measure is kept with the
+        // entry. A body that re-runs BELOW a kept boundary must clear what
+        // the boundaries above it kept — their size may hang on its own.
+        #[derive(Clone, Copy)]
+        struct Leaf {
+            wide: State<bool>,
+        }
+        impl Component for Leaf {
+            fn body(self, _ctx: &Context) -> impl View {
+                text(if self.wide.get() { "a much, much wider label" } else { "narrow" })
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Middle {
+            wide: State<bool>,
+        }
+        impl Component for Middle {
+            fn body(self, _ctx: &Context) -> impl View {
+                // hugs its child: its own size IS the leaf's
+                hstack!(Leaf { wide: self.wide }, text("|"))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            wide: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("title"), Middle { wide: self.wide })
+            }
+        }
+
+        let page = Page { wide: State::new(false) };
+        let size = crate::layout::Size { width: 600.0, height: 200.0 };
+        crate::paranoid::force(crate::paranoid::MEMO);
+        let runtime = Runtime::scene("w0");
+        let narrow = runtime.display_frame(&page, size);
+
+        // clean frames: one question at the root, answered from what was kept
+        let _ = crate::stats::take();
+        for _ in 0..3 {
+            let again = runtime.display_frame(&page, size);
+            assert_eq!(again.as_slice(), narrow.as_slice());
+        }
+        let stats = crate::stats::take();
+        assert_eq!(stats.measures_made, 0, "nothing re-ran: nothing is measured");
+        assert!(stats.measures_kept >= 3, "{stats:?}");
+
+        // ONLY the leaf re-runs (it alone reads the state). The page and
+        // the middle keep their entries — and must not keep their measures
+        page.wide.set(true);
+        let _ = crate::stats::take();
+        let wide = runtime.display_frame(&page, size);
+        let stats = crate::stats::take();
+        assert!(stats.measures_made >= 1, "the boundaries above the leaf were measured again: {stats:?}");
+        assert_ne!(wide.as_slice(), narrow.as_slice(), "the wider label moved the bar beside it");
+
+        // the bar sits right of the label: it moved by the label's growth
+        let bar_x = |display: &crate::layout::DisplayList| {
+            display
+                .as_slice()
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { origin, content, .. }
+                        if &**content == "|" =>
+                    {
+                        Some(origin.x)
+                    }
+                    _ => None,
+                })
+                .expect("the bar is drawn")
+        };
+        assert!(bar_x(&wide) > bar_x(&narrow) + 50.0, "{} vs {}", bar_x(&wide), bar_x(&narrow));
+        crate::paranoid::release();
+    }
+
+    #[test]
+    fn a_box_that_measures_itself_is_asked_every_frame() {
+        use std::cell::Cell;
+
+        // an app box can answer its measure from anything — a document
+        // that grew. Nothing above such a box is kept, unless the box says
+        // its answer depends on the question alone.
+        struct Growing {
+            height: Rc<Cell<f64>>,
+            asked: Rc<Cell<u32>>,
+            stable: bool,
+        }
+        impl CustomElement for Growing {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn measure(&self, proposal: Proposal, _metrics: &Metrics) -> Size {
+                self.asked.set(self.asked.get() + 1);
+                Size { width: proposal.width.unwrap_or(0.0), height: self.height.get() }
+            }
+            fn stable_measure(&self) -> bool {
+                self.stable
+            }
+        }
+
+        #[derive(Clone)]
+        struct Holder {
+            height: Rc<Cell<f64>>,
+            asked: Rc<Cell<u32>>,
+            stable: bool,
+        }
+        impl Component for Holder {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    custom(Growing {
+                        height: Rc::clone(&self.height),
+                        asked: Rc::clone(&self.asked),
+                        stable: self.stable,
+                    }),
+                    text("below"),
+                )
+            }
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 400.0 };
+        for stable in [false, true] {
+            let holder = Holder {
+                height: Rc::new(Cell::new(40.0)),
+                asked: Rc::new(Cell::new(0)),
+                stable,
+            };
+            let runtime = Runtime::scene("w0");
+            let first = runtime.display_frame(&holder, size);
+            let asked = holder.asked.get();
+            if stable {
+                // it promised its answer hangs on the question alone, and
+                // it keeps the promise: it is not asked again
+                let second = runtime.display_frame(&holder, size);
+                // (the paranoid check measures again on purpose: it is the
+                // one reader allowed to ask twice)
+                if !crate::paranoid::on(crate::paranoid::MEMO) {
+                    assert_eq!(holder.asked.get(), asked, "a stable box is not asked again");
+                }
+                assert_eq!(second.as_slice(), first.as_slice());
+            } else {
+                // the document grows with NO state write
+                holder.height.set(120.0);
+                let second = runtime.display_frame(&holder, size);
+                assert!(holder.asked.get() > asked, "its own measure: asked on every frame");
+                assert_ne!(second.as_slice(), first.as_slice(), "the label below moved down");
+            }
+        }
+    }
+
+    #[test]
+    fn a_box_that_keeps_its_picture_is_painted_once_for_each_version() {
+        use std::cell::Cell;
+
+        // a chart's paint is not small, and a page that scrolls places it
+        // again on every frame with the same data at the same size. A box
+        // that asks keeps its picture: painted once for each version and
+        // size, replayed at each new place — the same commands, moved.
+        #[derive(Clone)]
+        struct Page {
+            version: State<u64>,
+            painted: Rc<Cell<u32>>,
+            kept: bool,
+        }
+
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let painted = Rc::clone(&self.painted);
+                let chart = canvas(move |ctx, painter| {
+                    painted.set(painted.get() + 1);
+                    let size = ctx.size();
+                    painter.fill(
+                        Rect { origin: Point { x: 4.0, y: 4.0 }, size: Size { width: size.width - 8.0, height: 20.0 } },
+                        Color::rgba(200, 40, 40, 255),
+                    );
+                    painter.text(Point { x: 6.0, y: 30.0 }, "a label", Color::rgba(240, 240, 240, 255));
+                })
+                .frame(180.0, 60.0);
+                let chart = if self.kept { chart_kept(self.version.get(), self.painted.clone()) } else { erased(chart) };
+                scroll(vstack!(text("above").frame(180.0, 100.0), chart, text("below").frame(180.0, 600.0)))
+                    .id("page")
+            }
+        }
+
+        fn chart_kept(version: u64, painted: Rc<Cell<u32>>) -> Erased {
+            erased(
+                canvas(move |ctx, painter| {
+                    painted.set(painted.get() + 1);
+                    let size = ctx.size();
+                    painter.fill(
+                        Rect { origin: Point { x: 4.0, y: 4.0 }, size: Size { width: size.width - 8.0, height: 20.0 } },
+                        Color::rgba(200, 40, 40, 255),
+                    );
+                    painter.text(Point { x: 6.0, y: 30.0 }, "a label", Color::rgba(240, 240, 240, 255));
+                })
+                .cached(version)
+                .frame(180.0, 60.0),
+            )
+        }
+
+        let size = crate::layout::Size { width: 200.0, height: 300.0 };
+        let frames = |kept: bool| {
+            let page = Page { version: State::new(1), painted: Rc::new(Cell::new(0)), kept };
+            let runtime = Runtime::scene(if kept { "kept" } else { "plain" });
+            let mut pictures = vec![runtime.display_frame(&page, size)];
+            for _ in 0..4 {
+                assert!(runtime.wheel(100.0, 150.0, 0.0, -10.0));
+                pictures.push(runtime.display_frame(&page, size));
+            }
+            let painted_while_scrolling = page.painted.get();
+            // the data moved: the app says so with a new version
+            page.version.set(2);
+            pictures.push(runtime.display_frame(&page, size));
+            (pictures, painted_while_scrolling, page.painted.get())
+        };
+
+        let (plain, plain_scrolling, _) = frames(false);
+        let (kept, kept_scrolling, kept_after_a_new_version) = frames(true);
+        assert!(plain_scrolling >= 5, "painted on every frame: {plain_scrolling}");
+        assert_eq!(kept_scrolling, 1, "kept: painted once, replayed four times");
+        assert_eq!(kept_after_a_new_version, 2, "a new version is a new picture");
+        for (index, (plain, kept)) in plain.iter().zip(&kept).enumerate() {
+            assert_eq!(plain.as_slice(), kept.as_slice(), "frame {index}: the replay is the same picture");
+        }
+    }
+
+    #[test]
+    fn a_runtime_handed_another_root_forgets_the_old_boundary() {
+        #[derive(Clone, Copy)]
+        struct First;
+        #[derive(Clone, Copy)]
+        struct Second;
+
+        impl Component for First {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("first")
+            }
+        }
+        impl Component for Second {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("second, and wider")
+            }
+        }
+
+        let runtime = Runtime::scene("w0");
+        let size = crate::layout::Size { width: 300.0, height: 100.0 };
+        let first = runtime.display_frame(&First, size);
+        // the stable frame of the NEW root must not answer with the old
+        // boundary, which the retention still holds
+        runtime.render_stable(&Second);
+        let second = runtime.animation_frame(&Second, size);
+        assert_ne!(second.as_slice(), first.as_slice(), "the second root is what is laid out");
+    }
+
+    #[test]
     fn store_reads_in_the_body_are_dependencies_too() {
         // Object granularity: whoever read `store.value()` in the body depends
         // on the whole store — `send` re-runs the view, even with no State in
@@ -4919,6 +5421,8 @@ mod tests {
 
         let rows = Rows { flip: State::new(false) };
         let runtime = Runtime::new();
+        // as a shell mounts it: the list holds what the glass can show
+        runtime.drop_unseen();
         runtime.render_stable(&rows);
         let viewport = Proposal::exact(Size { width: 120.0, height: 100.0 });
         let result = runtime.layout(&rows, viewport);
@@ -4935,17 +5439,18 @@ mod tests {
         assert!(!runtime.wheel(10.0, 10.0, 0.0, -1.0), "no repaint at the end of travel");
         assert!(!runtime.wheel(500.0, 500.0, 0.0, -10.0), "outside any region");
 
-        // the offset applies in layout: the first text line moves up 60
+        // the offset applies in layout: every row moved up 60 — row 5 sits
+        // where row 1.25 sat — and the rows that left the window left the
+        // list with it
         let scrolled = runtime.layout(&rows, viewport);
-        let first_line_y = scrolled
-            .display
-            .iter()
-            .find_map(|command| match command {
-                DrawCommand::TextLine { origin, .. } => Some(origin.y),
+        let line_y = |wanted: &str| {
+            scrolled.display.iter().find_map(|command| match command {
+                DrawCommand::TextLine { origin, content, .. } if &**content == wanted => Some(origin.y),
                 _ => None,
             })
-            .unwrap();
-        assert_eq!(first_line_y, -60.0);
+        };
+        assert_eq!(line_y("row 5"), Some(5.0 * 16.0 - 60.0));
+        assert_eq!(line_y("row 0"), None, "a row above the window is not drawn");
 
         // invalidation and re-render do NOT lose the position — restoration
         // by structural identity
@@ -4953,15 +5458,11 @@ mod tests {
         runtime.render_stable(&rows);
         let after = runtime.layout(&rows, viewport);
         assert_eq!(runtime.scroll_offset(&path).y, 60.0);
-        let line_y = after
-            .display
-            .iter()
-            .find_map(|command| match command {
-                DrawCommand::TextLine { origin, .. } => Some(origin.y),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(line_y, -60.0);
+        let row_5 = after.display.iter().find_map(|command| match command {
+            DrawCommand::TextLine { origin, content, .. } if &**content == "row 5" => Some(origin.y),
+            _ => None,
+        });
+        assert_eq!(row_5, Some(5.0 * 16.0 - 60.0));
 
         // programmatic scrolling counts in the SAME frame
         runtime.set_scroll_offset(&path, crate::layout::Point { x: 0.0, y: 8.0 });
@@ -6430,6 +6931,191 @@ mod tests {
         );
     }
 
+    /// What the placement drops is what the clip would have erased: the
+    /// SAME pixels, byte for byte.
+    ///
+    /// The scene is the hard one for a cut — rows with a shadow that
+    /// reaches past their box, a border that straddles its edge, a rounded
+    /// fill, a line of text that starts inside the window and one that
+    /// starts outside it, a sideways region inside the vertical one — at
+    /// offsets that leave a row half under each edge, whole points and
+    /// fractions of one. One runtime places with the cut and one keeps
+    /// every command; both lists go through the same raster, at 1× and 2×.
+    #[test]
+    fn what_the_placement_drops_is_what_the_clip_would_have_erased() {
+        use crate::layout::{Color, Point, Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let rows: Vec<_> = (0..40)
+                    .map(|row| {
+                        let chips: Vec<_> = (0..12)
+                            .map(|chip| {
+                                erased(
+                                    text(format!("chip {row}.{chip}"))
+                                        .padding_length(4.0)
+                                        .background_color(Color::rgba(40, 90, 160, 255))
+                                        .corner_radius(6.0),
+                                )
+                            })
+                            .collect();
+                        erased(
+                            vstack!(
+                                text(format!("row {row} — a line of text that is wider than the card it sits in"))
+                                    .truncation_mode(Truncation::End),
+                                scroll(hstack!(chips).spacing(6.0)).horizontal().frame_height(28.0),
+                            )
+                            .spacing(4.0)
+                            .alignment(HorizontalAlignment::Leading)
+                            .padding_length(8.0)
+                            .background_color(Color::rgba(30, 30, 36, 255))
+                            .corner_radius(8.0)
+                            .border(Color::rgba(200, 80, 80, 255), 3.0)
+                            .shadow(9.0)
+                            .id(format!("row-{row}")),
+                        )
+                    })
+                    .collect();
+                vstack!(
+                    text("a header that does not scroll"),
+                    scroll(vstack!(rows).spacing(10.0).alignment(HorizontalAlignment::Leading)).id("rows"),
+                )
+                .spacing(6.0)
+                .alignment(HorizontalAlignment::Leading)
+                .padding_length(12.0)
+            }
+        }
+
+        // the paranoid check turns the cut on for EVERY runtime, so there is
+        // no control to raster against — and it compares the two lists of
+        // every layout of the suite on its own
+        if crate::paranoid::on(crate::paranoid::SEEN) {
+            return;
+        }
+        let size = Size { width: 300.0, height: 220.0 };
+        let (cut, whole) = (Runtime::new(), Runtime::new());
+        cut.drop_unseen();
+        let mut dropped = 0usize;
+        for offset in [0.0, 7.0, 33.5, 120.25, 611.0, 100_000.0] {
+            let mut lists = Vec::new();
+            for runtime in [&cut, &whole] {
+                let first = runtime.settled_layout(&Page, Proposal::exact(size));
+                let region = first
+                    .scrolls
+                    .iter()
+                    .find(|region| region.path.ends_with("[rows]"))
+                    .expect("the rows scroll")
+                    .path
+                    .clone();
+                runtime.set_scroll_offset(&region, Point { x: 0.0, y: offset });
+                lists.push(runtime.settled_layout(&Page, Proposal::exact(size)).display);
+            }
+            assert!(lists[0].len() < lists[1].len(), "offset {offset}: the cut dropped nothing");
+            dropped += lists[1].len() - lists[0].len();
+            for scale in [1usize, 2] {
+                let (width, height) = (size.width as usize * scale, size.height as usize * scale);
+                let ground = Color::rgba(12, 12, 14, 255);
+                let seen = crate::raster::rasterize_scaled(&lists[0], width, height, scale, ground);
+                let all = crate::raster::rasterize_scaled(&lists[1], width, height, scale, ground);
+                assert!(
+                    seen.pixels() == all.pixels(),
+                    "offset {offset} at {scale}×: the cut changed a pixel ({} commands against {})",
+                    lists[0].len(),
+                    lists[1].len(),
+                );
+            }
+        }
+        assert!(dropped > 1000, "forty rows behind two hundred points of glass: {dropped} dropped");
+    }
+
+    /// A row that is only paint is left UNPLACED while it sits far off the
+    /// glass — and everything a placement owes is still paid.
+    ///
+    /// Three hundred rows behind two hundred points of glass. The far ones
+    /// are not walked; their frames are still in the table, so a scroll-to
+    /// finds row 250 and the wheel brings it. One row holds an app's box, and
+    /// an app may read its own `paint` as "this frame happened": that row is
+    /// placed on every frame however far away it sits, because a row with
+    /// more than paint in it is not quiet.
+    #[test]
+    fn a_quiet_row_far_off_the_glass_is_left_unplaced() {
+        use crate::layout::{Proposal, Size};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        #[derive(Clone, Copy)]
+        struct Row(usize);
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                hstack!(rectangle().frame(8.0, 8.0), text(format!("row {}", self.0)), spacer())
+                    .on_click(|| {})
+                    .tooltip(format!("row {}", self.0))
+            }
+        }
+
+        #[derive(Clone)]
+        struct Page {
+            target: State<String>,
+            painted: Rc<Cell<usize>>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let painted = Rc::clone(&self.painted);
+                list(
+                    (0..300usize).collect(),
+                    |row| format!("row-{row}"),
+                    move |row| {
+                        if *row == 280 {
+                            let painted = Rc::clone(&painted);
+                            erased(canvas(move |_, _| painted.set(painted.get() + 1)).frame(40.0, 16.0))
+                        } else {
+                            erased(Row(*row))
+                        }
+                    },
+                )
+                .scroll_target(self.target.get())
+            }
+        }
+
+        let page = Page { target: State::new("row-0".to_string()), painted: Rc::new(Cell::new(0)) };
+        let runtime = Runtime::new();
+        runtime.drop_unseen();
+        let size = Proposal::exact(Size { width: 240.0, height: 200.0 });
+        let _ = runtime.settled_layout(&page, size);
+        let _ = crate::stats::take();
+        let before = page.painted.get();
+        let result = runtime.settled_layout(&page, size);
+        let stats = crate::stats::take();
+        if !crate::paranoid::on(crate::paranoid::SEEN) {
+            // (the paranoid check places every scene a second time, whole)
+            assert!(stats.children_unplaced > 250, "{} rows left unplaced", stats.children_unplaced);
+            assert_eq!(page.painted.get(), before + 1, "the app's box, far off the glass, was painted");
+        }
+        // a row far away still says where it is…
+        let far = result.frames.find("[row-250]").expect("row 250 has a frame");
+        assert!(far.origin.y > 3000.0, "{far:?}");
+        // …so a scroll-to finds it, and the wheel's region brings it
+        page.target.set("row-250".to_string());
+        let revealed = runtime.settled_layout(&page, size);
+        let shown = revealed.frames.find("[row-250]").expect("row 250 has a frame");
+        assert!(
+            shown.origin.y >= 0.0 && shown.origin.y + shown.size.height <= 200.0,
+            "row 250 was not revealed: {shown:?}"
+        );
+        let words: Vec<&str> = revealed
+            .display
+            .iter()
+            .filter_map(|command| match command {
+                crate::layout::DrawCommand::TextLine { content, .. } => Some(&**content),
+                _ => None,
+            })
+            .collect();
+        assert!(words.contains(&"row 250"), "{words:?}");
+        assert!(!words.contains(&"row 0"), "a row above the window was drawn");
+    }
+
     /// Proposed no height, a paragraph still answers every line.
     ///
     /// That is not a small room — it is the question not asked, and it is
@@ -6451,14 +7137,35 @@ mod tests {
         }
 
         let runtime = Runtime::new();
+        // as a shell mounts it: the list holds what the glass can show
+        runtime.drop_unseen();
         let result =
             runtime.settled_layout(&Page, Proposal::exact(Size { width: 200.0, height: 36.0 }));
-        let lines = result
-            .display
-            .iter()
-            .filter(|command| matches!(command, DrawCommand::TextLine { .. }))
-            .count();
-        assert!(lines >= 6, "the whole paragraph is there to scroll through, got {lines}");
+        // the paragraph is there to scroll through: the region's extent is
+        // every line of it. The LIST holds the lines its window shows and
+        // no more — what no pixel can show is not drawn
+        let extent = result.scrolls[0].content.height;
+        assert!(extent >= 6.0 * 16.0, "the whole paragraph is there to scroll through, got {extent}");
+        let lines = |result: &crate::layout::LayoutResult| {
+            result
+                .display
+                .iter()
+                .filter(|command| matches!(command, DrawCommand::TextLine { .. }))
+                .count()
+        };
+        let shown = lines(&result);
+        assert!((1..6).contains(&shown), "a window of 36 points shows a few lines, got {shown}");
+        // …and the lines further down are drawn when the wheel brings them
+        assert!(runtime.wheel(100.0, 18.0, 0.0, -48.0));
+        let scrolled =
+            runtime.settled_layout(&Page, Proposal::exact(Size { width: 200.0, height: 36.0 }));
+        let first = |result: &crate::layout::LayoutResult| {
+            result.display.iter().find_map(|command| match command {
+                DrawCommand::TextLine { content, range, .. } => Some(content[range.0..range.1].to_string()),
+                _ => None,
+            })
+        };
+        assert_ne!(first(&result), first(&scrolled), "the wheel showed other lines");
     }
 
     /// The same row, too NARROW for the content. The hug still takes
@@ -6756,6 +7463,49 @@ mod tests {
         assert_eq!(hosts[0].frame.size.height, 400.0, "the box keeps its declared height");
         assert_eq!(hosts[0].visible.size.height, 150.0, "the window is the region's worth");
         assert_eq!(hosts[0].visible.origin.y, 0.0);
+    }
+
+    /// A shell that owns its page pixels routes the hand itself: the
+    /// host under a point answers by name, a target beside it is not a
+    /// page, the clip cuts what the box reaches, and a sheet over the
+    /// page puts it out of reach.
+    #[test]
+    fn the_host_under_a_point_answers_unless_the_floor_or_a_target_covers_it() {
+        use crate::host::webview;
+        use crate::layout::{Proposal, Size};
+
+        const WINDOW: Size = Size { width: 400.0, height: 300.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            open: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                hstack((
+                    button(text("act"), || {}).frame(100.0, 300.0),
+                    scroll(webview("https://example.test/").frame(300.0, 600.0))
+                        .frame(300.0, 150.0),
+                ))
+                .sheet(self.open.binding(), |_| {
+                    crate::erased::erased(text("the palette").frame(200.0, 100.0))
+                })
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { open: State::new(false) };
+        let _ = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let path = runtime.hosts()[0].path.clone();
+        // the region is 150 tall, centred in the 300 of the window:
+        // rows 75 to 225 are the page's window, the box below is cut
+        assert_eq!(runtime.host_at(200.0, 100.0).as_deref(), Some(path.as_str()));
+        assert_eq!(runtime.host_at(50.0, 100.0), None, "the button beside it is not a page");
+        assert_eq!(runtime.host_at(200.0, 250.0), None, "the region's window ends at 225");
+
+        page.open.set(true);
+        let _ = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(runtime.host_at(200.0, 100.0), None, "under a sheet the page is out of reach");
     }
 
     /// The scene interleaves with the island: what paints AFTER the
@@ -7787,6 +8537,88 @@ mod tests {
         assert!(runtime.wheel(at.0, at.1, 0.0, -60.0));
         assert!(runtime.scroll_offset(&pop.path).y > 0.0, "the card's own list moves");
         assert_eq!(runtime.scroll_offset(&page.path), Point::ZERO, "the page under it holds still");
+    }
+
+    #[test]
+    fn a_region_that_slides_under_the_pointer_does_not_take_the_wheel() {
+        use crate::layout::{Point, Proposal, Size};
+
+        // a dashboard: a tall page, and a chart's legend down the page
+        // that scrolls too
+        #[derive(Clone, Copy)]
+        struct Dashboard;
+
+        impl Component for Dashboard {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(vstack!(
+                    text("charts").frame(400.0, 200.0),
+                    scroll(text("legend").frame(400.0, 900.0)).id("legend").frame(400.0, 100.0),
+                    text("more charts").frame(400.0, 3000.0),
+                ))
+                .id("page")
+            }
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 400.0, height: 300.0 };
+        let layout = || runtime.layout(&Dashboard, Proposal::exact(size));
+        runtime.render_stable(&Dashboard);
+        let result = layout();
+        let path = |suffix: &str| {
+            let region = result.scrolls.iter().find(|region| region.path.ends_with(suffix));
+            region.unwrap_or_else(|| panic!("{suffix} is a region")).path.clone()
+        };
+        let (page, legend) = (path("[page]"), path("[legend]"));
+        let legend_frame = || {
+            let result = layout();
+            result.scrolls.iter().find(|region| region.path == legend).expect("legend").frame
+        };
+
+        // the pointer rests over the page, above the legend; the page
+        // scrolls until the legend is under it
+        let (x, y) = (200.0, 50.0);
+        assert!(!legend_frame().contains(x, y));
+        assert!(runtime.wheel(x, y, 0.0, -200.0));
+        assert!(legend_frame().contains(x, y), "the legend slid under the pointer");
+
+        // the same gesture goes on: the page has it, the legend is quiet
+        assert!(runtime.wheel(x, y, 0.0, -30.0));
+        assert_eq!(runtime.scroll_offset(&page).y, 230.0, "the page keeps the wheel");
+        assert_eq!(runtime.scroll_offset(&legend), Point::ZERO, "the legend did not take it");
+
+        // a hand that turns a wheel moves the mouse a little, and one
+        // slow tick is not the end of a gesture
+        runtime.wheel_tick();
+        assert!(runtime.wheel(x + 4.0, y - 3.0, 0.0, -10.0));
+        assert_eq!(runtime.scroll_offset(&page).y, 240.0);
+        assert_eq!(runtime.scroll_offset(&legend), Point::ZERO);
+
+        // two slow ticks with no wheel: the gesture is over, and the
+        // next wheel is for what is under the pointer NOW
+        runtime.wheel_tick();
+        runtime.wheel_tick();
+        layout();
+        assert!(legend_frame().contains(x, y));
+        assert!(runtime.wheel(x, y, 0.0, -40.0));
+        assert_eq!(runtime.scroll_offset(&legend).y, 40.0, "the legend answers a new gesture");
+        assert_eq!(runtime.scroll_offset(&page).y, 240.0);
+
+        // a pointer that moves away starts a new gesture with no wait
+        assert!(runtime.wheel(x, y + 150.0, 0.0, -25.0));
+        assert_eq!(runtime.scroll_offset(&page).y, 265.0, "beside the legend the page answers");
+        assert_eq!(runtime.scroll_offset(&legend).y, 40.0);
+
+        // ...and so does a press: the page has the latch, the press
+        // lets it go, and the legend under the pointer answers
+        runtime.set_scroll_offset(&page, Point { x: 0.0, y: 0.0 });
+        layout();
+        assert!(runtime.wheel(x, y, 0.0, -200.0));
+        layout();
+        runtime.pointer_clicked(x, y, 1, crate::action::Modifiers::NONE);
+        runtime.pointer_released(x, y);
+        assert!(runtime.wheel(x, y, 0.0, -10.0));
+        assert_eq!(runtime.scroll_offset(&legend).y, 50.0, "a press ends the gesture");
+        assert_eq!(runtime.scroll_offset(&page).y, 200.0);
     }
 
     #[test]
@@ -8886,6 +9718,7 @@ mod tests {
             caret_visible: false,
             phase: 0.0,
             scale: 2.0,
+            touch: false,
         };
 
         // the product's own line, `(v * scale).round() / scale`
@@ -11126,6 +11959,8 @@ mod tests {
         }
 
         let runtime = Runtime::new();
+        // as a shell mounts it: the list holds what the glass can show
+        runtime.drop_unseen();
         let size = Size { width: 280.0, height: 140.0 };
         let result = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
 
@@ -11154,16 +11989,25 @@ mod tests {
             })
             .count();
         assert!(cells < 200, "the window stays a screenful: {cells}");
-        // the header paints its four titles
-        let headers = result
-            .display
-            .iter()
-            .filter(|command| {
-                matches!(command, crate::layout::DrawCommand::TextLine { content, .. }
-                    if ["Name", "Kind", "Size", "Modified"].contains(&&**content))
-            })
-            .count();
-        assert_eq!(headers, 4);
+        // the header paints the titles its window shows: the sheet is 510
+        // points of columns behind 260 of glass, so `Name` and the near
+        // edge of `Kind` — the other two are geometry until a wheel
+        // brings them
+        let headers = |result: &crate::layout::LayoutResult| {
+            result
+                .display
+                .iter()
+                .filter_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { content, .. }
+                        if ["Name", "Kind", "Size", "Modified"].contains(&&**content) =>
+                    {
+                        Some(content.to_string())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(headers(&result), ["Name", "Kind"]);
 
         // a vertical wheel moves the rows and leaves the header put
         assert!(runtime.wheel(100.0, 80.0, 0.0, -52.0));
@@ -11228,6 +12072,7 @@ mod tests {
         let slid = runtime.layout(&Sheet, crate::layout::Proposal::exact(size));
         assert_eq!(name_x(&slid), before.0 - 60.0, "the header slid with its columns");
         assert_eq!(cell_x(&slid), before.1 - 60.0, "and the rows slid in step");
+        assert_eq!(headers(&slid), ["Name", "Kind", "Size"], "and the wheel brought a third title");
     }
 
     #[derive(Clone, Copy, PartialEq, Debug)]
@@ -11745,6 +12590,195 @@ mod tests {
     /// A static screen: the finger lands on a button and lifts. The
     /// press shows at once (nothing under it can pan), the lift fires,
     /// and afterwards NOTHING hovers — a lifted finger is not there.
+    /// **The chrome follows the hand, not the machine.** A box that
+    /// paints selection pins a thumb can grab, or a bar of actions over
+    /// them, must not paint them for a cursor — and one device is a
+    /// mouse this minute and a finger the next, so the question is what
+    /// the LAST input was.
+    ///
+    /// The answer has to be right from inside the app's own handler,
+    /// which is the moment a box asks it; the touch road spends its
+    /// gestures through the pointer's own doors, so the naive reading
+    /// would be a mouse every time.
+    #[test]
+    fn the_modality_follows_the_last_hand_on_the_machine() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Asking {
+            saw: Rc<Cell<Option<bool>>>,
+        }
+
+        impl crate::custom::CustomElement for Asking {
+            fn name(&self) -> &'static str {
+                "asking"
+            }
+
+            fn measure(
+                &self,
+                proposal: crate::layout::Proposal,
+                _metrics: &crate::custom::Metrics<'_>,
+            ) -> Size {
+                Size {
+                    width: proposal.width.unwrap_or(40.0),
+                    height: proposal.height.unwrap_or(40.0),
+                }
+            }
+
+            fn event(
+                &self,
+                event: &crate::custom::ElementEvent,
+                ctx: &crate::custom::EventCtx<'_>,
+            ) -> crate::custom::Response {
+                if matches!(event, crate::custom::ElementEvent::PointerDown { .. }) {
+                    // asked from INSIDE the event, which is the only
+                    // moment the answer decides anything
+                    self.saw.set(Some(ctx.touch));
+                }
+                crate::custom::Response::handled()
+            }
+
+            fn paint(
+                &self,
+                _ctx: &crate::custom::PaintCtx<'_>,
+                _painter: &mut crate::custom::Painter<'_>,
+            ) {
+            }
+        }
+
+        #[derive(Clone)]
+        struct Board {
+            saw: Rc<Cell<Option<bool>>>,
+        }
+
+        impl Component for Board {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Asking { saw: self.saw })
+            }
+        }
+
+        let saw = Rc::new(Cell::new(None));
+        let view = Board { saw: Rc::clone(&saw) };
+        let runtime = Runtime::new();
+        let size = Size { width: 100.0, height: 100.0 };
+        let _ = runtime.display_frame(&view, size);
+
+        assert!(!runtime.last_input_was_touch(), "a runtime nobody has touched reads as a mouse");
+
+        runtime.touch_began(1, 50.0, 50.0, 1);
+        runtime.touch_ended(1, 50.0, 50.0);
+        assert_eq!(saw.get(), Some(true), "the finger's press says so to the box");
+        assert!(runtime.last_input_was_touch(), "and the modality outlives the gesture");
+
+        saw.set(None);
+        runtime.pointer_clicked(50.0, 50.0, 1, crate::action::Modifiers::NONE);
+        assert_eq!(saw.get(), Some(false), "a mouse click is a mouse");
+        assert!(!runtime.last_input_was_touch(), "the hand changed and the chrome follows");
+
+        // …and back, because the machine did not change — the hand did
+        runtime.touch_began(2, 50.0, 50.0, 1);
+        assert!(runtime.last_input_was_touch());
+        runtime.touch_ended(2, 50.0, 50.0);
+    }
+
+    /// **A frame does not speak for the hand.** A finger is down and a
+    /// box has it; the frame the press asked for must not announce that a
+    /// mouse arrived, and the gesture must survive the frame.
+    ///
+    /// A frame re-reads the pointer so hover stays honest when content
+    /// moves under a STILL MOUSE. Entered on a touch surface that re-read
+    /// is a lie — `note_pointer_source` reads any pointer door outside a
+    /// touch spend as a mouse — and the lie is expensive: a view that
+    /// shapes itself on the modality (pins for a finger, a menu region for
+    /// a cursor) rebuilds mid-gesture, the grabbed box lands at another
+    /// path, and the drag dies in the air with the finger still on the
+    /// glass. That is what it did to the phone's selection pins
+    /// (owner-reported 2026-09-12: *"ela fica piscando quando puxo mas nao
+    /// muda de lugar"*).
+    #[test]
+    fn a_frame_does_not_speak_for_the_hand() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        /// A box that takes the finger at any point and counts the moves
+        /// it hears while it holds it.
+        struct Held {
+            moves: Rc<Cell<usize>>,
+        }
+
+        impl crate::custom::CustomElement for Held {
+            fn name(&self) -> &'static str {
+                "held"
+            }
+
+            fn measure(
+                &self,
+                proposal: crate::layout::Proposal,
+                _metrics: &crate::custom::Metrics<'_>,
+            ) -> Size {
+                Size {
+                    width: proposal.width.unwrap_or(40.0),
+                    height: proposal.height.unwrap_or(40.0),
+                }
+            }
+
+            fn grabs_at(&self, _at: crate::layout::Point) -> bool {
+                true
+            }
+
+            fn event(
+                &self,
+                event: &crate::custom::ElementEvent,
+                _ctx: &crate::custom::EventCtx<'_>,
+            ) -> crate::custom::Response {
+                if matches!(event, crate::custom::ElementEvent::PointerMoved { .. }) {
+                    self.moves.set(self.moves.get() + 1);
+                }
+                crate::custom::Response::handled()
+            }
+
+            fn paint(
+                &self,
+                _ctx: &crate::custom::PaintCtx<'_>,
+                _painter: &mut crate::custom::Painter<'_>,
+            ) {
+            }
+        }
+
+        #[derive(Clone)]
+        struct Board {
+            moves: Rc<Cell<usize>>,
+        }
+
+        impl Component for Board {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Held { moves: self.moves })
+            }
+        }
+
+        let moves = Rc::new(Cell::new(0));
+        let view = Board { moves: Rc::clone(&moves) };
+        let runtime = Runtime::new();
+        let size = Size { width: 100.0, height: 100.0 };
+        let _ = runtime.display_frame(&view, size);
+
+        runtime.touch_began(1, 50.0, 50.0, 1);
+        assert!(runtime.last_input_was_touch(), "the finger is on the glass");
+
+        // every step of a drag paints, and the paint is where this broke
+        let _ = runtime.display_frame(&view, size);
+        assert!(
+            runtime.last_input_was_touch(),
+            "a frame is not an input: the hand is still the one that pressed",
+        );
+
+        runtime.touch_moved(1, 40.0, 50.0);
+        let _ = runtime.display_frame(&view, size);
+        runtime.touch_moved(1, 30.0, 50.0);
+        assert_eq!(moves.get(), 2, "and the box that took the press hears every move");
+        runtime.touch_ended(1, 30.0, 50.0);
+    }
+
     #[test]
     fn a_tap_fires_the_button_and_leaves_nothing_hovered() {
         use crate::layout::{Proposal, Size};
@@ -12499,6 +13533,68 @@ mod tests {
             }
         }
         assert_eq!(first_line(&Runtime::new().display_frame(&Preview, size)), "narrow");
+    }
+
+    /// The shell's insets reach a BODY, and the keyboard's band stays its
+    /// own number.
+    ///
+    /// The root is laid out inside them either way; what needs to read them
+    /// is a view that paints THROUGH a band and holds its content clear by
+    /// hand. And the two are separate because they mean opposite things to
+    /// such a view: the keyboard covers what cannot be used, while the home
+    /// indicator's band is a place a surface may paint.
+    #[test]
+    fn the_insets_reach_the_body_and_the_keyboard_keeps_its_own_band() {
+        use crate::layout::{Edges, Size};
+        use motor::state::{KeyboardInset, SafeAreaInsets};
+
+        #[derive(Clone, Copy)]
+        struct Reader;
+        impl Component for Reader {
+            fn body(self, ctx: &Context) -> impl View {
+                let safe = ctx.environment::<SafeAreaInsets>();
+                let keys = ctx.environment::<KeyboardInset>();
+                vstack!(text(format!("{} {} {}", safe.top, safe.bottom, keys.0)), spacer())
+            }
+        }
+        fn first_line(display: &crate::layout::DisplayList) -> String {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { content, .. } => {
+                        Some(content.to_string())
+                    }
+                    _ => None,
+                })
+                .expect("a line paints")
+        }
+
+        let runtime = Runtime::new();
+        let size = Size { width: 390.0, height: 844.0 };
+        assert_eq!(first_line(&runtime.display_frame(&Reader, size)), "0 0 0", "a desktop has none");
+
+        runtime.set_safe_area(Edges { top: 59.0, trailing: 0.0, bottom: 34.0, leading: 0.0 });
+        assert_eq!(
+            first_line(&runtime.display_frame(&Reader, size)),
+            "59 34 0",
+            "the phone's bands reach the body",
+        );
+        let _ = runtime.display_frame(&Reader, size);
+        assert!(runtime.body_runs().is_empty(), "and settle");
+
+        // The keyboard rises: its own number moves and the safe area's does
+        // not — the merger the layout uses is `frame_insets`, and a body that
+        // needed the merged number could compute it and a body that needs
+        // them apart could not recover them.
+        runtime.set_keyboard_inset(291.0);
+        assert_eq!(first_line(&runtime.display_frame(&Reader, size)), "59 34 291");
+
+        // An unchanged value costs nothing: no environment move, no re-run.
+        let _ = runtime.display_frame(&Reader, size);
+        runtime.set_safe_area(Edges { top: 59.0, trailing: 0.0, bottom: 34.0, leading: 0.0 });
+        runtime.set_keyboard_inset(291.0);
+        let _ = runtime.display_frame(&Reader, size);
+        assert!(runtime.body_runs().is_empty(), "nothing moved, nothing ran");
     }
 
     /// The same hold on a row OUTSIDE any scroll: the press went down at

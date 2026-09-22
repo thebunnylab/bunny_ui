@@ -129,7 +129,7 @@ fn enabled(env: Env, manager: JObject) -> Option<bool> {
 fn ask_permission(env: Env) -> Option<()> {
     let string_class = env.class(c"java/lang/String")?;
     let permission = env.string(POST_NOTIFICATIONS)?;
-    let wanted = env.new_object_array(string_class, 1, permission)?;
+    let wanted = env.new_object_array(string_class, &[permission])?;
     let activity_class = env.class(c"android/app/Activity")?;
     let request = env.method(activity_class, c"requestPermissions", c"([Ljava/lang/String;I)V")?;
     env.call_void(env.activity(), request, &[object(wanted), int(1)]).then_some(())
@@ -286,7 +286,7 @@ fn pending(env: Env, id: &str, action: Option<&str>) -> Option<JObject> {
     named.extend_from_slice(id.as_bytes());
     named.push(0);
     named.extend_from_slice(action.unwrap_or("").as_bytes());
-    let code = crate::face::fnv64(&named) as i32;
+    let code = bunny_ui::font_file::fnv64(&named) as i32;
     let uri_class = env.class(c"android/net/Uri")?;
     let parse = env.static_method(uri_class, c"parse", c"(Ljava/lang/String;)Landroid/net/Uri;")?;
     let url = env.string(&format!("bunny://notification/{:08x}", code as u32))?;

@@ -115,11 +115,15 @@ pub struct JniNativeInterface {
     release_string_utf_chars: Fn2<JString, *const c_char, ()>,        // 170
     get_array_length: Fn1<JObject, JInt>,                             // 171
     new_object_array: Fn3<JInt, JClass, JObject, JObject>, // 172
-    slots_173_175: [*const c_void; 3],
+    slot_173: *const c_void,
+    set_object_array_element: unsafe extern "C" fn(*mut JniEnv, JObject, JInt, JObject), // 174
+    slot_175: *const c_void,
     new_byte_array: Fn1<JInt, JObject>, // 176
     slots_177_180: [*const c_void; 4],
     new_float_array: Fn1<JInt, JObject>, // 181
-    slots_182_202: [*const c_void; 21],
+    slots_182_199: [*const c_void; 18],
+    get_byte_array_region: unsafe extern "C" fn(*mut JniEnv, JObject, JInt, JInt, *mut i8), // 200
+    slots_201_202: [*const c_void; 2],
     get_int_array_region: unsafe extern "C" fn(*mut JniEnv, JObject, JInt, JInt, *mut JInt), // 203
     slot_204: *const c_void,
     get_float_array_region: unsafe extern "C" fn(*mut JniEnv, JObject, JInt, JInt, *mut JFloat), // 205
@@ -360,13 +364,6 @@ impl Env {
         self.check().then_some(length)
     }
 
-    /// An object array of `length`, every slot holding `fill` — a
-    /// `null` fill is allowed, and an array of one IS its fill.
-    pub fn new_object_array(&self, class: JClass, length: i32, fill: JObject) -> Option<JObject> {
-        let array = unsafe { (self.table().new_object_array)(self.raw, length, class, fill) };
-        (self.check() && !array.is_null()).then_some(array)
-    }
-
     pub fn new_byte_array(&self, bytes: &[u8]) -> Option<JObject> {
         let array = unsafe { (self.table().new_byte_array)(self.raw, bytes.len() as JInt) };
         if !self.check() || array.is_null() {
@@ -376,6 +373,36 @@ impl Env {
             (self.table().set_byte_array_region)(self.raw, array, 0, bytes.len() as JInt, bytes.as_ptr().cast())
         };
         self.check().then_some(array)
+    }
+
+    /// An array of objects of one class, every slot the same value —
+    /// what a fluent Java builder takes for a list of one.
+    pub fn new_object_array(&self, class: JClass, values: &[JObject]) -> Option<JObject> {
+        let array = unsafe {
+            (self.table().new_object_array)(self.raw, values.len() as JInt, class, null_mut())
+        };
+        if !self.check() || array.is_null() {
+            return None;
+        }
+        for (index, value) in values.iter().enumerate() {
+            unsafe {
+                (self.table().set_object_array_element)(self.raw, array, index as JInt, *value);
+            }
+            if !self.check() {
+                return None;
+            }
+        }
+        Some(array)
+    }
+
+    /// A `byte[]` read back whole — the shape every cipher answers in.
+    pub fn byte_array(&self, array: JObject) -> Option<Vec<u8>> {
+        let length = self.array_length(array)?;
+        let mut out = vec![0i8; length.max(0) as usize];
+        unsafe {
+            (self.table().get_byte_array_region)(self.raw, array, 0, length, out.as_mut_ptr());
+        }
+        self.check().then(|| out.into_iter().map(|byte| byte as u8).collect())
     }
 
     pub fn float_array_region(&self, array: JObject, out: &mut [f32]) -> bool {

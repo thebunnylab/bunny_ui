@@ -41,7 +41,16 @@ thread_local! {
     /// that lagged its own corner).
     static VIEW_PRESENTERS: RefCell<HashMap<usize, MetalPresenter>> =
         RefCell::new(HashMap::new());
+    /// Did a present of the main window WAIT for a drawable since the last
+    /// beat asked? ([`take_congested`])
+    static CONGESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// A present that waited this long for a drawable, in milliseconds, found
+/// the line of frames in front of the display full. A drawable that is
+/// free is handed over in well under a tenth of this; one that is not is
+/// freed by the display's own refresh, milliseconds away.
+const CONGESTED_MS: f64 = 1.5;
 
 /// Grafts the CAMetalLayer onto the view — called by `create_window`
 /// BEFORE `setWantsLayer:`, so the view becomes layer-HOSTING and
@@ -164,6 +173,20 @@ pub(crate) fn present_window(
     PRESENTER.with(|slot| {
         if let Some(presenter) = slot.borrow_mut().as_mut() {
             presenter.present(display, size, scale, canvas, text, images, live);
+            // a live resize presents inside the window's own transaction
+            // and waits by design: that wait says nothing about the line
+            let waited = presenter.drawable_wait_ms();
+            if !live && waited > CONGESTED_MS {
+                CONGESTED.with(|flag| flag.set(true));
+                bunny_ui_apple::trace::mark("X", format_args!("what=line-full wait={waited:.1}"));
+            }
         }
     });
+}
+
+/// Did a present wait for the display since this was last asked? The frame
+/// pacer holds one beat for a yes (`FramePacer::congested`), and the line of
+/// frames in front of the display drains.
+pub(crate) fn take_congested() -> bool {
+    CONGESTED.with(|flag| flag.replace(false))
 }

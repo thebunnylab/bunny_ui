@@ -22,7 +22,11 @@ use bunny_ui::app::{AppEvent, Notification, emit};
 
 use crate::ffi::{Guid, Hresult, UnknownVtbl, com_init, com_ok, com_query, wide};
 
-#[link(name = "combase")]
+// `runtimeobject`, not `combase`: these are the WinRT entry points, and the
+// Windows SDK ships them under that import library — `combase.lib` is not in
+// `um/x64` on any SDK installed here (10.0.22000/22621/26100), so linking it
+// fails with LNK1181 on a machine that has everything it needs.
+#[link(name = "runtimeobject")]
 unsafe extern "system" {
     fn RoInitialize(kind: u32) -> Hresult;
     fn RoGetActivationFactory(

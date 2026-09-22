@@ -46,6 +46,38 @@ pub enum SizeClass {
     Regular,
 }
 
+/// `\.safeAreaInsets` — what the WINDOW is covered by at each edge: the
+/// notch and the status bar above, the home indicator below, a rounded
+/// corner's bite at the sides.
+///
+/// The root is laid out inside these already; a body reads them when it has
+/// to paint THROUGH them and hold its content clear by hand — an ambient
+/// wash that stops dead at a horizontal line under the status bar reads as
+/// exactly what it is, and a bottom sheet that stops above the home
+/// indicator is a sheet with a gap under it.
+///
+/// Leading is the left edge.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct SafeAreaInsets {
+    pub top: f64,
+    pub trailing: f64,
+    pub bottom: f64,
+    pub leading: f64,
+}
+
+/// `\.keyboardInset` — the software keyboard's height over the window, `0`
+/// when it hides.
+///
+/// Separate from [`SafeAreaInsets`] on purpose, because the two bands mean
+/// opposite things to a surface that reaches the screen's edge: whatever the
+/// keyboard covers is genuinely unusable and content must stand above it,
+/// while the home indicator's band is a place a surface may paint and only
+/// its CONTENT must keep clear of. A single merged number cannot say that,
+/// and an app that only has the merger has to choose which of the two rules
+/// to get wrong.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct KeyboardInset(pub f64);
+
 /// Everything `@Environment(\.key)` can read. App-specific values (the DI
 /// container, the SwiftData model container) ride along type-erased, exactly
 /// like `@Entry` extensions do in real SwiftUI.
@@ -54,6 +86,10 @@ pub struct EnvironmentValues {
     pub locale: Locale,
     /// `\.horizontalSizeClass`.
     pub horizontalSizeClass: SizeClass,
+    /// `\.safeAreaInsets` — the shell's, mirrored per layout.
+    pub safeAreaInsets: SafeAreaInsets,
+    /// `\.keyboardInset` — the shell's, mirrored per layout.
+    pub keyboardInset: KeyboardInset,
     /// `\.injected` — `Rc<DIContainer>` in the app.
     pub injected: Option<Rc<dyn Any>>,
     /// `\.modelContext` stand-in: resolves `Query<T>` sources by type name.
@@ -87,6 +123,18 @@ impl FromEnvironment for Locale {
 impl FromEnvironment for SizeClass {
     fn from_environment(values: &EnvironmentValues) -> Self {
         values.horizontalSizeClass
+    }
+}
+
+impl FromEnvironment for SafeAreaInsets {
+    fn from_environment(values: &EnvironmentValues) -> Self {
+        values.safeAreaInsets
+    }
+}
+
+impl FromEnvironment for KeyboardInset {
+    fn from_environment(values: &EnvironmentValues) -> Self {
+        values.keyboardInset
     }
 }
 

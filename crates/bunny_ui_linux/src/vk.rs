@@ -14,15 +14,18 @@ pub use bunny_ui_vulkan::OffscreenVk;
 use bunny_ui_vulkan::{Presented, SurfaceSource, VkPresenter};
 
 thread_local! {
-    static PRESENTER: RefCell<Option<VkPresenter>> = const { RefCell::new(None) };
+    /// One presenter per WINDOW, by the window's address — a swapchain
+    /// belongs to the surface it was made for.
+    static PRESENTER: RefCell<std::collections::HashMap<usize, VkPresenter>> =
+        RefCell::new(std::collections::HashMap::new());
     static RECREATE_SPENT: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The window the shell stands in front of, spoken as the tier's
 /// source — and whether it is a scene (the corner mask).
-fn source() -> Option<(SurfaceSource, bool)> {
+fn source(window: usize) -> Option<(SurfaceSource, bool)> {
     use crate::ffi::GpuTargets;
-    Some(match crate::ffi::gpu_targets()? {
+    Some(match crate::ffi::gpu_targets(window)? {
         GpuTargets::Wayland { display, surface, scene } => {
             (SurfaceSource::Wayland { display, surface }, scene)
         }
@@ -32,39 +35,39 @@ fn source() -> Option<(SurfaceSource, bool)> {
     })
 }
 
-fn install() -> Option<VkPresenter> {
-    let (source, scene) = source()?;
-    let (width, height) = crate::ffi::gpu_buffer_size();
+fn install(window: usize) -> Option<VkPresenter> {
+    let (source, scene) = source(window)?;
+    let (width, height) = crate::ffi::gpu_buffer_size(window);
     let presenter = VkPresenter::install(source, (width as u32, height as u32), scene)?;
     // the compositor must never grow the window past what the device
     // renders — the same ceiling the gl tier declares
-    crate::ffi::gpu_limit_size(presenter.max_texture_size() as usize);
+    crate::ffi::gpu_limit_size(window, presenter.max_texture_size() as usize);
     Some(presenter)
 }
 
 /// The front of the ladder: vulkan if it fully comes up, else the
 /// caller steps down to gl. `BUNNY_PRESENT=gl|cpu` skips this tier
 /// before any loader touch.
-pub(crate) fn try_install() -> bool {
+pub(crate) fn try_install(window: usize) -> bool {
     match std::env::var("BUNNY_PRESENT").ok().as_deref() {
         Some("cpu") | Some("gl") => return false,
         _ => {}
     }
-    let Some(presenter) = install() else {
+    let Some(presenter) = install(window) else {
         return false;
     };
-    PRESENTER.with(|slot| *slot.borrow_mut() = Some(presenter));
+    PRESENTER.with(|slot| slot.borrow_mut().insert(window, presenter));
     true
 }
 
-pub(crate) fn active() -> bool {
-    PRESENTER.with(|slot| slot.borrow().is_some())
+pub(crate) fn active(window: usize) -> bool {
+    PRESENTER.with(|slot| slot.borrow().contains_key(&window))
 }
 
 /// The ack road's skip-breaker, same contract as the gl tier's.
-pub(crate) fn invalidate() {
+pub(crate) fn invalidate(window: usize) {
     PRESENTER.with(|slot| {
-        if let Some(presenter) = slot.borrow_mut().as_mut() {
+        if let Some(presenter) = slot.borrow_mut().get_mut(&window) {
             presenter.invalidate();
         }
     });
@@ -74,6 +77,7 @@ pub(crate) fn invalidate() {
 /// scale, frame callback, "is the window configured") rides before the
 /// WSI commit, the note after — the same envelope the CPU commit wears.
 fn present_with(
+    window: usize,
     presenter: &mut VkPresenter,
     display: &DisplayList,
     size: Size,
@@ -89,12 +93,13 @@ fn present_with(
         canvas,
         text,
         images,
-        &mut |scale| crate::ffi::gpu_pre_present(scale),
-        &mut || crate::ffi::gpu_note_present(),
+        &mut |scale| crate::ffi::gpu_pre_present(window, scale),
+        &mut || crate::ffi::gpu_note_present(window),
     )
 }
 
 pub(crate) fn present_window(
+    window: usize,
     display: &DisplayList,
     size: Size,
     scale: usize,
@@ -103,9 +108,9 @@ pub(crate) fn present_window(
     images: &dyn ImageEngine,
 ) {
     let outcome = PRESENTER.with(|slot| {
-        slot.borrow_mut()
-            .as_mut()
-            .map(|presenter| present_with(presenter, display, size, scale, canvas, text, images))
+        slot.borrow_mut().get_mut(&window).map(|presenter| {
+            present_with(window, presenter, display, size, scale, canvas, text, images)
+        })
     });
     match outcome {
         None | Some(Presented::Ok) => return,
@@ -113,23 +118,28 @@ pub(crate) fn present_window(
         // rebuild the presenter once, then step down
         Some(Presented::SurfaceLost) | Some(Presented::DeviceLost) => {}
     }
-    teardown();
+    teardown(window);
     if !RECREATE_SPENT.with(|spent| spent.replace(true)) {
-        if let Some(mut presenter) = install() {
-            present_with(&mut presenter, display, size, scale, canvas, text, images);
-            PRESENTER.with(|slot| *slot.borrow_mut() = Some(presenter));
+        if let Some(mut presenter) = install(window) {
+            present_with(window, &mut presenter, display, size, scale, canvas, text, images);
+            PRESENTER.with(|slot| slot.borrow_mut().insert(window, presenter));
             return;
         }
     }
     // the gl tier below catches the window for the rest of its life
     eprintln!("bunny_ui vk: the device is lost — stepping down the ladder");
-    let _ = crate::gl::try_install();
+    let _ = crate::gl::try_install(window);
 }
 
-/// Lets the presenter go — swapchain, surface, device and instance:
-/// the window is closing.
-pub(crate) fn teardown() {
-    PRESENTER.with(|slot| drop(slot.borrow_mut().take()));
+/// Lets a window's presenter go — swapchain, surface, device and
+/// instance: the window is closing.
+pub(crate) fn teardown(window: usize) {
+    PRESENTER.with(|slot| drop(slot.borrow_mut().remove(&window)));
+}
+
+/// Every window's presenter, at the road's end.
+pub(crate) fn teardown_all() {
+    PRESENTER.with(|slot| slot.borrow_mut().clear());
 }
 
 #[cfg(test)]

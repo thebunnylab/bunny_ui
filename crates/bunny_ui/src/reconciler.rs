@@ -23,7 +23,7 @@
 //! accumulated modifier suffixes, and re-appends extra children (the
 //! `Sheet` node).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 use motor::hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -115,8 +115,12 @@ pub(crate) struct Entry {
     pub ctx: Context,
     pub node: RenderNode,
     /// The body's layout tree — retained along with the print (the two
-    /// outputs of the same body-eval).
-    pub layout: LayoutNode,
+    /// outputs of the same body-eval) — and the measures of it that were
+    /// kept, behind the SLOT a `BoundaryRef` holds: the layout reaches
+    /// both without asking the retention for a path. The slot outlives
+    /// the entry it was made for: a body that re-runs fills the same one,
+    /// so a parent that did NOT re-run still refers to the tree of today.
+    pub slot: Rc<Slot>,
     pub effects: Vec<EffectFn>,
     /// The body's interactive actions — retained like the effects: a
     /// skipped view's button stays clickable.
@@ -142,8 +146,9 @@ pub(crate) struct Entry {
     /// Key contexts declared in the body (`.key_context(name)`) — a
     /// context is ACTIVE while a view declaring it stays mounted.
     pub contexts: Vec<&'static str>,
-    /// The PARENT's path segments — the cursor seed for an isolated re-run.
-    pub parent_segments: Vec<String>,
+    /// The PARENT's path segments, packed — the cursor seed for an isolated
+    /// re-run.
+    pub parent_segments: motor::identity::PathSeed,
 }
 
 #[derive(Default)]
@@ -194,19 +199,160 @@ thread_local! {
     static FRAME_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
-/// A boundary's retained layout tree, borrowed in place — measure and
-/// place resolve `BoundaryRef` through here, WITHOUT stitching an
-/// expanded copy. Borrows nest (ref inside ref = shared borrows of the
-/// same RefCell); no body runs during layout, so no mutable re-borrow
-/// is possible.
-pub(crate) fn with_retained_layout<R>(
+/// A boundary's place in the retention, as a node of the layout tree
+/// holds it ([`LayoutNode::BoundaryRef`]).
+///
+/// The retention is keyed by path, and a path is long: every boundary of
+/// a frame — every row of every list — was looked up twice in a tree of
+/// strings, and the compare of those strings stood second in the profile
+/// of a placement. A reference holds its boundary's slot instead. The slot
+/// is as old as the PATH, not as the entry: a re-run fills it again
+/// ([`finish_entry`]), and an entry that leaves the retention empties it.
+///
+/// Public in name only — a layout node mentions it, and a layout node is
+/// public. An app has no door to one and nothing to do with one.
+pub struct Slot {
+    held: RefCell<Option<Rc<Held>>>,
+}
+
+/// What a slot holds while its boundary is retained.
+struct Held {
+    layout: LayoutNode,
+    /// The measures of that tree that were kept: the question, and the
+    /// size and fit it answered. A few, because one tree is asked a few
+    /// questions in a frame (a stack measures a flexible child twice).
+    /// A re-run replaces the whole `Held`, and the list with it; a body
+    /// that re-runs BELOW clears it ([`finish_entry`]).
+    measures_kept: RefCell<Vec<KeptMeasure>>,
+    /// Is the tree only paint? Asked when the boundary sits far off the
+    /// glass, answered once for this tree ([`crate::layout::Quiet`]).
+    quiet: std::cell::OnceCell<crate::layout::Quiet>,
+}
+
+impl std::fmt::Debug for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.held.borrow().is_some() { "Slot(held)" } else { "Slot(empty)" })
+    }
+}
+
+impl Slot {
+    fn empty() -> Rc<Slot> {
+        Rc::new(Slot { held: RefCell::new(None) })
+    }
+
+    fn held(&self) -> Option<Rc<Held>> {
+        self.held.borrow().clone()
+    }
+
+    /// Is the boundary's tree quiet NOW ([`crate::layout::Quiet`])? A
+    /// boundary that left the retention places nothing, which is quiet.
+    pub(crate) fn quiet_now(&self) -> bool {
+        self.held().is_none_or(|held| {
+            held.quiet
+                .get_or_init(|| crate::layout::Quiet::of_all(std::slice::from_ref(&held.layout)))
+                .holds()
+        })
+    }
+
+    /// The boundary's layout tree, borrowed in place — measure and place
+    /// resolve a `BoundaryRef` through here, WITHOUT stitching an expanded
+    /// copy. `None` = the boundary left the retention.
+    pub(crate) fn with_layout<R>(&self, reader: impl FnOnce(Option<&LayoutNode>) -> R) -> R {
+        let held = self.held();
+        reader(held.as_deref().map(|held| &held.layout))
+    }
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        // the entry left the retention: what refers to it finds nothing.
+        // A re-run takes the old entry out BEFORE it fills the slot again
+        // ([`finish_entry`]), so this never empties a fresh one.
+        self.slot.held.replace(None);
+    }
+}
+
+/// The slot of the boundary at `path` — what a new `BoundaryRef` holds.
+/// A path nothing retains answers an empty slot: the reference measures
+/// zero and places nothing, as it always did.
+pub(crate) fn slot_of(path: &str) -> Rc<Slot> {
+    RETAINED.with(|retained| {
+        retained.borrow().get(path).map_or_else(Slot::empty, |entry| Rc::clone(&entry.slot))
+    })
+}
+
+/// One kept answer of a retained tree's measure.
+pub(crate) struct KeptMeasure {
+    key: crate::layout::MeasureKey,
+    size: crate::layout::Size,
+    fit: Rc<crate::layout::Fit>,
+}
+
+/// How many questions one tree keeps the answer to.
+const KEPT_MEASURES: usize = 4;
+
+/// The measure of a retained boundary, kept from frame to frame.
+///
+/// `measure` runs on a miss, and its answer is kept — unless something
+/// inside said it is not a function of the key (the poison count moved).
+pub(crate) fn measure_retained(
+    slot: &Slot,
     path: &str,
-    reader: impl FnOnce(Option<&LayoutNode>) -> R,
-) -> R {
+    key: crate::layout::MeasureKey,
+    measure: impl FnOnce(&LayoutNode) -> (crate::layout::Size, crate::layout::Fit),
+) -> (crate::layout::Size, crate::layout::Fit) {
+    use crate::layout::Fit;
+
+    let Some(held) = slot.held() else {
+        debug_assert!(false, "layout reference without retention: {path}");
+        return (crate::layout::Size::default(), Fit::Leaf);
+    };
+    let kept = held
+        .measures_kept
+        .borrow()
+        .iter()
+        .find(|kept| kept.key == key)
+        .map(|kept| (kept.size, Rc::clone(&kept.fit)));
+    if let Some((size, fit)) = kept {
+        crate::stats::note_measure_kept(true);
+        if crate::paranoid::on(crate::paranoid::MEMO) {
+            let (fresh_size, fresh_fit) = measure(&held.layout);
+            assert!(
+                fresh_size == size && fresh_fit.same_as(&fit),
+                "a kept measure of `{path}` is stale: kept {size:?}, fresh {fresh_size:?}"
+            );
+        }
+        return (size, Fit::Shared(fit));
+    }
+    crate::stats::note_measure_kept(false);
+    let poison = crate::layout::measure_poison();
+    let (size, fit) = measure(&held.layout);
+    if crate::layout::measure_poison() != poison {
+        // something below answers by its own rules: ask again next frame
+        return (size, fit);
+    }
+    let fit = Rc::new(fit);
+    let mut kept = held.measures_kept.borrow_mut();
+    if kept.len() == KEPT_MEASURES {
+        kept.remove(0);
+    }
+    kept.push(KeptMeasure { key, size, fit: Rc::clone(&fit) });
+    (size, Fit::Shared(fit))
+}
+
+/// A body re-ran at `path`: the boundaries above it may size themselves
+/// by it, so what they kept is stale. Ancestors are prefixes of the path
+/// at a `/`. An id can hold a `/` of its own, so a prefix may name no
+/// entry — and then there is nothing to clear.
+fn clear_measures_above(path: &str) {
     RETAINED.with(|retained| {
         let retained = retained.borrow();
-        reader(retained.get(path).map(|entry| &entry.layout))
-    })
+        for (at, _) in path.match_indices('/') {
+            if let Some(held) = retained.get(&path[..at]).and_then(|entry| entry.slot.held()) {
+                held.measures_kept.borrow_mut().clear();
+            }
+        }
+    });
 }
 
 /// Is the boundary retained? (The guard for the `Runtime` stable frame.)
@@ -312,18 +458,28 @@ pub(crate) fn finish_entry(
                 ),
             }
         });
-    let parent_segments = motor::identity::current_path_segments()
-        .split_last()
-        .map(|(_, parents)| parents.to_vec())
-        .unwrap_or_default();
+    let parent_segments = motor::identity::parent_seed();
     RETAINED.with(|retained| {
-        retained.borrow_mut().insert(
+        let mut retained = retained.borrow_mut();
+        // the slot is as old as the path: the entry of the last run goes
+        // FIRST (its drop empties the slot), then the slot is filled again,
+        // so a parent that did not re-run refers to the tree of today
+        let slot = match retained.remove(path) {
+            Some(old) => Rc::clone(&old.slot),
+            None => Slot::empty(),
+        };
+        slot.held.replace(Some(Rc::new(Held {
+            layout,
+            measures_kept: RefCell::new(Vec::new()),
+            quiet: std::cell::OnceCell::new(),
+        })));
+        retained.insert(
             path.to_string(),
             Entry {
                 value,
                 ctx,
                 node,
-                layout,
+                slot,
                 effects,
                 actions,
                 editors,
@@ -338,6 +494,16 @@ pub(crate) fn finish_entry(
             },
         );
     });
+    // a body ran and its registrations are new closures: the tables
+    // built from the old entry are stale
+    bump_retention();
+    // …and so is every measure kept ABOVE it. The outermost re-run of a
+    // pass does this once: the boundaries between it and the ones it
+    // re-ran below are new entries themselves.
+    let outermost = PASS.with(|pass| pass.borrow().building.is_empty());
+    if outermost {
+        clear_measures_above(path);
+    }
 }
 
 /// An effect registered during render: goes to the entry being built,
@@ -585,7 +751,7 @@ pub(crate) fn run_isolated(root: &str) {
         }) else {
             continue; // dirty but never mounted (or already swept): nothing to re-run
         };
-        let _frames = motor::identity::seed(&parents);
+        let _frames = motor::identity::seed_from(&parents);
         let mut scratch = crate::view::NodeList::new();
         use crate::view::View;
         // the retained value re-renders through the blanket's normal
@@ -866,6 +1032,17 @@ pub(crate) fn run_webview_requested(path: &str, line: &str) -> bool {
     run_webview_report(path, |hooks| hooks.requested.clone(), line)
 }
 
+/// Does any handle hold a command the shell did not spend yet? A peek:
+/// nothing is drained. A handle queues its commands with no state write,
+/// so this is how a shell learns that a frame is due for them.
+pub(crate) fn has_webview_commands() -> bool {
+    WEBVIEWS.with(|webviews| {
+        webviews.borrow().values().any(|hooks| {
+            hooks.commands.as_ref().is_some_and(|queue| !queue.borrow().is_empty())
+        })
+    })
+}
+
 /// Drains every handle's queued commands, paired with the path the
 /// handle is bound to — the runtime stamps eval tokens and the shell
 /// spends the rest.
@@ -1029,6 +1206,131 @@ thread_local! {
     /// checks this before it reads them, and rebuilds its own if another
     /// scene left theirs standing.
     static ASSEMBLED_ROOT: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Moves each time the retention is written: an entry closed, an
+    /// entry fell. A registration enters the retention only through a
+    /// body run, which closes an entry, and leaves it only through a
+    /// sweep — so tables assembled at one generation stay true until the
+    /// number moves.
+    static RETENTION_GEN: Cell<u64> = const { Cell::new(0) };
+    /// The generation the assembled tables were built at, and whether a
+    /// root region fed them. A root region is rebuilt by every pass (its
+    /// closures are new each time), so tables that hold one never stay.
+    static ASSEMBLED_AT: Cell<Option<(u64, bool)>> = const { Cell::new(None) };
+    /// The effect queue of the last FULL assembly, with the root and the
+    /// generation it was built for. It has its own key: the input tables
+    /// are also rebuilt outside a pass, when a scene becomes current
+    /// again, and that rebuild makes no queue.
+    static ASSEMBLED_EFFECTS: RefCell<Option<(String, u64, Rc<[EffectFn]>)>> =
+        const { RefCell::new(None) };
+}
+
+/// A number that moves when any assembled table moves: every key, and
+/// the identity of every closure behind it. It is the paranoid check's
+/// question, and nothing else asks it.
+pub(crate) fn input_fingerprint() -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    fn of_key(key: &str) -> u64 {
+        let mut hasher = motor::hash::FxHasher::default();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+    fn of_ptr<T: ?Sized>(shared: &Rc<T>) -> u64 {
+        Rc::as_ptr(shared) as *const () as usize as u64
+    }
+
+    let mut total = 0u64;
+    let mut mix = |part: u64| total = total.wrapping_mul(31).wrapping_add(part);
+    // order never matters inside a table: a sum is the same in any order
+    mix(ACTIONS.with(|map| {
+        map.borrow().iter().fold(0u64, |sum, (key, action)| sum.wrapping_add(of_key(key) ^ of_ptr(action)))
+    }));
+    mix(EDITORS.with(|map| {
+        map.borrow().iter().fold(0u64, |sum, (key, editor)| sum.wrapping_add(of_key(key) ^ of_ptr(editor)))
+    }));
+    mix(SPLITS.with(|map| {
+        map.borrow().iter().fold(0u64, |sum, (key, split)| sum.wrapping_add(of_key(key) ^ of_ptr(split)))
+    }));
+    mix(SCROLLS.with(|map| {
+        map.borrow().iter().fold(0u64, |sum, (key, scroll)| sum.wrapping_add(of_key(key) ^ of_ptr(scroll)))
+    }));
+    mix(MEASURES.with(|map| {
+        map.borrow().iter().fold(0u64, |sum, (key, measure)| sum.wrapping_add(of_key(key) ^ of_ptr(measure)))
+    }));
+    mix(HANDLERS.with(|map| {
+        map.borrow().values().fold(0u64, |sum, (depth, handler)| {
+            sum.wrapping_add((*depth as u64).wrapping_mul(0x9E37_79B9) ^ of_ptr(handler))
+        })
+    }));
+    mix(WEBVIEWS.with(|map| map.borrow().keys().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
+    mix(CUSTOMS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
+    mix(KEYED_CUSTOMS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
+    mix(ACTIVE_CONTEXTS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
+    total
+}
+
+fn bump_retention() {
+    RETENTION_GEN.with(|generation| generation.set(generation.get().wrapping_add(1)));
+}
+
+/// Is the root region of THIS pass empty? Registrations made outside
+/// every boundary live there, and only for one pass.
+fn root_region_is_empty() -> bool {
+    PASS.with(|pass| {
+        let pass = pass.borrow();
+        pass.root_effects.is_empty()
+            && pass.root_actions.is_empty()
+            && pass.root_editors.is_empty()
+            && pass.root_splits.is_empty()
+            && pass.root_scrolls.is_empty()
+            && pass.root_measures.is_empty()
+            && pass.root_webviews.is_empty()
+            && pass.root_customs.is_empty()
+            && pass.root_handlers.is_empty()
+            && pass.root_contexts.is_empty()
+    })
+}
+
+/// Do the assembled tables still answer for `root`? They do when they
+/// were built for it, the retention did not move since, and no root
+/// region fed them then or wants to feed them now.
+pub(crate) fn assembly_is_current(root: &str) -> bool {
+    let same_root = ASSEMBLED_ROOT.with(|slot| slot.borrow().as_deref() == Some(root));
+    same_root
+        && ASSEMBLED_AT.with(Cell::get) == Some((RETENTION_GEN.with(Cell::get), false))
+        && root_region_is_empty()
+}
+
+/// The effect queue this root's last full assembly built — `None` when
+/// the retention moved since, when another scene assembled after it, or
+/// when a root region wants to feed the queue now. The caller then
+/// assembles a new one.
+pub(crate) fn assembled_effects(root: &str) -> Option<Rc<[EffectFn]>> {
+    if !root_region_is_empty() {
+        return None;
+    }
+    let generation = RETENTION_GEN.with(Cell::get);
+    ASSEMBLED_EFFECTS.with(|slot| match slot.borrow().as_ref() {
+        Some((kept_root, kept_at, queue)) if kept_root == root && *kept_at == generation => {
+            Some(Rc::clone(queue))
+        }
+        _ => None,
+    })
+}
+
+/// Keeps the queue a full assembly built, for the passes that change
+/// nothing. A queue a root region fed is never kept: the region's
+/// closures are new on every pass.
+pub(crate) fn keep_assembled_effects(root: &str, queue: &Rc<[EffectFn]>, had_root_region: bool) {
+    ASSEMBLED_EFFECTS.with(|slot| {
+        *slot.borrow_mut() = (!had_root_region)
+            .then(|| (root.to_string(), RETENTION_GEN.with(Cell::get), Rc::clone(queue)));
+    });
+}
+
+/// Was a root region waiting when this pass reached its assembly?
+pub(crate) fn pass_has_root_region() -> bool {
+    !root_region_is_empty()
 }
 
 /// Whose scene the assembled tables answer for right now.
@@ -1038,8 +1340,9 @@ pub(crate) fn assembled_root() -> Option<String> {
 
 /// Records that the tables now answer for `root` — the runtime calls
 /// this as the last step of assembling them.
-pub(crate) fn set_assembled_root(root: &str) {
+pub(crate) fn set_assembled_root(root: &str, had_root_region: bool) {
     ASSEMBLED_ROOT.with(|slot| *slot.borrow_mut() = Some(root.to_string()));
+    ASSEMBLED_AT.with(|at| at.set(Some((RETENTION_GEN.with(Cell::get), had_root_region))));
 }
 
 /// Drops every retained entry under `root` — the retention half of a
@@ -1047,6 +1350,7 @@ pub(crate) fn set_assembled_root(root: &str) {
 /// other scenes on this thread keep theirs.
 pub(crate) fn forget_under(root: &str) {
     let prefix = format!("{root}/");
+    bump_retention();
     RETAINED.with(|retained| {
         retained
             .borrow_mut()
@@ -1062,12 +1366,17 @@ pub(crate) fn forget_under(root: &str) {
 
 /// Identities swept by `end_pass`: their entries fall with them.
 pub(crate) fn forget(dead: &[String]) {
-    RETAINED.with(|retained| {
+    let fell = RETAINED.with(|retained| {
         let mut retained = retained.borrow_mut();
+        let mut fell = false;
         for path in dead {
-            retained.remove(path);
+            fell |= retained.remove(path).is_some();
         }
+        fell
     });
+    if fell {
+        bump_retention();
+    }
 }
 
 /// The TWIN of the identity sweep, for views with NO state of their
@@ -1087,20 +1396,27 @@ pub(crate) fn sweep_stale(root: &str) {
             pass.skipped.clone(),
         )
     });
-    RETAINED.with(|retained| {
-        retained.borrow_mut().retain(|path, _| {
+    let fell = RETAINED.with(|retained| {
+        let mut retained = retained.borrow_mut();
+        let before = retained.len();
+        retained.retain(|path, _| {
             if !covers(root, path) {
                 return true; // another tree mounted on the same thread
             }
             runs.contains(path) || skipped.iter().any(|skip| covers(skip, path))
         });
+        retained.len() != before
     });
+    if fell {
+        bump_retention();
+    }
 }
 
 /// Drops the whole retention — the next pass runs every body (the
 /// tests' `render_full`; the state in the identity arenas stays).
 pub(crate) fn clear() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
+    bump_retention();
 }
 
 /// The world-reset twin of [`clear`]: the retention AND every per-pass
@@ -1108,7 +1424,11 @@ pub(crate) fn clear() {
 /// `motor::identity::reset_world` for the other half of the contract.
 pub(crate) fn reset_world() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
+    crate::layout::forget_pictures();
+    bump_retention();
     ASSEMBLED_ROOT.with(|root| *root.borrow_mut() = None);
+    ASSEMBLED_AT.with(|at| at.set(None));
+    ASSEMBLED_EFFECTS.with(|slot| *slot.borrow_mut() = None);
     PASS.with(|pass| *pass.borrow_mut() = PassState::default());
     LAST_BODY_RUNS.with(|last| last.borrow_mut().clear());
     FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().clear());

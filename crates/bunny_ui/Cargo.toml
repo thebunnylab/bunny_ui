@@ -21,6 +21,10 @@ svg = []
 # through the rasterizer and every tier keeps the CPU path as its
 # oracle and its floor.
 gpu = ["canvas"]
+# The codecs of the house: PNG and JPEG decoded in safe Rust, for a
+# platform with no codec of its own (Linux). Off by default — the other
+# shells ask their platform, and their binaries carry no decoder.
+codec = []
 
 [dependencies]
 motor.workspace = true

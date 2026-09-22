@@ -116,6 +116,20 @@ const _: () = {
 /// the Surface uses for damage and clips.
 pub type Box4 = (i64, i64, i64, i64);
 
+/// How far a line's raster can reach right and down from its origin, in
+/// device pixels — a bound, never a measure. Two font sizes of advance
+/// for each BYTE of the text, plus its tracking, is wider than any face
+/// sets a character (a byte count is never below the character count),
+/// and sixteen sizes is taller than any line. A line that ends nearer
+/// than this to a clip's near side is resolved and tested exactly.
+fn line_reach(text: &str, font: &crate::text_engine::FontSpec, factor: f64) -> (i64, i64) {
+    let size = font.size.max(1.0);
+    let bytes = text.len().max(1) as f64;
+    let width = bytes * (2.0 * size + font.tracking.max(0.0)) + 2.0 * size;
+    let height = (16.0 * size).max(64.0);
+    ((width * factor).ceil() as i64, (height * factor).ceil() as i64)
+}
+
 pub fn box_intersect(a: Box4, b: Box4) -> Option<Box4> {
     let rect = (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3));
     (rect.0 < rect.2 && rect.1 < rect.3).then_some(rect)
@@ -943,14 +957,29 @@ pub fn build_frame(
             DrawCommand::TextLine { origin, content, range, color, font } => {
                 let Some(clip) = effective_clip(&clips, whole) else { continue };
                 let slice = &content[range.0..range.1];
-                let Some(entry) = atlas.resolve(ground, slice, font, *color, scale, engine)?
-                else {
-                    continue;
-                };
                 // the composite_text mirror: one snap of the logical
                 // origin, texels copied 1:1 from there
                 let base_x = (origin.x * factor).round() as i64;
                 let base_y = (origin.y * factor).round() as i64;
+                // A line that cannot meet the clip is dropped BEFORE it is
+                // resolved: resolving shapes it, rasters it and packs it
+                // into the atlas, and a scroll region holds far more lines
+                // outside its clip than inside. The raster grows right and
+                // down from the origin, so the far sides are exact. The
+                // near sides need the raster's size, which only resolving
+                // knows — so they use a bound no real line reaches, and a
+                // line inside the bound is resolved and tested as before.
+                if base_x >= clip.2 || base_y >= clip.3 {
+                    continue;
+                }
+                let (reach_x, reach_y) = line_reach(slice, font, factor);
+                if base_x + reach_x <= clip.0 || base_y + reach_y <= clip.1 {
+                    continue;
+                }
+                let Some(entry) = atlas.resolve(ground, slice, font, *color, scale, engine)?
+                else {
+                    continue;
+                };
                 let dest =
                     (base_x, base_y, base_x + entry.width as i64, base_y + entry.height as i64);
                 if box_intersect(dest, clip).is_none() {
@@ -1355,6 +1384,69 @@ mod tests {
         assert!(cold > 0, "the first frame cut the tiles");
         walk(&mut ground, &mut atlas, &mut batches);
         assert_eq!(ground.uploads.len(), cold, "a warm frame re-cuts nothing");
+    }
+
+    #[test]
+    fn a_line_outside_the_clip_is_never_rastered() {
+        // a scroll region: one clip, and a long column of lines of which a
+        // few show. Lines far outside never reach the atlas — and what is
+        // drawn is the very same bytes as a list that never held them.
+        let clip = Rect {
+            origin: crate::layout::Point { x: 10.0, y: 1100.0 },
+            size: crate::layout::Size { width: 120.0, height: 60.0 },
+        };
+        let column = |rows: std::ops::Range<usize>| {
+            let mut display = DisplayList::default();
+            display.push(DrawCommand::PushClip { rect: clip, corner_radius: Corners::ZERO });
+            for row in rows {
+                let label = format!("row {row:03}");
+                display.push(DrawCommand::TextLine {
+                    origin: crate::layout::Point { x: 12.0, y: row as f64 * 20.0 },
+                    range: (0, label.len()),
+                    content: std::sync::Arc::from(label),
+                    color: Color::rgba(240, 240, 240, 255),
+                    font: FontSpec::DEFAULT,
+                });
+            }
+            // and one line far to the RIGHT of the clip, on a row that shows
+            let aside = "aside";
+            display.push(DrawCommand::TextLine {
+                origin: crate::layout::Point { x: 400.0, y: 1120.0 },
+                range: (0, aside.len()),
+                content: std::sync::Arc::from(aside),
+                color: Color::rgba(240, 240, 240, 255),
+                font: FontSpec::DEFAULT,
+            });
+            display.push(DrawCommand::PopClip);
+            display
+        };
+        let walk = |display: &DisplayList| {
+            let mut ground = RecordingGround::default();
+            let mut atlas = RunAtlas::new();
+            let mut batches = FrameBatches::default();
+            build_frame(
+                &mut ground,
+                display,
+                2,
+                (300, 2400),
+                &crate::text_engine::PixelFont,
+                &crate::image_engine::RawImages::default(),
+                &mut atlas,
+                &mut batches,
+            )
+            .expect("the column fits the atlas");
+            (ground.uploads.len(), batches.checksum())
+        };
+
+        // 200 rows at 20 pt; the clip (y 1100..1160) shows rows 55, 56, 57.
+        // The far side is exact: no row from 58 on is resolved. The near
+        // side is a bound of 208 pt at this size: rows 45..55 are resolved
+        // and then tested exactly, rows 0..45 are never resolved.
+        let (uploads, picture) = walk(&column(0..200));
+        let (near_uploads, near_picture) = walk(&column(45..58));
+        assert_eq!(picture, near_picture, "what is drawn is the same bytes");
+        assert_eq!(uploads, near_uploads, "and nothing farther reached the atlas");
+        assert!(uploads <= 13, "{uploads} uploads: only the rows near the clip were resolved");
     }
 
     #[test]

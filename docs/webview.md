@@ -24,13 +24,19 @@ document EDITS in place — the composer: the engine's own editing, an
 allowlist of commands, every change reported, the paste the app's to
 own, the policy holding throughout;
 `cargo run -p bunny-ui-macos --example compose_window -- --drive` is
-that proof. WebKitGTK is open.*
+that proof. On Linux the same floor stands over WPE WebKit with no
+GTK in it: the engine's frames come BACK as pixels the shell paints
+into the scene, the hand goes in as native libwpe events, and the two
+hooks, the document and the editor all serve;
+`cargo run -p bunny-ui-linux --example browser_window_linux -- --drive`
+is that proof (`--editor` for the composer), run in the container on
+both doors and all three present tiers.*
 
 An app sometimes has to show a web page — the preview of the thing it
 is building, a documentation site, an OAuth dance. Bundling a browser
 engine to do it costs a few hundred megabytes and a CVE stream that
 never ends. Meanwhile every OS this framework targets already ships an
-engine: WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux.
+engine: WKWebView on macOS, WebView2 on Windows, WPE WebKit on Linux.
 The framework should be able to hold that engine the way it holds any
 other view — at zero bytes of bundled browser.
 
@@ -275,16 +281,16 @@ does not pretend they do. A backend declares what it serves; asking
 for more is an error with a name, never an empty answer that looks
 like a quiet page.
 
-| | WKWebView (macOS) | WKWebView (iOS) | WebView2 | WebKitGTK |
+| | WKWebView (macOS) | WKWebView (iOS) | WebView2 | WPE (Linux) |
 | -- | -- | -- | -- | -- |
-| console messages | injected hook | injected hook | native | native |
-| network: requests observed | injected wrap (fetch/XHR) | injected wrap (fetch/XHR) | native | native |
-| network: response bodies | no | no | yes¹ | yes |
-| synthetic input | NSEvent, trusted | no⁴ | native | open question |
-| media emulation (full motion) | no² | no² | CDP `Emulation.setEmulatedMedia` | open question |
-| devtools | external inspector | external inspector | built in | embeddable |
-| a document under a policy | `loadHTMLString`, CSP | `loadHTMLString`, CSP | `NavigateToString`, CSP | open |
-| html editor (`.editable()`) | editor script | editor script | editor script | no³ |
+| console messages | injected hook | injected hook | native | injected hook |
+| network: requests observed | injected wrap (fetch/XHR) | injected wrap (fetch/XHR) | native | injected wrap (fetch/XHR) |
+| network: response bodies | no | no | yes¹ | no |
+| synthetic input | NSEvent, trusted | no⁴ | native | libwpe events, trusted⁶ |
+| media emulation (full motion) | no² | no² | CDP `Emulation.setEmulatedMedia` | no² |
+| devtools | external inspector | external inspector | built in | no⁵ |
+| a document under a policy | `loadHTMLString`, CSP | `loadHTMLString`, CSP | `NavigateToString`, CSP | `load_html`, CSP |
+| html editor (`.editable()`) | editor script | editor script | editor script | editor script |
 
 ¹ Engine-ready, core door open: the engine can hand a response body
 over, but no hook of this API carries bytes yet — so the backend does
@@ -304,6 +310,14 @@ event is what real sites refuse — so the cell is not claimed. The two
 WKWebView columns are ONE tenant (`bunny_ui_apple::webview`); only the
 keyboard's door, the snapshot's image and this cell differ.
 
+⁵ The engine's inspector wants a window of its own to open in, which
+the SHM lane does not have yet.
+
+⁶ The pointer, the wheel and the keys are libwpe events the engine
+takes as its own, `isTrusted` true. The one exception is `Type`: libwpe
+has no text event, so the text is inserted by script, the way a paste
+lands — a page cannot tell it from one.
+
 The table is the design's honest centre. An app that needs full
 network capture on every OS needs a proxy or its own engine; this
 widget is for showing the web and observing what an app's own pages
@@ -312,9 +326,45 @@ reading the console of the page it drives.
 
 The declared set is a value the app can read —
 `bunny_ui_macos::webview::capabilities()`,
-`bunny_ui_ios::webview::capabilities()` — so a feature that needs a
-capability can decide its own shape per platform instead of
-half-working on two of four.
+`bunny_ui_ios::webview::capabilities()`,
+`bunny_ui_linux::webview::capabilities()` (empty where the WPE stack
+is not on the box) — so a feature that needs a capability can decide
+its own shape per platform instead of half-working on two of four.
+
+## Linux
+
+The page on Linux is WPE WebKit — WebKit with no GTK in it — and the
+island contract is different in kind: the shell OWNS the page's
+pixels. The engine renders out of process and hands every frame back
+as a `wl_shm` buffer (WPEBackend-fdo's SHM lane); the shell copies it
+once, straight RGBA, and paints it as one image where the host stood
+in the display list (`DisplayList::with_host_pixels`). There is no
+platform view to composite around and no sandwich to build: the scene
+painted after the host is above the page by paint order alone, on the
+CPU raster, GL and Vulkan alike, and the clip open at the host's mark
+cuts the page like anything else. The engine is paced by the shell's
+own present — a frame is acknowledged once it went up, and the next
+one follows — so a page never renders faster than the glass shows it.
+
+The hand is routed by the shell: `Runtime::host_at` names the page
+under the pointer (an interactive target above it wins, and a page
+under a sheet is out of reach), and the press, the move, the wheel and
+the keys go in through libwpe's own dispatch doors as the native
+events they are. A click in the page takes the keyboard from the
+scene; a click outside gives it back. The engine's GLib main context
+is pumped by the door's own loop — its file descriptors ride the same
+`poll` — so every report lands on the UI thread and outside a frame.
+
+The six libraries (`libwpe`, `WPEBackend-fdo`, `WPEWebKit`, GLib,
+GObject, `libwayland-server`) are opened by name at the first mount
+and never linked; a box without them refuses the road with one line
+naming the package, and `capabilities()` answers empty. The sandbox is
+WebKit's own, bubblewrap around the web process; a box that cannot
+build one (a container without user namespaces) says
+`WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1` for itself, as the
+container harness does. Not on this lane yet: the EGL zero-copy road
+(the frame as an `EGLImage` straight into the GL tier's atlas), which
+needs a real GPU to prove, and a cursor the page chooses.
 
 ## What this is not
 

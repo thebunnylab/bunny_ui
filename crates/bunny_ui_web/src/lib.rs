@@ -11,6 +11,16 @@
 //!
 //! One frame driver: the glue's `requestAnimationFrame` plays the role
 //! of the display link — armed only while an animation wants frames.
+//!
+//! Two glues speak this border. `glue/glue.js` instantiates the wasm
+//! itself and IS the platform layer of a page we own whole. `glue/esm/`
+//! is the same border as ES modules, for a page whose LOADER is someone
+//! else's — wasm-bindgen's, say — and resolves an import module it does
+//! not own as `import * as m from "<name>"`. That is why the modules
+//! below are named as RELATIVE specifiers (`./bunny.js`, `./bunny_gpu.js`):
+//! a bare name needs an import map, which a Web Worker never sees; a
+//! relative one resolves beside the generated JS wherever the module is
+//! evaluated, the workers a threaded build spawns included.
 #![cfg(target_arch = "wasm32")]
 
 #[cfg(feature = "gpu")]
@@ -35,6 +45,7 @@ use std::rc::Rc;
 
 use bunny_ui::layout::{Color, Size};
 use bunny_ui::action::KeyMatch;
+use bunny_ui::pacing::{Beat, FramePacer, Urgency, Verdict};
 use bunny_ui::prelude::*;
 #[cfg(feature = "canvas")]
 use bunny_ui::raster::Surface;
@@ -46,10 +57,18 @@ use bunny_ui::text_input::EditCommand;
 pub use image::CanvasImageEngine;
 pub use text::CanvasTextEngine;
 
-#[link(wasm_import_module = "bunny")]
+#[link(wasm_import_module = "./bunny.js")]
 unsafe extern "C" {
     /// The glue paints this RGBA buffer onto the canvas, whole.
     fn js_blit(pointer: *const u8, width: u32, height: u32);
+    /// The focused box copied: the text goes to the platform's clipboard
+    /// (`navigator.clipboard.writeText`, inside the stroke's own user
+    /// gesture — the one moment a page may write it).
+    fn js_clipboard_write(pointer: *const u8, len: usize);
+    /// The cursor the scene wants under the pointer, told after every
+    /// move: 0 arrow, 1 text, 2 pointing, 3 cell, 4 resize left-right,
+    /// 5 resize up-down — the mac shell's table, in the order it asks.
+    fn js_set_cursor(kind: u32);
     /// The glue schedules ONE requestAnimationFrame that calls
     /// `bunny_frame` back — the browser's display link.
     fn js_request_frame();
@@ -130,7 +149,13 @@ fn pattern(key: bunny_ui::action::Key, mods: u32) -> KeyPattern {
 /// = something changed and the frame is worth presenting.
 fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
     use bunny_ui::action::Key;
-    if runtime.key_stroke(&pattern).handled {
+    let taken = runtime.key_stroke(&pattern);
+    if taken.handled {
+        // a copy hands the text back for the platform's clipboard — the
+        // mac shell's rule, on the road the browser allows it
+        if let Some(text) = taken.text {
+            clipboard_write(&text);
+        }
         return true;
     }
     // a field of MANY lines owns the bare break and the bare vertical
@@ -172,6 +197,25 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
         Key::Home => Some(EditCommand::Home(pattern.shift)),
         Key::End => Some(EditCommand::End(pattern.shift)),
         Key::Char('a') if pattern.command => Some(EditCommand::SelectAll),
+        // cmd-c / cmd-x: the field's output goes to the platform
+        Key::Char('c') if pattern.command => {
+            if let Some(text) = runtime.key(EditCommand::Copy).output {
+                clipboard_write(&text);
+            }
+            return false;
+        }
+        Key::Char('x') if pattern.command => {
+            let cut = runtime.key(EditCommand::Cut);
+            if let Some(text) = &cut.output {
+                clipboard_write(text);
+            }
+            return cut.output.is_some();
+        }
+        // cmd-v is NOT an edit here: a page cannot read the clipboard on a
+        // keystroke, so the text arrives through the browser's own `paste`
+        // event (the glue forwards it as text) — the stroke is spent
+        // without inserting, or a paste would land twice
+        Key::Char('v') if pattern.command => return false,
         Key::Escape => return runtime.blur(),
         _ => None,
     };
@@ -180,6 +224,55 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
         None => false,
     }
 }
+
+/// Hands a copied text to the page's clipboard.
+fn clipboard_write(text: &str) {
+    unsafe { js_clipboard_write(text.as_ptr(), text.len()) };
+}
+
+/// The cursor the scene wants under the pointer, told to the page after
+/// every move — the mac shell's order: a split seam being dragged first,
+/// then the box under the pointer, then the hand over anything hoverable,
+/// then the arrow.
+fn point_cursor(runtime: &Runtime) {
+    use bunny_ui::layout::{Axis, Cursor};
+    let kind = match runtime.seam_axis() {
+        Some(Axis::Horizontal) => 4,
+        Some(Axis::Vertical) => 5,
+        None => match runtime.hovered_cursor() {
+            Some(Cursor::Text) => 1,
+            Some(Cursor::Pointing) => 2,
+            Some(Cursor::Cell) => 3,
+            Some(Cursor::Arrow) => 0,
+            None if runtime.interaction().hovered.is_some() => 2,
+            None => 0,
+        },
+    };
+    unsafe { js_set_cursor(kind) };
+}
+
+thread_local! {
+    /// Frames that reached the page — the tier's drawable or the canvas
+    /// blit — since boot.
+    static FRAMES_PRESENTED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Frames that reached the page since boot: the tier's drawable, or a
+/// canvas blit with damage. A harness's paint proof reads this — a frame
+/// the engine built but never presented does not count, and a blank
+/// canvas presents none.
+pub fn frames_presented() -> u32 {
+    FRAMES_PRESENTED.with(|count| count.get())
+}
+
+fn note_presented() {
+    FRAMES_PRESENTED.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+/// Who asked the pacer for a frame — small numbers, for a tape to name.
+const ORIGIN_POINTER: u8 = 1;
+const ORIGIN_WHEEL: u8 = 2;
+const ORIGIN_WAKE: u8 = 3;
 
 /// What the exports feed the shell — the web twin of the mac AppEvent.
 enum Event {
@@ -281,10 +374,33 @@ fn dispatch(event: Event) {
 /// from its exported `start`; everything after travels through events.
 #[cfg(feature = "canvas")]
 pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
-    install_panic_hook();
     let runtime = Runtime::new()
         .text_engine(Rc::new(CanvasTextEngine::new()))
         .image_engine(Rc::new(CanvasImageEngine::new()));
+    start_with(width, height, scale, Rc::new(runtime), root);
+}
+
+/// [`start`] with the `Runtime` assembled by the caller — the door for an
+/// app with an environment of its own (a keymap, host handlers, engines it
+/// seeded), the twin of the desktop shells' `run_window_with`. Shared,
+/// because such an app holds the runtime weakly for doors of its own, and
+/// a weak handle to an allocation the shell did not take over would never
+/// upgrade again. The engines are the caller's responsibility; the
+/// [`CanvasTextEngine`] and [`CanvasImageEngine`] are what this page can
+/// shape and decode with.
+#[cfg(feature = "canvas")]
+pub fn start_with(
+    width: f64,
+    height: f64,
+    scale: f64,
+    runtime: Rc<Runtime>,
+    root: impl View + 'static,
+) {
+    install_panic_hook();
+    // the pixel lowering presents the list and never reads it: what no pixel
+    // can show is not drawn. The element lowering keeps every command
+    // whatever this says — a browser scrolls what was lowered by itself
+    runtime.drop_unseen();
     // a task that woke asks the page for one turn — the browser's
     // answer to the desktop's run loop source
     runtime.set_wake_hook(std::sync::Arc::new(|| unsafe { js_request_wake() }));
@@ -306,11 +422,23 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
     // allocates the CPU bitmap at all
     let mut surface: Option<(Surface, usize, Color)> = None;
 
+    // WHEN the frame an event asked for is drawn ([`bunny_ui::pacing`]). A
+    // page hears as many wheel and pointer events as the device sends, and
+    // several can land between two animation frames: drawn in the handler,
+    // each one was a whole settle, layout and raster of a picture the next
+    // one replaced before the display showed it. The glue's ONE
+    // `requestAnimationFrame` is the display's beat here.
+    let pacer = FramePacer::new();
+    // Did this turn draw? `present` raises it; the turn's end tells the pacer.
+    let drew = Rc::new(std::cell::Cell::new(false));
+    let drawn = Rc::clone(&drew);
+
     let present = move |runtime: &Runtime,
                             root: &dyn Fn(&Runtime, Size) -> bunny_ui::layout::DisplayList,
                             size: Size,
                             scale: usize,
                             surface: &mut Option<(Surface, usize, Color)>| {
+        drawn.set(true);
         let canvas = bunny_ui::theme::canvas();
         let physical =
             ((size.width.round() as usize) * scale, (size.height.round() as usize) * scale);
@@ -328,6 +456,7 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 &*runtime.text(),
                 &*runtime.images(),
             );
+            note_presented();
             if runtime.wants_frame() {
                 unsafe { js_request_frame() };
             }
@@ -351,6 +480,7 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
             let (width, height) = (retained.bitmap().width(), retained.bitmap().height());
             let rgba = retained.rgba();
             unsafe { js_blit(rgba.as_ptr(), width as u32, height as u32) };
+            note_presented();
         }
         if runtime.wants_frame() {
             unsafe { js_request_frame() };
@@ -363,10 +493,17 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
         let tick =
             |runtime: &Runtime, size: Size| runtime.animation_frame(&root, size);
         match event {
+            // A move and a wheel can WAIT for the beat: cold, the first one
+            // draws at once; warm, the beat draws ONE frame for every one
+            // since the last. A key, a press and a release cannot — they
+            // draw before the handler returns, as they always did.
             Event::PointerMove { x, y, modifiers } => {
-                if runtime.pointer_moved(x, y, modifiers) {
+                if runtime.pointer_moved(x, y, modifiers)
+                    && pacer.ask(ORIGIN_POINTER, Urgency::Soon, false) == Verdict::Draw
+                {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
+                point_cursor(&runtime);
             }
             Event::PointerDown { x, y, clicks, modifiers } => {
                 if runtime.pointer_clicked(x, y, clicks, modifiers) {
@@ -381,7 +518,9 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 // browser deltas are the OPPOSITE of the engine's
                 // convention (positive reveals content above) — the
                 // sign flips here, once
-                if runtime.wheel(x, y, -dx, -dy) {
+                if runtime.wheel(x, y, -dx, -dy)
+                    && pacer.ask(ORIGIN_WHEEL, Urgency::Soon, false) == Verdict::Draw
+                {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
@@ -404,10 +543,15 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                 }
             }
             Event::Frame { dt } => {
-                if runtime.tick(dt).any() {
+                // The beat is also where the events that could wait are
+                // drawn: ONE settled frame for every wheel, move and wake
+                // since the last beat. It carries the tick too, so the
+                // springs lose nothing.
+                let moved = runtime.tick(dt);
+                if pacer.beat(false) == Beat::Draw {
+                    present(&runtime, &full, size, scale, &mut surface);
+                } else if moved.any() {
                     present(&runtime, &tick, size, scale, &mut surface);
-                } else if runtime.wants_frame() {
-                    unsafe { js_request_frame() };
                 }
             }
             Event::Resize { width, height, scale: ratio } => {
@@ -418,7 +562,9 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
             }
             Event::TooltipTick => {
                 // the same slow beat ages a sequence in the air: two
-                // ticks and `cmd-k` lets the keyboard go
+                // ticks and `cmd-k` lets the keyboard go — and the
+                // wheel's latch: two ticks with no wheel end the gesture
+                runtime.wheel_tick();
                 if runtime.tooltip_tick() | runtime.chord_tick() {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
@@ -436,11 +582,26 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
                     unsafe { js_request_frame() };
                 }
             }
-            Event::ImageReady | Event::Wake => {
-                // the layout reflows around the fresh intrinsic size
-                // (or around what a task just wrote) and the paint asks
-                // the engine again — one full frame, settle included
+            Event::ImageReady => {
+                // the layout reflows around the fresh intrinsic size and
+                // the paint asks the engine again — one full frame, settle
+                // included
                 present(&runtime, &full, size, scale, &mut surface);
+            }
+            Event::Wake => {
+                // The work always lands: the tasks are polled. The FRAME is
+                // for a turn that changed something. Most wakes change
+                // nothing — a poll that found no news, a sleeper that went
+                // back to sleep — and a page with a few of those mounted
+                // drew whole frames of what was already on screen. A turn
+                // that did change something folds into the beat like a
+                // wheel does: a stream of results is one frame a beat.
+                runtime.poll_tasks();
+                if runtime.needs_frame()
+                    && pacer.ask(ORIGIN_WAKE, Urgency::Soon, false) == Verdict::Draw
+                {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
             }
             // Dom-mode traffic — this shell rasterizes, nothing to do
             Event::DomScroll { .. }
@@ -450,6 +611,20 @@ pub fn start(width: f64, height: f64, scale: f64, root: impl View + 'static) {
             | Event::Action { .. }
             | Event::Field { .. } => {}
         }
+        // A frame went up, whoever asked: the asks it carried are served.
+        if drew.replace(false) {
+            pacer.drew();
+        }
+        // The beat runs while a spring, a sleeper or a warm period wants it.
+        // `present` re-arms it for the first two; a turn that did not draw —
+        // an event that waits, a wake with no news — still has to, and the
+        // pacer hears whether a beat is coming at all: while one is, an
+        // event that can wait is never drawn cold.
+        let beating = pacer.warm() || runtime.wants_frame();
+        if beating {
+            unsafe { js_request_frame() };
+        }
+        pacer.set_beating(beating);
     });
     SHELL.with(|slot| {
         *slot.borrow_mut() = Some(Shell { handle });
@@ -613,7 +788,9 @@ fn start_dom_with(
             }
             Event::TooltipTick => {
                 // the same slow beat ages a sequence in the air: two
-                // ticks and `cmd-k` lets the keyboard go
+                // ticks and `cmd-k` lets the keyboard go — and the
+                // wheel's latch: two ticks with no wheel end the gesture
+                runtime.wheel_tick();
                 if runtime.tooltip_tick() | runtime.chord_tick() {
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
@@ -738,8 +915,9 @@ pub extern "C" fn bunny_pointer_move(x: f64, y: f64, mods: u32) {
 }
 
 /// One beat of the glue's slow clock: the tooltip ages, then shows.
-/// The glue arms two of these after a pointer settles — the runtime
-/// no-ops the strays.
+/// The glue arms two of these after a pointer settles, and after a
+/// wheel (the second one ends the scroll gesture) — the runtime no-ops
+/// the strays.
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_tooltip_tick() {
     dispatch(Event::TooltipTick);

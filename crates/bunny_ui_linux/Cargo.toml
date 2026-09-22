@@ -8,7 +8,7 @@ edition.workspace = true
 autoexamples = false
 
 [dependencies]
-bunny-ui = { workspace = true, features = ["canvas", "gpu"] }
+bunny-ui = { workspace = true, features = ["canvas", "gpu", "codec"] }
 bunny-ui-vulkan.workspace = true
 
 [dev-dependencies]
@@ -54,3 +54,31 @@ path = "examples/countries_window.rs"
 [[example]]
 name = "bench_pipeline_linux"
 path = "examples/bench_pipeline_linux.rs"
+
+[[example]]
+name = "two_windows_linux"
+path = "examples/two_windows.rs"
+
+[[example]]
+name = "browser_window_linux"
+path = "examples/browser_window.rs"
+
+[[example]]
+name = "life_window_linux"
+path = "examples/life_window.rs"
+
+[[example]]
+name = "glass_window_linux"
+path = "examples/glass_window.rs"
+
+[[example]]
+name = "scroll_window_linux"
+path = "examples/scroll_window.rs"
+
+[[example]]
+name = "table_window_linux"
+path = "examples/table_window.rs"
+
+[[example]]
+name = "compose_window_linux"
+path = "examples/compose_window.rs"

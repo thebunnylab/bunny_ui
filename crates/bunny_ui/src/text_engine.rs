@@ -579,9 +579,16 @@ fn wrap_paragraph(
 
 type BreakLines = std::rc::Rc<Vec<(usize, usize)>>;
 
-/// A prev/current double-buffer swapped per layout pass: a hit promotes
-/// to current, the swap discards what nobody asked for in the frame — an
-/// exact-frame LRU, no timer.
+/// Measures and line breaks, kept by text: shaping is the costly call,
+/// and a scene asks for the same strings on every pass that measures.
+///
+/// An entry AGES, and an old one is dropped — but only in a cache that is
+/// full ([`MeasureCache::floor`]). The layout no longer measures a boundary
+/// that did not re-run, so a string can go many frames without a lookup and
+/// still be on screen. An age rule alone would empty the cache between two
+/// keystrokes, and the body that re-runs would re-shape every string in
+/// it. Under the floor nothing is dropped, and the pass does not even walk
+/// the entries.
 ///
 /// The maps are NESTED by font (and by width, for the breaks): the
 /// hot-path lookup queries by `&str` without allocating any key — only
@@ -594,6 +601,10 @@ pub struct MeasureCache {
     /// The cache clock: one tick per layout pass — entry age is measured
     /// against it.
     frame: std::cell::Cell<u32>,
+    /// Entries in both maps. A sweep recounts it.
+    entries: std::cell::Cell<usize>,
+    /// The size under which nothing ages out. `None` = [`CACHE_FLOOR`].
+    floor: Option<usize>,
     lines: RefCell<HashMap<FontKey, HashMap<String, (LineMetrics, std::cell::Cell<u32>)>>>,
     breaks:
         RefCell<HashMap<(FontKey, u32), HashMap<String, (BreakLines, std::cell::Cell<u32>)>>>,
@@ -605,12 +616,35 @@ pub struct MeasureCache {
 /// frame of absence. Eight frames of slack cost a few KiB.
 const CACHE_KEEP_FRAMES: u32 = 8;
 
+/// The size under which the cache drops nothing. A few thousand strings
+/// with their metrics are well under a mebibyte, and a product screen
+/// holds fewer than that.
+const CACHE_FLOOR: usize = 8192;
+
+/// A full cache is swept on one pass in this many, not on every one.
+const SWEEP_EVERY: u32 = 8;
+
 impl MeasureCache {
-    /// The start of a layout pass: clock tick + age sweep (drops what
-    /// went [`CACHE_KEEP_FRAMES`] without use).
+    /// A cache that starts to age its entries at `floor` of them — `0`
+    /// ages every entry, which is the rule the age tests pin.
+    pub fn with_floor(floor: usize) -> MeasureCache {
+        MeasureCache { floor: Some(floor), ..MeasureCache::default() }
+    }
+
+    fn floor(&self) -> usize {
+        self.floor.unwrap_or(CACHE_FLOOR)
+    }
+
+    /// The start of a layout pass: the clock ticks. A cache over its floor
+    /// is swept — what went [`CACHE_KEEP_FRAMES`] without use is dropped —
+    /// on one pass in [`SWEEP_EVERY`]; with a floor of zero, on every pass.
     pub fn begin_frame(&self) {
         let frame = self.frame.get().wrapping_add(1);
         self.frame.set(frame);
+        let floor = self.floor();
+        if self.entries.get() <= floor || (floor > 0 && frame % SWEEP_EVERY != 0) {
+            return;
+        }
         let mut lines = self.lines.borrow_mut();
         for by_text in lines.values_mut() {
             by_text.retain(|_, (_, used)| frame.wrapping_sub(used.get()) <= CACHE_KEEP_FRAMES);
@@ -621,6 +655,9 @@ impl MeasureCache {
             by_text.retain(|_, (_, used)| frame.wrapping_sub(used.get()) <= CACHE_KEEP_FRAMES);
         }
         breaks.retain(|_, by_text| !by_text.is_empty());
+        let kept = lines.values().map(HashMap::len).sum::<usize>()
+            + breaks.values().map(HashMap::len).sum::<usize>();
+        self.entries.set(kept);
     }
 
     pub fn get_or_measure(
@@ -648,6 +685,7 @@ impl MeasureCache {
             .entry(font_key)
             .or_default()
             .insert(text.to_string(), (measured, std::cell::Cell::new(self.frame.get())));
+        self.entries.set(self.entries.get() + 1);
         measured
     }
 
@@ -675,6 +713,7 @@ impl MeasureCache {
             .entry(mode)
             .or_default()
             .insert(text.to_string(), (broken.clone(), std::cell::Cell::new(self.frame.get())));
+        self.entries.set(self.entries.get() + 1);
         broken
     }
 }
@@ -731,7 +770,8 @@ mod tests {
 
         let calls = Rc::new(Cell::new(0));
         let engine = Counting(Rc::clone(&calls));
-        let cache = MeasureCache::default();
+        // a floor of zero: every entry ages, on every pass
+        let cache = MeasureCache::with_floor(0);
 
         cache.begin_frame();
         cache.get_or_measure("hello", &FontSpec::DEFAULT, &engine);
@@ -755,5 +795,19 @@ mod tests {
         }
         cache.get_or_measure("hello", &FontSpec::DEFAULT, &engine);
         assert_eq!(calls.get(), 2, "going past the window discards the entry");
+
+        // …and under its floor a cache drops nothing, however long a
+        // string goes without a lookup: a boundary that did not re-run is
+        // not measured, and its text is still on screen
+        let calls = Rc::new(Cell::new(0));
+        let engine = Counting(Rc::clone(&calls));
+        let cache = MeasureCache::default();
+        cache.begin_frame();
+        cache.get_or_measure("hello", &FontSpec::DEFAULT, &engine);
+        for _ in 0..10 * CACHE_KEEP_FRAMES {
+            cache.begin_frame();
+        }
+        cache.get_or_measure("hello", &FontSpec::DEFAULT, &engine);
+        assert_eq!(calls.get(), 1, "a cache under its floor keeps what it measured");
     }
 }

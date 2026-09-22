@@ -269,7 +269,8 @@ thread_local! {
     /// A handler is running: anything raised from inside it queues.
     static DISPATCHING: Cell<bool> = const { Cell::new(false) };
     /// What was raised while a handler ran, in the order it was raised.
-    static PENDING: RefCell<Vec<(usize, AppEvent)>> = const { RefCell::new(Vec::new()) };
+    static PENDING: RefCell<std::collections::VecDeque<(usize, AppEvent)>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
     /// Every top-level window the app has open, in the order they were
     /// created, with the view and delegate that came with it. The app
     /// quits when the LAST one closes — with one window that is the old
@@ -309,6 +310,8 @@ impl Default for Manners {
 /// which is to say on the very next frame. That crash is what this
 /// function exists to have already prevented.
 fn forget_window(window: usize) {
+    // a window that closed wants no beat
+    BEAT_WANTS.with(|wants| wants.borrow_mut().retain(|(open, _)| *open != window));
     let view = WINDOWS.with(|windows| {
         windows
             .borrow()
@@ -439,7 +442,7 @@ fn dispatch_from(source: usize, event: AppEvent) {
     // finishes, in the order it was raised. Dropping it would trade an abort
     // for a window that never draws.
     if DISPATCHING.with(Cell::get) {
-        PENDING.with(|queue| queue.borrow_mut().push((source, event)));
+        PENDING.with(|queue| hold(&mut queue.borrow_mut(), source, event));
         return;
     }
     DISPATCHING.with(|flag| flag.set(true));
@@ -454,13 +457,38 @@ fn dispatch_from(source: usize, event: AppEvent) {
     // …and whatever the handler raised while it ran, in order. Each one is a
     // full dispatch, so an event raised by one of THOSE queues behind it.
     loop {
-        let next = PENDING.with(|queue| {
-            let mut queue = queue.borrow_mut();
-            if queue.is_empty() { None } else { Some(queue.remove(0)) }
-        });
+        let next = PENDING.with(|queue| queue.borrow_mut().pop_front());
         let Some((source, event)) = next else { break };
         dispatch_from(source, event);
     }
+}
+
+/// An event that waits behind a running handler joins the line — and a
+/// CLOCK that ticks again while it waits folds into its twin at the end of
+/// it. A handler can run for as long as a person takes: a modal panel, a
+/// menu, an alert keep their own loop inside it, and the beat, the blink and
+/// every worker's wake kept arriving — thousands of them, each replayed in
+/// full when the panel closed, which is a window that answers late in
+/// proportion to how long the reader thought.
+///
+/// Only the LAST of the line is looked at, and only its own window's, so
+/// nothing is ever reordered: a beat absorbs the next beat's time (capped at
+/// the step a resume is capped at, so a spring never sees the whole wait as
+/// one step), a wake is a wake, a blink is a blink.
+fn hold(queue: &mut std::collections::VecDeque<(usize, AppEvent)>, source: usize, event: AppEvent) {
+    if let Some((waiting_source, waiting)) = queue.back_mut()
+        && *waiting_source == source
+    {
+        match (waiting, &event) {
+            (AppEvent::Frame { dt: held }, AppEvent::Frame { dt }) => {
+                *held = (*held + dt).min(1.0 / 30.0);
+                return;
+            }
+            (AppEvent::Wake, AppEvent::Wake) | (AppEvent::Blink, AppEvent::Blink) => return,
+            _ => {}
+        }
+    }
+    queue.push_back((source, event));
 }
 
 /// Delivers an event to the handler — used by the callbacks and by the
@@ -1405,6 +1433,45 @@ pub enum DriverPace {
     Slow(f64),
     /// Nothing moves.
     Off,
+}
+
+impl DriverPace {
+    /// The pace that serves both: the link serves everything, and of two
+    /// slow beats the shorter step serves both clocks.
+    fn faster(self, other: DriverPace) -> DriverPace {
+        match (self, other) {
+            (DriverPace::Full, _) | (_, DriverPace::Full) => DriverPace::Full,
+            (DriverPace::Slow(a), DriverPace::Slow(b)) => DriverPace::Slow(a.min(b)),
+            (DriverPace::Slow(step), DriverPace::Off) | (DriverPace::Off, DriverPace::Slow(step)) => {
+                DriverPace::Slow(step)
+            }
+            (DriverPace::Off, DriverPace::Off) => DriverPace::Off,
+        }
+    }
+}
+
+thread_local! {
+    /// The pace EACH window wants. The driver is one for the app, and every
+    /// window's handler says its own pace at the tail of every event: with
+    /// one slot, the last window to speak decided — an idle window paused
+    /// the link under another window's spring, and would pause it under
+    /// another window's pending frames.
+    static BEAT_WANTS: RefCell<Vec<(usize, DriverPace)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// One window says the pace it wants; the driver runs at the fastest pace
+/// any window wants. `true` = the display link runs now.
+pub fn want_beat(window: usize, pace: DriverPace) -> bool {
+    let effective = BEAT_WANTS.with(|wants| {
+        let mut wants = wants.borrow_mut();
+        match wants.iter_mut().find(|(open, _)| *open == window) {
+            Some(entry) => entry.1 = pace,
+            None => wants.push((window, pace)),
+        }
+        wants.iter().fold(DriverPace::Off, |pace, (_, wanted)| pace.faster(*wanted))
+    });
+    set_frame_driver(effective);
+    effective == DriverPace::Full
 }
 
 /// Points the frame driver at the pace the moment deserves. Without a
@@ -3333,5 +3400,44 @@ mod tests {
             );
             assert_ne!(responds, 0, "NSEvent has no charactersByApplyingModifiers:");
         }
+    }
+}
+
+#[cfg(test)]
+mod the_line_behind_a_handler {
+    use super::{AppEvent, hold};
+    use std::collections::VecDeque;
+
+    /// A clock that ticks again behind a running handler folds into its
+    /// twin; nothing else does, and nothing is reordered.
+    #[test]
+    fn a_clock_that_waits_folds_into_its_twin() {
+        let mut line = VecDeque::new();
+        for _ in 0..1000 {
+            hold(&mut line, 7, AppEvent::Frame { dt: 1.0 / 120.0 });
+            hold(&mut line, 7, AppEvent::Frame { dt: 1.0 / 120.0 });
+        }
+        assert_eq!(line.len(), 1, "two thousand beats wait as one");
+        assert!(
+            matches!(line[0], (7, AppEvent::Frame { dt }) if (dt - 1.0 / 30.0).abs() < 1e-9),
+            "and carry a step a spring can take, not the whole wait"
+        );
+        hold(&mut line, 7, AppEvent::Wake);
+        hold(&mut line, 7, AppEvent::Wake);
+        hold(&mut line, 7, AppEvent::Blink);
+        hold(&mut line, 7, AppEvent::Blink);
+        assert_eq!(line.len(), 3, "a wake is a wake, a blink is a blink");
+
+        // an event between two clocks keeps them apart: the order stands
+        hold(&mut line, 7, AppEvent::MouseExited);
+        hold(&mut line, 7, AppEvent::Blink);
+        assert_eq!(line.len(), 5);
+        // another window's clock is another clock
+        hold(&mut line, 9, AppEvent::Blink);
+        assert_eq!(line.len(), 6);
+        // and an event that is not a clock never folds
+        hold(&mut line, 9, AppEvent::MouseExited);
+        hold(&mut line, 9, AppEvent::MouseExited);
+        assert_eq!(line.len(), 8);
     }
 }

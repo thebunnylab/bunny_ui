@@ -1588,8 +1588,9 @@ where
                 let (prints, layouts) = row.into_parts();
                 let row_layout = match path {
                     Some(path) => LayoutNode::Boundary {
-                        path,
+                        path: path.into(),
                         children: vec![wrap_layout(layouts)],
+                        quiet: Default::default(),
                     },
                     None => wrap_layout(layouts),
                 };
@@ -1871,8 +1872,9 @@ where
                 let (row_prints, layouts) = row.into_parts();
                 let row_layout = match path {
                     Some(path) => LayoutNode::Boundary {
-                        path,
+                        path: path.into(),
                         children: vec![wrap_layout(layouts)],
+                        quiet: Default::default(),
                     },
                     None => wrap_layout(layouts),
                 };

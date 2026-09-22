@@ -20,7 +20,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 8;
+const EXPECTED_ABI = 9;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -1086,11 +1086,19 @@ const GPU_VERBS = [
   "gl_draw_arrays", "gl_draw_arrays_instanced", "gl_read_pixels",
 ];
 
+// Keyed by the modules' RELATIVE names — see glue.js on why.
 const imports = {
-  bunny_gpu:
+  "./bunny_gpu.js":
     typeof bunnyGlImports === "object" ? bunnyGlImports : bunnyGlStubsOrNothing(),
-  bunny: {
+  "./bunny.js": {
     js_blit() {},
+    // a focused island copied: the same road the canvas shell takes
+    js_clipboard_write(pointer, length) {
+      const text = decoder.decode(new Uint8Array(wasm.memory.buffer, pointer, length));
+      if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+    },
+    // the browser owns hover in this mode; the shell never asks
+    js_set_cursor() {},
     // The loop clocks' driver. Springs are the browser's here (a spec
     // lowers to a CSS transition), so this only ever runs while a
     // `.looping(…)` box is alive — and only when the reader allows

@@ -33,8 +33,6 @@
 //! keep `#![forbid(unsafe_code)]`.
 
 pub mod keys;
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
-mod face;
 
 #[cfg(target_os = "android")]
 #[macro_use]
@@ -49,6 +47,8 @@ mod image;
 mod text;
 #[cfg(target_os = "android")]
 mod app;
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub mod credentials;
 #[cfg(target_os = "android")]
 mod notify;
 
@@ -58,6 +58,23 @@ pub use app::{run_window, run_window_with, App, WindowId, WindowSpec, MANY_WINDO
 pub use image::AndroidImageEngine;
 #[cfg(target_os = "android")]
 pub use text::AndroidTextEngine;
+
+/// Where this app may WRITE: the activity's own private files directory.
+///
+/// Every other shell hands an app a home the OS already named — `$HOME` on
+/// the Unixes, the container on iOS, `%APPDATA%` on Windows. Android names
+/// none: an app process inherits no writable path in its environment, and the
+/// one directory it may write without a permission and without asking is the
+/// activity's, which only the activity knows. So the shell answers, the way
+/// it answers for the clipboard and the insets.
+///
+/// `None` before the system has handed an activity over, and if the platform
+/// left the path null — an app that cannot write is a sentence to say, not a
+/// path to guess.
+#[cfg(target_os = "android")]
+pub fn data_dir() -> Option<std::path::PathBuf> {
+    ffi::internal_data_path().map(std::path::PathBuf::from)
+}
 
 /// Exports the entry point the system looks for — `ANativeActivity_onCreate`
 /// — from the app's own shared object, and hands it `$main`: the
@@ -103,6 +120,7 @@ pub unsafe fn on_create(activity: *mut ::core::ffi::c_void, saved_state_size: us
 /// A switch the app has no environment for: the system property `name`
 /// (`adb shell setprop debug.bunny.<switch> 1`), or `None` when it is
 /// not set. Read each time — a property set after the launch counts.
+#[cfg(target_os = "android")]
 pub fn property(name: &str) -> Option<String> {
     let name = std::ffi::CString::new(name).ok()?;
     log::property(&name)
