@@ -322,6 +322,9 @@ pub struct Runtime {
     /// time, so the number needs no key: it belongs to whatever
     /// `interaction.pressed` names, and the release takes it.
     pressed_clicks: Cell<u8>,
+    /// Original word/line selected by a field press. Held motion extends
+    /// from this entire unit, never from a partially swept caret.
+    field_unit_anchor: Cell<Option<(usize, usize)>>,
     /// The finger's state machine — what a touch means is decided here
     /// and performed through the pointer's own doors ([`crate::touch`]).
     touch: RefCell<crate::touch::Recognizer>,
@@ -1187,6 +1190,7 @@ impl Runtime {
             last_drop_rings: RefCell::new(Vec::new()),
             drag_armed: RefCell::new(None),
             pressed_clicks: Cell::new(1),
+            field_unit_anchor: Cell::new(None),
             touch: RefCell::new(crate::touch::Recognizer::new()),
             touch_modality: Cell::new(false),
             in_touch: Cell::new(false),
@@ -1762,10 +1766,7 @@ impl Runtime {
     /// `.on_submit` asked for. The answer's `text` is what a copy
     /// hands the platform's clipboard; `handled: false` sends the
     /// stroke on to the app's bindings.
-    pub fn key_stroke(
-        &self,
-        stroke: impl Into<crate::action::Stroke>,
-    ) -> crate::custom::Response {
+    pub fn key_stroke(&self, stroke: impl Into<crate::action::Stroke>) -> crate::custom::Response {
         self.enter_scene();
         let stroke = stroke.into();
         let pattern = &stroke.pattern;
@@ -1786,6 +1787,57 @@ impl Runtime {
                 && self.submit(&path).applied
             {
                 return crate::custom::Response::handled();
+            }
+        }
+        if let Some(path) = self.focused() {
+            let mut state = self.carets.borrow().get(&path).copied().unwrap_or_default();
+            if reconciler::field_key(&path, &stroke, &mut state) {
+                self.carets.borrow_mut().insert(path.clone(), state);
+                self.caret_visible.set(true);
+                self.frame_asked.set(true);
+                self.goal_column.set(None);
+                self.reveal_caret(&path);
+                return crate::custom::Response::handled();
+            }
+        }
+        if let Some(path) = self.focused()
+            && self.field_at(&path).is_some()
+        {
+            use crate::action::Key;
+            let edit = match pattern.key {
+                Key::Enter if pattern.is_plain() && pattern.shift => {
+                    Some(EditCommand::Insert("\n".into()))
+                }
+                Key::Enter if pattern.is_plain() && reconciler::field_submits_on_enter(&path) => {
+                    Some(EditCommand::Submit)
+                }
+                Key::Left if pattern.command && !pattern.control && !pattern.option => {
+                    Some(EditCommand::LineStart(pattern.shift))
+                }
+                Key::Right if pattern.command && !pattern.control && !pattern.option => {
+                    Some(EditCommand::LineEnd(pattern.shift))
+                }
+                Key::Up if pattern.command && !pattern.control && !pattern.option => {
+                    Some(EditCommand::Home(pattern.shift))
+                }
+                Key::Down if pattern.command && !pattern.control && !pattern.option => {
+                    Some(EditCommand::End(pattern.shift))
+                }
+                Key::Left if pattern.option && !pattern.command && !pattern.control => {
+                    Some(EditCommand::WordLeft(pattern.shift))
+                }
+                Key::Right if pattern.option && !pattern.command && !pattern.control => {
+                    Some(EditCommand::WordRight(pattern.shift))
+                }
+                _ => None,
+            };
+            if let Some(edit) = edit {
+                // A one-line field must not consume Shift+Enter as text.
+                let multiline = self.field_at(&path).is_some_and(|field| field.multiline);
+                if (!matches!(edit, EditCommand::Insert(_)) || multiline) && self.key(edit).applied
+                {
+                    return crate::custom::Response::handled();
+                }
             }
         }
         let Some(placement) = self.focused_custom() else {
@@ -1912,6 +1964,7 @@ impl Runtime {
         // risen press of a box, the thumb, the seam and the ordinary
         // tail all take their count from here, and the release takes it
         self.pressed_clicks.set(clicks);
+        self.field_unit_anchor.set(None);
         let target = self.hover_target(x, y);
         // a press inside the app's box hands it the pointer: nothing
         // arms by default (a box has no up-inside action to mis-fire)
@@ -1996,6 +2049,7 @@ impl Runtime {
         // including the ones that end a drag, a grab, a seam or a thumb
         // and fire no action at all, so the next gesture starts at one
         let clicks = self.pressed_clicks.replace(1);
+        self.field_unit_anchor.set(None);
         // a live drag ends here: over a compatible target the value
         // lands (the drag clears FIRST — the action writes state into
         // a world without it); anywhere else it just goes home
@@ -2331,6 +2385,7 @@ impl Runtime {
 
     fn pointer_cancelled_road(&self) -> bool {
         self.pressed_clicks.set(1);
+        self.field_unit_anchor.set(None);
         self.drag_armed.borrow_mut().take();
         let dragged = self.drag_value.borrow_mut().take().is_some();
         if dragged {
@@ -2915,14 +2970,13 @@ impl Runtime {
     /// itself through [`crate::custom::CustomElement::takes_text`],
     /// which is how a modal editor keeps its command mode.
     pub fn focus_takes_text(&self) -> bool {
+        self.enter_scene();
         let Some(path) = self.focused() else {
             return false;
         };
         match self.custom_at(&path) {
             Some(placement) => placement.element.element().takes_text(),
-            // a field types, always — the box that is not the app's is
-            // the framework's own, and it has no mode
-            None => true,
+            None => reconciler::field_takes_text(&path),
         }
     }
 
@@ -2981,6 +3035,8 @@ impl Runtime {
             // selection at all, and the next move gives it width
             _ => CaretState { caret, anchor: Some(caret), marked: None },
         };
+        self.field_unit_anchor
+            .set((clicks >= 2).then_some((state.anchor.unwrap_or(state.caret), state.caret)));
         self.carets.borrow_mut().insert(path.to_string(), state);
         self.reveal_caret(path);
     }
@@ -2990,14 +3046,28 @@ impl Runtime {
     /// must repaint.
     fn sweep_to(&self, path: &str, x: Px, y: Px) -> bool {
         self.goal_column.set(None);
-        let Some((_, caret, _)) = self.caret_under(path, x, y) else { return false };
+        let Some((text, caret, line)) = self.caret_under(path, x, y) else {
+            return false;
+        };
         let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
-        if state.caret == caret {
+        let (anchor, caret) = if let Some((start, end)) = self.field_unit_anchor.get() {
+            let target = if self.pressed_clicks.get() == 2 {
+                word_around(&text, caret)
+            } else {
+                line
+            };
+            if target.0 < start {
+                (end, target.0)
+            } else {
+                (start, target.1.max(end))
+            }
+        } else {
+            (state.anchor.unwrap_or(state.caret), caret)
+        };
+        if state.caret == caret && state.anchor == Some(anchor) {
             return false;
         }
-        // a sweep that begins before the first layout has no anchor to
-        // sweep from — it drops one where it started
-        state.anchor = Some(state.anchor.unwrap_or(state.caret));
+        state.anchor = Some(anchor);
         state.caret = caret;
         self.carets.borrow_mut().insert(path.to_string(), state);
         self.caret_visible.set(true);
@@ -3126,7 +3196,7 @@ impl Runtime {
         };
         if field.multiline {
             let lines = self.wrap(text, &field);
-            let row = crate::layout::line_of(&lines, caret);
+            let row = crate::layout::caret_line(&lines, caret, reconciler::field_caret_shape(path));
             offset.x = 0.0;
             offset.y = follow(
                 row as Px * field.line_height,
@@ -3154,6 +3224,9 @@ impl Runtime {
     /// as a break; a one-line one declines, and the stroke goes on to
     /// the app's bindings — which is why `⌘↵` still commits.
     fn insert_break(&self, path: &str) -> Edited {
+        if reconciler::field_submits_on_enter(path) {
+            return self.submit(path);
+        }
         match self.field_at(path).is_some_and(|field| field.multiline) {
             true => self.key(EditCommand::Insert("\n".into())),
             // a one-line field has no break to take, so the bare
@@ -3429,6 +3502,7 @@ impl Runtime {
         // Enter and of the vertical arrows
         match command {
             EditCommand::Newline => return self.insert_break(&path),
+            EditCommand::Submit => return self.submit(&path),
             EditCommand::Up(select) => return self.walk_line(&path, false, select),
             EditCommand::Down(select) => return self.walk_line(&path, true, select),
             // any other command is a fresh start for the walk's column
@@ -5551,5 +5625,39 @@ impl crate::touch::TouchScene for Runtime {
         self.reachable(&menus, |floor| floor.menus)
             .iter()
             .any(|region| region.rect.contains(at.x, at.y))
+    }
+}
+
+/// Files offered by the operating system, distinct from an internal drag.
+#[derive(Clone, Debug)]
+pub struct ExternalPaths(pub Vec<std::path::PathBuf>);
+
+impl Runtime {
+    /// Preview a native file drag using the same clipped drop targets as an internal drag.
+    pub fn external_drag(&self, x: Px, y: Px, files: &ExternalPaths) -> bool {
+        self.enter_scene();
+        let region = self.drop_at(x, y, files);
+        self.note_drag_preview(region.as_ref(), x, y);
+        region.is_some() && !files.0.is_empty()
+    }
+
+    /// Deliver native files only to the accepting target under the pointer.
+    pub fn external_drop(&self, x: Px, y: Px, files: ExternalPaths) -> bool {
+        self.enter_scene();
+        let region = self.drop_at(x, y, &files);
+        self.note_drag_preview(None, x, y);
+        if files.0.is_empty() {
+            return false;
+        }
+        let Some(region) = region else { return false };
+        (region.action.0)(&files, Self::drop_point(&region, x, y));
+        self.frame_asked.set(true);
+        true
+    }
+
+    /// Clear a native drag preview when the pointer leaves the window.
+    pub fn external_drag_exited(&self) {
+        self.enter_scene();
+        self.note_drag_preview(None, 0.0, 0.0);
     }
 }

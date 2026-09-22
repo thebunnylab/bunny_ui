@@ -251,6 +251,8 @@ pub struct WindowId(usize);
 /// an app that must run on all of them asks before it detaches.
 pub const MANY_WINDOWS: bool = true;
 
+type FileDragFn = Box<dyn Fn(f64, f64, Vec<std::path::PathBuf>, ffi::FileDrag) -> bool>;
+
 /// Everything one window owns for as long as it is open. The app holds
 /// these and routes every event to the one it belongs to.
 struct Slot {
@@ -260,6 +262,7 @@ struct Slot {
     handler: RefCell<Box<dyn FnMut(AppEvent)>>,
     key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,
     drag_gate: Box<dyn Fn(f64, f64) -> bool>,
+    file_drag: FileDragFn,
     ime_index: Box<dyn Fn(f64, f64) -> Option<u64>>,
     ime_rect: Box<dyn Fn(u64) -> Option<ffi::CGRect>>,
     on_web: Box<dyn Fn(webview::WebviewEvent)>,
@@ -406,6 +409,13 @@ impl AppInner {
         let app = Rc::clone(&self);
         ffi::set_drag_gate(Box::new(move |x, y| {
             app.addressed().is_some_and(|slot| (slot.drag_gate)(x, y))
+        }));
+        let app = Rc::clone(&self);
+        ffi::set_file_drag(Box::new(move |source, x, y, paths, phase| {
+            app.live()
+                .into_iter()
+                .find(|slot| slot.window == source)
+                .is_some_and(|slot| (slot.file_drag)(x, y, paths, phase))
         }));
         let index_app = Rc::clone(&self);
         let rect_app = Rc::clone(&self);
@@ -1591,6 +1601,24 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let handler_pacer = Rc::clone(&pacer);
     let handler_resizing = Rc::clone(&resizing);
     let soon = soon.clone();
+    let file_drag = Box::new({
+        let runtime = Rc::clone(&runtime);
+        let root = Rc::clone(&root);
+        let blit = blit.clone();
+        move |x, y, paths, phase| {
+            let files = bunny_ui::runtime::ExternalPaths(paths);
+            let accepted = match phase {
+                ffi::FileDrag::Preview => runtime.external_drag(x, y, &files),
+                ffi::FileDrag::Drop => runtime.external_drop(x, y, files),
+                ffi::FileDrag::Exit => {
+                    runtime.external_drag_exited();
+                    false
+                }
+            };
+            blit(&runtime, &*root, trace::Origin::Input);
+            accepted
+        }
+    });
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
@@ -1922,16 +1950,24 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 "moveRight:" => Some(EditCommand::Right(false)),
                 "moveLeftAndModifySelection:" => Some(EditCommand::Left(true)),
                 "moveRightAndModifySelection:" => Some(EditCommand::Right(true)),
-                "moveToBeginningOfLine:" | "moveToLeftEndOfLine:" | "moveUp:" => {
-                    Some(EditCommand::Home(false))
-                }
+                "moveWordLeft:" | "moveWordBackward:" => Some(EditCommand::WordLeft(false)),
+                "moveWordRight:" | "moveWordForward:" => Some(EditCommand::WordRight(false)),
+                "moveWordLeftAndModifySelection:" | "moveWordBackwardAndModifySelection:" => Some(EditCommand::WordLeft(true)),
+                "moveWordRightAndModifySelection:" | "moveWordForwardAndModifySelection:" => Some(EditCommand::WordRight(true)),
+                "moveToBeginningOfLine:" | "moveToLeftEndOfLine:" => Some(EditCommand::LineStart(false)),
+                "moveUp:" => Some(EditCommand::Up(false)),
+                "moveDown:" => Some(EditCommand::Down(false)),
+                "moveToBeginningOfDocument:" => Some(EditCommand::Home(false)),
+                "moveToEndOfDocument:" => Some(EditCommand::End(false)),
+                "moveToBeginningOfDocumentAndModifySelection:" => Some(EditCommand::Home(true)),
+                "moveToEndOfDocumentAndModifySelection:" => Some(EditCommand::End(true)),
                 "moveToBeginningOfLineAndModifySelection:"
-                | "moveToLeftEndOfLineAndModifySelection:" => Some(EditCommand::Home(true)),
-                "moveToEndOfLine:" | "moveToRightEndOfLine:" | "moveDown:" => {
-                    Some(EditCommand::End(false))
+                | "moveToLeftEndOfLineAndModifySelection:" => Some(EditCommand::LineStart(true)),
+                "moveToEndOfLine:" | "moveToRightEndOfLine:" => {
+                    Some(EditCommand::LineEnd(false))
                 }
                 "moveToEndOfLineAndModifySelection:"
-                | "moveToRightEndOfLineAndModifySelection:" => Some(EditCommand::End(true)),
+                | "moveToRightEndOfLineAndModifySelection:" => Some(EditCommand::LineEnd(true)),
                 "selectAll:" => Some(EditCommand::SelectAll),
                 "cancelOperation:" => {
                     // esc releases focus
@@ -1966,6 +2002,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         handler: RefCell::new(handler),
         key_gate: RefCell::new(key_gate),
         drag_gate,
+        file_drag,
         ime_index,
         ime_rect,
         on_web,
