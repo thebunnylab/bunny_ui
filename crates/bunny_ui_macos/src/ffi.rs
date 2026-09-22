@@ -551,6 +551,87 @@ pub fn set_drag_gate(gate: Box<dyn Fn(f64, f64) -> bool>) {
     DRAG_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
 }
 
+/// The lifecycle of a native file drag.
+#[derive(Clone, Copy)]
+pub enum FileDrag {
+    Preview,
+    Drop,
+    Exit,
+}
+type FileDragHandler = Box<dyn Fn(usize, f64, f64, Vec<std::path::PathBuf>, FileDrag) -> bool>;
+thread_local! {
+    static FILE_DRAG: RefCell<Option<FileDragHandler>> = const { RefCell::new(None) };
+}
+
+pub fn set_file_drag(handler: FileDragHandler) {
+    FILE_DRAG.with(|slot| *slot.borrow_mut() = Some(handler));
+}
+
+fn file_drag(this: Id, info: Id, phase: FileDrag) -> bool {
+    // AppKit lends the pasteboard and its strings for this callback; Rust owns
+    // the paths before the callback returns. No URL decoding by hand.
+    unsafe {
+        let board = msg_id(info, sel("draggingPasteboard"));
+        let kind = msg_id_cstr(
+            class("NSString"),
+            sel("stringWithUTF8String:"),
+            c"NSFilenamesPboardType".as_ptr(),
+        );
+        let names = msg_id_arg(board, sel("propertyListForType:"), kind);
+        let count = if names.is_null() {
+            0
+        } else {
+            msg_u64(names, sel("count"))
+        };
+        let paths = (0..count)
+            .map(|i| {
+                std::path::PathBuf::from(text_argument_to_string(msg_id_u64(
+                    names,
+                    sel("objectAtIndex:"),
+                    i,
+                )))
+            })
+            .collect();
+        let point = msg_point(info, sel("draggingLocation"));
+        let bounds = msg_rect(this, sel("bounds"));
+        let (dx, dy) = PANEL_ORIGINS
+            .with(|origins| origins.borrow().get(&(this as usize)).copied())
+            .unwrap_or((0.0, 0.0));
+        let source = owning_window(msg_id(this, sel("window")));
+        FILE_DRAG.with(|handler| {
+            handler.borrow().as_ref().is_some_and(|handler| {
+                handler(
+                    source,
+                    point.x + dx,
+                    bounds.size.height - point.y + dy,
+                    paths,
+                    phase,
+                )
+            })
+        })
+    }
+}
+extern "C" fn bunny_drag_preview(this: Id, _: Sel, info: Id) -> u64 {
+    u64::from(file_drag(this, info, FileDrag::Preview))
+}
+extern "C" fn bunny_file_drop(this: Id, _: Sel, info: Id) -> i8 {
+    i8::from(file_drag(this, info, FileDrag::Drop))
+}
+extern "C" fn bunny_drag_exit(this: Id, _: Sel, info: Id) {
+    file_drag(this, info, FileDrag::Exit);
+}
+unsafe fn register_file_drag(view: Id) {
+    unsafe {
+        let kind = msg_id_cstr(
+            class("NSString"),
+            sel("stringWithUTF8String:"),
+            c"NSFilenamesPboardType".as_ptr(),
+        );
+        let kinds = msg_id_arg(class("NSArray"), sel("arrayWithObject:"), kind);
+        msg_void_id(view, sel("registerForDraggedTypes:"), kinds);
+    }
+}
+
 extern "C" fn bunny_right_mouse_down(this: Id, _sel: Sel, event: Id) {
     let (x, y) = unsafe { event_layout_point(this, event) };
     dispatch(AppEvent::RightMouseDown { x, y });
@@ -1542,6 +1623,12 @@ unsafe fn register_classes() {
             types.as_ptr(),
         );
         class_addMethod(view, sel("mouseUp:"), bunny_mouse_up as *const c_void, types.as_ptr());
+        class_addMethod(view, sel("draggingEntered:"), bunny_drag_preview as *const c_void, c"Q@:@".as_ptr());
+        class_addMethod(view, sel("draggingUpdated:"), bunny_drag_preview as *const c_void, c"Q@:@".as_ptr());
+        class_addMethod(view, sel("performDragOperation:"), bunny_file_drop as *const c_void, c"c@:@".as_ptr());
+        class_addMethod(view, sel("draggingExited:"), bunny_drag_exit as *const c_void, types.as_ptr());
+        class_addMethod(view, sel("concludeDragOperation:"), bunny_drag_exit as *const c_void, types.as_ptr());
+
         class_addMethod(
             view,
             sel("rightMouseDown:"),
@@ -2859,6 +2946,7 @@ pub fn create_window(
         // the event view becomes the content view, with its own layer
         let view = msg_id(class("BunnyView"), sel("alloc"));
         let view = msg_init_rect(view, sel("initWithFrame:"), rect);
+        register_file_drag(view);
         // the GPU graft goes BEFORE setWantsLayer: — a layer set first
         // makes the view layer-HOSTING (drawRect: never runs) and the
         // window presents by Metal; otherwise today's layer-backed CPU
@@ -2960,6 +3048,7 @@ pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHan
 
         let view = msg_id(class("BunnyView"), sel("alloc"));
         let view = msg_init_rect(view, sel("initWithFrame:"), rect);
+        register_file_drag(view);
         // CPU present only: no metal graft on panels (v1)
         msg_void_bool(view, sel("setWantsLayer:"), 1);
         msg_void_id(panel, sel("setContentView:"), view);
@@ -3081,6 +3170,7 @@ pub fn create_dialog(
 
         let view = msg_id(class("BunnyView"), sel("alloc"));
         let view = msg_init_rect(view, sel("initWithFrame:"), rect);
+        register_file_drag(view);
         // the GPU graft, BEFORE setWantsLayer: — the main window's own
         // discipline. A dialog is a real window that the reader
         // resizes, and a CPU raster of its whole content on every step

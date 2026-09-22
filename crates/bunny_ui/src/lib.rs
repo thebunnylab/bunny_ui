@@ -5733,9 +5733,33 @@ mod tests {
 
         // two clicks take the word under the pointer, three take the line
         runtime.pointer_clicked(at(8), y, 2, false);
+        runtime.pointer_moved(at(8) + 0.5, y, false);
+        assert_eq!(selected(), (6, 5), "held jitter preserves the entire word");
+        runtime.layout(&form, viewport);
+        assert_eq!(
+            selected(),
+            (6, 5),
+            "layout replay preserves the entire word"
+        );
+        runtime.pointer_moved(at(2), y, false);
+        assert_eq!(selected(), (0, 11), "backward drag takes whole words");
+        runtime.pointer_moved(at(8), y, false);
+        assert_eq!(
+            selected(),
+            (6, 5),
+            "returning to the original word restores it"
+        );
         runtime.pointer_released(at(8), y);
         assert_eq!(selected(), (6, 5), "the word `world`");
         runtime.pointer_clicked(at(8), y, 3, false);
+        runtime.pointer_moved(at(8) + 0.5, y, false);
+        assert_eq!(selected(), (0, 11), "held jitter preserves the entire line");
+        runtime.layout(&form, viewport);
+        assert_eq!(
+            selected(),
+            (0, 11),
+            "layout replay preserves the entire line"
+        );
         runtime.pointer_released(at(8), y);
         assert_eq!(selected(), (0, 11), "and a one-line field IS the line");
 
@@ -6221,6 +6245,447 @@ mod tests {
         assert_eq!(
             runtime.chord(Stroke::new(plain, Some('$'))),
             KeyMatch::Action(PUSH_INDENT),
+        );
+    }
+
+    #[test]
+    fn a_field_strategy_retains_native_editing_and_owns_modal_strokes() {
+        use crate::action::{Key, KeyPattern, Stroke};
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::{CaretState, EditCommand, EditingStrategy};
+        use std::{cell::Cell, rc::Rc};
+        struct Modal(Cell<bool>);
+        impl EditingStrategy for Modal {
+            fn takes_text(&self) -> bool {
+                self.0.get()
+            }
+            fn key(&self, stroke: &Stroke, text: &mut String, caret: &mut CaretState) -> bool {
+                if stroke.pattern.key == Key::Escape {
+                    self.0.set(false);
+                    return true;
+                }
+                if !self.0.get() && stroke.typed == Some('x') {
+                    crate::text_input::apply(text, caret, EditCommand::Backspace);
+                    return true;
+                }
+                false
+            }
+        }
+        #[derive(Clone)]
+        struct Panel {
+            note: State<String>,
+            policy: Rc<Modal>,
+            sent: State<i32>,
+        }
+        impl Component for Panel {
+            fn body(self, _: &Context) -> impl View {
+                text_editor("note", self.note.binding())
+                    .editing_strategy(Some(self.policy.clone()))
+                    .on_submit(move || self.sent.add(1))
+                    .frame(200.0, 80.0)
+            }
+        }
+        let panel = Panel {
+            note: State::new(String::new()),
+            policy: Rc::new(Modal(Cell::new(true))),
+            sent: State::new(0),
+        };
+        let runtime = Runtime::new();
+        runtime.render_stable(&panel);
+        let layout = runtime.layout(
+            &panel,
+            Proposal::exact(Size {
+                width: 200.0,
+                height: 80.0,
+            }),
+        );
+        let path = &layout.hits.first().expect("field target").0;
+        runtime.focus(path);
+        assert!(runtime.focus_takes_text());
+        runtime.key(EditCommand::Insert("é🦀".into()));
+        assert!(runtime.key_stroke(KeyPattern::key(Key::Escape)).handled);
+        assert!(!runtime.focus_takes_text());
+        assert!(
+            runtime
+                .key_stroke(Stroke::new(KeyPattern::key(Key::Char('x')), Some('x')))
+                .handled
+        );
+        assert_eq!(panel.note.get(), "é");
+        runtime.render_stable(&panel);
+        assert!(!runtime.focus_takes_text(), "redraw retains the policy");
+        assert!(runtime.key_stroke(KeyPattern::command(Key::Enter)).handled);
+        assert_eq!(panel.sent.get(), 1);
+    }
+
+    #[test]
+    fn native_inputs_request_a_text_pointer_inside_clickable_chrome() {
+        use crate::layout::{Cursor, Proposal, Size};
+        #[derive(Clone, Copy)]
+        struct Panel {
+            note: State<String>,
+        }
+        impl Component for Panel {
+            fn body(self, _: &Context) -> impl View {
+                vstack!(
+                    text_field("name", self.note.binding()).frame(200.0, 30.0),
+                    text_editor("message", self.note.binding()).frame(200.0, 60.0),
+                    zstack!(
+                        text_field("covered", self.note.binding()).frame(200.0, 30.0),
+                        button(text("Overlay action"), || {}).frame(200.0, 30.0),
+                    ),
+                )
+                .on_click(|| {})
+            }
+        }
+        let panel = Panel {
+            note: State::new(String::new()),
+        };
+        let runtime = Runtime::new();
+        let laid = runtime.settled_layout(
+            &panel,
+            Proposal::exact(Size {
+                width: 200.0,
+                height: 160.0,
+            }),
+        );
+        assert_eq!(laid.fields.len(), 3);
+        for field in laid.fields.iter().take(2) {
+            runtime.pointer_moved(
+                field.frame.origin.x + 10.0,
+                field.frame.origin.y + 10.0,
+                false,
+            );
+            assert_eq!(runtime.hovered_cursor(), Some(Cursor::Text));
+        }
+        let covered = &laid.fields[2];
+        runtime.pointer_moved(
+            covered.frame.origin.x + covered.frame.size.width / 2.0,
+            covered.frame.origin.y + covered.frame.size.height / 2.0,
+            false,
+        );
+        assert_ne!(
+            runtime.hovered_cursor(),
+            Some(Cursor::Text),
+            "overlay button wins over covered input"
+        );
+        runtime.pointer_moved(10.0, 150.0, false);
+        assert_ne!(
+            runtime.hovered_cursor(),
+            Some(Cursor::Text),
+            "chrome is not text"
+        );
+        runtime.pointer_moved(500.0, 500.0, false);
+        assert_eq!(runtime.hovered_cursor(), None);
+    }
+
+    #[test]
+    fn modal_caret_repaints_its_shape_without_changing_field_text() {
+        use crate::action::{Key, KeyPattern, Stroke};
+        use crate::layout::{DrawCommand, Proposal, Size};
+        use crate::text_input::{CaretShape, CaretState, EditingStrategy};
+        use std::{cell::Cell, rc::Rc};
+        struct Modal(Cell<CaretShape>);
+        impl EditingStrategy for Modal {
+            fn takes_text(&self) -> bool {
+                self.0.get() == CaretShape::Bar
+            }
+            fn caret_shape(&self) -> CaretShape {
+                self.0.get()
+            }
+            fn key(&self, stroke: &Stroke, _: &mut String, _: &mut CaretState) -> bool {
+                self.0.set(match stroke.pattern.key {
+                    Key::Escape => CaretShape::Block,
+                    Key::Char('R') => CaretShape::Underline,
+                    Key::Char('i') => CaretShape::Bar,
+                    _ => return false,
+                });
+                true
+            }
+        }
+        #[derive(Clone)]
+        struct Field {
+            note: State<String>,
+            policy: Rc<Modal>,
+        }
+        impl Component for Field {
+            fn body(self, _: &Context) -> impl View {
+                text_editor("placeholder", self.note.binding())
+                    .editing_strategy(Some(self.policy))
+                    .frame(40.0, 26.0)
+            }
+        }
+        for value in ["", "é", "🦀", "one\ntwo", "abcdef"] {
+            let note = State::new(value.to_string());
+            let view = Field {
+                note,
+                policy: Rc::new(Modal(Cell::new(CaretShape::Bar))),
+            };
+            let runtime = Runtime::new();
+            let proposal = Proposal::exact(Size {
+                width: 40.0,
+                height: 26.0,
+            });
+            let laid = runtime.settled_layout(&view, proposal);
+            runtime.focus(&laid.fields[0].path);
+            runtime.key(crate::text_input::EditCommand::Home(false));
+            if value == "abcdef" {
+                let field = &laid.fields[0];
+                let lines = crate::text_engine::break_lines(
+                    value,
+                    &field.font,
+                    field.run.size.width,
+                    &*runtime.text(),
+                    &crate::text_engine::MeasureCache::default(),
+                );
+                assert!(lines.len() > 1, "fixture must wrap: {field:?}");
+                for _ in 0..lines[1].0 {
+                    runtime.key(crate::text_input::EditCommand::Right(false));
+                }
+            }
+            for (key, block, underline) in [
+                (Key::Char('i'), false, false),
+                (Key::Escape, true, false),
+                (Key::Char('R'), false, true),
+                (Key::Char('i'), false, false),
+            ] {
+                assert!(runtime.key_stroke(KeyPattern::key(key)).handled);
+                let laid = runtime.settled_layout(&view, proposal);
+                let rect = laid
+                    .display
+                    .iter()
+                    .find_map(|op| match op {
+                        DrawCommand::FillRect { rect, color, .. }
+                            if *color == crate::theme::current().caret =>
+                        {
+                            Some(rect)
+                        }
+                        _ => None,
+                    })
+                    .expect("focused caret is painted");
+                assert_eq!(
+                    rect.size.width > 2.0,
+                    block || underline,
+                    "{value:?}: {rect:?}"
+                );
+                assert_eq!(rect.size.height > 2.0, !underline, "{value:?}: {rect:?}");
+                let frame = laid.fields[0].frame;
+                assert!(rect.origin.y >= frame.origin.y && rect.origin.y + rect.size.height <= frame.origin.y + frame.size.height,
+                    "caret stays visible at the wrap: {value:?}: {rect:?}, {frame:?}");
+                assert_eq!(note.get(), value, "mode changes do not edit the draft");
+            }
+        }
+    }
+
+    #[test]
+    fn external_files_drop_only_inside_the_accepting_target() {
+        use crate::layout::{Proposal, Size};
+        use crate::runtime::ExternalPaths;
+        #[derive(Clone, Copy)]
+        struct Panel {
+            count: State<usize>,
+        }
+        impl Component for Panel {
+            fn body(self, _: &Context) -> impl View {
+                text("drop here")
+                    .frame(100.0, 40.0)
+                    .on_drop::<ExternalPaths>(move |files| self.count.set(files.0.len()))
+            }
+        }
+        let panel = Panel {
+            count: State::new(0),
+        };
+        let runtime = Runtime::new();
+        runtime.render_stable(&panel);
+        runtime.layout(
+            &panel,
+            Proposal::exact(Size {
+                width: 100.0,
+                height: 40.0,
+            }),
+        );
+        let files = ExternalPaths(vec!["/tmp/é.png".into(), "/tmp/note.txt".into()]);
+        assert!(runtime.external_drag(20.0, 20.0, &files));
+        assert_eq!(panel.count.get(), 0, "hover never attaches");
+        assert!(!runtime.external_drop(500.0, 20.0, files.clone()));
+        assert!(runtime.external_drop(20.0, 20.0, files));
+        assert_eq!(panel.count.get(), 2);
+        assert!(!runtime.external_drop(20.0, 20.0, ExternalPaths(vec![])));
+    }
+
+    #[test]
+    fn multiline_multiclick_keeps_units_through_jitter_and_reverse_drag() {
+        use crate::layout::{Proposal, Size};
+        #[derive(Clone, Copy)]
+        struct Note(State<String>);
+        impl Component for Note {
+            fn body(self, _: &Context) -> impl View {
+                text_editor("note", self.0.binding()).frame(400.0, 100.0)
+            }
+        }
+        let note = Note(State::new("alpha café gamma\nsecond line\nlast".into()));
+        let runtime = Runtime::new();
+        let proposal = Proposal::exact(Size {
+            width: 400.0,
+            height: 100.0,
+        });
+        runtime.render_stable(&note);
+        let laid = runtime.layout(&note, proposal);
+        let (_, frame) = laid.hits.last().expect("field");
+        let x = frame.origin.x + 8.0;
+        let y = frame.origin.y + 9.0;
+        let selected = || runtime.ime_snapshot().expect("focused").selected;
+        // The previous caret is on another line, not at the selected word.
+        runtime.pointer_clicked(x + 24.0, y + 32.0, 1, false);
+        runtime.pointer_released(x + 24.0, y + 32.0);
+        runtime.pointer_clicked(x + 64.0, y, 2, false);
+        runtime.pointer_moved(x + 64.5, y, false);
+        runtime.layout(&note, proposal);
+        assert_eq!(selected(), (6, 4), "the entire accented word, in UTF-16");
+        runtime.pointer_moved(x + 96.0, y, false);
+        assert_eq!(selected(), (6, 10), "forward word drag");
+        runtime.pointer_moved(x + 16.0, y, false);
+        assert_eq!(
+            selected(),
+            (0, 10),
+            "reverse word drag keeps the original word"
+        );
+        runtime.pointer_released(x + 16.0, y);
+        runtime.pointer_clicked(x + 24.0, y + 16.0, 3, false);
+        runtime.pointer_moved(x + 24.5, y + 16.0, false);
+        runtime.layout(&note, proposal);
+        assert_eq!(selected(), (17, 11), "only the clicked line, in full");
+        runtime.pointer_moved(x + 8.0, y, false);
+        assert_eq!(selected(), (0, 28), "reverse drag keeps complete lines");
+        runtime.pointer_moved(x + 8.0, y + 32.0, false);
+        assert_eq!(selected(), (17, 16), "forward drag keeps complete lines");
+        runtime.pointer_cancelled();
+        runtime.pointer_clicked(x + 16.0, y, 1, false);
+        runtime.pointer_moved(x + 32.0, y, false);
+        assert_eq!(
+            selected(),
+            (2, 2),
+            "cancel clears the previous gesture unit"
+        );
+    }
+
+    #[test]
+    fn chat_enter_and_native_navigation_preserve_text_and_selection() {
+        use crate::action::{Key, KeyPattern};
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::EditCommand;
+        #[derive(Clone, Copy)]
+        struct Chat {
+            value: State<String>,
+            sends: State<i32>,
+        }
+        impl Component for Chat {
+            fn body(self, _: &Context) -> impl View {
+                text_editor("message", self.value.binding())
+                    .submit_on_enter()
+                    .on_submit(move || self.sends.add(1))
+                    .auto_focus()
+                    .frame(300.0, 100.0)
+            }
+        }
+        let chat = Chat {
+            value: State::new(String::new()),
+            sends: State::new(0),
+        };
+        let runtime = Runtime::new();
+        runtime.settled_layout(
+            &chat,
+            Proposal::exact(Size {
+                width: 300.0,
+                height: 100.0,
+            }),
+        );
+        runtime.key(EditCommand::Insert("one café\nlast line".into()));
+        assert!(runtime.key_stroke(KeyPattern::command(Key::Left)).handled);
+        let mut select_end = KeyPattern::command(Key::Right);
+        select_end.shift = true;
+        assert!(runtime.key_stroke(select_end).handled);
+        assert_eq!(
+            runtime.key(EditCommand::Copy).output.as_deref(),
+            Some("last line")
+        );
+        let mut word = KeyPattern::key(Key::Left);
+        word.option = true;
+        assert!(runtime.key_stroke(word).handled);
+        word.shift = true;
+        assert!(runtime.key_stroke(word).handled);
+        assert_eq!(
+            runtime.key(EditCommand::Copy).output.as_deref(),
+            Some("last ")
+        );
+        runtime.key_stroke(KeyPattern::command(Key::Up));
+        let mut word = KeyPattern::key(Key::Right);
+        word.option = true;
+        runtime.key_stroke(word);
+        word.shift = true;
+        runtime.key_stroke(word);
+        assert_eq!(
+            runtime.key(EditCommand::Copy).output.as_deref(),
+            Some(" café")
+        );
+        runtime.key_stroke(KeyPattern::command(Key::Down));
+        let mut newline = KeyPattern::key(Key::Enter);
+        newline.shift = true;
+        assert!(runtime.key_stroke(newline).handled);
+        assert_eq!(chat.value.get(), "one café\nlast line\n");
+        assert_eq!(chat.sends.get(), 0);
+        assert!(runtime.key_stroke(KeyPattern::key(Key::Enter)).handled);
+        assert_eq!(chat.sends.get(), 1);
+        assert_eq!(chat.value.get(), "one café\nlast line\n");
+        // Native input bridges can deliver the command rather than a stroke.
+        assert!(runtime.key(EditCommand::Newline).applied);
+        assert_eq!(chat.sends.get(), 2);
+    }
+
+    #[test]
+    fn command_arrows_keep_logical_line_boundaries_when_wrapped() {
+        use crate::action::{Key, KeyPattern};
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::EditCommand;
+        #[derive(Clone, Copy)]
+        struct Note(State<String>);
+        impl Component for Note {
+            fn body(self, _: &Context) -> impl View {
+                text_editor("", self.0.binding())
+                    .auto_focus()
+                    .frame(80.0, 200.0)
+            }
+        }
+        let note = Note(State::new(String::new()));
+        let runtime = Runtime::new();
+        runtime.settled_layout(
+            &note,
+            Proposal::exact(Size {
+                width: 80.0,
+                height: 200.0,
+            }),
+        );
+        runtime.key(EditCommand::Insert(
+            "first line\nsecond third fourth".into(),
+        ));
+        runtime.settled_layout(
+            &note,
+            Proposal::exact(Size {
+                width: 80.0,
+                height: 200.0,
+            }),
+        );
+        runtime.key_stroke(KeyPattern::command(Key::Left));
+        let mut end = KeyPattern::command(Key::Right);
+        end.shift = true;
+        runtime.key_stroke(end);
+        let selected = runtime
+            .key(EditCommand::Copy)
+            .output
+            .expect("last logical line");
+        assert_eq!(selected, "second third fourth");
+        assert!(
+            selected.len() < note.0.get().len(),
+            "line movement is not document movement"
         );
     }
 
@@ -13688,3 +14153,98 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod input_focus_policy_tests {
+    use crate::prelude::*;
+    use crate::text_input::{CaretState, EditingStrategy};
+    use std::{cell::RefCell, rc::Rc};
+
+    #[derive(Default)]
+    struct Policy(RefCell<Vec<bool>>);
+    impl EditingStrategy for Policy {
+        fn focus_changed(&self, focused: bool) {
+            self.0.borrow_mut().push(focused);
+        }
+        fn takes_text(&self) -> bool {
+            true
+        }
+        fn key(&self, _: &crate::action::Stroke, _: &mut String, _: &mut CaretState) -> bool {
+            false
+        }
+    }
+
+    #[derive(Clone)]
+    struct Fields {
+        first: Rc<Policy>,
+        second: Rc<Policy>,
+        enabled: State<bool>,
+        shown: State<bool>,
+        wrapped: State<bool>,
+    }
+    impl Component for Fields {
+        fn body(self, _: &Context) -> impl View {
+            let first = text_editor("one", State::new(String::new()).binding())
+                .editing_strategy(
+                    self.enabled
+                        .get()
+                        .then(|| self.first.clone() as Rc<dyn EditingStrategy>),
+                )
+                .id("one");
+            vstack!(
+                self.shown.get().then(|| if self.wrapped.get() {
+                    erased(hstack!(first))
+                } else {
+                    erased(first)
+                }),
+                text_field("two", State::new(String::new()).binding())
+                    .editing_strategy(Some(self.second.clone()))
+                    .id("two"),
+            )
+        }
+    }
+
+    #[test]
+    fn policies_follow_focus_replacement_migration_and_unmount() {
+        let runtime = Runtime::new();
+        let first = Rc::new(Policy::default());
+        let second = Rc::new(Policy::default());
+        let view = Fields {
+            first: first.clone(),
+            second: second.clone(),
+            enabled: State::new(true),
+            shown: State::new(true),
+            wrapped: State::new(false),
+        };
+        let proposal = crate::layout::Proposal::exact(crate::layout::Size {
+            width: 400.0,
+            height: 200.0,
+        });
+        let _ = runtime.settled_layout(&view, proposal);
+        assert!(runtime.focus_named("one"));
+        assert!(runtime.focus_named("one"));
+        assert_eq!(*first.0.borrow(), [true]);
+        assert!(runtime.focus_named("two"));
+        assert_eq!(*first.0.borrow(), [true, false]);
+        assert_eq!(*second.0.borrow(), [true]);
+        runtime.blur();
+        assert_eq!(*second.0.borrow(), [true, false]);
+        runtime.focus_named("one");
+        view.wrapped.set(true);
+        let _ = runtime.settled_layout(&view, proposal);
+        assert_eq!(
+            *first.0.borrow(),
+            [true, false, true],
+            "migration preserves focus"
+        );
+        view.enabled.set(false);
+        let _ = runtime.settled_layout(&view, proposal);
+        assert_eq!(*first.0.borrow(), [true, false, true, false]);
+        view.enabled.set(true);
+        let _ = runtime.settled_layout(&view, proposal);
+        assert_eq!(*first.0.borrow(), [true, false, true, false, true]);
+        view.shown.set(false);
+        let _ = runtime.settled_layout(&view, proposal);
+        assert_eq!(*first.0.borrow(), [true, false, true, false, true, false]);
+        assert!(runtime.focused().is_none());
+    }
+}

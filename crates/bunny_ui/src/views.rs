@@ -184,11 +184,30 @@ pub struct TextField {
     text: Binding<String>,
     multiline: bool,
     submit: Option<Rc<dyn Fn()>>,
+    submit_on_enter: bool,
     bare: bool,
     secret: bool,
+    editing: Option<Rc<dyn crate::text_input::EditingStrategy>>,
 }
 
 impl TextField {
+    /// Decorate native editing with a retained policy (for example modal editing).
+    pub fn editing_strategy(
+        mut self,
+        strategy: Option<Rc<dyn crate::text_input::EditingStrategy>>,
+    ) -> Self {
+        self.editing = strategy;
+        self
+    }
+
+    /// Chat-style submission: Enter submits and Shift+Enter inserts a newline.
+    /// Multiline editors otherwise retain Enter for a newline. A modal editing
+    /// strategy still receives the stroke first, so command mode can consume it.
+    pub fn submit_on_enter(mut self) -> Self {
+        self.submit_on_enter = true;
+        self
+    }
+
     /// What the field's OWN key runs — the pair of a button's
     /// `.on_click`. A one-line field submits on the bare Enter; a
     /// field of many lines keeps Enter for its break and submits on
@@ -254,9 +273,24 @@ impl View for TextField {
                 let binding = self.text.clone();
                 let multiline = self.multiline;
                 let submit = self.submit.clone();
+                let strategy = self.editing.clone();
+                let key_strategy = self.editing.clone();
+                let typing_strategy = self.editing.clone();
+                let key_binding = self.text.clone();
                 crate::reconciler::attribute_editor(
                     path.clone(),
-                    Rc::new(move |command, state| {
+                    crate::reconciler::EditorFn {
+                    submit_on_enter: self.submit_on_enter,
+                    key: self.editing.as_ref().map(|_| Rc::new(move |stroke: &crate::action::Stroke, state: &mut crate::text_input::CaretState| {
+                        let Some(strategy) = &key_strategy else { return false };
+                        let mut value = key_binding.wrappedValue();
+                        let original = value.clone();
+                        let handled = strategy.key(stroke, &mut value, state);
+                        if value != original { key_binding.set(value); }
+                        handled
+                    }) as crate::reconciler::FieldKeyFn),
+                    policy: typing_strategy,
+                    command: Rc::new(move |command, state| {
                         // the field's own key never touches the text.
                         // An EMPTY answer says a handler took the
                         // stroke; no answer at all says the app named
@@ -280,7 +314,10 @@ impl View for TextField {
                         };
                         let mut value = binding.wrappedValue();
                         let original = value.clone();
-                        let output = crate::text_input::apply(&mut value, state, command);
+                        let output = match &strategy {
+                            Some(strategy) => strategy.edit(&mut value, state, command),
+                            None => crate::text_input::apply(&mut value, state, command),
+                        };
                         // the set dirties whoever READS — only when the text
                         // actually changed (Read/Copy must not invalidate the world)
                         if value != original {
@@ -288,6 +325,7 @@ impl View for TextField {
                         }
                         output
                     }),
+                    },
                 );
                 out.push_layout(LayoutNode::Field {
                     bare: self.bare,
@@ -513,8 +551,10 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
         text,
         multiline: false,
         submit: None,
+        submit_on_enter: false,
         bare: false,
         secret: false,
+        editing: None,
     }
 }
 
@@ -534,8 +574,10 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         text,
         multiline: true,
         submit: None,
+        submit_on_enter: false,
         bare: false,
         secret: false,
+        editing: None,
     }
 }
 
