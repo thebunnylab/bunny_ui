@@ -62,3 +62,23 @@ path = "examples/two_windows.rs"
 [[example]]
 name = "browser_window_linux"
 path = "examples/browser_window.rs"
+
+[[example]]
+name = "life_window_linux"
+path = "examples/life_window.rs"
+
+[[example]]
+name = "glass_window_linux"
+path = "examples/glass_window.rs"
+
+[[example]]
+name = "scroll_window_linux"
+path = "examples/scroll_window.rs"
+
+[[example]]
+name = "table_window_linux"
+path = "examples/table_window.rs"
+
+[[example]]
+name = "compose_window_linux"
+path = "examples/compose_window.rs"

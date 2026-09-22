@@ -38,7 +38,13 @@ fi
 
 snapshot=$repo/target/container-snapshot
 mkdir -p "$snapshot"
-rsync -a --delete --exclude .git --exclude target --exclude target-linux "$repo/" "$snapshot/"
+# a file the sync rewrote is touched afterwards: rsync keeps the
+# host's mtime, and a build that ran in the container while the host
+# edited leaves an artifact NEWER than the edit — cargo would call the
+# stale artifact fresh. The touch makes the change the newest thing
+rsync -a --delete --itemize-changes --exclude .git --exclude target --exclude target-linux "$repo/" "$snapshot/" \
+    | awk '/^>f/ { print $2 }' \
+    | while IFS= read -r changed; do touch "$snapshot/$changed"; done
 
 # (the `+` form: an empty array is not "unbound" under set -u on old bash)
 exec docker run --rm ${tty_flags[@]+"${tty_flags[@]}"} \

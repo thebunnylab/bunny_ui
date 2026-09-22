@@ -42,8 +42,15 @@ the example's own.
 crates/bunny_ui_linux/container/run.sh                 # everything
 crates/bunny_ui_linux/container/run.sh test            # the crate tests
 crates/bunny_ui_linux/container/run.sh drive counter_window_linux
+crates/bunny_ui_linux/container/run.sh drive browser_window_linux --editor
 crates/bunny_ui_linux/container/run.sh shell           # both displays up
 ```
+
+The `--drive` sheets today: `counter_window_linux` (a click, the
+manners with `--fixed`, the pacer with `--sleeper`),
+`two_windows_linux`, `browser_window_linux` (the page, `--editor` for
+the letter), `scroll_window_linux`, `compose_window_linux` and
+`life_window_linux`.
 
 The script builds a Debian image with the libraries the shell links,
 raises a headless Weston (the Wayland door) and an Xvfb (the X11 door)
