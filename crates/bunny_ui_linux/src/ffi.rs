@@ -1268,6 +1268,10 @@ thread_local! {
     static HANDLER: RefCell<Option<Box<dyn FnMut(AppEvent)>>> = const { RefCell::new(None) };
     static NEXT_BLINK: Cell<Option<Instant>> = const { Cell::new(None) };
     static NEXT_REPEAT: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// The beat's own deadline: the compositor's frame callback is
+    /// the clock only while frames present; a window that wants frames
+    /// and presented nothing ticks on this instead.
+    static NEXT_FRAME: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 fn with_client<R>(body: impl FnOnce(&mut Client) -> R) -> R {
@@ -3068,9 +3072,20 @@ pub fn set_frame_driver_paused(paused: bool) {
     if is_x11() {
         return crate::x11::set_frame_driver_paused(paused);
     }
-    with_client(|client| {
-        if let Some(win) = client.win.as_mut() {
-            win.paused = paused;
+    let inflight = with_client(|client| {
+        let Some(win) = client.win.as_mut() else { return true };
+        win.paused = paused;
+        win.frame_inflight
+    });
+    // the compositor's callback is the clock only while frames present:
+    // a window that wants frames and presented nothing (a tick that
+    // moved no pixel, a task on a timer) keeps its beat on a deadline
+    // of its own, which the next present retires
+    NEXT_FRAME.with(|cell| {
+        if paused {
+            cell.set(None);
+        } else if !inflight && cell.get().is_none() {
+            cell.set(Some(Instant::now() + FRAME_INTERVAL));
         }
     });
 }
@@ -3762,7 +3777,8 @@ pub fn run() {
             }
             wl_display_flush(display);
             // the deadline heap, two entries tall: blink and repeat
-            let timeout = [NEXT_BLINK.with(Cell::get), NEXT_REPEAT.with(Cell::get)]
+            let timeout =
+                [NEXT_BLINK.with(Cell::get), NEXT_REPEAT.with(Cell::get), NEXT_FRAME.with(Cell::get)]
                 .into_iter()
                 .flatten()
                 .map(|at| at.saturating_duration_since(Instant::now()).as_millis() as c_int)
@@ -3815,11 +3831,47 @@ pub fn run() {
         if blink_due {
             dispatch(AppEvent::Blink);
         }
+        let frame_is_due = NEXT_FRAME.with(|cell| {
+            let due = cell.get().is_some_and(|at| Instant::now() >= at);
+            if due {
+                cell.set(None); // the handler re-arms through the driver
+            }
+            due
+        });
+        if frame_is_due {
+            frame_due();
+        }
         // the hand of a --drive sheet, delivered outside any dispatch
         crate::drive::drain();
     }
     teardown();
 }
+
+/// The deadline fired: a frame for a window that wants one and has no
+/// callback in flight — the x11 door's clock, on this door only while
+/// nothing presents. A present arms the compositor's callback, and
+/// that callback takes the beat back.
+fn frame_due() {
+    let dt = with_client(|client| {
+        let Some(win) = client.win.as_mut() else { return None };
+        if win.paused || win.frame_inflight {
+            return None;
+        }
+        let now = Instant::now();
+        let dt = win
+            .last_frame
+            .map(|last| (now - last).as_secs_f64())
+            .unwrap_or(1.0 / 60.0)
+            .clamp(0.0, 1.0 / 30.0);
+        win.last_frame = Some(now);
+        Some(dt)
+    });
+    if let Some(dt) = dt {
+        dispatch(AppEvent::Frame { dt });
+    }
+}
+
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_micros(16_666);
 
 /// How many frames this window has presented — the drive sheet's
 /// witness that a turn reached the glass.
