@@ -271,6 +271,7 @@ enum Iface {
     TextInput,
     Decoration,
     Pinch,
+    FractionalScale,
     CoreSurface,
     CoreSeat,
     CoreOutput,
@@ -291,6 +292,8 @@ pub(crate) struct Protocols {
     decoration: &'static WlInterface,
     gestures: &'static WlInterface,
     pinch: &'static WlInterface,
+    fractional_manager: &'static WlInterface,
+    fractional: &'static WlInterface,
 }
 
 /// The xdg-shell message rows, transcribed from the installed
@@ -478,7 +481,30 @@ fn pointer_gestures_spec() -> [(&'static CStr, u32, Vec<Msg>, Vec<Msg>); 2] {
     ]
 }
 
-/// Builds the eleven `WlInterface` tables and leaks them. Two passes:
+/// fractional-scale v1, transcribed from the staging XML in opcode
+/// order: the compositor's preferred scale for a surface, in 120ths.
+fn fractional_scale_spec() -> [(&'static CStr, u32, Vec<Msg>, Vec<Msg>); 2] {
+    use Iface::*;
+    [
+        (
+            c"wp_fractional_scale_manager_v1",
+            1,
+            vec![
+                Msg(c"destroy", c"", &[]),
+                Msg(c"get_fractional_scale", c"no", &[Some(FractionalScale), Some(CoreSurface)]),
+            ],
+            vec![],
+        ),
+        (
+            c"wp_fractional_scale_v1",
+            1,
+            vec![Msg(c"destroy", c"", &[])],
+            vec![Msg(c"preferred_scale", c"u", &[None])],
+        ),
+    ]
+}
+
+/// Builds the thirteen `WlInterface` tables and leaks them. Two passes:
 /// the interfaces are allocated first so the message rows can point at
 /// each other (popup → positioner, xdg_surface → toplevel, …).
 fn build_protocols() -> Protocols {
@@ -488,9 +514,10 @@ fn build_protocols() -> Protocols {
             .chain(text_input_spec())
             .chain(decoration_spec())
             .chain(pointer_gestures_spec())
+            .chain(fractional_scale_spec())
             .collect();
     // pass 1: stable homes, filled with placeholders
-    let slots: &'static mut [WlInterface; 11] = Box::leak(Box::new(std::array::from_fn(|_| {
+    let slots: &'static mut [WlInterface; 13] = Box::leak(Box::new(std::array::from_fn(|_| {
         WlInterface {
             name: c"".as_ptr(),
             version: 0,
@@ -510,6 +537,7 @@ fn build_protocols() -> Protocols {
             Iface::TextInput => unsafe { base.add(6) },
             Iface::Decoration => unsafe { base.add(8) },
             Iface::Pinch => unsafe { base.add(10) },
+            Iface::FractionalScale => unsafe { base.add(12) },
             Iface::CoreSurface => &raw const wl_surface_interface,
             Iface::CoreSeat => &raw const wl_seat_interface,
             Iface::CoreOutput => &raw const wl_output_interface,
@@ -559,6 +587,8 @@ fn build_protocols() -> Protocols {
         decoration: &slots[8],
         gestures: &slots[9],
         pinch: &slots[10],
+        fractional_manager: &slots[11],
+        fractional: &slots[12],
     }
 }
 
@@ -701,6 +731,7 @@ const TAG_TEXT_INPUT: usize = 16;
 const TAG_DECORATION: usize = 17;
 const TAG_TOUCH: usize = 18;
 const TAG_PINCH: usize = 19;
+const TAG_FRACTIONAL: usize = 20;
 const OUTPUT_TAG_BASE: usize = 0x1000;
 /// Panel proxies encode index and role: base | (index << 2) | kind.
 const PANEL_TAG_BASE: usize = 0x1000_0000;
@@ -736,6 +767,11 @@ enum Ev {
     /// discrete steps) and where the axis came from (v5+).
     PointerAxis120 { axis: u32, value120: i32 },
     PointerAxisSource { source: u32 },
+    /// The compositor's preferred scale for the window, in 120ths
+    /// (tier 1 of the ladder) — and the whole-number one a v6 surface
+    /// is told directly (tier 2).
+    PreferredScale { v120: u32 },
+    PreferredBufferScale { scale: i32 },
     /// The seat said what it has — the touch device is asked for here.
     SeatCapabilities { caps: u32 },
     TouchDown { surface_ptr: usize, id: i32, x: f64, y: f64 },
@@ -832,8 +868,14 @@ unsafe extern "C" fn dispatcher(
             // output pointer and the drain resolves the name
             0 => push_ev(Ev::SurfaceEnter { output_ptr: unsafe { arg(0).o } as usize }),
             1 => push_ev(Ev::SurfaceLeave { output_ptr: unsafe { arg(0).o } as usize }),
-            _ => {}
+            2 => push_ev(Ev::PreferredBufferScale { scale: unsafe { arg(0).i } }),
+            _ => {} // preferred_buffer_transform(3): unread
         },
+        TAG_FRACTIONAL => {
+            if opcode == 0 {
+                push_ev(Ev::PreferredScale { v120: unsafe { arg(0).u } });
+            }
+        }
         TAG_SEAT => {
             if opcode == 0 {
                 push_ev(Ev::SeatCapabilities { caps: unsafe { arg(0).u } });
@@ -1161,9 +1203,31 @@ fn pinch_ratio(last: &mut f64, scale: f64) -> f64 {
     ratio
 }
 
+/// The scale ladder: the compositor's exact preference in 120ths
+/// (tier 1, `wp_fractional_scale_v1`), the whole number a v6 surface
+/// is told (tier 2, `preferred_buffer_scale`), and the outputs the
+/// surface touches (tier 3, the one every compositor has). Answers the
+/// lattice the raster draws on — the ceiling of the exact scale, the
+/// Windows law — and the exact scale itself. The raster stays on the
+/// whole lattice; the compositor scales the buffer to the glass, which
+/// is what it does with a whole scale already.
+fn scale_ladder(
+    preferred_120: Option<u32>,
+    preferred_buffer: Option<i32>,
+    entered: &[u32],
+    outputs: &[(u32, i32)],
+) -> (usize, f64) {
+    let factor = match (preferred_120, preferred_buffer) {
+        (Some(v120), _) if v120 > 0 => v120 as f64 / 120.0,
+        (_, Some(scale)) if scale > 0 => scale as f64,
+        _ => resolve_scale(entered, outputs) as f64,
+    };
+    let factor = factor.max(1.0);
+    ((factor - 1e-9).ceil().max(1.0) as usize, factor)
+}
+
 /// Integer scale from the outputs the surface touches — tier 3 of the
-/// ladder, the one every compositor has. Tiers 1–2 (fractional scale,
-/// preferred_buffer_scale) slot in above when a compositor offers them.
+/// ladder, the one every compositor has.
 fn resolve_scale(entered: &[u32], outputs: &[(u32, i32)]) -> usize {
     entered
         .iter()
@@ -1233,6 +1297,14 @@ struct Window {
     /// speaks the protocol (null otherwise), and its answer.
     decoration: *mut Proxy,
     decoration_mode: Option<u32>,
+    /// The `wp_fractional_scale_v1` object (null where unspoken) and
+    /// the two upper tiers of the scale ladder it and a v6 surface
+    /// feed; `factor` is the exact scale the ladder resolved to,
+    /// `scale` the whole lattice the raster draws on (its ceiling).
+    fractional: *mut Proxy,
+    preferred_120: Option<u32>,
+    preferred_buffer: Option<i32>,
+    factor: f64,
 }
 
 struct CursorState {
@@ -1412,6 +1484,9 @@ struct Client {
     /// `zxdg_decoration_manager_v1` — null where the compositor draws
     /// no frame and says nothing (GNOME).
     decoration_manager: *mut Proxy,
+    /// `wp_fractional_scale_manager_v1` — null on a compositor that
+    /// speaks only whole scales.
+    fractional_manager: *mut Proxy,
     protocols: &'static Protocols,
     outputs: Vec<OutputInfo>,
     globals: Vec<(u32, String, u32)>,
@@ -1569,6 +1644,13 @@ fn connect() {
         1,
         TAG_SYNC,
     );
+    // the exact scale, where the compositor can say it
+    let fractional_manager = bind(
+        c"wp_fractional_scale_manager_v1",
+        protocols.fractional_manager as *const WlInterface,
+        1,
+        TAG_SYNC,
+    );
     assert!(!compositor.is_null(), "wl_compositor is mandatory");
     assert!(!shm.is_null(), "wl_shm is mandatory");
     assert!(!wm_base.is_null(), "xdg_wm_base is mandatory");
@@ -1710,6 +1792,7 @@ fn connect() {
             data_manager,
             wm_base,
             decoration_manager,
+            fractional_manager,
             protocols,
             outputs,
             globals,
@@ -1830,6 +1913,21 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
                 decoration
             }
         };
+        // the exact scale, asked before the first commit — the answer
+        // arrives with the compositor's first word on the surface
+        let fractional = if client.fractional_manager.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                construct(
+                    client.fractional_manager,
+                    1, // get_fractional_scale(new, surface)
+                    client.protocols.fractional as *const WlInterface,
+                    &mut [arg_n(), arg_o(surface)],
+                    TAG_FRACTIONAL,
+                )
+            }
+        };
         unsafe {
             // the first commit carries NO buffer — it asks to be configured
             request(surface, 6, &mut no_args());
@@ -1854,6 +1952,10 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
             minimizable: options.minimizable,
             decoration,
             decoration_mode: None,
+            fractional,
+            preferred_120: None,
+            preferred_buffer: None,
+            factor: 1.0,
         });
     });
     // the first configure arrives async; wait for it so the first
@@ -1974,6 +2076,15 @@ impl WindowHandle {
             return crate::x11::scale();
         }
         with_client(|client| client.win.as_ref().map(|w| w.scale).unwrap_or(1))
+    }
+
+    /// The exact scale the ladder resolved to — the lattice's ceiling
+    /// is [`scale`](Self::scale); on x11 the two are one whole number.
+    pub fn scale_factor(&self) -> f64 {
+        if is_x11() {
+            return crate::x11::scale() as f64;
+        }
+        with_client(|client| client.win.as_ref().map(|w| w.factor).unwrap_or(1.0))
     }
 
     /// Presents damaged rects only: syncs the shm backing with
@@ -3928,6 +4039,10 @@ fn drain_protocol_events() {
                     update_scale(|win| win.entered.retain(|&entered| entered != name));
                 }
             }
+            Ev::PreferredScale { v120 } => update_scale(|win| win.preferred_120 = Some(v120)),
+            Ev::PreferredBufferScale { scale } => {
+                update_scale(|win| win.preferred_buffer = Some(scale))
+            }
             Ev::OutputScale { output_name, scale } => with_client(|client| {
                 if let Some(output) =
                     client.outputs.iter_mut().find(|output| output.name == output_name)
@@ -4167,7 +4282,9 @@ fn update_scale(edit: impl FnOnce(&mut Window)) {
             client.outputs.iter().map(|output| (output.name, output.scale)).collect();
         let Some(win) = client.win.as_mut() else { return false };
         edit(win);
-        let scale = resolve_scale(&win.entered, &outputs);
+        let (scale, factor) =
+            scale_ladder(win.preferred_120, win.preferred_buffer, &win.entered, &outputs);
+        win.factor = factor;
         if scale != win.scale {
             win.scale = scale;
             true
@@ -4346,6 +4463,9 @@ fn teardown() {
             if let Some(win) = client.win {
                 if !win.decoration.is_null() {
                     destroy(win.decoration, 0); // before the toplevel — the protocol's order
+                }
+                if !win.fractional.is_null() {
+                    destroy(win.fractional, 0); // before the surface it watches
                 }
                 destroy(win.toplevel, 0);
                 destroy(win.xdg_surface, 0);
@@ -4577,6 +4697,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The fractional-scale tables against their own XML, the same way.
+    #[test]
+    fn the_fractional_scale_tables_match_the_installed_xml() {
+        let path = "/usr/share/wayland-protocols/staging/fractional-scale/fractional-scale-v1.xml";
+        let Ok(xml) = std::fs::read_to_string(path) else { return };
+        for (name, _, methods, events) in fractional_scale_spec() {
+            let open = format!("<interface name=\"{}\"", name.to_string_lossy());
+            let start = xml.find(&open).expect("interface present in the XML");
+            let block = &xml[start..];
+            let end = block.find("</interface>").expect("interface block closes");
+            let block = &block[..end];
+            let mut cursor = 0;
+            for Msg(msg, _, _) in &methods {
+                let needle = format!("<request name=\"{}\"", msg.to_string_lossy());
+                let at = block[cursor..]
+                    .find(&needle)
+                    .unwrap_or_else(|| panic!("{needle} in opcode order"));
+                cursor += at + needle.len();
+            }
+            let mut cursor = 0;
+            for Msg(msg, _, _) in &events {
+                let needle = format!("<event name=\"{}\"", msg.to_string_lossy());
+                let at = block[cursor..]
+                    .find(&needle)
+                    .unwrap_or_else(|| panic!("{needle} in opcode order"));
+                cursor += at + needle.len();
+            }
+        }
+        for (name, _, methods, events) in fractional_scale_spec() {
+            for Msg(msg, signature, types) in methods.iter().chain(events.iter()) {
+                assert_eq!(types.len(), arg_count(signature), "{}.{}", name.to_string_lossy(), msg.to_string_lossy());
+            }
+        }
+    }
+
+    #[test]
+    fn the_ladder_ceils_the_exact_scale_and_ranks_its_tiers() {
+        let outputs = [(7u32, 2i32)];
+        assert_eq!(scale_ladder(Some(120), None, &[], &[]), (1, 1.0));
+        assert_eq!(scale_ladder(Some(150), None, &[], &[]), (2, 1.25));
+        assert_eq!(scale_ladder(Some(180), None, &[], &[]), (2, 1.5));
+        assert_eq!(scale_ladder(Some(240), None, &[], &[]), (2, 2.0));
+        assert_eq!(scale_ladder(Some(300), None, &[], &[]), (3, 2.5));
+        // tier 1 outranks tier 2 outranks the outputs
+        assert_eq!(scale_ladder(Some(150), Some(3), &[7], &outputs), (2, 1.25));
+        assert_eq!(scale_ladder(None, Some(3), &[7], &outputs), (3, 3.0));
+        assert_eq!(scale_ladder(None, None, &[7], &outputs), (2, 2.0));
+        assert_eq!(scale_ladder(None, None, &[], &outputs), (1, 1.0), "no output entered: one");
+        assert_eq!(scale_ladder(Some(0), Some(0), &[], &[]), (1, 1.0), "zeros are no answer");
     }
 
     #[test]

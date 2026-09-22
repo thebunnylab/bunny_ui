@@ -614,7 +614,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                 trace::mark(
                     "F",
                     format_args!(
-                        "settle={:.2} layout={:.2} pass={:.2} asm={:.2} measure={:.2} place={:.2} hover={:.2} passes={} layouts={} asm#={} hover#={} paints={} cmds={}",
+                        "settle={:.2} layout={:.2} pass={:.2} asm={:.2} measure={:.2} place={:.2} hover={:.2} passes={} layouts={} asm#={} hover#={} paints={} cmds={} scale={} factor={:.2}",
                         ms(Stage::Settle),
                         ms(Stage::Layout),
                         ms(Stage::Pass),
@@ -628,6 +628,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                         stats.hover_relayouts,
                         stats.paints,
                         display.len(),
+                        window.scale(),
+                        window.scale_factor(),
                     ),
                 );
             }

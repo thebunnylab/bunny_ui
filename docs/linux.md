@@ -103,6 +103,23 @@ cross over a cell, a hand over anything that answers a press, the
 resize arrows at a seam or a band. On Wayland the shapes come from
 the cursor theme; on X11 from the core cursor font.
 
+## Scale
+
+The Wayland door climbs a ladder for the window's scale: the
+compositor's exact preference in 120ths where it speaks
+`wp_fractional_scale_v1` (KDE, the wlroots desktops, GNOME), the
+whole number a v6 surface is told directly, and the outputs the
+surface touches, which every compositor has. The raster draws on the
+whole lattice — the ceiling of the exact scale, the law the Windows
+shell keeps too — and the compositor scales the buffer to the glass,
+as it does with a whole scale already; the `F` line prints both
+numbers. A crisp 1:1 raster at a fractional scale needs the core's
+raster to take a fraction, which it does not yet, so a 125 % desktop
+draws the 2× lattice and lets the compositor bring it down. The X11
+door reads `Xft.dpi` and rounds to a whole number (150 % is 2×, 125 %
+stays 1×). The container's Weston speaks only whole scales; the
+fractional tier is proven by its tables and its arithmetic.
+
 ## The hand on the glass
 
 A wheel turns in detents: a compositor at `wl_pointer` v8 says them
