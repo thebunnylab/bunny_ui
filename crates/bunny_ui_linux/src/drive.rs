@@ -51,11 +51,7 @@ pub fn text(text: &str) {
 /// How many frames the shell has presented since the window opened —
 /// every road counts (CPU blit, GL swap, Vulkan present).
 pub fn presents() -> u64 {
-    if crate::ffi::is_x11() {
-        crate::x11::presents()
-    } else {
-        crate::ffi::presents()
-    }
+    crate::trace::presents()
 }
 
 /// Which door is open — `"wayland"` or `"x11"`.

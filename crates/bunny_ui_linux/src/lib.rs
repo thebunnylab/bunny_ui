@@ -17,6 +17,7 @@ mod gl;
 mod image;
 mod life;
 mod text;
+mod trace;
 mod vk;
 mod x11;
 
@@ -293,6 +294,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
     // a task that lands on a worker thread asks the pump for one more
     // turn; the frame it takes drains the queue on its way
     runtime.set_wake_hook(std::sync::Arc::new(ffi::wake_from_any_thread));
+    // the engine's stage timers ride the tape's clock: an `F` line for
+    // each frame says where the time went BEFORE the present opened
+    let frame_stats = trace::active();
+    if frame_stats {
+        bunny_ui::stats::set_clock(Some(trace::clock_ms));
+    }
     // two owners: the keyboard gate and the event handler
     let root = Rc::new(root);
 
@@ -391,6 +398,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                     &*runtime.text(),
                     &*runtime.images(),
                 );
+                if frame_stats {
+                    trace::mark("P", format_args!("road=vk presents={}", trace::presents()));
+                }
                 return;
             }
             if gl::active() {
@@ -404,6 +414,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                     &*runtime.text(),
                     &*runtime.images(),
                 );
+                if frame_stats {
+                    trace::mark("P", format_args!("road=gl presents={}", trace::presents()));
+                }
                 return;
             }
             let mut slot = surface.borrow_mut();
@@ -430,6 +443,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                 // damage-only surface marks in the same pass
                 let (width, height) = (retained.bitmap().width(), retained.bitmap().height());
                 window.blit_partial(width, height, retained.rgba(), &damage);
+                if frame_stats {
+                    trace::mark(
+                        "P",
+                        format_args!("road=cpu presents={} wounds={}", trace::presents(), damage.len()),
+                    );
+                }
             }
         }
     });
@@ -450,6 +469,30 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                 },
             ));
             let display = runtime.display_frame(root, Size { width, height });
+            if frame_stats {
+                let stats = bunny_ui::stats::take();
+                let ms = |stage| stats.ms(stage);
+                use bunny_ui::stats::Stage;
+                trace::mark(
+                    "F",
+                    format_args!(
+                        "settle={:.2} layout={:.2} pass={:.2} asm={:.2} measure={:.2} place={:.2} hover={:.2} passes={} layouts={} asm#={} hover#={} paints={} cmds={}",
+                        ms(Stage::Settle),
+                        ms(Stage::Layout),
+                        ms(Stage::Pass),
+                        ms(Stage::Assemble),
+                        ms(Stage::Measure),
+                        ms(Stage::Place),
+                        ms(Stage::Hover),
+                        stats.body_passes,
+                        stats.layout_passes,
+                        stats.assemblies,
+                        stats.hover_relayouts,
+                        stats.paints,
+                        display.len(),
+                    ),
+                );
+            }
             present(runtime, display);
             let interaction = runtime.interaction();
             // a live divider drag keeps the resizer even while the
