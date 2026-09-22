@@ -6315,6 +6315,67 @@ mod tests {
     }
 
     #[test]
+    fn native_inputs_request_a_text_pointer_inside_clickable_chrome() {
+        use crate::layout::{Cursor, Proposal, Size};
+        #[derive(Clone, Copy)]
+        struct Panel {
+            note: State<String>,
+        }
+        impl Component for Panel {
+            fn body(self, _: &Context) -> impl View {
+                vstack!(
+                    text_field("name", self.note.binding()).frame(200.0, 30.0),
+                    text_editor("message", self.note.binding()).frame(200.0, 60.0),
+                    zstack!(
+                        text_field("covered", self.note.binding()).frame(200.0, 30.0),
+                        button(text("Overlay action"), || {}).frame(200.0, 30.0),
+                    ),
+                )
+                .on_click(|| {})
+            }
+        }
+        let panel = Panel {
+            note: State::new(String::new()),
+        };
+        let runtime = Runtime::new();
+        let laid = runtime.settled_layout(
+            &panel,
+            Proposal::exact(Size {
+                width: 200.0,
+                height: 160.0,
+            }),
+        );
+        assert_eq!(laid.fields.len(), 3);
+        for field in laid.fields.iter().take(2) {
+            runtime.pointer_moved(
+                field.frame.origin.x + 10.0,
+                field.frame.origin.y + 10.0,
+                false,
+            );
+            assert_eq!(runtime.hovered_cursor(), Some(Cursor::Text));
+        }
+        let covered = &laid.fields[2];
+        runtime.pointer_moved(
+            covered.frame.origin.x + covered.frame.size.width / 2.0,
+            covered.frame.origin.y + covered.frame.size.height / 2.0,
+            false,
+        );
+        assert_ne!(
+            runtime.hovered_cursor(),
+            Some(Cursor::Text),
+            "overlay button wins over covered input"
+        );
+        runtime.pointer_moved(10.0, 150.0, false);
+        assert_ne!(
+            runtime.hovered_cursor(),
+            Some(Cursor::Text),
+            "chrome is not text"
+        );
+        runtime.pointer_moved(500.0, 500.0, false);
+        assert_eq!(runtime.hovered_cursor(), None);
+    }
+
+    #[test]
     fn modal_caret_repaints_its_shape_without_changing_field_text() {
         use crate::action::{Key, KeyPattern, Stroke};
         use crate::layout::{DrawCommand, Proposal, Size};
@@ -14043,5 +14104,101 @@ mod tests {
         let bottom = rect_of(Color::hex_a(0x34C75980)).expect("the bottom band paints");
         assert_eq!(bottom.origin.y, 874.0 - 20.0);
         assert_eq!(bottom.size.width, 402.0);
+    }
+}
+
+#[cfg(test)]
+mod input_focus_policy_tests {
+    use crate::prelude::*;
+    use crate::text_input::{CaretState, EditingStrategy};
+    use std::{cell::RefCell, rc::Rc};
+
+    #[derive(Default)]
+    struct Policy(RefCell<Vec<bool>>);
+    impl EditingStrategy for Policy {
+        fn focus_changed(&self, focused: bool) {
+            self.0.borrow_mut().push(focused);
+        }
+        fn takes_text(&self) -> bool {
+            true
+        }
+        fn key(&self, _: &crate::action::Stroke, _: &mut String, _: &mut CaretState) -> bool {
+            false
+        }
+    }
+
+    #[derive(Clone)]
+    struct Fields {
+        first: Rc<Policy>,
+        second: Rc<Policy>,
+        enabled: State<bool>,
+        shown: State<bool>,
+        wrapped: State<bool>,
+    }
+    impl Component for Fields {
+        fn body(self, _: &Context) -> impl View {
+            let first = text_editor("one", State::new(String::new()).binding())
+                .editing_strategy(
+                    self.enabled
+                        .get()
+                        .then(|| self.first.clone() as Rc<dyn EditingStrategy>),
+                )
+                .id("one");
+            vstack!(
+                self.shown.get().then(|| if self.wrapped.get() {
+                    erased(hstack!(first))
+                } else {
+                    erased(first)
+                }),
+                text_field("two", State::new(String::new()).binding())
+                    .editing_strategy(Some(self.second.clone()))
+                    .id("two"),
+            )
+        }
+    }
+
+    #[test]
+    fn policies_follow_focus_replacement_migration_and_unmount() {
+        let runtime = Runtime::new();
+        let first = Rc::new(Policy::default());
+        let second = Rc::new(Policy::default());
+        let view = Fields {
+            first: first.clone(),
+            second: second.clone(),
+            enabled: State::new(true),
+            shown: State::new(true),
+            wrapped: State::new(false),
+        };
+        let proposal = crate::layout::Proposal::exact(crate::layout::Size {
+            width: 400.0,
+            height: 200.0,
+        });
+        let _ = runtime.settled_layout(&view, proposal);
+        assert!(runtime.focus_named("one"));
+        assert!(runtime.focus_named("one"));
+        assert_eq!(*first.0.borrow(), [true]);
+        assert!(runtime.focus_named("two"));
+        assert_eq!(*first.0.borrow(), [true, false]);
+        assert_eq!(*second.0.borrow(), [true]);
+        runtime.blur();
+        assert_eq!(*second.0.borrow(), [true, false]);
+        runtime.focus_named("one");
+        view.wrapped.set(true);
+        let _ = runtime.settled_layout(&view, proposal);
+        assert_eq!(
+            *first.0.borrow(),
+            [true, false, true],
+            "migration preserves focus"
+        );
+        view.enabled.set(false);
+        let _ = runtime.settled_layout(&view, proposal);
+        assert_eq!(*first.0.borrow(), [true, false, true, false]);
+        view.enabled.set(true);
+        let _ = runtime.settled_layout(&view, proposal);
+        assert_eq!(*first.0.borrow(), [true, false, true, false, true]);
+        view.shown.set(false);
+        let _ = runtime.settled_layout(&view, proposal);
+        assert_eq!(*first.0.borrow(), [true, false, true, false, true, false]);
+        assert!(runtime.focused().is_none());
     }
 }

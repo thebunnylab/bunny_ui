@@ -188,6 +188,8 @@ pub struct Runtime {
     last_modal_floor: std::cell::Cell<Option<crate::layout::ModalFloor>>,
     /// The focused field (identity path) — owner of the keyboard.
     focus: RefCell<Option<String>>,
+    /// Retain the old policy so an unmounted field can still hear blur.
+    focused_policy: RefCell<Option<Rc<dyn crate::text_input::EditingStrategy>>>,
     /// Caret + selection per field — they survive blur/refocus and
     /// remount (restored by identity, like scroll).
     carets: RefCell<HashMap<String, CaretState>>,
@@ -1154,6 +1156,7 @@ impl Runtime {
             last_scrolls: RefCell::new(Vec::new()),
             last_modal_floor: std::cell::Cell::new(None),
             focus: RefCell::new(None),
+            focused_policy: RefCell::new(None),
             carets: RefCell::new(HashMap::default()),
             caret_visible: Cell::new(true),
             goal_column: Cell::new(None),
@@ -2170,7 +2173,18 @@ impl Runtime {
     /// coordinates, with the viewport beside it: a surface whose regions move
     /// with the scroll (a pinned gutter) cannot answer from an x alone.
     pub fn hovered_cursor(&self) -> Option<crate::layout::Cursor> {
-        let at = self.interaction.borrow().pointer?;
+        let interaction = self.interaction.borrow();
+        let at = interaction.pointer?;
+        // Use the winning hit target, not only field rectangles: a button or
+        // overlay in front of an input must retain its own cursor.
+        if interaction
+            .hovered
+            .as_deref()
+            .is_some_and(reconciler::has_editor)
+        {
+            return Some(crate::layout::Cursor::Text);
+        }
+        drop(interaction);
         let customs = self.last_customs.borrow();
         customs.iter().rev().find_map(|placement| {
             let local = crate::layout::Point {
@@ -2988,6 +3002,7 @@ impl Runtime {
         self.frame_asked.set(true);
         self.caret_visible.set(true);
         *self.focus.borrow_mut() = Some(path.to_string());
+        self.sync_field_focus();
         self.carets
             .borrow_mut()
             .entry(path.to_string())
@@ -3008,6 +3023,7 @@ impl Runtime {
         self.goal_column.set(None);
         let held = self.focus.borrow().as_deref() == Some(path);
         *self.focus.borrow_mut() = Some(path.to_string());
+        self.sync_field_focus();
         let Some((text, caret, line)) = self.caret_under(path, x, y) else {
             self.carets
                 .borrow_mut()
@@ -3311,8 +3327,33 @@ impl Runtime {
         Edited { applied: true, output: None }
     }
 
+    /// Publish focus transitions once, after dropping every runtime borrow.
+    fn sync_field_focus(&self) {
+        let next = self
+            .focus
+            .borrow()
+            .as_deref()
+            .and_then(reconciler::field_policy);
+        let same = match (&*self.focused_policy.borrow(), &next) {
+            (Some(old), Some(new)) => Rc::ptr_eq(old, new),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        let old = self.focused_policy.replace(next.clone());
+        if let Some(old) = old {
+            old.focus_changed(false);
+        }
+        if let Some(next) = next {
+            next.focus_changed(true);
+        }
+    }
+
     pub fn blur(&self) -> bool {
         let dropped = self.focus.borrow_mut().take();
+        self.sync_field_focus();
         // the box hears the keyboard leave — a selection that only
         // means something while focused goes quiet
         if let Some(placement) = dropped.as_deref().and_then(|path| self.custom_at(path)) {
@@ -5099,6 +5140,7 @@ impl Runtime {
         if focus_died {
             *self.focus.borrow_mut() = None;
         }
+        self.sync_field_focus();
     }
 
     /// An input whose PATH died but whose NAME is still on screen moves
