@@ -75,6 +75,65 @@ by law — `Xft.dpi: 144` is 2×, `Xft.dpi: 120` stays 1× — and there is
 no composition road on that door (XIM is a fossil; dead keys still
 compose client-side).
 
+## The frame and its manners
+
+`WindowSpec` says who draws the top edge (`Chrome::Native` or
+`Chrome::Scene`) and how the window behaves under the hand:
+`.fixed()` for one size, `.no_minimize()` for a window that cannot be
+put away. The platform refuses the gesture, never the scene: on
+Wayland the minimum and the maximum size are the one size, so the
+compositor refuses the resize grab; on X11 `WM_NORMAL_HINTS` says the
+same, and the Motif hints drop the resize, maximize and minimize
+verbs from the window manager's frame.
+
+A native window on Wayland asks the compositor for its frame through
+`xdg-decoration`. KDE and the wlroots desktops answer with a
+server-side frame. GNOME never does — Mutter speaks no
+`xdg-decoration` and draws no frame for a Wayland window — and the
+headless Weston of the container is the same. Where no server-side
+frame answers, the shell stands a 32-point bar of its own on the
+scene: the title, the minimize, maximize and close buttons, the whole
+bar a drag region, and the crown answering its verbs, the resize
+bands at the border and the rounded corners, exactly as a scene-chrome
+window has them. One line on stderr says so. The X11 door keeps the
+window manager's frame.
+
+The pointer's shape follows the box under it: an I-beam over text, a
+cross over a cell, a hand over anything that answers a press, the
+resize arrows at a seam or a band. On Wayland the shapes come from
+the cursor theme; on X11 from the core cursor font.
+
+## Fonts
+
+The text engine is fontconfig, FreeType and HarfBuzz. A family the
+app names is matched by fontconfig, weights on its own scale
+(regular 80 … black 210), with a charset fallback for the glyphs the
+matched face lacks. A face the app SHIPS registers with
+`FreeTypeEngine::register_font(include_bytes!(…))`: the family name,
+the weight and the slant are read out of the file's own tables
+(`bunny_ui::font_file`), and a spec naming that family lands on the
+registered face — the slant matched first, then the nearest weight —
+before fontconfig is asked. The container proves it with the
+machine's DejaVu Sans: registered, its bold file outranks the regular
+the machine would have answered.
+
+## Images
+
+The image engine decodes with the codecs of the house —
+`bunny_ui::codec`, behind the core's `codec` feature, which only this
+shell turns on: PNG (every bit depth and color type, the palette, the
+transparency chunk, the Adam7 interlace) and JPEG (baseline and
+progressive, any sampling, restart intervals, JFIF and Adobe). The
+JPEG road decodes the way libjpeg does — the same integer inverse DCT,
+the same triangle filter for the chroma, the same fixed-point color
+tables — and the fixtures in `crates/bunny_ui/tests/fixtures/codec/`
+pin it to libjpeg-turbo's output within two steps per channel. What
+the codec refuses, it refuses by name on stderr: arithmetic coding,
+lossless, hierarchical, 12-bit samples, CMYK and YCCK. No decoder
+here reads the EXIF orientation, and neither do the platform
+decoders the other shells use. File icons come from the freedesktop
+icon themes on disk.
+
 ## Logs
 
 Everything the shell says goes to stderr, one line per event: a tier

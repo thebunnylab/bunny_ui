@@ -1,403 +1,18 @@
-//! The linux image engine: a PNG decoder written in the house, safe
-//! Rust from the first byte — this platform has no OS codec, and the
-//! C ones speak setjmp, a road Rust cannot walk. The inflate below is
-//! the whole of RFC 1951 the format needs: stored, fixed and dynamic
-//! blocks, the 32K window, the adler check.
-//!
-//! File icons come from the freedesktop icon themes on disk (PNG
-//! sizes), with a procedural document glyph as the floor when a theme
-//! offers nothing. JPEG is deferred until a fixture demands it — the
-//! examples and the apps speak PNG.
+//! The linux image engine: the codecs of the house
+//! ([`bunny_ui::codec`] — PNG and JPEG in safe Rust, this platform has
+//! no OS codec and the C ones speak setjmp, a road Rust cannot walk),
+//! a bilinear resample, and file icons from the freedesktop icon
+//! themes on disk (PNG sizes), with a procedural document glyph as
+//! the floor when a theme offers nothing. A JPEG the codec refuses by
+//! name (arithmetic, lossless, CMYK …) says so once on stderr and
+//! paints nothing.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use bunny_ui::image_engine::{ImageEngine, ImageRaster, ImageSource};
-
-// MARK: - inflate (RFC 1951, by hand)
-
-struct BitReader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-    bit: u32,
-    value: u32,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(bytes: &'a [u8]) -> BitReader<'a> {
-        BitReader { bytes, at: 0, bit: 0, value: 0 }
-    }
-
-    fn take(&mut self, count: u32) -> Option<u32> {
-        while self.bit < count {
-            let byte = *self.bytes.get(self.at)? as u32;
-            self.at += 1;
-            self.value |= byte << self.bit;
-            self.bit += 8;
-        }
-        let out = self.value & ((1 << count) - 1);
-        self.value >>= count;
-        self.bit -= count;
-        Some(out)
-    }
-
-    fn align(&mut self) {
-        self.value = 0;
-        self.bit = 0;
-    }
-}
-
-/// A canonical Huffman table: code lengths in, symbol lookup out.
-struct Huffman {
-    /// counts[len] and offsets into `symbols`, the canonical walk.
-    counts: [u16; 16],
-    symbols: Vec<u16>,
-}
-
-impl Huffman {
-    fn new(lengths: &[u8]) -> Huffman {
-        let mut counts = [0u16; 16];
-        for &length in lengths {
-            counts[length as usize] += 1;
-        }
-        counts[0] = 0;
-        let mut offsets = [0u16; 16];
-        for length in 1..16 {
-            offsets[length] = offsets[length - 1] + counts[length - 1];
-        }
-        let mut symbols = vec![0u16; lengths.iter().filter(|&&l| l != 0).count()];
-        for (symbol, &length) in lengths.iter().enumerate() {
-            if length != 0 {
-                symbols[offsets[length as usize] as usize] = symbol as u16;
-                offsets[length as usize] += 1;
-            }
-        }
-        Huffman { counts, symbols }
-    }
-
-    /// One symbol off the stream — deflate codes arrive MSB-first
-    /// inside the LSB-first bit soup, so the walk goes bit by bit.
-    fn decode(&self, bits: &mut BitReader) -> Option<u16> {
-        let mut code: i32 = 0;
-        let mut first: i32 = 0;
-        let mut index: i32 = 0;
-        for length in 1..16 {
-            code |= bits.take(1)? as i32;
-            let count = self.counts[length] as i32;
-            if code - first < count {
-                return Some(self.symbols[(index + (code - first)) as usize]);
-            }
-            index += count;
-            first = (first + count) << 1;
-            code <<= 1;
-        }
-        None
-    }
-}
-
-const LENGTH_BASE: [u16; 29] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
-    131, 163, 195, 227, 258,
-];
-const LENGTH_EXTRA: [u8; 29] =
-    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
-const DIST_BASE: [u16; 30] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
-    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
-];
-const DIST_EXTRA: [u8; 30] = [
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
-    13, 13,
-];
-
-/// zlib in, raw bytes out. `None` on any malformation — the caller
-/// remembers the failure and never walks the bytes again.
-fn inflate_zlib(bytes: &[u8]) -> Option<Vec<u8>> {
-    if bytes.len() < 6 {
-        return None;
-    }
-    let cmf = bytes[0] as u32;
-    let flg = bytes[1] as u32;
-    // deflate method, window sane, header checksum, no preset dict
-    if cmf & 0x0F != 8 || (cmf * 256 + flg) % 31 != 0 || flg & 0x20 != 0 {
-        return None;
-    }
-    let deflate = &bytes[2..];
-    let mut bits = BitReader::new(deflate);
-    let mut out: Vec<u8> = Vec::new();
-    loop {
-        let last = bits.take(1)?;
-        match bits.take(2)? {
-            0 => {
-                // stored: aligned, LEN + one's complement
-                bits.align();
-                let at = bits.at;
-                let len = u16::from_le_bytes([*deflate.get(at)?, *deflate.get(at + 1)?]) as usize;
-                let nlen =
-                    u16::from_le_bytes([*deflate.get(at + 2)?, *deflate.get(at + 3)?]) as usize;
-                if len != !nlen & 0xFFFF {
-                    return None;
-                }
-                let data = deflate.get(at + 4..at + 4 + len)?;
-                out.extend_from_slice(data);
-                bits.at = at + 4 + len;
-            }
-            kind @ (1 | 2) => {
-                let (literals, distances);
-                if kind == 1 {
-                    // the fixed trees, straight from the RFC
-                    let mut lengths = [0u8; 288];
-                    lengths[..144].fill(8);
-                    lengths[144..256].fill(9);
-                    lengths[256..280].fill(7);
-                    lengths[280..].fill(8);
-                    literals = Huffman::new(&lengths);
-                    distances = Huffman::new(&[5u8; 30]);
-                } else {
-                    const ORDER: [usize; 19] =
-                        [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
-                    let hlit = bits.take(5)? as usize + 257;
-                    let hdist = bits.take(5)? as usize + 1;
-                    let hclen = bits.take(4)? as usize + 4;
-                    let mut code_lengths = [0u8; 19];
-                    for &slot in ORDER.iter().take(hclen) {
-                        code_lengths[slot] = bits.take(3)? as u8;
-                    }
-                    let decoder = Huffman::new(&code_lengths);
-                    let mut lengths = vec![0u8; hlit + hdist];
-                    let mut at = 0;
-                    while at < lengths.len() {
-                        let symbol = decoder.decode(&mut bits)?;
-                        match symbol {
-                            0..=15 => {
-                                lengths[at] = symbol as u8;
-                                at += 1;
-                            }
-                            16 => {
-                                let previous = *lengths.get(at.checked_sub(1)?)?;
-                                for _ in 0..bits.take(2)? + 3 {
-                                    *lengths.get_mut(at)? = previous;
-                                    at += 1;
-                                }
-                            }
-                            17 => at += bits.take(3)? as usize + 3,
-                            18 => at += bits.take(7)? as usize + 11,
-                            _ => return None,
-                        }
-                    }
-                    if at > lengths.len() {
-                        return None;
-                    }
-                    literals = Huffman::new(&lengths[..hlit]);
-                    distances = Huffman::new(&lengths[hlit..]);
-                }
-                loop {
-                    let symbol = literals.decode(&mut bits)?;
-                    match symbol {
-                        0..=255 => out.push(symbol as u8),
-                        256 => break,
-                        257..=285 => {
-                            let slot = symbol as usize - 257;
-                            let length = LENGTH_BASE[slot] as usize
-                                + bits.take(LENGTH_EXTRA[slot] as u32)? as usize;
-                            let dist_symbol = distances.decode(&mut bits)? as usize;
-                            if dist_symbol >= 30 {
-                                return None;
-                            }
-                            let distance = DIST_BASE[dist_symbol] as usize
-                                + bits.take(DIST_EXTRA[dist_symbol] as u32)? as usize;
-                            let start = out.len().checked_sub(distance)?;
-                            // the window copy may overlap itself — the
-                            // repeat IS the feature
-                            for offset in 0..length {
-                                let byte = out[start + offset];
-                                out.push(byte);
-                            }
-                        }
-                        _ => return None,
-                    }
-                }
-            }
-            _ => return None,
-        }
-        if last == 1 {
-            break;
-        }
-    }
-    // the adler tail seals the stream
-    let at = 2 + bits.at + if bits.bit >= 8 { 0 } else { 0 };
-    let tail = bytes.get(at..at + 4);
-    if let Some(tail) = tail {
-        let want = u32::from_be_bytes([tail[0], tail[1], tail[2], tail[3]]);
-        if adler32(&out) != want {
-            return None;
-        }
-    }
-    Some(out)
-}
-
-fn adler32(bytes: &[u8]) -> u32 {
-    let (mut a, mut b) = (1u32, 0u32);
-    for chunk in bytes.chunks(5552) {
-        for &byte in chunk {
-            a += byte as u32;
-            b += a;
-        }
-        a %= 65521;
-        b %= 65521;
-    }
-    (b << 16) | a
-}
-
-// MARK: - PNG
-
-struct Png {
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
-}
-
-/// IHDR only — the cheap answer `intrinsic` wants.
-fn png_header(bytes: &[u8]) -> Option<(u32, u32)> {
-    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-    if bytes.len() < 33 || bytes[..8] != SIGNATURE || &bytes[12..16] != b"IHDR" {
-        return None;
-    }
-    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
-    (width > 0 && height > 0).then_some((width, height))
-}
-
-/// The whole road: chunks → inflate → defilter → straight RGBA.
-/// Supported: bit depth 8 for gray/rgb/gray-alpha/rgba, palette at
-/// 1/2/4/8 with tRNS, 16-bit by its high byte. Interlace is refused —
-/// nothing in the house emits it.
-fn png_decode(bytes: &[u8]) -> Option<Png> {
-    let (width, height) = png_header(bytes)?;
-    let depth = bytes[24];
-    let color = bytes[25];
-    let interlace = bytes[28];
-    if interlace != 0 {
-        return None;
-    }
-    let mut palette: Vec<[u8; 3]> = Vec::new();
-    let mut trans: Vec<u8> = Vec::new();
-    let mut compressed: Vec<u8> = Vec::new();
-    let mut at = 8;
-    while at + 8 <= bytes.len() {
-        let len = u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-            as usize;
-        let kind = &bytes[at + 4..at + 8];
-        let payload = bytes.get(at + 8..at + 8 + len)?;
-        match kind {
-            b"PLTE" => palette = payload.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
-            b"tRNS" => trans = payload.to_vec(),
-            b"IDAT" => compressed.extend_from_slice(payload),
-            b"IEND" => break,
-            _ => {}
-        }
-        at += 12 + len; // len + type + payload + crc
-    }
-    let raw = inflate_zlib(&compressed)?;
-    let channels: usize = match color {
-        0 => 1,
-        2 => 3,
-        3 => 1,
-        4 => 2,
-        6 => 4,
-        _ => return None,
-    };
-    if color != 3 && depth != 8 && depth != 16 {
-        return None;
-    }
-    if color == 3 && !matches!(depth, 1 | 2 | 4 | 8) {
-        return None;
-    }
-    let sample_bytes = if depth == 16 { 2 } else { 1 };
-    let bits_per_pixel = channels * depth as usize;
-    let stride = (width as usize * bits_per_pixel + 7) / 8;
-    let bpp = ((bits_per_pixel + 7) / 8).max(1);
-    let mut rows: Vec<u8> = vec![0; stride * height as usize];
-    let mut previous_start = 0usize;
-    let mut cursor = 0usize;
-    for row in 0..height as usize {
-        let filter = *raw.get(cursor)?;
-        cursor += 1;
-        let line = raw.get(cursor..cursor + stride)?.to_vec();
-        cursor += stride;
-        let start = row * stride;
-        for index in 0..stride {
-            let x = line[index];
-            let a = if index >= bpp { rows[start + index - bpp] } else { 0 };
-            let b = if row > 0 { rows[previous_start + index] } else { 0 };
-            let c = if row > 0 && index >= bpp { rows[previous_start + index - bpp] } else { 0 };
-            let value = match filter {
-                0 => x,
-                1 => x.wrapping_add(a),
-                2 => x.wrapping_add(b),
-                3 => x.wrapping_add((((a as u16) + (b as u16)) / 2) as u8),
-                4 => {
-                    let (pa, pb, pc) = {
-                        let p = a as i16 + b as i16 - c as i16;
-                        ((p - a as i16).abs(), (p - b as i16).abs(), (p - c as i16).abs())
-                    };
-                    let predictor = if pa <= pb && pa <= pc {
-                        a
-                    } else if pb <= pc {
-                        b
-                    } else {
-                        c
-                    };
-                    x.wrapping_add(predictor)
-                }
-                _ => return None,
-            };
-            rows[start + index] = value;
-        }
-        previous_start = start;
-    }
-    // to straight RGBA
-    let mut rgba = vec![0u8; width as usize * height as usize * 4];
-    for row in 0..height as usize {
-        let line = &rows[row * stride..(row + 1) * stride];
-        for x in 0..width as usize {
-            let out = &mut rgba[(row * width as usize + x) * 4..][..4];
-            match color {
-                3 => {
-                    let index = match depth {
-                        8 => line[x] as usize,
-                        _ => {
-                            let per_byte = 8 / depth as usize;
-                            let byte = line[x / per_byte];
-                            let shift = 8 - depth as usize * (x % per_byte + 1);
-                            ((byte >> shift) & ((1 << depth) - 1)) as usize
-                        }
-                    };
-                    let [r, g, b] = *palette.get(index)?;
-                    out.copy_from_slice(&[
-                        r,
-                        g,
-                        b,
-                        trans.get(index).copied().unwrap_or(255),
-                    ]);
-                }
-                _ => {
-                    let px = &line[x * channels * sample_bytes..];
-                    let sample = |c: usize| px[c * sample_bytes];
-                    match color {
-                        0 => out.copy_from_slice(&[sample(0), sample(0), sample(0), 255]),
-                        2 => out.copy_from_slice(&[sample(0), sample(1), sample(2), 255]),
-                        4 => out.copy_from_slice(&[sample(0), sample(0), sample(0), sample(1)]),
-                        6 => out.copy_from_slice(&[sample(0), sample(1), sample(2), sample(3)]),
-                        _ => return None,
-                    }
-                }
-            }
-        }
-    }
-    Some(Png { width, height, rgba })
-}
+use bunny_ui::codec::{self, png, Image as Png};
+use bunny_ui::image_engine::{ImageEngine, ImageRaster, ImageSource, FILE_ICON_SIZE};
 
 // MARK: - resample (bilinear, straight alpha)
 
@@ -433,8 +48,6 @@ fn resample(source: &Png, width: usize, height: usize) -> Vec<u8> {
 
 // MARK: - file icons (freedesktop themes, PNG sizes)
 
-const FILE_ICON_SIZE: u32 = 32;
-
 /// Extension → the freedesktop icon names worth trying, best first.
 fn icon_names(path: &str) -> &'static [&'static str] {
     let name = path.rsplit('/').next().unwrap_or(path);
@@ -466,7 +79,7 @@ fn theme_icon(name: &str) -> Option<Png> {
                 {
                     let path = format!("{}/{theme}/{order}/{name}.png", ROOTS[0]);
                     if let Ok(bytes) = std::fs::read(&path)
-                        && let Some(png) = png_decode(&bytes)
+                        && let Some(png) = png::decode(&bytes)
                     {
                         return Some(png);
                     }
@@ -475,7 +88,7 @@ fn theme_icon(name: &str) -> Option<Png> {
         }
     }
     let flat = format!("{}/{name}.png", ROOTS[1]);
-    std::fs::read(flat).ok().and_then(|bytes| png_decode(&bytes))
+    std::fs::read(flat).ok().and_then(|bytes| png::decode(&bytes))
 }
 
 /// The floor: a plain document glyph — sheet, folded corner — so a
@@ -523,7 +136,19 @@ impl LinuxImageEngine {
         let (key, decode): (u64, Box<dyn FnOnce() -> Option<Png>>) = match source {
             ImageSource::Bytes { key, bytes } => {
                 let bytes = Rc::clone(bytes);
-                (*key, Box::new(move || png_decode(&bytes)))
+                let key = *key;
+                (key, Box::new(move || match codec::kind(&bytes) {
+                    // a JPEG the codec refuses says why, once per key —
+                    // the failure is remembered and never walked again
+                    Some(codec::Kind::Jpeg) => match codec::jpeg::decode(&bytes) {
+                        Ok(image) => Some(image),
+                        Err(why) => {
+                            eprintln!("bunny_ui_linux: a jpeg was refused — {why:?} (image {key:#x})");
+                            None
+                        }
+                    },
+                    _ => codec::decode(&bytes),
+                }))
             }
             ImageSource::FileIcon { key, path } => {
                 let path = Rc::clone(path);
@@ -554,7 +179,7 @@ impl LinuxImageEngine {
 impl ImageEngine for LinuxImageEngine {
     fn intrinsic(&self, source: &ImageSource) -> Option<(u32, u32)> {
         match source {
-            ImageSource::Bytes { bytes, .. } => png_header(bytes),
+            ImageSource::Bytes { bytes, .. } => codec::header(bytes),
             ImageSource::FileIcon { .. } => Some((FILE_ICON_SIZE, FILE_ICON_SIZE)),
             _ => None,
         }
@@ -633,7 +258,7 @@ mod tests {
         idat.extend_from_slice(&(raw.len() as u16).to_le_bytes());
         idat.extend_from_slice(&(!(raw.len() as u16)).to_le_bytes());
         idat.extend_from_slice(&raw);
-        idat.extend_from_slice(&adler32(&raw).to_be_bytes());
+        idat.extend_from_slice(&bunny_ui::codec::inflate::adler32(&raw).to_be_bytes());
         let mut out = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
         out.extend_from_slice(&chunk(b"IHDR", &ihdr));
         out.extend_from_slice(&chunk(b"IDAT", &idat));
@@ -645,36 +270,22 @@ mod tests {
         ImageSource::Bytes { key: bytes.iter().map(|&b| b as u64).sum(), bytes: bytes.into() }
     }
 
-    #[test]
-    fn the_embedded_png_decodes_byte_for_byte() {
-        let bytes = png_rgba(4, 3, |x, y| [x as u8 * 10, y as u8 * 20, 7, 255]);
-        let png = png_decode(&bytes).expect("a valid png decodes");
-        assert_eq!((png.width, png.height), (4, 3));
-        assert_eq!(&png.rgba[0..4], &[0, 0, 7, 255]);
-        assert_eq!(&png.rgba[(2 * 4 + 3) * 4..][..4], &[30, 40, 7, 255]);
-    }
 
+
+    /// The JPEG road of the engine: the size from the header, the
+    /// pixels from the codec, at the picture's own size and resampled.
     #[test]
-    fn a_paletted_png_reads_its_transparency() {
-        let mut ihdr = Vec::new();
-        ihdr.extend_from_slice(&2u32.to_be_bytes());
-        ihdr.extend_from_slice(&1u32.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 3, 0, 0, 0]); // 8-bit palette
-        let raw = [0u8, 0, 1]; // filter none, indexes 0 and 1
-        let mut idat = vec![0x78, 0x01, 0x01];
-        idat.extend_from_slice(&(raw.len() as u16).to_le_bytes());
-        idat.extend_from_slice(&(!(raw.len() as u16)).to_le_bytes());
-        idat.extend_from_slice(&raw);
-        idat.extend_from_slice(&adler32(&raw).to_be_bytes());
-        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-        bytes.extend_from_slice(&chunk(b"IHDR", &ihdr));
-        bytes.extend_from_slice(&chunk(b"PLTE", &[255, 0, 0, 0, 255, 0]));
-        bytes.extend_from_slice(&chunk(b"tRNS", &[128]));
-        bytes.extend_from_slice(&chunk(b"IDAT", &idat));
-        bytes.extend_from_slice(&chunk(b"IEND", &[]));
-        let png = png_decode(&bytes).expect("palette + tRNS decodes");
-        assert_eq!(&png.rgba[0..4], &[255, 0, 0, 128], "index 0 carries its tRNS alpha");
-        assert_eq!(&png.rgba[4..8], &[0, 255, 0, 255], "index 1 is opaque");
+    fn a_jpeg_answers_its_size_and_its_pixels() {
+        let bytes = include_bytes!("../../bunny_ui/tests/fixtures/codec/base_420.jpg");
+        let engine = LinuxImageEngine::new();
+        let src = source(bytes.to_vec());
+        assert_eq!(engine.intrinsic(&src), Some((33, 21)));
+        let raster = engine.raster(&src, 33, 21).expect("decodes");
+        let expected = include_bytes!("../../bunny_ui/tests/fixtures/codec/base_420.rgba");
+        let worst = raster.rgba.iter().zip(expected.iter()).map(|(a, b)| a.abs_diff(*b)).max();
+        assert!(worst.is_some_and(|w| w <= 2), "within two steps of libjpeg: {worst:?}");
+        let half = engine.raster(&src, 16, 10).expect("resamples");
+        assert_eq!(half.rgba.len(), 16 * 10 * 4);
     }
 
     #[test]

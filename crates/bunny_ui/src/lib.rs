@@ -56,6 +56,8 @@ pub mod modifier;
 pub mod one_of;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+#[cfg(feature = "codec")]
+pub mod codec;
 #[cfg(feature = "canvas")]
 pub mod raster;
 pub mod pacing;

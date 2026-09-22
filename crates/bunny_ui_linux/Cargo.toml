@@ -8,7 +8,7 @@ edition.workspace = true
 autoexamples = false
 
 [dependencies]
-bunny-ui = { workspace = true, features = ["canvas", "gpu"] }
+bunny-ui = { workspace = true, features = ["canvas", "gpu", "codec"] }
 bunny-ui-vulkan.workspace = true
 
 [dev-dependencies]
