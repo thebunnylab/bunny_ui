@@ -103,6 +103,27 @@ cross over a cell, a hand over anything that answers a press, the
 resize arrows at a seam or a band. On Wayland the shapes come from
 the cursor theme; on X11 from the core cursor font.
 
+## Pacing
+
+Every window has a pacer (`bunny_ui::pacing`), the shape the mac and
+the web shells keep: a burst of pointer, wheel or wake events folds
+into one frame a beat, and a wake with no news draws nothing. The
+beat is the compositor's frame callback on Wayland while frames
+present; a window that wants frames and presented nothing — a tick
+that moved no pixel, a task asleep on a timer — keeps its beat on a
+deadline of its own, at the display's interval or at the slower one
+the animator asks for, and the next present retires it. The X11 door
+has no callbacks and every window ticks on its own deadline. A
+deadline keeps its phase across the events that re-sync the driver
+(a blink every 500 ms would otherwise push an 800 ms sleep out
+forever) and moves only when a shorter pace pulls it in; a slow beat
+advances the engine's clock by the step it promised, as the mac's
+slow timer does. No bare commit is ever involved. `BUNNY_PACING=off` draws every ask at once,
+for a measurement that wants the raw count. The container proves it
+with `counter_window_linux --drive --sleeper`: a task awake twenty
+times a second that writes once a second presents its three writes
+and nothing for the sixty wakes.
+
 ## Scale
 
 The Wayland door climbs a ladder for the window's scale: the

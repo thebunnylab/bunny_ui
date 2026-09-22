@@ -1302,7 +1302,13 @@ struct Window {
     /// The frame callback in flight (null = none): the compositor's
     /// `done` names it, and it is destroyed once it spoke.
     frame_callback: *mut Proxy,
-    paused: bool,
+    /// What the window asked the driver for, and the deadline of its
+    /// own that stands in while no callback is in flight.
+    pace: DriverPace,
+    next_beat: Option<Instant>,
+    /// The compositor says the window is being resized (a state on the
+    /// configure) — the pacer draws every beat while it holds.
+    resizing: bool,
     last_frame: Option<Instant>,
     /// Presenting commits on THIS window — the configure road checks
     /// whether an ack was followed by one.
@@ -1610,10 +1616,6 @@ thread_local! {
     static HANDLER: RefCell<Option<Box<dyn FnMut(AppEvent)>>> = const { RefCell::new(None) };
     static NEXT_BLINK: Cell<Option<Instant>> = const { Cell::new(None) };
     static NEXT_REPEAT: Cell<Option<Instant>> = const { Cell::new(None) };
-    /// The beat's own deadline: the compositor's frame callback is
-    /// the clock only while frames present; a window that wants frames
-    /// and presented nothing ticks on this instead.
-    static NEXT_FRAME: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 fn with_client<R>(body: impl FnOnce(&mut Client) -> R) -> R {
@@ -2065,7 +2067,9 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
             entered: Vec::new(),
             backing: None,
             frame_callback: std::ptr::null_mut(),
-            paused: true,
+            pace: DriverPace::Off,
+            next_beat: None,
+            resizing: false,
             last_frame: None,
             presents: 0,
             maximized: false,
@@ -2164,7 +2168,9 @@ fn apply_toplevel_configure(client: &mut Client, toplevel_ptr: usize, width: i32
         // zero means "your choice": keep what we have
         win.pending_size = (width > 0 && height > 0).then_some((width, height));
         const STATE_MAXIMIZED: u32 = 1;
+        const STATE_RESIZING: u32 = 3;
         win.maximized = states.contains(&STATE_MAXIMIZED);
+        win.resizing = states.contains(&STATE_RESIZING);
     }
 }
 
@@ -3893,29 +3899,85 @@ fn ime_marked() -> bool {
 
 // MARK: - the frame driver (no thread: the compositor's callback is the clock)
 
-pub fn want_frames(window: usize, wants: bool) {
-    if is_x11() {
-        return crate::x11::want_frames(window as u32, wants);
+/// What the frame driver is asked for: every refresh, one tick every
+/// `s` seconds (a slow animation), or nothing.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DriverPace {
+    Full,
+    Slow(f64),
+    Off,
+}
+
+impl DriverPace {
+    /// The deadline a window keeps under this pace, given the one it
+    /// holds. `Off` drops it; `Full` is one frame away, or nothing while
+    /// the compositor's callback is in flight (the callback is the
+    /// clock then); `Slow` is the interval away. A deadline already
+    /// armed STAYS unless the new one comes sooner: the driver is
+    /// re-synced after every event, and a deadline that moved with each
+    /// of them never came due under a blink every 500 ms.
+    pub(crate) fn deadline(
+        self,
+        armed: Option<Instant>,
+        callback_in_flight: bool,
+        now: Instant,
+    ) -> Option<Instant> {
+        let wanted = match self {
+            DriverPace::Off => return None,
+            DriverPace::Full if callback_in_flight => return None,
+            DriverPace::Full => now + FRAME_INTERVAL,
+            DriverPace::Slow(interval) => {
+                now + std::time::Duration::from_secs_f64(interval.max(0.001))
+            }
+        };
+        Some(armed.map_or(wanted, |at| at.min(wanted)))
     }
-    let (inflight, any_wants) = with_client(|client| {
-        if let Some(win) = window_at(client, window) {
-            win.paused = !wants;
+
+    /// How far the engine's clock moves on a beat. At the display's
+    /// pace, the wall time since the last beat, clamped to two frames —
+    /// a stalled link never teleports a spring. At a slow pace, the
+    /// step that was promised, with no wall clock in the path (the mac's
+    /// slow timer keeps the same law): the sleeper that asked for the
+    /// step is due on it, whatever the pump's own lateness.
+    pub(crate) fn beat_dt(self, elapsed: Option<f64>) -> f64 {
+        match self {
+            DriverPace::Slow(interval) => interval.max(0.001),
+            DriverPace::Full | DriverPace::Off => elapsed.unwrap_or(1.0 / 60.0).clamp(0.0, 1.0 / 30.0),
         }
-        let inflight = window_ref(client, window).is_some_and(|w| !w.frame_callback.is_null());
-        (inflight, client.windows.iter().any(|w| !w.paused))
-    });
-    // the compositor's callback is the clock only while frames present:
-    // a window that wants frames and presented nothing (a tick that
-    // moved no pixel, a task on a timer) keeps its beat on a deadline
-    // of its own, which the next present retires — one deadline, every
-    // wanting window ticks on it
-    NEXT_FRAME.with(|cell| {
-        if !any_wants {
-            cell.set(None);
-        } else if wants && !inflight && cell.get().is_none() {
-            cell.set(Some(Instant::now() + FRAME_INTERVAL));
-        }
-    });
+    }
+}
+
+/// The frame driver, per window. Answers whether the beat runs at the
+/// display's own rate — what the pacer is told it is riding.
+///
+/// The compositor's callback is the clock only while frames present:
+/// a window that wants frames and presented nothing (a tick that moved
+/// no pixel, a task on a timer) keeps its beat on a deadline of its
+/// own, which the next present retires. A slow pace is a deadline
+/// too, at its own interval.
+pub fn want_beat(window: usize, pace: DriverPace) -> bool {
+    if is_x11() {
+        return crate::x11::want_beat(window as u32, pace);
+    }
+    with_client(|client| {
+        let Some(win) = window_at(client, window) else { return false };
+        win.pace = pace;
+        win.next_beat = pace.deadline(win.next_beat, !win.frame_callback.is_null(), Instant::now());
+        pace == DriverPace::Full
+    })
+}
+
+/// True while the compositor says this window is being resized.
+pub(crate) fn in_live_resize(window: usize) -> bool {
+    if is_x11() {
+        return false;
+    }
+    with_client(|client| window_ref(client, window).is_some_and(|win| win.resizing))
+}
+
+/// The nearest deadline any window holds — the pump's third clock.
+fn next_beat_deadline() -> Option<Instant> {
+    with_client(|client| client.windows.iter().filter_map(|win| win.next_beat).min())
 }
 
 // MARK: - the gpu graft (the shell side of gl.rs)
@@ -4119,16 +4181,15 @@ fn drain_protocol_events() {
                     let win = window_where(client, |w| w.frame_callback as usize == callback_ptr)?;
                     unsafe { wl_proxy_destroy(win.frame_callback) };
                     win.frame_callback = std::ptr::null_mut();
-                    if win.paused {
+                    // the callback took this beat; a deadline armed for
+                    // it stands down
+                    win.next_beat = None;
+                    if win.pace == DriverPace::Off {
                         win.last_frame = None;
                         return None;
                     }
                     let now = Instant::now();
-                    let dt = win
-                        .last_frame
-                        .map(|last| (now - last).as_secs_f64())
-                        .unwrap_or(1.0 / 60.0)
-                        .clamp(0.0, 1.0 / 30.0);
+                    let dt = win.pace.beat_dt(win.last_frame.map(|last| (now - last).as_secs_f64()));
                     win.last_frame = Some(now);
                     Some((win.surface as usize, dt))
                 });
@@ -4694,7 +4755,7 @@ pub fn run() {
             wl_display_flush(display);
             // the deadline heap, two entries tall: blink and repeat
             let timeout =
-                [NEXT_BLINK.with(Cell::get), NEXT_REPEAT.with(Cell::get), NEXT_FRAME.with(Cell::get)]
+                [NEXT_BLINK.with(Cell::get), NEXT_REPEAT.with(Cell::get), next_beat_deadline()]
                 .into_iter()
                 .flatten()
                 .map(|at| at.saturating_duration_since(Instant::now()).as_millis() as c_int)
@@ -4747,14 +4808,7 @@ pub fn run() {
         if blink_due {
             dispatch(AppEvent::Blink);
         }
-        let frame_is_due = NEXT_FRAME.with(|cell| {
-            let due = cell.get().is_some_and(|at| Instant::now() >= at);
-            if due {
-                cell.set(None); // the handler re-arms through the driver
-            }
-            due
-        });
-        if frame_is_due {
+        if next_beat_deadline().is_some_and(|at| Instant::now() >= at) {
             frame_due();
         }
         // the hand of a --drive sheet, delivered outside any dispatch
@@ -4770,18 +4824,15 @@ pub fn run() {
 /// nothing presents. A present arms the compositor's callback, and
 /// that callback takes the beat back.
 fn frame_due() {
+    let now = Instant::now();
     let beats: Vec<(usize, f64)> = with_client(|client| {
-        let now = Instant::now();
         client
             .windows
             .iter_mut()
-            .filter(|win| !win.paused && win.frame_callback.is_null())
+            .filter(|win| win.next_beat.is_some_and(|at| now >= at))
             .map(|win| {
-                let dt = win
-                    .last_frame
-                    .map(|last| (now - last).as_secs_f64())
-                    .unwrap_or(1.0 / 60.0)
-                    .clamp(0.0, 1.0 / 30.0);
+                win.next_beat = None; // the handler's sync re-arms
+                let dt = win.pace.beat_dt(win.last_frame.map(|last| (now - last).as_secs_f64()));
                 win.last_frame = Some(now);
                 (win.surface as usize, dt)
             })
@@ -4920,6 +4971,45 @@ fn teardown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The driver is re-synced after every event. A slow deadline keeps
+    /// its phase across them, moves only when a shorter pace pulls it
+    /// in, and the display's pace rides the callback when one flies.
+    #[test]
+    fn a_deadline_keeps_its_phase_across_the_events_that_resync_it() {
+        use std::time::Duration;
+        let now = Instant::now();
+        let later = now + Duration::from_millis(500);
+        // armed once, 800 ms out; a blink 500 ms later asks again and
+        // the deadline stands where it was
+        let armed = DriverPace::Slow(0.8).deadline(None, false, now);
+        assert_eq!(armed, Some(now + Duration::from_millis(800)));
+        assert_eq!(DriverPace::Slow(0.8).deadline(armed, false, later), armed);
+        // a sleeper nearer than the one armed pulls the deadline in
+        assert_eq!(
+            DriverPace::Slow(0.05).deadline(armed, false, later),
+            Some(later + Duration::from_millis(50))
+        );
+        // the display's pace: one frame away, kept if sooner is armed,
+        // and nothing at all while the compositor's callback is the clock
+        assert_eq!(DriverPace::Full.deadline(None, false, now), Some(now + FRAME_INTERVAL));
+        let soon = Some(now + Duration::from_millis(5));
+        assert_eq!(DriverPace::Full.deadline(soon, false, now), soon);
+        assert_eq!(DriverPace::Full.deadline(armed, true, now), None);
+        // off drops whatever was armed
+        assert_eq!(DriverPace::Off.deadline(armed, false, now), None);
+    }
+
+    /// A full beat moves the clock by the wall, clamped; a slow beat by
+    /// the step it promised.
+    #[test]
+    fn a_slow_beat_moves_the_clock_by_its_step_and_a_full_one_by_the_wall() {
+        assert!((DriverPace::Slow(0.8).beat_dt(Some(0.803)) - 0.8).abs() < 1e-12);
+        assert!((DriverPace::Slow(0.8).beat_dt(None) - 0.8).abs() < 1e-12);
+        assert!((DriverPace::Full.beat_dt(Some(0.012)) - 0.012).abs() < 1e-12);
+        assert!((DriverPace::Full.beat_dt(Some(2.0)) - 1.0 / 30.0).abs() < 1e-12);
+        assert!((DriverPace::Full.beat_dt(None) - 1.0 / 60.0).abs() < 1e-12);
+    }
 
     #[test]
     fn the_backend_pick_honors_force_then_displays() {

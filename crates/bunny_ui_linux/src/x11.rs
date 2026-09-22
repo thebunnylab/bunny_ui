@@ -878,7 +878,9 @@ struct Window {
     scale: usize,
     backing: Option<Backing>,
     mapped: bool,
-    paused: bool,
+    /// What the window asked the driver for, and its next tick.
+    pace: crate::ffi::DriverPace,
+    next_beat: Option<Instant>,
     last_frame: Option<Instant>,
     /// Scene chrome: the shell owns the border — resize bands, the
     /// crown verbs and the rounded corners.
@@ -980,7 +982,6 @@ fn first_window(client: &XClient) -> Option<u32> {
 
 thread_local! {
     static X_CLIENT: RefCell<Option<XClient>> = const { RefCell::new(None) };
-    static NEXT_FRAME: Cell<Option<Instant>> = const { Cell::new(None) };
     static NEXT_BLINK: Cell<Option<Instant>> = const { Cell::new(None) };
     /// Events pulled from xcb while the client was borrowed elsewhere
     /// wait here — same discipline as the wayland EVQ, though xcb has
@@ -1735,7 +1736,8 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate
                 scale,
                 backing: None,
                 mapped: false,
-                paused: true,
+                pace: crate::ffi::DriverPace::Off,
+                next_beat: None,
                 last_frame: None,
                 scene,
                 depth: window_depth,
@@ -2519,51 +2521,44 @@ pub(crate) fn gpu_note_present() {
 // MARK: - The frame clock (no callbacks on this door — the deadline
 // heap paces at the refresh interval while unpaused)
 
-const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_micros(16_666);
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// The frame driver, per window: one clock, every wanting window
-/// ticks on it.
-pub(crate) fn want_frames(window: u32, wants: bool) {
-    let any_wants = with_x(|client| {
-        if let Some(win) = window_at(client, window) {
-            win.paused = !wants;
-            if !wants {
-                win.last_frame = None;
-            }
+/// The frame driver, per window: no callbacks on this door — every
+/// window ticks on a deadline of its own at the pace it asked for.
+pub(crate) fn want_beat(window: u32, pace: crate::ffi::DriverPace) -> bool {
+    use crate::ffi::DriverPace;
+    with_x(|client| {
+        let Some(win) = window_at(client, window) else { return false };
+        win.pace = pace;
+        // no callback on this door: the deadline is the whole clock
+        win.next_beat = pace.deadline(win.next_beat, false, Instant::now());
+        if pace == DriverPace::Off {
+            win.last_frame = None;
         }
-        client.windows.iter().any(|w| !w.paused)
-    });
-    NEXT_FRAME.with(|cell| {
-        if !any_wants {
-            cell.set(None);
-        } else if cell.get().is_none() {
-            cell.set(Some(Instant::now() + FRAME_INTERVAL));
-        }
-    });
+        pace == DriverPace::Full
+    })
+}
+
+/// The nearest deadline any window holds.
+fn next_beat_deadline() -> Option<Instant> {
+    with_x(|client| client.windows.iter().filter_map(|win| win.next_beat).min())
 }
 
 fn frame_due() {
+    let now = Instant::now();
     let beats: Vec<(u32, f64)> = with_x(|client| {
-        let now = Instant::now();
         client
             .windows
             .iter_mut()
-            .filter(|win| !win.paused)
+            .filter(|win| win.next_beat.is_some_and(|at| now >= at))
             .map(|win| {
-                let dt = win
-                    .last_frame
-                    .map(|last| (now - last).as_secs_f64())
-                    .unwrap_or(1.0 / 60.0)
-                    .clamp(0.0, 1.0 / 30.0);
+                win.next_beat = None; // the handler's sync re-arms
+                let dt = win.pace.beat_dt(win.last_frame.map(|last| (now - last).as_secs_f64()));
                 win.last_frame = Some(now);
                 (win.id, dt)
             })
             .collect()
     });
-    if !beats.is_empty() {
-        NEXT_FRAME.with(|cell| cell.set(Some(Instant::now() + FRAME_INTERVAL)));
-    }
     for (window, dt) in beats {
         crate::ffi::dispatch_at(window as usize, AppEvent::Frame { dt });
     }
@@ -2969,7 +2964,7 @@ pub(crate) fn run() {
         unsafe {
             xcb_flush(connection);
         }
-        let timeout = [NEXT_BLINK.with(Cell::get), NEXT_FRAME.with(Cell::get)]
+        let timeout = [NEXT_BLINK.with(Cell::get), next_beat_deadline()]
             .into_iter()
             .flatten()
             .map(|at| at.saturating_duration_since(Instant::now()).as_millis() as c_int)
@@ -3005,9 +3000,7 @@ pub(crate) fn run() {
         if blink_due {
             dispatch(AppEvent::Blink);
         }
-        let frame_is_due =
-            NEXT_FRAME.with(|cell| cell.get().is_some_and(|at| Instant::now() >= at));
-        if frame_is_due {
+        if next_beat_deadline().is_some_and(|at| Instant::now() >= at) {
             frame_due();
         }
         // the hand of a --drive sheet, delivered outside any dispatch

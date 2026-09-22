@@ -26,6 +26,7 @@ use std::rc::Rc;
 
 use bunny_ui::action::{Key, KeyMatch, KeyPattern, Stroke};
 use bunny_ui::layout::{Axis, Size};
+use bunny_ui::pacing::{Beat, FramePacer, Urgency, Verdict};
 use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::{Either, Single, View};
 
@@ -355,6 +356,33 @@ pub fn run_window_chrome(
     app.run();
 }
 
+// The origins a frame is asked from — the pacer folds a burst of asks
+// into one draw a beat, and the tape can say who asked.
+const ORIGIN_REDRAW: u8 = 0;
+const ORIGIN_POINTER: u8 = 1;
+const ORIGIN_WHEEL: u8 = 2;
+const ORIGIN_WAKE: u8 = 3;
+const ORIGIN_BLINK: u8 = 4;
+const ORIGIN_FRAME: u8 = 5;
+const ORIGIN_KEY: u8 = 6;
+const ORIGIN_TOUCH: u8 = 7;
+
+/// Tells the driver what the window wants next — the display's own
+/// rate while the pacer is warm, else what the animator says — and
+/// tells the pacer whether it is riding that rate.
+fn sync_frame_driver(runtime: &Runtime, pacer: &FramePacer, window: usize) {
+    let wanted = if pacer.warm() {
+        ffi::DriverPace::Full
+    } else {
+        match runtime.frame_pace() {
+            bunny_ui::anim::FramePace::Display => ffi::DriverPace::Full,
+            bunny_ui::anim::FramePace::Slow(interval) => ffi::DriverPace::Slow(interval),
+            bunny_ui::anim::FramePace::Idle => ffi::DriverPace::Off,
+        }
+    };
+    pacer.set_beating(ffi::want_beat(window, wanted));
+}
+
 /// The app's root as ONE node, whatever its arity: a component is the
 /// boundary the core provides for that — its body may be several
 /// nodes, the component is one. The window's own root, so the house
@@ -645,9 +673,14 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
         }
     });
+    // the pacer: a burst of asks is one draw a beat, and a wake with
+    // no news draws nothing — the same shape the mac shell keeps
+    let pacer = Rc::new(FramePacer::new());
     let blit = {
         let present = Rc::clone(&present);
-        move |runtime: &Runtime, root: &_| {
+        let pacer = Rc::clone(&pacer);
+        move |runtime: &Runtime, root: &_, via: u8| {
+            let _ = via;
             let (width, height) = window.content_size();
             // a box that draws parts which TOUCH puts the shared edge
             // on a whole PIXEL — it needs the screen's scale
@@ -688,6 +721,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     ),
                 );
             }
+            pacer.drew();
             present(runtime, display);
             let interaction = runtime.interaction();
             // a live divider drag keeps the resizer even while the
@@ -723,7 +757,27 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }));
             // wake or park the frame driver — the event may have
             // started (or finished) an animation
-            ffi::want_frames(window.raw_window(), runtime.wants_frame());
+            sync_frame_driver(runtime, &pacer, window.raw_window());
+        }
+    };
+    // the door of the pacer: an ask that may wait for the beat. A
+    // frame that presented nothing still tells the driver what it
+    // wants, which is what starts the beat after a cold wait.
+    let unpaced = std::env::var("BUNNY_PACING").is_ok_and(|value| value == "off");
+    let soon = {
+        let blit = blit.clone();
+        let pacer = Rc::clone(&pacer);
+        move |runtime: &Runtime, root: &_, via: u8| {
+            let live = ffi::in_live_resize(window.raw_window());
+            if unpaced && !live {
+                blit(runtime, root, via);
+                return;
+            }
+            if pacer.ask(via, Urgency::Soon, live) == Verdict::Draw {
+                blit(runtime, root, via);
+            } else {
+                sync_frame_driver(runtime, &pacer, window.raw_window());
+            }
         }
     };
 
@@ -779,7 +833,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 if let Some(text) = taken.text {
                     ffi::clipboard_write(&text);
                 }
-                blit(&runtime, &*root);
+                blit(&runtime, &*root, ORIGIN_KEY);
                 return true;
             }
             // a field of MANY lines owns the bare break and the bare
@@ -796,7 +850,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 }
                 && runtime.key(command).applied
             {
-                blit(&runtime, &*root);
+                blit(&runtime, &*root, ORIGIN_KEY);
                 return true;
             }
             let action = match runtime.chord(Stroke::new(pattern, stroke.typed)) {
@@ -804,13 +858,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // the stroke opened (or let go of) a sequence: it is
                 // spent, and a which-key panel may have just changed
                 KeyMatch::Pending => {
-                    blit(&runtime, &*root);
+                    blit(&runtime, &*root, ORIGIN_KEY);
                     return true;
                 }
                 KeyMatch::None => return false,
             };
             if runtime.dispatch_action(action) {
-                blit(&runtime, &*root);
+                blit(&runtime, &*root, ORIGIN_KEY);
                 true
             } else {
                 false
@@ -821,11 +875,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let handler_runtime = Rc::clone(&runtime);
     let handler_root = Rc::clone(&root);
     let handler_present = Rc::clone(&present);
+    let handler_pacer = Rc::clone(&pacer);
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
         match event {
-            AppEvent::Redraw => blit(runtime, root),
+            AppEvent::Redraw => blit(runtime, root, ORIGIN_REDRAW),
             AppEvent::WindowClosed => {}
             // The work always lands: the tasks are polled. The FRAME is for a
             // turn that changed something. Most wakes change nothing — a poll
@@ -837,18 +892,18 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             AppEvent::Wake => {
                 runtime.poll_tasks();
                 if runtime.needs_frame() {
-                    blit(runtime, root);
+                    soon(runtime, root, ORIGIN_WAKE);
                 } else {
                     // no frame — but a task may have gone to sleep with a
                     // new deadline, and the driver follows it
-                    ffi::want_frames(window.raw_window(), runtime.wants_frame());
+                    sync_frame_driver(runtime, &handler_pacer, window.raw_window());
                 }
             }
             AppEvent::ResignKey => {
                 // the user switched away: popovers close like the
                 // platform's own
                 if runtime.dismiss_all_overlays() {
-                    blit(runtime, root);
+                    blit(runtime, root, ORIGIN_KEY);
                 }
             }
             AppEvent::DismissOverlays => {
@@ -856,14 +911,14 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // dismiss for us — the shell watched the geometry and
                 // says so; the press itself follows as its own event
                 if runtime.dismiss_all_overlays() {
-                    blit(runtime, root);
+                    blit(runtime, root, ORIGIN_KEY);
                 }
             }
             AppEvent::Text(text) => {
                 // typing, paste of characters, and the composed
                 // dead-key result — the same road for all of them
                 if !text.is_empty() && runtime.key(EditCommand::Insert(text)).applied {
-                    blit(runtime, root);
+                    blit(runtime, root, ORIGIN_KEY);
                 }
             }
             AppEvent::Key { sym, shift, command } => {
@@ -877,7 +932,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     0xff1b => {
                         // esc releases focus
                         if runtime.blur() {
-                            blit(runtime, root);
+                            blit(runtime, root, ORIGIN_KEY);
                         }
                         None
                     }
@@ -896,7 +951,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                             ffi::clipboard_write(text);
                         }
                         if cut.output.is_some() {
-                            blit(runtime, root);
+                            blit(runtime, root, ORIGIN_KEY);
                         }
                         None
                     }
@@ -906,40 +961,40 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 if let Some(edit) = edit
                     && runtime.key(edit).applied
                 {
-                    blit(runtime, root);
+                    blit(runtime, root, ORIGIN_KEY);
                 }
             }
             AppEvent::MouseMoved { x, y, modifiers } => {
                 if runtime.pointer_moved(x, y, modifiers) {
-                    blit(runtime, root);
+                    soon(runtime, root, ORIGIN_POINTER);
                 }
             }
             AppEvent::RightMouseDown { x, y } => {
                 // the runtime opens (or closes) the context menu; it
                 // presents with the scene until panels take it outside
                 if runtime.context_click(x, y) {
-                    blit(runtime, root);
+                    blit(runtime, root, ORIGIN_KEY);
                 }
             }
             AppEvent::MouseDown { x, y, clicks, modifiers } => {
                 if runtime.pointer_clicked(x, y, clicks, modifiers) {
-                    blit(runtime, root);
+                    blit(runtime, root, ORIGIN_KEY);
                 }
             }
             AppEvent::MouseUp { x, y } => {
                 // fires on up-inside; the pressed visual always clears
                 let _ = runtime.pointer_released(x, y);
-                blit(runtime, root);
+                blit(runtime, root, ORIGIN_KEY);
             }
             AppEvent::MouseExited => {
                 if runtime.pointer_exited() {
-                    blit(runtime, root);
+                    soon(runtime, root, ORIGIN_POINTER);
                 }
             }
             AppEvent::Wheel { x, y, dx, dy } => {
                 // offset is engine state: repaint without render
                 if runtime.wheel(x, y, dx, dy) {
-                    blit(runtime, root);
+                    soon(runtime, root, ORIGIN_WHEEL);
                 }
             }
             AppEvent::Touch { phase, id, x, y } => {
@@ -952,25 +1007,25 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     ffi::TouchPhase::Cancelled => runtime.touch_cancelled(id),
                 };
                 if changed || phase == ffi::TouchPhase::Ended {
-                    blit(runtime, root);
+                    soon(runtime, root, ORIGIN_TOUCH);
                 } else {
-                    ffi::want_frames(window.raw_window(), runtime.wants_frame());
+                    sync_frame_driver(runtime, &handler_pacer, window.raw_window());
                 }
             }
             AppEvent::Magnify { x, y, scale } => {
                 if runtime.magnify(x, y, scale) {
-                    blit(runtime, root);
+                    soon(runtime, root, ORIGIN_WHEEL);
                 }
             }
             AppEvent::ImeMark { text, caret } => {
                 let command = EditCommand::SetMarked { text, caret_utf16: (caret, 0) };
                 if runtime.key(command).applied {
-                    blit(runtime, root);
+                    blit(runtime, root, ORIGIN_KEY);
                 }
             }
             AppEvent::ImeUnmark => {
                 if runtime.key(EditCommand::Unmark).applied {
-                    blit(runtime, root);
+                    blit(runtime, root, ORIGIN_KEY);
                 }
             }
             AppEvent::Blink => {
@@ -986,21 +1041,40 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // the scroll gesture
                 runtime.wheel_tick();
                 if blinked || explained || chorded {
-                    blit(runtime, root);
+                    soon(runtime, root, ORIGIN_BLINK);
+                }
+                // the net under the beat: an ask that waited for a beat
+                // that never came (a window off screen keeps no beat)
+                // draws on this slow clock instead
+                if handler_pacer.pending().count > 0
+                    && !ffi::in_live_resize(window.raw_window())
+                {
+                    blit(runtime, root, ORIGIN_BLINK);
                 }
             }
             AppEvent::Frame { dt } => {
                 // the tick path: springs advance, then layout only —
                 // zero bodies on a stable tree; settle and effects
-                // belong to the real-event path
-                if runtime.tick(dt).any() {
-                    let (width, height) = window.content_size();
-                    let display = runtime.animation_frame(root, Size { width, height });
-                    handler_present(runtime, display);
+                // belong to the real-event path. The pacer says whether
+                // this beat draws what was asked for, holds, or is quiet
+                let moved = runtime.tick(dt);
+                match handler_pacer.beat(ffi::in_live_resize(window.raw_window())) {
+                    Beat::Hold => {}
+                    Beat::Draw => blit(runtime, root, ORIGIN_FRAME),
+                    Beat::Quiet => {
+                        if moved.any() {
+                            let (width, height) = window.content_size();
+                            let display =
+                                runtime.animation_frame(root, Size { width, height });
+                            handler_present(runtime, display);
+                        }
+                    }
                 }
-                ffi::want_frames(window.raw_window(), runtime.wants_frame());
             }
         }
+        // after EVERY event: an event can arm a timer without changing
+        // a pixel, and the driver has to follow it
+        sync_frame_driver(runtime, &handler_pacer, window.raw_window());
     });
 
     // the first frame and the reveal are the app's: painted through

@@ -13,7 +13,10 @@
 //! window opens through `App` as one that cannot resize or be put
 //! away, and the sheet reads the manners back: the hints on x11, the
 //! frame's owner on wayland — and where the house bar stands in, its
-//! close button ends the run. Exit 0 is the proof.
+//! close button ends the run. With `--sleeper` a task wakes twenty
+//! times a second and writes once a second for three seconds: the
+//! shell must present the writes and nothing for the wakes. Exit 0 is
+//! the proof.
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
@@ -23,14 +26,18 @@ use bunny_ui::prelude::*;
 #[derive(Clone, Copy)]
 struct Counter {
     count: State<i32>,
+    /// What the sleeper wrote so far — a line that changes once a second.
+    ticks: State<i32>,
     drive: bool,
     fixed: bool,
+    sleeper: bool,
 }
 
 impl Component for Counter {
     fn body(self, _ctx: &Context) -> impl View {
         vstack!(
             text!("Count: {}", self.count).font(Font::Title),
+            text!("Ticks: {}", self.ticks),
             spacer(),
             button(text("Tap me!"), move || self.count.add(1)),
         )
@@ -40,7 +47,20 @@ impl Component for Counter {
             if self.drive {
                 // the window is up and the pump is turning
                 task::sleep(std::time::Duration::from_millis(800)).await;
-                the_sheet(self.count, self.fixed).await;
+                the_sheet(self.count, self.fixed, self.sleeper).await;
+            }
+        })
+        .task(move || async move {
+            if self.sleeper {
+                // a poller: awake twenty times a second, news once a
+                // second — the shell must draw the news and nothing else
+                task::sleep(std::time::Duration::from_millis(1200)).await;
+                for wake in 0..60 {
+                    task::sleep(std::time::Duration::from_millis(50)).await;
+                    if wake % 20 == 19 {
+                        self.ticks.add(1);
+                    }
+                }
             }
         })
     }
@@ -53,7 +73,7 @@ const HEIGHT: f64 = 180.0;
 /// stack puts it (16 pt of padding, a leading column), then the two
 /// witnesses — the state and the glass. With `fixed`, the manners.
 #[cfg(target_os = "linux")]
-async fn the_sheet(count: State<i32>, fixed: bool) {
+async fn the_sheet(count: State<i32>, fixed: bool, sleeper: bool) {
     use bunny_ui_linux::drive;
     let start = std::time::Instant::now();
     let stamp = move || format!("{:>6}ms", start.elapsed().as_millis());
@@ -69,6 +89,16 @@ async fn the_sheet(count: State<i32>, fixed: bool) {
     check("the click counted", count.wrappedValue() == 1);
     let after = drive::presents();
     check("and the count was presented", after > before);
+    if sleeper {
+        // the poller starts at 1200 ms from mount; watch it for its
+        // three writes and a little slack
+        let before = drive::presents();
+        task::sleep(std::time::Duration::from_millis(3600)).await;
+        let grew = drive::presents() - before;
+        println!("[{}] sleeper: presents grew by {grew} over sixty wakes and three writes", stamp());
+        check("the three writes reached the glass", grew >= 3);
+        check("and the wakes with no news drew nothing", grew <= 8);
+    }
     let decoration = drive::decoration();
     println!("[{}] frame: backend={} decoration={decoration}", stamp(), drive::backend());
     if fixed {
@@ -109,16 +139,17 @@ async fn the_sheet(count: State<i32>, fixed: bool) {
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn the_sheet(_count: State<i32>, _fixed: bool) {}
+async fn the_sheet(_count: State<i32>, _fixed: bool, _sleeper: bool) {}
 
 #[cfg(target_os = "linux")]
 fn main() {
     let drive = std::env::args().any(|arg| arg == "--drive");
     let fixed = std::env::args().any(|arg| arg == "--fixed");
+    let sleeper = std::env::args().any(|arg| arg == "--sleeper");
     if drive {
-        bunny_ui_linux::drive::watchdog(20);
+        bunny_ui_linux::drive::watchdog(25);
     }
-    let counter = Counter { count: State::new(0), drive, fixed };
+    let counter = Counter { count: State::new(0), ticks: State::new(0), drive, fixed, sleeper };
     if fixed {
         // the App road: a spec carries the manners
         let app = bunny_ui_linux::App::new();
