@@ -13,12 +13,20 @@ use std::collections::VecDeque;
 
 use crate::ffi::AppEvent;
 
+/// One move of the hand: an event for the handler, or a click that
+/// walks the door's own press road (the crown answers first there —
+/// a bar, a band, a control — and only then the scene).
+enum Hand {
+    Event(AppEvent),
+    Click(f64, f64),
+}
+
 thread_local! {
-    static QUEUE: RefCell<VecDeque<AppEvent>> = const { RefCell::new(VecDeque::new()) };
+    static QUEUE: RefCell<VecDeque<Hand>> = const { RefCell::new(VecDeque::new()) };
 }
 
 fn push(event: AppEvent) {
-    QUEUE.with(|queue| queue.borrow_mut().push_back(event));
+    QUEUE.with(|queue| queue.borrow_mut().push_back(Hand::Event(event)));
 }
 
 /// Moves the pointer to `(x, y)` in layout points.
@@ -26,16 +34,11 @@ pub fn pointer(x: f64, y: f64) {
     push(AppEvent::MouseMoved { x, y, modifiers: bunny_ui::action::Modifiers::default() });
 }
 
-/// A click at `(x, y)`: the pointer arrives, presses, releases.
+/// A click at `(x, y)`: the pointer arrives, presses, releases — through
+/// the door's press road, so a window control or a drag region answers
+/// as it would to a real hand.
 pub fn click(x: f64, y: f64) {
-    pointer(x, y);
-    push(AppEvent::MouseDown {
-        x,
-        y,
-        clicks: 1,
-        modifiers: bunny_ui::action::Modifiers::default(),
-    });
-    push(AppEvent::MouseUp { x, y });
+    QUEUE.with(|queue| queue.borrow_mut().push_back(Hand::Click(x, y)));
 }
 
 /// A wheel step at `(x, y)` — the engine's sign: positive `dy` is up.
@@ -59,13 +62,36 @@ pub fn backend() -> &'static str {
     if crate::ffi::is_x11() { "x11" } else { "wayland" }
 }
 
+/// Who draws the frame: `"server"`, `"client"` or `"unknown"` (no
+/// `xdg-decoration` on this compositor — the house bar stands in).
+pub fn decoration() -> &'static str {
+    match crate::ffi::decoration() {
+        crate::ffi::Decoration::ServerSide => "server",
+        crate::ffi::Decoration::ClientSide => "client",
+        crate::ffi::Decoration::Unknown => "unknown",
+    }
+}
+
+/// A property of the window as 32-bit words, by atom name — what the
+/// x11 door wrote, read back through the server. Empty on wayland.
+pub fn x11_property(name: &str) -> Vec<u32> {
+    if crate::ffi::is_x11() {
+        crate::x11::read_property_u32(name)
+    } else {
+        Vec::new()
+    }
+}
+
 /// Delivers what the sheet queued. Called by both pumps at the end of
 /// a turn, outside any dispatch.
 pub(crate) fn drain() {
     loop {
         let next = QUEUE.with(|queue| queue.borrow_mut().pop_front());
-        let Some(event) = next else { break };
-        crate::ffi::dispatch(event);
+        match next {
+            Some(Hand::Event(event)) => crate::ffi::dispatch(event),
+            Some(Hand::Click(x, y)) => crate::ffi::drive_click(x, y),
+            None => break,
+        }
     }
 }
 

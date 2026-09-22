@@ -8,10 +8,14 @@
 #   container/run.sh shell      a shell inside, both displays up
 #   container/run.sh exec CMD   one command inside, both displays up
 #
-# The repository is bind-mounted at /work. The cargo registry and the
-# Linux target directory live in named volumes (`bunny-ui-cargo`,
+# A SNAPSHOT of the repository is mounted at /work — an rsync copy
+# under target/container-snapshot, so the container builds what the
+# tree held when the run started and an edit on the host during the
+# run cannot reach a build in flight. The cargo registry and the Linux
+# target directory live in named volumes (`bunny-ui-cargo`,
 # `bunny-ui-target`, mounted outside the repository): the host's own
-# target/ is never touched, and a rebuilt image keeps both. SCALE=2
+# target/ is never touched, and a rebuilt image keeps both. The logs
+# of a run land in target/container-snapshot/target/drive/. SCALE=2
 # gives the headless output an integer scale; everything else is
 # decided inside (see inside.sh).
 set -euo pipefail
@@ -32,9 +36,13 @@ if [[ -t 0 && -t 1 ]]; then
     tty_flags=(-it)
 fi
 
+snapshot=$repo/target/container-snapshot
+mkdir -p "$snapshot"
+rsync -a --delete --exclude .git --exclude target --exclude target-linux "$repo/" "$snapshot/"
+
 # (the `+` form: an empty array is not "unbound" under set -u on old bash)
 exec docker run --rm ${tty_flags[@]+"${tty_flags[@]}"} \
-    -v "$repo":/work \
+    -v "$snapshot":/work \
     -v bunny-ui-cargo:/root/.cargo/registry \
     -v bunny-ui-target:/cargo-target \
     -e CARGO_TARGET_DIR=/cargo-target \

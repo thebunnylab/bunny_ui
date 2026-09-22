@@ -27,7 +27,7 @@ use std::rc::Rc;
 use bunny_ui::action::{Key, KeyMatch, KeyPattern, Stroke};
 use bunny_ui::layout::{Axis, Size};
 use bunny_ui::prelude::{EditCommand, Runtime};
-use bunny_ui::view::View;
+use bunny_ui::view::{Either, Single, View};
 
 use ffi::AppEvent;
 pub use gl::OffscreenGl;
@@ -88,11 +88,30 @@ pub fn run_window(title: &str, size: Size, root: impl View) {
 /// Who draws the window's top edge.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Chrome {
-    /// The compositor's decoration, where the compositor offers one.
+    /// The compositor's decoration, where the compositor offers one —
+    /// and the house's own bar where it does not: GNOME never draws a
+    /// frame for a Wayland window, so the shell asks through
+    /// `xdg-decoration` and, refused or unanswered, stands a 32-point
+    /// bar of its own on the scene, with the crown answering its verbs.
     Native,
     /// The SCENE draws the bar. The crown phase wires the drag and
     /// control regions to the compositor's move/resize/menu verbs.
     Scene,
+}
+
+/// How a window behaves under the reader's hand: whether it resizes,
+/// whether it can be put away. The PLATFORM refuses the gesture — the
+/// scene never catches it afterwards.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Manners {
+    pub resizable: bool,
+    pub minimizable: bool,
+}
+
+impl Default for Manners {
+    fn default() -> Manners {
+        Manners { resizable: true, minimizable: true }
+    }
 }
 
 /// Like [`run_window`], but with the `Runtime` assembled by the caller —
@@ -113,6 +132,7 @@ pub struct WindowSpec {
     title: Rc<str>,
     size: Size,
     chrome: Chrome,
+    manners: Manners,
 }
 
 impl WindowSpec {
@@ -122,7 +142,26 @@ impl WindowSpec {
             title: title.into(),
             size: Size { width: 1024.0, height: 640.0 },
             chrome: Chrome::Native,
+            manners: Manners::default(),
         }
+    }
+
+    /// One size, and no other: the reader cannot resize it. On Wayland
+    /// the minimum and the maximum size are the one size, so the
+    /// compositor refuses the grab; on X11 `WM_NORMAL_HINTS` says the
+    /// same and the Motif hints drop the resize and maximize verbs.
+    pub fn fixed(mut self) -> WindowSpec {
+        self.manners.resizable = false;
+        self
+    }
+
+    /// It cannot be put away: the minimize verb is refused by the
+    /// crown, dropped from the Motif hints, and the house bar draws no
+    /// button for it. A compositor's own frame keeps its button —
+    /// no protocol takes a verb off a server-side frame.
+    pub fn no_minimize(mut self) -> WindowSpec {
+        self.manners.minimizable = false;
+        self
     }
 
     /// The content size the window opens at.
@@ -263,6 +302,92 @@ pub fn run_window_chrome(
     app.run();
 }
 
+/// The app's root as ONE node, whatever its arity: a component is the
+/// boundary the core provides for that — its body may be several
+/// nodes, the component is one. The window's own root, so the house
+/// bar can stack above it.
+#[derive(Clone)]
+struct WindowRoot<V: View> {
+    root: V,
+}
+
+impl<V: View> bunny_ui::view::Component for WindowRoot<V> {
+    fn body(self, _ctx: &bunny_ui::prelude::Context) -> impl View {
+        self.root
+    }
+}
+
+/// The app's root under the house bar, or the root alone — one type
+/// either way, so `mount` stays one function.
+fn framed(bar: Option<(Rc<str>, bool)>, root: impl View) -> impl View<Arity = Single> {
+    let root = WindowRoot { root };
+    match bar {
+        Some((title, minimizable)) => {
+            Either::First(bunny_ui::vstack!(house_bar(title, minimizable), root).spacing(0.0))
+        }
+        None => Either::Second(root),
+    }
+}
+
+/// The house's own bar — 32 points, the title, and the controls the
+/// crown answers — for a compositor that draws no frame of its own.
+/// The whole bar drags the window; the buttons are the window's own
+/// (`.window_control`), so the platform closes, minimizes, maximizes.
+fn house_bar(title: Rc<str>, minimizable: bool) -> impl View<Arity = Single> {
+    use bunny_ui::layout::{Color, WindowControl};
+    use bunny_ui::prelude::*;
+    const BAR_H: f64 = 32.0;
+    const CAPTION_W: f64 = 40.0;
+    const CLEAR: Color = Color { r: 0, g: 0, b: 0, a: 0 };
+    fn caption(
+        glyph: impl UnaryView + 'static,
+        control: WindowControl,
+        wash: Color,
+    ) -> impl View<Arity = Single> {
+        glyph
+            .frame(CAPTION_W, BAR_H)
+            .background_color(CLEAR)
+            .background_hovered(wash)
+            .on_click(|| {})
+            .window_control(control)
+    }
+    let minimize = if minimizable {
+        Either::First(caption(
+            icon(symbol::MINUS).font_size(10.0).foreground_color(theme::fg_secondary()),
+            WindowControl::Minimize,
+            theme::row_hover(),
+        ))
+    } else {
+        Either::Second(empty())
+    };
+    let maximize_glyph = canvas(|ctx, painter| {
+        let bounds = ctx.bounds();
+        painter.stroke(bounds, theme::fg_secondary(), 1.0, 1.0);
+    })
+    .frame(9.0, 9.0);
+    hstack!(
+        text(title.to_string())
+            .foreground_color(theme::fg_secondary())
+            .padding_edge(Edge::Leading, 12.0),
+        spacer(),
+        minimize,
+        caption(maximize_glyph, WindowControl::Maximize, theme::row_hover()),
+        caption(
+            icon(symbol::CLOSE)
+                .font_size(10.0)
+                .foreground_color(theme::fg_secondary())
+                .foreground_hovered(Color::WHITE),
+            WindowControl::Close,
+            Color::rgb(196, 43, 28),
+        ),
+    )
+    .spacing(0.0)
+    .alignment(VerticalAlignment::Center)
+    .frame_max(f64::INFINITY, BAR_H, Alignment::Leading)
+    .background_color(theme::panel())
+    .window_drag_region()
+}
+
 /// Raises the window `spec` asks for and wires everything that lives
 /// as long as it does — the frame path, the pools, the gates and the
 /// event handler. Answers the window's own address.
@@ -274,8 +399,20 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
         &spec.title,
         spec.size.width,
         spec.size.height,
-        spec.chrome == Chrome::Scene,
+        ffi::WindowOptions {
+            scene: spec.chrome == Chrome::Scene,
+            resizable: spec.manners.resizable,
+            minimizable: spec.manners.minimizable,
+        },
     );
+    // the bar: the compositor's where it offers one, the house's own
+    // where it does not — decided BEFORE the GPU installs, because the
+    // crown's corners want an alpha ground
+    let house_bar = spec.chrome == Chrome::Native && ffi::wants_house_bar();
+    if house_bar {
+        ffi::adopt_crown();
+        eprintln!("bunny_ui_linux: no server decoration — the house bar stands in");
+    }
     // the present backend, chosen ONCE: the GPU by default, the CPU
     // raster on refusal — and the window is still unmapped, so the
     // first frame (whichever road) IS the reveal
@@ -301,6 +438,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
         bunny_ui::stats::set_clock(Some(trace::clock_ms));
     }
     // two owners: the keyboard gate and the event handler
+    let root = framed(house_bar.then(|| (Rc::clone(&spec.title), spec.manners.minimizable)), root);
     let root = Rc::new(root);
 
     // one frame: the Runtime settles, lays out, retains the hits for
@@ -503,8 +641,18 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                 Some(Axis::Horizontal) => ffi::Cursor::ResizeLeftRight,
                 // lanes stacked: it travels up and down
                 Some(Axis::Vertical) => ffi::Cursor::ResizeUpDown,
-                None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
-                None => ffi::Cursor::Arrow,
+                // the BOX under the pointer answers first — text wants
+                // an I-beam, and the rule below cannot know that. Only
+                // where nobody answers does the old rule stand: the
+                // hand over anything hoverable
+                None => match runtime.hovered_cursor() {
+                    Some(bunny_ui::layout::Cursor::Text) => ffi::Cursor::Text,
+                    Some(bunny_ui::layout::Cursor::Pointing) => ffi::Cursor::Pointing,
+                    Some(bunny_ui::layout::Cursor::Cell) => ffi::Cursor::Cell,
+                    Some(bunny_ui::layout::Cursor::Arrow) => ffi::Cursor::Arrow,
+                    None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
+                    None => ffi::Cursor::Arrow,
+                },
             });
             // the input system's mirror: the door opens at the IME
             // phase; the slot keeps the twins' step order today

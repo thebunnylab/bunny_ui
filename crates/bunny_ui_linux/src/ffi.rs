@@ -268,6 +268,7 @@ enum Iface {
     Toplevel,
     Popup,
     TextInput,
+    Decoration,
     CoreSurface,
     CoreSeat,
     CoreOutput,
@@ -283,6 +284,8 @@ pub(crate) struct Protocols {
     positioner: &'static WlInterface,
     ti_manager: &'static WlInterface,
     text_input: &'static WlInterface,
+    decoration_manager: &'static WlInterface,
+    decoration: &'static WlInterface,
 }
 
 /// The xdg-shell message rows, transcribed from the installed
@@ -413,14 +416,41 @@ fn text_input_spec() -> [(&'static CStr, u32, Vec<Msg>, Vec<Msg>); 2] {
     ]
 }
 
-/// Builds the five `WlInterface` tables and leaks them. Two passes:
+/// xdg-decoration v1, transcribed from the unstable XML in opcode
+/// order — the question "who draws the frame", and the answer.
+fn decoration_spec() -> [(&'static CStr, u32, Vec<Msg>, Vec<Msg>); 2] {
+    use Iface::*;
+    [
+        (
+            c"zxdg_decoration_manager_v1",
+            1,
+            vec![
+                Msg(c"destroy", c"", &[]),
+                Msg(c"get_toplevel_decoration", c"no", &[Some(Decoration), Some(Toplevel)]),
+            ],
+            vec![],
+        ),
+        (
+            c"zxdg_toplevel_decoration_v1",
+            1,
+            vec![
+                Msg(c"destroy", c"", &[]),
+                Msg(c"set_mode", c"u", &[None]),
+                Msg(c"unset_mode", c"", &[]),
+            ],
+            vec![Msg(c"configure", c"u", &[None])],
+        ),
+    ]
+}
+
+/// Builds the nine `WlInterface` tables and leaks them. Two passes:
 /// the interfaces are allocated first so the message rows can point at
 /// each other (popup → positioner, xdg_surface → toplevel, …).
 fn build_protocols() -> Protocols {
     let spec: Vec<(&'static CStr, u32, Vec<Msg>, Vec<Msg>)> =
-        xdg_spec().into_iter().chain(text_input_spec()).collect();
+        xdg_spec().into_iter().chain(text_input_spec()).chain(decoration_spec()).collect();
     // pass 1: stable homes, filled with placeholders
-    let slots: &'static mut [WlInterface; 7] = Box::leak(Box::new(std::array::from_fn(|_| {
+    let slots: &'static mut [WlInterface; 9] = Box::leak(Box::new(std::array::from_fn(|_| {
         WlInterface {
             name: c"".as_ptr(),
             version: 0,
@@ -438,6 +468,7 @@ fn build_protocols() -> Protocols {
             Iface::Toplevel => unsafe { base.add(3) },
             Iface::Popup => unsafe { base.add(4) },
             Iface::TextInput => unsafe { base.add(6) },
+            Iface::Decoration => unsafe { base.add(8) },
             Iface::CoreSurface => &raw const wl_surface_interface,
             Iface::CoreSeat => &raw const wl_seat_interface,
             Iface::CoreOutput => &raw const wl_output_interface,
@@ -482,6 +513,8 @@ fn build_protocols() -> Protocols {
         popup: &slots[4],
         ti_manager: &slots[5],
         text_input: &slots[6],
+        decoration_manager: &slots[7],
+        decoration: &slots[8],
     }
 }
 
@@ -621,6 +654,7 @@ const TAG_DATA_DEVICE: usize = 13;
 const TAG_DATA_OFFER: usize = 14;
 const TAG_DATA_SOURCE: usize = 15;
 const TAG_TEXT_INPUT: usize = 16;
+const TAG_DECORATION: usize = 17;
 const OUTPUT_TAG_BASE: usize = 0x1000;
 /// Panel proxies encode index and role: base | (index << 2) | kind.
 const PANEL_TAG_BASE: usize = 0x1000_0000;
@@ -638,6 +672,9 @@ enum Ev {
     SurfaceConfigure { serial: u32 },
     ToplevelConfigure { width: i32, height: i32, states: Vec<u32> },
     ToplevelClose,
+    /// Who draws the frame, the compositor's answer: 1 = the client,
+    /// 2 = the server.
+    DecorationMode { mode: u32 },
     FrameDone,
     SurfaceEnter { output_ptr: usize },
     SurfaceLeave { output_ptr: usize },
@@ -722,6 +759,11 @@ unsafe extern "C" fn dispatcher(
             1 => push_ev(Ev::ToplevelClose),
             _ => {} // configure_bounds v4 / wm_capabilities v5 never arrive at our bind
         },
+        TAG_DECORATION => {
+            if opcode == 0 {
+                push_ev(Ev::DecorationMode { mode: unsafe { arg(0).u } });
+            }
+        }
         TAG_MAIN_SURFACE => match opcode {
             // the dispatcher may fire while the client is borrowed
             // (release waits dispatch too), so it carries the raw
@@ -1067,6 +1109,14 @@ struct Window {
     maximized: bool,
     /// Scene chrome: the shell owns the resize bands at the border.
     scene: bool,
+    /// The manners the spec asked for: the crown refuses the resize
+    /// grab and the minimize verb accordingly.
+    resizable: bool,
+    minimizable: bool,
+    /// The `zxdg_toplevel_decoration_v1` object, where the compositor
+    /// speaks the protocol (null otherwise), and its answer.
+    decoration: *mut Proxy,
+    decoration_mode: Option<u32>,
 }
 
 struct CursorState {
@@ -1233,6 +1283,9 @@ struct Client {
     data_device: *mut Proxy,
     data_manager: *mut Proxy,
     wm_base: *mut Proxy,
+    /// `zxdg_decoration_manager_v1` — null where the compositor draws
+    /// no frame and says nothing (GNOME).
+    decoration_manager: *mut Proxy,
     protocols: &'static Protocols,
     outputs: Vec<OutputInfo>,
     globals: Vec<(u32, String, u32)>,
@@ -1369,6 +1422,13 @@ fn connect() {
     let shm = bind(c"wl_shm", &raw const wl_shm_interface, 1, TAG_SYNC);
     let seat = bind(c"wl_seat", &raw const wl_seat_interface, 9, TAG_SEAT);
     let wm_base = bind(c"xdg_wm_base", protocols.wm_base, 5, TAG_WM_BASE);
+    // the frame question — asked where the compositor can answer it
+    let decoration_manager = bind(
+        c"zxdg_decoration_manager_v1",
+        protocols.decoration_manager as *const WlInterface,
+        1,
+        TAG_SYNC,
+    );
     assert!(!compositor.is_null(), "wl_compositor is mandatory");
     assert!(!shm.is_null(), "wl_shm is mandatory");
     assert!(!wm_base.is_null(), "xdg_wm_base is mandatory");
@@ -1488,6 +1548,7 @@ fn connect() {
             data_device,
             data_manager,
             wm_base,
+            decoration_manager,
             protocols,
             outputs,
             globals,
@@ -1535,11 +1596,12 @@ fn connect() {
 /// One window this phase. Creation runs the first half of the map
 /// dance and BLOCKS until the compositor's first configure — from here
 /// on, attaching is legal and the first present maps the window.
-pub fn create_window(title: &str, width: f64, height: f64, scene_chrome: bool) -> WindowHandle {
+pub fn create_window(title: &str, width: f64, height: f64, options: WindowOptions) -> WindowHandle {
     if is_x11() {
-        crate::x11::create_window(title, width, height, scene_chrome);
+        crate::x11::create_window(title, width, height, options);
         return WindowHandle(0);
     }
+    let scene_chrome = options.scene;
     if CLIENT.with(|slot| slot.borrow().is_none()) {
         connect();
     }
@@ -1575,6 +1637,39 @@ pub fn create_window(title: &str, width: f64, height: f64, scene_chrome: bool) -
         unsafe {
             request(toplevel, 2, &mut [WlArgument { s: title_c.as_ptr() }]);
             request(toplevel, 3, &mut [arg_s(c"bunny_ui")]);
+            if !options.resizable {
+                // one size: the minimum and the maximum are the size
+                // asked for, and the compositor refuses the grab and the
+                // maximize verb of its own accord
+                let (w, h) = (width.round() as i32, height.round() as i32);
+                request(toplevel, 8, &mut [arg_i(w), arg_i(h)]); // set_min_size
+                request(toplevel, 7, &mut [arg_i(w), arg_i(h)]); // set_max_size
+            }
+        }
+        // the frame question, before the first commit: server-side for
+        // a native window, client-side for a scene one — the answer
+        // rides the initial configure
+        let decoration = if client.decoration_manager.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                let decoration = construct(
+                    client.decoration_manager,
+                    1, // get_toplevel_decoration(new, toplevel)
+                    client.protocols.decoration as *const WlInterface,
+                    &mut [arg_n(), arg_o(toplevel)],
+                    TAG_DECORATION,
+                );
+                if !decoration.is_null() {
+                    const CLIENT_SIDE: u32 = 1;
+                    const SERVER_SIDE: u32 = 2;
+                    let mode = if scene_chrome { CLIENT_SIDE } else { SERVER_SIDE };
+                    request(decoration, 1, &mut [arg_u(mode)]); // set_mode
+                }
+                decoration
+            }
+        };
+        unsafe {
             // the first commit carries NO buffer — it asks to be configured
             request(surface, 6, &mut no_args());
             wl_display_flush(client.display);
@@ -1594,6 +1689,10 @@ pub fn create_window(title: &str, width: f64, height: f64, scene_chrome: bool) -
             last_frame: None,
             maximized: false,
             scene: scene_chrome,
+            resizable: options.resizable,
+            minimizable: options.minimizable,
+            decoration,
+            decoration_mode: None,
         });
     });
     // the first configure arrives async; wait for it so the first
@@ -1618,6 +1717,64 @@ pub fn show_window(_window: WindowHandle) {
     if is_x11() {
         crate::x11::show_window();
     }
+}
+
+/// What a window is asked to be at creation, beyond its size and its
+/// title: who draws its top edge, and its manners.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowOptions {
+    pub scene: bool,
+    pub resizable: bool,
+    pub minimizable: bool,
+}
+
+/// Who draws the window's frame, as far as the door knows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Decoration {
+    /// The compositor (or the window manager) draws it.
+    ServerSide,
+    /// The compositor answered: the client draws it.
+    ClientSide,
+    /// The compositor speaks no `xdg-decoration` — it draws nothing and
+    /// says nothing (GNOME), or has not answered yet.
+    Unknown,
+}
+
+/// The frame's owner. The x11 door always has the window manager's
+/// frame; the wayland door reports the compositor's answer.
+pub fn decoration() -> Decoration {
+    if is_x11() {
+        return Decoration::ServerSide;
+    }
+    with_client(|client| {
+        if client.decoration_manager.is_null() {
+            return Decoration::Unknown;
+        }
+        match client.win.as_ref().and_then(|win| win.decoration_mode) {
+            Some(2) => Decoration::ServerSide,
+            Some(1) => Decoration::ClientSide,
+            _ => Decoration::Unknown,
+        }
+    })
+}
+
+/// True where the shell must draw the bar itself: the wayland door,
+/// and no server-side frame answered.
+pub(crate) fn wants_house_bar() -> bool {
+    !is_x11() && decoration() != Decoration::ServerSide
+}
+
+/// The crown takes the border — bands, corners and verbs, as a scene
+/// window has them — for a native window the compositor left bare.
+pub(crate) fn adopt_crown() {
+    if is_x11() {
+        return;
+    }
+    with_client(|client| {
+        if let Some(win) = client.win.as_mut() {
+            win.scene = true;
+        }
+    });
 }
 
 /// 0 is the main window; N is panel N−1. The identity lives in the
@@ -2259,7 +2416,11 @@ fn present_rows(width: usize, height: usize, rgba: &[u8], damage: &[(i64, i64, i
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cursor {
     Arrow,
+    /// The I-beam: this is text, and a press puts a caret in it.
+    Text,
     Pointing,
+    /// The fat cross: a cell of content is selected here.
+    Cell,
     ResizeLeftRight,
     ResizeUpDown,
     ResizeNwSe,
@@ -2281,7 +2442,9 @@ pub(crate) fn edge_cursor(edge: u32) -> Cursor {
 fn cursor_names(cursor: Cursor) -> &'static [&'static CStr] {
     match cursor {
         Cursor::Arrow => &[c"default", c"left_ptr", c"arrow"],
+        Cursor::Text => &[c"text", c"xterm", c"ibeam"],
         Cursor::Pointing => &[c"pointer", c"hand2", c"hand1", c"pointing_hand"],
+        Cursor::Cell => &[c"cell", c"crosshair", c"cross"],
         Cursor::ResizeLeftRight => &[c"ew-resize", c"sb_h_double_arrow", c"size_hor", c"col-resize"],
         Cursor::ResizeUpDown => &[c"ns-resize", c"sb_v_double_arrow", c"size_ver", c"row-resize"],
         Cursor::ResizeNwSe => &[c"nwse-resize", c"size_fdiag", c"bd_double_arrow"],
@@ -2739,7 +2902,11 @@ fn crown_execute(take: CrownTake, x: f64, y: f64) -> bool {
         let seat = client.seat;
         let serial = client.serials.press;
         let Some(win) = client.win.as_ref() else { return false };
-        if seat.is_null() {
+        // a grab (move, resize, the menu) needs the seat that pressed;
+        // the window's own buttons and the maximize toggle need none —
+        // a compositor with no seat (a headless one) still closes
+        let needs_seat = matches!(take, CrownTake::Move | CrownTake::Menu | CrownTake::Resize(_));
+        if needs_seat && seat.is_null() {
             return false;
         }
         unsafe {
@@ -2760,6 +2927,9 @@ fn crown_execute(take: CrownTake, x: f64, y: f64) -> bool {
                     true
                 }
                 CrownTake::ToggleMaximize => {
+                    if !win.resizable {
+                        return false; // one size: the double click is the scene's
+                    }
                     request(win.toplevel, if win.maximized { 10 } else { 9 }, &mut no_args());
                     wl_display_flush(client.display);
                     true
@@ -2772,8 +2942,16 @@ fn crown_execute(take: CrownTake, x: f64, y: f64) -> bool {
                 CrownTake::Control(hit) => {
                     match hit {
                         ControlHit::Close => client.quit = true,
-                        ControlHit::Minimize => request(win.toplevel, 13, &mut no_args()),
+                        ControlHit::Minimize => {
+                            if !win.minimizable {
+                                return false; // the verb was refused by the spec
+                            }
+                            request(win.toplevel, 13, &mut no_args());
+                        }
                         ControlHit::Maximize => {
+                            if !win.resizable {
+                                return false;
+                            }
                             request(
                                 win.toplevel,
                                 if win.maximized { 10 } else { 9 },
@@ -2787,6 +2965,54 @@ fn crown_execute(take: CrownTake, x: f64, y: f64) -> bool {
             }
         }
     })
+}
+
+/// The left press road, shared by the pointer and the drive's hand.
+/// The frame conversation comes first: the border of a scene-chrome
+/// window belongs to the resize grab before anything else, a press on
+/// a drag region moves the window, a control answers as the window's
+/// own button — and only a press the crown declined reaches the scene.
+fn left_press(x: f64, y: f64, time_ms: u32, on_main: bool) {
+    let clicks = with_client(|client| client.clicks.click(time_ms, x, y));
+    // what the hand holds rides in with the press: the framework spends
+    // only the shift, and the box under the pointer spends the rest
+    let modifiers = with_client(|client| held_modifiers(&client.keyboard));
+    let edge = with_client(|client| {
+        client
+            .win
+            .as_ref()
+            .filter(|win| win.scene && win.resizable && !win.maximized)
+            .map(|win| resize_edge_of(x, y, win.logical.0, win.logical.1))
+            .unwrap_or(0)
+    });
+    let take = if on_main && edge != 0 {
+        CrownTake::Resize(edge)
+    } else if on_main {
+        crown_take(x, y, clicks, false)
+    } else {
+        CrownTake::None
+    };
+    if matches!(take, CrownTake::None) || !crown_execute(take, x, y) {
+        dispatch(AppEvent::MouseDown { x, y, clicks, modifiers });
+    }
+    // else: the compositor took the grab — the click is spent on the frame
+}
+
+/// A click by the drive's hand, at layout coordinates on the main
+/// window: the pointer arrives, the press walks the same road a real
+/// one walks (the crown first), the release follows.
+pub(crate) fn drive_click(x: f64, y: f64) {
+    if is_x11() {
+        return crate::x11::drive_click(x, y);
+    }
+    with_client(|client| {
+        client.pointer_focus = 0;
+        client.pointer_pos = (x, y);
+    });
+    let time_ms = crate::trace::clock_ms() as u32;
+    dispatch(AppEvent::MouseMoved { x, y, modifiers: bunny_ui::action::Modifiers::default() });
+    left_press(x, y, time_ms, true);
+    dispatch(AppEvent::MouseUp { x, y });
 }
 
 // MARK: - clipboard (the selection, both directions, never blocking)
@@ -3285,6 +3511,11 @@ fn drain_protocol_events() {
                 }
             }
             Ev::ToplevelClose => with_client(|client| client.quit = true),
+            Ev::DecorationMode { mode } => with_client(|client| {
+                if let Some(win) = client.win.as_mut() {
+                    win.decoration_mode = Some(mode);
+                }
+            }),
             Ev::FrameDone => {
                 let dt = with_client(|client| {
                     let Some(win) = client.win.as_mut() else { return None };
@@ -3339,7 +3570,10 @@ fn drain_protocol_events() {
                         .win
                         .as_ref()
                         .filter(|win| {
-                            client.pointer_focus == 0 && win.scene && !win.maximized
+                            client.pointer_focus == 0
+                                && win.scene
+                                && win.resizable
+                                && !win.maximized
                         })
                         .map(|win| resize_edge_of(x, y, win.logical.0, win.logical.1))
                         .unwrap_or(0);
@@ -3366,40 +3600,7 @@ fn drain_protocol_events() {
                 const BTN_RIGHT: u32 = 0x111;
                 let on_main = with_client(|client| client.pointer_focus == 0);
                 match (button, pressed) {
-                    (BTN_LEFT, true) => {
-                        let clicks =
-                            with_client(|client| client.clicks.click(time_ms, x, y));
-                        // what the hand holds rides in with the press:
-                        // the framework spends only the shift, and the
-                        // box under the pointer spends the rest
-                        let modifiers =
-                            with_client(|client| held_modifiers(&client.keyboard));
-                        // the frame conversation comes first: a press on
-                        // a drag region moves the window, a control
-                        // answers as the window's own button
-                        // the border of a scene-chrome window belongs
-                        // to the resize grab before anything else
-                        let edge = with_client(|client| {
-                            client
-                                .win
-                                .as_ref()
-                                .filter(|win| win.scene && !win.maximized)
-                                .map(|win| resize_edge_of(x, y, win.logical.0, win.logical.1))
-                                .unwrap_or(0)
-                        });
-                        let take = if on_main && edge != 0 {
-                            CrownTake::Resize(edge)
-                        } else if on_main {
-                            crown_take(x, y, clicks, false)
-                        } else {
-                            CrownTake::None
-                        };
-                        if matches!(take, CrownTake::None) || !crown_execute(take, x, y) {
-                            dispatch(AppEvent::MouseDown { x, y, clicks, modifiers });
-                        }
-                        // else: the compositor took the grab — the
-                        // click is spent on the frame
-                    }
+                    (BTN_LEFT, true) => left_press(x, y, time_ms, on_main),
                     (BTN_LEFT, false) => dispatch(AppEvent::MouseUp { x, y }),
                     (BTN_RIGHT, true) => {
                         if on_main && matches!(crown_take(x, y, 1, true), CrownTake::Menu) {
@@ -3920,6 +4121,9 @@ fn teardown() {
                 }
             }
             if let Some(win) = client.win {
+                if !win.decoration.is_null() {
+                    destroy(win.decoration, 0); // before the toplevel — the protocol's order
+                }
                 destroy(win.toplevel, 0);
                 destroy(win.xdg_surface, 0);
                 if let Some(backing) = win.backing {
@@ -4066,6 +4270,47 @@ mod tests {
                     .find(&needle)
                     .unwrap_or_else(|| panic!("{needle} in opcode order"));
                 cursor += at + needle.len();
+            }
+        }
+    }
+
+    /// The decoration tables against their own XML, the same way.
+    #[test]
+    fn the_decoration_tables_match_the_installed_xml() {
+        let path = "/usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml";
+        let Ok(xml) = std::fs::read_to_string(path) else { return };
+        for (name, _, methods, events) in decoration_spec() {
+            let open = format!("<interface name=\"{}\"", name.to_string_lossy());
+            let start = xml.find(&open).expect("interface present in the XML");
+            let block = &xml[start..];
+            let end = block.find("</interface>").expect("interface block closes");
+            let block = &block[..end];
+            let mut cursor = 0;
+            for Msg(msg, _, _) in &methods {
+                let needle = format!("<request name=\"{}\"", msg.to_string_lossy());
+                let at = block[cursor..]
+                    .find(&needle)
+                    .unwrap_or_else(|| panic!("{needle} in opcode order"));
+                cursor += at + needle.len();
+            }
+            let mut cursor = 0;
+            for Msg(msg, _, _) in &events {
+                let needle = format!("<event name=\"{}\"", msg.to_string_lossy());
+                let at = block[cursor..]
+                    .find(&needle)
+                    .unwrap_or_else(|| panic!("{needle} in opcode order"));
+                cursor += at + needle.len();
+            }
+        }
+        for (name, _, methods, events) in decoration_spec() {
+            for Msg(msg, signature, types) in methods.iter().chain(events.iter()) {
+                assert_eq!(
+                    types.len(),
+                    arg_count(signature),
+                    "{}.{}: one types slot per argument",
+                    name.to_string_lossy(),
+                    msg.to_string_lossy(),
+                );
             }
         }
     }

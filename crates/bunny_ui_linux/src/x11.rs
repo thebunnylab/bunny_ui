@@ -699,6 +699,31 @@ const ATOM_STRING: u32 = 31;
 const ATOM_WM_NAME: u32 = 39;
 const ATOM_WM_CLASS: u32 = 67;
 const ATOM_RESOURCE_MANAGER: u32 = 23;
+const ATOM_WM_NORMAL_HINTS: u32 = 40;
+const ATOM_WM_SIZE_HINTS: u32 = 41;
+// the Motif hints: which halves of the property speak, and the verbs
+// (with ALL set, the listed verbs are the ones REMOVED)
+const MWM_HINTS_FUNCTIONS: u32 = 1;
+const MWM_HINTS_DECORATIONS: u32 = 2;
+const MWM_FUNC_ALL: u32 = 1;
+const MWM_FUNC_RESIZE: u32 = 2;
+const MWM_FUNC_MINIMIZE: u32 = 8;
+const MWM_FUNC_MAXIMIZE: u32 = 16;
+// WM_NORMAL_HINTS: the two flags a fixed size needs
+const P_MIN_SIZE: u32 = 1 << 4;
+const P_MAX_SIZE: u32 = 1 << 5;
+
+/// The eighteen words of `WM_SIZE_HINTS` for a window of one size:
+/// minimum and maximum both the size, in physical pixels.
+fn size_hints_fixed(width: u32, height: u32) -> [u32; 18] {
+    let mut hints = [0u32; 18];
+    hints[0] = P_MIN_SIZE | P_MAX_SIZE;
+    hints[5] = width; // min_width
+    hints[6] = height; // min_height
+    hints[7] = width; // max_width
+    hints[8] = height; // max_height
+    hints
+}
 
 // MARK: - The atom table (interned once, one round trip)
 
@@ -841,6 +866,10 @@ struct Window {
     depth: u8,
     /// Mirrored off _NET_WM_STATE — bands and corners stand down.
     maximized: bool,
+    /// The manners the spec asked for — the crown's bands and verbs
+    /// honour them, and the hints told the window manager.
+    resizable: bool,
+    minimizable: bool,
 }
 
 pub(crate) struct XClient {
@@ -862,7 +891,7 @@ pub(crate) struct XClient {
     xkb_base_event: u8,
     /// The core cursor font and one lazily-made cursor per style.
     cursor_font: u32,
-    cursors: [u32; 6],
+    cursors: [u32; 8],
     cursor_current: Option<Cursor>,
     /// Client-side double click — X sends plain buttons, the shell
     /// counts (the same 400 ms / 4 px window every platform keeps).
@@ -987,7 +1016,7 @@ pub(crate) fn connect() {
             keyboard,
             xkb_base_event,
             cursor_font: 0,
-            cursors: [0; 6],
+            cursors: [0; 8],
             cursor_current: None,
             clicks: ClickClock::default(),
             source: None,
@@ -1362,7 +1391,9 @@ fn setup_keyboard(connection: *mut Connection) -> (Keyboard, u8) {
 fn glyph_of(cursor: Cursor) -> u16 {
     match cursor {
         Cursor::Arrow => 68,            // left_ptr
+        Cursor::Text => 152,            // xterm
         Cursor::Pointing => 60,         // hand2
+        Cursor::Cell => 34,             // crosshair
         Cursor::ResizeLeftRight => 108, // sb_h_double_arrow
         Cursor::ResizeUpDown => 116,    // sb_v_double_arrow
         Cursor::ResizeNwSe => 134,      // top_left_corner
@@ -1378,6 +1409,8 @@ fn cursor_slot(cursor: Cursor) -> usize {
         Cursor::ResizeUpDown => 3,
         Cursor::ResizeNwSe => 4,
         Cursor::ResizeNeSw => 5,
+        Cursor::Text => 6,
+        Cursor::Cell => 7,
     }
 }
 
@@ -1484,7 +1517,8 @@ fn read_scale(client: &mut XClient) -> usize {
 
 // MARK: - Window
 
-pub(crate) fn create_window(title: &str, width: f64, height: f64, scene: bool) {
+pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate::ffi::WindowOptions) {
+    let scene = options.scene;
     if X_CLIENT.with(|slot| slot.borrow().is_none()) {
         connect();
     }
@@ -1543,10 +1577,28 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, scene: bool) {
                 mask,
                 values.as_ptr(),
             );
-            if scene {
-                // the WM's own decorations stand down — the scene
-                // draws the bar and the crown answers the verbs
-                let hints: [u32; 5] = [2, 0, 0, 0, 0]; // flags=DECORATIONS, none
+            if scene || !options.resizable || !options.minimizable {
+                // the WM's own decorations stand down for a scene window
+                // (the scene draws the bar and the crown answers the
+                // verbs); a fixed or unminimizable window keeps the frame
+                // and drops the VERBS — with ALL set, the listed bits are
+                // the ones removed
+                let mut flags = 0u32;
+                let mut functions = 0u32;
+                if scene {
+                    flags |= MWM_HINTS_DECORATIONS;
+                }
+                if !options.resizable || !options.minimizable {
+                    flags |= MWM_HINTS_FUNCTIONS;
+                    functions |= MWM_FUNC_ALL;
+                    if !options.resizable {
+                        functions |= MWM_FUNC_RESIZE | MWM_FUNC_MAXIMIZE;
+                    }
+                    if !options.minimizable {
+                        functions |= MWM_FUNC_MINIMIZE;
+                    }
+                }
+                let hints: [u32; 5] = [flags, functions, 0, 0, 0];
                 xcb_change_property(
                     client.connection,
                     PROP_MODE_REPLACE,
@@ -1555,6 +1607,21 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, scene: bool) {
                     client.atoms.motif_wm_hints,
                     32,
                     5,
+                    hints.as_ptr().cast(),
+                );
+            }
+            if !options.resizable {
+                // one size, in physical pixels: the window manager
+                // refuses the resize before the scene ever sees it
+                let hints = size_hints_fixed(physical.0 as u32, physical.1 as u32);
+                xcb_change_property(
+                    client.connection,
+                    PROP_MODE_REPLACE,
+                    id,
+                    ATOM_WM_NORMAL_HINTS,
+                    ATOM_WM_SIZE_HINTS,
+                    32,
+                    18,
                     hints.as_ptr().cast(),
                 );
             }
@@ -1617,6 +1684,8 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, scene: bool) {
                 scene,
                 depth: window_depth,
                 maximized: false,
+                resizable: options.resizable,
+                minimizable: options.minimizable,
             });
         }
     });
@@ -2164,11 +2233,17 @@ fn crown_execute(take: crate::ffi::CrownTake, root_x: i16, root_y: i16) -> bool 
                 true
             }
             CrownTake::Control(ControlHit::Minimize) => {
+                if !win.minimizable {
+                    return false; // the verb was refused by the spec
+                }
                 const ICONIC: u32 = 3;
                 send_root_message(client, id, change_state, [ICONIC, 0, 0, 0, 0]);
                 true
             }
             CrownTake::Control(ControlHit::Maximize) | CrownTake::ToggleMaximize => {
+                if !win.resizable {
+                    return false;
+                }
                 const TOGGLE: u32 = 2;
                 send_root_message(
                     client,
@@ -2206,6 +2281,92 @@ fn refresh_wm_state(client: &mut XClient) {
             win.maximized = maximized;
         }
     }
+}
+
+/// The crown's half of a press on the main window, shared by the
+/// pointer and the drive's hand: the border bands first, then the
+/// drag and control gates. True when the crown consumed the press.
+fn crown_press(window: u32, detail: u8, x: i16, y: i16, root_x: i16, root_y: i16, time: u32) -> bool {
+    let crown = with_x(|client| {
+        let win = client.win.as_ref()?;
+        if win.id != window || !win.scene {
+            return None;
+        }
+        let logical_x = x as f64 / win.scale as f64;
+        let logical_y = y as f64 / win.scale as f64;
+        if detail == 1 && win.resizable && !win.maximized {
+            let edge =
+                crate::ffi::resize_edge_of(logical_x, logical_y, win.logical.0, win.logical.1);
+            if edge != 0 {
+                return Some(crate::ffi::CrownTake::Resize(edge));
+            }
+        }
+        Some(crate::ffi::crown_take(logical_x, logical_y, 1, detail == 3))
+    });
+    let Some(take) = crown else { return false };
+    // clicks for the double-click maximize: recount through the
+    // shared clock on the raw press
+    let take = if matches!(take, crate::ffi::CrownTake::Move) {
+        let clicks = with_x(|client| client.clicks.click(time, root_x as f64, root_y as f64));
+        if clicks >= 2 { crate::ffi::CrownTake::ToggleMaximize } else { take }
+    } else {
+        take
+    };
+    crown_execute(take, root_x, root_y)
+}
+
+/// A click by the drive's hand, at layout coordinates on the main
+/// window: the pointer arrives, the press asks the crown the way a
+/// real one does, the release follows.
+pub(crate) fn drive_click(x: f64, y: f64) {
+    let Some((id, scale)) = with_x(|client| client.win.as_ref().map(|w| (w.id, w.scale))) else {
+        return;
+    };
+    let (px, py) = ((x * scale as f64) as i16, (y * scale as f64) as i16);
+    let time = crate::trace::clock_ms() as u32;
+    let modifiers = bunny_ui::action::Modifiers::default();
+    dispatch(AppEvent::MouseMoved { x, y, modifiers });
+    if !crown_press(id, 1, px, py, 0, 0, time) {
+        let clicks = with_x(|client| client.clicks.click(time, x, y));
+        dispatch(AppEvent::MouseDown { x, y, clicks, modifiers });
+    }
+    dispatch(AppEvent::MouseUp { x, y });
+}
+
+/// A property of the main window as 32-bit words, by atom name — the
+/// drive sheet's read-back of what the door wrote (hints, states).
+pub(crate) fn read_property_u32(name: &str) -> Vec<u32> {
+    with_x(|client| {
+        let Some(win) = client.win.as_ref() else { return Vec::new() };
+        let id = win.id;
+        let Ok(name_c) = std::ffi::CString::new(name) else { return Vec::new() };
+        unsafe {
+            let cookie = xcb_intern_atom(
+                client.connection,
+                0,
+                name_c.as_bytes().len() as u16,
+                name_c.as_ptr(),
+            );
+            let reply = xcb_intern_atom_reply(client.connection, cookie, std::ptr::null_mut());
+            if reply.is_null() {
+                return Vec::new();
+            }
+            let atom = (*reply).atom;
+            free(reply.cast());
+            // type 0 = AnyPropertyType
+            let cookie = xcb_get_property(client.connection, 0, id, atom, 0, 0, 64);
+            let reply = xcb_get_property_reply(client.connection, cookie, std::ptr::null_mut());
+            if reply.is_null() {
+                return Vec::new();
+            }
+            let count = (xcb_get_property_value_length(reply).max(0) as usize) / 4;
+            let words =
+                std::slice::from_raw_parts(xcb_get_property_value(reply) as *const u32, count)
+                    .to_vec();
+            free(reply.cast());
+            words
+        }
+    })
 }
 
 // MARK: - The gpu graft (the x11 side of gl.rs)
@@ -2393,7 +2554,7 @@ fn interpret(event: *mut GenericEvent) -> Step {
             let band_change = with_x(|client| {
                 client.pointer_pos = (x as f64, y as f64);
                 let win = client.win.as_ref()?;
-                let edge = if win.id != window || !win.scene || win.maximized {
+                let edge = if win.id != window || !win.scene || !win.resizable || win.maximized {
                     0
                 } else {
                     crate::ffi::resize_edge_of(
@@ -2437,51 +2598,11 @@ fn interpret(event: *mut GenericEvent) -> Step {
             // main window asks the border bands first, then the drag
             // and control gates — a consumed press never reaches the
             // engine (the certified order of every door)
-            if kind == XCB_BUTTON_PRESS && matches!(detail, 1 | 3) {
-                let crown = with_x(|client| {
-                    let win = client.win.as_ref()?;
-                    if win.id != window || !win.scene {
-                        return None;
-                    }
-                    let logical_x = x as f64 / win.scale as f64;
-                    let logical_y = y as f64 / win.scale as f64;
-                    if detail == 1 && !win.maximized {
-                        let edge = crate::ffi::resize_edge_of(
-                            logical_x,
-                            logical_y,
-                            win.logical.0,
-                            win.logical.1,
-                        );
-                        if edge != 0 {
-                            return Some(crate::ffi::CrownTake::Resize(edge));
-                        }
-                    }
-                    Some(crate::ffi::crown_take(
-                        logical_x,
-                        logical_y,
-                        1,
-                        detail == 3,
-                    ))
-                });
-                if let Some(take) = crown {
-                    // clicks for the double-click maximize: recount
-                    // through the shared clock on the raw press
-                    let take = if matches!(take, crate::ffi::CrownTake::Move) {
-                        let clicks = with_x(|client| {
-                            client.clicks.click(time, root_x as f64, root_y as f64)
-                        });
-                        if clicks >= 2 {
-                            crate::ffi::CrownTake::ToggleMaximize
-                        } else {
-                            take
-                        }
-                    } else {
-                        take
-                    };
-                    if crown_execute(take, root_x, root_y) {
-                        return Step::Silence;
-                    }
-                }
+            if kind == XCB_BUTTON_PRESS
+                && matches!(detail, 1 | 3)
+                && crown_press(window, detail, x, y, root_x, root_y, time)
+            {
+                return Step::Silence;
             }
             // no compositor grab exists on this door: a press on the
             // MAIN window while a popover floats — outside all of them
@@ -2816,6 +2937,15 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_size_writes_min_and_max_as_the_one_size() {
+        let hints = size_hints_fixed(560, 360);
+        assert_eq!(hints[0], P_MIN_SIZE | P_MAX_SIZE);
+        assert_eq!(&hints[5..9], &[560, 360, 560, 360]);
+        assert!(hints[1..5].iter().all(|&word| word == 0), "position and size stay unsaid");
+        assert!(hints[9..].iter().all(|&word| word == 0), "no increments, aspect, base or gravity");
+    }
+
+    #[test]
     fn xft_dpi_parses_and_defaults() {
         assert_eq!(scale_from_resources("Xft.dpi:\t96\n"), 1);
         assert_eq!(scale_from_resources("Xft.dpi: 192"), 2);
@@ -2828,11 +2958,13 @@ mod tests {
 
     #[test]
     fn every_cursor_style_wears_a_core_glyph() {
-        // sources are even (mask = glyph+1 pairs with it), all six
+        // sources are even (mask = glyph+1 pairs with it), all eight
         // styles resolve, and no two share a face
         let all = [
             Cursor::Arrow,
+            Cursor::Text,
             Cursor::Pointing,
+            Cursor::Cell,
             Cursor::ResizeLeftRight,
             Cursor::ResizeUpDown,
             Cursor::ResizeNwSe,
@@ -2843,9 +2975,9 @@ mod tests {
             let glyph = glyph_of(cursor);
             assert_eq!(glyph % 2, 0, "cursor-font sources sit on even codes");
             assert!(seen.insert(glyph), "two styles share glyph {glyph}");
-            assert!(cursor_slot(cursor) < 6);
+            assert!(cursor_slot(cursor) < 8);
         }
-        assert_eq!(seen.len(), 6);
+        assert_eq!(seen.len(), 8);
     }
 
     #[test]

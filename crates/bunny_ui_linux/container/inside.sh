@@ -65,8 +65,14 @@ done
 
 run_tests() {
     local status=0
-    cargo test -p bunny-ui --features codec || status=1
-    cargo test -p bunny-ui-linux -p bunny-ui-vulkan || status=1
+    # the core with the features the Linux shell turns on; `codec` only
+    # once the core declares it
+    local core_features=canvas,gpu
+    if grep -q '^codec' /work/crates/bunny_ui/Cargo.toml; then
+        core_features=$core_features,codec
+    fi
+    cargo test --no-fail-fast -p bunny-ui --features "$core_features" || status=1
+    cargo test --no-fail-fast -p bunny-ui-linux -p bunny-ui-vulkan || status=1
     return $status
 }
 
@@ -80,7 +86,8 @@ failures=0
 run_one() {
     local example=$1 backend=$2 present=$3
     shift 3
-    local log="/tmp/drive-$example-$backend-$present.log"
+    mkdir -p /work/target/drive
+    local log="/work/target/drive/$example-$backend-$present.log"
     local env_present=()
     if [[ $present != vk ]]; then
         env_present=(BUNNY_PRESENT="$present")
