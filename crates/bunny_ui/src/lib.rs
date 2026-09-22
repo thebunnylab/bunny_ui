@@ -45,6 +45,7 @@ mod dom_flow;
 pub mod effects;
 pub mod erased;
 pub mod ext;
+pub mod font_file;
 pub mod glass;
 pub mod app;
 pub mod host;

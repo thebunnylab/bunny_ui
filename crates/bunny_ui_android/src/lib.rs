@@ -31,8 +31,6 @@
 //! keep `#![forbid(unsafe_code)]`.
 
 pub mod keys;
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
-mod face;
 
 #[cfg(target_os = "android")]
 #[macro_use]

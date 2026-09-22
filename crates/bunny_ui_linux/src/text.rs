@@ -94,6 +94,13 @@ const BITMAP_PIXEL_MODE: usize = 26;
 #[link(name = "freetype")]
 unsafe extern "C" {
     fn FT_Init_FreeType(library: *mut *mut c_void) -> c_int;
+    fn FT_New_Memory_Face(
+        library: *mut c_void,
+        base: *const u8,
+        size: c_long,
+        index: c_long,
+        face: *mut *mut c_void,
+    ) -> c_int;
     fn FT_New_Face(
         library: *mut c_void,
         path: *const c_char,
@@ -180,6 +187,16 @@ struct FaceKey {
     scale: usize,
 }
 
+/// A face the app SHIPS: its bytes, and what they say about themselves.
+struct Shipped {
+    /// The family as the file spells it.
+    name: String,
+    weight: u16,
+    italic: bool,
+    bytes: &'static [u8],
+    hash: u64,
+}
+
 /// The text engine backed by the platform stack. Face handles live for
 /// the engine's life (the process, in practice) — fonts do not churn.
 pub struct FreeTypeEngine {
@@ -187,6 +204,9 @@ pub struct FreeTypeEngine {
     config: *mut c_void,
     faces: RefCell<HashMap<FaceKey, Option<Face>>>,
     fallbacks: RefCell<HashMap<(FaceKey, u32), Option<Face>>>,
+    /// The faces the app registered, by lowercased family — a family is
+    /// several files, and each answers for its own weight and slant.
+    registered: RefCell<HashMap<String, Vec<Shipped>>>,
 }
 
 impl FreeTypeEngine {
@@ -202,7 +222,75 @@ impl FreeTypeEngine {
             config,
             faces: RefCell::new(HashMap::new()),
             fallbacks: RefCell::new(HashMap::new()),
+            registered: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Add a face this process SHIPS to the ones it can shape.
+    ///
+    /// Without it an app can only name faces the machine already has
+    /// installed, and [`FontSpec::family`] on a bundled one degrades to
+    /// fontconfig's best guess — silently. An app that carries its own
+    /// typeface therefore renders in the machine's on every box but the
+    /// designer's.
+    ///
+    /// The family name comes out of the file's own `name` table, its
+    /// weight and slant out of `OS/2` ([`bunny_ui::font_file`]); a spec
+    /// naming that family lands on the registered face from then on —
+    /// the slant matched first, then the nearest weight — before
+    /// fontconfig is asked. Process-scoped: nothing outside this app
+    /// sees the face. Registering the same bytes twice is a no-op that
+    /// answers `false`; a file with no family name answers `false` and
+    /// says so once on stderr. Every acceptance clears the resolved
+    /// faces — a spec that missed before this call cached the fallback
+    /// it got, and the very face just registered would stay invisible.
+    ///
+    /// The bytes must outlive the process: FreeType reads them for as
+    /// long as a face is open. `&'static [u8]` is the contract, and
+    /// `include_bytes!` is what satisfies it.
+    pub fn register_font(&self, bytes: &'static [u8]) -> bool {
+        use bunny_ui::font_file::{family_name, fnv64, style};
+        let Some(name) = family_name(bytes) else {
+            eprintln!("bunny_ui_linux: register_font — no family name in the face");
+            return false;
+        };
+        let hash = fnv64(bytes);
+        {
+            let mut registered = self.registered.borrow_mut();
+            let faces = registered.entry(name.to_lowercase()).or_default();
+            if faces.iter().any(|face| face.hash == hash) {
+                return false;
+            }
+            // a face with no `OS/2` table is an upright 400 — what the
+            // platform would assume, said once here
+            let (weight, italic) = style(bytes).unwrap_or((400, false));
+            faces.push(Shipped { name, weight, italic, bytes, hash });
+        }
+        self.faces.borrow_mut().clear();
+        self.fallbacks.borrow_mut().clear();
+        true
+    }
+
+    /// The shipped face a key lands on: the family by name, the slant
+    /// matched first, then the nearest weight.
+    fn shipped(&self, key: &FaceKey) -> Option<&'static [u8]> {
+        let name = key.family.name()?;
+        let registered = self.registered.borrow();
+        let faces = registered.get(&name.to_lowercase())?;
+        let want = [400i32, 500, 600, 700, 800, 900][key.weight as usize];
+        faces
+            .iter()
+            .min_by_key(|face| (face.italic != key.italic, (face.weight as i32 - want).abs()))
+            .map(|face| face.bytes)
+    }
+
+    /// The families the app registered, as the files spell them.
+    fn registered_names(&self) -> Vec<std::sync::Arc<str>> {
+        self.registered
+            .borrow()
+            .values()
+            .flat_map(|faces| faces.iter().map(|face| std::sync::Arc::from(face.name.as_str())))
+            .collect()
     }
 
     fn key(font: &FontSpec, scale: usize) -> FaceKey {
@@ -230,6 +318,21 @@ impl FreeTypeEngine {
         if self.config.is_null() || self.library.is_null() {
             return None;
         }
+        // a face the app shipped answers a NAMED family first; the
+        // fallback road (a charset) stays fontconfig's — a shipped face
+        // covers what it covers, the machine covers the rest
+        if charset.is_none()
+            && let Some(bytes) = self.shipped(key)
+        {
+            return unsafe {
+                let mut face = std::ptr::null_mut();
+                let size = bytes.len() as c_long;
+                if FT_New_Memory_Face(self.library, bytes.as_ptr(), size, 0, &mut face) != 0 {
+                    return None;
+                }
+                self.finish_face(face, key)
+            };
+        }
         let (path, index) = unsafe {
             let pattern = FcPatternCreate();
             // a family the app NAMED is the most specific thing anyone
@@ -243,8 +346,9 @@ impl FreeTypeEngine {
                 None => c"sans-serif",
             };
             FcPatternAddString(pattern, c"family".as_ptr(), family.as_ptr().cast());
-            // the fc scale: regular 80, medium 100, demibold 180, bold 200
-            let weight = [80, 100, 180, 200][key.weight as usize];
+            // the fc scale: regular 80, medium 100, demibold 180, bold
+            // 200, extrabold 205, black 210 — one entry per `Weight`
+            let weight = FC_WEIGHTS[key.weight as usize];
             FcPatternAddInteger(pattern, c"weight".as_ptr(), weight);
             FcPatternAddInteger(pattern, c"slant".as_ptr(), if key.italic { 100 } else { 0 });
             let charset_handle = charset.map(|code| {
@@ -286,6 +390,13 @@ impl FreeTypeEngine {
             if FT_New_Face(self.library, path_c.as_ptr(), index as c_long, &mut face) != 0 {
                 return None;
             }
+            self.finish_face(face, key)
+        }
+    }
+
+    /// An opened face becomes a sized one with its HarfBuzz twin.
+    unsafe fn finish_face(&self, face: *mut c_void, key: &FaceKey) -> Option<Face> {
+        unsafe {
             // points at 72dpi are pixels: the char size carries the
             // fractional logical px and the resolution carries scale
             let size = f64::from_bits(key.size_bits);
@@ -439,10 +550,13 @@ struct Shaped {
     y: i64,
 }
 
+/// fontconfig's weight for each `Weight`, in the key's order.
+const FC_WEIGHTS: [c_int; 6] = [80, 100, 180, 200, 205, 210];
+
 impl TextEngine for FreeTypeEngine {
     fn families(&self) -> Vec<std::sync::Arc<str>> {
         if self.config.is_null() {
-            return Vec::new();
+            return self.registered_names();
         }
         unsafe {
             let pattern = FcPatternCreate();
@@ -467,7 +581,8 @@ impl TextEngine for FreeTypeEngine {
             FcObjectSetDestroy(objects);
             FcPatternDestroy(pattern);
             // one face per FILE comes back, so a family with four
-            // weights is listed four times
+            // weights is listed four times — and the app's own join them
+            names.extend(self.registered_names());
             names.sort();
             names.dedup();
             names
@@ -605,6 +720,55 @@ mod tests {
 
     fn ink(raster: &TextRaster) -> usize {
         raster.rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
+    }
+
+    /// A face the app ships answers its family before the machine's:
+    /// the machine's DejaVu Sans Regular rasters one way, and after the
+    /// BOLD file is registered under the same name the raster is the
+    /// bold one — more ink at the same size.
+    #[test]
+    fn a_registered_face_wins_over_the_machine() {
+        let path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+        let Ok(bytes) = std::fs::read(path) else { return }; // no such face on this box
+        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let engine = engine();
+        let font = FontSpec {
+            family: bunny_ui::text_engine::Family::named("DejaVu Sans"),
+            size: 24.0,
+            ..FontSpec::DEFAULT
+        };
+        let ink_of = |engine: &FreeTypeEngine| {
+            engine.raster_line("Hamburg", &font, black(), 1).map(|r| ink(&r)).unwrap_or(0)
+        };
+        let before = ink_of(&engine);
+        assert!(before > 0, "the machine's face rasters");
+        assert!(engine.register_font(bytes), "the face registers once");
+        assert!(!engine.register_font(bytes), "and only once");
+        assert!(engine.families().iter().any(|name| &**name == "DejaVu Sans"));
+        let after = ink_of(&engine);
+        assert!(
+            after > before,
+            "the registered bold face has more ink than the machine's regular: {after} vs {before}"
+        );
+    }
+
+    /// Every `Weight` has a fontconfig weight — the table once stopped
+    /// at Bold, and ExtraBold or Black was an index out of bounds.
+    #[test]
+    fn every_weight_finds_the_fontconfig_scale() {
+        let engine = engine();
+        for weight in [
+            Weight::Regular,
+            Weight::Medium,
+            Weight::Semibold,
+            Weight::Bold,
+            Weight::ExtraBold,
+            Weight::Black,
+        ] {
+            let font = FontSpec { weight, ..FontSpec::DEFAULT };
+            let _ = engine.raster_line("w", &font, black(), 1);
+        }
+        assert_eq!(FC_WEIGHTS.len(), 6);
     }
 
     #[test]

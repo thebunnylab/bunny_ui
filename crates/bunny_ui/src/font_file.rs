@@ -1,6 +1,9 @@
-//! What a font file says about itself — pure, so the Mac runs the
-//! tests. The platform reads a face from a file and says nothing about
-//! it, so the family name comes out of the file's own `name` table.
+//! What a font file says about itself — the family name, the weight
+//! and the slant — read out of the file's own tables in pure Rust, so
+//! every shell registers a shipped face the same way and the Mac runs
+//! the tests. A platform reads a face from bytes and says nothing
+//! about it (FreeType on Linux, `Typeface` on Android); the name comes
+//! from here.
 
 /// FNV-1a over the face's bytes — the file's name under the app.
 pub fn fnv64(bytes: &[u8]) -> u64 {
@@ -33,7 +36,7 @@ pub fn style(bytes: &[u8]) -> Option<(u16, bool)> {
 
 /// Where a table starts, by its four-byte tag — a collection answers
 /// out of its first face's directory.
-fn table(bytes: &[u8], tag: &[u8; 4]) -> Option<usize> {
+pub fn table(bytes: &[u8], tag: &[u8; 4]) -> Option<usize> {
     let u16_at = |at: usize| Some(u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]));
     let u32_at = |at: usize| {
         Some(u32::from_be_bytes([

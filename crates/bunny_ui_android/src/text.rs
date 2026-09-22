@@ -30,7 +30,7 @@ use bunny_ui::text_engine::{
     FontDesign, FontKey, FontSpec, LineMetrics, Slant, TextEngine, TextRaster, Weight,
 };
 
-use crate::face::{family_name, fnv64};
+use bunny_ui::font_file::{family_name, fnv64};
 use crate::jni::{boolean, float, int, object, Env, Frame, JObject};
 
 /// `AndroidBitmapInfo`: the shape of a bitmap's pixels.
@@ -133,7 +133,7 @@ impl AndroidTextEngine {
         // What the file says about itself decides which asks it answers.
         // A face with no `OS/2` table is an upright 400 — the same thing
         // the platform would assume, said once here.
-        let (weight, italic) = crate::face::style(bytes).unwrap_or((400, false));
+        let (weight, italic) = bunny_ui::font_file::style(bytes).unwrap_or((400, false));
         // a spec that missed before this call cached the fallback it got
         self.drop_faces();
         let mut registered = self.registered.borrow_mut();
