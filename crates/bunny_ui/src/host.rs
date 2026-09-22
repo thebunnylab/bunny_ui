@@ -485,6 +485,98 @@ pub const EDITOR_SCRIPT: &str = r#"(function() {
   });
 })();"#;
 
+// MARK: - The WebKit transport (WKWebView on Apple, WPE on Linux)
+
+/// The page's side of the bus on a WebKit engine, injected at document
+/// start on every navigation, before anything the page runs.
+/// WKWebView (the Apple shells) and WPE (the Linux shell) expose the
+/// same door, `window.webkit.messageHandlers.<name>.postMessage`, so
+/// one text serves them all; each shell registers the handlers by
+/// name — `bunny` (the app's bus), `bunnyEval`, `bunnyConsole`,
+/// `bunnyNet`, `bunnyEdit` — and decodes what arrives on each.
+pub const WEBKIT_BOOT: &str = "window.bunny = { post: function(m) { \
+    window.webkit.messageHandlers.bunny.postMessage(String(m)); } };";
+/// The console hook — `WebviewCapability::ConsoleMessages` on a WebKit
+/// engine is an injected wrap: each level forwards a line on
+/// `bunnyConsole` and then speaks as before, and an uncaught error
+/// reports too. Injected only when the app declared `on_console`:
+/// nothing is captured for a page nobody watches.
+pub const WEBKIT_CONSOLE_HOOK: &str = "(function() { \
+    function forward(line) { try { \
+        window.webkit.messageHandlers.bunnyConsole.postMessage(line); } catch (e) {} } \
+    var levels = ['log', 'info', 'warn', 'error']; \
+    for (var i = 0; i < levels.length; i++) { (function(level) { \
+        var original = console[level]; \
+        console[level] = function() { \
+            var parts = []; \
+            for (var j = 0; j < arguments.length; j++) { var a = arguments[j]; \
+                try { parts.push(typeof a === 'string' ? a : JSON.stringify(a)); } \
+                catch (e) { parts.push(String(a)); } } \
+            forward(level + ': ' + parts.join(' ')); \
+            if (original) { original.apply(console, arguments); } \
+        }; })(levels[i]); } \
+    addEventListener('error', function(e) { forward('error: ' + e.message); }); \
+})();";
+/// The network wrap — `WebviewCapability::NetworkRequests` on a WebKit
+/// engine: fetch and XHR report on `bunnyNet` on completion, as
+/// `METHOD url status`. BLIND to subresources by construction — an
+/// image or a stylesheet never crosses fetch. Injected only when the
+/// app declared `on_request`.
+pub const WEBKIT_NET_WRAP: &str = "(function() { \
+    function forward(line) { try { \
+        window.webkit.messageHandlers.bunnyNet.postMessage(line); } catch (e) {} } \
+    var original = window.fetch; \
+    if (original) { window.fetch = function(input, init) { \
+        var method = (init && init.method) || (input && input.method) || 'GET'; \
+        var url = (typeof input === 'string') ? input : ((input && input.url) || String(input)); \
+        var pending = original.apply(this, arguments); \
+        pending.then(function(response) { forward(method + ' ' + url + ' ' + response.status); }, \
+                     function() { forward(method + ' ' + url + ' failed'); }); \
+        return pending; }; } \
+    var open = XMLHttpRequest.prototype.open; \
+    XMLHttpRequest.prototype.open = function(method, url) { \
+        this.__bunny = method + ' ' + url; return open.apply(this, arguments); }; \
+    var send = XMLHttpRequest.prototype.send; \
+    XMLHttpRequest.prototype.send = function() { var xhr = this; \
+        xhr.addEventListener('loadend', function() { \
+            forward((xhr.__bunny || '? ?') + ' ' + (xhr.status || 'failed')); }); \
+        return send.apply(this, arguments); }; \
+})();";
+/// What [`EDITOR_SCRIPT`] expects to find on a WebKit engine: the
+/// document's asks, and `bunnyEdit` as the road for a report line.
+pub fn webkit_editor_prelude(document: &Document) -> String {
+    format!(
+        "window.__bunnyEditor = {{ paste: {}, focus: {}, send: function(line) {{ \
+         window.webkit.messageHandlers.bunnyEdit.postMessage(line); }} }};",
+        document.paste, document.focus
+    )
+}
+
+/// `js` as an EXPRESSION whose answer rides `bunnyEval`, by token, in a
+/// `token \t ok|err \t payload` envelope (stringify escapes control
+/// characters, so the payload never contains a tab). `raw` hands the
+/// value back as the string it is (a null answers empty); otherwise it
+/// rides as JSON. A shell runs the text and waits for nothing: no
+/// completion block, no callback crosses its border.
+pub fn webkit_eval_wrap(token: u64, js: &str, raw: bool) -> String {
+    let serialize = if raw {
+        "(__v === undefined || __v === null) ? \"\" : String(__v)"
+    } else {
+        "JSON.stringify(__v)"
+    };
+    format!(
+        "(function() {{ try {{ \
+           var __v = (function() {{ return ( {js} ); }})(); \
+           var __s = {serialize}; \
+           window.webkit.messageHandlers.bunnyEval.postMessage(\
+             \"{token}\\tok\\t\" + (__s === undefined ? \"null\" : __s)); \
+         }} catch (e) {{ \
+           window.webkit.messageHandlers.bunnyEval.postMessage(\
+             \"{token}\\terr\\t\" + String(e)); \
+         }} }})();"
+    )
+}
+
 /// What the editor reported — decoded from one line of the editor's
 /// channel by [`editor_report`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1284,5 +1376,29 @@ mod tests {
         // the script escapes exactly what the decoder undoes
         assert!(EDITOR_SCRIPT.contains("replace(/\\\\/g, '\\\\\\\\').replace(/\\t/g, '\\\\t')"));
         assert!(EDITOR_SCRIPT.contains("send('change\\t' + document.body.innerHTML)"));
+    }
+
+    /// The WebKit transport names its channels, the editor prelude
+    /// carries the document's asks, and an eval rides the envelope.
+    #[test]
+    fn the_webkit_transport_names_its_channels() {
+        assert!(WEBKIT_BOOT.contains("window.webkit.messageHandlers.bunny.postMessage"));
+        assert!(WEBKIT_CONSOLE_HOOK.contains("messageHandlers.bunnyConsole.postMessage"));
+        assert!(WEBKIT_NET_WRAP.contains("messageHandlers.bunnyNet.postMessage"));
+
+        let document = Document::new("<p>x</p>", "", NetworkPolicy::Deny).editable().paste_owned();
+        let prelude = webkit_editor_prelude(&document);
+        assert!(prelude.contains("paste: true, focus: false"));
+        assert!(prelude.contains("messageHandlers.bunnyEdit.postMessage(line)"));
+
+        let json = webkit_eval_wrap(7, "1 + 1", false);
+        assert!(json.contains("return ( 1 + 1 );"));
+        assert!(json.contains("JSON.stringify(__v)"));
+        assert!(json.contains("\"7\\tok\\t\""));
+        assert!(json.contains("\"7\\terr\\t\""));
+        assert!(json.contains("messageHandlers.bunnyEval.postMessage"));
+        let raw = webkit_eval_wrap(8, "document.title", true);
+        assert!(raw.contains("String(__v)"));
+        assert!(!raw.contains("JSON.stringify"));
     }
 }

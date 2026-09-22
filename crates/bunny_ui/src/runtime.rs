@@ -1093,6 +1093,39 @@ impl Runtime {
         self.last_drag_regions.borrow().iter().any(|region| region.contains(x, y))
     }
 
+    /// Which native host sits under this point — for a shell that OWNS
+    /// its page pixels and routes the hand to the page itself (the
+    /// Linux shell; a shell with platform views never asks, the view
+    /// takes the event on its own). The topmost host whose box, cut to
+    /// what its clip lets through, holds the point — unless an
+    /// interactive target wins there, the rule the drag handle keeps: a
+    /// button floating over a page still clicks. A host under a modal
+    /// is out of reach with everything else the floor covers.
+    pub fn host_at(&self, x: Px, y: Px) -> Option<String> {
+        let taken = {
+            let hits = self.last_hits.borrow();
+            crate::layout::hit_test(self.reachable(&hits, |floor| floor.hits), x, y).is_some()
+        };
+        if taken {
+            return None;
+        }
+        let hosts = self.last_hosts.borrow();
+        self.reachable(&hosts, |floor| floor.hosts)
+            .iter()
+            .rev()
+            .find(|host| {
+                let window = Rect {
+                    origin: Point {
+                        x: host.frame.origin.x + host.visible.origin.x,
+                        y: host.frame.origin.y + host.visible.origin.y,
+                    },
+                    size: host.visible.size,
+                };
+                window.contains(x, y)
+            })
+            .map(|host| host.path.clone())
+    }
+
     /// Which of the window's own buttons sits at this point, topmost
     /// first. Unlike the drag handle, the control WINS by design: it
     /// IS the button, and the platform (not the scene) activates it.

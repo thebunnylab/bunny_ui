@@ -27,7 +27,10 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr::null_mut;
 
-use bunny_ui::host::{Document, EDITOR_SCRIPT, EditorAction, EditorReport, HostSpec, editor_report};
+use bunny_ui::host::{
+    Document, EDITOR_SCRIPT, EditorAction, EditorReport, HostSpec, WEBKIT_BOOT, WEBKIT_CONSOLE_HOOK,
+    WEBKIT_NET_WRAP, editor_report, webkit_editor_prelude, webkit_eval_wrap,
+};
 
 use crate::ffi::{CGPoint, CGRect, CGSize, Id, Sel, class, sel};
 
@@ -172,59 +175,6 @@ fn dispatch(event: WebviewEvent) {
         }
     });
 }
-
-/// The page's side of the bus, injected at document start on every
-/// navigation, before anything the page runs.
-const BOOT: &str = "window.bunny = { post: function(m) { \
-    window.webkit.messageHandlers.bunny.postMessage(String(m)); } };";
-
-/// The console hook — `WebviewCapability::ConsoleMessages` on this
-/// backend is an injected wrap: each level forwards a line and then
-/// speaks as before, and an uncaught error reports too. Injected only
-/// when the app declared `on_console`: nothing is captured for a page
-/// nobody watches.
-const CONSOLE_HOOK: &str = "(function() { \
-    function forward(line) { try { \
-        window.webkit.messageHandlers.bunnyConsole.postMessage(line); } catch (e) {} } \
-    var levels = ['log', 'info', 'warn', 'error']; \
-    for (var i = 0; i < levels.length; i++) { (function(level) { \
-        var original = console[level]; \
-        console[level] = function() { \
-            var parts = []; \
-            for (var j = 0; j < arguments.length; j++) { var a = arguments[j]; \
-                try { parts.push(typeof a === 'string' ? a : JSON.stringify(a)); } \
-                catch (e) { parts.push(String(a)); } } \
-            forward(level + ': ' + parts.join(' ')); \
-            if (original) { original.apply(console, arguments); } \
-        }; })(levels[i]); } \
-    addEventListener('error', function(e) { forward('error: ' + e.message); }); \
-})();";
-
-/// The network wrap — `WebviewCapability::NetworkRequests` on this
-/// backend: fetch and XHR report on completion, as
-/// `METHOD url status`. BLIND to subresources by construction — an
-/// image or a stylesheet never crosses fetch. Injected only when the
-/// app declared `on_request`.
-const NET_WRAP: &str = "(function() { \
-    function forward(line) { try { \
-        window.webkit.messageHandlers.bunnyNet.postMessage(line); } catch (e) {} } \
-    var original = window.fetch; \
-    if (original) { window.fetch = function(input, init) { \
-        var method = (init && init.method) || (input && input.method) || 'GET'; \
-        var url = (typeof input === 'string') ? input : ((input && input.url) || String(input)); \
-        var pending = original.apply(this, arguments); \
-        pending.then(function(response) { forward(method + ' ' + url + ' ' + response.status); }, \
-                     function() { forward(method + ' ' + url + ' failed'); }); \
-        return pending; }; } \
-    var open = XMLHttpRequest.prototype.open; \
-    XMLHttpRequest.prototype.open = function(method, url) { \
-        this.__bunny = method + ' ' + url; return open.apply(this, arguments); }; \
-    var send = XMLHttpRequest.prototype.send; \
-    XMLHttpRequest.prototype.send = function() { var xhr = this; \
-        xhr.addEventListener('loadend', function() { \
-            forward((xhr.__bunny || '? ?') + ' ' + (xhr.status || 'failed')); }); \
-        return send.apply(this, arguments); }; \
-})();";
 
 /// `userContentController:didReceiveScriptMessage:` — the one return
 /// channel. `bunny` is the app's bus; `bunnyEval` carries eval
@@ -693,33 +643,23 @@ unsafe fn install_bridge(controller: Id, spec: &bunny_ui::host::HostSpec) {
 unsafe fn apply_scripts(controller: Id, spec: &HostSpec) {
     let HostSpec::Webview { scripts, console, requests, document, .. } = spec;
     unsafe {
-        add_script(controller, BOOT);
+        add_script(controller, WEBKIT_BOOT);
         if *console {
-            add_script(controller, CONSOLE_HOOK);
+            add_script(controller, WEBKIT_CONSOLE_HOOK);
         }
         if *requests {
-            add_script(controller, NET_WRAP);
+            add_script(controller, WEBKIT_NET_WRAP);
         }
         if let Some(document) = document
             && document.editable
         {
-            add_script(controller, &editor_prelude(document));
+            add_script(controller, &webkit_editor_prelude(document));
             add_script(controller, EDITOR_SCRIPT);
         }
         for script in scripts.iter() {
             add_script(controller, script);
         }
     }
-}
-
-/// What the editor script expects to find: the document's asks, and
-/// this backend's road for a report line — the `bunnyEdit` channel.
-fn editor_prelude(document: &Document) -> String {
-    format!(
-        "window.__bunnyEditor = {{ paste: {}, focus: {}, send: function(line) {{ \
-         window.webkit.messageHandlers.bunnyEdit.postMessage(line); }} }};",
-        document.paste, document.focus
-    )
 }
 
 /// One WKUserScript at document start, main frame only.
@@ -865,22 +805,7 @@ pub fn forward(view: Id) {
 /// so no block ever crosses this border. `raw` hands the value back as
 /// the string it is (a null answers empty); otherwise it rides as JSON.
 pub fn eval(view: Id, token: u64, js: &str, raw: bool) {
-    let serialize = if raw {
-        "(__v === undefined || __v === null) ? \"\" : String(__v)"
-    } else {
-        "JSON.stringify(__v)"
-    };
-    let wrapped = format!(
-        "(function() {{ try {{ \
-           var __v = (function() {{ return ( {js} ); }})(); \
-           var __s = {serialize}; \
-           window.webkit.messageHandlers.bunnyEval.postMessage(\
-             \"{token}\\tok\\t\" + (__s === undefined ? \"null\" : __s)); \
-         }} catch (e) {{ \
-           window.webkit.messageHandlers.bunnyEval.postMessage(\
-             \"{token}\\terr\\t\" + String(e)); \
-         }} }})();"
-    );
+    let wrapped = webkit_eval_wrap(token, js, raw);
     unsafe { run_script(view, &wrapped) }
 }
 

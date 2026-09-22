@@ -7465,6 +7465,49 @@ mod tests {
         assert_eq!(hosts[0].visible.origin.y, 0.0);
     }
 
+    /// A shell that owns its page pixels routes the hand itself: the
+    /// host under a point answers by name, a target beside it is not a
+    /// page, the clip cuts what the box reaches, and a sheet over the
+    /// page puts it out of reach.
+    #[test]
+    fn the_host_under_a_point_answers_unless_the_floor_or_a_target_covers_it() {
+        use crate::host::webview;
+        use crate::layout::{Proposal, Size};
+
+        const WINDOW: Size = Size { width: 400.0, height: 300.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            open: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                hstack((
+                    button(text("act"), || {}).frame(100.0, 300.0),
+                    scroll(webview("https://example.test/").frame(300.0, 600.0))
+                        .frame(300.0, 150.0),
+                ))
+                .sheet(self.open.binding(), |_| {
+                    crate::erased::erased(text("the palette").frame(200.0, 100.0))
+                })
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { open: State::new(false) };
+        let _ = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        let path = runtime.hosts()[0].path.clone();
+        // the region is 150 tall, centred in the 300 of the window:
+        // rows 75 to 225 are the page's window, the box below is cut
+        assert_eq!(runtime.host_at(200.0, 100.0).as_deref(), Some(path.as_str()));
+        assert_eq!(runtime.host_at(50.0, 100.0), None, "the button beside it is not a page");
+        assert_eq!(runtime.host_at(200.0, 250.0), None, "the region's window ends at 225");
+
+        page.open.set(true);
+        let _ = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(runtime.host_at(200.0, 100.0), None, "under a sheet the page is out of reach");
+    }
+
     /// The scene interleaves with the island: what paints AFTER the
     /// host is a segment the shell composites above it — and a scene
     /// with nothing after its hosts answers nothing, which is the

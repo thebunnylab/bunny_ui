@@ -2319,6 +2319,35 @@ impl DisplayList {
                 .collect(),
         }
     }
+
+    /// The list with a picture spliced in at each host's mark — for a
+    /// shell that OWNS its page pixels (the Linux shell) and paints
+    /// them as one [`DrawCommand::Image`] where the host stood, so
+    /// everything the scene painted after the mark stays above the
+    /// page by list order, on every tier, and the clip open at the
+    /// mark still cuts it (a page inside a scroll region is cut like
+    /// anything else there). Marks come in any order; one past the end
+    /// appends; the rect is the host's frame, in window coordinates.
+    pub fn with_host_pixels(&self, pictures: &[(usize, Rect, ImageSource)]) -> DisplayList {
+        let mut order: Vec<&(usize, Rect, ImageSource)> = pictures.iter().collect();
+        order.sort_by_key(|(mark, _, _)| *mark);
+        let mut next = order.into_iter().peekable();
+        let mut commands = Vec::with_capacity(self.commands.len() + pictures.len());
+        for (index, command) in self.commands.iter().enumerate() {
+            while let Some((mark, rect, source)) = next.peek().copied() {
+                if *mark > index {
+                    break;
+                }
+                commands.push(DrawCommand::Image { rect: *rect, source: source.clone() });
+                next.next();
+            }
+            commands.push(command.clone());
+        }
+        commands.extend(
+            next.map(|(_, rect, source)| DrawCommand::Image { rect: *rect, source: source.clone() }),
+        );
+        DisplayList { commands }
+    }
 }
 
 /// How a split's seam and its floors are measured.
@@ -2395,6 +2424,10 @@ pub struct ModalFloor {
     pub menus: usize,
     pub drag_sources: usize,
     pub drops: usize,
+    /// The native hosts placed before the line — a page under a sheet
+    /// is out of reach for a shell that routes the hand to its hosts
+    /// itself.
+    pub hosts: usize,
 }
 
 /// A placed scroll region — the wheel's map, in PAINT order (last =
@@ -5345,6 +5378,7 @@ impl LayoutNode {
                     menus: out.menus.len(),
                     drag_sources: out.drag_sources.len(),
                     drops: out.drops.len(),
+                    hosts: out.hosts.len(),
                 });
                 // and out of the scene, on the popover's own road
                 out.overlay_queue.push(QueuedOverlay {
@@ -5759,6 +5793,7 @@ impl LayoutNode {
                             menus: out.menus.len(),
                             drag_sources: out.drag_sources.len(),
                             drops: out.drops.len(),
+                            hosts: out.hosts.len(),
                         });
                     }
                     // the alignment edge is horizontal — a 2pt accent bar
@@ -8167,6 +8202,56 @@ mod tests {
                 full_motion: false,
             },
         }
+    }
+
+    /// A shell that owns its page pixels splices them in at the mark:
+    /// the picture lands inside the clip open there, in the order of
+    /// the marks whatever order it was given, and a mark past the end
+    /// appends.
+    #[test]
+    fn host_pixels_land_at_their_marks_inside_the_clip_open_there() {
+        let clip = Rect { origin: Point::ZERO, size: Size { width: 100.0, height: 100.0 } };
+        let mut list = DisplayList::default();
+        list.push(DrawCommand::PushClip { rect: clip, corner_radius: Corners::ZERO });
+        // a host stood here (mark 1): nothing of its own is painted
+        list.push(DrawCommand::PopClip);
+        list.push(DrawCommand::PushClip { rect: clip, corner_radius: Corners::ZERO });
+        // and another here (mark 3)
+        list.push(DrawCommand::PopClip);
+        let picture = |key: u64| ImageSource::Bytes { key, bytes: Rc::from(Vec::<u8>::new()) };
+        let spliced = list.with_host_pixels(&[
+            (9, clip, picture(3)),
+            (3, clip, picture(2)),
+            (1, clip, picture(1)),
+        ]);
+        let keys: Vec<Option<u64>> = spliced
+            .iter()
+            .map(|command| match command {
+                DrawCommand::Image { source: ImageSource::Bytes { key, .. }, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec![None, Some(1), None, None, Some(2), None, Some(3)]);
+        assert!(matches!(spliced.as_slice()[0], DrawCommand::PushClip { .. }));
+        assert!(matches!(spliced.as_slice()[2], DrawCommand::PopClip));
+    }
+
+    /// A host under a modal layer sits below the floor: "which host is
+    /// here" stops at the line, like every other walk back.
+    #[test]
+    fn a_host_under_a_modal_layer_sits_below_the_floor() {
+        let pile = LayoutNode::Layered {
+            modal: true,
+            align: CrossAlign::Center,
+            children: vec![
+                host("page"),
+                LayoutNode::Leaf { size: Size { width: 50.0, height: 50.0 } },
+            ],
+        };
+        let result = layout(&pile, Proposal { width: Some(300.0), height: Some(200.0) });
+        assert_eq!(result.hosts.len(), 1);
+        let floor = result.modal_floor.expect("a modal pile draws its line");
+        assert_eq!(floor.hosts, 1, "the page is below it");
     }
 
     /// The host is a hole the scene keeps, not a paint: the placement
