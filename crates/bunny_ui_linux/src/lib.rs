@@ -181,20 +181,11 @@ impl WindowSpec {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct WindowId(usize);
 
-/// This shell holds ONE window. Both desktops here — X11 and
-/// Wayland — are answered by a single surface with its own event
-/// road, and a second document window is not built: an app that opens
-/// one on the other two platforms asks this constant first and keeps
-/// its second view INSIDE the window here.
-///
-/// ```ignore
-/// if bunny_ui_linux::MANY_WINDOWS {
-///     app.open(composer_spec, runtime, composer);
-/// } else {
-///     shell.detach_inside(composer);   // a pane, not a window
-/// }
-/// ```
-pub const MANY_WINDOWS: bool = false;
+/// Whether this shell opens more than one window at a time — it does:
+/// one poll loop, a `wl_surface` (or an xcb window) each, a presenter
+/// each. An app that must run on every platform asks the constant
+/// before it detaches a second window; the phones answer false.
+pub const MANY_WINDOWS: bool = true;
 
 /// The application: the event road, and the window on it.
 ///
@@ -215,9 +206,75 @@ pub struct App {
     inner: Rc<AppInner>,
 }
 
+/// Everything ONE window owns: its address, its handle, and the
+/// closures the doors consult for it — the event handler, the key
+/// gate, the crown's gates. The app installs ONE of each with the
+/// door and routes by the window the event arrived at.
+struct Slot {
+    window: usize,
+    handle: ffi::WindowHandle,
+    handler: RefCell<Box<dyn FnMut(AppEvent)>>,
+    key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,
+    drag_gate: Box<dyn Fn(f64, f64) -> bool>,
+    control_gate: Box<dyn Fn(f64, f64) -> Option<ffi::ControlHit>>,
+}
+
 struct AppInner {
-    open: RefCell<Vec<WindowId>>,
+    slots: RefCell<Vec<Rc<Slot>>>,
+    routed: std::cell::Cell<bool>,
     scenes: std::cell::Cell<usize>,
+}
+
+impl AppInner {
+    /// Installs the door's one handler and one set of gates, once:
+    /// each asks the door which window the event arrived at and
+    /// answers for that slot — or for every slot, when the source is 0
+    /// (a beat every window shares).
+    fn route(self: &Rc<Self>) {
+        if self.routed.replace(true) {
+            return;
+        }
+        let app = Rc::clone(self);
+        ffi::set_handler(Box::new(move |event| {
+            let source = ffi::event_source();
+            let closing = matches!(event, AppEvent::WindowClosed);
+            for slot in app.live() {
+                if source == 0 || slot.window == source {
+                    (slot.handler.borrow_mut())(event.clone());
+                }
+            }
+            if closing {
+                app.buried(source);
+            }
+        }));
+        let app = Rc::clone(self);
+        ffi::set_key_gate(Box::new(move |stroke| {
+            app.addressed().is_some_and(|slot| (slot.key_gate.borrow_mut())(stroke))
+        }));
+        let drag = Rc::clone(self);
+        let control = Rc::clone(self);
+        ffi::set_chrome_gates(
+            Box::new(move |x, y| drag.addressed().is_some_and(|slot| (slot.drag_gate)(x, y))),
+            Box::new(move |x, y| control.addressed().and_then(|slot| (slot.control_gate)(x, y))),
+        );
+    }
+
+    /// The slots, snapshotted BEFORE any handler runs — a window opened
+    /// or closed inside a handler does not disturb the walk.
+    fn live(&self) -> Vec<Rc<Slot>> {
+        self.slots.borrow().clone()
+    }
+
+    /// The slot the current event is addressed to (the first, for a
+    /// shared beat).
+    fn addressed(&self) -> Option<Rc<Slot>> {
+        let source = ffi::event_source();
+        self.slots.borrow().iter().find(|slot| source == 0 || slot.window == source).cloned()
+    }
+
+    fn buried(&self, window: usize) {
+        self.slots.borrow_mut().retain(|slot| slot.window != window);
+    }
 }
 
 impl Default for App {
@@ -234,7 +291,8 @@ impl App {
         life::install();
         App {
             inner: Rc::new(AppInner {
-                open: RefCell::new(Vec::new()),
+                slots: RefCell::new(Vec::new()),
+                routed: std::cell::Cell::new(false),
                 scenes: std::cell::Cell::new(0),
             }),
         }
@@ -247,33 +305,28 @@ impl App {
         Runtime::scene(format!("w{seq}"))
     }
 
-    /// Raises the window on `runtime`, showing `root`.
-    ///
-    /// # Panics
-    ///
-    /// A SECOND window: this shell holds one ([`MANY_WINDOWS`]), and a
-    /// silent half-window would be worse than the refusal.
+    /// Raises a window on `runtime`, showing `root` — painted first,
+    /// then shown, so it never appears blank. A window is usually
+    /// opened from inside an event, so the first paint goes through
+    /// the new slot's own handler, not the door's road.
     pub fn open(&self, spec: WindowSpec, runtime: Rc<Runtime>, root: impl View) -> WindowId {
-        assert!(
-            self.inner.open.borrow().is_empty(),
-            "this shell holds ONE window (bunny_ui_linux::MANY_WINDOWS is false) — \
-             ask the constant before opening a second"
-        );
-        let window = mount(&spec, runtime, root);
-        let id = WindowId(window);
-        self.inner.open.borrow_mut().push(id);
-        id
+        let slot = mount(&spec, runtime, root);
+        self.inner.slots.borrow_mut().push(Rc::clone(&slot));
+        self.inner.route();
+        (slot.handler.borrow_mut())(AppEvent::Redraw);
+        ffi::show_window(slot.handle);
+        WindowId(slot.window)
     }
 
-    /// Closes the window — which, being the last, quits the app.
+    /// Closes the window. The last one out quits the app.
     pub fn close(&self, id: WindowId) {
-        self.inner.open.borrow_mut().retain(|open| *open != id);
-        ffi::close_window();
+        ffi::close_top_level(id.0);
+        self.inner.buried(id.0);
     }
 
-    /// The windows the app has open.
+    /// The windows the app has open, oldest first.
     pub fn windows(&self) -> Vec<WindowId> {
-        self.inner.open.borrow().clone()
+        self.inner.slots.borrow().iter().map(|slot| WindowId(slot.window)).collect()
     }
 
     /// Enters the event road. Returns when the window closes.
@@ -390,8 +443,8 @@ fn house_bar(title: Rc<str>, minimizable: bool) -> impl View<Arity = Single> {
 
 /// Raises the window `spec` asks for and wires everything that lives
 /// as long as it does — the frame path, the pools, the gates and the
-/// event handler. Answers the window's own address.
-fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
+/// event handler — into a slot the app routes to.
+fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
@@ -408,9 +461,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
     // the bar: the compositor's where it offers one, the house's own
     // where it does not — decided BEFORE the GPU installs, because the
     // crown's corners want an alpha ground
-    let house_bar = spec.chrome == Chrome::Native && ffi::wants_house_bar();
+    let house_bar = spec.chrome == Chrome::Native && ffi::wants_house_bar(window.raw_window());
     if house_bar {
-        ffi::adopt_crown();
+        ffi::adopt_crown(window.raw_window());
         eprintln!("bunny_ui_linux: no server decoration — the house bar stands in");
     }
     // the present backend, chosen ONCE: the GPU by default, the CPU
@@ -525,10 +578,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                     );
                 }
             }
-            if vk::active() {
+            if vk::active(window.raw_window()) {
                 // the front of the ladder: the same display list, no
                 // Surface in the path — the queue present is the frame
                 vk::present_window(
+                    window.raw_window(),
                     &display,
                     Size { width, height },
                     scale,
@@ -541,10 +595,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                 }
                 return;
             }
-            if gl::active() {
+            if gl::active(window.raw_window()) {
                 // GPU present: the same display list, no Surface in
                 // the path — the swap is the frame
                 gl::present_window(
+                    window.raw_window(),
                     &display,
                     Size { width, height },
                     scale,
@@ -668,7 +723,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
             }));
             // wake or park the frame driver — the event may have
             // started (or finished) an animation
-            ffi::set_frame_driver_paused(!runtime.wants_frame());
+            ffi::want_frames(window.raw_window(), runtime.wants_frame());
         }
     };
 
@@ -676,22 +731,20 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
     // (with no interactive target above) moves the window by the
     // compositor's own grab; a `.window_control(…)` answers as the
     // window's own button
-    ffi::set_chrome_gates(
-        Box::new({
-            let runtime = Rc::clone(&runtime);
-            move |x, y| runtime.window_drag_at(x, y)
-        }),
-        Box::new({
-            let runtime = Rc::clone(&runtime);
-            move |x, y| {
-                runtime.window_control_at(x, y).map(|control| match control {
-                    bunny_ui::layout::WindowControl::Close => ffi::ControlHit::Close,
-                    bunny_ui::layout::WindowControl::Minimize => ffi::ControlHit::Minimize,
-                    bunny_ui::layout::WindowControl::Maximize => ffi::ControlHit::Maximize,
-                })
-            }
-        }),
-    );
+    let drag_gate: Box<dyn Fn(f64, f64) -> bool> = Box::new({
+        let runtime = Rc::clone(&runtime);
+        move |x, y| runtime.window_drag_at(x, y)
+    });
+    let control_gate: Box<dyn Fn(f64, f64) -> Option<ffi::ControlHit>> = Box::new({
+        let runtime = Rc::clone(&runtime);
+        move |x, y| {
+            runtime.window_control_at(x, y).map(|control| match control {
+                bunny_ui::layout::WindowControl::Close => ffi::ControlHit::Close,
+                bunny_ui::layout::WindowControl::Minimize => ffi::ControlHit::Minimize,
+                bunny_ui::layout::WindowControl::Maximize => ffi::ControlHit::Maximize,
+            })
+        }
+    });
 
     // the gate: keymap BEFORE the input system — bare chars pass
     // straight through to whoever holds the keyboard AND is taking
@@ -700,7 +753,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
     // mounted does not consume; an AltGr chord that types IS text and
     // never enters. The composition-first step arrives with the IME
     // phase.
-    ffi::set_key_gate(Box::new({
+    let key_gate: Box<dyn FnMut(&ffi::KeyStroke) -> bool> = Box::new({
         let runtime = Rc::clone(&runtime);
         let root = Rc::clone(&root);
         let blit = blit.clone();
@@ -763,16 +816,17 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                 false
             }
         }
-    }));
+    });
 
     let handler_runtime = Rc::clone(&runtime);
     let handler_root = Rc::clone(&root);
     let handler_present = Rc::clone(&present);
-    ffi::set_handler(Box::new(move |event| {
+    let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
         match event {
             AppEvent::Redraw => blit(runtime, root),
+            AppEvent::WindowClosed => {}
             // The work always lands: the tasks are polled. The FRAME is for a
             // turn that changed something. Most wakes change nothing — a poll
             // that found no news, a sleeper that went back to sleep — and a
@@ -787,7 +841,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                 } else {
                     // no frame — but a task may have gone to sleep with a
                     // new deadline, and the driver follows it
-                    ffi::set_frame_driver_paused(!runtime.wants_frame());
+                    ffi::want_frames(window.raw_window(), runtime.wants_frame());
                 }
             }
             AppEvent::ResignKey => {
@@ -900,7 +954,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                 if changed || phase == ffi::TouchPhase::Ended {
                     blit(runtime, root);
                 } else {
-                    ffi::set_frame_driver_paused(!runtime.wants_frame());
+                    ffi::want_frames(window.raw_window(), runtime.wants_frame());
                 }
             }
             AppEvent::Magnify { x, y, scale } => {
@@ -944,17 +998,22 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                     let display = runtime.animation_frame(root, Size { width, height });
                     handler_present(runtime, display);
                 }
-                ffi::set_frame_driver_paused(!runtime.wants_frame());
+                ffi::want_frames(window.raw_window(), runtime.wants_frame());
             }
         }
-    }));
+    });
 
-    // first frame into the unmapped window, then the reveal — on
-    // wayland the first presenting commit IS the reveal, so the window
-    // never flashes unpainted; the app's `run` takes the road from here
-    ffi::dispatch(AppEvent::Redraw);
-    ffi::show_window(window);
-    window.raw_window()
+    // the first frame and the reveal are the app's: painted through
+    // this slot's own handler, then shown — on wayland the first
+    // presenting commit IS the reveal, so the window never flashes
+    Rc::new(Slot {
+        window: window.raw_window(),
+        handle: window,
+        handler: RefCell::new(handler),
+        key_gate: RefCell::new(key_gate),
+        drag_gate,
+        control_gate,
+    })
 }
 
 #[cfg(test)]

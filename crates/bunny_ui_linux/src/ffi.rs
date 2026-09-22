@@ -746,15 +746,21 @@ enum Ev {
     Global { name: u32, interface: String, version: u32 },
     GlobalRemove { name: u32 },
     Ping { serial: u32 },
-    SurfaceConfigure { serial: u32 },
-    ToplevelConfigure { width: i32, height: i32, states: Vec<u32> },
-    ToplevelClose,
+    SurfaceConfigure { xdg_ptr: usize, serial: u32 },
+    ToplevelConfigure { toplevel_ptr: usize, width: i32, height: i32, states: Vec<u32> },
+    ToplevelClose { toplevel_ptr: usize },
     /// Who draws the frame, the compositor's answer: 1 = the client,
     /// 2 = the server.
-    DecorationMode { mode: u32 },
-    FrameDone,
-    SurfaceEnter { output_ptr: usize },
-    SurfaceLeave { output_ptr: usize },
+    DecorationMode { decoration_ptr: usize, mode: u32 },
+    /// The keyboard came to, or left, one of our surfaces.
+    KeyboardEnter { surface_ptr: usize },
+    KeyboardLeave { surface_ptr: usize },
+    /// The input method came to, or left, one of our surfaces.
+    ImeEnter { surface_ptr: usize },
+    ImeLeave { surface_ptr: usize },
+    FrameDone { callback_ptr: usize },
+    SurfaceEnter { surface_ptr: usize, output_ptr: usize },
+    SurfaceLeave { surface_ptr: usize, output_ptr: usize },
     OutputScale { output_name: u32, scale: i32 },
     OutputDone { output_name: u32 },
     PointerEnter { serial: u32, surface_ptr: usize, x: f64, y: f64 },
@@ -766,12 +772,14 @@ enum Ev {
     /// The wheel in 120ths of a detent (v8+, sent INSTEAD of the
     /// discrete steps) and where the axis came from (v5+).
     PointerAxis120 { axis: u32, value120: i32 },
-    PointerAxisSource { source: u32 },
+    /// Where the axis came from (v5+): unread — a finger tells itself
+    /// by its lack of detents.
+    PointerAxisSource,
     /// The compositor's preferred scale for the window, in 120ths
     /// (tier 1 of the ladder) — and the whole-number one a v6 surface
     /// is told directly (tier 2).
-    PreferredScale { v120: u32 },
-    PreferredBufferScale { scale: i32 },
+    PreferredScale { fractional_ptr: usize, v120: u32 },
+    PreferredBufferScale { surface_ptr: usize, scale: i32 },
     /// The seat said what it has — the touch device is asked for here.
     SeatCapabilities { caps: u32 },
     TouchDown { surface_ptr: usize, id: i32, x: f64, y: f64 },
@@ -785,10 +793,8 @@ enum Ev {
     PinchUpdate { scale: f64 },
     PinchEnd,
     PointerFrame,
-    BufferRelease,
+    BufferRelease { buffer_ptr: usize },
     KeyboardKeymap { format: u32, fd: i32, size: u32 },
-    KeyboardEnter,
-    KeyboardLeave,
     KeyboardKey { serial: u32, key: u32, pressed: bool },
     KeyboardMods { depressed: u32, latched: u32, locked: u32, group: u32 },
     RepeatInfo { rate: i32, delay: i32 },
@@ -803,7 +809,6 @@ enum Ev {
     ImePreedit { text: String, cursor_begin: i32 },
     ImeCommit { text: String },
     ImeDone { serial: u32 },
-    ImeLeave,
 }
 
 thread_local! {
@@ -816,7 +821,7 @@ fn push_ev(ev: Ev) {
 
 unsafe extern "C" fn dispatcher(
     tag: *const c_void,
-    _proxy: *mut c_void,
+    proxy: *mut c_void,
     opcode: u32,
     _msg: *const WlMessage,
     args: *mut WlArgument,
@@ -837,7 +842,7 @@ unsafe extern "C" fn dispatcher(
             _ => {}
         },
         TAG_SYNC => {} // roundtrip consumes the done itself
-        TAG_FRAME => push_ev(Ev::FrameDone),
+        TAG_FRAME => push_ev(Ev::FrameDone { callback_ptr: proxy as usize }),
         TAG_WM_BASE => {
             if opcode == 0 {
                 push_ev(Ev::Ping { serial: unsafe { arg(0).u } });
@@ -845,35 +850,45 @@ unsafe extern "C" fn dispatcher(
         }
         TAG_XDG_SURFACE => {
             if opcode == 0 {
-                push_ev(Ev::SurfaceConfigure { serial: unsafe { arg(0).u } });
+                push_ev(Ev::SurfaceConfigure { xdg_ptr: proxy as usize, serial: unsafe { arg(0).u } });
             }
         }
         TAG_TOPLEVEL => match opcode {
             0 => push_ev(Ev::ToplevelConfigure {
+                toplevel_ptr: proxy as usize,
                 width: unsafe { arg(0).i },
                 height: unsafe { arg(1).i },
                 states: array_u32s(unsafe { arg(2).a }),
             }),
-            1 => push_ev(Ev::ToplevelClose),
+            1 => push_ev(Ev::ToplevelClose { toplevel_ptr: proxy as usize }),
             _ => {} // configure_bounds v4 / wm_capabilities v5 never arrive at our bind
         },
         TAG_DECORATION => {
             if opcode == 0 {
-                push_ev(Ev::DecorationMode { mode: unsafe { arg(0).u } });
+                push_ev(Ev::DecorationMode { decoration_ptr: proxy as usize, mode: unsafe { arg(0).u } });
             }
         }
         TAG_MAIN_SURFACE => match opcode {
             // the dispatcher may fire while the client is borrowed
             // (release waits dispatch too), so it carries the raw
             // output pointer and the drain resolves the name
-            0 => push_ev(Ev::SurfaceEnter { output_ptr: unsafe { arg(0).o } as usize }),
-            1 => push_ev(Ev::SurfaceLeave { output_ptr: unsafe { arg(0).o } as usize }),
-            2 => push_ev(Ev::PreferredBufferScale { scale: unsafe { arg(0).i } }),
+            0 => push_ev(Ev::SurfaceEnter {
+                surface_ptr: proxy as usize,
+                output_ptr: unsafe { arg(0).o } as usize,
+            }),
+            1 => push_ev(Ev::SurfaceLeave {
+                surface_ptr: proxy as usize,
+                output_ptr: unsafe { arg(0).o } as usize,
+            }),
+            2 => push_ev(Ev::PreferredBufferScale {
+                surface_ptr: proxy as usize,
+                scale: unsafe { arg(0).i },
+            }),
             _ => {} // preferred_buffer_transform(3): unread
         },
         TAG_FRACTIONAL => {
             if opcode == 0 {
-                push_ev(Ev::PreferredScale { v120: unsafe { arg(0).u } });
+                push_ev(Ev::PreferredScale { fractional_ptr: proxy as usize, v120: unsafe { arg(0).u } });
             }
         }
         TAG_SEAT => {
@@ -927,7 +942,7 @@ unsafe extern "C" fn dispatcher(
                 value: fixed_to_f64(unsafe { arg(2).f }),
             }),
             5 => push_ev(Ev::PointerFrame),
-            6 => push_ev(Ev::PointerAxisSource { source: unsafe { arg(0).u } }),
+            6 => push_ev(Ev::PointerAxisSource),
             8 => push_ev(Ev::PointerAxisDiscrete {
                 axis: unsafe { arg(0).u },
                 steps: unsafe { arg(1).i },
@@ -938,15 +953,15 @@ unsafe extern "C" fn dispatcher(
             }),
             _ => {} // axis_stop(7), axis_relative_direction(10): unread
         },
-        TAG_BUFFER => push_ev(Ev::BufferRelease),
+        TAG_BUFFER => push_ev(Ev::BufferRelease { buffer_ptr: proxy as usize }),
         TAG_KEYBOARD => match opcode {
             0 => push_ev(Ev::KeyboardKeymap {
                 format: unsafe { arg(0).u },
                 fd: unsafe { arg(1).h },
                 size: unsafe { arg(2).u },
             }),
-            1 => push_ev(Ev::KeyboardEnter),
-            2 => push_ev(Ev::KeyboardLeave),
+            1 => push_ev(Ev::KeyboardEnter { surface_ptr: unsafe { arg(1).o } as usize }),
+            2 => push_ev(Ev::KeyboardLeave { surface_ptr: unsafe { arg(1).o } as usize }),
             3 => push_ev(Ev::KeyboardKey {
                 serial: unsafe { arg(0).u },
                 key: unsafe { arg(2).u },
@@ -988,7 +1003,7 @@ unsafe extern "C" fn dispatcher(
             if opcode == 0 {
                 let mime =
                     unsafe { CStr::from_ptr(arg(0).s) }.to_string_lossy().into_owned();
-                push_ev(Ev::OfferMime { offer_ptr: _proxy as usize, mime });
+                push_ev(Ev::OfferMime { offer_ptr: proxy as usize, mime });
             }
         }
         TAG_DATA_SOURCE => match opcode {
@@ -1002,7 +1017,6 @@ unsafe extern "C" fn dispatcher(
         },
         TAG_CURSOR_SURFACE => {}
         TAG_TEXT_INPUT => match opcode {
-            1 => push_ev(Ev::ImeLeave),
             2 => {
                 let s = unsafe { arg(0).s };
                 let text = if s.is_null() {
@@ -1022,7 +1036,9 @@ unsafe extern "C" fn dispatcher(
                 push_ev(Ev::ImeCommit { text });
             }
             5 => push_ev(Ev::ImeDone { serial: unsafe { arg(0).u } }),
-            _ => {} // enter(0): the focus follows sync_ime; delete_surrounding(4): documented gap
+            0 => push_ev(Ev::ImeEnter { surface_ptr: unsafe { arg(0).o } as usize }),
+            1 => push_ev(Ev::ImeLeave { surface_ptr: unsafe { arg(0).o } as usize }),
+            _ => {} // delete_surrounding(4): documented gap
         },
         tag if tag >= PANEL_TAG_BASE => {
             let index = (tag - PANEL_TAG_BASE) >> 2;
@@ -1283,9 +1299,14 @@ struct Window {
     scale: usize,
     entered: Vec<u32>,
     backing: Option<Backing>,
-    frame_inflight: bool,
+    /// The frame callback in flight (null = none): the compositor's
+    /// `done` names it, and it is destroyed once it spoke.
+    frame_callback: *mut Proxy,
     paused: bool,
     last_frame: Option<Instant>,
+    /// Presenting commits on THIS window — the configure road checks
+    /// whether an ack was followed by one.
+    presents: u64,
     maximized: bool,
     /// Scene chrome: the shell owns the resize bands at the border.
     scene: bool,
@@ -1409,6 +1430,8 @@ fn utf16_index_at(text: &str, byte_offset: usize) -> usize {
 }
 
 struct ImeState {
+    /// The window the input method is on (its surface address; 0 = none).
+    focus: usize,
     text_input: *mut Proxy,
     enabled: bool,
     marked: bool,
@@ -1426,6 +1449,8 @@ struct ImeState {
 /// The protocol objects materialize at the first present, when the
 /// position is known.
 struct Panel {
+    /// The window this panel hangs from (its surface address).
+    owner: usize,
     chip: bool,
     surface: *mut Proxy,
     xdg: *mut Proxy,
@@ -1443,8 +1468,9 @@ struct Panel {
 }
 
 impl Panel {
-    fn new(chip: bool) -> Panel {
+    fn new(owner: usize, chip: bool) -> Panel {
         Panel {
+            owner,
             chip,
             surface: std::ptr::null_mut(),
             xdg: std::ptr::null_mut(),
@@ -1472,8 +1498,8 @@ struct Client {
     /// (null until then), and the fingers down on the main window
     /// with where each was last seen.
     touch: *mut Proxy,
-    touch_live: Vec<(i32, f64, f64)>,
-    touch_pending: Vec<(TouchPhase, i32, f64, f64)>,
+    touch_live: Vec<(i32, f64, f64, usize)>,
+    touch_pending: Vec<(TouchPhase, i32, f64, f64, usize)>,
     /// The pinch gesture object (null where the compositor speaks no
     /// gestures) and the cumulative scale its last update carried.
     pinch: *mut Proxy,
@@ -1490,7 +1516,12 @@ struct Client {
     protocols: &'static Protocols,
     outputs: Vec<OutputInfo>,
     globals: Vec<(u32, String, u32)>,
-    win: Option<Window>,
+    /// The toplevel windows, oldest first — each named by its
+    /// `wl_surface`'s address.
+    windows: Vec<Window>,
+    /// The windows a verb or the compositor asked to close, settled
+    /// outside any borrow at the end of the turn.
+    close_requested: Vec<usize>,
     serials: Serials,
     clicks: ClickClock,
     pointer_pos: (f64, f64),
@@ -1505,8 +1536,12 @@ struct Client {
     subcompositor: *mut Proxy,
     ime: ImeState,
     panels: Vec<Option<Panel>>,
-    /// 0 = the main window; N = panel N−1 (event translation).
-    pointer_focus: usize,
+    /// Which of our surfaces the pointer is on — a window or a panel
+    /// (event translation and routing).
+    pointer_focus: Target,
+    /// The window holding the keyboard (its surface address, 0 = none)
+    /// — a key goes there and nowhere else.
+    keyboard_focus: usize,
     /// The resize band under the pointer (0 = none) — it outranks the
     /// scene's cursor while it holds.
     edge_hover: u32,
@@ -1515,6 +1550,59 @@ struct Client {
     /// an ack was followed by one.
     presents: u64,
     quit: bool,
+}
+
+/// Where the pointer is: on a toplevel (by its surface address), on
+/// panel N, or nowhere of ours.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Target {
+    None,
+    Window(usize),
+    Panel(usize),
+}
+
+/// The window named by its surface address.
+fn window_at(client: &mut Client, addr: usize) -> Option<&mut Window> {
+    client.windows.iter_mut().find(|win| win.surface as usize == addr)
+}
+
+fn window_ref(client: &Client, addr: usize) -> Option<&Window> {
+    client.windows.iter().find(|win| win.surface as usize == addr)
+}
+
+/// The window one of whose proxies is `ptr` — the callback, the xdg
+/// surface, the toplevel, the decoration, the fractional object.
+fn window_where(client: &mut Client, pick: impl Fn(&Window) -> bool) -> Option<&mut Window> {
+    client.windows.iter_mut().find(|win| pick(win))
+}
+
+/// The oldest window standing — the one a process-wide question
+/// (the cursor theme's scale, the drive's hand) is answered for.
+fn first_window(client: &Client) -> usize {
+    client.windows.first().map_or(0, |win| win.surface as usize)
+}
+
+/// Which of our surfaces `surface_ptr` is.
+fn target_of(client: &Client, surface_ptr: usize) -> Target {
+    if window_ref(client, surface_ptr).is_some() {
+        return Target::Window(surface_ptr);
+    }
+    client
+        .panels
+        .iter()
+        .position(|panel| panel.as_ref().is_some_and(|p| p.surface as usize == surface_ptr))
+        .map_or(Target::None, Target::Panel)
+}
+
+/// The window an event on `target` belongs to — a panel's owner.
+fn owner_of(client: &Client, target: Target) -> usize {
+    match target {
+        Target::Window(addr) => addr,
+        Target::Panel(index) => {
+            client.panels.get(index).and_then(|p| p.as_ref()).map_or(0, |p| p.owner)
+        }
+        Target::None => 0,
+    }
 }
 
 thread_local! {
@@ -1546,8 +1634,12 @@ pub enum TouchPhase {
     Cancelled,
 }
 
+#[derive(Clone)]
 pub enum AppEvent {
     Redraw,
+    /// This window closed — by its button, the compositor, or the app;
+    /// its slot retires. Delivered at the window, before it is gone.
+    WindowClosed,
     Wake,
     ResignKey,
     MouseMoved { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
@@ -1573,6 +1665,32 @@ pub enum AppEvent {
     ImeUnmark,
     Blink,
     Frame { dt: f64 },
+}
+
+thread_local! {
+    /// The window an event ARRIVED at, while its handler runs — 0 for
+    /// a beat every window shares (the blink, the wake, the frame of a
+    /// deadline). The app's `route` reads it to pick the slot.
+    static SOURCE: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The window the event being handled arrived at (0 = every window).
+pub fn event_source() -> usize {
+    SOURCE.with(Cell::get)
+}
+
+/// Runs `body` with the source set to `window` — the gates the doors
+/// consult BEFORE dispatch (the key gate, the crown's) route by it too.
+pub(crate) fn addressed<R>(window: usize, body: impl FnOnce() -> R) -> R {
+    let was = SOURCE.with(|cell| cell.replace(window));
+    let out = body();
+    SOURCE.with(|cell| cell.set(was));
+    out
+}
+
+/// Delivers `event` as arrived at `window`.
+pub(crate) fn dispatch_at(window: usize, event: AppEvent) {
+    addressed(window, || dispatch(event));
 }
 
 pub fn set_handler(handler: Box<dyn FnMut(AppEvent)>) {
@@ -1796,7 +1914,8 @@ fn connect() {
             protocols,
             outputs,
             globals,
-            win: None,
+            windows: Vec::new(),
+            close_requested: Vec::new(),
             serials: Serials::default(),
             clicks: ClickClock::default(),
             pointer_pos: (0.0, 0.0),
@@ -1813,6 +1932,7 @@ fn connect() {
             wake_read,
             subcompositor,
             ime: ImeState {
+                focus: 0,
                 text_input,
                 enabled: false,
                 marked: false,
@@ -1822,7 +1942,8 @@ fn connect() {
                 last_rect: (0, 0, 0, 0),
             },
             panels: Vec::new(),
-            pointer_focus: 0,
+            pointer_focus: Target::None,
+            keyboard_focus: 0,
             edge_hover: 0,
             axis: AxisAccumulator::default(),
             presents: 0,
@@ -1842,15 +1963,15 @@ fn connect() {
 /// on, attaching is legal and the first present maps the window.
 pub fn create_window(title: &str, width: f64, height: f64, options: WindowOptions) -> WindowHandle {
     if is_x11() {
-        crate::x11::create_window(title, width, height, options);
-        return WindowHandle(0);
+        let id = crate::x11::create_window(title, width, height, options);
+        return WindowHandle::toplevel(id as usize);
     }
     let scene_chrome = options.scene;
     if CLIENT.with(|slot| slot.borrow().is_none()) {
         connect();
     }
     let title_c = std::ffi::CString::new(title).unwrap_or_default();
-    with_client(|client| {
+    let addr = with_client(|client| {
         let surface = unsafe {
             construct(
                 client.compositor,
@@ -1933,7 +2054,7 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
             request(surface, 6, &mut no_args());
             wl_display_flush(client.display);
         }
-        client.win = Some(Window {
+        client.windows.push(Window {
             surface,
             xdg_surface,
             toplevel,
@@ -1943,9 +2064,10 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
             scale: 1,
             entered: Vec::new(),
             backing: None,
-            frame_inflight: false,
+            frame_callback: std::ptr::null_mut(),
             paused: true,
             last_frame: None,
+            presents: 0,
             maximized: false,
             scene: scene_chrome,
             resizable: options.resizable,
@@ -1957,28 +2079,128 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
             preferred_buffer: None,
             factor: 1.0,
         });
+        surface as usize
     });
     // the first configure arrives async; wait for it so the first
-    // present (still before anyone sees the window) is legal — the
-    // roundtrip runs OUTSIDE the client borrow (it dispatches)
+    // present (still before anyone sees the window) is legal. Only
+    // THIS window's setup is taken off the queue, without a dispatch —
+    // a window may be opened from inside a handler, and the pump
+    // delivers everything else on its next turn
     for _ in 0..64 {
         let display = with_client(|client| client.display);
         unsafe { wl_display_roundtrip(display) };
-        drain_protocol_events();
-        if with_client(|client| client.win.as_ref().is_some_and(|w| w.map.configured)) {
+        if absorb_setup(addr) {
             break;
         }
     }
-    WindowHandle(0)
+    WindowHandle::toplevel(addr)
+}
+
+/// A window's own setup events — its first configure (acked), its
+/// frame's answer, its scale — taken off the queue and applied without
+/// a dispatch. Every other event stays queued, in order, for the pump.
+/// True once the window is configured.
+fn absorb_setup(addr: usize) -> bool {
+    let (xdg, toplevel, decoration, fractional) = with_client(|client| {
+        let win = window_ref(client, addr).expect("the window just made");
+        (
+            win.xdg_surface as usize,
+            win.toplevel as usize,
+            win.decoration as usize,
+            win.fractional as usize,
+        )
+    });
+    let queue: Vec<Ev> = EVQ.with(|q| q.borrow_mut().drain(..).collect());
+    let mut kept = Vec::new();
+    for ev in queue {
+        match ev {
+            Ev::ToplevelConfigure { toplevel_ptr, width, height, states }
+                if toplevel_ptr == toplevel =>
+            {
+                with_client(|client| {
+                    apply_toplevel_configure(client, toplevel_ptr, width, height, &states)
+                });
+            }
+            Ev::SurfaceConfigure { xdg_ptr, serial } if xdg_ptr == xdg => {
+                with_client(|client| apply_surface_configure(client, xdg_ptr, serial));
+            }
+            Ev::DecorationMode { decoration_ptr, mode }
+                if decoration != 0 && decoration_ptr == decoration =>
+            {
+                with_client(|client| {
+                    if let Some(win) = window_at(client, addr) {
+                        win.decoration_mode = Some(mode);
+                    }
+                });
+            }
+            Ev::PreferredScale { fractional_ptr, v120 }
+                if fractional != 0 && fractional_ptr == fractional =>
+            {
+                update_scale(addr, |win| win.preferred_120 = Some(v120));
+            }
+            Ev::PreferredBufferScale { surface_ptr, scale } if surface_ptr == addr => {
+                update_scale(addr, |win| win.preferred_buffer = Some(scale));
+            }
+            Ev::SurfaceEnter { surface_ptr, output_ptr } if surface_ptr == addr => {
+                if let Some(name) = resolve_output(output_ptr) {
+                    update_scale(addr, |win| win.entered.push(name));
+                }
+            }
+            other => kept.push(other),
+        }
+    }
+    EVQ.with(|q| {
+        let mut q = q.borrow_mut();
+        let tail: Vec<Ev> = q.drain(..).collect();
+        q.extend(kept);
+        q.extend(tail);
+    });
+    with_client(|client| window_ref(client, addr).is_some_and(|win| win.map.configured))
+}
+
+/// The toplevel's word: a size (zero = our choice) and the states.
+fn apply_toplevel_configure(client: &mut Client, toplevel_ptr: usize, width: i32, height: i32, states: &[u32]) {
+    if let Some(win) = window_where(client, |w| w.toplevel as usize == toplevel_ptr) {
+        // zero means "your choice": keep what we have
+        win.pending_size = (width > 0 && height > 0).then_some((width, height));
+        const STATE_MAXIMIZED: u32 = 1;
+        win.maximized = states.contains(&STATE_MAXIMIZED);
+    }
+}
+
+/// The xdg surface's configure: acked at once, the staged size taken.
+/// Answers the window, whether its size changed, whether this was its
+/// FIRST configure, whether it is mapped, and its presents so far —
+/// what the pump needs to decide the redraw and the owed ack.
+fn apply_surface_configure(
+    client: &mut Client,
+    xdg_ptr: usize,
+    serial: u32,
+) -> Option<(usize, bool, bool, bool, u64)> {
+    let win = window_where(client, |w| w.xdg_surface as usize == xdg_ptr)?;
+    let first = !win.map.configured;
+    let staged = win.pending_size.take();
+    win.map.on_configure();
+    unsafe { request(win.xdg_surface, 4, &mut [arg_u(serial)]) };
+    let mapped = win.map.mapped;
+    let mut resized = false;
+    if let Some((w, h)) = staged {
+        let logical = (w as f64, h as f64);
+        if logical != win.logical {
+            win.logical = logical;
+            resized = true;
+        }
+    }
+    Some((win.surface as usize, resized, first, mapped, win.presents))
 }
 
 /// On wayland a window appears when its first buffer commits — the
 /// first present IS the reveal, so the anti-flash order holds by
 /// protocol design and this is a no-op on that door. The x11 door
 /// maps here, AFTER the first present landed in the backing.
-pub fn show_window(_window: WindowHandle) {
+pub fn show_window(window: WindowHandle) {
     if is_x11() {
-        crate::x11::show_window();
+        crate::x11::show_window(window.window as u32);
     }
 }
 
@@ -2005,7 +2227,7 @@ pub enum Decoration {
 
 /// The frame's owner. The x11 door always has the window manager's
 /// frame; the wayland door reports the compositor's answer.
-pub fn decoration() -> Decoration {
+pub fn decoration(window: usize) -> Decoration {
     if is_x11() {
         return Decoration::ServerSide;
     }
@@ -2013,7 +2235,7 @@ pub fn decoration() -> Decoration {
         if client.decoration_manager.is_null() {
             return Decoration::Unknown;
         }
-        match client.win.as_ref().and_then(|win| win.decoration_mode) {
+        match window_ref(client, window).and_then(|win| win.decoration_mode) {
             Some(2) => Decoration::ServerSide,
             Some(1) => Decoration::ClientSide,
             _ => Decoration::Unknown,
@@ -2023,68 +2245,149 @@ pub fn decoration() -> Decoration {
 
 /// True where the shell must draw the bar itself: the wayland door,
 /// and no server-side frame answered.
-pub(crate) fn wants_house_bar() -> bool {
-    !is_x11() && decoration() != Decoration::ServerSide
+pub(crate) fn wants_house_bar(window: usize) -> bool {
+    !is_x11() && decoration(window) != Decoration::ServerSide
 }
 
 /// The crown takes the border — bands, corners and verbs, as a scene
 /// window has them — for a native window the compositor left bare.
-pub(crate) fn adopt_crown() {
+pub(crate) fn adopt_crown(window: usize) {
     if is_x11() {
         return;
     }
     with_client(|client| {
-        if let Some(win) = client.win.as_mut() {
+        if let Some(win) = window_at(client, window) {
             win.scene = true;
         }
     });
 }
 
-/// 0 is the main window; N is panel N−1. The identity lives in the
-/// client state, the handle is the twins' shape.
-#[derive(Clone, Copy)]
-pub struct WindowHandle(usize);
+/// A window's address (its `wl_surface`, or the xcb window id) and,
+/// when the handle names a panel of that window, the panel's slot
+/// (N = panel N−1; 0 = the window itself).
+#[derive(Clone, Copy, Debug)]
+pub struct WindowHandle {
+    window: usize,
+    panel: usize,
+}
+
+impl WindowHandle {
+    fn toplevel(window: usize) -> WindowHandle {
+        WindowHandle { window, panel: 0 }
+    }
+}
 
 /// Asks the road to end — what the app's `close` spends on the one
 /// window this shell holds. The pump leaves on its next turn, and the
 /// process returns from `run`.
-pub fn close_window() {
+pub fn close_top_level(window: usize) {
     if is_x11() {
-        crate::x11::ask_quit();
-        return;
+        return crate::x11::close_top_level(window as u32);
     }
-    with_client(|client| client.quit = true);
+    // the GPU goes first of all — its EGL surface and `wl_egl_window`
+    // must die before the wayland surface they wrap
+    crate::vk::teardown(window);
+    crate::gl::teardown(window);
+    with_client(|client| {
+        // children before the parent — the protocol's teardown law
+        for slot in client.panels.iter_mut() {
+            if slot.as_ref().is_some_and(|panel| panel.owner == window)
+                && let Some(panel) = slot.take()
+            {
+                unsafe { teardown_panel(panel) };
+            }
+        }
+        let Some(index) = client.windows.iter().position(|w| w.surface as usize == window) else {
+            return;
+        };
+        let win = client.windows.remove(index);
+        unsafe {
+            destroy_window_proxies(win);
+            wl_display_flush(client.display);
+        }
+        if client.keyboard_focus == window {
+            client.keyboard_focus = 0;
+        }
+        if client.ime.focus == window {
+            client.ime.focus = 0;
+        }
+        if owner_of(client, client.pointer_focus) == window {
+            client.pointer_focus = Target::None;
+        }
+        // the last window out ends the road
+        client.quit = client.windows.is_empty();
+    });
+}
+
+/// Every close a verb or the compositor asked for this turn, done
+/// outside any borrow: the app hears `WindowClosed` at the window
+/// first, then the window goes.
+pub(crate) fn settle_closes() {
+    if is_x11() {
+        return crate::x11::settle_closes();
+    }
+    loop {
+        let next = with_client(|client| client.close_requested.pop());
+        let Some(window) = next else { break };
+        dispatch_at(window, AppEvent::WindowClosed);
+        close_top_level(window);
+    }
+}
+
+/// Protocol teardown order is law: role → xdg_surface → wl_surface
+/// last, with the buffer and its pool between.
+unsafe fn destroy_window_proxies(win: Window) {
+    unsafe {
+        if !win.frame_callback.is_null() {
+            wl_proxy_destroy(win.frame_callback);
+        }
+        if !win.decoration.is_null() {
+            destroy(win.decoration, 0); // before the toplevel — the protocol's order
+        }
+        if !win.fractional.is_null() {
+            destroy(win.fractional, 0); // before the surface it watches
+        }
+        destroy(win.toplevel, 0);
+        destroy(win.xdg_surface, 0);
+        if let Some(backing) = win.backing {
+            destroy(backing.buffer, 0);
+            destroy(backing.pool, 1);
+            munmap(backing.map as *mut c_void, backing.len);
+            close(backing.fd);
+        }
+        destroy(win.surface, 0);
+    }
 }
 
 impl WindowHandle {
     /// The window as an address — the app's own handle for it.
     pub fn raw_window(&self) -> usize {
-        self.0
+        self.window
     }
 
     /// Logical size of the content area (the layout viewport).
     pub fn content_size(&self) -> (f64, f64) {
         if is_x11() {
-            return crate::x11::content_size();
+            return crate::x11::content_size(self.window as u32);
         }
-        with_client(|client| client.win.as_ref().map(|w| w.logical).unwrap_or((0.0, 0.0)))
+        with_client(|client| window_ref(client, self.window).map(|w| w.logical).unwrap_or((0.0, 0.0)))
     }
 
     /// The integer raster scale the engine sees.
     pub fn scale(&self) -> usize {
         if is_x11() {
-            return crate::x11::scale();
+            return crate::x11::scale(self.window as u32);
         }
-        with_client(|client| client.win.as_ref().map(|w| w.scale).unwrap_or(1))
+        with_client(|client| window_ref(client, self.window).map(|w| w.scale).unwrap_or(1))
     }
 
     /// The exact scale the ladder resolved to — the lattice's ceiling
     /// is [`scale`](Self::scale); on x11 the two are one whole number.
     pub fn scale_factor(&self) -> f64 {
         if is_x11() {
-            return crate::x11::scale() as f64;
+            return crate::x11::scale(self.window as u32) as f64;
         }
-        with_client(|client| client.win.as_ref().map(|w| w.factor).unwrap_or(1.0))
+        with_client(|client| window_ref(client, self.window).map(|w| w.factor).unwrap_or(1.0))
     }
 
     /// Presents damaged rects only: syncs the shm backing with
@@ -2101,9 +2404,9 @@ impl WindowHandle {
             return;
         }
         if is_x11() {
-            return crate::x11::present_rows(width, height, rgba, damage);
+            return crate::x11::present_rows(self.window as u32, width, height, rgba, damage);
         }
-        present_rows(width, height, rgba, damage);
+        present_rows(self.window, width, height, rgba, damage);
     }
 
     pub fn set_cursor(&self, cursor: Cursor) {
@@ -2126,7 +2429,7 @@ impl WindowHandle {
     /// the base, and panels land absolutely.
     pub fn layout_rect_to_screen(&self, x: f64, y: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
         if is_x11() {
-            let origin = crate::x11::window_origin_logical();
+            let origin = crate::x11::window_origin_logical(self.window as u32);
             return (origin.0 + x, origin.1 + y, w, h);
         }
         (x, y, w, h)
@@ -2139,7 +2442,7 @@ impl WindowHandle {
     /// The x11 door answers with the REAL root bounds instead.
     pub fn screen_bounds_in_layout(&self) -> Option<(f64, f64, f64, f64)> {
         if is_x11() {
-            return crate::x11::screen_bounds_in_layout();
+            return crate::x11::screen_bounds_in_layout(self.window as u32);
         }
         const MARGIN: f64 = 512.0;
         let (w, h) = self.content_size();
@@ -2149,14 +2452,14 @@ impl WindowHandle {
     /// The panel's identity in the scene: the overlay's layout origin,
     /// the base for translating its surface-local pointer events.
     pub fn set_scene_origin(&self, x: f64, y: f64) {
-        if self.0 == 0 {
+        if self.panel == 0 {
             return;
         }
         if is_x11() {
-            return crate::x11::set_scene_origin(self.0 - 1, x, y);
+            return crate::x11::set_scene_origin(self.panel - 1, x, y);
         }
         with_client(|client| {
-            if let Some(Some(panel)) = client.panels.get_mut(self.0 - 1) {
+            if let Some(Some(panel)) = client.panels.get_mut(self.panel - 1) {
                 panel.scene_origin = (x, y);
             }
         });
@@ -2173,32 +2476,32 @@ impl WindowHandle {
         height: usize,
         rgba: &[u8],
     ) {
-        if self.0 == 0 {
+        if self.panel == 0 {
             return;
         }
         if is_x11() {
-            return crate::x11::panel_present(self.0 - 1, rect, width, height, rgba);
+            return crate::x11::panel_present(self.panel - 1, rect, width, height, rgba);
         }
-        panel_present(self.0 - 1, rect, width, height, rgba);
+        panel_present(self.panel - 1, rect, width, height, rgba);
     }
 
     /// Hide and forget: the pool retires a panel whose overlay closed.
     pub fn close_panel(&self) {
-        if self.0 == 0 {
+        if self.panel == 0 {
             return;
         }
         if is_x11() {
-            return crate::x11::close_panel(self.0 - 1);
+            return crate::x11::close_panel(self.panel - 1);
         }
         with_client(|client| {
-            let index = self.0 - 1;
+            let index = self.panel - 1;
             if let Some(slot) = client.panels.get_mut(index) {
                 if let Some(panel) = slot.take() {
                     unsafe { teardown_panel(panel) };
                 }
             }
-            if client.pointer_focus == self.0 {
-                client.pointer_focus = 0;
+            if client.pointer_focus == Target::Panel(index) {
+                client.pointer_focus = Target::None;
             }
         });
     }
@@ -2207,13 +2510,14 @@ impl WindowHandle {
 /// The pool asks for a panel slot; the protocol objects wait for the
 /// first present, when the placement is known. `chip` picks the
 /// subsurface road (the mouse-following drag label).
-pub fn create_panel(_window: &WindowHandle, chip: bool) -> WindowHandle {
+pub fn create_panel(window: &WindowHandle, chip: bool) -> WindowHandle {
+    let owner = window.window;
     if is_x11() {
-        return WindowHandle(crate::x11::create_panel(chip));
+        return WindowHandle { window: owner, panel: crate::x11::create_panel(owner as u32, chip) };
     }
     with_client(|client| {
-        client.panels.push(Some(Panel::new(chip)));
-        WindowHandle(client.panels.len())
+        client.panels.push(Some(Panel::new(owner, chip)));
+        WindowHandle { window: owner, panel: client.panels.len() }
     })
 }
 
@@ -2250,7 +2554,8 @@ unsafe fn teardown_panel(panel: Panel) {
 fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height: usize, rgba: &[u8]) {
     let (x, y, w, h) = rect;
     with_client(|client| {
-        let (parent_surface, parent_xdg, parent_logical, scale) = match client.win.as_ref() {
+        let owner = client.panels.get(index).and_then(|p| p.as_ref()).map_or(0, |p| p.owner);
+        let (parent_surface, parent_xdg, parent_logical, scale) = match window_ref(client, owner) {
             Some(win) if win.map.can_attach() => {
                 (win.surface, win.xdg_surface, win.logical, win.scale)
             }
@@ -2267,7 +2572,8 @@ fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height:
             && !panel.surface.is_null()
             && ((panel.asked.0 - x).abs() > 0.5 || (panel.asked.1 - y).abs() > 0.5);
         if moved {
-            let dead = std::mem::replace(panel, Panel::new(false));
+            let owner = panel.owner;
+            let dead = std::mem::replace(panel, Panel::new(owner, false));
             unsafe { teardown_panel(dead) };
         }
         if panel.surface.is_null() {
@@ -2436,8 +2742,9 @@ unsafe fn flush_panel_pixels(
 
 // MARK: - the shm backing and the present
 
-fn ensure_backing(client: &mut Client, width: usize, height: usize) -> bool {
-    let win = client.win.as_mut().expect("window for the backing");
+fn ensure_backing(client: &mut Client, addr: usize, width: usize, height: usize) -> bool {
+    let shm = client.shm;
+    let win = window_at(client, addr).expect("window for the backing");
     if let Some(backing) = &win.backing
         && backing.width == width
         && backing.height == height
@@ -2456,7 +2763,7 @@ fn ensure_backing(client: &mut Client, width: usize, height: usize) -> bool {
     const ARGB8888: u32 = 0;
     // a scene-chrome window carries alpha: its corners round by mask
     let format = if win.scene { ARGB8888 } else { XRGB8888 };
-    win.backing = make_backing(client.shm, width, height, format, TAG_BUFFER);
+    win.backing = make_backing(shm, width, height, format, TAG_BUFFER);
     win.backing.is_some()
 }
 
@@ -2558,11 +2865,9 @@ fn make_backing(
 /// pixels in place, so there is one buffer and the shell waits for its
 /// release before writing — weston releases on commit-upload, so the
 /// wait is almost always already over.
-fn wait_release(client: &mut Client) {
+fn wait_release(client: &mut Client, addr: usize) {
     for _ in 0..20 {
-        let released = client
-            .win
-            .as_ref()
+        let released = window_ref(client, addr)
             .and_then(|w| w.backing.as_ref())
             .is_none_or(|backing| backing.released);
         if released {
@@ -2583,9 +2888,11 @@ fn wait_release(client: &mut Client) {
             let mut q = q.borrow_mut();
             let mut keep = VecDeque::with_capacity(q.len());
             while let Some(ev) = q.pop_front() {
-                if matches!(ev, Ev::BufferRelease) {
-                    if let Some(backing) =
-                        client.win.as_mut().and_then(|w| w.backing.as_mut())
+                if let Ev::BufferRelease { buffer_ptr } = ev {
+                    if let Some(backing) = window_where(client, |w| {
+                        w.backing.as_ref().is_some_and(|b| b.buffer as usize == buffer_ptr)
+                    })
+                    .and_then(|w| w.backing.as_mut())
                     {
                         backing.released = true;
                     }
@@ -2598,16 +2905,17 @@ fn wait_release(client: &mut Client) {
     }
 }
 
-fn present_rows(width: usize, height: usize, rgba: &[u8], damage: &[(i64, i64, i64, i64)]) {
+fn present_rows(addr: usize, width: usize, height: usize, rgba: &[u8], damage: &[(i64, i64, i64, i64)]) {
     with_client(|client| {
-        if !client.win.as_ref().is_some_and(|w| w.map.can_attach()) {
+        if !window_ref(client, addr).is_some_and(|w| w.map.can_attach()) {
             return;
         }
-        if !ensure_backing(client, width, height) {
+        if !ensure_backing(client, addr, width, height) {
             return;
         }
-        wait_release(client);
-        let win = client.win.as_mut().expect("window for the present");
+        wait_release(client, addr);
+        let display = client.display;
+        let win = window_at(client, addr).expect("window for the present");
         let backing = win.backing.as_mut().expect("backing for the present");
         // damage rows: RGBA → XRGB (little-endian bytes B,G,R,X) in one pass
         for &rect in damage {
@@ -2665,20 +2973,20 @@ fn present_rows(width: usize, height: usize, rgba: &[u8], damage: &[(i64, i64, i
             // every presenting commit carries a frame callback; `done`
             // is gated by the paused flag, so a parked app simply lets
             // it fall — and no bare commit ever follows a present
-            if !win.frame_inflight {
-                let callback = construct(
+            if win.frame_callback.is_null() {
+                win.frame_callback = construct(
                     win.surface,
                     3,
                     &raw const wl_callback_interface,
                     &mut [arg_n()],
                     TAG_FRAME,
                 );
-                win.frame_inflight = !callback.is_null();
             }
             request(win.surface, 6, &mut no_args());
-            wl_display_flush(client.display);
+            wl_display_flush(display);
         }
         win.map.on_present();
+        win.presents += 1;
         client.presents += 1;
     });
 }
@@ -2726,7 +3034,8 @@ fn cursor_names(cursor: Cursor) -> &'static [&'static CStr] {
 
 fn apply_cursor() {
     with_client(|client| {
-        let scale = client.win.as_ref().map(|w| w.scale).unwrap_or(1);
+        let under = owner_of(client, client.pointer_focus);
+        let scale = window_ref(client, under).map(|w| w.scale).unwrap_or(1);
         if client.cursor.theme.is_null() || client.cursor.theme_scale != scale {
             if !client.cursor.theme.is_null() {
                 unsafe { wl_cursor_theme_destroy(client.cursor.theme) };
@@ -2929,6 +3238,21 @@ fn is_edit_key(stroke: &KeyStroke) -> bool {
 /// One pressed (or repeated) key walks the whole road: gate first,
 /// then the editing keys, then the character road. Runs OUTSIDE the
 /// client borrow.
+/// A key goes to the window holding the keyboard and nowhere else —
+/// no focus, no key (the compositor said nothing entered).
+fn deliver_key_focused(road: KeyRoad) {
+    let focus = with_client(|client| client.keyboard_focus);
+    if focus != 0 {
+        addressed(focus, || deliver_key(road));
+    }
+}
+
+/// The window the input method speaks to: the one it entered, else
+/// the one holding the keyboard.
+fn ime_window(client: &mut Client) -> usize {
+    if client.ime.focus != 0 { client.ime.focus } else { client.keyboard_focus }
+}
+
 pub(crate) fn deliver_key(road: KeyRoad) {
     // step one of the gate: a live composition wins outright
     if ime_marked() {
@@ -3169,11 +3493,11 @@ pub(crate) fn crown_take(x: f64, y: f64, clicks: u8, right: bool) -> CrownTake {
 }
 
 /// Executes a crown verb against the toplevel with the press serial.
-fn crown_execute(take: CrownTake, x: f64, y: f64) -> bool {
+fn crown_execute(window: usize, take: CrownTake, x: f64, y: f64) -> bool {
     with_client(|client| {
         let seat = client.seat;
         let serial = client.serials.press;
-        let Some(win) = client.win.as_ref() else { return false };
+        let Some(win) = window_ref(client, window) else { return false };
         // a grab (move, resize, the menu) needs the seat that pressed;
         // the window's own buttons and the maximize toggle need none —
         // a compositor with no seat (a headless one) still closes
@@ -3213,7 +3537,7 @@ fn crown_execute(take: CrownTake, x: f64, y: f64) -> bool {
                 }
                 CrownTake::Control(hit) => {
                     match hit {
-                        ControlHit::Close => client.quit = true,
+                        ControlHit::Close => client.close_requested.push(window),
                         ControlHit::Minimize => {
                             if !win.minimizable {
                                 return false; // the verb was refused by the spec
@@ -3244,28 +3568,29 @@ fn crown_execute(take: CrownTake, x: f64, y: f64) -> bool {
 /// window belongs to the resize grab before anything else, a press on
 /// a drag region moves the window, a control answers as the window's
 /// own button — and only a press the crown declined reaches the scene.
-fn left_press(x: f64, y: f64, time_ms: u32, on_main: bool) {
+fn left_press(window: usize, x: f64, y: f64, time_ms: u32, on_main: bool) {
     let clicks = with_client(|client| client.clicks.click(time_ms, x, y));
     // what the hand holds rides in with the press: the framework spends
     // only the shift, and the box under the pointer spends the rest
     let modifiers = with_client(|client| held_modifiers(&client.keyboard));
     let edge = with_client(|client| {
-        client
-            .win
-            .as_ref()
+        window_ref(client, window)
             .filter(|win| win.scene && win.resizable && !win.maximized)
             .map(|win| resize_edge_of(x, y, win.logical.0, win.logical.1))
             .unwrap_or(0)
     });
-    let take = if on_main && edge != 0 {
-        CrownTake::Resize(edge)
-    } else if on_main {
-        crown_take(x, y, clicks, false)
-    } else {
-        CrownTake::None
-    };
-    if matches!(take, CrownTake::None) || !crown_execute(take, x, y) {
-        dispatch(AppEvent::MouseDown { x, y, clicks, modifiers });
+    // the gates answer for the window the press is on
+    let take = addressed(window, || {
+        if on_main && edge != 0 {
+            CrownTake::Resize(edge)
+        } else if on_main {
+            crown_take(x, y, clicks, false)
+        } else {
+            CrownTake::None
+        }
+    });
+    if matches!(take, CrownTake::None) || !crown_execute(window, take, x, y) {
+        dispatch_at(window, AppEvent::MouseDown { x, y, clicks, modifiers });
     }
     // else: the compositor took the grab — the click is spent on the frame
 }
@@ -3277,14 +3602,16 @@ pub(crate) fn drive_click(x: f64, y: f64) {
     if is_x11() {
         return crate::x11::drive_click(x, y);
     }
-    with_client(|client| {
-        client.pointer_focus = 0;
+    let window = with_client(|client| {
+        let first = first_window(client);
+        client.pointer_focus = Target::Window(first);
         client.pointer_pos = (x, y);
+        first
     });
     let time_ms = crate::trace::clock_ms() as u32;
-    dispatch(AppEvent::MouseMoved { x, y, modifiers: bunny_ui::action::Modifiers::default() });
-    left_press(x, y, time_ms, true);
-    dispatch(AppEvent::MouseUp { x, y });
+    dispatch_at(window, AppEvent::MouseMoved { x, y, modifiers: bunny_ui::action::Modifiers::default() });
+    left_press(window, x, y, time_ms, true);
+    dispatch_at(window, AppEvent::MouseUp { x, y });
 }
 
 // MARK: - clipboard (the selection, both directions, never blocking)
@@ -3566,23 +3893,26 @@ fn ime_marked() -> bool {
 
 // MARK: - the frame driver (no thread: the compositor's callback is the clock)
 
-pub fn set_frame_driver_paused(paused: bool) {
+pub fn want_frames(window: usize, wants: bool) {
     if is_x11() {
-        return crate::x11::set_frame_driver_paused(paused);
+        return crate::x11::want_frames(window as u32, wants);
     }
-    let inflight = with_client(|client| {
-        let Some(win) = client.win.as_mut() else { return true };
-        win.paused = paused;
-        win.frame_inflight
+    let (inflight, any_wants) = with_client(|client| {
+        if let Some(win) = window_at(client, window) {
+            win.paused = !wants;
+        }
+        let inflight = window_ref(client, window).is_some_and(|w| !w.frame_callback.is_null());
+        (inflight, client.windows.iter().any(|w| !w.paused))
     });
     // the compositor's callback is the clock only while frames present:
     // a window that wants frames and presented nothing (a tick that
     // moved no pixel, a task on a timer) keeps its beat on a deadline
-    // of its own, which the next present retires
+    // of its own, which the next present retires — one deadline, every
+    // wanting window ticks on it
     NEXT_FRAME.with(|cell| {
-        if paused {
+        if !any_wants {
             cell.set(None);
-        } else if !inflight && cell.get().is_none() {
+        } else if wants && !inflight && cell.get().is_none() {
             cell.set(Some(Instant::now() + FRAME_INTERVAL));
         }
     });
@@ -3597,14 +3927,14 @@ pub fn set_frame_driver_paused(paused: bool) {
 /// will not use. A refusal (`BUNNY_PRESENT=cpu`, no libEGL, a shader
 /// that does not compile) changes nothing — the shm road, byte for
 /// byte.
-pub fn install_gpu(_window: &WindowHandle) {
+pub fn install_gpu(window: &WindowHandle) {
     // the ladder, per the user's decision: vulkan first, gl when it
     // cannot come up, cpu last (BUNNY_PRESENT=gl|cpu are the rungs'
     // own escapes)
-    if crate::vk::try_install() {
+    if crate::vk::try_install(window.window) {
         return;
     }
-    let _ = crate::gl::try_install();
+    let _ = crate::gl::try_install(window.window);
 }
 
 /// What the GPU surface wraps — one variant per door.
@@ -3613,12 +3943,12 @@ pub(crate) enum GpuTargets {
     X11 { connection: *mut c_void, window: u32, scene: bool },
 }
 
-pub(crate) fn gpu_targets() -> Option<GpuTargets> {
+pub(crate) fn gpu_targets(window: usize) -> Option<GpuTargets> {
     if is_x11() {
-        return crate::x11::gpu_targets();
+        return crate::x11::gpu_targets(window as u32);
     }
     with_client(|client| {
-        client.win.as_ref().map(|win| GpuTargets::Wayland {
+        window_ref(client, window).map(|win| GpuTargets::Wayland {
             display: client.display as *mut c_void,
             surface: win.surface as *mut c_void,
             scene: win.scene,
@@ -3627,12 +3957,12 @@ pub(crate) fn gpu_targets() -> Option<GpuTargets> {
 }
 
 /// The buffer size the GPU surface is born with, in device pixels.
-pub(crate) fn gpu_buffer_size() -> (usize, usize) {
+pub(crate) fn gpu_buffer_size(window: usize) -> (usize, usize) {
     if is_x11() {
-        return crate::x11::gpu_buffer_size();
+        return crate::x11::gpu_buffer_size(window as u32);
     }
     with_client(|client| {
-        client.win.as_ref().map_or((1, 1), |win| {
+        window_ref(client, window).map_or((1, 1), |win| {
             let scale = win.scale.max(1) as f64;
             (
                 (win.logical.0 * scale).round().max(1.0) as usize,
@@ -3647,14 +3977,14 @@ pub(crate) fn gpu_buffer_size() -> (usize, usize) {
 /// commit wears, minus attach and damage (the swap carries those).
 /// `false` = the window is not configured yet; committing is illegal
 /// and the caller keeps its frame for the next redraw.
-pub(crate) fn gpu_pre_present(scale: usize) -> bool {
+pub(crate) fn gpu_pre_present(window: usize, scale: usize) -> bool {
     if is_x11() {
         // no buffer scale to declare, no frame callback to arm — the
         // deadline clock paces; the only gate is a living window
-        return crate::x11::gpu_can_present();
+        return crate::x11::gpu_can_present(window as u32);
     }
     with_client(|client| {
-        let Some(win) = client.win.as_mut() else { return false };
+        let Some(win) = window_at(client, window) else { return false };
         if !win.map.can_attach() {
             return false;
         }
@@ -3665,15 +3995,14 @@ pub(crate) fn gpu_pre_present(scale: usize) -> bool {
             // every presenting commit carries a frame callback; `done`
             // is gated by the paused flag, so a parked app simply lets
             // it fall — and no bare commit ever follows a present
-            if !win.frame_inflight {
-                let callback = construct(
+            if win.frame_callback.is_null() {
+                win.frame_callback = construct(
                     win.surface,
                     3,
                     &raw const wl_callback_interface,
                     &mut [arg_n()],
                     TAG_FRAME,
                 );
-                win.frame_inflight = !callback.is_null();
             }
         }
         true
@@ -3682,13 +4011,14 @@ pub(crate) fn gpu_pre_present(scale: usize) -> bool {
 
 /// The swap went through: the surface is mapped and the ack road sees
 /// a presenting commit — the CPU present's bookkeeping, verbatim.
-pub(crate) fn gpu_note_present() {
+pub(crate) fn gpu_note_present(window: usize) {
     if is_x11() {
         return crate::x11::gpu_note_present();
     }
     with_client(|client| {
-        if let Some(win) = client.win.as_mut() {
+        if let Some(win) = window_at(client, window) {
             win.map.on_present();
+            win.presents += 1;
         }
         client.presents += 1;
     });
@@ -3697,7 +4027,7 @@ pub(crate) fn gpu_note_present() {
 /// The compositor must never resize the window past what the GPU can
 /// render — the texture ceiling, spoken as the toplevel's max size in
 /// logical units.
-pub(crate) fn gpu_limit_size(max_px: usize) {
+pub(crate) fn gpu_limit_size(window: usize, max_px: usize) {
     if is_x11() {
         // x11 has no protocol max-size request the WM must honor the
         // way xdg does; the texture ceiling is far past any monitor —
@@ -3706,7 +4036,7 @@ pub(crate) fn gpu_limit_size(max_px: usize) {
         return;
     }
     with_client(|client| {
-        let Some(win) = client.win.as_ref() else { return };
+        let Some(win) = window_ref(client, window) else { return };
         let logical = (max_px / win.scale.max(1)) as i32;
         unsafe {
             request(win.toplevel, 7, &mut [arg_i(logical), arg_i(logical)]);
@@ -3728,51 +4058,39 @@ fn drain_protocol_events() {
             Ev::Ping { serial } => with_client(|client| unsafe {
                 request(client.wm_base, 3, &mut [arg_u(serial)]);
             }),
-            Ev::ToplevelConfigure { width, height, states } => with_client(|client| {
-                if let Some(win) = client.win.as_mut() {
-                    // zero means "your choice": keep what we have
-                    win.pending_size = (width > 0 && height > 0).then_some((width, height));
-                    const STATE_MAXIMIZED: u32 = 1;
-                    win.maximized = states.contains(&STATE_MAXIMIZED);
-                }
+            Ev::ToplevelConfigure { toplevel_ptr, width, height, states } => with_client(|client| {
+                apply_toplevel_configure(client, toplevel_ptr, width, height, &states)
             }),
-            Ev::SurfaceConfigure { serial } => {
-                let (resized, mapped, before) = with_client(|client| {
-                    let presents = client.presents;
-                    let Some(win) = client.win.as_mut() else { return (false, false, presents) };
-                    let staged = win.pending_size.take();
-                    win.map.on_configure();
-                    unsafe { request(win.xdg_surface, 4, &mut [arg_u(serial)]) };
-                    let mapped = win.map.mapped;
-                    if let Some((w, h)) = staged {
-                        let logical = (w as f64, h as f64);
-                        if logical != win.logical {
-                            win.logical = logical;
-                            return (mapped, mapped, presents);
-                        }
-                    }
-                    (false, mapped, presents)
-                });
-                if resized {
-                    dispatch(AppEvent::Redraw);
+            Ev::SurfaceConfigure { xdg_ptr, serial } => {
+                let Some((addr, resized, first, mapped, before)) =
+                    with_client(|client| apply_surface_configure(client, xdg_ptr, serial))
+                else {
+                    continue;
+                };
+                if resized || first {
+                    // a new size, or the window's very first configure:
+                    // the reveal
+                    dispatch_at(addr, AppEvent::Redraw);
                 }
                 // an ack only takes effect on the NEXT commit — a
                 // state-only configure on a parked app would otherwise
                 // never see one, and the shell may hold the window's
                 // very reveal on that cycle closing
                 if mapped {
-                    let owed = with_client(|client| client.presents == before);
-                    if owed && (crate::vk::active() || crate::gl::active()) {
+                    let owed = with_client(|client| {
+                        window_ref(client, addr).is_some_and(|w| w.presents == before)
+                    });
+                    if owed && (crate::vk::active(addr) || crate::gl::active(addr)) {
                         // a GPU-owned surface never takes a bare commit
                         // (the recorded old-compositor corruption) —
                         // the ack rides a REAL present instead, and the
                         // skip key forgets so the swap cannot decline
-                        crate::vk::invalidate();
-                        crate::gl::invalidate();
-                        dispatch(AppEvent::Redraw);
+                        crate::vk::invalidate(addr);
+                        crate::gl::invalidate(addr);
+                        dispatch_at(addr, AppEvent::Redraw);
                     } else if owed {
                         with_client(|client| {
-                            if let Some(win) = client.win.as_ref() {
+                            if let Some(win) = window_ref(client, addr) {
                                 unsafe {
                                     request(win.surface, 6, &mut no_args());
                                     wl_display_flush(client.display);
@@ -3782,16 +4100,25 @@ fn drain_protocol_events() {
                     }
                 }
             }
-            Ev::ToplevelClose => with_client(|client| client.quit = true),
-            Ev::DecorationMode { mode } => with_client(|client| {
-                if let Some(win) = client.win.as_mut() {
+            Ev::ToplevelClose { toplevel_ptr } => with_client(|client| {
+                if let Some(addr) = window_where(client, |w| w.toplevel as usize == toplevel_ptr)
+                    .map(|w| w.surface as usize)
+                {
+                    client.close_requested.push(addr);
+                }
+            }),
+            Ev::DecorationMode { decoration_ptr, mode } => with_client(|client| {
+                if let Some(win) =
+                    window_where(client, |w| w.decoration as usize == decoration_ptr)
+                {
                     win.decoration_mode = Some(mode);
                 }
             }),
-            Ev::FrameDone => {
-                let dt = with_client(|client| {
-                    let Some(win) = client.win.as_mut() else { return None };
-                    win.frame_inflight = false;
+            Ev::FrameDone { callback_ptr } => {
+                let beat = with_client(|client| {
+                    let win = window_where(client, |w| w.frame_callback as usize == callback_ptr)?;
+                    unsafe { wl_proxy_destroy(win.frame_callback) };
+                    win.frame_callback = std::ptr::null_mut();
                     if win.paused {
                         win.last_frame = None;
                         return None;
@@ -3803,10 +4130,10 @@ fn drain_protocol_events() {
                         .unwrap_or(1.0 / 60.0)
                         .clamp(0.0, 1.0 / 30.0);
                     win.last_frame = Some(now);
-                    Some(dt)
+                    Some((win.surface as usize, dt))
                 });
-                if let Some(dt) = dt {
-                    dispatch(AppEvent::Frame { dt });
+                if let Some((addr, dt)) = beat {
+                    dispatch_at(addr, AppEvent::Frame { dt });
                 }
             }
             Ev::PointerEnter { serial, surface_ptr, x, y } => {
@@ -3814,14 +4141,7 @@ fn drain_protocol_events() {
                     client.serials.enter = serial;
                     // which of our surfaces the pointer entered decides
                     // the translation of everything that follows
-                    client.pointer_focus = client
-                        .panels
-                        .iter()
-                        .position(|panel| {
-                            panel.as_ref().is_some_and(|p| p.surface as usize == surface_ptr)
-                        })
-                        .map(|index| index + 1)
-                        .unwrap_or(0);
+                    client.pointer_focus = target_of(client, surface_ptr);
                     client.pointer_pos = (x, y);
                     translate_pointer(client, x, y)
                 });
@@ -3833,25 +4153,24 @@ fn drain_protocol_events() {
             }
             Ev::PointerLeave => {
                 with_client(|client| client.edge_hover = 0);
-                dispatch(AppEvent::MouseExited);
+                let owner = with_client(|client| owner_of(client, client.pointer_focus));
+                dispatch_at(owner, AppEvent::MouseExited);
             }
             Ev::PointerMotion { x, y } => {
-                let (band_changed, (x, y)) = with_client(|client| {
+                let (band_changed, (x, y), owner) = with_client(|client| {
                     client.pointer_pos = (x, y);
-                    let band = client
-                        .win
-                        .as_ref()
-                        .filter(|win| {
-                            client.pointer_focus == 0
-                                && win.scene
-                                && win.resizable
-                                && !win.maximized
-                        })
-                        .map(|win| resize_edge_of(x, y, win.logical.0, win.logical.1))
-                        .unwrap_or(0);
+                    let focus = client.pointer_focus;
+                    // the border band of the window under the pointer
+                    let band = match focus {
+                        Target::Window(addr) => window_ref(client, addr)
+                            .filter(|win| win.scene && win.resizable && !win.maximized)
+                            .map(|win| resize_edge_of(x, y, win.logical.0, win.logical.1))
+                            .unwrap_or(0),
+                        _ => 0,
+                    };
                     let changed = band != client.edge_hover;
                     client.edge_hover = band;
-                    (changed, translate_pointer(client, x, y))
+                    (changed, translate_pointer(client, x, y), owner_of(client, focus))
                 });
                 if band_changed {
                     apply_cursor();
@@ -3860,25 +4179,27 @@ fn drain_protocol_events() {
                 // same as it is for a press: the pointer has no state
                 // of its own on this platform
                 let modifiers = with_client(|client| held_modifiers(&client.keyboard));
-                dispatch(AppEvent::MouseMoved { x, y, modifiers });
+                dispatch_at(owner, AppEvent::MouseMoved { x, y, modifiers });
             }
             Ev::PointerButton { serial, time_ms, button, pressed } => {
-                let (x, y) = with_client(|client| {
+                let (x, y, focus) = with_client(|client| {
                     client.serials.record_button(serial, pressed);
                     let (x, y) = client.pointer_pos;
-                    translate_pointer(client, x, y)
+                    let (x, y) = translate_pointer(client, x, y);
+                    (x, y, client.pointer_focus)
                 });
+                let owner = with_client(|client| owner_of(client, focus));
                 const BTN_LEFT: u32 = 0x110;
                 const BTN_RIGHT: u32 = 0x111;
-                let on_main = with_client(|client| client.pointer_focus == 0);
+                let on_main = matches!(focus, Target::Window(_));
                 match (button, pressed) {
-                    (BTN_LEFT, true) => left_press(x, y, time_ms, on_main),
-                    (BTN_LEFT, false) => dispatch(AppEvent::MouseUp { x, y }),
+                    (BTN_LEFT, true) => left_press(owner, x, y, time_ms, on_main),
+                    (BTN_LEFT, false) => dispatch_at(owner, AppEvent::MouseUp { x, y }),
                     (BTN_RIGHT, true) => {
                         if on_main && matches!(crown_take(x, y, 1, true), CrownTake::Menu) {
-                            let _ = crown_execute(CrownTake::Menu, x, y);
+                            let _ = crown_execute(owner, CrownTake::Menu, x, y);
                         } else {
-                            dispatch(AppEvent::RightMouseDown { x, y });
+                            dispatch_at(owner, AppEvent::RightMouseDown { x, y });
                         }
                     }
                     _ => {}
@@ -3893,7 +4214,7 @@ fn drain_protocol_events() {
             Ev::PointerAxis120 { axis, value120 } => {
                 with_client(|client| client.axis.value120(axis, value120))
             }
-            Ev::PointerAxisSource { .. } => {} // the accumulator tells a finger by its lack of detents
+            Ev::PointerAxisSource => {}
             Ev::SeatCapabilities { caps } => with_client(|client| {
                 const TOUCH: u32 = 4;
                 if caps & TOUCH != 0 && client.touch.is_null() && !client.seat.is_null() {
@@ -3904,29 +4225,29 @@ fn drain_protocol_events() {
             }),
             Ev::TouchDown { surface_ptr, id, x, y } => with_client(|client| {
                 // fingers on the main window only — a panel takes none
-                let on_main = client.win.as_ref().is_some_and(|w| w.surface as usize == surface_ptr);
-                if on_main {
-                    client.touch_live.push((id, x, y));
-                    client.touch_pending.push((TouchPhase::Began, id, x, y));
+                if let Target::Window(owner) = target_of(client, surface_ptr) {
+                    client.touch_live.push((id, x, y, owner));
+                    client.touch_pending.push((TouchPhase::Began, id, x, y, owner));
                 }
             }),
             Ev::TouchMotion { id, x, y } => with_client(|client| {
                 if let Some(finger) = client.touch_live.iter_mut().find(|f| f.0 == id) {
                     finger.1 = x;
                     finger.2 = y;
-                    client.touch_pending.push((TouchPhase::Moved, id, x, y));
+                    let owner = finger.3;
+                    client.touch_pending.push((TouchPhase::Moved, id, x, y, owner));
                 }
             }),
             Ev::TouchUp { id } => with_client(|client| {
                 if let Some(index) = client.touch_live.iter().position(|f| f.0 == id) {
-                    let (_, x, y) = client.touch_live.remove(index);
-                    client.touch_pending.push((TouchPhase::Ended, id, x, y));
+                    let (_, x, y, owner) = client.touch_live.remove(index);
+                    client.touch_pending.push((TouchPhase::Ended, id, x, y, owner));
                 }
             }),
             Ev::TouchFrame => {
                 let steps = with_client(|client| std::mem::take(&mut client.touch_pending));
-                for (phase, id, x, y) in steps {
-                    dispatch(AppEvent::Touch { phase, id: id as u64, x, y });
+                for (phase, id, x, y, owner) in steps {
+                    dispatch_at(owner, AppEvent::Touch { phase, id: id as u64, x, y });
                 }
             }
             Ev::TouchCancel => {
@@ -3934,8 +4255,8 @@ fn drain_protocol_events() {
                     client.touch_pending.clear();
                     std::mem::take(&mut client.touch_live)
                 });
-                for (id, x, y) in live {
-                    dispatch(AppEvent::Touch { phase: TouchPhase::Cancelled, id: id as u64, x, y });
+                for (id, x, y, owner) in live {
+                    dispatch_at(owner, AppEvent::Touch { phase: TouchPhase::Cancelled, id: id as u64, x, y });
                 }
             }
             Ev::PinchBegin => with_client(|client| client.pinch_last = 1.0),
@@ -3944,11 +4265,11 @@ fn drain_protocol_events() {
                     let ratio = pinch_ratio(&mut client.pinch_last, scale);
                     let (x, y) = client.pointer_pos;
                     let (x, y) = translate_pointer(client, x, y);
-                    (ratio, x, y)
+                    (ratio, x, y, owner_of(client, client.pointer_focus))
                 });
-                let (ratio, x, y) = step;
+                let (ratio, x, y, owner) = step;
                 if ratio != 1.0 {
-                    dispatch(AppEvent::Magnify { x, y, scale: ratio });
+                    dispatch_at(owner, AppEvent::Magnify { x, y, scale: ratio });
                 }
             }
             Ev::PinchEnd => {}
@@ -3957,16 +4278,17 @@ fn drain_protocol_events() {
                     client.axis.flush().map(|(dx, dy)| {
                         let (x, y) = client.pointer_pos;
                         let (x, y) = translate_pointer(client, x, y);
-                        (x, y, dx, dy)
+                        (x, y, dx, dy, owner_of(client, client.pointer_focus))
                     })
                 });
-                if let Some((x, y, dx, dy)) = wheel {
-                    dispatch(AppEvent::Wheel { x, y, dx, dy });
+                if let Some((x, y, dx, dy, owner)) = wheel {
+                    dispatch_at(owner, AppEvent::Wheel { x, y, dx, dy });
                 }
             }
             Ev::PanelConfigure { index, serial } => with_client(|client| {
                 let shm = client.shm;
-                let scale = client.win.as_ref().map(|w| w.scale).unwrap_or(1);
+                let owner = client.panels.get(index).and_then(|p| p.as_ref()).map_or(0, |p| p.owner);
+                let scale = window_ref(client, owner).map(|w| w.scale).unwrap_or(1);
                 if let Some(Some(panel)) = client.panels.get_mut(index) {
                     unsafe { request(panel.xdg, 4, &mut [arg_u(serial)]) };
                     panel.configured = true;
@@ -3985,6 +4307,7 @@ fn drain_protocol_events() {
                     panel.delta = (x as f64 - panel.asked.0, y as f64 - panel.asked.1);
                 }
             }),
+            Ev::ImeEnter { surface_ptr } => with_client(|client| client.ime.focus = surface_ptr),
             Ev::ImePreedit { text, cursor_begin } => with_client(|client| {
                 client.ime.cycle.preedit = Some((text, cursor_begin));
             }),
@@ -3998,50 +4321,74 @@ fn drain_protocol_events() {
                     client.ime.marked = marked;
                     ops
                 });
+                let focus = with_client(ime_window);
                 for op in ops {
                     match op {
-                        ImeOp::Insert(text) => dispatch(AppEvent::Text(text)),
+                        ImeOp::Insert(text) => dispatch_at(focus, AppEvent::Text(text)),
                         ImeOp::Mark { text, caret_utf16 } => {
-                            dispatch(AppEvent::ImeMark { text, caret: caret_utf16 })
+                            dispatch_at(focus, AppEvent::ImeMark { text, caret: caret_utf16 })
                         }
-                        ImeOp::Unmark => dispatch(AppEvent::ImeUnmark),
+                        ImeOp::Unmark => dispatch_at(focus, AppEvent::ImeUnmark),
                     }
                 }
             }
-            Ev::ImeLeave => {
-                let was_marked = with_client(|client| {
+            Ev::ImeLeave { surface_ptr } => {
+                let (was_marked, focus) = with_client(|client| {
                     let was = client.ime.marked;
                     client.ime.marked = false;
                     client.ime.cycle = ImeCycle::default();
-                    was
+                    let focus = ime_window(client);
+                    if client.ime.focus == surface_ptr {
+                        client.ime.focus = 0;
+                    }
+                    (was, focus)
                 });
                 if was_marked {
-                    dispatch(AppEvent::ImeUnmark);
+                    dispatch_at(focus, AppEvent::ImeUnmark);
                 }
             }
             Ev::PopupDone { index } => with_client(|client| {
                 // the compositor dismissed it (parent unmap, rare on
                 // this road); the pool recreates if core still wants it
                 if let Some(slot) = client.panels.get_mut(index) {
+                    let owner = slot.as_ref().map_or(0, |panel| panel.owner);
                     if let Some(panel) = slot.take() {
                         unsafe { teardown_panel(panel) };
                     }
-                    *slot = Some(Panel::new(false));
+                    *slot = Some(Panel::new(owner, false));
                 }
             }),
-            Ev::SurfaceEnter { output_ptr } => {
-                if let Some(name) = resolve_output(output_ptr) {
-                    update_scale(|win| win.entered.push(name));
+            Ev::SurfaceEnter { surface_ptr, output_ptr } => {
+                if let Some(name) = resolve_output(output_ptr)
+                    && update_scale(surface_ptr, |win| win.entered.push(name))
+                {
+                    dispatch_at(surface_ptr, AppEvent::Redraw);
                 }
             }
-            Ev::SurfaceLeave { output_ptr } => {
-                if let Some(name) = resolve_output(output_ptr) {
-                    update_scale(|win| win.entered.retain(|&entered| entered != name));
+            Ev::SurfaceLeave { surface_ptr, output_ptr } => {
+                if let Some(name) = resolve_output(output_ptr)
+                    && update_scale(surface_ptr, |win| {
+                        win.entered.retain(|&entered| entered != name)
+                    })
+                {
+                    dispatch_at(surface_ptr, AppEvent::Redraw);
                 }
             }
-            Ev::PreferredScale { v120 } => update_scale(|win| win.preferred_120 = Some(v120)),
-            Ev::PreferredBufferScale { scale } => {
-                update_scale(|win| win.preferred_buffer = Some(scale))
+            Ev::PreferredScale { fractional_ptr, v120 } => {
+                let addr = with_client(|client| {
+                    window_where(client, |w| w.fractional as usize == fractional_ptr)
+                        .map(|w| w.surface as usize)
+                });
+                if let Some(addr) = addr
+                    && update_scale(addr, |win| win.preferred_120 = Some(v120))
+                {
+                    dispatch_at(addr, AppEvent::Redraw);
+                }
+            }
+            Ev::PreferredBufferScale { surface_ptr, scale } => {
+                if update_scale(surface_ptr, |win| win.preferred_buffer = Some(scale)) {
+                    dispatch_at(surface_ptr, AppEvent::Redraw);
+                }
             }
             Ev::OutputScale { output_name, scale } => with_client(|client| {
                 if let Some(output) =
@@ -4058,7 +4405,7 @@ fn drain_protocol_events() {
                         output.scale = output.pending_scale;
                     }
                 });
-                update_scale(|_| {});
+                update_scale_all();
             }
             Ev::Global { name, interface, version } => with_client(|client| {
                 // late arrivals join the census; later phases bind on demand
@@ -4080,11 +4427,15 @@ fn drain_protocol_events() {
                     }
                 });
                 if removed {
-                    update_scale(|win| win.entered.retain(|_| true));
+                    update_scale_all();
                 }
             }
-            Ev::BufferRelease => with_client(|client| {
-                if let Some(backing) = client.win.as_mut().and_then(|w| w.backing.as_mut()) {
+            Ev::BufferRelease { buffer_ptr } => with_client(|client| {
+                if let Some(backing) = window_where(client, |w| {
+                    w.backing.as_ref().is_some_and(|b| b.buffer as usize == buffer_ptr)
+                })
+                .and_then(|w| w.backing.as_mut())
+                {
                     backing.released = true;
                 }
             }),
@@ -4132,8 +4483,11 @@ fn drain_protocol_events() {
                     }
                 });
             }
-            Ev::KeyboardEnter => {}
-            Ev::KeyboardLeave => {
+            Ev::KeyboardEnter { surface_ptr } => with_client(|client| {
+                client.keyboard_focus =
+                    if window_ref(client, surface_ptr).is_some() { surface_ptr } else { 0 };
+            }),
+            Ev::KeyboardLeave { surface_ptr } => {
                 with_client(|client| {
                     let kb = &mut client.keyboard;
                     kb.generation += 1;
@@ -4145,7 +4499,12 @@ fn drain_protocol_events() {
                 });
                 NEXT_REPEAT.with(|cell| cell.set(None));
                 // focus left: popovers close like the platform's own
-                dispatch(AppEvent::ResignKey);
+                dispatch_at(surface_ptr, AppEvent::ResignKey);
+                with_client(|client| {
+                    if client.keyboard_focus == surface_ptr {
+                        client.keyboard_focus = 0;
+                    }
+                });
             }
             Ev::KeyboardMods { depressed, latched, locked, group } => with_client(|client| {
                 if !client.keyboard.state.is_null() {
@@ -4206,7 +4565,7 @@ fn drain_protocol_events() {
                         KeyRoad::Silence
                     }
                 });
-                deliver_key(road);
+                deliver_key_focused(road);
             }
             Ev::NewOffer { offer_ptr } => with_client(|client| {
                 client.offers.insert(offer_ptr, Vec::new());
@@ -4252,15 +4611,22 @@ fn drain_protocol_events() {
 /// speaks the window's. The panel's origin plus the compositor's
 /// adjustment is the bridge.
 fn translate_pointer(client: &Client, x: f64, y: f64) -> (f64, f64) {
-    if client.pointer_focus == 0 {
-        return (x, y);
-    }
-    match client.panels.get(client.pointer_focus - 1) {
+    let Target::Panel(index) = client.pointer_focus else { return (x, y) };
+    match client.panels.get(index) {
         Some(Some(panel)) => {
             (x + panel.scene_origin.0 + panel.delta.0, y + panel.scene_origin.1 + panel.delta.1)
         }
         _ => (x, y),
     }
+}
+
+/// The oldest window standing, as an address — what the drive's hand
+/// and a process-wide question address.
+pub(crate) fn first_window_address() -> usize {
+    if is_x11() {
+        return crate::x11::main_window().unwrap_or(0) as usize;
+    }
+    with_client(|client| first_window(client))
 }
 
 /// The census is keyed by registry name; enter/leave carried a proxy.
@@ -4274,13 +4640,25 @@ fn resolve_output(output_ptr: usize) -> Option<u32> {
     })
 }
 
-/// Applies an entered-outputs edit, re-resolves the ladder's tier 3,
-/// and asks for a fresh frame when the scale actually moved.
-fn update_scale(edit: impl FnOnce(&mut Window)) {
-    let changed = with_client(|client| {
+/// Every window re-resolves its ladder — an output changed.
+fn update_scale_all() {
+    let windows: Vec<usize> =
+        with_client(|client| client.windows.iter().map(|w| w.surface as usize).collect());
+    for addr in windows {
+        if update_scale(addr, |_| {}) {
+            dispatch_at(addr, AppEvent::Redraw);
+        }
+    }
+}
+
+/// Applies an edit to the window's scale inputs and re-resolves the
+/// ladder. True when the lattice actually moved — the caller asks for
+/// the fresh frame, or not (a window being set up draws soon anyway).
+fn update_scale(addr: usize, edit: impl FnOnce(&mut Window)) -> bool {
+    with_client(|client| {
         let outputs: Vec<(u32, i32)> =
             client.outputs.iter().map(|output| (output.name, output.scale)).collect();
-        let Some(win) = client.win.as_mut() else { return false };
+        let Some(win) = window_at(client, addr) else { return false };
         edit(win);
         let (scale, factor) =
             scale_ladder(win.preferred_120, win.preferred_buffer, &win.entered, &outputs);
@@ -4291,10 +4669,7 @@ fn update_scale(edit: impl FnOnce(&mut Window)) {
         } else {
             false
         }
-    });
-    if changed {
-        dispatch(AppEvent::Redraw);
-    }
+    })
 }
 
 /// The pump: prepare-read integration of the wayland fd plus the
@@ -4384,6 +4759,8 @@ pub fn run() {
         }
         // the hand of a --drive sheet, delivered outside any dispatch
         crate::drive::drain();
+        // a window a verb or the compositor asked to close, now
+        settle_closes();
     }
     teardown();
 }
@@ -4393,22 +4770,25 @@ pub fn run() {
 /// nothing presents. A present arms the compositor's callback, and
 /// that callback takes the beat back.
 fn frame_due() {
-    let dt = with_client(|client| {
-        let Some(win) = client.win.as_mut() else { return None };
-        if win.paused || win.frame_inflight {
-            return None;
-        }
+    let beats: Vec<(usize, f64)> = with_client(|client| {
         let now = Instant::now();
-        let dt = win
-            .last_frame
-            .map(|last| (now - last).as_secs_f64())
-            .unwrap_or(1.0 / 60.0)
-            .clamp(0.0, 1.0 / 30.0);
-        win.last_frame = Some(now);
-        Some(dt)
+        client
+            .windows
+            .iter_mut()
+            .filter(|win| !win.paused && win.frame_callback.is_null())
+            .map(|win| {
+                let dt = win
+                    .last_frame
+                    .map(|last| (now - last).as_secs_f64())
+                    .unwrap_or(1.0 / 60.0)
+                    .clamp(0.0, 1.0 / 30.0);
+                win.last_frame = Some(now);
+                (win.surface as usize, dt)
+            })
+            .collect()
     });
-    if let Some(dt) = dt {
-        dispatch(AppEvent::Frame { dt });
+    for (addr, dt) in beats {
+        dispatch_at(addr, AppEvent::Frame { dt });
     }
 }
 
@@ -4439,7 +4819,7 @@ fn fire_repeat() {
             .with(|cell| cell.set(Some(Instant::now() + std::time::Duration::from_millis(interval))));
         key_road(kb, keycode)
     });
-    deliver_key(road);
+    deliver_key_focused(road);
 }
 
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -4449,8 +4829,8 @@ const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500
 /// all — its EGL surface and `wl_egl_window` must die before the
 /// wayland surface they wrap.
 fn teardown() {
-    crate::vk::teardown();
-    crate::gl::teardown();
+    crate::vk::teardown_all();
+    crate::gl::teardown_all();
     CLIENT.with(|slot| {
         let Some(client) = slot.borrow_mut().take() else { return };
         unsafe {
@@ -4460,27 +4840,24 @@ fn teardown() {
                     teardown_panel(panel);
                 }
             }
-            if let Some(win) = client.win {
-                if !win.decoration.is_null() {
-                    destroy(win.decoration, 0); // before the toplevel — the protocol's order
-                }
-                if !win.fractional.is_null() {
-                    destroy(win.fractional, 0); // before the surface it watches
-                }
-                destroy(win.toplevel, 0);
-                destroy(win.xdg_surface, 0);
-                if let Some(backing) = win.backing {
-                    destroy(backing.buffer, 0);
-                    destroy(backing.pool, 1);
-                    munmap(backing.map as *mut c_void, backing.len);
-                    close(backing.fd);
-                }
-                destroy(win.surface, 0);
+            for win in client.windows {
+                destroy_window_proxies(win);
             }
             if !client.cursor.theme.is_null() {
                 wl_cursor_theme_destroy(client.cursor.theme);
             }
             destroy(client.cursor.surface, 0);
+            // the gestures and the fingers ride the seat: they go first
+            if !client.pinch.is_null() {
+                destroy(client.pinch, 0);
+            }
+            if !client.touch.is_null() {
+                if wl_proxy_get_version(client.touch) >= 3 {
+                    destroy(client.touch, 0); // release
+                } else {
+                    wl_proxy_destroy(client.touch);
+                }
+            }
             if !client.pointer.is_null() {
                 if wl_proxy_get_version(client.pointer) >= 3 {
                     destroy(client.pointer, 1); // release

@@ -54,3 +54,7 @@ path = "examples/countries_window.rs"
 [[example]]
 name = "bench_pipeline_linux"
 path = "examples/bench_pipeline_linux.rs"
+
+[[example]]
+name = "two_windows_linux"
+path = "examples/two_windows.rs"

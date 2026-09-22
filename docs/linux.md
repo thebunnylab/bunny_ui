@@ -137,6 +137,28 @@ X11 needs XInput2, a road this shell does not walk. The container
 proves the tables and the arithmetic; the hand itself is proven on a
 laptop.
 
+## More than one window
+
+`App::open` raises as many windows as the app asks for — `MANY_WINDOWS`
+is true on this shell. Each door keeps a list of windows: on Wayland
+each is named by its `wl_surface`, on X11 by its xid, and every event
+carries the surface it arrived at, so the pump routes it to that
+window's runtime and nowhere else. The keyboard's keys go to the
+window the compositor (or the server) said entered; a panel's events
+go to the window it hangs from; the pointer's shape is set on the
+window under it. Every window has its own GPU presenter — its own EGL
+context or Vulkan device, so a second window costs a second atlas —
+its own backing on the CPU tier, and its own frame callback on
+Wayland; one deadline keeps a beat alive for every window that wants
+one and presented nothing. A window opened from inside a handler (a
+button that opens a window) takes only its own setup events off the
+queue — its first configure, its frame's answer, its scale — without
+a dispatch, so nothing re-enters the handler. The last window out
+ends the road. `two_windows_linux --drive` is the proof: a third window
+raised from a running app, the counts kept apart, the FIRST window
+closed with the app still standing, then the survivors closed and the
+road ending by itself.
+
 ## Fonts
 
 The text engine is fontconfig, FreeType and HarfBuzz. A family the

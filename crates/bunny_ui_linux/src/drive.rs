@@ -65,7 +65,7 @@ pub fn backend() -> &'static str {
 /// Who draws the frame: `"server"`, `"client"` or `"unknown"` (no
 /// `xdg-decoration` on this compositor — the house bar stands in).
 pub fn decoration() -> &'static str {
-    match crate::ffi::decoration() {
+    match crate::ffi::decoration(crate::ffi::first_window_address()) {
         crate::ffi::Decoration::ServerSide => "server",
         crate::ffi::Decoration::ClientSide => "client",
         crate::ffi::Decoration::Unknown => "unknown",

@@ -542,6 +542,28 @@ struct ConfigureNotifyEvent {
 /// ClientMessage — verified against xproto.h (data union flattened to
 /// the 32-bit view; format tells the true one).
 #[repr(C)]
+/// DestroyNotify: the window that went.
+#[repr(C)]
+struct DestroyNotifyEvent {
+    response_type: u8,
+    pad0: u8,
+    sequence: u16,
+    event: u32,
+    window: u32,
+}
+
+/// FocusIn/FocusOut: the window the keyboard came to, or left.
+#[repr(C)]
+struct FocusEvent {
+    response_type: u8,
+    detail: u8,
+    sequence: u16,
+    event: u32,
+    mode: u8,
+    pad0: [u8; 3],
+}
+
+#[repr(C)]
 struct ClientMessageEvent {
     response_type: u8,
     format: u8,
@@ -878,7 +900,15 @@ pub(crate) struct XClient {
     root_depth: u8,
     root_visual: u32,
     atoms: Atoms,
-    win: Option<Window>,
+    /// The toplevel windows, oldest first — each named by its xid.
+    windows: Vec<Window>,
+    /// The window holding the keyboard (0 = none) and the window under
+    /// the pointer (the cursor is set on it).
+    keyboard_focus: u32,
+    pointer_window: u32,
+    /// The windows a verb or the manager asked to close, settled
+    /// outside any borrow at the end of the turn.
+    close_requested: Vec<u32>,
     wake_read: c_int,
     pointer_pos: (f64, f64),
     quit: bool,
@@ -915,6 +945,8 @@ pub(crate) struct XClient {
 /// One overlay window: override-redirect, ARGB, placed in ROOT
 /// coordinates — a popover hangs past every edge natively.
 struct XPanel {
+    /// The toplevel this panel hangs from (its xid).
+    owner: u32,
     window: u32,
     gc: u32,
     backing: Option<Backing>,
@@ -929,6 +961,21 @@ struct XPanel {
     /// Where the panel sits on the root, physical px — the ground the
     /// outside-press dismissal measures against.
     root_rect: (i32, i32, i32, i32),
+}
+
+/// The window named by its xid.
+fn window_at(client: &mut XClient, id: u32) -> Option<&mut Window> {
+    client.windows.iter_mut().find(|win| win.id == id)
+}
+
+fn window_ref(client: &XClient, id: u32) -> Option<&Window> {
+    client.windows.iter().find(|win| win.id == id)
+}
+
+/// The oldest window standing — what a process-wide question (the
+/// selection's owner, the drive's hand) is answered for.
+fn first_window(client: &XClient) -> Option<u32> {
+    client.windows.first().map(|win| win.id)
 }
 
 thread_local! {
@@ -1008,7 +1055,10 @@ pub(crate) fn connect() {
             root_depth,
             root_visual,
             atoms,
-            win: None,
+            windows: Vec::new(),
+            keyboard_focus: 0,
+            pointer_window: 0,
+            close_requested: Vec::new(),
             wake_read,
             pointer_pos: (0.0, 0.0),
             quit: false,
@@ -1087,10 +1137,10 @@ fn find_argb(connection: *mut Connection) -> Option<(u8, u32, u32)> {
 /// only a real timestamp and a live window.
 pub(crate) fn clipboard_write(text: &str) {
     with_x(|client| {
-        let Some(win) = client.win.as_ref() else { return };
+        let Some(id) = first_window(client) else { return };
         client.source = Some(text.to_string());
         unsafe {
-            xcb_set_selection_owner(client.connection, win.id, client.atoms.clipboard, client.last_time);
+            xcb_set_selection_owner(client.connection, id, client.atoms.clipboard, client.last_time);
             xcb_flush(client.connection);
         }
     });
@@ -1231,7 +1281,7 @@ fn take_property(window: u32, out: &mut Vec<u8>) -> (usize, bool) {
 /// the desktop can make it modal to the app that asked. `None` before
 /// the window is up.
 pub(crate) fn main_window() -> Option<u32> {
-    with_x(|client| client.win.as_ref().map(|win| win.id))
+    with_x(|client| first_window(client))
 }
 
 /// Reads the CLIPBOARD selection. Our own claim answers from memory;
@@ -1241,7 +1291,7 @@ pub(crate) fn main_window() -> Option<u32> {
 pub(crate) fn clipboard_read() -> Option<String> {
     // the self short-circuit: we are the owner, no round trip
     let (own, window) = with_x(|client| {
-        (client.source.clone(), client.win.as_ref().map(|w| w.id))
+        (client.source.clone(), first_window(client))
     });
     if own.is_some() {
         return own;
@@ -1434,7 +1484,13 @@ fn apply_current_cursor() {
         } else {
             client.cursor_current.unwrap_or(Cursor::Arrow)
         };
-        let Some(win) = client.win.as_ref() else { return };
+        // the window under the pointer wears the shape
+        let under = client.pointer_window;
+        let Some(target) =
+            window_ref(client, under).or_else(|| client.windows.first()).map(|win| win.id)
+        else {
+            return;
+        };
         unsafe {
             if client.cursor_font == 0 {
                 client.cursor_font = xcb_generate_id(client.connection);
@@ -1468,7 +1524,7 @@ fn apply_current_cursor() {
             }
             const CW_CURSOR: u32 = 0x4000;
             let values = [client.cursors[slot]];
-            xcb_change_window_attributes(client.connection, win.id, CW_CURSOR, values.as_ptr());
+            xcb_change_window_attributes(client.connection, target, CW_CURSOR, values.as_ptr());
             xcb_flush(client.connection);
         }
     });
@@ -1517,7 +1573,7 @@ fn read_scale(client: &mut XClient) -> usize {
 
 // MARK: - Window
 
-pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate::ffi::WindowOptions) {
+pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate::ffi::WindowOptions) -> u32 {
     let scene = options.scene;
     if X_CLIENT.with(|slot| slot.borrow().is_none()) {
         connect();
@@ -1672,7 +1728,7 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate
                 class.as_ptr().cast(),
             );
             xcb_flush(client.connection);
-            client.win = Some(Window {
+            client.windows.push(Window {
                 id,
                 gc,
                 logical: (width, height),
@@ -1687,49 +1743,95 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate
                 resizable: options.resizable,
                 minimizable: options.minimizable,
             });
+            id
         }
-    });
+    })
 }
 
 /// The reveal: the first present landed into the unmapped window's
 /// backing; mapping shows it (background pixel covers the gap between
 /// map and the first Expose re-put).
-pub(crate) fn show_window() {
+pub(crate) fn show_window(window: u32) {
     with_x(|client| {
-        if let Some(win) = client.win.as_mut() {
+        let connection = client.connection;
+        if let Some(win) = window_at(client, window) {
             unsafe {
-                xcb_map_window(client.connection, win.id);
-                xcb_flush(client.connection);
+                xcb_map_window(connection, win.id);
+                xcb_flush(connection);
             }
             win.mapped = true;
         }
     });
 }
 
-/// Asks the road to end — the app's `close` on the one window.
-pub(crate) fn ask_quit() {
-    with_x(|client| client.quit = true);
+/// Closes a window by its xid: its GPU presenter, its panels, its
+/// backing and the window itself go, in that order. The last window
+/// out ends the road.
+pub(crate) fn close_top_level(window: u32) {
+    crate::vk::teardown(window as usize);
+    crate::gl::teardown(window as usize);
+    with_x(|client| {
+        let connection = client.connection;
+        for slot in client.panels.iter_mut() {
+            if slot.as_ref().is_some_and(|panel| panel.owner == window)
+                && let Some(panel) = slot.take()
+            {
+                unsafe {
+                    if let Some(backing) = &panel.backing {
+                        xcb_shm_detach(connection, backing.segment);
+                        shmdt(backing.map.cast());
+                    }
+                    xcb_destroy_window(connection, panel.window);
+                }
+            }
+        }
+        let Some(index) = client.windows.iter().position(|win| win.id == window) else { return };
+        let win = client.windows.remove(index);
+        unsafe {
+            if let Some(backing) = win.backing {
+                drop_backing(connection, backing);
+            }
+            xcb_destroy_window(connection, win.id);
+            xcb_flush(connection);
+        }
+        if client.keyboard_focus == window {
+            client.keyboard_focus = 0;
+        }
+        if client.pointer_window == window {
+            client.pointer_window = 0;
+        }
+        client.quit = client.windows.is_empty();
+    });
 }
 
-pub(crate) fn content_size() -> (f64, f64) {
-    with_x(|client| client.win.as_ref().map(|w| w.logical).unwrap_or((0.0, 0.0)))
+/// Every close a verb or the manager asked for this turn, done outside
+/// any borrow: the app hears `WindowClosed` at the window first.
+pub(crate) fn settle_closes() {
+    loop {
+        let next = with_x(|client| client.close_requested.pop());
+        let Some(window) = next else { break };
+        crate::ffi::dispatch_at(window as usize, AppEvent::WindowClosed);
+        close_top_level(window);
+    }
 }
 
-pub(crate) fn scale() -> usize {
-    with_x(|client| client.win.as_ref().map(|w| w.scale).unwrap_or(1))
+pub(crate) fn content_size(window: u32) -> (f64, f64) {
+    with_x(|client| window_ref(client, window).map(|w| w.logical).unwrap_or((0.0, 0.0)))
 }
 
-fn ensure_backing(client: &mut XClient, width: usize, height: usize) -> bool {
-    let stale = client
-        .win
-        .as_ref()
+pub(crate) fn scale(window: u32) -> usize {
+    with_x(|client| window_ref(client, window).map(|w| w.scale).unwrap_or(1))
+}
+
+fn ensure_backing(client: &mut XClient, window: u32, width: usize, height: usize) -> bool {
+    let stale = window_ref(client, window)
         .and_then(|w| w.backing.as_ref())
         .is_none_or(|backing| backing.width != width || backing.height != height);
     if !stale {
         return true;
     }
     let connection = client.connection;
-    let Some(win) = client.win.as_mut() else { return false };
+    let Some(win) = window_at(client, window) else { return false };
     if let Some(old) = win.backing.take() {
         unsafe { drop_backing(connection, old) };
     }
@@ -1741,18 +1843,19 @@ fn ensure_backing(client: &mut XClient, width: usize, height: usize) -> bool {
 /// put per damage rect. ZPixmap depth-24 little-endian is the same
 /// byte lattice as wayland's XRGB8888 — the swizzle is identical.
 pub(crate) fn present_rows(
+    window: u32,
     width: usize,
     height: usize,
     rgba: &[u8],
     damage: &[(i64, i64, i64, i64)],
 ) {
     with_x(|client| {
-        if !ensure_backing(client, width, height) {
+        if !ensure_backing(client, window, width, height) {
             return;
         }
         let connection = client.connection;
         let argb = client.argb.is_some();
-        let win = client.win.as_mut().expect("window for the present");
+        let win = window_at(client, window).expect("window for the present");
         let depth = win.depth;
         let backing = win.backing.as_ref().expect("backing for the present");
         for &rect in damage {
@@ -1823,10 +1926,10 @@ fn clamp_rect(
 
 /// An Expose re-puts the wounded rect from the retained shm image —
 /// the frame is already there; the server only lost its copy.
-fn handle_expose(x: u16, y: u16, w: u16, h: u16) {
+fn handle_expose(window: u32, x: u16, y: u16, w: u16, h: u16) {
     with_x(|client| {
         let connection = client.connection;
-        let Some(win) = client.win.as_ref() else { return };
+        let Some(win) = window_ref(client, window) else { return };
         let root_depth = win.depth;
         let Some(backing) = win.backing.as_ref() else { return };
         let x1 = (x as usize + w as usize).min(backing.width);
@@ -1867,7 +1970,7 @@ const PANEL_BLEED: f64 = 32.0;
 /// Claims a pool slot and builds its window: override-redirect (the
 /// WM never decorates or moves it), ARGB when the ground offers it,
 /// its own input events. Returns the handle index (slot + 1).
-pub(crate) fn create_panel(chip: bool) -> usize {
+pub(crate) fn create_panel(owner: u32, chip: bool) -> usize {
     with_x(|client| {
         let (depth, visual, colormap) = client
             .argb
@@ -1931,6 +2034,7 @@ pub(crate) fn create_panel(chip: bool) -> usize {
             let gc = xcb_generate_id(client.connection);
             xcb_create_gc(client.connection, gc, id, 0, std::ptr::null());
             let panel = XPanel {
+                owner,
                 window: id,
                 gc,
                 backing: None,
@@ -1965,10 +2069,12 @@ pub(crate) fn set_scene_origin(index: usize, x: f64, y: f64) {
 
 /// The window's own origin in root pixels — the truth every overlay
 /// placement builds on.
-fn window_root_origin(client: &mut XClient) -> (i32, i32) {
-    let Some(win) = client.win.as_ref() else { return (0, 0) };
+fn window_root_origin(client: &mut XClient, window: u32) -> (i32, i32) {
+    if window_ref(client, window).is_none() {
+        return (0, 0);
+    }
     unsafe {
-        let cookie = xcb_translate_coordinates(client.connection, win.id, client.root, 0, 0);
+        let cookie = xcb_translate_coordinates(client.connection, window, client.root, 0, 0);
         let reply =
             xcb_translate_coordinates_reply(client.connection, cookie, std::ptr::null_mut());
         if reply.is_null() {
@@ -1994,7 +2100,8 @@ pub(crate) fn panel_present(
 ) {
     with_x(|client| {
         let connection = client.connection;
-        let scale = client.win.as_ref().map(|w| w.scale).unwrap_or(1);
+        let owner = client.panels.get(index).and_then(|p| p.as_ref()).map(|p| p.owner);
+        let scale = owner.and_then(|o| window_ref(client, o)).map(|w| w.scale).unwrap_or(1);
         let Some(Some(panel)) = client.panels.get_mut(index) else { return };
         // the backing follows the size
         let stale = panel
@@ -2123,10 +2230,10 @@ pub(crate) fn close_panel(index: usize) {
 
 /// The main window's origin in LOGICAL root coordinates — the base
 /// `layout_rect_to_screen` adds to, and the bounds math subtracts.
-pub(crate) fn window_origin_logical() -> (f64, f64) {
+pub(crate) fn window_origin_logical(window: u32) -> (f64, f64) {
     with_x(|client| {
-        let scale = client.win.as_ref().map(|w| w.scale).unwrap_or(1) as f64;
-        let origin = window_root_origin(client);
+        let scale = window_ref(client, window).map(|w| w.scale).unwrap_or(1) as f64;
+        let origin = window_root_origin(client, window);
         (origin.0 as f64 / scale, origin.1 as f64 / scale)
     })
 }
@@ -2134,10 +2241,10 @@ pub(crate) fn window_origin_logical() -> (f64, f64) {
 /// The whole root, in layout coordinates relative to the window — the
 /// REAL screen bounds the placement math clamps against (popovers may
 /// hang past the window; the screen edge is the only wall).
-pub(crate) fn screen_bounds_in_layout() -> Option<(f64, f64, f64, f64)> {
+pub(crate) fn screen_bounds_in_layout(window: u32) -> Option<(f64, f64, f64, f64)> {
     with_x(|client| {
-        let scale = client.win.as_ref().map(|w| w.scale).unwrap_or(1) as f64;
-        let origin = window_root_origin(client);
+        let scale = window_ref(client, window).map(|w| w.scale).unwrap_or(1) as f64;
+        let origin = window_root_origin(client, window);
         unsafe {
             let setup = xcb_get_setup(client.connection);
             let screens = xcb_setup_roots_iterator(setup);
@@ -2199,10 +2306,10 @@ fn send_root_message(client: &mut XClient, window: u32, kind: u32, data: [u32; 5
 
 /// Executes a crown verb through the WM. The implicit press grab is
 /// released first — a moveresize under our own grab never moves.
-fn crown_execute(take: crate::ffi::CrownTake, root_x: i16, root_y: i16) -> bool {
+fn crown_execute(window: u32, take: crate::ffi::CrownTake, root_x: i16, root_y: i16) -> bool {
     use crate::ffi::{ControlHit, CrownTake};
     with_x(|client| {
-        let Some(win) = client.win.as_ref() else { return false };
+        let Some(win) = window_ref(client, window) else { return false };
         let (id, time) = (win.id, client.last_time);
         let atoms_moveresize = client.atoms.net_wm_moveresize;
         let atoms_state = client.atoms.net_wm_state;
@@ -2229,7 +2336,7 @@ fn crown_execute(take: crate::ffi::CrownTake, root_x: i16, root_y: i16) -> bool 
                 true
             }
             CrownTake::Control(ControlHit::Close) => {
-                client.quit = true;
+                client.close_requested.push(window);
                 true
             }
             CrownTake::Control(ControlHit::Minimize) => {
@@ -2259,9 +2366,11 @@ fn crown_execute(take: crate::ffi::CrownTake, root_x: i16, root_y: i16) -> bool 
 
 /// Re-reads _NET_WM_STATE off the main window — the maximized mirror
 /// bands and corners consult.
-fn refresh_wm_state(client: &mut XClient) {
-    let Some(win) = client.win.as_ref() else { return };
-    let (id, state_atom) = (win.id, client.atoms.net_wm_state);
+fn refresh_wm_state(client: &mut XClient, window: u32) {
+    if window_ref(client, window).is_none() {
+        return;
+    }
+    let (id, state_atom) = (window, client.atoms.net_wm_state);
     let max_pair = (client.atoms.net_wm_state_max_horz, client.atoms.net_wm_state_max_vert);
     unsafe {
         let cookie =
@@ -2277,7 +2386,7 @@ fn refresh_wm_state(client: &mut XClient) {
         );
         let maximized = atoms.contains(&max_pair.0) || atoms.contains(&max_pair.1);
         free(reply.cast());
-        if let Some(win) = client.win.as_mut() {
+        if let Some(win) = window_at(client, window) {
             win.maximized = maximized;
         }
     }
@@ -2288,8 +2397,8 @@ fn refresh_wm_state(client: &mut XClient) {
 /// drag and control gates. True when the crown consumed the press.
 fn crown_press(window: u32, detail: u8, x: i16, y: i16, root_x: i16, root_y: i16, time: u32) -> bool {
     let crown = with_x(|client| {
-        let win = client.win.as_ref()?;
-        if win.id != window || !win.scene {
+        let win = window_ref(client, window)?;
+        if !win.scene {
             return None;
         }
         let logical_x = x as f64 / win.scale as f64;
@@ -2312,33 +2421,35 @@ fn crown_press(window: u32, detail: u8, x: i16, y: i16, root_x: i16, root_y: i16
     } else {
         take
     };
-    crown_execute(take, root_x, root_y)
+    crown_execute(window, take, root_x, root_y)
 }
 
 /// A click by the drive's hand, at layout coordinates on the main
 /// window: the pointer arrives, the press asks the crown the way a
 /// real one does, the release follows.
 pub(crate) fn drive_click(x: f64, y: f64) {
-    let Some((id, scale)) = with_x(|client| client.win.as_ref().map(|w| (w.id, w.scale))) else {
+    let Some((id, scale)) = with_x(|client| {
+        let first = first_window(client)?;
+        window_ref(client, first).map(|w| (w.id, w.scale))
+    }) else {
         return;
     };
     let (px, py) = ((x * scale as f64) as i16, (y * scale as f64) as i16);
     let time = crate::trace::clock_ms() as u32;
     let modifiers = bunny_ui::action::Modifiers::default();
-    dispatch(AppEvent::MouseMoved { x, y, modifiers });
+    crate::ffi::dispatch_at(id as usize, AppEvent::MouseMoved { x, y, modifiers });
     if !crown_press(id, 1, px, py, 0, 0, time) {
         let clicks = with_x(|client| client.clicks.click(time, x, y));
-        dispatch(AppEvent::MouseDown { x, y, clicks, modifiers });
+        crate::ffi::dispatch_at(id as usize, AppEvent::MouseDown { x, y, clicks, modifiers });
     }
-    dispatch(AppEvent::MouseUp { x, y });
+    crate::ffi::dispatch_at(id as usize, AppEvent::MouseUp { x, y });
 }
 
 /// A property of the main window as 32-bit words, by atom name — the
 /// drive sheet's read-back of what the door wrote (hints, states).
 pub(crate) fn read_property_u32(name: &str) -> Vec<u32> {
     with_x(|client| {
-        let Some(win) = client.win.as_ref() else { return Vec::new() };
-        let id = win.id;
+        let Some(id) = first_window(client) else { return Vec::new() };
         let Ok(name_c) = std::ffi::CString::new(name) else { return Vec::new() };
         unsafe {
             let cookie = xcb_intern_atom(
@@ -2373,9 +2484,9 @@ pub(crate) fn read_property_u32(name: &str) -> Vec<u32> {
 
 /// What the EGL surface wraps on this door: the xcb connection and
 /// the window xid (Mesa's xcb platform speaks both natively).
-pub(crate) fn gpu_targets() -> Option<crate::ffi::GpuTargets> {
+pub(crate) fn gpu_targets(window: u32) -> Option<crate::ffi::GpuTargets> {
     with_x(|client| {
-        client.win.as_ref().map(|win| crate::ffi::GpuTargets::X11 {
+        window_ref(client, window).map(|win| crate::ffi::GpuTargets::X11 {
             connection: client.connection.cast(),
             window: win.id,
             scene: win.scene,
@@ -2383,9 +2494,9 @@ pub(crate) fn gpu_targets() -> Option<crate::ffi::GpuTargets> {
     })
 }
 
-pub(crate) fn gpu_buffer_size() -> (usize, usize) {
+pub(crate) fn gpu_buffer_size(window: u32) -> (usize, usize) {
     with_x(|client| {
-        client.win.as_ref().map_or((1, 1), |win| {
+        window_ref(client, window).map_or((1, 1), |win| {
             let scale = win.scale.max(1) as f64;
             (
                 (win.logical.0 * scale).round().max(1.0) as usize,
@@ -2397,8 +2508,8 @@ pub(crate) fn gpu_buffer_size() -> (usize, usize) {
 
 /// The only present gate this door needs: a living window. No map
 /// dance, no callback — the swap presents whenever it likes.
-pub(crate) fn gpu_can_present() -> bool {
-    with_x(|client| client.win.is_some())
+pub(crate) fn gpu_can_present(window: u32) -> bool {
+    with_x(|client| window_ref(client, window).is_some())
 }
 
 pub(crate) fn gpu_note_present() {
@@ -2411,14 +2522,20 @@ pub(crate) fn gpu_note_present() {
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_micros(16_666);
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-pub(crate) fn set_frame_driver_paused(paused: bool) {
-    with_x(|client| {
-        if let Some(win) = client.win.as_mut() {
-            win.paused = paused;
+/// The frame driver, per window: one clock, every wanting window
+/// ticks on it.
+pub(crate) fn want_frames(window: u32, wants: bool) {
+    let any_wants = with_x(|client| {
+        if let Some(win) = window_at(client, window) {
+            win.paused = !wants;
+            if !wants {
+                win.last_frame = None;
+            }
         }
+        client.windows.iter().any(|w| !w.paused)
     });
     NEXT_FRAME.with(|cell| {
-        if paused {
+        if !any_wants {
             cell.set(None);
         } else if cell.get().is_none() {
             cell.set(Some(Instant::now() + FRAME_INTERVAL));
@@ -2427,24 +2544,28 @@ pub(crate) fn set_frame_driver_paused(paused: bool) {
 }
 
 fn frame_due() {
-    let dt = with_x(|client| {
-        let Some(win) = client.win.as_mut() else { return None };
-        if win.paused {
-            win.last_frame = None;
-            return None;
-        }
+    let beats: Vec<(u32, f64)> = with_x(|client| {
         let now = Instant::now();
-        let dt = win
-            .last_frame
-            .map(|last| (now - last).as_secs_f64())
-            .unwrap_or(1.0 / 60.0)
-            .clamp(0.0, 1.0 / 30.0);
-        win.last_frame = Some(now);
-        Some(dt)
+        client
+            .windows
+            .iter_mut()
+            .filter(|win| !win.paused)
+            .map(|win| {
+                let dt = win
+                    .last_frame
+                    .map(|last| (now - last).as_secs_f64())
+                    .unwrap_or(1.0 / 60.0)
+                    .clamp(0.0, 1.0 / 30.0);
+                win.last_frame = Some(now);
+                (win.id, dt)
+            })
+            .collect()
     });
-    if let Some(dt) = dt {
+    if !beats.is_empty() {
         NEXT_FRAME.with(|cell| cell.set(Some(Instant::now() + FRAME_INTERVAL)));
-        dispatch(AppEvent::Frame { dt });
+    }
+    for (window, dt) in beats {
+        crate::ffi::dispatch_at(window as usize, AppEvent::Frame { dt });
     }
 }
 
@@ -2453,8 +2574,10 @@ fn frame_due() {
 /// One decoded step of the drain: the borrow closes before any
 /// AppEvent leaves (the handler re-enters the facade freely).
 enum Step {
-    Deliver(AppEvent),
-    Quit,
+    /// An event, at the toplevel it belongs to.
+    Deliver(u32, AppEvent),
+    /// The manager (or the user) asked this window to close.
+    Close(u32),
     Silence,
 }
 
@@ -2462,19 +2585,21 @@ enum Step {
 /// translates from (0,0); a panel from its scene origin — hit-testing
 /// follows the overlay math, not the server's window tree. Also the
 /// one place every input event stamps the selection timestamp.
-fn surface_base(window: u32, time: u32) -> Option<((f64, f64), f64)> {
+fn surface_base(window: u32, time: u32) -> Option<(u32, (f64, f64), f64)> {
     with_x(|client| {
         client.last_time = time;
-        let scale = client.win.as_ref().map(|w| w.scale).unwrap_or(1) as f64;
-        if client.win.as_ref().is_some_and(|w| w.id == window) {
-            return Some(((0.0, 0.0), scale));
+        if let Some(scale) = window_ref(client, window).map(|w| w.scale) {
+            client.pointer_window = window;
+            return Some((window, (0.0, 0.0), scale as f64));
         }
-        client
+        let (owner, origin) = client
             .panels
             .iter()
             .flatten()
             .find(|panel| panel.window == window)
-            .map(|panel| (panel.scene_origin, scale))
+            .map(|panel| (panel.owner, panel.scene_origin))?;
+        let scale = window_ref(client, owner).map(|w| w.scale).unwrap_or(1) as f64;
+        Some((owner, origin, scale))
     })
 }
 
@@ -2495,16 +2620,18 @@ fn interpret(event: *mut GenericEvent) -> Step {
         }
         XCB_EXPOSE => {
             let expose = event as *mut ExposeEvent;
-            let (x, y, w, h) =
-                unsafe { ((*expose).x, (*expose).y, (*expose).width, (*expose).height) };
-            handle_expose(x, y, w, h);
+            let (window, x, y, w, h) = unsafe {
+                ((*expose).window, (*expose).x, (*expose).y, (*expose).width, (*expose).height)
+            };
+            handle_expose(window, x, y, w, h);
             Step::Silence
         }
         XCB_CONFIGURE_NOTIFY => {
             let configure = event as *mut ConfigureNotifyEvent;
-            let (width, height) = unsafe { ((*configure).width, (*configure).height) };
+            let (window, width, height) =
+                unsafe { ((*configure).window, (*configure).width, (*configure).height) };
             let resized = with_x(|client| {
-                let Some(win) = client.win.as_mut() else { return false };
+                let Some(win) = window_at(client, window) else { return false };
                 let logical = (
                     width as f64 / win.scale as f64,
                     height as f64 / win.scale as f64,
@@ -2517,7 +2644,7 @@ fn interpret(event: *mut GenericEvent) -> Step {
                 }
             });
             if resized {
-                Step::Deliver(AppEvent::Redraw)
+                Step::Deliver(window, AppEvent::Redraw)
             } else {
                 Step::Silence
             }
@@ -2529,12 +2656,18 @@ fn interpret(event: *mut GenericEvent) -> Step {
                     && (*message).data32[0] == client.atoms.wm_delete_window
             });
             if close {
-                Step::Quit
+                Step::Close(unsafe { (*message).window })
             } else {
                 Step::Silence
             }
         }
-        XCB_DESTROY_NOTIFY => Step::Quit,
+        XCB_DESTROY_NOTIFY => {
+            // killed from outside: still registered means the window
+            // goes now; our own close already unregistered it
+            let window = unsafe { (*(event as *mut DestroyNotifyEvent)).window };
+            let ours = with_x(|client| window_ref(client, window).is_some());
+            if ours { Step::Close(window) } else { Step::Silence }
+        }
         XCB_MOTION_NOTIFY => {
             let motion = event as *mut InputEvent;
             let (window, x, y, time, state) = unsafe {
@@ -2546,15 +2679,15 @@ fn interpret(event: *mut GenericEvent) -> Step {
                     (*motion).state,
                 )
             };
-            let Some((base, scale)) = surface_base(window, time) else {
+            let Some((owner, base, scale)) = surface_base(window, time) else {
                 return Step::Silence;
             };
             // a border band under the pointer outranks the scene's
             // own cursor while it holds
             let band_change = with_x(|client| {
                 client.pointer_pos = (x as f64, y as f64);
-                let win = client.win.as_ref()?;
-                let edge = if win.id != window || !win.scene || !win.resizable || win.maximized {
+                let win = window_ref(client, window)?;
+                let edge = if !win.scene || !win.resizable || win.maximized {
                     0
                 } else {
                     crate::ffi::resize_edge_of(
@@ -2571,7 +2704,7 @@ fn interpret(event: *mut GenericEvent) -> Step {
             if band_change.is_some() {
                 apply_current_cursor();
             }
-            Step::Deliver(AppEvent::MouseMoved {
+            Step::Deliver(owner, AppEvent::MouseMoved {
                 x: base.0 + x as f64 / scale,
                 y: base.1 + y as f64 / scale,
                 modifiers: held_modifiers(state),
@@ -2591,7 +2724,7 @@ fn interpret(event: *mut GenericEvent) -> Step {
                     (*button).root_y,
                 )
             };
-            let Some((base, scale)) = surface_base(window, time) else {
+            let Some((owner, base, scale)) = surface_base(window, time) else {
                 return Step::Silence;
             };
             // the crown outranks the scene: a press on a scene-chrome
@@ -2609,14 +2742,19 @@ fn interpret(event: *mut GenericEvent) -> Step {
             // — dismisses first, then lands as its own event
             if kind == XCB_BUTTON_PRESS && matches!(detail, 1 | 3) {
                 let outside_all = with_x(|client| {
-                    let on_main = client.win.as_ref().is_some_and(|w| w.id == window);
-                    let inset =
-                        (PANEL_BLEED * client.win.as_ref().map(|w| w.scale).unwrap_or(1) as f64)
-                            .round() as i32;
+                    let on_main = window_ref(client, window).is_some();
+                    let inset = (PANEL_BLEED
+                        * window_ref(client, window).map(|w| w.scale).unwrap_or(1) as f64)
+                        .round() as i32;
+                    // only THIS window's panels are in question
                     on_main
-                        && client.panels.iter().flatten().any(|panel| panel.mapped && !panel.chip)
+                        && client
+                            .panels
+                            .iter()
+                            .flatten()
+                            .any(|panel| panel.owner == window && panel.mapped && !panel.chip)
                         && client.panels.iter().flatten().all(|panel| {
-                            if !panel.mapped || panel.chip {
+                            if panel.owner != window || !panel.mapped || panel.chip {
                                 return true;
                             }
                             // the CONTENT box decides — the bleed ring
@@ -2630,35 +2768,35 @@ fn interpret(event: *mut GenericEvent) -> Step {
                         })
                 });
                 if outside_all {
-                    dispatch(AppEvent::DismissOverlays);
+                    crate::ffi::dispatch_at(window as usize, AppEvent::DismissOverlays);
                 }
             }
             let (x, y) = (base.0 + x as f64 / scale, base.1 + y as f64 / scale);
             match (kind, detail) {
                 (XCB_BUTTON_PRESS, 1) => {
                     let clicks = with_x(|client| client.clicks.click(time, x, y));
-                    Step::Deliver(AppEvent::MouseDown {
+                    Step::Deliver(owner, AppEvent::MouseDown {
                         x,
                         y,
                         clicks,
                         modifiers: held_modifiers(state),
                     })
                 }
-                (XCB_BUTTON_RELEASE, 1) => Step::Deliver(AppEvent::MouseUp { x, y }),
-                (XCB_BUTTON_PRESS, 3) => Step::Deliver(AppEvent::RightMouseDown { x, y }),
+                (XCB_BUTTON_RELEASE, 1) => Step::Deliver(owner, AppEvent::MouseUp { x, y }),
+                (XCB_BUTTON_PRESS, 3) => Step::Deliver(owner, AppEvent::RightMouseDown { x, y }),
                 // the wheel speaks buttons: one press per detent, the
                 // ×16 line doctrine, up positive toward the engine
                 (XCB_BUTTON_PRESS, 4) => {
-                    Step::Deliver(AppEvent::Wheel { x, y, dx: 0.0, dy: 16.0 })
+                    Step::Deliver(owner, AppEvent::Wheel { x, y, dx: 0.0, dy: 16.0 })
                 }
                 (XCB_BUTTON_PRESS, 5) => {
-                    Step::Deliver(AppEvent::Wheel { x, y, dx: 0.0, dy: -16.0 })
+                    Step::Deliver(owner, AppEvent::Wheel { x, y, dx: 0.0, dy: -16.0 })
                 }
                 (XCB_BUTTON_PRESS, 6) => {
-                    Step::Deliver(AppEvent::Wheel { x, y, dx: 16.0, dy: 0.0 })
+                    Step::Deliver(owner, AppEvent::Wheel { x, y, dx: 16.0, dy: 0.0 })
                 }
                 (XCB_BUTTON_PRESS, 7) => {
-                    Step::Deliver(AppEvent::Wheel { x, y, dx: -16.0, dy: 0.0 })
+                    Step::Deliver(owner, AppEvent::Wheel { x, y, dx: -16.0, dy: 0.0 })
                 }
                 _ => Step::Silence,
             }
@@ -2669,11 +2807,14 @@ fn interpret(event: *mut GenericEvent) -> Step {
             // door's timer used to walk
             let (keycode, time) =
                 unsafe { ((*(event as *mut InputEvent)).detail, (*(event as *mut InputEvent)).time) };
-            let road = with_x(|client| {
+            let (road, focus) = with_x(|client| {
                 client.last_time = time;
-                key_road(&mut client.keyboard, keycode as u32)
+                (key_road(&mut client.keyboard, keycode as u32), client.keyboard_focus)
             });
-            deliver_key(road);
+            // the window holding the keyboard hears the key, no other
+            if focus != 0 {
+                crate::ffi::addressed(focus as usize, || deliver_key(road));
+            }
             Step::Silence
         }
         XCB_KEY_RELEASE => Step::Silence,
@@ -2688,11 +2829,11 @@ fn interpret(event: *mut GenericEvent) -> Step {
                     (*crossing).state,
                 )
             };
-            let Some((base, scale)) = surface_base(window, time) else {
+            let Some((owner, base, scale)) = surface_base(window, time) else {
                 return Step::Silence;
             };
             with_x(|client| client.pointer_pos = (x as f64, y as f64));
-            Step::Deliver(AppEvent::MouseMoved {
+            Step::Deliver(owner, AppEvent::MouseMoved {
                 x: base.0 + x as f64 / scale,
                 y: base.1 + y as f64 / scale,
                 modifiers: held_modifiers(state),
@@ -2700,18 +2841,24 @@ fn interpret(event: *mut GenericEvent) -> Step {
         }
         XCB_LEAVE_NOTIFY => {
             // leaving a PANEL usually means entering the window (or a
-            // sibling) — only the main window's leave exits the scene
+            // sibling) — only a toplevel's leave exits its scene
             let window = unsafe { (*(event as *mut CrossingEvent)).event };
-            let main = with_x(|client| {
-                client.win.as_ref().is_some_and(|w| w.id == window)
-            });
-            if main {
-                Step::Deliver(AppEvent::MouseExited)
+            let ours = with_x(|client| window_ref(client, window).is_some());
+            if ours {
+                Step::Deliver(window, AppEvent::MouseExited)
             } else {
                 Step::Silence
             }
         }
-        XCB_FOCUS_OUT => Step::Deliver(AppEvent::ResignKey),
+        XCB_FOCUS_OUT => {
+            let window = unsafe { (*(event as *mut FocusEvent)).event };
+            with_x(|client| {
+                if client.keyboard_focus == window {
+                    client.keyboard_focus = 0;
+                }
+            });
+            Step::Deliver(window, AppEvent::ResignKey)
+        }
         XCB_SELECTION_REQUEST => {
             let request = unsafe { std::ptr::read(event as *const SelectionRequestEvent) };
             serve_selection(&request);
@@ -2737,15 +2884,24 @@ fn interpret(event: *mut GenericEvent) -> Step {
                 ((*notify).window, (*notify).atom)
             };
             with_x(|client| {
-                let interesting = client.win.as_ref().is_some_and(|w| w.id == window)
-                    && atom == client.atoms.net_wm_state;
+                let interesting =
+                    window_ref(client, window).is_some() && atom == client.atoms.net_wm_state;
                 if interesting {
-                    refresh_wm_state(client);
+                    refresh_wm_state(client, window);
                 }
             });
             Step::Silence
         }
-        XCB_FOCUS_IN => Step::Silence,
+        XCB_FOCUS_IN => {
+            // the keyboard came to this window: keys go there
+            let window = unsafe { (*(event as *mut FocusEvent)).event };
+            with_x(|client| {
+                if window_ref(client, window).is_some() {
+                    client.keyboard_focus = window;
+                }
+            });
+            Step::Silence
+        }
         _ => {
             // the xkb extension's own events ride above the core range;
             // StateNotify feeds the modifier truth into the state
@@ -2776,8 +2932,7 @@ fn interpret(event: *mut GenericEvent) -> Step {
 /// Pulls every queued xcb event and interprets it — events free after
 /// use (xcb mallocs each frame). Frames a selection pump set aside go
 /// first: their order against fresh events must hold.
-fn drain_events() -> bool {
-    let mut quit = false;
+fn drain_events() {
     loop {
         let event = PENDING
             .with(|q| q.borrow_mut().pop_front())
@@ -2790,12 +2945,11 @@ fn drain_events() -> bool {
         let step = interpret(event);
         unsafe { free(event.cast()) };
         match step {
-            Step::Deliver(app_event) => dispatch(app_event),
-            Step::Quit => quit = true,
+            Step::Deliver(window, app_event) => crate::ffi::dispatch_at(window as usize, app_event),
+            Step::Close(window) => with_x(|client| client.close_requested.push(window)),
             Step::Silence => {}
         }
     }
-    quit
 }
 
 pub(crate) fn run() {
@@ -2837,9 +2991,7 @@ pub(crate) fn run() {
             eprintln!("bunny_ui x11: the connection died");
             break;
         }
-        if drain_events() {
-            with_x(|client| client.quit = true);
-        }
+        drain_events();
         if wake_woke {
             dispatch(AppEvent::Wake);
         }
@@ -2860,6 +3012,8 @@ pub(crate) fn run() {
         }
         // the hand of a --drive sheet, delivered outside any dispatch
         crate::drive::drain();
+        // a window a verb or the manager asked to close, now
+        settle_closes();
     }
     teardown();
 }
@@ -2883,7 +3037,7 @@ fn teardown() {
                     xcb_destroy_window(client.connection, panel.window);
                 }
             }
-            if let Some(win) = client.win {
+            for win in client.windows {
                 if let Some(backing) = win.backing {
                     drop_backing(client.connection, backing);
                 }

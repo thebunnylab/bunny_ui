@@ -1,10 +1,10 @@
 # The app's life
 
-*Status: a second document window stands on macOS and Windows (the
-`App`, one `Runtime` per window, the pump routing each message to the
-window it arrived at) and is refused by name on Linux, which holds
-one; `cargo run -p bunny-ui-macos --example two_windows -- --drive` is
-the proof. The doors are standing in `bunny_ui::app` — the events
+*Status: a second document window stands on macOS, Windows and Linux
+(the `App`, one `Runtime` per window, the pump routing each message
+to the window it arrived at); `cargo run -p bunny-ui-macos --example
+two_windows -- --drive` and `cargo run -p bunny-ui-linux --example
+two_windows_linux -- --drive` are the proofs. The doors are standing in `bunny_ui::app` — the events
 (sleep, wake, a notification activated, a second launch with its
 arguments), the notifier, and the single instance — and each shell
 answers them: macOS by the application delegate, the workspace's
@@ -114,16 +114,21 @@ the three platforms asks it before it detaches:
 
 | | macOS | Windows | Linux | iOS | Android |
 | -- | -- | -- | -- | -- | -- |
-| `MANY_WINDOWS` | true | true | **false** | **false** | **false** |
-| the road | AppKit's run loop, one `NSWindow` each | one pump, one `HWND` each, a swapchain each | one surface, one road | UIKit's run loop, the screen | the activity's UI thread, the screen |
+| `MANY_WINDOWS` | true | true | true | **false** | **false** |
+| the road | AppKit's run loop, one `NSWindow` each | one pump, one `HWND` each, a swapchain each | one pump, one `wl_surface` (or xcb window) each, a presenter each | UIKit's run loop, the screen | the activity's UI thread, the screen |
 
-On Linux both desktops — X11 and Wayland — are answered here by a
-single surface with its own event road, and a second document window
-is not built: `App::open` refuses the second by name rather than
-half-serving it, and an app keeps its second view INSIDE the window
-(a pane, a sheet). The refusal is loud on purpose: a silent
-half-window would be worse. The phones answer the same: the screen is
-the window, `open` records the scene; on iOS `run` hands the process
+On Linux both doors — Wayland and X11 — hold a list of windows, each
+named by its surface (or its xid); an event names the surface it
+arrived at and the pump routes it there, the keyboard's keys go to
+the window the compositor said entered, a panel's events to the
+window it hangs from. Every window has its own GPU presenter (its own
+context or device — a second window costs a second atlas), its own
+backing, its own frame callback; the deadline that keeps a beat alive
+ticks every window that wants one. The last window out ends the road.
+A window opened from inside a handler takes only its own setup off
+the queue, so nothing dispatches twice. The phones answer
+differently: the screen is the window, `open` records the scene; on
+iOS `run` hands the process
 to UIKit, which never returns, and on Android it hands the window to
 the activity, which was running already, and returns.
 
