@@ -17,6 +17,7 @@ pub mod credentials;
 pub mod ffi;
 pub mod image;
 pub mod metal;
+pub mod notifications;
 pub mod text;
 pub mod trace;
 pub mod webview;

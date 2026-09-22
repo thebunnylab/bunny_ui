@@ -7,15 +7,21 @@ two_windows -- --drive` and `cargo run -p bunny-ui-linux --example
 two_windows_linux -- --drive` are the proofs. The doors are standing in `bunny_ui::app` — the events
 (sleep, wake, a notification activated, a second launch with its
 arguments), the notifier, and the single instance — and each shell
-answers them: macOS by the application delegate, the workspace's
-notifications and UserNotifications; Windows by the power broadcast
-and WinRT toasts over hand-written COM (type-checked, not run);
-Linux by libdbus on one thread, `org.freedesktop.Notifications` and
-`org.freedesktop.login1` (type-checked, not run). The single instance
-is one mechanism on every platform, in core, with nothing but std.
-`cargo run -p bunny-ui-macos --example life_window -- --drive` is the
-proof of the spool and of the refusal by name; wrapped in an `.app`
-it is the proof of the notification.*
+answers them: macOS and iOS by the application delegate and
+UserNotifications, the one module of the Apple half both shells share
+(the Mac adds the workspace's sleep and wake); Windows by the power
+broadcast and WinRT toasts over hand-written COM (type-checked, not
+run); Linux by libdbus on one thread, `org.freedesktop.Notifications`
+and `org.freedesktop.login1` (type-checked, not run); Android by the
+notification manager over JNI, the tap coming back as the activity
+re-created with the intent (proven on the emulator). The single
+instance is one mechanism on every platform, in core, with nothing
+but std. `cargo run -p bunny-ui-macos --example life_window -- --drive`
+is the proof of the spool and of the refusal by name; wrapped in an
+`.app` it is the proof of the notification, and
+`crates/bunny_ui_ios/simulator/run-sim.sh life_window_ios` and
+`crates/bunny_ui_android/android/run-emu.sh life_window_android` are
+the phones' — the banner, and the tap on it.*
 
 A mail client is not only a window. It is one process — a second
 launch, a link from another app, both must land in the one already
@@ -62,7 +68,8 @@ notification, updated. Its buttons come back as the `action`; the
 notification itself, clicked, comes back as `None`. `notify` answers
 `Err` with the platform's refusal by name — no shell running, an app
 the desktop does not know, a person who said no — and never a quiet
-nothing.
+nothing. Where the platform asks the person first, a notification
+posted before they answer is held, and posted the moment they allow.
 
 **The single instance** is a lock in the person's own runtime
 directory (`XDG_RUNTIME_DIR`, `LOCALAPPDATA`, or the temp dir), held
@@ -137,15 +144,24 @@ the activity, which was running already, and returns.
 | | macOS | Windows | Linux | iOS | Android |
 | -- | -- | -- | -- | -- | -- |
 | sleep, wake | `NSWorkspace` will-sleep / did-wake | `WM_POWERBROADCAST` suspend / automatic resume | logind `PrepareForSleep` | the app entering and leaving the background | the activity pausing and resuming |
-| notification | UserNotifications, a category per button set | a WinRT toast under the process's AppUserModelID | `org.freedesktop.Notifications` `Notify` | not yet — `notify` refuses by name | not yet — `notify` refuses by name |
-| activation | the center's delegate, while running or launched by the click | the toast's `Activated` event, while running | `ActionInvoked` on the session bus | — | — |
+| notification | UserNotifications, a category per button set | a WinRT toast under the process's AppUserModelID | `org.freedesktop.Notifications` `Notify` | UserNotifications, the same module as the Mac's; the system asks once | `NotificationManager` over JNI, one channel, a button per action; the person asked once at the first post |
+| activation | the center's delegate, while running or launched by the click | the toast's `Activated` event, while running | `ActionInvoked` on the session bus | the center's delegate, while running or launched by the tap | the activity RE-CREATED with the tap's intent, read at create — while running or as the launch |
 | second launch | the spool; a BUNDLED app reopens through the delegate instead | the spool | the spool | the system's own: one process by construction | the system's own: one activity by construction |
 | a url handed over | `application:openURLs:` → `Reopened` | an argument → the spool | an argument → the spool | `application:openURL:options:` → `Reopened` | not yet — a `NativeActivity` hears no new intent |
 
-Three honest edges. macOS shows notifications for a BUNDLE, never a
+Five honest edges. macOS shows notifications for a BUNDLE, never a
 bare binary — the system's own center raises for a process with no
 bundle identifier, so the framework refuses by name first; a dev
-binary is shown by wrapping it in an `.app` with an `Info.plist`.
+binary is shown by wrapping it in an `.app` with an `Info.plist`. On
+both Apple platforms the center refuses, quietly, a request it has no
+authorization for, so the first post asks the person and is held until
+they answer — allowed, it lands; denied, the next post says so. Android
+hears no new intent in a `NativeActivity` (that door is Java), so a tap
+on a notification re-creates the activity with the intent, and the
+scene is rebuilt from the app's own state — the same as after any
+re-creation the manifest does not cover; and the activity never hears
+the permission's answer either, so the first post on API 33 and later
+asks and refuses by name, and the next one posts.
 Windows shows a toast under the process's AppUserModelID
 (`bunnylab.<executable>`, set at boot); a Start Menu shortcut carrying
 that id gives it the app's name and icon, and a click on a toast of an

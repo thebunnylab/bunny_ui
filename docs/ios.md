@@ -69,7 +69,7 @@ the keymap first; a letter arrives once, through the keyboard's road.
 | synthetic input into a page | not claimed — the phone has no event constructor a page trusts |
 | a chrome, a cursor, a live resize | none: the phone has no window frame and no pointer |
 | an IME mirror | not yet: a composition arrives committed |
-| notifications | not yet: `bunny_ui::app::notify` refuses by name |
+| notifications | UserNotifications through the shared half, the Mac's own road: the system asks once, a post before the answer waits for it, and a tap — on the banner or on a button — comes back as `AppEvent::NotificationActivated`, while running or as the launch |
 | a url handed over | `application:openURL:options:` → `AppEvent::Reopened` |
 | background, foreground | `AppEvent::WillSleep` / `DidWake`, and the loop clocks rest |
 
