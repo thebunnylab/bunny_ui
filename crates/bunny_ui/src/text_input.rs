@@ -434,6 +434,11 @@ pub enum CaretShape {
 /// layout, selection, IME and scrolling; the policy interprets keyboard input.
 /// Retain one policy per document, independently of the rendered view's lifetime.
 pub trait EditingStrategy {
+    /// The native field gained or lost keyboard focus. Called outside runtime
+    /// borrows, including policy replacement and unmount; identity migration
+    /// of the same focused policy does not produce a blur/refocus pair.
+    fn focus_changed(&self, _focused: bool) {}
+
     /// Read at paint time, including when a mode change leaves the text unchanged.
     fn caret_shape(&self) -> CaretShape {
         CaretShape::Bar

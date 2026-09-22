@@ -14106,3 +14106,99 @@ mod tests {
         assert_eq!(bottom.size.width, 402.0);
     }
 }
+
+#[cfg(test)]
+mod input_focus_policy_tests {
+    use crate::prelude::*;
+    use crate::text_input::{CaretState, EditingStrategy};
+    use std::{cell::RefCell, rc::Rc};
+
+    #[derive(Default)]
+    struct Policy(RefCell<Vec<bool>>);
+    impl EditingStrategy for Policy {
+        fn focus_changed(&self, focused: bool) {
+            self.0.borrow_mut().push(focused);
+        }
+        fn takes_text(&self) -> bool {
+            true
+        }
+        fn key(&self, _: &crate::action::Stroke, _: &mut String, _: &mut CaretState) -> bool {
+            false
+        }
+    }
+
+    #[derive(Clone)]
+    struct Fields {
+        first: Rc<Policy>,
+        second: Rc<Policy>,
+        enabled: State<bool>,
+        shown: State<bool>,
+        wrapped: State<bool>,
+    }
+    impl Component for Fields {
+        fn body(self, _: &Context) -> impl View {
+            let first = text_editor("one", State::new(String::new()).binding())
+                .editing_strategy(
+                    self.enabled
+                        .get()
+                        .then(|| self.first.clone() as Rc<dyn EditingStrategy>),
+                )
+                .id("one");
+            vstack!(
+                self.shown.get().then(|| if self.wrapped.get() {
+                    erased(hstack!(first))
+                } else {
+                    erased(first)
+                }),
+                text_field("two", State::new(String::new()).binding())
+                    .editing_strategy(Some(self.second.clone()))
+                    .id("two"),
+            )
+        }
+    }
+
+    #[test]
+    fn policies_follow_focus_replacement_migration_and_unmount() {
+        let runtime = Runtime::new();
+        let first = Rc::new(Policy::default());
+        let second = Rc::new(Policy::default());
+        let view = Fields {
+            first: first.clone(),
+            second: second.clone(),
+            enabled: State::new(true),
+            shown: State::new(true),
+            wrapped: State::new(false),
+        };
+        let proposal = crate::layout::Proposal::exact(crate::layout::Size {
+            width: 400.0,
+            height: 200.0,
+        });
+        let _ = runtime.settled_layout(&view, proposal);
+        assert!(runtime.focus_named("one"));
+        assert!(runtime.focus_named("one"));
+        assert_eq!(*first.0.borrow(), [true]);
+        assert!(runtime.focus_named("two"));
+        assert_eq!(*first.0.borrow(), [true, false]);
+        assert_eq!(*second.0.borrow(), [true]);
+        runtime.blur();
+        assert_eq!(*second.0.borrow(), [true, false]);
+        runtime.focus_named("one");
+        view.wrapped.set(true);
+        let _ = runtime.settled_layout(&view, proposal);
+        assert_eq!(
+            *first.0.borrow(),
+            [true, false, true],
+            "migration preserves focus"
+        );
+        view.enabled.set(false);
+        let _ = runtime.settled_layout(&view, proposal);
+        assert_eq!(*first.0.borrow(), [true, false, true, false]);
+        view.enabled.set(true);
+        let _ = runtime.settled_layout(&view, proposal);
+        assert_eq!(*first.0.borrow(), [true, false, true, false, true]);
+        view.shown.set(false);
+        let _ = runtime.settled_layout(&view, proposal);
+        assert_eq!(*first.0.borrow(), [true, false, true, false, true, false]);
+        assert!(runtime.focused().is_none());
+    }
+}
