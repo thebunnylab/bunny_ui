@@ -4250,6 +4250,15 @@ pub struct OffscreenVk {
 }
 
 impl OffscreenVk {
+    /// Who renders — the physical device's own name for itself
+    /// (`llvmpipe` for lavapipe, on a box without a GPU).
+    pub fn device_name(&self) -> String {
+        let mut properties = unsafe { std::mem::zeroed::<PhysicalDeviceProperties>() };
+        unsafe { (self.stack.fns.get_physical_device_properties)(self.stack.physical, &mut properties) };
+        let end = properties.device_name.iter().position(|&byte| byte == 0).unwrap_or(256);
+        String::from_utf8_lossy(&properties.device_name[..end]).into_owned()
+    }
+
     pub fn new(width: usize, height: usize) -> Option<OffscreenVk> {
         if width == 0 || height == 0 {
             return None;
@@ -4557,6 +4566,23 @@ mod tests {
             eprintln!("no vulkan device — skipping");
         }
         present
+    }
+
+    /// The bar the material must clear, for the renderer under the
+    /// test: `gpu` is the mac tier's, measured against the same
+    /// rasterizer; `software` is Mesa's lavapipe's, which filters with
+    /// 8-bit weights where a GPU keeps more. Measured on llvmpipe 19
+    /// (lavapipe IS llvmpipe, and answers the same numbers): the six
+    /// single panes within 5 but the frosted one within 9, with up to
+    /// 7.9% of channels beyond one step; the stacked pair within 12,
+    /// 12.0% beyond. The software bar sits a third above that. A GPU
+    /// keeps the bar it always had.
+    fn glass_gate(gpu: (u8, f64), software: (u8, f64)) -> (u8, f64) {
+        let renderer = OffscreenVk::new(4, 4).map(|vk| vk.device_name()).unwrap_or_default();
+        let soft = ["llvmpipe", "lavapipe", "swiftshader"]
+            .iter()
+            .any(|name| renderer.to_ascii_lowercase().contains(name));
+        if soft { software } else { gpu }
     }
 
     /// Renders the same scene by both backends: the GPU offscreen target
@@ -5249,6 +5275,9 @@ mod tests {
             }
         }
         let share = beyond as f64 / gpu.len() as f64;
+        // the measurement itself, for `--nocapture`: what a new
+        // renderer answers, before the bar is argued about
+        eprintln!("{label}: worst channel delta {worst}, {:.3}% beyond one step", share * 100.0);
         assert!(
             worst <= max_delta,
             "{label}: worst channel delta {worst} (allowed {max_delta}), {:.3}% beyond one",
@@ -5301,7 +5330,8 @@ mod tests {
             let root = glass_scene(glass, radius);
             let (gpu, cpu) =
                 scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, Color::CANVAS);
-            assert_glass_close(&gpu, &cpu, 3, 0.005, label);
+            let (worst, share) = glass_gate((3, 0.005), (12, 0.10));
+            assert_glass_close(&gpu, &cpu, worst, share, label);
         }
     }
 
@@ -5329,6 +5359,7 @@ mod tests {
             scene_bytes(&root, Size { width: 240.0, height: 160.0 }, 2, Color::CANVAS);
         // a pane over a pane compounds: the upper one samples a scene
         // that already carries the lower one's own difference
-        assert_glass_close(&gpu, &cpu, 6, 0.015, "stacked panes");
+        let (worst, share) = glass_gate((6, 0.015), (16, 0.15));
+        assert_glass_close(&gpu, &cpu, worst, share, "stacked panes");
     }
 }

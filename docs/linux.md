@@ -58,7 +58,11 @@ under a session bus, points Mesa at its software renderers (llvmpipe
 for GL, lavapipe for Vulkan), and runs the tests of the core, the
 Linux crate and the Vulkan tier, then every `--drive` example across
 the matrix: two doors × three tiers. The table at the end names the
-runs that did not hold. The repository is mounted read-write; the
+runs that did not hold. The two glass parity tests (the material
+against the raster, and a pane over a pane) hold a wider bar on the
+software renderers, by name — llvmpipe and lavapipe filter with 8-bit
+weights where a GPU keeps more, and the tests say what they measured
+there — and keep the GPU's bar on a GPU. The repository is mounted read-write; the
 cargo registry and the target directory live in named Docker volumes,
 so the host's `target/` is never touched and the second run is fast.
 `SCALE=2` gives the headless output an integer scale.
