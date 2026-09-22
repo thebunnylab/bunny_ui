@@ -28,6 +28,9 @@ VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -
 export WAYLAND_DISPLAY=bunny
 export DISPLAY=:99
 export CARGO_TERM_COLOR=never
+# WPE's web process runs under bubblewrap, and Docker grants no user
+# namespace to build one: the sandbox is off here, and only here
+export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
 
 weston --backend=headless --socket=bunny --width=1280 --height=800 \
     --scale="${SCALE:-1}" --renderer=pixman --idle-time=0 \

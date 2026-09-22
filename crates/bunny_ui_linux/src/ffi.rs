@@ -2290,8 +2290,9 @@ pub fn close_top_level(window: usize) {
     if is_x11() {
         return crate::x11::close_top_level(window as u32);
     }
-    // the GPU goes first of all — its EGL surface and `wl_egl_window`
-    // must die before the wayland surface they wrap
+    // the pages go first, then the GPU — its EGL surface and
+    // `wl_egl_window` must die before the wayland surface they wrap
+    crate::webview::teardown(window);
     crate::vk::teardown(window);
     crate::gl::teardown(window);
     with_client(|client| {
@@ -3143,7 +3144,16 @@ pub(crate) enum KeyRoad {
 ///
 /// The keyboard is the authority on who is held, even for a press:
 /// xkb keeps the effective state and the pointer has none of its own.
-fn held_modifiers(keyboard: &Keyboard) -> bunny_ui::action::Modifiers {
+/// The keysym a keycode names under the live xkb state — zero with
+/// no keymap yet.
+pub(crate) fn keysym_of(keyboard: &Keyboard, keycode: u32) -> u32 {
+    if keyboard.state.is_null() {
+        return 0;
+    }
+    unsafe { xkb_state_key_get_one_sym(keyboard.state, keycode) }
+}
+
+pub(crate) fn held_modifiers(keyboard: &Keyboard) -> bunny_ui::action::Modifiers {
     if keyboard.state.is_null() {
         return bunny_ui::action::Modifiers::NONE;
     }
@@ -4587,8 +4597,23 @@ fn drain_protocol_events() {
                 client.keyboard.repeat_delay = delay;
             }),
             Ev::KeyboardKey { serial, key, pressed } => {
-                let road = with_client(|client| {
+                // a page holding the keyboard hears the key first, as
+                // the native event it is; the scene's road stays shut
+                let raw = with_client(|client| {
                     client.serials.record_key(serial, pressed);
+                    let keycode = key + 8;
+                    crate::webview::RawKey {
+                        window: client.keyboard_focus,
+                        keysym: keysym_of(&client.keyboard, keycode),
+                        keycode,
+                        pressed,
+                        modifiers: held_modifiers(&client.keyboard),
+                    }
+                });
+                if crate::webview::takes_key(&raw) {
+                    continue;
+                }
+                let road = with_client(|client| {
                     let keycode = key + 8; // the evdev offset
                     let kb = &mut client.keyboard;
                     if pressed {
@@ -4762,22 +4787,28 @@ pub fn run() {
                 .min()
                 .unwrap_or(1000)
                 .clamp(0, 1000);
-            let mut fds = [
+            let mut fds = vec![
                 PollFd { fd: wl_display_get_fd(display), events: POLLIN, revents: 0 },
                 PollFd { fd: wake_fd, events: POLLIN, revents: 0 },
             ];
-            let count = if wake_fd >= 0 { 2 } else { 1 };
-            let ready = poll(fds.as_mut_ptr(), count, timeout);
+            // the engine's own descriptors ride this poll: a page's
+            // frame, a signal, a message — all land on this thread
+            let timeout = match crate::webview::pump_prepare(&mut fds) {
+                Some(bound) => timeout.min(bound),
+                None => timeout,
+            };
+            let ready = poll(fds.as_mut_ptr(), fds.len() as u64, timeout);
             if ready > 0 && fds[0].revents & POLLIN != 0 {
                 wl_display_read_events(display);
             } else {
                 wl_display_cancel_read(display);
             }
-            wake_woke = count == 2 && ready > 0 && fds[1].revents & POLLIN != 0;
+            wake_woke = ready > 0 && fds[1].revents & POLLIN != 0;
             if wake_woke {
                 let mut drain = [0u8; 64];
                 while read(wake_fd, drain.as_mut_ptr().cast(), drain.len()) > 0 {}
             }
+            crate::webview::pump_after(&mut fds);
             wl_display_dispatch_pending(display);
             if wl_display_get_error(display) != 0 {
                 eprintln!("bunny_ui_linux: the wayland connection died");
@@ -4813,6 +4844,8 @@ pub fn run() {
         }
         // the hand of a --drive sheet, delivered outside any dispatch
         crate::drive::drain();
+        // what a page answered inside a frame, delivered outside it
+        crate::webview::deliver_pending();
         // a window a verb or the compositor asked to close, now
         settle_closes();
     }
@@ -4880,6 +4913,7 @@ const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500
 /// all — its EGL surface and `wl_egl_window` must die before the
 /// wayland surface they wrap.
 fn teardown() {
+    crate::webview::teardown_all();
     crate::vk::teardown_all();
     crate::gl::teardown_all();
     CLIENT.with(|slot| {

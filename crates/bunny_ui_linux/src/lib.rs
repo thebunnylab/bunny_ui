@@ -19,12 +19,15 @@ mod life;
 mod text;
 mod trace;
 mod vk;
+pub mod webview;
+mod wpe;
 mod x11;
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use bunny_ui::action::{Key, KeyMatch, KeyPattern, Stroke};
+use bunny_ui::action::{Key, KeyMatch, KeyPattern, Modifiers, Stroke};
+use bunny_ui::host::MouseButton;
 use bunny_ui::layout::{Axis, Size};
 use bunny_ui::pacing::{Beat, FramePacer, Urgency, Verdict};
 use bunny_ui::prelude::{EditCommand, Runtime};
@@ -538,6 +541,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
         move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
+            (|| {
             let (width, height) = window.content_size();
             let scale = window.scale();
             let canvas = bunny_ui::theme::canvas();
@@ -557,6 +561,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 Some(first) => full_display.translated_slice((0, first.display.0), 0.0, 0.0),
                 None => full_display.clone(),
             };
+            // the pages: mounted, re-instructed, placed and swept by
+            // this layout's host boxes, then painted INTO the list
+            // where each host stood — no platform view, no sandwich:
+            // paint order is the truth on every tier because the page
+            // is a picture in the list. The page's scale is the
+            // raster's whole number, so its pixels land 1:1
+            let hosts = runtime.hosts();
+            webview::reconcile(window.raw_window(), &hosts, scale as f64);
+            let display = webview::paint_into(window.raw_window(), &display, &hosts);
             {
                 let mut store = panels.borrow_mut();
                 let dead: Vec<String> = store
@@ -671,6 +684,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     );
                 }
             }
+            })();
+            // the page's next frame comes after this one went up: the
+            // engine is paced by the shell's own present
+            webview::frame_presented(window.raw_window());
         }
     });
     // the pacer: a burst of asks is one draw a beat, and a wake with
@@ -694,6 +711,30 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     size: Size { width: w, height: h },
                 },
             ));
+            // what the app asked its pages since the last frame — the
+            // hands, the navigations, the evals and the snapshots — goes
+            // to the engine before the scene settles
+            for op in runtime.webview_commands() {
+                use bunny_ui::host::WebviewOp;
+                let at = window.raw_window();
+                match op {
+                    WebviewOp::Navigate { path, url } => webview::navigate(at, &path, &url),
+                    WebviewOp::Back { path } => webview::back(at, &path),
+                    WebviewOp::Forward { path } => webview::forward(at, &path),
+                    WebviewOp::Input { path, event } => webview::input(at, &path, &event),
+                    WebviewOp::Edit { path, action } => webview::edit(at, &path, &action),
+                    WebviewOp::Eval { path, token, js, raw } => {
+                        if let Err(why) = webview::eval(at, &path, token, &js, raw) {
+                            let _ = runtime.webview_eval_done(token, Err(why));
+                        }
+                    }
+                    WebviewOp::Snapshot { path, token } => {
+                        if let Err(why) = webview::snapshot(at, &path, token) {
+                            let _ = runtime.webview_snapshot_done(token, Err(why));
+                        }
+                    }
+                }
+            }
             let display = runtime.display_frame(root, Size { width, height });
             if frame_stats {
                 let stats = bunny_ui::stats::take();
@@ -780,6 +821,51 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
         }
     };
+    // everything a page reports lands here and runs the matching
+    // runtime door; a door that ran a retained writer re-presents. A
+    // report arrives from the engine's pump, outside any dispatch, so
+    // the frame is drawn at once and never nested
+    {
+        let runtime = Rc::clone(&runtime);
+        let root = Rc::clone(&root);
+        let blit = blit.clone();
+        webview::add_dispatch(
+            window.raw_window(),
+            Rc::new(move |event: webview::WebviewEvent| {
+                use webview::WebviewEvent;
+                let woke = match event {
+                    WebviewEvent::Navigated { path, url } => runtime.webview_navigated(&path, &url),
+                    WebviewEvent::Linked { path, url } => runtime.webview_linked(&path, &url),
+                    WebviewEvent::Changed { path, html } => runtime.webview_changed(&path, &html),
+                    WebviewEvent::Pasted { path, html, text } => {
+                        runtime.webview_pasted(&path, &html, &text)
+                    }
+                    WebviewEvent::NavigationFailed { path, url, why } => {
+                        runtime.webview_navigate_failed(&path, &url, &why)
+                    }
+                    WebviewEvent::Posted { path, body } => runtime.webview_posted(&path, &body),
+                    WebviewEvent::Console { path, line } => runtime.webview_console(&path, &line),
+                    WebviewEvent::Requested { path, line } => {
+                        runtime.webview_requested(&path, &line)
+                    }
+                    WebviewEvent::EvalDone { token, result } => {
+                        runtime.webview_eval_done(token, result)
+                    }
+                    WebviewEvent::SnapshotDone { token, result } => runtime.webview_snapshot_done(
+                        token,
+                        result.map(|(width, height, rgba)| bunny_ui::host::WebviewSnapshot {
+                            width,
+                            height,
+                            rgba,
+                        }),
+                    ),
+                };
+                if woke {
+                    blit(&runtime, &*root, ORIGIN_KEY);
+                }
+            }),
+        );
+    }
 
     // the frame conversation: a press on a `.window_drag_region()`
     // (with no interactive target above) moves the window by the
@@ -891,7 +977,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // (`bunny_ui::request_frame`).
             AppEvent::Wake => {
                 runtime.poll_tasks();
-                if runtime.needs_frame() {
+                if runtime.needs_frame() || webview::fresh(window.raw_window()) {
                     soon(runtime, root, ORIGIN_WAKE);
                 } else {
                     // no frame — but a task may have gone to sleep with a
@@ -901,7 +987,8 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             AppEvent::ResignKey => {
                 // the user switched away: popovers close like the
-                // platform's own
+                // platform's own, and a page lets the keyboard go
+                webview::unfocus();
                 if runtime.dismiss_all_overlays() {
                     blit(runtime, root, ORIGIN_KEY);
                 }
@@ -965,26 +1052,59 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 }
             }
             AppEvent::MouseMoved { x, y, modifiers } => {
+                // a page under the pointer (or one holding a press)
+                // hears the move as its own; the scene still sees it,
+                // so a hover it held clears cleanly
+                let at = window.raw_window();
+                if let Some(path) = webview::grab_or(at, runtime.host_at(x, y)) {
+                    webview::pointer_motion(at, &path, x, y, modifiers);
+                }
                 if runtime.pointer_moved(x, y, modifiers) {
                     soon(runtime, root, ORIGIN_POINTER);
                 }
             }
             AppEvent::RightMouseDown { x, y } => {
-                // the runtime opens (or closes) the context menu; it
-                // presents with the scene until panels take it outside
-                if runtime.context_click(x, y) {
+                let at = window.raw_window();
+                if let Some(path) = runtime.host_at(x, y) {
+                    // the page's own menu, where it draws one
+                    webview::press(at, &path, x, y, MouseButton::Right, Modifiers::NONE);
+                    webview::release(at, &path, x, y, MouseButton::Right, Modifiers::NONE);
+                } else if runtime.context_click(x, y) {
+                    // the runtime opens (or closes) the context menu; it
+                    // presents with the scene until panels take it outside
                     blit(runtime, root, ORIGIN_KEY);
                 }
             }
             AppEvent::MouseDown { x, y, clicks, modifiers } => {
-                if runtime.pointer_clicked(x, y, clicks, modifiers) {
-                    blit(runtime, root, ORIGIN_KEY);
+                let at = window.raw_window();
+                if let Some(path) = runtime.host_at(x, y) {
+                    // the press is the page's: the scene lets the
+                    // keyboard go, a popover closes as it would beside
+                    // any click, and the page holds the pointer until
+                    // the release (the engine counts the clicks itself)
+                    let _ = runtime.blur();
+                    let dismissed = runtime.dismiss_all_overlays();
+                    webview::focus(at, &path);
+                    webview::press(at, &path, x, y, MouseButton::Left, modifiers);
+                    if dismissed {
+                        blit(runtime, root, ORIGIN_KEY);
+                    }
+                } else {
+                    webview::unfocus();
+                    if runtime.pointer_clicked(x, y, clicks, modifiers) {
+                        blit(runtime, root, ORIGIN_KEY);
+                    }
                 }
             }
             AppEvent::MouseUp { x, y } => {
-                // fires on up-inside; the pressed visual always clears
-                let _ = runtime.pointer_released(x, y);
-                blit(runtime, root, ORIGIN_KEY);
+                let at = window.raw_window();
+                if let Some(path) = webview::take_grab(at) {
+                    webview::release(at, &path, x, y, MouseButton::Left, Modifiers::NONE);
+                } else {
+                    // fires on up-inside; the pressed visual always clears
+                    let _ = runtime.pointer_released(x, y);
+                    blit(runtime, root, ORIGIN_KEY);
+                }
             }
             AppEvent::MouseExited => {
                 if runtime.pointer_exited() {
@@ -992,8 +1112,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 }
             }
             AppEvent::Wheel { x, y, dx, dy } => {
-                // offset is engine state: repaint without render
-                if runtime.wheel(x, y, dx, dy) {
+                let at = window.raw_window();
+                if let Some(path) = runtime.host_at(x, y) {
+                    webview::wheel(at, &path, x, y, dx, dy);
+                } else if runtime.wheel(x, y, dx, dy) {
+                    // offset is engine state: repaint without render
                     soon(runtime, root, ORIGIN_WHEEL);
                 }
             }

@@ -178,9 +178,10 @@ cargo run -p bunny-ui-macos --example icon_window
 cargo run -p countries-pure
 crates/bunny_ui_ios/simulator/run-sim.sh touch_window_ios
 crates/bunny_ui_android/android/run-emu.sh touch_window_android
+cargo run -p bunny-ui-linux --example browser_window_linux
 ```
 
-The first demo prints a small interface to the terminal. The second opens a native macOS window. The third reads this repository's own `git log` from a worker thread and fills the window while it scrolls. The fourth is one box the application owns: it draws its own ink with the pointer, sizes its brush with the wheel, and types into a caption of its own — composition included. The fifth shows the sixteen house glyphs across fonts and inks. The sixth prints a full sample application. The seventh runs on the iOS Simulator: a list that pans and flings, a field that raises the keyboard, a canvas that draws under one finger and zooms under two (`docs/ios.md`). The last one is the same screen on the Android emulator, presented by Vulkan (`docs/android.md`).
+The first demo prints a small interface to the terminal. The second opens a native macOS window. The third reads this repository's own `git log` from a worker thread and fills the window while it scrolls. The fourth is one box the application owns: it draws its own ink with the pointer, sizes its brush with the wheel, and types into a caption of its own — composition included. The fifth shows the sixteen house glyphs across fonts and inks. The sixth prints a full sample application. The seventh runs on the iOS Simulator: a list that pans and flings, a field that raises the keyboard, a canvas that draws under one finger and zooms under two (`docs/ios.md`). The eighth is the same screen on the Android emulator, presented by Vulkan (`docs/android.md`). The last one opens a web page on Linux — WPE WebKit held as one box of the scene, its pixels painted by the shell itself (`docs/linux.md`, `docs/webview.md`).
 
 ## Design rules
 

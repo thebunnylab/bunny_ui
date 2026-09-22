@@ -211,18 +211,59 @@ here reads the EXIF orientation, and neither do the platform
 decoders the other shells use. File icons come from the freedesktop
 icon themes on disk.
 
+## The webview
+
+The page is WPE WebKit — WebKit with no GTK in it — loaded at run
+time through six libraries the shell opens by name (`libwpe`,
+`WPEBackend-fdo`, `WPEWebKit`, GLib, GObject, `libwayland-server`;
+`wpe.rs`) and never links: an app without a webview never loads them,
+and a box without them refuses the road with one line naming the
+package. The engine renders out of process and hands every frame back
+as a `wl_shm` buffer; the shell copies it once, straight RGBA, and
+paints it as one image where the host stood in the display list
+(`webview.rs`). That is the whole island contract on this shell — no
+platform view, no sandwich: the scene painted after the host is above
+the page by list order on the CPU raster, GL and Vulkan alike, and
+the clip open at the mark cuts the page like anything else. The
+engine is paced by the shell's own present: a frame is acknowledged
+once it went up. The hand is routed by the shell — `Runtime::host_at`
+names the page under the pointer — and lands as native libwpe events
+the page trusts; the keyboard is the page's from a click in it until
+a click outside; the engine's main context is pumped by the door's
+loop (its file descriptors ride the same `poll`), so every report
+lands on this thread and outside a frame. The container proves it
+with `browser_window_linux --drive` (`--editor` for the composer) on
+both doors and all three tiers: the bus, the console hook, the
+network wrap, every step of the hand's vocabulary read back by the
+page's own probe with `trusted=true`, a dead url refusing by name,
+the eval and the snapshot; `--page <url>` points the same example at
+any page. A still page costs nothing — no frame is exported until the
+page changes — and a page that animates renders one frame per ack, at
+the rate the software raster allows (a scrollable page shows the
+engine's own overlay scrollbar for a few seconds after it loads, and
+renders while it fades). The sandbox is WebKit's own (bubblewrap
+around the web process); the container has no user namespace to
+build one and says `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1` for
+itself. Not on this lane yet: the EGL zero-copy road (the frame as an
+`EGLImage` straight into the GL tier) and a cursor the page chooses.
+`docs/webview.md` has the capability table.
+
 ## Logs
 
 Everything the shell says goes to stderr, one line per event: a tier
 that came up or refused, the door that opened, a bus that could not
 be reached. `BUNNY_FRAME_STATS=1` adds the `F` line (where the frame's
-time went, before the present opened) and the `P` line (which tier
-presented, and how many presents so far).
+time went, before the present opened), the `P` line (which tier
+presented, and how many presents so far) and the `W` line (a page
+frame the engine exported: which host, its size in pixels, its
+serial).
 
 ## What is not proven here
 
 The container runs software GL and Vulkan on a headless compositor.
 A real GPU, a real desktop's decorations, a trackpad's pinch, a
-touchscreen and a fractional scale need a Linux machine with a screen.
-The sections above say, item by item, what the container proved and
-what waits for that machine.
+touchscreen, a fractional scale, and a web page at the display's own
+rate under a real compositor (the webview's EGL lane, which would
+spare the copy, does not exist yet) need a Linux machine with a
+screen. The sections above say, item by item, what the container
+proved and what waits for that machine.

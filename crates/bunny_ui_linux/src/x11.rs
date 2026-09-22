@@ -1770,6 +1770,7 @@ pub(crate) fn show_window(window: u32) {
 /// backing and the window itself go, in that order. The last window
 /// out ends the road.
 pub(crate) fn close_top_level(window: u32) {
+    crate::webview::teardown(window as usize);
     crate::vk::teardown(window as usize);
     crate::gl::teardown(window as usize);
     with_x(|client| {
@@ -2800,10 +2801,25 @@ fn interpret(event: *mut GenericEvent) -> Step {
             // detectable autorepeat holds: a held key arrives as
             // repeated presses — each walks the same road the first
             // door's timer used to walk
-            let (keycode, time) =
-                unsafe { ((*(event as *mut InputEvent)).detail, (*(event as *mut InputEvent)).time) };
-            let (road, focus) = with_x(|client| {
+            let (keycode, time, state) = unsafe {
+                let input = event as *mut InputEvent;
+                ((*input).detail, (*input).time, (*input).state)
+            };
+            // a page holding the keyboard hears the key first
+            let raw = with_x(|client| {
                 client.last_time = time;
+                crate::webview::RawKey {
+                    window: client.keyboard_focus as usize,
+                    keysym: crate::ffi::keysym_of(&client.keyboard, keycode as u32),
+                    keycode: keycode as u32,
+                    pressed: true,
+                    modifiers: held_modifiers(state),
+                }
+            });
+            if crate::webview::takes_key(&raw) {
+                return Step::Silence;
+            }
+            let (road, focus) = with_x(|client| {
                 (key_road(&mut client.keyboard, keycode as u32), client.keyboard_focus)
             });
             // the window holding the keyboard hears the key, no other
@@ -2812,7 +2828,22 @@ fn interpret(event: *mut GenericEvent) -> Step {
             }
             Step::Silence
         }
-        XCB_KEY_RELEASE => Step::Silence,
+        XCB_KEY_RELEASE => {
+            // the page hears the release too; the scene never did
+            let (keycode, state) = unsafe {
+                let input = event as *mut InputEvent;
+                ((*input).detail, (*input).state)
+            };
+            let raw = with_x(|client| crate::webview::RawKey {
+                window: client.keyboard_focus as usize,
+                keysym: crate::ffi::keysym_of(&client.keyboard, keycode as u32),
+                keycode: keycode as u32,
+                pressed: false,
+                modifiers: held_modifiers(state),
+            });
+            let _ = crate::webview::takes_key(&raw);
+            Step::Silence
+        }
         XCB_ENTER_NOTIFY => {
             let crossing = event as *mut CrossingEvent;
             let (window, x, y, time, state) = unsafe {
@@ -2971,17 +3002,23 @@ pub(crate) fn run() {
             .min()
             .unwrap_or(1000)
             .clamp(0, 1000);
-        let mut fds = [
+        let mut fds = vec![
             PollFd { fd, events: POLLIN, revents: 0 },
             PollFd { fd: wake_fd, events: POLLIN, revents: 0 },
         ];
-        let count = if wake_fd >= 0 { 2 } else { 1 };
-        let ready = unsafe { poll(fds.as_mut_ptr(), count, timeout) };
-        let wake_woke = count == 2 && ready > 0 && fds[1].revents & POLLIN != 0;
+        // the engine's own descriptors ride this poll (see the wayland
+        // door)
+        let timeout = match crate::webview::pump_prepare(&mut fds) {
+            Some(bound) => timeout.min(bound),
+            None => timeout,
+        };
+        let ready = unsafe { poll(fds.as_mut_ptr(), fds.len() as u64, timeout) };
+        let wake_woke = ready > 0 && fds[1].revents & POLLIN != 0;
         if wake_woke {
             let mut drain = [0u8; 64];
             unsafe { while read(wake_fd, drain.as_mut_ptr().cast(), drain.len()) > 0 {} }
         }
+        crate::webview::pump_after(&mut fds);
         if unsafe { xcb_connection_has_error(connection) } != 0 {
             eprintln!("bunny_ui x11: the connection died");
             break;
@@ -3005,6 +3042,8 @@ pub(crate) fn run() {
         }
         // the hand of a --drive sheet, delivered outside any dispatch
         crate::drive::drain();
+        // what a page answered inside a frame, delivered outside it
+        crate::webview::deliver_pending();
         // a window a verb or the manager asked to close, now
         settle_closes();
     }
@@ -3018,6 +3057,7 @@ pub(crate) fn presents() -> u64 {
 }
 
 fn teardown() {
+    crate::webview::teardown_all();
     X_CLIENT.with(|slot| {
         let Some(client) = slot.borrow_mut().take() else { return };
         unsafe {
