@@ -2170,7 +2170,18 @@ impl Runtime {
     /// coordinates, with the viewport beside it: a surface whose regions move
     /// with the scroll (a pinned gutter) cannot answer from an x alone.
     pub fn hovered_cursor(&self) -> Option<crate::layout::Cursor> {
-        let at = self.interaction.borrow().pointer?;
+        let interaction = self.interaction.borrow();
+        let at = interaction.pointer?;
+        // Use the winning hit target, not only field rectangles: a button or
+        // overlay in front of an input must retain its own cursor.
+        if interaction
+            .hovered
+            .as_deref()
+            .is_some_and(reconciler::has_editor)
+        {
+            return Some(crate::layout::Cursor::Text);
+        }
+        drop(interaction);
         let customs = self.last_customs.borrow();
         customs.iter().rev().find_map(|placement| {
             let local = crate::layout::Point {

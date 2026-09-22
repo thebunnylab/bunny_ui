@@ -6315,6 +6315,67 @@ mod tests {
     }
 
     #[test]
+    fn native_inputs_request_a_text_pointer_inside_clickable_chrome() {
+        use crate::layout::{Cursor, Proposal, Size};
+        #[derive(Clone, Copy)]
+        struct Panel {
+            note: State<String>,
+        }
+        impl Component for Panel {
+            fn body(self, _: &Context) -> impl View {
+                vstack!(
+                    text_field("name", self.note.binding()).frame(200.0, 30.0),
+                    text_editor("message", self.note.binding()).frame(200.0, 60.0),
+                    zstack!(
+                        text_field("covered", self.note.binding()).frame(200.0, 30.0),
+                        button(text("Overlay action"), || {}).frame(200.0, 30.0),
+                    ),
+                )
+                .on_click(|| {})
+            }
+        }
+        let panel = Panel {
+            note: State::new(String::new()),
+        };
+        let runtime = Runtime::new();
+        let laid = runtime.settled_layout(
+            &panel,
+            Proposal::exact(Size {
+                width: 200.0,
+                height: 160.0,
+            }),
+        );
+        assert_eq!(laid.fields.len(), 3);
+        for field in laid.fields.iter().take(2) {
+            runtime.pointer_moved(
+                field.frame.origin.x + 10.0,
+                field.frame.origin.y + 10.0,
+                false,
+            );
+            assert_eq!(runtime.hovered_cursor(), Some(Cursor::Text));
+        }
+        let covered = &laid.fields[2];
+        runtime.pointer_moved(
+            covered.frame.origin.x + covered.frame.size.width / 2.0,
+            covered.frame.origin.y + covered.frame.size.height / 2.0,
+            false,
+        );
+        assert_ne!(
+            runtime.hovered_cursor(),
+            Some(Cursor::Text),
+            "overlay button wins over covered input"
+        );
+        runtime.pointer_moved(10.0, 150.0, false);
+        assert_ne!(
+            runtime.hovered_cursor(),
+            Some(Cursor::Text),
+            "chrome is not text"
+        );
+        runtime.pointer_moved(500.0, 500.0, false);
+        assert_eq!(runtime.hovered_cursor(), None);
+    }
+
+    #[test]
     fn modal_caret_repaints_its_shape_without_changing_field_text() {
         use crate::action::{Key, KeyPattern, Stroke};
         use crate::layout::{DrawCommand, Proposal, Size};
