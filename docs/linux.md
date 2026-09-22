@@ -103,6 +103,23 @@ cross over a cell, a hand over anything that answers a press, the
 resize arrows at a seam or a band. On Wayland the shapes come from
 the cursor theme; on X11 from the core cursor font.
 
+## The hand on the glass
+
+A wheel turns in detents: a compositor at `wl_pointer` v8 says them
+in 120ths of a step (and sends no `axis_discrete` at all), an older
+one in whole steps, and a finger on a pad says neither and stays
+continuous — the shell reads all three and keeps the ×16 line every
+platform shares. A pinch on a pad arrives through
+`zwp_pointer_gestures_v1` where the compositor speaks it, as a ratio
+per step for the box under the pointer. A touchscreen arrives through
+`wl_touch`, asked for when the seat says it has one: each finger on
+the main window reaches the runtime's own recognizer, which makes the
+taps, the pans and the flings out of it, the same as on the phones.
+The X11 door reads none of this — a touchscreen or a pad's pinch on
+X11 needs XInput2, a road this shell does not walk. The container
+proves the tables and the arithmetic; the hand itself is proven on a
+laptop.
+
 ## Fonts
 
 The text engine is fontconfig, FreeType and HarfBuzz. A family the

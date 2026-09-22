@@ -160,6 +160,7 @@ unsafe extern "C" {
     static wl_seat_interface: WlInterface;
     static wl_pointer_interface: WlInterface;
     static wl_keyboard_interface: WlInterface;
+    static wl_touch_interface: WlInterface;
     static wl_data_device_manager_interface: WlInterface;
     static wl_data_device_interface: WlInterface;
     static wl_data_source_interface: WlInterface;
@@ -269,9 +270,11 @@ enum Iface {
     Popup,
     TextInput,
     Decoration,
+    Pinch,
     CoreSurface,
     CoreSeat,
     CoreOutput,
+    CorePointer,
 }
 
 /// The built tables, leaked to `'static` — libwayland keeps pointers
@@ -286,6 +289,8 @@ pub(crate) struct Protocols {
     text_input: &'static WlInterface,
     decoration_manager: &'static WlInterface,
     decoration: &'static WlInterface,
+    gestures: &'static WlInterface,
+    pinch: &'static WlInterface,
 }
 
 /// The xdg-shell message rows, transcribed from the installed
@@ -443,14 +448,49 @@ fn decoration_spec() -> [(&'static CStr, u32, Vec<Msg>, Vec<Msg>); 2] {
     ]
 }
 
-/// Builds the nine `WlInterface` tables and leaks them. Two passes:
+/// pointer-gestures v1, transcribed from the unstable XML in opcode
+/// order. Only the pinch is constructed; the swipe and the hold rows
+/// stand for their opcodes and carry no interface of their own.
+fn pointer_gestures_spec() -> [(&'static CStr, u32, Vec<Msg>, Vec<Msg>); 2] {
+    use Iface::*;
+    [
+        (
+            c"zwp_pointer_gestures_v1",
+            3,
+            vec![
+                Msg(c"get_swipe_gesture", c"no", &[None, Some(CorePointer)]),
+                Msg(c"get_pinch_gesture", c"no", &[Some(Pinch), Some(CorePointer)]),
+                Msg(c"release", c"2", &[]),
+                Msg(c"get_hold_gesture", c"3no", &[None, Some(CorePointer)]),
+            ],
+            vec![],
+        ),
+        (
+            c"zwp_pointer_gesture_pinch_v1",
+            3,
+            vec![Msg(c"destroy", c"", &[])],
+            vec![
+                Msg(c"begin", c"uuou", &[None, None, Some(CoreSurface), None]),
+                Msg(c"update", c"uffff", &[None, None, None, None, None]),
+                Msg(c"end", c"uui", &[None, None, None]),
+            ],
+        ),
+    ]
+}
+
+/// Builds the eleven `WlInterface` tables and leaks them. Two passes:
 /// the interfaces are allocated first so the message rows can point at
 /// each other (popup → positioner, xdg_surface → toplevel, …).
 fn build_protocols() -> Protocols {
     let spec: Vec<(&'static CStr, u32, Vec<Msg>, Vec<Msg>)> =
-        xdg_spec().into_iter().chain(text_input_spec()).chain(decoration_spec()).collect();
+        xdg_spec()
+            .into_iter()
+            .chain(text_input_spec())
+            .chain(decoration_spec())
+            .chain(pointer_gestures_spec())
+            .collect();
     // pass 1: stable homes, filled with placeholders
-    let slots: &'static mut [WlInterface; 9] = Box::leak(Box::new(std::array::from_fn(|_| {
+    let slots: &'static mut [WlInterface; 11] = Box::leak(Box::new(std::array::from_fn(|_| {
         WlInterface {
             name: c"".as_ptr(),
             version: 0,
@@ -469,9 +509,11 @@ fn build_protocols() -> Protocols {
             Iface::Popup => unsafe { base.add(4) },
             Iface::TextInput => unsafe { base.add(6) },
             Iface::Decoration => unsafe { base.add(8) },
+            Iface::Pinch => unsafe { base.add(10) },
             Iface::CoreSurface => &raw const wl_surface_interface,
             Iface::CoreSeat => &raw const wl_seat_interface,
             Iface::CoreOutput => &raw const wl_output_interface,
+            Iface::CorePointer => &raw const wl_pointer_interface,
         }
     };
     let build_rows = |rows: &[Msg]| -> (*const WlMessage, c_int) {
@@ -515,6 +557,8 @@ fn build_protocols() -> Protocols {
         text_input: &slots[6],
         decoration_manager: &slots[7],
         decoration: &slots[8],
+        gestures: &slots[9],
+        pinch: &slots[10],
     }
 }
 
@@ -655,6 +699,8 @@ const TAG_DATA_OFFER: usize = 14;
 const TAG_DATA_SOURCE: usize = 15;
 const TAG_TEXT_INPUT: usize = 16;
 const TAG_DECORATION: usize = 17;
+const TAG_TOUCH: usize = 18;
+const TAG_PINCH: usize = 19;
 const OUTPUT_TAG_BASE: usize = 0x1000;
 /// Panel proxies encode index and role: base | (index << 2) | kind.
 const PANEL_TAG_BASE: usize = 0x1000_0000;
@@ -686,6 +732,22 @@ enum Ev {
     PointerButton { serial: u32, time_ms: u32, button: u32, pressed: bool },
     PointerAxis { axis: u32, value: f64 },
     PointerAxisDiscrete { axis: u32, steps: i32 },
+    /// The wheel in 120ths of a detent (v8+, sent INSTEAD of the
+    /// discrete steps) and where the axis came from (v5+).
+    PointerAxis120 { axis: u32, value120: i32 },
+    PointerAxisSource { source: u32 },
+    /// The seat said what it has — the touch device is asked for here.
+    SeatCapabilities { caps: u32 },
+    TouchDown { surface_ptr: usize, id: i32, x: f64, y: f64 },
+    TouchUp { id: i32 },
+    TouchMotion { id: i32, x: f64, y: f64 },
+    TouchFrame,
+    TouchCancel,
+    PinchBegin,
+    /// The pinch's scale since its begin — cumulative, the ratio is
+    /// taken here.
+    PinchUpdate { scale: f64 },
+    PinchEnd,
     PointerFrame,
     BufferRelease,
     KeyboardKeymap { format: u32, fd: i32, size: u32 },
@@ -772,7 +834,34 @@ unsafe extern "C" fn dispatcher(
             1 => push_ev(Ev::SurfaceLeave { output_ptr: unsafe { arg(0).o } as usize }),
             _ => {}
         },
-        TAG_SEAT => {} // capabilities handled at bind time (pointer today, keyboard at its phase)
+        TAG_SEAT => {
+            if opcode == 0 {
+                push_ev(Ev::SeatCapabilities { caps: unsafe { arg(0).u } });
+            }
+        }
+        TAG_TOUCH => match opcode {
+            0 => push_ev(Ev::TouchDown {
+                surface_ptr: unsafe { arg(2).o } as usize,
+                id: unsafe { arg(3).i },
+                x: fixed_to_f64(unsafe { arg(4).f }),
+                y: fixed_to_f64(unsafe { arg(5).f }),
+            }),
+            1 => push_ev(Ev::TouchUp { id: unsafe { arg(2).i } }),
+            2 => push_ev(Ev::TouchMotion {
+                id: unsafe { arg(1).i },
+                x: fixed_to_f64(unsafe { arg(2).f }),
+                y: fixed_to_f64(unsafe { arg(3).f }),
+            }),
+            3 => push_ev(Ev::TouchFrame),
+            4 => push_ev(Ev::TouchCancel),
+            _ => {} // shape(5), orientation(6): unread
+        },
+        TAG_PINCH => match opcode {
+            0 => push_ev(Ev::PinchBegin),
+            1 => push_ev(Ev::PinchUpdate { scale: fixed_to_f64(unsafe { arg(3).f }) }),
+            2 => push_ev(Ev::PinchEnd),
+            _ => {}
+        },
         TAG_POINTER => match opcode {
             0 => push_ev(Ev::PointerEnter {
                 serial: unsafe { arg(0).u },
@@ -796,11 +885,16 @@ unsafe extern "C" fn dispatcher(
                 value: fixed_to_f64(unsafe { arg(2).f }),
             }),
             5 => push_ev(Ev::PointerFrame),
+            6 => push_ev(Ev::PointerAxisSource { source: unsafe { arg(0).u } }),
             8 => push_ev(Ev::PointerAxisDiscrete {
                 axis: unsafe { arg(0).u },
                 steps: unsafe { arg(1).i },
             }),
-            _ => {} // axis_source/stop and the v8+ refinements: unread
+            9 => push_ev(Ev::PointerAxis120 {
+                axis: unsafe { arg(0).u },
+                value120: unsafe { arg(1).i },
+            }),
+            _ => {} // axis_stop(7), axis_relative_direction(10): unread
         },
         TAG_BUFFER => push_ev(Ev::BufferRelease),
         TAG_KEYBOARD => match opcode {
@@ -1001,15 +1095,20 @@ impl ClickClock {
 }
 
 /// The wheel between pointer frames: continuous values in surface px,
-/// discrete detents when a real wheel turns. The flush prefers the
-/// detents (the ×16 line doctrine all platforms share) and flips the
-/// sign — wayland's positive is content-down, the engine's is up.
+/// discrete detents when a real wheel turns — as steps (v5..7) or as
+/// 120ths of a step (v8+, sent INSTEAD of the steps, and the finer
+/// wheels turn in fractions). The flush prefers the detents (the ×16
+/// line doctrine all platforms share) and flips the sign — wayland's
+/// positive is content-down, the engine's is up. A finger on a pad
+/// sends no detents at all and stays continuous.
 #[derive(Default)]
 struct AxisAccumulator {
     vertical: f64,
     horizontal: f64,
     vertical_steps: i32,
     horizontal_steps: i32,
+    vertical_120: i32,
+    horizontal_120: i32,
 }
 
 impl AxisAccumulator {
@@ -1029,20 +1128,37 @@ impl AxisAccumulator {
         }
     }
 
+    fn value120(&mut self, axis: u32, value120: i32) {
+        match axis {
+            0 => self.vertical_120 += value120,
+            1 => self.horizontal_120 += value120,
+            _ => {}
+        }
+    }
+
     fn flush(&mut self) -> Option<(f64, f64)> {
-        let dy = if self.vertical_steps != 0 {
-            -(self.vertical_steps as f64) * 16.0
-        } else {
-            -self.vertical
+        let line = |continuous: f64, steps: i32, v120: i32| {
+            if v120 != 0 {
+                -(v120 as f64 / 120.0) * 16.0
+            } else if steps != 0 {
+                -(steps as f64) * 16.0
+            } else {
+                -continuous
+            }
         };
-        let dx = if self.horizontal_steps != 0 {
-            -(self.horizontal_steps as f64) * 16.0
-        } else {
-            -self.horizontal
-        };
+        let dy = line(self.vertical, self.vertical_steps, self.vertical_120);
+        let dx = line(self.horizontal, self.horizontal_steps, self.horizontal_120);
         *self = AxisAccumulator::default();
         (dx != 0.0 || dy != 0.0).then_some((dx, dy))
     }
+}
+
+/// The ratio of one pinch step: the protocol's scale is cumulative
+/// since the gesture began, the engine speaks in steps.
+fn pinch_ratio(last: &mut f64, scale: f64) -> f64 {
+    let ratio = if *last > 0.0 { scale / *last } else { 1.0 };
+    *last = scale;
+    ratio
 }
 
 /// Integer scale from the outputs the surface touches — tier 3 of the
@@ -1280,6 +1396,16 @@ struct Client {
     seat: *mut Proxy,
     pointer: *mut Proxy,
     keyboard_proxy: *mut Proxy,
+    /// The touch device, asked for when the seat says it has one
+    /// (null until then), and the fingers down on the main window
+    /// with where each was last seen.
+    touch: *mut Proxy,
+    touch_live: Vec<(i32, f64, f64)>,
+    touch_pending: Vec<(TouchPhase, i32, f64, f64)>,
+    /// The pinch gesture object (null where the compositor speaks no
+    /// gestures) and the cumulative scale its last update carried.
+    pinch: *mut Proxy,
+    pinch_last: f64,
     data_device: *mut Proxy,
     data_manager: *mut Proxy,
     wm_base: *mut Proxy,
@@ -1336,6 +1462,15 @@ fn with_client<R>(body: impl FnOnce(&mut Client) -> R) -> R {
 
 // MARK: - events out (the shell's vocabulary)
 
+/// Where a finger is in its life.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TouchPhase {
+    Began,
+    Moved,
+    Ended,
+    Cancelled,
+}
+
 pub enum AppEvent {
     Redraw,
     Wake,
@@ -1354,6 +1489,11 @@ pub enum AppEvent {
     /// compositor grab to say `popup_done`, so it says this instead.
     DismissOverlays,
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
+    /// A finger on the main window — the runtime's own recognizer
+    /// makes the gestures out of it.
+    Touch { phase: TouchPhase, id: u64, x: f64, y: f64 },
+    /// One step of a pinch: the RATIO of this step (1 = no change).
+    Magnify { x: f64, y: f64, scale: f64 },
     ImeMark { text: String, caret: usize },
     ImeUnmark,
     Blink,
@@ -1471,6 +1611,22 @@ fn connect() {
         3,
         TAG_SYNC,
     );
+    // the pinch rides the pointer where the compositor speaks gestures
+    let gestures =
+        bind(c"zwp_pointer_gestures_v1", protocols.gestures as *const WlInterface, 1, TAG_SYNC);
+    let pinch = if gestures.is_null() || pointer.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe {
+            construct(
+                gestures,
+                1, // get_pinch_gesture(new, pointer)
+                protocols.pinch as *const WlInterface,
+                &mut [arg_n(), arg_o(pointer)],
+                TAG_PINCH,
+            )
+        }
+    };
     let subcompositor =
         bind(c"wl_subcompositor", &raw const wl_subcompositor_interface, 1, TAG_SYNC);
     // text-input v3 where the compositor speaks it (WSLg's does not —
@@ -1545,6 +1701,11 @@ fn connect() {
             seat,
             pointer,
             keyboard_proxy,
+            touch: std::ptr::null_mut(),
+            touch_live: Vec::new(),
+            touch_pending: Vec::new(),
+            pinch,
+            pinch_last: 1.0,
             data_device,
             data_manager,
             wm_base,
@@ -3618,6 +3779,68 @@ fn drain_protocol_events() {
             Ev::PointerAxisDiscrete { axis, steps } => {
                 with_client(|client| client.axis.discrete(axis, steps))
             }
+            Ev::PointerAxis120 { axis, value120 } => {
+                with_client(|client| client.axis.value120(axis, value120))
+            }
+            Ev::PointerAxisSource { .. } => {} // the accumulator tells a finger by its lack of detents
+            Ev::SeatCapabilities { caps } => with_client(|client| {
+                const TOUCH: u32 = 4;
+                if caps & TOUCH != 0 && client.touch.is_null() && !client.seat.is_null() {
+                    client.touch = unsafe {
+                        construct(client.seat, 2, &raw const wl_touch_interface, &mut [arg_n()], TAG_TOUCH)
+                    };
+                }
+            }),
+            Ev::TouchDown { surface_ptr, id, x, y } => with_client(|client| {
+                // fingers on the main window only — a panel takes none
+                let on_main = client.win.as_ref().is_some_and(|w| w.surface as usize == surface_ptr);
+                if on_main {
+                    client.touch_live.push((id, x, y));
+                    client.touch_pending.push((TouchPhase::Began, id, x, y));
+                }
+            }),
+            Ev::TouchMotion { id, x, y } => with_client(|client| {
+                if let Some(finger) = client.touch_live.iter_mut().find(|f| f.0 == id) {
+                    finger.1 = x;
+                    finger.2 = y;
+                    client.touch_pending.push((TouchPhase::Moved, id, x, y));
+                }
+            }),
+            Ev::TouchUp { id } => with_client(|client| {
+                if let Some(index) = client.touch_live.iter().position(|f| f.0 == id) {
+                    let (_, x, y) = client.touch_live.remove(index);
+                    client.touch_pending.push((TouchPhase::Ended, id, x, y));
+                }
+            }),
+            Ev::TouchFrame => {
+                let steps = with_client(|client| std::mem::take(&mut client.touch_pending));
+                for (phase, id, x, y) in steps {
+                    dispatch(AppEvent::Touch { phase, id: id as u64, x, y });
+                }
+            }
+            Ev::TouchCancel => {
+                let live = with_client(|client| {
+                    client.touch_pending.clear();
+                    std::mem::take(&mut client.touch_live)
+                });
+                for (id, x, y) in live {
+                    dispatch(AppEvent::Touch { phase: TouchPhase::Cancelled, id: id as u64, x, y });
+                }
+            }
+            Ev::PinchBegin => with_client(|client| client.pinch_last = 1.0),
+            Ev::PinchUpdate { scale } => {
+                let step = with_client(|client| {
+                    let ratio = pinch_ratio(&mut client.pinch_last, scale);
+                    let (x, y) = client.pointer_pos;
+                    let (x, y) = translate_pointer(client, x, y);
+                    (ratio, x, y)
+                });
+                let (ratio, x, y) = step;
+                if ratio != 1.0 {
+                    dispatch(AppEvent::Magnify { x, y, scale: ratio });
+                }
+            }
+            Ev::PinchEnd => {}
             Ev::PointerFrame => {
                 let wheel = with_client(|client| {
                     client.axis.flush().map(|(dx, dy)| {
@@ -4313,6 +4536,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The pointer-gestures tables against their own XML, the same way.
+    #[test]
+    fn the_gesture_tables_match_the_installed_xml() {
+        let path = "/usr/share/wayland-protocols/unstable/pointer-gestures/pointer-gestures-unstable-v1.xml";
+        let Ok(xml) = std::fs::read_to_string(path) else { return };
+        for (name, _, methods, events) in pointer_gestures_spec() {
+            let open = format!("<interface name=\"{}\"", name.to_string_lossy());
+            let start = xml.find(&open).expect("interface present in the XML");
+            let block = &xml[start..];
+            let end = block.find("</interface>").expect("interface block closes");
+            let block = &block[..end];
+            let mut cursor = 0;
+            for Msg(msg, _, _) in &methods {
+                let needle = format!("<request name=\"{}\"", msg.to_string_lossy());
+                let at = block[cursor..]
+                    .find(&needle)
+                    .unwrap_or_else(|| panic!("{needle} in opcode order"));
+                cursor += at + needle.len();
+            }
+            let mut cursor = 0;
+            for Msg(msg, _, _) in &events {
+                let needle = format!("<event name=\"{}\"", msg.to_string_lossy());
+                let at = block[cursor..]
+                    .find(&needle)
+                    .unwrap_or_else(|| panic!("{needle} in opcode order"));
+                cursor += at + needle.len();
+            }
+        }
+        for (name, _, methods, events) in pointer_gestures_spec() {
+            for Msg(msg, signature, types) in methods.iter().chain(events.iter()) {
+                assert_eq!(
+                    types.len(),
+                    arg_count(signature),
+                    "{}.{}: one types slot per argument",
+                    name.to_string_lossy(),
+                    msg.to_string_lossy(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_wheel_prefers_the_120ths_then_the_steps_then_the_continuous() {
+        let mut axis = AxisAccumulator::default();
+        axis.axis(0, 10.0);
+        axis.value120(0, 240);
+        assert_eq!(axis.flush(), Some((0.0, -32.0)), "two detents in 120ths");
+        axis.value120(0, 60);
+        assert_eq!(axis.flush(), Some((0.0, -8.0)), "half a detent, a fine wheel");
+        axis.axis(1, 5.0);
+        axis.discrete(1, 1);
+        assert_eq!(axis.flush(), Some((-16.0, 0.0)), "a v5 wheel's step");
+        axis.axis(0, 7.5);
+        assert_eq!(axis.flush(), Some((0.0, -7.5)), "a finger stays continuous");
+        assert_eq!(axis.flush(), None, "and nothing is nothing");
+    }
+
+    #[test]
+    fn a_pinch_speaks_in_ratios() {
+        let mut last = 1.0;
+        assert!((pinch_ratio(&mut last, 1.1) - 1.1).abs() < 1e-9);
+        assert!((pinch_ratio(&mut last, 1.21) - 1.1).abs() < 1e-9, "cumulative 1.21 is another 1.1");
+        assert!((pinch_ratio(&mut last, 1.21) - 1.0).abs() < 1e-9, "no change is 1");
+        let mut zero = 0.0;
+        assert_eq!(pinch_ratio(&mut zero, 2.0), 1.0, "a zero last answers no step");
     }
 
     #[test]

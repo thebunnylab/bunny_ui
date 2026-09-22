@@ -886,6 +886,26 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> usize {
                     blit(runtime, root);
                 }
             }
+            AppEvent::Touch { phase, id, x, y } => {
+                // a touch that changed nothing visible may still have
+                // put the finger on the clock (a fling in the air)
+                let changed = match phase {
+                    ffi::TouchPhase::Began => runtime.touch_began(id, x, y, 1),
+                    ffi::TouchPhase::Moved => runtime.touch_moved(id, x, y),
+                    ffi::TouchPhase::Ended => runtime.touch_ended(id, x, y),
+                    ffi::TouchPhase::Cancelled => runtime.touch_cancelled(id),
+                };
+                if changed || phase == ffi::TouchPhase::Ended {
+                    blit(runtime, root);
+                } else {
+                    ffi::set_frame_driver_paused(!runtime.wants_frame());
+                }
+            }
+            AppEvent::Magnify { x, y, scale } => {
+                if runtime.magnify(x, y, scale) {
+                    blit(runtime, root);
+                }
+            }
             AppEvent::ImeMark { text, caret } => {
                 let command = EditCommand::SetMarked { text, caret_utf16: (caret, 0) };
                 if runtime.key(command).applied {
