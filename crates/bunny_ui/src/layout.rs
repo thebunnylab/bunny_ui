@@ -6607,9 +6607,12 @@ const SETTLED: Px = 0.5;
 /// The split is a waterfall, not one equal cut. A flexible child can be
 /// bounded (a `frame_max` title bar over a spacer): offered its equal
 /// share, it takes less. What it leaves is not lost — the pool re-splits
-/// among the still-hungry and offers again. Every round retires at least
-/// one child, so the loop is bounded by the child count; shares within a
-/// round are equal, so no child's position buys it space.
+/// among the still-hungry and offers again. A child can also be floored
+/// (a region whose content does not shrink): offered less than its floor,
+/// it keeps the floor, and the ones that only fill pay for it. Every
+/// round retires at least one child, so the loop is bounded by the child
+/// count; shares within a round are equal, so no child's position buys
+/// it space.
 ///
 /// A last pass hands the row's OWN thickness back. A child too big to
 /// shrink can make the row thicker than the box that holds it, and
@@ -6673,6 +6676,26 @@ fn measure_stack(
         // among the rest until a round leaves nothing. It runs twice
         // now: once over the children that named a size, then over the
         // ones that only fill.
+        //
+        // The flow runs the other way too. A child that answers MORE
+        // than its share has a floor it cannot go under — content that
+        // does not shrink, a `frame_flex` minimum — and it keeps it. The
+        // excess is taken from the children still in the pool, which
+        // shrink to pay for it: a floor a filler honours by borrowing
+        // from its sibling, the CSS grid's `minmax(min-content, 1fr)`.
+        // Without it two equal regions either split the row or, when one
+        // region's content is wider than half, push the other off its
+        // end — a title bar whose wide mark sends the controls past the
+        // window's edge while the region beside it still has room.
+        //
+        // The deficit waits for the surplus. A round in which someone
+        // gives space back retires only the givers, because a floor over
+        // this share may fit under the next one, which is larger; only a
+        // round in which nobody gives anything back retires the floors.
+        // The shares only shrink from there, so no floor is kept too
+        // early. When every child in the pool is over its share there is
+        // nobody left to borrow from, and the row overflows at its
+        // content, as it always did.
         let waterfall = |measured: &mut Vec<(Size, Fit)>, pool: Vec<usize>, budget: Px| {
             let (mut pool, mut budget) = (pool, budget);
             while !pool.is_empty() {
@@ -6680,25 +6703,31 @@ fn measure_stack(
                 for &index in &pool {
                     measured[index] = children[index].measure(cross_proposal(Some(share)), env);
                 }
-                let (under, full): (Vec<usize>, Vec<usize>) = pool
-                    .into_iter()
-                    .partition(|&index| main(&measured[index].0) < share - SETTLED);
-                if under.is_empty() || full.is_empty() {
+                let took = |index: &usize| main(&measured[*index].0);
+                let under: Vec<usize> =
+                    pool.iter().copied().filter(|index| took(index) < share - SETTLED).collect();
+                let retired = if under.is_empty() {
+                    pool.iter().copied().filter(|index| took(index) > share + SETTLED).collect()
+                } else {
+                    under
+                };
+                if retired.is_empty() || retired.len() == pool.len() {
                     break;
                 }
-                budget -= under.iter().map(|&index| main(&measured[index].0)).sum::<Px>();
+                budget -= retired.iter().map(took).sum::<Px>();
                 budget = budget.max(0.0);
-                pool = full;
+                pool.retain(|index| !retired.contains(index));
             }
         };
 
         // Before the quotas: WHO here actually wants a size?
         //
-        // The waterfall below only ever hands surplus downward — a child
-        // that takes less than its quota releases the rest. Nothing in it
-        // lets a child that wants MORE take from one that wants nothing
-        // in particular, and that is the case a strip beside a spacer
-        // is: the hug clamps at its quota and answers "full", the spacer
+        // The waterfall below hands surplus downward and lets a FLOOR
+        // borrow — a child that answers more than its quota takes the
+        // excess from the rest. Neither lets a child that WANTS more,
+        // and would accept less, take from one that wants nothing in
+        // particular, and that is the case a strip beside a spacer is:
+        // the hug clamps at its quota and answers "full", the spacer
         // swallows its quota and answers "full", and the loop stops on
         // the first round with the hug pinned at half the row.
         //
@@ -7478,6 +7507,132 @@ mod tests {
         assert_eq!(result.frames.get("line").unwrap().size.width, 1.0);
         assert_eq!(result.frames.get("editor").unwrap().size.width, 939.0);
         assert_eq!(result.frames.get("editor").unwrap().origin.x, 261.0);
+    }
+
+    /// The title bar of three regions: two fillers whose content does not
+    /// shrink — the lights' reserve and a wide mark on the leading side,
+    /// the controls on the trailing — and a rigid switcher between them.
+    /// Equal fillers centre the switcher by construction; the question is
+    /// the window narrower than twice the leading content.
+    fn three_regions(width: Px) -> LayoutResult {
+        let leaf = |width: Px| LayoutNode::Leaf { size: Size { width, height: 20.0 } };
+        let row = |children: Vec<LayoutNode>| LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing: 0.0,
+            align: CrossAlign::Center,
+            children,
+        };
+        let bar = row(vec![
+            boundary("lead", row(vec![leaf(300.0), LayoutNode::Spacer])),
+            boundary("switcher", leaf(100.0)),
+            boundary("trail", row(vec![LayoutNode::Spacer, leaf(150.0)])),
+        ]);
+        layout(&bar, Proposal { width: Some(width), height: Some(40.0) })
+    }
+
+    #[test]
+    fn a_floor_over_its_share_borrows_from_the_filler_beside_it() {
+        // wide: both halves hold their content, and the switcher sits in
+        // the middle of the window
+        let wide = three_regions(800.0);
+        assert_eq!(wide.frames.get("lead").unwrap().size.width, 350.0);
+        assert_eq!(wide.frames.get("switcher").unwrap().origin.x, 350.0);
+        assert_eq!(wide.frames.get("trail").unwrap().size.width, 350.0);
+
+        // narrow: an equal half would cut the leading content, so the
+        // leading region keeps its content and the trailing one, which
+        // only fills, pays for it — the row still ends at the window
+        let narrow = three_regions(600.0);
+        assert_eq!(narrow.frames.get("lead").unwrap().size.width, 300.0);
+        assert_eq!(narrow.frames.get("switcher").unwrap().origin.x, 300.0);
+        assert_eq!(narrow.frames.get("trail").unwrap().size.width, 200.0);
+        assert_eq!(narrow.size.width, 600.0, "nothing is pushed past the window's edge");
+    }
+
+    #[test]
+    fn two_floors_that_cannot_both_fit_overflow_at_their_content() {
+        // nobody is left to borrow from: each region keeps what its
+        // content needs, and the row answers more than it was offered
+        let squeezed = three_regions(500.0);
+        assert_eq!(squeezed.frames.get("lead").unwrap().size.width, 300.0);
+        assert_eq!(squeezed.frames.get("trail").unwrap().size.width, 150.0);
+        assert_eq!(squeezed.size.width, 550.0);
+    }
+
+    #[test]
+    fn a_flex_frame_floor_takes_its_minimum_from_a_spacer() {
+        // `frame_flex` is the same floor said with a number: a lane of
+        // 300 beside a spacer in a row of 500 keeps its 300
+        let root = LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children: vec![
+                boundary(
+                    "lane",
+                    LayoutNode::FlexFrame {
+                        min_width: 300.0,
+                        min_height: 0.0,
+                        align: CrossAlign::Start,
+                        child: Box::new(LayoutNode::Spacer),
+                    },
+                ),
+                boundary("rest", LayoutNode::Spacer),
+            ],
+        };
+        let result = layout(&root, Proposal { width: Some(500.0), height: Some(100.0) });
+        assert_eq!(result.frames.get("lane").unwrap().size.width, 300.0);
+        assert_eq!(result.frames.get("rest").unwrap().size.width, 200.0);
+        assert_eq!(result.size.width, 500.0);
+    }
+
+    #[test]
+    fn a_floor_borrows_after_the_ceilings_are_served() {
+        // A lane floored at 320, a spacer, and a box capped at 100. The
+        // cap is served first and whatever it leaves is the fillers'; the
+        // floor then borrows only from what the fillers were handed —
+        // never from the capped box, which already has what it wanted.
+        let root = LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children: vec![
+                boundary(
+                    "lane",
+                    LayoutNode::FlexFrame {
+                        min_width: 320.0,
+                        min_height: 0.0,
+                        align: CrossAlign::Start,
+                        child: Box::new(LayoutNode::Spacer),
+                    },
+                ),
+                boundary("spacer", LayoutNode::Spacer),
+                boundary(
+                    "capped",
+                    LayoutNode::MaxFrame {
+                        max_width: 100.0,
+                        max_height: f64::INFINITY,
+                        align: CrossAlign::Start,
+                        child: Box::new(LayoutNode::Spacer),
+                    },
+                ),
+            ],
+        };
+        let width_of = |result: &LayoutResult, name: &str| result.frames.get(name).unwrap().size.width;
+
+        // room for everyone: the fillers split what the cap leaves
+        let roomy = layout(&root, Proposal { width: Some(900.0), height: Some(100.0) });
+        assert_eq!(width_of(&roomy, "capped"), 100.0);
+        assert_eq!(width_of(&roomy, "lane"), 400.0);
+        assert_eq!(width_of(&roomy, "spacer"), 400.0);
+
+        // tight: the fillers' equal 200 is under the floor, so the lane
+        // keeps its 320 and the spacer is what pays
+        let tight = layout(&root, Proposal { width: Some(500.0), height: Some(100.0) });
+        assert_eq!(width_of(&tight, "capped"), 100.0);
+        assert_eq!(width_of(&tight, "lane"), 320.0);
+        assert_eq!(width_of(&tight, "spacer"), 80.0);
+        assert_eq!(tight.size.width, 500.0);
     }
 
     #[test]
