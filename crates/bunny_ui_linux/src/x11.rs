@@ -394,7 +394,9 @@ unsafe extern "C" {
 
 const XKB_ID_USE_CORE_KBD: u16 = 256;
 const XKB_PER_CLIENT_FLAG_DETECTABLE_AUTO_REPEAT: u32 = 1;
-const XKB_EVENT_TYPE_STATE_NOTIFY: u16 = 4;
+// Selection uses a bit mask; the event header carries the opcode itself.
+const XKB_STATE_NOTIFY_MASK: u16 = 1 << 2;
+const XKB_STATE_NOTIFY: u8 = 2;
 
 /// `xcb_xkb_state_notify_event_t` head — verified against xkb.h; only
 /// the mod/group fields are read (update_mask wants exactly those).
@@ -422,6 +424,12 @@ struct XkbStateNotifyEvent {
     changed: u16,
     keycode: u8,
     event_type: u8,
+}
+
+impl XkbStateNotifyEvent {
+    fn is_state_notify(&self) -> bool {
+        self.xkb_type == XKB_STATE_NOTIFY
+    }
 }
 
 const _: () = {
@@ -1423,9 +1431,9 @@ fn setup_keyboard(connection: *mut Connection) -> (Keyboard, u8) {
         xcb_xkb_select_events(
             connection,
             XKB_ID_USE_CORE_KBD,
-            XKB_EVENT_TYPE_STATE_NOTIFY,
+            XKB_STATE_NOTIFY_MASK,
             0,
-            XKB_EVENT_TYPE_STATE_NOTIFY,
+            XKB_STATE_NOTIFY_MASK,
             0,
             0,
             std::ptr::null(),
@@ -2934,7 +2942,7 @@ fn interpret(event: *mut GenericEvent) -> Step {
             let base = with_x(|client| client.xkb_base_event);
             if base != 0 && kind == base {
                 let notify = event as *mut XkbStateNotifyEvent;
-                if unsafe { (*notify).xkb_type } == XKB_EVENT_TYPE_STATE_NOTIFY as u8 {
+                if unsafe { (*notify).is_state_notify() } {
                     with_x(|client| unsafe {
                         if !client.keyboard.state.is_null() {
                             crate::ffi::xkb_state_update_mask(
@@ -3165,6 +3173,22 @@ mod tests {
             assert!(cursor_slot(cursor) < 8);
         }
         assert_eq!(seen.len(), 8);
+    }
+
+    #[test]
+    fn state_notifications_use_the_wire_opcode_not_the_selection_mask() {
+        // XKB protocol: StateNotify = 2, IndicatorStateNotify = 4.
+        // A zeroed wire frame is valid here: every field is an integer.
+        let mut event: XkbStateNotifyEvent = unsafe { std::mem::zeroed() };
+        event.xkb_type = 2;
+        event.base_mods = 1; // Shift, needed for US Shift+2 -> @.
+        assert!(event.is_state_notify());
+        event.base_mods = 4; // Control, needed for Ctrl+V.
+        assert!(event.is_state_notify());
+        event.base_mods = 0; // Releases must update the state too.
+        assert!(event.is_state_notify());
+        event.xkb_type = 4;
+        assert!(!event.is_state_notify(), "indicator events are not modifier state");
     }
 
     #[test]
