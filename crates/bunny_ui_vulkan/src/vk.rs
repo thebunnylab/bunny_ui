@@ -901,9 +901,24 @@ struct PhysicalDeviceProperties {
     device_type: u32,
     device_name: [u8; 256],
     cache_uuid: [u8; 16],
-    limits: [u8; 504],
+    limits: PhysicalDeviceLimits,
     sparse: [u8; 20],
 }
+
+/// `VkPhysicalDeviceLimits`, opaque but for its ALIGNMENT: the block holds
+/// `VkDeviceSize` and `size_t` members, so C aligns it to 8. A bare
+/// `[u8; 504]` aligns to 1, which starts the block 4 bytes early and leaves
+/// the whole struct 816 bytes where the driver writes 824 — eight bytes of
+/// the caller's stack overwritten on every call, the next device handle in
+/// the pick's sort among them.
+#[repr(C, align(8))]
+struct PhysicalDeviceLimits([u8; 504]);
+
+const _: () = {
+    assert!(std::mem::size_of::<PhysicalDeviceProperties>() == 824);
+    assert!(std::mem::offset_of!(PhysicalDeviceProperties, limits) == 296);
+    assert!(std::mem::offset_of!(PhysicalDeviceProperties, sparse) == 800);
+};
 
 // MARK: - The function table (one resolve through GetInstanceProcAddr)
 
@@ -1532,10 +1547,10 @@ impl VkStack {
                 let mut properties = std::mem::zeroed::<PhysicalDeviceProperties>();
                 (fns.get_physical_device_properties)(physical, &mut properties);
                 u32::from_ne_bytes([
-                    properties.limits[4],
-                    properties.limits[5],
-                    properties.limits[6],
-                    properties.limits[7],
+                    properties.limits.0[4],
+                    properties.limits.0[5],
+                    properties.limits.0[6],
+                    properties.limits.0[7],
                 ])
             };
             let format = match wsi.as_ref() {
