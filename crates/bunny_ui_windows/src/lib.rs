@@ -54,6 +54,9 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
         0x2E => Some(Key::Delete),
         0x24 => Some(Key::Home),
         0x23 => Some(Key::End),
+        // VK_F1 to VK_F24; F10 arrives as a system key, and the pump
+        // gates those too
+        0x70..=0x87 => Some(Key::F((stroke.vk - 0x6F) as u8)),
         _ => None,
     };
     let key = named.or_else(|| {
@@ -1345,8 +1348,16 @@ mod tests {
     fn a_lone_modifier_is_no_pattern() {
         // VK_SHIFT alone: no named key, no base char
         assert!(key_pattern(&stroke(0x10, "", true, false, false)).is_none());
-        // a control character as the base is not a Char either
-        assert!(key_pattern(&stroke(0x73, "", false, false, false)).is_none(), "F4 is silent");
+    }
+
+    #[test]
+    fn the_function_row_is_named_by_number() {
+        let pattern = key_pattern(&stroke(0x73, "", false, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::F(4));
+        let pattern = key_pattern(&stroke(0x7B, "", true, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::F(12));
+        assert!(pattern.shift);
+        assert_eq!(key_pattern(&stroke(0x87, "", false, false, false)).unwrap().key, Key::F(24));
     }
 
     #[test]

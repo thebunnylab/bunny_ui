@@ -63,6 +63,8 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
         0xffff => Some(Key::Delete),
         0xff50 => Some(Key::Home),
         0xff57 => Some(Key::End),
+        // XK_F1 to XK_F24, one run in the sym table
+        0xffbe..=0xffd5 => Some(Key::F((stroke.sym - 0xffbd) as u8)),
         _ => None,
     };
     let key = named.or_else(|| {
@@ -1270,8 +1272,16 @@ mod tests {
     fn a_lone_modifier_is_no_pattern() {
         // Shift_L alone: no named key, no base char
         assert!(key_pattern(&stroke(0xffe1, "", true, false, false)).is_none());
-        // a function key has no base char either
-        assert!(key_pattern(&stroke(0xffc1, "", false, false, false)).is_none(), "F4 is silent");
+    }
+
+    #[test]
+    fn the_function_row_is_named_by_number() {
+        let pattern = key_pattern(&stroke(0xffc1, "", false, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::F(4));
+        let pattern = key_pattern(&stroke(0xffc9, "", true, false, false)).unwrap();
+        assert_eq!(pattern.key, Key::F(12));
+        assert!(pattern.shift);
+        assert_eq!(key_pattern(&stroke(0xffd5, "", false, false, false)).unwrap().key, Key::F(24));
     }
 
     #[test]

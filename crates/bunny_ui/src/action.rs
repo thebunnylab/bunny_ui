@@ -69,6 +69,17 @@ pub enum Key {
     Delete,
     Home,
     End,
+    /// A function key, by its number: `F(1)` is F1, `F(12)` is F12.
+    ///
+    /// Every platform numbers the row the same way and none goes past
+    /// 24, so neither does this: a shell reports `F(1)` to `F(24)` and
+    /// nothing outside them. A keymap that says `f12` means the key a
+    /// product's go-to-definition lives on, on any keyboard.
+    ///
+    /// What arrives is the KEY. On a laptop the row is brightness and
+    /// volume until `fn` is held, and those belong to the system — they
+    /// never become a stroke, here or in any other app.
+    F(u8),
     /// A printable key, named by THE CHARACTER IT TYPES WITH NO
     /// MODIFIER APPLIED, lowercased.
     ///

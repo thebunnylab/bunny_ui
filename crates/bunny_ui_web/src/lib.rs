@@ -116,6 +116,8 @@ fn named_key(code: u32) -> Option<bunny_ui::action::Key> {
         11 => Key::Tab,
         12 => Key::PageUp,
         13 => Key::PageDown,
+        // the function row: `F1` to `F24` as 101 to 124
+        101..=124 => Key::F((code - 100) as u8),
         _ => return None,
     })
 }
@@ -319,6 +321,10 @@ thread_local! {
     /// Did the last press arm a drag? The element mode's glue reads it
     /// right after a press and opens its pointer-move door only then.
     static DRAG_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Did the named key just dispatched find a taker? `bunny_key`
+    /// answers it, so the glue keeps the browser's own meaning for a key
+    /// nobody here wanted.
+    static KEY_TAKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The running click count, `(when, x, y, count)`. The browser
     /// counts on `mousedown` and NOT on `pointerdown` (which reports
     /// `detail` zero), and the glue listens on `pointerdown` so touch
@@ -539,6 +545,7 @@ pub fn start_with(
                     return;
                 };
                 if stroke(&runtime, pattern(key, mods)) {
+                    KEY_TAKEN.with(|taken| taken.set(true));
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
@@ -814,6 +821,7 @@ fn start_dom_with(
                     return;
                 };
                 if stroke(&runtime, pattern(key, mods)) {
+                    KEY_TAKEN.with(|taken| taken.set(true));
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
@@ -969,9 +977,18 @@ pub extern "C" fn bunny_wheel(x: f64, y: f64, dx: f64, dy: f64) {
 /// One named key: `code` from the glue's table (mirrored in
 /// [`named_key`]), `mods` as the bit flags 1 shift, 2 command, 4
 /// option, 8 control.
+///
+/// Answers 1 when the stroke found a taker — a binding fired, a
+/// sequence moved, a focused box or field used it. The function row is
+/// the browser's as much as the page's: F5 reloads, F11 fills the
+/// screen, F12 opens the tools. The glue prevents those defaults only
+/// for a key the app took, so a page that binds F12 keeps it and a page
+/// that binds nothing still reloads.
 #[unsafe(no_mangle)]
-pub extern "C" fn bunny_key(code: u32, mods: u32) {
+pub extern "C" fn bunny_key(code: u32, mods: u32) -> u32 {
+    KEY_TAKEN.with(|taken| taken.set(false));
     dispatch(Event::Key(code, mods));
+    KEY_TAKEN.with(|taken| taken.get()) as u32
 }
 
 /// One character stroke — the code point plus the same modifier bits.

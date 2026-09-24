@@ -72,6 +72,28 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
         117 => Some(Key::Delete),
         115 => Some(Key::Home),
         119 => Some(Key::End),
+        // the function row, by the virtual-key table: its codes follow
+        // the keyboard's physical layout, not the numbers on the caps
+        122 => Some(Key::F(1)),
+        120 => Some(Key::F(2)),
+        99 => Some(Key::F(3)),
+        118 => Some(Key::F(4)),
+        96 => Some(Key::F(5)),
+        97 => Some(Key::F(6)),
+        98 => Some(Key::F(7)),
+        100 => Some(Key::F(8)),
+        101 => Some(Key::F(9)),
+        109 => Some(Key::F(10)),
+        103 => Some(Key::F(11)),
+        111 => Some(Key::F(12)),
+        105 => Some(Key::F(13)),
+        107 => Some(Key::F(14)),
+        113 => Some(Key::F(15)),
+        106 => Some(Key::F(16)),
+        64 => Some(Key::F(17)),
+        79 => Some(Key::F(18)),
+        80 => Some(Key::F(19)),
+        90 => Some(Key::F(20)),
         _ => None,
     };
     let key = named.or_else(|| {
@@ -82,6 +104,11 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
         // '|'). Reading the bare character asks the user's own layout
         // instead of assuming a US keyboard.
         let base = stroke.chars_bare.chars().next()?;
+        // F21–F24 have no virtual-key code; AppKit files them, like the
+        // whole row, as NSF1FunctionKey (U+F704) onwards
+        if let Some(number) = function_key_number(base) {
+            return Some(Key::F(number));
+        }
         // PUA F700–F8FF: AppKit function keys — never text
         (!base.is_control() && !('\u{F700}'..='\u{F8FF}').contains(&base))
             .then(|| Key::Char(base.to_ascii_lowercase()))
@@ -93,6 +120,13 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
         option: stroke.option,
         control: stroke.control,
     })
+}
+
+/// NSF1FunctionKey (U+F704) onwards: the character AppKit files each
+/// function key under, F1 to F24 in a row.
+fn function_key_number(character: char) -> Option<u8> {
+    let offset = (character as u32).checked_sub(0xF704)?;
+    (offset < 24).then(|| offset as u8 + 1)
 }
 
 /// Opens the window and enters the live cycle. Returns when the app quits
@@ -2012,3 +2046,38 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
 // =============================================================================
 // BUNNY_PRESENT_TRACE — the tape a trembling present is diagnosed from
 // =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stroke(code: u16, bare: &str, shift: bool) -> ffi::KeyStroke {
+        ffi::KeyStroke {
+            code,
+            shift,
+            control: false,
+            option: false,
+            command: false,
+            chars: bare.to_string(),
+            typed: None,
+            chars_bare: bare.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_function_row_is_named_by_number() {
+        // the codes follow the physical row, not the caps: F1 is 122,
+        // F2 is 120, F3 is 99
+        assert_eq!(key_pattern(&stroke(122, "\u{F704}", false)).unwrap().key, Key::F(1));
+        assert_eq!(key_pattern(&stroke(120, "\u{F705}", false)).unwrap().key, Key::F(2));
+        assert_eq!(key_pattern(&stroke(99, "\u{F706}", false)).unwrap().key, Key::F(3));
+        let pattern = key_pattern(&stroke(111, "\u{F70F}", true)).unwrap();
+        assert_eq!(pattern.key, Key::F(12));
+        assert!(pattern.shift);
+        // no virtual-key code past F20: the character names the rest
+        let unknown = u16::MAX;
+        assert_eq!(key_pattern(&stroke(unknown, "\u{F71B}", false)).unwrap().key, Key::F(24));
+        // and the rest of AppKit's private block is still never a key
+        assert!(key_pattern(&stroke(unknown, "\u{F727}", false)).is_none());
+    }
+}

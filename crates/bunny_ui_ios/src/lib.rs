@@ -64,6 +64,10 @@ fn key_pattern(stroke: &ffi::KeyStroke) -> Option<KeyPattern> {
         0x4C => Some(Key::Delete),
         0x4A => Some(Key::Home),
         0x4D => Some(Key::End),
+        // the HID page keeps the function row in two runs: F1 to F12,
+        // and F13 to F24 far below them
+        0x3A..=0x45 => Some(Key::F((stroke.hid - 0x39) as u8)),
+        0x68..=0x73 => Some(Key::F((stroke.hid - 0x5B) as u8)),
         _ => None,
     };
     let key = named.or_else(|| {

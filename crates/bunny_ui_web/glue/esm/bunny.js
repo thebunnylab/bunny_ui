@@ -355,6 +355,9 @@ const KEYS = {
   PageDown: 13,
 };
 
+// The function row: `F1` to `F24`, sent as 101 to 124.
+const FUNCTION_KEY = /^F([1-9]|1[0-9]|2[0-4])$/;
+
 // 1 shift, 2 command, 4 option, 8 control — the engine's bits. The
 // COMMAND bit is the platform's primary modifier, the way the Windows
 // shell hands Ctrl to the engine as `command`: ⌘ on a Mac, Ctrl
@@ -540,6 +543,14 @@ export async function attach(memoryHandle, exports, hostElement, start) {
   );
   window.addEventListener("keydown", (event) => {
     const mods = modifiers(event);
+    // the function row is the browser's as much as the page's — F5
+    // reloads, F12 opens the tools — so its default goes only when
+    // the app took the key
+    const row = FUNCTION_KEY.exec(event.key);
+    if (row) {
+      if (wasm.bunny_key(100 + Number(row[1]), mods)) event.preventDefault();
+      return;
+    }
     const code = KEYS[event.key];
     if (code !== undefined) {
       event.preventDefault();

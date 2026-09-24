@@ -27,6 +27,8 @@ pub const KEYCODE_ESCAPE: i32 = 111;
 pub const KEYCODE_FORWARD_DEL: i32 = 112;
 pub const KEYCODE_MOVE_HOME: i32 = 122;
 pub const KEYCODE_MOVE_END: i32 = 123;
+pub const KEYCODE_F1: i32 = 131;
+pub const KEYCODE_F12: i32 = 142;
 pub const KEYCODE_NUMPAD_ENTER: i32 = 160;
 pub const KEYCODE_DPAD_UP: i32 = 19;
 pub const KEYCODE_DPAD_DOWN: i32 = 20;
@@ -146,6 +148,9 @@ pub fn key_pattern(stroke: &KeyStroke) -> Option<KeyPattern> {
         KEYCODE_FORWARD_DEL => Some(Key::Delete),
         KEYCODE_MOVE_HOME => Some(Key::Home),
         KEYCODE_MOVE_END => Some(Key::End),
+        // the platform names twelve, and a keyboard with more sends
+        // nothing for the rest
+        KEYCODE_F1..=KEYCODE_F12 => Some(Key::F((stroke.keycode - KEYCODE_F1 + 1) as u8)),
         _ => None,
     };
     let key = named.or_else(|| {
@@ -221,6 +226,15 @@ mod tests {
     }
 
     #[test]
+    fn the_function_row_is_named_by_number() {
+        assert_eq!(key_pattern(&stroke_of(KEYCODE_F1, 0)).unwrap().key, Key::F(1));
+        assert_eq!(key_pattern(&stroke_of(KEYCODE_F1 + 3, 0)).unwrap().key, Key::F(4));
+        let pattern = key_pattern(&stroke_of(KEYCODE_F12, META_SHIFT_ON)).unwrap();
+        assert_eq!(pattern.key, Key::F(12));
+        assert!(pattern.shift);
+    }
+
+    #[test]
     fn control_carries_command() {
         let pattern = key_pattern(&stroke_of(29 + 5, META_CTRL_ON)).unwrap(); // ctrl-f
         assert_eq!(pattern.key, Key::Char('f'));
@@ -240,7 +254,6 @@ mod tests {
     #[test]
     fn a_lone_modifier_is_no_pattern() {
         assert!(key_pattern(&stroke_of(59, META_SHIFT_ON)).is_none(), "left shift alone");
-        assert!(key_pattern(&stroke_of(131, 0)).is_none(), "F1 is silent");
     }
 
     #[test]
