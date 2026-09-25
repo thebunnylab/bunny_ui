@@ -109,6 +109,11 @@ struct Chord {
     context: Option<&'static str>,
 }
 
+/// Who hears the modifier keys move ([`Runtime::observe_modifiers`]).
+type ModifierSink = Rc<dyn Fn(crate::action::Modifiers, crate::action::Modifiers)>;
+/// Who hears every stroke the keymap resolves ([`Runtime::observe_keys`]).
+type KeySink = Rc<dyn Fn(&crate::action::KeyReport)>;
+
 pub struct Runtime {
     /// The environment every body reads. Behind a cell because the
     /// shell moves it at runtime — a rotation flips the size class —
@@ -276,10 +281,10 @@ pub struct Runtime {
     held: Cell<crate::action::Modifiers>,
     /// Who hears the modifier keys move: what was held, and what is
     /// held now.
-    modifier_sink: RefCell<Option<Rc<dyn Fn(crate::action::Modifiers, crate::action::Modifiers)>>>,
+    modifier_sink: RefCell<Option<ModifierSink>>,
     /// Who hears every stroke the keymap resolves — a key-context
     /// debugger's door.
-    key_sink: RefCell<Option<Rc<dyn Fn(&crate::action::KeyReport)>>>,
+    key_sink: RefCell<Option<KeySink>>,
     /// A finger landed since the last beat: that beat's gap may be from
     /// before it, and the hand's clock counts at most one step of it.
     touch_fresh: Cell<bool>,
