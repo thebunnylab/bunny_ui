@@ -1751,6 +1751,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             runtime.set_loops_paused(false);
             sync_frame_driver(runtime, &handler_pacer, window_id);
         }
+        AppEvent::Modifiers(held) => {
+            // a release confirms, closes, opens — whatever the sink did,
+            // the frame that shows it is not one to wait for
+            if runtime.modifiers_changed(held) {
+                blit(runtime, root, trace::Origin::Input);
+            }
+        }
         AppEvent::MouseMoved { x, y, modifiers } => {
             // a move — and every drag is a stream of them — can wait for the
             // beat; a press and a release cannot, and stay where they were

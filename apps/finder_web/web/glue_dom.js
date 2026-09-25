@@ -51,6 +51,9 @@ const KEYS = {
 // The function row: `F1` to `F24`, sent as 101 to 124.
 const FUNCTION_KEY = /^F([1-9]|1[0-9]|2[0-4])$/;
 
+// The keys whose going down or coming up is itself the news.
+const MODIFIER_KEYS = new Set(["Shift", "Meta", "Control", "Alt"]);
+
 // 1 shift, 2 command, 4 option, 8 control — the engine's bits.
 function modifiers(event) {
   return (
@@ -1369,6 +1372,13 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       }
     });
     window.addEventListener("resize", repositionPopovers);
+    // a modifier's release types nothing and makes no stroke: the
+    // state it leaves is the whole event
+    window.addEventListener("keyup", (event) => {
+      if (MODIFIER_KEYS.has(event.key) && wasm && wasm.bunny_modifiers) {
+        wasm.bunny_modifiers(modifiers(event));
+      }
+    });
     // the browser owns the <input>s in this mode. What still belongs
     // to the engine: Escape (the keymap dismisses the popover) and
     // every stroke a focused canvas island wants — a box the app
@@ -1376,6 +1386,10 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     window.addEventListener("keydown", (event) => {
       const typing = event.target && event.target.tagName === "INPUT";
       const mods = modifiers(event);
+      if (MODIFIER_KEYS.has(event.key)) {
+        if (wasm.bunny_modifiers) wasm.bunny_modifiers(mods);
+        return;
+      }
       // the function row is the browser's as much as the page's — F5
       // reloads, F12 opens the tools — so its default goes only when
       // the app took the key

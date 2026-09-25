@@ -279,6 +279,9 @@ pub enum AppEvent {
     /// A key the keymap gate did not take, that types nothing — an
     /// arrow, a forward delete, the back key, a chord with control.
     Key(KeyStroke),
+    /// A hardware keyboard's modifier keys moved — what the hand holds
+    /// now. The release makes no stroke; this is the only report of it.
+    Modifiers(bunny_ui::action::Modifiers),
     /// The caret's blink half-period.
     Blink,
     /// One frame tick; `dt` seconds since the last, clamped.
@@ -1019,6 +1022,13 @@ fn motion(event: *mut AInputEvent) -> bool {
 /// the app took keeps its release too.
 fn key(event: *mut AInputEvent) -> bool {
     let keycode = unsafe { AKeyEvent_getKeyCode(event) };
+    // a modifier key, down or up: the meta state is the state it leaves,
+    // and the platform keeps the key for its own bookkeeping
+    if keys::is_modifier(keycode) {
+        let held = keys::held(unsafe { AKeyEvent_getMetaState(event) });
+        dispatch(AppEvent::Modifiers(held));
+        return false;
+    }
     match unsafe { AKeyEvent_getAction(event) } {
         AKEY_EVENT_ACTION_DOWN => {}
         AKEY_EVENT_ACTION_UP => {

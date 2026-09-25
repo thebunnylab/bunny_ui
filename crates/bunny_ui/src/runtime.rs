@@ -271,6 +271,12 @@ pub struct Runtime {
     /// end is announced exactly when its start was, and a plain stroke
     /// (pushed and resolved in one breath) says nothing at all.
     chord_announced: Cell<bool>,
+    /// The modifier keys the hand holds, as the shell last reported
+    /// them — the state a RELEASE is measured against.
+    held: Cell<crate::action::Modifiers>,
+    /// Who hears the modifier keys move: what was held, and what is
+    /// held now.
+    modifier_sink: RefCell<Option<Rc<dyn Fn(crate::action::Modifiers, crate::action::Modifiers)>>>,
     /// The size last HANDED to each measurement probe. A probe fires on
     /// change and only on change: a view at rest costs nothing, and a
     /// handler that writes state cannot spin against its own report.
@@ -1208,6 +1214,8 @@ impl Runtime {
             pending: RefCell::new(Vec::new()),
             chord_sink: RefCell::new(None),
             chord_announced: Cell::new(false),
+            held: Cell::new(crate::action::Modifiers::NONE),
+            modifier_sink: RefCell::new(None),
             pending_aged: Cell::new(false),
             wheel_latch: RefCell::new(None),
             measures: RefCell::new(HashMap::default()),
@@ -2892,6 +2900,57 @@ impl Runtime {
         let pending = self.pending.borrow().clone();
         self.chord_announced.set(!pending.is_empty());
         sink(&pending);
+    }
+
+    /// The modifier keys the hand holds, as the shell last reported them.
+    pub fn held_modifiers(&self) -> crate::action::Modifiers {
+        self.held.get()
+    }
+
+    /// The shell's door for the modifier keys: shift, command, option or
+    /// control went down or came UP — `held` is what the hand holds now.
+    ///
+    /// A stroke carries its modifiers, and that is enough for a chord.
+    /// It is not enough for a gesture that ENDS when a key is let go:
+    /// ⌘P opens a file finder, ⌘P again walks down its list while the
+    /// command key stays down, and letting the key go opens the line
+    /// the walk stopped on — one touch for "the file before this one".
+    /// The release types nothing and makes no stroke, so it arrives
+    /// here, from the platform's own report of the modifier state
+    /// (`flagsChanged:` on the mac, the key-up of a modifier on Windows,
+    /// the keyboard's modifier state on Linux, `keyup` in a browser).
+    ///
+    /// `true` when the change was news AND someone heard it — the
+    /// shell presents a frame, because the sink may well have written
+    /// state. Reporting the same modifiers twice is not a change.
+    pub fn modifiers_changed(&self, held: crate::action::Modifiers) -> bool {
+        let was = self.held.replace(held);
+        if was == held {
+            return false;
+        }
+        self.enter_scene();
+        // out of the borrow before it runs: the sink writes state, and
+        // may install another sink
+        let sink = self.modifier_sink.borrow().clone();
+        match sink {
+            Some(sink) => {
+                sink(was, held);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Installs who hears the modifier keys move: the sink is called
+    /// with what was held and what is held now, on every change the
+    /// shell reports — [`Runtime::modifiers_changed`]. The door a
+    /// cycling finder confirms through: `was.command && !now.command`
+    /// is the release. One sink; installing another replaces it.
+    pub fn observe_modifiers(
+        &self,
+        sink: impl Fn(crate::action::Modifiers, crate::action::Modifiers) + 'static,
+    ) {
+        *self.modifier_sink.borrow_mut() = Some(Rc::new(sink));
     }
 
     /// The slow clock, aging a pending prefix: the SECOND tick drops

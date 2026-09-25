@@ -1654,6 +1654,10 @@ pub enum AppEvent {
     Text(String),
     /// An editing key that passed the gate unconsumed.
     Key { sym: u32, shift: bool, command: bool },
+    /// The modifier keys moved — what the hand holds now, from the
+    /// keyboard's own modifier state. A modifier coming UP types nothing
+    /// and makes no key event of ours; this is the only report of it.
+    Modifiers(bunny_ui::action::Modifiers),
     /// A press landed outside every open overlay — the x11 door has no
     /// compositor grab to say `popup_done`, so it says this instead.
     DismissOverlays,
@@ -4577,8 +4581,11 @@ fn drain_protocol_events() {
                     }
                 });
             }
-            Ev::KeyboardMods { depressed, latched, locked, group } => with_client(|client| {
-                if !client.keyboard.state.is_null() {
+            Ev::KeyboardMods { depressed, latched, locked, group } => {
+                let report = with_client(|client| {
+                    if client.keyboard.state.is_null() {
+                        return None;
+                    }
                     unsafe {
                         xkb_state_update_mask(
                             client.keyboard.state,
@@ -4590,8 +4597,17 @@ fn drain_protocol_events() {
                             group,
                         );
                     }
+                    Some((client.keyboard_focus, held_modifiers(&client.keyboard)))
+                });
+                // the compositor's word for a modifier going down or
+                // coming up — out of the borrow, since the handler
+                // re-enters the client freely
+                if let Some((surface, held)) = report
+                    && surface != 0
+                {
+                    dispatch_at(surface, AppEvent::Modifiers(held));
                 }
-            }),
+            }
             Ev::RepeatInfo { rate, delay } => with_client(|client| {
                 client.keyboard.repeat_rate = rate;
                 client.keyboard.repeat_delay = delay;

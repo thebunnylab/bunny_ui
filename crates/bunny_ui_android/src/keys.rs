@@ -43,6 +43,24 @@ const META_CTRL_ON: i32 = 0x1000;
 const META_META_ON: i32 = 0x10000;
 const META_CAPS_LOCK_ON: i32 = 0x100000;
 
+/// The modifier keys themselves: left and right shift, alt, control
+/// and meta.
+pub fn is_modifier(keycode: i32) -> bool {
+    matches!(keycode, 57..=60 | 113 | 114 | 117 | 118)
+}
+
+/// What a meta state holds, in the shell's own mapping — Ctrl is the
+/// accelerator and carries `command`, Alt carries `option`, and
+/// `control` stays with the system, as [`key_pattern`] has it.
+pub fn held(meta_state: i32) -> bunny_ui::action::Modifiers {
+    bunny_ui::action::Modifiers {
+        shift: meta_state & META_SHIFT_ON != 0,
+        command: meta_state & META_CTRL_ON != 0,
+        option: meta_state & META_ALT_ON != 0,
+        control: false,
+    }
+}
+
 /// One key press, in the terms the keymap reads.
 #[derive(Clone, Debug)]
 pub struct KeyStroke {
@@ -232,6 +250,15 @@ mod tests {
         let pattern = key_pattern(&stroke_of(KEYCODE_F12, META_SHIFT_ON)).unwrap();
         assert_eq!(pattern.key, Key::F(12));
         assert!(pattern.shift);
+    }
+
+    #[test]
+    fn a_modifier_key_reports_the_state_it_leaves() {
+        assert!(is_modifier(59) && is_modifier(113) && is_modifier(117), "shift, ctrl, meta");
+        assert!(!is_modifier(KEYCODE_A));
+        let held = held(META_CTRL_ON | META_SHIFT_ON);
+        assert!(held.command && held.shift && !held.option && !held.control);
+        assert_eq!(super::held(0), bunny_ui::action::Modifiers::NONE, "the release");
     }
 
     #[test]

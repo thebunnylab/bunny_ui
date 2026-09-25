@@ -10558,6 +10558,70 @@ mod tests {
         assert_eq!(heard.borrow().last().map(Vec::len), Some(0), "the second lets go, and says so");
     }
 
+    /// The ⌘P cycle in miniature: the finder opens under a held command,
+    /// a second ⌘P walks the list, and LETTING GO of the command key is
+    /// what confirms — an event no stroke carries.
+    #[test]
+    fn letting_go_of_command_confirms_a_cycling_finder() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        use crate::action::Modifiers;
+        const FINDER: ActionId = ActionId("finder.open_or_cycle");
+        let runtime = Runtime::new();
+        runtime.bind(KeyPattern::command(Key::Char('p')), FINDER);
+        let selected = Rc::new(Cell::new(None::<usize>));
+        let opened: Rc<RefCell<Vec<usize>>> = Rc::default();
+        {
+            let selected = Rc::clone(&selected);
+            runtime.on_action(FINDER, move || {
+                selected.set(Some(selected.get().map_or(0, |line| line + 1)));
+            });
+        }
+        {
+            let (selected, opened) = (Rc::clone(&selected), Rc::clone(&opened));
+            runtime.observe_modifiers(move |was, now| {
+                if was.command
+                    && !now.command
+                    && let Some(line) = selected.take()
+                {
+                    opened.borrow_mut().push(line);
+                }
+            });
+        }
+        let command = Modifiers { command: true, ..Modifiers::NONE };
+
+        assert!(runtime.modifiers_changed(command), "the press is heard");
+        assert!(!runtime.modifiers_changed(command), "the same state twice is no change");
+        assert_eq!(runtime.held_modifiers(), command);
+        for _ in 0..3 {
+            let crate::action::KeyMatch::Action(id) = runtime.chord(&KeyPattern::command(Key::Char('p')))
+            else {
+                panic!("⌘P is bound");
+            };
+            assert!(runtime.dispatch_action(id));
+        }
+        assert_eq!(selected.get(), Some(2), "the walk moved twice after opening");
+        assert!(opened.borrow().is_empty(), "nothing opens while the key is down");
+
+        // shift joins and leaves — the command key never came up
+        assert!(runtime.modifiers_changed(Modifiers { shift: true, ..command }));
+        assert!(runtime.modifiers_changed(command));
+        assert!(opened.borrow().is_empty());
+
+        assert!(runtime.modifiers_changed(Modifiers::NONE), "the release is heard");
+        assert_eq!(opened.borrow().as_slice(), [2], "and it opens the line the walk stopped on");
+        assert_eq!(selected.get(), None, "the finder closed with it");
+    }
+
+    #[test]
+    fn a_modifier_change_nobody_hears_asks_for_no_frame() {
+        let runtime = Runtime::new();
+        let shift = crate::action::Modifiers::SHIFT;
+        assert!(!runtime.modifiers_changed(shift), "no sink: nothing to redraw for");
+        assert_eq!(runtime.held_modifiers(), shift, "the state still moved");
+    }
+
     #[test]
     fn the_key_table_can_be_emptied_so_a_cascade_re_installs() {
         use crate::layout::{Proposal, Size};

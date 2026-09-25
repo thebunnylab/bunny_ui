@@ -2943,7 +2943,7 @@ fn interpret(event: *mut GenericEvent) -> Step {
             if base != 0 && kind == base {
                 let notify = event as *mut XkbStateNotifyEvent;
                 if unsafe { (*notify).is_state_notify() } {
-                    with_x(|client| unsafe {
+                    let focus = with_x(|client| unsafe {
                         if !client.keyboard.state.is_null() {
                             crate::ffi::xkb_state_update_mask(
                                 client.keyboard.state,
@@ -2955,7 +2955,15 @@ fn interpret(event: *mut GenericEvent) -> Step {
                                 (*notify).locked_group as u32,
                             );
                         }
+                        client.keyboard_focus
                     });
+                    // the effective mods in the core mask's bits — the
+                    // only word of a modifier coming up, which makes no
+                    // key event the key road would hear
+                    if focus != 0 {
+                        let held = held_modifiers(unsafe { (*notify).mods } as u16);
+                        return Step::Deliver(focus, AppEvent::Modifiers(held));
+                    }
                 }
             }
             Step::Silence

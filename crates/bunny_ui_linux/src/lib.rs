@@ -987,6 +987,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     sync_frame_driver(runtime, &handler_pacer, window.raw_window());
                 }
             }
+            AppEvent::Modifiers(held) => {
+                // a release confirms, closes, opens — whatever the sink
+                // did, the frame that shows it is not one to wait for
+                if runtime.modifiers_changed(held) {
+                    blit(runtime, root, ORIGIN_KEY);
+                }
+            }
             AppEvent::ResignKey => {
                 // the user switched away: popovers close like the
                 // platform's own, and a page lets the keyboard go

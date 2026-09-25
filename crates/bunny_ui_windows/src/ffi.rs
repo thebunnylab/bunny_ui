@@ -332,8 +332,10 @@ const WM_ERASEBKGND: u32 = 0x0014;
 const WM_SETCURSOR: u32 = 0x0020;
 const WM_TIMER: u32 = 0x0113;
 const WM_KEYDOWN: u32 = 0x0100;
+const WM_KEYUP: u32 = 0x0101;
 const WM_CHAR: u32 = 0x0102;
 const WM_SYSKEYDOWN: u32 = 0x0104;
+const WM_SYSKEYUP: u32 = 0x0105;
 const WM_SYSCHAR: u32 = 0x0106;
 const WM_UNICHAR: u32 = 0x0109;
 const WM_MOVE: u32 = 0x0003;
@@ -577,6 +579,10 @@ pub enum AppEvent {
     /// movement, deletion, and the Ctrl chords over a focused field.
     /// `command` carries Ctrl, the platform's accelerator.
     Key { vk: u32, shift: bool, command: bool },
+    /// The modifier keys moved — what the hand holds now, read after a
+    /// Shift, Ctrl or Alt went down or came UP. The release types
+    /// nothing and makes no stroke; this is the only report of it.
+    Modifiers(bunny_ui::action::Modifiers),
     /// The text road: typing, a paste of characters, the IME's final
     /// commit — surrogate halves already joined at the boundary.
     Text(String),
@@ -713,6 +719,13 @@ fn held_modifiers_now() -> bunny_ui::action::Modifiers {
         option: down(VK_MENU),
         control: false,
     }
+}
+
+/// Is this virtual key one of the modifiers the keymap names? Shift,
+/// Ctrl and Alt, and their left and right twins (`VK_LSHIFT` to
+/// `VK_RMENU`), which is what a raw-input keyboard reports instead.
+fn is_modifier_key(vk: u32) -> bool {
+    matches!(vk, 0x10..=0x12 | 0xA0..=0xA5)
 }
 
 /// Builds the stroke for one `WM_KEYDOWN`/`WM_SYSKEYDOWN`.
@@ -2071,6 +2084,18 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             reclaim_keyboard();
             let (x, y) = layout_point(hwnd, lparam);
             dispatch_at(hwnd, AppEvent::RightMouseDown { x, y });
+            0
+        }
+        // a modifier going down or coming up: the state is read AFTER the
+        // message, which is what `GetKeyState` answers inside it. Alt
+        // travels as a system key, and the platform keeps its own use of
+        // those (the menu's F10, Alt+F4), so the default road still runs
+        WM_KEYUP | WM_SYSKEYUP | WM_SYSKEYDOWN if is_modifier_key(wparam as u32) => {
+            dispatch_at(hwnd, AppEvent::Modifiers(held_modifiers_now()));
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_KEYDOWN if is_modifier_key(wparam as u32) => {
+            dispatch_at(hwnd, AppEvent::Modifiers(held_modifiers_now()));
             0
         }
         WM_KEYDOWN => {

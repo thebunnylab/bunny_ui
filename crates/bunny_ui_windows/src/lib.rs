@@ -1156,6 +1156,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     blit(runtime, root);
                 }
             }
+            AppEvent::Modifiers(held) => {
+                // a release confirms, closes, opens — whatever the sink
+                // did, the frame that shows it is not one to wait for
+                if runtime.modifiers_changed(held) {
+                    blit(runtime, root);
+                }
+            }
             AppEvent::RightMouseDown { x, y } => {
                 // the runtime opens (or closes) the context menu; it
                 // presents with the scene until panels take it outside

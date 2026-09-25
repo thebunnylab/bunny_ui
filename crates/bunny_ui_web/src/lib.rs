@@ -288,6 +288,8 @@ enum Event {
     /// A character stroke (the modifiers decide whether it types or
     /// commands).
     KeyChar(char, u32),
+    /// The modifier keys moved: the bits of what the hand holds now.
+    Modifiers(u32),
     Frame { dt: f64 },
     /// The platform's motion preference, at boot and on every change.
     Motion { allowed: bool },
@@ -581,6 +583,11 @@ pub fn start_with(
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
+            Event::Modifiers(mods) => {
+                if runtime.modifiers_changed(held(mods)) {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
+            }
             // the canvas shell drives every animation itself, so the
             // reader's preference is the whole switch
             Event::Motion { allowed } => {
@@ -848,6 +855,11 @@ fn start_dom_with(
                 }
                 DRAG_ARMED.with(|armed| armed.set(runtime.drag_armed()));
             }
+            Event::Modifiers(mods) => {
+                if runtime.modifiers_changed(held(mods)) {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
             // The reader's own answer about motion. Springs stay the
             // browser's; the loops are ours, so they follow this.
             Event::Motion { allowed } => {
@@ -999,6 +1011,15 @@ pub extern "C" fn bunny_key_char(code_point: u32, mods: u32) {
     if let Some(character) = char::from_u32(code_point) {
         dispatch(Event::KeyChar(character, mods));
     }
+}
+
+/// The modifier keys moved — `mods` in the same bits a stroke carries,
+/// read from the `keydown` or `keyup` of the modifier itself. The glue
+/// calls it only when this export exists, so a page and a wasm of
+/// different ages still agree.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_modifiers(mods: u32) {
+    dispatch(Event::Modifiers(mods));
 }
 
 #[unsafe(no_mangle)]

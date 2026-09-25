@@ -187,6 +187,10 @@ pub enum AppEvent {
     /// The trackpad's pinch over the view: `scale` is the ratio of this
     /// step (1.0 = nothing), at the pointer.
     Magnify { x: f64, y: f64, scale: f64 },
+    /// The modifier keys moved (`flagsChanged:`) — what the hand holds
+    /// now. A modifier going down or coming UP types nothing and makes
+    /// no stroke; this is the only report of a release.
+    Modifiers(bunny_ui::action::Modifiers),
     /// RAW key — only arrives here when the focused field is NOT in the
     /// path (no focus, or cmd held): shortcuts and function keys. With
     /// focus, the event enters the input system (`interpretKeyEvents:`)
@@ -630,6 +634,14 @@ unsafe fn register_file_drag(view: Id) {
         let kinds = msg_id_arg(class("NSArray"), sel("arrayWithObject:"), kind);
         msg_void_id(view, sel("registerForDraggedTypes:"), kinds);
     }
+}
+
+/// `flagsChanged:` — a modifier key went down or came up. AppKit sends
+/// it to the key window's first responder, which is this view whenever
+/// the scene holds the keyboard.
+extern "C" fn bunny_flags_changed(_this: Id, _sel: Sel, event: Id) {
+    let held = unsafe { modifiers_of(msg_u64(event, sel("modifierFlags"))) };
+    dispatch(AppEvent::Modifiers(held));
 }
 
 extern "C" fn bunny_right_mouse_down(this: Id, _sel: Sel, event: Id) {
@@ -1675,6 +1687,12 @@ unsafe fn register_classes() {
             view,
             sel("keyDown:"),
             bunny_key_down as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            view,
+            sel("flagsChanged:"),
+            bunny_flags_changed as *const c_void,
             types.as_ptr(),
         );
         // the chord road that survives a hosted page holding the

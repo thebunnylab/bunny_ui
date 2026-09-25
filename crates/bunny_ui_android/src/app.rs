@@ -472,6 +472,11 @@ fn mount(runtime: Rc<Runtime>, root: impl View, app: Rc<AppInner>) {
                     blit(runtime, root);
                 }
             }
+            AppEvent::Modifiers(held) => {
+                if runtime.modifiers_changed(held) {
+                    blit(runtime, root);
+                }
+            }
             AppEvent::Key(stroke) => {
                 let shift = stroke.shift;
                 let edit = match stroke.keycode {

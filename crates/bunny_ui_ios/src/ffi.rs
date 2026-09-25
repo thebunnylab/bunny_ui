@@ -167,6 +167,9 @@ pub enum AppEvent {
     /// A hardware key the keymap gate did not take, that types nothing
     /// — an arrow, a forward delete, an escape, a chord with command.
     Key(KeyStroke),
+    /// A hardware keyboard's modifier keys moved — what the hand holds
+    /// now. The release makes no stroke; this is the only report of it.
+    Modifiers(bunny_ui::action::Modifiers),
     /// The caret's blink half-period.
     Blink,
     /// One display-link tick; `dt` seconds since the last, clamped.
@@ -624,11 +627,32 @@ fn silent_key(hid: u64) -> bool {
     matches!(hid, 0x29 | 0x2B | 0x4A..=0x52)
 }
 
+/// The HID usages of the modifier keys themselves — left and right
+/// control, shift, option and command (0xE0 to 0xE7).
+fn modifier_key(hid: u64) -> bool {
+    (0xE0..=0xE7).contains(&hid)
+}
+
+/// A press of a modifier key, down or up: the EVENT's flags are the
+/// state it leaves, which is the whole news. `true` when one was found.
+fn report_modifiers(presses: Id, event: Id) -> bool {
+    let moved = unsafe { touches_of(presses) }.into_iter().any(|press| unsafe {
+        let key = msg_id(press, sel("key"));
+        !key.is_null() && modifier_key(msg_i64(key, sel("keyCode")).max(0) as u64)
+    });
+    if moved {
+        let flags = unsafe { msg_i64(event, sel("modifierFlags")) }.max(0) as u64;
+        dispatch(AppEvent::Modifiers(modifiers_of(flags)));
+    }
+    moved
+}
+
 /// A hardware key. The keymap gate hears it first; a silent key the
 /// gate declines becomes an editing command; everything else goes on to
 /// UIKit, which types it through `insertText:` — so a letter is never
 /// typed twice, and backspace and return arrive by the keyboard's road.
 extern "C" fn bunny_presses_began(this: Id, _sel: Sel, presses: Id, event: Id) {
+    report_modifiers(presses, event);
     let mut taken = false;
     for press in unsafe { touches_of(presses) } {
         let key = unsafe { msg_id(press, sel("key")) };
@@ -683,6 +707,7 @@ extern "C" fn bunny_presses_began(this: Id, _sel: Sel, presses: Id, event: Id) {
 }
 
 extern "C" fn bunny_presses_ended(this: Id, _sel: Sel, presses: Id, event: Id) {
+    report_modifiers(presses, event);
     unsafe {
         let sup = ObjcSuper { receiver: this, class: class("UIView") };
         msg_super_void_id_id(&sup, sel("pressesEnded:withEvent:"), presses, event);
