@@ -682,9 +682,9 @@ pub enum LayoutNode {
         /// scrolls sideways; a many-line one takes the height the
         /// parent offers, wraps inside it, and scrolls down.
         multiline: bool,
-        /// `.auto_focus()`: the runtime focuses this field on its FIRST
-        /// appearance — and never again (a user blur is final).
-        auto_focus: bool,
+        /// When the field asks for the keyboard by itself — never, on its
+        /// first appearance, or on each new beat the app hands it.
+        auto_focus: AutoFocus,
         /// No chrome of its own: no fill, no border, and the clip is
         /// square. What is behind the field shows through, so a cell in
         /// a grid can be editable without wearing a box the design
@@ -2754,6 +2754,20 @@ struct QueuedOverlay {
     anchor_visible: bool,
 }
 
+/// When a field asks for the keyboard by itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AutoFocus {
+    /// Never: the keyboard comes by a click, a Tab or the app's own call.
+    #[default]
+    Off,
+    /// `.auto_focus()` — on the field's FIRST appearance, and only when
+    /// nobody holds the keyboard. Never again: a user blur is final.
+    First,
+    /// `.auto_focus_beat(beat)` — on each NEW beat, from whoever holds
+    /// the keyboard. A beat is one intent of the app's, fired once.
+    Beat(u64),
+}
+
 /// A placed text field: geometry + EFFECTIVE font at that point of the
 /// scene — click-to-position and IME sync measure through here.
 #[derive(Clone, Debug)]
@@ -2772,8 +2786,8 @@ pub struct FieldPlacement {
     pub run: Rect,
     pub text_origin: Point,
     pub font: FontSpec,
-    /// The field asked for focus on first appearance.
-    pub auto_focus: bool,
+    /// When the field asks for the keyboard by itself.
+    pub auto_focus: AutoFocus,
     /// The field shows bullets, not what it holds — so the runtime
     /// measures the MASK when it turns a click into a caret, and
     /// refuses the platform a copy.

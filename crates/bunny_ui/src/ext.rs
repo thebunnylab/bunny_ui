@@ -972,6 +972,26 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// The field takes the keyboard on each NEW `beat` — from whoever
+    /// holds it. The rule a custom box's `auto_focus(beat)` has always
+    /// kept, applied to a field.
+    ///
+    /// `.auto_focus()` is a first appearance that waits its turn: it
+    /// focuses only when nobody holds the keyboard, and a user blur is
+    /// final. That is right for a form that opens with its first box
+    /// live, and wrong for an intent: ⌘F hands a keymap editor's filter
+    /// the keyboard while the grid beside it holds the keys, and a find
+    /// bar opened over an editor must take them from the editor. The app
+    /// bumps the beat when it means it — each (field, beat) fires once,
+    /// so the reader can click away and stay away until the app beats
+    /// again.
+    fn auto_focus_beat(self, beat: u64) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::AutoFocusBeat(beat),
+        }
+    }
+
     /// A soft shadow behind the view — panel-grade halo with the house
     /// ink (quadratic falloff, paints outside the frame only).
     fn shadow(self, radius: f64) -> Modified<Self> {

@@ -188,6 +188,7 @@ pub struct TextField {
     bare: bool,
     secret: bool,
     editing: Option<Rc<dyn crate::text_input::EditingStrategy>>,
+    nav_intercept: Option<Binding<bool>>,
 }
 
 impl TextField {
@@ -197,6 +198,24 @@ impl TextField {
         strategy: Option<Rc<dyn crate::text_input::EditingStrategy>>,
     ) -> Self {
         self.editing = strategy;
+        self
+    }
+
+    /// Hands the bare vertical arrows and the bare Enter to the app's keys
+    /// while `intercepting` reads true: the field declines the three and
+    /// the stroke walks on to the keymap, where an open popover's own
+    /// context answers.
+    ///
+    /// A composer with a completion open is the case. ↑ and ↓ walk the
+    /// list and Enter accepts the row, and a field of many lines would
+    /// take all three first — the arrows for its caret, Enter for its
+    /// break or its submit — so the list never heard them. Read live, at
+    /// the stroke: the field stands aside for exactly as long as the list
+    /// is up. Everything else stays the field's — typing, the horizontal
+    /// arrows, Backspace — so the query keeps growing under the list, and
+    /// shift or a modifier with the arrows still selects and walks.
+    pub fn nav_intercept(mut self, intercepting: Binding<bool>) -> Self {
+        self.nav_intercept = Some(intercepting);
         self
     }
 
@@ -281,6 +300,7 @@ impl View for TextField {
                     path.clone(),
                     crate::reconciler::EditorFn {
                     submit_on_enter: self.submit_on_enter,
+                    nav_intercept: self.nav_intercept.clone(),
                     key: self.editing.as_ref().map(|_| Rc::new(move |stroke: &crate::action::Stroke, state: &mut crate::text_input::CaretState| {
                         let Some(strategy) = &key_strategy else { return false };
                         let mut value = key_binding.wrappedValue();
@@ -335,7 +355,7 @@ impl View for TextField {
                     content: Arc::from(value),
                     placeholder: self.placeholder.clone(),
                     multiline: self.multiline,
-                    auto_focus: false,
+                    auto_focus: crate::layout::AutoFocus::Off,
                     secret: self.secret,
                 });
             }
@@ -555,6 +575,7 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
         bare: false,
         secret: false,
         editing: None,
+        nav_intercept: None,
     }
 }
 
@@ -578,6 +599,7 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         bare: false,
         secret: false,
         editing: None,
+        nav_intercept: None,
     }
 }
 

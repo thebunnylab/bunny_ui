@@ -59,8 +59,8 @@ pub(crate) struct FlowOutput {
     /// already in island-local coordinates (each subtree placed at its
     /// own origin).
     pub display: crate::layout::DisplayList,
-    /// The fields on stage: `(path, wants the first focus)`.
-    pub fields: Vec<(String, bool)>,
+    /// The fields on stage, and when each asks for the keyboard.
+    pub fields: Vec<(String, crate::layout::AutoFocus)>,
     /// The app's boxes inside each island, with ISLAND-LOCAL frames —
     /// exactly the coordinates the browser reports on the canvas.
     pub customs: Vec<(std::rc::Rc<str>, crate::layout::CustomPlacement)>,
@@ -152,7 +152,7 @@ struct Walk<'a> {
     drops_seen: usize,
     overlays: Vec<DomNode>,
     display: crate::layout::DisplayList,
-    fields: Vec<(String, bool)>,
+    fields: Vec<(String, crate::layout::AutoFocus)>,
     /// A class the current boundary's body declared for its OWN
     /// group element (`boundary_class`), consumed when it closes.
     pending_boundary_class: Option<String>,

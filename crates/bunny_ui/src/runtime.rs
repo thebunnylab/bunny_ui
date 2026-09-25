@@ -3673,6 +3673,13 @@ impl Runtime {
         {
             return Edited { applied: false, output: None };
         }
+        // the same three, handed to the app's navigation while it asks:
+        // a completion open over a composer walks and accepts with them
+        if matches!(command, EditCommand::Newline | EditCommand::Up(false) | EditCommand::Down(false))
+            && reconciler::field_intercepts_nav(&path)
+        {
+            return Edited { applied: false, output: None };
+        }
         // three commands a headless model cannot answer: they need the
         // wrap, and the wrap is geometry. A field that declines lets
         // the stroke through to the app, which is the whole point of
@@ -4131,15 +4138,10 @@ impl Runtime {
         *self.dom_customs.borrow_mut() = output.customs.clone();
         drop(offsets);
         drop(carets);
-        // the first field that asks for focus takes it — once
-        for (path, wants) in &output.fields {
-            if *wants
-                && !self.auto_focused.borrow().contains(path)
-            {
-                self.auto_focused.borrow_mut().insert(path.clone());
-                if self.focus.borrow().is_none() {
-                    self.focus(path);
-                }
+        // a field that asks for the keyboard takes it by the one rule
+        for (path, ask) in &output.fields {
+            if self.claim_auto_focus(path, *ask) {
+                break;
             }
         }
         self.dom.borrow_mut().lower(&output.scene, &output.display)
@@ -5256,12 +5258,13 @@ impl Runtime {
         self.follow_named_inputs();
         self.carets.borrow_mut().retain(|path, _| reconciler::has_editor(path));
         self.auto_focused.borrow_mut().retain(|key| {
-            // a custom box's once-per-beat memory is keyed `path#beat`:
-            // keep it while the BOX lives — sweeping it would re-arm the
-            // beat every pass and the box would steal focus forever
+            // a once-per-beat memory is keyed `path#beat`, a box's or a
+            // field's: keep it while that input lives — sweeping it would
+            // re-arm the beat every pass and the input would steal focus
+            // forever
             match key.rsplit_once('#') {
                 Some((path, beat)) if beat.bytes().all(|b| b.is_ascii_digit()) => {
-                    reconciler::has_custom(path)
+                    reconciler::has_custom(path) || reconciler::has_editor(path)
                 }
                 _ => reconciler::has_editor(key),
             }
@@ -5343,18 +5346,49 @@ impl Runtime {
         if seen.remove(from) {
             seen.insert(to.to_string());
         }
+        // the beats it already answered move with it, or the new house
+        // would answer them again
+        let beats: Vec<String> = seen
+            .iter()
+            .filter(|key| key.strip_prefix(from).is_some_and(|rest| rest.starts_with('#')))
+            .cloned()
+            .collect();
+        for key in beats {
+            seen.remove(&key);
+            seen.insert(format!("{to}{}", &key[from.len()..]));
+        }
     }
 
-    /// Focuses the first `.auto_focus()` field never seen before — once
-    /// per identity: blur is final, remounting does not re-focus.
+    /// A field's own ask for the keyboard, answered once. The first
+    /// appearance takes it only when nobody holds it; a beat is an intent
+    /// of the app's and takes it from whoever does — the box's rule, the
+    /// same words. `true` when the keyboard moved.
+    fn claim_auto_focus(&self, path: &str, ask: crate::layout::AutoFocus) -> bool {
+        use crate::layout::AutoFocus;
+        let key = match ask {
+            AutoFocus::Off => return false,
+            AutoFocus::First => path.to_string(),
+            AutoFocus::Beat(beat) => format!("{path}#{beat}"),
+        };
+        if !self.auto_focused.borrow_mut().insert(key) {
+            return false;
+        }
+        let free = match ask {
+            AutoFocus::Beat(_) => self.focus.borrow().as_deref() != Some(path),
+            _ => self.focus.borrow().is_none(),
+        };
+        if free {
+            self.focus(path);
+        }
+        free
+    }
+
+    /// Focuses the first field whose ask is new — once per identity for
+    /// `.auto_focus()` (blur is final, remounting does not re-focus), once
+    /// per beat for `.auto_focus_beat` — then the boxes' beats.
     fn apply_auto_focus(&self, result: &crate::layout::LayoutResult) -> bool {
         for field in &result.fields {
-            if !field.auto_focus || self.auto_focused.borrow().contains(&field.path) {
-                continue;
-            }
-            self.auto_focused.borrow_mut().insert(field.path.clone());
-            if self.focus.borrow().is_none() {
-                self.focus(&field.path);
+            if self.claim_auto_focus(&field.path, field.auto_focus) {
                 return true;
             }
         }

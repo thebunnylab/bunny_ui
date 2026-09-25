@@ -5947,6 +5947,125 @@ mod tests {
         assert_eq!(box_of(&Name { text: State::new(String::new()) }, viewport).size.height, 26.0);
     }
 
+    /// A composer with a completion open: the list walks with ↑ and ↓ and
+    /// accepts on Enter, so the field of many lines must stand aside for
+    /// those three — and only those three, and only while the list is up.
+    #[test]
+    fn a_field_hands_its_navigation_to_the_app_while_it_intercepts() {
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::EditCommand;
+
+        #[derive(Clone, Copy)]
+        struct Composer {
+            prompt: State<String>,
+            completing: State<bool>,
+        }
+
+        impl Component for Composer {
+            fn body(self, _ctx: &Context) -> impl View {
+                text_editor("ask", self.prompt.binding())
+                    .nav_intercept(self.completing.binding())
+                    .id("composer")
+                    .frame(240.0, 80.0)
+            }
+        }
+
+        let composer = Composer { prompt: State::new("@re".to_string()), completing: State::new(true) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&composer);
+        runtime.layout(&composer, Proposal::exact(Size { width: 300.0, height: 120.0 }));
+        assert!(runtime.focus_named("composer"));
+
+        assert!(!runtime.key(EditCommand::Up(false)).applied, "↑ walks the list");
+        assert!(!runtime.key(EditCommand::Down(false)).applied, "↓ walks the list");
+        assert!(!runtime.key(EditCommand::Newline).applied, "Enter accepts the row");
+        assert!(runtime.key(EditCommand::Insert("a".into())).applied, "the query keeps growing");
+        assert!(runtime.key(EditCommand::Up(true)).applied, "a shifted arrow still selects");
+        assert_eq!(composer.prompt.get(), "@rea");
+
+        // the list closes: the three come back, read at the stroke
+        composer.completing.set(false);
+        assert!(runtime.key(EditCommand::Newline).applied, "the break is the field's again");
+        assert!(runtime.key(EditCommand::Up(false)).applied);
+        assert!(composer.prompt.get().contains('\n'));
+    }
+
+    /// ⌘F in a keymap editor: the grid (a box) holds the keys since the
+    /// tab opened, and the filter field is mounted under a beat. A field's
+    /// `.auto_focus()` waits for a keyboard nobody holds; a beat takes it.
+    #[test]
+    fn a_field_beat_takes_the_keyboard_from_the_box_that_holds_it() {
+        use crate::layout::{Proposal, Size};
+
+        struct Grid;
+
+        impl CustomElement for Grid {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+        }
+
+        #[derive(Clone, Copy)]
+        struct Tab {
+            filter: State<String>,
+            beat: State<u64>,
+            first_only: State<bool>,
+        }
+
+        impl Component for Tab {
+            fn body(self, _ctx: &Context) -> impl View {
+                let field = text_field("filter", self.filter.binding()).id("filter");
+                let field = if self.first_only.get() {
+                    Either::First(field.auto_focus())
+                } else {
+                    Either::Second(field.auto_focus_beat(self.beat.get()))
+                };
+                vstack!(field, custom(Grid).id("grid").frame(300.0, 200.0))
+            }
+        }
+
+        let tab = Tab { filter: State::new(String::new()), beat: State::new(0), first_only: State::new(true) };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 320.0, height: 260.0 });
+        let lay = || {
+            runtime.render_stable(&tab);
+            runtime.layout(&tab, viewport)
+        };
+        let press_grid = |result: &crate::layout::LayoutResult| {
+            let grid = result.customs.first().expect("the grid is placed").frame;
+            runtime.pointer_pressed(grid.origin.x + 10.0, grid.origin.y + 10.0);
+            runtime.pointer_released(grid.origin.x + 10.0, grid.origin.y + 10.0);
+            runtime.focused().expect("a press on the grid holds the keys")
+        };
+        let focused_field = || runtime.focused().is_some_and(|path| path.ends_with("[filter]"));
+
+        // the first appearance focused the field; the grid takes the keys
+        let result = lay();
+        assert!(focused_field(), "nobody held the keyboard: the first ask lands");
+        let grid = press_grid(&result);
+
+        // a first-only ask never comes back to take them
+        lay();
+        assert_eq!(runtime.focused(), Some(grid.clone()), "the first ask was spent");
+
+        // ⌘F: the field is mounted under a beat — it takes the keyboard
+        tab.first_only.set(false);
+        tab.beat.set(1);
+        let result = lay();
+        assert!(focused_field(), "the beat takes the keys from the grid");
+
+        // the reader goes back to the grid, and the same beat stays spent
+        let grid = press_grid(&result);
+        lay();
+        assert_eq!(runtime.focused(), Some(grid), "each (field, beat) fires once");
+
+        // the next ⌘F beats again
+        tab.beat.set(2);
+        lay();
+        assert!(focused_field(), "a new beat is a new intent");
+    }
+
     #[test]
     fn the_many_line_field_owns_the_break_and_the_vertical_arrows() {
         use crate::layout::{Proposal, Size};
