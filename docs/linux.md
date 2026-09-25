@@ -229,7 +229,10 @@ time through six libraries the shell opens by name (`libwpe`,
 `WPEBackend-fdo`, `WPEWebKit`, GLib, GObject, `libwayland-server`;
 `wpe.rs`) and never links: an app without a webview never loads them,
 and a box without them refuses the road with one line naming the
-package. The engine renders out of process and hands every frame back
+package. The backend is named to libwpe through `wpe_loader_init`,
+not the `WPE_BACKEND_LIBRARY` variable alone — a release build of
+libwpe (Arch's) never reads it and aborts looking for a
+`libWPEBackend-default.so` no distribution ships. The engine renders out of process and hands every frame back
 as a `wl_shm` buffer; the shell copies it once, straight RGBA, and
 paints it as one image where the host stood in the display list
 (`webview.rs`). That is the whole island contract on this shell — no

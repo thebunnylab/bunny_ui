@@ -296,6 +296,20 @@ pub(crate) fn loader() -> Option<&'static Stack> {
                 }
             }
             let [glib, gobject, wpe, fdo, webkit, wl] = handles;
+            // the variable is read only by a libwpe built without
+            // NDEBUG (Debian's is; Arch's is not, and falls back to a
+            // `libWPEBackend-default.so` no distribution ships, then
+            // aborts). The loader's own door works on every build, and
+            // WebKit hands the loaded name on to its web process
+            if let Some(init) = resolve(wpe, "wpe_loader_init") {
+                let init: unsafe extern "C" fn(*const c_char) -> bool =
+                    unsafe { std::mem::transmute(init) };
+                let chosen = std::env::var("WPE_BACKEND_LIBRARY")
+                    .ok()
+                    .and_then(|name| CString::new(name).ok())
+                    .unwrap_or_else(|| CString::new(BACKEND_LIBRARY).expect("a soname"));
+                unsafe { init(chosen.as_ptr()) };
+            }
             let stack = unsafe { table(glib, gobject, wpe, fdo, webkit, wl) };
             if stack.is_none() {
                 eprintln!(
