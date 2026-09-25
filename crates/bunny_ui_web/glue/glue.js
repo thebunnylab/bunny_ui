@@ -185,6 +185,7 @@ const imports = {
       queueMicrotask(() => {
         wakeArmed = false;
         wasm.bunny_wake();
+        followText();
       });
     },
     // dom-mode imports — the single binary carries both shells, and
@@ -353,6 +354,10 @@ const FUNCTION_KEY = /^F([1-9]|1[0-9]|2[0-4])$/;
 // The keys whose going down or coming up is itself the news.
 const MODIFIER_KEYS = new Set(["Shift", "Meta", "Control", "Alt"]);
 
+// Set when the page attaches: moves the composition editable to wherever
+// the engine's keyboard is taking text (see the composition road).
+let followText = () => {};
+
 // 1 shift, 2 command, 4 option, 8 control — the engine's bits.
 function modifiers(event) {
   return (
@@ -427,6 +432,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       // the same four bits a stroke carries: what the hand holds means
       // the same thing whether it arrives with a key or with a click
       wasm.bunny_pointer_down(x, y, event.timeStamp, event.button, modifiers(event));
+      followText();
     });
     host.addEventListener("contextmenu", (event) => {
       // the scene offers its own menu — the browser's stays home
@@ -437,6 +443,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     host.addEventListener("pointerup", (event) => {
       const [x, y] = point(event);
       wasm.bunny_pointer_up(x, y);
+      followText();
     });
     host.addEventListener(
       "wheel",
@@ -450,6 +457,68 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       },
       { passive: false },
     );
+    // The composition road. Canvas mode owns no editable element, so an input
+    // method had nothing to compose into: Latin typing, dead keys and AltGr
+    // arrive by `keydown`, and a composition — every CJK reader's — produced
+    // nothing at all. A hidden editable is the input method's target while the
+    // engine's keyboard takes text: it stands under the caret, so the
+    // candidates open there, and hands the composition over as marked text and
+    // its commit as text. It lives on the BODY, never in the host, whose
+    // children are the drawing surface and are replaced whole.
+    const ime = document.createElement("textarea");
+    ime.setAttribute("aria-hidden", "true");
+    ime.setAttribute("autocomplete", "off");
+    ime.setAttribute("autocorrect", "off");
+    ime.setAttribute("autocapitalize", "off");
+    ime.spellcheck = false;
+    ime.tabIndex = -1;
+    ime.style.cssText =
+      "position:fixed;left:0;top:0;width:1px;height:16px;padding:0;margin:0;border:0;" +
+      "opacity:0;resize:none;overflow:hidden;pointer-events:none;white-space:pre;z-index:-1";
+    document.body.appendChild(ime);
+    let composing = false;
+    // the editable follows the keyboard: focused, under the caret, exactly
+    // while the engine takes text — asked after anything that could move it
+    followText = () => {
+      if (!wasm || !wasm.bunny_text_caret) return;
+      if (wasm.bunny_text_caret()) {
+        const box = host.getBoundingClientRect();
+        ime.style.left = `${box.left + wasm.bunny_caret_x()}px`;
+        ime.style.top = `${box.top + wasm.bunny_caret_y()}px`;
+        ime.style.height = `${Math.max(1, wasm.bunny_caret_height())}px`;
+        if (document.activeElement !== ime) ime.focus({ preventScroll: true });
+      } else if (document.activeElement === ime && !composing) {
+        ime.blur();
+      }
+    };
+    const sendMarked = (value) => {
+      if (!wasm.bunny_marked) return;
+      const encoded = new TextEncoder().encode(value);
+      const pointer = wasm.bunny_alloc(encoded.length);
+      new Uint8Array(wasm.memory.buffer, pointer >>> 0, encoded.length).set(encoded);
+      wasm.bunny_marked(pointer, encoded.length);
+    };
+    ime.addEventListener("compositionstart", () => {
+      composing = true;
+    });
+    ime.addEventListener("compositionupdate", (event) => sendMarked(event.data || ""));
+    ime.addEventListener("compositionend", (event) => {
+      composing = false;
+      // the commit replaces what is marked; an empty one cancels the mark
+      if (event.data) sendText(event.data);
+      else sendMarked("");
+      ime.value = "";
+      followText();
+    });
+    // what arrives by `input` and never by `keydown`: a driver's insertText, a
+    // keyboard that types without keys. A composition's own input events are
+    // the composition's, and it already spoke for them
+    ime.addEventListener("input", (event) => {
+      if (composing || event.isComposing) return;
+      if (event.inputType === "insertText" && event.data) sendText(event.data);
+      ime.value = "";
+    });
+
     // a modifier's release types nothing and makes no stroke: the
     // state it leaves is the whole event
     window.addEventListener("keyup", (event) => {
@@ -458,6 +527,9 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       }
     });
     window.addEventListener("keydown", (event) => {
+      // a key the input method is composing with is the input method's:
+      // it commits, walks the candidates, cancels — none of it is ours
+      if (event.isComposing || event.keyCode === 229) return;
       const mods = modifiers(event);
       if (MODIFIER_KEYS.has(event.key)) {
         if (wasm.bunny_modifiers) wasm.bunny_modifiers(mods);
@@ -490,6 +562,8 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         sendText(event.key);
       }
     });
+    // after every key — a Tab, an Escape, a binding may have moved the keyboard
+    window.addEventListener("keydown", () => followText());
     // The paste road: a page cannot read the clipboard on a keystroke,
     // so cmd-v is let through above and the browser's own `paste` event
     // carries the text — through the same door typing takes.

@@ -236,6 +236,21 @@ fn stroke(runtime: &Runtime, pattern: KeyPattern) -> bool {
     }
 }
 
+/// Where the keyboard is taking text, for the glue's editable: whether a
+/// field or a box holds the keyboard and takes text, and the caret.
+fn note_text_caret(runtime: &Runtime) {
+    let takes = runtime.focus_takes_text();
+    let caret = takes
+        .then(|| runtime.ime_snapshot())
+        .flatten()
+        .map(|snapshot| {
+            let rect = snapshot.caret_rect;
+            (rect.origin.x, rect.origin.y, rect.size.height)
+        });
+    let (x, y, height) = caret.unwrap_or((0.0, 0.0, 16.0));
+    TEXT_CARET.with(|slot| slot.set((takes, x, y, height)));
+}
+
 /// Hands a copied text to the page's clipboard.
 fn clipboard_write(text: &str) {
     unsafe { js_clipboard_write(text.as_ptr(), text.len()) };
@@ -302,6 +317,12 @@ enum Event {
     KeyChar(char, u32),
     /// The modifier keys moved: the bits of what the hand holds now.
     Modifiers(u32),
+    /// A live composition: the marked text, which replaces the last one
+    /// and stays marked until the commit (`Text`) or an empty mark.
+    Marked(String),
+    /// The glue asks where the keyboard is taking text, so its editable
+    /// stands under the caret — answered into [`TEXT_CARET`].
+    TextCaret,
     Frame { dt: f64 },
     /// The platform's motion preference, at boot and on every change.
     Motion { allowed: bool },
@@ -339,6 +360,11 @@ thread_local! {
     /// answers it, so the glue keeps the browser's own meaning for a key
     /// nobody here wanted.
     static KEY_TAKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the keyboard is taking text, and the caret it would type
+    /// at `(x, y, height)`, layout points of the page — the last answer
+    /// to `bunny_text_caret`.
+    static TEXT_CARET: std::cell::Cell<(bool, f64, f64, f64)> =
+        const { std::cell::Cell::new((false, 0.0, 0.0, 0.0)) };
     /// The running click count, `(when, x, y, count)`. The browser
     /// counts on `mousedown` and NOT on `pointerdown` (which reports
     /// `detail` zero), and the glue listens on `pointerdown` so touch
@@ -550,6 +576,15 @@ pub fn start_with(
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
+            Event::Marked(text) => {
+                // the caret stands at the composition's end, the way
+                // every input system leaves it while the reader types
+                let caret = text.encode_utf16().count();
+                if runtime.key(EditCommand::SetMarked { text, caret_utf16: (caret, 0) }).applied {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
+            }
+            Event::TextCaret => note_text_caret(&runtime),
             Event::KeyChar(character, mods) => {
                 if stroke(&runtime, pattern(bunny_ui::action::Key::Char(character.to_ascii_lowercase()), mods)) {
                     present(&runtime, &full, size, scale, &mut surface);
@@ -864,6 +899,13 @@ fn start_dom_with(
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
+            Event::Marked(text) => {
+                let caret = text.encode_utf16().count();
+                if runtime.key(EditCommand::SetMarked { text, caret_utf16: (caret, 0) }).applied {
+                    present(&runtime, runtime.dom_frame(&root, size), scale);
+                }
+            }
+            Event::TextCaret => note_text_caret(&runtime),
             // a pointer MOVE reaches us in this mode only between a
             // press that armed a drag and its release (the glue opens
             // the door and closes it) — so a drag works here too and
@@ -943,6 +985,49 @@ pub extern "C" fn bunny_alloc(len: usize) -> *mut u8 {
 pub extern "C" fn bunny_text(pointer: *mut u8, len: usize) {
     let text = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
     dispatch(Event::Text(text));
+}
+
+/// A live composition — the marked text, UTF-8 through the same
+/// allocator road as `bunny_text`. An empty one cancels the mark; the
+/// commit is `bunny_text`, which replaces what is marked.
+///
+/// The canvas owns no editable element, so without this the browser had
+/// nothing to compose into: Latin typing, dead keys and AltGr arrive by
+/// `keydown` as text, and an input method that commits through
+/// `compositionend` — every CJK reader's — produced nothing at all.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_marked(pointer: *mut u8, len: usize) {
+    let text = unsafe { String::from_raw_parts(pointer, len, len.max(1)) };
+    dispatch(Event::Marked(text));
+}
+
+/// Is the keyboard taking text right now? 1 = a field or a box that
+/// takes text holds it. The glue asks after the input that could move
+/// the keyboard, and keeps its editable focused — and standing under the
+/// caret, so the input method's candidates open there — exactly while
+/// this says yes. The caret is `bunny_caret_x`, `_y` and `_height`.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_text_caret() -> u32 {
+    dispatch(Event::TextCaret);
+    TEXT_CARET.with(|slot| slot.get().0) as u32
+}
+
+/// The caret's left edge, layout points from the page's own box.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_caret_x() -> f64 {
+    TEXT_CARET.with(|slot| slot.get().1)
+}
+
+/// The caret's top, layout points from the page's own box.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_caret_y() -> f64 {
+    TEXT_CARET.with(|slot| slot.get().2)
+}
+
+/// The caret's height, layout points.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_caret_height() -> f64 {
+    TEXT_CARET.with(|slot| slot.get().3)
 }
 
 /// `mods` is the same four bits a press and a stroke carry: 1 shift,
