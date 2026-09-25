@@ -10419,6 +10419,109 @@ mod tests {
         assert_eq!(runtime.match_key(&escape), Some(GLOBAL), "unmounted context goes quiet");
     }
 
+    /// The agent's Escape: the composer sits in a dock that is open
+    /// beside the editor. Its chain — deny the oldest request, interrupt
+    /// the turn — must run for an Escape given IN the composer and never
+    /// for one given in the editor, although both are mounted.
+    #[test]
+    fn a_focused_context_answers_only_while_the_keyboard_is_inside_it() {
+        use crate::layout::{Proposal, Size};
+
+        const DENY: ActionId = ActionId("agent.escape");
+        const EDITOR_ESCAPE: ActionId = ActionId("editor.escape");
+
+        #[derive(Clone, Copy)]
+        struct Bench {
+            code: State<String>,
+            prompt: State<String>,
+        }
+
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text_field("code", self.code.binding()).id("editor"),
+                    vstack!(text("Agent"), text_field("ask", self.prompt.binding()).id("composer"))
+                        .key_context_focused("agent")
+                        .key_context("dock"),
+                )
+            }
+        }
+
+        let viewport = Proposal::exact(Size { width: 400.0, height: 200.0 });
+        let bench = Bench { code: State::new(String::new()), prompt: State::new(String::new()) };
+        let runtime = Runtime::new();
+        let escape = KeyPattern::key(Key::Escape);
+        runtime.bind(escape, EDITOR_ESCAPE);
+        runtime.bind_in("agent", escape, DENY);
+        runtime.settle(&bench);
+        runtime.layout(&bench, viewport);
+
+        assert_eq!(runtime.match_key(&escape), Some(EDITOR_ESCAPE), "nobody holds the keyboard");
+        assert_eq!(runtime.active_contexts(), vec!["dock"], "mounted, and nothing more");
+
+        assert!(runtime.focus_named("editor"));
+        assert_eq!(runtime.match_key(&escape), Some(EDITOR_ESCAPE), "the editor's Escape is its own");
+        assert_eq!(runtime.active_contexts(), vec!["dock"]);
+
+        assert!(runtime.focus_named("composer"));
+        assert_eq!(runtime.match_key(&escape), Some(DENY), "the composer's Escape runs the chain");
+        assert_eq!(runtime.active_contexts(), vec!["agent", "dock"], "declared on one view, in order");
+
+        runtime.blur();
+        assert_eq!(runtime.match_key(&escape), Some(EDITOR_ESCAPE), "a blur takes the chain away");
+    }
+
+    /// The key-context debugger's door: every stroke the keymap reads,
+    /// with the contexts in force and what it resolved to.
+    #[test]
+    fn a_key_sink_hears_the_stroke_its_contexts_and_its_answer() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use crate::action::{KeyMatch, KeyReport, Stroke};
+        use crate::layout::{Proposal, Size};
+
+        const CLOSE: ActionId = ActionId("palette.close");
+        const KEYMAP: ActionId = ActionId("workbench.keymap");
+
+        #[derive(Clone, Copy)]
+        struct App;
+
+        impl Component for App {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("bench"), text("palette").key_context("palette")).key_context("workbench")
+            }
+        }
+
+        let runtime = Runtime::new();
+        let escape = KeyPattern::key(Key::Escape);
+        let k = KeyPattern::command(Key::Char('k'));
+        let s_key = KeyPattern::command(Key::Char('s'));
+        runtime.bind_in("palette", escape, CLOSE);
+        runtime.bind_sequence(&[k, s_key], KEYMAP);
+        runtime.settle(&App);
+        runtime.layout(&App, Proposal::exact(Size { width: 200.0, height: 100.0 }));
+        let heard: Rc<RefCell<Vec<KeyReport>>> = Rc::default();
+        {
+            let heard = Rc::clone(&heard);
+            runtime.observe_keys(move |report| heard.borrow_mut().push(report.clone()));
+        }
+
+        let _ = runtime.chord(&escape);
+        let _ = runtime.chord(&k);
+        let _ = runtime.chord(&s_key);
+        let _ = runtime.chord(&KeyPattern::key(Key::F(12)));
+
+        let heard = heard.borrow();
+        let answers: Vec<KeyMatch> = heard.iter().map(|report| report.matched).collect();
+        assert_eq!(
+            answers,
+            [KeyMatch::Action(CLOSE), KeyMatch::Pending, KeyMatch::Action(KEYMAP), KeyMatch::None],
+        );
+        assert_eq!(heard[0].stroke, Stroke::from(escape));
+        assert_eq!(heard[0].contexts, vec!["workbench", "palette"], "outermost first");
+    }
+
     #[test]
     fn a_sequence_holds_the_keyboard_until_the_second_stroke() {
         use crate::action::KeyMatch;

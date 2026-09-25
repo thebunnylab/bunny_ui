@@ -1098,6 +1098,29 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// Declares a key context active while the KEYBOARD is inside this
+    /// view — a field or a box somewhere below it holds the focus. The
+    /// bindings `bind_in(name, …)` answer then and only then.
+    ///
+    /// `.key_context` counts while the view is mounted, and that is the
+    /// right law for a palette: it is open, its keys work. It is the
+    /// wrong one for a composer that sits in a dock beside the editor.
+    /// Mounted is not focused — an Escape given in the editor, with the
+    /// dock open and a turn running, would fall into the composer's
+    /// chain and deny a request nobody was answering. Declared this way,
+    /// the composer's keys belong to the composer only while the caret
+    /// is in it, which is how the product's own editor hears its Escape.
+    ///
+    /// A focused declaration that nobody's keyboard is in is simply not
+    /// active — the global map and the other contexts answer as if it
+    /// were not there.
+    fn key_context_focused(self, name: &'static str) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::KeyContextFocused(name),
+        }
+    }
+
     // MARK: - Interaction
 
     /// `.onTapGesture { … }` — in the headless runtime it fires on render.

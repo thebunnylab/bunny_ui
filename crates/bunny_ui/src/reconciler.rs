@@ -73,6 +73,11 @@ pub(crate) type ScrollEntry = (String, ScrollFn);
 pub(crate) type MeasureFn = Rc<dyn Fn(crate::layout::Size)>;
 pub(crate) type MeasureEntry = (String, MeasureFn);
 
+/// A key context declared at render: (the declaring view's path, the
+/// name, whether it counts only while the keyboard is inside that view).
+/// Retained like the handlers — a skipped view's context stays declared.
+pub(crate) type ContextEntry = (String, &'static str, bool);
+
 /// A NAMED action handler registered at render: (registration path,
 /// id, what runs). Retained like the actions — a skipped view's
 /// handler lives.
@@ -152,8 +157,9 @@ pub(crate) struct Entry {
     /// The body's named-action handlers — same retention.
     pub handlers: Vec<HandlerEntry>,
     /// Key contexts declared in the body (`.key_context(name)`) — a
-    /// context is ACTIVE while a view declaring it stays mounted.
-    pub contexts: Vec<&'static str>,
+    /// context is ACTIVE while a view declaring it stays mounted, or
+    /// (`.key_context_focused(name)`) while the keyboard is inside it.
+    pub contexts: Vec<ContextEntry>,
     /// The PARENT's path segments, packed — the cursor seed for an isolated
     /// re-run.
     pub parent_segments: motor::identity::PathSeed,
@@ -171,7 +177,7 @@ struct BuildingFrame {
     webviews: Vec<WebviewEntry>,
     customs: Vec<(String, bool)>,
     handlers: Vec<HandlerEntry>,
-    contexts: Vec<&'static str>,
+    contexts: Vec<ContextEntry>,
 }
 
 #[derive(Default)]
@@ -192,7 +198,7 @@ struct PassState {
     root_webviews: Vec<WebviewEntry>,
     root_customs: Vec<(String, bool)>,
     root_handlers: Vec<HandlerEntry>,
-    root_contexts: Vec<&'static str>,
+    root_contexts: Vec<ContextEntry>,
     /// Instrumentation: bodies that ran in this pass.
     body_runs: Vec<String>,
     /// Boundaries SKIPPED in this pass — a skipped one's subtree
@@ -617,45 +623,87 @@ pub(crate) fn attribute_custom(path: String, accepts_keys: bool) {
     });
 }
 
-/// A named-action handler registered during render — same attribution
-/// as the actions: entry being built, or the root region.
-/// A key context declared during render — active while its view stays
-/// mounted (retained like the handlers; the sweep deactivates it).
-pub(crate) fn attribute_context(name: &'static str) {
+/// A key context declared during render at `path` — active while its
+/// view stays mounted, or, `focused`, only while the keyboard is inside
+/// that view (retained like the handlers; the sweep deactivates it).
+pub(crate) fn attribute_context(path: String, name: &'static str, focused: bool) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         if let Some(frame) = pass.building.last_mut() {
-            frame.contexts.push(name);
+            frame.contexts.push((path, name, focused));
         } else {
-            pass.root_contexts.push(name);
+            pass.root_contexts.push((path, name, focused));
         }
     });
 }
 
 thread_local! {
+    /// The contexts a mounted view declares — active for as long as it
+    /// is mounted, whoever holds the keyboard.
     static ACTIVE_CONTEXTS: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::default());
+    /// Every live declaration, in the order a stack reads them —
+    /// outermost first — with the view it hangs on and whether it
+    /// waits for the keyboard to be inside that view.
+    static DECLARED_CONTEXTS: RefCell<Vec<ContextEntry>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Rebuilds the active-context set from the retention (the live
+/// Rebuilds the active contexts from the retention (the live
 /// declarations) — the twin of the handler assembly.
 pub(crate) fn assemble_contexts(root: &str) {
-    let mut active: HashSet<&'static str> = HashSet::default();
+    let mut declared: Vec<ContextEntry> = Vec::new();
     RETAINED.with(|retained| {
         for (path, entry) in retained.borrow().iter() {
             if covers(root, path) {
-                active.extend(entry.contexts.iter().copied());
+                declared.extend(entry.contexts.iter().cloned());
             }
         }
     });
     PASS.with(|pass| {
-        active.extend(std::mem::take(&mut pass.borrow_mut().root_contexts));
+        declared.extend(std::mem::take(&mut pass.borrow_mut().root_contexts));
     });
-    ACTIVE_CONTEXTS.with(|contexts| *contexts.borrow_mut() = active);
+    // outermost first: a view nearer the root holds the ones below it,
+    // and among equals the tree's own order stands
+    declared.sort_by(|(a, ..), (b, ..)| {
+        let depth = |path: &str| path.split('/').count();
+        depth(a).cmp(&depth(b)).then_with(|| a.cmp(b))
+    });
+    let mounted: HashSet<&'static str> =
+        declared.iter().filter(|(_, _, focused)| !focused).map(|(_, name, _)| *name).collect();
+    ACTIVE_CONTEXTS.with(|contexts| *contexts.borrow_mut() = mounted);
+    DECLARED_CONTEXTS.with(|contexts| *contexts.borrow_mut() = declared);
 }
 
-/// Is the context declared by any mounted view?
-pub(crate) fn context_active(name: &str) -> bool {
+/// Does the declaration count for a keyboard held at `focus`? A context
+/// that waits for the keyboard counts only when the focused field or
+/// box sits inside the view that declares it.
+fn declaration_counts((path, _, focused): &ContextEntry, focus: Option<&str>) -> bool {
+    !focused || focus.is_some_and(|focus| covers(path, focus))
+}
+
+/// Is the context active for a keyboard held at `focus` — declared by a
+/// mounted view, or by a view the focused field or box sits inside?
+pub(crate) fn context_active(name: &str, focus: Option<&str>) -> bool {
     ACTIVE_CONTEXTS.with(|contexts| contexts.borrow().contains(name))
+        || DECLARED_CONTEXTS.with(|contexts| {
+            contexts
+                .borrow()
+                .iter()
+                .any(|entry| entry.1 == name && entry.2 && declaration_counts(entry, focus))
+        })
+}
+
+/// The contexts active for a keyboard held at `focus`, outermost first,
+/// each named once — the stack a key-context debugger shows.
+pub(crate) fn active_contexts(focus: Option<&str>) -> Vec<&'static str> {
+    DECLARED_CONTEXTS.with(|contexts| {
+        let mut stack: Vec<&'static str> = Vec::new();
+        for entry in contexts.borrow().iter() {
+            if declaration_counts(entry, focus) && !stack.contains(&entry.1) {
+                stack.push(entry.1);
+            }
+        }
+        stack
+    })
 }
 
 pub(crate) fn attribute_handler(path: String, id: crate::action::ActionId, handler: HandlerFn) {
@@ -1274,6 +1322,11 @@ pub(crate) fn input_fingerprint() -> u64 {
     mix(CUSTOMS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
     mix(KEYED_CUSTOMS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
     mix(ACTIVE_CONTEXTS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
+    mix(DECLARED_CONTEXTS.with(|list| {
+        list.borrow().iter().fold(0u64, |sum, (path, name, focused)| {
+            sum.wrapping_add(of_key(path) ^ of_key(name) ^ u64::from(*focused))
+        })
+    }));
     total
 }
 
@@ -1441,6 +1494,7 @@ pub(crate) fn reset_world() {
     LAST_BODY_RUNS.with(|last| last.borrow_mut().clear());
     FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().clear());
     ACTIVE_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
+    DECLARED_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     HANDLERS.with(|handlers| handlers.borrow_mut().clear());
     ACTIONS.with(|actions| actions.borrow_mut().clear());
     EDITORS.with(|editors| editors.borrow_mut().clear());

@@ -128,6 +128,9 @@ pub enum Modifier {
     Rendering(crate::layout::Rendering),
     /// Declares a key context active while this view is mounted.
     KeyContext(&'static str),
+    /// A key context that counts only while the keyboard is inside the
+    /// view (`.key_context_focused`).
+    KeyContextFocused(&'static str),
     /// Pressing this view (where no interactive target wins) drags the
     /// WINDOW — the scene's own title bar on a chrome-less window.
     WindowDragRegion,
@@ -314,6 +317,7 @@ impl Modifier {
             ),
             Modifier::Rendering(mode) => format!(" [.rendering(.{mode:?})]"),
             Modifier::KeyContext(name) => format!(" [.keyContext({name})]"),
+            Modifier::KeyContextFocused(name) => format!(" [.keyContextFocused({name})]"),
             Modifier::WindowDragRegion => " [.windowDragRegion()]".into(),
             Modifier::WindowControl(control) => format!(
                 " [.windowControl(.{})]",
@@ -1056,7 +1060,11 @@ fn apply(
                     crate::action::OVERLAY_DISMISS,
                     close,
                 );
-                crate::reconciler::attribute_context(crate::action::OVERLAY_CONTEXT);
+                crate::reconciler::attribute_context(
+                    path.clone(),
+                    crate::action::OVERLAY_CONTEXT,
+                    false,
+                );
             }
             let side = *side;
             out.wrap_layout_from(mark, |base| LayoutNode::Anchored {
@@ -1472,7 +1480,14 @@ fn apply(
         Modifier::KeyContext(name) => {
             // declaration, not paint: retained with the entry — the
             // context deactivates when the view unmounts
-            crate::reconciler::attribute_context(name);
+            let path = motor::identity::cursor_scope().unwrap_or_default();
+            crate::reconciler::attribute_context(path, name, false);
+        }
+        Modifier::KeyContextFocused(name) => {
+            // the same declaration, with the view it hangs on: it counts
+            // while the focused field or box is somewhere below it
+            let path = motor::identity::cursor_scope().unwrap_or_default();
+            crate::reconciler::attribute_context(path, name, true);
         }
         Modifier::WindowControl(control) => {
             let control = *control;

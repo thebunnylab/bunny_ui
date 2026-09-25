@@ -277,6 +277,9 @@ pub struct Runtime {
     /// Who hears the modifier keys move: what was held, and what is
     /// held now.
     modifier_sink: RefCell<Option<Rc<dyn Fn(crate::action::Modifiers, crate::action::Modifiers)>>>,
+    /// Who hears every stroke the keymap resolves — a key-context
+    /// debugger's door.
+    key_sink: RefCell<Option<Rc<dyn Fn(&crate::action::KeyReport)>>>,
     /// The size last HANDED to each measurement probe. A probe fires on
     /// change and only on change: a view at rest costs nothing, and a
     /// handler that writes state cannot spin against its own report.
@@ -1216,6 +1219,7 @@ impl Runtime {
             chord_announced: Cell::new(false),
             held: Cell::new(crate::action::Modifiers::NONE),
             modifier_sink: RefCell::new(None),
+            key_sink: RefCell::new(None),
             pending_aged: Cell::new(false),
             wheel_latch: RefCell::new(None),
             measures: RefCell::new(HashMap::default()),
@@ -2764,11 +2768,13 @@ impl Runtime {
     /// mounted `.key_context` turns its bindings on), the global map as
     /// the fallback.
     pub fn match_key(&self, pattern: &KeyPattern) -> Option<ActionId> {
+        let focus = self.focus.borrow().clone();
+        let focus = focus.as_deref();
         let scoped = self.scoped_keymap.borrow();
         // the reserved popover context wins DETERMINISTICALLY — the
         // map below iterates in arbitrary order, and an app binding
         // Escape in its own active context must not shadow the dismiss
-        if reconciler::context_active(OVERLAY_CONTEXT)
+        if reconciler::context_active(OVERLAY_CONTEXT, focus)
             && let Some(action) =
                 scoped.get(OVERLAY_CONTEXT).and_then(|map| map.get(pattern))
         {
@@ -2776,7 +2782,7 @@ impl Runtime {
         }
         for (context, map) in scoped.iter() {
             if let Some(action) = map.get(pattern)
-                && reconciler::context_active(context)
+                && reconciler::context_active(context, focus)
             {
                 return Some(*action);
             }
@@ -2798,9 +2804,22 @@ impl Runtime {
     /// ends it, and the shell's slow clock ages it out through
     /// [`Runtime::chord_tick`].
     pub fn chord(&self, stroke: impl Into<crate::action::Stroke>) -> crate::action::KeyMatch {
-        use crate::action::KeyMatch;
         self.enter_scene();
         let stroke = stroke.into();
+        let matched = self.resolve_chord(&stroke);
+        // out of every borrow: the sink writes the app's state
+        let sink = self.key_sink.borrow().clone();
+        if let Some(sink) = sink {
+            let contexts = self.active_contexts();
+            sink(&crate::action::KeyReport { stroke, contexts, matched });
+        }
+        matched
+    }
+
+    /// The keymap's reading of one stroke — [`Runtime::chord`] without
+    /// the report.
+    fn resolve_chord(&self, stroke: &crate::action::Stroke) -> crate::action::KeyMatch {
+        use crate::action::KeyMatch;
         let pattern = &stroke.pattern;
         let held = !self.pending.borrow().is_empty();
         // the explicit way out, and it consumes: a chord abandoned with
@@ -2811,8 +2830,9 @@ impl Runtime {
         }
         self.pending.borrow_mut().push(*pattern);
         self.pending_aged.set(false);
+        let focus = self.focus.borrow().clone();
         let live = |context: &Option<&'static str>| {
-            context.is_none_or(|name| reconciler::context_active(name))
+            context.is_none_or(|name| reconciler::context_active(name, focus.as_deref()))
         };
         let answer = {
             let chords = self.chords.borrow();
@@ -2863,6 +2883,31 @@ impl Runtime {
             // how an editor fires something nobody asked for
             other => other,
         }
+    }
+
+    /// The key contexts in force right now, OUTERMOST first, each named
+    /// once: the ones mounted views declare, and the focused ones whose
+    /// view holds the keyboard. The stack a key-context debugger shows,
+    /// read the same way the keymap reads it.
+    pub fn active_contexts(&self) -> Vec<&'static str> {
+        self.enter_scene();
+        let focus = self.focus.borrow().clone();
+        reconciler::active_contexts(focus.as_deref())
+    }
+
+    /// Installs who hears every stroke the keymap resolves: the sink is
+    /// called with the stroke, the contexts in force when it arrived and
+    /// the keymap's answer — [`KeyReport`] — after each
+    /// [`Runtime::chord`]. The door a key-context debugger reads
+    /// through, since the app's bodies never see a stroke.
+    ///
+    /// A stroke the focused box or field took BEFORE the keymap is not
+    /// the keymap's, and is not reported. One sink; installing another
+    /// replaces it.
+    ///
+    /// [`KeyReport`]: crate::action::KeyReport
+    pub fn observe_keys(&self, sink: impl Fn(&crate::action::KeyReport) + 'static) {
+        *self.key_sink.borrow_mut() = Some(Rc::new(sink));
     }
 
     /// The strokes of a sequence still in the air — what a which-key

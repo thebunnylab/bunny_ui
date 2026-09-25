@@ -33,6 +33,22 @@ pub enum KeyMatch {
     None,
 }
 
+/// One stroke as the keymap saw it — what a key-context debugger lists:
+/// the key, the contexts in force when it arrived, and what the keymap
+/// made of it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyReport {
+    /// The stroke, as the shell read it.
+    pub stroke: Stroke,
+    /// The key contexts active when it arrived, OUTERMOST first — the
+    /// view nearest the root leads, and each context is named once.
+    pub contexts: Vec<&'static str>,
+    /// The keymap's answer: the action it resolved to, the middle of a
+    /// sequence, or nothing bound. Whether a handler then ran is the
+    /// dispatch's business, and a stroke is reported the same either way.
+    pub matched: KeyMatch,
+}
+
 /// Closes the innermost open popover. Every mounted popover registers
 /// a handler for it, and the runtime pre-binds Escape inside the
 /// reserved [`OVERLAY_CONTEXT`] — apps never wire this themselves.
