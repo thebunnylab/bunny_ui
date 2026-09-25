@@ -2787,20 +2787,34 @@ fn interpret(event: *mut GenericEvent) -> Step {
                     })
                 }
                 (XCB_BUTTON_RELEASE, 1) => Step::Deliver(owner, AppEvent::MouseUp { x, y }),
-                (XCB_BUTTON_PRESS, 3) => Step::Deliver(owner, AppEvent::RightMouseDown { x, y }),
+                (XCB_BUTTON_PRESS, 2) => Step::Deliver(owner, AppEvent::MiddleMouseDown {
+                    x,
+                    y,
+                    modifiers: held_modifiers(state),
+                }),
+                (XCB_BUTTON_PRESS, 3) => Step::Deliver(owner, AppEvent::RightMouseDown {
+                    x,
+                    y,
+                    modifiers: held_modifiers(state),
+                }),
                 // the wheel speaks buttons: one press per detent, the
-                // ×16 line doctrine, up positive toward the engine
-                (XCB_BUTTON_PRESS, 4) => {
-                    Step::Deliver(owner, AppEvent::Wheel { x, y, dx: 0.0, dy: 16.0 })
-                }
-                (XCB_BUTTON_PRESS, 5) => {
-                    Step::Deliver(owner, AppEvent::Wheel { x, y, dx: 0.0, dy: -16.0 })
-                }
-                (XCB_BUTTON_PRESS, 6) => {
-                    Step::Deliver(owner, AppEvent::Wheel { x, y, dx: 16.0, dy: 0.0 })
-                }
-                (XCB_BUTTON_PRESS, 7) => {
-                    Step::Deliver(owner, AppEvent::Wheel { x, y, dx: -16.0, dy: 0.0 })
+                // ×16 line doctrine, up positive toward the engine — and
+                // a detent is a step of no gesture
+                (XCB_BUTTON_PRESS, 4..=7) => {
+                    let (dx, dy) = match detail {
+                        4 => (0.0, 16.0),
+                        5 => (0.0, -16.0),
+                        6 => (16.0, 0.0),
+                        _ => (-16.0, 0.0),
+                    };
+                    Step::Deliver(owner, AppEvent::Wheel {
+                        x,
+                        y,
+                        dx,
+                        dy,
+                        modifiers: held_modifiers(state),
+                        phase: bunny_ui::custom::WheelPhase::Changed,
+                    })
                 }
                 _ => Step::Silence,
             }

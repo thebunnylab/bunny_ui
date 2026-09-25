@@ -19,7 +19,14 @@ use crate::ffi::{self, AppEvent};
 /// wake polls — the event waits for the handler to return, like any event
 /// raised from inside one.
 pub fn wheel(x: f64, y: f64, dx: f64, dy: f64) {
-    ffi::dispatch(AppEvent::Wheel { x, y, dx, dy });
+    ffi::dispatch(AppEvent::Wheel {
+        x,
+        y,
+        dx,
+        dy,
+        modifiers: bunny_ui::action::Modifiers::NONE,
+        phase: bunny_ui::custom::WheelPhase::Changed,
+    });
 }
 
 /// The pointer at a point of the key window, with nothing held.

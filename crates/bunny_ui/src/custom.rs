@@ -693,6 +693,33 @@ impl<'a> Painter<'a> {
 
 // MARK: - What reaches the box
 
+/// The pointer's buttons past the primary one. The primary press — the
+/// left button, a finger, a pen's tip — is [`ElementEvent::PointerDown`],
+/// as it always was.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PointerButton {
+    /// The context button: the right one, or a two-finger tap on a
+    /// trackpad — the platform's own answer to which is which, so a
+    /// left-handed mouse still says what its owner means.
+    Secondary,
+    /// The wheel's own press.
+    Middle,
+}
+
+/// Where one turn of the wheel sits in the gesture that made it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum WheelPhase {
+    /// The first step of a trackpad gesture: the fingers just began to
+    /// travel.
+    Began,
+    /// Any other step — the gesture's own, the momentum after the
+    /// fingers lift, or a notch of a wheel, which has no gesture at all.
+    #[default]
+    Changed,
+    /// The fingers lifted. Momentum may still follow, as `Changed`.
+    Ended,
+}
+
 /// One event for the app's box, in LOCAL coordinates: the origin is the
 /// box's own top-left corner.
 ///
@@ -720,9 +747,32 @@ pub enum ElementEvent {
     /// give one.
     PointerDown { at: Point, clicks: u8, modifiers: crate::action::Modifiers },
     PointerUp { at: Point },
+    /// A press of a button past the primary one: the context button or
+    /// the middle one. The left press is `PointerDown`, and a box that
+    /// never looks at this arm hears none of them — a secondary press it
+    /// ignores goes on to the `.context_menu` around it, as it always did.
+    ///
+    /// Only the press: there is no release and no drag, and the press
+    /// does not move the keyboard. That is what the two gestures need. A
+    /// terminal opens its copy menu at the point without disturbing the
+    /// selection the menu acts on ([`EventCtx::open_menu`]); an editor
+    /// pastes the primary selection where the middle button landed.
+    ButtonDown { at: Point, button: PointerButton, modifiers: crate::action::Modifiers },
     /// The wheel turned over the box. Ignore it and the scroll region
     /// around the box takes the turn instead.
-    Wheel { at: Point, dx: Px, dy: Px },
+    ///
+    /// `modifiers` is what the hand holds while it turns — shift is how
+    /// a vertical wheel scrolls sideways — and `phase` is where the turn
+    /// sits in a trackpad's gesture, which is what an axis lock needs:
+    /// choose the axis on `Began`, keep it through `Changed`, let it go
+    /// at `Ended`.
+    Wheel {
+        at: Point,
+        dx: Px,
+        dy: Px,
+        modifiers: crate::action::Modifiers,
+        phase: WheelPhase,
+    },
     /// The pointer left the box (or the window).
     PointerExited,
     /// A keystroke, while the box has focus — arrows, Enter, Tab and

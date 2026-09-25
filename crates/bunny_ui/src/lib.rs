@@ -11862,6 +11862,142 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 
+    /// A terminal copies on the secondary press over its selection — its
+    /// own menu, at the point, the selection untouched — and an editor
+    /// pastes the primary selection on the middle one. Neither is a left
+    /// press, and a box that never answers them keeps the menu around it.
+    #[test]
+    fn a_box_hears_the_buttons_past_the_primary_before_the_menu_around_it() {
+        use crate::action::Modifiers;
+        use crate::custom::PointerButton;
+        use std::cell::RefCell;
+
+        #[derive(Default)]
+        struct Heard {
+            buttons: Vec<(PointerButton, Modifiers)>,
+            left: usize,
+        }
+
+        struct Terminal {
+            heard: Rc<RefCell<Heard>>,
+            answers: bool,
+        }
+
+        impl CustomElement for Terminal {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> crate::custom::Response {
+                match event {
+                    ElementEvent::ButtonDown { button, modifiers, .. } => {
+                        self.heard.borrow_mut().buttons.push((*button, *modifiers));
+                        if self.answers {
+                            return crate::custom::Response::handled();
+                        }
+                    }
+                    ElementEvent::PointerDown { .. } => self.heard.borrow_mut().left += 1,
+                    _ => {}
+                }
+                crate::custom::Response::ignored()
+            }
+        }
+
+        #[derive(Clone)]
+        struct Pane {
+            heard: Rc<RefCell<Heard>>,
+            answers: bool,
+        }
+
+        impl Component for Pane {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Terminal { heard: Rc::clone(&self.heard), answers: self.answers })
+                    .frame(200.0, 100.0)
+                    .context_menu(vec![menu_item("Inspect", || {})])
+            }
+        }
+
+        let size = Size { width: 300.0, height: 200.0 };
+        for answers in [true, false] {
+            let heard = Rc::new(RefCell::new(Heard::default()));
+            let pane = Pane { heard: Rc::clone(&heard), answers };
+            let runtime = Runtime::new();
+            runtime.render_stable(&pane);
+            let result = runtime.layout(&pane, crate::layout::Proposal::exact(size));
+            let frame = result.customs.first().expect("the box is placed").frame;
+            let (x, y) = (frame.origin.x + 20.0, frame.origin.y + 20.0);
+
+            let held = Modifiers { option: true, ..Modifiers::NONE };
+            assert!(runtime.button_pressed(x, y, PointerButton::Secondary, held));
+            assert_eq!(
+                runtime.interaction().menu.is_some(),
+                !answers,
+                "the menu around the box opens only for a box that let the press go",
+            );
+            // any press closes an open menu first, the middle one too
+            runtime.button_pressed(x, y, PointerButton::Middle, Modifiers::NONE);
+            assert!(runtime.interaction().menu.is_none());
+            let heard = heard.borrow();
+            assert_eq!(
+                heard.buttons,
+                [(PointerButton::Secondary, held), (PointerButton::Middle, Modifiers::NONE)],
+            );
+            assert_eq!(heard.left, 0, "neither press is a left one");
+        }
+    }
+
+    /// Shift turns a vertical wheel sideways and a trackpad gesture locks
+    /// its axis: the box hears what the hand holds and where the turn sits.
+    #[test]
+    fn a_box_hears_what_the_hand_holds_while_the_wheel_turns() {
+        use crate::action::Modifiers;
+        use crate::custom::WheelPhase;
+        use std::cell::RefCell;
+
+        struct Surface {
+            heard: Rc<RefCell<Vec<(Modifiers, WheelPhase)>>>,
+        }
+
+        impl CustomElement for Surface {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> crate::custom::Response {
+                if let ElementEvent::Wheel { modifiers, phase, .. } = event {
+                    self.heard.borrow_mut().push((*modifiers, *phase));
+                    return crate::custom::Response::handled();
+                }
+                crate::custom::Response::ignored()
+            }
+        }
+
+        #[derive(Clone)]
+        struct Root {
+            heard: Rc<RefCell<Vec<(Modifiers, WheelPhase)>>>,
+        }
+
+        impl Component for Root {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Surface { heard: Rc::clone(&self.heard) }).frame(200.0, 100.0)
+            }
+        }
+
+        let heard: Rc<RefCell<Vec<(Modifiers, WheelPhase)>>> = Rc::default();
+        let root = Root { heard: Rc::clone(&heard) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&root);
+        runtime.layout(&root, crate::layout::Proposal::exact(Size { width: 300.0, height: 200.0 }));
+
+        runtime.wheel_with(20.0, 20.0, 0.0, -12.0, Modifiers::SHIFT, WheelPhase::Began);
+        runtime.wheel_with(20.0, 20.0, 0.0, -4.0, Modifiers::SHIFT, WheelPhase::Ended);
+        // the plain door reads the state the shell reported last
+        runtime.modifiers_changed(Modifiers { command: true, ..Modifiers::NONE });
+        runtime.wheel(20.0, 20.0, 0.0, -16.0);
+        assert_eq!(
+            heard.borrow().as_slice(),
+            [
+                (Modifiers::SHIFT, WheelPhase::Began),
+                (Modifiers::SHIFT, WheelPhase::Ended),
+                (Modifiers { command: true, ..Modifiers::NONE }, WheelPhase::Changed),
+            ],
+        );
+    }
+
     #[test]
     fn a_right_press_offers_the_menu_and_a_row_fires_on_the_down() {
         use crate::layout::MENU_PATH;

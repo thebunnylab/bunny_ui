@@ -174,7 +174,9 @@ unsafe extern "C" {
 pub enum AppEvent {
     MouseDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     /// The right button (or a two-finger tap): the context-menu press.
-    RightMouseDown { x: f64, y: f64 },
+    RightMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
+    /// The middle button's press — the wheel pressed down.
+    MiddleMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     MouseUp { x: f64, y: f64 },
     MouseMoved { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     /// The pointer left the window — without this event the hover would
@@ -182,8 +184,16 @@ pub enum AppEvent {
     MouseExited,
     /// Scrolling: deltas in points (trackpad arrives precise and with
     /// momentum; the legacy wheel is converted from lines to points on
-    /// arrival).
-    Wheel { x: f64, y: f64, dx: f64, dy: f64 },
+    /// arrival), what the hand holds, and where the step sits in the
+    /// trackpad's gesture.
+    Wheel {
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+        modifiers: bunny_ui::action::Modifiers,
+        phase: bunny_ui::custom::WheelPhase,
+    },
     /// The trackpad's pinch over the view: `scale` is the ratio of this
     /// step (1.0 = nothing), at the pointer.
     Magnify { x: f64, y: f64, scale: f64 },
@@ -646,7 +656,20 @@ extern "C" fn bunny_flags_changed(_this: Id, _sel: Sel, event: Id) {
 
 extern "C" fn bunny_right_mouse_down(this: Id, _sel: Sel, event: Id) {
     let (x, y) = unsafe { event_layout_point(this, event) };
-    dispatch(AppEvent::RightMouseDown { x, y });
+    let modifiers = unsafe { modifiers_of(msg_u64(event, sel("modifierFlags"))) };
+    dispatch(AppEvent::RightMouseDown { x, y, modifiers });
+}
+
+/// `otherMouseDown:` — every button past the first two. Number 2 is the
+/// middle one; the rest (a mouse's back and forward) say nothing yet.
+extern "C" fn bunny_other_mouse_down(this: Id, _sel: Sel, event: Id) {
+    let number = unsafe { msg_i64(event, sel("buttonNumber")) };
+    if number != 2 {
+        return;
+    }
+    let (x, y) = unsafe { event_layout_point(this, event) };
+    let modifiers = unsafe { modifiers_of(msg_u64(event, sel("modifierFlags"))) };
+    dispatch(AppEvent::MiddleMouseDown { x, y, modifiers });
 }
 
 extern "C" fn bunny_mouse_down(this: Id, _sel: Sel, event: Id) {
@@ -1082,7 +1105,16 @@ extern "C" fn bunny_scroll_wheel(this: Id, _sel: Sel, event: Id) {
             dx *= 16.0;
             dy *= 16.0;
         }
-        dispatch(AppEvent::Wheel { x, y, dx, dy });
+        let modifiers = modifiers_of(msg_u64(event, sel("modifierFlags")));
+        // NSEventPhase: MayBegin 32 and Began 1 open a gesture, Ended 8
+        // and Cancelled 16 close it; the steps between, the momentum
+        // after the lift (phase 0) and a notched wheel are all steps
+        let phase = match msg_u64(event, sel("phase")) {
+            1 | 32 => bunny_ui::custom::WheelPhase::Began,
+            8 | 16 => bunny_ui::custom::WheelPhase::Ended,
+            _ => bunny_ui::custom::WheelPhase::Changed,
+        };
+        dispatch(AppEvent::Wheel { x, y, dx, dy, modifiers, phase });
     }
 }
 
@@ -1645,6 +1677,12 @@ unsafe fn register_classes() {
             view,
             sel("rightMouseDown:"),
             bunny_right_mouse_down as *const c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            view,
+            sel("otherMouseDown:"),
+            bunny_other_mouse_down as *const c_void,
             types.as_ptr(),
         );
         class_addMethod(

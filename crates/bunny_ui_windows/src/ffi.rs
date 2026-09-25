@@ -344,6 +344,7 @@ const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
 const WM_RBUTTONDOWN: u32 = 0x0204;
+const WM_MBUTTONDOWN: u32 = 0x0207;
 const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_MOUSEHWHEEL: u32 = 0x020E;
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -566,7 +567,9 @@ pub(crate) fn com_init() {
 pub enum AppEvent {
     MouseDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     /// The right button: the context-menu press.
-    RightMouseDown { x: f64, y: f64 },
+    RightMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
+    /// The middle button's press — the wheel pressed down.
+    MiddleMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     MouseUp { x: f64, y: f64 },
     MouseMoved { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     /// The pointer left the window — without this event the hover would
@@ -574,7 +577,7 @@ pub enum AppEvent {
     MouseExited,
     /// Scrolling: deltas in logical points, the engine's sign
     /// (positive reveals content above). Notches convert at arrival.
-    Wheel { x: f64, y: f64, dx: f64, dy: f64 },
+    Wheel { x: f64, y: f64, dx: f64, dy: f64, modifiers: bunny_ui::action::Modifiers },
     /// RAW editing key — only arrives when the keymap gate declined:
     /// movement, deletion, and the Ctrl chords over a focused field.
     /// `command` carries Ctrl, the platform's accelerator.
@@ -2019,7 +2022,9 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // content above); the tilt wheel flips, like the web's dx
             let (dx, dy) =
                 if msg == WM_MOUSEWHEEL { (0.0, px) } else { (-px, 0.0) };
-            dispatch_at(hwnd, AppEvent::Wheel { x, y, dx, dy });
+            // what the hand holds while it turns: shift is how a vertical
+            // wheel scrolls sideways, and the box decides what it means
+            dispatch_at(hwnd, AppEvent::Wheel { x, y, dx, dy, modifiers: held_modifiers_now() });
             0
         }
         WM_MOUSEACTIVATE => {
@@ -2083,7 +2088,13 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // still the scene's click
             reclaim_keyboard();
             let (x, y) = layout_point(hwnd, lparam);
-            dispatch_at(hwnd, AppEvent::RightMouseDown { x, y });
+            dispatch_at(hwnd, AppEvent::RightMouseDown { x, y, modifiers: held_modifiers_now() });
+            0
+        }
+        WM_MBUTTONDOWN => {
+            reclaim_keyboard();
+            let (x, y) = layout_point(hwnd, lparam);
+            dispatch_at(hwnd, AppEvent::MiddleMouseDown { x, y, modifiers: held_modifiers_now() });
             0
         }
         // a modifier going down or coming up: the state is read AFTER the

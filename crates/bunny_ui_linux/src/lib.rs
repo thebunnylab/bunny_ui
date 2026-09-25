@@ -1072,15 +1072,25 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     soon(runtime, root, ORIGIN_POINTER);
                 }
             }
-            AppEvent::RightMouseDown { x, y } => {
+            AppEvent::RightMouseDown { x, y, modifiers } => {
                 let at = window.raw_window();
                 if let Some(path) = runtime.host_at(x, y) {
                     // the page's own menu, where it draws one
-                    webview::press(at, &path, x, y, MouseButton::Right, Modifiers::NONE);
-                    webview::release(at, &path, x, y, MouseButton::Right, Modifiers::NONE);
-                } else if runtime.context_click(x, y) {
-                    // the runtime opens (or closes) the context menu; it
+                    webview::press(at, &path, x, y, MouseButton::Right, modifiers);
+                    webview::release(at, &path, x, y, MouseButton::Right, modifiers);
+                } else if runtime.button_pressed(x, y, bunny_ui::custom::PointerButton::Secondary, modifiers) {
+                    // the box under the pointer hears it first; what it
+                    // ignores opens (or closes) the context menu, which
                     // presents with the scene until panels take it outside
+                    blit(runtime, root, ORIGIN_KEY);
+                }
+            }
+            AppEvent::MiddleMouseDown { x, y, modifiers } => {
+                let at = window.raw_window();
+                if let Some(path) = runtime.host_at(x, y) {
+                    webview::press(at, &path, x, y, MouseButton::Middle, modifiers);
+                    webview::release(at, &path, x, y, MouseButton::Middle, modifiers);
+                } else if runtime.button_pressed(x, y, bunny_ui::custom::PointerButton::Middle, modifiers) {
                     blit(runtime, root, ORIGIN_KEY);
                 }
             }
@@ -1120,11 +1130,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     soon(runtime, root, ORIGIN_POINTER);
                 }
             }
-            AppEvent::Wheel { x, y, dx, dy } => {
+            AppEvent::Wheel { x, y, dx, dy, modifiers, phase } => {
                 let at = window.raw_window();
                 if let Some(path) = runtime.host_at(x, y) {
                     webview::wheel(at, &path, x, y, dx, dy);
-                } else if runtime.wheel(x, y, dx, dy) {
+                } else if runtime.wheel_with(x, y, dx, dy, modifiers, phase) {
                     // offset is engine state: repaint without render
                     soon(runtime, root, ORIGIN_WHEEL);
                 }

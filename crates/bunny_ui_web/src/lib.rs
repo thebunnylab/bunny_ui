@@ -281,7 +281,10 @@ enum Event {
     PointerMove { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     PointerDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     PointerUp { x: f64, y: f64 },
-    Wheel { x: f64, y: f64, dx: f64, dy: f64 },
+    Wheel { x: f64, y: f64, dx: f64, dy: f64, modifiers: bunny_ui::action::Modifiers },
+    /// A press of a button past the primary one (the middle one; the
+    /// secondary press is the browser's `contextmenu`).
+    ButtonDown { x: f64, y: f64, button: bunny_ui::custom::PointerButton, modifiers: bunny_ui::action::Modifiers },
     Text(String),
     /// A named key from the glue's table, with the modifier bits.
     Key(u32, u32),
@@ -302,7 +305,7 @@ enum Event {
     /// The glue's slow clock beat once — the tooltip ages, then shows.
     TooltipTick,
     /// A right press (the browser's contextmenu, default prevented).
-    ContextClick { x: f64, y: f64 },
+    ContextClick { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     /// Dom mode: the browser's scroll observer — the element scrolled
     /// and the engine mirrors the offset (the dual ownership).
     DomScroll { id: u32, x: f64, y: f64 },
@@ -522,11 +525,12 @@ pub fn start_with(
                 let _ = runtime.pointer_released(x, y);
                 present(&runtime, &full, size, scale, &mut surface);
             }
-            Event::Wheel { x, y, dx, dy } => {
+            Event::Wheel { x, y, dx, dy, modifiers } => {
                 // browser deltas are the OPPOSITE of the engine's
                 // convention (positive reveals content above) — the
-                // sign flips here, once
-                if runtime.wheel(x, y, -dx, -dy)
+                // sign flips here, once. The page says no gesture phase:
+                // every turn is a step
+                if runtime.wheel_with(x, y, -dx, -dy, modifiers, bunny_ui::custom::WheelPhase::Changed)
                     && pacer.ask(ORIGIN_WHEEL, Urgency::Soon, false) == Verdict::Draw
                 {
                     present(&runtime, &full, size, scale, &mut surface);
@@ -578,8 +582,14 @@ pub fn start_with(
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
-            Event::ContextClick { x, y } => {
-                if runtime.context_click(x, y) {
+            Event::ContextClick { x, y, modifiers } => {
+                // the box under the pointer hears it first
+                if runtime.button_pressed(x, y, bunny_ui::custom::PointerButton::Secondary, modifiers) {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
+            }
+            Event::ButtonDown { x, y, button, modifiers } => {
+                if runtime.button_pressed(x, y, button, modifiers) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
@@ -809,8 +819,8 @@ fn start_dom_with(
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
-            Event::ContextClick { x, y } => {
-                if runtime.context_click(x, y) {
+            Event::ContextClick { x, y, modifiers } => {
+                if runtime.button_pressed(x, y, bunny_ui::custom::PointerButton::Secondary, modifiers) {
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
@@ -950,30 +960,41 @@ pub extern "C" fn bunny_drag_armed() -> u32 {
     DRAG_ARMED.with(|armed| armed.get() as u32)
 }
 
-/// The browser's contextmenu, default prevented by the glue.
+/// The browser's contextmenu, default prevented by the glue — the
+/// secondary press, with the modifier bits (an older glue sends none).
 #[unsafe(no_mangle)]
-pub extern "C" fn bunny_context_click(x: f64, y: f64) {
-    dispatch(Event::ContextClick { x, y });
+pub extern "C" fn bunny_context_click(x: f64, y: f64, mods: u32) {
+    dispatch(Event::ContextClick { x, y, modifiers: held(mods) });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_pointer_down(x: f64, y: f64, time_ms: f64, button: u32, mods: u32) {
     // the glue hands the event's own timestamp and which button it was;
     // the count is the shell's to keep, because `pointerdown` carries
-    // no count of its own. Only the PRIMARY button counts, the way
-    // AppKit and Win32 count — a right press between two left ones must
-    // not turn the second into a double.
-    let clicks = if button == 0 {
-        let next = CLICK_STATE.with(|state| {
-            let next = count_click(state.get(), x, y, time_ms);
-            state.set(next);
-            next
-        });
-        next.3
-    } else {
-        1
-    };
-    dispatch(Event::PointerDown { x, y, clicks, modifiers: held(mods) });
+    // no count of its own. Only the PRIMARY button counts and presses,
+    // the way AppKit and Win32 have it: a right press is no left one,
+    // and a right press between two left ones must not turn the second
+    // into a double.
+    match button {
+        0 => {
+            let next = CLICK_STATE.with(|state| {
+                let next = count_click(state.get(), x, y, time_ms);
+                state.set(next);
+                next
+            });
+            dispatch(Event::PointerDown { x, y, clicks: next.3, modifiers: held(mods) });
+        }
+        // the wheel pressed: the box's middle press, never a left one
+        1 => dispatch(Event::ButtonDown {
+            x,
+            y,
+            button: bunny_ui::custom::PointerButton::Middle,
+            modifiers: held(mods),
+        }),
+        // the secondary press arrives by `contextmenu`, the browser's own
+        // word for it; a mouse's back and forward say nothing yet
+        _ => {}
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -981,9 +1002,11 @@ pub extern "C" fn bunny_pointer_up(x: f64, y: f64) {
     dispatch(Event::PointerUp { x, y });
 }
 
+/// One wheel event in the browser's own deltas, with the modifier bits
+/// (an older glue sends none).
 #[unsafe(no_mangle)]
-pub extern "C" fn bunny_wheel(x: f64, y: f64, dx: f64, dy: f64) {
-    dispatch(Event::Wheel { x, y, dx, dy });
+pub extern "C" fn bunny_wheel(x: f64, y: f64, dx: f64, dy: f64, mods: u32) {
+    dispatch(Event::Wheel { x, y, dx, dy, modifiers: held(mods) });
 }
 
 /// One named key: `code` from the glue's table (mirrored in

@@ -516,6 +516,8 @@ export async function attach(memoryHandle, exports, hostElement, start) {
   });
   host.addEventListener("pointerdown", (event) => {
     const [x, y] = point(event);
+    // the middle press is the scene's: no autoscroll over a canvas
+    if (event.button === 1) event.preventDefault();
     // `pointerdown` reports detail 0 — the browser only counts on
     // `mousedown`, and this door stays on pointer events so touch and
     // pen keep working. The shell counts, from the event's own
@@ -526,7 +528,7 @@ export async function attach(memoryHandle, exports, hostElement, start) {
     // the scene offers its own menu — the browser's stays home
     event.preventDefault();
     const [x, y] = point(event);
-    wasm.bunny_context_click(x, y);
+    wasm.bunny_context_click(x, y, modifiers(event));
   });
   host.addEventListener("pointerup", (event) => {
     const [x, y] = point(event);
@@ -537,7 +539,7 @@ export async function attach(memoryHandle, exports, hostElement, start) {
     (event) => {
       event.preventDefault();
       const [x, y] = point(event);
-      wasm.bunny_wheel(x, y, event.deltaX, event.deltaY);
+      wasm.bunny_wheel(x, y, event.deltaX, event.deltaY, modifiers(event));
       // the same two beats end the scroll gesture: the region that
       // took the wheel keeps it until they land
       armTooltip();

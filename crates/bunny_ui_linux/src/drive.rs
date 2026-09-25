@@ -43,7 +43,14 @@ pub fn click(x: f64, y: f64) {
 
 /// A wheel step at `(x, y)` — the engine's sign: positive `dy` is up.
 pub fn wheel(x: f64, y: f64, dx: f64, dy: f64) {
-    push(AppEvent::Wheel { x, y, dx, dy });
+    push(AppEvent::Wheel {
+        x,
+        y,
+        dx,
+        dy,
+        modifiers: bunny_ui::action::Modifiers::NONE,
+        phase: bunny_ui::custom::WheelPhase::Changed,
+    });
 }
 
 /// Typed text, the way the keyboard road delivers it.

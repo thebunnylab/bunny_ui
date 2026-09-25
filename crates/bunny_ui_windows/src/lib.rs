@@ -1163,10 +1163,16 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     blit(runtime, root);
                 }
             }
-            AppEvent::RightMouseDown { x, y } => {
-                // the runtime opens (or closes) the context menu; it
+            AppEvent::RightMouseDown { x, y, modifiers } => {
+                // the box under the pointer hears it first; what it
+                // ignores opens (or closes) the context menu, which
                 // presents with the scene until panels take it outside
-                if runtime.context_click(x, y) {
+                if runtime.button_pressed(x, y, bunny_ui::custom::PointerButton::Secondary, modifiers) {
+                    blit(runtime, root);
+                }
+            }
+            AppEvent::MiddleMouseDown { x, y, modifiers } => {
+                if runtime.button_pressed(x, y, bunny_ui::custom::PointerButton::Middle, modifiers) {
                     blit(runtime, root);
                 }
             }
@@ -1185,9 +1191,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     blit(runtime, root);
                 }
             }
-            AppEvent::Wheel { x, y, dx, dy } => {
-                // offset is engine state: repaint without render
-                if runtime.wheel(x, y, dx, dy) {
+            AppEvent::Wheel { x, y, dx, dy, modifiers } => {
+                // offset is engine state: repaint without render. A
+                // notched wheel has no gesture, so every turn is a step
+                if runtime.wheel_with(x, y, dx, dy, modifiers, bunny_ui::custom::WheelPhase::Changed) {
                     blit(runtime, root);
                 }
             }

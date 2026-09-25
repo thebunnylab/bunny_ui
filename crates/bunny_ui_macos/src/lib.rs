@@ -1765,10 +1765,16 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 soon(runtime, root, trace::Origin::Input);
             }
         }
-        AppEvent::RightMouseDown { x, y } => {
-            // the runtime opens (or closes) the context menu; the
-            // panel presents like any overlay — outside the window too
-            if runtime.context_click(x, y) {
+        AppEvent::RightMouseDown { x, y, modifiers } => {
+            // the box under the pointer hears it first; what it ignores
+            // opens (or closes) the context menu — the panel presents
+            // like any overlay, outside the window too
+            if runtime.button_pressed(x, y, bunny_ui::custom::PointerButton::Secondary, modifiers) {
+                blit(runtime, root, trace::Origin::Input);
+            }
+        }
+        AppEvent::MiddleMouseDown { x, y, modifiers } => {
+            if runtime.button_pressed(x, y, bunny_ui::custom::PointerButton::Middle, modifiers) {
                 blit(runtime, root, trace::Origin::Input);
             }
         }
@@ -1787,14 +1793,14 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 soon(runtime, root, trace::Origin::Input);
             }
         }
-        AppEvent::Wheel { x, y, dx, dy } => {
+        AppEvent::Wheel { x, y, dx, dy, modifiers, phase } => {
             // offset is engine state: repaint without render (zero bodies).
             // The wheel speaks faster than the display shows — ninety to a
             // hundred and twenty events a second, then momentum. The offsets
             // accumulate in the runtime, so a frame on the next beat shows
             // every one of them; a frame for each blocked inside this
             // handler while the present waited for the display.
-            if runtime.wheel(x, y, dx, dy) {
+            if runtime.wheel_with(x, y, dx, dy, modifiers, phase) {
                 soon(runtime, root, trace::Origin::Input);
             }
         }

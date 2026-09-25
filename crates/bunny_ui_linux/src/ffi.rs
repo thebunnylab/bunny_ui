@@ -775,6 +775,7 @@ enum Ev {
     /// Where the axis came from (v5+): unread — a finger tells itself
     /// by its lack of detents.
     PointerAxisSource,
+    PointerAxisStop,
     /// The compositor's preferred scale for the window, in 120ths
     /// (tier 1 of the ladder) — and the whole-number one a v6 surface
     /// is told directly (tier 2).
@@ -951,7 +952,8 @@ unsafe extern "C" fn dispatcher(
                 axis: unsafe { arg(0).u },
                 value120: unsafe { arg(1).i },
             }),
-            _ => {} // axis_stop(7), axis_relative_direction(10): unread
+            7 => push_ev(Ev::PointerAxisStop),
+            _ => {} // axis_relative_direction(10): unread
         },
         TAG_BUFFER => push_ev(Ev::BufferRelease { buffer_ptr: proxy as usize }),
         TAG_KEYBOARD => match opcode {
@@ -1167,6 +1169,11 @@ struct AxisAccumulator {
     horizontal_steps: i32,
     vertical_120: i32,
     horizontal_120: i32,
+    /// `axis_stop` arrived in this frame.
+    stopped: bool,
+    /// A finger's gesture is in flight — it began and has not stopped.
+    /// The one field a flush keeps.
+    gesture: bool,
 }
 
 impl AxisAccumulator {
@@ -1194,7 +1201,14 @@ impl AxisAccumulator {
         }
     }
 
-    fn flush(&mut self) -> Option<(f64, f64)> {
+    /// The compositor's `axis_stop`: the finger on the pad lifted. The
+    /// frame it arrives in ends the gesture.
+    fn stop(&mut self) {
+        self.stopped = true;
+    }
+
+    fn flush(&mut self) -> Option<(f64, f64, bunny_ui::custom::WheelPhase)> {
+        use bunny_ui::custom::WheelPhase;
         let line = |continuous: f64, steps: i32, v120: i32| {
             if v120 != 0 {
                 -(v120 as f64 / 120.0) * 16.0
@@ -1206,8 +1220,30 @@ impl AxisAccumulator {
         };
         let dy = line(self.vertical, self.vertical_steps, self.vertical_120);
         let dx = line(self.horizontal, self.horizontal_steps, self.horizontal_120);
-        *self = AxisAccumulator::default();
-        (dx != 0.0 || dy != 0.0).then_some((dx, dy))
+        let detents = self.vertical_steps != 0
+            || self.horizontal_steps != 0
+            || self.vertical_120 != 0
+            || self.horizontal_120 != 0;
+        let moved = dx != 0.0 || dy != 0.0;
+        // a finger travels continuously and a wheel turns in detents: the
+        // gesture is the finger's, from its first frame to the stop
+        let phase = if self.stopped {
+            WheelPhase::Ended
+        } else if moved && !detents && !self.gesture {
+            WheelPhase::Began
+        } else {
+            WheelPhase::Changed
+        };
+        let ending = self.stopped && self.gesture;
+        let gesture = match phase {
+            WheelPhase::Began => true,
+            WheelPhase::Ended => false,
+            WheelPhase::Changed => self.gesture && !detents,
+        };
+        *self = AxisAccumulator { gesture, ..AxisAccumulator::default() };
+        // the stop is news even with nothing left to travel: it is what
+        // lets a box's axis lock go
+        (moved || ending).then_some((dx, dy, phase))
     }
 }
 
@@ -1647,7 +1683,9 @@ pub enum AppEvent {
     MouseMoved { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     MouseDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     MouseUp { x: f64, y: f64 },
-    RightMouseDown { x: f64, y: f64 },
+    RightMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
+    /// The middle button's press — the wheel pressed down.
+    MiddleMouseDown { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     MouseExited,
     /// Typing, paste of characters, and the composed dead-key result —
     /// the same road for all of them.
@@ -1661,7 +1699,16 @@ pub enum AppEvent {
     /// A press landed outside every open overlay — the x11 door has no
     /// compositor grab to say `popup_done`, so it says this instead.
     DismissOverlays,
-    Wheel { x: f64, y: f64, dx: f64, dy: f64 },
+    /// A wheel step, what the hand holds, and where the step sits in a
+    /// finger's gesture on a pad (a wheel's detents are all steps).
+    Wheel {
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+        modifiers: bunny_ui::action::Modifiers,
+        phase: bunny_ui::custom::WheelPhase,
+    },
     /// A finger on the main window — the runtime's own recognizer
     /// makes the gestures out of it.
     Touch { phase: TouchPhase, id: u64, x: f64, y: f64 },
@@ -4266,7 +4313,11 @@ fn drain_protocol_events() {
                 let owner = with_client(|client| owner_of(client, focus));
                 const BTN_LEFT: u32 = 0x110;
                 const BTN_RIGHT: u32 = 0x111;
+                const BTN_MIDDLE: u32 = 0x112;
                 let on_main = matches!(focus, Target::Window(_));
+                // the keyboard is the authority on who is held, for every
+                // button alike
+                let modifiers = with_client(|client| held_modifiers(&client.keyboard));
                 match (button, pressed) {
                     (BTN_LEFT, true) => left_press(owner, x, y, time_ms, on_main),
                     (BTN_LEFT, false) => dispatch_at(owner, AppEvent::MouseUp { x, y }),
@@ -4274,8 +4325,11 @@ fn drain_protocol_events() {
                         if on_main && matches!(crown_take(x, y, 1, true), CrownTake::Menu) {
                             let _ = crown_execute(owner, CrownTake::Menu, x, y);
                         } else {
-                            dispatch_at(owner, AppEvent::RightMouseDown { x, y });
+                            dispatch_at(owner, AppEvent::RightMouseDown { x, y, modifiers });
                         }
+                    }
+                    (BTN_MIDDLE, true) => {
+                        dispatch_at(owner, AppEvent::MiddleMouseDown { x, y, modifiers })
                     }
                     _ => {}
                 }
@@ -4290,6 +4344,7 @@ fn drain_protocol_events() {
                 with_client(|client| client.axis.value120(axis, value120))
             }
             Ev::PointerAxisSource => {}
+            Ev::PointerAxisStop => with_client(|client| client.axis.stop()),
             Ev::SeatCapabilities { caps } => with_client(|client| {
                 const TOUCH: u32 = 4;
                 if caps & TOUCH != 0 && client.touch.is_null() && !client.seat.is_null() {
@@ -4350,14 +4405,15 @@ fn drain_protocol_events() {
             Ev::PinchEnd => {}
             Ev::PointerFrame => {
                 let wheel = with_client(|client| {
-                    client.axis.flush().map(|(dx, dy)| {
+                    client.axis.flush().map(|(dx, dy, phase)| {
                         let (x, y) = client.pointer_pos;
                         let (x, y) = translate_pointer(client, x, y);
-                        (x, y, dx, dy, owner_of(client, client.pointer_focus))
+                        let modifiers = held_modifiers(&client.keyboard);
+                        (x, y, dx, dy, modifiers, phase, owner_of(client, client.pointer_focus))
                     })
                 });
-                if let Some((x, y, dx, dy, owner)) = wheel {
-                    dispatch_at(owner, AppEvent::Wheel { x, y, dx, dy });
+                if let Some((x, y, dx, dy, modifiers, phase, owner)) = wheel {
+                    dispatch_at(owner, AppEvent::Wheel { x, y, dx, dy, modifiers, phase });
                 }
             }
             Ev::PanelConfigure { index, serial } => with_client(|client| {
@@ -5281,18 +5337,35 @@ mod tests {
 
     #[test]
     fn the_wheel_prefers_the_120ths_then_the_steps_then_the_continuous() {
+        use bunny_ui::custom::WheelPhase::{Began, Changed};
         let mut axis = AxisAccumulator::default();
         axis.axis(0, 10.0);
         axis.value120(0, 240);
-        assert_eq!(axis.flush(), Some((0.0, -32.0)), "two detents in 120ths");
+        assert_eq!(axis.flush(), Some((0.0, -32.0, Changed)), "two detents in 120ths");
         axis.value120(0, 60);
-        assert_eq!(axis.flush(), Some((0.0, -8.0)), "half a detent, a fine wheel");
+        assert_eq!(axis.flush(), Some((0.0, -8.0, Changed)), "half a detent, a fine wheel");
         axis.axis(1, 5.0);
         axis.discrete(1, 1);
-        assert_eq!(axis.flush(), Some((-16.0, 0.0)), "a v5 wheel's step");
+        assert_eq!(axis.flush(), Some((-16.0, 0.0, Changed)), "a v5 wheel's step");
         axis.axis(0, 7.5);
-        assert_eq!(axis.flush(), Some((0.0, -7.5)), "a finger stays continuous");
+        assert_eq!(axis.flush(), Some((0.0, -7.5, Began)), "a finger stays continuous");
         assert_eq!(axis.flush(), None, "and nothing is nothing");
+    }
+
+    #[test]
+    fn a_finger_on_the_pad_is_one_gesture_from_its_first_frame_to_the_stop() {
+        use bunny_ui::custom::WheelPhase::{Began, Changed, Ended};
+        let mut axis = AxisAccumulator::default();
+        axis.axis(0, 3.0);
+        assert_eq!(axis.flush(), Some((0.0, -3.0, Began)));
+        axis.axis(0, 4.0);
+        assert_eq!(axis.flush(), Some((0.0, -4.0, Changed)));
+        axis.stop();
+        assert_eq!(axis.flush(), Some((0.0, 0.0, Ended)), "the lift is news with nothing to travel");
+        axis.axis(1, 2.0);
+        assert_eq!(axis.flush(), Some((-2.0, 0.0, Began)), "the next touch begins again");
+        axis.discrete(0, 1);
+        assert_eq!(axis.flush(), Some((0.0, -16.0, Changed)), "a wheel between has no gesture");
     }
 
     #[test]
@@ -5438,15 +5511,16 @@ mod tests {
 
     #[test]
     fn the_wheel_prefers_detents_and_flips_the_sign() {
+        use bunny_ui::custom::WheelPhase::{Began, Changed};
         let mut axis = AxisAccumulator::default();
         axis.axis(0, 10.0);
         axis.discrete(0, 1);
-        assert_eq!(axis.flush(), Some((0.0, -16.0)), "a detent wins over its own px value");
+        assert_eq!(axis.flush(), Some((0.0, -16.0, Changed)), "a detent wins over its own px value");
         axis.axis(0, -7.5);
-        assert_eq!(axis.flush(), Some((0.0, 7.5)), "trackpad px flip sign, keep magnitude");
+        assert_eq!(axis.flush(), Some((0.0, 7.5, Began)), "trackpad px flip sign, keep magnitude");
         axis.axis(1, 4.0);
         axis.discrete(1, -2);
-        assert_eq!(axis.flush(), Some((32.0, 0.0)), "horizontal detents ride the same law");
+        assert_eq!(axis.flush(), Some((32.0, 0.0, Changed)), "horizontal detents ride the same law");
         assert_eq!(axis.flush(), None, "a flush drains the accumulator");
     }
 

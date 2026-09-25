@@ -810,10 +810,51 @@ impl Runtime {
     /// pointer. A press outside every region closes whatever is open.
     /// `true` = repaint.
     pub fn context_click(&self, x: Px, y: Px) -> bool {
+        self.button_pressed(x, y, crate::custom::PointerButton::Secondary, self.held.get())
+    }
+
+    /// A press of a button past the primary one — the shell's door for
+    /// the context button and the middle one, with what the hand holds.
+    ///
+    /// The app's box under the pointer hears it first
+    /// ([`ElementEvent::ButtonDown`]): a terminal answers the secondary
+    /// press with its own menu, an editor the middle one with a paste.
+    /// What the box ignores walks on — the secondary press to the
+    /// `.context_menu(…)` region under the point, exactly as before; the
+    /// middle one to nobody. Whatever answers, an open menu and a tooltip
+    /// close first, the platform's manner for any press.
+    ///
+    /// `true` = something changed and the frame is worth presenting.
+    ///
+    /// [`ElementEvent::ButtonDown`]: crate::custom::ElementEvent::ButtonDown
+    pub fn button_pressed(
+        &self,
+        x: Px,
+        y: Px,
+        button: crate::custom::PointerButton,
+        modifiers: crate::action::Modifiers,
+    ) -> bool {
         self.enter_scene();
         self.note_pointer_source();
         let was_open = self.close_menu();
         let cleared = self.clear_tooltip();
+        let over = self.hover_target(x, y).and_then(|path| self.custom_at(&path));
+        if let Some(placement) = over {
+            let at = Self::local(&placement, x, y);
+            let event = crate::custom::ElementEvent::ButtonDown { at, button, modifiers };
+            if self.deliver(&placement, event).handled {
+                return true;
+            }
+        }
+        match button {
+            crate::custom::PointerButton::Secondary => self.context_menu_at(x, y) || was_open || cleared,
+            crate::custom::PointerButton::Middle => was_open || cleared,
+        }
+    }
+
+    /// The `.context_menu(…)` region under a secondary press: its handler
+    /// hears the point, or its items open there. `false` = no region.
+    fn context_menu_at(&self, x: Px, y: Px) -> bool {
         let menus = self.last_menus.borrow();
         let region = self
             .reachable(&menus, |floor| floor.menus)
@@ -822,8 +863,9 @@ impl Runtime {
             .find(|region| region.rect.contains(x, y))
             .cloned();
         let Some(region) = region else {
-            return was_open || cleared;
+            return false;
         };
+        drop(menus);
         // The app asked to hear this one: it gets the point and answers it
         // however it likes, and the runtime opens nothing. Whichever region is
         // INNER wins the press, which is the same precedence a menu of items
@@ -2513,6 +2555,24 @@ impl Runtime {
     /// finger lands, or when [`Runtime::wheel_tick`] has aged the latch
     /// out.
     pub fn wheel(&self, x: Px, y: Px, dx: Px, dy: Px) -> bool {
+        self.wheel_with(x, y, dx, dy, self.held.get(), crate::custom::WheelPhase::Changed)
+    }
+
+    /// [`Runtime::wheel`] with what the hand holds while it turns and where
+    /// the turn sits in a trackpad's gesture — the door a shell uses when
+    /// its platform says both. The app's box hears the two
+    /// ([`ElementEvent::Wheel`]); the scroll regions read neither.
+    ///
+    /// [`ElementEvent::Wheel`]: crate::custom::ElementEvent::Wheel
+    pub fn wheel_with(
+        &self,
+        x: Px,
+        y: Px,
+        dx: Px,
+        dy: Px,
+        modifiers: crate::action::Modifiers,
+        phase: crate::custom::WheelPhase,
+    ) -> bool {
         self.enter_scene();
         // the content is about to slide under a still pointer — the
         // explanation dies and so does the menu, rather than pointing
@@ -2544,7 +2604,7 @@ impl Runtime {
         if let Some((placement, path)) = over {
             offered = Some(path);
             let at = Self::local(&placement, x, y);
-            let event = crate::custom::ElementEvent::Wheel { at, dx, dy };
+            let event = crate::custom::ElementEvent::Wheel { at, dx, dy, modifiers, phase };
             if self.deliver(&placement, event).handled {
                 return true;
             }
