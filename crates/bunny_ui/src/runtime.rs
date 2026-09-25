@@ -2366,7 +2366,6 @@ impl Runtime {
     /// be right. The guard is what keeps the pointer doors below from
     /// reading their own call as a mouse.
     fn perform_touch(&self, gestures: Vec<crate::touch::Gesture>) -> (bool, bool) {
-        use crate::touch::Gesture;
         self.touch_modality.set(true);
         self.in_touch.set(true);
         let answer = self.perform_touch_inner(gestures);

@@ -70,7 +70,8 @@ const WIDTH: f64 = 280.0;
 const HEIGHT: f64 = 180.0;
 
 /// The hand: one click on the button, at the bottom-left where the
-/// stack puts it (16 pt of padding, a leading column), then the two
+/// stack puts it (16 pt of padding, a leading column, measured from
+/// the size the window was granted), then the two
 /// witnesses — the state and the glass. With `fixed`, the manners.
 #[cfg(target_os = "linux")]
 async fn the_sheet(count: State<i32>, fixed: bool, sleeper: bool) {
@@ -84,7 +85,10 @@ async fn the_sheet(count: State<i32>, fixed: bool, sleeper: bool) {
     };
     let before = drive::presents();
     check("the first frame reached the glass", before >= 1);
-    drive::click(40.0, HEIGHT - 28.0);
+    // aimed from the granted size: a tiling desktop answers 280×180
+    // with a tile of its own
+    let (width, height) = drive::window_size();
+    drive::click(40.0, height - 28.0);
     task::sleep(std::time::Duration::from_millis(300)).await;
     check("the click counted", count.wrappedValue() == 1);
     let after = drive::presents();
@@ -125,7 +129,7 @@ async fn the_sheet(count: State<i32>, fixed: bool, sleeper: bool) {
         // the window's own, and closing the last window ends the run —
         // main prints the verdict after `run` returns
         println!("[{}] the house bar stands — closing through its button", stamp());
-        drive::click(WIDTH - 20.0, 16.0);
+        drive::click(width - 20.0, 16.0);
         task::sleep(std::time::Duration::from_millis(1500)).await;
         check("the close button closed the window", false);
     }

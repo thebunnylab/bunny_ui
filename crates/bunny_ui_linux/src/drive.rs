@@ -57,6 +57,14 @@ pub fn presents() -> u64 {
     crate::trace::presents()
 }
 
+/// The first window's size in layout points, as granted: a tiling
+/// compositor (niri, sway, Hyprland) answers the asked size with a
+/// tile of its own, so a sheet that aims from the bottom or the right
+/// edge measures here instead of trusting its own request.
+pub fn window_size() -> (f64, f64) {
+    crate::ffi::first_window_size()
+}
+
 /// Which door is open — `"wayland"` or `"x11"`.
 pub fn backend() -> &'static str {
     if crate::ffi::is_x11() { "x11" } else { "wayland" }

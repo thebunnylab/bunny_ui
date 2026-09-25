@@ -4715,6 +4715,18 @@ pub(crate) fn first_window_address() -> usize {
     with_client(|client| first_window(client))
 }
 
+/// The oldest window's size in layout points — the size the
+/// compositor granted, which a tiling desktop picks for itself.
+pub(crate) fn first_window_size() -> (f64, f64) {
+    if is_x11() {
+        return crate::x11::content_size(crate::x11::main_window().unwrap_or(0));
+    }
+    with_client(|client| {
+        let first = first_window(client);
+        window_ref(client, first).map(|w| w.logical).unwrap_or((0.0, 0.0))
+    })
+}
+
 /// The census is keyed by registry name; enter/leave carried a proxy.
 fn resolve_output(output_ptr: usize) -> Option<u32> {
     with_client(|client| {

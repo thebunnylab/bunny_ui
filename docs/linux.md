@@ -34,7 +34,10 @@ An example that answers `--drive` drives itself: a sheet queues the
 events a person would make, reads the state and counts the frames the
 shell presented, prints one line per check and exits 0 when they all
 hold. `crates/bunny_ui_linux/src/drive.rs` is the hand; the sheet is
-the example's own.
+the example's own. A tiling compositor (niri, sway, Hyprland) answers
+the size a window asks for with a tile of its own, so a sheet that
+aims from the bottom or the right edge measures `drive::window_size()`
+first.
 
 ## Prove it without a Linux desktop
 
