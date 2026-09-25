@@ -990,6 +990,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     sync_frame_driver(runtime, &handler_pacer, window.raw_window());
                 }
             }
+            AppEvent::WindowState { maximized } => {
+                if runtime.set_window_state(bunny_ui::prelude::WindowState { maximized }) {
+                    soon(runtime, root, ORIGIN_KEY);
+                }
+            }
             AppEvent::Modifiers(held) => {
                 // a release confirms, closes, opens — whatever the sink
                 // did, the frame that shows it is not one to wait for

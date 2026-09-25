@@ -78,6 +78,73 @@ pub struct SafeAreaInsets {
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct KeyboardInset(pub f64);
 
+/// `\.viewport` — the size the window lays its root out at, in layout
+/// points: the whole window, the safe area included.
+///
+/// A body reads it to choose a SHAPE — a desktop chassis or a portrait
+/// one, a sidebar that fits or a sheet that replaces it — which is the
+/// question a product asks `Form::of(window)` in twenty places. It is a
+/// dependency like a `State`: a body that reads it re-runs when the
+/// window changes size, and only that body. A body that only needs a
+/// threshold does best to read it in a small view of its own, so the
+/// rest of the tree stays still while a resize crosses nothing.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Viewport {
+    pub width: f64,
+    pub height: f64,
+}
+
+/// `\.windowState` — what the platform says about the window itself.
+///
+/// A scene that draws its own caption buttons draws the middle one as a
+/// square or as the restore glyph, and only the platform knows which the
+/// window is: the button's click was always right in both states, and
+/// now its picture can be too. A dependency like [`Viewport`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct WindowState {
+    /// The window fills the screen's work area, by the platform's own
+    /// maximize (zoom on the mac) — not by being dragged that big.
+    pub maximized: bool,
+}
+
+/// The values the runtime keeps for its window, readable from every body.
+/// Shared handles, so a read is a dependency and a move re-runs only the
+/// bodies that read — never the whole retention, which is what moving
+/// any other environment value costs, and what a live resize could not
+/// afford once a frame.
+#[derive(Clone)]
+pub struct WindowValues {
+    viewport: Store<Viewport>,
+    state: Store<WindowState>,
+}
+
+impl Default for WindowValues {
+    fn default() -> Self {
+        WindowValues { viewport: Store::new(Viewport::default()), state: Store::new(WindowState::default()) }
+    }
+}
+
+impl WindowValues {
+    /// The runtime's write: `true` when the viewport moved, and then the
+    /// bodies that read it are due.
+    pub fn set_viewport(&self, viewport: Viewport) -> bool {
+        let moved = self.viewport.value() != viewport;
+        if moved {
+            self.viewport.send(viewport);
+        }
+        moved
+    }
+
+    /// The runtime's write for the platform's report: `true` when it moved.
+    pub fn set_state(&self, state: WindowState) -> bool {
+        let moved = self.state.value() != state;
+        if moved {
+            self.state.send(state);
+        }
+        moved
+    }
+}
+
 /// Everything `@Environment(\.key)` can read. App-specific values (the DI
 /// container, the SwiftData model container) ride along type-erased, exactly
 /// like `@Entry` extensions do in real SwiftUI.
@@ -90,6 +157,8 @@ pub struct EnvironmentValues {
     pub safeAreaInsets: SafeAreaInsets,
     /// `\.keyboardInset` — the shell's, mirrored per layout.
     pub keyboardInset: KeyboardInset,
+    /// `\.viewport` and `\.windowState` — the runtime's, kept live.
+    pub window: WindowValues,
     /// `\.injected` — `Rc<DIContainer>` in the app.
     pub injected: Option<Rc<dyn Any>>,
     /// `\.modelContext` stand-in: resolves `Query<T>` sources by type name.
@@ -135,6 +204,18 @@ impl FromEnvironment for SafeAreaInsets {
 impl FromEnvironment for KeyboardInset {
     fn from_environment(values: &EnvironmentValues) -> Self {
         values.keyboardInset
+    }
+}
+
+impl FromEnvironment for Viewport {
+    fn from_environment(values: &EnvironmentValues) -> Self {
+        values.window.viewport.value()
+    }
+}
+
+impl FromEnvironment for WindowState {
+    fn from_environment(values: &EnvironmentValues) -> Self {
+        values.window.state.value()
     }
 }
 

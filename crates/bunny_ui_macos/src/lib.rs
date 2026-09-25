@@ -1668,6 +1668,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         };
         match event {
         AppEvent::Redraw => blit(runtime, root, trace::Origin::Redraw),
+        // the Redraw that follows presents it
+        AppEvent::WindowState { maximized } => {
+            let _ = runtime.set_window_state(bunny_ui::prelude::WindowState { maximized });
+        }
         AppEvent::WindowClosed => {
             // Nothing to take down by hand: the popover panels and the
             // dialogs are CHILDREN of this window and AppKit closes

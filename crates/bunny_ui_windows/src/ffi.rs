@@ -425,6 +425,7 @@ const CF_UNICODETEXT: u32 = 13;
 const GMEM_MOVEABLE: u32 = 2;
 // WM_SIZE minimized
 const SIZE_MINIMIZED: usize = 1;
+const SIZE_MAXIMIZED: usize = 2;
 // WM_ACTIVATE inactive
 const WA_INACTIVE: usize = 0;
 // hit-test: the client area (WM_SETCURSOR's low word)
@@ -600,6 +601,9 @@ pub enum AppEvent {
     Frame { dt: f64 },
     /// The window changed size (or needs the first frame).
     Redraw,
+    /// The platform's word on the window itself — maximized or not —
+    /// sent before the frame that shows it.
+    WindowState { maximized: bool },
     /// The window deactivated (the user switched apps or windows) —
     /// open popovers close, the platform's own manner.
     ResignKey,
@@ -1783,6 +1787,10 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 return 0;
             }
             refresh_metrics(hwnd);
+            // the platform's word on the window itself, BEFORE the frame
+            // that shows it: a scene-drawn caption swaps the square for
+            // the restore glyph in the same composition as the new size
+            dispatch_at(hwnd, AppEvent::WindowState { maximized: wparam == SIZE_MAXIMIZED });
             // present synchronously before returning: content and size
             // land in the same composition — the resize never shows a
             // stretched stale frame

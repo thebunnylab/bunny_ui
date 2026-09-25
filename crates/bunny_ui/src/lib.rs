@@ -163,7 +163,7 @@ pub mod prelude {
     pub use motor::runtime::Site;
     pub use motor::state::{
         Binding, Context, Environment, EnvironmentValues, FromEnvironment, KeyboardInset, Locale,
-        ProvidesQueries, SafeAreaInsets, SizeClass, State,
+        ProvidesQueries, SafeAreaInsets, SizeClass, State, Viewport, WindowState,
     };
     pub use motor::views::{
         ContentMode, Edge, Font, ListStyle, NavigationPath, ProgressViewStyle, Query,
@@ -14369,6 +14369,96 @@ mod tests {
     }
 
     // MARK: - The environment moves at runtime
+
+    /// The chassis asks the window's shape the way a product asks
+    /// `Form::of(window)`: it reads the viewport, and it is the only body
+    /// a resize runs again — in the same frame, with no sensor beside it.
+    #[test]
+    fn a_body_reads_the_viewport_and_only_its_readers_follow_a_resize() {
+        #[derive(Clone, Copy)]
+        struct Workbench;
+        impl Component for Workbench {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(Chassis, Still)
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Chassis;
+        impl Component for Chassis {
+            fn body(self, ctx: &Context) -> impl View {
+                let window = ctx.environment::<Viewport>();
+                let portrait = window.width < 600.0 && window.width < window.height;
+                text(if portrait { "portrait" } else { "desktop" })
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Still;
+        impl Component for Still {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("the rest of the tree")
+            }
+        }
+        fn first_line(display: &crate::layout::DisplayList) -> String {
+            display
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { content, .. } => {
+                        Some(content.to_string())
+                    }
+                    _ => None,
+                })
+                .expect("a line paints")
+        }
+
+        let runtime = Runtime::new();
+        let desktop = Size { width: 1280.0, height: 800.0 };
+        let phone = Size { width: 390.0, height: 844.0 };
+        assert_eq!(first_line(&runtime.display_frame(&Workbench, desktop)), "desktop");
+        let _ = runtime.display_frame(&Workbench, desktop);
+        assert!(runtime.body_runs().is_empty(), "a still window runs no body");
+        assert!(!runtime.needs_frame(), "and asks for none");
+
+        // the resize is read in the frame it happens in, by its reader
+        // alone, once — the size was written before the frame settled
+        let _ = crate::reconciler::take_frame_runs();
+        assert_eq!(first_line(&runtime.display_frame(&Workbench, phone)), "portrait");
+        let ran = crate::reconciler::take_frame_runs();
+        assert_eq!(ran.len(), 1, "one body ran, once: {ran:?}");
+        assert!(ran[0].ends_with("Chassis"), "the reader: {ran:?}");
+        let _ = runtime.display_frame(&Workbench, phone);
+        assert!(runtime.body_runs().is_empty(), "and settled");
+    }
+
+    /// The scene's caption draws the middle button as the platform's own
+    /// state: a square, or the restore glyph.
+    #[test]
+    fn the_window_state_reaches_the_body_that_draws_the_caption() {
+        #[derive(Clone, Copy)]
+        struct Caption;
+        impl Component for Caption {
+            fn body(self, ctx: &Context) -> impl View {
+                text(if ctx.environment::<WindowState>().maximized { "restore" } else { "maximize" })
+            }
+        }
+        let runtime = Runtime::new();
+        let size = Size { width: 800.0, height: 40.0 };
+        let line = |runtime: &Runtime| {
+            runtime
+                .display_frame(&Caption, size)
+                .iter()
+                .find_map(|command| match command {
+                    crate::layout::DrawCommand::TextLine { content, .. } => Some(content.to_string()),
+                    _ => None,
+                })
+                .expect("the caption paints")
+        };
+        assert_eq!(line(&runtime), "maximize");
+        assert!(runtime.set_window_state(WindowState { maximized: true }), "news");
+        assert!(!runtime.set_window_state(WindowState { maximized: true }), "the same state is none");
+        assert_eq!(line(&runtime), "restore");
+        assert!(runtime.set_window_state(WindowState::default()));
+        assert_eq!(line(&runtime), "maximize");
+    }
 
     /// The size class reaches a body through the environment; the shell
     /// moving it re-runs the bodies that read it — once — and a pass with

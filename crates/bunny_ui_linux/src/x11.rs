@@ -2376,11 +2376,9 @@ fn crown_execute(window: u32, take: crate::ffi::CrownTake, root_x: i16, root_y: 
 }
 
 /// Re-reads _NET_WM_STATE off the main window — the maximized mirror
-/// bands and corners consult.
-fn refresh_wm_state(client: &mut XClient, window: u32) {
-    if window_ref(client, window).is_none() {
-        return;
-    }
+/// bands and corners consult. Answers the mirror as it stands now.
+fn refresh_wm_state(client: &mut XClient, window: u32) -> Option<bool> {
+    window_ref(client, window)?;
     let (id, state_atom) = (window, client.atoms.net_wm_state);
     let max_pair = (client.atoms.net_wm_state_max_horz, client.atoms.net_wm_state_max_vert);
     unsafe {
@@ -2388,7 +2386,7 @@ fn refresh_wm_state(client: &mut XClient, window: u32) {
             xcb_get_property(client.connection, 0, id, state_atom, ATOM_ATOM, 0, 64);
         let reply = xcb_get_property_reply(client.connection, cookie, std::ptr::null_mut());
         if reply.is_null() {
-            return;
+            return None;
         }
         let count = (xcb_get_property_value_length(reply).max(0) as usize) / 4;
         let atoms = std::slice::from_raw_parts(
@@ -2397,9 +2395,9 @@ fn refresh_wm_state(client: &mut XClient, window: u32) {
         );
         let maximized = atoms.contains(&max_pair.0) || atoms.contains(&max_pair.1);
         free(reply.cast());
-        if let Some(win) = window_at(client, window) {
-            win.maximized = maximized;
-        }
+        let win = window_at(client, window)?;
+        win.maximized = maximized;
+        Some(maximized)
     }
 }
 
@@ -2931,13 +2929,15 @@ fn interpret(event: *mut GenericEvent) -> Step {
                 let notify = event as *mut PropertyNotifyEvent;
                 ((*notify).window, (*notify).atom)
             };
-            with_x(|client| {
+            let maximized = with_x(|client| {
                 let interesting =
                     window_ref(client, window).is_some() && atom == client.atoms.net_wm_state;
-                if interesting {
-                    refresh_wm_state(client, window);
-                }
+                if interesting { refresh_wm_state(client, window) } else { None }
             });
+            // …and the app hears it: a scene-drawn caption draws it
+            if let Some(maximized) = maximized {
+                return Step::Deliver(window, AppEvent::WindowState { maximized });
+            }
             Step::Silence
         }
         XCB_FOCUS_IN => {

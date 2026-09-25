@@ -1680,6 +1680,8 @@ pub enum AppEvent {
     WindowClosed,
     Wake,
     ResignKey,
+    /// The platform's word on the window itself — maximized or not.
+    WindowState { maximized: bool },
     MouseMoved { x: f64, y: f64, modifiers: bunny_ui::action::Modifiers },
     MouseDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     MouseUp { x: f64, y: f64 },
@@ -2172,7 +2174,9 @@ fn absorb_setup(addr: usize) -> bool {
             Ev::ToplevelConfigure { toplevel_ptr, width, height, states }
                 if toplevel_ptr == toplevel =>
             {
-                with_client(|client| {
+                // the window is being born: its first frame reads the
+                // runtime's state, which the next configure keeps honest
+                let _ = with_client(|client| {
                     apply_toplevel_configure(client, toplevel_ptr, width, height, &states)
                 });
             }
@@ -2214,15 +2218,23 @@ fn absorb_setup(addr: usize) -> bool {
 }
 
 /// The toplevel's word: a size (zero = our choice) and the states.
-fn apply_toplevel_configure(client: &mut Client, toplevel_ptr: usize, width: i32, height: i32, states: &[u32]) {
-    if let Some(win) = window_where(client, |w| w.toplevel as usize == toplevel_ptr) {
-        // zero means "your choice": keep what we have
-        win.pending_size = (width > 0 && height > 0).then_some((width, height));
-        const STATE_MAXIMIZED: u32 = 1;
-        const STATE_RESIZING: u32 = 3;
-        win.maximized = states.contains(&STATE_MAXIMIZED);
-        win.resizing = states.contains(&STATE_RESIZING);
-    }
+/// Answers the window and whether it is maximized now — the app hears
+/// the second, since a scene-drawn caption draws it.
+fn apply_toplevel_configure(
+    client: &mut Client,
+    toplevel_ptr: usize,
+    width: i32,
+    height: i32,
+    states: &[u32],
+) -> Option<(usize, bool)> {
+    let win = window_where(client, |w| w.toplevel as usize == toplevel_ptr)?;
+    // zero means "your choice": keep what we have
+    win.pending_size = (width > 0 && height > 0).then_some((width, height));
+    const STATE_MAXIMIZED: u32 = 1;
+    const STATE_RESIZING: u32 = 3;
+    win.maximized = states.contains(&STATE_MAXIMIZED);
+    win.resizing = states.contains(&STATE_RESIZING);
+    Some((win.surface as usize, win.maximized))
 }
 
 /// The xdg surface's configure: acked at once, the staged size taken.
@@ -4181,9 +4193,17 @@ fn drain_protocol_events() {
             Ev::Ping { serial } => with_client(|client| unsafe {
                 request(client.wm_base, 3, &mut [arg_u(serial)]);
             }),
-            Ev::ToplevelConfigure { toplevel_ptr, width, height, states } => with_client(|client| {
-                apply_toplevel_configure(client, toplevel_ptr, width, height, &states)
-            }),
+            Ev::ToplevelConfigure { toplevel_ptr, width, height, states } => {
+                let window = with_client(|client| {
+                    apply_toplevel_configure(client, toplevel_ptr, width, height, &states)
+                });
+                // the compositor's word on the window itself: a scene
+                // caption swaps the square for the restore glyph. The
+                // surface configure that follows presents it
+                if let Some((addr, maximized)) = window {
+                    dispatch_at(addr, AppEvent::WindowState { maximized });
+                }
+            }
             Ev::SurfaceConfigure { xdg_ptr, serial } => {
                 let Some((addr, resized, first, mapped, before)) =
                     with_client(|client| apply_surface_configure(client, xdg_ptr, serial))

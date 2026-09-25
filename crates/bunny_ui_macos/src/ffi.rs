@@ -222,6 +222,9 @@ pub enum AppEvent {
     Frame { dt: f64 },
     /// The window changed size (or needs the first frame).
     Redraw,
+    /// The platform's word on the window itself — zoomed (the mac's
+    /// maximized) or not — sent before the frame that shows it.
+    WindowState { maximized: bool },
     /// The window stopped being key (the user switched apps or
     /// windows) — open popovers close, the platform's own manner.
     ResignKey,
@@ -1202,6 +1205,12 @@ fn window_frame_changed(note: Id, kind: &str) {
         }
     }
     place_traffic_lights(window);
+    // the platform's word on the window itself, before the frame that
+    // shows it: zoomed is the mac's maximized
+    if kind == "resize" {
+        let maximized = unsafe { msg_bool(window, sel("isZoomed")) } != 0;
+        dispatch_to(window, AppEvent::WindowState { maximized });
+    }
     dispatch_to(window, AppEvent::Redraw);
 }
 

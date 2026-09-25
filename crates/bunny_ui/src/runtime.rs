@@ -706,6 +706,33 @@ impl Runtime {
         self.safe_area.get()
     }
 
+    /// The size the window lays its root out at, written where a body
+    /// reads it (`ctx.environment::<Viewport>()`). A move dirties exactly
+    /// the bodies that read it; the frame writing it is the frame that
+    /// serves them, so a quiet scene stays quiet to a shell that asks.
+    fn note_viewport(&self, proposal: crate::layout::Proposal) {
+        let viewport = motor::state::Viewport {
+            width: proposal.width.unwrap_or(0.0),
+            height: proposal.height.unwrap_or(0.0),
+        };
+        let quiet = motor::identity::write_epoch() == self.settled_epoch.get();
+        if self.ctx.borrow().values.window.set_viewport(viewport) && quiet {
+            self.settled_epoch.set(motor::identity::write_epoch());
+        }
+    }
+
+    /// The shell's door for what the platform says about the window —
+    /// maximized or not. A body reads it as
+    /// `ctx.environment::<WindowState>()`, and only the bodies that read
+    /// it re-run when it moves. `true` when it moved: the shell presents.
+    pub fn set_window_state(&self, state: motor::state::WindowState) -> bool {
+        let moved = self.ctx.borrow().values.window.set_state(state);
+        if moved {
+            self.frame_asked.set(true);
+        }
+        moved
+    }
+
     /// The software keyboard's height over the window, 0 when it hides.
     /// The bottom inset becomes the larger of the safe area's and this,
     /// so the content stands above the keys instead of under them.
@@ -3829,6 +3856,9 @@ impl Runtime {
         root: &impl View,
         size: crate::layout::Size,
     ) -> crate::layout::DisplayList {
+        // the size is known before the settle: the settle's own pass reads
+        // it, and a reader runs once for a resize and never with a stale one
+        self.note_viewport(crate::layout::Proposal::exact(size));
         self.settle(root);
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
         if let Some(again) = self.reread_hover(root, size, &result) {
@@ -4105,6 +4135,7 @@ impl Runtime {
         root: &impl View,
         size: crate::layout::Size,
     ) -> Vec<crate::dom::DomPatch> {
+        self.note_viewport(crate::layout::Proposal::exact(size));
         self.settle(root);
         // everything that ran while settling — the reuse decision's
         // whole evidence (a theme change already cleared retention,
@@ -5494,6 +5525,10 @@ impl Runtime {
         // every call walks measure+place (the stable-root shortcut
         // skips BODIES, not geometry) — so every call counts
         crate::stats::note_layout_pass();
+        // the window's size, BEFORE the pass: a body that reads it is due
+        // in this very frame, not in the one after — no body lays out a
+        // window it has never seen
+        self.note_viewport(proposal);
         // STABLE boundary-root frame (hover, wheel, blink, the
         // post-settle layout): nothing dirty, same theme, retained
         // root — the walk would be all-skip and emit exactly ONE

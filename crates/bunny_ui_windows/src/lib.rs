@@ -1111,6 +1111,10 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // frame. A worker's wake mid-drag polls on the next turn
             // instead of racing the one presenter (the mac's law).
             AppEvent::Redraw => blit(runtime, root),
+            // the Redraw that follows presents it
+            AppEvent::WindowState { maximized } => {
+                let _ = runtime.set_window_state(bunny_ui::prelude::WindowState { maximized });
+            }
             // The work always lands: the tasks are polled. The FRAME is for a
             // turn that changed something. Most wakes change nothing — a poll
             // that found no news, a sleeper that went back to sleep — and a
