@@ -13802,6 +13802,40 @@ mod tests {
     /// A finger held still over a row with a context menu: half a second
     /// on the clock opens the menu, the lift after it changes nothing,
     /// and the next tap picks a row.
+    /// The Android emulator's workbench drew at about eight frames a
+    /// second, and half a second of hold took four seconds of finger. The
+    /// hand's clock is the wall's now — and the first beat after the
+    /// finger lands never counts a nap the driver took before it.
+    #[test]
+    fn a_long_press_is_half_a_second_of_finger_on_a_slow_scene() {
+        #[derive(Clone)]
+        struct Row;
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                scroll(vstack!(
+                    text("file_0001.rs").context_menu(vec![menu_item("Open", || {})]),
+                    text("tall").frame_height(1000.0),
+                ))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&Row, Size { width: 300.0, height: 200.0 });
+        let (step, beat) = (1.0 / 30.0, 1.0 / 8.0);
+
+        runtime.touch_began(1, 30.0, 8.0, 1);
+        // the driver slept five seconds before the finger came: one step of
+        // that gap counts, never the nap
+        runtime.tick_clocked(step, 5.0);
+        assert!(runtime.interaction().menu.is_none(), "a fresh touch is not a long press");
+        for _ in 0..3 {
+            runtime.tick_clocked(step, beat);
+        }
+        assert!(runtime.interaction().menu.is_none(), "0.41 seconds of finger");
+        runtime.tick_clocked(step, beat);
+        assert!(runtime.interaction().menu.is_some(), "0.53: the menu opens under the finger");
+    }
+
     #[test]
     fn a_long_press_opens_the_context_menu_and_the_lift_keeps_it() {
         use crate::layout::{MENU_PATH, Proposal, Size};

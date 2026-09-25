@@ -2553,21 +2553,22 @@ fn next_beat_deadline() -> Option<Instant> {
 
 fn frame_due() {
     let now = Instant::now();
-    let beats: Vec<(u32, f64)> = with_x(|client| {
+    let beats: Vec<(u32, f64, f64)> = with_x(|client| {
         client
             .windows
             .iter_mut()
             .filter(|win| win.next_beat.is_some_and(|at| now >= at))
             .map(|win| {
                 win.next_beat = None; // the handler's sync re-arms
-                let dt = win.pace.beat_dt(win.last_frame.map(|last| (now - last).as_secs_f64()));
+                let gap = win.last_frame.map(|last| (now - last).as_secs_f64());
+                let dt = win.pace.beat_dt(gap);
                 win.last_frame = Some(now);
-                (win.id, dt)
+                (win.id, dt, gap.unwrap_or(dt))
             })
             .collect()
     });
-    for (window, dt) in beats {
-        crate::ffi::dispatch_at(window as usize, AppEvent::Frame { dt });
+    for (window, dt, elapsed) in beats {
+        crate::ffi::dispatch_at(window as usize, AppEvent::Frame { dt, elapsed });
     }
 }
 

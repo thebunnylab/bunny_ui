@@ -292,12 +292,29 @@ impl Recognizer {
     }
 
     /// The frame clock: ages a hold into a menu or a press, samples the
-    /// velocity of a pan, and steps a fling.
+    /// velocity of a pan, and steps a fling — all by `dt`, the frame's
+    /// own step. [`Recognizer::tick_timed`] tells the hand's time apart.
     pub fn tick(&mut self, dt: f64, scene: &dyn TouchScene) -> Vec<Gesture> {
+        self.tick_timed(dt, dt, scene)
+    }
+
+    /// The frame clock with two readings, because it measures two things.
+    ///
+    /// `hand` is the seconds the HAND spent, by the clock on the wall:
+    /// a hold ages by it and a pan's speed is read against it. `dt` is
+    /// the frame's step, which a shell clamps so a stalled display never
+    /// throws a spring across the screen — and a fling, which is motion
+    /// on the screen and not the hand's, steps by it like any spring.
+    ///
+    /// With one reading the hold measured the RENDERER: a shell clamps
+    /// each step to a thirtieth, so on a scene drawing eight frames a
+    /// second half a second of finger took four seconds of it, and a
+    /// long press looked like one that does not work.
+    pub fn tick_timed(&mut self, dt: f64, hand: f64, scene: &dyn TouchScene) -> Vec<Gesture> {
         let mut out = Vec::new();
         match self.phase {
             Phase::Undecided { start, taps, held } => {
-                let held = held + dt;
+                let held = held + hand;
                 if held >= LONG_PRESS {
                     if scene.menu_at(start) {
                         // the rest of this touch is spent: a lift after a
@@ -316,7 +333,7 @@ impl Recognizer {
             }
             Phase::Panning { .. } => {
                 let (dx, dy) = std::mem::take(&mut self.pending);
-                self.samples.push(Sample { dt, dx, dy });
+                self.samples.push(Sample { dt: hand, dx, dy });
                 // the window is short; the ring stays short
                 if self.samples.len() > 16 {
                     self.samples.remove(0);
@@ -346,7 +363,7 @@ impl Recognizer {
                 // menu: the row was pressed, and the hold is the second
                 // click. Nothing under it has fired — a button fires on
                 // the lift — so the cancel costs no one anything
-                let held = held + dt;
+                let held = held + hand;
                 if held < LONG_PRESS {
                     self.phase = Phase::Pressing { start, held, still: true };
                 } else if scene.menu_at(start) {
@@ -560,6 +577,36 @@ mod tests {
         touch.tick(0.3, &LIST);
         assert_eq!(touch.tick(0.3, &LIST), vec![Gesture::Press { at: p(10.0, 10.0), taps: 1, held: 0.6 }]);
         assert_eq!(touch.moved(1, p(40.0, 10.0)), vec![Gesture::Move { at: p(40.0, 10.0) }]);
+    }
+
+    /// A scene drawing eight frames a second, stepped at the shells' clamp
+    /// of a thirtieth: the hold is half a second of FINGER, four beats of
+    /// an eighth, and not fifteen beats of the clamp.
+    #[test]
+    fn a_hold_is_timed_by_the_hand_and_not_by_the_renderer() {
+        let (step, beat) = (1.0 / 30.0, 1.0 / 8.0);
+        let mut touch = Recognizer::new();
+        touch.began(1, p(10.0, 10.0), 1, &LIST);
+        for _ in 0..3 {
+            assert!(touch.tick_timed(step, beat, &LIST).is_empty(), "not yet");
+        }
+        assert_eq!(
+            touch.tick_timed(step, beat, &LIST),
+            vec![Gesture::Press { at: p(10.0, 10.0), taps: 1, held: 0.5 }],
+        );
+
+        // and a pan's speed is the hand's: ten points a beat is eighty a
+        // second, however short the clamped step says the beat was
+        let mut touch = Recognizer::new();
+        touch.began(1, p(10.0, 500.0), 1, &LIST);
+        let mut y = 500.0;
+        for _ in 0..4 {
+            y -= 10.0;
+            touch.moved(1, p(10.0, y));
+            touch.tick_timed(step, beat, &LIST);
+        }
+        let (_, dy) = touch.velocity();
+        assert!((dy.abs() - 80.0).abs() < 1e-6, "the hand's speed, not the renderer's: {dy}");
     }
 
     /// Runs a pan of `steps` moves of `dy` each at the given frame rate,

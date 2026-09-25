@@ -285,7 +285,9 @@ pub enum AppEvent {
     /// The caret's blink half-period.
     Blink,
     /// One frame tick; `dt` seconds since the last, clamped.
-    Frame { dt: f64 },
+    /// `dt` is the animations' step, clamped; `elapsed` the seconds since
+    /// the last beat by the wall, which the hand's clock reads.
+    Frame { dt: f64, elapsed: f64 },
     /// The window went away (the background, a rotation): nothing
     /// presents until one comes back.
     WindowLost,
@@ -825,7 +827,8 @@ unsafe extern "C" fn on_blink(fd: c_int, _events: c_int, _data: *mut c_void) -> 
 unsafe extern "C" fn on_slow(fd: c_int, _events: c_int, _data: *mut c_void) -> c_int {
     let mut count = 0u64;
     unsafe { read(fd, (&raw mut count).cast(), 8) };
-    dispatch(AppEvent::Frame { dt: SLOW_INTERVAL.with(Cell::get) });
+    let step = SLOW_INTERVAL.with(Cell::get);
+    dispatch(AppEvent::Frame { dt: step, elapsed: step });
     1
 }
 
@@ -833,13 +836,15 @@ unsafe extern "C" fn on_slow(fd: c_int, _events: c_int, _data: *mut c_void) -> c
 /// while the pace stays full.
 unsafe extern "C" fn on_frame(frame_time_nanos: i64, _data: *mut c_void) {
     FRAME_POSTED.with(|slot| slot.set(false));
-    let dt = match LAST_FRAME_NANOS.with(|slot| slot.replace(Some(frame_time_nanos))) {
-        // the first tick after a pause would report the whole pause as
-        // the gap — a clamped step keeps springs continuous
-        Some(last) => ((frame_time_nanos - last).max(0) as f64 / 1e9).clamp(0.0, 1.0 / 30.0),
-        None => 1.0 / 60.0,
-    };
-    dispatch(AppEvent::Frame { dt });
+    let gap = LAST_FRAME_NANOS
+        .with(|slot| slot.replace(Some(frame_time_nanos)))
+        .map(|last| (frame_time_nanos - last).max(0) as f64 / 1e9);
+    // the first tick after a pause would report the whole pause as the
+    // gap — a clamped step keeps springs continuous. The hand's clock
+    // reads the gap itself: a scene drawing eight frames a second is an
+    // eighth of a second of finger per beat, not a thirtieth
+    let dt = gap.map_or(1.0 / 60.0, |gap| gap.clamp(0.0, 1.0 / 30.0));
+    dispatch(AppEvent::Frame { dt, elapsed: gap.unwrap_or(dt) });
     if PACE.with(Cell::get) == DriverPace::Full {
         post_frame();
     }
@@ -914,6 +919,11 @@ fn install_clocks(looper: *mut ALooper) {
 /// Points the frame driver at the pace the moment deserves.
 pub fn set_frame_driver(pace: DriverPace) {
     PACE.with(|slot| slot.set(pace));
+    // a driver that stops forgets its last beat: a resume never reports
+    // the nap as a gap
+    if pace != DriverPace::Full {
+        LAST_FRAME_NANOS.with(|slot| slot.set(None));
+    }
     match pace {
         DriverPace::Full => {
             arm_slow(0.0);

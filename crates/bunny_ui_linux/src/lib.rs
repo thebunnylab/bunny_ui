@@ -1202,12 +1202,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     blit(runtime, root, ORIGIN_BLINK);
                 }
             }
-            AppEvent::Frame { dt } => {
+            AppEvent::Frame { dt, elapsed } => {
                 // the tick path: springs advance, then layout only —
                 // zero bodies on a stable tree; settle and effects
                 // belong to the real-event path. The pacer says whether
-                // this beat draws what was asked for, holds, or is quiet
-                let moved = runtime.tick(dt);
+                // this beat draws what was asked for, holds, or is quiet.
+                // A finger's hold reads the wall; the springs, the step
+                let moved = runtime.tick_clocked(dt, elapsed);
                 match handler_pacer.beat(ffi::in_live_resize(window.raw_window())) {
                     Beat::Hold => {}
                     Beat::Draw => blit(runtime, root, ORIGIN_FRAME),

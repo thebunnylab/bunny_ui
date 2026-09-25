@@ -836,11 +836,12 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                     blit(runtime, root);
                 }
             }
-            AppEvent::Frame { dt } => {
+            AppEvent::Frame { dt, elapsed } => {
                 // the tick path: springs and flings advance, then layout
                 // only — zero bodies on a stable tree. A finger the
-                // clock decided for reached the app: that frame settles
-                let ticked = runtime.tick(dt);
+                // clock decided for reached the app: that frame settles.
+                // A finger's hold reads the wall; the springs, the step
+                let ticked = runtime.tick_clocked(dt, elapsed);
                 if ticked.input {
                     blit(runtime, root);
                 } else {

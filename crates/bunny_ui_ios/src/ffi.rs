@@ -173,7 +173,9 @@ pub enum AppEvent {
     /// The caret's blink half-period.
     Blink,
     /// One display-link tick; `dt` seconds since the last, clamped.
-    Frame { dt: f64 },
+    /// `dt` is the animations' step, clamped; `elapsed` the seconds since
+    /// the last beat by the wall, which the hand's clock reads.
+    Frame { dt: f64, elapsed: f64 },
 }
 
 /// One hardware key press, in the terms the keymap reads.
@@ -412,18 +414,31 @@ extern "C" fn bunny_blink(_this: Id, _sel: Sel, _timer: Id) {
 }
 
 extern "C" fn bunny_slow(_this: Id, _sel: Sel, _timer: Id) {
-    dispatch(AppEvent::Frame { dt: SLOW.with(|slot| slot.get().1) });
+    let step = SLOW.with(|slot| slot.get().1);
+    dispatch(AppEvent::Frame { dt: step, elapsed: step });
 }
 
 extern "C" fn bunny_frame(_this: Id, _sel: Sel, link: Id) {
-    let dt = unsafe {
+    let (dt, stamp) = unsafe {
         let last = msg_f64(link, sel("timestamp"));
         let next = msg_f64(link, sel("targetTimestamp"));
         // the first tick after a resume reports the whole pause as the
         // gap — a clamped step keeps springs continuous
-        (next - last).clamp(0.0, 1.0 / 30.0)
+        ((next - last).clamp(0.0, 1.0 / 30.0), last)
     };
-    dispatch(AppEvent::Frame { dt });
+    // the wall's gap between two frames that were DRAWN: a scene that
+    // takes a hundred milliseconds a frame skips the display's beats, and
+    // the link's own step would count every skipped one as nothing
+    let elapsed = LAST_STAMP
+        .with(|slot| slot.replace(Some(stamp)))
+        .map_or(dt, |previous| (stamp - previous).max(0.0));
+    dispatch(AppEvent::Frame { dt, elapsed });
+}
+
+thread_local! {
+    /// The display link's timestamp at the last beat — forgotten when the
+    /// link pauses, so a resume never reports the nap as a gap.
+    static LAST_STAMP: Cell<Option<f64>> = const { Cell::new(None) };
 }
 
 /// The keyboard moved: its frame after the move, in screen coordinates,
@@ -464,6 +479,9 @@ pub enum DriverPace {
 /// Points the frame driver at the pace the moment deserves.
 pub fn set_frame_driver(pace: DriverPace) {
     let full = pace == DriverPace::Full && !BACKGROUNDED.with(Cell::get);
+    if !full {
+        LAST_STAMP.with(|slot| slot.set(None));
+    }
     LINK.with(|slot| {
         let link = slot.get();
         if !link.is_null() {

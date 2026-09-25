@@ -280,6 +280,9 @@ pub struct Runtime {
     /// Who hears every stroke the keymap resolves — a key-context
     /// debugger's door.
     key_sink: RefCell<Option<Rc<dyn Fn(&crate::action::KeyReport)>>>,
+    /// A finger landed since the last beat: that beat's gap may be from
+    /// before it, and the hand's clock counts at most one step of it.
+    touch_fresh: Cell<bool>,
     /// The size last HANDED to each measurement probe. A probe fires on
     /// change and only on change: a view at rest costs nothing, and a
     /// handler that writes state cannot spin against its own report.
@@ -1289,6 +1292,7 @@ impl Runtime {
             held: Cell::new(crate::action::Modifiers::NONE),
             modifier_sink: RefCell::new(None),
             key_sink: RefCell::new(None),
+            touch_fresh: Cell::new(false),
             pending_aged: Cell::new(false),
             wheel_latch: RefCell::new(None),
             measures: RefCell::new(HashMap::default()),
@@ -2413,6 +2417,7 @@ impl Runtime {
         // a new finger is a new gesture: the pan asks again what is
         // under its anchor
         self.wheel_latch.borrow_mut().take();
+        self.touch_fresh.set(true);
         let gestures = self.touch.borrow_mut().began(id, Point { x, y }, taps, self);
         self.perform_touch(gestures).0
     }
@@ -3963,6 +3968,22 @@ impl Runtime {
     /// the looping boxes. With nothing animating the call is free — the
     /// shell pauses its frame driver while both stay false.
     pub fn tick(&self, dt: f64) -> crate::anim::Ticked {
+        self.tick_clocked(dt, dt)
+    }
+
+    /// [`Runtime::tick`], with the seconds the beat really took on the
+    /// wall. `dt` is the step every animation takes — the shell clamps it,
+    /// so a stalled display never throws a spring across the screen — and
+    /// `elapsed` is the time since the last beat by the wall clock,
+    /// unclamped. The clocks that measure the HAND read the second: a
+    /// hold becomes a long press after half a second of finger, however
+    /// slowly the scene draws, and a pan's speed is its real speed.
+    ///
+    /// The first beat after a finger lands counts at most one step of
+    /// its gap: the beat before it may be from before the finger, and a
+    /// driver that slept through a quiet scene must not hand a fresh
+    /// touch the whole nap as holding.
+    pub fn tick_clocked(&self, dt: f64, elapsed: f64) -> crate::anim::Ticked {
         // the engine's clock moves with the frames: a sleeping task
         // wakes here, and its waker asks the shell for a settled turn
         // (this path only repaints, and a task needs the bodies)
@@ -3976,9 +3997,10 @@ impl Runtime {
                 .borrow_mut()
                 .insert(path.as_ref().to_string(), Point { x, y });
         }
-        // the finger's clock: a hold ages into a menu or a press, a
-        // fling slides the content one more step
-        let gestures = self.touch.borrow_mut().tick(dt, self);
+        // the finger's clock: a hold ages into a menu or a press by the
+        // hand's own time, a fling slides the content one more step
+        let hand = if self.touch_fresh.replace(false) { elapsed.min(dt) } else { elapsed };
+        let gestures = self.touch.borrow_mut().tick_timed(dt, hand.max(0.0), self);
         let mut moved = moved;
         if !gestures.is_empty() {
             let (repaint, input) = self.perform_touch(gestures);

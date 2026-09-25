@@ -1719,7 +1719,10 @@ pub enum AppEvent {
     ImeMark { text: String, caret: usize },
     ImeUnmark,
     Blink,
-    Frame { dt: f64 },
+    /// One beat: `dt` is the animations' step, clamped; `elapsed` the
+    /// seconds since the last beat by the wall, which the hand's clock
+    /// reads (a hold, a pan's speed).
+    Frame { dt: f64, elapsed: f64 },
 }
 
 thread_local! {
@@ -4270,12 +4273,13 @@ fn drain_protocol_events() {
                         return None;
                     }
                     let now = Instant::now();
-                    let dt = win.pace.beat_dt(win.last_frame.map(|last| (now - last).as_secs_f64()));
+                    let gap = win.last_frame.map(|last| (now - last).as_secs_f64());
+                    let dt = win.pace.beat_dt(gap);
                     win.last_frame = Some(now);
-                    Some((win.surface as usize, dt))
+                    Some((win.surface as usize, dt, gap.unwrap_or(dt)))
                 });
-                if let Some((addr, dt)) = beat {
-                    dispatch_at(addr, AppEvent::Frame { dt });
+                if let Some((addr, dt, elapsed)) = beat {
+                    dispatch_at(addr, AppEvent::Frame { dt, elapsed });
                 }
             }
             Ev::PointerEnter { serial, surface_ptr, x, y } => {
@@ -4962,21 +4966,22 @@ pub fn run() {
 /// that callback takes the beat back.
 fn frame_due() {
     let now = Instant::now();
-    let beats: Vec<(usize, f64)> = with_client(|client| {
+    let beats: Vec<(usize, f64, f64)> = with_client(|client| {
         client
             .windows
             .iter_mut()
             .filter(|win| win.next_beat.is_some_and(|at| now >= at))
             .map(|win| {
                 win.next_beat = None; // the handler's sync re-arms
-                let dt = win.pace.beat_dt(win.last_frame.map(|last| (now - last).as_secs_f64()));
+                let gap = win.last_frame.map(|last| (now - last).as_secs_f64());
+                let dt = win.pace.beat_dt(gap);
                 win.last_frame = Some(now);
-                (win.surface as usize, dt)
+                (win.surface as usize, dt, gap.unwrap_or(dt))
             })
             .collect()
     });
-    for (addr, dt) in beats {
-        dispatch_at(addr, AppEvent::Frame { dt });
+    for (addr, dt, elapsed) in beats {
+        dispatch_at(addr, AppEvent::Frame { dt, elapsed });
     }
 }
 
