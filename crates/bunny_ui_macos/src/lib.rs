@@ -356,8 +356,10 @@ impl App {
         // the app's life outside its windows opens with the app: the
         // delegate, the workspace's sleep and wake, the notifier
         life::install();
-        // the general pasteboard, for the app's own handlers too
+        // the general pasteboard, for the app's own handlers too — its
+        // pictures as well as its text
         bunny_ui::clipboard::install(ffi::clipboard_write, ffi::clipboard_read);
+        bunny_ui::clipboard::install_image_reader(ffi::clipboard_read_image);
         App {
             inner: Rc::new(AppInner {
                 slots: RefCell::new(Vec::new()),
@@ -1853,7 +1855,14 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     }
                     None
                 }
-                9 if command => ffi::clipboard_read().map(EditCommand::Insert),
+                9 if command => {
+                    // cmd+V — a picture first, for the input that takes
+                    // one, and the text after, as a paste always went
+                    if runtime.paste() {
+                        blit(runtime, root, trace::Origin::Input);
+                    }
+                    None
+                }
                 _ if !command && !chars.is_empty() && chars.chars().all(printable) => {
                     Some(EditCommand::Insert(chars))
                 }

@@ -796,6 +796,12 @@ pub enum ElementEvent {
     Marked { text: String, caret_utf16: (usize, usize) },
     /// The composition ended: what is marked stands as typed.
     Unmark,
+    /// A paste that carries a PICTURE — a screenshot, an image copied
+    /// from a page — offered before the paste's text. Answer it handled
+    /// and the text does not follow; ignore it and the text arrives as
+    /// [`ElementEvent::Text`], as a paste always did. Only where the
+    /// shell can read pictures off its clipboard (the mac today).
+    PasteImage(crate::clipboard::ClipboardImage),
     /// Answer with [`Response::text`] and the shell writes the
     /// clipboard.
     Copy,

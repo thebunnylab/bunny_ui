@@ -189,6 +189,7 @@ pub struct TextField {
     secret: bool,
     editing: Option<Rc<dyn crate::text_input::EditingStrategy>>,
     nav_intercept: Option<Binding<bool>>,
+    paste_image: Option<Rc<dyn Fn(crate::clipboard::ClipboardImage)>>,
 }
 
 impl TextField {
@@ -216,6 +217,20 @@ impl TextField {
     /// shift or a modifier with the arrows still selects and walks.
     pub fn nav_intercept(mut self, intercepting: Binding<bool>) -> Self {
         self.nav_intercept = Some(intercepting);
+        self
+    }
+
+    /// A paste that carries a PICTURE goes here instead of into the text:
+    /// ⌘V with a screenshot on the clipboard hands `take` the image, and
+    /// the field inserts nothing. A paste of text is the field's, as it
+    /// always was. The composer's attachment queue is the case — an image
+    /// has no place in a line of text, and pasted as text it is nothing.
+    ///
+    /// The picture is read only when the field is focused, the stroke is
+    /// a paste and this door is open; where the shell cannot read
+    /// pictures ([`crate::clipboard::read_image`]) the paste is text.
+    pub fn on_paste_image(mut self, take: impl Fn(crate::clipboard::ClipboardImage) + 'static) -> Self {
+        self.paste_image = Some(Rc::new(take));
         self
     }
 
@@ -301,6 +316,7 @@ impl View for TextField {
                     crate::reconciler::EditorFn {
                     submit_on_enter: self.submit_on_enter,
                     nav_intercept: self.nav_intercept.clone(),
+                    paste_image: self.paste_image.clone(),
                     key: self.editing.as_ref().map(|_| Rc::new(move |stroke: &crate::action::Stroke, state: &mut crate::text_input::CaretState| {
                         let Some(strategy) = &key_strategy else { return false };
                         let mut value = key_binding.wrappedValue();
@@ -576,6 +592,7 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
         secret: false,
         editing: None,
         nav_intercept: None,
+        paste_image: None,
     }
 }
 
@@ -600,6 +617,7 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         secret: false,
         editing: None,
         nav_intercept: None,
+        paste_image: None,
     }
 }
 

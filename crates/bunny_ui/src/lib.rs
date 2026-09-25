@@ -5948,6 +5948,100 @@ mod tests {
         assert_eq!(box_of(&Name { text: State::new(String::new()) }, viewport).size.height, 26.0);
     }
 
+    /// ⌘V with a screenshot on the clipboard: the composer's attachment
+    /// queue takes the picture and no text follows; a field that opened
+    /// no door pastes the text; a box may take the picture or let it go.
+    #[test]
+    fn a_paste_offers_the_picture_first_to_whoever_takes_one() {
+        use crate::clipboard::ClipboardImage;
+        use crate::layout::{Proposal, Size};
+        use std::cell::RefCell;
+
+        let png = ClipboardImage { media_type: "image/png".into(), bytes: vec![0x89, b'P', b'N', b'G'] };
+        {
+            let png = png.clone();
+            crate::clipboard::install(|_| {}, || Some("pasted text".to_string()));
+            crate::clipboard::install_image_reader(move || Some(png.clone()));
+        }
+
+        struct Canvas {
+            takes: bool,
+            heard: Rc<RefCell<Vec<String>>>,
+        }
+        impl CustomElement for Canvas {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> crate::custom::Response {
+                match event {
+                    ElementEvent::PasteImage(image) if self.takes => {
+                        self.heard.borrow_mut().push(image.media_type.clone());
+                        crate::custom::Response::handled()
+                    }
+                    ElementEvent::Text(text) => {
+                        self.heard.borrow_mut().push(text.clone());
+                        crate::custom::Response::handled()
+                    }
+                    _ => crate::custom::Response::ignored(),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct Panel {
+            prompt: State<String>,
+            note: State<String>,
+            attached: Rc<RefCell<Vec<ClipboardImage>>>,
+            heard: Rc<RefCell<Vec<String>>>,
+            box_takes: bool,
+        }
+        impl Component for Panel {
+            fn body(self, _ctx: &Context) -> impl View {
+                let attached = Rc::clone(&self.attached);
+                vstack!(
+                    text_editor("ask", self.prompt.binding())
+                        .on_paste_image(move |image| attached.borrow_mut().push(image))
+                        .id("composer")
+                        .frame(200.0, 40.0),
+                    text_field("note", self.note.binding()).id("note"),
+                    custom(Canvas { takes: self.box_takes, heard: Rc::clone(&self.heard) })
+                        .id("canvas")
+                        .frame(100.0, 100.0),
+                )
+            }
+        }
+
+        for box_takes in [true, false] {
+            let panel = Panel {
+                prompt: State::new(String::new()),
+                note: State::new(String::new()),
+                attached: Rc::default(),
+                heard: Rc::default(),
+                box_takes,
+            };
+            let runtime = Runtime::new();
+            runtime.render_stable(&panel);
+            let result = runtime.layout(&panel, Proposal::exact(Size { width: 300.0, height: 300.0 }));
+
+            assert!(runtime.focus_named("composer"));
+            assert!(runtime.paste(), "the picture landed");
+            assert_eq!(panel.attached.borrow().as_slice(), [png.clone()]);
+            assert_eq!(panel.prompt.get(), "", "and no text followed it");
+
+            assert!(runtime.focus_named("note"));
+            assert!(runtime.paste());
+            assert_eq!(panel.note.get(), "pasted text", "a field with no door pastes the text");
+
+            let canvas = result.customs.first().expect("the box is placed").frame;
+            runtime.pointer_pressed(canvas.origin.x + 5.0, canvas.origin.y + 5.0);
+            runtime.pointer_released(canvas.origin.x + 5.0, canvas.origin.y + 5.0);
+            assert!(runtime.paste());
+            let expected = if box_takes { "image/png" } else { "pasted text" };
+            assert_eq!(panel.heard.borrow().as_slice(), [expected.to_string()]);
+        }
+    }
+
     /// A composer with a completion open: the list walks with ↑ and ↓ and
     /// accepts on Enter, so the field of many lines must stand aside for
     /// those three — and only those three, and only while the list is up.

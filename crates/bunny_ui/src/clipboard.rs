@@ -18,17 +18,33 @@
 //! Where nobody lent one — a headless probe, a test — the process keeps
 //! its own, so a copy followed by a paste still agrees with itself.
 //!
-//! Text only, on the thread the app runs on, like every door a handler
-//! is called from.
+//! Text, and a picture where the shell can read one — the mac today —
+//! on the thread the app runs on, like every door a handler is called
+//! from. A paste reaches the input that holds the keyboard through
+//! [`crate::runtime::Runtime::paste`]: the picture first, for a field or
+//! a box that takes one, the text after.
 
 use std::cell::RefCell;
 
 type Writer = Box<dyn Fn(&str)>;
 type Reader = Box<dyn Fn() -> Option<String>>;
+type ImageReader = Box<dyn Fn() -> Option<ClipboardImage>>;
+
+/// A picture on the clipboard: the bytes of one of its encodings, and
+/// what they are (`image/png`, `image/tiff`). A screenshot copied to
+/// the clipboard, an image copied from a page — what a composer turns
+/// into an attachment instead of pasting as nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClipboardImage {
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
 
 thread_local! {
     /// The platform's clipboard, lent by the shell at boot.
     static SYSTEM: RefCell<Option<(Writer, Reader)>> = const { RefCell::new(None) };
+    /// The platform's pictures, lent by a shell that can read them.
+    static IMAGES: RefCell<Option<ImageReader>> = const { RefCell::new(None) };
     /// The process's own, where no shell lent one.
     static MEMORY: RefCell<Option<String>> = const { RefCell::new(None) };
 }
@@ -38,6 +54,20 @@ thread_local! {
 /// answers.
 pub fn install(write: impl Fn(&str) + 'static, read: impl Fn() -> Option<String> + 'static) {
     SYSTEM.with(|slot| *slot.borrow_mut() = Some((Box::new(write), Box::new(read))));
+}
+
+/// The shell's half for pictures: how this platform reads an image off
+/// its clipboard. A shell that cannot lends nothing, and a read answers
+/// `None` there.
+pub fn install_image_reader(read: impl Fn() -> Option<ClipboardImage> + 'static) {
+    IMAGES.with(|slot| *slot.borrow_mut() = Some(Box::new(read)));
+}
+
+/// The picture the clipboard holds, when it holds one and the shell can
+/// read it — the mac today (PNG, then TIFF, the order the system puts
+/// them). The others answer `None` until their shells learn to.
+pub fn read_image() -> Option<ClipboardImage> {
+    IMAGES.with(|slot| slot.borrow().as_ref().and_then(|read| read()))
 }
 
 /// Puts `text` on the clipboard — the system's, where a shell lent one.

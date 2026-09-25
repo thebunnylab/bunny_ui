@@ -1256,7 +1256,15 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         }
                         None
                     }
-                    0x56 if command => ffi::clipboard_read().map(EditCommand::Insert), // Ctrl+V
+                    0x56 if command => {
+                        // Ctrl+V — the runtime's paste: a picture for the
+                        // input that takes one (where this shell can read
+                        // one), the text otherwise
+                        if runtime.paste() {
+                            blit(runtime, root);
+                        }
+                        None
+                    }
                     _ => None,
                 };
                 if let Some(edit) = edit

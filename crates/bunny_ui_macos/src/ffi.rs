@@ -3384,6 +3384,32 @@ pub fn clipboard_read() -> Option<String> {
     }
 }
 
+/// Reads a picture off the general pasteboard: PNG first, TIFF after —
+/// the order the system itself offers a screenshot and an image copied
+/// from a page. `None` when neither is there.
+pub fn clipboard_read_image() -> Option<bunny_ui::clipboard::ClipboardImage> {
+    unsafe {
+        let pasteboard = msg_id(class("NSPasteboard"), sel("generalPasteboard"));
+        for (uti, media_type) in [(c"public.png", "image/png"), (c"public.tiff", "image/tiff")] {
+            let kind = msg_id_cstr(class("NSString"), sel("stringWithUTF8String:"), uti.as_ptr());
+            let data = msg_id_arg(pasteboard, sel("dataForType:"), kind);
+            if data.is_null() {
+                continue;
+            }
+            let length = msg_u64(data, sel("length")) as usize;
+            let bytes = msg_id(data, sel("bytes")) as *const u8;
+            if length == 0 || bytes.is_null() {
+                continue;
+            }
+            return Some(bunny_ui::clipboard::ClipboardImage {
+                media_type: media_type.to_string(),
+                bytes: std::slice::from_raw_parts(bytes, length).to_vec(),
+            });
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3511,6 +3537,20 @@ mod tests {
                 sel("standardWindowButton:"),
             );
             assert_ne!(responds, 0, "NSWindow has no standardWindowButton:");
+        }
+    }
+
+    #[test]
+    fn the_pasteboard_answers_the_pictures_reader() {
+        // the image reader's messages, asked of the real AppKit — reading
+        // the pasteboard here would be reading the person's own clipboard
+        unsafe {
+            let responds = |class_name: &str, name: &str| {
+                msg_bool_sel(class(class_name), sel("instancesRespondToSelector:"), sel(name))
+            };
+            assert_ne!(responds("NSPasteboard", "dataForType:"), 0, "NSPasteboard has no dataForType:");
+            assert_ne!(responds("NSData", "length"), 0, "NSData has no length");
+            assert_ne!(responds("NSData", "bytes"), 0, "NSData has no bytes");
         }
     }
 

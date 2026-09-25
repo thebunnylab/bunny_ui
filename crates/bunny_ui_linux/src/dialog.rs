@@ -157,20 +157,29 @@ const PUMP_SLICE_MS: c_int = 200;
 /// the folder is FOR ("Open a project"). An empty one leaves the panel
 /// with its own wording.
 pub fn open_folder(prompt: &str) -> Option<PathBuf> {
-    open(prompt, true)
+    open(prompt, true, false).into_iter().next()
 }
 
 /// The same panel, for ONE file. `None` = cancelled.
 pub fn open_file(prompt: &str) -> Option<PathBuf> {
-    open(prompt, false)
+    open(prompt, false, false).into_iter().next()
 }
 
-fn open(prompt: &str, directory: bool) -> Option<PathBuf> {
-    let title = CString::new(prompt).ok()?;
-    unsafe { ask_the_portal(&title, directory) }
+/// The same panel, for as MANY files as the reader selects — a batch of
+/// attachments is one trip to the panel. Empty = cancelled (or no
+/// portal), and the order is the portal's.
+pub fn open_files(prompt: &str) -> Vec<PathBuf> {
+    open(prompt, false, true)
 }
 
-unsafe fn ask_the_portal(title: &CStr, directory: bool) -> Option<PathBuf> {
+fn open(prompt: &str, directory: bool, many: bool) -> Vec<PathBuf> {
+    let Ok(title) = CString::new(prompt) else {
+        return Vec::new();
+    };
+    unsafe { ask_the_portal(&title, directory, many) }.unwrap_or_default()
+}
+
+unsafe fn ask_the_portal(title: &CStr, directory: bool, many: bool) -> Option<Vec<PathBuf>> {
     unsafe {
         let mut error = DbusError::new();
         let connection = dbus_bus_get_private(DBUS_BUS_SESSION, &mut error);
@@ -178,7 +187,7 @@ unsafe fn ask_the_portal(title: &CStr, directory: bool) -> Option<PathBuf> {
             dbus_error_free(&mut error);
             return None;
         }
-        let chosen = converse(connection, title, directory, &mut error);
+        let chosen = converse(connection, title, directory, many, &mut error);
         dbus_error_free(&mut error);
         dbus_connection_close(connection);
         dbus_connection_unref(connection);
@@ -190,8 +199,9 @@ unsafe fn converse(
     connection: *mut c_void,
     title: &CStr,
     directory: bool,
+    many: bool,
     error: *mut DbusError,
-) -> Option<PathBuf> {
+) -> Option<Vec<PathBuf>> {
     unsafe {
         // The answer is a SIGNAL on an object the portal is about to
         // make, so the match rule goes up FIRST — a portal that
@@ -221,7 +231,7 @@ unsafe fn converse(
             return None;
         }
         let parent = parent_window();
-        write_request(message, &parent, title, token, directory);
+        write_request(message, &parent, title, token, directory, many);
         let reply =
             dbus_connection_send_with_reply_and_block(connection, message, ACCEPT_TIMEOUT_MS, error);
         dbus_message_unref(message);
@@ -273,6 +283,7 @@ unsafe fn write_request(
     title: &CStr,
     token: &CStr,
     directory: bool,
+    many: bool,
 ) {
     unsafe {
         let mut iter = DbusIter::new();
@@ -291,8 +302,8 @@ unsafe fn write_request(
         append_option(&mut options, c"handle_token", Variant::Text(token));
         // a container, not a file: the one flag this module exists for
         append_option(&mut options, c"directory", Variant::Flag(directory));
-        // one answer, so the result is a path and not a list
-        append_option(&mut options, c"multiple", Variant::Flag(false));
+        // one answer, or as many as the reader selects
+        append_option(&mut options, c"multiple", Variant::Flag(many));
         dbus_message_iter_close_container(&mut iter, &mut options);
     }
 }
@@ -356,7 +367,7 @@ unsafe fn append_option(array: &mut DbusIter, key: &CStr, value: Variant<'_>) {
 /// Pumps the connection until the Response arrives. The reader is not
 /// on a clock — the only way out other than the answer is the bus
 /// going away, which is what `read_write` reports.
-unsafe fn wait_for_response(connection: *mut c_void) -> Option<PathBuf> {
+unsafe fn wait_for_response(connection: *mut c_void) -> Option<Vec<PathBuf>> {
     unsafe {
         loop {
             if dbus_connection_read_write(connection, PUMP_SLICE_MS) == 0 {
@@ -383,8 +394,9 @@ unsafe fn wait_for_response(connection: *mut c_void) -> Option<PathBuf> {
 }
 
 /// `Response(u response, a{sv} results)` — the chosen paths arrive as
-/// `uris`, a list of file URLs, and this call asked for one.
-unsafe fn read_response(message: *mut c_void) -> Option<PathBuf> {
+/// `uris`, a list of file URLs: one for a single choice, every one the
+/// reader selected for many.
+unsafe fn read_response(message: *mut c_void) -> Option<Vec<PathBuf>> {
     unsafe {
         let mut iter = DbusIter::new();
         if dbus_message_iter_init(message, &mut iter) == 0 {
@@ -415,7 +427,14 @@ unsafe fn read_response(message: *mut c_void) -> Option<PathBuf> {
                 dbus_message_iter_recurse(&mut entry, &mut variant);
                 let mut uris = DbusIter::new();
                 dbus_message_iter_recurse(&mut variant, &mut uris);
-                return read_string(&mut uris).as_deref().and_then(path_of_uri);
+                let mut paths = Vec::new();
+                while let Some(uri) = read_string(&mut uris) {
+                    paths.extend(path_of_uri(&uri));
+                    if dbus_message_iter_next(&mut uris) == 0 {
+                        break;
+                    }
+                }
+                return Some(paths);
             }
             if dbus_message_iter_next(&mut results) == 0 {
                 break;

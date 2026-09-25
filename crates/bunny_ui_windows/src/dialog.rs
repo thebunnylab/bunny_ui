@@ -52,8 +52,36 @@ struct FileOpenDialogVtbl {
     // 20 GetResult
     get_result:
         unsafe extern "system" fn(*mut FileOpenDialog, *mut *mut ShellItem) -> Hresult,
-    // 21 AddPlace … 26 SetFilter, then IFileOpenDialog's own two
-    _pad_21_28: [usize; 8],
+    // 21 AddPlace, 22 SetDefaultExtension, 23 Close, 24 SetClientGuid,
+    // 25 ClearClientData, 26 SetFilter
+    _pad_21_26: [usize; 6],
+    // 27 IFileOpenDialog::GetResults — every item a multiple selection
+    // chose
+    get_results:
+        unsafe extern "system" fn(*mut FileOpenDialog, *mut *mut ShellItemArray) -> Hresult,
+    // 28 GetSelectedItems
+    _pad_28: [usize; 1],
+}
+
+/// `IShellItemArray` — slots verified against shobjidl_core.h.
+#[repr(C)]
+struct ShellItemArray {
+    vtbl: *const ShellItemArrayVtbl,
+}
+
+#[repr(C)]
+struct ShellItemArrayVtbl {
+    unknown: UnknownVtbl, // 0..=2
+    // 3 BindToHandler, 4 GetPropertyStore, 5 GetPropertyDescriptionList,
+    // 6 GetAttributes
+    _pad_3_6: [usize; 4],
+    // 7 GetCount
+    get_count: unsafe extern "system" fn(*mut ShellItemArray, *mut u32) -> Hresult,
+    // 8 GetItemAt
+    get_item_at:
+        unsafe extern "system" fn(*mut ShellItemArray, u32, *mut *mut ShellItem) -> Hresult,
+    // 9 EnumItems
+    _pad_9: [usize; 1],
 }
 
 /// `IShellItem` — slots verified against shobjidl_core.h.
@@ -99,6 +127,8 @@ const FOS_FILE_MUST_EXIST: u32 = 0x0000_1000;
 /// `FOS_NOCHANGEDIR` — the panel must not move the process's working
 /// directory out from under the app.
 const FOS_NO_CHANGE_DIR: u32 = 0x0000_0008;
+/// `FOS_ALLOWMULTISELECT` — the reader may choose several files at once.
+const FOS_ALLOW_MULTI_SELECT: u32 = 0x0000_0200;
 
 /// `SIGDN_FILESYSPATH`.
 const SIGDN_FILESYSPATH: u32 = 0x8005_8000;
@@ -115,15 +145,26 @@ unsafe extern "system" {
 /// the folder is FOR ("Open a project"). An empty one leaves the panel
 /// with its own wording.
 pub fn open_folder(prompt: &str) -> Option<PathBuf> {
-    run(prompt, true)
+    run(prompt, true, false).into_iter().next()
 }
 
 /// The same panel, for ONE file. `None` = cancelled.
 pub fn open_file(prompt: &str) -> Option<PathBuf> {
-    run(prompt, false)
+    run(prompt, false, false).into_iter().next()
 }
 
-fn run(prompt: &str, directories: bool) -> Option<PathBuf> {
+/// The same panel, for as MANY files as the reader selects — a batch of
+/// attachments is one trip to the panel. Empty = cancelled, and the
+/// order is the panel's.
+pub fn open_files(prompt: &str) -> Vec<PathBuf> {
+    run(prompt, false, true)
+}
+
+fn run(prompt: &str, directories: bool, many: bool) -> Vec<PathBuf> {
+    run_dialog(prompt, directories, many).unwrap_or_default()
+}
+
+fn run_dialog(prompt: &str, directories: bool, many: bool) -> Option<Vec<PathBuf>> {
     com_init();
     let mut raw: *mut c_void = std::ptr::null_mut();
     let created = unsafe {
@@ -153,6 +194,9 @@ fn run(prompt: &str, directories: bool) -> Option<PathBuf> {
             true => FOS_PICK_FOLDERS,
             false => FOS_FILE_MUST_EXIST,
         };
+        if many {
+            options |= FOS_ALLOW_MULTI_SELECT;
+        }
         if !com_ok(((*vtbl).set_options)(dialog, options)) {
             return None;
         }
@@ -166,12 +210,36 @@ fn run(prompt: &str, directories: bool) -> Option<PathBuf> {
         if !com_ok(((*vtbl).show)(dialog, main_window())) {
             return None;
         }
-        let mut item: *mut ShellItem = std::ptr::null_mut();
-        if !com_ok(((*vtbl).get_result)(dialog, &mut item)) {
+        if !many {
+            let mut item: *mut ShellItem = std::ptr::null_mut();
+            if !com_ok(((*vtbl).get_result)(dialog, &mut item)) {
+                return None;
+            }
+            let item = Com::from_raw(item)?;
+            return Some(path_of(item.as_ptr()).into_iter().collect());
+        }
+        // a multiple selection answers an ARRAY, walked item by item
+        let mut items: *mut ShellItemArray = std::ptr::null_mut();
+        if !com_ok(((*vtbl).get_results)(dialog, &mut items)) {
             return None;
         }
-        let item = Com::from_raw(item)?;
-        path_of(item.as_ptr())
+        let items = Com::from_raw(items)?;
+        let items = items.as_ptr();
+        let mut count = 0u32;
+        if !com_ok(((*(*items).vtbl).get_count)(items, &mut count)) {
+            return None;
+        }
+        let mut paths = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let mut item: *mut ShellItem = std::ptr::null_mut();
+            if com_ok(((*(*items).vtbl).get_item_at)(items, index, &mut item))
+                && let Some(item) = Com::from_raw(item)
+                && let Some(path) = path_of(item.as_ptr())
+            {
+                paths.push(path);
+            }
+        }
+        Some(paths)
     }
 }
 
@@ -212,5 +280,9 @@ mod tests {
         // IUnknown 3 + BindToHandler, GetParent, GetDisplayName,
         // GetAttributes, Compare
         assert_eq!(std::mem::size_of::<ShellItemVtbl>(), 8 * slot);
+        // IUnknown 3 + BindToHandler, GetPropertyStore,
+        // GetPropertyDescriptionList, GetAttributes, GetCount, GetItemAt,
+        // EnumItems
+        assert_eq!(std::mem::size_of::<ShellItemArrayVtbl>(), 10 * slot);
     }
 }

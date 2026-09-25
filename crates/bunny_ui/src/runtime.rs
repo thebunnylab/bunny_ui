@@ -3825,6 +3825,43 @@ impl Runtime {
         }
     }
 
+    /// The shell's door for a paste — ⌘V, Ctrl+V — into whoever holds the
+    /// keyboard: a picture first, for the input that takes one, then the
+    /// clipboard's text, the way a paste always went.
+    ///
+    /// The picture is read only for a box (it hears
+    /// [`ElementEvent::PasteImage`] and may decline it) or a field that
+    /// opened [`crate::views::TextField::on_paste_image`]; everyone else
+    /// never pays for reading an image. `true` = the paste landed.
+    ///
+    /// [`ElementEvent::PasteImage`]: crate::custom::ElementEvent::PasteImage
+    pub fn paste(&self) -> bool {
+        self.enter_scene();
+        let Some(path) = self.focus.borrow().clone() else {
+            return false;
+        };
+        if let Some(placement) = self.custom_at(&path) {
+            if let Some(image) = crate::clipboard::read_image() {
+                let response = self.deliver(&placement, crate::custom::ElementEvent::PasteImage(image));
+                if response.handled {
+                    self.caret_visible.set(true);
+                    self.dirty_island_of(&placement.path);
+                    return true;
+                }
+            }
+        } else if let Some(take) = reconciler::field_paste_image(&path)
+            && let Some(image) = crate::clipboard::read_image()
+        {
+            take(image);
+            self.frame_asked.set(true);
+            return true;
+        }
+        match crate::clipboard::read() {
+            Some(text) => self.key(EditCommand::Insert(text)).applied,
+            None => false,
+        }
+    }
+
     /// A full frame for the shell: settle, layout at the viewport,
     /// raster at the scale — the hits stay retained for the events. If
     /// content moved under a still pointer (an action inserted/removed),

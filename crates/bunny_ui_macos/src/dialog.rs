@@ -60,34 +60,40 @@ const MODAL_OK: i64 = 1;
 /// what the folder is FOR ("Open a project", "Choose where to export").
 /// An empty one leaves the panel with its own wording.
 pub fn open_folder(prompt: &str) -> Option<PathBuf> {
-    run(prompt, true)
+    run(prompt, true, false).into_iter().next()
 }
 
 /// The same panel, for ONE file. `None` = cancelled.
 pub fn open_file(prompt: &str) -> Option<PathBuf> {
-    run(prompt, false)
+    run(prompt, false, false).into_iter().next()
 }
 
-fn run(prompt: &str, directories: bool) -> Option<PathBuf> {
+/// The same panel, for as MANY files as the reader selects — a batch of
+/// attachments is one trip to the panel, not one trip per file. Empty =
+/// cancelled, and the order is the panel's.
+pub fn open_files(prompt: &str) -> Vec<PathBuf> {
+    run(prompt, false, true)
+}
+
+fn run(prompt: &str, directories: bool, many: bool) -> Vec<PathBuf> {
     // the panel makes a great many temporaries, and this call may be
     // the only thing on the stack: its own pool, drained on the way out
     let pool = unsafe { objc_autoreleasePoolPush() };
-    let picked = unsafe { run_panel(prompt, directories) };
+    let picked = unsafe { run_panel(prompt, directories, many) };
     unsafe { objc_autoreleasePoolPop(pool) };
     picked
 }
 
-unsafe fn run_panel(prompt: &str, directories: bool) -> Option<PathBuf> {
+unsafe fn run_panel(prompt: &str, directories: bool, many: bool) -> Vec<PathBuf> {
     unsafe {
         let panel = msg_id(class("NSOpenPanel"), sel("openPanel"));
         if panel.is_null() {
-            return None;
+            return Vec::new();
         }
-        // exactly one of the two, and one at a time: an app that wanted
-        // several would want a different answer type than this one
+        // exactly one of the two: a folder picker or a file picker
         msg_void_bool(panel, sel("setCanChooseDirectories:"), directories as i8);
         msg_void_bool(panel, sel("setCanChooseFiles:"), (!directories) as i8);
-        msg_void_bool(panel, sel("setAllowsMultipleSelection:"), 0);
+        msg_void_bool(panel, sel("setAllowsMultipleSelection:"), many as i8);
         // the reader can always REACH a folder that is not there yet,
         // which is what makes this the picker a project opener wants
         msg_void_bool(panel, sel("setCanCreateDirectories:"), directories as i8);
@@ -101,14 +107,15 @@ unsafe fn run_panel(prompt: &str, directories: bool) -> Option<PathBuf> {
         // the platform's own modal loop: the app keeps drawing behind
         // the panel and this returns when the reader answers
         if msg_i64(panel, sel("runModal")) != MODAL_OK {
-            return None;
+            return Vec::new();
         }
         let urls = msg_id(panel, sel("URLs"));
-        if urls.is_null() || msg_u64(urls, sel("count")) == 0 {
-            return None;
+        if urls.is_null() {
+            return Vec::new();
         }
-        let url = msg_id_u64(urls, sel("objectAtIndex:"), 0);
-        path_of(url)
+        (0..msg_u64(urls, sel("count")))
+            .filter_map(|index| path_of(msg_id_u64(urls, sel("objectAtIndex:"), index)))
+            .collect()
     }
 }
 

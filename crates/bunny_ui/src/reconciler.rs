@@ -56,6 +56,8 @@ pub(crate) struct EditorFn {
     /// While it reads true the field declines the bare vertical arrows
     /// and the bare Enter (`TextField::nav_intercept`).
     pub nav_intercept: Option<motor::state::Binding<bool>>,
+    /// Where a pasted picture goes (`TextField::on_paste_image`).
+    pub paste_image: Option<Rc<dyn Fn(crate::clipboard::ClipboardImage)>>,
     pub command: EditFn,
     pub key: Option<FieldKeyFn>,
     pub policy: Option<Rc<dyn crate::text_input::EditingStrategy>>,
@@ -1600,6 +1602,11 @@ pub(crate) fn field_takes_text(path: &str) -> bool {
 }
 
 /// Whether this retained field opts into chat-style Enter submission.
+/// The door a pasted picture goes through, when the field opened one.
+pub(crate) fn field_paste_image(path: &str) -> Option<Rc<dyn Fn(crate::clipboard::ClipboardImage)>> {
+    EDITORS.with(|editors| editors.borrow().get(path).and_then(|editor| editor.paste_image.clone()))
+}
+
 /// Does the field stand aside for the app's navigation right now? Read
 /// at the stroke, from the binding the app holds.
 pub(crate) fn field_intercepts_nav(path: &str) -> bool {
