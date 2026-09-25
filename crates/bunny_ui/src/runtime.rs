@@ -5246,6 +5246,63 @@ impl Runtime {
     ///   the region, and the binding is told where it landed.
     ///
     /// `true` = an offset moved and the caller relayouts.
+    /// A list whose rows measure themselves found a row ABOVE the glass
+    /// at another height than it was counted at: the offset moves by the
+    /// difference, so the rows the reader is looking at stay where they
+    /// are while the geometry above them heals. `true` = an offset moved.
+    fn apply_row_anchors(&self) -> bool {
+        let mut moved = false;
+        for cache in crate::viewport::row_caches() {
+            let shift = cache.take_shift();
+            if shift == 0.0 {
+                continue;
+            }
+            let at = self.scroll_offset(&cache.path);
+            self.set_scroll_offset(&cache.path, Point { x: at.x, y: (at.y + shift).max(0.0) });
+            moved = true;
+        }
+        moved
+    }
+
+    /// The lists that follow their tail: kept at the END while following,
+    /// and told where the reader is. A region found where the list left
+    /// it (or at the end) follows on to the new end as the content grows;
+    /// one the reader scrolled away ends the follow, and its binding hears
+    /// false; one the reader brought back to the end resumes it.
+    fn apply_tail_follow(&self, result: &crate::layout::LayoutResult) -> bool {
+        /// Within this of the end is at the end: a reader who scrolled
+        /// back to the bottom by hand lands within a line of it.
+        const AT_END: Px = 4.0;
+        let mut moved = false;
+        for region in &result.scrolls {
+            let cache = crate::viewport::row_cache_if_any(&region.path);
+            let Some(cache) = cache else { continue };
+            let Some(following) = cache.follow.borrow().clone() else { continue };
+            let end = (region.content.height.round() - region.frame.size.height.round()).max(0.0);
+            let at = self.scroll_offset(&region.path);
+            let at_end = at.y >= end - AT_END;
+            if following.wrappedValue() {
+                let left_there = cache.followed_to.get().is_none_or(|left| (left - at.y).abs() < 0.5);
+                if left_there || at_end {
+                    if (at.y - end).abs() >= 0.5 {
+                        self.set_scroll_offset(&region.path, Point { x: at.x, y: end });
+                        moved = true;
+                    }
+                    cache.followed_to.set(Some(end));
+                } else {
+                    // the reader moved it: the tail is theirs to leave
+                    cache.followed_to.set(None);
+                    following.set(false);
+                }
+            } else if at_end {
+                // back at the end by hand: the follow resumes
+                cache.followed_to.set(Some(at.y));
+                following.set(true);
+            }
+        }
+        moved
+    }
+
     fn apply_scroll_offsets(&self, result: &crate::layout::LayoutResult) -> bool {
         let mut moved = false;
         for region in &result.scrolls {
@@ -5337,7 +5394,9 @@ impl Runtime {
             let moved = self.apply_scroll_targets(&result)
                 | self.apply_element_reveals(&result)
                 | self.apply_scroll_offsets(&result)
-                | self.apply_measures(&result);
+                | self.apply_measures(&result)
+                | self.apply_row_anchors()
+                | self.apply_tail_follow(&result);
             let focused = self.apply_auto_focus(&result);
             // a miss measured on the round a target just moved is
             // spurious — it audited the PRE-jump offset; the relayout

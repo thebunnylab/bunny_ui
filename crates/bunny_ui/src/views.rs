@@ -1792,6 +1792,10 @@ pub struct VirtualList<I, F> {
     reveal: Option<usize>,
     heights: Option<std::rc::Rc<dyn Fn(usize) -> f64>>,
     declared_extent: Option<f64>,
+    /// Rows measure themselves; the estimate stands for a row not yet seen.
+    measured: Option<f64>,
+    /// The tail's binding: the list keeps to its end while it reads true.
+    follow: Option<Binding<bool>>,
 }
 
 impl<I, F> VirtualList<I, F> {
@@ -1813,6 +1817,32 @@ impl<I, F> VirtualList<I, F> {
     /// height of the first one.
     pub fn row_height_with(mut self, height: impl Fn(usize) -> f64 + 'static) -> Self {
         self.heights = Some(std::rc::Rc::new(height));
+        self
+    }
+
+    /// The rows MEASURE THEMSELVES: each is counted at the height it
+    /// came out the last time it was on the glass, and `estimate` stands
+    /// for a row never seen yet. A column of prose bubbles, expanded tool
+    /// cards and diffs has no height anyone can declare — and a plain
+    /// scroll over it lays every entry out on every frame.
+    ///
+    /// A row on the glass is measured on every layout, so a row that
+    /// grows — a reply streaming in — is counted at its new height in the
+    /// frame it grew, without being asked. A row ABOVE the glass that
+    /// comes out different from what it was counted at moves the scroll
+    /// by the difference, so what the reader is looking at stays put.
+    pub fn measured_rows(mut self, estimate: f64) -> Self {
+        self.measured = Some(estimate);
+        self
+    }
+
+    /// The list keeps to its END while `following` reads true — a
+    /// transcript that follows its tail as it grows — and says where the
+    /// reader is: it writes false when the reader scrolls away from the
+    /// end and true when they come back to it. Setting it true takes the
+    /// list back to the end, which is the "jump to the latest" pill.
+    pub fn follow_tail(mut self, following: Binding<bool>) -> Self {
+        self.follow = Some(following);
         self
     }
 
@@ -1857,13 +1887,32 @@ where
         // viewport, measured row height) — one frame of lag masked by
         // the buffer; a miss re-runs this body in the same frame
         let snapshot = crate::viewport::region(scope.as_deref());
+        // rows that measure themselves count by what they measured: the
+        // cache is the list's own, kept across frames, and it becomes the
+        // heights closure every other road below already reads
+        let cache = match (self.measured, scope.as_deref()) {
+            (Some(estimate), Some(path)) => {
+                let cache = crate::viewport::row_cache(path);
+                cache.set_estimate(estimate);
+                *cache.follow.borrow_mut() = self.follow.clone();
+                Some(cache)
+            }
+            _ => None,
+        };
+        let heights: Option<std::rc::Rc<dyn Fn(usize) -> f64>> = match &cache {
+            Some(cache) => {
+                let cache = std::rc::Rc::clone(cache);
+                Some(std::rc::Rc::new(move |index| cache.height(index)))
+            }
+            None => self.heights.clone(),
+        };
         // the LOCAL authority speaks first: a heights closure gives
         // exact prefix sums, a declared extent gives the uniform math.
         // Measured geometry (last frame's snapshot) only fills in when
         // the app declared nothing — which the flow lowering cannot
         // accept, because there the browser owns layout and a measured
         // extent never exists.
-        let local_offsets = self.heights.as_ref().map(|rows| {
+        let local_offsets = heights.as_ref().map(|rows| {
             let mut acc = 0.0;
             let mut offsets = Vec::with_capacity(self.count + 1);
             offsets.push(0.0);
@@ -2037,7 +2086,8 @@ where
                     .unwrap_or(0.0),
                 count: self.count,
                 children,
-                heights: self.heights.clone().map(crate::layout::RowHeights),
+                heights: heights.map(crate::layout::RowHeights),
+                measured: cache,
             }),
         });
     }
@@ -2051,7 +2101,16 @@ where
     F: Fn(usize) -> R + Clone + 'static,
     R: View,
 {
-    VirtualList { count, id, row, reveal: None, heights: None, declared_extent: None }
+    VirtualList {
+        count,
+        id,
+        row,
+        reveal: None,
+        heights: None,
+        declared_extent: None,
+        measured: None,
+        follow: None,
+    }
 }
 
 /// `ForEach(collection, id: \.keyPath) { item in … }` — the `id` is the

@@ -35,12 +35,39 @@ pub(crate) struct RegionSnapshot {
 thread_local! {
     static SNAPSHOT: RefCell<FxHashMap<String, RegionSnapshot>> =
         RefCell::new(FxHashMap::default());
+    /// The rows of every list that measures its own, by region — kept
+    /// across frames, which is the whole point: a row measured once is
+    /// counted at what it really is from then on.
+    static ROWS: RefCell<FxHashMap<String, Rc<crate::layout::RowCache>>> =
+        RefCell::new(FxHashMap::default());
 }
 
 /// Drops every retained region — part of the newborn runtime's world
 /// reset.
 pub(crate) fn reset() {
     SNAPSHOT.with(|slot| slot.borrow_mut().clear());
+    ROWS.with(|slot| slot.borrow_mut().clear());
+}
+
+/// The row cache of the list at `path`, made the first time it is asked.
+pub(crate) fn row_cache(path: &str) -> Rc<crate::layout::RowCache> {
+    ROWS.with(|slot| {
+        Rc::clone(
+            slot.borrow_mut()
+                .entry(path.to_string())
+                .or_insert_with(|| Rc::new(crate::layout::RowCache::new(path.to_string()))),
+        )
+    })
+}
+
+/// The row cache of the list at `path`, if it measures its own rows.
+pub(crate) fn row_cache_if_any(path: &str) -> Option<Rc<crate::layout::RowCache>> {
+    ROWS.with(|slot| slot.borrow().get(path).cloned())
+}
+
+/// Every list that measures its own rows, for the runtime's follow-ups.
+pub(crate) fn row_caches() -> Vec<Rc<crate::layout::RowCache>> {
+    ROWS.with(|slot| slot.borrow().values().cloned().collect())
 }
 
 /// Replaces the snapshot — the runtime calls this before each pass.

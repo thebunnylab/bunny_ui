@@ -234,6 +234,78 @@ pub enum CrossAlign {
 #[derive(Clone)]
 pub struct RowHeights(pub Rc<dyn Fn(usize) -> Px>);
 
+/// What a list whose rows MEASURE themselves keeps of them, per region:
+/// each row's height from the last time it was on the glass, the
+/// estimate for a row never seen, the scroll a changed height above the
+/// viewport owes, and the tail it may be following.
+///
+/// Public in name only — a layout node mentions it, and a layout node is
+/// public. An app reaches it through `virtual_list(…).measured_rows(…)`.
+pub struct RowCache {
+    pub(crate) path: String,
+    /// By row index; NaN is a row never measured.
+    heights: std::cell::RefCell<Vec<Px>>,
+    estimate: std::cell::Cell<Px>,
+    /// What rows above the viewport grew by since the last layout —
+    /// the offset moves by it so what is on the glass stays put.
+    shift: std::cell::Cell<Px>,
+    /// The tail's binding, while the list follows one.
+    pub(crate) follow: std::cell::RefCell<Option<motor::state::Binding<bool>>>,
+    /// Where the list last put itself to follow the tail: a region found
+    /// anywhere else was moved by the reader.
+    pub(crate) followed_to: std::cell::Cell<Option<Px>>,
+}
+
+impl RowCache {
+    pub(crate) fn new(path: String) -> RowCache {
+        RowCache {
+            path,
+            heights: std::cell::RefCell::new(Vec::new()),
+            estimate: std::cell::Cell::new(0.0),
+            shift: std::cell::Cell::new(0.0),
+            follow: std::cell::RefCell::new(None),
+            followed_to: std::cell::Cell::new(None),
+        }
+    }
+
+    pub(crate) fn set_estimate(&self, estimate: Px) {
+        self.estimate.set(estimate.max(0.0));
+    }
+
+    /// A row's height: the last it measured, or the estimate.
+    pub(crate) fn height(&self, index: usize) -> Px {
+        self.heights
+            .borrow()
+            .get(index)
+            .copied()
+            .filter(|height| !height.is_nan())
+            .unwrap_or_else(|| self.estimate.get())
+    }
+
+    /// Keeps what a row measured; answers the height it was counted at
+    /// before — its last measure, or the estimate — when that differs.
+    fn record(&self, index: usize, height: Px) -> Option<Px> {
+        let before = self.height(index);
+        let mut heights = self.heights.borrow_mut();
+        if heights.len() <= index {
+            heights.resize(index + 1, Px::NAN);
+        }
+        heights[index] = height;
+        ((before - height).abs() > SETTLED).then_some(before)
+    }
+
+    /// The shift owed since the last ask, spent by asking.
+    pub(crate) fn take_shift(&self) -> Px {
+        self.shift.replace(0.0)
+    }
+}
+
+impl std::fmt::Debug for RowCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "row-cache({})", self.path)
+    }
+}
+
 impl std::fmt::Debug for RowHeights {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("row-heights(fn)")
@@ -672,6 +744,9 @@ pub enum LayoutNode {
         count: usize,
         children: Vec<(usize, LayoutNode)>,
         heights: Option<RowHeights>,
+        /// Rows that measure themselves: what each measures on the
+        /// glass is kept, and the heights read it.
+        measured: Option<Rc<RowCache>>,
     },
     /// Semantic visual property: background behind the child, border on
     /// top, foreground inherited. Transparent to the measure — by type.
@@ -4478,7 +4553,7 @@ impl LayoutNode {
                 measure_flow(*spacing, *line_spacing, children, proposal, env)
             }
 
-            LayoutNode::VirtualStack { row_extent, count, children, heights } => {
+            LayoutNode::VirtualStack { row_extent, count, children, heights, measured: cache } => {
                 let child_proposal = Proposal { width: proposal.width, height: None };
                 let measured: Vec<(usize, Size, Fit)> = children
                     .iter()
@@ -4487,6 +4562,33 @@ impl LayoutNode {
                         (*index, size, fit)
                     })
                     .collect();
+                // rows that measure themselves: what the glass shows is
+                // kept, so the offsets below count every row seen at
+                // what it really is — and a row above the viewport that
+                // changed owes the scroll its difference, so the rows on
+                // the glass stay where the reader is looking
+                if let Some(cache) = cache {
+                    let offset = env.scroll_offsets.get(&cache.path).map_or(0.0, |at| at.y);
+                    // where each row started BEFORE this measure: a row
+                    // is above the glass by the geometry the reader saw
+                    let mut starts = Vec::with_capacity(*count);
+                    let mut top: Px = 0.0;
+                    for index in 0..*count {
+                        starts.push(top);
+                        top += cache.height(index);
+                    }
+                    let mut owed = 0.0;
+                    for (index, size, _) in &measured {
+                        if let Some(before) = cache.record(*index, size.height)
+                            && starts.get(*index).is_some_and(|start| *start < offset - SETTLED)
+                        {
+                            owed += size.height - before;
+                        }
+                    }
+                    if owed != 0.0 {
+                        cache.shift.set(cache.shift.get() + owed);
+                    }
+                }
                 let width = proposal.width.unwrap_or_else(|| {
                     measured
                         .iter()

@@ -587,7 +587,7 @@ impl Walk<'_> {
                 }
                 out.push(scroll);
             }
-            LayoutNode::VirtualStack { row_extent, count, children, heights } => {
+            LayoutNode::VirtualStack { row_extent, count, children, heights, .. } => {
                 // the ONE number the browser cannot give: the app
                 // declared every row's extent, so the total and each
                 // slot are prefix sums — arithmetic, never measure
@@ -1267,6 +1267,7 @@ mod tests {
                 (4, text_node("row 4")),
             ],
             heights: None,
+            measured: None,
         };
         let offsets = HashMap::default();
         let scene = lower(&tree, &env_fixture(&offsets)).scene;

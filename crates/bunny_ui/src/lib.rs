@@ -1162,6 +1162,150 @@ mod tests {
         assert!(lines < 40, "window-sized, not count-sized: {lines}");
     }
 
+    /// A transcript: bubbles, cards and diffs no one can declare a height
+    /// for. The rows measure themselves — each counted at what it came out
+    /// on the glass, and one that grows re-counted in the frame it grew.
+    #[test]
+    fn rows_that_measure_themselves_are_placed_at_what_they_measured() {
+        #[derive(Clone, Copy)]
+        struct Transcript {
+            reply: State<f64>,
+        }
+        impl Component for Transcript {
+            fn body(self, _ctx: &Context) -> impl View {
+                let reply = self.reply.get();
+                virtual_list(2000, |row| format!("entry{row}"), move |row| {
+                    let height = match row {
+                        1 => reply,
+                        _ => 20.0 * (1 + row % 3) as f64,
+                    };
+                    spacer().frame_height(height)
+                })
+                .measured_rows(30.0)
+            }
+        }
+        let size = crate::layout::Size { width: 200.0, height: 300.0 };
+        let transcript = Transcript { reply: State::new(40.0) };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&transcript, size);
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let top = |result: &crate::layout::LayoutResult, row: usize| {
+            result.frames.find(&format!("[entry{row}]")).expect("the row is on the glass").origin.y
+        };
+        // 20, 40 (the reply), 60, 20, 40, …: each row starts where the
+        // ones above it really end, not where an estimate put them
+        assert_eq!(top(&result, 1), 20.0);
+        assert_eq!(top(&result, 2), 60.0);
+        assert_eq!(top(&result, 4), 140.0);
+        let region = result.scrolls.first().expect("the region exists");
+        let offsets = region.row_offsets.as_ref().expect("the heights ride the region");
+        assert_eq!(offsets[5] - offsets[4], 40.0, "a measured row's own height");
+        // the first frame materializes a generous window before any
+        // geometry is known; far past it, a row was never seen
+        assert_eq!(offsets[1501] - offsets[1500], 30.0, "a row never seen stands at the estimate");
+
+        // the reply streams in and grows: the rows under it move in the
+        // frame it grew, with nobody asking for a remeasure
+        transcript.reply.set(100.0);
+        let _ = runtime.display_frame(&transcript, size);
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        assert_eq!(top(&result, 2), 120.0);
+    }
+
+    /// Scrolled into the middle, a row just above the glass comes out
+    /// taller than it was counted: the offset moves by the difference and
+    /// the row the reader is looking at does not.
+    #[test]
+    fn a_row_that_changes_above_the_glass_leaves_the_reader_where_they_were() {
+        #[derive(Clone, Copy)]
+        struct Transcript {
+            grown: State<bool>,
+        }
+        impl Component for Transcript {
+            fn body(self, _ctx: &Context) -> impl View {
+                let grown = self.grown.get();
+                virtual_list(100, |row| format!("entry{row}"), move |row| {
+                    spacer().frame_height(if row == 9 && grown { 90.0 } else { 30.0 })
+                })
+                .measured_rows(30.0)
+            }
+        }
+        let size = crate::layout::Size { width: 200.0, height: 150.0 };
+        let transcript = Transcript { grown: State::new(false) };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&transcript, size);
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let path = result.scrolls.first().expect("the region exists").path.clone();
+        // row 10 at the top of the glass
+        runtime.set_scroll_offset(&path, crate::layout::Point { x: 0.0, y: 300.0 });
+        let _ = runtime.display_frame(&transcript, size);
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let on_glass = |result: &crate::layout::LayoutResult| {
+            result.frames.find("[entry10]").expect("row 10 is on the glass").origin.y
+        };
+        assert_eq!(on_glass(&result), 0.0);
+
+        // row 9, just above, grows by sixty points
+        transcript.grown.set(true);
+        let _ = runtime.display_frame(&transcript, size);
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        assert_eq!(runtime.scroll_offset(&path).y, 360.0, "the offset took the difference");
+        assert_eq!(on_glass(&result), 0.0, "and row 10 stayed where the reader was looking");
+    }
+
+    /// The tail follow: the transcript keeps to its end as it grows, lets
+    /// go when the reader scrolls up, and takes the tail back when the
+    /// reader returns to it.
+    #[test]
+    fn a_list_that_follows_its_tail_keeps_to_the_end_until_the_reader_leaves() {
+        #[derive(Clone, Copy)]
+        struct Transcript {
+            entries: State<usize>,
+            following: State<bool>,
+        }
+        impl Component for Transcript {
+            fn body(self, _ctx: &Context) -> impl View {
+                virtual_list(self.entries.get(), |row| format!("entry{row}"), |_| {
+                    spacer().frame_height(40.0)
+                })
+                .measured_rows(40.0)
+                .follow_tail(self.following.binding())
+            }
+        }
+        let size = crate::layout::Size { width: 200.0, height: 200.0 };
+        let transcript = Transcript { entries: State::new(20), following: State::new(true) };
+        let runtime = Runtime::new();
+        let frame = |runtime: &Runtime| {
+            let _ = runtime.display_frame(&transcript, size);
+            runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+        };
+        let result = frame(&runtime);
+        let path = result.scrolls.first().expect("the region exists").path.clone();
+        let _ = frame(&runtime);
+        assert_eq!(runtime.scroll_offset(&path).y, 20.0 * 40.0 - 200.0, "at the end");
+
+        // the reply lands: five more entries, and the list follows
+        transcript.entries.set(25);
+        let _ = frame(&runtime);
+        let _ = frame(&runtime);
+        assert_eq!(runtime.scroll_offset(&path).y, 25.0 * 40.0 - 200.0, "still at the end");
+        assert!(transcript.following.get());
+
+        // the reader scrolls up: the follow ends, and the app hears it
+        runtime.wheel(100.0, 100.0, 0.0, 300.0);
+        let _ = frame(&runtime);
+        assert!(!transcript.following.get(), "the reader left the tail");
+        let parked = runtime.scroll_offset(&path).y;
+        transcript.entries.set(30);
+        let _ = frame(&runtime);
+        assert_eq!(runtime.scroll_offset(&path).y, parked, "and new entries do not pull them down");
+
+        // back to the end by hand: the tail is followed again
+        runtime.wheel(100.0, 100.0, 0.0, -5000.0);
+        let _ = frame(&runtime);
+        assert!(transcript.following.get(), "at the end, following");
+    }
+
     #[test]
     fn a_reveal_lands_on_a_variable_row() {
         #[derive(Clone, Copy)]
