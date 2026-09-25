@@ -1465,6 +1465,8 @@ pub fn vstack<C: View>(children: C) -> VStack<C> {
 pub struct HStack<C> {
     alignment: VerticalAlignment,
     spacing: Option<f64>,
+    /// `Some(line_spacing)` when the row wraps.
+    wrap: Option<Option<f64>>,
     children: C,
 }
 
@@ -1472,16 +1474,36 @@ impl<C: View> View for HStack<C> {
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
-        render_stack(
-            &self.children,
-            ctx,
-            out,
-            "HStack",
-            self.alignment.print(),
-            self.spacing,
-            Some(Axis::Horizontal),
-            self.alignment.cross(),
-        );
+        let Some(line_spacing) = self.wrap else {
+            return render_stack(
+                &self.children,
+                ctx,
+                out,
+                "HStack",
+                self.alignment.print(),
+                self.spacing,
+                Some(Axis::Horizontal),
+                self.alignment.cross(),
+            );
+        };
+        let mut nodes = NodeList::new();
+        self.children.render_into(ctx, &mut nodes);
+        let (prints, layouts) = nodes.into_parts();
+        out.push(RenderNode::branch(
+            if crate::view::print_enabled() {
+                stack_line("HStack.wrapping", self.alignment.print(), self.spacing)
+            } else {
+                String::new()
+            },
+            prints,
+        ));
+        let spacing = self.spacing.unwrap_or(0.0);
+        out.push_layout(LayoutNode::Flow {
+            spacing,
+            line_spacing: line_spacing.unwrap_or(spacing),
+            align: self.alignment.cross(),
+            children: layouts,
+        });
     }
 }
 
@@ -1497,6 +1519,28 @@ impl<C> HStack<C> {
         self.spacing = Some(spacing);
         self
     }
+
+    /// The row WRAPS: a child that would pass the width the row is
+    /// offered starts the next line — the `flex flex-wrap` of a row of
+    /// chips in a rail. The lines stand `spacing` apart, like the chips,
+    /// until [`HStack::line_spacing`] says otherwise; each child sits in
+    /// its line's height by the row's alignment.
+    ///
+    /// The wrap is the CONTENT's: where a line ends depends on how wide
+    /// each chip is, so the chips of a narrow rail read at a glance
+    /// instead of by a push of a scrolled strip. A child wider than the
+    /// whole row takes a line of its own at that width, so a long label
+    /// wraps inside it.
+    pub fn wrapping(mut self) -> Self {
+        self.wrap = Some(self.wrap.flatten());
+        self
+    }
+
+    /// The gap between the lines of a [`HStack::wrapping`] row.
+    pub fn line_spacing(mut self, line_spacing: f64) -> Self {
+        self.wrap = Some(Some(line_spacing));
+        self
+    }
 }
 
 /// `HStack { … }`
@@ -1504,6 +1548,7 @@ pub fn hstack<C: View>(children: C) -> HStack<C> {
     HStack {
         alignment: VerticalAlignment::Center,
         spacing: None,
+        wrap: None,
         children,
     }
 }

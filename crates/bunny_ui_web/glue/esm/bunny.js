@@ -30,7 +30,7 @@ import { attach as attachGpu } from "./bunny_gpu.js";
 // the key table, the modifier bits, the import/export surface. The
 // wasm exports its own number; `attach` compares the two and refuses a
 // pairing this mirror was not written for.
-export const EXPECTED_ABI = 9;
+export const EXPECTED_ABI = 10;
 
 const IN_WORKER = typeof window === "undefined";
 const WAKE_CHANNEL = "bunny-wake";

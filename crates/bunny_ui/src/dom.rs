@@ -751,6 +751,9 @@ pub struct DomLayout {
     /// interior fills a definite box, and an auto box still sizes to
     /// the content instead of collapsing to a zero basis.
     pub fill: bool,
+    /// The row WRAPS, with this gap between its lines, px — `flex-wrap:
+    /// wrap` and `row-gap`, a flow's lowering.
+    pub wrap: Option<f64>,
 }
 
 /// Element hints only the Dom consumes — a real tag, a class, an id.
@@ -1758,7 +1761,11 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 /// 9 (2026-09-14): the import modules are named as relative specifiers
 /// (`./bunny.js`, `./bunny_gpu.js`) so a foreign ES-module loader resolves
 /// them, and the shell gained `js_clipboard_write` and `js_set_cursor`.
-pub const ABI_VERSION: u32 = 9;
+///
+/// 10 (2026-09-24): the flow record carries a wrapping row (bit 11 and
+/// its line gap, after the slot), and the key table grew the function
+/// row (101 to 124, `bunny_key` now answering whether a key was taken).
+pub const ABI_VERSION: u32 = 10;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -2075,6 +2082,9 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 if layout.fill {
                     mask |= 1 << 10;
                 }
+                if layout.wrap.is_some() {
+                    mask |= 1 << 11;
+                }
                 push_u16(&mut out, mask);
                 if let Some(gap) = layout.gap {
                     push_f32(&mut out, gap);
@@ -2102,6 +2112,9 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 }
                 if let Some(slot_y) = layout.slot_y {
                     push_f32(&mut out, slot_y);
+                }
+                if let Some(wrap) = layout.wrap {
+                    push_f32(&mut out, wrap);
                 }
             }
             DomPatch::Move { id, parent, before } => {
@@ -3104,6 +3117,36 @@ mod tests {
     /// every wrapper on the way (`fill`, `flex: 1 1 auto`) — the
     /// finder's padded panel reaches the bottom of the window, like
     /// the engine that proposes its box has always guaranteed.
+    /// A row of chips that wraps is the browser's own flex row that wraps,
+    /// with the chips' gap and the lines' gap both on the wire.
+    #[test]
+    fn a_wrapping_row_lowers_to_a_flex_row_that_wraps() {
+        #[derive(Clone)]
+        struct Chips;
+
+        impl Component for Chips {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::hstack!(text("Objective D8"), text("Variables D2:D6"), text("Constraints 2"))
+                    .spacing(6.0)
+                    .line_spacing(4.0)
+            }
+        }
+
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&Chips, Size { width: 272.0, height: 200.0 });
+        let wraps = mount.iter().any(|patch| {
+            matches!(
+                patch,
+                DomPatch::SetLayout { layout, .. }
+                    if layout.wrap == Some(4.0) && layout.gap == Some(6.0)
+            )
+        });
+        assert!(wraps, "the row wraps, both gaps on the record: {mount:?}");
+        // and the record survives its own encoding: bit 11, its gap last
+        let bytes = encode(&mount);
+        assert!(!bytes.is_empty());
+    }
+
     #[test]
     fn the_windows_box_flows_down_to_a_padded_panel() {
         #[derive(Clone)]

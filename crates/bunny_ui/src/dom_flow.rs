@@ -249,6 +249,25 @@ impl Walk<'_> {
                 Self::inherit_stretch(&mut container);
                 out.push(container);
             }
+            // a row that wraps is the browser's own: a flex row that
+            // wraps its items, with the gaps in both directions — the
+            // lines break where the items' own widths say, as here
+            LayoutNode::Flow { spacing, line_spacing, align, children } => {
+                let mut container = node(DomKind::FlexRow);
+                container.style.interactive = self.pending_interactive.take();
+                container.style.tooltip = self.pending_tooltip.take();
+                container.style.transition = self.pending_transition.take();
+                let layout = container.layout.as_mut().expect("flow node");
+                if *spacing != 0.0 {
+                    layout.gap = Some(*spacing);
+                }
+                layout.align = Some(align_code(*align));
+                layout.wrap = Some(*line_spacing);
+                for child in children {
+                    self.lower_into(child, &mut container.children);
+                }
+                out.push(container);
+            }
             // In flow mode there is no native child view to cross and
             // no second surface to present on: the sheet is a layer over
             // the page, which is what it looks like anyway.

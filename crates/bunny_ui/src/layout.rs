@@ -512,6 +512,18 @@ pub enum LayoutNode {
     /// Fills whatever the proposal gives (Rectangle).
     Fill,
     Stack { axis: Axis, spacing: Px, align: CrossAlign, children: Vec<LayoutNode> },
+    /// A row that WRAPS (`hstack!(…).wrapping()`): the children go left to
+    /// right at their own size, and a child that would pass the width the
+    /// row was offered starts the next line. `spacing` separates the
+    /// children of a line, `line_spacing` the lines; `align` places each
+    /// child inside the height of its line.
+    ///
+    /// The wrap is the CONTENT's: where a line ends depends on how wide
+    /// the chips are, which no fixed pairing of columns can reproduce. A
+    /// child wider than the whole width takes a line of its own and is
+    /// offered that width, so a long label wraps inside it instead of
+    /// overflowing.
+    Flow { spacing: Px, line_spacing: Px, align: CrossAlign, children: Vec<LayoutNode> },
     /// Overlay: all children in the same frame (ZStack, sheet on top).
     /// `align` is the HORIZONTAL edge each child sits on; the vertical
     /// one stays centered, exactly what SwiftUI's `.leading` means.
@@ -918,6 +930,11 @@ pub enum Fit {
         offsets: Option<Rc<Vec<Px>>>,
     },
     Wrapped(Size, Box<Fit>),
+    /// A flow's lines: the index each line STARTS at, and the children's
+    /// sizes and fits in order. The breaks are the measure's, kept, so
+    /// the place draws the lines that were measured and never breaks
+    /// them again against a frame of another width.
+    Lines(Vec<usize>, Vec<(Size, Fit)>),
     /// The real content size (it can exceed the frame — that is what scrolls).
     ScrollContent(Size, Box<Fit>),
     /// A retained boundary's KEPT fit: measured on an earlier frame for
@@ -946,6 +963,7 @@ impl Fit {
         match (self.unshared(), other.unshared()) {
             (Fit::Leaf, Fit::Leaf) => true,
             (Fit::Children(a), Fit::Children(b)) => pairs(a, b),
+            (Fit::Lines(la, a), Fit::Lines(lb, b)) => la == lb && pairs(a, b),
             (
                 Fit::Virtual { row_extent: ra, children: ca, offsets: oa },
                 Fit::Virtual { row_extent: rb, children: cb, offsets: ob },
@@ -1903,7 +1921,9 @@ impl LayoutNode {
             | LayoutNode::Icon { .. }
             | LayoutNode::Fill
             | LayoutNode::BoundaryHint { .. } => true,
-            LayoutNode::Stack { children, .. } | LayoutNode::Boundary { children, .. } => {
+            LayoutNode::Stack { children, .. }
+            | LayoutNode::Flow { children, .. }
+            | LayoutNode::Boundary { children, .. } => {
                 children.iter().all(|child| child.collect_quiet(held))
             }
             // a modal pile draws the line no pointer crosses: not paint
@@ -4174,6 +4194,9 @@ impl LayoutNode {
             LayoutNode::Stack { children, axis: main, .. } => {
                 children.iter().any(|child| child.is_flexible(axis, Some(*main)))
             }
+            // a flow takes the width it is offered — that is where it
+            // wraps — and answers its height with its lines
+            LayoutNode::Flow { .. } => axis == Axis::Horizontal,
             // a layer pile has no main axis of its own — the question
             // passes through it unchanged
             LayoutNode::Layered { children, .. } => {
@@ -4251,7 +4274,7 @@ impl LayoutNode {
             LayoutNode::Padding { edges, child } => {
                 child.first_baseline(env).map(|baseline| baseline + edges.top)
             }
-            LayoutNode::Stack { children, .. } => {
+            LayoutNode::Stack { children, .. } | LayoutNode::Flow { children, .. } => {
                 children.first().and_then(|child| child.first_baseline(env))
             }
             LayoutNode::Boundary { children, .. } => {
@@ -4449,6 +4472,10 @@ impl LayoutNode {
 
             LayoutNode::Stack { axis, spacing, children, .. } => {
                 measure_stack(*axis, *spacing, children, proposal, env)
+            }
+
+            LayoutNode::Flow { spacing, line_spacing, children, .. } => {
+                measure_flow(*spacing, *line_spacing, children, proposal, env)
             }
 
             LayoutNode::VirtualStack { row_extent, count, children, heights } => {
@@ -5716,6 +5743,13 @@ impl LayoutNode {
             }
 
             (
+                LayoutNode::Flow { spacing, line_spacing, align, children },
+                Fit::Lines(lines, fits),
+            ) => {
+                place_flow(*spacing, *line_spacing, *align, children, frame, lines, fits, env, out);
+            }
+
+            (
                 LayoutNode::Split { path, axis, unit, min_a, min_b, trailing, children, .. },
                 Fit::Children(fits),
             ) => {
@@ -6836,6 +6870,103 @@ fn measure_stack(
     (size, Fit::Children(measured))
 }
 
+/// The flow's measure: every child at its own size, lines broken where
+/// the next child would pass the width offered. Unproposed, the width is
+/// endless and the flow is one line, which is what a row is.
+///
+/// A child asks its natural size first. One wider than the whole width
+/// is asked again AT that width, alone on its line: a label wraps there,
+/// a chip that cannot shrink overflows by exactly itself.
+fn measure_flow(
+    spacing: Px,
+    line_spacing: Px,
+    children: &[LayoutNode],
+    proposal: Proposal,
+    env: &LayoutEnv<'_>,
+) -> (Size, Fit) {
+    let limit = proposal.width.unwrap_or(Px::INFINITY);
+    let natural = Proposal { width: None, height: None };
+    let measured: Vec<(Size, Fit)> = children
+        .iter()
+        .map(|child| {
+            let (size, fit) = child.measure(natural, env);
+            if size.width > limit + SETTLED {
+                child.measure(Proposal { width: Some(limit), height: None }, env)
+            } else {
+                (size, fit)
+            }
+        })
+        .collect();
+    let mut lines = vec![0];
+    let (mut line_width, mut line_height) = (0.0, 0.0);
+    let (mut widest, mut height): (Px, Px) = (0.0, 0.0);
+    for (index, (size, _)) in measured.iter().enumerate() {
+        let next = if index == *lines.last().expect("a line") {
+            size.width
+        } else {
+            line_width + spacing + size.width
+        };
+        if index > *lines.last().expect("a line") && next > limit + SETTLED {
+            // the line is full: it closes at what it holds
+            widest = widest.max(line_width);
+            height += line_height + line_spacing;
+            lines.push(index);
+            line_width = size.width;
+            line_height = size.height;
+        } else {
+            line_width = next;
+            line_height = Px::max(line_height, size.height);
+        }
+    }
+    widest = widest.max(line_width);
+    height += line_height;
+    if measured.is_empty() {
+        lines.clear();
+    }
+    (Size { width: widest, height }, Fit::Lines(lines, measured))
+}
+
+/// The flow's place: the measured lines, top to bottom from the frame's
+/// leading edge, each child set inside its line's height by `align`.
+#[allow(clippy::too_many_arguments)]
+fn place_flow(
+    spacing: Px,
+    line_spacing: Px,
+    align: CrossAlign,
+    children: &[LayoutNode],
+    frame: Rect,
+    lines: &[usize],
+    fits: &[(Size, Fit)],
+    env: &LayoutEnv<'_>,
+    out: &mut Placement,
+) {
+    let mut top = frame.origin.y;
+    for (line, &start) in lines.iter().enumerate() {
+        let end = lines.get(line + 1).copied().unwrap_or(fits.len());
+        let height = fits[start..end].iter().fold(0.0, |tallest: Px, (size, _)| tallest.max(size.height));
+        let mut left = frame.origin.x;
+        for index in start..end {
+            let (size, fit) = &fits[index];
+            // a baseline is a line's own: its children share it the way
+            // a row's do; everything else is the ordinary cross offset
+            let offset = match align {
+                CrossAlign::Baseline => height - size.height,
+                align => align_offset(height, size.height, align),
+            };
+            let at = Rect { origin: Point { x: left, y: top + offset }, size: *size };
+            let child = &children[index];
+            if out.leaves_unplaced(at) && child.quiet_now() {
+                child.record_unplaced(at, env, out);
+                crate::stats::note_unplaced();
+            } else {
+                child.place(at, fit, env, out);
+            }
+            left += size.width + spacing;
+        }
+        top += height + line_spacing;
+    }
+}
+
 /// Paints a placed text: single line, word-wrapped, or truncated with an
 /// ellipsis — always through the SAME caches as measurement.
 fn place_text(
@@ -7598,6 +7729,77 @@ mod tests {
         assert_eq!(result.frames.get("lane").unwrap().size.width, 300.0);
         assert_eq!(result.frames.get("rest").unwrap().size.width, 200.0);
         assert_eq!(result.size.width, 500.0);
+    }
+
+    /// Three chips in a flow — the model row of a solver rail.
+    fn chips(widths: &[Px]) -> LayoutNode {
+        LayoutNode::Flow {
+            spacing: 6.0,
+            line_spacing: 4.0,
+            align: CrossAlign::Center,
+            children: widths
+                .iter()
+                .enumerate()
+                .map(|(index, width)| {
+                    boundary(
+                        &format!("chip{index}"),
+                        LayoutNode::Leaf { size: Size { width: *width, height: 20.0 } },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_flow_goes_down_a_line_when_the_next_chip_does_not_fit() {
+        let result = layout(&chips(&[100.0, 80.0, 120.0]), Proposal { width: Some(250.0), height: None });
+        let at = |name: &str| result.frames.get(name).unwrap().origin;
+        assert_eq!(at("chip0"), Point { x: 0.0, y: 0.0 });
+        assert_eq!(at("chip1"), Point { x: 106.0, y: 0.0 }, "the chips of a line stand spacing apart");
+        assert_eq!(at("chip2"), Point { x: 0.0, y: 24.0 }, "and the next line the line spacing below");
+        assert_eq!(result.size, Size { width: 186.0, height: 44.0 }, "the widest line, both lines tall");
+    }
+
+    #[test]
+    fn a_flow_offered_nothing_is_one_line() {
+        let result = layout(&chips(&[100.0, 80.0, 120.0]), Proposal { width: None, height: None });
+        assert_eq!(result.size, Size { width: 312.0, height: 20.0 });
+        assert_eq!(result.frames.get("chip2").unwrap().origin, Point { x: 192.0, y: 0.0 });
+    }
+
+    #[test]
+    fn a_chip_wider_than_the_flow_takes_a_line_of_its_own() {
+        let result = layout(&chips(&[40.0, 300.0, 40.0]), Proposal { width: Some(250.0), height: None });
+        let at = |name: &str| result.frames.get(name).unwrap().origin;
+        assert_eq!(at("chip0"), Point { x: 0.0, y: 0.0 });
+        assert_eq!(at("chip1"), Point { x: 0.0, y: 24.0 }, "alone on its line");
+        assert_eq!(at("chip2"), Point { x: 0.0, y: 48.0 }, "and nothing joins it there");
+        assert_eq!(result.size.width, 300.0, "a chip that cannot shrink overflows by exactly itself");
+    }
+
+    #[test]
+    fn a_flow_in_a_rail_wraps_at_the_rails_width() {
+        // the solver's rail: 272 points, a heading above, the chips below
+        let rail = LayoutNode::Frame {
+            width: Some(272.0),
+            height: None,
+            align: CrossAlign::Start,
+            child: Box::new(LayoutNode::Stack {
+                axis: Axis::Vertical,
+                spacing: 8.0,
+                align: CrossAlign::Start,
+                children: vec![
+                    boundary("heading", LayoutNode::Leaf { size: Size { width: 90.0, height: 16.0 } }),
+                    boundary("chips", chips(&[110.0, 130.0, 90.0])),
+                    boundary("below", LayoutNode::Leaf { size: Size { width: 60.0, height: 16.0 } }),
+                ],
+            }),
+        };
+        let result = layout(&rail, Proposal { width: Some(800.0), height: Some(600.0) });
+        let chips = result.frames.get("chips").unwrap();
+        assert_eq!(chips.size.height, 44.0, "two lines inside the rail");
+        assert_eq!(result.frames.get("chip2").unwrap().origin.y, chips.origin.y + 24.0);
+        assert_eq!(result.frames.get("below").unwrap().origin.y, chips.origin.y + 44.0 + 8.0, "and the column makes room");
     }
 
     #[test]

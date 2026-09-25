@@ -20,7 +20,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 9;
+const EXPECTED_ABI = 10;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -857,6 +857,8 @@ function applyPatches(view, length) {
         style.maxWidth = "";
         style.maxHeight = "";
         style.flex = "";
+        style.flexWrap = "";
+        style.rowGap = "";
         style.minWidth = "0";
         style.minHeight = "0";
         style.position = el.__pos || "";
@@ -925,6 +927,14 @@ function applyPatches(view, length) {
         apply.flex = "1 1 auto";
         apply.minWidth = "0";
         apply.minHeight = "0";
+      }
+      if (mask & 2048) {
+        // a row that wraps: its lines break where its items' widths say
+        const lineGap = f32();
+        if (apply) {
+          apply.flexWrap = "wrap";
+          apply.rowGap = `${lineGap}px`;
+        }
       }
     } else if (op === 12) {
       // one insertBefore, identity intact (0 = to the end)
