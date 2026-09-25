@@ -356,6 +356,8 @@ impl App {
         // the app's life outside its windows opens with the app: the
         // delegate, the workspace's sleep and wake, the notifier
         life::install();
+        // the general pasteboard, for the app's own handlers too
+        bunny_ui::clipboard::install(ffi::clipboard_write, ffi::clipboard_read);
         App {
             inner: Rc::new(AppInner {
                 slots: RefCell::new(Vec::new()),

@@ -99,6 +99,15 @@ fn install_panic_hook() {
     }));
 }
 
+/// What the page lends the app at boot, in either mode: the panic hook,
+/// and the clipboard — the app's own handlers write it the way a field's
+/// copy does, inside the gesture that clicked; a page is granted no
+/// reading on demand, so the read answers nothing.
+fn install_platform() {
+    install_panic_hook();
+    bunny_ui::clipboard::install(clipboard_write, || None);
+}
+
 /// The glue's key table, mirrored: one number per named key.
 fn named_key(code: u32) -> Option<bunny_ui::action::Key> {
     use bunny_ui::action::Key;
@@ -407,7 +416,7 @@ pub fn start_with(
     runtime: Rc<Runtime>,
     root: impl View + 'static,
 ) {
-    install_panic_hook();
+    install_platform();
     // the pixel lowering presents the list and never reads it: what no pixel
     // can show is not drawn. The element lowering keeps every command
     // whatever this says — a browser scrolls what was lowered by itself
@@ -680,7 +689,7 @@ fn start_dom_with(
     hydrate: bool,
     root: impl View + 'static,
 ) {
-    install_panic_hook();
+    install_platform();
     let runtime = Runtime::new()
         .text_engine(Rc::new(CanvasTextEngine::new()))
         .image_engine(Rc::new(CanvasImageEngine::new()));

@@ -216,6 +216,8 @@ impl App {
         // the app's life outside its window: the notifier is the shared
         // half's, installed on the main thread — the one UIKit runs on
         bunny_ui::app::install_notifier(bunny_ui_apple::notifications::notify);
+        // the general pasteboard, for the app's own handlers too
+        bunny_ui::clipboard::install(ffi::clipboard_write, ffi::clipboard_read);
         App {
             inner: Rc::new(AppInner {
                 pending: RefCell::new(None),

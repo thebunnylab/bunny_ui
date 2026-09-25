@@ -295,6 +295,9 @@ impl App {
         // the app's life outside its window: the bus thread, the
         // notifier
         life::install();
+        // the selection — Wayland's or X11's, whichever this session
+        // speaks — for the app's own handlers too
+        bunny_ui::clipboard::install(ffi::clipboard_write, ffi::clipboard_read);
         App {
             inner: Rc::new(AppInner {
                 slots: RefCell::new(Vec::new()),

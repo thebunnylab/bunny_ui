@@ -39,6 +39,7 @@
 
 pub mod action;
 pub mod anim;
+pub mod clipboard;
 pub mod custom;
 pub mod dom;
 mod dom_flow;

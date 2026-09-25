@@ -150,6 +150,8 @@ impl App {
         // the app's life outside its window: the phone's notification
         // manager, over JNI, on the UI thread the app runs on
         bunny_ui::app::install_notifier(crate::notify::notify);
+        // the clipboard manager, for the app's own handlers too
+        bunny_ui::clipboard::install(ffi::clipboard_write, ffi::clipboard_read);
         App {
             inner: Rc::new(AppInner {
                 pending: RefCell::new(None),
