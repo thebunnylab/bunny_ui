@@ -692,6 +692,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         );
                         dialog
                     });
+                    dialog.dress_dialog(&spec.title, spec.min.width, spec.min.height);
                     if !scene_chrome {
                         // a system-drawn bar still wears the scene's
                         // appearance: a dark workbench under a white caption

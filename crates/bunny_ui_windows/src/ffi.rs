@@ -230,6 +230,7 @@ unsafe extern "system" {
         cy: i32,
         flags: u32,
     ) -> i32;
+    fn SetWindowTextW(hwnd: Hwnd, text: *const u16) -> i32;
     fn BeginPaint(hwnd: Hwnd, paint: *mut PaintStruct) -> Hdc;
     fn EndPaint(hwnd: Hwnd, paint: *const PaintStruct) -> i32;
     fn LoadCursorW(instance: Handle, name: *const u16) -> Handle;
@@ -2985,6 +2986,9 @@ thread_local! {
     /// The caption appearance each was last given — a steady theme must not
     /// spend a DWM call per frame.
     static DIALOG_DARK: RefCell<HashMap<Hwnd, bool>> = RefCell::new(HashMap::new());
+    /// The title each was last given — a steady one must not spend a call
+    /// per frame either.
+    static DIALOG_TITLES: RefCell<HashMap<Hwnd, String>> = RefCell::new(HashMap::new());
     /// Each dialog's own answers for the hit-test. Keyed, unlike the window
     /// gates: a dialog is a second surface over the same scene, and the two
     /// cannot share one pair.
@@ -3030,6 +3034,9 @@ pub fn create_dialog(
     assert!(hwnd != 0, "the platform refused the dialog");
     DIALOG_MINS.with(|mins| {
         mins.borrow_mut().insert(hwnd, (min_width, min_height));
+    });
+    DIALOG_TITLES.with(|titles| {
+        titles.borrow_mut().insert(hwnd, title.to_owned());
     });
     if scene_chrome {
         SCENE_CHROME.with(|windows| {
@@ -3097,6 +3104,9 @@ fn forget_dialog(hwnd: Hwnd) {
     });
     DIALOG_DARK.with(|seen| {
         seen.borrow_mut().remove(&hwnd);
+    });
+    DIALOG_TITLES.with(|titles| {
+        titles.borrow_mut().remove(&hwnd);
     });
     DIALOG_GATES.with(|gates| {
         gates.borrow_mut().remove(&hwnd);
@@ -3183,6 +3193,33 @@ impl WindowHandle {
     pub fn show_dialog(&self) {
         unsafe {
             ShowWindow(self.hwnd, SW_SHOW);
+        }
+    }
+
+    /// Dresses the dialog in the title and the floor its spec names NOW.
+    ///
+    /// The window is keyed by its overlay's path, and every `.dialog` chained
+    /// on one view presents at that view's one path — so a page that hands off
+    /// to a sibling in the same pass (Account → Organization) keeps the window,
+    /// which went on wearing the first page's name on its caption, its taskbar
+    /// button and Alt-Tab. Silent when nothing changed.
+    pub fn dress_dialog(&self, title: &str, min_width: f64, min_height: f64) {
+        DIALOG_MINS.with(|mins| {
+            mins.borrow_mut().insert(self.hwnd, (min_width, min_height));
+        });
+        let retitled = DIALOG_TITLES.with(|titles| {
+            let mut titles = titles.borrow_mut();
+            if titles.get(&self.hwnd).is_some_and(|held| held == title) {
+                return false;
+            }
+            titles.insert(self.hwnd, title.to_owned());
+            true
+        });
+        if retitled {
+            let wide_title = wide(title);
+            unsafe {
+                SetWindowTextW(self.hwnd, wide_title.as_ptr());
+            }
         }
     }
 
@@ -3780,6 +3817,41 @@ mod tests {
         assert!(work_w > 100.0 && work_h > 100.0);
         unsafe {
             DestroyWindow(window.hwnd);
+        }
+    }
+
+    #[test]
+    fn a_dialog_wears_the_title_and_floor_its_spec_names_now() {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max: i32) -> i32;
+        }
+        let caption = |hwnd: Hwnd| {
+            let mut buffer = [0u16; 64];
+            let len = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), 64) };
+            String::from_utf16_lossy(&buffer[..usize::try_from(len).unwrap_or(0)])
+        };
+        let owner = create_window("bunny owner", 200.0, 150.0, false, true, true);
+        let dialog = create_dialog(&owner, "Account", 100.0, 80.0, true);
+        assert_eq!(caption(dialog.hwnd), "Account");
+
+        // the sibling took the overlay's path in the same pass, and with it
+        // the window: the window now names what it shows
+        dialog.dress_dialog("Organization", 120.0, 90.0);
+        assert_eq!(caption(dialog.hwnd), "Organization", "the caption, the taskbar and Alt-Tab read this");
+        assert_eq!(
+            DIALOG_MINS.with(|mins| mins.borrow().get(&dialog.hwnd).copied()),
+            Some((120.0, 90.0)),
+            "the frame's floor is the new page's",
+        );
+
+        dialog.close_dialog();
+        assert!(
+            DIALOG_TITLES.with(|titles| !titles.borrow().contains_key(&dialog.hwnd)),
+            "a closed dialog leaves no title behind",
+        );
+        unsafe {
+            DestroyWindow(owner.hwnd);
         }
     }
 
