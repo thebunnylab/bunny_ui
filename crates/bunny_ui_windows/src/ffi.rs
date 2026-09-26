@@ -233,6 +233,7 @@ unsafe extern "system" {
     fn BeginPaint(hwnd: Hwnd, paint: *mut PaintStruct) -> Hdc;
     fn EndPaint(hwnd: Hwnd, paint: *const PaintStruct) -> i32;
     fn LoadCursorW(instance: Handle, name: *const u16) -> Handle;
+    fn LoadIconW(instance: Handle, name: *const u16) -> Handle;
     fn SetCursor(cursor: Handle) -> Handle;
     fn SetTimer(hwnd: Hwnd, id: usize, elapse: u32, callback: *const c_void) -> usize;
     fn KillTimer(hwnd: Hwnd, id: usize) -> i32;
@@ -2505,10 +2506,15 @@ fn install_dpi_awareness() {
     });
 }
 
+/// `MAKEINTRESOURCEW(1)`: the application icon's resource id — an integer
+/// resource name is its id in the pointer's low word, an address of nothing.
+const APP_ICON: *const u16 = std::ptr::without_provenance(1);
+
 fn register_class() -> Vec<u16> {
     static ONCE: OnceLock<Vec<u16>> = OnceLock::new();
     ONCE.get_or_init(|| {
         let name = wide("BunnyWindow");
+        let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
         let class = WndClassW {
             // no CS_HREDRAW/CS_VREDRAW: a resize repaints through the
             // synchronous present, never through a forced erase
@@ -2516,8 +2522,14 @@ fn register_class() -> Vec<u16> {
             wnd_proc: window_proc,
             cls_extra: 0,
             wnd_extra: 0,
-            instance: unsafe { GetModuleHandleW(std::ptr::null()) },
-            icon: 0,
+            instance,
+            // The app's own icon: resource 1 of its exe, the id a resource
+            // script gives the application icon by convention. The taskbar
+            // button and Alt-Tab read a running window's CLASS icon, not the
+            // exe's, so an app that embeds one still showed the generic glyph
+            // there. An exe with no resource 1 loads nothing — the class stays
+            // icon-less, as before.
+            icon: unsafe { LoadIconW(instance, APP_ICON) },
             // the class cursor stays empty — WM_SETCURSOR applies the
             // scene's choice instead
             cursor: 0,
