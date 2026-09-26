@@ -898,17 +898,11 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             let display = runtime.display_frame(root, Size { width, height });
             present(runtime, display);
             let interaction = runtime.interaction();
-            // a live divider drag keeps the resizer even while the
-            // pointer runs ahead of the seam; hovering the grip
-            // announces it
-            let desired = match runtime.seam_axis() {
-                // lanes side by side: the seam travels left and right
-                Some(Axis::Horizontal) => ffi::Cursor::ResizeLeftRight,
-                // lanes stacked: it travels up and down
-                Some(Axis::Vertical) => ffi::Cursor::ResizeUpDown,
-                None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
-                None => ffi::Cursor::Arrow,
-            };
+            let desired = desired_cursor(
+                runtime.seam_axis(),
+                runtime.hovered_cursor(),
+                interaction.hovered.is_some(),
+            );
             // over the island with only the DEFAULT to say, the shell
             // YIELDS: the engine owns the cursor over its own page
             // (the hand over a link is the webview's to give)
@@ -1322,9 +1316,57 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     })
 }
 
+/// What the pointer wears this frame — the mac shell's rule, word for word.
+///
+/// A live divider drag keeps the resizer even while the pointer runs ahead of
+/// the seam, and hovering the grip announces it. Otherwise the BOX under the
+/// pointer answers first (`Runtime::hovered_cursor`): text wants an I-beam and
+/// a sheet's cells the cross, which the old rule — the hand over anything
+/// hoverable — could not know, so text read as a link. Only where no box
+/// answers does that rule stand.
+fn desired_cursor(
+    seam: Option<Axis>,
+    asked: Option<bunny_ui::layout::Cursor>,
+    hovered: bool,
+) -> ffi::Cursor {
+    use bunny_ui::layout::Cursor as Asked;
+    match (seam, asked) {
+        // lanes side by side: the seam travels left and right
+        (Some(Axis::Horizontal), _) => ffi::Cursor::ResizeLeftRight,
+        // lanes stacked: it travels up and down
+        (Some(Axis::Vertical), _) => ffi::Cursor::ResizeUpDown,
+        (None, Some(Asked::Text)) => ffi::Cursor::Text,
+        (None, Some(Asked::Pointing)) => ffi::Cursor::Pointing,
+        (None, Some(Asked::Cell)) => ffi::Cursor::Cell,
+        (None, Some(Asked::Arrow)) => ffi::Cursor::Arrow,
+        (None, None) if hovered => ffi::Cursor::Pointing,
+        (None, None) => ffi::Cursor::Arrow,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_box_under_the_pointer_names_its_cursor_before_the_hover_rule() {
+        use bunny_ui::layout::Cursor as Asked;
+        // text is text even where it is hoverable: an editor, a field
+        assert_eq!(desired_cursor(None, Some(Asked::Text), true), ffi::Cursor::Text);
+        assert_eq!(desired_cursor(None, Some(Asked::Cell), true), ffi::Cursor::Cell);
+        // a box may insist on the arrow over something hoverable: a gutter
+        assert_eq!(desired_cursor(None, Some(Asked::Arrow), true), ffi::Cursor::Arrow);
+        assert_eq!(desired_cursor(None, Some(Asked::Pointing), false), ffi::Cursor::Pointing);
+        // where no box answers, the old rule stands
+        assert_eq!(desired_cursor(None, None, true), ffi::Cursor::Pointing);
+        assert_eq!(desired_cursor(None, None, false), ffi::Cursor::Arrow);
+        // and a seam outranks everything: a drag keeps its resizer over text
+        assert_eq!(
+            desired_cursor(Some(Axis::Horizontal), Some(Asked::Text), true),
+            ffi::Cursor::ResizeLeftRight
+        );
+        assert_eq!(desired_cursor(Some(Axis::Vertical), None, false), ffi::Cursor::ResizeUpDown);
+    }
 
     fn stroke(vk: u32, base: &str, shift: bool, control: bool, alt: bool) -> ffi::KeyStroke {
         ffi::KeyStroke {
