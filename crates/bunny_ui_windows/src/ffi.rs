@@ -36,12 +36,69 @@ struct WndClassW {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct Rect {
     pub left: i32,
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
+}
+
+impl Rect {
+    fn width(self) -> i32 {
+        self.right - self.left
+    }
+
+    fn height(self) -> i32 {
+        self.bottom - self.top
+    }
+}
+
+/// Fits a window's outer rectangle into a monitor's work area the way AppKit
+/// constrains a titled window to the screen's visible frame.
+///
+/// A side longer than the work area shrinks to it — never below `floor`, the
+/// content's own minimum in pixels — and the rectangle then moves the least
+/// distance that puts it inside. Where even the floor cannot fit, the
+/// top-left edge wins: the caption stays reachable, so the reader can still
+/// drag, resize or close what did not fit.
+///
+/// Why this exists: `CreateWindowExW` places nothing on the reader's behalf.
+/// A product asking for 1280×800 points on a laptop whose work area is 752
+/// points tall got a window whose caption buttons and bottom edge started off
+/// the screen — where the mac, asked the same, answers a window that fits.
+fn fit_to_work_area(window: Rect, work: Rect, floor: (i32, i32)) -> Rect {
+    let width = window.width().min(work.width()).max(floor.0);
+    let height = window.height().min(work.height()).max(floor.1);
+    let left = window.left.min(work.right - width).max(work.left);
+    let top = window.top.min(work.bottom - height).max(work.top);
+    Rect { left, top, right: left + width, bottom: top + height }
+}
+
+/// A `width`×`height` rectangle centred on `work` — where a new window opens,
+/// as the mac's `WindowSpec::size` promises ("centred on the screen").
+fn centred(work: Rect, width: i32, height: i32) -> Rect {
+    let left = work.left + (work.width() - width) / 2;
+    let top = work.top + (work.height() - height) / 2;
+    Rect { left, top, right: left + width, bottom: top + height }
+}
+
+/// The work area (the monitor minus the taskbar) of the monitor `hwnd` is
+/// nearest to, in screen pixels. `None` when the system answers no monitor.
+fn work_area_of(hwnd: Hwnd) -> Option<Rect> {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULT_TO_NEAREST);
+        if monitor == 0 {
+            return None;
+        }
+        let mut info = MonitorInfo {
+            size: std::mem::size_of::<MonitorInfo>() as u32,
+            monitor: Rect::default(),
+            work: Rect::default(),
+            flags: 0,
+        };
+        (GetMonitorInfoW(monitor, &mut info) != 0).then_some(info.work)
+    }
 }
 
 #[repr(C)]
@@ -2555,15 +2612,28 @@ pub fn create_window(
         if !scene_chrome {
             AdjustWindowRectExForDpi(&mut rect, style, 0, 0, dpi);
         }
+    }
+    // Centred on the monitor's work area and fitted inside it — the mac's
+    // promise for `WindowSpec::size`, which AppKit keeps by constraining a
+    // titled window to the visible frame. The default position alone left a
+    // window taller than the work area with its caption buttons and its
+    // bottom edge off the screen.
+    let (placed, keep_position) = match work_area_of(hwnd) {
+        Some(work) => {
+            (fit_to_work_area(centred(work, rect.width(), rect.height()), work, (0, 0)), 0)
+        }
+        None => (rect, SWP_NOMOVE),
+    };
+    unsafe {
         const SWP_FRAMECHANGED: u32 = 0x0020;
         SetWindowPos(
             hwnd,
             0,
-            0,
-            0,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_FRAMECHANGED,
+            placed.left,
+            placed.top,
+            placed.width(),
+            placed.height(),
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | keep_position,
         );
     }
     refresh_metrics(hwnd);
@@ -2778,29 +2848,17 @@ impl WindowHandle {
     /// negative. What popovers clamp against.
     pub fn screen_bounds_in_layout(&self) -> Option<(f64, f64, f64, f64)> {
         let factor = shared_factor_for(self.hwnd);
+        let work = work_area_of(self.hwnd)?;
+        let mut origin = Point { x: 0, y: 0 };
         unsafe {
-            let monitor = MonitorFromWindow(self.hwnd, MONITOR_DEFAULT_TO_NEAREST);
-            if monitor == 0 {
-                return None;
-            }
-            let mut info = MonitorInfo {
-                size: std::mem::size_of::<MonitorInfo>() as u32,
-                monitor: Rect::default(),
-                work: Rect::default(),
-                flags: 0,
-            };
-            if GetMonitorInfoW(monitor, &mut info) == 0 {
-                return None;
-            }
-            let mut origin = Point { x: 0, y: 0 };
             ClientToScreen(self.hwnd, &mut origin);
-            Some((
-                (info.work.left - origin.x) as f64 / factor,
-                (info.work.top - origin.y) as f64 / factor,
-                (info.work.right - info.work.left) as f64 / factor,
-                (info.work.bottom - info.work.top) as f64 / factor,
-            ))
         }
+        Some((
+            (work.left - origin.x) as f64 / factor,
+            (work.top - origin.y) as f64 / factor,
+            work.width() as f64 / factor,
+            work.height() as f64 / factor,
+        ))
     }
 
     /// Registers where this panel's slice sits in the scene, so its
@@ -3073,15 +3131,41 @@ impl WindowHandle {
     }
 
     /// Places the dialog so its CLIENT area lands on the given screen
-    /// rectangle. Under scene chrome the client IS the window, so there is no
-    /// frame to grow around it.
+    /// rectangle — fitted inside the work area of the monitor its owner is on.
+    /// Under scene chrome the client IS the window, so there is no frame to
+    /// grow around it.
+    ///
+    /// The layout centres a dialog at its opening size, which can stand taller
+    /// than the screen (a 1220×820-point page over a 752-point work area). The
+    /// mac never shows that — AppKit constrains a titled window to the visible
+    /// frame — and this is that constraint: shrink to the work area, never
+    /// below the content's floor, then move inside it. The size it settles at
+    /// reaches the layout through `Runtime::set_dialog_frame`, which the shell
+    /// reads back from the window, so the page reflows to what fit.
     pub fn set_dialog_client_frame(&self, client: Rect) {
         let dpi = unsafe { GetDpiForWindow(self.hwnd) };
+        let factor = shared_factor_for(self.hwnd);
+        let (min_width, min_height) = DIALOG_MINS
+            .with(|mins| mins.borrow().get(&self.hwnd).copied())
+            .unwrap_or((0.0, 0.0));
         let mut rect = client;
+        // the content's floor, framed exactly as `WM_GETMINMAXINFO` frames it
+        let mut floor = Rect {
+            left: 0,
+            top: 0,
+            right: (min_width * factor).round() as i32,
+            bottom: (min_height * factor).round() as i32,
+        };
         unsafe {
             if !wears_scene_chrome(self.hwnd) {
                 AdjustWindowRectExForDpi(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0, dpi);
+                AdjustWindowRectExForDpi(&mut floor, WS_OVERLAPPEDWINDOW, 0, 0, dpi);
             }
+        }
+        if let Some(work) = work_area_of(owner_of(self.hwnd)) {
+            rect = fit_to_work_area(rect, work, (floor.width(), floor.height()));
+        }
+        unsafe {
             SetWindowPos(
                 self.hwnd,
                 0,
@@ -3579,6 +3663,56 @@ mod tests {
     #[link(name = "user32", kind = "raw-dylib")]
     unsafe extern "system" {
         fn IsWindow(hwnd: Hwnd) -> i32;
+    }
+
+    fn rect(left: i32, top: i32, width: i32, height: i32) -> Rect {
+        Rect { left, top, right: left + width, bottom: top + height }
+    }
+
+    /// A 2560×1600 panel at 200 % with the taskbar at the bottom: a
+    /// 1280×752-point work area, the everyday Windows laptop.
+    const WORK: Rect = Rect { left: 0, top: 0, right: 2560, bottom: 1504 };
+
+    /// The workbench's 1280×800 points (2560×1600 px) do not fit a 752-point
+    /// work area: the window shrinks to it and opens inside it — its caption
+    /// and its bottom edge on the screen, as AppKit would have it.
+    #[test]
+    fn a_window_taller_than_the_work_area_shrinks_into_it() {
+        let asked = centred(WORK, 2560, 1600);
+        assert_eq!(fit_to_work_area(asked, WORK, (0, 0)), WORK);
+        // the default position that used to stand: pushed down and right
+        assert_eq!(fit_to_work_area(rect(147, 147, 2560, 1600), WORK, (0, 0)), WORK);
+    }
+
+    /// A dialog the layout centred at 1220×820 points over the same screen
+    /// keeps its width, loses only the height it could not have, and moves
+    /// the least distance that puts it inside.
+    #[test]
+    fn a_dialog_keeps_what_fits_and_moves_the_least() {
+        let asked = rect(40, -68, 2440, 1640);
+        let fitted = fit_to_work_area(asked, WORK, (1440, 960));
+        assert_eq!(fitted, rect(40, 0, 2440, 1504));
+        // one that already fits is left exactly where the layout put it
+        let small = rect(300, 200, 1440, 960);
+        assert_eq!(fit_to_work_area(small, WORK, (1440, 960)), small);
+        // off the right edge: moved back in, size kept
+        assert_eq!(fit_to_work_area(rect(2000, 100, 1440, 960), WORK, (0, 0)), rect(1120, 100, 1440, 960));
+    }
+
+    /// Where not even the content's floor fits, the floor wins and the
+    /// top-left edge stays on the screen — the caption is reachable, so the
+    /// reader can still move or close what did not fit.
+    #[test]
+    fn the_floor_wins_and_the_caption_stays_reachable() {
+        let tiny = Rect { left: 0, top: 40, right: 1000, bottom: 640 };
+        let fitted = fit_to_work_area(rect(-50, 0, 1440, 960), tiny, (1440, 960));
+        assert_eq!((fitted.width(), fitted.height()), (1440, 960), "never below the floor");
+        assert_eq!((fitted.left, fitted.top), (0, 40), "the caption's corner on the screen");
+    }
+
+    #[test]
+    fn a_new_window_opens_centred_on_the_work_area() {
+        assert_eq!(centred(WORK, 1600, 1000), rect(480, 252, 1600, 1000));
     }
 
     #[test]
