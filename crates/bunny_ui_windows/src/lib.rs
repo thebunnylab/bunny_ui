@@ -994,7 +994,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }));
             // wake or park the frame driver — the event may have
             // started (or finished) an animation
-            ffi::want_frames(window.raw_window(), runtime.wants_frame());
+            ffi::want_pace(window.raw_window(), pace_of(&runtime));
         }
     };
 
@@ -1209,7 +1209,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 } else {
                     // no frame — but a task may have gone to sleep with a
                     // new deadline, and the driver follows it
-                    ffi::want_frames(window.raw_window(), runtime.wants_frame());
+                    ffi::want_pace(window.raw_window(), pace_of(&runtime));
                 }
             }
             AppEvent::SettingsChanged => {
@@ -1237,12 +1237,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     blit(runtime, root);
                 }
                 // a frozen loop asks for no frames: the beat parks
-                ffi::want_frames(window.raw_window(), runtime.wants_frame());
+                ffi::want_pace(window.raw_window(), pace_of(&runtime));
             }
             AppEvent::BecomeKey => {
                 // the front returns: a frozen loop resumes mid-phase
                 runtime.set_loops_paused(false);
-                ffi::want_frames(window.raw_window(), runtime.wants_frame());
+                ffi::want_pace(window.raw_window(), pace_of(&runtime));
             }
             AppEvent::MouseMoved { x, y, modifiers } => {
                 if runtime.pointer_moved(x, y, modifiers) {
@@ -1389,7 +1389,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     let display = runtime.animation_frame(root, Size { width, height });
                     handler_present(runtime, display);
                 }
-                ffi::want_frames(window.raw_window(), runtime.wants_frame());
+                ffi::want_pace(window.raw_window(), pace_of(&runtime));
             }
             // the app buries the slot by the source; the window itself
             // has nothing left to draw
@@ -1408,6 +1408,19 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         on_web,
         file_drag,
     })
+}
+
+/// The pace this window wants its frames at — the mac shell's reading of
+/// [`Runtime::frame_pace`]: the composition clock while a spring or a flight
+/// moves, a slow beat when only loop clocks (or a sleeping task) live, and
+/// nothing when nothing does. A caret-like loop held the display-rate beat
+/// before, which a laptop pays for in battery.
+fn pace_of(runtime: &Runtime) -> ffi::DriverPace {
+    match runtime.frame_pace() {
+        bunny_ui::anim::FramePace::Display => ffi::DriverPace::Full,
+        bunny_ui::anim::FramePace::Slow(step) => ffi::DriverPace::Slow(step),
+        bunny_ui::anim::FramePace::Idle => ffi::DriverPace::Off,
+    }
 }
 
 /// What the pointer wears this frame — the mac shell's rule, word for word.
