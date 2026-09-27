@@ -666,8 +666,12 @@ pub enum AppEvent {
     /// sent before the frame that shows it.
     WindowState { maximized: bool },
     /// The window deactivated (the user switched apps or windows) —
-    /// open popovers close, the platform's own manner.
+    /// open popovers close, the platform's own manner, and the loop
+    /// clocks freeze.
     ResignKey,
+    /// The window activated — the front returned, and a frozen loop
+    /// resumes mid-phase.
+    BecomeKey,
     /// A system setting moved (theme, animation preference) — the
     /// shell re-reads its mirrors.
     SettingsChanged,
@@ -1259,6 +1263,19 @@ pub(crate) fn scene_owner(hwnd: Hwnd) -> Hwnd {
 /// shares.
 pub fn event_source() -> usize {
     SOURCE.with(Cell::get) as usize
+}
+
+/// What a `WM_ACTIVATE` says: the low word is `WA_INACTIVE`, `WA_ACTIVE`
+/// or `WA_CLICKACTIVE`, and the high word only flags a minimized window.
+/// Moving from a window to its own dialog is a resign and then a become,
+/// both addressed to the one scene, so the loops keep running; leaving the
+/// app (or minimizing) is a resign alone.
+const fn activation(wparam: usize) -> AppEvent {
+    if (wparam & 0xFFFF) == WA_INACTIVE {
+        AppEvent::ResignKey
+    } else {
+        AppEvent::BecomeKey
+    }
 }
 
 /// Delivers an event ADDRESSED to the window it happened in — the
@@ -2409,9 +2426,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_ACTIVATE => {
-            if (wparam & 0xFFFF) == WA_INACTIVE {
-                dispatch_at(hwnd, AppEvent::ResignKey);
-            }
+            dispatch_at(hwnd, activation(wparam));
             0
         }
         WM_GETMINMAXINFO => {
@@ -3803,6 +3818,18 @@ mod tests {
         assert_eq!(clamp_damage((8, 8, 200, 200), 10, 10), Some((8, 8, 10, 10)));
         assert_eq!(clamp_damage((3, 3, 3, 9), 10, 10), None);
         assert_eq!(clamp_damage((20, 0, 30, 5), 10, 10), None);
+    }
+
+    #[test]
+    fn activation_reads_the_low_word_and_ignores_the_minimized_flag() {
+        const MINIMIZED: usize = 1 << 16;
+        assert!(matches!(activation(0), AppEvent::ResignKey), "WA_INACTIVE");
+        assert!(matches!(activation(MINIMIZED), AppEvent::ResignKey), "minimized away");
+        assert!(matches!(activation(1), AppEvent::BecomeKey), "WA_ACTIVE");
+        assert!(matches!(activation(2), AppEvent::BecomeKey), "WA_CLICKACTIVE");
+        // restored from the taskbar: active, and still flagged minimized
+        // for this one message
+        assert!(matches!(activation(1 | MINIMIZED), AppEvent::BecomeKey));
     }
 
     #[test]
