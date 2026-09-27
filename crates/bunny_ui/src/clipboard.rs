@@ -64,8 +64,10 @@ pub fn install_image_reader(read: impl Fn() -> Option<ClipboardImage> + 'static)
 }
 
 /// The picture the clipboard holds, when it holds one and the shell can
-/// read it — the mac today (PNG, then TIFF, the order the system puts
-/// them). The others answer `None` until their shells learn to.
+/// read it — the mac (PNG, then TIFF, the order the system puts them) and
+/// Windows (PNG, then a DIB re-encoded as PNG, and never beside text: a
+/// copy from an office app carries its rendering as a bitmap). The others
+/// answer `None` until their shells learn to.
 pub fn read_image() -> Option<ClipboardImage> {
     IMAGES.with(|slot| slot.borrow().as_ref().and_then(|read| read()))
 }

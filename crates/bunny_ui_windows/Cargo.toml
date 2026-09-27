@@ -8,6 +8,9 @@ description = "bunny-ui Windows shell — native window and bitmap blit, depende
 bunny-ui = { workspace = true, features = ["canvas", "gpu"] }
 
 [dev-dependencies]
+# tests only: the house PNG decoder reads back what WIC encodes, so the
+# check does not ask the platform to grade its own work
+bunny-ui = { workspace = true, features = ["canvas", "gpu", "codec"] }
 # examples only (the real countries app in a native window)
 countries-core.workspace = true
 countries-pure.workspace = true

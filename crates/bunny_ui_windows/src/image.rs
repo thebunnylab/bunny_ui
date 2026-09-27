@@ -100,6 +100,20 @@ const WIC_PIXEL_32BPP_RGBA: Guid = Guid {
     d3: 0x43DD,
     d4: [0xA7, 0xA8, 0xA2, 0x99, 0x35, 0x26, 0x1A, 0xE9],
 };
+// GUID_ContainerFormatPng {1B7CFAF4-713F-473C-BBCD-6137425FAEAF}
+const WIC_CONTAINER_PNG: Guid = Guid {
+    d1: 0x1B7C_FAF4,
+    d2: 0x713F,
+    d3: 0x473C,
+    d4: [0xBB, 0xCD, 0x61, 0x37, 0x42, 0x5F, 0xAE, 0xAF],
+};
+// GUID_WICPixelFormat32bppBGRA {6FDDC324-4E03-4BFE-B185-3D77768DC90F}
+const WIC_PIXEL_32BPP_BGRA: Guid = Guid {
+    d1: 0x6FDD_C324,
+    d2: 0x4E03,
+    d3: 0x4BFE,
+    d4: [0xB1, 0x85, 0x3D, 0x77, 0x76, 0x8D, 0xC9, 0x0F],
+};
 // IID_IShellItemImageFactory {BCC18B79-BA16-442F-80C4-8A59C30C463B}
 const IID_ISHELL_ITEM_IMAGE_FACTORY: Guid = Guid {
     d1: 0xBCC1_8B79,
@@ -115,15 +129,23 @@ const SIIGBF_ICON_ONLY: u32 = 0x4;
 
 // MARK: - Vtables (wincodec.h / shobjidl_core.h, in header order)
 
-/// An opaque COM stream — only ever released.
+/// A COM stream: 3 Read, 4 Write, 5 Seek — read back after an encode.
+#[repr(C)]
+struct IStreamVtbl {
+    unknown: UnknownVtbl,
+    read: unsafe extern "system" fn(*mut IStream, *mut c_void, u32, *mut u32) -> Hresult,
+    _write: usize,
+    seek: unsafe extern "system" fn(*mut IStream, i64, u32, *mut u64) -> Hresult,
+}
 #[repr(C)]
 struct IStream {
-    vtbl: *const UnknownVtbl,
+    vtbl: *const IStreamVtbl,
 }
 
 // slots 3 CreateDecoderFromFilename; 4 CreateDecoderFromStream;
-// 5..=9 file handles, component info, decoders, encoders, palette;
-// 10 CreateFormatConverter; 11 CreateBitmapScaler; the rest unused.
+// 5..=7 file handles, component info, decoders; 8 CreateEncoder;
+// 9 CreatePalette; 10 CreateFormatConverter; 11 CreateBitmapScaler;
+// the rest unused.
 #[repr(C)]
 struct IWICImagingFactoryVtbl {
     unknown: UnknownVtbl,
@@ -135,7 +157,14 @@ struct IWICImagingFactoryVtbl {
         u32,
         *mut *mut IWICBitmapDecoder,
     ) -> Hresult,
-    _pad_5_9: [usize; 5],
+    _pad_5_7: [usize; 3],
+    create_encoder: unsafe extern "system" fn(
+        *mut IWICImagingFactory,
+        *const Guid,
+        *const Guid,
+        *mut *mut IWICBitmapEncoder,
+    ) -> Hresult,
+    _pad_9: [usize; 1],
     create_format_converter: unsafe extern "system" fn(
         *mut IWICImagingFactory,
         *mut *mut IWICFormatConverter,
@@ -223,6 +252,48 @@ struct IWICBitmapScalerVtbl {
 #[repr(C)]
 struct IWICBitmapScaler {
     vtbl: *const IWICBitmapScalerVtbl,
+}
+
+// 3 Initialize; 4..=9 container format, encoder info, color contexts,
+// palette, thumbnail, preview; 10 CreateNewFrame; 11 Commit.
+#[repr(C)]
+struct IWICBitmapEncoderVtbl {
+    unknown: UnknownVtbl,
+    initialize: unsafe extern "system" fn(*mut IWICBitmapEncoder, *mut IStream, u32) -> Hresult,
+    _pad_4_9: [usize; 6],
+    create_new_frame: unsafe extern "system" fn(
+        *mut IWICBitmapEncoder,
+        *mut *mut IWICBitmapFrameEncode,
+        *mut *mut c_void,
+    ) -> Hresult,
+    commit: unsafe extern "system" fn(*mut IWICBitmapEncoder) -> Hresult,
+}
+#[repr(C)]
+struct IWICBitmapEncoder {
+    vtbl: *const IWICBitmapEncoderVtbl,
+}
+
+// 3 Initialize; 4 SetSize; 5 SetResolution; 6 SetPixelFormat;
+// 7..=10 color contexts, palette, thumbnail, WritePixels; 11 WriteSource;
+// 12 Commit.
+#[repr(C)]
+struct IWICBitmapFrameEncodeVtbl {
+    unknown: UnknownVtbl,
+    initialize: unsafe extern "system" fn(*mut IWICBitmapFrameEncode, *mut c_void) -> Hresult,
+    set_size: unsafe extern "system" fn(*mut IWICBitmapFrameEncode, u32, u32) -> Hresult,
+    _pad_5: [usize; 1],
+    set_pixel_format: unsafe extern "system" fn(*mut IWICBitmapFrameEncode, *mut Guid) -> Hresult,
+    _pad_7_10: [usize; 4],
+    write_source: unsafe extern "system" fn(
+        *mut IWICBitmapFrameEncode,
+        *mut c_void,
+        *const c_void,
+    ) -> Hresult,
+    commit: unsafe extern "system" fn(*mut IWICBitmapFrameEncode) -> Hresult,
+}
+#[repr(C)]
+struct IWICBitmapFrameEncode {
+    vtbl: *const IWICBitmapFrameEncodeVtbl,
 }
 
 #[repr(C)]
@@ -646,6 +717,130 @@ pub(crate) fn decode_rgba(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), Strin
     }
 }
 
+// MARK: - A clipboard picture, as PNG
+
+/// `BI_BITFIELDS`: three colour masks follow a plain `BITMAPINFOHEADER`.
+const BI_BITFIELDS: u32 = 3;
+/// `WICBitmapEncoderNoCache`.
+const WIC_ENCODER_NO_CACHE: u32 = 2;
+/// `STREAM_SEEK_SET` / `STREAM_SEEK_END`.
+const SEEK_SET: u32 = 0;
+const SEEK_END: u32 = 2;
+
+/// A `CF_DIB` — a `BITMAPINFO` and its pixels, with no file header — as the
+/// `.bmp` file WIC's decoder reads: the 14-byte `BITMAPFILEHEADER` in front,
+/// its pixel offset past the header, the masks a `BI_BITFIELDS` header
+/// carries after it, and the colour table. `None` for a DIB too short for
+/// the header it names.
+fn bmp_file(dib: &[u8]) -> Option<Vec<u8>> {
+    const FILE_HEADER: usize = 14;
+    let word = |at: usize| dib.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let header = word(0)? as usize;
+    let bit_count = u16::from_le_bytes([*dib.get(14)?, *dib.get(15)?]);
+    let compression = word(16)?;
+    let colours_used = word(32)? as usize;
+    // a V4/V5 header holds its masks inside itself; the plain one after
+    let masks = if compression == BI_BITFIELDS && header == 40 { 12 } else { 0 };
+    let table = match (colours_used, bit_count) {
+        (0, bits @ 1..=8) => (1usize << bits) * 4,
+        (used, _) => used * 4,
+    };
+    let pixels_at = header + masks + table;
+    if header < 40 || dib.len() < pixels_at {
+        return None;
+    }
+    let total = u32::try_from(FILE_HEADER + dib.len()).ok()?;
+    let offset = u32::try_from(FILE_HEADER + pixels_at).ok()?;
+    let mut file = Vec::with_capacity(FILE_HEADER + dib.len());
+    file.extend_from_slice(b"BM");
+    file.extend_from_slice(&total.to_le_bytes());
+    file.extend_from_slice(&0u32.to_le_bytes());
+    file.extend_from_slice(&offset.to_le_bytes());
+    file.extend_from_slice(dib);
+    Some(file)
+}
+
+/// A clipboard `CF_DIB` re-encoded as PNG — what a composer takes. Print
+/// Screen and older tools put only a DIB there, and a DIB is not a format
+/// any receiver accepts; WIC decodes it as the `.bmp` it almost is and
+/// encodes a compressed PNG.
+pub(crate) fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
+    let file = bmp_file(dib)?;
+    let engine = WicImageEngine::new();
+    let factory = engine.factory.as_ref()?;
+    let source = engine.decode(&file)?;
+    unsafe {
+        encode_png(
+            factory.as_ptr(),
+            source.converter.as_ptr() as *mut c_void,
+            source.width,
+            source.height,
+        )
+    }
+}
+
+/// Encodes a WIC source as PNG into memory and reads the bytes back.
+unsafe fn encode_png(
+    factory: *mut IWICImagingFactory,
+    source: *mut c_void,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    unsafe {
+        let stream = Com::from_raw(SHCreateMemStream(std::ptr::null(), 0))?;
+        let mut encoder: *mut IWICBitmapEncoder = std::ptr::null_mut();
+        let hr = ((*(*factory).vtbl).create_encoder)(
+            factory,
+            &WIC_CONTAINER_PNG,
+            std::ptr::null(),
+            &mut encoder,
+        );
+        if !com_ok(hr) {
+            return None;
+        }
+        let encoder = Com::from_raw(encoder)?;
+        let encoder_vtbl = &*(*encoder.as_ptr()).vtbl;
+        if !com_ok((encoder_vtbl.initialize)(encoder.as_ptr(), stream.as_ptr(), WIC_ENCODER_NO_CACHE)) {
+            return None;
+        }
+        let mut frame: *mut IWICBitmapFrameEncode = std::ptr::null_mut();
+        let mut options: *mut c_void = std::ptr::null_mut();
+        if !com_ok((encoder_vtbl.create_new_frame)(encoder.as_ptr(), &mut frame, &mut options)) {
+            return None;
+        }
+        let frame = Com::from_raw(frame)?;
+        let _options = Com::from_raw(options);
+        let frame_vtbl = &*(*frame.as_ptr()).vtbl;
+        // the encoder may answer a nearer format than the one asked;
+        // `WriteSource` converts the source to whatever it settled on
+        let mut format = WIC_PIXEL_32BPP_BGRA;
+        let written = com_ok((frame_vtbl.initialize)(frame.as_ptr(), options))
+            && com_ok((frame_vtbl.set_size)(frame.as_ptr(), width, height))
+            && com_ok((frame_vtbl.set_pixel_format)(frame.as_ptr(), &mut format))
+            && com_ok((frame_vtbl.write_source)(frame.as_ptr(), source, std::ptr::null()))
+            && com_ok((frame_vtbl.commit)(frame.as_ptr()))
+            && com_ok((encoder_vtbl.commit)(encoder.as_ptr()));
+        if !written {
+            return None;
+        }
+        let stream_vtbl = &*(*stream.as_ptr()).vtbl;
+        let mut length = 0u64;
+        if !com_ok((stream_vtbl.seek)(stream.as_ptr(), 0, SEEK_END, &mut length))
+            || !com_ok((stream_vtbl.seek)(stream.as_ptr(), 0, SEEK_SET, std::ptr::null_mut()))
+        {
+            return None;
+        }
+        let length = u32::try_from(length).ok()?;
+        let mut bytes = vec![0u8; length as usize];
+        let mut read = 0u32;
+        if !com_ok((stream_vtbl.read)(stream.as_ptr(), bytes.as_mut_ptr() as *mut c_void, length, &mut read)) {
+            return None;
+        }
+        bytes.truncate(read as usize);
+        Some(bytes)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -679,6 +874,67 @@ pub(crate) mod tests {
         out.extend_from_slice(&body);
         out.extend_from_slice(&crc32(&body).to_be_bytes());
         out
+    }
+
+    /// A `BITMAPINFOHEADER` (40 bytes) for `width`×`height` at `bits`, with
+    /// `compression` and `colours` table entries named.
+    fn info_header(width: i32, height: i32, bits: u16, compression: u32, colours: u32) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend_from_slice(&40u32.to_le_bytes());
+        header.extend_from_slice(&width.to_le_bytes());
+        header.extend_from_slice(&height.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&bits.to_le_bytes());
+        header.extend_from_slice(&compression.to_le_bytes());
+        header.extend_from_slice(&[0; 12]); // image size, resolution
+        header.extend_from_slice(&colours.to_le_bytes());
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn a_dib_becomes_the_bmp_file_whose_pixels_start_past_its_tables() {
+        let offset = |file: &[u8]| u32::from_le_bytes([file[10], file[11], file[12], file[13]]);
+        // 24-bit, no table: file header + info header
+        let plain = [info_header(1, 1, 24, 0, 0), vec![0; 4]].concat();
+        let file = bmp_file(&plain).expect("a whole DIB");
+        assert_eq!(&file[..2], b"BM");
+        assert_eq!(offset(&file), 14 + 40);
+        assert_eq!(u32::from_le_bytes([file[2], file[3], file[4], file[5]]) as usize, file.len());
+        // 32-bit BI_BITFIELDS: three masks after a plain header
+        let fields = [info_header(1, 1, 32, BI_BITFIELDS, 0), vec![0; 12 + 4]].concat();
+        assert_eq!(offset(&bmp_file(&fields).expect("masks")), 14 + 40 + 12);
+        // 8-bit with no count: the full 256-entry table
+        let indexed = [info_header(1, 1, 8, 0, 0), vec![0; 1024 + 4]].concat();
+        assert_eq!(offset(&bmp_file(&indexed).expect("table")), 14 + 40 + 1024);
+        // …and with 16 named, sixteen
+        let named = [info_header(1, 1, 8, 0, 16), vec![0; 64 + 4]].concat();
+        assert_eq!(offset(&bmp_file(&named).expect("short table")), 14 + 40 + 64);
+        // a DIB shorter than the table its header names is refused
+        assert!(bmp_file(&info_header(1, 1, 8, 0, 0)).is_none());
+        assert!(bmp_file(&[0; 8]).is_none());
+    }
+
+    #[test]
+    fn a_clipboard_dib_comes_out_as_a_png_with_its_pixels() {
+        // 2×2, 24-bit, bottom-up: rows padded to four bytes, BGR order,
+        // the BOTTOM row first in memory
+        let (red, green, blue, white) = ([0, 0, 255], [0, 255, 0], [255, 0, 0], [255, 255, 255]);
+        let pixels = [
+            &blue[..], &white[..], &[0, 0][..], // bottom row
+            &red[..], &green[..], &[0, 0][..], // top row
+        ]
+        .concat();
+        let dib = [info_header(2, 2, 24, 0, 0), pixels].concat();
+        let png = dib_to_png(&dib).expect("WIC encodes the DIB");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "a PNG, what a composer takes");
+        let image = bunny_ui::codec::decode(&png).expect("the house decoder reads it back");
+        assert_eq!((image.width, image.height), (2, 2));
+        assert_eq!(
+            image.rgba,
+            [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255],
+            "top-left red, top-right green, bottom-left blue, bottom-right white — opaque"
+        );
     }
 
     /// A REAL png, written by hand: zlib with one stored (uncompressed)
