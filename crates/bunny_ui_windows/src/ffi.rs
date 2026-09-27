@@ -495,6 +495,9 @@ const HTCLIENT: isize = 1;
 // timers
 const TIMER_BLINK: usize = 1;
 const TIMER_RESIZE: usize = 2;
+/// The slow beat: only loop clocks (or a sleeping task) live, so a plain
+/// timer beats once per step instead of the composition clock every frame.
+const TIMER_SLOW: usize = 3;
 // TrackMouseEvent
 const TME_LEAVE: u32 = 0x0002;
 // raster op
@@ -1433,6 +1436,14 @@ fn unregister_top_level(hwnd: Hwnd) -> usize {
     }
     if driver().hwnd.load(Ordering::Acquire) == hwnd {
         driver().hwnd.store(heir, Ordering::Release);
+        // the slow beat is the driver's too, and moves house with it
+        if let Some(step) = SLOW_STEP.with(Cell::get)
+            && heir != 0
+        {
+            unsafe {
+                SetTimer(heir, TIMER_SLOW, slow_interval_ms(step), std::ptr::null());
+            }
+        }
     }
     TOP_LEVEL.with(|windows| windows.borrow().len())
 }
@@ -1811,23 +1822,93 @@ fn driver() -> &'static Driver {
 
 /// Parks or resumes the frame driver. Born paused; the shell resumes it
 /// only while an animation (or a sleeping task) needs the clock.
-pub fn want_frames(window: usize, wants: bool) {
-    let none = WANTS_FRAMES.with(|windows| {
-        let mut windows = windows.borrow_mut();
-        if wants {
-            windows.insert(window as Hwnd);
-        } else {
-            windows.remove(&(window as Hwnd));
+pub fn want_pace(window: usize, pace: DriverPace) {
+    let effective = PACES.with(|paces| {
+        let mut paces = paces.borrow_mut();
+        match pace {
+            DriverPace::Off => {
+                paces.remove(&(window as Hwnd));
+            }
+            wanted => {
+                paces.insert(window as Hwnd, wanted);
+            }
         }
-        windows.is_empty()
+        paces.values().fold(DriverPace::Off, |pace, wanted| pace.faster(*wanted))
     });
-    set_frame_driver_paused(none);
+    set_frame_driver_paused(effective != DriverPace::Full);
+    set_slow_beat(match effective {
+        DriverPace::Slow(step) => Some(step),
+        DriverPace::Full | DriverPace::Off => None,
+    });
+}
+
+/// How fast the shell drives frames — the mac shell's `DriverPace`, read
+/// from `Runtime::frame_pace` after every event.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DriverPace {
+    /// The composition clock beats every frame — springs and flights move.
+    Full,
+    /// Only loop clocks (or a sleeping task) live: a timer beats once per
+    /// step, in seconds.
+    Slow(f64),
+    /// Nothing moves.
+    Off,
+}
+
+impl DriverPace {
+    /// The pace that serves both: the composition clock serves everything,
+    /// and of two slow beats the shorter step serves both clocks.
+    fn faster(self, other: DriverPace) -> DriverPace {
+        match (self, other) {
+            (DriverPace::Full, _) | (_, DriverPace::Full) => DriverPace::Full,
+            (DriverPace::Slow(a), DriverPace::Slow(b)) => DriverPace::Slow(a.min(b)),
+            (DriverPace::Slow(step), DriverPace::Off) | (DriverPace::Off, DriverPace::Slow(step)) => {
+                DriverPace::Slow(step)
+            }
+            (DriverPace::Off, DriverPace::Off) => DriverPace::Off,
+        }
+    }
 }
 
 thread_local! {
-    /// Which windows are animating — the beat is the APP's, and it
-    /// runs while any one of them wants a frame.
-    static WANTS_FRAMES: RefCell<HashSet<Hwnd>> = RefCell::new(HashSet::new());
+    /// The pace EACH window wants. The beat is the APP's and runs at the
+    /// fastest pace any window wants: with one answer, the last window to
+    /// speak decided, and an idle window would park another's spring.
+    static PACES: RefCell<HashMap<Hwnd, DriverPace>> = RefCell::new(HashMap::new());
+    /// The slow beat's step while it is armed.
+    static SLOW_STEP: Cell<Option<f64>> = const { Cell::new(None) };
+}
+
+/// A slow step as a `SetTimer` interval: whole milliseconds, never under
+/// the platform's floor (`USER_TIMER_MINIMUM`, 10 ms).
+fn slow_interval_ms(step: f64) -> u32 {
+    const USER_TIMER_MINIMUM: f64 = 10.0;
+    (step * 1000.0).round().clamp(USER_TIMER_MINIMUM, f64::from(u32::MAX)) as u32
+}
+
+/// Arms (or re-arms, or disarms) the slow beat on the driver's window.
+/// Silent when the step did not change: a steady loop re-states its pace
+/// after every frame.
+fn set_slow_beat(step: Option<f64>) {
+    let held = SLOW_STEP.with(Cell::get);
+    if held == step {
+        return;
+    }
+    SLOW_STEP.with(|slot| slot.set(step));
+    let hwnd = driver().hwnd.load(Ordering::Acquire);
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        match step {
+            Some(step) => {
+                SetTimer(hwnd, TIMER_SLOW, slow_interval_ms(step), std::ptr::null());
+            }
+            None => {
+                KillTimer(hwnd, TIMER_SLOW);
+            }
+        }
+    }
 }
 
 pub fn set_frame_driver_paused(paused: bool) {
@@ -2475,6 +2556,17 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                 dispatch(AppEvent::Frame { dt });
                 return 0;
             }
+            if wparam == TIMER_SLOW {
+                // the slow beat covers exactly one step — the clocks
+                // advance by the step they were promised, with no wall
+                // clock in the path (the mac's `bunnySlow:`); the frame
+                // clock's own dt is clamped for springs and would run a
+                // quarter-second loop at an eighth of its speed
+                if let Some(step) = SLOW_STEP.with(Cell::get) {
+                    dispatch(AppEvent::Frame { dt: step });
+                }
+                return 0;
+            }
             0
         }
         WM_APP_FRAME => {
@@ -2611,7 +2703,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             if is_top_level(hwnd) {
                 // the swapchain must not outlive its window
                 crate::d3d::teardown(hwnd);
-                want_frames(hwnd as usize, false);
+                want_pace(hwnd as usize, DriverPace::Off);
                 // reported while the window can still be ADDRESSED: the
                 // app buries the slot the source names
                 dispatch_at(hwnd, AppEvent::WindowClosed);
@@ -3967,6 +4059,44 @@ mod tests {
         // monitor: the caret is 30 × 50 points into the DIALOG
         let dialog = scene_rect_to_client(caret, 1.5, (100.0, 40.0));
         assert_eq!((dialog.left, dialog.top, dialog.right, dialog.bottom), (45, 75, 48, 102));
+    }
+
+    #[test]
+    fn the_beat_runs_at_the_fastest_pace_any_window_wants() {
+        use DriverPace::{Full, Off, Slow};
+        assert_eq!(Off.faster(Off), Off);
+        assert_eq!(Slow(0.25).faster(Off), Slow(0.25));
+        assert_eq!(Off.faster(Slow(0.5)), Slow(0.5));
+        // two loops: the shorter step serves both clocks
+        assert_eq!(Slow(0.25).faster(Slow(0.1)), Slow(0.1));
+        // a spring anywhere wants the composition clock
+        assert_eq!(Slow(0.1).faster(Full), Full);
+        assert_eq!(Full.faster(Off), Full);
+    }
+
+    #[test]
+    fn a_slow_step_becomes_a_timer_the_platform_keeps() {
+        assert_eq!(slow_interval_ms(0.25), 250);
+        assert_eq!(slow_interval_ms(0.0333), 33);
+        // under the platform's floor: the floor
+        assert_eq!(slow_interval_ms(0.001), 10);
+        assert_eq!(slow_interval_ms(0.0), 10);
+    }
+
+    #[test]
+    fn a_window_that_only_loops_arms_the_slow_beat_and_a_spring_takes_it_back() {
+        let window = create_window("bunny pace", 80.0, 60.0, false, true, true);
+        let id = window.raw_window();
+        want_pace(id, DriverPace::Slow(0.25));
+        assert_eq!(SLOW_STEP.with(Cell::get), Some(0.25), "a loop alone: the slow beat");
+        want_pace(id, DriverPace::Full);
+        assert_eq!(SLOW_STEP.with(Cell::get), None, "a spring: the composition clock");
+        want_pace(id, DriverPace::Slow(0.5));
+        want_pace(id, DriverPace::Off);
+        assert_eq!(SLOW_STEP.with(Cell::get), None, "nothing moves: nothing beats");
+        unsafe {
+            DestroyWindow(window.hwnd);
+        }
     }
 
     #[test]
