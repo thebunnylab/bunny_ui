@@ -184,6 +184,8 @@ unsafe extern "system" {
     fn EmptyClipboard() -> i32;
     fn GetClipboardData(format: u32) -> Handle;
     fn SetClipboardData(format: u32, data: Handle) -> Handle;
+    fn IsClipboardFormatAvailable(format: u32) -> i32;
+    fn RegisterClipboardFormatW(name: *const u16) -> u32;
     fn RegisterClassW(class: *const WndClassW) -> u16;
     fn CreateWindowExW(
         ex_style: u32,
@@ -342,6 +344,7 @@ unsafe extern "system" {
     fn GlobalLock(handle: Handle) -> *mut c_void;
     fn GlobalUnlock(handle: Handle) -> i32;
     fn GlobalFree(handle: Handle) -> Handle;
+    fn GlobalSize(handle: Handle) -> usize;
     fn Sleep(milliseconds: u32);
 }
 
@@ -666,8 +669,12 @@ pub enum AppEvent {
     /// sent before the frame that shows it.
     WindowState { maximized: bool },
     /// The window deactivated (the user switched apps or windows) —
-    /// open popovers close, the platform's own manner.
+    /// open popovers close, the platform's own manner, and the loop
+    /// clocks freeze.
     ResignKey,
+    /// The window activated — the front returned, and a frozen loop
+    /// resumes mid-phase.
+    BecomeKey,
     /// A system setting moved (theme, animation preference) — the
     /// shell re-reads its mirrors.
     SettingsChanged,
@@ -895,6 +902,87 @@ pub fn clipboard_read() -> Option<String> {
         CloseClipboard();
     }
     text
+}
+
+/// `CF_DIB`.
+const CF_DIB: u32 = 8;
+/// The eight bytes every PNG opens with.
+const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+/// Which clipboard format a picture is read from, given what is there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PictureFormat {
+    /// The registered `"PNG"` format: browsers, Snipping Tool.
+    Png,
+    /// `CF_DIB`: Print Screen and older tools — encoded as PNG after.
+    Dib,
+}
+
+/// The picture a paste should take, if any. A copy that carries TEXT is a
+/// text copy: Windows synthesizes `CF_DIB` from any bitmap or metafile, and
+/// Word, Excel and Outlook put one beside every selection, so reading a
+/// picture there would turn a paragraph pasted into a composer into an
+/// attachment of its rendering.
+fn picture_format(has_text: bool, has_png: bool, has_dib: bool) -> Option<PictureFormat> {
+    match (has_text, has_png, has_dib) {
+        (true, ..) => None,
+        (false, true, _) => Some(PictureFormat::Png),
+        (false, false, true) => Some(PictureFormat::Dib),
+        (false, false, false) => None,
+    }
+}
+
+/// The bytes of one clipboard format, copied out while the clipboard is open.
+unsafe fn clipboard_bytes(format: u32) -> Option<Vec<u8>> {
+    unsafe {
+        let handle = GetClipboardData(format);
+        if handle == 0 {
+            return None;
+        }
+        let size = GlobalSize(handle);
+        let memory = GlobalLock(handle) as *const u8;
+        if memory.is_null() || size == 0 {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(memory, size).to_vec();
+        GlobalUnlock(handle);
+        Some(bytes)
+    }
+}
+
+/// Reads a picture off the clipboard: the registered `"PNG"` format first,
+/// `CF_DIB` after (re-encoded as PNG, the one of the two a receiver takes)
+/// — and nothing when the copy also carries text ([`picture_format`]).
+/// The mac's twin reads PNG, then TIFF.
+pub fn clipboard_read_image() -> Option<bunny_ui::clipboard::ClipboardImage> {
+    let png = unsafe { RegisterClipboardFormatW(wide("PNG").as_ptr()) };
+    let (has_text, has_png, has_dib) = unsafe {
+        (
+            IsClipboardFormatAvailable(CF_UNICODETEXT) != 0,
+            png != 0 && IsClipboardFormatAvailable(png) != 0,
+            IsClipboardFormatAvailable(CF_DIB) != 0,
+        )
+    };
+    let format = picture_format(has_text, has_png, has_dib)?;
+    if !open_clipboard_patiently() {
+        return None;
+    }
+    let bytes = unsafe {
+        match format {
+            PictureFormat::Png => clipboard_bytes(png),
+            PictureFormat::Dib => clipboard_bytes(CF_DIB),
+        }
+    };
+    unsafe {
+        CloseClipboard();
+    }
+    // the clipboard is closed before any encoding: another app's copy
+    // never waits on this one's PNG
+    let bytes = match format {
+        PictureFormat::Png => bytes.filter(|bytes| bytes.starts_with(PNG_SIGNATURE))?,
+        PictureFormat::Dib => crate::image::dib_to_png(&bytes?)?,
+    };
+    Some(bunny_ui::clipboard::ClipboardImage { media_type: "image/png".to_owned(), bytes })
 }
 
 // MARK: - The season's mirrors (OS theme and reduced motion)
@@ -1259,6 +1347,19 @@ pub(crate) fn scene_owner(hwnd: Hwnd) -> Hwnd {
 /// shares.
 pub fn event_source() -> usize {
     SOURCE.with(Cell::get) as usize
+}
+
+/// What a `WM_ACTIVATE` says: the low word is `WA_INACTIVE`, `WA_ACTIVE`
+/// or `WA_CLICKACTIVE`, and the high word only flags a minimized window.
+/// Moving from a window to its own dialog is a resign and then a become,
+/// both addressed to the one scene, so the loops keep running; leaving the
+/// app (or minimizing) is a resign alone.
+const fn activation(wparam: usize) -> AppEvent {
+    if (wparam & 0xFFFF) == WA_INACTIVE {
+        AppEvent::ResignKey
+    } else {
+        AppEvent::BecomeKey
+    }
 }
 
 /// Delivers an event ADDRESSED to the window it happened in — the
@@ -1817,6 +1918,29 @@ fn layout_point(hwnd: Hwnd, lparam: isize) -> (f64, f64) {
     let factor = shared_factor_for(hwnd);
     let (dx, dy) = scene_origin(hwnd);
     (x as f64 / factor + dx, y as f64 / factor + dy)
+}
+
+/// A SCREEN point (what OLE's drag callbacks carry) in the scene
+/// coordinates of the window it is over — a dialog's own offset included.
+pub(crate) fn screen_to_layout(hwnd: Hwnd, x: i32, y: i32) -> (f64, f64) {
+    let mut point = Point { x, y };
+    unsafe {
+        ScreenToClient(hwnd, &mut point);
+    }
+    let factor = shared_factor_for(hwnd);
+    let (dx, dy) = scene_origin(hwnd);
+    (f64::from(point.x) / factor + dx, f64::from(point.y) / factor + dy)
+}
+
+/// Runs `answer` ADDRESSED to the scene `hwnd` belongs to — what a
+/// platform callback that wants a synchronous reply (a drop target's
+/// "would you take these?") does instead of [`dispatch_at`].
+pub(crate) fn addressed<R>(hwnd: Hwnd, answer: impl FnOnce() -> R) -> R {
+    let owner = scene_owner(hwnd);
+    let held = SOURCE.with(|source| source.replace(owner));
+    let answered = answer();
+    SOURCE.with(|source| source.set(held));
+    answered
 }
 
 /// Wheel notches → logical points. `delta` is the raw wheel value
@@ -2409,9 +2533,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_ACTIVATE => {
-            if (wparam & 0xFFFF) == WA_INACTIVE {
-                dispatch_at(hwnd, AppEvent::ResignKey);
-            }
+            dispatch_at(hwnd, activation(wparam));
             0
         }
         WM_GETMINMAXINFO => {
@@ -2468,6 +2590,8 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // earlier — dropping them on `WM_MOUSELEAVE` once left the
             // header undraggable the first time the pointer wandered off.
             forget_dialog(hwnd);
+            // OLE lets go of the drop target while the window still stands
+            crate::filedrop::revoke(hwnd);
             // a panel dies in silence; a top-level window leaves the
             // registry, and the LAST one out quits the app — the
             // single-window contract said again
@@ -2609,6 +2733,9 @@ pub fn create_window(
     // resize below re-runs it — and the first window takes the app's
     // roles: the cross-thread knock, the frame beat, the slow clock
     register_top_level(hwnd, scene_chrome);
+    // files dragged in from the system land on the scene (the mac's
+    // `registerForDraggedTypes:`)
+    crate::filedrop::register(hwnd);
     if scene_chrome {
         // a frameless window keeps the system's rounded corners — the
         // compositor cuts and antialiases them, the platform's own
@@ -3084,6 +3211,9 @@ pub fn create_dialog(
     // birth records them here rather than from `WM_SIZE`: that message arrives
     // DURING `CreateWindowExW`, before this window is known to be a dialog.
     refresh_metrics(hwnd);
+    // a dialog's content is its owner's scene, and so are the files dropped
+    // on it — the target addresses the owner
+    crate::filedrop::register(hwnd);
     WindowHandle { hwnd }
 }
 
@@ -3731,6 +3861,15 @@ mod tests {
         Rect { left, top, right: left + width, bottom: top + height }
     }
 
+    /// The factor the code under test reads for this window — asked of the
+    /// window ITSELF, never through `MAIN_HWND`. That one is one per
+    /// process, while each test runs on a thread of its own and the metrics
+    /// are kept per thread: a neighbour's window, or none, reads as 1.0 on
+    /// a 200 % screen.
+    fn factor_of(window: &WindowHandle) -> f64 {
+        shared_factor_for(window.hwnd)
+    }
+
     /// A 2560×1600 panel at 200 % with the taskbar at the bottom: a
     /// 1280×752-point work area, the everyday Windows laptop.
     const WORK: Rect = Rect { left: 0, top: 0, right: 2560, bottom: 1504 };
@@ -3806,6 +3945,29 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_that_carries_text_pastes_as_text() {
+        // text beside a picture — Word, Excel, Outlook — is a text copy
+        assert_eq!(picture_format(true, true, true), None);
+        assert_eq!(picture_format(true, false, true), None);
+        // a screenshot or an image from a page: PNG first, DIB after
+        assert_eq!(picture_format(false, true, true), Some(PictureFormat::Png));
+        assert_eq!(picture_format(false, false, true), Some(PictureFormat::Dib));
+        assert_eq!(picture_format(false, false, false), None);
+    }
+
+    #[test]
+    fn activation_reads_the_low_word_and_ignores_the_minimized_flag() {
+        const MINIMIZED: usize = 1 << 16;
+        assert!(matches!(activation(0), AppEvent::ResignKey), "WA_INACTIVE");
+        assert!(matches!(activation(MINIMIZED), AppEvent::ResignKey), "minimized away");
+        assert!(matches!(activation(1), AppEvent::BecomeKey), "WA_ACTIVE");
+        assert!(matches!(activation(2), AppEvent::BecomeKey), "WA_CLICKACTIVE");
+        // restored from the taskbar: active, and still flagged minimized
+        // for this one message
+        assert!(matches!(activation(1 | MINIMIZED), AppEvent::BecomeKey));
+    }
+
+    #[test]
     fn each_cursor_loads_the_system_cursor_of_its_name() {
         // the documented `IDC_*` ids — an I-beam that loaded the arrow would
         // compile, run and look exactly like the bug it fixes
@@ -3854,8 +4016,7 @@ mod tests {
     #[test]
     fn a_layout_rect_lands_on_screen_and_comes_back() {
         let window = create_window("bunny screen", 200.0, 150.0, false, true, true);
-        MAIN_HWND.store(window.hwnd, Ordering::Release);
-        let factor = shared_factor();
+        let factor = factor_of(&window);
         let rect = window.layout_rect_to_screen(10.0, 20.0, 30.0, 40.0);
         assert_eq!(rect.right - rect.left, (30.0 * factor).round() as i32);
         assert_eq!(rect.bottom - rect.top, (40.0 * factor).round() as i32);
@@ -3905,10 +4066,9 @@ mod tests {
     #[test]
     fn a_panel_translates_its_events_into_the_scene() {
         let window = create_window("bunny panel", 100.0, 80.0, false, true, true);
-        MAIN_HWND.store(window.hwnd, Ordering::Release);
         let panel = create_panel(&window);
         panel.set_scene_origin(300.0, -20.0);
-        let factor = shared_factor();
+        let factor = factor_of(&window);
         // a client point on the panel reads as scene coordinates
         let lparam = ((10.0 * factor) as isize) | (((8.0 * factor) as isize) << 16);
         let (x, y) = layout_point(panel.hwnd, lparam);
@@ -3924,8 +4084,7 @@ mod tests {
     fn a_host_mounts_places_and_sweeps() {
         use std::cell::Cell;
         let window = create_window("bunny host", 200.0, 150.0, false, true, true);
-        MAIN_HWND.store(window.hwnd, Ordering::Release);
-        let factor = shared_factor();
+        let factor = factor_of(&window);
         let px = |v: f64| (v * factor).round() as i32;
 
         // first sight: the container is born, the tenant is asked once,
