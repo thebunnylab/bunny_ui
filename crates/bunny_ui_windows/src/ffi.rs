@@ -1819,6 +1819,29 @@ fn layout_point(hwnd: Hwnd, lparam: isize) -> (f64, f64) {
     (x as f64 / factor + dx, y as f64 / factor + dy)
 }
 
+/// A SCREEN point (what OLE's drag callbacks carry) in the scene
+/// coordinates of the window it is over — a dialog's own offset included.
+pub(crate) fn screen_to_layout(hwnd: Hwnd, x: i32, y: i32) -> (f64, f64) {
+    let mut point = Point { x, y };
+    unsafe {
+        ScreenToClient(hwnd, &mut point);
+    }
+    let factor = shared_factor_for(hwnd);
+    let (dx, dy) = scene_origin(hwnd);
+    (f64::from(point.x) / factor + dx, f64::from(point.y) / factor + dy)
+}
+
+/// Runs `answer` ADDRESSED to the scene `hwnd` belongs to — what a
+/// platform callback that wants a synchronous reply (a drop target's
+/// "would you take these?") does instead of [`dispatch_at`].
+pub(crate) fn addressed<R>(hwnd: Hwnd, answer: impl FnOnce() -> R) -> R {
+    let owner = scene_owner(hwnd);
+    let held = SOURCE.with(|source| source.replace(owner));
+    let answered = answer();
+    SOURCE.with(|source| source.set(held));
+    answered
+}
+
 /// Wheel notches → logical points. `delta` is the raw wheel value
 /// (±120 per notch, fractional on precision touchpads); a notch moves
 /// the system's scroll-lines setting worth of ~16-point lines — the
@@ -2468,6 +2491,8 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // earlier — dropping them on `WM_MOUSELEAVE` once left the
             // header undraggable the first time the pointer wandered off.
             forget_dialog(hwnd);
+            // OLE lets go of the drop target while the window still stands
+            crate::filedrop::revoke(hwnd);
             // a panel dies in silence; a top-level window leaves the
             // registry, and the LAST one out quits the app — the
             // single-window contract said again
@@ -2609,6 +2634,9 @@ pub fn create_window(
     // resize below re-runs it — and the first window takes the app's
     // roles: the cross-thread knock, the frame beat, the slow clock
     register_top_level(hwnd, scene_chrome);
+    // files dragged in from the system land on the scene (the mac's
+    // `registerForDraggedTypes:`)
+    crate::filedrop::register(hwnd);
     if scene_chrome {
         // a frameless window keeps the system's rounded corners — the
         // compositor cuts and antialiases them, the platform's own
@@ -3084,6 +3112,9 @@ pub fn create_dialog(
     // birth records them here rather than from `WM_SIZE`: that message arrives
     // DURING `CreateWindowExW`, before this window is known to be a dialog.
     refresh_metrics(hwnd);
+    // a dialog's content is its owner's scene, and so are the files dropped
+    // on it — the target addresses the owner
+    crate::filedrop::register(hwnd);
     WindowHandle { hwnd }
 }
 
