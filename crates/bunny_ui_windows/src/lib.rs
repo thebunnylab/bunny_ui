@@ -237,8 +237,10 @@ impl App {
         // the app's life outside its windows opens with the app: the
         // desktop learns this process's name, and the notifier opens
         life::install();
-        // the system clipboard, for the app's own handlers too
+        // the system clipboard, for the app's own handlers too — its
+        // pictures as well, for a composer that takes a pasted image
         bunny_ui::clipboard::install(ffi::clipboard_write, ffi::clipboard_read);
+        bunny_ui::clipboard::install_image_reader(ffi::clipboard_read_image);
         App {
             inner: Rc::new(AppInner {
                 slots: RefCell::new(Vec::new()),
