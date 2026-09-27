@@ -3746,6 +3746,15 @@ mod tests {
         Rect { left, top, right: left + width, bottom: top + height }
     }
 
+    /// The factor the code under test reads for this window — asked of the
+    /// window ITSELF, never through `MAIN_HWND`. That one is one per
+    /// process, while each test runs on a thread of its own and the metrics
+    /// are kept per thread: a neighbour's window, or none, reads as 1.0 on
+    /// a 200 % screen.
+    fn factor_of(window: &WindowHandle) -> f64 {
+        shared_factor_for(window.hwnd)
+    }
+
     /// A 2560×1600 panel at 200 % with the taskbar at the bottom: a
     /// 1280×752-point work area, the everyday Windows laptop.
     const WORK: Rect = Rect { left: 0, top: 0, right: 2560, bottom: 1504 };
@@ -3881,8 +3890,7 @@ mod tests {
     #[test]
     fn a_layout_rect_lands_on_screen_and_comes_back() {
         let window = create_window("bunny screen", 200.0, 150.0, false, true, true);
-        MAIN_HWND.store(window.hwnd, Ordering::Release);
-        let factor = shared_factor();
+        let factor = factor_of(&window);
         let rect = window.layout_rect_to_screen(10.0, 20.0, 30.0, 40.0);
         assert_eq!(rect.right - rect.left, (30.0 * factor).round() as i32);
         assert_eq!(rect.bottom - rect.top, (40.0 * factor).round() as i32);
@@ -3932,10 +3940,9 @@ mod tests {
     #[test]
     fn a_panel_translates_its_events_into_the_scene() {
         let window = create_window("bunny panel", 100.0, 80.0, false, true, true);
-        MAIN_HWND.store(window.hwnd, Ordering::Release);
         let panel = create_panel(&window);
         panel.set_scene_origin(300.0, -20.0);
-        let factor = shared_factor();
+        let factor = factor_of(&window);
         // a client point on the panel reads as scene coordinates
         let lparam = ((10.0 * factor) as isize) | (((8.0 * factor) as isize) << 16);
         let (x, y) = layout_point(panel.hwnd, lparam);
@@ -3951,8 +3958,7 @@ mod tests {
     fn a_host_mounts_places_and_sweeps() {
         use std::cell::Cell;
         let window = create_window("bunny host", 200.0, 150.0, false, true, true);
-        MAIN_HWND.store(window.hwnd, Ordering::Release);
-        let factor = shared_factor();
+        let factor = factor_of(&window);
         let px = |v: f64| (v * factor).round() as i32;
 
         // first sight: the container is born, the tenant is asked once,
