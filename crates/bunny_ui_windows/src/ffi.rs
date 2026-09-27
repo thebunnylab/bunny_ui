@@ -500,6 +500,8 @@ const SRCCOPY: u32 = 0x00CC_0020;
 const HALFTONE: i32 = 4;
 // stock cursors
 const IDC_ARROW: usize = 32512;
+const IDC_IBEAM: usize = 32513;
+const IDC_CROSS: usize = 32515;
 const IDC_HAND: usize = 32649;
 const IDC_SIZEWE: usize = 32644;
 const IDC_SIZENS: usize = 32645;
@@ -1591,15 +1593,32 @@ fn clamp_damage(
 
 // MARK: - Cursor
 
-/// What the pointer wears: the hand over an interactive target, a
-/// resizer over a split's grip — the one that matches the way THAT
-/// seam travels — and the arrow elsewhere.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// What the pointer wears: the I-beam over text, the cross over a sheet's
+/// cells, the hand over an interactive target, a resizer over a split's
+/// grip — the one that matches the way THAT seam travels — and the arrow
+/// elsewhere.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cursor {
     Arrow,
+    /// The I-beam: text, where a press puts a caret.
+    Text,
     Pointing,
+    /// The cross: a rectangle of content is selected here.
+    Cell,
     ResizeLeftRight,
     ResizeUpDown,
+}
+
+/// The system cursor each outfit loads.
+const fn cursor_id(cursor: Cursor) -> usize {
+    match cursor {
+        Cursor::Arrow => IDC_ARROW,
+        Cursor::Text => IDC_IBEAM,
+        Cursor::Pointing => IDC_HAND,
+        Cursor::Cell => IDC_CROSS,
+        Cursor::ResizeLeftRight => IDC_SIZEWE,
+        Cursor::ResizeUpDown => IDC_SIZENS,
+    }
 }
 
 thread_local! {
@@ -1619,14 +1638,8 @@ pub(crate) fn yield_cursor() {
 }
 
 fn apply_cursor(cursor: Cursor) {
-    let id = match cursor {
-        Cursor::Arrow => IDC_ARROW,
-        Cursor::Pointing => IDC_HAND,
-        Cursor::ResizeLeftRight => IDC_SIZEWE,
-        Cursor::ResizeUpDown => IDC_SIZENS,
-    };
     unsafe {
-        SetCursor(LoadCursorW(0, id as *const u16));
+        SetCursor(LoadCursorW(0, cursor_id(cursor) as *const u16));
     }
 }
 
@@ -3790,6 +3803,28 @@ mod tests {
         assert_eq!(clamp_damage((8, 8, 200, 200), 10, 10), Some((8, 8, 10, 10)));
         assert_eq!(clamp_damage((3, 3, 3, 9), 10, 10), None);
         assert_eq!(clamp_damage((20, 0, 30, 5), 10, 10), None);
+    }
+
+    #[test]
+    fn each_cursor_loads_the_system_cursor_of_its_name() {
+        // the documented `IDC_*` ids — an I-beam that loaded the arrow would
+        // compile, run and look exactly like the bug it fixes
+        assert_eq!(cursor_id(Cursor::Text), 32513, "IDC_IBEAM");
+        assert_eq!(cursor_id(Cursor::Cell), 32515, "IDC_CROSS");
+        assert_eq!(cursor_id(Cursor::Pointing), 32649, "IDC_HAND");
+        assert_eq!(cursor_id(Cursor::Arrow), 32512, "IDC_ARROW");
+        // and the system has every one of them
+        for cursor in [
+            Cursor::Arrow,
+            Cursor::Text,
+            Cursor::Pointing,
+            Cursor::Cell,
+            Cursor::ResizeLeftRight,
+            Cursor::ResizeUpDown,
+        ] {
+            let handle = unsafe { LoadCursorW(0, cursor_id(cursor) as *const u16) };
+            assert_ne!(handle, 0, "{cursor:?} loads nothing");
+        }
     }
 
     #[test]
