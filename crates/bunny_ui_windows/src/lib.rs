@@ -12,6 +12,7 @@ pub mod credentials;
 mod d3d;
 pub mod dialog;
 mod ffi;
+mod filedrop;
 mod image;
 mod life;
 mod text;
@@ -183,6 +184,8 @@ struct Slot {
     control_gate: Box<dyn Fn(f64, f64) -> Option<ffi::ControlHit>>,
     ime_rect: Box<dyn Fn(usize) -> Option<(f64, f64, f64, f64)>>,
     on_web: Box<dyn Fn(webview::WebviewEvent)>,
+    /// Files dragged in from the system: previewed, dropped, or gone.
+    file_drag: Box<dyn Fn(f64, f64, Vec<std::path::PathBuf>, filedrop::FileDrag) -> bool>,
 }
 
 /// This shell holds MORE THAN ONE window — the detachable composer,
@@ -330,6 +333,10 @@ impl AppInner {
         let app = Rc::clone(&self);
         ffi::set_ime_rect_resolver(Box::new(move |utf16| {
             app.addressed().and_then(|slot| (slot.ime_rect)(utf16))
+        }));
+        let app = Rc::clone(&self);
+        filedrop::set_gate(Box::new(move |x, y, files, phase| {
+            app.addressed().is_some_and(|slot| (slot.file_drag)(x, y, files, phase))
         }));
         let app = Rc::clone(&self);
         webview::set_dispatch(move |event| {
@@ -959,6 +966,29 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         }
     });
 
+    // files from the system, the mac's three phases: the preview asks the
+    // same clipped drop targets an internal drag does, the drop delivers
+    // to the one that accepts, and the exit clears the preview
+    let file_drag: Box<dyn Fn(f64, f64, Vec<std::path::PathBuf>, filedrop::FileDrag) -> bool> =
+        Box::new({
+            let runtime = Rc::clone(&runtime);
+            let root = Rc::clone(&root);
+            let blit = blit.clone();
+            move |x, y, paths, phase| {
+                let files = bunny_ui::runtime::ExternalPaths(paths);
+                let accepted = match phase {
+                    filedrop::FileDrag::Preview => runtime.external_drag(x, y, &files),
+                    filedrop::FileDrag::Drop => runtime.external_drop(x, y, files),
+                    filedrop::FileDrag::Exit => {
+                        runtime.external_drag_exited();
+                        false
+                    }
+                };
+                blit(&runtime, &*root);
+                accepted
+            }
+        });
+
     // the candidate window's anchor: the rect at the composition's
     // start, answered live by the runtime in layout points
     let ime_rect: Box<dyn Fn(usize) -> Option<(f64, f64, f64, f64)>> = Box::new({
@@ -1149,10 +1179,19 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             AppEvent::ResignKey => {
                 // the user switched away: popovers close like the
-                // platform's own
+                // platform's own — and the decorations freeze: they
+                // animate for eyes that are on them (the mac's rule)
+                runtime.set_loops_paused(true);
                 if runtime.dismiss_all_overlays() {
                     blit(runtime, root);
                 }
+                // a frozen loop asks for no frames: the beat parks
+                ffi::want_frames(window.raw_window(), runtime.wants_frame());
+            }
+            AppEvent::BecomeKey => {
+                // the front returns: a frozen loop resumes mid-phase
+                runtime.set_loops_paused(false);
+                ffi::want_frames(window.raw_window(), runtime.wants_frame());
             }
             AppEvent::MouseMoved { x, y, modifiers } => {
                 if runtime.pointer_moved(x, y, modifiers) {
@@ -1316,6 +1355,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         control_gate,
         ime_rect,
         on_web,
+        file_drag,
     })
 }
 
