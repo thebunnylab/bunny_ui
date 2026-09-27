@@ -666,8 +666,12 @@ pub enum AppEvent {
     /// sent before the frame that shows it.
     WindowState { maximized: bool },
     /// The window deactivated (the user switched apps or windows) —
-    /// open popovers close, the platform's own manner.
+    /// open popovers close, the platform's own manner, and the loop
+    /// clocks freeze.
     ResignKey,
+    /// The window activated — the front returned, and a frozen loop
+    /// resumes mid-phase.
+    BecomeKey,
     /// A system setting moved (theme, animation preference) — the
     /// shell re-reads its mirrors.
     SettingsChanged,
@@ -1259,6 +1263,19 @@ pub(crate) fn scene_owner(hwnd: Hwnd) -> Hwnd {
 /// shares.
 pub fn event_source() -> usize {
     SOURCE.with(Cell::get) as usize
+}
+
+/// What a `WM_ACTIVATE` says: the low word is `WA_INACTIVE`, `WA_ACTIVE`
+/// or `WA_CLICKACTIVE`, and the high word only flags a minimized window.
+/// Moving from a window to its own dialog is a resign and then a become,
+/// both addressed to the one scene, so the loops keep running; leaving the
+/// app (or minimizing) is a resign alone.
+const fn activation(wparam: usize) -> AppEvent {
+    if (wparam & 0xFFFF) == WA_INACTIVE {
+        AppEvent::ResignKey
+    } else {
+        AppEvent::BecomeKey
+    }
 }
 
 /// Delivers an event ADDRESSED to the window it happened in — the
@@ -2432,9 +2449,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_ACTIVATE => {
-            if (wparam & 0xFFFF) == WA_INACTIVE {
-                dispatch_at(hwnd, AppEvent::ResignKey);
-            }
+            dispatch_at(hwnd, activation(wparam));
             0
         }
         WM_GETMINMAXINFO => {
@@ -3762,6 +3777,15 @@ mod tests {
         Rect { left, top, right: left + width, bottom: top + height }
     }
 
+    /// The factor the code under test reads for this window — asked of the
+    /// window ITSELF, never through `MAIN_HWND`. That one is one per
+    /// process, while each test runs on a thread of its own and the metrics
+    /// are kept per thread: a neighbour's window, or none, reads as 1.0 on
+    /// a 200 % screen.
+    fn factor_of(window: &WindowHandle) -> f64 {
+        shared_factor_for(window.hwnd)
+    }
+
     /// A 2560×1600 panel at 200 % with the taskbar at the bottom: a
     /// 1280×752-point work area, the everyday Windows laptop.
     const WORK: Rect = Rect { left: 0, top: 0, right: 2560, bottom: 1504 };
@@ -3837,6 +3861,18 @@ mod tests {
     }
 
     #[test]
+    fn activation_reads_the_low_word_and_ignores_the_minimized_flag() {
+        const MINIMIZED: usize = 1 << 16;
+        assert!(matches!(activation(0), AppEvent::ResignKey), "WA_INACTIVE");
+        assert!(matches!(activation(MINIMIZED), AppEvent::ResignKey), "minimized away");
+        assert!(matches!(activation(1), AppEvent::BecomeKey), "WA_ACTIVE");
+        assert!(matches!(activation(2), AppEvent::BecomeKey), "WA_CLICKACTIVE");
+        // restored from the taskbar: active, and still flagged minimized
+        // for this one message
+        assert!(matches!(activation(1 | MINIMIZED), AppEvent::BecomeKey));
+    }
+
+    #[test]
     fn each_cursor_loads_the_system_cursor_of_its_name() {
         // the documented `IDC_*` ids — an I-beam that loaded the arrow would
         // compile, run and look exactly like the bug it fixes
@@ -3885,8 +3921,7 @@ mod tests {
     #[test]
     fn a_layout_rect_lands_on_screen_and_comes_back() {
         let window = create_window("bunny screen", 200.0, 150.0, false, true, true);
-        MAIN_HWND.store(window.hwnd, Ordering::Release);
-        let factor = shared_factor();
+        let factor = factor_of(&window);
         let rect = window.layout_rect_to_screen(10.0, 20.0, 30.0, 40.0);
         assert_eq!(rect.right - rect.left, (30.0 * factor).round() as i32);
         assert_eq!(rect.bottom - rect.top, (40.0 * factor).round() as i32);
@@ -3936,10 +3971,9 @@ mod tests {
     #[test]
     fn a_panel_translates_its_events_into_the_scene() {
         let window = create_window("bunny panel", 100.0, 80.0, false, true, true);
-        MAIN_HWND.store(window.hwnd, Ordering::Release);
         let panel = create_panel(&window);
         panel.set_scene_origin(300.0, -20.0);
-        let factor = shared_factor();
+        let factor = factor_of(&window);
         // a client point on the panel reads as scene coordinates
         let lparam = ((10.0 * factor) as isize) | (((8.0 * factor) as isize) << 16);
         let (x, y) = layout_point(panel.hwnd, lparam);
@@ -3955,8 +3989,7 @@ mod tests {
     fn a_host_mounts_places_and_sweeps() {
         use std::cell::Cell;
         let window = create_window("bunny host", 200.0, 150.0, false, true, true);
-        MAIN_HWND.store(window.hwnd, Ordering::Release);
-        let factor = shared_factor();
+        let factor = factor_of(&window);
         let px = |v: f64| (v * factor).round() as i32;
 
         // first sight: the container is born, the tenant is asked once,
