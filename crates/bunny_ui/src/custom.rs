@@ -2062,6 +2062,45 @@ mod tests {
         assert_eq!(editor.focus_log.borrow().as_slice(), &[true, false]);
     }
 
+    /// The keyboard handed over by an `.auto_focus` beat is heard the way
+    /// a click's is: the box that takes it hears `Focused(true)`, and when
+    /// the keyboard moves on by the same road the box hears it leave. An
+    /// editor starts its caret clock on that word — with the beat road
+    /// silent, a file opened from the explorer stood with a still caret
+    /// until the first click (2026-09-27).
+    #[test]
+    fn an_auto_focus_beat_is_heard_by_the_box_it_hands_the_keyboard_to() {
+        #[derive(Clone)]
+        struct Beating {
+            editor: MiniEditor,
+        }
+        impl Component for Beating {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                use crate::ext::ViewExt;
+                crate::vstack!(
+                    crate::views::text("above"),
+                    custom(self.editor).auto_focus(1).frame(200.0, 40.0),
+                )
+            }
+        }
+        let editor = MiniEditor::default();
+        let runtime = Runtime::new();
+        let view = Beating { editor: editor.clone() };
+        let proposal = Proposal { width: Some(200.0), height: Some(80.0) };
+        runtime.layout(&view, proposal);
+        let taken = runtime.focused().expect("the beat handed the box the keyboard");
+        assert_eq!(editor.focus_log.borrow().as_slice(), &[true], "and the box heard it arrive");
+
+        // a re-layout is not a second arrival
+        runtime.layout(&view, proposal);
+        assert_eq!(editor.focus_log.borrow().as_slice(), &[true]);
+
+        // the keyboard moving on by the focus road is heard leaving too
+        runtime.focus("elsewhere");
+        assert_ne!(runtime.focused().as_deref(), Some(taken.as_str()));
+        assert_eq!(editor.focus_log.borrow().as_slice(), &[true, false]);
+    }
+
     #[test]
     fn a_box_that_does_not_ask_never_takes_the_keyboard() {
         #[derive(Clone)]

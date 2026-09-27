@@ -3231,8 +3231,28 @@ impl Runtime {
     /// stamp's clamp resolves the `usize::MAX`); refocusing restores
     /// the retained position.
     pub fn focus(&self, path: &str) {
+        self.focus_via(path, None);
+    }
+
+    /// [`Self::focus`], with the box's placement in hand when the caller
+    /// has it: the auto-focus pass runs on a layout whose boxes are not
+    /// retained yet, so the lookup by path would miss the very box it is
+    /// focusing.
+    ///
+    /// The keyboard moving between boxes is heard on both ends by this
+    /// road too, the way the click road ([`Self::focus_element`]) has it:
+    /// the box it left hears `Focused(false)` and closes what only meant
+    /// something while focused, and the box that takes it hears
+    /// `Focused(true)`. An editor starts its caret clock on that word —
+    /// with this road silent, a file opened from the explorer stood with a
+    /// still caret until the first click (2026-09-27).
+    fn focus_via(&self, path: &str, placement: Option<&crate::layout::CustomPlacement>) {
         self.enter_scene();
         self.frame_asked.set(true);
+        let moved = self.focus.borrow().as_deref() != Some(path);
+        if moved {
+            self.blur();
+        }
         self.caret_visible.set(true);
         *self.focus.borrow_mut() = Some(path.to_string());
         self.sync_field_focus();
@@ -3240,6 +3260,13 @@ impl Runtime {
             .borrow_mut()
             .entry(path.to_string())
             .or_insert(CaretState { caret: usize::MAX, anchor: None, marked: None });
+        if !moved {
+            return;
+        }
+        if let Some(placement) = placement.cloned().or_else(|| self.custom_at(path)) {
+            self.deliver(&placement, crate::custom::ElementEvent::Focused(true));
+            self.dirty_island_of(&placement.path);
+        }
     }
 
     /// The press that opens a selection: focuses, puts the caret under
@@ -5622,7 +5649,7 @@ impl Runtime {
             }
             self.auto_focused.borrow_mut().insert(key);
             if self.focus.borrow().as_deref() != Some(placement.path.as_str()) {
-                self.focus(&placement.path);
+                self.focus_via(&placement.path, Some(placement));
                 return true;
             }
         }
