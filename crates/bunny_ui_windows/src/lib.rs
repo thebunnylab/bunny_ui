@@ -422,6 +422,14 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // the open popovers' panels, pooled by identity path
     let panels: Rc<RefCell<std::collections::HashMap<String, ffi::WindowHandle>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
+    // The scene a popover's MATERIAL samples, kept per panel beside the base
+    // commands it was rasterized from (the mac's `beneaths`): a card that
+    // scrolls its own text does not move the window behind it, and
+    // re-rasterizing that window every frame to hand the panel the same
+    // pixels is milliseconds a frame spent proving nothing changed.
+    type Beneath = (Vec<bunny_ui::layout::DrawCommand>, (usize, usize), bunny_ui::raster::Bitmap);
+    let beneaths: Rc<RefCell<std::collections::HashMap<String, Beneath>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
     // the open dialogs' windows, pooled the same way — an overlay that asked
     // to BE a window (`OverlaySurface::Window`) gets a real one
     let dialogs: Rc<RefCell<std::collections::HashMap<String, ffi::WindowHandle>>> =
@@ -438,6 +446,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
+        let beneaths = Rc::clone(&beneaths);
         let dialogs = Rc::clone(&dialogs);
         // A dialog's hit-test answers must outlive the frame that raised it,
         // so they hold the runtime itself and not this frame's borrow of it.
@@ -762,6 +771,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     if let Some(panel) = store.remove(&path) {
                         panel.close_panel();
                     }
+                    beneaths.borrow_mut().remove(&path);
                 }
                 for overlay in &overlays {
                     // the panel is BLED around the frame so the card's
@@ -779,7 +789,46 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     let slice = full_display.translated_slice(overlay.display, -x, -y);
                     let panel_physical =
                         ((w * scale as f64).round() as usize, (h * scale as f64).round() as usize);
-                    let bitmap = bunny_ui::raster::rasterize_with(
+                    // What a MATERIAL inside the popover samples. The panel
+                    // carries only the popover's own commands, so a pane in
+                    // one read transparency and showed nothing — a glass card
+                    // with no glass on it. The window under the panel is
+                    // rasterized into the panel's own pixels and handed over
+                    // for sampling ONLY: the panel stays transparent wherever
+                    // the popover does not paint, so this is never drawn.
+                    // Skipped when the popover asks for no material, which is
+                    // every menu and every tooltip.
+                    let wants_backdrop = slice.iter().any(|command| {
+                        matches!(command, bunny_ui::layout::DrawCommand::Backdrop { .. })
+                    });
+                    if wants_backdrop {
+                        let base = full_display.translated_slice(
+                            (0, overlay_cut.unwrap_or(full_display.len())),
+                            -x,
+                            -y,
+                        );
+                        let commands: Vec<_> = base.iter().cloned().collect();
+                        let mut kept = beneaths.borrow_mut();
+                        let stale = kept.get(&overlay.path).is_none_or(|(was, size, _)| {
+                            *size != panel_physical || *was != commands
+                        });
+                        if stale {
+                            let fresh = bunny_ui::raster::rasterize_with(
+                                &base,
+                                panel_physical.0,
+                                panel_physical.1,
+                                scale,
+                                canvas,
+                                &*runtime.text(),
+                                &*runtime.images(),
+                            );
+                            kept.insert(overlay.path.clone(), (commands, panel_physical, fresh));
+                        }
+                    } else {
+                        beneaths.borrow_mut().remove(&overlay.path);
+                    }
+                    let kept = beneaths.borrow();
+                    let bitmap = bunny_ui::raster::rasterize_over(
                         &slice,
                         panel_physical.0,
                         panel_physical.1,
@@ -787,7 +836,9 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         bunny_ui::layout::Color { r: 0, g: 0, b: 0, a: 0 },
                         &*runtime.text(),
                         &*runtime.images(),
+                        kept.get(&overlay.path).map(|(_, _, bitmap)| bitmap),
                     );
+                    drop(kept);
                     // position, size and pixels land atomically; the
                     // premultiply for the per-pixel-alpha window fuses
                     // into the copy at the boundary
