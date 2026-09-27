@@ -1248,21 +1248,39 @@ pub(crate) fn ime_composing() -> bool {
     IME.with(|cell| cell.get().marked)
 }
 
-/// Places the candidate window at the composition's start (or the
-/// caret), excluding the rect so the list never covers what it spells.
-fn place_candidate_window(himc: isize) {
-    let mirror = IME.with(|cell| cell.get());
-    let rect = IME_RECT
-        .with(|slot| slot.borrow().as_ref().and_then(|resolve| resolve(mirror.marked_start)))
-        .unwrap_or(mirror.caret);
-    let factor = shared_factor();
+/// A rect in SCENE points as the client pixels of the window it is drawn
+/// in: the window's own scale, less the window's origin in its scene — a
+/// dialog's content is laid out in its owner's scene, from wherever the
+/// dialog sits in it.
+fn scene_rect_to_client(rect: (f64, f64, f64, f64), factor: f64, origin: (f64, f64)) -> Rect {
     let (x, y, w, h) = rect;
-    let area = Rect {
-        left: (x * factor).round() as i32,
-        top: (y * factor).round() as i32,
-        right: ((x + w) * factor).round() as i32,
-        bottom: ((y + h) * factor).round() as i32,
-    };
+    let (dx, dy) = origin;
+    Rect {
+        left: ((x - dx) * factor).round() as i32,
+        top: ((y - dy) * factor).round() as i32,
+        right: ((x + w - dx) * factor).round() as i32,
+        bottom: ((y + h - dy) * factor).round() as i32,
+    }
+}
+
+/// Places `hwnd`'s candidate window at the composition's start (or the
+/// caret), excluding the rect so the list never covers what it spells.
+///
+/// The rect is asked of the scene `hwnd` belongs to — this runs outside
+/// [`dispatch_at`], and with no source named the app answered from its
+/// FIRST window, so a second workbench spelled into the first one's caret —
+/// and it lands in `hwnd`'s own client pixels: its monitor's scale, not the
+/// main window's, and less a dialog's origin in its owner's scene.
+fn place_candidate_window(hwnd: Hwnd, himc: isize) {
+    let mirror = IME.with(|cell| cell.get());
+    let resolved = addressed(hwnd, || {
+        IME_RECT.with(|slot| slot.borrow().as_ref().and_then(|resolve| resolve(mirror.marked_start)))
+    });
+    let area = scene_rect_to_client(
+        resolved.unwrap_or(mirror.caret),
+        shared_factor_for(hwnd),
+        scene_origin(hwnd),
+    );
     let form = CandidateForm {
         index: 0,
         style: CFS_EXCLUDE,
@@ -1903,11 +1921,6 @@ fn shared_factor_for(hwnd: Hwnd) -> f64 {
     if factor > 0.0 { factor } else { 1.0 }
 }
 
-/// The scale where no window is in hand — the app's first window's.
-fn shared_factor() -> f64 {
-    shared_factor_for(MAIN_HWND.load(Ordering::Acquire))
-}
-
 fn scene_origin(hwnd: Hwnd) -> (f64, f64) {
     PANEL_ORIGINS.with(|origins| origins.borrow().get(&hwnd).copied().unwrap_or((0.0, 0.0)))
 }
@@ -2336,7 +2349,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             // window — the scene draws marked text inline instead
             let himc = unsafe { ImmGetContext(hwnd) };
             if himc != 0 {
-                place_candidate_window(himc);
+                place_candidate_window(hwnd, himc);
                 unsafe {
                     ImmReleaseContext(hwnd, himc);
                 }
@@ -2363,7 +2376,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
                     let caret =
                         unsafe { ImmGetCompositionStringW(himc, GCS_CURSORPOS, std::ptr::null_mut(), 0) };
                     dispatch_at(hwnd, AppEvent::ImeMark { text, caret: caret.max(0) as usize });
-                    place_candidate_window(himc);
+                    place_candidate_window(hwnd, himc);
                 }
             }
             unsafe {
@@ -3942,6 +3955,18 @@ mod tests {
         assert_eq!(clamp_damage((8, 8, 200, 200), 10, 10), Some((8, 8, 10, 10)));
         assert_eq!(clamp_damage((3, 3, 3, 9), 10, 10), None);
         assert_eq!(clamp_damage((20, 0, 30, 5), 10, 10), None);
+    }
+
+    #[test]
+    fn a_candidate_rect_lands_in_its_own_windows_client_pixels() {
+        let caret = (130.0, 90.0, 2.0, 18.0);
+        // a main window: its scene starts at its client's corner
+        let main = scene_rect_to_client(caret, 2.0, (0.0, 0.0));
+        assert_eq!((main.left, main.top, main.right, main.bottom), (260, 180, 264, 216));
+        // a dialog laid out at (100, 40) of its owner's scene, on a 150 %
+        // monitor: the caret is 30 × 50 points into the DIALOG
+        let dialog = scene_rect_to_client(caret, 1.5, (100.0, 40.0));
+        assert_eq!((dialog.left, dialog.top, dialog.right, dialog.bottom), (45, 75, 48, 102));
     }
 
     #[test]
