@@ -1147,10 +1147,19 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             }
             AppEvent::ResignKey => {
                 // the user switched away: popovers close like the
-                // platform's own
+                // platform's own — and the decorations freeze: they
+                // animate for eyes that are on them (the mac's rule)
+                runtime.set_loops_paused(true);
                 if runtime.dismiss_all_overlays() {
                     blit(runtime, root);
                 }
+                // a frozen loop asks for no frames: the beat parks
+                ffi::want_frames(window.raw_window(), runtime.wants_frame());
+            }
+            AppEvent::BecomeKey => {
+                // the front returns: a frozen loop resumes mid-phase
+                runtime.set_loops_paused(false);
+                ffi::want_frames(window.raw_window(), runtime.wants_frame());
             }
             AppEvent::MouseMoved { x, y, modifiers } => {
                 if runtime.pointer_moved(x, y, modifiers) {
