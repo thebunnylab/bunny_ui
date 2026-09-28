@@ -90,6 +90,10 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_bool_id_id(obj: Id, sel: Sel, a: Id, b: Id) -> i8;
     #[link_name = "objc_msgSend"]
+    fn msg_bool_id(obj: Id, sel: Sel, a: Id) -> i8;
+    #[link_name = "objc_msgSend"]
+    fn msg_id_u64_id(obj: Id, sel: Sel, a: u64, b: Id) -> Id;
+    #[link_name = "objc_msgSend"]
     fn msg_timer(
         obj: Id,
         sel: Sel,
@@ -3384,29 +3388,88 @@ pub fn clipboard_read() -> Option<String> {
     }
 }
 
-/// Reads a picture off the general pasteboard: PNG first, TIFF after —
-/// the order the system itself offers a screenshot and an image copied
-/// from a page. `None` when neither is there.
+/// `NSBitmapImageFileTypePNG`.
+const BITMAP_FILE_TYPE_PNG: u64 = 4;
+
+/// Reads a picture off the general pasteboard: PNG first, TIFF after (the
+/// order the system itself offers a screenshot and an image copied from a
+/// page), the TIFF re-encoded as PNG — the one of the two a receiver
+/// takes, the way the Windows twin re-encodes its DIB. `None` when neither
+/// is there, and `None` when the copy also carries text, by the rule every
+/// shell shares ([`bunny_ui::clipboard::picture_to_read`]): Office and
+/// iWork put a rendering of every selection beside its text, and a pasted
+/// paragraph must stay a paragraph.
+///
+/// The pasteboard's TYPES are asked first, so a text copy never makes the
+/// source app render the picture it will not be asked for.
 pub fn clipboard_read_image() -> Option<bunny_ui::clipboard::ClipboardImage> {
+    use bunny_ui::clipboard::{ClipboardImage, Picture, picture_to_read};
     unsafe {
         let pasteboard = msg_id(class("NSPasteboard"), sel("generalPasteboard"));
-        for (uti, media_type) in [(c"public.png", "image/png"), (c"public.tiff", "image/tiff")] {
-            let kind = msg_id_cstr(class("NSString"), sel("stringWithUTF8String:"), uti.as_ptr());
-            let data = msg_id_arg(pasteboard, sel("dataForType:"), kind);
-            if data.is_null() {
-                continue;
-            }
-            let length = msg_u64(data, sel("length")) as usize;
-            let bytes = msg_id(data, sel("bytes")) as *const u8;
-            if length == 0 || bytes.is_null() {
-                continue;
-            }
-            return Some(bunny_ui::clipboard::ClipboardImage {
-                media_type: media_type.to_string(),
-                bytes: std::slice::from_raw_parts(bytes, length).to_vec(),
-            });
+        let png = msg_id_cstr(
+            class("NSString"),
+            sel("stringWithUTF8String:"),
+            c"public.png".as_ptr(),
+        );
+        let tiff = msg_id_cstr(
+            class("NSString"),
+            sel("stringWithUTF8String:"),
+            c"public.tiff".as_ptr(),
+        );
+        let types = msg_id(pasteboard, sel("types"));
+        let has =
+            |kind: Id| !types.is_null() && msg_bool_id(types, sel("containsObject:"), kind) != 0;
+        let picture = picture_to_read(has(NSPasteboardTypeString), has(png), has(tiff))?;
+        let bytes = match picture {
+            Picture::Png => data_bytes(msg_id_arg(pasteboard, sel("dataForType:"), png))?,
+            Picture::Native => tiff_to_png(msg_id_arg(pasteboard, sel("dataForType:"), tiff))?,
+        };
+        Some(ClipboardImage {
+            media_type: "image/png".to_owned(),
+            bytes,
+        })
+    }
+}
+
+/// An `NSData`'s bytes, copied out; `None` for a nil or empty one.
+///
+/// # Safety
+///
+/// `data` is nil or an `NSData`.
+unsafe fn data_bytes(data: Id) -> Option<Vec<u8>> {
+    if data.is_null() {
+        return None;
+    }
+    unsafe {
+        let length = msg_u64(data, sel("length")) as usize;
+        let bytes = msg_id(data, sel("bytes")) as *const u8;
+        (length > 0 && !bytes.is_null()).then(|| std::slice::from_raw_parts(bytes, length).to_vec())
+    }
+}
+
+/// A TIFF's bytes re-encoded as PNG through `NSBitmapImageRep` — the
+/// system's own codec, so any TIFF the pasteboard can hold, it can read.
+/// `None` when the data is not a bitmap it can decode.
+///
+/// # Safety
+///
+/// `tiff` is nil or an `NSData`.
+unsafe fn tiff_to_png(tiff: Id) -> Option<Vec<u8>> {
+    if tiff.is_null() {
+        return None;
+    }
+    unsafe {
+        let rep = msg_id_arg(class("NSBitmapImageRep"), sel("imageRepWithData:"), tiff);
+        if rep.is_null() {
+            return None;
         }
-        None
+        let properties = msg_id(class("NSDictionary"), sel("dictionary"));
+        data_bytes(msg_id_u64_id(
+            rep,
+            sel("representationUsingType:properties:"),
+            BITMAP_FILE_TYPE_PNG,
+            properties,
+        ))
     }
 }
 
