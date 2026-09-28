@@ -738,6 +738,7 @@ const PANEL_TAG_BASE: usize = 0x1000_0000;
 const PANEL_KIND_SURFACE: usize = 0;
 const PANEL_KIND_XDG: usize = 1;
 const PANEL_KIND_POPUP: usize = 2;
+const PANEL_KIND_TOPLEVEL: usize = 3;
 
 /// A decoded protocol event, queued for the loop. The dispatcher owns
 /// NOTHING but this queue — state and marshalling stay outside, so a
@@ -807,6 +808,11 @@ enum Ev {
     PanelConfigure { index: usize, serial: u32 },
     PopupPosition { index: usize, x: i32, y: i32 },
     PopupDone { index: usize },
+    /// A dialog's toplevel was told its size (0 × 0 = its own choice)
+    /// and its states; the xdg configure that follows commits them.
+    DialogConfigure { index: usize, width: i32, height: i32, states: Vec<u32> },
+    /// The compositor asked a dialog to close.
+    DialogClose { index: usize },
     ImePreedit { text: String, cursor_begin: i32 },
     ImeCommit { text: String },
     ImeDone { serial: u32 },
@@ -1058,6 +1064,16 @@ unsafe extern "C" fn dispatcher(
                     }),
                     1 => push_ev(Ev::PopupDone { index }),
                     _ => {}
+                },
+                PANEL_KIND_TOPLEVEL => match opcode {
+                    0 => push_ev(Ev::DialogConfigure {
+                        index,
+                        width: unsafe { arg(0).i },
+                        height: unsafe { arg(1).i },
+                        states: array_u32s(unsafe { arg(2).a }),
+                    }),
+                    1 => push_ev(Ev::DialogClose { index }),
+                    _ => {} // configure_bounds / wm_capabilities: unread
                 },
                 _ => {} // the panel's wl_surface: enter/leave unread
             }
@@ -1485,15 +1501,103 @@ struct ImeState {
     last_rect: (i32, i32, i32, i32),
 }
 
-/// One overlay panel. A popover/tooltip/menu is an xdg_popup (it may
-/// hang past the window's edge — the fidelity bar); the drag chip is a
-/// subsurface (a mouse-following popup would be a recreate storm).
+/// What a panel's surface is to the compositor — the protocol role it
+/// plays, and the state only that role carries.
+enum Role {
+    /// A popover, tooltip or menu: an `xdg_popup` placed where core put
+    /// it. `host` is the dialog panel it was born inside — its parent
+    /// surface, so it stacks over the dialog and rides its moves.
+    Popup { host: Option<usize> },
+    /// The drag label: a desync subsurface of the main window.
+    Chip,
+    /// A dialog: a real `xdg_toplevel` parented to the owner's — the
+    /// compositor stacks it over the parent and floats it (a tiling
+    /// one included), and it moves, resizes and closes as a window.
+    Dialog(Dialog),
+}
+
+impl Role {
+    /// The role a popup or chip is reborn with after its surface went.
+    /// A dialog is never reborn in place: its window is the truth.
+    fn reborn(&self) -> Option<Role> {
+        match self {
+            Role::Popup { host } => Some(Role::Popup { host: *host }),
+            Role::Chip => Some(Role::Chip),
+            Role::Dialog(_) => None,
+        }
+    }
+
+    fn dialog(&self) -> Option<&Dialog> {
+        match self {
+            Role::Dialog(dialog) => Some(dialog),
+            Role::Popup { .. } | Role::Chip => None,
+        }
+    }
+
+    fn dialog_mut(&mut self) -> Option<&mut Dialog> {
+        match self {
+            Role::Dialog(dialog) => Some(dialog),
+            Role::Popup { .. } | Role::Chip => None,
+        }
+    }
+}
+
+/// A dialog's own toplevel state.
+struct Dialog {
+    title: std::ffi::CString,
+    /// The floor, in points: the compositor refuses a smaller window.
+    min: (f64, f64),
+    /// Scene chrome: the content draws the bar, the frame is ours.
+    scene: bool,
+    toplevel: *mut Proxy,
+    decoration: *mut Proxy,
+    /// The size the last toplevel configure named, waiting for the xdg
+    /// configure that commits it.
+    pending: Option<(f64, f64)>,
+    pending_maximized: bool,
+    /// The size the compositor granted — the frame layout follows.
+    /// `None` until it names one: the dialog then keeps its own.
+    granted: Option<(f64, f64)>,
+    maximized: bool,
+    /// The size last presented, in points — where a hosted popup's
+    /// anchor must land inside.
+    logical: (f64, f64),
+}
+
+impl Dialog {
+    /// A toplevel configure's word, held until the xdg configure commits
+    /// it. 0 × 0 means the dialog picks — it keeps what it has; any other
+    /// size is held to the floor the dialog was raised with.
+    fn hear(&mut self, width: i32, height: i32, states: &[u32]) {
+        const MAXIMIZED: u32 = 1;
+        if width > 0 && height > 0 {
+            self.pending =
+                Some((f64::from(width).max(self.min.0), f64::from(height).max(self.min.1)));
+        }
+        self.pending_maximized = states.contains(&MAXIMIZED);
+    }
+
+    /// The xdg configure commits what the toplevel said. `true` when the
+    /// granted size changed — the owner must lay the dialog out again.
+    fn commit(&mut self) -> bool {
+        self.maximized = self.pending_maximized;
+        match self.pending.take() {
+            Some(granted) if self.granted != Some(granted) => {
+                self.granted = Some(granted);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// One overlay panel: a popup, the drag chip or a dialog ([`Role`]).
 /// The protocol objects materialize at the first present, when the
 /// position is known.
 struct Panel {
     /// The window this panel hangs from (its surface address).
     owner: usize,
-    chip: bool,
+    role: Role,
     surface: *mut Proxy,
     xdg: *mut Proxy,
     popup: *mut Proxy,
@@ -1510,10 +1614,10 @@ struct Panel {
 }
 
 impl Panel {
-    fn new(owner: usize, chip: bool) -> Panel {
+    fn new(owner: usize, role: Role) -> Panel {
         Panel {
             owner,
-            chip,
+            role,
             surface: std::ptr::null_mut(),
             xdg: std::ptr::null_mut(),
             popup: std::ptr::null_mut(),
@@ -1647,6 +1751,12 @@ fn owner_of(client: &Client, target: Target) -> usize {
     }
 }
 
+/// The window a surface speaks for: a toplevel for itself, a panel — a
+/// dialog above all — for its owner; 0 for a surface that is not ours.
+fn window_of_surface(client: &Client, surface_ptr: usize) -> usize {
+    owner_of(client, target_of(client, surface_ptr))
+}
+
 thread_local! {
     static CLIENT: RefCell<Option<Client>> = const { RefCell::new(None) };
     static HANDLER: RefCell<Option<Box<dyn FnMut(AppEvent)>>> = const { RefCell::new(None) };
@@ -1701,6 +1811,11 @@ pub enum AppEvent {
     /// A press landed outside every open overlay — the x11 door has no
     /// compositor grab to say `popup_done`, so it says this instead.
     DismissOverlays,
+    /// A dialog's window was asked to close — its ✕ or the compositor.
+    /// It did NOT close: the app dismisses the overlay, and the sweep
+    /// takes the window down. `panel` is the slot
+    /// ([`WindowHandle::panel_slot`]).
+    DialogClose { panel: usize },
     /// A wheel step, what the hand holds, and where the step sits in a
     /// finger's gesture on a pad (a wheel's detents are all steps).
     Wheel {
@@ -2347,6 +2462,13 @@ impl WindowHandle {
     fn toplevel(window: usize) -> WindowHandle {
         WindowHandle { window, panel: 0 }
     }
+
+    /// The panel slot this handle names, if it names one — the identity
+    /// an [`AppEvent::DialogClose`] carries.
+    #[must_use]
+    pub fn panel_slot(&self) -> Option<usize> {
+        self.panel.checked_sub(1)
+    }
 }
 
 /// Asks the road to end — what the app's `close` spends on the one
@@ -2362,12 +2484,16 @@ pub fn close_top_level(window: usize) {
     crate::vk::teardown(window);
     crate::gl::teardown(window);
     with_client(|client| {
-        // children before the parent — the protocol's teardown law
-        for slot in client.panels.iter_mut() {
-            if slot.as_ref().is_some_and(|panel| panel.owner == window)
-                && let Some(panel) = slot.take()
-            {
-                unsafe { teardown_panel(panel) };
+        // children before the parent — the protocol's teardown law: the
+        // popups first (one may hang from a dialog), then the dialogs
+        for dialogs in [false, true] {
+            for slot in client.panels.iter_mut() {
+                if slot.as_ref().is_some_and(|panel| {
+                    panel.owner == window && panel.role.dialog().is_some() == dialogs
+                }) && let Some(panel) = slot.take()
+                {
+                    unsafe { teardown_panel(panel) };
+                }
             }
         }
         let Some(index) = client.windows.iter().position(|w| w.surface as usize == window) else {
@@ -2568,15 +2694,55 @@ impl WindowHandle {
         }
         with_client(|client| {
             let index = self.panel - 1;
-            if let Some(slot) = client.panels.get_mut(index) {
-                if let Some(panel) = slot.take() {
-                    unsafe { teardown_panel(panel) };
+            // a closing dialog's popups go first: the protocol forbids
+            // destroying a parent under a live child
+            let hosted = client.panels.iter().enumerate().filter_map(|(at, slot)| {
+                matches!(
+                    slot.as_ref().map(|panel| &panel.role),
+                    Some(Role::Popup { host: Some(host) }) if *host == index
+                )
+                .then_some(at)
+            });
+            for at in hosted.chain([index]).collect::<Vec<_>>() {
+                if let Some(slot) = client.panels.get_mut(at) {
+                    let reborn = slot.as_ref().and_then(|panel| {
+                        (at != index).then(|| panel.role.reborn().map(|role| (panel.owner, role)))
+                    });
+                    if let Some(panel) = slot.take() {
+                        unsafe { teardown_panel(panel) };
+                    }
+                    // a hosted popup keeps its slot — the pool still
+                    // holds its handle and re-presents it, parentless
+                    if let Some(Some((owner, role))) = reborn {
+                        *slot = Some(Panel::new(owner, role));
+                    }
+                }
+                if client.pointer_focus == Target::Panel(at) {
+                    client.pointer_focus = Target::None;
                 }
             }
-            if client.pointer_focus == Target::Panel(index) {
-                client.pointer_focus = Target::None;
-            }
         });
+    }
+
+    /// The size the compositor granted this dialog's window, in points —
+    /// `None` until it names one (or for a handle that is no dialog). The
+    /// frame layout follows it: the window drives, the content follows.
+    #[must_use]
+    pub fn dialog_size(&self) -> Option<(f64, f64)> {
+        if self.panel == 0 {
+            return None;
+        }
+        if is_x11() {
+            return crate::x11::dialog_size(self.panel - 1);
+        }
+        with_client(|client| {
+            client
+                .panels
+                .get(self.panel - 1)
+                .and_then(Option::as_ref)
+                .and_then(|panel| panel.role.dialog())
+                .and_then(|dialog| dialog.granted)
+        })
     }
 }
 
@@ -2588,8 +2754,63 @@ pub fn create_panel(window: &WindowHandle, chip: bool) -> WindowHandle {
     if is_x11() {
         return WindowHandle { window: owner, panel: crate::x11::create_panel(owner as u32, chip) };
     }
+    let role = if chip { Role::Chip } else { Role::Popup { host: None } };
     with_client(|client| {
-        client.panels.push(Some(Panel::new(owner, chip)));
+        client.panels.push(Some(Panel::new(owner, role)));
+        WindowHandle { window: owner, panel: client.panels.len() }
+    })
+}
+
+/// A popup born inside a dialog: its parent is the DIALOG's surface, so
+/// it stacks over the dialog and rides its moves. On the x11 door it is
+/// placed from the dialog's root origin, which the window manager chose.
+pub fn create_panel_in(window: &WindowHandle, dialog: &WindowHandle) -> WindowHandle {
+    let owner = window.window;
+    if dialog.panel == 0 {
+        return create_panel(window, false);
+    }
+    if is_x11() {
+        let panel = crate::x11::create_panel_in(owner as u32, dialog.panel - 1);
+        return WindowHandle { window: owner, panel };
+    }
+    with_client(|client| {
+        client.panels.push(Some(Panel::new(owner, Role::Popup { host: Some(dialog.panel - 1) })));
+        WindowHandle { window: owner, panel: client.panels.len() }
+    })
+}
+
+/// A dialog's window, over `window`: on wayland a real `xdg_toplevel`
+/// whose parent is `window`'s, born at its first present; on x11 a
+/// managed window transient for it. `min` is the floor the compositor
+/// holds it to; `scene` = the content draws the bar and the controls.
+/// `frame` is where the scene opens it, in `window`'s layout points —
+/// only x11 may honour the place; wayland decides it alone.
+pub fn create_dialog(
+    window: &WindowHandle,
+    title: &str,
+    min: (f64, f64),
+    scene: bool,
+    frame: (f64, f64, f64, f64),
+) -> WindowHandle {
+    let owner = window.window;
+    if is_x11() {
+        let panel = crate::x11::create_dialog(owner as u32, title, min, scene, frame);
+        return WindowHandle { window: owner, panel };
+    }
+    let dialog = Dialog {
+        title: std::ffi::CString::new(title).unwrap_or_default(),
+        min,
+        scene,
+        toplevel: std::ptr::null_mut(),
+        decoration: std::ptr::null_mut(),
+        pending: None,
+        pending_maximized: false,
+        granted: None,
+        maximized: false,
+        logical: (0.0, 0.0),
+    };
+    with_client(|client| {
+        client.panels.push(Some(Panel::new(owner, Role::Dialog(dialog))));
         WindowHandle { window: owner, panel: client.panels.len() }
     })
 }
@@ -2605,6 +2826,16 @@ unsafe fn teardown_panel(panel: Panel) {
     unsafe {
         if !panel.popup.is_null() {
             destroy(panel.popup, 0);
+        }
+        if let Some(dialog) = panel.role.dialog() {
+            // the decoration dies before its toplevel, the toplevel
+            // before its xdg_surface
+            if !dialog.decoration.is_null() {
+                destroy(dialog.decoration, 0);
+            }
+            if !dialog.toplevel.is_null() {
+                destroy(dialog.toplevel, 0);
+            }
         }
         if !panel.xdg.is_null() {
             destroy(panel.xdg, 0);
@@ -2628,26 +2859,53 @@ fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height:
     let (x, y, w, h) = rect;
     with_client(|client| {
         let owner = client.panels.get(index).and_then(|p| p.as_ref()).map_or(0, |p| p.owner);
-        let (parent_surface, parent_xdg, parent_logical, scale) = match window_ref(client, owner) {
-            Some(win) if win.map.can_attach() => {
-                (win.surface, win.xdg_surface, win.logical, win.scale)
+        let (mut parent_surface, mut parent_xdg, mut parent_logical, parent_toplevel, scale) =
+            match window_ref(client, owner) {
+                Some(win) if win.map.can_attach() => {
+                    (win.surface, win.xdg_surface, win.logical, win.toplevel, win.scale)
+                }
+                _ => return,
+            };
+        // a popup born inside a dialog hangs from the DIALOG: its
+        // placement is spoken relative to the dialog's origin in the
+        // scene. A dialog not yet on screen lends nothing — the popup
+        // hangs from the main window until it is
+        let host = match client.panels.get(index).and_then(Option::as_ref).map(|p| &p.role) {
+            Some(Role::Popup { host: Some(host) }) => client
+                .panels
+                .get(*host)
+                .and_then(Option::as_ref)
+                .filter(|dialog| dialog.configured && !dialog.surface.is_null())
+                .and_then(|dialog| Some((dialog, dialog.role.dialog()?))),
+            _ => None,
+        };
+        let (x, y) = match host {
+            Some((panel, dialog)) => {
+                parent_surface = panel.surface;
+                parent_xdg = panel.xdg;
+                parent_logical = dialog.logical;
+                (x - panel.scene_origin.0, y - panel.scene_origin.1)
             }
-            _ => return,
+            None => (x, y),
         };
         let wm_base = client.wm_base;
         let compositor = client.compositor;
         let subcompositor = client.subcompositor;
+        let decoration_manager = client.decoration_manager;
         let protocols = client.protocols;
         let Some(Some(panel)) = client.panels.get_mut(index) else { return };
         // a moved popup cannot re-anchor below reposition v3 — it is
         // reborn at the new place (moves are rare: a reopened popover)
-        let moved = !panel.chip
+        let moved = matches!(panel.role, Role::Popup { .. })
             && !panel.surface.is_null()
             && ((panel.asked.0 - x).abs() > 0.5 || (panel.asked.1 - y).abs() > 0.5);
-        if moved {
+        if moved && let Some(role) = panel.role.reborn() {
             let owner = panel.owner;
-            let dead = std::mem::replace(panel, Panel::new(owner, false));
+            let dead = std::mem::replace(panel, Panel::new(owner, role));
             unsafe { teardown_panel(dead) };
+        }
+        if let Some(dialog) = panel.role.dialog_mut() {
+            dialog.logical = (w, h);
         }
         if panel.surface.is_null() {
             unsafe {
@@ -2659,7 +2917,60 @@ fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height:
                     &mut [arg_n()],
                     tag + PANEL_KIND_SURFACE,
                 );
-                if panel.chip && !subcompositor.is_null() {
+                let chip = matches!(panel.role, Role::Chip);
+                if let Some(dialog) = panel.role.dialog_mut() {
+                    let xdg = construct(
+                        wm_base,
+                        2,
+                        protocols.xdg_surface as *const WlInterface,
+                        &mut [arg_n(), arg_o(surface)],
+                        tag + PANEL_KIND_XDG,
+                    );
+                    let toplevel = construct(
+                        xdg,
+                        1, // get_toplevel
+                        protocols.toplevel as *const WlInterface,
+                        &mut [arg_n()],
+                        tag + PANEL_KIND_TOPLEVEL,
+                    );
+                    // the parent is what makes it a DIALOG: stacked
+                    // over the window, floated by a tiling compositor
+                    request(toplevel, 1, &mut [arg_o(parent_toplevel)]); // set_parent
+                    request(toplevel, 2, &mut [WlArgument { s: dialog.title.as_ptr() }]);
+                    request(toplevel, 3, &mut [arg_s(c"bunny_ui")]);
+                    request(
+                        toplevel,
+                        8, // set_min_size
+                        &mut [
+                            arg_i(dialog.min.0.ceil() as i32),
+                            arg_i(dialog.min.1.ceil() as i32),
+                        ],
+                    );
+                    // the frame question, the main window's answer: the
+                    // content's bar on scene chrome, the server's else
+                    if !decoration_manager.is_null() {
+                        let decoration = construct(
+                            decoration_manager,
+                            1, // get_toplevel_decoration(new, toplevel)
+                            protocols.decoration as *const WlInterface,
+                            &mut [arg_n(), arg_o(toplevel)],
+                            TAG_DECORATION,
+                        );
+                        if !decoration.is_null() {
+                            const CLIENT_SIDE: u32 = 1;
+                            const SERVER_SIDE: u32 = 2;
+                            let mode = if dialog.scene { CLIENT_SIDE } else { SERVER_SIDE };
+                            request(decoration, 1, &mut [arg_u(mode)]); // set_mode
+                        }
+                        dialog.decoration = decoration;
+                    }
+                    dialog.toplevel = toplevel;
+                    panel.xdg = xdg;
+                    panel.configured = false;
+                    // the toplevel's map dance: an empty commit asks for
+                    // the first configure; the pixels wait staged
+                    request(surface, 6, &mut no_args());
+                } else if chip && !subcompositor.is_null() {
                     let subsurface = construct(
                         subcompositor,
                         1, // get_subsurface(new, surface, parent)
@@ -2732,7 +3043,7 @@ fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height:
                 panel.asked = (x, y);
                 panel.delta = (0.0, 0.0);
             }
-        } else if panel.chip {
+        } else if matches!(panel.role, Role::Chip) {
             let position_moved =
                 (panel.asked.0 - x).abs() > 0.5 || (panel.asked.1 - y).abs() > 0.5;
             if position_moved && !panel.subsurface.is_null() {
@@ -3650,31 +3961,110 @@ fn crown_execute(window: usize, take: CrownTake, x: f64, y: f64) -> bool {
 /// window belongs to the resize grab before anything else, a press on
 /// a drag region moves the window, a control answers as the window's
 /// own button — and only a press the crown declined reaches the scene.
-fn left_press(window: usize, x: f64, y: f64, time_ms: u32, on_main: bool) {
+fn left_press(window: usize, x: f64, y: f64, time_ms: u32, on: PressedOn) {
     let clicks = with_client(|client| client.clicks.click(time_ms, x, y));
     // what the hand holds rides in with the press: the framework spends
     // only the shift, and the box under the pointer spends the rest
     let modifiers = with_client(|client| held_modifiers(&client.keyboard));
-    let edge = with_client(|client| {
-        window_ref(client, window)
+    let edge = with_client(|client| match on {
+        PressedOn::Window => window_ref(client, window)
             .filter(|win| win.scene && win.resizable && !win.maximized)
             .map(|win| resize_edge_of(x, y, win.logical.0, win.logical.1))
-            .unwrap_or(0)
+            .unwrap_or(0),
+        PressedOn::Dialog { index, local } => client
+            .panels
+            .get(index)
+            .and_then(Option::as_ref)
+            .and_then(|panel| panel.role.dialog())
+            .filter(|dialog| dialog.scene && !dialog.maximized)
+            .map(|dialog| resize_edge_of(local.0, local.1, dialog.logical.0, dialog.logical.1))
+            .unwrap_or(0),
+        PressedOn::Popup => 0,
     });
-    // the gates answer for the window the press is on
-    let take = addressed(window, || {
-        if on_main && edge != 0 {
-            CrownTake::Resize(edge)
-        } else if on_main {
-            crown_take(x, y, clicks, false)
-        } else {
-            CrownTake::None
-        }
+    // the gates answer for the window the press is on — a dialog's
+    // controls are its owner's scene, at scene coordinates
+    let take = addressed(window, || match on {
+        PressedOn::Window | PressedOn::Dialog { .. } if edge != 0 => CrownTake::Resize(edge),
+        PressedOn::Window | PressedOn::Dialog { .. } => crown_take(x, y, clicks, false),
+        PressedOn::Popup => CrownTake::None,
     });
-    if matches!(take, CrownTake::None) || !crown_execute(window, take, x, y) {
+    let spent = match on {
+        _ if matches!(take, CrownTake::None) => false,
+        PressedOn::Window => crown_execute(window, take, x, y),
+        PressedOn::Dialog { index, local } => dialog_crown_execute(window, index, take, local),
+        PressedOn::Popup => false,
+    };
+    if !spent {
         dispatch_at(window, AppEvent::MouseDown { x, y, clicks, modifiers });
     }
     // else: the compositor took the grab — the click is spent on the frame
+}
+
+/// Which of our surfaces a press landed on: the crown speaks to THAT
+/// surface's frame.
+#[derive(Clone, Copy)]
+enum PressedOn {
+    /// A toplevel window.
+    Window,
+    /// A dialog's window — `local` is the press in its own coordinates,
+    /// where its resize band lives.
+    Dialog { index: usize, local: (f64, f64) },
+    /// A popup or the drag chip: no frame of its own.
+    Popup,
+}
+
+/// A crown verb against a DIALOG's toplevel. The ✕ does not close the
+/// window: it asks the app, which dismisses the overlay, and the sweep
+/// takes the window down. A dialog has no minimize — the button is
+/// spent and nothing moves.
+fn dialog_crown_execute(owner: usize, index: usize, take: CrownTake, local: (f64, f64)) -> bool {
+    match take {
+        CrownTake::None => false,
+        CrownTake::Control(ControlHit::Close) => {
+            dispatch_at(owner, AppEvent::DialogClose { panel: index });
+            true
+        }
+        CrownTake::Control(ControlHit::Minimize) => true,
+        CrownTake::Move
+        | CrownTake::Menu
+        | CrownTake::ToggleMaximize
+        | CrownTake::Control(ControlHit::Maximize)
+        | CrownTake::Resize(_) => with_client(|client| {
+            let seat = client.seat;
+            let serial = client.serials.press;
+            let Some(dialog) = client
+                .panels
+                .get(index)
+                .and_then(Option::as_ref)
+                .and_then(|panel| panel.role.dialog())
+                .filter(|dialog| !dialog.toplevel.is_null())
+            else {
+                return false;
+            };
+            let toplevel = dialog.toplevel;
+            let needs_seat = matches!(take, CrownTake::Move | CrownTake::Menu | CrownTake::Resize(_));
+            if needs_seat && seat.is_null() {
+                return false;
+            }
+            unsafe {
+                match take {
+                    CrownTake::Move => request(toplevel, 5, &mut [arg_o(seat), arg_u(serial)]),
+                    CrownTake::Menu => request(
+                        toplevel,
+                        4,
+                        &mut [arg_o(seat), arg_u(serial), arg_i(local.0 as i32), arg_i(local.1 as i32)],
+                    ),
+                    CrownTake::Resize(edge) => {
+                        request(toplevel, 6, &mut [arg_o(seat), arg_u(serial), arg_u(edge)]);
+                    }
+                    // the maximize toggle, by button or double click
+                    _ => request(toplevel, if dialog.maximized { 10 } else { 9 }, &mut no_args()),
+                }
+                wl_display_flush(client.display);
+            }
+            true
+        }),
+    }
 }
 
 /// A click by the drive's hand, at layout coordinates on the main
@@ -3692,7 +4082,7 @@ pub(crate) fn drive_click(x: f64, y: f64) {
     });
     let time_ms = crate::trace::clock_ms() as u32;
     dispatch_at(window, AppEvent::MouseMoved { x, y, modifiers: bunny_ui::action::Modifiers::default() });
-    left_press(window, x, y, time_ms, true);
+    left_press(window, x, y, time_ms, PressedOn::Window);
     dispatch_at(window, AppEvent::MouseUp { x, y });
 }
 
@@ -4312,7 +4702,16 @@ fn drain_protocol_events() {
                             .filter(|win| win.scene && win.resizable && !win.maximized)
                             .map(|win| resize_edge_of(x, y, win.logical.0, win.logical.1))
                             .unwrap_or(0),
-                        _ => 0,
+                        // a dialog's own border, in its own coordinates
+                        Target::Panel(index) => client
+                            .panels
+                            .get(index)
+                            .and_then(Option::as_ref)
+                            .and_then(|panel| panel.role.dialog())
+                            .filter(|dialog| dialog.scene && !dialog.maximized)
+                            .map(|dialog| resize_edge_of(x, y, dialog.logical.0, dialog.logical.1))
+                            .unwrap_or(0),
+                        Target::None => 0,
                     };
                     let changed = band != client.edge_hover;
                     client.edge_hover = band;
@@ -4328,22 +4727,35 @@ fn drain_protocol_events() {
                 dispatch_at(owner, AppEvent::MouseMoved { x, y, modifiers });
             }
             Ev::PointerButton { serial, time_ms, button, pressed } => {
-                let (x, y, focus) = with_client(|client| {
+                let (x, y, focus, on) = with_client(|client| {
                     client.serials.record_button(serial, pressed);
-                    let (x, y) = client.pointer_pos;
-                    let (x, y) = translate_pointer(client, x, y);
-                    (x, y, client.pointer_focus)
+                    let local = client.pointer_pos;
+                    let (x, y) = translate_pointer(client, local.0, local.1);
+                    let on = match client.pointer_focus {
+                        Target::Window(_) => PressedOn::Window,
+                        Target::Panel(index)
+                            if client
+                                .panels
+                                .get(index)
+                                .and_then(Option::as_ref)
+                                .is_some_and(|panel| panel.role.dialog().is_some()) =>
+                        {
+                            PressedOn::Dialog { index, local }
+                        }
+                        Target::Panel(_) | Target::None => PressedOn::Popup,
+                    };
+                    (x, y, client.pointer_focus, on)
                 });
                 let owner = with_client(|client| owner_of(client, focus));
                 const BTN_LEFT: u32 = 0x110;
                 const BTN_RIGHT: u32 = 0x111;
                 const BTN_MIDDLE: u32 = 0x112;
-                let on_main = matches!(focus, Target::Window(_));
+                let on_main = matches!(on, PressedOn::Window);
                 // the keyboard is the authority on who is held, for every
                 // button alike
                 let modifiers = with_client(|client| held_modifiers(&client.keyboard));
                 match (button, pressed) {
-                    (BTN_LEFT, true) => left_press(owner, x, y, time_ms, on_main),
+                    (BTN_LEFT, true) => left_press(owner, x, y, time_ms, on),
                     (BTN_LEFT, false) => dispatch_at(owner, AppEvent::MouseUp { x, y }),
                     (BTN_RIGHT, true) => {
                         if on_main && matches!(crown_take(x, y, 1, true), CrownTake::Menu) {
@@ -4440,21 +4852,56 @@ fn drain_protocol_events() {
                     dispatch_at(owner, AppEvent::Wheel { x, y, dx, dy, modifiers, phase });
                 }
             }
-            Ev::PanelConfigure { index, serial } => with_client(|client| {
-                let shm = client.shm;
-                let owner = client.panels.get(index).and_then(|p| p.as_ref()).map_or(0, |p| p.owner);
-                let scale = window_ref(client, owner).map(|w| w.scale).unwrap_or(1);
-                if let Some(Some(panel)) = client.panels.get_mut(index) {
+            Ev::PanelConfigure { index, serial } => {
+                let resized = with_client(|client| {
+                    let shm = client.shm;
+                    let owner =
+                        client.panels.get(index).and_then(|p| p.as_ref()).map_or(0, |p| p.owner);
+                    let scale = window_ref(client, owner).map(|w| w.scale).unwrap_or(1);
+                    let Some(Some(panel)) = client.panels.get_mut(index) else { return None };
                     unsafe { request(panel.xdg, 4, &mut [arg_u(serial)]) };
                     panel.configured = true;
+                    // a dialog's toplevel configure lands here: the size
+                    // the compositor granted is now the dialog's truth
+                    let resized = panel
+                        .role
+                        .dialog_mut()
+                        .is_some_and(Dialog::commit)
+                        .then_some(owner);
                     if let Some((width, height, bytes)) = panel.staged.take() {
                         unsafe {
                             flush_panel_pixels(shm, panel, width, height, &bytes, scale);
                             wl_display_flush(client.display);
                         }
                     }
+                    resized
+                });
+                // the frame follows the window: the owner lays the
+                // dialog out again at the size it was given
+                if let Some(owner) = resized {
+                    dispatch_at(owner, AppEvent::Redraw);
+                }
+            }
+            Ev::DialogConfigure { index, width, height, states } => with_client(|client| {
+                if let Some(dialog) = client
+                    .panels
+                    .get_mut(index)
+                    .and_then(Option::as_mut)
+                    .and_then(|panel| panel.role.dialog_mut())
+                {
+                    dialog.hear(width, height, &states);
                 }
             }),
+            Ev::DialogClose { index } => {
+                // the compositor's close (a keybinding, a taskbar): the
+                // app hears it as the dialog's own close button
+                let owner = with_client(|client| {
+                    client.panels.get(index).and_then(Option::as_ref).map_or(0, |p| p.owner)
+                });
+                if owner != 0 {
+                    dispatch_at(owner, AppEvent::DialogClose { panel: index });
+                }
+            }
             Ev::PopupPosition { index, x, y } => with_client(|client| {
                 if let Some(Some(panel)) = client.panels.get_mut(index) {
                     // the compositor's answer is the truth hit-testing
@@ -4462,7 +4909,11 @@ fn drain_protocol_events() {
                     panel.delta = (x as f64 - panel.asked.0, y as f64 - panel.asked.1);
                 }
             }),
-            Ev::ImeEnter { surface_ptr } => with_client(|client| client.ime.focus = surface_ptr),
+            // a dialog's surface speaks for its owner, whose runtime
+            // holds the field being typed into
+            Ev::ImeEnter { surface_ptr } => {
+                with_client(|client| client.ime.focus = window_of_surface(client, surface_ptr));
+            }
             Ev::ImePreedit { text, cursor_begin } => with_client(|client| {
                 client.ime.cycle.preedit = Some((text, cursor_begin));
             }),
@@ -4493,7 +4944,7 @@ fn drain_protocol_events() {
                     client.ime.marked = false;
                     client.ime.cycle = ImeCycle::default();
                     let focus = ime_window(client);
-                    if client.ime.focus == surface_ptr {
+                    if client.ime.focus == window_of_surface(client, surface_ptr) {
                         client.ime.focus = 0;
                     }
                     (was, focus)
@@ -4506,11 +4957,14 @@ fn drain_protocol_events() {
                 // the compositor dismissed it (parent unmap, rare on
                 // this road); the pool recreates if core still wants it
                 if let Some(slot) = client.panels.get_mut(index) {
-                    let owner = slot.as_ref().map_or(0, |panel| panel.owner);
+                    let reborn =
+                        slot.as_ref().and_then(|panel| Some((panel.owner, panel.role.reborn()?)));
                     if let Some(panel) = slot.take() {
                         unsafe { teardown_panel(panel) };
                     }
-                    *slot = Some(Panel::new(owner, false));
+                    if let Some((owner, role)) = reborn {
+                        *slot = Some(Panel::new(owner, role));
+                    }
                 }
             }),
             Ev::SurfaceEnter { surface_ptr, output_ptr } => {
@@ -4638,11 +5092,13 @@ fn drain_protocol_events() {
                     }
                 });
             }
+            // a dialog holding the keyboard types into its OWNER's
+            // runtime — the scene the dialog is a slice of
             Ev::KeyboardEnter { surface_ptr } => with_client(|client| {
-                client.keyboard_focus =
-                    if window_ref(client, surface_ptr).is_some() { surface_ptr } else { 0 };
+                client.keyboard_focus = window_of_surface(client, surface_ptr);
             }),
             Ev::KeyboardLeave { surface_ptr } => {
+                let window = with_client(|client| window_of_surface(client, surface_ptr));
                 with_client(|client| {
                     let kb = &mut client.keyboard;
                     kb.generation += 1;
@@ -4654,9 +5110,12 @@ fn drain_protocol_events() {
                 });
                 NEXT_REPEAT.with(|cell| cell.set(None));
                 // focus left: popovers close like the platform's own
-                dispatch_at(surface_ptr, AppEvent::ResignKey);
+                // (a dialog survives it — it is a window, not a popover)
+                if window != 0 {
+                    dispatch_at(window, AppEvent::ResignKey);
+                }
                 with_client(|client| {
-                    if client.keyboard_focus == surface_ptr {
+                    if client.keyboard_focus == window {
                         client.keyboard_focus = 0;
                     }
                 });
@@ -5431,6 +5890,87 @@ mod tests {
         assert!(!map.mapped, "configured is not yet mapped");
         map.on_present();
         assert!(map.mapped, "the first real present maps the window");
+    }
+
+    fn dialog(min: (f64, f64)) -> Dialog {
+        Dialog {
+            title: std::ffi::CString::new("Account").unwrap(),
+            min,
+            scene: true,
+            toplevel: std::ptr::null_mut(),
+            decoration: std::ptr::null_mut(),
+            pending: None,
+            pending_maximized: false,
+            granted: None,
+            maximized: false,
+            logical: (0.0, 0.0),
+        }
+    }
+
+    /// The compositor's first word is usually 0 × 0 — the dialog opens
+    /// at its own size, and the scene keeps laying it out there.
+    #[test]
+    fn a_dialog_the_compositor_lets_pick_keeps_its_own_size() {
+        let mut account = dialog((720.0, 480.0));
+        account.hear(0, 0, &[]);
+        assert!(!account.commit(), "nothing was granted, nothing to lay out again");
+        assert_eq!(account.granted, None, "the scene's own frame stands");
+    }
+
+    /// A size is only the truth once the xdg configure commits it, and
+    /// a resize the reader drags is laid out again exactly once.
+    #[test]
+    fn a_granted_size_lands_at_the_commit_and_only_once() {
+        let mut account = dialog((720.0, 480.0));
+        account.hear(1220, 820, &[]);
+        assert_eq!(account.granted, None, "a toplevel configure alone commits nothing");
+        assert!(account.commit(), "the commit grants the size");
+        assert_eq!(account.granted, Some((1220.0, 820.0)));
+        account.hear(1220, 820, &[]);
+        assert!(!account.commit(), "the same size again is no news");
+        account.hear(900, 600, &[]);
+        assert!(account.commit(), "the reader's resize is");
+        assert_eq!(account.granted, Some((900.0, 600.0)));
+    }
+
+    /// A tiling compositor may tile a dialog narrower than its floor;
+    /// the layout never goes under it — the content is clipped by the
+    /// window instead of crushed.
+    #[test]
+    fn a_granted_size_is_held_to_the_floor() {
+        let mut account = dialog((720.0, 480.0));
+        account.hear(500, 900, &[]);
+        assert!(account.commit());
+        assert_eq!(account.granted, Some((720.0, 900.0)));
+    }
+
+    #[test]
+    fn the_maximized_state_follows_the_last_commit() {
+        const MAXIMIZED: u32 = 1;
+        let mut account = dialog((720.0, 480.0));
+        account.hear(1920, 1080, &[MAXIMIZED]);
+        assert!(!account.maximized, "not before the commit");
+        account.commit();
+        assert!(account.maximized, "the double click toggles it back down");
+        account.hear(1220, 820, &[]);
+        account.commit();
+        assert!(!account.maximized);
+    }
+
+    /// A popup whose surface the compositor took is reborn in its slot
+    /// with the SAME parent; a dialog never is — its window is the truth.
+    #[test]
+    fn a_popup_is_reborn_with_its_host_and_a_dialog_is_not() {
+        let hosted = Role::Popup { host: Some(3) };
+        assert!(matches!(hosted.reborn(), Some(Role::Popup { host: Some(3) })));
+        assert!(matches!(Role::Chip.reborn(), Some(Role::Chip)));
+        assert!(Role::Dialog(dialog((320.0, 240.0))).reborn().is_none());
+    }
+
+    #[test]
+    fn a_handle_names_its_panel_slot() {
+        assert_eq!(WindowHandle::toplevel(7).panel_slot(), None, "a window is no panel");
+        assert_eq!(WindowHandle { window: 7, panel: 3 }.panel_slot(), Some(2));
     }
 
     #[test]
