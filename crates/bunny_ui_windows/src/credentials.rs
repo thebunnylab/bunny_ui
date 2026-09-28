@@ -34,7 +34,11 @@
 //!   would be a wrong key that looks like a right one.
 //! - **The sweep finds every part.** After a write, every part past the
 //!   new end is deleted — enumerated by the prefix their names share, so
-//!   a gap a failed write left cannot hide the parts beyond it.
+//!   a gap a failed write left cannot hide the parts beyond it. After a
+//!   write the sweep is housekeeping: the seal already makes a leftover
+//!   unreachable, so a write that saved says so even when its sweep could
+//!   not finish. A DELETE promises the secret's bytes are gone, so there a
+//!   part the sweep could not remove is a failure.
 //!
 //! A head with no seal is an item from before the parts, and it reads
 //! exactly as it always did: its own bytes, nothing joined.
@@ -385,7 +389,14 @@ pub fn read(service: &str, account: &str) -> Option<String> {
 
 /// Stores the secret for this service and account, replacing whatever
 /// the pair held — `CredWriteW` overwrites by name, which is what a
-/// settings page means by saving. `true` = the store took all of it.
+/// settings page means by saving. `true` = the secret is saved: every
+/// tail, then the head that seals them.
+///
+/// The sweep of an earlier, longer secret's parts runs after, and its
+/// outcome does not change the answer: the head's seal already names
+/// exactly this secret's parts, so a part the sweep could not reach is
+/// unreachable to every read, and the next write or delete sweeps it
+/// again. Answering `false` there would report a saved secret as lost.
 ///
 /// A pair whose name holds the reserved part mark is refused (`false`).
 pub fn write(service: &str, account: &str, secret: &str) -> bool {
@@ -407,20 +418,28 @@ pub fn write(service: &str, account: &str, secret: &str) -> bool {
             None,
         )
     });
-    tails_written
+    let saved = tails_written
         && write_item(
             &part_target(service, account, 0),
             account,
             head,
             Some(Seal::of(bytes)),
-        )
-        && sweep(service, account, parts.len())
+        );
+    if saved {
+        // housekeeping, not the save: see above
+        sweep(service, account, parts.len());
+    }
+    saved
 }
 
 /// Removes the secret for this service and account, every part of it.
 /// `true` = the pair carries none NOW, which a pair that never carried
 /// one already satisfied — deleting is idempotent, the way a settings
 /// page needs. A reserved pair carries none by construction.
+///
+/// Unlike a write's, this sweep decides the answer: a part it could not
+/// remove still holds some of the secret's bytes, and a sign-out that
+/// leaves them behind has not signed out.
 pub fn delete(service: &str, account: &str) -> bool {
     if reserved(service, account) {
         return true;
