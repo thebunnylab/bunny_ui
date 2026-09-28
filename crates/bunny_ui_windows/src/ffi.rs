@@ -912,29 +912,6 @@ const CF_DIB: u32 = 8;
 /// The eight bytes every PNG opens with.
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
-/// Which clipboard format a picture is read from, given what is there.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PictureFormat {
-    /// The registered `"PNG"` format: browsers, Snipping Tool.
-    Png,
-    /// `CF_DIB`: Print Screen and older tools — encoded as PNG after.
-    Dib,
-}
-
-/// The picture a paste should take, if any. A copy that carries TEXT is a
-/// text copy: Windows synthesizes `CF_DIB` from any bitmap or metafile, and
-/// Word, Excel and Outlook put one beside every selection, so reading a
-/// picture there would turn a paragraph pasted into a composer into an
-/// attachment of its rendering.
-fn picture_format(has_text: bool, has_png: bool, has_dib: bool) -> Option<PictureFormat> {
-    match (has_text, has_png, has_dib) {
-        (true, ..) => None,
-        (false, true, _) => Some(PictureFormat::Png),
-        (false, false, true) => Some(PictureFormat::Dib),
-        (false, false, false) => None,
-    }
-}
-
 /// The bytes of one clipboard format, copied out while the clipboard is open.
 unsafe fn clipboard_bytes(format: u32) -> Option<Vec<u8>> {
     unsafe {
@@ -953,11 +930,16 @@ unsafe fn clipboard_bytes(format: u32) -> Option<Vec<u8>> {
     }
 }
 
-/// Reads a picture off the clipboard: the registered `"PNG"` format first,
-/// `CF_DIB` after (re-encoded as PNG, the one of the two a receiver takes)
-/// — and nothing when the copy also carries text ([`picture_format`]).
-/// The mac's twin reads PNG, then TIFF.
+/// Reads a picture off the clipboard: the registered `"PNG"` format first
+/// (browsers, Snipping Tool), `CF_DIB` after (Print Screen and older tools,
+/// re-encoded as PNG, the one of the two a receiver takes) — and nothing
+/// when the copy also carries text, by the rule every shell shares
+/// ([`bunny_ui::clipboard::picture_to_read`]). Here that rule matters twice
+/// over: Windows synthesizes `CF_DIB` from any bitmap or metafile, and Word,
+/// Excel and Outlook put one beside every selection. The mac's twin reads
+/// PNG, then TIFF.
 pub fn clipboard_read_image() -> Option<bunny_ui::clipboard::ClipboardImage> {
+    use bunny_ui::clipboard::{Picture, picture_to_read};
     let png = unsafe { RegisterClipboardFormatW(wide("PNG").as_ptr()) };
     let (has_text, has_png, has_dib) = unsafe {
         (
@@ -966,14 +948,14 @@ pub fn clipboard_read_image() -> Option<bunny_ui::clipboard::ClipboardImage> {
             IsClipboardFormatAvailable(CF_DIB) != 0,
         )
     };
-    let format = picture_format(has_text, has_png, has_dib)?;
+    let picture = picture_to_read(has_text, has_png, has_dib)?;
     if !open_clipboard_patiently() {
         return None;
     }
     let bytes = unsafe {
-        match format {
-            PictureFormat::Png => clipboard_bytes(png),
-            PictureFormat::Dib => clipboard_bytes(CF_DIB),
+        match picture {
+            Picture::Png => clipboard_bytes(png),
+            Picture::Native => clipboard_bytes(CF_DIB),
         }
     };
     unsafe {
@@ -981,9 +963,9 @@ pub fn clipboard_read_image() -> Option<bunny_ui::clipboard::ClipboardImage> {
     }
     // the clipboard is closed before any encoding: another app's copy
     // never waits on this one's PNG
-    let bytes = match format {
-        PictureFormat::Png => bytes.filter(|bytes| bytes.starts_with(PNG_SIGNATURE))?,
-        PictureFormat::Dib => crate::image::dib_to_png(&bytes?)?,
+    let bytes = match picture {
+        Picture::Png => bytes.filter(|bytes| bytes.starts_with(PNG_SIGNATURE))?,
+        Picture::Native => crate::image::dib_to_png(&bytes?)?,
     };
     Some(bunny_ui::clipboard::ClipboardImage { media_type: "image/png".to_owned(), bytes })
 }
@@ -4097,17 +4079,6 @@ mod tests {
         unsafe {
             DestroyWindow(window.hwnd);
         }
-    }
-
-    #[test]
-    fn a_copy_that_carries_text_pastes_as_text() {
-        // text beside a picture — Word, Excel, Outlook — is a text copy
-        assert_eq!(picture_format(true, true, true), None);
-        assert_eq!(picture_format(true, false, true), None);
-        // a screenshot or an image from a page: PNG first, DIB after
-        assert_eq!(picture_format(false, true, true), Some(PictureFormat::Png));
-        assert_eq!(picture_format(false, false, true), Some(PictureFormat::Dib));
-        assert_eq!(picture_format(false, false, false), None);
     }
 
     #[test]
