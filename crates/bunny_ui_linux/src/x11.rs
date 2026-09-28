@@ -731,6 +731,8 @@ const ATOM_WM_CLASS: u32 = 67;
 const ATOM_RESOURCE_MANAGER: u32 = 23;
 const ATOM_WM_NORMAL_HINTS: u32 = 40;
 const ATOM_WM_SIZE_HINTS: u32 = 41;
+const ATOM_WINDOW: u32 = 33;
+const ATOM_WM_TRANSIENT_FOR: u32 = 68;
 // the Motif hints: which halves of the property speak, and the verbs
 // (with ALL set, the listed verbs are the ones REMOVED)
 const MWM_HINTS_FUNCTIONS: u32 = 1;
@@ -742,6 +744,9 @@ const MWM_FUNC_MAXIMIZE: u32 = 16;
 // WM_NORMAL_HINTS: the two flags a fixed size needs
 const P_MIN_SIZE: u32 = 1 << 4;
 const P_MAX_SIZE: u32 = 1 << 5;
+// …and the two a dialog adds: its place, and its size, as the program's
+const P_POSITION: u32 = 1 << 2;
+const P_SIZE: u32 = 1 << 3;
 
 /// The eighteen words of `WM_SIZE_HINTS` for a window of one size:
 /// minimum and maximum both the size, in physical pixels.
@@ -774,9 +779,13 @@ pub(crate) struct Atoms {
     pub(crate) net_wm_state_max_vert: u32,
     pub(crate) motif_wm_hints: u32,
     pub(crate) wm_change_state: u32,
+    /// What a dialog's window says it is (`NORMAL` — see
+    /// `create_dialog` for why not `DIALOG`).
+    pub(crate) net_wm_window_type: u32,
+    pub(crate) net_wm_window_type_normal: u32,
 }
 
-const ATOM_NAMES: [&CStr; 14] = [
+const ATOM_NAMES: [&CStr; 16] = [
     c"WM_PROTOCOLS",
     c"WM_DELETE_WINDOW",
     c"_NET_WM_NAME",
@@ -791,6 +800,8 @@ const ATOM_NAMES: [&CStr; 14] = [
     c"_NET_WM_STATE_MAXIMIZED_VERT",
     c"_MOTIF_WM_HINTS",
     c"WM_CHANGE_STATE",
+    c"_NET_WM_WINDOW_TYPE",
+    c"_NET_WM_WINDOW_TYPE_NORMAL",
 ];
 
 use std::ffi::CStr;
@@ -802,7 +813,7 @@ fn intern_atoms(connection: *mut Connection) -> Atoms {
             xcb_intern_atom(connection, 0, name.to_bytes().len() as u16, name.as_ptr())
         })
         .collect();
-    let mut atoms = [0u32; 14];
+    let mut atoms = [0u32; ATOM_NAMES.len()];
     for (slot, cookie) in atoms.iter_mut().zip(cookies) {
         unsafe {
             let reply = xcb_intern_atom_reply(connection, cookie, std::ptr::null_mut());
@@ -827,6 +838,8 @@ fn intern_atoms(connection: *mut Connection) -> Atoms {
         net_wm_state_max_vert: atoms[11],
         motif_wm_hints: atoms[12],
         wm_change_state: atoms[13],
+        net_wm_window_type: atoms[14],
+        net_wm_window_type_normal: atoms[15],
     }
 }
 
@@ -963,14 +976,62 @@ struct XPanel {
     /// The overlay's layout origin — the base for translating its
     /// surface-local pointer events back into scene coordinates.
     scene_origin: (f64, f64),
-    /// The drag chip never takes input at all.
-    chip: bool,
+    role: XRole,
     mapped: bool,
     /// The last carved input inset, physical px — re-carved on resize.
     carved: (usize, usize),
     /// Where the panel sits on the root, physical px — the ground the
     /// outside-press dismissal measures against.
     root_rect: (i32, i32, i32, i32),
+}
+
+/// What a pool window is to the window manager — the role decides who
+/// places it, whether it takes input, and who closes it.
+enum XRole {
+    /// A popover: override-redirect, placed by core in root pixels. `host`
+    /// is the dialog slot it was born inside — the WM placed that dialog,
+    /// so the popup's root position is measured from the dialog's.
+    Popup { host: Option<usize> },
+    /// The drag chip: never takes input at all.
+    Chip,
+    /// A dialog: a MANAGED window, transient for its owner — the WM
+    /// frames, floats, stacks, moves and sizes it.
+    Dialog(XDialog),
+}
+
+impl XRole {
+    fn dialog(&self) -> Option<&XDialog> {
+        match self {
+            XRole::Dialog(dialog) => Some(dialog),
+            XRole::Popup { .. } | XRole::Chip => None,
+        }
+    }
+
+    fn dialog_mut(&mut self) -> Option<&mut XDialog> {
+        match self {
+            XRole::Dialog(dialog) => Some(dialog),
+            XRole::Popup { .. } | XRole::Chip => None,
+        }
+    }
+
+    /// A popover — the one role an outside press dismisses.
+    const fn is_popup(&self) -> bool {
+        matches!(self, XRole::Popup { .. })
+    }
+}
+
+/// A dialog window's own state.
+struct XDialog {
+    /// Scene chrome: the content draws the bar, the crown answers it.
+    scene: bool,
+    /// The size the window manager granted, in points — `None` until a
+    /// ConfigureNotify names one. The frame layout follows it.
+    granted: Option<(f64, f64)>,
+    /// Mirrored off _NET_WM_STATE.
+    maximized: bool,
+    /// The physical size last asked of the server — a present at the
+    /// size already granted configures nothing.
+    asked: (usize, usize),
 }
 
 /// The window named by its xid.
@@ -986,6 +1047,14 @@ fn window_ref(client: &XClient, id: u32) -> Option<&Window> {
 /// selection's owner, the drive's hand) is answered for.
 fn first_window(client: &XClient) -> Option<u32> {
     client.windows.first().map(|win| win.id)
+}
+
+/// The dialog whose window is `window`: its pool slot and its owner.
+fn dialog_of(client: &XClient, window: u32) -> Option<(usize, u32)> {
+    client.panels.iter().enumerate().find_map(|(index, slot)| {
+        let panel = slot.as_ref()?;
+        (panel.window == window && panel.role.dialog().is_some()).then_some((index, panel.owner))
+    })
 }
 
 thread_local! {
@@ -1940,9 +2009,21 @@ fn clamp_rect(
 fn handle_expose(window: u32, x: u16, y: u16, w: u16, h: u16) {
     with_x(|client| {
         let connection = client.connection;
-        let Some(win) = window_ref(client, window) else { return };
-        let root_depth = win.depth;
-        let Some(backing) = win.backing.as_ref() else { return };
+        // a toplevel, or a pool window — a dialog the WM uncovered
+        let pool_depth = client.argb.map_or(client.root_depth, |(depth, _, _)| depth);
+        let (id, gc, root_depth, backing) = match window_ref(client, window) {
+            Some(win) => (win.id, win.gc, win.depth, win.backing.as_ref()),
+            None => match client
+                .panels
+                .iter()
+                .flatten()
+                .find(|panel| panel.window == window && panel.role.dialog().is_some())
+            {
+                Some(panel) => (panel.window, panel.gc, pool_depth, panel.backing.as_ref()),
+                None => return,
+            },
+        };
+        let Some(backing) = backing else { return };
         let x1 = (x as usize + w as usize).min(backing.width);
         let y1 = (y as usize + h as usize).min(backing.height);
         if x1 <= x as usize || y1 <= y as usize {
@@ -1951,8 +2032,8 @@ fn handle_expose(window: u32, x: u16, y: u16, w: u16, h: u16) {
         unsafe {
             xcb_shm_put_image(
                 connection,
-                win.id,
-                win.gc,
+                id,
+                gc,
                 backing.width as u16,
                 backing.height as u16,
                 x,
@@ -1982,6 +2063,16 @@ const PANEL_BLEED: f64 = 32.0;
 /// WM never decorates or moves it), ARGB when the ground offers it,
 /// its own input events. Returns the handle index (slot + 1).
 pub(crate) fn create_panel(owner: u32, chip: bool) -> usize {
+    create_override(owner, if chip { XRole::Chip } else { XRole::Popup { host: None } })
+}
+
+/// A popup born inside a dialog — the pool slot `host` names the dialog
+/// its root position is measured from.
+pub(crate) fn create_panel_in(owner: u32, host: usize) -> usize {
+    create_override(owner, XRole::Popup { host: Some(host) })
+}
+
+fn create_override(owner: u32, role: XRole) -> usize {
     with_x(|client| {
         let (depth, visual, colormap) = client
             .argb
@@ -2050,23 +2141,165 @@ pub(crate) fn create_panel(owner: u32, chip: bool) -> usize {
                 gc,
                 backing: None,
                 scene_origin: (0.0, 0.0),
-                chip,
+                role,
                 mapped: false,
                 carved: (0, 0),
                 root_rect: (0, 0, 0, 0),
             };
-            let slot = client.panels.iter().position(Option::is_none);
-            match slot {
-                Some(index) => {
-                    client.panels[index] = Some(panel);
-                    index + 1
-                }
-                None => {
-                    client.panels.push(Some(panel));
-                    client.panels.len()
-                }
-            }
+            claim_slot(client, panel)
         }
+    })
+}
+
+/// Seats a pool window in the first free slot; answers the handle
+/// index (slot + 1).
+fn claim_slot(client: &mut XClient, panel: XPanel) -> usize {
+    match client.panels.iter().position(Option::is_none) {
+        Some(index) => {
+            client.panels[index] = Some(panel);
+            index + 1
+        }
+        None => {
+            client.panels.push(Some(panel));
+            client.panels.len()
+        }
+    }
+}
+
+/// A dialog's window: MANAGED, not override-redirect — the WM frames,
+/// floats and stacks it over its owner (`WM_TRANSIENT_FOR`), and its
+/// close arrives by `WM_DELETE_WINDOW`. It opens
+/// at `frame` — layout coordinates of the owner, the size the spec
+/// opens at — and never goes under `min`. Scene chrome drops the WM's
+/// decorations: the content's header is the bar and the crown answers
+/// it. Mapped at its first present.
+pub(crate) fn create_dialog(
+    owner: u32,
+    title: &str,
+    min: (f64, f64),
+    scene: bool,
+    frame: (f64, f64, f64, f64),
+) -> usize {
+    let origin = with_x(|client| window_root_origin(client, owner));
+    with_x(|client| {
+        let scale = window_ref(client, owner).map_or(1, |w| w.scale) as f64;
+        let (depth, visual, colormap) = client.argb.unwrap_or((0, client.root_visual, 0));
+        let physical = |points: f64| (points * scale).round().max(1.0) as u32;
+        let (x, y) = (
+            origin.0 + (frame.0 * scale).round() as i32,
+            origin.1 + (frame.1 * scale).round() as i32,
+        );
+        let (width, height) = (physical(frame.2), physical(frame.3));
+        unsafe {
+            let id = xcb_generate_id(client.connection);
+            const CW_BORDER_PIXEL: u32 = 0x0008;
+            const CW_COLORMAP: u32 = 0x2000;
+            let events = EVENT_MASK_KEY_PRESS
+                | EVENT_MASK_KEY_RELEASE
+                | EVENT_MASK_BUTTON_PRESS
+                | EVENT_MASK_BUTTON_RELEASE
+                | EVENT_MASK_ENTER_WINDOW
+                | EVENT_MASK_LEAVE_WINDOW
+                | EVENT_MASK_POINTER_MOTION
+                | EVENT_MASK_EXPOSURE
+                | EVENT_MASK_STRUCTURE_NOTIFY
+                | EVENT_MASK_FOCUS_CHANGE
+                | EVENT_MASK_PROPERTY_CHANGE;
+            // the pool's ground, so the present's depth is the pool's
+            // (value order follows the mask's bit order)
+            let (mask, values): (u32, Vec<u32>) = if client.argb.is_some() {
+                (CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_EVENT_MASK | CW_COLORMAP, vec![
+                    0, 0, events, colormap,
+                ])
+            } else {
+                (CW_BACK_PIXEL | CW_EVENT_MASK, vec![0, events])
+            };
+            xcb_create_window(
+                client.connection,
+                depth,
+                id,
+                client.root,
+                x as i16,
+                y as i16,
+                width as u16,
+                height as u16,
+                0,
+                WINDOW_CLASS_INPUT_OUTPUT,
+                visual,
+                mask,
+                values.as_ptr(),
+            );
+            let connection = client.connection;
+            let set = |property: u32, kind: u32, format: u8, len: u32, data: *const c_void| {
+                xcb_change_property(connection, PROP_MODE_REPLACE, id, property, kind, format, len, data);
+            };
+            // what makes it a dialog to the window manager is WHOSE it
+            // is: `WM_TRANSIENT_FOR` stacks it over the owner (ICCCM) and,
+            // through xwayland-satellite, becomes the xdg parent a tiling
+            // compositor floats.
+            //
+            // Production gotcha: the type is `NORMAL`, never `DIALOG`.
+            // xwayland-satellite (0.8) turns a transient `DIALOG` whose
+            // Motif hints drop the decorations — every scene-chrome
+            // dialog — into an xdg_popup inside its parent: the covering,
+            // unclosable panel this window exists to replace. A `NORMAL`
+            // transient stays a toplevel there, and a window manager of
+            // its own still keeps it over its parent by the transient
+            // hint alone.
+            set(ATOM_WM_TRANSIENT_FOR, ATOM_WINDOW, 32, 1, (&raw const owner).cast());
+            let kind = client.atoms.net_wm_window_type_normal;
+            set(client.atoms.net_wm_window_type, ATOM_ATOM, 32, 1, (&raw const kind).cast());
+            // the close handshake: the ✕ of the WM's frame asks, the app
+            // answers by dismissing the overlay
+            set(client.atoms.wm_protocols, ATOM_ATOM, 32, 1, (&raw const client.atoms.wm_delete_window).cast());
+            set(client.atoms.net_wm_name, client.atoms.utf8_string, 8, title.len() as u32, title.as_ptr().cast());
+            set(ATOM_WM_NAME, ATOM_STRING, 8, title.len() as u32, title.as_ptr().cast());
+            let class = b"bunny_ui\0bunny_ui\0";
+            set(ATOM_WM_CLASS, ATOM_STRING, 8, class.len() as u32, class.as_ptr().cast());
+            // the place and the size are the program's own; the floor
+            // is the spec's
+            let mut hints = [0u32; 18];
+            hints[0] = P_POSITION | P_SIZE | P_MIN_SIZE;
+            hints[1] = x as u32;
+            hints[2] = y as u32;
+            hints[3] = width;
+            hints[4] = height;
+            hints[5] = physical(min.0);
+            hints[6] = physical(min.1);
+            set(ATOM_WM_NORMAL_HINTS, ATOM_WM_SIZE_HINTS, 32, 18, hints.as_ptr().cast());
+            // a dialog has no minimize; scene chrome also drops the frame
+            let flags = MWM_HINTS_FUNCTIONS | if scene { MWM_HINTS_DECORATIONS } else { 0 };
+            let motif: [u32; 5] = [flags, MWM_FUNC_ALL | MWM_FUNC_MINIMIZE, 0, 0, 0];
+            set(client.atoms.motif_wm_hints, client.atoms.motif_wm_hints, 32, 5, motif.as_ptr().cast());
+            let gc = xcb_generate_id(connection);
+            xcb_create_gc(connection, gc, id, 0, std::ptr::null());
+            xcb_flush(connection);
+            let panel = XPanel {
+                owner,
+                window: id,
+                gc,
+                backing: None,
+                scene_origin: (frame.0, frame.1),
+                role: XRole::Dialog(XDialog {
+                    scene,
+                    granted: None,
+                    maximized: false,
+                    asked: (width as usize, height as usize),
+                }),
+                mapped: false,
+                carved: (0, 0),
+                root_rect: (x, y, width as i32, height as i32),
+            };
+            claim_slot(client, panel)
+        }
+    })
+}
+
+/// The size the window manager granted a dialog, in points — `None`
+/// until it names one.
+pub(crate) fn dialog_size(index: usize) -> Option<(f64, f64)> {
+    with_x(|client| {
+        client.panels.get(index)?.as_ref()?.role.dialog()?.granted
     })
 }
 
@@ -2084,6 +2317,12 @@ fn window_root_origin(client: &mut XClient, window: u32) -> (i32, i32) {
     if window_ref(client, window).is_none() {
         return (0, 0);
     }
+    root_origin_of(client, window)
+}
+
+/// Any window's origin in root pixels, asked of the server — a dialog's
+/// too, which the WM placed.
+fn root_origin_of(client: &XClient, window: u32) -> (i32, i32) {
     unsafe {
         let cookie = xcb_translate_coordinates(client.connection, window, client.root, 0, 0);
         let reply =
@@ -2113,7 +2352,34 @@ pub(crate) fn panel_present(
         let connection = client.connection;
         let owner = client.panels.get(index).and_then(|p| p.as_ref()).map(|p| p.owner);
         let scale = owner.and_then(|o| window_ref(client, o)).map(|w| w.scale).unwrap_or(1);
+        // a popup born inside a dialog is measured from the DIALOG's
+        // root origin — the WM placed the dialog, not the scene: the
+        // shift is where the dialog stands less where the scene put it
+        let host = match client.panels.get(index).and_then(Option::as_ref).map(|p| &p.role) {
+            Some(XRole::Popup { host: Some(host) }) => client
+                .panels
+                .get(*host)
+                .and_then(Option::as_ref)
+                .filter(|dialog| dialog.mapped && dialog.role.dialog().is_some())
+                .map(|dialog| (dialog.window, dialog.scene_origin)),
+            _ => None,
+        };
+        let shift = match (host, owner) {
+            (Some((dialog, scene_origin)), Some(owner)) => {
+                let stands = root_origin_of(client, dialog);
+                let owner_at = root_origin_of(client, owner);
+                let scale = scale as f64;
+                (
+                    stands.0 - owner_at.0 - (scene_origin.0 * scale).round() as i32,
+                    stands.1 - owner_at.1 - (scene_origin.1 * scale).round() as i32,
+                )
+            }
+            _ => (0, 0),
+        };
         let Some(Some(panel)) = client.panels.get_mut(index) else { return };
+        if panel.role.dialog().is_some() {
+            return dialog_present(connection, client.argb, client.root_depth, panel, width, height, rgba);
+        }
         // the backing follows the size
         let stale = panel
             .backing
@@ -2126,25 +2392,12 @@ pub(crate) fn panel_present(
             panel.backing = make_backing(connection, width, height);
         }
         let Some(backing) = panel.backing.as_ref() else { return };
-        // premultiply RGBA → BGRA in one pass (little-endian ARGB32)
-        let pixels = rgba.len().min(backing.len) / 4;
-        unsafe {
-            let target = std::slice::from_raw_parts_mut(backing.map, pixels * 4);
-            for (source_px, target_px) in
-                rgba.chunks_exact(4).take(pixels).zip(target.chunks_exact_mut(4))
-            {
-                let alpha = source_px[3] as u32;
-                target_px[0] = ((source_px[2] as u32 * alpha + 127) / 255) as u8;
-                target_px[1] = ((source_px[1] as u32 * alpha + 127) / 255) as u8;
-                target_px[2] = ((source_px[0] as u32 * alpha + 127) / 255) as u8;
-                target_px[3] = alpha as u8;
-            }
-        }
+        premultiply_into(backing, rgba);
         // root placement: the rect arrives ALREADY in logical root
         // coordinates (layout_rect_to_screen added the window origin);
         // device pixels from here, always stacked above
-        let x = (rect.0 * scale as f64).round() as i32;
-        let y = (rect.1 * scale as f64).round() as i32;
+        let x = (rect.0 * scale as f64).round() as i32 + shift.0;
+        let y = (rect.1 * scale as f64).round() as i32 + shift.1;
         panel.root_rect = (x, y, width as i32, height as i32);
         unsafe {
             const CONFIG_X: u16 = 1;
@@ -2170,7 +2423,7 @@ pub(crate) fn panel_present(
             if panel.carved != (width, height) {
                 panel.carved = (width, height);
                 let region = xcb_generate_id(connection);
-                if panel.chip {
+                if matches!(panel.role, XRole::Chip) {
                     xcb_xfixes_create_region(connection, region, 0, std::ptr::null());
                 } else {
                     let inset = (PANEL_BLEED * scale as f64).round() as i64;
@@ -2218,6 +2471,86 @@ pub(crate) fn panel_present(
             xcb_flush(connection);
         }
     });
+}
+
+/// Premultiplies straight RGBA into the backing's BGRA in one pass
+/// (little-endian ARGB32) — the pool's one pixel road.
+fn premultiply_into(backing: &Backing, rgba: &[u8]) {
+    let pixels = rgba.len().min(backing.len) / 4;
+    unsafe {
+        let target = std::slice::from_raw_parts_mut(backing.map, pixels * 4);
+        for (source_px, target_px) in
+            rgba.chunks_exact(4).take(pixels).zip(target.chunks_exact_mut(4))
+        {
+            let alpha = source_px[3] as u32;
+            target_px[0] = ((source_px[2] as u32 * alpha + 127) / 255) as u8;
+            target_px[1] = ((source_px[1] as u32 * alpha + 127) / 255) as u8;
+            target_px[2] = ((source_px[0] as u32 * alpha + 127) / 255) as u8;
+            target_px[3] = alpha as u8;
+        }
+    }
+}
+
+/// A dialog's present: its own window, at the size the scene laid it
+/// out at. The WM owns the place — nothing here moves it — and a size
+/// the window already stands at configures nothing, so a resize the
+/// user drags is never fought. No bleed, no carve, no stacking: the
+/// frame, the shadow and the order are the WM's.
+fn dialog_present(
+    connection: *mut Connection,
+    argb: Option<(u8, u32, u32)>,
+    root_depth: u8,
+    panel: &mut XPanel,
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+) {
+    let stale = panel
+        .backing
+        .as_ref()
+        .is_none_or(|backing| backing.width != width || backing.height != height);
+    if stale {
+        if let Some(old) = panel.backing.take() {
+            unsafe { drop_backing(connection, old) };
+        }
+        panel.backing = make_backing(connection, width, height);
+    }
+    let Some(backing) = panel.backing.as_ref() else { return };
+    premultiply_into(backing, rgba);
+    let Some(dialog) = panel.role.dialog_mut() else { return };
+    unsafe {
+        if dialog.asked != (width, height) {
+            dialog.asked = (width, height);
+            const CONFIG_W: u16 = 4;
+            const CONFIG_H: u16 = 8;
+            let values = [width.max(1) as u32, height.max(1) as u32];
+            xcb_configure_window(connection, panel.window, CONFIG_W | CONFIG_H, values.as_ptr());
+        }
+        let depth = argb.map_or(root_depth, |(depth, _, _)| depth);
+        xcb_shm_put_image(
+            connection,
+            panel.window,
+            panel.gc,
+            width as u16,
+            height as u16,
+            0,
+            0,
+            width as u16,
+            height as u16,
+            0,
+            0,
+            depth,
+            IMAGE_FORMAT_Z_PIXMAP,
+            0,
+            backing.segment,
+            0,
+        );
+        if !panel.mapped {
+            xcb_map_window(connection, panel.window);
+            panel.mapped = true;
+        }
+        xcb_flush(connection);
+    }
 }
 
 /// Hide and forget: the pool retires a panel whose overlay closed.
@@ -2379,6 +2712,14 @@ fn crown_execute(window: u32, take: crate::ffi::CrownTake, root_x: i16, root_y: 
 /// bands and corners consult. Answers the mirror as it stands now.
 fn refresh_wm_state(client: &mut XClient, window: u32) -> Option<bool> {
     window_ref(client, window)?;
+    let maximized = read_maximized(client, window)?;
+    let win = window_at(client, window)?;
+    win.maximized = maximized;
+    Some(maximized)
+}
+
+/// Whether _NET_WM_STATE says `window` is maximized on either axis.
+fn read_maximized(client: &XClient, window: u32) -> Option<bool> {
     let (id, state_atom) = (window, client.atoms.net_wm_state);
     let max_pair = (client.atoms.net_wm_state_max_horz, client.atoms.net_wm_state_max_vert);
     unsafe {
@@ -2395,9 +2736,97 @@ fn refresh_wm_state(client: &mut XClient, window: u32) -> Option<bool> {
         );
         let maximized = atoms.contains(&max_pair.0) || atoms.contains(&max_pair.1);
         free(reply.cast());
-        let win = window_at(client, window)?;
-        win.maximized = maximized;
         Some(maximized)
+    }
+}
+
+/// The resize band under the pointer on a scene dialog's window — `None`
+/// for a window that is no dialog.
+fn dialog_band(client: &XClient, window: u32, x: i16, y: i16) -> Option<u32> {
+    let (index, owner) = dialog_of(client, window)?;
+    let panel = client.panels.get(index)?.as_ref()?;
+    let dialog = panel.role.dialog()?;
+    if !dialog.scene || dialog.maximized {
+        return Some(0);
+    }
+    let scale = window_ref(client, owner).map_or(1, |w| w.scale) as f64;
+    let (width, height) = (dialog.asked.0 as f64 / scale, dialog.asked.1 as f64 / scale);
+    Some(crate::ffi::resize_edge_of(x as f64 / scale, y as f64 / scale, width, height))
+}
+
+/// What a left press on a dialog's window came to.
+enum DialogPress {
+    /// Not the frame's — the scene hears it.
+    Scene,
+    /// The WM took it (a move, a resize, the maximize), or a verb a
+    /// dialog refuses (minimize) spent it.
+    Spent,
+    /// The ✕: the app dismisses the overlay.
+    Close { owner: u32, panel: usize },
+}
+
+/// The crown against a DIALOG's window: its border bands first (in its
+/// own points), then the owner's drag and control gates at SCENE
+/// coordinates — the dialog is a slice of the owner's scene.
+fn dialog_crown_press(
+    window: u32,
+    x: i16,
+    y: i16,
+    (base, scale): ((f64, f64), f64),
+    root_x: i16,
+    root_y: i16,
+    time: u32,
+) -> DialogPress {
+    use crate::ffi::{ControlHit, CrownTake};
+    let Some((panel, owner, edge)) = with_x(|client| {
+        let (panel, owner) = dialog_of(client, window)?;
+        let scene = client.panels.get(panel)?.as_ref()?.role.dialog()?.scene;
+        scene.then(|| (panel, owner, dialog_band(client, window, x, y).unwrap_or(0)))
+    }) else {
+        return DialogPress::Scene;
+    };
+    let (scene_x, scene_y) = (base.0 + x as f64 / scale, base.1 + y as f64 / scale);
+    let take = if edge != 0 {
+        CrownTake::Resize(edge)
+    } else {
+        crate::ffi::addressed(owner as usize, || crate::ffi::crown_take(scene_x, scene_y, 1, false))
+    };
+    // the double click on the bar maximizes, through the shared clock
+    let take = if matches!(take, CrownTake::Move)
+        && with_x(|client| client.clicks.click(time, root_x as f64, root_y as f64)) >= 2
+    {
+        CrownTake::ToggleMaximize
+    } else {
+        take
+    };
+    let verb = |client: &mut XClient, kind: u32, data: [u32; 5]| {
+        send_root_message(client, window, kind, data);
+    };
+    match take {
+        CrownTake::None | CrownTake::Menu => DialogPress::Scene,
+        CrownTake::Control(ControlHit::Close) => DialogPress::Close { owner, panel },
+        CrownTake::Control(ControlHit::Minimize) => DialogPress::Spent,
+        CrownTake::Move | CrownTake::Resize(_) => {
+            let direction = match take {
+                CrownTake::Resize(edge) => moveresize_direction(edge),
+                _ => 8, // move
+            };
+            with_x(|client| {
+                unsafe { xcb_ungrab_pointer(client.connection, client.last_time) };
+                let kind = client.atoms.net_wm_moveresize;
+                verb(client, kind, [root_x as u32, root_y as u32, direction, 1, 1]);
+            });
+            DialogPress::Spent
+        }
+        CrownTake::Control(ControlHit::Maximize) | CrownTake::ToggleMaximize => {
+            with_x(|client| {
+                const TOGGLE: u32 = 2;
+                let kind = client.atoms.net_wm_state;
+                let pair = (client.atoms.net_wm_state_max_horz, client.atoms.net_wm_state_max_vert);
+                verb(client, kind, [TOGGLE, pair.0, pair.1, 0, 1]);
+            });
+            DialogPress::Spent
+        }
     }
 }
 
@@ -2633,6 +3062,23 @@ fn interpret(event: *mut GenericEvent) -> Step {
             let configure = event as *mut ConfigureNotifyEvent;
             let (window, width, height) =
                 unsafe { ((*configure).window, (*configure).width, (*configure).height) };
+            // a dialog's window: the size the WM granted is the size
+            // the owner lays the dialog out at next
+            let dialog = with_x(|client| {
+                let (index, owner) = dialog_of(client, window)?;
+                let scale = window_ref(client, owner).map_or(1, |w| w.scale) as f64;
+                let dialog = client.panels.get_mut(index)?.as_mut()?.role.dialog_mut()?;
+                let granted = (width as f64 / scale, height as f64 / scale);
+                let changed = width > 0 && height > 0 && dialog.granted != Some(granted);
+                if changed {
+                    dialog.granted = Some(granted);
+                    dialog.asked = (width as usize, height as usize);
+                }
+                Some((owner, changed))
+            });
+            if let Some((owner, changed)) = dialog {
+                return if changed { Step::Deliver(owner, AppEvent::Redraw) } else { Step::Silence };
+            }
             let resized = with_x(|client| {
                 let Some(win) = window_at(client, window) else { return false };
                 let logical = (
@@ -2658,10 +3104,15 @@ fn interpret(event: *mut GenericEvent) -> Step {
                 (*message).kind == client.atoms.wm_protocols
                     && (*message).data32[0] == client.atoms.wm_delete_window
             });
-            if close {
-                Step::Close(unsafe { (*message).window })
-            } else {
-                Step::Silence
+            let window = unsafe { (*message).window };
+            // a dialog's close asks the app, which dismisses the overlay
+            // — the sweep takes the window down, never this road
+            match with_x(|client| dialog_of(client, window)) {
+                Some((panel, owner)) if close => {
+                    Step::Deliver(owner, AppEvent::DialogClose { panel })
+                }
+                None if close => Step::Close(window),
+                _ => Step::Silence,
             }
         }
         XCB_DESTROY_NOTIFY => {
@@ -2689,16 +3140,16 @@ fn interpret(event: *mut GenericEvent) -> Step {
             // own cursor while it holds
             let band_change = with_x(|client| {
                 client.pointer_pos = (x as f64, y as f64);
-                let win = window_ref(client, window)?;
-                let edge = if !win.scene || !win.resizable || win.maximized {
-                    0
-                } else {
-                    crate::ffi::resize_edge_of(
+                let edge = match window_ref(client, window) {
+                    Some(win) if !win.scene || !win.resizable || win.maximized => 0,
+                    Some(win) => crate::ffi::resize_edge_of(
                         x as f64 / win.scale as f64,
                         y as f64 / win.scale as f64,
                         win.logical.0,
                         win.logical.1,
-                    )
+                    ),
+                    // a scene dialog's own border, in its own points
+                    None => dialog_band(client, window, x, y)?,
                 };
                 let was = client.edge_hover;
                 client.edge_hover = edge;
@@ -2740,26 +3191,40 @@ fn interpret(event: *mut GenericEvent) -> Step {
             {
                 return Step::Silence;
             }
+            // …and on a dialog's window, the same order against the
+            // DIALOG's frame: its ✕ is the app's to answer
+            if kind == XCB_BUTTON_PRESS && detail == 1 {
+                match dialog_crown_press(window, x, y, (base, scale), root_x, root_y, time) {
+                    DialogPress::Scene => {}
+                    DialogPress::Spent => return Step::Silence,
+                    DialogPress::Close { owner, panel } => {
+                        return Step::Deliver(owner, AppEvent::DialogClose { panel });
+                    }
+                }
+            }
             // no compositor grab exists on this door: a press on the
             // MAIN window while a popover floats — outside all of them
             // — dismisses first, then lands as its own event
             if kind == XCB_BUTTON_PRESS && matches!(detail, 1 | 3) {
                 let outside_all = with_x(|client| {
-                    let on_main = window_ref(client, window).is_some();
+                    // a press on the window, or on one of its dialogs —
+                    // the popovers of either are the owner's
+                    let window = match dialog_of(client, window) {
+                        Some((_, owner)) => owner,
+                        None if window_ref(client, window).is_some() => window,
+                        None => return None,
+                    };
                     let inset = (PANEL_BLEED
                         * window_ref(client, window).map(|w| w.scale).unwrap_or(1) as f64)
                         .round() as i32;
-                    // only THIS window's panels are in question
-                    on_main
-                        && client
-                            .panels
-                            .iter()
-                            .flatten()
-                            .any(|panel| panel.owner == window && panel.mapped && !panel.chip)
-                        && client.panels.iter().flatten().all(|panel| {
-                            if panel.owner != window || !panel.mapped || panel.chip {
-                                return true;
-                            }
+                    let popover = |panel: &&XPanel| {
+                        panel.owner == window && panel.mapped && panel.role.is_popup()
+                    };
+                    // only THIS window's popovers are in question — a
+                    // dialog is a window, not a popover, and a press
+                    // beside it dismisses nothing
+                    let outside = client.panels.iter().flatten().any(|panel| popover(&panel))
+                        && client.panels.iter().flatten().filter(popover).all(|panel| {
                             // the CONTENT box decides — the bleed ring
                             // is click-through by carve, so a press on
                             // it is visually outside the card
@@ -2768,9 +3233,10 @@ fn interpret(event: *mut GenericEvent) -> Step {
                             let (pw, ph) = ((pw - 2 * inset).max(0), (ph - 2 * inset).max(0));
                             let (rx, ry) = (root_x as i32, root_y as i32);
                             rx < px || ry < py || rx >= px + pw || ry >= py + ph
-                        })
+                        });
+                    outside.then_some(window)
                 });
-                if outside_all {
+                if let Some(window) = outside_all {
                     crate::ffi::dispatch_at(window as usize, AppEvent::DismissOverlays);
                 }
             }
@@ -2890,19 +3356,29 @@ fn interpret(event: *mut GenericEvent) -> Step {
             // leaving a PANEL usually means entering the window (or a
             // sibling) — only a toplevel's leave exits its scene
             let window = unsafe { (*(event as *mut CrossingEvent)).event };
-            let ours = with_x(|client| window_ref(client, window).is_some());
-            if ours {
-                Step::Deliver(window, AppEvent::MouseExited)
-            } else {
-                Step::Silence
+            let exited = with_x(|client| {
+                if window_ref(client, window).is_some() {
+                    return Some(window);
+                }
+                // a dialog is a toplevel of its own: leaving it leaves
+                // the scene it is a slice of
+                dialog_of(client, window).map(|(_, owner)| owner)
+            });
+            match exited {
+                Some(window) => Step::Deliver(window, AppEvent::MouseExited),
+                None => Step::Silence,
             }
         }
         XCB_FOCUS_OUT => {
             let window = unsafe { (*(event as *mut FocusEvent)).event };
-            with_x(|client| {
+            // a dialog's focus is its owner's: the owner hears the
+            // resign (its popovers close; the dialog survives it)
+            let window = with_x(|client| {
+                let window = dialog_of(client, window).map_or(window, |(_, owner)| owner);
                 if client.keyboard_focus == window {
                     client.keyboard_focus = 0;
                 }
+                window
             });
             Step::Deliver(window, AppEvent::ResignKey)
         }
@@ -2931,8 +3407,16 @@ fn interpret(event: *mut GenericEvent) -> Step {
                 ((*notify).window, (*notify).atom)
             };
             let maximized = with_x(|client| {
-                let interesting =
-                    window_ref(client, window).is_some() && atom == client.atoms.net_wm_state;
+                if atom != client.atoms.net_wm_state {
+                    return None;
+                }
+                if let Some((index, _)) = dialog_of(client, window) {
+                    // a dialog's own mirror: its band stands down
+                    let maximized = read_maximized(client, window)?;
+                    client.panels.get_mut(index)?.as_mut()?.role.dialog_mut()?.maximized = maximized;
+                    return None;
+                }
+                let interesting = window_ref(client, window).is_some();
                 if interesting { refresh_wm_state(client, window) } else { None }
             });
             // …and the app hears it: a scene-drawn caption draws it
@@ -2947,6 +3431,10 @@ fn interpret(event: *mut GenericEvent) -> Step {
             with_x(|client| {
                 if window_ref(client, window).is_some() {
                     client.keyboard_focus = window;
+                } else if let Some((_, owner)) = dialog_of(client, window) {
+                    // a dialog holding the keyboard types into its
+                    // OWNER's runtime — the scene the dialog is a slice of
+                    client.keyboard_focus = owner;
                 }
             });
             Step::Silence

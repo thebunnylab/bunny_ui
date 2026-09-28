@@ -477,6 +477,16 @@ fn house_bar(title: Rc<str>, minimizable: bool) -> impl View<Arity = Single> {
     .window_drag_region()
 }
 
+/// One open dialog's window, pooled by the overlay's identity path.
+#[derive(Clone, Copy)]
+struct DialogWindow {
+    handle: ffi::WindowHandle,
+    /// Where the scene last placed the dialog. Wayland never says where
+    /// a window stands, so this stays the scene's own origin — the base
+    /// its pointer events translate from.
+    origin: bunny_ui::layout::Point,
+}
+
 /// Raises the window `spec` asks for and wires everything that lives
 /// as long as it does — the frame path, the pools, the gates and the
 /// event handler — into a slot the app routes to.
@@ -540,11 +550,17 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // the open popovers' panels, pooled by identity path
     let panels: Rc<RefCell<std::collections::HashMap<String, ffi::WindowHandle>>> =
         Rc::new(RefCell::new(std::collections::HashMap::new()));
+    // the open dialogs' windows, by identity path — a dialog presents
+    // on a REAL window over this one (a parented xdg_toplevel; a
+    // transient, managed x11 window)
+    let dialogs: Rc<RefCell<std::collections::HashMap<String, DialogWindow>>> =
+        Rc::new(RefCell::new(std::collections::HashMap::new()));
     // present takes a READY display list to the window — the tick path
     // reuses it without paying settle or effects
     let present: Rc<dyn Fn(&Runtime, bunny_ui::layout::DisplayList)> = Rc::new({
         let surface = Rc::clone(&surface);
         let panels = Rc::clone(&panels);
+        let dialogs = Rc::clone(&dialogs);
         move |runtime: &Runtime, full_display: bunny_ui::layout::DisplayList| {
             (|| {
             let (width, height) = window.content_size();
@@ -587,7 +603,72 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         panel.close_panel();
                     }
                 }
+                // the dialogs' own sweep, AFTER the panels': a dropdown
+                // inside a closing dialog goes before the window it
+                // hangs from
+                let mut dialog_store = dialogs.borrow_mut();
+                dialog_store.retain(|path, dialog| {
+                    let open = overlays.iter().any(|overlay| &overlay.path == path);
+                    if !open {
+                        dialog.handle.close_panel();
+                    }
+                    open
+                });
                 for overlay in &overlays {
+                    // a dialog presents on a REAL window: no bleed, no
+                    // drawn shadow — the frame and its shadow are the
+                    // compositor's. The window is the truth of the size
+                    // (`dialog_size`, pulled before the layout), so the
+                    // frame here is already what the window was granted
+                    if let bunny_ui::layout::OverlaySurface::Window(spec) = &overlay.surface {
+                        let frame = overlay.frame;
+                        let dialog =
+                            dialog_store.entry(overlay.path.clone()).or_insert_with(|| {
+                                DialogWindow {
+                                    handle: ffi::create_dialog(
+                                        &window,
+                                        &spec.title,
+                                        (spec.min.width, spec.min.height),
+                                        matches!(
+                                            spec.chrome,
+                                            bunny_ui::layout::DialogChrome::Scene { .. }
+                                        ),
+                                        (
+                                            frame.origin.x,
+                                            frame.origin.y,
+                                            frame.size.width,
+                                            frame.size.height,
+                                        ),
+                                    ),
+                                    origin: frame.origin,
+                                }
+                            });
+                        dialog.origin = frame.origin;
+                        let (x, y) = (frame.origin.x, frame.origin.y);
+                        let (w, h) = (frame.size.width, frame.size.height);
+                        dialog.handle.set_scene_origin(x, y);
+                        let slice = full_display.translated_slice(overlay.display, -x, -y);
+                        let physical =
+                            ((w * scale as f64).round() as usize, (h * scale as f64).round() as usize);
+                        // the window's own ground under the content — a
+                        // toplevel has no parent pixels to show through
+                        let bitmap = bunny_ui::raster::rasterize_with(
+                            &slice,
+                            physical.0,
+                            physical.1,
+                            scale,
+                            canvas,
+                            &*runtime.text(),
+                            &*runtime.images(),
+                        );
+                        dialog.handle.present_layered(
+                            (x, y, w, h),
+                            physical.0,
+                            physical.1,
+                            &bitmap.to_rgba_bytes(),
+                        );
+                        continue;
+                    }
                     // the panel is BLED around the frame so the card's
                     // own shadow has room — the same pixels every
                     // target paints, no system shadow involved
@@ -597,9 +678,17 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     let w = overlay.frame.size.width + 2.0 * BLEED;
                     let h = overlay.frame.size.height + 2.0 * BLEED;
                     let chip = overlay.path == bunny_ui::layout::DRAG_LABEL_PATH;
-                    let panel = store
-                        .entry(overlay.path.clone())
-                        .or_insert_with(|| ffi::create_panel(&window, chip));
+                    // a popover born inside a dialog is the DIALOG's
+                    // child: it stacks over the dialog and rides its
+                    // moves — the identity path says whose it is
+                    let host = dialog_store
+                        .iter()
+                        .find(|(path, _)| overlay.path.starts_with(path.as_str()))
+                        .map(|(_, dialog)| dialog.handle);
+                    let panel = store.entry(overlay.path.clone()).or_insert_with(|| match host {
+                        Some(dialog) if !chip => ffi::create_panel_in(&window, &dialog),
+                        _ => ffi::create_panel(&window, chip),
+                    });
                     panel.set_scene_origin(x, y);
                     let slice = full_display.translated_slice(overlay.display, -x, -y);
                     let panel_physical =
@@ -701,6 +790,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let blit = {
         let present = Rc::clone(&present);
         let pacer = Rc::clone(&pacer);
+        let dialogs = Rc::clone(&dialogs);
         move |runtime: &Runtime, root: &_, via: u8| {
             let _ = via;
             let (width, height) = window.content_size();
@@ -716,6 +806,22 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     size: Size { width: w, height: h },
                 },
             ));
+            // an open dialog's WINDOW is the truth of its size: pull it
+            // into the runtime before the pass, so this very layout
+            // follows the compositor's configure or the user's resize.
+            // Wayland tells a client nothing of where its window stands,
+            // so the origin stays the scene's own
+            for (path, dialog) in dialogs.borrow().iter() {
+                if let Some((w, h)) = dialog.handle.dialog_size() {
+                    runtime.set_dialog_frame(
+                        path,
+                        bunny_ui::layout::Rect {
+                            origin: dialog.origin,
+                            size: Size { width: w, height: h },
+                        },
+                    );
+                }
+            }
             // what the app asked its pages since the last frame — the
             // hands, the navigations, the evals and the snapshots — goes
             // to the engine before the scene settles
@@ -967,12 +1073,27 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let handler_root = Rc::clone(&root);
     let handler_present = Rc::clone(&present);
     let handler_pacer = Rc::clone(&pacer);
+    let handler_dialogs = Rc::clone(&dialogs);
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
         match event {
             AppEvent::Redraw => blit(runtime, root, ORIGIN_REDRAW),
             AppEvent::WindowClosed => {}
+            AppEvent::DialogClose { panel } => {
+                // its ✕ or the compositor: the window did NOT close — the
+                // overlay's dismissal flips the app's binding, and the
+                // frame this blit draws takes the window down through
+                // the ordinary sweep
+                let path = handler_dialogs.borrow().iter().find_map(|(path, dialog)| {
+                    (dialog.handle.panel_slot() == Some(panel)).then(|| path.clone())
+                });
+                if let Some(path) = path
+                    && runtime.dismiss_overlay(&path)
+                {
+                    blit(runtime, root, ORIGIN_POINTER);
+                }
+            }
             // The work always lands: the tasks are polled. The FRAME is for a
             // turn that changed something. Most wakes change nothing — a poll
             // that found no news, a sleeper that went back to sleep — and a
