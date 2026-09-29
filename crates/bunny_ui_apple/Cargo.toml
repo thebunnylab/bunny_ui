@@ -7,6 +7,24 @@ description = "bunny-ui Apple half — CoreText, ImageIO, Security and Metal thr
 [dependencies]
 bunny-ui = { workspace = true, features = ["canvas", "gpu"] }
 
+[features]
+wgpu-surface = ["dep:wgpu", "dep:metal", "dep:foreign-types"]
+
+[dependencies.wgpu]
+version = "27.0.1"
+default-features = false
+features = ["metal", "std"]
+optional = true
+
+[dependencies.metal]
+version = "0.32"
+optional = true
+
+[dependencies.foreign-types]
+version = "0.5"
+optional = true
+
 [dev-dependencies]
 # the codecs of the house, so ImageIO can judge them (tests/codec_parity.rs)
 bunny-ui = { workspace = true, features = ["canvas", "gpu", "codec"] }
+pollster = "0.4"

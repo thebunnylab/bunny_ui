@@ -444,6 +444,7 @@ impl WicImageEngine {
             // intercepts glyphs and traced paths alike
             ImageSource::Symbol { .. }
             | ImageSource::Path { .. }
+            | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
             | ImageSource::Faded { .. } => None,
         };
@@ -609,6 +610,7 @@ impl ImageEngine for WicImageEngine {
             ImageSource::FileIcon { path, .. } => icon_rgba(path, width, height)?,
             ImageSource::Symbol { .. }
             | ImageSource::Path { .. }
+            | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
             | ImageSource::Faded { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");

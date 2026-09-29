@@ -208,6 +208,10 @@ pub const KIND_ELLIPTIC: f32 = 5.0;
 /// Where tiles physically land. The walk keeps every allocation
 /// decision; the ground only moves bytes and mints handles.
 pub trait AtlasGround {
+    /// Import a completed native image. The returned handle owns the resource
+    /// through its in-flight present. Native frames do not enter the atlas cache.
+    fn import_native(&mut self, _source: &ImageSource) -> Option<u64> { None }
+
     /// The shared texture exists at `size`×`size` (create if absent).
     fn ensure_shared(&mut self, size: u32) -> bool;
     /// One tile of straight-RGBA rows into virgin shared space.
@@ -530,6 +534,16 @@ impl RunAtlas {
         height: u32,
         engine: &dyn ImageEngine,
     ) -> Result<Option<ResolvedImage<'_>>, AtlasFull> {
+        let (width, height) = match source {
+            ImageSource::Native { size, .. } => *size,
+            _ => (width, height),
+        };
+        if matches!(source, ImageSource::Native { .. }) {
+            // Native frames belong to the presenter's in-flight ring, not the
+            // image atlas. A video stream must never trigger atlas GC/fence waits.
+            return Ok(ground.import_native(source)
+                .map(|id| ResolvedImage::Dedicated(id, width, height)));
+        }
         let cache_key = (source.key(), width, height);
         let walk = self.walk;
         if let Some(entry) = self.dedicated.get_mut(&cache_key) {
