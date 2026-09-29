@@ -14,6 +14,12 @@
 //! (the system interface font); `Mono` tries Menlo and, if the family
 //! does not exist, DEGRADES to the system font — it never fails. Each
 //! `CTFont` is created once per `FontKey` and retained in the engine.
+//!
+//! A `Mono` line shapes with the required ligatures only. A monospace face
+//! is a grid — every character its own cell, the source verbatim — and
+//! CoreText applies a face's standard ligatures by default: Geist Mono's
+//! `--` ligature drew `--submit` as `-submit`, one cell and one character
+//! short, in every inline code span that carried a flag.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -89,6 +95,8 @@ unsafe extern "C" {
     /// name for what the design calls tracking and CSS calls
     /// `letter-spacing`.
     static kCTKernAttributeName: CFStringRef;
+    /// Which ligatures shape the range: `0` keeps the required ones only.
+    static kCTLigatureAttributeName: CFStringRef;
     /// Add a face to THIS PROCESS's font list. Nothing outside the app
     /// sees it, and it goes away with the app.
     fn CTFontManagerRegisterGraphicsFont(font: *mut c_void, error: *mut *const c_void) -> bool;
@@ -152,6 +160,8 @@ unsafe extern "C" {
 
 /// `kCFNumberDoubleType` — the f64 the kern attribute reads.
 const CF_NUMBER_DOUBLE: isize = 13;
+/// `kCFNumberSInt32Type` — the integer the ligature attribute reads.
+const CF_NUMBER_SINT32: isize = 3;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -306,9 +316,11 @@ unsafe fn create_upright(spec: &FontSpec) -> CTFontRef {
 }
 
 /// The text's CTLine with the font + context color (the color enters as
-/// fill color at draw time — no CGColor created), and the tracking the
-/// run asked for. The caller releases the line.
-unsafe fn make_line(text: &str, font: CTFontRef, tracking: f64) -> CTLineRef {
+/// fill color at draw time — no CGColor created), the tracking the run
+/// asked for, and — for a `Mono` face — no optional ligature, so every
+/// character keeps its cell. The caller releases the line.
+unsafe fn make_line(text: &str, font: CTFontRef, spec: &FontSpec) -> CTLineRef {
+    let tracking = spec.tracking;
     unsafe {
         let string = cf_string(text);
         let attributed = CFAttributedStringCreateMutable(std::ptr::null(), 0);
@@ -336,6 +348,18 @@ unsafe fn make_line(text: &str, font: CTFontRef, tracking: f64) -> CTLineRef {
             );
             CFAttributedStringSetAttribute(attributed, range, kCTKernAttributeName, kern);
             CFRelease(kern);
+        }
+        // a monospace face is a grid: what is measured and drawn is the
+        // source, character for character — never a ligature's fewer cells
+        if matches!(spec.design, FontDesign::Mono) {
+            let required_only: i32 = 0;
+            let ligatures = CFNumberCreate(
+                std::ptr::null(),
+                CF_NUMBER_SINT32,
+                std::ptr::from_ref(&required_only).cast(),
+            );
+            CFAttributedStringSetAttribute(attributed, range, kCTLigatureAttributeName, ligatures);
+            CFRelease(ligatures);
         }
         let line = CTLineCreateWithAttributedString(attributed as *const c_void);
         CFRelease(attributed as *const c_void);
@@ -480,7 +504,7 @@ impl TextEngine for CoreTextEngine {
                 // line height preserved without creating a CTLine
                 return LineMetrics { width: 0.0, ascent, descent };
             }
-            let line = make_line(text, ct_font, font.tracking);
+            let line = make_line(text, ct_font, font);
             let width = CTLineGetTypographicBounds(
                 line,
                 std::ptr::null_mut(),
@@ -514,7 +538,7 @@ impl TextEngine for CoreTextEngine {
         unsafe {
             // the SAME line the measurement built: what is drawn is what
             // was measured, tracking included
-            let line = make_line(text, ct_font, font.tracking);
+            let line = make_line(text, ct_font, font);
             let space = CGColorSpaceCreateDeviceRGB();
             let context = CGBitmapContextCreate(
                 rgba.as_mut_ptr() as *mut c_void,
@@ -670,6 +694,42 @@ mod tests {
             .raster_line(text, &closed, Color::hex(0xFFFFFF), 1)
             .expect("the line paints");
         assert_eq!(raster.width, tight.ceil() as usize);
+    }
+
+    /// A mono line shapes with the required ligatures only, whatever face
+    /// it names — so a face that ligates `--` (Geist Mono) still draws the
+    /// two cells the source has; a proportional line keeps its face's own.
+    #[test]
+    fn a_mono_line_keeps_the_required_ligatures_only() {
+        #[link(name = "CoreText", kind = "framework")]
+        unsafe extern "C" {
+            fn CTLineGetGlyphRuns(line: CTLineRef) -> *const c_void;
+            fn CTRunGetAttributes(run: *const c_void) -> *const c_void;
+        }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            fn CFDictionaryGetValue(dictionary: *const c_void, key: *const c_void) -> *const c_void;
+            fn CFNumberGetValue(number: *const c_void, number_type: isize, value: *mut c_void) -> bool;
+        }
+        let engine = CoreTextEngine::new();
+        let ligatures_of = |spec: &FontSpec| -> Option<i32> {
+            let font = engine.font(spec);
+            unsafe {
+                let line = make_line("--submit", font, spec);
+                let run = CFArrayGetValueAtIndex(CTLineGetGlyphRuns(line), 0);
+                let value = CFDictionaryGetValue(CTRunGetAttributes(run), kCTLigatureAttributeName);
+                let asked = (!value.is_null()).then(|| {
+                    let mut number = -1_i32;
+                    CFNumberGetValue(value, CF_NUMBER_SINT32, std::ptr::from_mut(&mut number).cast());
+                    number
+                });
+                CFRelease(line);
+                asked
+            }
+        };
+        let mono = FontSpec { design: FontDesign::Mono, ..FontSpec::DEFAULT };
+        assert_eq!(ligatures_of(&mono), Some(0), "a mono line keeps the required ligatures only");
+        assert_eq!(ligatures_of(&FontSpec::DEFAULT), None, "a proportional line keeps its face's own");
     }
 
     #[test]
