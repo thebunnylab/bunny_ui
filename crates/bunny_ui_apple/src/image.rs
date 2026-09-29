@@ -274,6 +274,7 @@ impl CoreGraphicsImageEngine {
             // intercepts glyphs and traced paths alike
             ImageSource::Symbol { .. }
             | ImageSource::Path { .. }
+            | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
             | ImageSource::Faded { .. } => std::ptr::null_mut(),
         };
@@ -328,6 +329,7 @@ impl ImageEngine for CoreGraphicsImageEngine {
             ImageSource::FileIcon { path, .. } => unsafe { icon_rgba(path, width, height) }?,
             ImageSource::Symbol { .. }
             | ImageSource::Path { .. }
+            | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
             | ImageSource::Faded { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");

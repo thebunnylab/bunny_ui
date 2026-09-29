@@ -65,6 +65,10 @@ pub enum ImageSource {
     /// it draws any other image. No engine sees this variant either —
     /// there is nothing to decode.
     Rgba { key: u64, size: (u32, u32), rgba: Rc<[u8]> },
+    /// Immutable GPU frame. The platform imports its owned payload directly;
+    /// CPU/headless renderers never download it implicitly. The producer must
+    /// publish only completed frames and retain resources through this owner.
+    Native { key: u64, size: (u32, u32), payload: std::sync::Arc<dyn std::any::Any + Send + Sync> },
     /// Any source, seen through a VEIL — what `.opacity(…)` leaves for
     /// the pixel pipelines, where there is no offscreen layer to fade.
     /// The fade rides the identity, so the compositor, the GPU atlas
@@ -309,6 +313,7 @@ impl ImageSource {
             | ImageSource::FileIcon { key, .. }
             | ImageSource::Symbol { key, .. }
             | ImageSource::Path { key, .. }
+            | ImageSource::Native { key, .. }
             | ImageSource::Rgba { key, .. }
             | ImageSource::Faded { key, .. } => *key,
         }
@@ -344,8 +349,12 @@ impl PartialEq for ImageSource {
             | (
                 ImageSource::Path { key, .. },
                 ImageSource::Path { key: other_key, .. },
-            )
-            | (
+            ) => key == other_key,
+            (
+                ImageSource::Native { key, size, .. },
+                ImageSource::Native { key: other_key, size: other_size, .. },
+            ) => key == other_key && size == other_size,
+            (
                 ImageSource::Rgba { key, .. },
                 ImageSource::Rgba { key: other_key, .. },
             )
@@ -382,6 +391,7 @@ impl fmt::Debug for ImageSource {
             ImageSource::Path { key, verbs, .. } => {
                 write!(f, "path(0x{key:016x}, {} verbs)", verbs.len())
             }
+            ImageSource::Native { key, size, .. } => write!(f, "native(0x{key:016x}, {}×{})", size.0, size.1),
             ImageSource::Rgba { key, size, .. } => {
                 write!(f, "rgba(0x{key:016x}, {}×{})", size.0, size.1)
             }
@@ -460,6 +470,7 @@ pub fn raster_source(
     height: usize,
 ) -> Option<Rc<ImageRaster>> {
     match source {
+        ImageSource::Native { .. } => None,
         ImageSource::Symbol { key, symbol, color, forced } => {
             crate::icon::raster(*key, symbol, *color, *forced, width, height)
         }
@@ -501,7 +512,7 @@ pub fn intrinsic_of(engine: &dyn ImageEngine, source: &ImageSource) -> Option<(u
             Some((box_size.0.round() as u32, box_size.1.round() as u32))
         }
         // the app declared its own box when it handed the pixels over
-        ImageSource::Rgba { size, .. } => Some(*size),
+        ImageSource::Rgba { size, .. } | ImageSource::Native { size, .. } => Some(*size),
         // a veil never changes a size
         ImageSource::Faded { inner, .. } => intrinsic_of(engine, inner),
         _ => engine.intrinsic(source),
@@ -645,7 +656,7 @@ impl ImageEngine for RawImages {
             ImageSource::FileIcon { .. } => Some((FILE_ICON_SIZE, FILE_ICON_SIZE)),
             ImageSource::Symbol { .. }
             | ImageSource::Path { .. }
-            | ImageSource::Rgba { .. }
+            | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
             | ImageSource::Faded { .. } => {
                 // the door intercepts what the house draws before any
@@ -677,6 +688,7 @@ impl ImageEngine for RawImages {
             ImageSource::FileIcon { key, .. } => RawImages::checker(*key, width, height),
             ImageSource::Symbol { .. }
             | ImageSource::Path { .. }
+            | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
             | ImageSource::Faded { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
