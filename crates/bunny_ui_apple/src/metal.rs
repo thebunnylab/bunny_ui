@@ -40,7 +40,6 @@ use bunny_ui::gpu::walk::{
     RoundClip, RunAtlas, RunKind, SpriteInstance, build_frame,
 };
 use bunny_ui::image_engine::ImageEngine;
-#[cfg(test)]
 use bunny_ui::image_engine::ImageSource;
 use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
@@ -422,7 +421,8 @@ fragment float4 sprite_fragment(SpriteVary in [[stage_in]],
                                 constant ClipRound& round [[buffer(1)]],
                                 texture2d<float, access::read> atlas [[texture(0)]]) {
     SpriteInstance sprite = sprites[in.id];
-    float2 texel = sprite.tex.xy + (floor(in.position.xy) - floor(sprite.dest.xy));
+    float2 ratio = (sprite.tex.zw - sprite.tex.xy) / (sprite.dest.zw - sprite.dest.xy);
+    float2 texel = sprite.tex.xy + (floor(in.position.xy) - floor(sprite.dest.xy)) * ratio;
     // straight alpha in, straight alpha out — only the coverage moves,
     // and text under a rounded corner loses its square edge at last
     float4 ink = atlas.read(uint2(texel));
@@ -1378,11 +1378,22 @@ struct MetalGround {
     /// The dedicated textures by the handle the walk was given.
     textures: HashMap<u64, Id>,
     next: u64,
+    native: HashMap<u64, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl MetalGround {
     fn new(device: Id) -> MetalGround {
-        MetalGround { device, shared: null_mut(), textures: HashMap::new(), next: 1 }
+        MetalGround { device, shared: null_mut(), textures: HashMap::new(), next: 1, native: HashMap::new() }
+    }
+
+    /// Release this walk's native imports. In-flight slots retain their leases.
+    fn clear_native(&mut self) {
+        for id in self.native.keys() {
+            if let Some(texture) = self.textures.remove(id) {
+                unsafe { msg_void(texture, sel("release")) };
+            }
+        }
+        self.native.clear();
     }
 
     /// The texture behind a handle the walk handed out — null when the
@@ -1434,6 +1445,22 @@ impl MetalGround {
 }
 
 impl AtlasGround for MetalGround {
+    fn import_native(&mut self, source: &ImageSource) -> Option<u64> {
+        #[cfg(feature = "wgpu-surface")]
+        {
+            let ImageSource::Native { payload, .. } = source else { return None };
+            let surface = payload.downcast_ref::<crate::surface::MetalFrame>()?;
+            let texture = surface.import(self.device)?;
+            let id = self.next;
+            self.next += 1;
+            self.textures.insert(id, texture);
+            self.native.insert(id, payload.clone());
+            Some(id)
+        }
+        #[cfg(not(feature = "wgpu-surface"))]
+        { let _ = source; None }
+    }
+
     fn ensure_shared(&mut self, size: u32) -> bool {
         if !self.shared.is_null() {
             return true;
@@ -1468,6 +1495,7 @@ impl AtlasGround for MetalGround {
     }
 
     fn drop_dedicated(&mut self, id: u64) {
+        self.native.remove(&id);
         if let Some(texture) = self.textures.remove(&id) {
             unsafe { msg_void(texture, sel("release")) };
         }
@@ -1480,17 +1508,34 @@ impl AtlasGround for MetalGround {
 /// reads it. The command buffer is RETAINED while stored; `status >=
 /// Completed` (or Error — Metal completes errored buffers too) frees the
 /// slot for reuse.
-#[derive(Clone, Copy)]
 struct FrameSlot {
     buffer: Id,
     capacity: usize,
     command: Id,
+    native: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl FrameSlot {
     const fn empty() -> FrameSlot {
-        FrameSlot { buffer: null_mut(), capacity: 0, command: null_mut() }
+        FrameSlot { buffer: null_mut(), capacity: 0, command: null_mut(), native: Vec::new() }
     }
+}
+
+impl Drop for FrameSlot {
+    fn drop(&mut self) {
+        // Window/offscreen teardown only: never release an owned frame while
+        // the compositor may still sample it. Normal reuse polls completion.
+        unsafe {
+            if !self.command.is_null() {
+                msg_void(self.command, sel("waitUntilCompleted"));
+                msg_void(self.command, sel("release"));
+            }
+            if !self.buffer.is_null() { msg_void(self.buffer, sel("release")); }
+        }
+    }
+}
+impl Drop for MetalGround {
+    fn drop(&mut self) { self.clear_native(); }
 }
 
 /// A free slot from a ring: polled by `status`, oldest-first. When all
@@ -1506,6 +1551,7 @@ fn acquire_slot(slots: &mut [FrameSlot; 3], cursor: &mut usize, sels: &Sels) -> 
                 if !slots[index].command.is_null() {
                     msg_void(slots[index].command, sels.release);
                     slots[index].command = null_mut();
+                    slots[index].native.clear();
                 }
                 *cursor = (index + 1) % slots.len();
                 return index;
@@ -1515,6 +1561,7 @@ fn acquire_slot(slots: &mut [FrameSlot; 3], cursor: &mut usize, sels: &Sels) -> 
         msg_void(slots[index].command, sels.wait_completed);
         msg_void(slots[index].command, sels.release);
         slots[index].command = null_mut();
+        slots[index].native.clear();
         *cursor = (index + 1) % slots.len();
         index
     }
@@ -1688,6 +1735,7 @@ impl MetalPresenter {
                     msg_void(slot.command, self.stack.sels.wait_completed);
                     msg_void(slot.command, self.stack.sels.release);
                     slot.command = null_mut();
+                    slot.native.clear();
                 }
             }
         }
@@ -1703,6 +1751,7 @@ impl MetalPresenter {
         text: &dyn TextEngine,
         images: &dyn ImageEngine,
     ) {
+        self.ground.clear_native();
         for attempt in 0..3 {
             match build_frame(
                 &mut self.ground,
@@ -1812,6 +1861,7 @@ impl MetalPresenter {
                 Some(textures) => (textures.scene, drawable_texture),
                 None => (drawable_texture, null_mut()),
             };
+            self.slots[index].native = self.ground.native.values().cloned().collect();
             let textures = self.ground.bound(&self.batches.textures);
             let command = self.stack.encode_frame(EncodeFrame {
                 target,
@@ -1892,7 +1942,7 @@ impl MetalPresenter {
             layer,
             physical: (0, 0),
             scale: 0,
-            slots: [FrameSlot::empty(); 3],
+            slots: std::array::from_fn(|_| FrameSlot::empty()),
             cursor: 0,
             ground: MetalGround::new(device),
             atlas: RunAtlas::new(),
@@ -1992,7 +2042,7 @@ impl OffscreenGpu {
                 glass: None,
                 width,
                 height,
-                slots: [FrameSlot::empty(); 3],
+                slots: std::array::from_fn(|_| FrameSlot::empty()),
                 cursor: 0,
                 ground: MetalGround::new(device),
                 atlas: RunAtlas::new(),
@@ -2008,6 +2058,7 @@ impl OffscreenGpu {
                     msg_void(slot.command, self.stack.sels.wait_completed);
                     msg_void(slot.command, self.stack.sels.release);
                     slot.command = null_mut();
+                    slot.native.clear();
                 }
             }
         }
@@ -2024,6 +2075,7 @@ impl OffscreenGpu {
     ) {
         unsafe {
             let pool = objc_autoreleasePoolPush();
+            self.ground.clear_native();
             for attempt in 0..3 {
                 match build_frame(
                     &mut self.ground,
@@ -2064,6 +2116,7 @@ impl OffscreenGpu {
                 );
             }
             let pyramid = (!self.batches.glass.is_empty()).then_some(()).and(self.glass.as_ref());
+            self.slots[index].native = self.ground.native.values().cloned().collect();
             let textures = self.ground.bound(&self.batches.textures);
             let command = self.stack.encode_frame(EncodeFrame {
                 target: self.target,
