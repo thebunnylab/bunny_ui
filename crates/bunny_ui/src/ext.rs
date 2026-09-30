@@ -842,6 +842,28 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// `.on_copy { … }` — a read-only view that answers the platform's
+    /// Copy: SwiftUI's `.focusable()` and `.onCopyCommand` in one call.
+    ///
+    /// ```ignore
+    /// table.on_copy(move || selected.get().map(|row| rows[row].tsv()))
+    /// ```
+    ///
+    /// Copy is a command routed to whoever holds the keyboard, and a table
+    /// or a card never held it: a click on one fired its action and let
+    /// the keyboard go, so ⌘C over it copied nothing and the clipboard
+    /// kept what it had. Now a click on this view, or on anything inside
+    /// it, leaves the keyboard HERE, with no caret, and ⌘C writes what the
+    /// closure answers. `None` means nothing is selected: nothing is
+    /// written, and the press counts as unhandled. Escape, or a click on
+    /// anything else, takes the keyboard away as it always did.
+    ///
+    /// The view becomes a pointer target, as `.on_click` makes one. A Cut
+    /// is refused: the view is read-only.
+    fn on_copy(self, answer: impl Fn() -> Option<String> + 'static) -> Modified<Self> {
+        Modified { base: self, modifier: Modifier::OnCopy(std::rc::Rc::new(answer)) }
+    }
+
     /// The same target, told HOW MANY clicks the press carried: 1, then
     /// 2 on the double, 3 on the triple. The count is the PLATFORM's —
     /// the framework holds no clock — and it is the same number the

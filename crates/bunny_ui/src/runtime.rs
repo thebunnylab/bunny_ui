@@ -589,6 +589,7 @@ impl Runtime {
     /// Rebuilds only the tables the input doors read.
     fn assemble_input(&self, root: &str, had_root_region: bool) {
         reconciler::assemble_actions(root);
+        reconciler::assemble_copies(root);
         reconciler::assemble_editors(root);
         reconciler::assemble_splits(root);
         reconciler::assemble_scrolls(root);
@@ -2321,16 +2322,17 @@ impl Runtime {
             }
         };
         // outside the borrow: the action can write state and re-enter here
-        match fired {
-            Some(path) if self.activate_clicks(&path, clicks) => {
+        let activated = fired.as_deref().is_some_and(|path| self.activate_clicks(path, clicks));
+        // the keyboard follows the click: to the view that answers a copy
+        // for what was clicked (the row's table), and away from every
+        // field otherwise — first responder follows the click
+        match fired.as_deref().and_then(reconciler::copy_owner) {
+            Some(owner) => self.focus_element(&owner),
+            None => {
                 self.blur();
-                Some(path)
-            }
-            _ => {
-                self.blur();
-                None
             }
         }
+        fired.filter(|_| activated)
     }
 
     /// What the pointer should look like where it is — the box under it
@@ -3726,8 +3728,15 @@ impl Runtime {
 
     /// Half-period of the blink (the shell calls it on a timer):
     /// toggles caret visibility. `true` = a field is focused — repaint.
+    /// A view that holds the keyboard only to answer a copy has no caret,
+    /// so it asks for no repaint: a focused table is not redrawn twice a
+    /// second for nothing.
     pub fn blink(&self) -> bool {
-        if self.focus.borrow().is_none() {
+        let focus = self.focus.borrow().clone();
+        let caretless = focus
+            .as_deref()
+            .is_none_or(|path| reconciler::answers_copy(path) && self.custom_at(path).is_none());
+        if caretless {
             self.caret_visible.set(true);
             return false;
         }
@@ -3894,6 +3903,14 @@ impl Runtime {
             && self.field_at(&path).is_some_and(|field| field.secret)
         {
             return Edited { applied: false, output: None };
+        }
+        // a read-only view that answers a copy (`.on_copy`) holds the
+        // keyboard with no caret, and Copy is the one command it takes:
+        // the rest fall through to nobody, a Cut included
+        if matches!(command, EditCommand::Copy)
+            && let Some(answer) = reconciler::run_copy(&path)
+        {
+            return Edited { applied: answer.is_some(), output: answer };
         }
         // the same three, handed to the app's navigation while it asks:
         // a completion open over a composer walks and accepts with them
@@ -6195,11 +6212,13 @@ impl FrameNeed {
 /// Is the input at `path` on screen THIS pass? A field re-registers its
 /// editor and an app's box itself on every pass they render, so both
 /// tables together are the truth — and an open alert holds the keyboard
-/// itself, known by the context its sub-root declares.
+/// itself, known by the context its sub-root declares, as a read-only
+/// view that answers a copy holds it by its `.on_copy`.
 fn input_lives(path: &str) -> bool {
     reconciler::has_editor(path)
         || reconciler::has_custom(path)
         || reconciler::declares(path, ALERT_CONTEXT)
+        || reconciler::answers_copy(path)
 }
 
 /// How far a region can scroll on each axis — its content past its
