@@ -7234,6 +7234,176 @@ mod tests {
         assert!(!runtime.dispatch_action(POKE), "an unmounted handler does not respond");
     }
 
+    /// Two rows that pick themselves on a click, under a table that answers
+    /// a copy with the picked row — the fixture the `.on_copy` probes share.
+    #[derive(Clone, Copy)]
+    struct CopyTable {
+        picked: State<Option<usize>>,
+    }
+
+    const COPY_ROWS: [&str; 2] = ["alpha\t1", "beta\t2"];
+
+    impl Component for CopyTable {
+        fn body(self, _ctx: &Context) -> impl View {
+            let picked = self.picked;
+            vstack((
+                text(COPY_ROWS[0]).on_click(move || picked.set(Some(0))),
+                text(COPY_ROWS[1]).on_click(move || picked.set(Some(1))),
+            ))
+            .on_copy(move || picked.get().map(|row| COPY_ROWS[row].to_owned()))
+        }
+    }
+
+    /// The table's own target and its rows' centres, top first.
+    fn copy_targets(
+        hits: &[(String, crate::layout::Rect)],
+    ) -> (String, Vec<(crate::layout::Px, crate::layout::Px)>) {
+        let (table, _) = hits
+            .iter()
+            .find(|(path, _)| hits.iter().any(|(row, _)| row.starts_with(&format!("{path}/"))))
+            .cloned()
+            .expect("the table is a target over its rows");
+        let mut rows: Vec<_> =
+            hits.iter().filter(|(path, _)| path.starts_with(&format!("{table}/"))).map(|(_, rect)| *rect).collect();
+        rows.sort_by(|a, b| a.origin.y.total_cmp(&b.origin.y));
+        let centres =
+            rows.iter().map(|rect| (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0)).collect();
+        (table, centres)
+    }
+
+    #[test]
+    fn a_click_inside_a_copy_target_leaves_it_the_keyboard_and_copy_answers() {
+        use crate::layout::{Proposal, Size};
+
+        let table = CopyTable { picked: State::new(None) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&table);
+        let viewport = Proposal::exact(Size { width: 300.0, height: 200.0 });
+        let result = runtime.layout(&table, viewport);
+        let (table_path, rows) = copy_targets(&result.hits);
+        assert_eq!(rows.len(), 2);
+
+        // nothing holds the keyboard yet: a copy answers nothing
+        let copied = runtime.key(EditCommand::Copy);
+        assert!(!copied.applied);
+        assert_eq!(copied.output, None);
+
+        // the row's click picks it, and the keyboard stays on its TABLE
+        let (x, y) = rows[1];
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        assert_eq!(table.picked.get(), Some(1));
+        assert_eq!(runtime.focused(), Some(table_path.clone()), "first responder follows the click");
+        // a frame goes by, as one always does between a click and a key:
+        // the keyboard is still the table's
+        runtime.render_stable(&table);
+        runtime.layout(&table, viewport);
+        assert_eq!(runtime.focused(), Some(table_path.clone()), "a frame does not take the keyboard away");
+        let copied = runtime.key(EditCommand::Copy);
+        assert!(copied.applied);
+        assert_eq!(copied.output.as_deref(), Some("beta\t2"));
+
+        // read-only: a cut takes nothing, and there is no caret to blink
+        let cut = runtime.key(EditCommand::Cut);
+        assert!(!cut.applied);
+        assert_eq!(cut.output, None);
+        assert!(!runtime.blink(), "a copy target asks for no caret repaint");
+
+        // another row, another answer
+        runtime.layout(&table, viewport);
+        let (x, y) = rows[0];
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some("alpha\t1"));
+
+        // a click on nothing lets the keyboard go, and a copy answers nothing
+        runtime.pointer_pressed(299.0, 199.0);
+        runtime.pointer_released(299.0, 199.0);
+        assert_eq!(runtime.focused(), None);
+        assert_eq!(runtime.key(EditCommand::Copy).output, None);
+
+        // and Escape (the shells' blur) lets it go too
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        assert!(runtime.blur());
+        assert_eq!(runtime.key(EditCommand::Copy).output, None);
+    }
+
+    #[test]
+    fn a_copy_target_with_nothing_selected_writes_nothing() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Empty;
+
+        impl Component for Empty {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("no rows").on_copy(|| None)
+            }
+        }
+
+        let runtime = Runtime::new();
+        runtime.render_stable(&Empty);
+        let result = runtime.layout(&Empty, Proposal::exact(Size { width: 200.0, height: 100.0 }));
+        let (path, rect) = result.hits.last().expect("the copy target is a pointer target").clone();
+        let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        assert_eq!(runtime.focused(), Some(path), "the keyboard lands even with nothing selected");
+        let copied = runtime.key(EditCommand::Copy);
+        assert!(!copied.applied, "nothing selected is not a copy");
+        assert_eq!(copied.output, None, "and the clipboard keeps what it had");
+    }
+
+    #[test]
+    fn a_skipped_copy_target_still_answers_and_dies_with_its_view() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Holder {
+            mounted: State<bool>,
+            other: State<i32>,
+            table: CopyTable,
+        }
+
+        impl Component for Holder {
+            fn body(self, _ctx: &Context) -> impl View {
+                let _ = self.other.get();
+                if self.mounted.get() {
+                    Either::First(self.table)
+                } else {
+                    Either::Second(text("closed"))
+                }
+            }
+        }
+
+        let holder = Holder {
+            mounted: State::new(true),
+            other: State::new(0),
+            table: CopyTable { picked: State::new(None) },
+        };
+        let runtime = Runtime::new();
+        runtime.render_stable(&holder);
+        let viewport = Proposal::exact(Size { width: 300.0, height: 200.0 });
+        let result = runtime.layout(&holder, viewport);
+        let (table_path, rows) = copy_targets(&result.hits);
+        let (x, y) = rows[1];
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        assert_eq!(runtime.focused(), Some(table_path));
+
+        // the holder re-runs and the table is SKIPPED: its answer is retained
+        holder.other.set(1);
+        runtime.render(&holder);
+        assert!(!runtime.body_runs().iter().any(|run| run == "CopyTable"), "the table was skipped");
+        assert_eq!(runtime.key(EditCommand::Copy).output.as_deref(), Some("beta\t2"));
+
+        // unmounted, the answer is swept with the entry
+        holder.mounted.set(false);
+        runtime.render_stable(&holder);
+        assert_eq!(runtime.key(EditCommand::Copy).output, None, "an unmounted table does not answer");
+    }
+
     /// A host mounts a TABLE outside the tree: the shape ninety actions
     /// from a shared `const` arrive in. It answers when nothing in the
     /// tree claims the id, and it stands across passes.
