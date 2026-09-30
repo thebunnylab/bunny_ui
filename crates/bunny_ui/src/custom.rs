@@ -153,6 +153,21 @@ pub trait CustomElement: 'static {
         false
     }
 
+    /// Does a press on the box leave the keyboard where it is?
+    ///
+    /// The default is no: a box that takes keys takes them on the click
+    /// ([`CustomElement::accepts_keys`]), and one that does not drops them,
+    /// the way a click on a page leaves a field. A box that is CHROME answers
+    /// yes — a grip that resizes a frame, a handle of the app's own. The
+    /// press is about the frame, not the content, so the reader who was
+    /// typing keeps typing when the hand lets go: the manners the
+    /// framework's own chrome already has, where a seam or a scroll thumb
+    /// moves no focus. A box that answers yes is never focused by a press,
+    /// whatever [`CustomElement::accepts_keys`] says.
+    fn leaves_keyboard(&self) -> bool {
+        false
+    }
+
     /// Does the box want the DRAG on a touch surface? `true` makes a
     /// finger that lands on the box a press at once — `PointerDown`,
     /// then `PointerMoved { pressed: true }` for every move — even
@@ -1667,6 +1682,137 @@ mod tests {
             Some(crate::layout::Cursor::Arrow),
             "the row numbers are chrome, and they are in the same box",
         );
+    }
+
+    /// A frame's grip holds the pointer from the press to the release, and
+    /// it names the cursor the whole way — past its own edge too. The edge a
+    /// grip drags trails the hand: a clamp stops the frame, and the next
+    /// layout moves it a beat later. A resizer that turned into whatever lay
+    /// under the hand the moment the hand outran the grip would say the drag
+    /// had let go while it had not; the split's seam has always kept its
+    /// resizer, and a box's grip now keeps its own. A box that says nothing
+    /// there leaves the question to the box under the hand.
+    #[test]
+    fn a_box_holding_the_pointer_names_the_cursor_past_its_edge() {
+        /// A 12pt grip; `reach` says whether it answers past its frame.
+        struct Grip {
+            reach: bool,
+        }
+        impl CustomElement for Grip {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn name(&self) -> &str {
+                "grip"
+            }
+            fn event(&self, _event: &ElementEvent, _ctx: &EventCtx) -> Response {
+                Response::handled()
+            }
+            fn cursor(&self, at: Point, _visible: Rect) -> Option<crate::layout::Cursor> {
+                let inside = (0.0..=12.0).contains(&at.x) && (0.0..=12.0).contains(&at.y);
+                (inside || self.reach).then_some(crate::layout::Cursor::ResizeUpLeftDownRight)
+            }
+        }
+        struct Cells;
+        impl CustomElement for Cells {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn name(&self) -> &str {
+                "cells"
+            }
+            fn cursor(&self, _at: Point, _visible: Rect) -> Option<crate::layout::Cursor> {
+                Some(crate::layout::Cursor::Cell)
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Screen {
+            reach: bool,
+        }
+        impl Component for Screen {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                use crate::ext::ViewExt;
+                // the grip over the middle of the cells: (94, 44) to (106, 56)
+                crate::zstack!(custom(Cells), custom(Grip { reach: self.reach }).frame(12.0, 12.0))
+            }
+        }
+        use crate::layout::Cursor::{Cell, ResizeUpLeftDownRight as Corner};
+
+        for reach in [true, false] {
+            let runtime = Runtime::new();
+            let screen = Screen { reach };
+            runtime.layout(&screen, Proposal { width: Some(200.0), height: Some(100.0) });
+
+            runtime.pointer_moved(100.0, 50.0, false);
+            assert_eq!(runtime.hovered_cursor(), Some(Corner), "over the grip");
+            runtime.pointer_moved(150.0, 80.0, false);
+            assert_eq!(runtime.hovered_cursor(), Some(Cell), "a free hand: the box under it");
+
+            runtime.pointer_moved(100.0, 50.0, false);
+            runtime.pointer_pressed(100.0, 50.0);
+            runtime.pointer_moved(150.0, 80.0, false);
+            let held = if reach { Corner } else { Cell };
+            assert_eq!(runtime.hovered_cursor(), Some(held), "held past the edge (reach: {reach})");
+
+            runtime.pointer_released(150.0, 80.0);
+            assert_eq!(runtime.hovered_cursor(), Some(Cell), "let go: the box under the hand again");
+        }
+    }
+
+    /// A box that is chrome leaves the keyboard where it was: a grip is
+    /// pressed, dragged and let go beside the field the reader is typing
+    /// into, and the field keeps the keys — the manners the framework's own
+    /// seam and scroll thumb have. A plain box still drops them, the way a
+    /// click on a page leaves a field.
+    #[test]
+    fn a_press_on_chrome_leaves_the_keyboard_where_it_was() {
+        struct Grip {
+            chrome: bool,
+        }
+        impl CustomElement for Grip {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn name(&self) -> &str {
+                "grip"
+            }
+            fn event(&self, _event: &ElementEvent, _ctx: &EventCtx) -> Response {
+                Response::handled()
+            }
+            fn leaves_keyboard(&self) -> bool {
+                self.chrome
+            }
+        }
+        #[derive(Clone)]
+        struct Screen {
+            editor: MiniEditor,
+        }
+        impl Component for Screen {
+            fn body(self, _ctx: &ViewContext) -> impl View {
+                use crate::ext::ViewExt;
+                // the editor on 0..40, the chrome on 40..46, a plain box on 46..52
+                crate::vstack!(
+                    custom(self.editor).frame(200.0, 40.0),
+                    custom(Grip { chrome: true }).frame(200.0, 6.0),
+                    custom(Grip { chrome: false }).frame(200.0, 6.0),
+                )
+                .spacing(0.0)
+            }
+        }
+        let editor = MiniEditor::default();
+        let runtime = Runtime::new();
+        let screen = Screen { editor: editor.clone() };
+        runtime.layout(&screen, Proposal { width: Some(200.0), height: Some(80.0) });
+        runtime.pointer_pressed(10.0, 20.0);
+        runtime.pointer_released(10.0, 20.0);
+        let typing = runtime.focused().expect("the click handed the editor the keys");
+        assert!(runtime.key(EditCommand::Insert("ab".into())).applied);
+
+        runtime.pointer_pressed(100.0, 43.0);
+        runtime.pointer_moved(100.0, 70.0, false);
+        runtime.pointer_released(100.0, 70.0);
+        assert_eq!(runtime.focused(), Some(typing), "the grip let go, the editor kept the keys");
+        assert!(runtime.key(EditCommand::Insert("c".into())).applied, "and the typing goes on");
+        assert_eq!(&*editor.text.borrow(), "abc");
+        assert_eq!(editor.focus_log.borrow().as_slice(), &[true], "nothing told it the keys left");
+
+        runtime.pointer_pressed(100.0, 49.0);
+        runtime.pointer_released(100.0, 49.0);
+        assert_eq!(runtime.focused(), None, "a plain box drops them, as a page does");
     }
 
     /// A move says what the hand HOLDS, so a box can offer before the

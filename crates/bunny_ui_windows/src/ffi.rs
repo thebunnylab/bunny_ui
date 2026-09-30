@@ -509,6 +509,8 @@ const IDC_ARROW: usize = 32512;
 const IDC_IBEAM: usize = 32513;
 const IDC_CROSS: usize = 32515;
 const IDC_HAND: usize = 32649;
+const IDC_SIZENWSE: usize = 32642;
+const IDC_SIZENESW: usize = 32643;
 const IDC_SIZEWE: usize = 32644;
 const IDC_SIZENS: usize = 32645;
 
@@ -1723,8 +1725,9 @@ fn clamp_damage(
 
 /// What the pointer wears: the I-beam over text, the cross over a sheet's
 /// cells, the hand over an interactive target, a resizer over a split's
-/// grip — the one that matches the way THAT seam travels — and the arrow
-/// elsewhere.
+/// grip — the one that matches the way THAT seam travels — or over the edge
+/// or corner of a frame a box lets the hand drag, and the arrow elsewhere.
+/// Windows draws a seam and a frame's edge with the same two arrows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cursor {
     Arrow,
@@ -1735,6 +1738,10 @@ pub enum Cursor {
     Cell,
     ResizeLeftRight,
     ResizeUpDown,
+    /// A frame's top-left or bottom-right corner (↖↘).
+    ResizeUpLeftDownRight,
+    /// A frame's top-right or bottom-left corner (↗↙).
+    ResizeUpRightDownLeft,
 }
 
 /// The system cursor each outfit loads.
@@ -1746,6 +1753,8 @@ const fn cursor_id(cursor: Cursor) -> usize {
         Cursor::Cell => IDC_CROSS,
         Cursor::ResizeLeftRight => IDC_SIZEWE,
         Cursor::ResizeUpDown => IDC_SIZENS,
+        Cursor::ResizeUpLeftDownRight => IDC_SIZENWSE,
+        Cursor::ResizeUpRightDownLeft => IDC_SIZENESW,
     }
 }
 
@@ -4124,6 +4133,8 @@ mod tests {
         assert_eq!(cursor_id(Cursor::Cell), 32515, "IDC_CROSS");
         assert_eq!(cursor_id(Cursor::Pointing), 32649, "IDC_HAND");
         assert_eq!(cursor_id(Cursor::Arrow), 32512, "IDC_ARROW");
+        assert_eq!(cursor_id(Cursor::ResizeUpLeftDownRight), 32642, "IDC_SIZENWSE");
+        assert_eq!(cursor_id(Cursor::ResizeUpRightDownLeft), 32643, "IDC_SIZENESW");
         // and the system has every one of them
         for cursor in [
             Cursor::Arrow,
@@ -4132,6 +4143,8 @@ mod tests {
             Cursor::Cell,
             Cursor::ResizeLeftRight,
             Cursor::ResizeUpDown,
+            Cursor::ResizeUpLeftDownRight,
+            Cursor::ResizeUpRightDownLeft,
         ] {
             let handle = unsafe { LoadCursorW(0, cursor_id(cursor) as *const u16) };
             assert_ne!(handle, 0, "{cursor:?} loads nothing");
