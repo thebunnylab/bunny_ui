@@ -26,8 +26,25 @@
 //! **These calls block.** They are the platform's own, they cross a bus
 //! and the desktop may ask the reader to unlock the keyring — so they
 //! belong on a thread, not in a body. The macOS twin carries the shape.
+//!
+//! ## Production gotchas
+//!
+//! **A desktop may have no store at all.** The Mac always has a keychain
+//! and Windows a Credential Manager; here the store is a SERVICE, and a
+//! compositor session that starts no keyring daemon — niri, sway or
+//! Hyprland without gnome-keyring, KeePassXC or oo7 — has nobody on the
+//! bus to answer. [`read`] then answers `None`, exactly as for a pair
+//! that holds nothing, and [`write`] answers `false`, exactly as for a
+//! refusal: the answers a settings page needs, and the wrong ones for a
+//! caller that promised to keep something. That caller asks
+//! [`availability`], which tells the absence apart, and says the truth.
+//! This door never keeps the secret anywhere else — a token in a file
+//! that reads like a keyring is the failure that looks like success, and
+//! the Android twin carries the same rule.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+
+use crate::wpe::GError;
 
 /// `SECRET_SCHEMA_NONE` — the schema name is part of the match, so an
 /// item written through this door is found through this door and not
@@ -37,6 +54,17 @@ const SECRET_SCHEMA_NONE: c_int = 0;
 const ATTRIBUTE_STRING: c_int = 0;
 /// libsecret's own count — the array is fixed and the tail is zeroed.
 const SCHEMA_ATTRIBUTE_SLOTS: usize = 32;
+/// `G_DBUS_ERROR_SERVICE_UNKNOWN` — nothing holds the name and nothing
+/// can start it: what the bus says when no provider is installed.
+const SERVICE_UNKNOWN: c_int = 2;
+/// `G_DBUS_ERROR_NAME_HAS_NO_OWNER` — the name is known, but nothing
+/// holds it now.
+const NAME_HAS_NO_OWNER: c_int = 3;
+/// The pair [`availability`] asks for. Nothing in the house writes it, so
+/// the lookup can only find nothing or fail — and finding nothing
+/// unlocks nothing, so the question never raises a prompt.
+const PROBE_SERVICE: &CStr = c"com.thebunnylab.bunny_ui.availability";
+const PROBE_ACCOUNT: &CStr = c"probe";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -74,7 +102,7 @@ unsafe extern "C" {
     fn secret_password_lookup_sync(
         schema: *const SecretSchema,
         cancellable: *mut c_void,
-        error: *mut *mut c_void,
+        error: *mut *mut GError,
         ...
     ) -> *mut c_char;
     fn secret_password_store_sync(
@@ -83,16 +111,28 @@ unsafe extern "C" {
         label: *const c_char,
         password: *const c_char,
         cancellable: *mut c_void,
-        error: *mut *mut c_void,
+        error: *mut *mut GError,
         ...
     ) -> c_int;
     fn secret_password_clear_sync(
         schema: *const SecretSchema,
         cancellable: *mut c_void,
-        error: *mut *mut c_void,
+        error: *mut *mut GError,
         ...
     ) -> c_int;
     fn secret_password_free(password: *mut c_char);
+}
+
+#[link(name = "glib-2.0")]
+unsafe extern "C" {
+    /// Frees an error libsecret handed back, message and all.
+    fn g_error_free(error: *mut GError);
+}
+
+#[link(name = "gio-2.0")]
+unsafe extern "C" {
+    /// `G_DBUS_ERROR` — the domain of an error the bus itself answered.
+    fn g_dbus_error_quark() -> u32;
 }
 
 /// The pair, as libsecret sees it. The name namespaces the attribute
@@ -210,4 +250,168 @@ pub fn delete(service: &str, account: &str) -> bool {
     // libsecret answers false for "there was nothing to remove" as well
     // as for a real failure, and only one of those is a failure
     cleared != 0 || read(service, account).is_none()
+}
+
+/// Why this desktop has no store the door can open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unavailable {
+    /// The session bus answered, and nothing on it holds or can start
+    /// `org.freedesktop.secrets`: a session that runs no keyring daemon.
+    NoProvider,
+    /// libsecret failed some other way — no session bus to ask, or a
+    /// provider that answered with an error. GLib's own words, verbatim.
+    Failed(String),
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoProvider => f.write_str("no Secret Service provider on the session bus"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for Unavailable {}
+
+/// Whether this desktop has a store to open at all — the one question
+/// [`read`] and [`write`] cannot answer (see the module's gotchas).
+///
+/// It asks libsecret itself, not the bus's list of names, so the answer
+/// follows whichever backend libsecret would pick for the three calls
+/// above — its own file store inside a sandbox included. It blocks like
+/// they do: one round trip on the session bus, plus the start of a
+/// provider that is installed but not running yet.
+///
+/// # Errors
+///
+/// [`Unavailable::NoProvider`] when the bus has nobody to answer for the
+/// store; [`Unavailable::Failed`] for every other way the question failed.
+pub fn availability() -> Result<(), Unavailable> {
+    let mut error: *mut GError = std::ptr::null_mut();
+    let found = unsafe {
+        secret_password_lookup_sync(
+            &raw const SCHEMA,
+            std::ptr::null_mut(),
+            &raw mut error,
+            c"service".as_ptr(),
+            PROBE_SERVICE.as_ptr(),
+            c"account".as_ptr(),
+            PROBE_ACCOUNT.as_ptr(),
+            std::ptr::null::<c_char>(),
+        )
+    };
+    if !found.is_null() {
+        // somebody wrote the reserved pair; a store answered all the same
+        unsafe { secret_password_free(found) };
+    }
+    if error.is_null() {
+        return Ok(());
+    }
+    // GLib's memory: copied out, then handed back to GLib — always
+    let raised = unsafe {
+        let copied = Raised {
+            domain: (*error).domain,
+            code: (*error).code,
+            message: if (*error).message.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr((*error).message).to_string_lossy().into_owned()
+            },
+        };
+        g_error_free(error);
+        copied
+    };
+    Err(raised.into_unavailable(unsafe { g_dbus_error_quark() }))
+}
+
+/// A `GError`, copied out of GLib's memory.
+struct Raised {
+    domain: u32,
+    code: c_int,
+    message: String,
+}
+
+impl Raised {
+    /// The bus's own "nobody is there" is the absence; every other
+    /// failure travels in GLib's words. A code means something only inside
+    /// its domain, so the domain is checked first — `2` from GIO's own
+    /// domain is not the bus's `ServiceUnknown`.
+    fn into_unavailable(self, dbus: u32) -> Unavailable {
+        match self.code {
+            SERVICE_UNKNOWN | NAME_HAS_NO_OWNER if self.domain == dbus => Unavailable::NoProvider,
+            _ => Unavailable::Failed(self.message),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two quarks as the process might have registered them: which one is
+    /// the bus's is the point, not the numbers.
+    const DBUS: u32 = 7;
+    const IO: u32 = 9;
+
+    fn raised(domain: u32, code: c_int) -> Raised {
+        Raised {
+            domain,
+            code,
+            message: "GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: \
+                      The name is not activatable"
+                .to_owned(),
+        }
+    }
+
+    /// Nothing can start the name, or nothing holds it now: either way
+    /// the desktop has no store, and that is the one answer named.
+    #[test]
+    fn the_bus_saying_nobody_is_there_is_no_provider() {
+        assert_eq!(raised(DBUS, SERVICE_UNKNOWN).into_unavailable(DBUS), Unavailable::NoProvider);
+        assert_eq!(raised(DBUS, NAME_HAS_NO_OWNER).into_unavailable(DBUS), Unavailable::NoProvider);
+    }
+
+    /// A code is read inside its domain: the same number from another
+    /// domain, or another code from the bus, is carried in GLib's words
+    /// instead of guessed into an absence.
+    #[test]
+    fn every_other_failure_is_carried_in_glibs_words() {
+        let words = raised(IO, SERVICE_UNKNOWN).into_unavailable(DBUS);
+        assert!(
+            matches!(&words, Unavailable::Failed(message) if message.ends_with("not activatable")),
+            "{words:?}",
+        );
+        // G_DBUS_ERROR_FAILED: the bus answered, and it was not about who is there
+        assert!(matches!(raised(DBUS, 0).into_unavailable(DBUS), Unavailable::Failed(_)));
+    }
+
+    /// The absence reads as a sentence, and a failure as exactly GLib's.
+    #[test]
+    fn a_reason_reads_as_its_own_sentence() {
+        assert_eq!(
+            Unavailable::NoProvider.to_string(),
+            "no Secret Service provider on the session bus",
+        );
+        assert_eq!(Unavailable::Failed("verbatim".to_owned()).to_string(), "verbatim");
+    }
+
+    /// On a session with no keyring daemon — the bare compositor this
+    /// module's gotchas describe — the store is named absent, while the
+    /// doors still answer what they answer for an empty pair.
+    #[test]
+    #[ignore = "requires a session bus with no Secret Service provider"]
+    fn no_secret_service_is_named_and_not_taken_for_an_empty_store() {
+        assert_eq!(availability(), Err(Unavailable::NoProvider));
+        assert_eq!(read("bunny-ui-test", "absent"), None);
+        assert!(!write("bunny-ui-test", "absent", "never kept"));
+    }
+
+    /// With a provider on the bus — running, or started by the asking —
+    /// the store is there.
+    #[test]
+    #[ignore = "requires a running Secret Service provider"]
+    fn a_secret_service_is_available() {
+        assert_eq!(availability(), Ok(()));
+    }
 }

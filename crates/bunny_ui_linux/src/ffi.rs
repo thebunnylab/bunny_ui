@@ -1562,6 +1562,9 @@ struct Dialog {
     /// The size last presented, in points — where a hosted popup's
     /// anchor must land inside.
     logical: (f64, f64),
+    /// An alert's: ONE size — `min` is the ceiling too, and both move
+    /// with the content's fit, never with the reader's hand.
+    fixed: bool,
 }
 
 impl Dialog {
@@ -2182,6 +2185,11 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
                 let (w, h) = (width.round() as i32, height.round() as i32);
                 request(toplevel, 8, &mut [arg_i(w), arg_i(h)]); // set_min_size
                 request(toplevel, 7, &mut [arg_i(w), arg_i(h)]); // set_max_size
+            } else if let Some((min_width, min_height)) = options.min {
+                // a floor alone: the grab stops there, and no maximum is
+                // said, so the maximize verb stays the compositor's
+                let (w, h) = (min_width.round() as i32, min_height.round() as i32);
+                request(toplevel, 8, &mut [arg_i(w), arg_i(h)]); // set_min_size
             }
         }
         // the frame question, before the first commit: server-side for
@@ -2392,12 +2400,14 @@ pub fn show_window(window: WindowHandle) {
 }
 
 /// What a window is asked to be at creation, beyond its size and its
-/// title: who draws its top edge, and its manners.
+/// title: who draws its top edge, its manners, and the floor a resizable
+/// one may not be dragged under, in logical points.
 #[derive(Clone, Copy, Debug)]
 pub struct WindowOptions {
     pub scene: bool,
     pub resizable: bool,
     pub minimizable: bool,
+    pub min: Option<(f64, f64)>,
 }
 
 /// Who draws the window's frame, as far as the door knows.
@@ -2784,17 +2794,19 @@ pub fn create_panel_in(window: &WindowHandle, dialog: &WindowHandle) -> WindowHa
 /// managed window transient for it. `min` is the floor the compositor
 /// holds it to; `scene` = the content draws the bar and the controls.
 /// `frame` is where the scene opens it, in `window`'s layout points —
-/// only x11 may honour the place; wayland decides it alone.
+/// only x11 may honour the place; wayland decides it alone. `fixed` = an
+/// alert's: `min` is also the ceiling, and it follows the content's fit.
 pub fn create_dialog(
     window: &WindowHandle,
     title: &str,
     min: (f64, f64),
     scene: bool,
     frame: (f64, f64, f64, f64),
+    fixed: bool,
 ) -> WindowHandle {
     let owner = window.window;
     if is_x11() {
-        let panel = crate::x11::create_dialog(owner as u32, title, min, scene, frame);
+        let panel = crate::x11::create_dialog(owner as u32, title, min, scene, frame, fixed);
         return WindowHandle { window: owner, panel };
     }
     let dialog = Dialog {
@@ -2808,6 +2820,7 @@ pub fn create_dialog(
         granted: None,
         maximized: false,
         logical: (0.0, 0.0),
+        fixed,
     };
     with_client(|client| {
         client.panels.push(Some(Panel::new(owner, Role::Dialog(dialog))));
@@ -2906,6 +2919,21 @@ fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height:
         }
         if let Some(dialog) = panel.role.dialog_mut() {
             dialog.logical = (w, h);
+            // an alert's one size follows its content: the floor and the
+            // ceiling move together, BEFORE the pixels of the new size
+            // commit (a toplevel not born yet is born at the latest fit)
+            let refit = (dialog.min.0 - w).abs() > 0.5 || (dialog.min.1 - h).abs() > 0.5;
+            if dialog.fixed && refit {
+                dialog.min = (w, h);
+                if !dialog.toplevel.is_null() {
+                    let (width, height) = (w.ceil() as i32, h.ceil() as i32);
+                    unsafe {
+                        // set_min_size, then set_max_size
+                        request(dialog.toplevel, 8, &mut [arg_i(width), arg_i(height)]);
+                        request(dialog.toplevel, 7, &mut [arg_i(width), arg_i(height)]);
+                    }
+                }
+            }
         }
         if panel.surface.is_null() {
             unsafe {
@@ -2946,6 +2974,18 @@ fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height:
                             arg_i(dialog.min.1.ceil() as i32),
                         ],
                     );
+                    // an alert's floor is its ceiling: one size, which
+                    // the compositor holds it to
+                    if dialog.fixed {
+                        request(
+                            toplevel,
+                            7, // set_max_size
+                            &mut [
+                                arg_i(dialog.min.0.ceil() as i32),
+                                arg_i(dialog.min.1.ceil() as i32),
+                            ],
+                        );
+                    }
                     // the frame question, the main window's answer: the
                     // content's bar on scene chrome, the server's else
                     if !decoration_manager.is_null() {
@@ -4363,7 +4403,7 @@ fn ime_marked() -> bool {
     with_client(|client| client.ime.marked)
 }
 
-// MARK: - the frame driver (no thread: the compositor's callback is the clock)
+// MARK: - the frame driver (no thread: the display's pace rides the compositor's callback)
 
 /// What the frame driver is asked for: every refresh, one tick every
 /// `s` seconds (a slow animation), or nothing.
@@ -4411,6 +4451,35 @@ impl DriverPace {
             DriverPace::Full | DriverPace::Off => elapsed.unwrap_or(1.0 / 60.0).clamp(0.0, 1.0 / 30.0),
         }
     }
+
+    /// What the compositor's frame callback is under this pace, given
+    /// the wall time since the last beat that moved the clock.
+    ///
+    /// At the display's pace the callback IS the clock. At a slow pace
+    /// the deadline is: the callback only says a present reached the
+    /// glass, one refresh after it. Moving the clock there too spent
+    /// the promised step twice — every step of a caret's blink presents,
+    /// so each step came due a refresh after the last one and the holds
+    /// between the fades were skipped. The blink ran visibly fast on
+    /// Wayland and nowhere else, since no other door has a callback.
+    pub(crate) fn callback_beat(self, elapsed: Option<f64>) -> CallbackBeat {
+        match self {
+            DriverPace::Full => CallbackBeat::Clock(self.beat_dt(elapsed)),
+            DriverPace::Slow(_) => CallbackBeat::Present,
+            DriverPace::Off => CallbackBeat::Parked,
+        }
+    }
+}
+
+/// A frame callback's part in the beat ([`DriverPace::callback_beat`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum CallbackBeat {
+    /// The window wants no frames: the callback falls, nothing beats.
+    Parked,
+    /// A beat for the pacer that moves no clock — the deadline owns it.
+    Present,
+    /// The beat itself: the clock moves by this many seconds.
+    Clock(f64),
 }
 
 /// The frame driver, per window. Answers whether the beat runs at the
@@ -4655,18 +4724,25 @@ fn drain_protocol_events() {
                     let win = window_where(client, |w| w.frame_callback as usize == callback_ptr)?;
                     unsafe { wl_proxy_destroy(win.frame_callback) };
                     win.frame_callback = std::ptr::null_mut();
-                    // the callback took this beat; a deadline armed for
-                    // it stands down
-                    win.next_beat = None;
-                    if win.pace == DriverPace::Off {
-                        win.last_frame = None;
-                        return None;
-                    }
                     let now = Instant::now();
                     let gap = win.last_frame.map(|last| (now - last).as_secs_f64());
-                    let dt = win.pace.beat_dt(gap);
-                    win.last_frame = Some(now);
-                    Some((win.surface as usize, dt, gap.unwrap_or(dt)))
+                    match win.pace.callback_beat(gap) {
+                        CallbackBeat::Parked => {
+                            win.next_beat = None;
+                            win.last_frame = None;
+                            None
+                        }
+                        // the deadline keeps its beat and the step it
+                        // promised; this beat only lets the pacer draw
+                        CallbackBeat::Present => Some((win.surface as usize, 0.0, 0.0)),
+                        CallbackBeat::Clock(dt) => {
+                            // the callback took this beat; a deadline
+                            // armed for it stands down
+                            win.next_beat = None;
+                            win.last_frame = Some(now);
+                            Some((win.surface as usize, dt, gap.unwrap_or(dt)))
+                        }
+                    }
                 });
                 if let Some((addr, dt, elapsed)) = beat {
                     dispatch_at(addr, AppEvent::Frame { dt, elapsed });
@@ -5613,6 +5689,20 @@ mod tests {
         assert!((DriverPace::Full.beat_dt(None) - 1.0 / 60.0).abs() < 1e-12);
     }
 
+    /// Under a slow pace the callback that answers a present one
+    /// refresh later moves no clock: the deadline already owes the
+    /// step, and a caret whose every blink step presents would
+    /// otherwise walk its cycle a refresh at a time.
+    #[test]
+    fn a_callback_moves_the_clock_only_at_the_displays_pace() {
+        let slow = DriverPace::Slow(0.32);
+        assert_eq!(slow.callback_beat(Some(0.016)), CallbackBeat::Present);
+        assert_eq!(slow.callback_beat(None), CallbackBeat::Present);
+        assert_eq!(DriverPace::Full.callback_beat(Some(0.012)), CallbackBeat::Clock(0.012));
+        assert_eq!(DriverPace::Full.callback_beat(Some(2.0)), CallbackBeat::Clock(1.0 / 30.0));
+        assert_eq!(DriverPace::Off.callback_beat(Some(0.016)), CallbackBeat::Parked);
+    }
+
     #[test]
     fn the_backend_pick_honors_force_then_displays() {
         use Backend::{Wayland, X11};
@@ -5904,6 +5994,7 @@ mod tests {
             granted: None,
             maximized: false,
             logical: (0.0, 0.0),
+            fixed: false,
         }
     }
 

@@ -760,6 +760,17 @@ fn size_hints_fixed(width: u32, height: u32) -> [u32; 18] {
     hints
 }
 
+/// The eighteen words of `WM_SIZE_HINTS` for a resizable window with a
+/// floor: the minimum alone, in physical pixels, and no maximum, so the
+/// window manager still offers the maximize verb.
+fn size_hints_min(width: u32, height: u32) -> [u32; 18] {
+    let mut hints = [0u32; 18];
+    hints[0] = P_MIN_SIZE;
+    hints[5] = width; // min_width
+    hints[6] = height; // min_height
+    hints
+}
+
 // MARK: - The atom table (interned once, one round trip)
 
 /// Every atom this door speaks, interned in one batch at connect.
@@ -1032,6 +1043,9 @@ struct XDialog {
     /// The physical size last asked of the server — a present at the
     /// size already granted configures nothing.
     asked: (usize, usize),
+    /// An alert's: ONE size, the floor and the ceiling both, moved with
+    /// the content's fit and never by the reader.
+    fixed: bool,
 }
 
 /// The window named by its xid.
@@ -1744,10 +1758,17 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate
                     hints.as_ptr().cast(),
                 );
             }
-            if !options.resizable {
-                // one size, in physical pixels: the window manager
-                // refuses the resize before the scene ever sees it
-                let hints = size_hints_fixed(physical.0 as u32, physical.1 as u32);
+            // one size, or a floor, in physical pixels: the window manager
+            // refuses the resize before the scene ever sees it
+            let hints = match (options.resizable, options.min) {
+                (false, _) => Some(size_hints_fixed(physical.0 as u32, physical.1 as u32)),
+                (true, Some((min_width, min_height))) => Some(size_hints_min(
+                    (min_width * scale as f64) as u32,
+                    (min_height * scale as f64) as u32,
+                )),
+                (true, None) => None,
+            };
+            if let Some(hints) = hints {
                 xcb_change_property(
                     client.connection,
                     PROP_MODE_REPLACE,
@@ -2172,13 +2193,15 @@ fn claim_slot(client: &mut XClient, panel: XPanel) -> usize {
 /// at `frame` — layout coordinates of the owner, the size the spec
 /// opens at — and never goes under `min`. Scene chrome drops the WM's
 /// decorations: the content's header is the bar and the crown answers
-/// it. Mapped at its first present.
+/// it. Mapped at its first present. `fixed` = an alert's: `min` is also
+/// the ceiling, and neither resize nor maximize is offered.
 pub(crate) fn create_dialog(
     owner: u32,
     title: &str,
     min: (f64, f64),
     scene: bool,
     frame: (f64, f64, f64, f64),
+    fixed: bool,
 ) -> usize {
     let origin = with_x(|client| window_root_origin(client, owner));
     with_x(|client| {
@@ -2259,17 +2282,26 @@ pub(crate) fn create_dialog(
             // the place and the size are the program's own; the floor
             // is the spec's
             let mut hints = [0u32; 18];
-            hints[0] = P_POSITION | P_SIZE | P_MIN_SIZE;
+            hints[0] = P_POSITION | P_SIZE | P_MIN_SIZE | if fixed { P_MAX_SIZE } else { 0 };
             hints[1] = x as u32;
             hints[2] = y as u32;
             hints[3] = width;
             hints[4] = height;
             hints[5] = physical(min.0);
             hints[6] = physical(min.1);
+            // an alert's floor is its ceiling: the WM refuses the resize
+            // before the scene ever sees it
+            if fixed {
+                hints[7] = physical(min.0);
+                hints[8] = physical(min.1);
+            }
             set(ATOM_WM_NORMAL_HINTS, ATOM_WM_SIZE_HINTS, 32, 18, hints.as_ptr().cast());
-            // a dialog has no minimize; scene chrome also drops the frame
+            // a dialog has no minimize, an alert no resize or maximize
+            // either; scene chrome also drops the frame
             let flags = MWM_HINTS_FUNCTIONS | if scene { MWM_HINTS_DECORATIONS } else { 0 };
-            let motif: [u32; 5] = [flags, MWM_FUNC_ALL | MWM_FUNC_MINIMIZE, 0, 0, 0];
+            let removed = MWM_FUNC_MINIMIZE
+                | if fixed { MWM_FUNC_RESIZE | MWM_FUNC_MAXIMIZE } else { 0 };
+            let motif: [u32; 5] = [flags, MWM_FUNC_ALL | removed, 0, 0, 0];
             set(client.atoms.motif_wm_hints, client.atoms.motif_wm_hints, 32, 5, motif.as_ptr().cast());
             let gc = xcb_generate_id(connection);
             xcb_create_gc(connection, gc, id, 0, std::ptr::null());
@@ -2285,6 +2317,7 @@ pub(crate) fn create_dialog(
                     granted: None,
                     maximized: false,
                     asked: (width as usize, height as usize),
+                    fixed,
                 }),
                 mapped: false,
                 carved: (0, 0),
@@ -2521,6 +2554,22 @@ fn dialog_present(
     unsafe {
         if dialog.asked != (width, height) {
             dialog.asked = (width, height);
+            if dialog.fixed {
+                // an alert's one size moved with its content: the floor
+                // and the ceiling move first, or the WM holds the window
+                // to the size it no longer is
+                let hints = size_hints_fixed(width.max(1) as u32, height.max(1) as u32);
+                xcb_change_property(
+                    connection,
+                    PROP_MODE_REPLACE,
+                    panel.window,
+                    ATOM_WM_NORMAL_HINTS,
+                    ATOM_WM_SIZE_HINTS,
+                    32,
+                    18,
+                    hints.as_ptr().cast(),
+                );
+            }
             const CONFIG_W: u16 = 4;
             const CONFIG_H: u16 = 8;
             let values = [width.max(1) as u32, height.max(1) as u32];
@@ -3649,6 +3698,15 @@ mod tests {
         assert_eq!(&hints[5..9], &[560, 360, 560, 360]);
         assert!(hints[1..5].iter().all(|&word| word == 0), "position and size stay unsaid");
         assert!(hints[9..].iter().all(|&word| word == 0), "no increments, aspect, base or gravity");
+    }
+
+    #[test]
+    fn a_floor_writes_the_minimum_and_leaves_the_maximum_unsaid() {
+        let hints = size_hints_min(1440, 960);
+        assert_eq!(hints[0], P_MIN_SIZE, "no P_MAX_SIZE: the window still maximizes");
+        assert_eq!(&hints[5..7], &[1440, 960]);
+        assert!(hints[1..5].iter().all(|&word| word == 0), "position and size stay unsaid");
+        assert!(hints[7..].iter().all(|&word| word == 0), "no maximum, increments, aspect, base or gravity");
     }
 
     #[test]

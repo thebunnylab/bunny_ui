@@ -1006,7 +1006,14 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// bar opened over an editor must take them from the editor. The app
     /// bumps the beat when it means it — each (field, beat) fires once,
     /// so the reader can click away and stay away until the app beats
-    /// again.
+    /// again. A field that leaves the scene forgets its beats, so a popup
+    /// whose field is born on each open can wear one constant beat.
+    ///
+    /// The beat BORROWS the keyboard. When the field leaves the scene still
+    /// holding it — the picker closed on Escape, the pick ran and the popup
+    /// went — the keys go back to whoever held them before the beat, if
+    /// that input is still on screen. A field the keyboard already left
+    /// gives nothing back: the reader's own move stands.
     fn auto_focus_beat(self, beat: u64) -> Modified<Self> {
         Modified {
             base: self,
@@ -1371,6 +1378,60 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         Modified {
             base: self,
             modifier: Modifier::Dialog {
+                is_presented,
+                spec,
+                content: Rc::new(content),
+            },
+        }
+    }
+
+    /// `.alert(isPresented: $flag, spec) { … }` — a modal ASK: a real
+    /// window over the parent, like [`ViewExt::dialog`], with an alert's
+    /// manners instead of a workspace's.
+    ///
+    /// - **One size.** `spec.width` wide and as tall as the content is
+    ///   there, re-fitted on every pass. The reader can move it and
+    ///   nothing else: no resize, no zoom, no minimize — on macOS no bar
+    ///   and no lights at all, the system's own alerts' shape. A press on
+    ///   its ground (anywhere no button wins) drags it.
+    /// - **One cancel answer.** The window's close button, Escape and ⌘.
+    ///   all write `false` to the binding, and the app's setter IS the
+    ///   cancel answer — deny, keep, don't. A press on the parent does
+    ///   nothing: outside is not an answer.
+    /// - **Return is the default button** — whatever the content mounted
+    ///   under [`ALERT_DEFAULT`], beside that button. Mount none for an
+    ///   ask that arrives unasked, so a stroke meant for the page cannot
+    ///   decide it.
+    /// - **The keyboard is the alert's.** Opening one lends it the keys
+    ///   from whoever held them, and answering gives them back; while it
+    ///   is up the page's own bindings are inert.
+    /// - **Nothing transient stands beside it.** Opening one closes the
+    ///   popovers, the menu and the tooltip floating over the page, each
+    ///   through its own dismissal — an ask holds words and buttons, not
+    ///   menus, and no popover of its own takes Escape from it.
+    ///
+    /// Everywhere without real windows it presents like
+    /// [`ViewExt::sheet`], with the same keys. It opens centred every
+    /// time — a question appears where questions appear.
+    ///
+    /// ```ignore
+    /// row.alert(
+    ///     Binding::new(move || ask.get().is_some(), move |open| if !open { cancel() }),
+    ///     AlertSpec::new("Unsaved Changes", 420.0),
+    ///     move |_| erased(unsaved_body(save.clone()).on_action(ALERT_DEFAULT, save.clone())),
+    /// )
+    /// ```
+    ///
+    /// [`ALERT_DEFAULT`]: crate::action::ALERT_DEFAULT
+    fn alert(
+        self,
+        is_presented: Binding<bool>,
+        spec: crate::layout::AlertSpec,
+        content: impl Fn(&Context) -> Erased + 'static,
+    ) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::Alert {
                 is_presented,
                 spec,
                 content: Rc::new(content),

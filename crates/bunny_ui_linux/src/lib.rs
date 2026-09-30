@@ -137,6 +137,7 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
 pub struct WindowSpec {
     title: Rc<str>,
     size: Size,
+    min: Option<Size>,
     chrome: Chrome,
     manners: Manners,
 }
@@ -147,9 +148,36 @@ impl WindowSpec {
         WindowSpec {
             title: title.into(),
             size: Size { width: 1024.0, height: 640.0 },
+            min: None,
             chrome: Chrome::Native,
             manners: Manners::default(),
         }
+    }
+
+    /// The smallest content the reader may drag the window down to. On
+    /// Wayland it is the toplevel's `set_min_size`; on X11 a
+    /// `WM_NORMAL_HINTS` that carries the minimum alone. Both measure the
+    /// window, so where the house bar is drawn by the client, the bar's
+    /// height comes out of the content under it.
+    pub fn min_size(mut self, width: f64, height: f64) -> WindowSpec {
+        self.min = Some(Size { width, height });
+        self
+    }
+
+    /// The floor [`WindowSpec::min_size`] set, if one was.
+    #[must_use]
+    pub fn min(&self) -> Option<Size> {
+        self.min
+    }
+
+    /// The size the window opens at: [`WindowSpec::size`], raised to the
+    /// floor on any axis that asked for less.
+    #[must_use]
+    pub fn opening_size(&self) -> Size {
+        self.min.map_or(self.size, |min| Size {
+            width: self.size.width.max(min.width),
+            height: self.size.height.max(min.height),
+        })
     }
 
     /// One size, and no other: the reader cannot resize it. On Wayland
@@ -494,14 +522,16 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
+    let size = spec.opening_size();
     let window = ffi::create_window(
         &spec.title,
-        spec.size.width,
-        spec.size.height,
+        size.width,
+        size.height,
         ffi::WindowOptions {
             scene: spec.chrome == Chrome::Scene,
             resizable: spec.manners.resizable,
             minimizable: spec.manners.minimizable,
+            min: spec.min.map(|min| (min.width, min.height)),
         },
     );
     // the bar: the compositor's where it offers one, the house's own
@@ -619,26 +649,41 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     // drawn shadow — the frame and its shadow are the
                     // compositor's. The window is the truth of the size
                     // (`dialog_size`, pulled before the layout), so the
-                    // frame here is already what the window was granted
-                    if let bunny_ui::layout::OverlaySurface::Window(spec) = &overlay.surface {
-                        let frame = overlay.frame;
+                    // frame here is already what the window was granted.
+                    // An alert is the one exception: its size is its
+                    // content's, one size the window is held to (`fixed`)
+                    let frame = overlay.frame;
+                    let asked = match &overlay.surface {
+                        bunny_ui::layout::OverlaySurface::Window(spec) => Some((
+                            &spec.title,
+                            (spec.min.width, spec.min.height),
+                            matches!(spec.chrome, bunny_ui::layout::DialogChrome::Scene { .. }),
+                            false,
+                        )),
+                        bunny_ui::layout::OverlaySurface::Alert(spec) => Some((
+                            &spec.title,
+                            (frame.size.width, frame.size.height),
+                            false,
+                            true,
+                        )),
+                        bunny_ui::layout::OverlaySurface::Layer => None,
+                    };
+                    if let Some((title, min, scene, fixed)) = asked {
                         let dialog =
                             dialog_store.entry(overlay.path.clone()).or_insert_with(|| {
                                 DialogWindow {
                                     handle: ffi::create_dialog(
                                         &window,
-                                        &spec.title,
-                                        (spec.min.width, spec.min.height),
-                                        matches!(
-                                            spec.chrome,
-                                            bunny_ui::layout::DialogChrome::Scene { .. }
-                                        ),
+                                        title,
+                                        min,
+                                        scene,
                                         (
                                             frame.origin.x,
                                             frame.origin.y,
                                             frame.size.width,
                                             frame.size.height,
                                         ),
+                                        fixed,
                                     ),
                                     origin: frame.origin,
                                 }
@@ -887,12 +932,23 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // the BOX under the pointer answers first — text wants
                 // an I-beam, and the rule below cannot know that. Only
                 // where nobody answers does the old rule stand: the
-                // hand over anything hoverable
+                // hand over anything hoverable. A box's frame grip
+                // wears the border band's own resizers
                 None => match runtime.hovered_cursor() {
                     Some(bunny_ui::layout::Cursor::Text) => ffi::Cursor::Text,
                     Some(bunny_ui::layout::Cursor::Pointing) => ffi::Cursor::Pointing,
                     Some(bunny_ui::layout::Cursor::Cell) => ffi::Cursor::Cell,
                     Some(bunny_ui::layout::Cursor::Arrow) => ffi::Cursor::Arrow,
+                    Some(bunny_ui::layout::Cursor::ResizeLeftRight) => {
+                        ffi::Cursor::ResizeLeftRight
+                    }
+                    Some(bunny_ui::layout::Cursor::ResizeUpDown) => ffi::Cursor::ResizeUpDown,
+                    Some(bunny_ui::layout::Cursor::ResizeUpLeftDownRight) => {
+                        ffi::Cursor::ResizeNwSe
+                    }
+                    Some(bunny_ui::layout::Cursor::ResizeUpRightDownLeft) => {
+                        ffi::Cursor::ResizeNeSw
+                    }
                     None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
                     None => ffi::Cursor::Arrow,
                 },
@@ -1373,6 +1429,22 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_has_no_floor_until_its_spec_names_one() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0);
+        assert_eq!(spec.min(), None);
+        assert_eq!(spec.opening_size(), Size { width: 1280.0, height: 800.0 });
+    }
+
+    #[test]
+    fn a_floor_is_kept_and_the_window_opens_over_it() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0).min_size(720.0, 480.0);
+        assert_eq!(spec.min(), Some(Size { width: 720.0, height: 480.0 }));
+        assert_eq!(spec.opening_size(), Size { width: 1280.0, height: 800.0 });
+        let narrow = WindowSpec::titled("Trinity").size(600.0, 900.0).min_size(720.0, 480.0);
+        assert_eq!(narrow.opening_size(), Size { width: 720.0, height: 900.0 });
+    }
 
     fn stroke(sym: u32, base: &str, shift: bool, control: bool, alt: bool) -> ffi::KeyStroke {
         ffi::KeyStroke {

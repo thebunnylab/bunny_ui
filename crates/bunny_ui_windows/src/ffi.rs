@@ -509,6 +509,8 @@ const IDC_ARROW: usize = 32512;
 const IDC_IBEAM: usize = 32513;
 const IDC_CROSS: usize = 32515;
 const IDC_HAND: usize = 32649;
+const IDC_SIZENWSE: usize = 32642;
+const IDC_SIZENESW: usize = 32643;
 const IDC_SIZEWE: usize = 32644;
 const IDC_SIZENS: usize = 32645;
 
@@ -1039,6 +1041,11 @@ thread_local! {
     /// Which top-level windows wear scene chrome — a window's own
     /// answer, because two windows of one app need not dress alike.
     static SCENE_CHROME: RefCell<HashSet<Hwnd>> = RefCell::new(HashSet::new());
+    /// A top-level window's floor in layout points, when its spec named
+    /// one — the answer `WM_GETMINMAXINFO` gives, as `DIALOG_MINS` is a
+    /// dialog's. Kept apart from that map because membership there is
+    /// what makes a window a dialog.
+    static WINDOW_MINS: RefCell<HashMap<Hwnd, (f64, f64)>> = RefCell::new(HashMap::new());
     /// Which caption button the press went down on — the release only
     /// fires over the same one.
     static PRESSED_CONTROL: Cell<isize> = const { Cell::new(0) };
@@ -1375,6 +1382,14 @@ fn dispatch_at(hwnd: Hwnd, event: AppEvent) {
     SOURCE.with(|source| source.set(held));
 }
 
+/// The content floor `WM_GETMINMAXINFO` answers with, in layout points:
+/// a dialog's always, a top-level window's when its spec named one.
+fn content_floor(hwnd: Hwnd) -> Option<(f64, f64)> {
+    DIALOG_MINS
+        .with(|mins| mins.borrow().get(&hwnd).copied())
+        .or_else(|| WINDOW_MINS.with(|mins| mins.borrow().get(&hwnd).copied()))
+}
+
 /// Takes a window into the registry, and hands the app's roles — the
 /// cross-thread knock, the frame beat, the slow clock — to it when
 /// nobody holds them yet.
@@ -1406,6 +1421,9 @@ fn unregister_top_level(hwnd: Hwnd) -> usize {
     });
     SCENE_CHROME.with(|windows| {
         windows.borrow_mut().remove(&hwnd);
+    });
+    WINDOW_MINS.with(|mins| {
+        mins.borrow_mut().remove(&hwnd);
     });
     let heir = left.unwrap_or(0);
     if MAIN_HWND.load(Ordering::Acquire) == hwnd {
@@ -1707,8 +1725,9 @@ fn clamp_damage(
 
 /// What the pointer wears: the I-beam over text, the cross over a sheet's
 /// cells, the hand over an interactive target, a resizer over a split's
-/// grip — the one that matches the way THAT seam travels — and the arrow
-/// elsewhere.
+/// grip — the one that matches the way THAT seam travels — or over the edge
+/// or corner of a frame a box lets the hand drag, and the arrow elsewhere.
+/// Windows draws a seam and a frame's edge with the same two arrows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cursor {
     Arrow,
@@ -1719,6 +1738,10 @@ pub enum Cursor {
     Cell,
     ResizeLeftRight,
     ResizeUpDown,
+    /// A frame's top-left or bottom-right corner (↖↘).
+    ResizeUpLeftDownRight,
+    /// A frame's top-right or bottom-left corner (↗↙).
+    ResizeUpRightDownLeft,
 }
 
 /// The system cursor each outfit loads.
@@ -1730,6 +1753,8 @@ const fn cursor_id(cursor: Cursor) -> usize {
         Cursor::Cell => IDC_CROSS,
         Cursor::ResizeLeftRight => IDC_SIZEWE,
         Cursor::ResizeUpDown => IDC_SIZENS,
+        Cursor::ResizeUpLeftDownRight => IDC_SIZENWSE,
+        Cursor::ResizeUpRightDownLeft => IDC_SIZENESW,
     }
 }
 
@@ -2624,9 +2649,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_GETMINMAXINFO => {
-            let Some((min_width, min_height)) =
-                DIALOG_MINS.with(|mins| mins.borrow().get(&hwnd).copied())
-            else {
+            let Some((min_width, min_height)) = content_floor(hwnd) else {
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             };
             // the floor is the CONTENT's, in layout points; under scene chrome
@@ -2641,7 +2664,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             };
             unsafe {
                 if !wears_scene_chrome(hwnd) {
-                    AdjustWindowRectExForDpi(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0, dpi);
+                    AdjustWindowRectExForDpi(&mut rect, dialog_style(hwnd), 0, 0, dpi);
                 }
                 let info = lparam as *mut MinMaxInfo;
                 (*info).min_track =
@@ -2774,11 +2797,14 @@ fn register_class() -> Vec<u16> {
 /// The caller presents the first frame and then shows it — the window
 /// never flashes unpainted. With `scene_chrome`, the frame belongs to
 /// the scene: the non-client conversation answers with the scene's
-/// own drag handle and buttons, and resize borders survive.
+/// own drag handle and buttons, and resize borders survive. `min`, when
+/// given, is the content floor in layout points that a drag cannot go
+/// under.
 pub fn create_window(
     title: &str,
     width: f64,
     height: f64,
+    min: Option<(f64, f64)>,
     scene_chrome: bool,
     resizable: bool,
     minimizable: bool,
@@ -2820,6 +2846,12 @@ pub fn create_window(
     // resize below re-runs it — and the first window takes the app's
     // roles: the cross-thread knock, the frame beat, the slow clock
     register_top_level(hwnd, scene_chrome);
+    // the floor too, before that resize asks `WM_GETMINMAXINFO`
+    if let Some(min) = min {
+        WINDOW_MINS.with(|mins| {
+            mins.borrow_mut().insert(hwnd, min);
+        });
+    }
     // files dragged in from the system land on the scene (the mac's
     // `registerForDraggedTypes:`)
     crate::filedrop::register(hwnd);
@@ -3232,6 +3264,24 @@ thread_local! {
     /// gates: a dialog is a second surface over the same scene, and the two
     /// cannot share one pair.
     static DIALOG_GATES: RefCell<HashMap<Hwnd, DialogGates>> = RefCell::new(HashMap::new());
+    /// The dialogs born with an ALERT's frame ([`ALERT_STYLE`]) — what every
+    /// client rect of theirs is framed by.
+    static DIALOG_ALERTS: RefCell<HashSet<Hwnd>> = RefCell::new(HashSet::new());
+}
+
+/// An alert's frame: a caption with the close button alone. No sizing
+/// border, no maximize, no minimize — dropping the bits is what makes the
+/// PLATFORM refuse the gesture, the door's own rule, and the close button
+/// that stays is the ask's cancel answer (`WM_CLOSE` dismisses it).
+const ALERT_STYLE: u32 = WS_OVERLAPPEDWINDOW & !(WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX);
+
+/// The frame style a dialog was born with.
+fn dialog_style(hwnd: Hwnd) -> u32 {
+    if DIALOG_ALERTS.with(|alerts| alerts.borrow().contains(&hwnd)) {
+        ALERT_STYLE
+    } else {
+        WS_OVERLAPPEDWINDOW
+    }
 }
 
 /// One dialog's answers for the platform's hit-test.
@@ -3243,23 +3293,27 @@ struct DialogGates {
 /// A real titled window for an overlay that asked to be one. Shares the window
 /// class — and so the pointer road and the frame driver — with its owner.
 ///
-/// `min_width`/`min_height` are the CONTENT's floor in layout points.
+/// `min_width`/`min_height` are the CONTENT's floor in layout points. `alert`
+/// = an ask's frame ([`ALERT_STYLE`]): one size, which the shell sets from
+/// the layout's fit, never the reader's hand.
 pub fn create_dialog(
     owner: &WindowHandle,
     title: &str,
     min_width: f64,
     min_height: f64,
     scene_chrome: bool,
+    alert: bool,
 ) -> WindowHandle {
     const CW_USEDEFAULT: i32 = i32::MIN;
     let class_name = register_class();
     let wide_title = wide(title);
+    let style = if alert { ALERT_STYLE } else { WS_OVERLAPPEDWINDOW };
     let hwnd = unsafe {
         CreateWindowExW(
             0,
             class_name.as_ptr(),
             wide_title.as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            style | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -3277,6 +3331,11 @@ pub fn create_dialog(
     DIALOG_TITLES.with(|titles| {
         titles.borrow_mut().insert(hwnd, title.to_owned());
     });
+    if alert {
+        DIALOG_ALERTS.with(|alerts| {
+            alerts.borrow_mut().insert(hwnd);
+        });
+    }
     if scene_chrome {
         SCENE_CHROME.with(|windows| {
             windows.borrow_mut().insert(hwnd);
@@ -3356,6 +3415,9 @@ fn forget_dialog(hwnd: Hwnd) {
     SCENE_CHROME.with(|windows| {
         windows.borrow_mut().remove(&hwnd);
     });
+    DIALOG_ALERTS.with(|alerts| {
+        alerts.borrow_mut().remove(&hwnd);
+    });
 }
 
 impl WindowHandle {
@@ -3410,8 +3472,11 @@ impl WindowHandle {
         };
         unsafe {
             if !wears_scene_chrome(self.hwnd) {
-                AdjustWindowRectExForDpi(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0, dpi);
-                AdjustWindowRectExForDpi(&mut floor, WS_OVERLAPPEDWINDOW, 0, 0, dpi);
+                // framed by the frame it WEARS: an alert's has no sizing
+                // border, and the overlapped one's would grow the client
+                let style = dialog_style(self.hwnd);
+                AdjustWindowRectExForDpi(&mut rect, style, 0, 0, dpi);
+                AdjustWindowRectExForDpi(&mut floor, style, 0, 0, dpi);
             }
         }
         if let Some(work) = work_area_of(owner_of(self.hwnd)) {
@@ -4067,7 +4132,7 @@ mod tests {
 
     #[test]
     fn a_window_that_only_loops_arms_the_slow_beat_and_a_spring_takes_it_back() {
-        let window = create_window("bunny pace", 80.0, 60.0, false, true, true);
+        let window = create_window("bunny pace", 80.0, 60.0, None, false, true, true);
         let id = window.raw_window();
         want_pace(id, DriverPace::Slow(0.25));
         assert_eq!(SLOW_STEP.with(Cell::get), Some(0.25), "a loop alone: the slow beat");
@@ -4101,6 +4166,8 @@ mod tests {
         assert_eq!(cursor_id(Cursor::Cell), 32515, "IDC_CROSS");
         assert_eq!(cursor_id(Cursor::Pointing), 32649, "IDC_HAND");
         assert_eq!(cursor_id(Cursor::Arrow), 32512, "IDC_ARROW");
+        assert_eq!(cursor_id(Cursor::ResizeUpLeftDownRight), 32642, "IDC_SIZENWSE");
+        assert_eq!(cursor_id(Cursor::ResizeUpRightDownLeft), 32643, "IDC_SIZENESW");
         // and the system has every one of them
         for cursor in [
             Cursor::Arrow,
@@ -4109,6 +4176,8 @@ mod tests {
             Cursor::Cell,
             Cursor::ResizeLeftRight,
             Cursor::ResizeUpDown,
+            Cursor::ResizeUpLeftDownRight,
+            Cursor::ResizeUpRightDownLeft,
         ] {
             let handle = unsafe { LoadCursorW(0, cursor_id(cursor) as *const u16) };
             assert_ne!(handle, 0, "{cursor:?} loads nothing");
@@ -4119,7 +4188,7 @@ mod tests {
     fn a_window_registers_creates_and_dies() {
         // headless smoke: the class registers and a real window is
         // born and destroyed without a pump
-        let window = create_window("bunny test", 120.0, 90.0, false, true, true);
+        let window = create_window("bunny test", 120.0, 90.0, None, false, true, true);
         let (width, height) = window.content_size();
         assert!(width > 0.0 && height > 0.0);
         assert!(window.scale() >= 1);
@@ -4141,7 +4210,7 @@ mod tests {
 
     #[test]
     fn a_layout_rect_lands_on_screen_and_comes_back() {
-        let window = create_window("bunny screen", 200.0, 150.0, false, true, true);
+        let window = create_window("bunny screen", 200.0, 150.0, None, false, true, true);
         let factor = factor_of(&window);
         let rect = window.layout_rect_to_screen(10.0, 20.0, 30.0, 40.0);
         assert_eq!(rect.right - rect.left, (30.0 * factor).round() as i32);
@@ -4165,8 +4234,8 @@ mod tests {
             let len = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), 64) };
             String::from_utf16_lossy(&buffer[..usize::try_from(len).unwrap_or(0)])
         };
-        let owner = create_window("bunny owner", 200.0, 150.0, false, true, true);
-        let dialog = create_dialog(&owner, "Account", 100.0, 80.0, true);
+        let owner = create_window("bunny owner", 200.0, 150.0, None, false, true, true);
+        let dialog = create_dialog(&owner, "Account", 100.0, 80.0, true, false);
         assert_eq!(caption(dialog.hwnd), "Account");
 
         // the sibling took the overlay's path in the same pass, and with it
@@ -4189,9 +4258,45 @@ mod tests {
         }
     }
 
+    /// An alert's frame is a caption with the close button alone — the
+    /// platform refuses the resize, the maximize and the minimize — and
+    /// its client lands on exactly the size layout fitted, framed by the
+    /// frame it wears rather than the sizing border it does not have.
+    #[test]
+    fn an_alert_wears_a_caption_with_the_close_button_alone() {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
+        }
+        const GWL_STYLE: i32 = -16;
+        let owner = create_window("bunny owner", 400.0, 300.0, None, false, true, true);
+        let alert = create_dialog(&owner, "Unsaved Changes", 420.0, 150.0, false, true);
+        let style = unsafe { GetWindowLongPtrW(alert.hwnd, GWL_STYLE) } as u32;
+        assert_eq!(style & (WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX), 0, "{style:#x}");
+        assert_ne!(style & WS_OVERLAPPEDWINDOW, 0, "a caption and its close button stay");
+
+        let client = owner.layout_rect_to_screen(10.0, 10.0, 420.0, 150.0);
+        alert.set_dialog_client_frame(client);
+        let placed = alert.client_rect_screen();
+        assert_eq!(
+            (placed.right - placed.left, placed.bottom - placed.top),
+            (client.right - client.left, client.bottom - client.top),
+            "the client is the fitted size, not a sizing border short of it",
+        );
+
+        alert.close_dialog();
+        assert!(
+            DIALOG_ALERTS.with(|alerts| !alerts.borrow().contains(&alert.hwnd)),
+            "a closed alert leaves no frame memory behind",
+        );
+        unsafe {
+            DestroyWindow(owner.hwnd);
+        }
+    }
+
     #[test]
     fn a_panel_translates_its_events_into_the_scene() {
-        let window = create_window("bunny panel", 100.0, 80.0, false, true, true);
+        let window = create_window("bunny panel", 100.0, 80.0, None, false, true, true);
         let panel = create_panel(&window);
         panel.set_scene_origin(300.0, -20.0);
         let factor = factor_of(&window);
@@ -4209,7 +4314,7 @@ mod tests {
     #[test]
     fn a_host_mounts_places_and_sweeps() {
         use std::cell::Cell;
-        let window = create_window("bunny host", 200.0, 150.0, false, true, true);
+        let window = create_window("bunny host", 200.0, 150.0, None, false, true, true);
         let factor = factor_of(&window);
         let px = |v: f64| (v * factor).round() as i32;
 
@@ -4311,7 +4416,7 @@ mod tests {
 
     #[test]
     fn the_layered_copy_premultiplies_into_bgra() {
-        let window = create_window("bunny layered", 60.0, 40.0, false, true, true);
+        let window = create_window("bunny layered", 60.0, 40.0, None, false, true, true);
         let panel = create_panel(&window);
         // one half-transparent red pixel: premultiplied BGRA
         panel.present_layered(
@@ -4346,7 +4451,7 @@ mod tests {
 
     #[test]
     fn a_wake_crosses_threads_into_the_pump() {
-        let window = create_window("bunny wake", 80.0, 60.0, false, true, true);
+        let window = create_window("bunny wake", 80.0, 60.0, None, false, true, true);
         let hwnd = window.hwnd;
         let handle = std::thread::spawn(move || {
             // the thread-safe half of the pump, from another thread
@@ -4373,7 +4478,7 @@ mod tests {
     #[test]
     fn the_backing_holds_the_swizzled_rows()
     {
-        let window = create_window("bunny backing", 64.0, 64.0, false, true, true);
+        let window = create_window("bunny backing", 64.0, 64.0, None, false, true, true);
         let width = 8usize;
         let height = 4usize;
         let mut rgba = vec![0u8; width * height * 4];
@@ -4392,5 +4497,19 @@ mod tests {
         unsafe {
             DestroyWindow(window.hwnd);
         }
+    }
+
+    #[test]
+    fn a_window_floor_answers_the_frame_and_leaves_with_the_window() {
+        let window = create_window("bunny floor", 800.0, 600.0, Some((720.0, 480.0)), false, true, true);
+        assert_eq!(content_floor(window.hwnd), Some((720.0, 480.0)), "WM_GETMINMAXINFO answers from this");
+        assert!(!is_dialog(window.hwnd), "a floor does not make a window a dialog");
+        let plain = create_window("bunny plain", 800.0, 600.0, None, false, true, true);
+        assert_eq!(content_floor(plain.hwnd), None, "no floor: the platform answers alone");
+        unsafe {
+            DestroyWindow(window.hwnd);
+            DestroyWindow(plain.hwnd);
+        }
+        assert_eq!(content_floor(window.hwnd), None, "a closed window leaves no floor behind");
     }
 }

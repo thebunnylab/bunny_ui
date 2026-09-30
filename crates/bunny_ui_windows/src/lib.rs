@@ -117,11 +117,13 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
 /// ```ignore
 /// WindowSpec::titled("Trinity Mail").size(1080.0, 720.0)
 /// WindowSpec::titled("New message").size(720.0, 560.0)
+/// WindowSpec::titled("Trinity").size(1280.0, 800.0).min_size(720.0, 480.0)
 /// ```
 #[derive(Clone, Debug)]
 pub struct WindowSpec {
     title: Rc<str>,
     size: Size,
+    min: Option<Size>,
     chrome: Chrome,
     resizable: bool,
     minimizable: bool,
@@ -133,10 +135,36 @@ impl WindowSpec {
         WindowSpec {
             title: title.into(),
             size: Size { width: 1024.0, height: 640.0 },
+            min: None,
             chrome: Chrome::Native,
             resizable: true,
             minimizable: true,
         }
+    }
+
+    /// The smallest content the reader may drag the window down to — the
+    /// answer `WM_GETMINMAXINFO` gives, as it already does for a dialog's
+    /// floor. The mac's spec says the same with `setContentMinSize:`.
+    #[must_use]
+    pub fn min_size(mut self, width: f64, height: f64) -> WindowSpec {
+        self.min = Some(Size { width, height });
+        self
+    }
+
+    /// The floor [`WindowSpec::min_size`] set, if one was.
+    #[must_use]
+    pub fn min(&self) -> Option<Size> {
+        self.min
+    }
+
+    /// The size the window opens at: [`WindowSpec::size`], raised to the
+    /// floor on any axis that asked for less.
+    #[must_use]
+    pub fn opening_size(&self) -> Size {
+        self.min.map_or(self.size, |min| Size {
+            width: self.size.width.max(min.width),
+            height: self.size.height.max(min.height),
+        })
     }
 
     /// A door has ONE size: no resize border, no zoom box. The mac's spec has
@@ -394,10 +422,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
+    let size = spec.opening_size();
     let window = ffi::create_window(
         &spec.title,
-        spec.size.width,
-        spec.size.height,
+        size.width,
+        size.height,
+        spec.min.map(|min| (min.width, min.height)),
         spec.chrome == Chrome::Scene,
         spec.resizable,
         spec.minimizable,
@@ -631,12 +661,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // each overlay re-presents its own slice on an owned panel
             // in screen coordinates — that is how it leaves the window
             let all_overlays = runtime.overlays();
-            // An overlay that asked to BE a window takes a different road from
-            // one that rides a panel: the platform draws its frame, the reader
-            // moves it, and its own close button dismisses it.
+            // An overlay that asked to BE a window — a dialog or an alert —
+            // takes a different road from one that rides a panel: the
+            // platform draws its frame, the reader moves it, and its own
+            // close button dismisses it.
             let (window_overlays, overlays): (Vec<_>, Vec<_>) =
                 all_overlays.iter().cloned().partition(|overlay| {
-                    matches!(overlay.surface, bunny_ui::layout::OverlaySurface::Window(_))
+                    !matches!(overlay.surface, bunny_ui::layout::OverlaySurface::Layer)
                 });
             // Where the window's OWN content ends. Every overlay — a panel's
             // and a dialog's alike — is carried by its own surface, so the cut
@@ -658,28 +689,34 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     }
                 }
                 for overlay in &window_overlays {
-                    let bunny_ui::layout::OverlaySurface::Window(spec) = &overlay.surface else {
-                        continue;
-                    };
                     let x = overlay.frame.origin.x;
                     let y = overlay.frame.origin.y;
                     let w = overlay.frame.size.width;
                     let h = overlay.frame.size.height;
-                    // `DialogChrome::Scene` is the content saying it owns its
-                    // own top edge — the mac places the native lights inside
-                    // it; here there are none to place, and the scene draws
-                    // its own `.window_control(…)` regions instead.
-                    let scene_chrome =
-                        matches!(spec.chrome, bunny_ui::layout::DialogChrome::Scene { .. });
+                    // what the window is born as: a dialog's title, floor and
+                    // chrome, or an alert's — whose floor is its one size,
+                    // under the system's caption with the close button alone
+                    let (title, min, scene_chrome, alert) = match &overlay.surface {
+                        // `DialogChrome::Scene` is the content saying it owns
+                        // its own top edge — the mac places the native lights
+                        // inside it; here there are none to place, and the
+                        // scene draws its own `.window_control(…)` regions
+                        // instead.
+                        bunny_ui::layout::OverlaySurface::Window(spec) => (
+                            &spec.title,
+                            (spec.min.width, spec.min.height),
+                            matches!(spec.chrome, bunny_ui::layout::DialogChrome::Scene { .. }),
+                            false,
+                        ),
+                        bunny_ui::layout::OverlaySurface::Alert(spec) => {
+                            (&spec.title, (w, h), false, true)
+                        }
+                        bunny_ui::layout::OverlaySurface::Layer => continue,
+                    };
                     let opening = !store.contains_key(&overlay.path);
                     let dialog = store.entry(overlay.path.clone()).or_insert_with(|| {
-                        let dialog = ffi::create_dialog(
-                            &window,
-                            &spec.title,
-                            spec.min.width,
-                            spec.min.height,
-                            scene_chrome,
-                        );
+                        let dialog =
+                            ffi::create_dialog(&window, title, min.0, min.1, scene_chrome, alert);
                         dialog.stands_for(&overlay.path);
                         // Its own answers for the hit-test, from the OWNER's
                         // runtime: the dialog's content was laid out in the
@@ -710,7 +747,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         );
                         dialog
                     });
-                    dialog.dress_dialog(&spec.title, spec.min.width, spec.min.height);
+                    dialog.dress_dialog(title, min.0, min.1);
                     if !scene_chrome {
                         // a system-drawn bar still wears the scene's
                         // appearance: a dark workbench under a white caption
@@ -726,6 +763,16 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         // not yanked back every frame
                         dialog.set_dialog_client_frame(window.layout_rect_to_screen(x, y, w, h));
                         dialog.show_dialog();
+                    } else if alert {
+                        // …except an alert's SIZE, which is its content's: a
+                        // taller ask grows the window where the reader left it
+                        let (at_x, at_y, held_w, held_h) =
+                            window.screen_rect_to_layout(dialog.client_rect_screen());
+                        if (held_w - w).abs() > 0.5 || (held_h - h).abs() > 0.5 {
+                            dialog.set_dialog_client_frame(
+                                window.layout_rect_to_screen(at_x, at_y, w, h),
+                            );
+                        }
                     }
                     // layout follows the real window: the frame the reader
                     // left it at is what the next pass lays out against
@@ -1429,8 +1476,9 @@ fn pace_of(runtime: &Runtime) -> ffi::DriverPace {
 /// the seam, and hovering the grip announces it. Otherwise the BOX under the
 /// pointer answers first (`Runtime::hovered_cursor`): text wants an I-beam and
 /// a sheet's cells the cross, which the old rule — the hand over anything
-/// hoverable — could not know, so text read as a link. Only where no box
-/// answers does that rule stand.
+/// hoverable — could not know, so text read as a link, and a frame's grip the
+/// resizer of the way its edge travels. Only where no box answers does that
+/// rule stand.
 fn desired_cursor(
     seam: Option<Axis>,
     asked: Option<bunny_ui::layout::Cursor>,
@@ -1439,9 +1487,15 @@ fn desired_cursor(
     use bunny_ui::layout::Cursor as Asked;
     match (seam, asked) {
         // lanes side by side: the seam travels left and right
-        (Some(Axis::Horizontal), _) => ffi::Cursor::ResizeLeftRight,
+        (Some(Axis::Horizontal), _) | (None, Some(Asked::ResizeLeftRight)) => {
+            ffi::Cursor::ResizeLeftRight
+        }
         // lanes stacked: it travels up and down
-        (Some(Axis::Vertical), _) => ffi::Cursor::ResizeUpDown,
+        (Some(Axis::Vertical), _) | (None, Some(Asked::ResizeUpDown)) => {
+            ffi::Cursor::ResizeUpDown
+        }
+        (None, Some(Asked::ResizeUpLeftDownRight)) => ffi::Cursor::ResizeUpLeftDownRight,
+        (None, Some(Asked::ResizeUpRightDownLeft)) => ffi::Cursor::ResizeUpRightDownLeft,
         (None, Some(Asked::Text)) => ffi::Cursor::Text,
         (None, Some(Asked::Pointing)) => ffi::Cursor::Pointing,
         (None, Some(Asked::Cell)) => ffi::Cursor::Cell,
@@ -1454,6 +1508,22 @@ fn desired_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_has_no_floor_until_its_spec_names_one() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0);
+        assert_eq!(spec.min(), None);
+        assert_eq!(spec.opening_size(), Size { width: 1280.0, height: 800.0 });
+    }
+
+    #[test]
+    fn a_floor_is_kept_and_the_window_opens_over_it() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0).min_size(720.0, 480.0);
+        assert_eq!(spec.min(), Some(Size { width: 720.0, height: 480.0 }));
+        assert_eq!(spec.opening_size(), Size { width: 1280.0, height: 800.0 });
+        let narrow = WindowSpec::titled("Trinity").size(600.0, 900.0).min_size(720.0, 480.0);
+        assert_eq!(narrow.opening_size(), Size { width: 720.0, height: 900.0 });
+    }
 
     #[test]
     fn the_box_under_the_pointer_names_its_cursor_before_the_hover_rule() {
@@ -1473,6 +1543,21 @@ mod tests {
             ffi::Cursor::ResizeLeftRight
         );
         assert_eq!(desired_cursor(Some(Axis::Vertical), None, false), ffi::Cursor::ResizeUpDown);
+        // a frame's grip wears the resizer of the way its edge travels —
+        // hoverable or not, it is never the hand
+        assert_eq!(
+            desired_cursor(None, Some(Asked::ResizeLeftRight), true),
+            ffi::Cursor::ResizeLeftRight
+        );
+        assert_eq!(desired_cursor(None, Some(Asked::ResizeUpDown), true), ffi::Cursor::ResizeUpDown);
+        assert_eq!(
+            desired_cursor(None, Some(Asked::ResizeUpLeftDownRight), true),
+            ffi::Cursor::ResizeUpLeftDownRight
+        );
+        assert_eq!(
+            desired_cursor(None, Some(Asked::ResizeUpRightDownLeft), false),
+            ffi::Cursor::ResizeUpRightDownLeft
+        );
     }
 
     fn stroke(vk: u32, base: &str, shift: bool, control: bool, alt: bool) -> ffi::KeyStroke {

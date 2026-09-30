@@ -53,6 +53,7 @@ pub mod host;
 pub mod icon;
 pub mod image_engine;
 pub mod layout;
+mod loans;
 pub mod modifier;
 pub mod one_of;
 #[cfg(feature = "gpu")]
@@ -141,7 +142,7 @@ pub mod prelude {
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{
-        Color, CrossAlign, DialogChrome, DialogSpec, Edges, Fraction, Glass, Gradient,
+        AlertSpec, Color, CrossAlign, DialogChrome, DialogSpec, Edges, Fraction, Glass, Gradient,
         OverlaySurface, Point, Proposal, Px, Rect, Rendering, Side, Size, Truncation, UnitPoint,
         VisualProps,
     };
@@ -6305,6 +6306,192 @@ mod tests {
         assert!(focused_field(), "a new beat is a new intent");
     }
 
+    /// The picker over an editor, from the keyboard's side: ⌘⇧P mounts a
+    /// query under a beat, which takes the keys from the box that held
+    /// them, and Escape unmounts it STILL HOLDING them. A beat borrows:
+    /// the keys go home, so a picker that closes never strands them.
+    #[test]
+    fn a_field_beat_gives_back_the_keyboard_it_borrowed() {
+        use crate::layout::{Proposal, Size};
+
+        struct Pane;
+
+        impl CustomElement for Pane {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+        }
+
+        #[derive(Clone, Copy)]
+        struct Desk {
+            query: State<String>,
+            open: State<bool>,
+        }
+
+        impl Component for Desk {
+            fn body(self, _ctx: &Context) -> impl View {
+                let picker = self.open.get().then(|| {
+                    text_field("query", self.query.binding()).id("query").auto_focus_beat(1)
+                });
+                vstack!(
+                    picker,
+                    custom(Pane).id("editor").frame(300.0, 100.0),
+                    custom(Pane).id("terminal").frame(300.0, 100.0),
+                )
+            }
+        }
+
+        let desk = Desk { query: State::new(String::new()), open: State::new(false) };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 320.0, height: 280.0 });
+        let lay = || {
+            runtime.render_stable(&desk);
+            runtime.layout(&desk, viewport)
+        };
+        let press = |result: &crate::layout::LayoutResult, name: &str| {
+            let tail = format!("[{name}]");
+            let pane = result
+                .customs
+                .iter()
+                .find(|placement| placement.path.ends_with(&tail))
+                .expect("the pane is placed")
+                .frame;
+            runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+            runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
+            runtime.focused().expect("a press on a pane holds the keys")
+        };
+        let holds_query = || runtime.focused().is_some_and(|path| path.ends_with("[query]"));
+
+        // the reader works in the editor
+        let result = lay();
+        let editor = press(&result, "editor");
+
+        // ⌘⇧P: the query borrows the keys …
+        desk.open.set(true);
+        lay();
+        assert!(holds_query(), "the beat takes the keys from the editor");
+
+        // … and Escape closes it while it holds them: they go home
+        desk.open.set(false);
+        lay();
+        assert_eq!(runtime.focused(), Some(editor), "the borrowed keyboard went back");
+
+        // the reader moved on before the close: that move stands
+        desk.open.set(true);
+        let result = lay();
+        assert!(holds_query(), "a new mount claims again under the same beat");
+        let terminal = press(&result, "terminal");
+        desk.open.set(false);
+        lay();
+        assert_eq!(
+            runtime.focused(),
+            Some(terminal),
+            "a borrower the keys already left gives nothing back",
+        );
+
+        // nobody held the keys: nobody is owed them
+        runtime.blur();
+        desk.open.set(true);
+        lay();
+        assert!(holds_query(), "a beat takes a free keyboard too");
+        desk.open.set(false);
+        lay();
+        assert_eq!(runtime.focused(), None, "a free keyboard is not owed to anyone");
+    }
+
+    /// A borrower can lend in turn — a picker's query opens another picker
+    /// over it. The road home walks to the first input still on screen:
+    /// past a borrower that left WITH the keys' holder, past one that left
+    /// first, and to nobody when the lender itself is gone.
+    #[test]
+    fn a_borrowed_keyboard_walks_home_past_borrowers_that_left() {
+        use crate::layout::{Proposal, Size};
+
+        struct Pane;
+
+        impl CustomElement for Pane {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+        }
+
+        #[derive(Clone, Copy)]
+        struct Desk {
+            query: State<String>,
+            outer: State<bool>,
+            inner: State<bool>,
+            editor: State<bool>,
+        }
+
+        impl Component for Desk {
+            fn body(self, _ctx: &Context) -> impl View {
+                let outer = self.outer.get().then(|| {
+                    text_field("outer", self.query.binding()).id("outer").auto_focus_beat(1)
+                });
+                let inner = self.inner.get().then(|| {
+                    text_field("inner", self.query.binding()).id("inner").auto_focus_beat(1)
+                });
+                let editor = self.editor.get().then(|| custom(Pane).id("editor").frame(300.0, 100.0));
+                vstack!(outer, inner, editor)
+            }
+        }
+
+        let desk = Desk {
+            query: State::new(String::new()),
+            outer: State::new(false),
+            inner: State::new(false),
+            editor: State::new(true),
+        };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 320.0, height: 280.0 });
+        let lay = || {
+            runtime.render_stable(&desk);
+            runtime.layout(&desk, viewport)
+        };
+        let holds = |name: &str| {
+            let tail = format!("[{name}]");
+            runtime.focused().is_some_and(|path| path.ends_with(&tail))
+        };
+        let open = |outer: bool, inner: bool| {
+            desk.outer.set(outer);
+            desk.inner.set(inner);
+            lay();
+        };
+
+        let result = lay();
+        let pane = result.customs.first().expect("the editor is placed").frame;
+        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        let editor = runtime.focused().expect("the editor holds the keys");
+
+        // the outer borrows from the editor, the inner from the outer —
+        // and both close in one pass: the inner's lender left with it
+        open(true, false);
+        open(true, true);
+        assert!(holds("inner"), "the inner borrowed from the outer");
+        open(false, false);
+        assert_eq!(runtime.focused(), Some(editor.clone()), "home is the first lender still here");
+
+        // the middle of the chain leaves FIRST, without the keys: it hands
+        // its own lender down to the one that borrowed from it
+        open(true, false);
+        open(true, true);
+        open(false, true);
+        assert!(holds("inner"), "the outer left without the keys");
+        open(false, false);
+        assert_eq!(runtime.focused(), Some(editor), "the outer's lender was handed down");
+
+        // the lender itself is gone: nothing is revived
+        open(true, false);
+        desk.editor.set(false);
+        lay();
+        assert!(holds("outer"));
+        open(false, false);
+        assert_eq!(runtime.focused(), None, "a lender that left is not revived");
+    }
+
     #[test]
     fn the_many_line_field_owns_the_break_and_the_vertical_arrows() {
         use crate::layout::{Proposal, Size};
@@ -10091,6 +10278,7 @@ mod tests {
                 assert_eq!(spec.min, Size { width: 300.0, height: 200.0 });
             }
             OverlaySurface::Layer => panic!("a dialog asks for a window, not a layer"),
+            OverlaySurface::Alert(_) => panic!("a dialog is a workspace, not an ask"),
         }
         assert_eq!(
             dialog.frame.size,
@@ -10376,6 +10564,318 @@ mod tests {
         runtime.render_stable(&stage);
         assert!(stage.open.get(), "the dialog is still up");
         assert_eq!(stage.behind.get(), 0, "and the press reached nothing behind it");
+    }
+
+    /// An `.alert` is the dialog's lowering asking for an ALERT's window,
+    /// and it has one size: the spec's width and the content's own height
+    /// there, centred like the sheet it degrades to. The reader may move
+    /// it — the window's travels land in `set_dialog_frame` — but no
+    /// reported size resizes it; a taller content grows it where it
+    /// stands. An app switch leaves it standing, and once answered it
+    /// forgets the spot: the next ask opens centred again.
+    #[test]
+    fn an_alert_is_one_size_its_content_fits_and_opens_centred_every_time() {
+        use crate::layout::{AlertSpec, OverlaySurface, Point, Proposal, Rect, Size};
+
+        const WINDOW: Size = Size { width: 800.0, height: 600.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            open: State<bool>,
+            tall: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let tall = self.tall;
+                text("the page").frame(WINDOW.width, WINDOW.height).alert(
+                    self.open.binding(),
+                    AlertSpec::new("Unsaved Changes", 300.0),
+                    move |_| erased(text("ask").frame(200.0, if tall.get() { 140.0 } else { 90.0 })),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { open: State::new(true), tall: State::new(false) };
+        let first = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(first.overlays.len(), 1, "the ask is presented on its own");
+        let alert = &first.overlays[0];
+        let OverlaySurface::Alert(spec) = &alert.surface else {
+            panic!("an alert asks for an alert's window, got {:?}", alert.surface)
+        };
+        assert_eq!(*spec, AlertSpec::new("Unsaved Changes", 300.0));
+        assert_eq!(
+            alert.frame,
+            Rect { origin: Point { x: 250.0, y: 255.0 }, size: Size { width: 300.0, height: 90.0 } },
+            "the spec's width, the content's height, centred",
+        );
+
+        // the reader dragged it, and the shell reported a size it never had
+        let path = alert.path.clone();
+        runtime.set_dialog_frame(
+            &path,
+            Rect { origin: Point { x: 40.0, y: 50.0 }, size: Size { width: 900.0, height: 20.0 } },
+        );
+        let moved = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(
+            moved.overlays[0].frame,
+            Rect { origin: Point { x: 40.0, y: 50.0 }, size: Size { width: 300.0, height: 90.0 } },
+            "the spot is the reader's, the size the content's",
+        );
+
+        // a taller ask grows the window where it stands
+        page.tall.set(true);
+        let grown = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(grown.overlays[0].frame.size, Size { width: 300.0, height: 140.0 });
+        assert_eq!(grown.overlays[0].frame.origin, Point { x: 40.0, y: 50.0 });
+
+        // an app switch closes popovers; an ask is a window, and stands
+        runtime.dismiss_all_overlays();
+        runtime.render_stable(&page);
+        assert!(page.open.get(), "an app switch is not an answer");
+
+        // answered, it forgets the spot: the next ask opens centred
+        page.open.set(false);
+        assert!(runtime.settled_layout(&page, Proposal::exact(WINDOW)).overlays.is_empty());
+        page.open.set(true);
+        let again = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(
+            again.overlays[0].frame.origin,
+            Point { x: 250.0, y: 230.0 },
+            "a question appears where questions appear",
+        );
+    }
+
+    /// An open alert's keys are its own. Return runs what the content
+    /// mounted under `ALERT_DEFAULT`; Escape, ⌘. and the window's close
+    /// button all write `false` to the binding — the app's cancel answer.
+    /// And the page under it is DEAF: its ⌘W would close the very tab an
+    /// unsaved-work ask is about, and a chord it began before the ask
+    /// cannot finish beneath it. Answered, the page hears its keys again.
+    #[test]
+    fn an_alert_answers_its_own_keys_and_the_page_under_it_hears_none() {
+        use crate::action::{ALERT_CANCEL, ALERT_DEFAULT, KeyMatch};
+        use crate::layout::{AlertSpec, Proposal, Size};
+
+        const CLOSE_TAB: ActionId = ActionId("page.close_tab");
+        const THEMES: ActionId = ActionId("page.themes");
+        const WINDOW: Size = Size { width: 800.0, height: 600.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            open: State<bool>,
+            answer: State<&'static str>,
+            heard: State<i32>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let (open, answer, heard) = (self.open, self.answer, self.heard);
+                text("the page")
+                    .frame(WINDOW.width, WINDOW.height)
+                    .on_action(CLOSE_TAB, move || heard.add(1))
+                    .on_action(THEMES, move || heard.add(10))
+                    .alert(
+                        Binding::new(
+                            move || open.get(),
+                            move |shown: bool| {
+                                if !shown {
+                                    open.set(false);
+                                    answer.set("cancel");
+                                }
+                            },
+                        ),
+                        AlertSpec::new("Delete", 300.0),
+                        move |_| {
+                            erased(text("Delete the file?").frame(200.0, 60.0).on_action(
+                                ALERT_DEFAULT,
+                                move || {
+                                    open.set(false);
+                                    answer.set("default");
+                                },
+                            ))
+                        },
+                    )
+            }
+        }
+
+        let runtime = Runtime::new();
+        runtime.bind(KeyPattern::command(Key::Char('w')), CLOSE_TAB);
+        runtime.bind_sequence(
+            &[KeyPattern::command(Key::Char('k')), KeyPattern::command(Key::Char('t'))],
+            THEMES,
+        );
+        let page = Page { open: State::new(false), answer: State::new("none"), heard: State::new(0) };
+        let lay = || {
+            runtime.render_stable(&page);
+            runtime.layout(&page, Proposal::exact(WINDOW))
+        };
+        let press = |pattern: KeyPattern| match runtime.chord(&pattern) {
+            KeyMatch::Action(action) => {
+                runtime.dispatch_action(action);
+                runtime.render_stable(&page);
+                Some(action)
+            }
+            KeyMatch::Pending | KeyMatch::None => None,
+        };
+        let ask = |answer: &'static str| {
+            page.open.set(true);
+            page.answer.set(answer);
+            lay()
+        };
+
+        // the page begins a chord, then the ask arrives
+        lay();
+        assert_eq!(runtime.chord(KeyPattern::command(Key::Char('k'))), KeyMatch::Pending);
+        ask("none");
+        assert_eq!(press(KeyPattern::command(Key::Char('t'))), None, "the chord died under the ask");
+        assert_eq!(press(KeyPattern::command(Key::Char('w'))), None, "⌘W reaches nothing under it");
+        assert_eq!(page.heard.get(), 0, "the page heard neither");
+
+        // Return presses the default button
+        assert_eq!(press(KeyPattern::key(Key::Enter)), Some(ALERT_DEFAULT));
+        assert_eq!(page.answer.get(), "default");
+        assert!(!page.open.get(), "and the answer closed the ask");
+
+        // Escape is the cancel answer, and so is the mac's ⌘.
+        for cancel in [KeyPattern::key(Key::Escape), KeyPattern::command(Key::Char('.'))] {
+            ask("none");
+            assert_eq!(press(cancel), Some(ALERT_CANCEL), "{cancel:?}");
+            assert_eq!(page.answer.get(), "cancel", "{cancel:?}");
+            assert!(!page.open.get(), "{cancel:?}");
+        }
+
+        // the window's close button takes the same road
+        let placed = ask("none");
+        assert!(runtime.dismiss_overlay(&placed.overlays[0].path), "the dismissal answered");
+        runtime.render_stable(&page);
+        assert_eq!(page.answer.get(), "cancel", "closing is the cancel answer");
+
+        // answered, the page hears its own keys again
+        lay();
+        assert_eq!(press(KeyPattern::command(Key::Char('w'))), Some(CLOSE_TAB));
+        assert_eq!(page.heard.get(), 1);
+    }
+
+    /// An alert holds the keyboard ITSELF while it asks — nothing types
+    /// into the box under an unsaved-work ask — and it holds it on LOAN:
+    /// answered, the keys go back to the box that held them, without a
+    /// click. Nobody held them? Then nobody is owed them.
+    #[test]
+    fn an_alert_holds_the_keyboard_while_it_asks_and_gives_it_back() {
+        use crate::layout::{AlertSpec, Proposal, Size};
+
+        struct Pane;
+
+        impl CustomElement for Pane {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+        }
+
+        #[derive(Clone, Copy)]
+        struct Desk {
+            open: State<bool>,
+        }
+
+        impl Component for Desk {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Pane).id("editor").frame(300.0, 200.0).alert(
+                    self.open.binding(),
+                    AlertSpec::new("Unsaved Changes", 260.0),
+                    |_| erased(text("a.rs has unsaved changes").frame(200.0, 60.0)),
+                )
+            }
+        }
+
+        let desk = Desk { open: State::new(false) };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 320.0, height: 240.0 });
+        let lay = || {
+            runtime.render_stable(&desk);
+            runtime.layout(&desk, viewport)
+        };
+        let result = lay();
+        let pane = result.customs.first().expect("the pane is placed").frame;
+        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        let editor = runtime.focused().expect("a press on the pane holds the keys");
+
+        // the ask opens: the alert takes the keys, and holds them itself
+        desk.open.set(true);
+        let result = lay();
+        let alert = result.overlays[0].path.clone();
+        assert_eq!(runtime.focused(), Some(alert.clone()), "the alert holds the keyboard");
+        assert!(!runtime.focus_takes_text(), "and types nothing");
+        assert!(
+            !runtime.key_stroke(KeyPattern::key(Key::Enter)).handled,
+            "no box under the ask hears a stroke",
+        );
+        lay();
+        assert_eq!(runtime.focused(), Some(alert), "it keeps them from pass to pass");
+
+        // answered: the keys go home
+        desk.open.set(false);
+        lay();
+        assert_eq!(runtime.focused(), Some(editor), "the lent keyboard went back");
+
+        // nobody held them: nobody is owed them
+        runtime.blur();
+        desk.open.set(true);
+        lay();
+        assert!(runtime.focused().is_some(), "the ask takes a free keyboard too");
+        desk.open.set(false);
+        lay();
+        assert_eq!(runtime.focused(), None, "and owes it to nobody");
+    }
+
+    /// A modal question closes what floated over the page: a dropdown left
+    /// open closes through its OWN dismissal the pass the ask opens, so
+    /// nothing transient stands beside the alert or stays clickable above
+    /// its floor — the way a system alert closes the menus.
+    #[test]
+    fn an_alert_closes_the_popovers_floating_over_the_page() {
+        use crate::layout::{AlertSpec, OverlaySurface, Proposal, Side, Size};
+
+        const WINDOW: Size = Size { width: 800.0, height: 600.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            menu: State<bool>,
+            asking: State<bool>,
+            dismissed: State<i32>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let dismissed = self.dismissed;
+                text("Theme")
+                    .frame(80.0, 24.0)
+                    .popover_on_dismiss(
+                        self.menu.binding(),
+                        Side::Bottom,
+                        move || dismissed.add(1),
+                        |_| erased(text("Islands Dark").frame(120.0, 60.0)),
+                    )
+                    .frame(WINDOW.width, WINDOW.height)
+                    .alert(
+                        self.asking.binding(),
+                        AlertSpec::new("Delete", 300.0),
+                        |_| erased(text("Delete the file?").frame(200.0, 60.0)),
+                    )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { menu: State::new(true), asking: State::new(false), dismissed: State::new(0) };
+        let open = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert_eq!(open.overlays.len(), 1, "the dropdown floats over the page");
+
+        page.asking.set(true);
+        let asked = runtime.settled_layout(&page, Proposal::exact(WINDOW));
+        assert!(!page.menu.get(), "the ask closed the dropdown");
+        assert_eq!(page.dismissed.get(), 1, "through the dropdown's own dismissal");
+        assert_eq!(asked.overlays.len(), 1, "and the alert stands alone");
+        assert!(matches!(asked.overlays[0].surface, OverlaySurface::Alert(_)));
     }
 
     #[test]

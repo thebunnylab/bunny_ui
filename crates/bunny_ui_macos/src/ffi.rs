@@ -88,6 +88,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_id_u64(obj: Id, sel: Sel, a: u64) -> Id;
     #[link_name = "objc_msgSend"]
+    fn msg_id_u64_u64(obj: Id, sel: Sel, a: u64, b: u64) -> Id;
+    #[link_name = "objc_msgSend"]
     fn msg_bool_id_id(obj: Id, sel: Sel, a: Id, b: Id) -> i8;
     #[link_name = "objc_msgSend"]
     fn msg_bool_id(obj: Id, sel: Sel, a: Id) -> i8;
@@ -2493,24 +2495,35 @@ impl WindowHandle {
         if LAST_CURSOR.with(|last| last.replace(Some(cursor))) == Some(cursor) {
             return;
         }
-        let name = match cursor {
-            Cursor::Arrow => "arrowCursor",
-            Cursor::Text => "IBeamCursor",
-            Cursor::Pointing => "pointingHandCursor",
-            Cursor::Cell => "crosshairCursor",
-            Cursor::ResizeLeftRight => "resizeLeftRightCursor",
-            Cursor::ResizeUpDown => "resizeUpDownCursor",
-        };
         unsafe {
-            msg_void(msg_id(class("NSCursor"), sel(name)), sel("set"));
+            msg_void(shape_of(cursor), sel("set"));
+        }
+    }
+}
+
+/// The `NSCursor` an outfit wears on this system. A frame's edge wears the
+/// cursor a window's own edge shows — macOS 15's, asked for only where the
+/// class answers it — and everything else, everywhere, its class property.
+unsafe fn shape_of(cursor: Cursor) -> Id {
+    unsafe {
+        let cursors = class("NSCursor");
+        let framed = frame_position(cursor).filter(|_| {
+            msg_bool_sel(cursors, sel("respondsToSelector:"), sel(FRAME_RESIZE)) != 0
+        });
+        match framed {
+            Some(position) => {
+                msg_id_u64_u64(cursors, sel(FRAME_RESIZE), position, FRAME_RESIZE_ALL)
+            }
+            None => msg_id(cursors, sel(classic_name(cursor))),
         }
     }
 }
 
 /// What the pointer wears: the hand over an interactive target, a
 /// resizer over a split's grip — the one that matches the way THAT
-/// seam travels — and the arrow elsewhere.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// seam travels — a frame's resizer over the edge a box lets the hand
+/// drag, and the arrow elsewhere.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cursor {
     Arrow,
     /// The I-beam, for text a press puts a caret in.
@@ -2518,8 +2531,63 @@ pub enum Cursor {
     Pointing,
     /// The crosshair, for a grid of cells a press selects a rectangle of.
     Cell,
+    /// A split's seam between lanes side by side — a divider, not a frame.
     ResizeLeftRight,
+    /// A split's seam between stacked lanes.
     ResizeUpDown,
+    /// A frame's side edge, the way a window's own edge wears it.
+    FrameLeftRight,
+    /// A frame's top or bottom edge.
+    FrameUpDown,
+    /// A frame's top-left or bottom-right corner (↖↘).
+    FrameUpLeftDownRight,
+    /// A frame's top-right or bottom-left corner (↗↙).
+    FrameUpRightDownLeft,
+}
+
+/// macOS 15's frame cursor: `+[NSCursor
+/// frameResizeCursorFromPosition:inDirections:]`, the cursor a window's own
+/// edges wear. Apple splits the resizers in two — a divider re-positioned
+/// and a rectangular frame resized — and the older `resizeLeftRightCursor`
+/// family is the divider's.
+const FRAME_RESIZE: &str = "frameResizeCursorFromPosition:inDirections:";
+
+/// `NSCursorFrameResizeDirectionsAll`: the arrow points both ways.
+const FRAME_RESIZE_ALL: u64 = 0b11;
+
+/// Where on a frame each frame outfit sits, in `NSCursorFrameResizePosition`
+/// bits (top 1, left 2, bottom 4, right 8) — any position on the axis draws
+/// the same two-way arrow, so each outfit names one. `None` for an outfit
+/// that is not a frame's.
+const fn frame_position(cursor: Cursor) -> Option<u64> {
+    match cursor {
+        Cursor::FrameLeftRight => Some(8),
+        Cursor::FrameUpDown => Some(4),
+        Cursor::FrameUpLeftDownRight => Some(4 | 8),
+        Cursor::FrameUpRightDownLeft => Some(4 | 2),
+        Cursor::Arrow
+        | Cursor::Text
+        | Cursor::Pointing
+        | Cursor::Cell
+        | Cursor::ResizeLeftRight
+        | Cursor::ResizeUpDown => None,
+    }
+}
+
+/// The `NSCursor` class property each outfit wears — every outfit on a
+/// system before macOS 15, where a frame's edge borrows the divider's
+/// resizer and a corner, which had no public cursor there, the arrow.
+const fn classic_name(cursor: Cursor) -> &'static str {
+    match cursor {
+        Cursor::Arrow | Cursor::FrameUpLeftDownRight | Cursor::FrameUpRightDownLeft => {
+            "arrowCursor"
+        }
+        Cursor::Text => "IBeamCursor",
+        Cursor::Pointing => "pointingHandCursor",
+        Cursor::Cell => "crosshairCursor",
+        Cursor::ResizeLeftRight | Cursor::FrameLeftRight => "resizeLeftRightCursor",
+        Cursor::ResizeUpDown | Cursor::FrameUpDown => "resizeUpDownCursor",
+    }
 }
 
 /// `kCGImageAlphaPremultipliedLast` — bytes R,G,B,A, alpha last.
@@ -2951,11 +3019,13 @@ extern "C" fn bunny_draw_rect(this: Id, _sel: Sel, _dirty: CGRect) {
 /// Creates the app + the window with the event view, ready for blit.
 /// `scene_chrome` hides the system title bar: full-size content, a
 /// transparent titlebar and no title text — the native traffic lights
-/// stay at the corner and the SCENE draws the bar.
+/// stay at the corner and the SCENE draws the bar. `min`, when given, is
+/// the content floor a drag cannot go under — the same
+/// `setContentMinSize:` a dialog is born with.
 pub fn create_window(
     title: &str,
-    width: f64,
-    height: f64,
+    size: CGSize,
+    min: Option<CGSize>,
     scene_chrome: bool,
     manners: Manners,
 ) -> WindowHandle {
@@ -2967,10 +3037,7 @@ pub fn create_window(
         // Regular: a terminal app gets a window, the Dock and focus
         let _ = msg_bool_i64(app, sel("setActivationPolicy:"), 0);
 
-        let rect = CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: CGSize { width, height },
-        };
+        let rect = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size };
         // titled | closable (+ miniaturizable, + resizable, + full-size
         // content when the scene owns the chrome). A mask without
         // Miniaturizable draws the yellow light dead, which is exactly
@@ -3002,6 +3069,9 @@ pub fn create_window(
             // window in Mission Control and the Dock
             msg_void_i64(window, sel("setTitleVisibility:"), 1);
         }
+        if let Some(min) = min {
+            msg_void_size(window, sel("setContentMinSize:"), min);
+        }
 
         let title = CString::new(title).expect("title without NUL");
         let ns_title = msg_id_cstr(
@@ -3023,8 +3093,8 @@ pub fn create_window(
         let _ = crate::metal::try_install(
             view,
             msg_f64(window, sel("backingScaleFactor")),
-            width,
-            height,
+            size.width,
+            size.height,
         );
         msg_void_bool(view, sel("setWantsLayer:"), 1);
         msg_void_id(window, sel("setContentView:"), view);
@@ -3157,6 +3227,17 @@ pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHan
     }
 }
 
+/// Which manners a dialog's window is born with — the two real windows a
+/// scene can ask for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DialogManners {
+    /// `OverlaySurface::Window`: a place the reader works in (Settings).
+    /// `min` is the content's floor, `lights` the scene-chrome point.
+    Workspace { min: (f64, f64), lights: Option<(f64, f64)> },
+    /// `OverlaySurface::Alert`: a question — one size, no bar, no lights.
+    Ask,
+}
+
 /// Creates a DIALOG window over `parent` — the real titled window an
 /// overlay with `OverlaySurface::Window` asked for. Sized by its
 /// CONTENT rect; the caller places it with
@@ -3184,14 +3265,15 @@ pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHan
 /// to the OS), and the native traffic lights placed at that point
 /// from the window's top-left — the app's own header carries them,
 /// the main window's `Chrome::SceneAt` road for a dialog.
+///
+/// An ALERT ([`DialogManners::Ask`]) is the same window with the
+/// system's own alerts' shape instead: no bar and no lights at all.
 pub fn create_dialog(
     parent: &WindowHandle,
     title: &str,
     width: f64,
     height: f64,
-    min_width: f64,
-    min_height: f64,
-    lights: Option<(f64, f64)>,
+    manners: DialogManners,
 ) -> WindowHandle {
     unsafe {
         let pool = objc_autoreleasePoolPush();
@@ -3201,10 +3283,22 @@ pub fn create_dialog(
             origin: CGPoint { x: 0.0, y: 0.0 },
             size: CGSize { width, height },
         };
-        // titled | closable | resizable — miniaturizable stays OFF, so
-        // the yellow light is born disabled (+ full-size content when
-        // the dialog's own header owns the top edge)
-        let style: u64 = if lights.is_some() { 1 | 2 | 8 | (1 << 15) } else { 1 | 2 | 8 };
+        let (style, lights, bare): (u64, Option<(f64, f64)>, bool) = match manners {
+            // titled | closable | resizable — miniaturizable stays OFF,
+            // so the yellow light is born disabled (+ full-size content
+            // when the dialog's own header owns the top edge)
+            DialogManners::Workspace { lights: Some(lights), .. } => {
+                (1 | 2 | 8 | (1 << 15), Some(lights), true)
+            }
+            DialogManners::Workspace { lights: None, .. } => (1 | 2 | 8, None, false),
+            // titled ONLY for what a title brings — the system's shadow,
+            // its rounded corners, a window that can take key — over
+            // full-size content with the bar made invisible. Not
+            // closable, not resizable, not miniaturizable: an alert's
+            // answers are its buttons, Escape and ⌘., and its size is
+            // its content's (the shell sets the frame layout fitted)
+            DialogManners::Ask => (1 | (1 << 15), None, true),
+        };
         let window = msg_id(class("NSWindow"), sel("alloc"));
         let window = msg_init_window(
             window,
@@ -3214,19 +3308,32 @@ pub fn create_dialog(
             2, // buffered
             0,
         );
-        if lights.is_some() {
+        if bare {
             msg_void_bool(window, sel("setTitlebarAppearsTransparent:"), 1);
             // NSWindowTitleHidden = 1 — the title still names the
             // window in Mission Control
             msg_void_i64(window, sel("setTitleVisibility:"), 1);
         }
+        if matches!(manners, DialogManners::Ask) {
+            // the three lights would stand disabled in the invisible
+            // bar: an alert has none, so they go (hidden, not removed —
+            // AppKit keeps its own buttons)
+            for kind in WINDOW_BUTTONS {
+                let button = msg_id_u64(window, sel("standardWindowButton:"), kind);
+                if !button.is_null() {
+                    msg_void_bool(button, sel("setHidden:"), 1);
+                }
+            }
+        }
         // NSWindowCollectionBehaviorFullScreenAuxiliary (1 << 8)
         msg_void_u64(window, sel("setCollectionBehavior:"), 1 << 8);
-        msg_void_size(
-            window,
-            sel("setContentMinSize:"),
-            CGSize { width: min_width, height: min_height },
-        );
+        if let DialogManners::Workspace { min: (min_width, min_height), .. } = manners {
+            msg_void_size(
+                window,
+                sel("setContentMinSize:"),
+                CGSize { width: min_width, height: min_height },
+            );
+        }
         let title = CString::new(title).expect("title without NUL");
         let ns_title = msg_id_cstr(
             class("NSString"),
@@ -3476,6 +3583,54 @@ unsafe fn tiff_to_png(tiff: Id) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame's four outfits reach macOS 15's frame cursor at a position on
+    /// their own axis, in the SDK's bits (`NSCursor.h`: top 1, left 2,
+    /// bottom 4, right 8), and a seam never does — a divider is not a frame.
+    /// Before macOS 15 the edges borrow the divider's resizer and a corner,
+    /// which had no public cursor, wears the arrow. And on this machine each
+    /// of the ten names a real cursor.
+    #[test]
+    fn a_frame_edge_wears_the_resizer_a_window_edge_wears() {
+        assert_eq!(frame_position(Cursor::FrameLeftRight), Some(8), "right");
+        assert_eq!(frame_position(Cursor::FrameUpDown), Some(4), "bottom");
+        assert_eq!(frame_position(Cursor::FrameUpLeftDownRight), Some(12), "bottom-right");
+        assert_eq!(frame_position(Cursor::FrameUpRightDownLeft), Some(6), "bottom-left");
+        assert_eq!(frame_position(Cursor::ResizeLeftRight), None, "a seam is a divider");
+        assert_eq!(frame_position(Cursor::ResizeUpDown), None);
+        assert_eq!(classic_name(Cursor::FrameLeftRight), "resizeLeftRightCursor");
+        assert_eq!(classic_name(Cursor::FrameUpDown), "resizeUpDownCursor");
+        assert_eq!(classic_name(Cursor::FrameUpRightDownLeft), "arrowCursor");
+        // AppKit answers no cursor at all before the application exists —
+        // the shell always runs inside one
+        let cursors = unsafe {
+            msg_id(class("NSApplication"), sel("sharedApplication"));
+            class("NSCursor")
+        };
+        let framed = unsafe {
+            msg_bool_sel(cursors, sel("respondsToSelector:"), sel(FRAME_RESIZE)) != 0
+        };
+        if framed {
+            // where the frame cursor exists the shell asks for it, and a
+            // frame's edge stops wearing the divider's resizer
+            let divider = unsafe { msg_id(cursors, sel("resizeUpDownCursor")) };
+            assert_ne!(unsafe { shape_of(Cursor::FrameUpDown) }, divider);
+        }
+        for outfit in [
+            Cursor::Arrow,
+            Cursor::Text,
+            Cursor::Pointing,
+            Cursor::Cell,
+            Cursor::ResizeLeftRight,
+            Cursor::ResizeUpDown,
+            Cursor::FrameLeftRight,
+            Cursor::FrameUpDown,
+            Cursor::FrameUpLeftDownRight,
+            Cursor::FrameUpRightDownLeft,
+        ] {
+            assert!(!unsafe { shape_of(outfit) }.is_null(), "{outfit:?} names no cursor");
+        }
+    }
 
     /// An event raised from INSIDE a handler waits its turn.
     ///

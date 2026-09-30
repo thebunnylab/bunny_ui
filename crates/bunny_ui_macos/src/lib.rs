@@ -228,11 +228,14 @@ impl Chrome {
 /// WindowSpec::titled("Trinity").size(1280.0, 800.0).chrome(Chrome::SceneAt(Lights::at(16.0, 14.0)))
 /// // a door has ONE size
 /// WindowSpec::titled("Trinity").size(1040.0, 660.0).fixed().no_minimize()
+/// // a window whose chrome stops fitting under 720×480
+/// WindowSpec::titled("Trinity").size(1280.0, 800.0).min_size(720.0, 480.0)
 /// ```
 #[derive(Clone, Debug)]
 pub struct WindowSpec {
     title: Rc<str>,
     size: Size,
+    min: Option<Size>,
     chrome: Chrome,
     manners: ffi::Manners,
 }
@@ -245,6 +248,7 @@ impl WindowSpec {
         WindowSpec {
             title: title.into(),
             size: Size { width: 1024.0, height: 640.0 },
+            min: None,
             chrome: Chrome::Native,
             manners: ffi::Manners::default(),
         }
@@ -254,6 +258,31 @@ impl WindowSpec {
     pub fn size(mut self, width: f64, height: f64) -> WindowSpec {
         self.size = Size { width, height };
         self
+    }
+
+    /// The smallest content the reader may drag the window down to —
+    /// `setContentMinSize:`, the floor a dialog's `DialogSpec::min_size`
+    /// already sets. Without it AppKit lets a frame shrink until its
+    /// chrome clips and its controls fall off the edge.
+    pub fn min_size(mut self, width: f64, height: f64) -> WindowSpec {
+        self.min = Some(Size { width, height });
+        self
+    }
+
+    /// The floor [`WindowSpec::min_size`] set, if one was.
+    #[must_use]
+    pub fn min(&self) -> Option<Size> {
+        self.min
+    }
+
+    /// The size the window opens at: [`WindowSpec::size`], raised to the
+    /// floor on any axis that asked for less.
+    #[must_use]
+    pub fn opening_size(&self) -> Size {
+        self.min.map_or(self.size, |min| Size {
+            width: self.size.width.max(min.width),
+            height: self.size.height.max(min.height),
+        })
     }
 
     /// Who draws the top edge — see [`Chrome`].
@@ -536,12 +565,18 @@ fn why(need: bunny_ui::runtime::FrameNeed) -> String {
     if named.is_empty() { "-".to_string() } else { named.join("+") }
 }
 
+/// A layout size in AppKit's own struct — the one crossing `create_window`
+/// takes. Both types are foreign here, so it is a function, not a `From`.
+const fn cg_size(size: Size) -> ffi::CGSize {
+    ffi::CGSize { width: size.width, height: size.height }
+}
+
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
     let title: &str = &spec.title;
-    let size = spec.size;
+    let size = spec.opening_size();
     let chrome = spec.chrome;
     // the placement is armed before the window exists: the buttons are
     // born with it, and the first frame already has them in place
@@ -550,7 +585,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // notifications are SYNCHRONOUS, and a window opened from inside an
     // event would re-enter the handler that asked for it
     let window = ffi::lend_hand(|| {
-        ffi::create_window(title, size.width, size.height, chrome.scene(), spec.manners)
+        ffi::create_window(title, cg_size(size), spec.min.map(cg_size), chrome.scene(), spec.manners)
     });
     // a task that lands on a worker thread asks the main run loop for
     // one more turn; the frame it takes drains the queue on its way
@@ -779,54 +814,72 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     })
                     .map(|(path, _)| path.clone())
                     .collect();
-                for path in dead_dialogs {
-                    if let Some(dialog) = dialog_store.get(&path) {
-                        ffi::lend_hand(|| {
-                            // the flag drops FIRST: the make-key below
-                            // asks the parent `canBecomeKeyWindow`, and
-                            // the answer has to already be yes. Safe
-                            // over a fullscreen parent too — its space
-                            // is the one on screen, so re-keying it
-                            // switches nothing.
-                            ffi::end_window_modal(&window);
-                            dialog.close_panel(&window);
-                            window.make_key_with_view();
-                        });
+                for path in &dead_dialogs {
+                    if let Some(dialog) = dialog_store.get(path) {
+                        ffi::lend_hand(|| dialog.close_panel(&window));
                     }
-                    dialog_surfaces.borrow_mut().remove(&path);
+                    dialog_surfaces.borrow_mut().remove(path);
+                }
+                if !dead_dialogs.is_empty() {
+                    // the keyboard goes to the window still standing on
+                    // top — an ask answered over Settings hands the keys
+                    // back to Settings, not to the workbench under both —
+                    // and only when none stands does the modal hold end.
+                    // The flag drops FIRST: the make-key asks the parent
+                    // `canBecomeKeyWindow`, and the answer has to already
+                    // be yes. Safe over a fullscreen parent too — its
+                    // space is the one on screen, so re-keying it
+                    // switches nothing.
+                    let standing = overlays.iter().rev().find_map(|overlay| {
+                        dialog_store.get(&overlay.path).filter(|dialog| dialog.is_visible())
+                    });
+                    ffi::lend_hand(|| match standing {
+                        Some(dialog) => dialog.make_key_with_view(),
+                        None => {
+                            ffi::end_window_modal(&window);
+                            window.make_key_with_view();
+                        }
+                    });
                 }
                 for overlay in &overlays {
-                    // a dialog overlay presents on a REAL window, not a
-                    // panel — raised on first sight, held to the frame
+                    // a dialog or an alert presents on a REAL window, not
+                    // a panel — raised on first sight, held to the frame
                     // layout answered (which is the frame the window
                     // itself reported through `Runtime::set_dialog_frame`,
-                    // so a steady frame is a no-op under the ε guard)
-                    if let bunny_ui::layout::OverlaySurface::Window(spec) = &overlay.surface {
+                    // so a steady frame is a no-op under the ε guard; an
+                    // alert's SIZE is its content's, so a taller ask
+                    // grows its window here)
+                    let asked = match &overlay.surface {
+                        bunny_ui::layout::OverlaySurface::Window(spec) => Some((
+                            spec.title.as_ref(),
+                            ffi::DialogManners::Workspace {
+                                min: (spec.min.width, spec.min.height),
+                                // scene chrome: the header owns the top
+                                // edge and the native lights sit where the
+                                // spec says
+                                lights: match &spec.chrome {
+                                    bunny_ui::layout::DialogChrome::Native => None,
+                                    bunny_ui::layout::DialogChrome::Scene { lights } => {
+                                        Some((lights.x, lights.y))
+                                    }
+                                },
+                            },
+                        )),
+                        bunny_ui::layout::OverlaySurface::Alert(spec) => {
+                            Some((spec.title.as_ref(), ffi::DialogManners::Ask))
+                        }
+                        bunny_ui::layout::OverlaySurface::Layer => None,
+                    };
+                    if let Some((title, manners)) = asked {
                         let x = overlay.frame.origin.x;
                         let y = overlay.frame.origin.y;
                         let w = overlay.frame.size.width;
                         let h = overlay.frame.size.height;
                         let created = !dialog_store.contains_key(&overlay.path);
-                        // scene chrome: the header owns the top edge and
-                        // the native lights sit where the spec says
-                        let lights = match &spec.chrome {
-                            bunny_ui::layout::DialogChrome::Native => None,
-                            bunny_ui::layout::DialogChrome::Scene { lights } => {
-                                Some((lights.x, lights.y))
-                            }
-                        };
                         let dialog =
                             *dialog_store.entry(overlay.path.clone()).or_insert_with(|| {
                                 ffi::lend_hand(|| {
-                                    ffi::create_dialog(
-                                        &window,
-                                        spec.title.as_ref(),
-                                        w,
-                                        h,
-                                        spec.min.width,
-                                        spec.min.height,
-                                        lights,
-                                    )
+                                    ffi::create_dialog(&window, title, w, h, manners)
                                 })
                             });
                         let opening = created || !dialog.is_visible();
@@ -1386,11 +1439,21 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // The BOX under the pointer answers first — text wants an I-beam,
             // and the rule below cannot know that. Only where nobody answers
             // does the old rule stand: the hand over anything hoverable.
+            // A box's resizer is a FRAME's, which AppKit draws unlike the
+            // seam's divider.
             None => match runtime.hovered_cursor() {
                 Some(bunny_ui::layout::Cursor::Text) => ffi::Cursor::Text,
                 Some(bunny_ui::layout::Cursor::Pointing) => ffi::Cursor::Pointing,
                 Some(bunny_ui::layout::Cursor::Cell) => ffi::Cursor::Cell,
                 Some(bunny_ui::layout::Cursor::Arrow) => ffi::Cursor::Arrow,
+                Some(bunny_ui::layout::Cursor::ResizeLeftRight) => ffi::Cursor::FrameLeftRight,
+                Some(bunny_ui::layout::Cursor::ResizeUpDown) => ffi::Cursor::FrameUpDown,
+                Some(bunny_ui::layout::Cursor::ResizeUpLeftDownRight) => {
+                    ffi::Cursor::FrameUpLeftDownRight
+                }
+                Some(bunny_ui::layout::Cursor::ResizeUpRightDownLeft) => {
+                    ffi::Cursor::FrameUpRightDownLeft
+                }
                 None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
                 None => ffi::Cursor::Arrow,
             },
@@ -2107,5 +2170,29 @@ mod tests {
         assert_eq!(key_pattern(&stroke(unknown, "\u{F71B}", false)).unwrap().key, Key::F(24));
         // and the rest of AppKit's private block is still never a key
         assert!(key_pattern(&stroke(unknown, "\u{F727}", false)).is_none());
+    }
+
+    #[test]
+    fn a_window_has_no_floor_until_its_spec_names_one() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0);
+        assert_eq!(spec.min(), None);
+        assert_eq!(spec.opening_size(), Size { width: 1280.0, height: 800.0 });
+    }
+
+    #[test]
+    fn a_floor_is_kept_and_the_window_opens_over_it() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0).min_size(720.0, 480.0);
+        assert_eq!(spec.min(), Some(Size { width: 720.0, height: 480.0 }));
+        // a size over the floor opens as asked
+        assert_eq!(spec.opening_size(), Size { width: 1280.0, height: 800.0 });
+        // a size under it is raised on each axis that asked for less
+        let narrow = WindowSpec::titled("Trinity").size(600.0, 900.0).min_size(720.0, 480.0);
+        assert_eq!(narrow.opening_size(), Size { width: 720.0, height: 900.0 });
+    }
+
+    #[test]
+    fn the_floor_crosses_into_appkit_unchanged() {
+        let crossed = cg_size(Size { width: 720.0, height: 480.0 });
+        assert_eq!((crossed.width, crossed.height), (720.0, 480.0));
     }
 }
