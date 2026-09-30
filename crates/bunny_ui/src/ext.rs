@@ -984,7 +984,14 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// bar opened over an editor must take them from the editor. The app
     /// bumps the beat when it means it — each (field, beat) fires once,
     /// so the reader can click away and stay away until the app beats
-    /// again.
+    /// again. A field that leaves the scene forgets its beats, so a popup
+    /// whose field is born on each open can wear one constant beat.
+    ///
+    /// The beat BORROWS the keyboard. When the field leaves the scene still
+    /// holding it — the picker closed on Escape, the pick ran and the popup
+    /// went — the keys go back to whoever held them before the beat, if
+    /// that input is still on screen. A field the keyboard already left
+    /// gives nothing back: the reader's own move stands.
     fn auto_focus_beat(self, beat: u64) -> Modified<Self> {
         Modified {
             base: self,
