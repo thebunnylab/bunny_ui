@@ -779,54 +779,72 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     })
                     .map(|(path, _)| path.clone())
                     .collect();
-                for path in dead_dialogs {
-                    if let Some(dialog) = dialog_store.get(&path) {
-                        ffi::lend_hand(|| {
-                            // the flag drops FIRST: the make-key below
-                            // asks the parent `canBecomeKeyWindow`, and
-                            // the answer has to already be yes. Safe
-                            // over a fullscreen parent too — its space
-                            // is the one on screen, so re-keying it
-                            // switches nothing.
-                            ffi::end_window_modal(&window);
-                            dialog.close_panel(&window);
-                            window.make_key_with_view();
-                        });
+                for path in &dead_dialogs {
+                    if let Some(dialog) = dialog_store.get(path) {
+                        ffi::lend_hand(|| dialog.close_panel(&window));
                     }
-                    dialog_surfaces.borrow_mut().remove(&path);
+                    dialog_surfaces.borrow_mut().remove(path);
+                }
+                if !dead_dialogs.is_empty() {
+                    // the keyboard goes to the window still standing on
+                    // top — an ask answered over Settings hands the keys
+                    // back to Settings, not to the workbench under both —
+                    // and only when none stands does the modal hold end.
+                    // The flag drops FIRST: the make-key asks the parent
+                    // `canBecomeKeyWindow`, and the answer has to already
+                    // be yes. Safe over a fullscreen parent too — its
+                    // space is the one on screen, so re-keying it
+                    // switches nothing.
+                    let standing = overlays.iter().rev().find_map(|overlay| {
+                        dialog_store.get(&overlay.path).filter(|dialog| dialog.is_visible())
+                    });
+                    ffi::lend_hand(|| match standing {
+                        Some(dialog) => dialog.make_key_with_view(),
+                        None => {
+                            ffi::end_window_modal(&window);
+                            window.make_key_with_view();
+                        }
+                    });
                 }
                 for overlay in &overlays {
-                    // a dialog overlay presents on a REAL window, not a
-                    // panel — raised on first sight, held to the frame
+                    // a dialog or an alert presents on a REAL window, not
+                    // a panel — raised on first sight, held to the frame
                     // layout answered (which is the frame the window
                     // itself reported through `Runtime::set_dialog_frame`,
-                    // so a steady frame is a no-op under the ε guard)
-                    if let bunny_ui::layout::OverlaySurface::Window(spec) = &overlay.surface {
+                    // so a steady frame is a no-op under the ε guard; an
+                    // alert's SIZE is its content's, so a taller ask
+                    // grows its window here)
+                    let asked = match &overlay.surface {
+                        bunny_ui::layout::OverlaySurface::Window(spec) => Some((
+                            spec.title.as_ref(),
+                            ffi::DialogManners::Workspace {
+                                min: (spec.min.width, spec.min.height),
+                                // scene chrome: the header owns the top
+                                // edge and the native lights sit where the
+                                // spec says
+                                lights: match &spec.chrome {
+                                    bunny_ui::layout::DialogChrome::Native => None,
+                                    bunny_ui::layout::DialogChrome::Scene { lights } => {
+                                        Some((lights.x, lights.y))
+                                    }
+                                },
+                            },
+                        )),
+                        bunny_ui::layout::OverlaySurface::Alert(spec) => {
+                            Some((spec.title.as_ref(), ffi::DialogManners::Ask))
+                        }
+                        bunny_ui::layout::OverlaySurface::Layer => None,
+                    };
+                    if let Some((title, manners)) = asked {
                         let x = overlay.frame.origin.x;
                         let y = overlay.frame.origin.y;
                         let w = overlay.frame.size.width;
                         let h = overlay.frame.size.height;
                         let created = !dialog_store.contains_key(&overlay.path);
-                        // scene chrome: the header owns the top edge and
-                        // the native lights sit where the spec says
-                        let lights = match &spec.chrome {
-                            bunny_ui::layout::DialogChrome::Native => None,
-                            bunny_ui::layout::DialogChrome::Scene { lights } => {
-                                Some((lights.x, lights.y))
-                            }
-                        };
                         let dialog =
                             *dialog_store.entry(overlay.path.clone()).or_insert_with(|| {
                                 ffi::lend_hand(|| {
-                                    ffi::create_dialog(
-                                        &window,
-                                        spec.title.as_ref(),
-                                        w,
-                                        h,
-                                        spec.min.width,
-                                        spec.min.height,
-                                        lights,
-                                    )
+                                    ffi::create_dialog(&window, title, w, h, manners)
                                 })
                             });
                         let opening = created || !dialog.is_visible();

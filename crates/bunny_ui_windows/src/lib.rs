@@ -631,12 +631,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // each overlay re-presents its own slice on an owned panel
             // in screen coordinates — that is how it leaves the window
             let all_overlays = runtime.overlays();
-            // An overlay that asked to BE a window takes a different road from
-            // one that rides a panel: the platform draws its frame, the reader
-            // moves it, and its own close button dismisses it.
+            // An overlay that asked to BE a window — a dialog or an alert —
+            // takes a different road from one that rides a panel: the
+            // platform draws its frame, the reader moves it, and its own
+            // close button dismisses it.
             let (window_overlays, overlays): (Vec<_>, Vec<_>) =
                 all_overlays.iter().cloned().partition(|overlay| {
-                    matches!(overlay.surface, bunny_ui::layout::OverlaySurface::Window(_))
+                    !matches!(overlay.surface, bunny_ui::layout::OverlaySurface::Layer)
                 });
             // Where the window's OWN content ends. Every overlay — a panel's
             // and a dialog's alike — is carried by its own surface, so the cut
@@ -658,28 +659,34 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     }
                 }
                 for overlay in &window_overlays {
-                    let bunny_ui::layout::OverlaySurface::Window(spec) = &overlay.surface else {
-                        continue;
-                    };
                     let x = overlay.frame.origin.x;
                     let y = overlay.frame.origin.y;
                     let w = overlay.frame.size.width;
                     let h = overlay.frame.size.height;
-                    // `DialogChrome::Scene` is the content saying it owns its
-                    // own top edge — the mac places the native lights inside
-                    // it; here there are none to place, and the scene draws
-                    // its own `.window_control(…)` regions instead.
-                    let scene_chrome =
-                        matches!(spec.chrome, bunny_ui::layout::DialogChrome::Scene { .. });
+                    // what the window is born as: a dialog's title, floor and
+                    // chrome, or an alert's — whose floor is its one size,
+                    // under the system's caption with the close button alone
+                    let (title, min, scene_chrome, alert) = match &overlay.surface {
+                        // `DialogChrome::Scene` is the content saying it owns
+                        // its own top edge — the mac places the native lights
+                        // inside it; here there are none to place, and the
+                        // scene draws its own `.window_control(…)` regions
+                        // instead.
+                        bunny_ui::layout::OverlaySurface::Window(spec) => (
+                            &spec.title,
+                            (spec.min.width, spec.min.height),
+                            matches!(spec.chrome, bunny_ui::layout::DialogChrome::Scene { .. }),
+                            false,
+                        ),
+                        bunny_ui::layout::OverlaySurface::Alert(spec) => {
+                            (&spec.title, (w, h), false, true)
+                        }
+                        bunny_ui::layout::OverlaySurface::Layer => continue,
+                    };
                     let opening = !store.contains_key(&overlay.path);
                     let dialog = store.entry(overlay.path.clone()).or_insert_with(|| {
-                        let dialog = ffi::create_dialog(
-                            &window,
-                            &spec.title,
-                            spec.min.width,
-                            spec.min.height,
-                            scene_chrome,
-                        );
+                        let dialog =
+                            ffi::create_dialog(&window, title, min.0, min.1, scene_chrome, alert);
                         dialog.stands_for(&overlay.path);
                         // Its own answers for the hit-test, from the OWNER's
                         // runtime: the dialog's content was laid out in the
@@ -710,7 +717,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         );
                         dialog
                     });
-                    dialog.dress_dialog(&spec.title, spec.min.width, spec.min.height);
+                    dialog.dress_dialog(title, min.0, min.1);
                     if !scene_chrome {
                         // a system-drawn bar still wears the scene's
                         // appearance: a dark workbench under a white caption
@@ -726,6 +733,16 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                         // not yanked back every frame
                         dialog.set_dialog_client_frame(window.layout_rect_to_screen(x, y, w, h));
                         dialog.show_dialog();
+                    } else if alert {
+                        // …except an alert's SIZE, which is its content's: a
+                        // taller ask grows the window where the reader left it
+                        let (at_x, at_y, held_w, held_h) =
+                            window.screen_rect_to_layout(dialog.client_rect_screen());
+                        if (held_w - w).abs() > 0.5 || (held_h - h).abs() > 0.5 {
+                            dialog.set_dialog_client_frame(
+                                window.layout_rect_to_screen(at_x, at_y, w, h),
+                            );
+                        }
                     }
                     // layout follows the real window: the frame the reader
                     // left it at is what the next pass lays out against

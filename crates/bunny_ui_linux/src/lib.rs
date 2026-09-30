@@ -619,26 +619,41 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     // drawn shadow — the frame and its shadow are the
                     // compositor's. The window is the truth of the size
                     // (`dialog_size`, pulled before the layout), so the
-                    // frame here is already what the window was granted
-                    if let bunny_ui::layout::OverlaySurface::Window(spec) = &overlay.surface {
-                        let frame = overlay.frame;
+                    // frame here is already what the window was granted.
+                    // An alert is the one exception: its size is its
+                    // content's, one size the window is held to (`fixed`)
+                    let frame = overlay.frame;
+                    let asked = match &overlay.surface {
+                        bunny_ui::layout::OverlaySurface::Window(spec) => Some((
+                            &spec.title,
+                            (spec.min.width, spec.min.height),
+                            matches!(spec.chrome, bunny_ui::layout::DialogChrome::Scene { .. }),
+                            false,
+                        )),
+                        bunny_ui::layout::OverlaySurface::Alert(spec) => Some((
+                            &spec.title,
+                            (frame.size.width, frame.size.height),
+                            false,
+                            true,
+                        )),
+                        bunny_ui::layout::OverlaySurface::Layer => None,
+                    };
+                    if let Some((title, min, scene, fixed)) = asked {
                         let dialog =
                             dialog_store.entry(overlay.path.clone()).or_insert_with(|| {
                                 DialogWindow {
                                     handle: ffi::create_dialog(
                                         &window,
-                                        &spec.title,
-                                        (spec.min.width, spec.min.height),
-                                        matches!(
-                                            spec.chrome,
-                                            bunny_ui::layout::DialogChrome::Scene { .. }
-                                        ),
+                                        title,
+                                        min,
+                                        scene,
                                         (
                                             frame.origin.x,
                                             frame.origin.y,
                                             frame.size.width,
                                             frame.size.height,
                                         ),
+                                        fixed,
                                     ),
                                     origin: frame.origin,
                                 }
