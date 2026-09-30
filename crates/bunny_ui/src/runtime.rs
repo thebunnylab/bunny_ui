@@ -306,6 +306,9 @@ pub struct Runtime {
     /// Fields whose `.auto_focus()` already fired — first appearance
     /// only; a user blur is final.
     auto_focused: RefCell<std::collections::HashSet<String>>,
+    /// Who lent the keyboard to a field's beat — the road home when the
+    /// field leaves still holding it (`crate::loans`).
+    loans: RefCell<crate::loans::Loans>,
     /// The retained animations — springs keyed by identity, resolved
     /// at place through the env, advanced by the shell's tick.
     animator: RefCell<crate::anim::Animator>,
@@ -1305,6 +1308,7 @@ impl Runtime {
             scroll_targets: RefCell::new(HashMap::default()),
             element_reveals: RefCell::new(HashMap::default()),
             auto_focused: RefCell::new(std::collections::HashSet::default()),
+            loans: RefCell::new(crate::loans::Loans::default()),
             animator: RefCell::new(crate::anim::Animator::default()),
             last_proposal: Cell::new(None),
             last_overlays: RefCell::new(Vec::new()),
@@ -3248,6 +3252,14 @@ impl Runtime {
     /// still caret until the first click (2026-09-27).
     fn focus_via(&self, path: &str, placement: Option<&crate::layout::CustomPlacement>) {
         self.enter_scene();
+        self.hand_keyboard(path, placement);
+    }
+
+    /// [`Self::focus_via`] for a pass that has already assembled its own
+    /// input tables. The loans' road home runs at the end of a render,
+    /// where re-entering the scene would lay the PREVIOUS root's tables
+    /// over the ones this pass just built.
+    fn hand_keyboard(&self, path: &str, placement: Option<&crate::layout::CustomPlacement>) {
         self.frame_asked.set(true);
         let moved = self.focus.borrow().as_deref() != Some(path);
         if moved {
@@ -5512,14 +5524,17 @@ impl Runtime {
         });
         // the app's own box counts as a live input too: it registers
         // itself every pass it renders, exactly like a field's editor
-        let focus_died = self
-            .focus
-            .borrow()
-            .as_deref()
-            .is_some_and(|path| !reconciler::has_editor(path) && !reconciler::has_custom(path));
-        if focus_died {
+        let died = self.focus.borrow().clone().filter(|path| !input_lives(path));
+        if let Some(dead) = died {
             *self.focus.borrow_mut() = None;
+            // the keys a beat borrowed go home (`crate::loans`): a picker
+            // that closed holding them hands them back to where they were
+            let heir = self.loans.borrow().heir(&dead, input_lives).map(str::to_owned);
+            if let Some(heir) = heir {
+                self.hand_keyboard(&heir, None);
+            }
         }
+        self.loans.borrow_mut().settle(input_lives);
         self.sync_field_focus();
     }
 
@@ -5598,12 +5613,16 @@ impl Runtime {
             seen.remove(&key);
             seen.insert(format!("{to}{}", &key[from.len()..]));
         }
+        drop(seen);
+        self.loans.borrow_mut().follow(from, to);
     }
 
     /// A field's own ask for the keyboard, answered once. The first
     /// appearance takes it only when nobody holds it; a beat is an intent
     /// of the app's and takes it from whoever does — the box's rule, the
-    /// same words. `true` when the keyboard moved.
+    /// same words — and BORROWS it: whoever held the keys gets them back
+    /// when the field leaves still holding them (`crate::loans`). `true`
+    /// when the keyboard moved.
     fn claim_auto_focus(&self, path: &str, ask: crate::layout::AutoFocus) -> bool {
         use crate::layout::AutoFocus;
         let key = match ask {
@@ -5619,6 +5638,10 @@ impl Runtime {
             _ => self.focus.borrow().is_none(),
         };
         if free {
+            let lender = self.focus.borrow().clone();
+            if let (AutoFocus::Beat(_), Some(lender)) = (ask, lender) {
+                self.loans.borrow_mut().lend(path, &lender);
+            }
             self.focus(path);
         }
         free
@@ -6040,6 +6063,13 @@ impl FrameNeed {
             || self.insets
             || self.webview
     }
+}
+
+/// Is the input at `path` on screen THIS pass? A field re-registers its
+/// editor and an app's box itself on every pass they render, so both
+/// tables together are the truth.
+fn input_lives(path: &str) -> bool {
+    reconciler::has_editor(path) || reconciler::has_custom(path)
 }
 
 /// How far a region can scroll on each axis — its content past its

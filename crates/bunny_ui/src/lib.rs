@@ -53,6 +53,7 @@ pub mod host;
 pub mod icon;
 pub mod image_engine;
 pub mod layout;
+mod loans;
 pub mod modifier;
 pub mod one_of;
 #[cfg(feature = "gpu")]
@@ -6303,6 +6304,192 @@ mod tests {
         tab.beat.set(2);
         lay();
         assert!(focused_field(), "a new beat is a new intent");
+    }
+
+    /// The picker over an editor, from the keyboard's side: ⌘⇧P mounts a
+    /// query under a beat, which takes the keys from the box that held
+    /// them, and Escape unmounts it STILL HOLDING them. A beat borrows:
+    /// the keys go home, so a picker that closes never strands them.
+    #[test]
+    fn a_field_beat_gives_back_the_keyboard_it_borrowed() {
+        use crate::layout::{Proposal, Size};
+
+        struct Pane;
+
+        impl CustomElement for Pane {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+        }
+
+        #[derive(Clone, Copy)]
+        struct Desk {
+            query: State<String>,
+            open: State<bool>,
+        }
+
+        impl Component for Desk {
+            fn body(self, _ctx: &Context) -> impl View {
+                let picker = self.open.get().then(|| {
+                    text_field("query", self.query.binding()).id("query").auto_focus_beat(1)
+                });
+                vstack!(
+                    picker,
+                    custom(Pane).id("editor").frame(300.0, 100.0),
+                    custom(Pane).id("terminal").frame(300.0, 100.0),
+                )
+            }
+        }
+
+        let desk = Desk { query: State::new(String::new()), open: State::new(false) };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 320.0, height: 280.0 });
+        let lay = || {
+            runtime.render_stable(&desk);
+            runtime.layout(&desk, viewport)
+        };
+        let press = |result: &crate::layout::LayoutResult, name: &str| {
+            let tail = format!("[{name}]");
+            let pane = result
+                .customs
+                .iter()
+                .find(|placement| placement.path.ends_with(&tail))
+                .expect("the pane is placed")
+                .frame;
+            runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+            runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
+            runtime.focused().expect("a press on a pane holds the keys")
+        };
+        let holds_query = || runtime.focused().is_some_and(|path| path.ends_with("[query]"));
+
+        // the reader works in the editor
+        let result = lay();
+        let editor = press(&result, "editor");
+
+        // ⌘⇧P: the query borrows the keys …
+        desk.open.set(true);
+        lay();
+        assert!(holds_query(), "the beat takes the keys from the editor");
+
+        // … and Escape closes it while it holds them: they go home
+        desk.open.set(false);
+        lay();
+        assert_eq!(runtime.focused(), Some(editor), "the borrowed keyboard went back");
+
+        // the reader moved on before the close: that move stands
+        desk.open.set(true);
+        let result = lay();
+        assert!(holds_query(), "a new mount claims again under the same beat");
+        let terminal = press(&result, "terminal");
+        desk.open.set(false);
+        lay();
+        assert_eq!(
+            runtime.focused(),
+            Some(terminal),
+            "a borrower the keys already left gives nothing back",
+        );
+
+        // nobody held the keys: nobody is owed them
+        runtime.blur();
+        desk.open.set(true);
+        lay();
+        assert!(holds_query(), "a beat takes a free keyboard too");
+        desk.open.set(false);
+        lay();
+        assert_eq!(runtime.focused(), None, "a free keyboard is not owed to anyone");
+    }
+
+    /// A borrower can lend in turn — a picker's query opens another picker
+    /// over it. The road home walks to the first input still on screen:
+    /// past a borrower that left WITH the keys' holder, past one that left
+    /// first, and to nobody when the lender itself is gone.
+    #[test]
+    fn a_borrowed_keyboard_walks_home_past_borrowers_that_left() {
+        use crate::layout::{Proposal, Size};
+
+        struct Pane;
+
+        impl CustomElement for Pane {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+        }
+
+        #[derive(Clone, Copy)]
+        struct Desk {
+            query: State<String>,
+            outer: State<bool>,
+            inner: State<bool>,
+            editor: State<bool>,
+        }
+
+        impl Component for Desk {
+            fn body(self, _ctx: &Context) -> impl View {
+                let outer = self.outer.get().then(|| {
+                    text_field("outer", self.query.binding()).id("outer").auto_focus_beat(1)
+                });
+                let inner = self.inner.get().then(|| {
+                    text_field("inner", self.query.binding()).id("inner").auto_focus_beat(1)
+                });
+                let editor = self.editor.get().then(|| custom(Pane).id("editor").frame(300.0, 100.0));
+                vstack!(outer, inner, editor)
+            }
+        }
+
+        let desk = Desk {
+            query: State::new(String::new()),
+            outer: State::new(false),
+            inner: State::new(false),
+            editor: State::new(true),
+        };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 320.0, height: 280.0 });
+        let lay = || {
+            runtime.render_stable(&desk);
+            runtime.layout(&desk, viewport)
+        };
+        let holds = |name: &str| {
+            let tail = format!("[{name}]");
+            runtime.focused().is_some_and(|path| path.ends_with(&tail))
+        };
+        let open = |outer: bool, inner: bool| {
+            desk.outer.set(outer);
+            desk.inner.set(inner);
+            lay();
+        };
+
+        let result = lay();
+        let pane = result.customs.first().expect("the editor is placed").frame;
+        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        let editor = runtime.focused().expect("the editor holds the keys");
+
+        // the outer borrows from the editor, the inner from the outer —
+        // and both close in one pass: the inner's lender left with it
+        open(true, false);
+        open(true, true);
+        assert!(holds("inner"), "the inner borrowed from the outer");
+        open(false, false);
+        assert_eq!(runtime.focused(), Some(editor.clone()), "home is the first lender still here");
+
+        // the middle of the chain leaves FIRST, without the keys: it hands
+        // its own lender down to the one that borrowed from it
+        open(true, false);
+        open(true, true);
+        open(false, true);
+        assert!(holds("inner"), "the outer left without the keys");
+        open(false, false);
+        assert_eq!(runtime.focused(), Some(editor), "the outer's lender was handed down");
+
+        // the lender itself is gone: nothing is revived
+        open(true, false);
+        desk.editor.set(false);
+        lay();
+        assert!(holds("outer"));
+        open(false, false);
+        assert_eq!(runtime.focused(), None, "a lender that left is not revived");
     }
 
     #[test]
