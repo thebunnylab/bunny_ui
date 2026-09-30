@@ -355,6 +355,16 @@ impl Side {
 ///
 /// A box answers per POINT ([`crate::custom::CustomElement::cursor`]), because
 /// one box is often several surfaces: an editor's gutter is not its text.
+///
+/// The four `Resize…` sentences belong to a FRAME a drag resizes — a
+/// popup's edge, a panel's corner — and they name the way that edge
+/// travels, the vocabulary every platform shares (`ew`/`ns`/`nwse`/`nesw`
+/// in CSS, `IDC_SIZE*` on Windows). A divider between two lanes is not a
+/// frame: the split announces its own seam, and macOS draws the two
+/// differently. The box that answers one also takes the press
+/// ([`crate::custom::CustomElement::event`]) and holds the pointer until the
+/// release, and while it holds it the box names the cursor wherever the hand
+/// has run ([`crate::runtime::Runtime::hovered_cursor`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cursor {
     /// The plain arrow — chrome, gutters, anything that is not text and not
@@ -372,6 +382,16 @@ pub enum Cursor {
     /// has. Every platform names it: `NSCursor.crosshair`, `IDC_CROSS`,
     /// and `cell`/`crosshair` in CSS.
     Cell,
+    /// A frame's side edge: the box grows and shrinks left and right.
+    ResizeLeftRight,
+    /// A frame's top or bottom edge: up and down.
+    ResizeUpDown,
+    /// A frame's top-leading or bottom-trailing corner: both axes at once,
+    /// along the falling diagonal (↖↘).
+    ResizeUpLeftDownRight,
+    /// A frame's top-trailing or bottom-leading corner: along the rising
+    /// diagonal (↗↙).
+    ResizeUpRightDownLeft,
 }
 
 /// Padding insets, per edge.

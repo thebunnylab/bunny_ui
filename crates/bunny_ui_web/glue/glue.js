@@ -322,7 +322,10 @@ const imports = {
   },
 };
 
-const CURSORS = ["default", "text", "pointer", "cell", "col-resize", "row-resize"];
+const CURSORS = [
+  "default", "text", "pointer", "cell", "col-resize", "row-resize",
+  "ew-resize", "ns-resize", "nwse-resize", "nesw-resize",
+];
 
 function sendText(text) {
   const bytes = new TextEncoder().encode(text);

@@ -259,7 +259,9 @@ fn clipboard_write(text: &str) {
 /// The cursor the scene wants under the pointer, told to the page after
 /// every move — the mac shell's order: a split seam being dragged first,
 /// then the box under the pointer, then the hand over anything hoverable,
-/// then the arrow.
+/// then the arrow. The number indexes the glue's `CURSORS`: a seam is
+/// CSS's `col-resize`/`row-resize`, a frame's edge its `ew`/`ns`/`nwse`/
+/// `nesw-resize`.
 fn point_cursor(runtime: &Runtime) {
     use bunny_ui::layout::{Axis, Cursor};
     let kind = match runtime.seam_axis() {
@@ -270,6 +272,10 @@ fn point_cursor(runtime: &Runtime) {
             Some(Cursor::Pointing) => 2,
             Some(Cursor::Cell) => 3,
             Some(Cursor::Arrow) => 0,
+            Some(Cursor::ResizeLeftRight) => 6,
+            Some(Cursor::ResizeUpDown) => 7,
+            Some(Cursor::ResizeUpLeftDownRight) => 8,
+            Some(Cursor::ResizeUpRightDownLeft) => 9,
             None if runtime.interaction().hovered.is_some() => 2,
             None => 0,
         },

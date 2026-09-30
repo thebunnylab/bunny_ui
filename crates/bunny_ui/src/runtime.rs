@@ -2211,11 +2211,15 @@ impl Runtime {
                 self.deliver(&placement, crate::custom::ElementEvent::PointerUp { at });
                 // a box that takes the keyboard takes it on the click,
                 // the way a field does — the caret is the app's, so
-                // nothing here measures a column
-                if placement.element.element().accepts_keys() {
-                    self.focus_element(&placement.path);
-                } else {
-                    self.blur();
+                // nothing here measures a column. Chrome moves no
+                // keyboard at all, the way a seam or a thumb does not
+                let element = placement.element.element();
+                match (element.leaves_keyboard(), element.accepts_keys()) {
+                    (true, _) => {}
+                    (false, true) => self.focus_element(&placement.path),
+                    (false, false) => {
+                        self.blur();
+                    }
                 }
             }
             // the RISEN press fires like any button: released inside
@@ -2282,16 +2286,6 @@ impl Runtime {
         }
     }
 
-    /// The seam the pointer is on, by the AXIS it resizes — `None` when
-    /// the pointer is not on one. It answers for the grip under the
-    /// hand and for a drag already under way, because a seam keeps the
-    /// pointer while the hand runs ahead of it.
-    ///
-    /// The shell dresses the pointer from this: a seam between lanes
-    /// side by side travels left and right; one between stacked lanes
-    /// travels up and down. Without the axis a workbench wears the same
-    /// arrow on every seam, and the cursor is the only thing that says
-    /// which way a seam moves before the hand pulls it.
     /// What the pointer should look like where it is — the box under it
     /// answers, or `None` and the shell's own rule stands.
     ///
@@ -2299,19 +2293,36 @@ impl Runtime {
     /// drawn last is the one the eye sees. The point reaches the box in ITS
     /// coordinates, with the viewport beside it: a surface whose regions move
     /// with the scroll (a pinned gutter) cannot answer from an x alone.
+    ///
+    /// A box that took the press holds the pointer until the release, and
+    /// while it holds it, it answers first — wherever the hand has run. The
+    /// edge a grip drags trails the hand (a clamp stops the frame, the next
+    /// layout moves it a beat later), and a resizer that became whatever lay
+    /// under the hand would say the drag had let go while it had not; the
+    /// seam keeps its resizer the same way ([`Self::seam_axis`]). A holding
+    /// box that says nothing at that point leaves the question to the boxes
+    /// under the hand.
     pub fn hovered_cursor(&self) -> Option<crate::layout::Cursor> {
         let interaction = self.interaction.borrow();
         let at = interaction.pointer?;
+        let holding = interaction.element_grab.clone();
         // Use the winning hit target, not only field rectangles: a button or
         // overlay in front of an input must retain its own cursor.
-        if interaction
+        let over_text = interaction
             .hovered
             .as_deref()
-            .is_some_and(reconciler::has_editor)
-        {
+            .is_some_and(reconciler::has_editor);
+        drop(interaction);
+        let held = holding.and_then(|path| self.custom_at(&path)).and_then(|placement| {
+            let local = Self::local(&placement, at.x, at.y);
+            placement.element.element().cursor(local, placement.visible)
+        });
+        if held.is_some() {
+            return held;
+        }
+        if over_text {
             return Some(crate::layout::Cursor::Text);
         }
-        drop(interaction);
         let customs = self.last_customs.borrow();
         customs.iter().rev().find_map(|placement| {
             let local = crate::layout::Point {
@@ -2326,6 +2337,16 @@ impl Runtime {
         })
     }
 
+    /// The seam the pointer is on, by the AXIS it resizes — `None` when
+    /// the pointer is not on one. It answers for the grip under the
+    /// hand and for a drag already under way, because a seam keeps the
+    /// pointer while the hand runs ahead of it.
+    ///
+    /// The shell dresses the pointer from this: a seam between lanes
+    /// side by side travels left and right; one between stacked lanes
+    /// travels up and down. Without the axis a workbench wears the same
+    /// arrow on every seam, and the cursor is the only thing that says
+    /// which way a seam moves before the hand pulls it.
     pub fn seam_axis(&self) -> Option<crate::layout::Axis> {
         let interaction = self.interaction.borrow();
         let path = match interaction.split_drag.as_deref() {

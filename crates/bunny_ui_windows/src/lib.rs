@@ -1429,8 +1429,9 @@ fn pace_of(runtime: &Runtime) -> ffi::DriverPace {
 /// the seam, and hovering the grip announces it. Otherwise the BOX under the
 /// pointer answers first (`Runtime::hovered_cursor`): text wants an I-beam and
 /// a sheet's cells the cross, which the old rule — the hand over anything
-/// hoverable — could not know, so text read as a link. Only where no box
-/// answers does that rule stand.
+/// hoverable — could not know, so text read as a link, and a frame's grip the
+/// resizer of the way its edge travels. Only where no box answers does that
+/// rule stand.
 fn desired_cursor(
     seam: Option<Axis>,
     asked: Option<bunny_ui::layout::Cursor>,
@@ -1439,9 +1440,15 @@ fn desired_cursor(
     use bunny_ui::layout::Cursor as Asked;
     match (seam, asked) {
         // lanes side by side: the seam travels left and right
-        (Some(Axis::Horizontal), _) => ffi::Cursor::ResizeLeftRight,
+        (Some(Axis::Horizontal), _) | (None, Some(Asked::ResizeLeftRight)) => {
+            ffi::Cursor::ResizeLeftRight
+        }
         // lanes stacked: it travels up and down
-        (Some(Axis::Vertical), _) => ffi::Cursor::ResizeUpDown,
+        (Some(Axis::Vertical), _) | (None, Some(Asked::ResizeUpDown)) => {
+            ffi::Cursor::ResizeUpDown
+        }
+        (None, Some(Asked::ResizeUpLeftDownRight)) => ffi::Cursor::ResizeUpLeftDownRight,
+        (None, Some(Asked::ResizeUpRightDownLeft)) => ffi::Cursor::ResizeUpRightDownLeft,
         (None, Some(Asked::Text)) => ffi::Cursor::Text,
         (None, Some(Asked::Pointing)) => ffi::Cursor::Pointing,
         (None, Some(Asked::Cell)) => ffi::Cursor::Cell,
@@ -1473,6 +1480,21 @@ mod tests {
             ffi::Cursor::ResizeLeftRight
         );
         assert_eq!(desired_cursor(Some(Axis::Vertical), None, false), ffi::Cursor::ResizeUpDown);
+        // a frame's grip wears the resizer of the way its edge travels —
+        // hoverable or not, it is never the hand
+        assert_eq!(
+            desired_cursor(None, Some(Asked::ResizeLeftRight), true),
+            ffi::Cursor::ResizeLeftRight
+        );
+        assert_eq!(desired_cursor(None, Some(Asked::ResizeUpDown), true), ffi::Cursor::ResizeUpDown);
+        assert_eq!(
+            desired_cursor(None, Some(Asked::ResizeUpLeftDownRight), true),
+            ffi::Cursor::ResizeUpLeftDownRight
+        );
+        assert_eq!(
+            desired_cursor(None, Some(Asked::ResizeUpRightDownLeft), false),
+            ffi::Cursor::ResizeUpRightDownLeft
+        );
     }
 
     fn stroke(vk: u32, base: &str, shift: bool, control: bool, alt: bool) -> ffi::KeyStroke {

@@ -1386,11 +1386,21 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
             // The BOX under the pointer answers first — text wants an I-beam,
             // and the rule below cannot know that. Only where nobody answers
             // does the old rule stand: the hand over anything hoverable.
+            // A box's resizer is a FRAME's, which AppKit draws unlike the
+            // seam's divider.
             None => match runtime.hovered_cursor() {
                 Some(bunny_ui::layout::Cursor::Text) => ffi::Cursor::Text,
                 Some(bunny_ui::layout::Cursor::Pointing) => ffi::Cursor::Pointing,
                 Some(bunny_ui::layout::Cursor::Cell) => ffi::Cursor::Cell,
                 Some(bunny_ui::layout::Cursor::Arrow) => ffi::Cursor::Arrow,
+                Some(bunny_ui::layout::Cursor::ResizeLeftRight) => ffi::Cursor::FrameLeftRight,
+                Some(bunny_ui::layout::Cursor::ResizeUpDown) => ffi::Cursor::FrameUpDown,
+                Some(bunny_ui::layout::Cursor::ResizeUpLeftDownRight) => {
+                    ffi::Cursor::FrameUpLeftDownRight
+                }
+                Some(bunny_ui::layout::Cursor::ResizeUpRightDownLeft) => {
+                    ffi::Cursor::FrameUpRightDownLeft
+                }
                 None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
                 None => ffi::Cursor::Arrow,
             },
