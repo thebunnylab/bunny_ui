@@ -1774,6 +1774,13 @@ where
 /// the window-miss pass corrects the rare shortfall.
 const FIRST_WINDOW: usize = 256;
 
+/// The tail a following list materializes on its first frame, in points
+/// of its known heights: a tall screen and the buffer above it. Counted
+/// in points rather than rows because a list whose rows vary has no
+/// honest row count for a screen; the window-miss pass corrects the rare
+/// shortfall, as it does [`FIRST_WINDOW`]'s.
+const FIRST_TAIL: f64 = 4096.0;
+
 /// A virtualized list: `count` rows of ONE uniform height, and only the
 /// visible window (plus one viewport of buffer on each side) exists.
 /// Closures take the row INDEX — no collection is cloned into the view.
@@ -1796,6 +1803,8 @@ pub struct VirtualList<I, F> {
     measured: Option<f64>,
     /// The tail's binding: the list keeps to its end while it reads true.
     follow: Option<Binding<bool>>,
+    /// The ordinal of row zero in the list's own history.
+    first_row: usize,
 }
 
 impl<I, F> VirtualList<I, F> {
@@ -1843,6 +1852,20 @@ impl<I, F> VirtualList<I, F> {
     /// list back to the end, which is the "jump to the latest" pill.
     pub fn follow_tail(mut self, following: Binding<bool>) -> Self {
         self.follow = Some(following);
+        self
+    }
+
+    /// Row zero is the list's `ordinal`-th row: how many rows have left
+    /// its head since it began. A transcript that keeps a bounded window
+    /// drops its oldest rows as new ones arrive, and every index moves up
+    /// by what it dropped — told so here, a list whose rows measure
+    /// themselves lets the dropped rows' heights go with them instead of
+    /// lending them to the rows that moved into their places, and the
+    /// scroll takes their sum: the rows the reader is looking at stay
+    /// where they are, and a tail being followed keeps being followed.
+    /// An ordinal that goes BACK is a list that started over.
+    pub fn first_row(mut self, ordinal: usize) -> Self {
+        self.first_row = ordinal;
         self
     }
 
@@ -1894,11 +1917,14 @@ where
             (Some(estimate), Some(path)) => {
                 let cache = crate::viewport::row_cache(path);
                 cache.set_estimate(estimate);
+                cache.rebase(self.first_row);
                 *cache.follow.borrow_mut() = self.follow.clone();
                 Some(cache)
             }
             _ => None,
         };
+        // read once: the first frame's window is the tail's while it holds
+        let following = self.follow.as_ref().is_some_and(Binding::wrappedValue);
         let heights: Option<std::rc::Rc<dyn Fn(usize) -> f64>> = match &cache {
             Some(cache) => {
                 let cache = std::rc::Rc::clone(cache);
@@ -1966,6 +1992,22 @@ where
                 let last = (top + 2 * rows_in_view).min(self.count - 1);
                 (first, last)
             }
+            // a list that follows its tail OPENS at its tail: before any
+            // geometry the glass is headed for the end, so the rows worth
+            // building are the last ones — the head's first window would
+            // be built, measured and thrown away in the same frame
+            (None, _) if following && self.count > 0 => match &offsets {
+                Some(offsets) => {
+                    let total = *offsets.last().expect("offsets carry the total");
+                    let first_edge = (total - FIRST_TAIL).max(0.0);
+                    let first = offsets
+                        .partition_point(|start| *start <= first_edge)
+                        .saturating_sub(1)
+                        .min(self.count - 1);
+                    (first, self.count - 1)
+                }
+                None => (self.count.saturating_sub(FIRST_WINDOW), self.count - 1),
+            },
             _ => (0, self.count.min(FIRST_WINDOW).saturating_sub(1)),
         };
         // an EMPTY list has no window: `first..=last` is (0, 0) there,
@@ -2110,6 +2152,7 @@ where
         declared_extent: None,
         measured: None,
         follow: None,
+        first_row: 0,
     }
 }
 

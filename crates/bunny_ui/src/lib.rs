@@ -1307,6 +1307,140 @@ mod tests {
         assert!(transcript.following.get(), "at the end, following");
     }
 
+    /// A long transcript opened on a following list: the glass is headed
+    /// for the end, so the first frame builds the tail — never the head's
+    /// window, which would be built, measured and thrown away in the same
+    /// frame (a session of two thousand entries paid two hundred and
+    /// fifty-six of its oldest on every mount).
+    #[test]
+    fn a_list_that_follows_its_tail_opens_at_its_tail() {
+        #[derive(Clone)]
+        struct Transcript {
+            built: std::rc::Rc<RefCell<Vec<usize>>>,
+            following: State<bool>,
+        }
+        impl Component for Transcript {
+            fn body(self, _ctx: &Context) -> impl View {
+                let built = std::rc::Rc::clone(&self.built);
+                virtual_list(2000, |row| format!("entry{row}"), move |row| {
+                    built.borrow_mut().push(row);
+                    spacer().frame_height(40.0)
+                })
+                .measured_rows(40.0)
+                .follow_tail(self.following.binding())
+            }
+        }
+        let size = crate::layout::Size { width: 200.0, height: 300.0 };
+        let transcript = Transcript { built: std::rc::Rc::default(), following: State::new(true) };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&transcript, size);
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let built = transcript.built.borrow();
+        let oldest = built.iter().copied().min().expect("rows were built");
+        // a tall screen and its buffer of the tail, at forty points a row
+        assert!(oldest >= 2000 - 4096 / 40 - 1, "the head was built: row {oldest}");
+        assert!(built.len() < 256, "{} rows built for a screen of eight", built.len());
+        let path = result.scrolls.first().expect("the region exists").path.clone();
+        assert_eq!(runtime.scroll_offset(&path).y, 2000.0 * 40.0 - 300.0, "the glass is at the end");
+        assert!(result.frames.find("[entry1999]").is_some(), "the newest row is on the glass");
+    }
+
+    /// A bounded transcript drops its oldest rows as new ones arrive, and
+    /// every index moves up by what it dropped. Told the ordinal of its
+    /// first row, the list lets the dropped rows' heights go with them —
+    /// kept by index they would be lent to the rows that moved into their
+    /// places — and the scroll takes their sum: the reader parked on a row
+    /// keeps looking at it.
+    #[test]
+    fn a_list_that_drops_its_head_keeps_the_reader_where_they_were() {
+        #[derive(Clone, Copy)]
+        struct Transcript {
+            first: State<usize>,
+        }
+        impl Component for Transcript {
+            fn body(self, _ctx: &Context) -> impl View {
+                let first = self.first.get();
+                // a row is as tall as what it holds, wherever the window puts it
+                virtual_list(100, move |row| format!("entry{}", first + row), move |row| {
+                    spacer().frame_height(20.0 * (1 + (first + row) % 3) as f64)
+                })
+                .measured_rows(40.0)
+                .first_row(first)
+            }
+        }
+        let tall = |ordinal: usize| 20.0 * (1 + ordinal % 3) as f64;
+        let size = crate::layout::Size { width: 200.0, height: 150.0 };
+        let transcript = Transcript { first: State::new(0) };
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&transcript, size);
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let path = result.scrolls.first().expect("the region exists").path.clone();
+        // ordinal ten at the top of the glass
+        let above: f64 = (0..10).map(tall).sum();
+        runtime.set_scroll_offset(&path, crate::layout::Point { x: 0.0, y: above });
+        let _ = runtime.display_frame(&transcript, size);
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let on_glass = |result: &crate::layout::LayoutResult| {
+            result.frames.find("[entry10]").expect("ordinal ten is on the glass").origin.y
+        };
+        assert_eq!(on_glass(&result), 0.0);
+
+        // three rows leave the head
+        transcript.first.set(3);
+        let _ = runtime.display_frame(&transcript, size);
+        let result = runtime.layout(&transcript, crate::layout::Proposal::exact(size));
+        let dropped: f64 = (0..3).map(tall).sum();
+        assert_eq!(runtime.scroll_offset(&path).y, above - dropped, "the scroll took the dropped rows");
+        assert_eq!(on_glass(&result), 0.0, "and the reader's row stayed where they were looking");
+    }
+
+    /// A bounded transcript at its cap, followed: every new row drops the
+    /// oldest, and the list keeps following — the scroll the dropped head
+    /// owes is its own doing, never the reader leaving the tail.
+    #[test]
+    fn a_list_that_drops_its_head_while_following_keeps_following() {
+        #[derive(Clone, Copy)]
+        struct Transcript {
+            first: State<usize>,
+            following: State<bool>,
+        }
+        impl Component for Transcript {
+            fn body(self, _ctx: &Context) -> impl View {
+                let first = self.first.get();
+                virtual_list(50, move |row| format!("entry{}", first + row), move |row| {
+                    spacer().frame_height(20.0 * (1 + (first + row) % 3) as f64)
+                })
+                .measured_rows(40.0)
+                .first_row(first)
+                .follow_tail(self.following.binding())
+            }
+        }
+        let size = crate::layout::Size { width: 200.0, height: 200.0 };
+        let transcript = Transcript { first: State::new(0), following: State::new(true) };
+        let runtime = Runtime::new();
+        let frame = |runtime: &Runtime| {
+            let _ = runtime.display_frame(&transcript, size);
+            runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+        };
+        let _ = frame(&runtime);
+        let _ = frame(&runtime);
+        for step in 1..=5 {
+            transcript.first.set(step);
+            let _ = frame(&runtime);
+            let result = frame(&runtime);
+            assert!(transcript.following.get(), "step {step}: the list still follows its tail");
+            let newest = result
+                .frames
+                .find(&format!("[entry{}]", step + 49))
+                .expect("the newest row is on the glass");
+            assert!(
+                (newest.origin.y + newest.size.height - 200.0).abs() < 0.5,
+                "step {step}: the glass is at the end, the newest row's bottom at {}",
+                newest.origin.y + newest.size.height
+            );
+        }
+    }
+
     #[test]
     fn a_reveal_lands_on_a_variable_row() {
         #[derive(Clone, Copy)]

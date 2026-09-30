@@ -246,6 +246,9 @@ pub struct RowCache {
     /// By row index; NaN is a row never measured.
     heights: std::cell::RefCell<Vec<Px>>,
     estimate: std::cell::Cell<Px>,
+    /// The ordinal of row zero in the list's own history (`first_row`) —
+    /// `None` until the list first says it.
+    first: std::cell::Cell<Option<usize>>,
     /// What rows above the viewport grew by since the last layout —
     /// the offset moves by it so what is on the glass stays put.
     shift: std::cell::Cell<Px>,
@@ -262,6 +265,7 @@ impl RowCache {
             path,
             heights: std::cell::RefCell::new(Vec::new()),
             estimate: std::cell::Cell::new(0.0),
+            first: std::cell::Cell::new(None),
             shift: std::cell::Cell::new(0.0),
             follow: std::cell::RefCell::new(None),
             followed_to: std::cell::Cell::new(None),
@@ -270,6 +274,43 @@ impl RowCache {
 
     pub(crate) fn set_estimate(&self, estimate: Px) {
         self.estimate.set(estimate.max(0.0));
+    }
+
+    /// Row zero is now the `first`-th row of the list's history. Rows that
+    /// left the head since the list last said so take their heights with
+    /// them — kept by index, they would otherwise be lent to the rows that
+    /// moved up into their places — and the scroll owes their sum: the rows
+    /// on the glass stay where the reader is looking, and a tail being
+    /// followed is found where the list left it.
+    ///
+    /// A head that moved BACK is a list that started over: nothing kept
+    /// describes its rows any more.
+    pub(crate) fn rebase(&self, first: usize) {
+        let Some(before) = self.first.replace(Some(first)) else {
+            return;
+        };
+        if first < before {
+            self.heights.borrow_mut().clear();
+            return;
+        }
+        let dropped = first - before;
+        if dropped == 0 {
+            return;
+        }
+        let estimate = self.estimate.get();
+        let gone: Px = {
+            let mut heights = self.heights.borrow_mut();
+            let known = dropped.min(heights.len());
+            let measured: Px = heights
+                .drain(..known)
+                .map(|height| if height.is_nan() { estimate } else { height })
+                .sum();
+            measured + (dropped - known) as Px * estimate
+        };
+        self.shift.set(self.shift.get() - gone);
+        if let Some(left) = self.followed_to.get() {
+            self.followed_to.set(Some((left - gone).max(0.0)));
+        }
     }
 
     /// A row's height: the last it measured, or the estimate.
