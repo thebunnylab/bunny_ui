@@ -2951,11 +2951,13 @@ extern "C" fn bunny_draw_rect(this: Id, _sel: Sel, _dirty: CGRect) {
 /// Creates the app + the window with the event view, ready for blit.
 /// `scene_chrome` hides the system title bar: full-size content, a
 /// transparent titlebar and no title text — the native traffic lights
-/// stay at the corner and the SCENE draws the bar.
+/// stay at the corner and the SCENE draws the bar. `min`, when given, is
+/// the content floor a drag cannot go under — the same
+/// `setContentMinSize:` a dialog is born with.
 pub fn create_window(
     title: &str,
-    width: f64,
-    height: f64,
+    size: CGSize,
+    min: Option<CGSize>,
     scene_chrome: bool,
     manners: Manners,
 ) -> WindowHandle {
@@ -2967,10 +2969,7 @@ pub fn create_window(
         // Regular: a terminal app gets a window, the Dock and focus
         let _ = msg_bool_i64(app, sel("setActivationPolicy:"), 0);
 
-        let rect = CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: CGSize { width, height },
-        };
+        let rect = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size };
         // titled | closable (+ miniaturizable, + resizable, + full-size
         // content when the scene owns the chrome). A mask without
         // Miniaturizable draws the yellow light dead, which is exactly
@@ -3002,6 +3001,9 @@ pub fn create_window(
             // window in Mission Control and the Dock
             msg_void_i64(window, sel("setTitleVisibility:"), 1);
         }
+        if let Some(min) = min {
+            msg_void_size(window, sel("setContentMinSize:"), min);
+        }
 
         let title = CString::new(title).expect("title without NUL");
         let ns_title = msg_id_cstr(
@@ -3023,8 +3025,8 @@ pub fn create_window(
         let _ = crate::metal::try_install(
             view,
             msg_f64(window, sel("backingScaleFactor")),
-            width,
-            height,
+            size.width,
+            size.height,
         );
         msg_void_bool(view, sel("setWantsLayer:"), 1);
         msg_void_id(window, sel("setContentView:"), view);

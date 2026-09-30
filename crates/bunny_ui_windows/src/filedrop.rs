@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn a_window_takes_drops_and_its_target_answers_through_the_gate() {
-        let window = ffi::create_window("bunny drop", 200.0, 150.0, false, true, true);
+        let window = ffi::create_window("bunny drop", 200.0, 150.0, None, false, true, true);
         let hwnd = window.raw_window() as Hwnd;
         // `create_window` made it a drop target: OLE refuses a second
         // registration (and says so, never a panic)
