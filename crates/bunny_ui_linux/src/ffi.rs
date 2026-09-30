@@ -2182,6 +2182,11 @@ pub fn create_window(title: &str, width: f64, height: f64, options: WindowOption
                 let (w, h) = (width.round() as i32, height.round() as i32);
                 request(toplevel, 8, &mut [arg_i(w), arg_i(h)]); // set_min_size
                 request(toplevel, 7, &mut [arg_i(w), arg_i(h)]); // set_max_size
+            } else if let Some((min_width, min_height)) = options.min {
+                // a floor alone: the grab stops there, and no maximum is
+                // said, so the maximize verb stays the compositor's
+                let (w, h) = (min_width.round() as i32, min_height.round() as i32);
+                request(toplevel, 8, &mut [arg_i(w), arg_i(h)]); // set_min_size
             }
         }
         // the frame question, before the first commit: server-side for
@@ -2392,12 +2397,14 @@ pub fn show_window(window: WindowHandle) {
 }
 
 /// What a window is asked to be at creation, beyond its size and its
-/// title: who draws its top edge, and its manners.
+/// title: who draws its top edge, its manners, and the floor a resizable
+/// one may not be dragged under, in logical points.
 #[derive(Clone, Copy, Debug)]
 pub struct WindowOptions {
     pub scene: bool,
     pub resizable: bool,
     pub minimizable: bool,
+    pub min: Option<(f64, f64)>,
 }
 
 /// Who draws the window's frame, as far as the door knows.
