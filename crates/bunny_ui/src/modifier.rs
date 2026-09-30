@@ -150,6 +150,9 @@ pub enum Modifier {
     /// STATE the app can hold. The five hover modifiers beside it are
     /// paint and tell nobody anything.
     OnHover(crate::reconciler::ClickAction),
+    /// `.on_copy(|| …)` — a read-only view that takes the keyboard on a
+    /// click (no caret) and answers ⌘C with what it has selected.
+    OnCopy(crate::reconciler::CopyFn),
     OnAction(crate::action::ActionId, Rc<dyn Fn()>),
 
     // MARK: - Interaction (the action fires at render, as in the headless engine)
@@ -346,6 +349,7 @@ impl Modifier {
             Modifier::LayoutMode(mode) => format!(" [.layout({mode:?})]"),
             Modifier::OnClick(_) => " [.onClick()]".into(),
             Modifier::OnHover(_) => " [.onHover()]".into(),
+            Modifier::OnCopy(_) => " [.onCopy()]".into(),
             Modifier::OnAction(id, _) => format!(" [.onAction({id})]"),
             Modifier::OnAppear(_) => " [.onAppear()]".into(),
             Modifier::OnTapGesture(_) => " [.onTapGesture()]".into(),
@@ -1632,6 +1636,19 @@ fn apply(
                     format!("{path}/{}", crate::reconciler::HOVER_KEY),
                     action.clone(),
                 );
+                out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
+                    path,
+                    child: Box::new(node),
+                });
+            }
+        }
+        Modifier::OnCopy(copy) => {
+            // a view the keyboard can land on must be one the pointer can
+            // hit, so it becomes a target the way `.on_click` makes one;
+            // its answer waits in its own map, because a copy returns text
+            // and a click returns nothing
+            if let Some(path) = motor::identity::cursor_scope() {
+                crate::reconciler::attribute_copy(path.clone(), copy.clone());
                 out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
                     path,
                     child: Box::new(node),

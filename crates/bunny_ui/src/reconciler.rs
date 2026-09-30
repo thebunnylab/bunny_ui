@@ -45,6 +45,13 @@ pub(crate) type ClickAction = Rc<dyn Fn(u8)>;
 
 pub(crate) type ActionEntry = (String, ClickAction);
 
+/// What a `.on_copy` answers when ⌘C reaches it: the text of what the
+/// view has selected, or `None` when nothing is. Retained like the
+/// actions — a skipped view's table still copies.
+pub(crate) type CopyFn = Rc<dyn Fn() -> Option<String>>;
+
+pub(crate) type CopyEntry = (String, CopyFn);
+
 /// A text field's editor: applies a command to the (binding, caret)
 /// pair and returns the output of `Read`/`Copy`/`Cut`. Retained like
 /// the actions — a skipped view's field still edits.
@@ -143,6 +150,8 @@ pub(crate) struct Entry {
     /// The body's interactive actions — retained like the effects: a
     /// skipped view's button stays clickable.
     pub actions: Vec<ActionEntry>,
+    /// The body's `.on_copy` answers — same retention.
+    pub copies: Vec<CopyEntry>,
     /// The body's field editors — same retention.
     pub editors: Vec<EditorEntry>,
     /// The body's split-position writers — same retention.
@@ -175,6 +184,7 @@ struct BuildingFrame {
     path: String,
     effects: Vec<EffectFn>,
     actions: Vec<ActionEntry>,
+    copies: Vec<CopyEntry>,
     editors: Vec<EditorEntry>,
     splits: Vec<SplitEntry>,
     scrolls: Vec<ScrollEntry>,
@@ -196,6 +206,7 @@ struct PassState {
     /// re-run on every walk.
     root_effects: Vec<EffectFn>,
     root_actions: Vec<ActionEntry>,
+    root_copies: Vec<CopyEntry>,
     root_editors: Vec<EditorEntry>,
     root_splits: Vec<SplitEntry>,
     root_scrolls: Vec<ScrollEntry>,
@@ -444,7 +455,7 @@ pub(crate) fn finish_entry(
     node: RenderNode,
     layout: LayoutNode,
 ) {
-    let (effects, actions, editors, splits, scrolls, measures, webviews, customs, handlers, contexts) =
+    let (effects, actions, copies, editors, splits, scrolls, measures, webviews, customs, handlers, contexts) =
         PASS.with(|pass| {
             let mut pass = pass.borrow_mut();
             match pass.building.pop() {
@@ -453,6 +464,7 @@ pub(crate) fn finish_entry(
                     (
                         frame.effects,
                         frame.actions,
+                        frame.copies,
                         frame.editors,
                         frame.splits,
                         frame.scrolls,
@@ -464,6 +476,7 @@ pub(crate) fn finish_entry(
                     )
                 }
                 None => (
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -501,6 +514,7 @@ pub(crate) fn finish_entry(
                 slot,
                 effects,
                 actions,
+                copies,
                 editors,
                 splits,
                 scrolls,
@@ -546,6 +560,18 @@ pub(crate) fn attribute_action(path: String, action: ClickAction) {
             frame.actions.push((path, action));
         } else {
             pass.root_actions.push((path, action));
+        }
+    });
+}
+
+/// A `.on_copy` answer registered during render — same attribution.
+pub(crate) fn attribute_copy(path: String, copy: CopyFn) {
+    PASS.with(|pass| {
+        let mut pass = pass.borrow_mut();
+        if let Some(frame) = pass.building.last_mut() {
+            frame.copies.push((path, copy));
+        } else {
+            pass.root_copies.push((path, copy));
         }
     });
 }
@@ -910,6 +936,62 @@ pub(crate) fn run_action(path: &str, clicks: u8) -> bool {
         }
         None => false,
     }
+}
+
+thread_local! {
+    /// The live copy map: target path → what a ⌘C there answers.
+    /// Reassembled on every pass, like the click map.
+    static COPIES: RefCell<HashMap<String, CopyFn>> = RefCell::new(HashMap::default());
+}
+
+/// Reassembles the copy map from the retention under the root (a
+/// skipped view's table still copies) + the root region.
+pub(crate) fn assemble_copies(root: &str) {
+    let mut map: HashMap<String, CopyFn> = HashMap::default();
+    RETAINED.with(|retained| {
+        for (path, entry) in retained.borrow().iter() {
+            if covers(root, path) {
+                for (key, copy) in &entry.copies {
+                    map.insert(key.clone(), copy.clone());
+                }
+            }
+        }
+    });
+    PASS.with(|pass| {
+        for (key, copy) in std::mem::take(&mut pass.borrow_mut().root_copies) {
+            map.insert(key, copy);
+        }
+    });
+    COPIES.with(|copies| *copies.borrow_mut() = map);
+}
+
+/// The view that answers a copy for a press at `path`: the path itself
+/// or its nearest ancestor that registered `.on_copy`. A click on a row
+/// hands the keyboard to the table the row belongs to.
+pub(crate) fn copy_owner(path: &str) -> Option<String> {
+    COPIES.with(|copies| {
+        copies
+            .borrow()
+            .keys()
+            .filter(|owner| covers(owner, path))
+            .max_by_key(|owner| owner.len())
+            .cloned()
+    })
+}
+
+/// Does the view at `path` answer a copy? A focus that lands on one
+/// holds the keyboard with no caret.
+pub(crate) fn answers_copy(path: &str) -> bool {
+    COPIES.with(|copies| copies.borrow().contains_key(path))
+}
+
+/// What the `.on_copy` at `path` answers now — `None` when nothing is
+/// registered there, `Some(None)` when it is but nothing is selected.
+pub(crate) fn run_copy(path: &str) -> Option<Option<String>> {
+    // outside the borrow: the answer reads the app's state, which may
+    // read the runtime back
+    let copy = COPIES.with(|copies| copies.borrow().get(path).cloned())?;
+    Some(copy())
 }
 
 thread_local! {
@@ -1316,6 +1398,9 @@ pub(crate) fn input_fingerprint() -> u64 {
     mix(ACTIONS.with(|map| {
         map.borrow().iter().fold(0u64, |sum, (key, action)| sum.wrapping_add(of_key(key) ^ of_ptr(action)))
     }));
+    mix(COPIES.with(|map| {
+        map.borrow().iter().fold(0u64, |sum, (key, copy)| sum.wrapping_add(of_key(key) ^ of_ptr(copy)))
+    }));
     mix(EDITORS.with(|map| {
         map.borrow().iter().fold(0u64, |sum, (key, editor)| sum.wrapping_add(of_key(key) ^ of_ptr(&editor.command)))
     }));
@@ -1356,6 +1441,7 @@ fn root_region_is_empty() -> bool {
         let pass = pass.borrow();
         pass.root_effects.is_empty()
             && pass.root_actions.is_empty()
+            && pass.root_copies.is_empty()
             && pass.root_editors.is_empty()
             && pass.root_splits.is_empty()
             && pass.root_scrolls.is_empty()
@@ -1512,6 +1598,7 @@ pub(crate) fn reset_world() {
     DECLARED_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     HANDLERS.with(|handlers| handlers.borrow_mut().clear());
     ACTIONS.with(|actions| actions.borrow_mut().clear());
+    COPIES.with(|copies| copies.borrow_mut().clear());
     EDITORS.with(|editors| editors.borrow_mut().clear());
     SPLITS.with(|splits| splits.borrow_mut().clear());
     SCROLLS.with(|scrolls| scrolls.borrow_mut().clear());
