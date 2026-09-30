@@ -3227,6 +3227,17 @@ pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHan
     }
 }
 
+/// Which manners a dialog's window is born with — the two real windows a
+/// scene can ask for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DialogManners {
+    /// `OverlaySurface::Window`: a place the reader works in (Settings).
+    /// `min` is the content's floor, `lights` the scene-chrome point.
+    Workspace { min: (f64, f64), lights: Option<(f64, f64)> },
+    /// `OverlaySurface::Alert`: a question — one size, no bar, no lights.
+    Ask,
+}
+
 /// Creates a DIALOG window over `parent` — the real titled window an
 /// overlay with `OverlaySurface::Window` asked for. Sized by its
 /// CONTENT rect; the caller places it with
@@ -3254,14 +3265,15 @@ pub fn create_panel(parent: &WindowHandle, width: f64, height: f64) -> WindowHan
 /// to the OS), and the native traffic lights placed at that point
 /// from the window's top-left — the app's own header carries them,
 /// the main window's `Chrome::SceneAt` road for a dialog.
+///
+/// An ALERT ([`DialogManners::Ask`]) is the same window with the
+/// system's own alerts' shape instead: no bar and no lights at all.
 pub fn create_dialog(
     parent: &WindowHandle,
     title: &str,
     width: f64,
     height: f64,
-    min_width: f64,
-    min_height: f64,
-    lights: Option<(f64, f64)>,
+    manners: DialogManners,
 ) -> WindowHandle {
     unsafe {
         let pool = objc_autoreleasePoolPush();
@@ -3271,10 +3283,22 @@ pub fn create_dialog(
             origin: CGPoint { x: 0.0, y: 0.0 },
             size: CGSize { width, height },
         };
-        // titled | closable | resizable — miniaturizable stays OFF, so
-        // the yellow light is born disabled (+ full-size content when
-        // the dialog's own header owns the top edge)
-        let style: u64 = if lights.is_some() { 1 | 2 | 8 | (1 << 15) } else { 1 | 2 | 8 };
+        let (style, lights, bare): (u64, Option<(f64, f64)>, bool) = match manners {
+            // titled | closable | resizable — miniaturizable stays OFF,
+            // so the yellow light is born disabled (+ full-size content
+            // when the dialog's own header owns the top edge)
+            DialogManners::Workspace { lights: Some(lights), .. } => {
+                (1 | 2 | 8 | (1 << 15), Some(lights), true)
+            }
+            DialogManners::Workspace { lights: None, .. } => (1 | 2 | 8, None, false),
+            // titled ONLY for what a title brings — the system's shadow,
+            // its rounded corners, a window that can take key — over
+            // full-size content with the bar made invisible. Not
+            // closable, not resizable, not miniaturizable: an alert's
+            // answers are its buttons, Escape and ⌘., and its size is
+            // its content's (the shell sets the frame layout fitted)
+            DialogManners::Ask => (1 | (1 << 15), None, true),
+        };
         let window = msg_id(class("NSWindow"), sel("alloc"));
         let window = msg_init_window(
             window,
@@ -3284,19 +3308,32 @@ pub fn create_dialog(
             2, // buffered
             0,
         );
-        if lights.is_some() {
+        if bare {
             msg_void_bool(window, sel("setTitlebarAppearsTransparent:"), 1);
             // NSWindowTitleHidden = 1 — the title still names the
             // window in Mission Control
             msg_void_i64(window, sel("setTitleVisibility:"), 1);
         }
+        if matches!(manners, DialogManners::Ask) {
+            // the three lights would stand disabled in the invisible
+            // bar: an alert has none, so they go (hidden, not removed —
+            // AppKit keeps its own buttons)
+            for kind in WINDOW_BUTTONS {
+                let button = msg_id_u64(window, sel("standardWindowButton:"), kind);
+                if !button.is_null() {
+                    msg_void_bool(button, sel("setHidden:"), 1);
+                }
+            }
+        }
         // NSWindowCollectionBehaviorFullScreenAuxiliary (1 << 8)
         msg_void_u64(window, sel("setCollectionBehavior:"), 1 << 8);
-        msg_void_size(
-            window,
-            sel("setContentMinSize:"),
-            CGSize { width: min_width, height: min_height },
-        );
+        if let DialogManners::Workspace { min: (min_width, min_height), .. } = manners {
+            msg_void_size(
+                window,
+                sel("setContentMinSize:"),
+                CGSize { width: min_width, height: min_height },
+            );
+        }
         let title = CString::new(title).expect("title without NUL");
         let ns_title = msg_id_cstr(
             class("NSString"),

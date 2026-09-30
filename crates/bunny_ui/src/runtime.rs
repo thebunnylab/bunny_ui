@@ -17,7 +17,10 @@ use std::rc::Rc;
 
 use motor::state::{Context, EnvironmentValues};
 
-use crate::action::{ActionId, KeyPattern, OVERLAY_CONTEXT, OVERLAY_DISMISS};
+use crate::action::{
+    ALERT_CANCEL, ALERT_CONTEXT, ALERT_DEFAULT, ActionId, KeyPattern, OVERLAY_CONTEXT,
+    OVERLAY_DISMISS,
+};
 use crate::effects;
 use crate::layout::{
     FieldPlacement, Interaction, LayoutEnv, OverlayPlacement, Point, Px, Rect, ScrollRegion,
@@ -396,6 +399,11 @@ pub struct Runtime {
     /// reopening lands where the reader left the window (the session's
     /// memory — a fresh runtime starts centered again).
     dialog_frames: RefCell<HashMap<String, Rect>>,
+    /// The alerts the last layout placed, by overlay path. An alert's
+    /// window reports its travels into `dialog_frames` like a dialog's,
+    /// but an alert remembers no spot: the pass it closes, its entry
+    /// goes, and the next ask opens centred.
+    open_alerts: RefCell<Vec<String>>,
     /// How many PHYSICAL pixels one layout point is worth on this
     /// screen. The shell installs it; everyone else keeps `1.0`.
     device_scale: Cell<Px>,
@@ -665,9 +673,37 @@ impl Runtime {
     /// Runs ONE overlay's dismissal — the road a dialog window's own
     /// close button arrives by (the shell hears `windowShouldClose`,
     /// fires this, and the flipped binding is what closes the window).
-    /// `true` = the overlay answered and the shell repaints.
+    /// An alert's dismissal is its cancel answer. `true` = the overlay
+    /// answered and the shell repaints.
     pub fn dismiss_overlay(&self, path: &str) -> bool {
         reconciler::run_action(&format!("{path}/#dismiss"), 1)
+    }
+
+    /// An alert that left the scene forgets the spot its window was
+    /// dragged to — a dialog keeps its spot, an ask opens centred.
+    fn forget_answered_alerts(&self, placed: &[OverlayPlacement]) {
+        let mut open = self.open_alerts.borrow_mut();
+        let alerts = || {
+            placed
+                .iter()
+                .filter(|overlay| {
+                    matches!(overlay.surface, crate::layout::OverlaySurface::Alert(_))
+                })
+                .map(|overlay| overlay.path.as_str())
+        };
+        let mut frames = self.dialog_frames.borrow_mut();
+        open.retain(|path| {
+            let stands = alerts().any(|alert| alert == path);
+            if !stands {
+                frames.remove(path);
+            }
+            stands
+        });
+        for alert in alerts() {
+            if !open.iter().any(|path| path == alert) {
+                open.push(alert.to_owned());
+            }
+        }
     }
 
     /// How many PHYSICAL pixels one layout point covers — what the
@@ -1332,6 +1368,7 @@ impl Runtime {
             last_control_regions: RefCell::new(Vec::new()),
             overlay_bounds: Cell::new(None),
             dialog_frames: RefCell::new(HashMap::default()),
+            open_alerts: RefCell::new(Vec::new()),
             device_scale: Cell::new(1.0),
             safe_area: Cell::new(crate::layout::Edges::ZERO),
             keyboard_inset: Cell::new(0.0),
@@ -1350,6 +1387,16 @@ impl Runtime {
             .entry(OVERLAY_CONTEXT)
             .or_default()
             .insert(KeyPattern::key(crate::action::Key::Escape), OVERLAY_DISMISS);
+        // an alert's answers, pre-bound the same way: Escape and the
+        // mac's ⌘. are its cancel, Return its default button
+        {
+            use crate::action::Key;
+            let mut scoped = runtime.scoped_keymap.borrow_mut();
+            let alert = scoped.entry(ALERT_CONTEXT).or_default();
+            alert.insert(KeyPattern::key(Key::Escape), ALERT_CANCEL);
+            alert.insert(KeyPattern::command(Key::Char('.')), ALERT_CANCEL);
+            alert.insert(KeyPattern::key(Key::Enter), ALERT_DEFAULT);
+        }
         runtime
     }
 
@@ -2888,11 +2935,22 @@ impl Runtime {
 
     /// The binding for the pattern: ACTIVE scoped contexts first (a
     /// mounted `.key_context` turns its bindings on), the global map as
-    /// the fallback.
+    /// the fallback — and while an alert is up, its reserved context
+    /// alone.
     pub fn match_key(&self, pattern: &KeyPattern) -> Option<ActionId> {
         let focus = self.focus.borrow().clone();
         let focus = focus.as_deref();
         let scoped = self.scoped_keymap.borrow();
+        // an open alert answers ALONE: its own keys, and nothing of the
+        // page's under it. Modal to the keyboard as to the pointer — a
+        // ⌘W that reached the page past an unsaved-work ask would close
+        // the very tab the ask is about, without asking.
+        //
+        // Nothing inside an alert takes Escape from it either, a popover
+        // included: an ask holds words and buttons, not menus.
+        if reconciler::context_active(ALERT_CONTEXT, focus) {
+            return scoped.get(ALERT_CONTEXT).and_then(|map| map.get(pattern)).copied();
+        }
         // the reserved popover context wins DETERMINISTICALLY — the
         // map below iterates in arbitrary order, and an app binding
         // Escape in its own active context must not shadow the dismiss
@@ -2943,6 +3001,14 @@ impl Runtime {
     fn resolve_chord(&self, stroke: &crate::action::Stroke) -> crate::action::KeyMatch {
         use crate::action::KeyMatch;
         let pattern = &stroke.pattern;
+        // under an open alert nothing is held in the air: a sequence the
+        // page began before the ask cannot finish beneath it, and only
+        // the alert's own single strokes answer (`match_key`)
+        let focus = self.focus.borrow().clone();
+        if reconciler::context_active(ALERT_CONTEXT, focus.as_deref()) {
+            self.cancel_chord();
+            return self.match_key(pattern).map_or(KeyMatch::None, KeyMatch::Action);
+        }
         let held = !self.pending.borrow().is_empty();
         // the explicit way out, and it consumes: a chord abandoned with
         // Escape must not also close the app's palette behind it
@@ -2952,7 +3018,6 @@ impl Runtime {
         }
         self.pending.borrow_mut().push(*pattern);
         self.pending_aged.set(false);
-        let focus = self.focus.borrow().clone();
         let live = |context: &Option<&'static str>| {
             context.is_none_or(|name| reconciler::context_active(name, focus.as_deref()))
         };
@@ -5540,6 +5605,9 @@ impl Runtime {
                 Some((path, beat)) if beat.bytes().all(|b| b.is_ascii_digit()) => {
                     reconciler::has_custom(path) || reconciler::has_editor(path)
                 }
+                // an alert's claim, for as long as the alert stands: a
+                // reopen is a new question, and claims again
+                Some((path, "alert")) => reconciler::declares(path, ALERT_CONTEXT),
                 _ => reconciler::has_editor(key),
             }
         });
@@ -5580,8 +5648,9 @@ impl Runtime {
     fn follow_named_inputs(&self) {
         let held = self.focus.borrow().clone();
         if let Some(path) = held {
-            let alive = reconciler::has_editor(&path) || reconciler::has_custom(&path);
-            if !alive {
+            // an open alert holding the keys is alive too, and must not
+            // be "followed" into a field that happens to wear its name
+            if !input_lives(&path) {
                 let chain = motor::identity::named_chain(&path);
                 if let Some(moved) = reconciler::input_by_chain(&chain, false) {
                     *self.focus.borrow_mut() = Some(moved.clone());
@@ -5670,8 +5739,44 @@ impl Runtime {
 
     /// Focuses the first field whose ask is new — once per identity for
     /// `.auto_focus()` (blur is final, remounting does not re-focus), once
-    /// per beat for `.auto_focus_beat` — then the boxes' beats.
+    /// per beat for `.auto_focus_beat` — then the boxes' beats. An alert
+    /// that just opened comes before all of them.
     fn apply_auto_focus(&self, result: &crate::layout::LayoutResult) -> bool {
+        // An alert takes the keyboard the pass it opens, from whoever
+        // holds it, and on LOAN (`crate::loans`): answering it gives the
+        // keys back, so the editor that held them before the ask holds
+        // them after, caret and all, without a click. It holds them
+        // ITSELF — its content is words and buttons — which is what keeps
+        // a stroke from typing into the file under an unsaved-work ask.
+        // Once per opening: the memory lives as long as the alert does.
+        for overlay in &result.overlays {
+            if !matches!(overlay.surface, crate::layout::OverlaySurface::Alert(_)) {
+                continue;
+            }
+            if !self.auto_focused.borrow_mut().insert(format!("{}#alert", overlay.path)) {
+                continue;
+            }
+            let lender = self.focus.borrow().clone();
+            let inside = lender.as_deref().is_some_and(|held| {
+                held.strip_prefix(overlay.path.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            });
+            if inside {
+                continue;
+            }
+            // a modal question also closes what floated over the page — a
+            // palette, a dropdown, a menu, a tooltip — the way a system
+            // alert closes the menus: nothing transient stands beside the
+            // ask, or stays clickable above its floor. Their own dismissal
+            // runs (a previewed theme is restored), and the keys a closing
+            // query held go home through the loan chain below
+            self.dismiss_all_overlays();
+            if let Some(lender) = lender {
+                self.loans.borrow_mut().lend(&overlay.path, &lender);
+            }
+            self.focus(&overlay.path);
+            return true;
+        }
         for field in &result.fields {
             if self.claim_auto_focus(&field.path, field.auto_focus) {
                 return true;
@@ -5833,6 +5938,7 @@ impl Runtime {
         self.last_customs.borrow_mut().clone_from(&result.customs);
         self.last_hosts.borrow_mut().clone_from(&result.hosts);
         self.last_overlays.borrow_mut().clone_from(&result.overlays);
+        self.forget_answered_alerts(&result.overlays);
         self.last_tooltips.borrow_mut().clone_from(&result.tooltips);
         self.last_menus.borrow_mut().clone_from(&result.menus);
         self.last_drag_sources.borrow_mut().clone_from(&result.drag_sources);
@@ -6088,9 +6194,12 @@ impl FrameNeed {
 
 /// Is the input at `path` on screen THIS pass? A field re-registers its
 /// editor and an app's box itself on every pass they render, so both
-/// tables together are the truth.
+/// tables together are the truth — and an open alert holds the keyboard
+/// itself, known by the context its sub-root declares.
 fn input_lives(path: &str) -> bool {
-    reconciler::has_editor(path) || reconciler::has_custom(path)
+    reconciler::has_editor(path)
+        || reconciler::has_custom(path)
+        || reconciler::declares(path, ALERT_CONTEXT)
 }
 
 /// How far a region can scroll on each axis — its content past its

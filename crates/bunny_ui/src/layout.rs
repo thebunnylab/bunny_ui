@@ -2578,14 +2578,18 @@ pub struct ScrollRegion {
 /// key. A `Window` is the other thing entirely — a REAL titled window
 /// with dialog manners (the settings dialog every IDE opens): its own
 /// bar, its own resize, the keyboard while it is up, the parent inert
-/// underneath. A shell without real windows presents it exactly like a
-/// sheet, and loses nothing but the chrome.
+/// underneath. An `Alert` is a real window too, with an ask's manners
+/// instead: one size, and the keyboard's answers are the framework's.
+/// A shell without real windows presents either exactly like a sheet,
+/// and loses nothing but the chrome.
 #[derive(Clone, Debug, PartialEq)]
 pub enum OverlaySurface {
     /// The in-scene layer — the road every popover and sheet rides.
     Layer,
     /// A real titled window, wearing the spec.
     Window(DialogSpec),
+    /// A real window with an alert's manners, wearing the spec.
+    Alert(AlertSpec),
 }
 
 /// Who draws a dialog's top edge.
@@ -2674,6 +2678,37 @@ impl DialogSpec {
     pub fn scene_lights(mut self, x: Px, y: Px) -> Self {
         self.chrome = DialogChrome::Scene { lights: Point { x, y } };
         self
+    }
+}
+
+/// What the shell needs to raise an ALERT's window: the name the OS
+/// knows it by, and how wide its content is. That is all an ask has.
+///
+/// An alert is not a small dialog. A dialog is a place the reader works
+/// in, so the window is theirs to size; an alert is a question, so it
+/// has exactly one size — `width` wide and as tall as its content there,
+/// fitted by layout on every pass, never by the reader's hand. The
+/// reader may MOVE it; nothing resizes, zooms or minimizes it, and each
+/// shell dresses it in its own platform's alert manners: no bar and no
+/// lights on macOS (the system's own alerts have none), a caption with
+/// only the close button on Windows, one fixed size on Linux.
+///
+/// Where a dialog remembers the spot the reader left it, an alert opens
+/// centred every time: a question should appear where questions appear.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlertSpec {
+    /// Names the window to the OS — the caption on a platform whose
+    /// alerts wear one, the accessibility name where they do not.
+    pub title: Arc<str>,
+    /// The content's width. Its height is the content's own answer at
+    /// this width.
+    pub width: Px,
+}
+
+impl AlertSpec {
+    /// An ask named `title`, laid out `width` points wide.
+    pub fn new(title: impl Into<Arc<str>>, width: Px) -> Self {
+        Self { title: title.into(), width }
     }
 }
 
@@ -4051,6 +4086,32 @@ fn place_overlays(viewport: Rect, env: &LayoutEnv<'_>, out: &mut Placement) {
                             size: open,
                         }
                     }
+                })
+            }
+            // an alert has ONE size, and it is its content's: the height
+            // it asks for at the spec's width, on every pass — whatever
+            // the window last reported. Only the ORIGIN is the window's
+            // (the reader may drag an alert; nothing resizes one), and
+            // a first open centres it like the sheet it degrades to.
+            (None, OverlaySurface::Alert(spec)) => {
+                let (natural, _) = queued
+                    .node
+                    .measure(Proposal { width: Some(spec.width), height: None }, env);
+                let size = Size { width: spec.width, height: natural.height };
+                let held = env
+                    .dialog_frames
+                    .and_then(|frames| frames.get(&queued.path));
+                Some(Rect {
+                    origin: held.map_or_else(
+                        || Point {
+                            x: room.origin.x
+                                + align_offset(room.size.width, size.width, CrossAlign::Center),
+                            y: room.origin.y
+                                + align_offset(room.size.height, size.height, CrossAlign::Center),
+                        },
+                        |frame| frame.origin,
+                    ),
+                    size,
                 })
             }
             _ => None,

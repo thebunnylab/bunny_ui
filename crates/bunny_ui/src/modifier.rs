@@ -180,6 +180,15 @@ pub enum Modifier {
         spec: crate::layout::DialogSpec,
         content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
     },
+    /// `.alert(…)`: a dialog's window with an ask's manners — one size
+    /// fitted to the content, Escape, ⌘. and the close button all the
+    /// cancel answer, Return the default button, and the keyboard held
+    /// by the alert while it is up.
+    Alert {
+        is_presented: Binding<bool>,
+        spec: crate::layout::AlertSpec,
+        content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
+    },
     /// An anchored popover: the modified view is the ANCHOR, `side`
     /// the preferred edge. Closes on Escape and on a press outside;
     /// `on_dismiss` runs after any of the framework's dismissal doors
@@ -344,6 +353,9 @@ impl Modifier {
             Modifier::Sheet { .. } => " [.sheet(isPresented: $…)]".into(),
             Modifier::Dialog { spec, .. } => {
                 format!(" [.dialog(isPresented: $…, {:?})]", spec.title)
+            }
+            Modifier::Alert { spec, .. } => {
+                format!(" [.alert(isPresented: $…, {:?})]", spec.title)
             }
             Modifier::Popover { side, .. } => format!(" [.popover(.{side:?})]"),
             Modifier::EnvSet { name, detail, .. } => format!(" [.{name}{detail}]"),
@@ -1013,6 +1025,73 @@ fn apply(
                     align: CrossAlign::Center,
                     modal: true,
                     children: vec![base, wrap_layout(dialog_layouts.clone())],
+                }),
+            }
+        }
+        Modifier::Alert {
+            is_presented,
+            spec,
+            content,
+        } if is_presented.get() => {
+            let mut alert_nodes = NodeList::new();
+            let path;
+            {
+                // its own identity sub-root, the dialog's: what the
+                // closure builds anchors here and dies when it is answered
+                let _frame = motor::identity::enter("alert");
+                path = motor::identity::cursor_scope();
+                content(ctx).render_into(ctx, &mut alert_nodes);
+            }
+            let (alert_prints, alert_layouts) = alert_nodes.into_parts();
+            if let Some(node) = out.last_mut() {
+                node.children
+                    .push(RenderNode::branch("Alert", alert_prints));
+            }
+            if let Some(path) = &path {
+                // ONE cancel answer and three roads to it: the window's
+                // close button (the shell fires `#dismiss`), Escape and
+                // ⌘. (`ALERT_CANCEL`, pre-bound in the reserved context).
+                // Each writes `false` to the binding, and what the app
+                // does on that write IS its cancel answer.
+                let cancel: Rc<dyn Fn()> = {
+                    let is_presented = is_presented.clone();
+                    Rc::new(move || is_presented.set(false))
+                };
+                crate::reconciler::attribute_action(format!("{path}/#dismiss"), {
+                    let cancel = cancel.clone();
+                    Rc::new(move |_| cancel())
+                });
+                crate::reconciler::attribute_handler(
+                    path.clone(),
+                    crate::action::ALERT_CANCEL,
+                    cancel,
+                );
+                // the context turns the reserved keys on, and while it
+                // stands the keymap answers from nothing else; it is
+                // also what the runtime lends the keyboard to
+                crate::reconciler::attribute_context(
+                    path.clone(),
+                    crate::action::ALERT_CONTEXT,
+                    false,
+                );
+            }
+            // the dialog's lowering asking for an ALERT's window, its
+            // content a drag handle wherever no button wins — an ask
+            // moves by its ground, the platform's own manner. Without a
+            // pass there is no identity to key on: the plain modal pile.
+            match path {
+                Some(path) => out.wrap_layout_from(mark, |base| LayoutNode::Sheet {
+                    path: path.clone(),
+                    content: Rc::new(LayoutNode::DragRegion {
+                        child: Box::new(wrap_layout(alert_layouts.clone())),
+                    }),
+                    child: Box::new(base),
+                    surface: crate::layout::OverlaySurface::Alert(spec.clone()),
+                }),
+                None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
+                    align: CrossAlign::Center,
+                    modal: true,
+                    children: vec![base, wrap_layout(alert_layouts.clone())],
                 }),
             }
         }

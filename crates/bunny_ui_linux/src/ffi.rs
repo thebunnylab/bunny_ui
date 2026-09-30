@@ -1562,6 +1562,9 @@ struct Dialog {
     /// The size last presented, in points — where a hosted popup's
     /// anchor must land inside.
     logical: (f64, f64),
+    /// An alert's: ONE size — `min` is the ceiling too, and both move
+    /// with the content's fit, never with the reader's hand.
+    fixed: bool,
 }
 
 impl Dialog {
@@ -2791,17 +2794,19 @@ pub fn create_panel_in(window: &WindowHandle, dialog: &WindowHandle) -> WindowHa
 /// managed window transient for it. `min` is the floor the compositor
 /// holds it to; `scene` = the content draws the bar and the controls.
 /// `frame` is where the scene opens it, in `window`'s layout points —
-/// only x11 may honour the place; wayland decides it alone.
+/// only x11 may honour the place; wayland decides it alone. `fixed` = an
+/// alert's: `min` is also the ceiling, and it follows the content's fit.
 pub fn create_dialog(
     window: &WindowHandle,
     title: &str,
     min: (f64, f64),
     scene: bool,
     frame: (f64, f64, f64, f64),
+    fixed: bool,
 ) -> WindowHandle {
     let owner = window.window;
     if is_x11() {
-        let panel = crate::x11::create_dialog(owner as u32, title, min, scene, frame);
+        let panel = crate::x11::create_dialog(owner as u32, title, min, scene, frame, fixed);
         return WindowHandle { window: owner, panel };
     }
     let dialog = Dialog {
@@ -2815,6 +2820,7 @@ pub fn create_dialog(
         granted: None,
         maximized: false,
         logical: (0.0, 0.0),
+        fixed,
     };
     with_client(|client| {
         client.panels.push(Some(Panel::new(owner, Role::Dialog(dialog))));
@@ -2913,6 +2919,21 @@ fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height:
         }
         if let Some(dialog) = panel.role.dialog_mut() {
             dialog.logical = (w, h);
+            // an alert's one size follows its content: the floor and the
+            // ceiling move together, BEFORE the pixels of the new size
+            // commit (a toplevel not born yet is born at the latest fit)
+            let refit = (dialog.min.0 - w).abs() > 0.5 || (dialog.min.1 - h).abs() > 0.5;
+            if dialog.fixed && refit {
+                dialog.min = (w, h);
+                if !dialog.toplevel.is_null() {
+                    let (width, height) = (w.ceil() as i32, h.ceil() as i32);
+                    unsafe {
+                        // set_min_size, then set_max_size
+                        request(dialog.toplevel, 8, &mut [arg_i(width), arg_i(height)]);
+                        request(dialog.toplevel, 7, &mut [arg_i(width), arg_i(height)]);
+                    }
+                }
+            }
         }
         if panel.surface.is_null() {
             unsafe {
@@ -2953,6 +2974,18 @@ fn panel_present(index: usize, rect: (f64, f64, f64, f64), width: usize, height:
                             arg_i(dialog.min.1.ceil() as i32),
                         ],
                     );
+                    // an alert's floor is its ceiling: one size, which
+                    // the compositor holds it to
+                    if dialog.fixed {
+                        request(
+                            toplevel,
+                            7, // set_max_size
+                            &mut [
+                                arg_i(dialog.min.0.ceil() as i32),
+                                arg_i(dialog.min.1.ceil() as i32),
+                            ],
+                        );
+                    }
                     // the frame question, the main window's answer: the
                     // content's bar on scene chrome, the server's else
                     if !decoration_manager.is_null() {
@@ -5961,6 +5994,7 @@ mod tests {
             granted: None,
             maximized: false,
             logical: (0.0, 0.0),
+            fixed: false,
         }
     }
 

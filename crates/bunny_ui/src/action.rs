@@ -58,6 +58,27 @@ pub const OVERLAY_DISMISS: ActionId = ActionId("bunny.popover.dismiss");
 /// reserved for the framework's own contexts.
 pub const OVERLAY_CONTEXT: &str = "bunny.popover";
 
+/// The key context every open alert declares — and while one is up, the
+/// ONLY context the keymap answers from. An alert is modal to the
+/// keyboard as well as to the pointer: the page's bindings under it (a
+/// close, a chord, a palette) are inert until it is answered. The
+/// runtime pre-binds Escape and ⌘. to [`ALERT_CANCEL`] and Return to
+/// [`ALERT_DEFAULT`] here; apps never wire these keys themselves.
+pub const ALERT_CONTEXT: &str = "bunny.alert";
+
+/// The open alert's cancel answer — Escape and ⌘. — on the same road its
+/// window's close button takes: the alert's binding is set to `false`,
+/// and what the app does on that write IS its cancel answer.
+pub const ALERT_CANCEL: ActionId = ActionId("bunny.alert.cancel");
+
+/// Return, inside an open alert: runs what the alert's content mounted
+/// under this id — the default button's own action, registered beside it
+/// with `.on_action(ALERT_DEFAULT, …)`. An alert that mounts none has no
+/// default, and Return does nothing there: the right answer for an ask
+/// that arrives unasked, where a stroke meant for the page underneath
+/// must not become a decision.
+pub const ALERT_DEFAULT: ActionId = ActionId("bunny.alert.default");
+
 /// The prefix the framework keeps for itself. A key context under it
 /// belongs to the house: an app never declares one, and emptying the
 /// key table leaves them standing.

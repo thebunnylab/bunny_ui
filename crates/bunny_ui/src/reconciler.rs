@@ -697,6 +697,16 @@ pub(crate) fn context_active(name: &str, focus: Option<&str>) -> bool {
         })
 }
 
+/// Does the view at exactly `path` declare `name` this pass? An open
+/// alert is known by this: its sub-root declares the reserved context
+/// for as long as it is mounted, a skipped pass included (the
+/// declaration is retained like a handler).
+pub(crate) fn declares(path: &str, name: &str) -> bool {
+    DECLARED_CONTEXTS.with(|contexts| {
+        contexts.borrow().iter().any(|(declarer, declared, _)| *declared == name && declarer == path)
+    })
+}
+
 /// The contexts active for a keyboard held at `focus`, outermost first,
 /// each named once — the stack a key-context debugger shows.
 pub(crate) fn active_contexts(focus: Option<&str>) -> Vec<&'static str> {

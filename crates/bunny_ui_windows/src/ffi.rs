@@ -2664,7 +2664,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             };
             unsafe {
                 if !wears_scene_chrome(hwnd) {
-                    AdjustWindowRectExForDpi(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0, dpi);
+                    AdjustWindowRectExForDpi(&mut rect, dialog_style(hwnd), 0, 0, dpi);
                 }
                 let info = lparam as *mut MinMaxInfo;
                 (*info).min_track =
@@ -3264,6 +3264,24 @@ thread_local! {
     /// gates: a dialog is a second surface over the same scene, and the two
     /// cannot share one pair.
     static DIALOG_GATES: RefCell<HashMap<Hwnd, DialogGates>> = RefCell::new(HashMap::new());
+    /// The dialogs born with an ALERT's frame ([`ALERT_STYLE`]) — what every
+    /// client rect of theirs is framed by.
+    static DIALOG_ALERTS: RefCell<HashSet<Hwnd>> = RefCell::new(HashSet::new());
+}
+
+/// An alert's frame: a caption with the close button alone. No sizing
+/// border, no maximize, no minimize — dropping the bits is what makes the
+/// PLATFORM refuse the gesture, the door's own rule, and the close button
+/// that stays is the ask's cancel answer (`WM_CLOSE` dismisses it).
+const ALERT_STYLE: u32 = WS_OVERLAPPEDWINDOW & !(WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX);
+
+/// The frame style a dialog was born with.
+fn dialog_style(hwnd: Hwnd) -> u32 {
+    if DIALOG_ALERTS.with(|alerts| alerts.borrow().contains(&hwnd)) {
+        ALERT_STYLE
+    } else {
+        WS_OVERLAPPEDWINDOW
+    }
 }
 
 /// One dialog's answers for the platform's hit-test.
@@ -3275,23 +3293,27 @@ struct DialogGates {
 /// A real titled window for an overlay that asked to be one. Shares the window
 /// class — and so the pointer road and the frame driver — with its owner.
 ///
-/// `min_width`/`min_height` are the CONTENT's floor in layout points.
+/// `min_width`/`min_height` are the CONTENT's floor in layout points. `alert`
+/// = an ask's frame ([`ALERT_STYLE`]): one size, which the shell sets from
+/// the layout's fit, never the reader's hand.
 pub fn create_dialog(
     owner: &WindowHandle,
     title: &str,
     min_width: f64,
     min_height: f64,
     scene_chrome: bool,
+    alert: bool,
 ) -> WindowHandle {
     const CW_USEDEFAULT: i32 = i32::MIN;
     let class_name = register_class();
     let wide_title = wide(title);
+    let style = if alert { ALERT_STYLE } else { WS_OVERLAPPEDWINDOW };
     let hwnd = unsafe {
         CreateWindowExW(
             0,
             class_name.as_ptr(),
             wide_title.as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            style | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -3309,6 +3331,11 @@ pub fn create_dialog(
     DIALOG_TITLES.with(|titles| {
         titles.borrow_mut().insert(hwnd, title.to_owned());
     });
+    if alert {
+        DIALOG_ALERTS.with(|alerts| {
+            alerts.borrow_mut().insert(hwnd);
+        });
+    }
     if scene_chrome {
         SCENE_CHROME.with(|windows| {
             windows.borrow_mut().insert(hwnd);
@@ -3388,6 +3415,9 @@ fn forget_dialog(hwnd: Hwnd) {
     SCENE_CHROME.with(|windows| {
         windows.borrow_mut().remove(&hwnd);
     });
+    DIALOG_ALERTS.with(|alerts| {
+        alerts.borrow_mut().remove(&hwnd);
+    });
 }
 
 impl WindowHandle {
@@ -3442,8 +3472,11 @@ impl WindowHandle {
         };
         unsafe {
             if !wears_scene_chrome(self.hwnd) {
-                AdjustWindowRectExForDpi(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0, dpi);
-                AdjustWindowRectExForDpi(&mut floor, WS_OVERLAPPEDWINDOW, 0, 0, dpi);
+                // framed by the frame it WEARS: an alert's has no sizing
+                // border, and the overlapped one's would grow the client
+                let style = dialog_style(self.hwnd);
+                AdjustWindowRectExForDpi(&mut rect, style, 0, 0, dpi);
+                AdjustWindowRectExForDpi(&mut floor, style, 0, 0, dpi);
             }
         }
         if let Some(work) = work_area_of(owner_of(self.hwnd)) {
@@ -4202,7 +4235,7 @@ mod tests {
             String::from_utf16_lossy(&buffer[..usize::try_from(len).unwrap_or(0)])
         };
         let owner = create_window("bunny owner", 200.0, 150.0, None, false, true, true);
-        let dialog = create_dialog(&owner, "Account", 100.0, 80.0, true);
+        let dialog = create_dialog(&owner, "Account", 100.0, 80.0, true, false);
         assert_eq!(caption(dialog.hwnd), "Account");
 
         // the sibling took the overlay's path in the same pass, and with it
@@ -4219,6 +4252,42 @@ mod tests {
         assert!(
             DIALOG_TITLES.with(|titles| !titles.borrow().contains_key(&dialog.hwnd)),
             "a closed dialog leaves no title behind",
+        );
+        unsafe {
+            DestroyWindow(owner.hwnd);
+        }
+    }
+
+    /// An alert's frame is a caption with the close button alone — the
+    /// platform refuses the resize, the maximize and the minimize — and
+    /// its client lands on exactly the size layout fitted, framed by the
+    /// frame it wears rather than the sizing border it does not have.
+    #[test]
+    fn an_alert_wears_a_caption_with_the_close_button_alone() {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
+        }
+        const GWL_STYLE: i32 = -16;
+        let owner = create_window("bunny owner", 400.0, 300.0, None, false, true, true);
+        let alert = create_dialog(&owner, "Unsaved Changes", 420.0, 150.0, false, true);
+        let style = unsafe { GetWindowLongPtrW(alert.hwnd, GWL_STYLE) } as u32;
+        assert_eq!(style & (WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX), 0, "{style:#x}");
+        assert_ne!(style & WS_OVERLAPPEDWINDOW, 0, "a caption and its close button stay");
+
+        let client = owner.layout_rect_to_screen(10.0, 10.0, 420.0, 150.0);
+        alert.set_dialog_client_frame(client);
+        let placed = alert.client_rect_screen();
+        assert_eq!(
+            (placed.right - placed.left, placed.bottom - placed.top),
+            (client.right - client.left, client.bottom - client.top),
+            "the client is the fitted size, not a sizing border short of it",
+        );
+
+        alert.close_dialog();
+        assert!(
+            DIALOG_ALERTS.with(|alerts| !alerts.borrow().contains(&alert.hwnd)),
+            "a closed alert leaves no frame memory behind",
         );
         unsafe {
             DestroyWindow(owner.hwnd);
