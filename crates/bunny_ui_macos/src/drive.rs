@@ -37,3 +37,19 @@ pub fn pointer(x: f64, y: f64) {
         modifiers: bunny_ui::action::Modifiers::NONE,
     });
 }
+
+/// Text typed into the key window's focused input — the input system's
+/// commit, the road plain typing takes.
+pub fn text(text: &str) {
+    ffi::dispatch(AppEvent::ImeInsert { text: text.to_owned() });
+}
+
+/// The Backspace key, bare.
+pub fn backspace() {
+    ffi::dispatch(AppEvent::Key {
+        code: 51,
+        shift: false,
+        command: false,
+        chars: String::new(),
+    });
+}
