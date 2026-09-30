@@ -265,6 +265,21 @@ itself. Not on this lane yet: the EGL zero-copy road (the frame as an
 `EGLImage` straight into the GL tier) and a cursor the page chooses.
 `docs/webview.md` has the capability table.
 
+## The secret store
+
+`credentials` is the same pair-named door as every other shell's,
+through libsecret — the desktop's own client for the Secret Service
+(`credentials.rs`). Unlike the Mac's keychain, the store is a service
+a session may not run: a compositor that starts no keyring daemon
+(niri, sway or Hyprland without gnome-keyring, KeePassXC or oo7) has
+nobody on the bus to answer, and `read` then looks exactly like an
+empty pair. `credentials::availability()` is the call that tells the
+two apart — `NoProvider`, or GLib's own words for any other failure —
+and the door never keeps a secret anywhere else. On a machine with no
+provider, `cargo test -p bunny-ui-linux credentials -- --ignored
+no_secret_service` proves the absence is named; `a_secret_service` is
+its twin for a desktop that has one.
+
 ## Logs
 
 Everything the shell says goes to stderr, one line per event: a tier
