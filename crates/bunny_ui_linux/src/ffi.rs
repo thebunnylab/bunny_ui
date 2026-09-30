@@ -4363,7 +4363,7 @@ fn ime_marked() -> bool {
     with_client(|client| client.ime.marked)
 }
 
-// MARK: - the frame driver (no thread: the compositor's callback is the clock)
+// MARK: - the frame driver (no thread: the display's pace rides the compositor's callback)
 
 /// What the frame driver is asked for: every refresh, one tick every
 /// `s` seconds (a slow animation), or nothing.
@@ -4411,6 +4411,35 @@ impl DriverPace {
             DriverPace::Full | DriverPace::Off => elapsed.unwrap_or(1.0 / 60.0).clamp(0.0, 1.0 / 30.0),
         }
     }
+
+    /// What the compositor's frame callback is under this pace, given
+    /// the wall time since the last beat that moved the clock.
+    ///
+    /// At the display's pace the callback IS the clock. At a slow pace
+    /// the deadline is: the callback only says a present reached the
+    /// glass, one refresh after it. Moving the clock there too spent
+    /// the promised step twice — every step of a caret's blink presents,
+    /// so each step came due a refresh after the last one and the holds
+    /// between the fades were skipped. The blink ran visibly fast on
+    /// Wayland and nowhere else, since no other door has a callback.
+    pub(crate) fn callback_beat(self, elapsed: Option<f64>) -> CallbackBeat {
+        match self {
+            DriverPace::Full => CallbackBeat::Clock(self.beat_dt(elapsed)),
+            DriverPace::Slow(_) => CallbackBeat::Present,
+            DriverPace::Off => CallbackBeat::Parked,
+        }
+    }
+}
+
+/// A frame callback's part in the beat ([`DriverPace::callback_beat`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum CallbackBeat {
+    /// The window wants no frames: the callback falls, nothing beats.
+    Parked,
+    /// A beat for the pacer that moves no clock — the deadline owns it.
+    Present,
+    /// The beat itself: the clock moves by this many seconds.
+    Clock(f64),
 }
 
 /// The frame driver, per window. Answers whether the beat runs at the
@@ -4655,18 +4684,25 @@ fn drain_protocol_events() {
                     let win = window_where(client, |w| w.frame_callback as usize == callback_ptr)?;
                     unsafe { wl_proxy_destroy(win.frame_callback) };
                     win.frame_callback = std::ptr::null_mut();
-                    // the callback took this beat; a deadline armed for
-                    // it stands down
-                    win.next_beat = None;
-                    if win.pace == DriverPace::Off {
-                        win.last_frame = None;
-                        return None;
-                    }
                     let now = Instant::now();
                     let gap = win.last_frame.map(|last| (now - last).as_secs_f64());
-                    let dt = win.pace.beat_dt(gap);
-                    win.last_frame = Some(now);
-                    Some((win.surface as usize, dt, gap.unwrap_or(dt)))
+                    match win.pace.callback_beat(gap) {
+                        CallbackBeat::Parked => {
+                            win.next_beat = None;
+                            win.last_frame = None;
+                            None
+                        }
+                        // the deadline keeps its beat and the step it
+                        // promised; this beat only lets the pacer draw
+                        CallbackBeat::Present => Some((win.surface as usize, 0.0, 0.0)),
+                        CallbackBeat::Clock(dt) => {
+                            // the callback took this beat; a deadline
+                            // armed for it stands down
+                            win.next_beat = None;
+                            win.last_frame = Some(now);
+                            Some((win.surface as usize, dt, gap.unwrap_or(dt)))
+                        }
+                    }
                 });
                 if let Some((addr, dt, elapsed)) = beat {
                     dispatch_at(addr, AppEvent::Frame { dt, elapsed });
@@ -5611,6 +5647,20 @@ mod tests {
         assert!((DriverPace::Full.beat_dt(Some(0.012)) - 0.012).abs() < 1e-12);
         assert!((DriverPace::Full.beat_dt(Some(2.0)) - 1.0 / 30.0).abs() < 1e-12);
         assert!((DriverPace::Full.beat_dt(None) - 1.0 / 60.0).abs() < 1e-12);
+    }
+
+    /// Under a slow pace the callback that answers a present one
+    /// refresh later moves no clock: the deadline already owes the
+    /// step, and a caret whose every blink step presents would
+    /// otherwise walk its cycle a refresh at a time.
+    #[test]
+    fn a_callback_moves_the_clock_only_at_the_displays_pace() {
+        let slow = DriverPace::Slow(0.32);
+        assert_eq!(slow.callback_beat(Some(0.016)), CallbackBeat::Present);
+        assert_eq!(slow.callback_beat(None), CallbackBeat::Present);
+        assert_eq!(DriverPace::Full.callback_beat(Some(0.012)), CallbackBeat::Clock(0.012));
+        assert_eq!(DriverPace::Full.callback_beat(Some(2.0)), CallbackBeat::Clock(1.0 / 30.0));
+        assert_eq!(DriverPace::Off.callback_beat(Some(0.016)), CallbackBeat::Parked);
     }
 
     #[test]
