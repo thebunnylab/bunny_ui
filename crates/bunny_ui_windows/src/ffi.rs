@@ -1041,6 +1041,11 @@ thread_local! {
     /// Which top-level windows wear scene chrome — a window's own
     /// answer, because two windows of one app need not dress alike.
     static SCENE_CHROME: RefCell<HashSet<Hwnd>> = RefCell::new(HashSet::new());
+    /// A top-level window's floor in layout points, when its spec named
+    /// one — the answer `WM_GETMINMAXINFO` gives, as `DIALOG_MINS` is a
+    /// dialog's. Kept apart from that map because membership there is
+    /// what makes a window a dialog.
+    static WINDOW_MINS: RefCell<HashMap<Hwnd, (f64, f64)>> = RefCell::new(HashMap::new());
     /// Which caption button the press went down on — the release only
     /// fires over the same one.
     static PRESSED_CONTROL: Cell<isize> = const { Cell::new(0) };
@@ -1377,6 +1382,14 @@ fn dispatch_at(hwnd: Hwnd, event: AppEvent) {
     SOURCE.with(|source| source.set(held));
 }
 
+/// The content floor `WM_GETMINMAXINFO` answers with, in layout points:
+/// a dialog's always, a top-level window's when its spec named one.
+fn content_floor(hwnd: Hwnd) -> Option<(f64, f64)> {
+    DIALOG_MINS
+        .with(|mins| mins.borrow().get(&hwnd).copied())
+        .or_else(|| WINDOW_MINS.with(|mins| mins.borrow().get(&hwnd).copied()))
+}
+
 /// Takes a window into the registry, and hands the app's roles — the
 /// cross-thread knock, the frame beat, the slow clock — to it when
 /// nobody holds them yet.
@@ -1408,6 +1421,9 @@ fn unregister_top_level(hwnd: Hwnd) -> usize {
     });
     SCENE_CHROME.with(|windows| {
         windows.borrow_mut().remove(&hwnd);
+    });
+    WINDOW_MINS.with(|mins| {
+        mins.borrow_mut().remove(&hwnd);
     });
     let heir = left.unwrap_or(0);
     if MAIN_HWND.load(Ordering::Acquire) == hwnd {
@@ -2633,9 +2649,7 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_GETMINMAXINFO => {
-            let Some((min_width, min_height)) =
-                DIALOG_MINS.with(|mins| mins.borrow().get(&hwnd).copied())
-            else {
+            let Some((min_width, min_height)) = content_floor(hwnd) else {
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             };
             // the floor is the CONTENT's, in layout points; under scene chrome
@@ -2783,11 +2797,14 @@ fn register_class() -> Vec<u16> {
 /// The caller presents the first frame and then shows it — the window
 /// never flashes unpainted. With `scene_chrome`, the frame belongs to
 /// the scene: the non-client conversation answers with the scene's
-/// own drag handle and buttons, and resize borders survive.
+/// own drag handle and buttons, and resize borders survive. `min`, when
+/// given, is the content floor in layout points that a drag cannot go
+/// under.
 pub fn create_window(
     title: &str,
     width: f64,
     height: f64,
+    min: Option<(f64, f64)>,
     scene_chrome: bool,
     resizable: bool,
     minimizable: bool,
@@ -2829,6 +2846,12 @@ pub fn create_window(
     // resize below re-runs it — and the first window takes the app's
     // roles: the cross-thread knock, the frame beat, the slow clock
     register_top_level(hwnd, scene_chrome);
+    // the floor too, before that resize asks `WM_GETMINMAXINFO`
+    if let Some(min) = min {
+        WINDOW_MINS.with(|mins| {
+            mins.borrow_mut().insert(hwnd, min);
+        });
+    }
     // files dragged in from the system land on the scene (the mac's
     // `registerForDraggedTypes:`)
     crate::filedrop::register(hwnd);
@@ -4109,7 +4132,7 @@ mod tests {
 
     #[test]
     fn a_window_that_only_loops_arms_the_slow_beat_and_a_spring_takes_it_back() {
-        let window = create_window("bunny pace", 80.0, 60.0, false, true, true);
+        let window = create_window("bunny pace", 80.0, 60.0, None, false, true, true);
         let id = window.raw_window();
         want_pace(id, DriverPace::Slow(0.25));
         assert_eq!(SLOW_STEP.with(Cell::get), Some(0.25), "a loop alone: the slow beat");
@@ -4165,7 +4188,7 @@ mod tests {
     fn a_window_registers_creates_and_dies() {
         // headless smoke: the class registers and a real window is
         // born and destroyed without a pump
-        let window = create_window("bunny test", 120.0, 90.0, false, true, true);
+        let window = create_window("bunny test", 120.0, 90.0, None, false, true, true);
         let (width, height) = window.content_size();
         assert!(width > 0.0 && height > 0.0);
         assert!(window.scale() >= 1);
@@ -4187,7 +4210,7 @@ mod tests {
 
     #[test]
     fn a_layout_rect_lands_on_screen_and_comes_back() {
-        let window = create_window("bunny screen", 200.0, 150.0, false, true, true);
+        let window = create_window("bunny screen", 200.0, 150.0, None, false, true, true);
         let factor = factor_of(&window);
         let rect = window.layout_rect_to_screen(10.0, 20.0, 30.0, 40.0);
         assert_eq!(rect.right - rect.left, (30.0 * factor).round() as i32);
@@ -4211,7 +4234,7 @@ mod tests {
             let len = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), 64) };
             String::from_utf16_lossy(&buffer[..usize::try_from(len).unwrap_or(0)])
         };
-        let owner = create_window("bunny owner", 200.0, 150.0, false, true, true);
+        let owner = create_window("bunny owner", 200.0, 150.0, None, false, true, true);
         let dialog = create_dialog(&owner, "Account", 100.0, 80.0, true, false);
         assert_eq!(caption(dialog.hwnd), "Account");
 
@@ -4246,7 +4269,7 @@ mod tests {
             fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
         }
         const GWL_STYLE: i32 = -16;
-        let owner = create_window("bunny owner", 400.0, 300.0, false, true, true);
+        let owner = create_window("bunny owner", 400.0, 300.0, None, false, true, true);
         let alert = create_dialog(&owner, "Unsaved Changes", 420.0, 150.0, false, true);
         let style = unsafe { GetWindowLongPtrW(alert.hwnd, GWL_STYLE) } as u32;
         assert_eq!(style & (WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX), 0, "{style:#x}");
@@ -4273,7 +4296,7 @@ mod tests {
 
     #[test]
     fn a_panel_translates_its_events_into_the_scene() {
-        let window = create_window("bunny panel", 100.0, 80.0, false, true, true);
+        let window = create_window("bunny panel", 100.0, 80.0, None, false, true, true);
         let panel = create_panel(&window);
         panel.set_scene_origin(300.0, -20.0);
         let factor = factor_of(&window);
@@ -4291,7 +4314,7 @@ mod tests {
     #[test]
     fn a_host_mounts_places_and_sweeps() {
         use std::cell::Cell;
-        let window = create_window("bunny host", 200.0, 150.0, false, true, true);
+        let window = create_window("bunny host", 200.0, 150.0, None, false, true, true);
         let factor = factor_of(&window);
         let px = |v: f64| (v * factor).round() as i32;
 
@@ -4393,7 +4416,7 @@ mod tests {
 
     #[test]
     fn the_layered_copy_premultiplies_into_bgra() {
-        let window = create_window("bunny layered", 60.0, 40.0, false, true, true);
+        let window = create_window("bunny layered", 60.0, 40.0, None, false, true, true);
         let panel = create_panel(&window);
         // one half-transparent red pixel: premultiplied BGRA
         panel.present_layered(
@@ -4428,7 +4451,7 @@ mod tests {
 
     #[test]
     fn a_wake_crosses_threads_into_the_pump() {
-        let window = create_window("bunny wake", 80.0, 60.0, false, true, true);
+        let window = create_window("bunny wake", 80.0, 60.0, None, false, true, true);
         let hwnd = window.hwnd;
         let handle = std::thread::spawn(move || {
             // the thread-safe half of the pump, from another thread
@@ -4455,7 +4478,7 @@ mod tests {
     #[test]
     fn the_backing_holds_the_swizzled_rows()
     {
-        let window = create_window("bunny backing", 64.0, 64.0, false, true, true);
+        let window = create_window("bunny backing", 64.0, 64.0, None, false, true, true);
         let width = 8usize;
         let height = 4usize;
         let mut rgba = vec![0u8; width * height * 4];
@@ -4474,5 +4497,19 @@ mod tests {
         unsafe {
             DestroyWindow(window.hwnd);
         }
+    }
+
+    #[test]
+    fn a_window_floor_answers_the_frame_and_leaves_with_the_window() {
+        let window = create_window("bunny floor", 800.0, 600.0, Some((720.0, 480.0)), false, true, true);
+        assert_eq!(content_floor(window.hwnd), Some((720.0, 480.0)), "WM_GETMINMAXINFO answers from this");
+        assert!(!is_dialog(window.hwnd), "a floor does not make a window a dialog");
+        let plain = create_window("bunny plain", 800.0, 600.0, None, false, true, true);
+        assert_eq!(content_floor(plain.hwnd), None, "no floor: the platform answers alone");
+        unsafe {
+            DestroyWindow(window.hwnd);
+            DestroyWindow(plain.hwnd);
+        }
+        assert_eq!(content_floor(window.hwnd), None, "a closed window leaves no floor behind");
     }
 }

@@ -760,6 +760,17 @@ fn size_hints_fixed(width: u32, height: u32) -> [u32; 18] {
     hints
 }
 
+/// The eighteen words of `WM_SIZE_HINTS` for a resizable window with a
+/// floor: the minimum alone, in physical pixels, and no maximum, so the
+/// window manager still offers the maximize verb.
+fn size_hints_min(width: u32, height: u32) -> [u32; 18] {
+    let mut hints = [0u32; 18];
+    hints[0] = P_MIN_SIZE;
+    hints[5] = width; // min_width
+    hints[6] = height; // min_height
+    hints
+}
+
 // MARK: - The atom table (interned once, one round trip)
 
 /// Every atom this door speaks, interned in one batch at connect.
@@ -1747,10 +1758,17 @@ pub(crate) fn create_window(title: &str, width: f64, height: f64, options: crate
                     hints.as_ptr().cast(),
                 );
             }
-            if !options.resizable {
-                // one size, in physical pixels: the window manager
-                // refuses the resize before the scene ever sees it
-                let hints = size_hints_fixed(physical.0 as u32, physical.1 as u32);
+            // one size, or a floor, in physical pixels: the window manager
+            // refuses the resize before the scene ever sees it
+            let hints = match (options.resizable, options.min) {
+                (false, _) => Some(size_hints_fixed(physical.0 as u32, physical.1 as u32)),
+                (true, Some((min_width, min_height))) => Some(size_hints_min(
+                    (min_width * scale as f64) as u32,
+                    (min_height * scale as f64) as u32,
+                )),
+                (true, None) => None,
+            };
+            if let Some(hints) = hints {
                 xcb_change_property(
                     client.connection,
                     PROP_MODE_REPLACE,
@@ -3680,6 +3698,15 @@ mod tests {
         assert_eq!(&hints[5..9], &[560, 360, 560, 360]);
         assert!(hints[1..5].iter().all(|&word| word == 0), "position and size stay unsaid");
         assert!(hints[9..].iter().all(|&word| word == 0), "no increments, aspect, base or gravity");
+    }
+
+    #[test]
+    fn a_floor_writes_the_minimum_and_leaves_the_maximum_unsaid() {
+        let hints = size_hints_min(1440, 960);
+        assert_eq!(hints[0], P_MIN_SIZE, "no P_MAX_SIZE: the window still maximizes");
+        assert_eq!(&hints[5..7], &[1440, 960]);
+        assert!(hints[1..5].iter().all(|&word| word == 0), "position and size stay unsaid");
+        assert!(hints[7..].iter().all(|&word| word == 0), "no maximum, increments, aspect, base or gravity");
     }
 
     #[test]

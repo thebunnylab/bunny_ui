@@ -117,11 +117,13 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
 /// ```ignore
 /// WindowSpec::titled("Trinity Mail").size(1080.0, 720.0)
 /// WindowSpec::titled("New message").size(720.0, 560.0)
+/// WindowSpec::titled("Trinity").size(1280.0, 800.0).min_size(720.0, 480.0)
 /// ```
 #[derive(Clone, Debug)]
 pub struct WindowSpec {
     title: Rc<str>,
     size: Size,
+    min: Option<Size>,
     chrome: Chrome,
     resizable: bool,
     minimizable: bool,
@@ -133,10 +135,36 @@ impl WindowSpec {
         WindowSpec {
             title: title.into(),
             size: Size { width: 1024.0, height: 640.0 },
+            min: None,
             chrome: Chrome::Native,
             resizable: true,
             minimizable: true,
         }
+    }
+
+    /// The smallest content the reader may drag the window down to — the
+    /// answer `WM_GETMINMAXINFO` gives, as it already does for a dialog's
+    /// floor. The mac's spec says the same with `setContentMinSize:`.
+    #[must_use]
+    pub fn min_size(mut self, width: f64, height: f64) -> WindowSpec {
+        self.min = Some(Size { width, height });
+        self
+    }
+
+    /// The floor [`WindowSpec::min_size`] set, if one was.
+    #[must_use]
+    pub fn min(&self) -> Option<Size> {
+        self.min
+    }
+
+    /// The size the window opens at: [`WindowSpec::size`], raised to the
+    /// floor on any axis that asked for less.
+    #[must_use]
+    pub fn opening_size(&self) -> Size {
+        self.min.map_or(self.size, |min| Size {
+            width: self.size.width.max(min.width),
+            height: self.size.height.max(min.height),
+        })
     }
 
     /// A door has ONE size: no resize border, no zoom box. The mac's spec has
@@ -394,10 +422,12 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
+    let size = spec.opening_size();
     let window = ffi::create_window(
         &spec.title,
-        spec.size.width,
-        spec.size.height,
+        size.width,
+        size.height,
+        spec.min.map(|min| (min.width, min.height)),
         spec.chrome == Chrome::Scene,
         spec.resizable,
         spec.minimizable,
@@ -1478,6 +1508,22 @@ fn desired_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_has_no_floor_until_its_spec_names_one() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0);
+        assert_eq!(spec.min(), None);
+        assert_eq!(spec.opening_size(), Size { width: 1280.0, height: 800.0 });
+    }
+
+    #[test]
+    fn a_floor_is_kept_and_the_window_opens_over_it() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0).min_size(720.0, 480.0);
+        assert_eq!(spec.min(), Some(Size { width: 720.0, height: 480.0 }));
+        assert_eq!(spec.opening_size(), Size { width: 1280.0, height: 800.0 });
+        let narrow = WindowSpec::titled("Trinity").size(600.0, 900.0).min_size(720.0, 480.0);
+        assert_eq!(narrow.opening_size(), Size { width: 720.0, height: 900.0 });
+    }
 
     #[test]
     fn the_box_under_the_pointer_names_its_cursor_before_the_hover_rule() {

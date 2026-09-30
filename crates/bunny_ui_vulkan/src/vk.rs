@@ -3577,6 +3577,11 @@ fn upload_instances(stack: &VkStack, slot: &mut VkSlot, batches: &FrameBatches) 
 struct Swapchain {
     handle: SwapchainKHR,
     extent: (u32, u32),
+    /// The size it was built for. On a surface with no size of its own
+    /// the extent is this ask, clamped to what the surface allows — and
+    /// the ask, not the extent, is what a frame compares against, so a
+    /// clamped size cannot rebuild the swapchain every frame.
+    asked: (u32, u32),
     views: Vec<ImageView>,
     framebuffers: Vec<Framebuffer>,
 }
@@ -3711,7 +3716,7 @@ fn build_swapchain(
             views.push(view);
             framebuffers.push(framebuffer);
         }
-        Some(Swapchain { handle, extent, views, framebuffers })
+        Some(Swapchain { handle, extent, asked: wanted, views, framebuffers })
     }
 }
 
@@ -3829,6 +3834,15 @@ impl VkPresenter {
         );
         if physical.0 == 0 || physical.1 == 0 {
             return Presented::Ok;
+        }
+        // a frame at a size the swapchain was not built for, on a surface
+        // that takes its size FROM the swapchain: rebuilt before anything
+        // is drawn, or the compositor keeps showing the old size
+        let asked = self.swapchain.as_ref().map(|swapchain| swapchain.asked);
+        if asked.is_some_and(|asked| moved(self.stack.door, asked, physical))
+            && !self.recreate_swapchain(physical)
+        {
+            return Presented::DeviceLost;
         }
         if frame_repeats(&self.retained, display, physical, scale, canvas) {
             return Presented::Ok;
@@ -4033,6 +4047,21 @@ impl VkPresenter {
             && (capabilities.current_extent[0], capabilities.current_extent[1])
                 != swapchain.extent
     }
+}
+
+/// Whether a frame of `physical` pixels needs a new swapchain, on `door`,
+/// over one built for `asked`.
+///
+/// Only a surface that takes its size from its swapchain moves this way:
+/// Wayland's. Its `currentExtent` is `0xFFFFFFFF` for the window's whole
+/// life and no `OUT_OF_DATE` ever comes, so a configure the shell took — a
+/// tile, a drag, fullscreen, a new scale — reaches the swapchain only
+/// through the size of the next frame. Missed, the window keeps its first
+/// size and the compositor centres it in black (T2-BUNNY-251). X11 says a
+/// move through the surface's own extent (`extent_stale`, `OUT_OF_DATE`),
+/// and Android's shell calls [`VkPresenter::resize`].
+fn moved(door: Option<Door>, asked: (u32, u32), physical: (usize, usize)) -> bool {
+    door == Some(Door::Wayland) && (asked.0 as usize, asked.1 as usize) != physical
 }
 
 // MARK: - The surface, and the presenter's life
@@ -5376,5 +5405,35 @@ mod tests {
         // that already carries the lower one's own difference
         let (worst, share) = glass_gate((6, 0.015), (16, 0.15));
         assert_glass_close(&gpu, &cpu, worst, share, "stacked panes");
+    }
+
+    /// A Wayland window that moved — a tile, a drag, fullscreen, a new
+    /// scale — rebuilds its swapchain at the frame's size; nothing else
+    /// on that door would ever say it moved (T2-BUNNY-251).
+    #[test]
+    fn a_wayland_frame_at_a_new_size_rebuilds_the_swapchain() {
+        let tiled = (816, 986);
+        assert!(moved(Some(Door::Wayland), tiled, (1680, 1050)), "fullscreen");
+        assert!(moved(Some(Door::Wayland), tiled, (1632, 1972)), "a new scale");
+        assert!(moved(Some(Door::Wayland), tiled, (816, 900)), "one axis is enough");
+        assert!(!moved(Some(Door::Wayland), tiled, (816, 986)), "the same size is the same swapchain");
+    }
+
+    /// The ask is compared, not the extent: a size the surface clamped is
+    /// built once and then kept, rather than rebuilt on every frame.
+    #[test]
+    fn an_ask_already_built_is_kept_whatever_the_surface_made_of_it() {
+        let beyond = (40_000, 1050);
+        assert!(!moved(Some(Door::Wayland), (40_000, 1050), beyond));
+    }
+
+    /// The other doors are told another way — X11 by the surface's own
+    /// extent, Android by its shell — and an offscreen stack has no
+    /// surface at all: none of them rebuild here.
+    #[test]
+    fn only_a_surface_sized_by_its_swapchain_follows_the_frame() {
+        for door in [Some(Door::Xcb), Some(Door::Android), None] {
+            assert!(!moved(door, (816, 986), (1680, 1050)));
+        }
     }
 }

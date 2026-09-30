@@ -228,11 +228,14 @@ impl Chrome {
 /// WindowSpec::titled("Trinity").size(1280.0, 800.0).chrome(Chrome::SceneAt(Lights::at(16.0, 14.0)))
 /// // a door has ONE size
 /// WindowSpec::titled("Trinity").size(1040.0, 660.0).fixed().no_minimize()
+/// // a window whose chrome stops fitting under 720×480
+/// WindowSpec::titled("Trinity").size(1280.0, 800.0).min_size(720.0, 480.0)
 /// ```
 #[derive(Clone, Debug)]
 pub struct WindowSpec {
     title: Rc<str>,
     size: Size,
+    min: Option<Size>,
     chrome: Chrome,
     manners: ffi::Manners,
 }
@@ -245,6 +248,7 @@ impl WindowSpec {
         WindowSpec {
             title: title.into(),
             size: Size { width: 1024.0, height: 640.0 },
+            min: None,
             chrome: Chrome::Native,
             manners: ffi::Manners::default(),
         }
@@ -254,6 +258,31 @@ impl WindowSpec {
     pub fn size(mut self, width: f64, height: f64) -> WindowSpec {
         self.size = Size { width, height };
         self
+    }
+
+    /// The smallest content the reader may drag the window down to —
+    /// `setContentMinSize:`, the floor a dialog's `DialogSpec::min_size`
+    /// already sets. Without it AppKit lets a frame shrink until its
+    /// chrome clips and its controls fall off the edge.
+    pub fn min_size(mut self, width: f64, height: f64) -> WindowSpec {
+        self.min = Some(Size { width, height });
+        self
+    }
+
+    /// The floor [`WindowSpec::min_size`] set, if one was.
+    #[must_use]
+    pub fn min(&self) -> Option<Size> {
+        self.min
+    }
+
+    /// The size the window opens at: [`WindowSpec::size`], raised to the
+    /// floor on any axis that asked for less.
+    #[must_use]
+    pub fn opening_size(&self) -> Size {
+        self.min.map_or(self.size, |min| Size {
+            width: self.size.width.max(min.width),
+            height: self.size.height.max(min.height),
+        })
     }
 
     /// Who draws the top edge — see [`Chrome`].
@@ -536,12 +565,18 @@ fn why(need: bunny_ui::runtime::FrameNeed) -> String {
     if named.is_empty() { "-".to_string() } else { named.join("+") }
 }
 
+/// A layout size in AppKit's own struct — the one crossing `create_window`
+/// takes. Both types are foreign here, so it is a function, not a `From`.
+const fn cg_size(size: Size) -> ffi::CGSize {
+    ffi::CGSize { width: size.width, height: size.height }
+}
+
 fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
     let title: &str = &spec.title;
-    let size = spec.size;
+    let size = spec.opening_size();
     let chrome = spec.chrome;
     // the placement is armed before the window exists: the buttons are
     // born with it, and the first frame already has them in place
@@ -550,7 +585,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // notifications are SYNCHRONOUS, and a window opened from inside an
     // event would re-enter the handler that asked for it
     let window = ffi::lend_hand(|| {
-        ffi::create_window(title, size.width, size.height, chrome.scene(), spec.manners)
+        ffi::create_window(title, cg_size(size), spec.min.map(cg_size), chrome.scene(), spec.manners)
     });
     // a task that lands on a worker thread asks the main run loop for
     // one more turn; the frame it takes drains the queue on its way
@@ -2135,5 +2170,29 @@ mod tests {
         assert_eq!(key_pattern(&stroke(unknown, "\u{F71B}", false)).unwrap().key, Key::F(24));
         // and the rest of AppKit's private block is still never a key
         assert!(key_pattern(&stroke(unknown, "\u{F727}", false)).is_none());
+    }
+
+    #[test]
+    fn a_window_has_no_floor_until_its_spec_names_one() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0);
+        assert_eq!(spec.min(), None);
+        assert_eq!(spec.opening_size(), Size { width: 1280.0, height: 800.0 });
+    }
+
+    #[test]
+    fn a_floor_is_kept_and_the_window_opens_over_it() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0).min_size(720.0, 480.0);
+        assert_eq!(spec.min(), Some(Size { width: 720.0, height: 480.0 }));
+        // a size over the floor opens as asked
+        assert_eq!(spec.opening_size(), Size { width: 1280.0, height: 800.0 });
+        // a size under it is raised on each axis that asked for less
+        let narrow = WindowSpec::titled("Trinity").size(600.0, 900.0).min_size(720.0, 480.0);
+        assert_eq!(narrow.opening_size(), Size { width: 720.0, height: 900.0 });
+    }
+
+    #[test]
+    fn the_floor_crosses_into_appkit_unchanged() {
+        let crossed = cg_size(Size { width: 720.0, height: 480.0 });
+        assert_eq!((crossed.width, crossed.height), (720.0, 480.0));
     }
 }

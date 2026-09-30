@@ -137,6 +137,7 @@ pub fn run_window_with(title: &str, size: Size, runtime: Runtime, root: impl Vie
 pub struct WindowSpec {
     title: Rc<str>,
     size: Size,
+    min: Option<Size>,
     chrome: Chrome,
     manners: Manners,
 }
@@ -147,9 +148,36 @@ impl WindowSpec {
         WindowSpec {
             title: title.into(),
             size: Size { width: 1024.0, height: 640.0 },
+            min: None,
             chrome: Chrome::Native,
             manners: Manners::default(),
         }
+    }
+
+    /// The smallest content the reader may drag the window down to. On
+    /// Wayland it is the toplevel's `set_min_size`; on X11 a
+    /// `WM_NORMAL_HINTS` that carries the minimum alone. Both measure the
+    /// window, so where the house bar is drawn by the client, the bar's
+    /// height comes out of the content under it.
+    pub fn min_size(mut self, width: f64, height: f64) -> WindowSpec {
+        self.min = Some(Size { width, height });
+        self
+    }
+
+    /// The floor [`WindowSpec::min_size`] set, if one was.
+    #[must_use]
+    pub fn min(&self) -> Option<Size> {
+        self.min
+    }
+
+    /// The size the window opens at: [`WindowSpec::size`], raised to the
+    /// floor on any axis that asked for less.
+    #[must_use]
+    pub fn opening_size(&self) -> Size {
+        self.min.map_or(self.size, |min| Size {
+            width: self.size.width.max(min.width),
+            height: self.size.height.max(min.height),
+        })
     }
 
     /// One size, and no other: the reader cannot resize it. On Wayland
@@ -494,14 +522,16 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // a shell presents the list and never reads it: what no pixel can show
     // is not drawn
     runtime.drop_unseen();
+    let size = spec.opening_size();
     let window = ffi::create_window(
         &spec.title,
-        spec.size.width,
-        spec.size.height,
+        size.width,
+        size.height,
         ffi::WindowOptions {
             scene: spec.chrome == Chrome::Scene,
             resizable: spec.manners.resizable,
             minimizable: spec.manners.minimizable,
+            min: spec.min.map(|min| (min.width, min.height)),
         },
     );
     // the bar: the compositor's where it offers one, the house's own
@@ -1399,6 +1429,22 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_has_no_floor_until_its_spec_names_one() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0);
+        assert_eq!(spec.min(), None);
+        assert_eq!(spec.opening_size(), Size { width: 1280.0, height: 800.0 });
+    }
+
+    #[test]
+    fn a_floor_is_kept_and_the_window_opens_over_it() {
+        let spec = WindowSpec::titled("Trinity").size(1280.0, 800.0).min_size(720.0, 480.0);
+        assert_eq!(spec.min(), Some(Size { width: 720.0, height: 480.0 }));
+        assert_eq!(spec.opening_size(), Size { width: 1280.0, height: 800.0 });
+        let narrow = WindowSpec::titled("Trinity").size(600.0, 900.0).min_size(720.0, 480.0);
+        assert_eq!(narrow.opening_size(), Size { width: 720.0, height: 900.0 });
+    }
 
     fn stroke(sym: u32, base: &str, shift: bool, control: bool, alt: bool) -> ffi::KeyStroke {
         ffi::KeyStroke {
