@@ -199,8 +199,12 @@ export function js_clipboard_write(pointer, length) {
 }
 
 // The cursor the scene wants under the pointer — the shell's table:
-// 0 arrow, 1 text, 2 pointing, 3 cell, 4 resize left-right, 5 up-down.
-const CURSORS = ["default", "text", "pointer", "cell", "col-resize", "row-resize"];
+// 0 arrow, 1 text, 2 pointing, 3 cell, 4 a seam left-right, 5 up-down,
+// 6 a frame's side edge, 7 its top or bottom, 8 and 9 its corners.
+const CURSORS = [
+  "default", "text", "pointer", "cell", "col-resize", "row-resize",
+  "ew-resize", "ns-resize", "nwse-resize", "nesw-resize",
+];
 export function js_set_cursor(kind) {
   if (!host) return;
   host.style.cursor = CURSORS[kind >>> 0] || "default";

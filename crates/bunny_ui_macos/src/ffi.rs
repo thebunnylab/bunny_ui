@@ -88,6 +88,8 @@ unsafe extern "C" {
     #[link_name = "objc_msgSend"]
     fn msg_id_u64(obj: Id, sel: Sel, a: u64) -> Id;
     #[link_name = "objc_msgSend"]
+    fn msg_id_u64_u64(obj: Id, sel: Sel, a: u64, b: u64) -> Id;
+    #[link_name = "objc_msgSend"]
     fn msg_bool_id_id(obj: Id, sel: Sel, a: Id, b: Id) -> i8;
     #[link_name = "objc_msgSend"]
     fn msg_bool_id(obj: Id, sel: Sel, a: Id) -> i8;
@@ -2493,24 +2495,35 @@ impl WindowHandle {
         if LAST_CURSOR.with(|last| last.replace(Some(cursor))) == Some(cursor) {
             return;
         }
-        let name = match cursor {
-            Cursor::Arrow => "arrowCursor",
-            Cursor::Text => "IBeamCursor",
-            Cursor::Pointing => "pointingHandCursor",
-            Cursor::Cell => "crosshairCursor",
-            Cursor::ResizeLeftRight => "resizeLeftRightCursor",
-            Cursor::ResizeUpDown => "resizeUpDownCursor",
-        };
         unsafe {
-            msg_void(msg_id(class("NSCursor"), sel(name)), sel("set"));
+            msg_void(shape_of(cursor), sel("set"));
+        }
+    }
+}
+
+/// The `NSCursor` an outfit wears on this system. A frame's edge wears the
+/// cursor a window's own edge shows — macOS 15's, asked for only where the
+/// class answers it — and everything else, everywhere, its class property.
+unsafe fn shape_of(cursor: Cursor) -> Id {
+    unsafe {
+        let cursors = class("NSCursor");
+        let framed = frame_position(cursor).filter(|_| {
+            msg_bool_sel(cursors, sel("respondsToSelector:"), sel(FRAME_RESIZE)) != 0
+        });
+        match framed {
+            Some(position) => {
+                msg_id_u64_u64(cursors, sel(FRAME_RESIZE), position, FRAME_RESIZE_ALL)
+            }
+            None => msg_id(cursors, sel(classic_name(cursor))),
         }
     }
 }
 
 /// What the pointer wears: the hand over an interactive target, a
 /// resizer over a split's grip — the one that matches the way THAT
-/// seam travels — and the arrow elsewhere.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// seam travels — a frame's resizer over the edge a box lets the hand
+/// drag, and the arrow elsewhere.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cursor {
     Arrow,
     /// The I-beam, for text a press puts a caret in.
@@ -2518,8 +2531,63 @@ pub enum Cursor {
     Pointing,
     /// The crosshair, for a grid of cells a press selects a rectangle of.
     Cell,
+    /// A split's seam between lanes side by side — a divider, not a frame.
     ResizeLeftRight,
+    /// A split's seam between stacked lanes.
     ResizeUpDown,
+    /// A frame's side edge, the way a window's own edge wears it.
+    FrameLeftRight,
+    /// A frame's top or bottom edge.
+    FrameUpDown,
+    /// A frame's top-left or bottom-right corner (↖↘).
+    FrameUpLeftDownRight,
+    /// A frame's top-right or bottom-left corner (↗↙).
+    FrameUpRightDownLeft,
+}
+
+/// macOS 15's frame cursor: `+[NSCursor
+/// frameResizeCursorFromPosition:inDirections:]`, the cursor a window's own
+/// edges wear. Apple splits the resizers in two — a divider re-positioned
+/// and a rectangular frame resized — and the older `resizeLeftRightCursor`
+/// family is the divider's.
+const FRAME_RESIZE: &str = "frameResizeCursorFromPosition:inDirections:";
+
+/// `NSCursorFrameResizeDirectionsAll`: the arrow points both ways.
+const FRAME_RESIZE_ALL: u64 = 0b11;
+
+/// Where on a frame each frame outfit sits, in `NSCursorFrameResizePosition`
+/// bits (top 1, left 2, bottom 4, right 8) — any position on the axis draws
+/// the same two-way arrow, so each outfit names one. `None` for an outfit
+/// that is not a frame's.
+const fn frame_position(cursor: Cursor) -> Option<u64> {
+    match cursor {
+        Cursor::FrameLeftRight => Some(8),
+        Cursor::FrameUpDown => Some(4),
+        Cursor::FrameUpLeftDownRight => Some(4 | 8),
+        Cursor::FrameUpRightDownLeft => Some(4 | 2),
+        Cursor::Arrow
+        | Cursor::Text
+        | Cursor::Pointing
+        | Cursor::Cell
+        | Cursor::ResizeLeftRight
+        | Cursor::ResizeUpDown => None,
+    }
+}
+
+/// The `NSCursor` class property each outfit wears — every outfit on a
+/// system before macOS 15, where a frame's edge borrows the divider's
+/// resizer and a corner, which had no public cursor there, the arrow.
+const fn classic_name(cursor: Cursor) -> &'static str {
+    match cursor {
+        Cursor::Arrow | Cursor::FrameUpLeftDownRight | Cursor::FrameUpRightDownLeft => {
+            "arrowCursor"
+        }
+        Cursor::Text => "IBeamCursor",
+        Cursor::Pointing => "pointingHandCursor",
+        Cursor::Cell => "crosshairCursor",
+        Cursor::ResizeLeftRight | Cursor::FrameLeftRight => "resizeLeftRightCursor",
+        Cursor::ResizeUpDown | Cursor::FrameUpDown => "resizeUpDownCursor",
+    }
 }
 
 /// `kCGImageAlphaPremultipliedLast` — bytes R,G,B,A, alpha last.
@@ -3478,6 +3546,54 @@ unsafe fn tiff_to_png(tiff: Id) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame's four outfits reach macOS 15's frame cursor at a position on
+    /// their own axis, in the SDK's bits (`NSCursor.h`: top 1, left 2,
+    /// bottom 4, right 8), and a seam never does — a divider is not a frame.
+    /// Before macOS 15 the edges borrow the divider's resizer and a corner,
+    /// which had no public cursor, wears the arrow. And on this machine each
+    /// of the ten names a real cursor.
+    #[test]
+    fn a_frame_edge_wears_the_resizer_a_window_edge_wears() {
+        assert_eq!(frame_position(Cursor::FrameLeftRight), Some(8), "right");
+        assert_eq!(frame_position(Cursor::FrameUpDown), Some(4), "bottom");
+        assert_eq!(frame_position(Cursor::FrameUpLeftDownRight), Some(12), "bottom-right");
+        assert_eq!(frame_position(Cursor::FrameUpRightDownLeft), Some(6), "bottom-left");
+        assert_eq!(frame_position(Cursor::ResizeLeftRight), None, "a seam is a divider");
+        assert_eq!(frame_position(Cursor::ResizeUpDown), None);
+        assert_eq!(classic_name(Cursor::FrameLeftRight), "resizeLeftRightCursor");
+        assert_eq!(classic_name(Cursor::FrameUpDown), "resizeUpDownCursor");
+        assert_eq!(classic_name(Cursor::FrameUpRightDownLeft), "arrowCursor");
+        // AppKit answers no cursor at all before the application exists —
+        // the shell always runs inside one
+        let cursors = unsafe {
+            msg_id(class("NSApplication"), sel("sharedApplication"));
+            class("NSCursor")
+        };
+        let framed = unsafe {
+            msg_bool_sel(cursors, sel("respondsToSelector:"), sel(FRAME_RESIZE)) != 0
+        };
+        if framed {
+            // where the frame cursor exists the shell asks for it, and a
+            // frame's edge stops wearing the divider's resizer
+            let divider = unsafe { msg_id(cursors, sel("resizeUpDownCursor")) };
+            assert_ne!(unsafe { shape_of(Cursor::FrameUpDown) }, divider);
+        }
+        for outfit in [
+            Cursor::Arrow,
+            Cursor::Text,
+            Cursor::Pointing,
+            Cursor::Cell,
+            Cursor::ResizeLeftRight,
+            Cursor::ResizeUpDown,
+            Cursor::FrameLeftRight,
+            Cursor::FrameUpDown,
+            Cursor::FrameUpLeftDownRight,
+            Cursor::FrameUpRightDownLeft,
+        ] {
+            assert!(!unsafe { shape_of(outfit) }.is_null(), "{outfit:?} names no cursor");
+        }
+    }
 
     /// An event raised from INSIDE a handler waits its turn.
     ///

@@ -917,12 +917,23 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 // the BOX under the pointer answers first — text wants
                 // an I-beam, and the rule below cannot know that. Only
                 // where nobody answers does the old rule stand: the
-                // hand over anything hoverable
+                // hand over anything hoverable. A box's frame grip
+                // wears the border band's own resizers
                 None => match runtime.hovered_cursor() {
                     Some(bunny_ui::layout::Cursor::Text) => ffi::Cursor::Text,
                     Some(bunny_ui::layout::Cursor::Pointing) => ffi::Cursor::Pointing,
                     Some(bunny_ui::layout::Cursor::Cell) => ffi::Cursor::Cell,
                     Some(bunny_ui::layout::Cursor::Arrow) => ffi::Cursor::Arrow,
+                    Some(bunny_ui::layout::Cursor::ResizeLeftRight) => {
+                        ffi::Cursor::ResizeLeftRight
+                    }
+                    Some(bunny_ui::layout::Cursor::ResizeUpDown) => ffi::Cursor::ResizeUpDown,
+                    Some(bunny_ui::layout::Cursor::ResizeUpLeftDownRight) => {
+                        ffi::Cursor::ResizeNwSe
+                    }
+                    Some(bunny_ui::layout::Cursor::ResizeUpRightDownLeft) => {
+                        ffi::Cursor::ResizeNeSw
+                    }
                     None if interaction.hovered.is_some() => ffi::Cursor::Pointing,
                     None => ffi::Cursor::Arrow,
                 },
