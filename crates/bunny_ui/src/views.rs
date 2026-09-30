@@ -1911,8 +1911,9 @@ where
         // the buffer; a miss re-runs this body in the same frame
         let snapshot = crate::viewport::region(scope.as_deref());
         // rows that measure themselves count by what they measured: the
-        // cache is the list's own, kept across frames, and it becomes the
-        // heights closure every other road below already reads
+        // cache is the list's own, kept across frames — its starts are the
+        // window's below and the measure's, and its heights become the
+        // closure the flow lowering reads
         let cache = match (self.measured, scope.as_deref()) {
             (Some(estimate), Some(path)) => {
                 let cache = crate::viewport::row_cache(path);
@@ -1938,16 +1939,23 @@ where
         // the app declared nothing — which the flow lowering cannot
         // accept, because there the browser owns layout and a measured
         // extent never exists.
-        let local_offsets = heights.as_ref().map(|rows| {
-            let mut acc = 0.0;
-            let mut offsets = Vec::with_capacity(self.count + 1);
-            offsets.push(0.0);
-            for index in 0..self.count {
-                acc += rows(index);
-                offsets.push(acc);
+        let local_offsets = match (&cache, &heights) {
+            // rows that measure themselves: the starts the cache keeps,
+            // which only a changed row makes add up again
+            (Some(cache), _) => Some(cache.offsets(self.count)),
+            (None, Some(rows)) => {
+                let mut acc = 0.0;
+                let mut offsets = Vec::with_capacity(self.count + 1);
+                offsets.push(0.0);
+                for index in 0..self.count {
+                    acc += rows(index);
+                    offsets.push(acc);
+                }
+                crate::stats::note_rows_summed(self.count);
+                Some(std::rc::Rc::new(offsets))
             }
-            std::rc::Rc::new(offsets)
-        });
+            (None, None) => None,
+        };
         // last frame's offsets, when they still describe THIS count —
         // a count that changed falls back and heals by miss
         let offsets = local_offsets.or_else(|| {

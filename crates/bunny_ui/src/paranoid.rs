@@ -28,13 +28,17 @@ pub(crate) const HOVER: u32 = 1 << 2;
 pub(crate) const MEMO: u32 = 1 << 3;
 /// The draw commands a placement drops because no pixel can show them.
 pub(crate) const SEEN: u32 = 1 << 4;
+/// The row starts a list whose rows measure themselves keeps instead of
+/// summing them again.
+pub(crate) const ROWS: u32 = 1 << 5;
 
-const NAMES: [(&str, u32); 5] = [
+const NAMES: [(&str, u32); 6] = [
     ("assemble", ASSEMBLE),
     ("settle", SETTLE),
     ("hover", HOVER),
     ("memo", MEMO),
     ("seen", SEEN),
+    ("rows", ROWS),
 ];
 
 thread_local! {
@@ -60,7 +64,7 @@ fn from_environment() -> u32 {
                     .map(|(_, flag)| *flag)
                     .unwrap_or_else(|| {
                         // a name nobody knows would check nothing, in silence
-                        panic!("BUNNY_PARANOID: `{name}` is not a check (known: all, assemble, settle, hover, memo, seen)")
+                        panic!("BUNNY_PARANOID: `{name}` is not a check (known: all, assemble, settle, hover, memo, seen, rows)")
                     }),
             })
             .fold(0, |flags, flag| flags | flag)
