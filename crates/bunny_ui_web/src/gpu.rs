@@ -208,6 +208,118 @@ pub(crate) fn say(message: &str) {
     unsafe { gl_log(message.as_ptr(), message.len()) };
 }
 
+/// Has the zeroing of a fresh texture finished before the first tile
+/// lands in it? WebGL hands a texture out zeroed, but the browser zeroes
+/// it LAZILY, the first time it is touched — and a phone's tiled GPU can
+/// run that clear after the uploads that follow it. On a Samsung phone
+/// every tile the first frame put in the atlas came out blank (the words,
+/// the check marks, the body of a drawn mark) while what later frames
+/// put there showed. Reading one texel through a framebuffer makes the
+/// browser clear the texture now and wait for the clear: the texel it
+/// returns has to be the cleared one. One stall per atlas texture — two
+/// in the life of a page.
+fn settle(texture: u32) {
+    let mut texel = [0u8; 4];
+    unsafe {
+        let framebuffer = gl_create_framebuffer();
+        gl_bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
+        gl_framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+        if gl_check_framebuffer_status(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE {
+            gl_read_pixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, texel.as_mut_ptr(), texel.len());
+        }
+        // the frame binds the framebuffer it draws into before it draws
+        gl_bind_framebuffer(GL_FRAMEBUFFER, 0);
+        gl_delete_framebuffer(framebuffer);
+    }
+}
+
+thread_local! {
+    /// `?present=gpu`: the tier comes up whatever its own probe says —
+    /// how a person sees what it draws on a device it would refuse.
+    static FORCED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The page asked for the GPU tier whatever the probe says.
+pub(crate) fn force() {
+    FORCED.with(|forced| forced.set(true));
+}
+
+/// The height of the probe's tall picture — taller than any shelf takes,
+/// so it gets a texture of its own.
+const PROBE_TALL: u32 = 300;
+
+/// Can this tier show what it uploads? One tile and one tall picture go
+/// the whole road — the tile shelved in the shared atlas, the picture
+/// given a texture of its own, both sampled and drawn — and come back
+/// through a read of the drawable. A tier that loses them draws the boxes
+/// and none of the words, and the CPU road draws the same scene whole.
+fn tiles_survive() -> bool {
+    use bunny_ui::custom::{CustomElement, Metrics, PaintCtx, Painter};
+    use bunny_ui::image_engine::ImageSource;
+    use bunny_ui::layout::{Point, Proposal, Rect};
+
+    struct Probe {
+        tile: ImageSource,
+        tall: ImageSource,
+    }
+    impl CustomElement for Probe {
+        fn measure(&self, proposal: Proposal, _metrics: &Metrics) -> Size {
+            Size { width: proposal.width.unwrap_or(0.0), height: proposal.height.unwrap_or(0.0) }
+        }
+        fn paint(&self, _ctx: &PaintCtx, painter: &mut Painter) {
+            let at = |x: f64, width: f64, height: f64| Rect {
+                origin: Point { x, y: 0.0 },
+                size: Size { width, height },
+            };
+            painter.image(at(0.0, 8.0, 8.0), self.tile.clone());
+            painter.image(at(8.0, 2.0, f64::from(PROBE_TALL)), self.tall.clone());
+        }
+    }
+
+    // the tile: four quadrants in four colours, which survive any
+    // drawable's depth exactly
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+    const MAGENTA: [u8; 4] = [255, 0, 255, 255];
+    let mut tile = Vec::with_capacity(8 * 8 * 4);
+    for y in 0..8 {
+        for x in 0..8 {
+            tile.extend_from_slice(match (x < 4, y < 4) {
+                (true, true) => &RED,
+                (false, true) => &GREEN,
+                (true, false) => &BLUE,
+                (false, false) => &WHITE,
+            });
+        }
+    }
+    let tall = MAGENTA.repeat(2 * PROBE_TALL as usize);
+    let probe = Probe {
+        tile: ImageSource::rgba(0x7E57_0000_0000_0001, (8, 8), tile),
+        tall: ImageSource::rgba(0x7E57_0000_0000_0002, (2, PROBE_TALL), tall),
+    };
+
+    let size = Size { width: 10.0, height: f64::from(PROBE_TALL) };
+    // a scene of its own: runtimes on one thread take turns at the input
+    // tables by their roots' names, and the page's is never this one
+    let runtime = bunny_ui::runtime::Runtime::scene("bunny-gpu-probe");
+    let display = runtime.display_frame(&bunny_ui::custom::custom(probe), size);
+    let black = Color { r: 0, g: 0, b: 0, a: 255 };
+    present_window(None, &display, size, 1, black, &*runtime.text(), &*runtime.images());
+    let rgba = read_rgba((10, PROBE_TALL));
+    let near = |x: usize, y: usize, want: [u8; 4]| {
+        let at = (y * 10 + x) * 4;
+        rgba.get(at..at + 3)
+            .is_some_and(|got| got.iter().zip(want).all(|(&got, want)| got.abs_diff(want) <= 8))
+    };
+    near(1, 1, RED)
+        && near(6, 1, GREEN)
+        && near(1, 6, BLUE)
+        && near(6, 6, WHITE)
+        && near(8, PROBE_TALL as usize - 10, MAGENTA)
+}
+
 fn compile(kind: u32, source: &str) -> u32 {
     unsafe { gl_compile_shader(kind, source.as_ptr(), source.len()) }
 }
@@ -617,6 +729,8 @@ impl AtlasGround for WebGround {
             gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             texture
         };
+        // …and settled before the first tile lands (see `settle`)
+        settle(texture);
         self.shared = Some(texture);
         true
     }
@@ -734,6 +848,22 @@ pub(crate) fn try_install(kind: u32, physical: (u32, u32)) -> bool {
             batches: FrameBatches::default(),
             glass: None,
         })
+    });
+    // …and before it takes the page it shows that it can show what it
+    // uploads: a device that loses the tiles would draw every box and none
+    // of the words
+    if !FORCED.with(Cell::get) && !tiles_survive() {
+        say("bunny gl: a tile the atlas took came back wrong - the page presents by CPU");
+        teardown();
+        return false;
+    }
+    // the probe's tiles leave with it, and the first frame finds the atlas
+    // empty — and settled
+    TIER.with(|slot| {
+        if let Some(tier) = slot.borrow_mut().as_mut() {
+            let Tier { ground, atlas, .. } = tier;
+            atlas.reset(ground, false);
+        }
     });
     true
 }

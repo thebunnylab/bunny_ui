@@ -1488,6 +1488,15 @@ pub extern "C" fn bunny_gpu_restored(width: u32, height: u32) {
     let _ = gpu::restored((width.max(1), height.max(1)));
 }
 
+/// `?present=gpu`: the GPU tier takes the page whatever its own probe of
+/// the device says — the way a person sees what the tier draws on a
+/// device it would refuse. The glue says it before `start`.
+#[cfg(feature = "gpu")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_gpu_forced() {
+    gpu::force();
+}
+
 /// Clears the drawable to one colour and reads the middle pixel back,
 /// packed as `0xRRGGBBAA`. The first thing a tier must be able to say,
 /// and the first thing a browser can check: the clear is exact, the

@@ -34,6 +34,16 @@ pictures side by side. A lost context falls back on its own: the tier
 rebuilds once in silence, and a second loss hands the page to the
 rasterizer for as long as it lives.
 
+Before the tier takes the page it proves it can show what it uploads: a
+tile and a picture with a texture of its own go the whole road and come
+back through a read of the drawable, and a device that loses them is
+handed to the rasterizer. A Samsung phone drew every box and none of the
+words that way — the browser zeroes a new texture lazily, and the phone
+ran that clear after the first frame's tiles — so the atlas is also
+settled the moment it is made, by one texel read through a framebuffer.
+`?present=gpu` keeps the tier whatever the probe says, to see what it
+draws on a device it would refuse.
+
 The tier is measured against the rasterizer, in the browser, on the
 device that runs it:
 
