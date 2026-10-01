@@ -1345,6 +1345,22 @@ extern "C" fn bunny_build_menu(_this: Id, _sel: Sel, builder: Id) {
                 }
             }
         }
+        // `BUNNY_IOS_TRACE=1`: the main menu as UIKit HOLDS it after the
+        // build — read back from the builder, so a menu it dropped shows as
+        // missing rather than as asked for
+        if std::env::var_os("BUNNY_IOS_TRACE").is_some() {
+            for (filed, (_, identifier)) in arranged.menus.iter().zip(&built) {
+                let held = msg_id_id(builder, sel("menuForIdentifier:"), *identifier);
+                let rows = if held.is_null() {
+                    "MISSING".to_owned()
+                } else {
+                    format!("{} groups", msg_u64(msg_id(held, sel("children")), sel("count")))
+                };
+                eprintln!("bunny_ui ios: main menu {:?}: {rows}", filed.title);
+            }
+            let settings = exists(builder, UIMenuPreferences);
+            eprintln!("bunny_ui ios: main menu Settings group held: {settings}");
+        }
     }
 }
 
