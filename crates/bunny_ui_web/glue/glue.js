@@ -403,6 +403,11 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       host.replaceChildren(notice);
       return;
     }
+    // `?present=gpu`: the GPU tier takes the page whatever its own probe of
+    // the device says (and `?present=cpu` keeps it off the page)
+    if (new URLSearchParams(location.search).get("present") === "gpu" && wasm.bunny_gpu_forced) {
+      wasm.bunny_gpu_forced();
+    }
     const scale = window.devicePixelRatio || 1;
     const rect = host.getBoundingClientRect();
     let lastBox = [rect.width, rect.height, scale];

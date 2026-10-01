@@ -341,9 +341,16 @@ export function gl_draw_arrays_instanced(mode, first, count, instances) {
 }
 // this STALLS the thread: it flushes and waits. No frame may call it;
 // it is the parity harness's own sync point.
+// A read the browser refuses leaves the bytes as they were: the tier's
+// probe then sees a tier that cannot show its tiles, and an exception
+// never unwinds through the wasm.
 export function gl_read_pixels(x, y, width, height, format, kind, pointer, length) {
-  gl.readPixels(
-    x | 0, y | 0, width | 0, height | 0, format >>> 0, kind >>> 0,
-    glHeap(), pointer >>> 0,
-  );
+  try {
+    gl.readPixels(
+      x | 0, y | 0, width | 0, height | 0, format >>> 0, kind >>> 0,
+      glHeap(), pointer >>> 0,
+    );
+  } catch (refused) {
+    console.warn("bunny gl: the browser refused a read -", refused);
+  }
 }
