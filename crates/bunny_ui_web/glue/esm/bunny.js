@@ -534,15 +534,9 @@ export async function attach(memoryHandle, exports, hostElement, start) {
   // content and flings on after the lift, a hold that opens a menu. A
   // wasm without the door keeps the pointer's road for every pointer.
   const fingers = new Set();
-  // a browser that sends touch events lifts a finger with a `touchend`
-  const touchEvents = "ontouchend" in window;
   let fingerLifted = -Infinity;
   // did the last press come from a finger? its keyboard is a phone's
   let byFinger = false;
-  // where the gesture's first finger landed, and whether it travelled past
-  // the recognizer's slop since: a pan is no tap, and raises no keyboard
-  let landed = [0, 0];
-  let panned = false;
   const touch = (event, phase) => {
     if (event.pointerType !== "touch" || !wasm.bunny_touch) return false;
     if (phase === 0) fingers.add(event.pointerId);
@@ -551,14 +545,6 @@ export async function attach(memoryHandle, exports, hostElement, start) {
       fingerLifted = event.timeStamp;
     }
     const [x, y] = point(event);
-    if (event.isPrimary) {
-      if (phase === 0) {
-        landed = [x, y];
-        panned = false;
-      } else if (Math.hypot(x - landed[0], y - landed[1]) > 8) {
-        panned = true;
-      }
-    }
     wasm.bunny_touch(phase, event.pointerId >>> 0, x, y, event.timeStamp, event.isPrimary ? 1 : 0);
     return true;
   };
@@ -570,8 +556,7 @@ export async function attach(memoryHandle, exports, hostElement, start) {
   });
   host.addEventListener("pointerdown", (event) => {
     byFinger = event.pointerType === "touch";
-    // a finger's keyboard waits for the lift: only its `touchend` may
-    // raise one (see below)
+    // a finger's keyboard comes with its tap's click (see below)
     if (touch(event, 0)) return;
     const [x, y] = point(event);
     // the middle press is the scene's: no autoscroll over a canvas
@@ -595,11 +580,7 @@ export async function attach(memoryHandle, exports, hostElement, start) {
     wasm.bunny_context_click(x, y, modifiers(event));
   });
   host.addEventListener("pointerup", (event) => {
-    if (touch(event, 2)) {
-      // a browser that sends no touch events has no `touchend` to wait for
-      if (!touchEvents) followText(!panned);
-      return;
-    }
+    if (touch(event, 2)) return;
     const [x, y] = point(event);
     wasm.bunny_pointer_up(x, y);
     followText();
@@ -607,24 +588,22 @@ export async function attach(memoryHandle, exports, hostElement, start) {
   // the browser took the finger (a gesture of the system's): a press in
   // flight fires nothing
   host.addEventListener("pointercancel", (event) => touch(event, 3));
-  // The lift of a finger is the one moment a page may raise the software
-  // keyboard: iOS grants a focus its keys inside `touchend` and nothing
-  // earlier. It is also where the browser hands the tap to the mouse — a
-  // compatibility `mousedown` that focused the host and took the focus
-  // straight back from the editable, so the keys rose and fell at once.
-  // The finger already spoke through its pointer events; its default goes.
-  host.addEventListener(
-    "touchend",
-    (event) => {
-      if (event.cancelable) event.preventDefault();
-      followText(!panned);
-    },
-    { passive: false },
-  );
-  // A press of the mouse keeps the editable's focus the same way: the
-  // host taking it would leave the keyboard with nothing to type into.
+  // The keyboard a finger raises comes with its tap's `click`. A phone
+  // opens the keys only for a focus taken inside a gesture it trusts, and
+  // the click it makes of a tap is the one every phone trusts: an iPhone
+  // grants nothing to a `touchend`, which it may dispatch outside the tap.
+  // A press the recognizer decided at the lift (a field in a scroll
+  // region) has put the keyboard on its field by then too.
+  host.addEventListener("click", () => {
+    if (byFinger || fingerFirst()) summon();
+  });
+  // Before its click the tap hands the browser a compatibility `mousedown`,
+  // whose default focused the host and took the focus from the editable —
+  // the keys rose and fell at once. While the keyboard is taking text, the
+  // default goes; a press of the mouse keeps the editable's focus the same
+  // way.
   host.addEventListener("mousedown", (event) => {
-    if (document.activeElement === ime) event.preventDefault();
+    if (document.activeElement === ime || takesText()) event.preventDefault();
   });
   host.addEventListener(
     "wheel",
@@ -662,9 +641,8 @@ export async function attach(memoryHandle, exports, hostElement, start) {
     "opacity:0;resize:none;overflow:hidden;pointer-events:none;white-space:pre;z-index:-1";
   document.body.appendChild(ime);
   let composing = false;
-  // Did a gesture that may raise the keys focus the editable? Only a
-  // finger's lift is one; a press that focused a field on its way down,
-  // or a task that did, focused it with no keyboard at all.
+  // Did a tap focus the editable, so a keyboard rose with it? A focus
+  // taken any other way raised none.
   let granted = false;
   // the blur in flight is ours, never the reader's
   let releasing = false;
@@ -673,35 +651,49 @@ export async function attach(memoryHandle, exports, hostElement, start) {
     ime.blur();
     releasing = false;
   };
+  // Is the engine's keyboard taking text? (The caret it would type at is
+  // then in `bunny_caret_x`, `_y` and `_height`.)
+  const takesText = () => !!(wasm && wasm.bunny_text_caret && wasm.bunny_text_caret());
+  // Does a finger drive this device? Its keys rise only for a tap.
+  const fingerFirst = () => matchMedia("(pointer: coarse)").matches;
+  // The editable stands under the caret, so an input method's candidates
+  // open there. A finger's keyboard is a phone's, whose candidates ride the
+  // keys, and the browser scrolls the whole page to reveal an editable the
+  // keys would cover — the engine already lifts the field above them, so
+  // the page moved twice. There the editable stands at the top.
+  const place = () => {
+    const box = host.getBoundingClientRect();
+    ime.style.left = `${box.left + wasm.bunny_caret_x()}px`;
+    const top = byFinger ? Math.max(0, box.top) : box.top + wasm.bunny_caret_y();
+    ime.style.top = `${top}px`;
+    ime.style.height = `${Math.max(1, wasm.bunny_caret_height())}px`;
+  };
   // The editable follows the keyboard: focused, under the caret, exactly
-  // while the engine takes text — asked after anything that could move
-  // it. `gesture` says the call runs inside a finger's lift.
-  followText = (gesture = false) => {
-    if (!wasm || !wasm.bunny_text_caret) return;
-    if (wasm.bunny_text_caret()) {
-      const box = host.getBoundingClientRect();
-      ime.style.left = `${box.left + wasm.bunny_caret_x()}px`;
-      // Under the caret, so an input method's candidates open there. A
-      // finger's keyboard is a phone's, whose candidates ride the keys,
-      // and the browser scrolls the whole page to reveal an editable the
-      // keys would cover — the engine already lifts the field above them,
-      // so the page moved twice. There the editable stands at the top.
-      const top = byFinger ? Math.max(0, box.top) : box.top + wasm.bunny_caret_y();
-      ime.style.top = `${top}px`;
-      ime.style.height = `${Math.max(1, wasm.bunny_caret_height())}px`;
-      if (document.activeElement !== ime) {
-        ime.focus({ preventScroll: true });
-        granted = gesture;
-      } else if (gesture && !granted) {
-        // focused with no gesture to grant the keys: focused again here,
-        // inside the one that does
-        release();
-        ime.focus({ preventScroll: true });
-        granted = true;
-      }
-    } else if (document.activeElement === ime && !composing) {
-      release();
+  // while the engine takes text — asked after anything that could move it.
+  // Not on a device a finger drives: a focus no tap asked for raises no
+  // keys there, and it strands the next tap's — an iPhone raises nothing
+  // for a focus that lands where the focus already is. There the editable
+  // waits for the finger's tap (`summon`).
+  followText = () => {
+    if (!takesText()) {
+      if (document.activeElement === ime && !composing) release();
+      return;
     }
+    place();
+    if (document.activeElement !== ime && !fingerFirst()) {
+      ime.focus({ preventScroll: true });
+      granted = false;
+    }
+  };
+  // The tap's own focus — the one place a phone raises the keys.
+  const summon = () => {
+    if (!takesText()) {
+      if (document.activeElement === ime && !composing) release();
+      return;
+    }
+    place();
+    if (document.activeElement !== ime) ime.focus({ preventScroll: true });
+    granted = true;
   };
   // The reader put the keys away while a field held them: iOS's Done
   // blurs the editable, and Android's back key hides the keys and leaves

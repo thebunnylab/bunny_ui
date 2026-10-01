@@ -120,6 +120,9 @@ type MenuKeys = Rc<dyn Fn(crate::menu::MenuKey) -> bool>;
 
 /// Who hears every stroke the keymap resolves ([`Runtime::observe_keys`]).
 type KeySink = Rc<dyn Fn(&crate::action::KeyReport)>;
+/// The field that last heard it holds the keyboard (its path), and the word
+/// it gave for that (`TextField::on_focus`).
+type FocusHeard = (Option<String>, Option<Rc<dyn Fn(bool)>>);
 
 pub struct Runtime {
     /// The environment every body reads. Behind a cell because the
@@ -202,6 +205,10 @@ pub struct Runtime {
     focus: RefCell<Option<String>>,
     /// Retain the old policy so an unmounted field can still hear blur.
     focused_policy: RefCell<Option<Rc<dyn crate::text_input::EditingStrategy>>>,
+    /// The field that last heard it holds the keyboard, and the word it
+    /// gave for it (`TextField::on_focus`) — kept by PATH, because the app's
+    /// closure is minted again every render.
+    focus_heard: RefCell<FocusHeard>,
     /// Caret + selection per field — they survive blur/refocus and
     /// remount (restored by identity, like scroll).
     carets: RefCell<HashMap<String, CaretState>>,
@@ -1323,6 +1330,7 @@ impl Runtime {
             last_modal_floor: std::cell::Cell::new(None),
             focus: RefCell::new(None),
             focused_policy: RefCell::new(None),
+            focus_heard: RefCell::new((None, None)),
             carets: RefCell::new(HashMap::default()),
             caret_visible: Cell::new(true),
             goal_column: Cell::new(None),
@@ -3845,16 +3853,44 @@ impl Runtime {
             (None, None) => true,
             _ => false,
         };
-        if same {
+        if !same {
+            let old = self.focused_policy.replace(next.clone());
+            if let Some(old) = old {
+                old.focus_changed(false);
+            }
+            if let Some(next) = next {
+                next.focus_changed(true);
+            }
+        }
+        self.tell_field_focus();
+    }
+
+    /// The app's own word for a move of the keyboard
+    /// (`TextField::on_focus`): the field it left hears `false`, the one it
+    /// reached `true`. Read off the focus as it stands NOW — a policy above
+    /// may have moved it again — and delivered on the next turn, never
+    /// inside the press or the pass that moved the keyboard: an auto-focus
+    /// moves it in the middle of a layout, and the handler may move it
+    /// again.
+    fn tell_field_focus(&self) {
+        let path = self.focus.borrow().clone();
+        if self.focus_heard.borrow().0 == path {
             return;
         }
-        let old = self.focused_policy.replace(next.clone());
-        if let Some(old) = old {
-            old.focus_changed(false);
+        let reached = path.as_deref().and_then(reconciler::field_focus_hook);
+        let (_, left) = self.focus_heard.replace((path, reached.clone()));
+        if left.is_none() && reached.is_none() {
+            return;
         }
-        if let Some(next) = next {
-            next.focus_changed(true);
-        }
+        motor::task::spawn(async move {
+            if let Some(left) = left {
+                left(false);
+            }
+            if let Some(reached) = reached {
+                reached(true);
+            }
+        })
+        .detach();
     }
 
     pub fn blur(&self) -> bool {
@@ -5817,6 +5853,13 @@ impl Runtime {
                 let chain = motor::identity::named_chain(&path);
                 if let Some(moved) = reconciler::input_by_chain(&chain, false) {
                     *self.focus.borrow_mut() = Some(moved.clone());
+                    // the same field at a new path: it never lost the
+                    // keyboard, so it hears no word of it either
+                    let mut heard = self.focus_heard.borrow_mut();
+                    if heard.0.as_deref() == Some(path.as_str()) {
+                        heard.0 = Some(moved.clone());
+                    }
+                    drop(heard);
                     self.follow_caret(&path, &moved);
                 }
             }
