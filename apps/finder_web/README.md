@@ -131,3 +131,15 @@ fallback of a scene that, on the desktop shell, steps OUTSIDE the
 window on a child panel. Escape closes it; a press outside closes it
 and is consumed. In dom mode the card mounts as the root's last child
 (the portal), so no scroll container ever clips it.
+
+**Phones**: in canvas mode a finger takes the phones' road. The glue
+hands every touch to `bunny_touch`, and the recognizer the iOS and
+Android shells feed decides what it meant — a pan slides the list and
+flings on after the lift, a tap presses, a held finger opens a menu —
+so a drag over the rows scrolls them instead of sweeping a selection.
+The software keyboard opens inside the finger's own `touchend`, the one
+moment iOS grants a focus its keys, and that lift's default is spent so
+no compatibility `mousedown` can take the focus back. The scene lays
+itself out above the keys (`bunny_keyboard`, read off the visual
+viewport), and a keyboard the reader puts away — iOS's Done, Android's
+back key — lets the field go (`bunny_keyboard_dismissed`).
