@@ -142,7 +142,10 @@ every phone grants a focus its keys (an iPhone grants nothing to a
 `touchend`), and the compatibility `mousedown` before it no longer
 takes the focus back while the keyboard is taking text. On a device a
 finger drives, nothing focuses the editable outside a tap, so every tap
-finds a focus of its own to take. The scene lays itself out above the
-keys (`bunny_keyboard`, read off the visual viewport), and a keyboard
-the reader puts away — iOS's Done, Android's back key — lets the field
-go (`bunny_keyboard_dismissed`).
+finds a focus of its own to take. A field's `keyboard_type` is the
+editable's `inputmode` — an address gets the `@`, a code the number
+pad — and it changes in place when the keys move to a field of another
+kind. The scene lays itself out above the keys (`bunny_keyboard`, read
+off the visual viewport), and a keyboard the reader puts away — iOS's
+Done, Android's back key — lets the field go
+(`bunny_keyboard_dismissed`).

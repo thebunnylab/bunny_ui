@@ -430,6 +430,33 @@ pub enum CaretShape {
     Underline,
 }
 
+/// The keys a software keyboard lays out while a field holds it — what the
+/// field is FOR, said to the platform: a phone offers an `@` for an address
+/// and a number pad for a code. A hardware keyboard has no layout to change
+/// and ignores it.
+///
+/// The web shell says it as the editable's `inputmode`, the iOS shell as the
+/// view's `keyboardType`. Android's `NativeActivity` shell raises the one
+/// keyboard it can and says nothing of a type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum KeyboardType {
+    /// Letters — what a field gets when it names nothing.
+    #[default]
+    Text,
+    /// An address: `@` and `.` beside the letters.
+    Email,
+    /// Whole numbers and nothing else — a one-time code, a PIN.
+    Digits,
+    /// Numbers with the decimal separator.
+    Decimal,
+    /// A phone number's pad.
+    Phone,
+    /// A web address: `/` and `.com` within reach.
+    Url,
+    /// A query: the return key reads as a search.
+    Search,
+}
+
 /// An optional editing policy for a native field. The field keeps its binding,
 /// layout, selection, IME and scrolling; the policy interprets keyboard input.
 /// Retain one policy per document, independently of the rendered view's lifetime.

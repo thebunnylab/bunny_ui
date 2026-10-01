@@ -248,7 +248,23 @@ fn note_text_caret(runtime: &Runtime) {
             (rect.origin.x, rect.origin.y, rect.size.height)
         });
     let (x, y, height) = caret.unwrap_or((0.0, 0.0, 16.0));
-    TEXT_CARET.with(|slot| slot.set((takes, x, y, height)));
+    let keys = keyboard_code(runtime.focus_keyboard_type());
+    TEXT_CARET.with(|slot| slot.set((takes, x, y, height, keys)));
+}
+
+/// The glue's number for the keys a field asks for — the index of its
+/// `inputmode` in the glue's `INPUT_MODES`.
+fn keyboard_code(keyboard: bunny_ui::text_input::KeyboardType) -> u32 {
+    use bunny_ui::text_input::KeyboardType;
+    match keyboard {
+        KeyboardType::Text => 0,
+        KeyboardType::Email => 1,
+        KeyboardType::Digits => 2,
+        KeyboardType::Decimal => 3,
+        KeyboardType::Phone => 4,
+        KeyboardType::Url => 5,
+        KeyboardType::Search => 6,
+    }
 }
 
 /// Hands a copied text to the page's clipboard.
@@ -381,11 +397,12 @@ thread_local! {
     /// answers it, so the glue keeps the browser's own meaning for a key
     /// nobody here wanted.
     static KEY_TAKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Whether the keyboard is taking text, and the caret it would type
-    /// at `(x, y, height)`, layout points of the page — the last answer
-    /// to `bunny_text_caret`.
-    static TEXT_CARET: std::cell::Cell<(bool, f64, f64, f64)> =
-        const { std::cell::Cell::new((false, 0.0, 0.0, 0.0)) };
+    /// Whether the keyboard is taking text, the caret it would type at
+    /// `(x, y, height)` in layout points of the page, and the keys its
+    /// field asks for ([`keyboard_code`]) — the last answer to
+    /// `bunny_text_caret`.
+    static TEXT_CARET: std::cell::Cell<(bool, f64, f64, f64, u32)> =
+        const { std::cell::Cell::new((false, 0.0, 0.0, 0.0, 0)) };
     /// The running click count, `(when, x, y, count)`. The browser
     /// counts on `mousedown` and NOT on `pointerdown` (which reports
     /// `detail` zero), and the glue listens on `pointerdown` so touch
@@ -1130,6 +1147,16 @@ pub extern "C" fn bunny_caret_y() -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_caret_height() -> f64 {
     TEXT_CARET.with(|slot| slot.get().3)
+}
+
+/// The keys the field holding the keyboard asks a software keyboard for
+/// (`TextField::keyboard_type`): 0 letters, 1 an email, 2 digits, 3 a
+/// decimal, 4 a phone, 5 a web address, 6 a search — the index of the
+/// editable's `inputmode` in the glue's `INPUT_MODES`. Read with the caret,
+/// after `bunny_text_caret`.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_caret_keyboard() -> u32 {
+    TEXT_CARET.with(|slot| slot.get().4)
 }
 
 /// `mods` is the same four bits a press and a stroke carry: 1 shift,

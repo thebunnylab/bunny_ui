@@ -191,6 +191,7 @@ pub struct TextField {
     nav_intercept: Option<Binding<bool>>,
     paste_image: Option<Rc<dyn Fn(crate::clipboard::ClipboardImage)>>,
     focus: Option<Rc<dyn Fn(bool)>>,
+    keyboard: crate::text_input::KeyboardType,
 }
 
 impl TextField {
@@ -273,6 +274,18 @@ impl TextField {
         self
     }
 
+    /// The keys a software keyboard lays out while this field holds it:
+    /// an email's `@`, a code's number pad. What the field is FOR, said to
+    /// the platform — a hardware keyboard ignores it.
+    ///
+    /// ```ignore
+    /// text_field("", email).keyboard_type(KeyboardType::Email)
+    /// ```
+    pub fn keyboard_type(mut self, keyboard: crate::text_input::KeyboardType) -> Self {
+        self.keyboard = keyboard;
+        self
+    }
+
     /// No chrome of its own — no ground, no edge, no rounded corner.
     ///
     /// A field wears the theme's box, which is right almost everywhere
@@ -336,6 +349,7 @@ impl View for TextField {
                     nav_intercept: self.nav_intercept.clone(),
                     paste_image: self.paste_image.clone(),
                     focus: self.focus.clone(),
+                    keyboard: self.keyboard,
                     key: self.editing.as_ref().map(|_| Rc::new(move |stroke: &crate::action::Stroke, state: &mut crate::text_input::CaretState| {
                         let Some(strategy) = &key_strategy else { return false };
                         let mut value = key_binding.wrappedValue();
@@ -613,6 +627,7 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
         nav_intercept: None,
         paste_image: None,
         focus: None,
+        keyboard: crate::text_input::KeyboardType::Text,
     }
 }
 
@@ -639,6 +654,7 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         nav_intercept: None,
         paste_image: None,
         focus: None,
+        keyboard: crate::text_input::KeyboardType::Text,
     }
 }
 

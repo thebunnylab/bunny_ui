@@ -226,6 +226,10 @@ thread_local! {
     /// Whether the soft keyboard is wanted — the view claims or drops
     /// the first responder when this flips.
     static KEYBOARD_WANTED: Cell<bool> = const { Cell::new(false) };
+    /// The keys the soft keyboard lays out, as the `UIKeyboardType` the
+    /// view answers to `keyboardType` — the focused field's
+    /// (`TextField::keyboard_type`).
+    static KEYBOARD_KIND: Cell<i64> = const { Cell::new(0) };
 }
 
 /// Registers who receives the events (the shell's loop).
@@ -673,13 +677,32 @@ extern "C" fn bunny_no(_this: Id, _sel: Sel) -> i8 {
 /// `UITextInputTraits` answered by hand: an empty adoption leaves every
 /// getter nil, and the keyboard then guesses — sentence capitals and
 /// autocorrection on a field that wanted neither. The traits say NO
-/// (the enum's `…No` is 1) and `autocapitalizationType` says none (0).
+/// (the enum's `…No` is 1) and `autocapitalizationType` says none (0);
+/// `keyboardType` is the focused field's ([`want_keys`]).
 extern "C" fn bunny_trait_no(_this: Id, _sel: Sel) -> i64 {
     1
 }
 
 extern "C" fn bunny_trait_zero(_this: Id, _sel: Sel) -> i64 {
     0
+}
+
+extern "C" fn bunny_keyboard_type(_this: Id, _sel: Sel) -> i64 {
+    KEYBOARD_KIND.with(Cell::get)
+}
+
+/// The keys change under a keyboard that is up: UIKit read `keyboardType`
+/// when the view took the first responder and reads it again only when
+/// asked to. A keyboard on its way down is left to go.
+extern "C" fn bunny_reload_keys(this: Id, _sel: Sel) {
+    if !KEYBOARD_WANTED.with(Cell::get) {
+        return;
+    }
+    unsafe {
+        if msg_bool(this, sel("isFirstResponder")) != 0 {
+            msg_void(this, sel("reloadInputViews"));
+        }
+    }
 }
 
 extern "C" fn bunny_insert_text(_this: Id, _sel: Sel, text: Id) {
@@ -879,6 +902,43 @@ pub fn reduce_motion() -> bool {
     unsafe { UIAccessibilityIsReduceMotionEnabled() }
 }
 
+/// The keys the soft keyboard lays out for the field that holds it — an
+/// email's `@`, a code's number pad. Said before [`want_keyboard`]: a
+/// keyboard about to come up reads the kind as it comes, and one already
+/// up is told to lay its keys out again — on the next turn of the main
+/// queue, like the claim.
+pub fn want_keys(keyboard: bunny_ui::text_input::KeyboardType) {
+    use bunny_ui::text_input::KeyboardType;
+    // UIKeyboardType: default 0, URL 3, ASCII-capable number pad 11 (a
+    // code's digits are ASCII whatever the locale), phone pad 5, email
+    // address 7, decimal pad 8, web search 10
+    let kind = match keyboard {
+        KeyboardType::Text => 0,
+        KeyboardType::Email => 7,
+        KeyboardType::Digits => 11,
+        KeyboardType::Decimal => 8,
+        KeyboardType::Phone => 5,
+        KeyboardType::Url => 3,
+        KeyboardType::Search => 10,
+    };
+    if KEYBOARD_KIND.with(|slot| slot.replace(kind)) == kind || !KEYBOARD_WANTED.with(Cell::get) {
+        return;
+    }
+    let view = VIEW.with(Cell::get);
+    if view.is_null() {
+        return;
+    }
+    unsafe {
+        msg_void_sel_id_f64(
+            view,
+            sel("performSelector:withObject:afterDelay:"),
+            sel("bunnyReloadKeys"),
+            null_mut(),
+            0.0,
+        );
+    }
+}
+
 /// Claims (or drops) the soft keyboard — deferred to the next turn of
 /// the main queue, because UIKit re-enters the app synchronously from
 /// a first-responder change and the handler that asked is still running.
@@ -1017,6 +1077,7 @@ unsafe fn register_classes() {
         class_addMethod(view, sel("deleteBackward"), bunny_delete_backward as *const c_void, v.as_ptr());
         class_addMethod(view, sel("bunnyClaimKeyboard"), bunny_claim_keyboard as *const c_void, v.as_ptr());
         class_addMethod(view, sel("bunnyDropKeyboard"), bunny_drop_keyboard as *const c_void, v.as_ptr());
+        class_addMethod(view, sel("bunnyReloadKeys"), bunny_reload_keys as *const c_void, v.as_ptr());
         for name in [
             "autocorrectionType",
             "spellCheckingType",
@@ -1026,9 +1087,10 @@ unsafe fn register_classes() {
         ] {
             class_addMethod(view, sel(name), bunny_trait_no as *const c_void, int.as_ptr());
         }
-        for name in ["autocapitalizationType", "keyboardType", "returnKeyType", "keyboardAppearance"] {
+        for name in ["autocapitalizationType", "returnKeyType", "keyboardAppearance"] {
             class_addMethod(view, sel(name), bunny_trait_zero as *const c_void, int.as_ptr());
         }
+        class_addMethod(view, sel("keyboardType"), bunny_keyboard_type as *const c_void, int.as_ptr());
         for protocol in ["UIKeyInput", "UITextInputTraits"] {
             let name = CString::new(protocol).expect("protocol name");
             let protocol = objc_getProtocol(name.as_ptr());

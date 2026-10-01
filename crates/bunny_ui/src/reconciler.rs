@@ -71,6 +71,9 @@ pub(crate) struct EditorFn {
     /// The app's word for the keyboard reaching or leaving the field
     /// (`TextField::on_focus`).
     pub focus: Option<Rc<dyn Fn(bool)>>,
+    /// The keys a software keyboard lays out for the field
+    /// (`TextField::keyboard_type`).
+    pub keyboard: crate::text_input::KeyboardType,
 }
 pub(crate) type EditorEntry = (String, EditorFn);
 
@@ -1704,6 +1707,14 @@ pub(crate) fn field_key(
 ) -> bool {
     let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
     editor.and_then(|editor| editor.key).is_some_and(|key| key(stroke, state))
+}
+
+/// The keys the field at `path` asks a software keyboard for — the
+/// letters when nothing there named any.
+pub(crate) fn field_keyboard(path: &str) -> crate::text_input::KeyboardType {
+    EDITORS.with(|editors| {
+        editors.borrow().get(path).map(|editor| editor.keyboard).unwrap_or_default()
+    })
 }
 
 /// The field's own word for the keyboard (`TextField::on_focus`), if the

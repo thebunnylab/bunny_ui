@@ -87,7 +87,9 @@ method for the keyboard, in the name of the view the platform serves;
 a scene with no such field asks for it back. The input method keeps
 the back key while the keyboard is up, so a keyboard the person sent
 away is noticed by the window's insets, and the field lets go — or the
-next frame would raise it again.
+next frame would raise it again. The keyboard is the input method's
+own: `NativeActivity` serves no editor to describe a field to, so a
+field's `keyboard_type` goes unsaid here.
 
 Keys arrive as key codes, not text. A table of the latin layout says
 what each types, with shift and caps lock; a return is the break a
