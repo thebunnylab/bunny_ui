@@ -236,8 +236,9 @@ pub struct RowHeights(pub Rc<dyn Fn(usize) -> Px>);
 
 /// What a list whose rows MEASURE themselves keeps of them, per region:
 /// each row's height from the last time it was on the glass, the
-/// estimate for a row never seen, the scroll a changed height above the
-/// viewport owes, and the tail it may be following.
+/// estimate for a row never seen, the starts those heights add up to,
+/// the scroll a changed height above the viewport owes, and the tail it
+/// may be following.
 ///
 /// Public in name only — a layout node mentions it, and a layout node is
 /// public. An app reaches it through `virtual_list(…).measured_rows(…)`.
@@ -246,6 +247,17 @@ pub struct RowCache {
     /// By row index; NaN is a row never measured.
     heights: std::cell::RefCell<Vec<Px>>,
     estimate: std::cell::Cell<Px>,
+    /// The rows' prefix offsets as they were last worked out —
+    /// `offsets[i]` is row `i`'s start, and one entry more holds the
+    /// total. Handed out whole: a layout's fit, its scroll region and the
+    /// next body's window read the same `Rc`, and it is never written
+    /// while anyone else holds it, so what a finished layout read stays
+    /// what it read.
+    offsets: std::cell::RefCell<Rc<Vec<Px>>>,
+    /// How many leading entries of `offsets` still hold. A row whose
+    /// height changed leaves every start above it standing and every
+    /// start below it to add up again.
+    summed: std::cell::Cell<usize>,
     /// The ordinal of row zero in the list's own history (`first_row`) —
     /// `None` until the list first says it.
     first: std::cell::Cell<Option<usize>>,
@@ -265,6 +277,8 @@ impl RowCache {
             path,
             heights: std::cell::RefCell::new(Vec::new()),
             estimate: std::cell::Cell::new(0.0),
+            offsets: std::cell::RefCell::new(Rc::new(Vec::new())),
+            summed: std::cell::Cell::new(0),
             first: std::cell::Cell::new(None),
             shift: std::cell::Cell::new(0.0),
             follow: std::cell::RefCell::new(None),
@@ -273,7 +287,15 @@ impl RowCache {
     }
 
     pub(crate) fn set_estimate(&self, estimate: Px) {
-        self.estimate.set(estimate.max(0.0));
+        let estimate = estimate.max(0.0);
+        if self.estimate.replace(estimate) == estimate {
+            return;
+        }
+        // a row never measured stands at the estimate: the starts under
+        // the first of them moved with it, and none above it did
+        let heights = self.heights.borrow();
+        let unseen = heights.iter().position(|height| height.is_nan()).unwrap_or(heights.len());
+        self.stale_under(unseen);
     }
 
     /// Row zero is now the `first`-th row of the list's history. Rows that
@@ -281,7 +303,8 @@ impl RowCache {
     /// them — kept by index, they would otherwise be lent to the rows that
     /// moved up into their places — and the scroll owes their sum: the rows
     /// on the glass stay where the reader is looking, and a tail being
-    /// followed is found where the list left it.
+    /// followed is found where the list left it. The kept starts move up
+    /// with their rows, less what left.
     ///
     /// A head that moved BACK is a list that started over: nothing kept
     /// describes its rows any more.
@@ -291,6 +314,7 @@ impl RowCache {
         };
         if first < before {
             self.heights.borrow_mut().clear();
+            self.summed.set(0);
             return;
         }
         let dropped = first - before;
@@ -307,6 +331,20 @@ impl RowCache {
                 .sum();
             measured + (dropped - known) as Px * estimate
         };
+        // one pass over the starts that were summed, and no height asked:
+        // a start below the drop is where it was, less where the first
+        // row that stayed began
+        let mut offsets = self.offsets.borrow_mut();
+        let summed = self.summed.get().min(offsets.len());
+        if summed > dropped {
+            let base = offsets[dropped];
+            *offsets = Rc::new(offsets[dropped..summed].iter().map(|start| start - base).collect());
+            crate::stats::note_rows_summed(summed - dropped);
+            self.summed.set(summed - dropped);
+        } else {
+            self.summed.set(0);
+        }
+        drop(offsets);
         self.shift.set(self.shift.get() - gone);
         if let Some(left) = self.followed_to.get() {
             self.followed_to.set(Some((left - gone).max(0.0)));
@@ -315,30 +353,107 @@ impl RowCache {
 
     /// A row's height: the last it measured, or the estimate.
     pub(crate) fn height(&self, index: usize) -> Px {
-        self.heights
-            .borrow()
-            .get(index)
-            .copied()
-            .filter(|height| !height.is_nan())
-            .unwrap_or_else(|| self.estimate.get())
+        row_height(&self.heights.borrow(), index, self.estimate.get())
     }
 
     /// Keeps what a row measured; answers the height it was counted at
     /// before — its last measure, or the estimate — when that differs.
     fn record(&self, index: usize, height: Px) -> Option<Px> {
         let before = self.height(index);
-        let mut heights = self.heights.borrow_mut();
-        if heights.len() <= index {
-            heights.resize(index + 1, Px::NAN);
+        {
+            let mut heights = self.heights.borrow_mut();
+            if heights.len() <= index {
+                heights.resize(index + 1, Px::NAN);
+            }
+            heights[index] = height;
         }
-        heights[index] = height;
+        if height != before {
+            self.stale_under(index);
+        }
         ((before - height).abs() > SETTLED).then_some(before)
+    }
+
+    /// The rows under `index` start somewhere else now; `index` itself,
+    /// and every row above it, starts where it did.
+    fn stale_under(&self, index: usize) {
+        self.summed.set(self.summed.get().min(index + 1));
+    }
+
+    /// The prefix offsets of the list's `count` rows: `offsets[i]` is row
+    /// `i`'s start, and the last entry the total.
+    ///
+    /// Kept, not worked out again. A list where nothing changed hands back
+    /// the `Rc` it handed out before; after a change only the starts it
+    /// left behind add up again — from the topmost row that changed to the
+    /// end, once, however many changed. A transcript changes at its tail (a
+    /// reply streaming into the newest entry, an entry arriving), where
+    /// that is a sum or two. A change far above the tail — history read for
+    /// the first time, a new width re-measuring the window — pays the
+    /// linear pass every layout used to pay, on the layout that measured it
+    /// and no other.
+    pub(crate) fn offsets(&self, count: usize) -> Rc<Vec<Px>> {
+        let mut offsets = self.offsets.borrow_mut();
+        let summed = self.summed.get().min(offsets.len()).min(count + 1);
+        if summed == count + 1 && offsets.len() == count + 1 {
+            self.check_offsets(&offsets);
+            return Rc::clone(&offsets);
+        }
+        if Rc::get_mut(&mut offsets).is_none() {
+            // a finished layout still reads the old starts: they stay what
+            // it read, and the ones that hold are copied, never re-summed
+            let mut fresh = Vec::with_capacity(count + 1);
+            fresh.extend_from_slice(&offsets[..summed]);
+            *offsets = Rc::new(fresh);
+        }
+        let starts = Rc::get_mut(&mut offsets).expect("the starts are this cache's alone now");
+        starts.truncate(summed);
+        if starts.is_empty() {
+            starts.push(0.0);
+        }
+        let heights = self.heights.borrow();
+        let estimate = self.estimate.get();
+        let mut total = *starts.last().expect("row zero starts at zero");
+        for index in starts.len() - 1..count {
+            total += row_height(&heights, index, estimate).max(0.0);
+            starts.push(total);
+        }
+        crate::stats::note_rows_summed(count + 1 - summed.max(1));
+        self.summed.set(count + 1);
+        drop(heights);
+        self.check_offsets(&offsets);
+        Rc::clone(&offsets)
+    }
+
+    /// Paranoid: the kept starts are the ones a fresh sum would give. A
+    /// thousandth of a point is arithmetic — a head's drop subtracts where
+    /// a sum adds; a start missed by a change is off by a row.
+    fn check_offsets(&self, offsets: &[Px]) {
+        if !crate::paranoid::on(crate::paranoid::ROWS) {
+            return;
+        }
+        let heights = self.heights.borrow();
+        let estimate = self.estimate.get();
+        let mut fresh: Px = 0.0;
+        for (index, kept) in offsets.iter().enumerate() {
+            assert!(
+                (kept - fresh).abs() < 1e-3,
+                "row {index} of `{}` starts at {kept} kept, {fresh} summed",
+                self.path
+            );
+            fresh += row_height(&heights, index, estimate).max(0.0);
+        }
     }
 
     /// The shift owed since the last ask, spent by asking.
     pub(crate) fn take_shift(&self) -> Px {
         self.shift.replace(0.0)
     }
+}
+
+/// A row's height in a list that measures its own: what it measured, or
+/// the estimate for a row never seen.
+fn row_height(heights: &[Px], index: usize, estimate: Px) -> Px {
+    heights.get(index).copied().filter(|height| !height.is_nan()).unwrap_or(estimate)
 }
 
 impl std::fmt::Debug for RowCache {
@@ -4692,13 +4807,9 @@ impl LayoutNode {
                 if let Some(cache) = cache {
                     let offset = env.scroll_offsets.get(&cache.path).map_or(0.0, |at| at.y);
                     // where each row started BEFORE this measure: a row
-                    // is above the glass by the geometry the reader saw
-                    let mut starts = Vec::with_capacity(*count);
-                    let mut top: Px = 0.0;
-                    for index in 0..*count {
-                        starts.push(top);
-                        top += cache.height(index);
-                    }
+                    // is above the glass by the geometry the reader saw —
+                    // the kept starts, which a settled list never re-sums
+                    let starts = cache.offsets(*count);
                     let mut owed = 0.0;
                     for (index, size, _) in &measured {
                         if let Some(before) = cache.record(*index, size.height)
@@ -4716,13 +4827,15 @@ impl LayoutNode {
                         .iter()
                         .fold(0.0_f64, |acc, (_, size, _)| acc.max(size.width))
                 });
-                match heights {
-                    // variable heights: the closure is the authority —
-                    // offsets are prefix sums, the total is honest to
-                    // every row that does not exist
-                    Some(heights) => {
-                        // the app answers each row's height: not ours to keep
-                        poison_measure();
+                // variable heights: offsets are prefix sums, the total
+                // is honest to every row that does not exist
+                let offsets = match (cache, heights) {
+                    // rows that measure themselves: the sums are the
+                    // cache's, and only the starts under a row that
+                    // changed add up again
+                    (Some(cache), _) => Some(cache.offsets(*count)),
+                    // the closure is the authority, asked for every row
+                    (None, Some(heights)) => {
                         let mut offsets = Vec::with_capacity(*count + 1);
                         let mut total: Px = 0.0;
                         offsets.push(0.0);
@@ -4730,12 +4843,23 @@ impl LayoutNode {
                             total += (heights.0)(index).max(0.0);
                             offsets.push(total);
                         }
+                        crate::stats::note_rows_summed(*count);
+                        Some(Rc::new(offsets))
+                    }
+                    (None, None) => None,
+                };
+                match offsets {
+                    Some(offsets) => {
+                        // the app answers each row's height, or the glass
+                        // does: not ours to keep
+                        poison_measure();
+                        let total = *offsets.last().expect("offsets carry the total");
                         (
                             Size { width, height: total },
                             Fit::Virtual {
                                 row_extent: 0.0,
                                 children: measured,
-                                offsets: Some(Rc::new(offsets)),
+                                offsets: Some(offsets),
                             },
                         )
                     }
@@ -7672,6 +7796,64 @@ mod tests {
 
     fn boundary(path: &str, child: LayoutNode) -> LayoutNode {
         LayoutNode::Boundary { path: Rc::from(path), children: vec![child], quiet: Default::default() }
+    }
+
+    /// The starts a list whose rows measure themselves keeps are the ones
+    /// a fresh sum would give, through every way they go stale: a row
+    /// measured at another height, the estimate moved, the head dropped, a
+    /// list started over, a count grown or cut. And the starts a layout
+    /// was handed stay what it was handed, whatever the cache does next.
+    #[test]
+    fn kept_row_starts_are_the_ones_a_fresh_sum_gives() {
+        let fresh = |cache: &RowCache, count: usize| -> Vec<Px> {
+            let mut starts = vec![0.0];
+            for index in 0..count {
+                let top = *starts.last().expect("row zero starts at zero");
+                starts.push(top + cache.height(index));
+            }
+            starts
+        };
+        // a seeded walk, the same every run
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut roll = |bound: usize| -> usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let cache = RowCache::new("transcript".to_string());
+        cache.set_estimate(30.0);
+        cache.rebase(0);
+        let mut count = 200;
+        let mut first = 0;
+        for step in 0..4000 {
+            let handed = cache.offsets(count);
+            let read: Vec<Px> = handed.as_ref().clone();
+            match roll(12) {
+                0..=5 => {
+                    let _ = cache.record(roll(count), (10 * (1 + roll(6))) as Px);
+                }
+                6 => cache.set_estimate((20 + 10 * roll(3)) as Px),
+                7 => {
+                    first += roll(5);
+                    cache.rebase(first);
+                }
+                8 => {
+                    first = first.saturating_sub(roll(3));
+                    cache.rebase(first);
+                }
+                9 => count = 150 + roll(100),
+                // a layout that measured nothing new
+                _ => {}
+            }
+            assert_eq!(*cache.offsets(count), fresh(&cache, count), "step {step}");
+            assert_eq!(*handed, read, "step {step}: the starts handed out moved");
+        }
+        // and a settled list sums nothing to hand them out again
+        let _ = crate::stats::take();
+        let settled = cache.offsets(count);
+        assert!(Rc::ptr_eq(&settled, &cache.offsets(count)), "the same starts, not a copy");
+        assert_eq!(crate::stats::take().rows_summed, 0);
     }
 
     #[test]
