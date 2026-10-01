@@ -802,6 +802,13 @@ pub(crate) fn assemble_handlers(root: &str) {
     HANDLERS.with(|handlers| *handlers.borrow_mut() = map);
 }
 
+/// Is a handler for the id mounted in the tree? The question a menu asks
+/// before it draws an item enabled — the same table [`run_handler`] reads,
+/// read without running anything.
+pub(crate) fn has_handler(id: crate::action::ActionId) -> bool {
+    HANDLERS.with(|handlers| handlers.borrow().contains_key(&id))
+}
+
 /// Runs the innermost handler for the id. `false` = nobody registered —
 /// the key is NOT consumed (it continues to the field/input system).
 pub(crate) fn run_handler(id: crate::action::ActionId) -> bool {
