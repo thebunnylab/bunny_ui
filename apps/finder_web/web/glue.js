@@ -356,6 +356,16 @@ const KEYS = {
 // (bunny_ui_web::keyboard_code).
 const INPUT_MODES = ["text", "email", "numeric", "decimal", "tel", "url", "search"];
 
+// A trackpad's pinch, said by the browser as a turn of the wheel with
+// control held: Chromium makes the turn −100·ln(ratio) pixels, so the
+// ratio of the span comes back out of it. A mouse's notch is a line or a
+// page, made pixels first, and no single turn is taken for more than
+// doubling or halving.
+const pinchRatio = (event) => {
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 400 : 1;
+  return Math.min(2, Math.max(0.5, Math.exp((-event.deltaY * unit) / 100)));
+};
+
 // The function row: `F1` to `F24`, sent as 101 to 124.
 const FUNCTION_KEY = /^F([1-9]|1[0-9]|2[0-4])$/;
 
@@ -464,6 +474,11 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     // content and flings on after the lift, a hold that opens a menu. A
     // wasm without the door keeps the pointer's road for every pointer.
     const fingers = new Set();
+    // where the mouse last stood — a trackpad's pinch zooms around it
+    let lastPoint = [0, 0];
+    // Safari's pinch in flight: the `scale` its last gesture event said, 0
+    // when none is
+    let pinchScale = 0;
     let fingerLifted = -Infinity;
     // did the last press come from a finger? its keyboard is a phone's
     let byFinger = false;
@@ -481,6 +496,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     host.addEventListener("pointermove", (event) => {
       if (touch(event, 1)) return;
       const [x, y] = point(event);
+      lastPoint = [x, y];
       wasm.bunny_pointer_move(x, y, modifiers(event));
       armTooltip();
     });
@@ -542,6 +558,14 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       (event) => {
         event.preventDefault();
         const [x, y] = point(event);
+        // A trackpad's pinch comes as a turn with control held: a box that
+        // zooms takes it as the pinch it is, and a turn nobody zoomed goes on
+        // as the wheel it always was. Inside Safari's own pinch (below) the
+        // turn is that gesture's, never a second zoom.
+        if (event.ctrlKey && wasm.bunny_magnify) {
+          if (pinchScale) return;
+          if (wasm.bunny_magnify(x, y, pinchRatio(event))) return;
+        }
         wasm.bunny_wheel(x, y, event.deltaX, event.deltaY, modifiers(event));
         // the same two beats end the scroll gesture: the region that
         // took the wheel keeps it until they land
@@ -549,6 +573,30 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       },
       { passive: false },
     );
+    // Safari says a trackpad's pinch with gesture events of its own, the
+    // `scale` counted from the gesture's start, and zooms the page unless the
+    // default goes. A phone's two fingers make them too: those are the
+    // fingers' (`bunny_touch`), so a gesture that begins with a finger down is
+    // left alone.
+    host.addEventListener("gesturestart", (event) => {
+      if (fingers.size > 0 || !wasm.bunny_magnify) return;
+      event.preventDefault();
+      pinchScale = 1;
+    });
+    host.addEventListener("gesturechange", (event) => {
+      if (!pinchScale) return;
+      event.preventDefault();
+      const scale = event.scale > 0 ? event.scale : pinchScale;
+      const ratio = scale / pinchScale;
+      pinchScale = scale;
+      const [x, y] = Number.isFinite(event.clientX) ? point(event) : lastPoint;
+      if (ratio !== 1) wasm.bunny_magnify(x, y, ratio);
+    });
+    host.addEventListener("gestureend", (event) => {
+      if (!pinchScale) return;
+      event.preventDefault();
+      pinchScale = 0;
+    });
     // The composition road. Canvas mode owns no editable element, so an input
     // method had nothing to compose into: Latin typing, dead keys and AltGr
     // arrive by `keydown`, and a composition — every CJK reader's — produced

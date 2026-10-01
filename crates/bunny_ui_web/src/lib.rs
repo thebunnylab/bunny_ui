@@ -328,6 +328,10 @@ enum Event {
     PointerDown { x: f64, y: f64, clicks: u8, modifiers: bunny_ui::action::Modifiers },
     PointerUp { x: f64, y: f64 },
     Wheel { x: f64, y: f64, dx: f64, dy: f64, modifiers: bunny_ui::action::Modifiers },
+    /// A trackpad's pinch: `ratio` is this step's change of the span —
+    /// the browser's word for it is a `wheel` with control held, or
+    /// Safari's gesture events.
+    Magnify { x: f64, y: f64, ratio: f64 },
     /// A press of a button past the primary one (the middle one; the
     /// secondary press is the browser's `contextmenu`).
     ButtonDown { x: f64, y: f64, button: bunny_ui::custom::PointerButton, modifiers: bunny_ui::action::Modifiers },
@@ -397,6 +401,10 @@ thread_local! {
     /// answers it, so the glue keeps the browser's own meaning for a key
     /// nobody here wanted.
     static KEY_TAKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Did the pinch just dispatched find a box that zooms? `bunny_magnify`
+    /// answers it, so the glue can hand a turn of the wheel nobody zoomed
+    /// back to the wheel's road.
+    static MAGNIFY_TAKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether the keyboard is taking text, the caret it would type at
     /// `(x, y, height)` in layout points of the page, and the keys its
     /// field asks for ([`keyboard_code`]) — the last answer to
@@ -647,6 +655,15 @@ pub fn start_with(
             }
             // a pan is the wheel's road under a finger, and it folds into
             // the beat the way the wheel does
+            Event::Magnify { x, y, ratio } => {
+                // the trackpad's pinch takes the door two fingers take on
+                // the touch road: the box under the point zooms
+                let taken = runtime.magnify(x, y, ratio);
+                MAGNIFY_TAKEN.with(|slot| slot.set(taken));
+                if taken && pacer.ask(ORIGIN_POINTER, Urgency::Soon, false) == Verdict::Draw {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
+            }
             Event::TouchMoved { id, x, y } => {
                 if runtime.touch_moved(id, x, y)
                     && pacer.ask(ORIGIN_POINTER, Urgency::Soon, false) == Verdict::Draw
@@ -1230,6 +1247,25 @@ pub extern "C" fn bunny_pointer_up(x: f64, y: f64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_wheel(x: f64, y: f64, dx: f64, dy: f64, mods: u32) {
     dispatch(Event::Wheel { x, y, dx, dy, modifiers: held(mods) });
+}
+
+/// A trackpad's pinch over the page, in layout points of the page's own
+/// box: `ratio` is the step's change of the span between the fingers —
+/// 2 for twice as far apart, ½ for half. The box under the point hears it
+/// as [`bunny_ui::custom::ElementEvent::Magnify`], as two fingers on a
+/// phone's screen and a mac's trackpad are heard.
+///
+/// Answers 1 when a box zoomed. A browser says a trackpad's pinch as a
+/// turn of the wheel with control held, and so does a control-turn of a
+/// mouse's wheel: the glue hands a turn nobody zoomed to the wheel's
+/// road, where it went before there was this door.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_magnify(x: f64, y: f64, ratio: f64) -> u32 {
+    MAGNIFY_TAKEN.with(|taken| taken.set(false));
+    if ratio.is_finite() && ratio > 0.0 {
+        dispatch(Event::Magnify { x, y, ratio });
+    }
+    MAGNIFY_TAKEN.with(|taken| taken.get()) as u32
 }
 
 /// A finger on the page, in layout points of the page's own box —
