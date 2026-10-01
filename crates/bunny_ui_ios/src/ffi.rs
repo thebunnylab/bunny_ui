@@ -3,13 +3,19 @@
 //! This module is the shell's `unsafe` border on the phone. UIKit is
 //! called through `objc_msgSend` re-declared with the concrete signature
 //! of each message (the shared Apple half carries the vocabulary; every
-//! module declares its own aliases), and three classes are born at
+//! module declares its own aliases), and four classes are born at
 //! runtime via `objc_allocateClassPair`/`class_addMethod`:
 //!
 //! - `BunnyAppDelegate` (UIResponder) — the application delegate: the
-//!   launch that builds the window, the background and foreground, a
-//!   memory warning, a url handed over, and the app's two clocks (the
-//!   caret blink, the display link) delivered by selector;
+//!   launch, a memory warning, the main menu, the scene configuration
+//!   that names the scene delegate, and the app's two clocks (the caret
+//!   blink, the display link) delivered by selector;
+//! - `BunnySceneDelegate` (UIResponder) — the window scene's delegate:
+//!   the connection that builds (or re-homes) the window and runs the
+//!   mount, the background and foreground, a url handed over. An app
+//!   built with the iOS 27 SDK that adopts no scene life cycle is
+//!   trapped by UIKit before its launch returns, so the window lives
+//!   here and nowhere else;
 //! - `BunnyViewController` (UIViewController) — the safe area and the
 //!   traits (dark, the size class), which UIKit tells the controller;
 //! - `BunnyView` (UIView) — whose backing layer IS a `CAMetalLayer`
@@ -99,6 +105,8 @@ unsafe extern "C" {
     fn msg_void_f64(obj: Id, sel: Sel, a: f64);
     #[link_name = "objc_msgSend"]
     fn msg_id_id(obj: Id, sel: Sel, a: Id) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_id_id_id(obj: Id, sel: Sel, a: Id, b: Id) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_id_u64(obj: Id, sel: Sel, a: u64) -> Id;
     #[link_name = "objc_msgSend"]
@@ -267,8 +275,8 @@ extern "C" fn perform_wake(_info: *mut c_void) {
 // MARK: - The application
 
 /// Hands the process to UIKit. `boot` runs once the app has launched
-/// and the window exists — it mounts the scene. UIKit's main loop never
-/// returns.
+/// and the first scene connected its window — it mounts the scene.
+/// UIKit's main loop never returns.
 pub fn run(boot: Box<dyn FnOnce()>) -> ! {
     unsafe {
         register_classes();
@@ -287,24 +295,23 @@ pub fn run(boot: Box<dyn FnOnce()>) -> ! {
     unreachable!("UIApplicationMain never returns")
 }
 
-/// The launch: the window, its controller and the view are built here,
-/// the beat starts, the mount runs, and the window shows.
+/// The launch: the beat starts and the process-wide doors open. The
+/// window is NOT built here — it belongs to the scene that connects
+/// next ([`bunny_scene_connect`]), and so does the mount.
 extern "C" fn bunny_did_finish_launching(this: Id, _sel: Sel, _app: Id, _options: Id) -> i8 {
     unsafe {
-        let screen = msg_id(class("UIScreen"), sel("mainScreen"));
-        let bounds = msg_rect(screen, sel("bounds"));
-        let window =
-            msg_init_rect(msg_id(class("UIWindow"), sel("alloc")), sel("initWithFrame:"), bounds);
-        let controller = msg_id(msg_id(class("BunnyViewController"), sel("alloc")), sel("init"));
-        let view =
-            msg_init_rect(msg_id(class("BunnyView"), sel("alloc")), sel("initWithFrame:"), bounds);
-        // off, a view is handed exactly one touch and the second finger
-        // is never reported at all
-        msg_void_bool(view, sel("setMultipleTouchEnabled:"), 1);
-        msg_void_id(controller, sel("setView:"), view);
-        msg_void_id(window, sel("setRootViewController:"), controller);
-        WINDOW.with(|slot| slot.set(window));
-        VIEW.with(|slot| slot.set(view));
+        // on an SDK before 27, a bundle with no scene manifest launches
+        // the old way and no scene ever connects: a window that never
+        // comes is a blank screen that looks like a hang, so say it here
+        let bundle = msg_id(class("NSBundle"), sel("mainBundle"));
+        let key = ns_string("UIApplicationSceneManifest");
+        if msg_id_id(bundle, sel("objectForInfoDictionaryKey:"), key).is_null() {
+            eprintln!(
+                "bunny_ui ios: the bundle's Info.plist declares no UIApplicationSceneManifest — \
+                 the window is built when a scene connects, and without the manifest none ever does"
+            );
+            std::process::abort();
+        }
         DELEGATE.with(|slot| slot.set(this));
         // the center learns its delegate BEFORE the launch returns: a
         // tap on a notification can be the very thing that launched
@@ -330,17 +337,82 @@ extern "C" fn bunny_did_finish_launching(this: Id, _sel: Sel, _app: Id, _options
             UIKeyboardWillHideNotification,
             null_mut(),
         );
-        // the mount: the GPU road, the handler, the gates
-        if let Some(boot) = BOOT.with(|slot| slot.borrow_mut().take()) {
-            boot();
-        }
-        msg_void(window, sel("makeKeyAndVisible"));
     }
-    dispatch(AppEvent::Redraw);
     1
 }
 
-extern "C" fn bunny_did_enter_background(_this: Id, _sel: Sel, _app: Id) {
+/// Which delegate a connecting scene gets — the framework's own, named
+/// here rather than in the app's `Info.plist`, so the manifest the app
+/// declares needs no class name from inside the shell.
+extern "C" fn bunny_scene_configuration(_this: Id, _sel: Sel, _app: Id, session: Id, _options: Id) -> Id {
+    unsafe {
+        let configuration = msg_id_id_id(
+            class("UISceneConfiguration"),
+            sel("configurationWithName:sessionRole:"),
+            ns_string("Default"),
+            msg_id(session, sel("role")),
+        );
+        msg_void_id(configuration, sel("setDelegateClass:"), class("BunnySceneDelegate"));
+        configuration
+    }
+}
+
+/// A scene connected: the window is built inside it, the mount runs,
+/// and the window shows. A scene the system DISCONNECTED (to reclaim a
+/// background scene's memory) comes back as a new scene for the same
+/// process — the window, the view and the GPU road it carries survive,
+/// and are re-homed into it instead of built twice.
+extern "C" fn bunny_scene_connect(_this: Id, _sel: Sel, scene: Id, _session: Id, options: Id) {
+    unsafe {
+        let window = WINDOW.with(Cell::get);
+        if window.is_null() {
+            let window = msg_id_id(msg_id(class("UIWindow"), sel("alloc")), sel("initWithWindowScene:"), scene);
+            let bounds = msg_rect(window, sel("bounds"));
+            let controller = msg_id(msg_id(class("BunnyViewController"), sel("alloc")), sel("init"));
+            let view =
+                msg_init_rect(msg_id(class("BunnyView"), sel("alloc")), sel("initWithFrame:"), bounds);
+            // off, a view is handed exactly one touch and the second finger
+            // is never reported at all
+            msg_void_bool(view, sel("setMultipleTouchEnabled:"), 1);
+            msg_void_id(controller, sel("setView:"), view);
+            msg_void_id(window, sel("setRootViewController:"), controller);
+            WINDOW.with(|slot| slot.set(window));
+            VIEW.with(|slot| slot.set(view));
+            // the mount: the GPU road, the handler, the gates
+            if let Some(boot) = BOOT.with(|slot| slot.borrow_mut().take()) {
+                boot();
+            }
+            msg_void(window, sel("makeKeyAndVisible"));
+        } else {
+            msg_void_id(window, sel("setWindowScene:"), scene);
+            msg_void(window, sel("makeKeyAndVisible"));
+        }
+        // a url that launched the app rides the connection, and its own
+        // door is never knocked for it
+        reopen_with(msg_id(options, sel("URLContexts")));
+    }
+    dispatch(AppEvent::Redraw);
+}
+
+/// Urls handed to a scene that is already connected.
+extern "C" fn bunny_scene_open_urls(_this: Id, _sel: Sel, _scene: Id, contexts: Id) {
+    unsafe { reopen_with(contexts) };
+}
+
+/// Each url of a set of `UIOpenURLContext`s, as the deep link — the same
+/// event a second launch delivers everywhere else.
+unsafe fn reopen_with(contexts: Id) {
+    for context in unsafe { members_of(contexts) } {
+        let text = unsafe {
+            let string = msg_id(msg_id(context, sel("URL")), sel("absoluteString"));
+            let chars = msg_cstr(string, sel("UTF8String"));
+            if chars.is_null() { String::new() } else { CStr::from_ptr(chars).to_string_lossy().into_owned() }
+        };
+        let _ = bunny_ui::app::emit(bunny_ui::app::AppEvent::Reopened { arguments: vec![text] });
+    }
+}
+
+extern "C" fn bunny_did_enter_background(_this: Id, _sel: Sel, _scene: Id) {
     BACKGROUNDED.with(|slot| slot.set(true));
     // the link parks: a frame drawn off the screen is a frame the
     // system kills the app for
@@ -349,26 +421,19 @@ extern "C" fn bunny_did_enter_background(_this: Id, _sel: Sel, _app: Id) {
     let _ = bunny_ui::app::emit(bunny_ui::app::AppEvent::WillSleep);
 }
 
-extern "C" fn bunny_will_enter_foreground(_this: Id, _sel: Sel, _app: Id) {
-    BACKGROUNDED.with(|slot| slot.set(false));
+/// The scene is coming back. A scene ALSO enters the foreground on its
+/// first connection, which is a launch and not a return: only an app
+/// that went to the background hears that it came back.
+extern "C" fn bunny_will_enter_foreground(_this: Id, _sel: Sel, _scene: Id) {
+    if !BACKGROUNDED.with(|slot| slot.replace(false)) {
+        return;
+    }
     dispatch(AppEvent::Foreground);
     let _ = bunny_ui::app::emit(bunny_ui::app::AppEvent::DidWake);
 }
 
 extern "C" fn bunny_memory_warning(_this: Id, _sel: Sel, _app: Id) {
     dispatch(AppEvent::MemoryWarning);
-}
-
-/// A url handed to the app — the deep link, the same event a second
-/// launch delivers everywhere else.
-extern "C" fn bunny_open_url(_this: Id, _sel: Sel, _app: Id, url: Id, _options: Id) -> i8 {
-    let text = unsafe {
-        let string = msg_id(url, sel("absoluteString"));
-        let chars = msg_cstr(string, sel("UTF8String"));
-        if chars.is_null() { String::new() } else { CStr::from_ptr(chars).to_string_lossy().into_owned() }
-    };
-    let _ = bunny_ui::app::emit(bunny_ui::app::AppEvent::Reopened { arguments: vec![text] });
-    1
 }
 
 // MARK: - The beat
@@ -527,8 +592,9 @@ pub fn set_frame_driver(pace: DriverPace) {
 
 // MARK: - The view: touches, layout, the keyboard
 
-/// The touches of an `NSSet`, by address.
-unsafe fn touches_of(set: Id) -> Vec<Id> {
+/// The members of an `NSSet`, by address — the touches or presses of
+/// an event, the urls a scene was handed.
+unsafe fn members_of(set: Id) -> Vec<Id> {
     unsafe {
         if set.is_null() {
             return Vec::new();
@@ -545,7 +611,7 @@ unsafe fn touch_point(touch: Id, view: Id) -> (f64, f64) {
 }
 
 extern "C" fn bunny_touches_began(this: Id, _sel: Sel, touches: Id, _event: Id) {
-    for touch in unsafe { touches_of(touches) } {
+    for touch in unsafe { members_of(touches) } {
         let (x, y) = unsafe { touch_point(touch, this) };
         let taps = unsafe { msg_u64(touch, sel("tapCount")) }.clamp(1, u8::MAX as u64) as u8;
         dispatch(AppEvent::TouchBegan { id: touch as u64, x, y, taps });
@@ -556,7 +622,7 @@ extern "C" fn bunny_touches_began(this: Id, _sel: Sel, touches: Id, _event: Id) 
 /// still during a pinch is in the EVENT's set and nowhere else — so the
 /// event is asked, and every live finger reports where it stands.
 extern "C" fn bunny_touches_moved(this: Id, _sel: Sel, _touches: Id, event: Id) {
-    let all = unsafe { touches_of(msg_id(event, sel("allTouches"))) };
+    let all = unsafe { members_of(msg_id(event, sel("allTouches"))) };
     for touch in all {
         // UITouchPhase: began 0, moved 1, stationary 2, ended 3, cancelled 4
         let phase = unsafe { msg_i64(touch, sel("phase")) };
@@ -568,14 +634,14 @@ extern "C" fn bunny_touches_moved(this: Id, _sel: Sel, _touches: Id, event: Id) 
 }
 
 extern "C" fn bunny_touches_ended(this: Id, _sel: Sel, touches: Id, _event: Id) {
-    for touch in unsafe { touches_of(touches) } {
+    for touch in unsafe { members_of(touches) } {
         let (x, y) = unsafe { touch_point(touch, this) };
         dispatch(AppEvent::TouchEnded { id: touch as u64, x, y });
     }
 }
 
 extern "C" fn bunny_touches_cancelled(_this: Id, _sel: Sel, touches: Id, _event: Id) {
-    for touch in unsafe { touches_of(touches) } {
+    for touch in unsafe { members_of(touches) } {
         dispatch(AppEvent::TouchCancelled { id: touch as u64 });
     }
 }
@@ -654,7 +720,7 @@ fn modifier_key(hid: u64) -> bool {
 /// A press of a modifier key, down or up: the EVENT's flags are the
 /// state it leaves, which is the whole news. `true` when one was found.
 fn report_modifiers(presses: Id, event: Id) -> bool {
-    let moved = unsafe { touches_of(presses) }.into_iter().any(|press| unsafe {
+    let moved = unsafe { members_of(presses) }.into_iter().any(|press| unsafe {
         let key = msg_id(press, sel("key"));
         !key.is_null() && modifier_key(msg_i64(key, sel("keyCode")).max(0) as u64)
     });
@@ -672,7 +738,7 @@ fn report_modifiers(presses: Id, event: Id) -> bool {
 extern "C" fn bunny_presses_began(this: Id, _sel: Sel, presses: Id, event: Id) {
     report_modifiers(presses, event);
     let mut taken = false;
-    for press in unsafe { touches_of(presses) } {
+    for press in unsafe { members_of(presses) } {
         let key = unsafe { msg_id(press, sel("key")) };
         if key.is_null() {
             continue;
@@ -912,7 +978,8 @@ unsafe fn register_classes() {
         let v = CString::new("v@:").expect("type encoding");
         let bool_ = CString::new("c@:").expect("type encoding");
         let bool_id_id = CString::new("c@:@@").expect("type encoding");
-        let bool_id_id_id = CString::new("c@:@@@").expect("type encoding");
+        let v_id_id_id = CString::new("v@:@@@").expect("type encoding");
+        let id_id_id_id = CString::new("@@:@@@").expect("type encoding");
         let class_ = CString::new("#@:").expect("type encoding");
         let int = CString::new("q@:").expect("type encoding");
 
@@ -1012,13 +1079,11 @@ unsafe fn register_classes() {
         );
         class_addMethod(
             delegate,
-            sel("application:openURL:options:"),
-            bunny_open_url as *const c_void,
-            bool_id_id_id.as_ptr(),
+            sel("application:configurationForConnectingSceneSession:options:"),
+            bunny_scene_configuration as *const c_void,
+            id_id_id_id.as_ptr(),
         );
         for (name, imp) in [
-            ("applicationDidEnterBackground:", bunny_did_enter_background as *const c_void),
-            ("applicationWillEnterForeground:", bunny_will_enter_foreground as *const c_void),
             ("applicationDidReceiveMemoryWarning:", bunny_memory_warning as *const c_void),
             ("bunnyBlink:", bunny_blink as *const c_void),
             ("bunnySlow:", bunny_slow as *const c_void),
@@ -1040,6 +1105,31 @@ unsafe fn register_classes() {
             bunny_delegate_can_perform as *const c_void,
         );
         objc_registerClassPair(delegate);
+
+        // the scene's delegate: the window, the life on the screen, a url
+        let scene = objc_allocateClassPair(
+            class("UIResponder"),
+            CString::new("BunnySceneDelegate").expect("name").as_ptr(),
+            0,
+        );
+        class_addMethod(
+            scene,
+            sel("scene:willConnectToSession:options:"),
+            bunny_scene_connect as *const c_void,
+            v_id_id_id.as_ptr(),
+        );
+        class_addMethod(scene, sel("scene:openURLContexts:"), bunny_scene_open_urls as *const c_void, v_id_id.as_ptr());
+        for (name, imp) in [
+            ("sceneDidEnterBackground:", bunny_did_enter_background as *const c_void),
+            ("sceneWillEnterForeground:", bunny_will_enter_foreground as *const c_void),
+        ] {
+            class_addMethod(scene, sel(name), imp, v_id.as_ptr());
+        }
+        let protocol = objc_getProtocol(c"UIWindowSceneDelegate".as_ptr());
+        if !protocol.is_null() {
+            class_addProtocol(scene, protocol);
+        }
+        objc_registerClassPair(scene);
     });
 }
 

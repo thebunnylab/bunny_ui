@@ -26,6 +26,17 @@
 //! The project's `unsafe` lives ONLY in the shell crates (here, the
 //! [`ffi`] FFI), wrapped in this safe API. The core and the facade
 //! keep `#![forbid(unsafe_code)]`.
+//!
+//! ## Production gotchas
+//!
+//! - **The bundle must declare a scene manifest.** The window is built
+//!   when a window scene connects, through the shell's own scene
+//!   delegate, so the app's `Info.plist` needs `UIApplicationSceneManifest`
+//!   (with `UIApplicationSupportsMultipleScenes` false — the screen is
+//!   the window) and no class name. Without it, an app built with the
+//!   iOS 27 SDK is trapped by UIKit at launch, before any of this crate
+//!   runs; one built with an older SDK launches and the shell aborts,
+//!   naming the key, instead of showing a screen that never draws.
 
 #![cfg(target_os = "ios")]
 
