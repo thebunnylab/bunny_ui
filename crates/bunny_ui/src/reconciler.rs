@@ -90,6 +90,12 @@ pub(crate) type MeasureEntry = (String, MeasureFn);
 /// Retained like the handlers — a skipped view's context stays declared.
 pub(crate) type ContextEntry = (String, &'static str, bool);
 
+/// The mark `.leaves_keyboard()` declares. It rides the key-context table
+/// because that table is the framework's retained record of subtree marks
+/// — a skipped view keeps its mark, an unmounted one drops it — and no
+/// binding ever names it: the `bunny.` prefix is the house's.
+pub(crate) const KEYBOARD_NEUTRAL: &str = "bunny.keyboard-neutral";
+
 /// A NAMED action handler registered at render: (registration path,
 /// id, what runs). Retained like the actions — a skipped view's
 /// handler lives.
@@ -723,6 +729,14 @@ pub(crate) fn context_active(name: &str, focus: Option<&str>) -> bool {
         })
 }
 
+/// Is `path` inside a view that leaves the keyboard where it is
+/// (`.leaves_keyboard()`)? A click there moves no focus.
+pub(crate) fn leaves_keyboard(path: &str) -> bool {
+    DECLARED_CONTEXTS.with(|contexts| {
+        contexts.borrow().iter().any(|(declarer, name, _)| *name == KEYBOARD_NEUTRAL && covers(declarer, path))
+    })
+}
+
 /// Does the view at exactly `path` declare `name` this pass? An open
 /// alert is known by this: its sub-root declares the reserved context
 /// for as long as it is mounted, a skipped pass included (the
@@ -739,6 +753,10 @@ pub(crate) fn active_contexts(focus: Option<&str>) -> Vec<&'static str> {
     DECLARED_CONTEXTS.with(|contexts| {
         let mut stack: Vec<&'static str> = Vec::new();
         for entry in contexts.borrow().iter() {
+            // a mark, not a context a key could be read in
+            if entry.1 == KEYBOARD_NEUTRAL {
+                continue;
+            }
             if declaration_counts(entry, focus) && !stack.contains(&entry.1) {
                 stack.push(entry.1);
             }

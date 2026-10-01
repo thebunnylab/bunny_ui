@@ -277,6 +277,8 @@ pub struct Custom {
     /// The focus beat the app last stamped on this box, if any — see
     /// [`CustomView::auto_focus`].
     auto_focus: Option<u64>,
+    /// The beat BORROWS the keyboard — see [`CustomView::borrow_focus`].
+    borrows: bool,
     /// The version of the picture the app vouches for, if any — see
     /// [`CustomView::cached`].
     cached: Option<u64>,
@@ -284,7 +286,7 @@ pub struct Custom {
 
 impl Custom {
     pub fn new(element: impl CustomElement) -> Custom {
-        Custom { element: Rc::new(element), auto_focus: None, cached: None }
+        Custom { element: Rc::new(element), auto_focus: None, borrows: false, cached: None }
     }
 
     /// The picture's version, when the app asked for it to be kept.
@@ -299,6 +301,11 @@ impl Custom {
     /// The beat riding this box, for the runtime's focus pass.
     pub(crate) fn auto_focus_beat(&self) -> Option<u64> {
         self.auto_focus
+    }
+
+    /// Does the beat borrow the keyboard, to hand it home when the box goes?
+    pub(crate) fn borrows_focus(&self) -> bool {
+        self.borrows
     }
 }
 
@@ -971,6 +978,21 @@ impl CustomView {
     #[must_use]
     pub fn auto_focus(mut self, beat: u64) -> Self {
         self.element.auto_focus = Some(beat);
+        self
+    }
+
+    /// [`Self::auto_focus`] that BORROWS: the box takes the keyboard on each
+    /// new beat, and when it leaves the scene still holding it, the keys go
+    /// back to whoever held them before — if that input is still on screen
+    /// (`crate::loans`, the rule a field's beat keeps).
+    ///
+    /// For a box that holds the keyboard for a moment: a menu that walks by
+    /// the arrows while it is open, over the editor that will want its keys
+    /// back. An editor opened from a tree row TAKES the keyboard instead — the
+    /// row is exactly who must not get it back — which is [`Self::auto_focus`].
+    pub fn borrow_focus(mut self, beat: u64) -> Self {
+        self.element.auto_focus = Some(beat);
+        self.element.borrows = true;
         self
     }
 

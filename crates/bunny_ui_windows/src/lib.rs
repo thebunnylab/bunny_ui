@@ -208,6 +208,8 @@ struct Slot {
     handle: ffi::WindowHandle,
     handler: RefCell<Box<dyn FnMut(AppEvent)>>,
     key_gate: RefCell<Box<dyn FnMut(&ffi::KeyStroke) -> bool>>,
+    /// The bar's answer to a menu key — Alt alone, F10, an Alt chord.
+    menu_gate: RefCell<Box<dyn FnMut(bunny_ui::menu::MenuKey) -> bool>>,
     drag_gate: Box<dyn Fn(f64, f64) -> bool>,
     control_gate: Box<dyn Fn(f64, f64) -> Option<ffi::ControlHit>>,
     ime_rect: Box<dyn Fn(usize) -> Option<(f64, f64, f64, f64)>>,
@@ -347,6 +349,10 @@ impl AppInner {
         let app = Rc::clone(&self);
         ffi::set_key_gate(Box::new(move |stroke| {
             app.addressed().is_some_and(|slot| (slot.key_gate.borrow_mut())(stroke))
+        }));
+        let app = Rc::clone(&self);
+        ffi::set_menu_gate(Box::new(move |key| {
+            app.addressed().is_some_and(|slot| (slot.menu_gate.borrow_mut())(key))
         }));
         let drag_app = Rc::clone(&self);
         let control_app = Rc::clone(&self);
@@ -1227,6 +1233,21 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let handler_runtime = Rc::clone(&runtime);
     let handler_root = Rc::clone(&root);
     let handler_present = Rc::clone(&present);
+    // the menu keys the platform reads for us (`SC_KEYMENU`, `WM_SYSCHAR`):
+    // the app's bar answers, and a key it takes is a frame to draw now
+    let menu_gate: Box<dyn FnMut(bunny_ui::menu::MenuKey) -> bool> = Box::new({
+        let runtime = Rc::clone(&runtime);
+        let root = Rc::clone(&root);
+        let blit = blit.clone();
+        move |key| {
+            let taken = runtime.menu_key(key);
+            if taken {
+                blit(&runtime, &*root);
+            }
+            taken
+        }
+    });
+
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
@@ -1449,6 +1470,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         handle: window,
         handler: RefCell::new(handler),
         key_gate: RefCell::new(key_gate),
+        menu_gate: RefCell::new(menu_gate),
         drag_gate,
         control_gate,
         ime_rect,

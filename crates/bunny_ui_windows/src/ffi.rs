@@ -424,6 +424,9 @@ const SC_MINIMIZE: usize = 0xF020;
 const SC_MAXIMIZE: usize = 0xF030;
 const SC_CLOSE: usize = 0xF060;
 const SC_RESTORE: usize = 0xF120;
+/// The system command a lone Alt, F10 and an unclaimed Alt chord turn into:
+/// "enter the menu bar". `lParam` 0 is the keyboard with no letter.
+const SC_KEYMENU: usize = 0xF100;
 const HTCAPTION: isize = 2;
 const HTMINBUTTON: isize = 8;
 const HTMAXBUTTON: isize = 9;
@@ -725,6 +728,29 @@ thread_local! {
 /// only translates what the gate declined.
 pub fn set_key_gate(gate: Box<dyn FnMut(&KeyStroke) -> bool>) {
     KEY_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+thread_local! {
+    static MENU_GATE: RefCell<Option<Box<dyn FnMut(bunny_ui::menu::MenuKey) -> bool>>> =
+        const { RefCell::new(None) };
+}
+
+/// Installs who answers the menu keys — the app's bar, through the window's
+/// runtime. `true` takes the key, and the platform's own menu mode never
+/// starts.
+pub fn set_menu_gate(gate: Box<dyn FnMut(bunny_ui::menu::MenuKey) -> bool>) {
+    MENU_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+/// Offers a menu key to the bar of the window it came from. Synchronous,
+/// like the key gate, because the window procedure must answer the
+/// system command with the verdict.
+fn menu_key_taken(hwnd: Hwnd, key: bunny_ui::menu::MenuKey) -> bool {
+    let owner = scene_owner(hwnd);
+    let held = SOURCE.with(|source| source.replace(owner));
+    let taken = MENU_GATE.with(|slot| slot.borrow_mut().as_mut().is_some_and(|gate| gate(key)));
+    SOURCE.with(|source| source.set(held));
+    taken
 }
 
 /// What the key TYPED, under the modifiers actually held — the twin
@@ -2548,8 +2574,27 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
             0
         }
         WM_SYSCHAR => {
-            // no menu bar to ring: a consumed Alt chord stays silent
+            // an Alt chord the keymap declined, as the character it spells:
+            // the access key of a menu the scene draws. Silent either way —
+            // there is no system menu bar to ring
+            if let Some(key) = char::from_u32(wparam as u32)
+                .filter(|key| key.is_alphanumeric())
+                .and_then(|key| key.to_lowercase().next())
+            {
+                let _ = menu_key_taken(hwnd, bunny_ui::menu::MenuKey::Access(key));
+            }
             0
+        }
+        // Alt let go alone, or F10 the keymap declined: the platform's "enter
+        // the menu bar", which the scene's own bar answers. Unanswered, the
+        // system's menu mode runs as it always did — and Alt+Space (its own
+        // letter) always reaches the window menu
+        WM_SYSCOMMAND if wparam & 0xFFF0 == SC_KEYMENU && lparam == 0 => {
+            if menu_key_taken(hwnd, bunny_ui::menu::MenuKey::Bar) {
+                0
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
         }
         WM_TIMER => {
             if wparam == TIMER_BLINK {
