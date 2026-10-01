@@ -371,6 +371,10 @@ enum Event {
     /// The browser finished decoding a registered image — measure and
     /// paint can answer for real now.
     ImageReady,
+    /// The page draws itself again, whole: the GPU tier came back, and
+    /// what its drawable holds is the probe it ran on the way up.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    Repaint,
     /// A task has something to run: a fetch came back, a callback fired.
     Wake,
     /// The glue's slow clock beat once — the tooltip ages, then shows.
@@ -792,6 +796,7 @@ pub fn start_with(
                 // included
                 present(&runtime, &full, size, scale, &mut surface);
             }
+            Event::Repaint => present(&runtime, &full, size, scale, &mut surface),
             Event::Wake => {
                 // The work always lands: the tasks are polled. The FRAME is
                 // for a turn that changed something. Most wakes change
@@ -1004,7 +1009,7 @@ fn start_dom_with(
                     present(&runtime, runtime.dom_frame(&root, size), scale);
                 }
             }
-            Event::ImageReady | Event::Wake => {
+            Event::ImageReady | Event::Wake | Event::Repaint => {
                 // geometry reflows around the fresh intrinsic size (or
                 // around what a task just wrote); the <img> elements
                 // themselves paint on their own
@@ -1485,7 +1490,11 @@ pub extern "C" fn bunny_gpu_lost() {
 #[cfg(feature = "gpu")]
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_gpu_restored(width: u32, height: u32) {
-    let _ = gpu::restored((width.max(1), height.max(1)));
+    // a tier that came back holds its probe in the drawable, and a page
+    // with nothing moving would show it until something did
+    if gpu::restored((width.max(1), height.max(1))) {
+        dispatch(Event::Repaint);
+    }
 }
 
 /// `?present=gpu`: the GPU tier takes the page whatever its own probe of
