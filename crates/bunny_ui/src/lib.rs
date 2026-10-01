@@ -149,7 +149,7 @@ pub mod prelude {
     };
     pub use crate::theme::{self, Theme};
     pub use crate::text_engine::{FontDesign, FontSpec, PixelFont, TextEngine, Tracking, Weight};
-    pub use crate::text_input::{CaretState, EditCommand};
+    pub use crate::text_input::{CaretState, EditCommand, KeyboardType};
     pub use crate::one_of::{OneOf3, OneOf4, OneOf5, OneOf6, OneOf7, OneOf8};
     pub use crate::runtime::{Edited, FrameNeed, ImeSnapshot, LiveBlit, Runtime};
     pub use crate::state_ext::{BindingExt, StateExt};
@@ -10895,6 +10895,41 @@ mod tests {
         assert!(focused.starts_with("w9/"), "under its own scene: {focused}");
 
         assert!(!runtime.focus_named("third"), "a name nothing wears is refused");
+    }
+
+    /// A field names the keys a software keyboard lays out for it, and the
+    /// runtime answers for whatever holds the keyboard: an email's field asks
+    /// for the address keys, a field that named nothing for the letters, and
+    /// so does no focus at all.
+    #[test]
+    fn the_focused_field_names_its_keyboard() {
+        use crate::layout::{Proposal, Size};
+        use crate::text_input::KeyboardType;
+
+        #[derive(Clone, Copy)]
+        struct Form {
+            email: State<String>,
+            note: State<String>,
+        }
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text_field("email", self.email.binding())
+                        .keyboard_type(KeyboardType::Email)
+                        .id("email"),
+                    text_field("note", self.note.binding()).id("note"),
+                )
+            }
+        }
+
+        let form = Form { email: State::new(String::new()), note: State::new(String::new()) };
+        let runtime = Runtime::new();
+        let _ = runtime.settled_layout(&form, Proposal::exact(Size { width: 300.0, height: 120.0 }));
+        assert_eq!(runtime.focus_keyboard_type(), KeyboardType::Text, "no focus, the letters");
+        assert!(runtime.focus_named("email"));
+        assert_eq!(runtime.focus_keyboard_type(), KeyboardType::Email, "the address keys");
+        assert!(runtime.focus_named("note"));
+        assert_eq!(runtime.focus_keyboard_type(), KeyboardType::Text, "a field that named nothing");
     }
 
     /// A form that paints its own focus ring hears the keyboard move,

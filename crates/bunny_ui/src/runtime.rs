@@ -3473,6 +3473,18 @@ impl Runtime {
         }
     }
 
+    /// The keys a software keyboard should lay out for whatever holds the
+    /// keyboard now — the focused field's `keyboard_type`, and the letters
+    /// for a box the app owns or for no focus at all. A shell asks it when it
+    /// raises the keys, and again when the focus moves between fields.
+    pub fn focus_keyboard_type(&self) -> crate::text_input::KeyboardType {
+        self.enter_scene();
+        match self.focused() {
+            Some(path) if self.custom_at(&path).is_none() => reconciler::field_keyboard(&path),
+            _ => crate::text_input::KeyboardType::Text,
+        }
+    }
+
     /// Focuses a field. The caret goes to the END the first time (the
     /// stamp's clamp resolves the `usize::MAX`); refocusing restores
     /// the retained position.
