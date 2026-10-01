@@ -388,6 +388,120 @@ pub enum Pick {
     Edit(Edit),
 }
 
+// =============================================================================
+// Access keys — the letter Alt reaches a menu by
+// =============================================================================
+
+/// The letter a menu is opened by with Alt held — Windows' access key, a
+/// GTK mnemonic — and where it stands in the title, for the underline a
+/// shell draws while the keyboard is on the bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AccessKey {
+    key: char,
+    at: usize,
+}
+
+impl AccessKey {
+    /// The key, lowercase — what `Alt` and the letter must spell.
+    pub const fn key(self) -> char {
+        self.key
+    }
+
+    /// The byte offset of the underlined character in the title.
+    pub const fn at(self) -> usize {
+        self.at
+    }
+}
+
+/// Each title's access key, in order: the first of its letters or digits
+/// that no earlier title took — File F, Edit E, View V, Go G, Run R, Help H,
+/// the convention every Windows menu bar follows. A title with no free
+/// character has none, and is reached by the arrows alone.
+pub fn access_keys<'title>(titles: impl IntoIterator<Item = &'title str>) -> Vec<Option<AccessKey>> {
+    let mut taken: Vec<char> = Vec::new();
+    titles
+        .into_iter()
+        .map(|title| {
+            let found = title.char_indices().find_map(|(at, character)| {
+                let key = character.to_lowercase().next()?;
+                (character.is_alphanumeric() && !taken.contains(&key)).then_some(AccessKey { key, at })
+            });
+            if let Some(found) = found {
+                taken.push(found.key);
+            }
+            found
+        })
+        .collect()
+}
+
+impl MenuBar {
+    /// The access key of each menu, in the bar's order ([`access_keys`]).
+    pub fn access_keys(&self) -> Vec<Option<AccessKey>> {
+        access_keys(self.menus.iter().map(Menu::title))
+    }
+}
+
+// =============================================================================
+// Menu keys — the keys a platform keeps for its menu bar
+// =============================================================================
+
+/// A key the platform keeps for its menu bar, as a shell read it. Only what
+/// the keymap declined arrives here: a binding on `alt-f` or `f10` keeps its
+/// stroke, as every binding does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MenuKey {
+    /// Alt pressed and let go alone, or F10 — the bar takes the keyboard,
+    /// or gives it back.
+    Bar,
+    /// Alt and a character — the menu whose access key it is opens.
+    Access(char),
+}
+
+impl MenuKey {
+    /// The menu key a declined stroke spells, on a platform where Alt types
+    /// nothing (a PC: AltGr, which does type, arrives as text and never as a
+    /// stroke): plain F10, or Alt and a letter or digit with nothing else
+    /// held. `None` for everything else, which walks on as it always did.
+    pub fn of_stroke(stroke: &KeyPattern) -> Option<MenuKey> {
+        let alone = !stroke.command && !stroke.control;
+        match stroke.key {
+            Key::F(10) if alone && !stroke.option && !stroke.shift => Some(MenuKey::Bar),
+            Key::Char(character) if alone && stroke.option && character.is_alphanumeric() => {
+                character.to_lowercase().next().map(MenuKey::Access)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Alt pressed and let go with nothing between — the tap a PC's menu bar
+/// answers — told apart from Alt held for a chord.
+///
+/// A shell whose platform does not say so itself (Windows does, as
+/// `SC_KEYMENU`) feeds this the modifier changes it already reports, and
+/// every stroke and press it reads while Alt is down.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AltTap {
+    armed: bool,
+}
+
+impl AltTap {
+    /// The modifiers moved from `was` to `now`. `true` when this was Alt let
+    /// go after being pressed alone, with nothing read in between.
+    pub fn modifiers(&mut self, was: crate::action::Modifiers, now: crate::action::Modifiers) -> bool {
+        let alt = crate::action::Modifiers { option: true, ..crate::action::Modifiers::NONE };
+        let tapped = self.armed && was == alt && now == crate::action::Modifiers::NONE;
+        self.armed = was == crate::action::Modifiers::NONE && now == alt;
+        tapped
+    }
+
+    /// A stroke or a press arrived: whatever Alt was held for, it was not a
+    /// tap.
+    pub fn interrupted(&mut self) {
+        self.armed = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,4 +571,55 @@ mod tests {
         assert_eq!(Menu::help("Help").role(), Some(MenuRole::Help));
         assert_eq!(Menu::new("View").role(), None);
     }
+
+    #[test]
+    fn each_title_takes_the_first_letter_nobody_took() {
+        let keys = access_keys(["File", "Edit", "View", "Go", "Run", "Help"]);
+        let letters: Vec<_> = keys.iter().map(|key| key.map(AccessKey::key)).collect();
+        assert_eq!(letters, [Some('f'), Some('e'), Some('v'), Some('g'), Some('r'), Some('h')]);
+        let keys = access_keys(["File", "Find", "Format", "ff"]);
+        assert_eq!(keys[1], Some(AccessKey { key: 'i', at: 1 }), "F was File's, so Find takes its i");
+        assert_eq!(keys[2], Some(AccessKey { key: 'o', at: 1 }));
+        assert_eq!(keys[3], None, "nothing left in ff: reached by the arrows alone");
+        let keys = access_keys(["Édition", "…More"]);
+        assert_eq!(keys[0], Some(AccessKey { key: 'é', at: 0 }), "a letter is a letter in any script");
+        assert_eq!(keys[1], Some(AccessKey { key: 'm', at: 3 }), "the offset is in bytes, past the ellipsis");
+    }
+
+    #[test]
+    fn a_declined_stroke_spells_a_menu_key_only_in_the_platforms_shapes() {
+        assert_eq!(MenuKey::of_stroke(&KeyPattern::key(Key::F(10))), Some(MenuKey::Bar));
+        assert_eq!(MenuKey::of_stroke(&KeyPattern::option(Key::Char('F'))), Some(MenuKey::Access('f')));
+        assert_eq!(MenuKey::of_stroke(&KeyPattern::option(Key::Char('3'))), Some(MenuKey::Access('3')));
+        assert_eq!(MenuKey::of_stroke(&KeyPattern::shift(Key::F(10))), None, "shift-F10 is the context menu's");
+        assert_eq!(MenuKey::of_stroke(&KeyPattern::control(Key::F(10))), None);
+        assert_eq!(MenuKey::of_stroke(&KeyPattern::key(Key::Char('f'))), None, "a bare letter is typing");
+        let control_alt = KeyPattern { option: true, ..KeyPattern::control(Key::Char('f')) };
+        assert_eq!(MenuKey::of_stroke(&control_alt), None, "Ctrl+Alt is a chord, AltGr on some layouts");
+        assert_eq!(MenuKey::of_stroke(&KeyPattern::option(Key::Enter)), None);
+    }
+
+    #[test]
+    fn alt_tapped_alone_is_a_tap_and_alt_held_for_a_chord_is_not() {
+        use crate::action::Modifiers;
+        let alt = Modifiers { option: true, ..Modifiers::NONE };
+        let alt_shift = Modifiers { shift: true, ..alt };
+        let mut tap = AltTap::default();
+        assert!(!tap.modifiers(Modifiers::NONE, alt));
+        assert!(tap.modifiers(alt, Modifiers::NONE), "down and up, nothing between: a tap");
+        assert!(!tap.modifiers(alt, Modifiers::NONE), "the release is spent once");
+
+        assert!(!tap.modifiers(Modifiers::NONE, alt));
+        tap.interrupted();
+        assert!(!tap.modifiers(alt, Modifiers::NONE), "Alt+F held a stroke between: a chord");
+
+        assert!(!tap.modifiers(Modifiers::NONE, alt));
+        assert!(!tap.modifiers(alt, alt_shift));
+        assert!(!tap.modifiers(alt_shift, alt));
+        assert!(!tap.modifiers(alt, Modifiers::NONE), "shift joined it: not a tap");
+
+        assert!(!tap.modifiers(Modifiers::SHIFT, alt_shift), "Alt pressed over shift is no tap either");
+        assert!(!tap.modifiers(alt_shift, Modifiers::NONE));
+    }
+
 }

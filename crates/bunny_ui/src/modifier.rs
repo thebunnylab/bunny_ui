@@ -130,6 +130,8 @@ pub enum Modifier {
     Rendering(crate::layout::Rendering),
     /// Declares a key context active while this view is mounted.
     KeyContext(&'static str),
+    /// `.leaves_keyboard()` — a click inside moves no keyboard.
+    LeavesKeyboard,
     /// A key context that counts only while the keyboard is inside the
     /// view (`.key_context_focused`).
     KeyContextFocused(&'static str),
@@ -332,6 +334,7 @@ impl Modifier {
             ),
             Modifier::Rendering(mode) => format!(" [.rendering(.{mode:?})]"),
             Modifier::KeyContext(name) => format!(" [.keyContext({name})]"),
+            Modifier::LeavesKeyboard => " [.leavesKeyboard()]".into(),
             Modifier::KeyContextFocused(name) => format!(" [.keyContextFocused({name})]"),
             Modifier::WindowDragRegion => " [.windowDragRegion()]".into(),
             Modifier::WindowControl(control) => format!(
@@ -1583,6 +1586,11 @@ fn apply(
             // while the focused field or box is somewhere below it
             let path = motor::identity::cursor_scope().unwrap_or_default();
             crate::reconciler::attribute_context(path, name, true);
+        }
+        Modifier::LeavesKeyboard => {
+            // a mark on the subtree, retained like a context's declaration
+            let path = motor::identity::cursor_scope().unwrap_or_default();
+            crate::reconciler::attribute_context(path, crate::reconciler::KEYBOARD_NEUTRAL, false);
         }
         Modifier::WindowControl(control) => {
             let control = *control;

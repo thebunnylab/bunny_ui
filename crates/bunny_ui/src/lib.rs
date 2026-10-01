@@ -8017,6 +8017,193 @@ mod tests {
         );
     }
 
+    /// A menu key reaches the app's handler, which says whether the bar took
+    /// it; with no handler installed nothing takes it and the platform's own
+    /// road runs.
+    #[test]
+    fn a_menu_key_reaches_the_bar_that_answers_it() {
+        use crate::menu::MenuKey;
+        use std::cell::RefCell;
+
+        let runtime = Runtime::new();
+        assert!(!runtime.menu_key(MenuKey::Bar), "no bar: the key is the platform's");
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        runtime.on_menu_key({
+            let heard = Rc::clone(&heard);
+            move |key| {
+                heard.borrow_mut().push(key);
+                key != MenuKey::Access('z')
+            }
+        });
+        assert!(runtime.menu_key(MenuKey::Bar));
+        assert!(runtime.menu_key(MenuKey::Access('f')));
+        assert!(!runtime.menu_key(MenuKey::Access('z')), "an access key no menu wears is not taken");
+        assert_eq!(*heard.borrow(), [MenuKey::Bar, MenuKey::Access('f'), MenuKey::Access('z')]);
+    }
+
+    /// A box that BORROWS the keyboard on a beat — a menu over an editor —
+    /// hands it back to the field that held it when the box leaves the scene;
+    /// a box that TAKES it (`auto_focus`) keeps the old rule, and gives
+    /// nothing back.
+    #[test]
+    fn a_box_that_borrows_the_keyboard_hands_it_home_when_it_goes() {
+        use crate::layout::{Proposal, Size};
+        use std::cell::Cell;
+
+        struct Keys;
+        impl CustomElement for Keys {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+        }
+
+        #[derive(Clone)]
+        struct Page {
+            name: State<String>,
+            open: State<bool>,
+            borrows: Rc<Cell<bool>>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let keys = self.open.get().then(|| {
+                    let keys = custom(Keys);
+                    let keys = if self.borrows.get() { keys.borrow_focus(1) } else { keys.auto_focus(1) };
+                    keys.id("menu-keys")
+                });
+                vstack((text_field("name", self.name.binding()).id("name").frame_width(200.0), keys))
+            }
+        }
+
+        for borrows in [true, false] {
+            let page = Page {
+                name: State::new(String::new()),
+                open: State::new(false),
+                borrows: Rc::new(Cell::new(borrows)),
+            };
+            let runtime = Runtime::new();
+            let viewport = Proposal::exact(Size { width: 300.0, height: 200.0 });
+            let lay = || {
+                runtime.render_stable(&page);
+                runtime.layout(&page, viewport)
+            };
+            let result = lay();
+            let (field, rect) = result.hits.iter().find(|(path, _)| path.contains("name")).cloned().expect("the field");
+            runtime.pointer_pressed(rect.origin.x + 4.0, rect.origin.y + 4.0);
+            runtime.pointer_released(rect.origin.x + 4.0, rect.origin.y + 4.0);
+            assert_eq!(runtime.focused().as_deref(), Some(field.as_str()), "the field holds the keys");
+
+            page.open.set(true);
+            lay();
+            assert!(runtime.focused().is_some_and(|path| path.contains("menu-keys")), "the box took them");
+
+            page.open.set(false);
+            lay();
+            lay();
+            if borrows {
+                assert_eq!(runtime.focused().as_deref(), Some(field.as_str()), "borrowed: they went home");
+            } else {
+                assert_eq!(runtime.focused(), None, "taken: nobody is owed them");
+            }
+        }
+    }
+
+    /// A click on chrome (`.leaves_keyboard()`) moves no keyboard: the field
+    /// that held it still holds it, and the button's action still runs. A
+    /// plain button beside it takes the keyboard away, as the scene's rule
+    /// says.
+    #[test]
+    fn a_click_on_chrome_leaves_the_keyboard_where_it_was() {
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            name: State<String>,
+            chrome: State<i32>,
+            plain: State<i32>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let (chrome, plain) = (self.chrome, self.plain);
+                vstack((
+                    text_field("name", self.name.binding()).id("name").frame_width(200.0),
+                    vstack((text("Edit").frame(60.0, 20.0).on_click(move || chrome.add(1)),)).leaves_keyboard(),
+                    text("Plain").frame(60.0, 20.0).on_click(move || plain.add(1)),
+                ))
+            }
+        }
+
+        let page = Page { name: State::new(String::new()), chrome: State::new(0), plain: State::new(0) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&page);
+        let result = runtime.layout(&page, Proposal::exact(Size { width: 300.0, height: 200.0 }));
+        let centre = |rect: &crate::layout::Rect| (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+        let (field, field_rect) = result.hits.iter().find(|(path, _)| path.contains("name")).cloned().expect("the field");
+        let mut targets: Vec<_> = result.hits.iter().filter(|(path, _)| !path.contains("name")).cloned().collect();
+        targets.sort_by(|a, b| a.1.origin.y.total_cmp(&b.1.origin.y));
+        let (x, y) = centre(&field_rect);
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        assert_eq!(runtime.focused().as_deref(), Some(field.as_str()));
+
+        let (x, y) = centre(&targets[0].1);
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        assert_eq!(page.chrome.get(), 1, "the chrome's action ran");
+        assert_eq!(runtime.focused().as_deref(), Some(field.as_str()), "and the field kept the keyboard");
+
+        let (x, y) = centre(&targets[1].1);
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        assert_eq!(page.plain.get(), 1);
+        assert_eq!(runtime.focused(), None, "a plain button takes the keyboard away");
+    }
+
+    /// A borrowed keyboard goes back on request, before its borrower leaves:
+    /// what a menu's pick does so the editor under it is who the pick acts on.
+    #[test]
+    fn a_borrowed_keyboard_goes_back_when_asked() {
+        use crate::layout::{Proposal, Size};
+
+        struct Keys;
+        impl CustomElement for Keys {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+        }
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            name: State<String>,
+            open: State<bool>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let keys = self.open.get().then(|| custom(Keys).borrow_focus(1).id("menu-keys"));
+                vstack((text_field("name", self.name.binding()).id("name").frame_width(200.0), keys))
+            }
+        }
+
+        let page = Page { name: State::new(String::new()), open: State::new(false) };
+        let runtime = Runtime::new();
+        let lay = || {
+            runtime.render_stable(&page);
+            runtime.layout(&page, Proposal::exact(Size { width: 300.0, height: 200.0 }))
+        };
+        let result = lay();
+        let (field, rect) = result.hits.iter().find(|(path, _)| path.contains("name")).cloned().expect("the field");
+        runtime.pointer_pressed(rect.origin.x + 4.0, rect.origin.y + 4.0);
+        runtime.pointer_released(rect.origin.x + 4.0, rect.origin.y + 4.0);
+        assert!(!runtime.give_back_keyboard(), "nothing borrowed, nothing to give back");
+
+        page.open.set(true);
+        lay();
+        assert!(runtime.focused().is_some_and(|path| path.contains("menu-keys")));
+        assert!(runtime.give_back_keyboard());
+        assert_eq!(runtime.focused().as_deref(), Some(field.as_str()), "the keys are the field's again");
+    }
+
     #[test]
     fn a_skipped_copy_target_still_answers_and_dies_with_its_view() {
         use crate::layout::{Proposal, Size};

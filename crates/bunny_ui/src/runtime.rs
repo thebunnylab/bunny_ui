@@ -115,6 +115,9 @@ struct Chord {
 
 /// Who hears the modifier keys move ([`Runtime::observe_modifiers`]).
 type ModifierSink = Rc<dyn Fn(crate::action::Modifiers, crate::action::Modifiers)>;
+/// Who answers the platform's menu keys ([`Runtime::on_menu_key`]).
+type MenuKeys = Rc<dyn Fn(crate::menu::MenuKey) -> bool>;
+
 /// Who hears every stroke the keymap resolves ([`Runtime::observe_keys`]).
 type KeySink = Rc<dyn Fn(&crate::action::KeyReport)>;
 
@@ -286,6 +289,8 @@ pub struct Runtime {
     /// Who hears the modifier keys move: what was held, and what is
     /// held now.
     modifier_sink: RefCell<Option<ModifierSink>>,
+    /// Who answers the platform's menu keys ([`Runtime::menu_key`]).
+    menu_keys: RefCell<Option<MenuKeys>>,
     /// Who hears every stroke the keymap resolves — a key-context
     /// debugger's door.
     key_sink: RefCell<Option<KeySink>>,
@@ -1304,6 +1309,7 @@ impl Runtime {
             hover_move_had_more: Cell::new(false),
             drops_unseen: Cell::new(false),
             hosted_handlers: RefCell::new(HashMap::default()),
+            menu_keys: RefCell::new(None),
             interaction: RefCell::new(Interaction::default()),
             pointer_modifiers: std::cell::Cell::new(crate::action::Modifiers::NONE),
             text,
@@ -2326,11 +2332,15 @@ impl Runtime {
         let activated = fired.as_deref().is_some_and(|path| self.activate_clicks(path, clicks));
         // the keyboard follows the click: to the view that answers a copy
         // for what was clicked (the row's table), and away from every
-        // field otherwise — first responder follows the click
-        match fired.as_deref().and_then(reconciler::copy_owner) {
-            Some(owner) => self.focus_element(&owner),
-            None => {
-                self.blur();
+        // field otherwise — first responder follows the click. Chrome is
+        // the exception (`.leaves_keyboard()`): a menu's row, a toolbar
+        // button, and the keyboard stays where it was
+        if !fired.as_deref().is_some_and(reconciler::leaves_keyboard) {
+            match fired.as_deref().and_then(reconciler::copy_owner) {
+                Some(owner) => self.focus_element(&owner),
+                None => {
+                    self.blur();
+                }
             }
         }
         fired.filter(|_| activated)
@@ -3361,6 +3371,45 @@ impl Runtime {
     /// from its context alone and the menus answer no command.
     fn alert_asks(&self) -> bool {
         reconciler::context_active(ALERT_CONTEXT, self.focus.borrow().as_deref())
+    }
+
+    /// Gives a borrowed keyboard back NOW: when what holds it took it on a
+    /// beat that borrows (`CustomView::borrow_focus`, a field's
+    /// `.auto_focus_beat`), the keys go to the first lender still on screen
+    /// — the editor under the menu that borrowed them. `true` when they
+    /// moved.
+    ///
+    /// For a menu's pick: the reader chose Edit ▸ Copy for the selection in
+    /// the editor, and the menu still holds the keys it walked with. Handed
+    /// back first, the copy reaches the editor; the menu leaves the scene
+    /// right after, holding nothing.
+    pub fn give_back_keyboard(&self) -> bool {
+        self.enter_scene();
+        let Some(borrower) = self.focused() else { return false };
+        let heir = self.loans.borrow().heir(&borrower, input_lives).map(str::to_owned);
+        heir.is_some_and(|heir| {
+            self.hand_keyboard(&heir, None);
+            true
+        })
+    }
+
+    /// Installs who answers the platform's menu keys — Alt let go alone, F10,
+    /// Alt and a letter — on a platform whose menu bar the scene draws. One
+    /// handler; installing another replaces it. It answers `true` when the
+    /// bar took the key.
+    pub fn on_menu_key(&self, handler: impl Fn(crate::menu::MenuKey) -> bool + 'static) {
+        *self.menu_keys.borrow_mut() = Some(Rc::new(handler));
+    }
+
+    /// A menu key the shell read, after the keymap declined it. `true` when
+    /// the app's bar took it: the shell swallows the key and presents a frame.
+    /// `false` with no handler installed, or when the bar had no use for it —
+    /// an access key no menu wears — and the platform's own road runs.
+    pub fn menu_key(&self, key: crate::menu::MenuKey) -> bool {
+        self.enter_scene();
+        // out of the borrow before it runs: the handler writes state
+        let handler = self.menu_keys.borrow().clone();
+        handler.is_some_and(|handler| handler(key))
     }
 
     // MARK: - Focus and keyboard (the focused field owns the keyboard)
@@ -5912,6 +5961,15 @@ impl Runtime {
             }
             self.auto_focused.borrow_mut().insert(key);
             if self.focus.borrow().as_deref() != Some(placement.path.as_str()) {
+                // a box that BORROWS (`CustomView::borrow_focus`) — a menu's
+                // keys, a picker's — hands them home when it leaves still
+                // holding them, as a field's beat does (`crate::loans`)
+                let lender = self.focus.borrow().clone();
+                if placement.element.borrows_focus()
+                    && let Some(lender) = lender
+                {
+                    self.loans.borrow_mut().lend(&placement.path, &lender);
+                }
                 self.focus_via(&placement.path, Some(placement));
                 return true;
             }
