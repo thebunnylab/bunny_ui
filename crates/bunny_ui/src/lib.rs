@@ -15788,6 +15788,79 @@ mod tests {
         assert!(!Runtime::new().magnify(10.0, 10.0, 2.0));
     }
 
+    /// **A pinch takes the first finger's press back; it does not release
+    /// it.** The first finger pressed a map and the second made the pair a
+    /// zoom: the box hears its press cancelled — a map that walks where a
+    /// press lifts must not walk to where the pinch began — and the zoom
+    /// follows. A box with no word for a cancel hears the release it always
+    /// heard, so a drag that ends on the release still ends. And the
+    /// fingers lifting one by one end the pinch with no tap, on a box that
+    /// takes the drag or not.
+    #[test]
+    fn a_pinch_takes_the_first_fingers_press_back() {
+        use crate::layout::Size;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct Map {
+            heard: Rc<RefCell<Vec<&'static str>>>,
+            knows_cancel: bool,
+            grabs: bool,
+        }
+        impl CustomElement for Map {
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn takes_drag(&self) -> bool {
+                self.grabs
+            }
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> Response {
+                let word = match event {
+                    ElementEvent::PointerDown { .. } => "down",
+                    ElementEvent::PointerUp { .. } => "up",
+                    ElementEvent::PointerCancelled { .. } if self.knows_cancel => "cancelled",
+                    ElementEvent::Magnify { .. } => "magnify",
+                    _ => return Response::default(),
+                };
+                self.heard.borrow_mut().push(word);
+                Response::handled()
+            }
+        }
+
+        #[derive(Clone)]
+        struct Office {
+            heard: Rc<RefCell<Vec<&'static str>>>,
+            knows_cancel: bool,
+            grabs: bool,
+        }
+        impl Component for Office {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Map {
+                    heard: self.heard.clone(),
+                    knows_cancel: self.knows_cancel,
+                    grabs: self.grabs,
+                })
+            }
+        }
+
+        for (grabs, knows_cancel, heard_then) in [
+            (true, true, vec!["down", "cancelled", "magnify"]),
+            (true, false, vec!["down", "up", "magnify"]),
+            // a box a finger only scrolls was never pressed: the zoom alone
+            (false, true, vec!["magnify"]),
+        ] {
+            let heard = Rc::new(RefCell::new(Vec::new()));
+            let view = Office { heard: heard.clone(), knows_cancel, grabs };
+            let runtime = Runtime::new();
+            let _ = runtime.display_frame(&view, Size { width: 400.0, height: 300.0 });
+
+            runtime.touch_began(1, 100.0, 100.0, 1);
+            runtime.touch_began(2, 200.0, 100.0, 1);
+            assert!(runtime.touch_moved(2, 300.0, 100.0), "the pair zooms");
+            runtime.touch_ended(1, 100.0, 100.0);
+            runtime.touch_ended(2, 300.0, 100.0);
+            assert_eq!(*heard.borrow(), heard_then, "grabs {grabs}, knows a cancel {knows_cancel}");
+        }
+    }
+
     /// A box that takes the drag, inside a scroll region: the finger is
     /// a hand on the box at once — the box hears the press and every
     /// move, and the region around it never scrolls.

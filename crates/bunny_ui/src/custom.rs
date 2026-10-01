@@ -769,6 +769,15 @@ pub enum ElementEvent {
     /// give one.
     PointerDown { at: Point, clicks: u8, modifiers: crate::action::Modifiers },
     PointerUp { at: Point },
+    /// The press this box held was taken back before it lifted: a second
+    /// finger made it a pinch, the system claimed the touch, the window
+    /// lost the hand. Nothing should act on it — a map that walks where
+    /// a press is released must not walk here.
+    ///
+    /// Answer it handled and no `PointerUp` follows. Ignore it and the
+    /// box hears the end of its press as `PointerUp`, as it always did,
+    /// so a box that ends its drag on the release still ends it.
+    PointerCancelled { at: Point },
     /// A press of a button past the primary one: the context button or
     /// the middle one. The left press is `PointerDown`, and a box that
     /// never looks at this arm hears none of them — a secondary press it

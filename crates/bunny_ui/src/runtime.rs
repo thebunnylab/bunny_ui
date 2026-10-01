@@ -2603,10 +2603,12 @@ impl Runtime {
     }
 
     /// A press that ends without a release — the system took the
-    /// pointer (a touch the OS claimed, a window that lost the hand).
-    /// The pressed visual clears, a drag in flight goes home, a grabbed
-    /// box hears the pointer go up; nothing fires and the focus stays.
-    /// `true` = repaint.
+    /// pointer (a touch the OS claimed, a window that lost the hand, a
+    /// second finger that made the press a pinch). The pressed visual
+    /// clears, a drag in flight goes home, a grabbed box hears
+    /// [`crate::custom::ElementEvent::PointerCancelled`] (or the
+    /// `PointerUp` it always heard, when it has no word for that);
+    /// nothing fires and the focus stays. `true` = repaint.
     pub fn pointer_cancelled(&self) -> bool {
         self.enter_scene();
         let (repaint, told) = self.watching_hover(|| self.pointer_cancelled_road());
@@ -2634,7 +2636,14 @@ impl Runtime {
         };
         if let Some(placement) = grabbed.as_deref().and_then(|path| self.custom_at(path)) {
             let at = Self::local(&placement, at.x, at.y);
-            self.deliver(&placement, crate::custom::ElementEvent::PointerUp { at });
+            // the box hears its press taken back; one with no word for that
+            // hears the release it always heard, so its drag still ends
+            let heard = self
+                .deliver(&placement, crate::custom::ElementEvent::PointerCancelled { at })
+                .handled;
+            if !heard {
+                self.deliver(&placement, crate::custom::ElementEvent::PointerUp { at });
+            }
         }
         changed || dragged || grabbed.is_some()
     }
