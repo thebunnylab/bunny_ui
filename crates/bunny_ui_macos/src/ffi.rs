@@ -33,9 +33,12 @@ pub(crate) use bunny_ui_apple::ffi::{
     CGContextSetInterpolationQuality, CGImageRelease, CGPoint, CGRect, CGSize, Id, NS_NOT_FOUND,
     NSRange, NSRunLoopCommonModes, ObjcSuper, Sel, class, class_addMethod, class_addProtocol,
     kill_layer_actions, modifiers_of, objc_allocateClassPair, objc_autoreleasePoolPop,
-    objc_autoreleasePoolPush, objc_getProtocol, objc_registerClassPair, owned_provider, sel,
-    sel_getName, text_argument_to_string, wake_from_any_thread,
+    objc_autoreleasePoolPush, objc_getProtocol, objc_registerClassPair, ns_string, owned_provider,
+    sel, sel_getName, text_argument_to_string, wake_from_any_thread,
 };
+
+use bunny_ui::action::ActionId;
+use bunny_ui::menu::Pick;
 
 // Re-declaring `objc_msgSend` with the concrete signature of each message
 // is the runtime's designed usage (the symbol is a trampoline that
@@ -129,6 +132,10 @@ unsafe extern "C" {
     fn msg_void_u64(obj: Id, sel: Sel, a: u64);
     #[link_name = "objc_msgSend"]
     fn msg_void_size(obj: Id, sel: Sel, size: CGSize);
+    #[link_name = "objc_msgSend"]
+    fn msg_sel(obj: Id, sel: Sel) -> Sel;
+    #[link_name = "objc_msgSend"]
+    fn msg_init_item(obj: Id, sel: Sel, title: Id, action: Sel, key: Id) -> Id;
 }
 
 // AppKit comes in via the ObjC runtime; the link guarantees the classes.
@@ -255,6 +262,9 @@ pub enum AppEvent {
     /// step. The frame the shell already knows how to draw drains the
     /// queue on its way.
     Wake,
+    /// The reader chose a menu item this window answers — a command from
+    /// the menu bar, or a standard edit sent to this window's view.
+    Menu(Pick),
 }
 
 thread_local! {
@@ -1020,17 +1030,40 @@ unsafe fn key_equivalent_super(this: Id, event: Id) -> i8 {
     unsafe { msg_super_bool_id(&sup, sel("performKeyEquivalent:"), event) }
 }
 
-/// `performKeyEquivalent:` — the app's chords survive the island
-/// holding the keyboard. A click on a hosted page hands the first
-/// responder to the platform view and `keyDown:` stops arriving; but
-/// AppKit walks the view tree for COMMAND chords before any of that,
-/// and this view is visited before its children. Three rules:
-/// - only while the view is NOT the responder: when it is, the chord
-///   arrives by `keyDown:` as ever, and running the gate twice would
-///   break a pending two-step chord.
-/// - command chords only — everything else is the page's to type (a
-///   form that is being typed in must receive the typing).
-/// - not consumed → super, so the page keeps its own chords.
+thread_local! {
+    /// The key event the gate has already heard, by its address and its
+    /// timestamp's bits — see [`first_offer`].
+    static OFFERED: Cell<(usize, u64)> = const { Cell::new((0, 0)) };
+}
+
+/// Is this the first time the gate is offered `event`? AppKit hands ONE
+/// key event to `performKeyEquivalent:` and — when neither the views nor
+/// the menu bar took it — to `keyDown:` after, and the gate must hear it
+/// once: a second hearing would end a pending two-step chord with the very
+/// stroke that began it. The timestamp rides with the address because an
+/// event the menu consumed never reaches `keyDown:` to clear the mark, and
+/// a later event may be born at the same address.
+unsafe fn first_offer(event: Id) -> bool {
+    let identity = (event as usize, unsafe { msg_f64(event, sel("timestamp")) }.to_bits());
+    OFFERED.with(|offered| offered.replace(identity)) != identity
+}
+
+/// `performKeyEquivalent:` — the keymap hears a stroke before the menu bar
+/// does, and the app's chords survive the island holding the keyboard.
+///
+/// AppKit offers a key event to the key window's views BEFORE its main
+/// menu, and this view is visited before its children. So:
+/// - **while the view holds the keyboard**, every stroke the input method
+///   is not composing goes to the gate here, first. A pending chord, a
+///   binding scoped to a context and the reader's own rebind keep their
+///   strokes, and only what the keymap declines reaches an item's key
+///   equivalent — the menu is never a second keymap. `keyDown:` then does
+///   not offer the same event again ([`first_offer`]).
+/// - **while a hosted page holds it**, command chords only: a click on the
+///   page handed it the first responder and `keyDown:` stopped arriving
+///   here, and everything but a chord is the page's to type.
+/// - not consumed → super, so the page keeps its own chords, and the menu
+///   bar has its turn after.
 extern "C" fn bunny_perform_key_equivalent(this: Id, _sel: Sel, event: Id) -> i8 {
     unsafe {
         let window = msg_id(this, sel("window"));
@@ -1038,12 +1071,12 @@ extern "C" fn bunny_perform_key_equivalent(this: Id, _sel: Sel, event: Id) -> i8
             return key_equivalent_super(this, event);
         }
         let responder = msg_id(window, sel("firstResponder"));
-        if std::ptr::eq(responder, this) {
-            return key_equivalent_super(this, event);
-        }
+        let holds_keyboard = std::ptr::eq(responder, this);
         let flags = msg_u64(event, sel("modifierFlags"));
         let held = modifiers_of(flags);
-        if !held.command {
+        let composing = ime_mirror().is_some_and(|ime| ime.marked.location != NS_NOT_FOUND);
+        let offered = if holds_keyboard { !composing } else { held.command };
+        if !offered || !first_offer(event) {
             return key_equivalent_super(this, event);
         }
         let code = msg_u16(event, sel("keyCode"));
@@ -1081,9 +1114,11 @@ extern "C" fn bunny_key_down(this: Id, _sel: Sel, event: Id) {
         };
 
         // live IME composition: the keys belong to the IME (Esc closes
-        // candidates, arrows walk the composition) — the keymap doesn't steal
+        // candidates, arrows walk the composition) — the keymap doesn't
+        // steal. A stroke `performKeyEquivalent:` already offered — and the
+        // gate and the menu bar both declined — is not offered twice.
         let composing = ime_mirror().is_some_and(|ime| ime.marked.location != NS_NOT_FOUND);
-        if !composing && gate_consumed(&stroke) {
+        if !composing && first_offer(event) && gate_consumed(&stroke) {
             return; // the keymap dispatched — the event dies here
         }
 
@@ -1856,7 +1891,40 @@ unsafe fn register_classes() {
             class_addProtocol(view, protocol);
         }
 
+        // the Edit menu's standard selectors, sent to the first responder,
+        // and the question the menu asks before it draws them enabled
+        for edit in bunny_ui::menu::Edit::ALL {
+            class_addMethod(
+                view,
+                sel(crate::menu::edit_selector(edit)),
+                bunny_view_edit as *const c_void,
+                types.as_ptr(),
+            );
+        }
+        let validate_types = CString::new("c@:@").expect("type encoding");
+        class_addMethod(
+            view,
+            sel("validateMenuItem:"),
+            bunny_view_validate as *const c_void,
+            validate_types.as_ptr(),
+        );
+
         objc_registerClassPair(view);
+
+        // the target every command on the menu bar is sent to
+        let target = objc_allocateClassPair(
+            class("NSObject"),
+            CString::new("BunnyMenuTarget").expect("name").as_ptr(),
+            0,
+        );
+        class_addMethod(target, sel("bunnyMenuPick:"), bunny_menu_pick as *const c_void, types.as_ptr());
+        class_addMethod(
+            target,
+            sel("validateMenuItem:"),
+            bunny_menu_validate as *const c_void,
+            validate_types.as_ptr(),
+        );
+        objc_registerClassPair(target);
 
         let delegate = objc_allocateClassPair(
             class("NSObject"),
@@ -3451,6 +3519,281 @@ impl WindowHandle {
             Some((in_window.origin.x, top, in_window.size.width, in_window.size.height))
         }
     }
+}
+
+// MARK: - The menu bar
+
+/// What an item on the shell's own target stands for, by the item's `tag`.
+/// The standard edits and the platform's items carry no entry: AppKit
+/// sends them by selector, up the responder chain.
+#[derive(Clone, Copy)]
+enum MenuEntry {
+    /// A command the menu's window runs.
+    Command(ActionId),
+    /// Quit: the app's command while the window answers it, and the
+    /// system's `terminate:` otherwise.
+    Quit(Option<ActionId>),
+}
+
+thread_local! {
+    /// The items of the bar now on screen, indexed by tag. A new bar
+    /// replaces the table whole.
+    static MENU_ENTRIES: RefCell<Vec<MenuEntry>> = const { RefCell::new(Vec::new()) };
+    /// The one `BunnyMenuTarget` the bar's commands are sent to, as an
+    /// address. Born with the first bar and never released: an item holds
+    /// its target weakly, and this outlives every item.
+    static MENU_TARGET: Cell<usize> = const { Cell::new(0) };
+    /// "Does this window answer this item?" — installed by the app, which
+    /// knows which runtime a window belongs to.
+    static MENU_ANSWERS: RefCell<Option<Box<dyn Fn(usize, Pick) -> bool>>> =
+        const { RefCell::new(None) };
+}
+
+/// Registers who says whether a window answers a menu item: the app's
+/// windows by their address, the item by what it asks.
+pub fn set_menu_answers(answers: Box<dyn Fn(usize, Pick) -> bool>) {
+    MENU_ANSWERS.with(|slot| *slot.borrow_mut() = Some(answers));
+}
+
+fn menu_answers(window: usize, pick: Pick) -> bool {
+    MENU_ANSWERS.with(|slot| slot.borrow().as_ref().is_some_and(|answers| answers(window, pick)))
+}
+
+/// The window a menu command acts on: the key window's owner (a dialog
+/// or a popover panel answers for the window it hangs from), else the
+/// main window's, else the oldest open window. A window that is not the
+/// app's — the About panel, a system sheet — is passed over.
+fn menu_window() -> usize {
+    let ours = |window: usize| {
+        WINDOWS.with(|windows| windows.borrow().iter().any(|(open, _, _)| *open == window))
+    };
+    unsafe {
+        let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+        for question in ["keyWindow", "mainWindow"] {
+            let owner = owning_window(msg_id(app, sel(question)));
+            if owner != 0 && ours(owner) {
+                return owner;
+            }
+        }
+    }
+    WINDOWS.with(|windows| windows.borrow().first().map_or(0, |(window, _, _)| *window))
+}
+
+fn menu_entry(item: Id) -> Option<MenuEntry> {
+    let tag = unsafe { msg_i64(item, sel("tag")) };
+    let index = usize::try_from(tag).ok()?;
+    MENU_ENTRIES.with(|entries| entries.borrow().get(index).copied())
+}
+
+unsafe fn terminate() {
+    unsafe {
+        let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+        msg_void_id(app, sel("terminate:"), std::ptr::null_mut());
+    }
+}
+
+/// `bunnyMenuPick:` — a command chosen from the bar, by click or by its
+/// key equivalent, travels to its window as an event like any other.
+extern "C" fn bunny_menu_pick(_this: Id, _sel: Sel, item: Id) {
+    let Some(entry) = menu_entry(item) else {
+        return;
+    };
+    let window = menu_window();
+    match entry {
+        MenuEntry::Command(action) => dispatch_from(window, AppEvent::Menu(Pick::Command(action))),
+        MenuEntry::Quit(Some(action)) if menu_answers(window, Pick::Command(action)) => {
+            dispatch_from(window, AppEvent::Menu(Pick::Command(action)));
+        }
+        MenuEntry::Quit(_) => unsafe { terminate() },
+    }
+}
+
+/// `validateMenuItem:` on the target: a command is enabled while its
+/// window answers it, and Quit always is.
+extern "C" fn bunny_menu_validate(_this: Id, _sel: Sel, item: Id) -> i8 {
+    i8::from(match menu_entry(item) {
+        Some(MenuEntry::Command(action)) => menu_answers(menu_window(), Pick::Command(action)),
+        Some(MenuEntry::Quit(_)) => true,
+        None => false,
+    })
+}
+
+/// The name of a selector, when it has one.
+unsafe fn selector_name(selector: Sel) -> Option<String> {
+    let name = unsafe { sel_getName(selector) };
+    (!name.is_null())
+        .then(|| unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned())
+}
+
+/// `cut:`, `copy:`, `paste:`, `selectAll:`, `undo:` and `redo:` on the
+/// framework's view — Edit's items, sent to the first responder, reach the
+/// window this view draws. A hosted page that holds the keyboard answers
+/// its own and never sends them here.
+extern "C" fn bunny_view_edit(this: Id, selector: Sel, _sender: Id) {
+    let Some(edit) = (unsafe { selector_name(selector) })
+        .as_deref()
+        .and_then(crate::menu::edit_of_selector)
+    else {
+        return;
+    };
+    let window = unsafe { msg_id(this, sel("window")) };
+    dispatch_to(window, AppEvent::Menu(Pick::Edit(edit)));
+}
+
+/// `validateMenuItem:` on the view: an edit is enabled while this window's
+/// keyboard is held by someone who can take it.
+extern "C" fn bunny_view_validate(this: Id, _sel: Sel, item: Id) -> i8 {
+    let edit = unsafe { selector_name(msg_sel(item, sel("action"))) }
+        .as_deref()
+        .and_then(crate::menu::edit_of_selector);
+    match edit {
+        Some(edit) => {
+            let window = owning_window(unsafe { msg_id(this, sel("window")) });
+            i8::from(menu_answers(window, Pick::Edit(edit)))
+        }
+        None => 1,
+    }
+}
+
+/// The app's name as the menu bar shows it: the bundle's, or the process's
+/// when there is no bundle.
+pub fn app_name() -> String {
+    unsafe {
+        let running = msg_id(class("NSRunningApplication"), sel("currentApplication"));
+        let name = msg_id(running, sel("localizedName"));
+        let name = if name.is_null() {
+            msg_id(msg_id(class("NSProcessInfo"), sel("processInfo")), sel("processName"))
+        } else {
+            name
+        };
+        text_argument_to_string(name)
+    }
+}
+
+/// Puts `menus` on the menu bar, replacing the bar that was there.
+pub(crate) fn install_menu_bar(menus: &[crate::menu::NativeMenu]) {
+    use crate::menu::MenuKind;
+
+    unsafe {
+        register_classes();
+        let pool = objc_autoreleasePoolPush();
+        MENU_ENTRIES.with(|entries| entries.borrow_mut().clear());
+        let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+        let bar = new_menu("");
+        for menu in menus {
+            let item = new_item(&menu.title, None, None);
+            let submenu = build_menu(menu);
+            msg_void_id(item, sel("setSubmenu:"), submenu);
+            match menu.kind {
+                MenuKind::Window => msg_void_id(app, sel("setWindowsMenu:"), submenu),
+                MenuKind::Help => msg_void_id(app, sel("setHelpMenu:"), submenu),
+                MenuKind::App | MenuKind::Plain => {}
+            }
+            msg_void(submenu, sel("release"));
+            msg_void_id(bar, sel("addItem:"), item);
+            msg_void(item, sel("release"));
+        }
+        msg_void_id(app, sel("setMainMenu:"), bar);
+        msg_void(bar, sel("release"));
+        objc_autoreleasePoolPop(pool);
+    }
+}
+
+/// One `NSMenu`, owned by the caller (+1).
+unsafe fn build_menu(menu: &crate::menu::NativeMenu) -> Id {
+    use crate::menu::Line;
+
+    unsafe {
+        let native = new_menu(&menu.title);
+        for line in &menu.lines {
+            let item = match line {
+                Line::Command { title, action, key } => {
+                    targeted(new_item(title, Some("bunnyMenuPick:"), key.as_ref()), MenuEntry::Command(*action))
+                }
+                Line::Quit { title, action, key } => {
+                    targeted(new_item(title, Some("bunnyMenuPick:"), key.as_ref()), MenuEntry::Quit(*action))
+                }
+                Line::Edit { edit, key } => {
+                    new_item(edit.title(), Some(crate::menu::edit_selector(*edit)), key.as_ref())
+                }
+                Line::System { title, selector, key } => new_item(title, Some(selector), key.as_ref()),
+                Line::Services => {
+                    let item = new_item("Services", None, None);
+                    let services = new_menu("Services");
+                    msg_void_id(item, sel("setSubmenu:"), services);
+                    let app = msg_id(class("NSApplication"), sel("sharedApplication"));
+                    msg_void_id(app, sel("setServicesMenu:"), services);
+                    msg_void(services, sel("release"));
+                    item
+                }
+                Line::Submenu(submenu) => {
+                    let item = new_item(&submenu.title, None, None);
+                    let built = build_menu(submenu);
+                    msg_void_id(item, sel("setSubmenu:"), built);
+                    msg_void(built, sel("release"));
+                    item
+                }
+                Line::Separator => {
+                    // autoreleased, and the menu keeps it
+                    msg_void_id(native, sel("addItem:"), msg_id(class("NSMenuItem"), sel("separatorItem")));
+                    continue;
+                }
+            };
+            msg_void_id(native, sel("addItem:"), item);
+            msg_void(item, sel("release"));
+        }
+        native
+    }
+}
+
+/// An empty `NSMenu`, owned by the caller (+1).
+unsafe fn new_menu(title: &str) -> Id {
+    unsafe { msg_id_arg(msg_id(class("NSMenu"), sel("alloc")), sel("initWithTitle:"), ns_string(title)) }
+}
+
+/// An `NSMenuItem`, owned by the caller (+1): `action` sent up the
+/// responder chain unless a target is set, and the key equivalent with its
+/// mask exactly as given.
+unsafe fn new_item(title: &str, action: Option<&str>, key: Option<&crate::menu::KeyEquivalent>) -> Id {
+    unsafe {
+        let equivalent = key.map_or_else(String::new, |key| key.key.to_string());
+        let item = msg_init_item(
+            msg_id(class("NSMenuItem"), sel("alloc")),
+            sel("initWithTitle:action:keyEquivalent:"),
+            ns_string(title),
+            action.map_or(std::ptr::null_mut(), |action| sel(action)),
+            ns_string(&equivalent),
+        );
+        if let Some(key) = key {
+            msg_void_u64(item, sel("setKeyEquivalentModifierMask:"), key.mask);
+        }
+        item
+    }
+}
+
+/// Points an item at the shell's target, tagged with what it stands for.
+unsafe fn targeted(item: Id, entry: MenuEntry) -> Id {
+    let tag = MENU_ENTRIES.with(|entries| {
+        let mut entries = entries.borrow_mut();
+        entries.push(entry);
+        entries.len() - 1
+    });
+    unsafe {
+        msg_void_id(item, sel("setTarget:"), menu_target());
+        msg_void_i64(item, sel("setTag:"), i64::try_from(tag).unwrap_or(i64::MAX));
+    }
+    item
+}
+
+/// The shell's one menu target — see [`MENU_TARGET`].
+unsafe fn menu_target() -> Id {
+    MENU_TARGET.with(|slot| {
+        if slot.get() == 0 {
+            let target = unsafe { msg_id(msg_id(class("BunnyMenuTarget"), sel("alloc")), sel("init")) };
+            slot.set(target as usize);
+        }
+        slot.get() as Id
+    })
 }
 
 /// Enters the AppKit run loop — returns when the app terminates.

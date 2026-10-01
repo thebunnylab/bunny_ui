@@ -13,6 +13,7 @@ pub mod dialog;
 pub mod drive;
 mod ffi;
 mod life;
+mod menu;
 mod metal;
 pub mod webview;
 
@@ -329,6 +330,9 @@ struct Slot {
     ime_index: Box<dyn Fn(f64, f64) -> Option<u64>>,
     ime_rect: Box<dyn Fn(u64) -> Option<ffi::CGRect>>,
     on_web: Box<dyn Fn(webview::WebviewEvent)>,
+    /// Does this window answer a menu item now? Asked while the menu bar
+    /// draws an item, and before Quit falls back to the system's.
+    menu_answers: Box<dyn Fn(bunny_ui::menu::Pick) -> bool>,
 }
 
 /// The application: the run loop, and the windows on it.
@@ -440,6 +444,23 @@ impl App {
         self.inner.slots.borrow().iter().map(|slot| WindowId(slot.window)).collect()
     }
 
+    /// Puts the app's menus on the mac's menu bar, replacing the bar that
+    /// was there — call it again when the keys behind the items change.
+    ///
+    /// The bar is arranged by the mac's rules: the app menu first, with
+    /// About, the app's Settings and Quit filed there beside the platform's
+    /// Services, Hide and Show All; then the app's menus; then a Window menu
+    /// before Help. The keymap hears every stroke before an item's key
+    /// equivalent does, an item the frontmost window does not answer is
+    /// drawn disabled, and the standard edits reach whoever holds the
+    /// keyboard — see [`bunny_ui::menu`].
+    ///
+    /// One bar for the app, as the mac has one menu bar: every window's
+    /// commands run in the window that is frontmost when they are chosen.
+    pub fn set_menu_bar(&self, bar: &bunny_ui::menu::MenuBar) {
+        ffi::install_menu_bar(&menu::arrange(bar, &ffi::app_name()));
+    }
+
     /// Enters the AppKit run loop. Returns when the app terminates.
     pub fn run(&self) {
         ffi::run();
@@ -494,6 +515,13 @@ impl AppInner {
                 rect_app.addressed().and_then(|slot| (slot.ime_rect)(utf16))
             }),
         );
+        let app = Rc::clone(&self);
+        ffi::set_menu_answers(Box::new(move |window, pick| {
+            app.live()
+                .into_iter()
+                .find(|slot| slot.window == window)
+                .is_some_and(|slot| (slot.menu_answers)(pick))
+        }));
         let app = Rc::clone(&self);
         webview::set_dispatch(move |event| {
             // a page belongs to ONE window and every other answers
@@ -1626,6 +1654,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         })
     };
 
+    // the menu bar's question — does this window answer the item now? —
+    // asked synchronously while AppKit draws the item
+    let menu_answers: Box<dyn Fn(bunny_ui::menu::Pick) -> bool> = Box::new({
+        let runtime = Rc::clone(&runtime);
+        move |pick| runtime.menu_answers(pick)
+    });
+
     // what the pages report — navigations, the bus, eval answers —
     // lands here from WebKit's own runloop callbacks, and re-renders
     // exactly when a retained writer ran
@@ -1736,6 +1771,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         // the Redraw that follows presents it
         AppEvent::WindowState { maximized } => {
             let _ = runtime.set_window_state(bunny_ui::prelude::WindowState { maximized });
+        }
+        AppEvent::Menu(pick) => {
+            // an item does what its keys do: the command's dispatch, the
+            // edit's road, and the clipboard is the runtime's business
+            if runtime.menu_pick(pick) {
+                blit(runtime, root, trace::Origin::Input);
+            }
         }
         AppEvent::WindowClosed => {
             // Nothing to take down by hand: the popover panels and the
@@ -2131,6 +2173,7 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
         ime_index,
         ime_rect,
         on_web,
+        menu_answers,
     })
 }
 
