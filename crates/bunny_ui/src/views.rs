@@ -190,6 +190,7 @@ pub struct TextField {
     editing: Option<Rc<dyn crate::text_input::EditingStrategy>>,
     nav_intercept: Option<Binding<bool>>,
     paste_image: Option<Rc<dyn Fn(crate::clipboard::ClipboardImage)>>,
+    focus: Option<Rc<dyn Fn(bool)>>,
 }
 
 impl TextField {
@@ -255,6 +256,23 @@ impl TextField {
         self
     }
 
+    /// The field took the keyboard (`true`) or let it go (`false`) — by a
+    /// click or a tap on its own line, the Tab walk, the app's
+    /// `focus_named`, an auto-focus, a blur.
+    ///
+    /// A form that paints its own focus ring is the case. The ring is the
+    /// app's state and the keyboard is the framework's, and a press that
+    /// lands on the field's own line is the field's: a click handler on the
+    /// box around it never hears it, so the keys went to the new field and
+    /// the ring stayed on the old one.
+    ///
+    /// The word arrives on the next turn, never inside the press or the
+    /// pass that moved the keyboard — the handler may move it again.
+    pub fn on_focus(mut self, heard: impl Fn(bool) + 'static) -> Self {
+        self.focus = Some(Rc::new(heard));
+        self
+    }
+
     /// No chrome of its own — no ground, no edge, no rounded corner.
     ///
     /// A field wears the theme's box, which is right almost everywhere
@@ -317,6 +335,7 @@ impl View for TextField {
                     submit_on_enter: self.submit_on_enter,
                     nav_intercept: self.nav_intercept.clone(),
                     paste_image: self.paste_image.clone(),
+                    focus: self.focus.clone(),
                     key: self.editing.as_ref().map(|_| Rc::new(move |stroke: &crate::action::Stroke, state: &mut crate::text_input::CaretState| {
                         let Some(strategy) = &key_strategy else { return false };
                         let mut value = key_binding.wrappedValue();
@@ -593,6 +612,7 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
         editing: None,
         nav_intercept: None,
         paste_image: None,
+        focus: None,
     }
 }
 
@@ -618,6 +638,7 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         editing: None,
         nav_intercept: None,
         paste_image: None,
+        focus: None,
     }
 }
 

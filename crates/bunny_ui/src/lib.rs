@@ -10897,6 +10897,83 @@ mod tests {
         assert!(!runtime.focus_named("third"), "a name nothing wears is refused");
     }
 
+    /// A form that paints its own focus ring hears the keyboard move,
+    /// whichever road moved it: a click on the field's own line — which a
+    /// handler on the box around the field never hears — the app's
+    /// `focus_named`, a blur. The word comes on the next turn, never inside
+    /// the press, and a field that already holds the keyboard hears nothing
+    /// again.
+    #[test]
+    fn a_field_says_when_the_keyboard_reaches_it_and_leaves_it() {
+        use crate::layout::{Proposal, Size};
+
+        const VIEWPORT: Size = Size { width: 300.0, height: 120.0 };
+        type Heard = Rc<std::cell::RefCell<Vec<(&'static str, bool)>>>;
+
+        #[derive(Clone)]
+        struct Form {
+            first: State<String>,
+            second: State<String>,
+            heard: Heard,
+        }
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                let (one, two) = (self.heard.clone(), self.heard.clone());
+                vstack!(
+                    text_field("one", self.first.binding())
+                        .on_focus(move |taken| one.borrow_mut().push(("one", taken)))
+                        .id("one"),
+                    text_field("two", self.second.binding())
+                        .on_focus(move |taken| two.borrow_mut().push(("two", taken)))
+                        .id("two"),
+                )
+            }
+        }
+
+        let heard = Heard::default();
+        let form = Form {
+            first: State::new(String::new()),
+            second: State::new(String::new()),
+            heard: Rc::clone(&heard),
+        };
+        let runtime = Runtime::new();
+        let laid = runtime.settled_layout(&form, Proposal::exact(VIEWPORT));
+        let two = laid
+            .fields
+            .iter()
+            .find(|field| field.path.contains("[two]"))
+            .expect("the second field laid out")
+            .frame;
+        let (x, y) = (two.origin.x + 8.0, two.origin.y + two.size.height / 2.0);
+
+        // a click on the field's own line
+        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_released(x, y);
+        assert!(heard.borrow().is_empty(), "the word never comes inside the press");
+        runtime.poll_tasks();
+        assert_eq!(*heard.borrow(), vec![("two", true)], "the field the keyboard reached");
+
+        // the same field again: the keyboard did not move
+        runtime.pointer_clicked(x, y, 1, false);
+        runtime.pointer_released(x, y);
+        runtime.poll_tasks();
+        assert_eq!(heard.borrow().len(), 1, "a field that holds the keyboard hears nothing new");
+
+        // the app's own road
+        assert!(runtime.focus_named("one"));
+        runtime.poll_tasks();
+        assert_eq!(
+            *heard.borrow(),
+            vec![("two", true), ("two", false), ("one", true)],
+            "the field it left, then the one it reached",
+        );
+
+        // and the keyboard leaving
+        assert!(runtime.blur());
+        runtime.poll_tasks();
+        assert_eq!(heard.borrow().last(), Some(&("one", false)));
+    }
+
     /// A scene names its own paths, so an app can ask for one by name
     /// without guessing the window's prefix.
     #[test]
