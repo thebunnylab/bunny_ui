@@ -329,7 +329,22 @@ enum Event {
     /// The glue asks where the keyboard is taking text, so its editable
     /// stands under the caret — answered into [`TEXT_CARET`].
     TextCaret,
-    Frame { dt: f64 },
+    /// A finger, on the phones' road: the engine's recognizer decides
+    /// what it meant — a tap, a pan, a hold — so a finger never arrives
+    /// as a mouse that drags. `taps` is the series the landing continues.
+    TouchBegan { id: u64, x: f64, y: f64, taps: u8 },
+    TouchMoved { id: u64, x: f64, y: f64 },
+    TouchEnded { id: u64, x: f64, y: f64 },
+    /// The browser took the finger: a press in flight fires nothing.
+    TouchCancelled { id: u64 },
+    /// The software keyboard covers this much of the page's bottom.
+    Keyboard { overlap: f64 },
+    /// The reader put the software keyboard away.
+    KeyboardDismissed,
+    /// One display beat: `dt` is the step the springs take (clamped),
+    /// `elapsed` the wall's own seconds since the last beat — the clock
+    /// a finger's hold ages by.
+    Frame { dt: f64, elapsed: f64 },
     /// The platform's motion preference, at boot and on every change.
     Motion { allowed: bool },
     Resize { width: f64, height: f64, scale: f64 },
@@ -378,6 +393,44 @@ thread_local! {
     /// Windows one does over its own message stream.
     static CLICK_STATE: std::cell::Cell<(f64, f64, f64, u8)> =
         const { std::cell::Cell::new((f64::NEG_INFINITY, 0.0, 0.0, 0)) };
+    /// The finger's tap series — the platform counts none for a touch,
+    /// so the shell does, the way the Android one does.
+    static TAP_SERIES: std::cell::Cell<TapSeries> = const { std::cell::Cell::new(TapSeries::NEW) };
+}
+
+/// A series of taps: the lift the next landing continues from, `(when,
+/// x, y)`, and how many taps it has counted. The phone shells' rule —
+/// a landing within the window and the reach of the last lift is the
+/// next tap of the same series. Pure over its state, like
+/// [`count_click`].
+#[derive(Clone, Copy)]
+struct TapSeries {
+    last_up: Option<(f64, f64, f64)>,
+    count: u8,
+}
+
+impl TapSeries {
+    const NEW: TapSeries = TapSeries { last_up: None, count: 0 };
+    /// From the last lift to the next landing.
+    const WINDOW_MS: f64 = 300.0;
+    /// How far the next landing may be from the last lift, in points:
+    /// a fingertip is wider than a pointer, so the reach is too.
+    const REACH: f64 = 25.0;
+
+    /// A finger landed at `(x, y)`: the series it continues, and the tap
+    /// it is.
+    fn down(self, x: f64, y: f64, now_ms: f64) -> (TapSeries, u8) {
+        let continues = self.last_up.is_some_and(|(at, last_x, last_y)| {
+            now_ms - at <= Self::WINDOW_MS && (x - last_x).hypot(y - last_y) <= Self::REACH
+        });
+        let count = if continues { self.count.saturating_add(1) } else { 1 };
+        (TapSeries { last_up: self.last_up, count }, count)
+    }
+
+    /// The finger lifted at `(x, y)`.
+    fn up(self, x: f64, y: f64, now_ms: f64) -> TapSeries {
+        TapSeries { last_up: Some((now_ms, x, y)), count: self.count }
+    }
 }
 
 /// How long after a press a second one is still the SAME gesture. The
@@ -566,6 +619,47 @@ pub fn start_with(
                 let _ = runtime.pointer_released(x, y);
                 present(&runtime, &full, size, scale, &mut surface);
             }
+            // A landing that changed nothing visible may still have put the
+            // finger on the clock — a hold that may become a menu, a press
+            // that waits to see whether the finger meant to scroll. The
+            // turn's end hears `wants_frame` and keeps the beat for it.
+            Event::TouchBegan { id, x, y, taps } => {
+                if runtime.touch_began(id, x, y, taps) {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
+            }
+            // a pan is the wheel's road under a finger, and it folds into
+            // the beat the way the wheel does
+            Event::TouchMoved { id, x, y } => {
+                if runtime.touch_moved(id, x, y)
+                    && pacer.ask(ORIGIN_POINTER, Urgency::Soon, false) == Verdict::Draw
+                {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
+            }
+            Event::TouchEnded { id, x, y } => {
+                // the lift may fire; the pressed visual always clears
+                let _ = runtime.touch_ended(id, x, y);
+                present(&runtime, &full, size, scale, &mut surface);
+            }
+            Event::TouchCancelled { id } => {
+                if runtime.touch_cancelled(id) {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
+            }
+            Event::Keyboard { overlap } => {
+                // the root lays itself out above the keys, as on the phones
+                runtime.set_keyboard_inset(overlap);
+                if runtime.needs_frame() {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
+            }
+            Event::KeyboardDismissed => {
+                // the phones' rule: the keys going away lets the field go
+                if runtime.blur() {
+                    present(&runtime, &full, size, scale, &mut surface);
+                }
+            }
             Event::Wheel { x, y, dx, dy, modifiers } => {
                 // browser deltas are the OPPOSITE of the engine's
                 // convention (positive reveals content above) — the
@@ -605,13 +699,15 @@ pub fn start_with(
                     present(&runtime, &full, size, scale, &mut surface);
                 }
             }
-            Event::Frame { dt } => {
+            Event::Frame { dt, elapsed } => {
                 // The beat is also where the events that could wait are
                 // drawn: ONE settled frame for every wheel, move and wake
                 // since the last beat. It carries the tick too, so the
-                // springs lose nothing.
-                let moved = runtime.tick(dt);
-                if pacer.beat(false) == Beat::Draw {
+                // springs lose nothing — and a finger whose meaning the
+                // clock decided (a hold that became a press or a menu)
+                // reached the app, so that frame settles like a press does.
+                let moved = runtime.tick_clocked(dt, elapsed);
+                if pacer.beat(false) == Beat::Draw || moved.input {
                     present(&runtime, &full, size, scale, &mut surface);
                 } else if moved.any() {
                     present(&runtime, &tick, size, scale, &mut surface);
@@ -940,7 +1036,7 @@ fn start_dom_with(
             // no body, no patch, no settle — which is what lets a
             // decoration tick beside real elements without the page
             // re-laying itself out around it.
-            Event::Frame { dt } => {
+            Event::Frame { dt, .. } => {
                 let moved = runtime.tick(dt);
                 if moved.islands {
                     #[cfg(feature = "canvas")]
@@ -1109,6 +1205,69 @@ pub extern "C" fn bunny_wheel(x: f64, y: f64, dx: f64, dy: f64, mods: u32) {
     dispatch(Event::Wheel { x, y, dx, dy, modifiers: held(mods) });
 }
 
+/// A finger on the page, in layout points of the page's own box —
+/// `phase` 0 landed, 1 moved, 2 lifted, 3 taken by the browser; `id`
+/// names the finger for its life (the pointer's own id); `time_ms` is
+/// the event's timestamp; `primary` says it is the gesture's first
+/// finger, the one a tap series follows (a second finger is a zoom's,
+/// and counts one).
+///
+/// The glue sends a finger here and never down the pointer's road when
+/// the wasm has this door: the recognizer the phone shells feed decides
+/// what the touch meant, and the content slides under a pan and flings
+/// on after the lift. A mouse and a pen keep the pointer's road.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_touch(phase: u32, id: u32, x: f64, y: f64, time_ms: f64, primary: u32) {
+    let id = u64::from(id);
+    let primary = primary != 0;
+    match phase {
+        0 => {
+            let taps = if primary {
+                TAP_SERIES.with(|series| {
+                    let (next, taps) = series.get().down(x, y, time_ms);
+                    series.set(next);
+                    taps
+                })
+            } else {
+                1
+            };
+            dispatch(Event::TouchBegan { id, x, y, taps });
+        }
+        1 => dispatch(Event::TouchMoved { id, x, y }),
+        2 => {
+            if primary {
+                TAP_SERIES.with(|series| series.set(series.get().up(x, y, time_ms)));
+            }
+            dispatch(Event::TouchEnded { id, x, y });
+        }
+        _ => {
+            // the browser took the touch back: the series ends with it
+            if primary {
+                TAP_SERIES.with(|series| series.set(TapSeries::NEW));
+            }
+            dispatch(Event::TouchCancelled { id });
+        }
+    }
+}
+
+/// The software keyboard covers `overlap` layout points of the page's
+/// bottom, 0 when it hides — the glue reads it off the browser's visual
+/// viewport, which shrinks under the keys while the page keeps its size.
+/// The root lays itself out above them, the way the phone shells have it.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_keyboard(overlap: f64) {
+    dispatch(Event::Keyboard { overlap });
+}
+
+/// The reader put the software keyboard away while a field held it —
+/// iOS's Done, Android's back key. The field lets the keyboard go, as on
+/// the phones: a field that kept it would raise the keys again at the
+/// next tap anywhere.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_keyboard_dismissed() {
+    dispatch(Event::KeyboardDismissed);
+}
+
 /// One named key: `code` from the glue's table (mirrored in
 /// [`named_key`]), `mods` as the bit flags 1 shift, 2 command, 4
 /// option, 8 control.
@@ -1145,9 +1304,14 @@ pub extern "C" fn bunny_modifiers(mods: u32) {
     dispatch(Event::Modifiers(mods));
 }
 
+/// One display beat, `dt` the seconds since the last one by the page's
+/// own clock. The springs step by it clamped, so a page that stalled
+/// never throws one across the screen; a finger's hold ages by it as it
+/// came, so half a second of finger is half a second however slowly the
+/// scene draws.
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_frame(dt: f64) {
-    dispatch(Event::Frame { dt: dt.clamp(0.0, 1.0 / 30.0) });
+    dispatch(Event::Frame { dt: dt.clamp(0.0, 1.0 / 30.0), elapsed: dt.max(0.0) });
 }
 
 #[unsafe(no_mangle)]
