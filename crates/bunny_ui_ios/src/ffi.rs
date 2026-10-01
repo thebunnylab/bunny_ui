@@ -3,13 +3,19 @@
 //! This module is the shell's `unsafe` border on the phone. UIKit is
 //! called through `objc_msgSend` re-declared with the concrete signature
 //! of each message (the shared Apple half carries the vocabulary; every
-//! module declares its own aliases), and three classes are born at
+//! module declares its own aliases), and four classes are born at
 //! runtime via `objc_allocateClassPair`/`class_addMethod`:
 //!
 //! - `BunnyAppDelegate` (UIResponder) — the application delegate: the
-//!   launch that builds the window, the background and foreground, a
-//!   memory warning, a url handed over, and the app's two clocks (the
-//!   caret blink, the display link) delivered by selector;
+//!   launch, a memory warning, the main menu, the scene configuration
+//!   that names the scene delegate, and the app's two clocks (the caret
+//!   blink, the display link) delivered by selector;
+//! - `BunnySceneDelegate` (UIResponder) — the window scene's delegate:
+//!   the connection that builds (or re-homes) the window and runs the
+//!   mount, the background and foreground, a url handed over. An app
+//!   built with the iOS 27 SDK that adopts no scene life cycle is
+//!   trapped by UIKit before its launch returns, so the window lives
+//!   here and nowhere else;
 //! - `BunnyViewController` (UIViewController) — the safe area and the
 //!   traits (dark, the size class), which UIKit tells the controller;
 //! - `BunnyView` (UIView) — whose backing layer IS a `CAMetalLayer`
@@ -99,6 +105,8 @@ unsafe extern "C" {
     fn msg_void_f64(obj: Id, sel: Sel, a: f64);
     #[link_name = "objc_msgSend"]
     fn msg_id_id(obj: Id, sel: Sel, a: Id) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_id_id_id(obj: Id, sel: Sel, a: Id, b: Id) -> Id;
     #[link_name = "objc_msgSend"]
     fn msg_id_u64(obj: Id, sel: Sel, a: u64) -> Id;
     #[link_name = "objc_msgSend"]
@@ -267,8 +275,8 @@ extern "C" fn perform_wake(_info: *mut c_void) {
 // MARK: - The application
 
 /// Hands the process to UIKit. `boot` runs once the app has launched
-/// and the window exists — it mounts the scene. UIKit's main loop never
-/// returns.
+/// and the first scene connected its window — it mounts the scene.
+/// UIKit's main loop never returns.
 pub fn run(boot: Box<dyn FnOnce()>) -> ! {
     unsafe {
         register_classes();
@@ -287,24 +295,23 @@ pub fn run(boot: Box<dyn FnOnce()>) -> ! {
     unreachable!("UIApplicationMain never returns")
 }
 
-/// The launch: the window, its controller and the view are built here,
-/// the beat starts, the mount runs, and the window shows.
+/// The launch: the beat starts and the process-wide doors open. The
+/// window is NOT built here — it belongs to the scene that connects
+/// next ([`bunny_scene_connect`]), and so does the mount.
 extern "C" fn bunny_did_finish_launching(this: Id, _sel: Sel, _app: Id, _options: Id) -> i8 {
     unsafe {
-        let screen = msg_id(class("UIScreen"), sel("mainScreen"));
-        let bounds = msg_rect(screen, sel("bounds"));
-        let window =
-            msg_init_rect(msg_id(class("UIWindow"), sel("alloc")), sel("initWithFrame:"), bounds);
-        let controller = msg_id(msg_id(class("BunnyViewController"), sel("alloc")), sel("init"));
-        let view =
-            msg_init_rect(msg_id(class("BunnyView"), sel("alloc")), sel("initWithFrame:"), bounds);
-        // off, a view is handed exactly one touch and the second finger
-        // is never reported at all
-        msg_void_bool(view, sel("setMultipleTouchEnabled:"), 1);
-        msg_void_id(controller, sel("setView:"), view);
-        msg_void_id(window, sel("setRootViewController:"), controller);
-        WINDOW.with(|slot| slot.set(window));
-        VIEW.with(|slot| slot.set(view));
+        // on an SDK before 27, a bundle with no scene manifest launches
+        // the old way and no scene ever connects: a window that never
+        // comes is a blank screen that looks like a hang, so say it here
+        let bundle = msg_id(class("NSBundle"), sel("mainBundle"));
+        let key = ns_string("UIApplicationSceneManifest");
+        if msg_id_id(bundle, sel("objectForInfoDictionaryKey:"), key).is_null() {
+            eprintln!(
+                "bunny_ui ios: the bundle's Info.plist declares no UIApplicationSceneManifest — \
+                 the window is built when a scene connects, and without the manifest none ever does"
+            );
+            std::process::abort();
+        }
         DELEGATE.with(|slot| slot.set(this));
         // the center learns its delegate BEFORE the launch returns: a
         // tap on a notification can be the very thing that launched
@@ -330,17 +337,82 @@ extern "C" fn bunny_did_finish_launching(this: Id, _sel: Sel, _app: Id, _options
             UIKeyboardWillHideNotification,
             null_mut(),
         );
-        // the mount: the GPU road, the handler, the gates
-        if let Some(boot) = BOOT.with(|slot| slot.borrow_mut().take()) {
-            boot();
-        }
-        msg_void(window, sel("makeKeyAndVisible"));
     }
-    dispatch(AppEvent::Redraw);
     1
 }
 
-extern "C" fn bunny_did_enter_background(_this: Id, _sel: Sel, _app: Id) {
+/// Which delegate a connecting scene gets — the framework's own, named
+/// here rather than in the app's `Info.plist`, so the manifest the app
+/// declares needs no class name from inside the shell.
+extern "C" fn bunny_scene_configuration(_this: Id, _sel: Sel, _app: Id, session: Id, _options: Id) -> Id {
+    unsafe {
+        let configuration = msg_id_id_id(
+            class("UISceneConfiguration"),
+            sel("configurationWithName:sessionRole:"),
+            ns_string("Default"),
+            msg_id(session, sel("role")),
+        );
+        msg_void_id(configuration, sel("setDelegateClass:"), class("BunnySceneDelegate"));
+        configuration
+    }
+}
+
+/// A scene connected: the window is built inside it, the mount runs,
+/// and the window shows. A scene the system DISCONNECTED (to reclaim a
+/// background scene's memory) comes back as a new scene for the same
+/// process — the window, the view and the GPU road it carries survive,
+/// and are re-homed into it instead of built twice.
+extern "C" fn bunny_scene_connect(_this: Id, _sel: Sel, scene: Id, _session: Id, options: Id) {
+    unsafe {
+        let window = WINDOW.with(Cell::get);
+        if window.is_null() {
+            let window = msg_id_id(msg_id(class("UIWindow"), sel("alloc")), sel("initWithWindowScene:"), scene);
+            let bounds = msg_rect(window, sel("bounds"));
+            let controller = msg_id(msg_id(class("BunnyViewController"), sel("alloc")), sel("init"));
+            let view =
+                msg_init_rect(msg_id(class("BunnyView"), sel("alloc")), sel("initWithFrame:"), bounds);
+            // off, a view is handed exactly one touch and the second finger
+            // is never reported at all
+            msg_void_bool(view, sel("setMultipleTouchEnabled:"), 1);
+            msg_void_id(controller, sel("setView:"), view);
+            msg_void_id(window, sel("setRootViewController:"), controller);
+            WINDOW.with(|slot| slot.set(window));
+            VIEW.with(|slot| slot.set(view));
+            // the mount: the GPU road, the handler, the gates
+            if let Some(boot) = BOOT.with(|slot| slot.borrow_mut().take()) {
+                boot();
+            }
+            msg_void(window, sel("makeKeyAndVisible"));
+        } else {
+            msg_void_id(window, sel("setWindowScene:"), scene);
+            msg_void(window, sel("makeKeyAndVisible"));
+        }
+        // a url that launched the app rides the connection, and its own
+        // door is never knocked for it
+        reopen_with(msg_id(options, sel("URLContexts")));
+    }
+    dispatch(AppEvent::Redraw);
+}
+
+/// Urls handed to a scene that is already connected.
+extern "C" fn bunny_scene_open_urls(_this: Id, _sel: Sel, _scene: Id, contexts: Id) {
+    unsafe { reopen_with(contexts) };
+}
+
+/// Each url of a set of `UIOpenURLContext`s, as the deep link — the same
+/// event a second launch delivers everywhere else.
+unsafe fn reopen_with(contexts: Id) {
+    for context in unsafe { members_of(contexts) } {
+        let text = unsafe {
+            let string = msg_id(msg_id(context, sel("URL")), sel("absoluteString"));
+            let chars = msg_cstr(string, sel("UTF8String"));
+            if chars.is_null() { String::new() } else { CStr::from_ptr(chars).to_string_lossy().into_owned() }
+        };
+        let _ = bunny_ui::app::emit(bunny_ui::app::AppEvent::Reopened { arguments: vec![text] });
+    }
+}
+
+extern "C" fn bunny_did_enter_background(_this: Id, _sel: Sel, _scene: Id) {
     BACKGROUNDED.with(|slot| slot.set(true));
     // the link parks: a frame drawn off the screen is a frame the
     // system kills the app for
@@ -349,26 +421,19 @@ extern "C" fn bunny_did_enter_background(_this: Id, _sel: Sel, _app: Id) {
     let _ = bunny_ui::app::emit(bunny_ui::app::AppEvent::WillSleep);
 }
 
-extern "C" fn bunny_will_enter_foreground(_this: Id, _sel: Sel, _app: Id) {
-    BACKGROUNDED.with(|slot| slot.set(false));
+/// The scene is coming back. A scene ALSO enters the foreground on its
+/// first connection, which is a launch and not a return: only an app
+/// that went to the background hears that it came back.
+extern "C" fn bunny_will_enter_foreground(_this: Id, _sel: Sel, _scene: Id) {
+    if !BACKGROUNDED.with(|slot| slot.replace(false)) {
+        return;
+    }
     dispatch(AppEvent::Foreground);
     let _ = bunny_ui::app::emit(bunny_ui::app::AppEvent::DidWake);
 }
 
 extern "C" fn bunny_memory_warning(_this: Id, _sel: Sel, _app: Id) {
     dispatch(AppEvent::MemoryWarning);
-}
-
-/// A url handed to the app — the deep link, the same event a second
-/// launch delivers everywhere else.
-extern "C" fn bunny_open_url(_this: Id, _sel: Sel, _app: Id, url: Id, _options: Id) -> i8 {
-    let text = unsafe {
-        let string = msg_id(url, sel("absoluteString"));
-        let chars = msg_cstr(string, sel("UTF8String"));
-        if chars.is_null() { String::new() } else { CStr::from_ptr(chars).to_string_lossy().into_owned() }
-    };
-    let _ = bunny_ui::app::emit(bunny_ui::app::AppEvent::Reopened { arguments: vec![text] });
-    1
 }
 
 // MARK: - The beat
@@ -527,8 +592,9 @@ pub fn set_frame_driver(pace: DriverPace) {
 
 // MARK: - The view: touches, layout, the keyboard
 
-/// The touches of an `NSSet`, by address.
-unsafe fn touches_of(set: Id) -> Vec<Id> {
+/// The members of an `NSSet`, by address — the touches or presses of
+/// an event, the urls a scene was handed.
+unsafe fn members_of(set: Id) -> Vec<Id> {
     unsafe {
         if set.is_null() {
             return Vec::new();
@@ -545,7 +611,7 @@ unsafe fn touch_point(touch: Id, view: Id) -> (f64, f64) {
 }
 
 extern "C" fn bunny_touches_began(this: Id, _sel: Sel, touches: Id, _event: Id) {
-    for touch in unsafe { touches_of(touches) } {
+    for touch in unsafe { members_of(touches) } {
         let (x, y) = unsafe { touch_point(touch, this) };
         let taps = unsafe { msg_u64(touch, sel("tapCount")) }.clamp(1, u8::MAX as u64) as u8;
         dispatch(AppEvent::TouchBegan { id: touch as u64, x, y, taps });
@@ -556,7 +622,7 @@ extern "C" fn bunny_touches_began(this: Id, _sel: Sel, touches: Id, _event: Id) 
 /// still during a pinch is in the EVENT's set and nowhere else — so the
 /// event is asked, and every live finger reports where it stands.
 extern "C" fn bunny_touches_moved(this: Id, _sel: Sel, _touches: Id, event: Id) {
-    let all = unsafe { touches_of(msg_id(event, sel("allTouches"))) };
+    let all = unsafe { members_of(msg_id(event, sel("allTouches"))) };
     for touch in all {
         // UITouchPhase: began 0, moved 1, stationary 2, ended 3, cancelled 4
         let phase = unsafe { msg_i64(touch, sel("phase")) };
@@ -568,14 +634,14 @@ extern "C" fn bunny_touches_moved(this: Id, _sel: Sel, _touches: Id, event: Id) 
 }
 
 extern "C" fn bunny_touches_ended(this: Id, _sel: Sel, touches: Id, _event: Id) {
-    for touch in unsafe { touches_of(touches) } {
+    for touch in unsafe { members_of(touches) } {
         let (x, y) = unsafe { touch_point(touch, this) };
         dispatch(AppEvent::TouchEnded { id: touch as u64, x, y });
     }
 }
 
 extern "C" fn bunny_touches_cancelled(_this: Id, _sel: Sel, touches: Id, _event: Id) {
-    for touch in unsafe { touches_of(touches) } {
+    for touch in unsafe { members_of(touches) } {
         dispatch(AppEvent::TouchCancelled { id: touch as u64 });
     }
 }
@@ -654,7 +720,7 @@ fn modifier_key(hid: u64) -> bool {
 /// A press of a modifier key, down or up: the EVENT's flags are the
 /// state it leaves, which is the whole news. `true` when one was found.
 fn report_modifiers(presses: Id, event: Id) -> bool {
-    let moved = unsafe { touches_of(presses) }.into_iter().any(|press| unsafe {
+    let moved = unsafe { members_of(presses) }.into_iter().any(|press| unsafe {
         let key = msg_id(press, sel("key"));
         !key.is_null() && modifier_key(msg_i64(key, sel("keyCode")).max(0) as u64)
     });
@@ -672,7 +738,7 @@ fn report_modifiers(presses: Id, event: Id) -> bool {
 extern "C" fn bunny_presses_began(this: Id, _sel: Sel, presses: Id, event: Id) {
     report_modifiers(presses, event);
     let mut taken = false;
-    for press in unsafe { touches_of(presses) } {
+    for press in unsafe { members_of(presses) } {
         let key = unsafe { msg_id(press, sel("key")) };
         if key.is_null() {
             continue;
@@ -912,7 +978,8 @@ unsafe fn register_classes() {
         let v = CString::new("v@:").expect("type encoding");
         let bool_ = CString::new("c@:").expect("type encoding");
         let bool_id_id = CString::new("c@:@@").expect("type encoding");
-        let bool_id_id_id = CString::new("c@:@@@").expect("type encoding");
+        let v_id_id_id = CString::new("v@:@@@").expect("type encoding");
+        let id_id_id_id = CString::new("@@:@@@").expect("type encoding");
         let class_ = CString::new("#@:").expect("type encoding");
         let int = CString::new("q@:").expect("type encoding");
 
@@ -969,6 +1036,13 @@ unsafe fn register_classes() {
                 class_addProtocol(view, protocol);
             }
         }
+        // the main menu's rows and the standard edits, while the view
+        // holds the keyboard
+        add_menu_methods(
+            view,
+            bunny_view_validate as *const c_void,
+            bunny_view_can_perform as *const c_void,
+        );
         objc_registerClassPair(view);
 
         // the controller: what UIKit tells a controller and not a view
@@ -1005,13 +1079,11 @@ unsafe fn register_classes() {
         );
         class_addMethod(
             delegate,
-            sel("application:openURL:options:"),
-            bunny_open_url as *const c_void,
-            bool_id_id_id.as_ptr(),
+            sel("application:configurationForConnectingSceneSession:options:"),
+            bunny_scene_configuration as *const c_void,
+            id_id_id_id.as_ptr(),
         );
         for (name, imp) in [
-            ("applicationDidEnterBackground:", bunny_did_enter_background as *const c_void),
-            ("applicationWillEnterForeground:", bunny_will_enter_foreground as *const c_void),
             ("applicationDidReceiveMemoryWarning:", bunny_memory_warning as *const c_void),
             ("bunnyBlink:", bunny_blink as *const c_void),
             ("bunnySlow:", bunny_slow as *const c_void),
@@ -1024,8 +1096,475 @@ unsafe fn register_classes() {
         // the shared half — the class is still open, so they land on
         // the very object UIKit hands the launch to
         bunny_ui_apple::notifications::add_delegate_methods(delegate);
+        // the main menu: built here, and answered here when no view holds
+        // the keyboard — the delegate ends every responder chain
+        class_addMethod(delegate, sel("buildMenuWithBuilder:"), bunny_build_menu as *const c_void, v_id.as_ptr());
+        add_menu_methods(
+            delegate,
+            bunny_delegate_validate as *const c_void,
+            bunny_delegate_can_perform as *const c_void,
+        );
         objc_registerClassPair(delegate);
+
+        // the scene's delegate: the window, the life on the screen, a url
+        let scene = objc_allocateClassPair(
+            class("UIResponder"),
+            CString::new("BunnySceneDelegate").expect("name").as_ptr(),
+            0,
+        );
+        class_addMethod(
+            scene,
+            sel("scene:willConnectToSession:options:"),
+            bunny_scene_connect as *const c_void,
+            v_id_id_id.as_ptr(),
+        );
+        class_addMethod(scene, sel("scene:openURLContexts:"), bunny_scene_open_urls as *const c_void, v_id_id.as_ptr());
+        for (name, imp) in [
+            ("sceneDidEnterBackground:", bunny_did_enter_background as *const c_void),
+            ("sceneWillEnterForeground:", bunny_will_enter_foreground as *const c_void),
+        ] {
+            class_addMethod(scene, sel(name), imp, v_id.as_ptr());
+        }
+        let protocol = objc_getProtocol(c"UIWindowSceneDelegate".as_ptr());
+        if !protocol.is_null() {
+            class_addProtocol(scene, protocol);
+        }
+        objc_registerClassPair(scene);
     });
+}
+
+// MARK: - The main menu (the iPad's menu bar, the ⌘-hold sheet)
+
+use bunny_ui::action::KeyPattern;
+use bunny_ui::menu::{Edit, Pick};
+use bunny_ui_apple::ffi::ns_string;
+use bunny_ui_apple::uikit_menu::{Anchor, NamedKey, Place, Standard, UiArrangement, UiCommand, UiInput, UiItem};
+
+#[link(name = "UIKit", kind = "framework")]
+unsafe extern "C" {
+    static UIMenuApplication: Id;
+    static UIMenuFile: Id;
+    static UIMenuEdit: Id;
+    static UIMenuView: Id;
+    static UIMenuWindow: Id;
+    static UIMenuHelp: Id;
+    static UIMenuPreferences: Id;
+    static UIMenuAbout: Id;
+    static UIMenuFormat: Id;
+    static UIMenuFind: Id;
+    static UIKeyInputUpArrow: Id;
+    static UIKeyInputDownArrow: Id;
+    static UIKeyInputLeftArrow: Id;
+    static UIKeyInputRightArrow: Id;
+    static UIKeyInputEscape: Id;
+    static UIKeyInputPageUp: Id;
+    static UIKeyInputPageDown: Id;
+    static UIKeyInputHome: Id;
+    static UIKeyInputEnd: Id;
+    static UIKeyInputDelete: Id;
+    static UIKeyInputF1: Id;
+    static UIKeyInputF2: Id;
+    static UIKeyInputF3: Id;
+    static UIKeyInputF4: Id;
+    static UIKeyInputF5: Id;
+    static UIKeyInputF6: Id;
+    static UIKeyInputF7: Id;
+    static UIKeyInputF8: Id;
+    static UIKeyInputF9: Id;
+    static UIKeyInputF10: Id;
+    static UIKeyInputF11: Id;
+    static UIKeyInputF12: Id;
+}
+
+#[allow(clashing_extern_declarations)]
+#[link(name = "objc", kind = "dylib")]
+unsafe extern "C" {
+    #[link_name = "objc_msgSend"]
+    fn msg_menu(class: Id, sel: Sel, title: Id, image: Id, identifier: Id, options: u64, children: Id) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_key_command(class: Id, sel: Sel, title: Id, image: Id, action: Sel, input: Id, flags: u64, plist: Id) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_command(class: Id, sel: Sel, title: Id, image: Id, action: Sel, plist: Id) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_array(class: Id, sel: Sel, objects: *const Id, count: u64) -> Id;
+    #[link_name = "objc_msgSend"]
+    fn msg_void_u64(obj: Id, sel: Sel, a: u64);
+    #[link_name = "objc_msgSend"]
+    fn msg_bool_id(obj: Id, sel: Sel, a: Id) -> i8;
+    #[link_name = "objc_msgSendSuper"]
+    fn msg_super_bool_sel_id(sup: *const ObjcSuper, sel: Sel, a: Sel, b: Id) -> i8;
+}
+
+/// `UIMenuOptionsDisplayInline`: a group drawn in place, rules around it.
+const INLINE: u64 = 1;
+/// `UIMenuElementAttributesDisabled`.
+const DISABLED: u64 = 1;
+
+/// Runs a chosen row, with the single stroke it stands for: `true` = it
+/// ran (or the keymap took the stroke first).
+pub type MenuGate = Box<dyn FnMut(Pick, Option<KeyPattern>) -> bool>;
+
+/// Says whether the window answers a row now.
+pub type MenuAnswers = Box<dyn Fn(Pick) -> bool>;
+
+thread_local! {
+    /// The app's main menu, as `buildMenuWithBuilder:` will file it.
+    static MENU: RefCell<Option<UiArrangement>> = const { RefCell::new(None) };
+    /// What each built row runs, by the index its property list carries,
+    /// and the single stroke it stands for. A rebuild replaces it whole.
+    static MENU_ROWS: RefCell<Vec<(Pick, Option<KeyPattern>)>> = const { RefCell::new(Vec::new()) };
+    /// Runs a chosen row: its stroke offered to the keymap first, the row
+    /// after — installed by the shell, which holds the runtime.
+    static MENU_GATE: RefCell<Option<MenuGate>> = const { RefCell::new(None) };
+    /// Does the window answer a row now?
+    static MENU_ANSWERS: RefCell<Option<MenuAnswers>> = const { RefCell::new(None) };
+}
+
+/// Files `menu` as the app's main menu; UIKit rebuilds it now if the app
+/// has launched, or builds it the first time it is asked.
+pub fn install_menu_bar(menu: UiArrangement) {
+    MENU.with(|slot| *slot.borrow_mut() = Some(menu));
+    if DELEGATE.with(Cell::get).is_null() {
+        return;
+    }
+    unsafe {
+        let system = msg_id(class("UIMenuSystem"), sel("mainSystem"));
+        if !system.is_null() {
+            msg_void(system, sel("setNeedsRebuild"));
+        }
+    }
+}
+
+/// Registers who runs a chosen row.
+pub fn set_menu_gate(gate: MenuGate) {
+    MENU_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+}
+
+/// Registers who says whether the window answers a row.
+pub fn set_menu_answers(answers: MenuAnswers) {
+    MENU_ANSWERS.with(|slot| *slot.borrow_mut() = Some(answers));
+}
+
+fn menu_answers(pick: Pick) -> bool {
+    MENU_ANSWERS.with(|slot| slot.borrow().as_ref().is_some_and(|answers| answers(pick)))
+}
+
+fn menu_run(pick: Pick, stroke: Option<KeyPattern>) {
+    let _ = MENU_GATE.with(|slot| slot.borrow_mut().as_mut().is_some_and(|gate| gate(pick, stroke)));
+}
+
+/// UIKit's identifier for one of its own menus.
+fn standard(menu: Standard) -> Id {
+    unsafe {
+        match menu {
+            Standard::File => UIMenuFile,
+            Standard::Edit => UIMenuEdit,
+            Standard::View => UIMenuView,
+            Standard::Window => UIMenuWindow,
+            Standard::Help => UIMenuHelp,
+        }
+    }
+}
+
+/// An `NSArray` of `items`.
+unsafe fn array(items: &[Id]) -> Id {
+    unsafe { msg_array(class("NSArray"), sel("arrayWithObjects:count:"), items.as_ptr(), items.len() as u64) }
+}
+
+/// A `UIMenu` — inline (a group) or a titled menu of its own.
+unsafe fn menu(title: &str, identifier: Id, options: u64, children: &[Id]) -> Id {
+    unsafe {
+        msg_menu(
+            class("UIMenu"),
+            sel("menuWithTitle:image:identifier:options:children:"),
+            ns_string(title),
+            null_mut(),
+            identifier,
+            options,
+            array(children),
+        )
+    }
+}
+
+/// UIKit's input string for a key command.
+unsafe fn input(key: UiInput) -> Id {
+    unsafe {
+        match key {
+            UiInput::Text(character) => ns_string(&character.to_string()),
+            UiInput::Named(named) => match named {
+                NamedKey::Up => UIKeyInputUpArrow,
+                NamedKey::Down => UIKeyInputDownArrow,
+                NamedKey::Left => UIKeyInputLeftArrow,
+                NamedKey::Right => UIKeyInputRightArrow,
+                NamedKey::Escape => UIKeyInputEscape,
+                NamedKey::PageUp => UIKeyInputPageUp,
+                NamedKey::PageDown => UIKeyInputPageDown,
+                NamedKey::Home => UIKeyInputHome,
+                NamedKey::End => UIKeyInputEnd,
+                NamedKey::Delete => UIKeyInputDelete,
+                NamedKey::F(number) => [
+                    UIKeyInputF1,
+                    UIKeyInputF2,
+                    UIKeyInputF3,
+                    UIKeyInputF4,
+                    UIKeyInputF5,
+                    UIKeyInputF6,
+                    UIKeyInputF7,
+                    UIKeyInputF8,
+                    UIKeyInputF9,
+                    UIKeyInputF10,
+                    UIKeyInputF11,
+                    UIKeyInputF12,
+                ][usize::from(number.clamp(1, 12)) - 1],
+            },
+        }
+    }
+}
+
+/// One row: a key command where UIKit can name the stroke, a command
+/// otherwise; its property list is the index of what it runs.
+unsafe fn command(row: &UiCommand) -> Id {
+    let index = MENU_ROWS.with(|rows| {
+        let mut rows = rows.borrow_mut();
+        rows.push((row.pick(), row.stroke()));
+        rows.len() - 1
+    });
+    unsafe {
+        let plist = msg_id_u64(class("NSNumber"), sel("numberWithUnsignedLongLong:"), index as u64);
+        let title = ns_string(&row.title);
+        match &row.key {
+            Some(key) => msg_key_command(
+                class("UIKeyCommand"),
+                sel("commandWithTitle:image:action:input:modifierFlags:propertyList:"),
+                title,
+                null_mut(),
+                sel("bunnyMenuPick:"),
+                input(key.input),
+                key.modifiers,
+                plist,
+            ),
+            None => msg_command(
+                class("UICommand"),
+                sel("commandWithTitle:image:action:propertyList:"),
+                title,
+                null_mut(),
+                sel("bunnyMenuPick:"),
+                plist,
+            ),
+        }
+    }
+}
+
+unsafe fn element(item: &UiItem) -> Id {
+    unsafe {
+        match item {
+            UiItem::Command(row) => command(row),
+            UiItem::Submenu { title, groups } => menu(title, null_mut(), 0, &self::groups(groups)),
+        }
+    }
+}
+
+/// Each group an inline menu — UIKit rules them apart.
+unsafe fn groups(groups: &[Vec<UiItem>]) -> Vec<Id> {
+    groups
+        .iter()
+        .map(|group| {
+            let items: Vec<Id> = group.iter().map(|item| unsafe { element(item) }).collect();
+            unsafe { menu("", null_mut(), INLINE, &items) }
+        })
+        .collect()
+}
+
+unsafe fn exists(builder: Id, identifier: Id) -> bool {
+    unsafe { !msg_id_id(builder, sel("menuForIdentifier:"), identifier).is_null() }
+}
+
+/// `buildMenuWithBuilder:` — the app's main menu, filed into UIKit's
+/// (`bunny_ui_apple::uikit_menu` decided where; this only builds it).
+/// Context menus ask the same method with another system, and get nothing.
+extern "C" fn bunny_build_menu(_this: Id, _sel: Sel, builder: Id) {
+    let Some(arranged) = MENU.with(|slot| slot.borrow().clone()) else { return };
+    unsafe {
+        let main = msg_id(class("UIMenuSystem"), sel("mainSystem"));
+        if !std::ptr::eq(msg_id(builder, sel("system")), main) {
+            return;
+        }
+        MENU_ROWS.with(|rows| rows.borrow_mut().clear());
+        for gone in [UIMenuFormat, UIMenuFind] {
+            msg_void_id(builder, sel("removeMenuForIdentifier:"), gone);
+        }
+        if !arranged.about {
+            msg_void_id(builder, sel("removeMenuForIdentifier:"), UIMenuAbout);
+        }
+        if let Some(settings) = &arranged.settings {
+            let group = menu("", UIMenuPreferences, INLINE, &[command(settings)]);
+            if exists(builder, UIMenuPreferences) {
+                msg_void_id_id(builder, sel("replaceMenuForIdentifier:withMenu:"), UIMenuPreferences, group);
+            } else {
+                msg_void_id_id(builder, sel("insertChildMenu:atStartOfMenuForIdentifier:"), group, UIMenuApplication);
+            }
+        }
+        // the menu each new one stands after, as it was actually built: an
+        // anchor UIKit does not hold is a menu inserted nowhere, silently
+        let mut built: Vec<(Anchor, Id)> = Vec::new();
+        for filed in &arranged.menus {
+            let children = groups(&filed.groups);
+            match &filed.place {
+                Place::Into(own) if exists(builder, standard(*own)) => {
+                    for group in children {
+                        msg_void_id_id(builder, sel("insertChildMenu:atEndOfMenuForIdentifier:"), group, standard(*own));
+                    }
+                    built.push((Anchor::Standard(*own), standard(*own)));
+                }
+                place => {
+                    let identifier = match place {
+                        Place::Into(own) => standard(*own),
+                        Place::After(_) => ns_string(&filed.identifier),
+                    };
+                    let after = match place {
+                        Place::After(anchor) => built
+                            .iter()
+                            .rev()
+                            .find(|(placed, _)| placed == anchor)
+                            .map(|(_, id)| *id)
+                            .filter(|id| exists(builder, *id)),
+                        Place::Into(_) => built.last().map(|(_, id)| *id),
+                    }
+                    .unwrap_or(if exists(builder, UIMenuView) { UIMenuView } else { UIMenuApplication });
+                    let own = menu(&filed.title, identifier, 0, &children);
+                    msg_void_id_id(builder, sel("insertSiblingMenu:afterMenuForIdentifier:"), own, after);
+                    let anchor = match place {
+                        Place::Into(own) => Anchor::Standard(*own),
+                        Place::After(_) => Anchor::Own(filed.identifier.clone()),
+                    };
+                    built.push((anchor, identifier));
+                }
+            }
+        }
+        // `BUNNY_IOS_TRACE=1`: the main menu as UIKit HOLDS it after the
+        // build — read back from the builder, so a menu it dropped shows as
+        // missing rather than as asked for
+        if std::env::var_os("BUNNY_IOS_TRACE").is_some() {
+            for (filed, (_, identifier)) in arranged.menus.iter().zip(&built) {
+                let held = msg_id_id(builder, sel("menuForIdentifier:"), *identifier);
+                let rows = if held.is_null() {
+                    "MISSING".to_owned()
+                } else {
+                    format!("{} groups", msg_u64(msg_id(held, sel("children")), sel("count")))
+                };
+                eprintln!("bunny_ui ios: main menu {:?}: {rows}", filed.title);
+            }
+            let settings = exists(builder, UIMenuPreferences);
+            eprintln!("bunny_ui ios: main menu Settings group held: {settings}");
+        }
+    }
+}
+
+/// What a row of ours runs, read off the command UIKit hands back.
+fn row_of(command: Id) -> Option<(Pick, Option<KeyPattern>)> {
+    if command.is_null() {
+        return None;
+    }
+    let index = unsafe {
+        let plist = msg_id(command, sel("propertyList"));
+        let number = class("NSNumber");
+        if plist.is_null() || msg_bool_id(plist, sel("isKindOfClass:"), number) == 0 {
+            return None;
+        }
+        usize::try_from(msg_u64(plist, sel("unsignedLongLongValue"))).ok()?
+    };
+    MENU_ROWS.with(|rows| rows.borrow().get(index).copied())
+}
+
+/// `bunnyMenuPick:` — a row was chosen, by a click or by its keys. Its
+/// stroke goes to the keymap first: UIKit matched the key command before
+/// the view heard the key (`uikit_menu`'s gotcha).
+extern "C" fn bunny_menu_pick(_this: Id, _sel: Sel, command: Id) {
+    if let Some((pick, stroke)) = row_of(command) {
+        menu_run(pick, stroke);
+    }
+}
+
+/// `validateCommand:` — a row the window does not answer is dark. A
+/// command that is not ours keeps the class's own answer.
+unsafe fn validate(this: Id, command: Id, superclass: &str) {
+    match row_of(command) {
+        Some((pick, _)) => {
+            if !menu_answers(pick) {
+                unsafe { msg_void_u64(command, sel("setAttributes:"), DISABLED) };
+            }
+        }
+        None => unsafe {
+            let sup = ObjcSuper { receiver: this, class: class(superclass) };
+            msg_super_void_id(&sup, sel("validateCommand:"), command);
+        },
+    }
+}
+
+extern "C" fn bunny_view_validate(this: Id, _sel: Sel, command: Id) {
+    unsafe { validate(this, command, "UIView") }
+}
+
+extern "C" fn bunny_delegate_validate(this: Id, _sel: Sel, command: Id) {
+    unsafe { validate(this, command, "UIResponder") }
+}
+
+/// The standard edits this shell answers, by UIKit's selector.
+fn edit_of(action: Sel) -> Option<Edit> {
+    let name = unsafe { CStr::from_ptr(bunny_ui_apple::ffi::sel_getName(action)) }.to_str().ok()?;
+    match name {
+        "cut:" => Some(Edit::Cut),
+        "copy:" => Some(Edit::Copy),
+        "paste:" => Some(Edit::Paste),
+        "selectAll:" => Some(Edit::SelectAll),
+        _ => None,
+    }
+}
+
+/// `canPerformAction:withSender:` — our rows always find their target here,
+/// an edit only while the window can take it; anything else is the class's.
+unsafe fn can_perform(this: Id, action: Sel, sender: Id, superclass: &str) -> i8 {
+    if std::ptr::eq(action, unsafe { sel("bunnyMenuPick:") }) {
+        return 1;
+    }
+    match edit_of(action) {
+        Some(edit) => i8::from(menu_answers(Pick::Edit(edit))),
+        None => unsafe {
+            let sup = ObjcSuper { receiver: this, class: class(superclass) };
+            msg_super_bool_sel_id(&sup, sel("canPerformAction:withSender:"), action, sender)
+        },
+    }
+}
+
+extern "C" fn bunny_view_can_perform(this: Id, _sel: Sel, action: Sel, sender: Id) -> i8 {
+    unsafe { can_perform(this, action, sender, "UIView") }
+}
+
+extern "C" fn bunny_delegate_can_perform(this: Id, _sel: Sel, action: Sel, sender: Id) -> i8 {
+    unsafe { can_perform(this, action, sender, "UIResponder") }
+}
+
+/// `cut:`, `copy:`, `paste:` and `selectAll:` — UIKit's own Edit rows and
+/// their keys, offered to the keymap as their stroke first, as every row is.
+extern "C" fn bunny_edit(_this: Id, action: Sel, _sender: Id) {
+    if let Some(edit) = edit_of(action) {
+        menu_run(Pick::Edit(edit), Some(edit.stroke()));
+    }
+}
+
+/// The menu's methods, on a responder class: the view when it holds the
+/// keyboard, the delegate at the chain's end when nothing does.
+unsafe fn add_menu_methods(class: Id, validate: *const c_void, can_perform: *const c_void) {
+    let v_id = CString::new("v@:@").expect("type encoding");
+    let can = CString::new("c@::@").expect("type encoding");
+    unsafe {
+        class_addMethod(class, sel("bunnyMenuPick:"), bunny_menu_pick as *const c_void, v_id.as_ptr());
+        class_addMethod(class, sel("validateCommand:"), validate, v_id.as_ptr());
+        class_addMethod(class, sel("canPerformAction:withSender:"), can_perform, can.as_ptr());
+        for edit in ["cut:", "copy:", "paste:", "selectAll:"] {
+            class_addMethod(class, sel(edit), bunny_edit as *const c_void, v_id.as_ptr());
+        }
+    }
 }
 
 // MARK: - Native hosts (a platform view in the hole the layout keeps)
