@@ -87,6 +87,11 @@ pub struct FrameStats {
     pub measures_kept: u32,
     /// Retained boundaries that were measured.
     pub measures_made: u32,
+    /// Row starts a variable-height virtual list worked out for its prefix
+    /// offsets. A list whose heights come from the app sums every row each
+    /// time; one whose rows measure themselves only the rows under a change,
+    /// and, when its head drops, moves the starts of the rows that stayed.
+    pub rows_summed: u32,
     /// Milliseconds per [`Stage`], all zero without a clock.
     pub stage_ms: [f64; STAGES],
 }
@@ -117,6 +122,7 @@ thread_local! {
     static CHILDREN_UNPLACED: Cell<u32> = const { Cell::new(0) };
     static MEASURES_KEPT: Cell<u32> = const { Cell::new(0) };
     static MEASURES_MADE: Cell<u32> = const { Cell::new(0) };
+    static ROWS_SUMMED: Cell<u32> = const { Cell::new(0) };
     static STAGE_MS: Cell<[f64; STAGES]> = const { Cell::new([0.0; STAGES]) };
     static CLOCK: Cell<Option<fn() -> f64>> = const { Cell::new(None) };
 }
@@ -150,6 +156,7 @@ pub fn take() -> FrameStats {
         children_unplaced: CHILDREN_UNPLACED.with(|c| c.replace(0)),
         measures_kept: MEASURES_KEPT.with(|c| c.replace(0)),
         measures_made: MEASURES_MADE.with(|c| c.replace(0)),
+        rows_summed: ROWS_SUMMED.with(|c| c.replace(0)),
         stage_ms: STAGE_MS.with(|c| c.replace([0.0; STAGES])),
     }
 }
@@ -250,6 +257,11 @@ pub(crate) fn note_measure_kept(kept: bool) {
     } else {
         bump(&MEASURES_MADE, 1);
     }
+}
+
+#[inline]
+pub(crate) fn note_rows_summed(rows: usize) {
+    bump(&ROWS_SUMMED, rows as u32);
 }
 
 #[inline]

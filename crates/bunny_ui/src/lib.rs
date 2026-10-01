@@ -1442,6 +1442,69 @@ mod tests {
         }
     }
 
+    /// A transcript of ten thousand entries, settled: a layout that
+    /// measured nothing new — the second of a frame, or a keystroke's in a
+    /// composer beside the list — works out no row's start. The sums are
+    /// kept with the heights, and only a row that changed makes the rows
+    /// under it add up again: the reply streaming into the newest entry
+    /// re-sums that entry alone.
+    #[test]
+    fn a_settled_transcript_sums_none_of_its_rows() {
+        #[derive(Clone, Copy)]
+        struct Transcript {
+            reply: State<f64>,
+            following: State<bool>,
+        }
+        impl Component for Transcript {
+            fn body(self, _ctx: &Context) -> impl View {
+                let reply = self.reply.get();
+                virtual_list(10_000, |row| format!("entry{row}"), move |row| {
+                    let height = match row {
+                        9_999 => reply,
+                        _ => 20.0 * (1 + row % 3) as f64,
+                    };
+                    spacer().frame_height(height)
+                })
+                .measured_rows(30.0)
+                .follow_tail(self.following.binding())
+            }
+        }
+        let size = crate::layout::Size { width: 200.0, height: 300.0 };
+        let transcript = Transcript { reply: State::new(40.0), following: State::new(true) };
+        let runtime = Runtime::new();
+        let frame = |runtime: &Runtime| {
+            let _ = runtime.display_frame(&transcript, size);
+            runtime.layout(&transcript, crate::layout::Proposal::exact(size))
+        };
+        let at_the_end = |result: &crate::layout::LayoutResult| {
+            let newest =
+                result.frames.find("[entry9999]").expect("the newest entry is on the glass");
+            (newest.origin.y + newest.size.height - size.height).abs() < 0.5
+        };
+        let _ = frame(&runtime);
+        let _ = frame(&runtime);
+
+        // settled: a frame and a layout more, and nothing on the glass moved
+        let _ = crate::stats::take();
+        let result = frame(&runtime);
+        let settled = crate::stats::take();
+        assert!(settled.layout_passes >= 2, "the layouts walked: {}", settled.layout_passes);
+        assert_eq!(settled.rows_summed, 0, "a settled layout sums none of the ten thousand");
+        assert!(at_the_end(&result), "the glass is at the end");
+
+        // the reply streams into the newest entry: the starts above it are
+        // kept, and its end is the one sum that moves
+        transcript.reply.set(100.0);
+        let _ = crate::stats::take();
+        let result = frame(&runtime);
+        let streamed = crate::stats::take();
+        assert_eq!(streamed.rows_summed, 1, "the newest entry alone");
+        let region = result.scrolls.first().expect("the region exists");
+        let offsets = region.row_offsets.as_ref().expect("the heights ride the region");
+        assert_eq!(offsets[10_000] - offsets[9_999], 100.0, "counted at what it grew to");
+        assert!(at_the_end(&result), "and the tail is still followed");
+    }
+
     #[test]
     fn a_reveal_lands_on_a_variable_row() {
         #[derive(Clone, Copy)]
