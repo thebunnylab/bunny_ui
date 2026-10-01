@@ -11,7 +11,8 @@
 //! page does the arithmetic.
 //!
 //! What still owns numbers: a virtual list's row extents (declared by
-//! the app, turned into prefix sums here — pure arithmetic), a canvas
+//! the app and turned into prefix sums here, or kept as starts by a
+//! list whose rows measure themselves — pure arithmetic), a canvas
 //! island's size (the engine measures its own pixels), and one day a
 //! `.layout(Exact)` interior. Everything else speaks records.
 
@@ -587,16 +588,33 @@ impl Walk<'_> {
                 }
                 out.push(scroll);
             }
-            LayoutNode::VirtualStack { row_extent, count, children, heights, .. } => {
-                // the ONE number the browser cannot give: the app
-                // declared every row's extent, so the total and each
-                // slot are prefix sums — arithmetic, never measure
+            LayoutNode::VirtualStack { row_extent, count, children, heights, measured } => {
+                // the ONE number the browser cannot give: each row's
+                // slot and the total, prefix sums — arithmetic, never
+                // measure. Summed once and read for every row on the
+                // glass: a sum per row walked the whole head above it,
+                // once for each
+                let starts: Option<std::rc::Rc<Vec<Px>>> = match (measured, heights) {
+                    // rows that measure themselves: the starts their
+                    // cache keeps, which a settled list never re-sums
+                    (Some(cache), _) => Some(cache.offsets(*count)),
+                    // the app declared every row's extent
+                    (None, Some(rows)) => {
+                        let mut starts = Vec::with_capacity(*count + 1);
+                        let mut top: Px = 0.0;
+                        starts.push(top);
+                        for row in 0..*count {
+                            top += (rows.0)(row);
+                            starts.push(top);
+                        }
+                        crate::stats::note_rows_summed(*count);
+                        Some(std::rc::Rc::new(starts))
+                    }
+                    (None, None) => None,
+                };
                 let start_of = |index: usize| -> Px {
-                    match heights {
-                        // prefix sums over the app-declared extents —
-                        // arithmetic, never measure (the window is
-                        // small; the total is one pass over the count)
-                        Some(rows) => (0..index).map(|row| (rows.0)(row)).sum(),
+                    match &starts {
+                        Some(starts) => starts[index.min(*count)],
                         None => *row_extent * index as f64,
                     }
                 };
@@ -1283,6 +1301,88 @@ mod tests {
             .map(|row| row.layout.as_ref().expect("flow").slot_y)
             .collect();
         assert_eq!(slots, vec![Some(66.0), Some(88.0)]);
+    }
+
+    /// Rows whose extents the app declares sit at the sum of the rows
+    /// above them, and the content spans every row — and each row is
+    /// asked for its extent ONCE, however deep the glass sits: three rows
+    /// at the end of a thousand asked nearly four thousand times when
+    /// every slot was a sum of its own.
+    #[test]
+    fn declared_rows_take_their_prefix_sums_asked_once() {
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let heights = {
+            let asked = std::rc::Rc::clone(&asked);
+            crate::layout::RowHeights(std::rc::Rc::new(move |row: usize| {
+                asked.set(asked.get() + 1);
+                if row.is_multiple_of(3) { 40.0 } else { 20.0 }
+            }))
+        };
+        let tree = LayoutNode::VirtualStack {
+            row_extent: 0.0,
+            count: 1000,
+            children: vec![
+                (997, text_node("row 997")),
+                (998, text_node("row 998")),
+                (999, text_node("row 999")),
+            ],
+            heights: Some(heights),
+            measured: None,
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let content = &scene.children[0];
+        // 334 rows of forty (0, 3, …, 999) and 666 of twenty
+        let height = content.layout.as_ref().expect("flow").height;
+        assert_eq!(height, Some(334.0 * 40.0 + 666.0 * 20.0));
+        let slots: Vec<_> = content
+            .children
+            .iter()
+            .map(|row| row.layout.as_ref().expect("flow").slot_y)
+            .collect();
+        // above row 997: 333 rows of forty and 664 of twenty
+        assert_eq!(slots, vec![Some(26_600.0), Some(26_620.0), Some(26_640.0)]);
+        assert_eq!(asked.get(), 1000, "each row asked once");
+    }
+
+    /// Rows that measure themselves are slotted by the starts their row
+    /// cache keeps: the heights closure is never walked, and the same
+    /// list lowered again sums nothing.
+    #[test]
+    fn measured_rows_take_the_starts_their_cache_keeps() {
+        let cache = std::rc::Rc::new(crate::layout::RowCache::new("transcript".to_string()));
+        cache.set_estimate(30.0);
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        // the closure the list hands every road, as `virtual_list` does
+        let heights = {
+            let (asked, cache) = (std::rc::Rc::clone(&asked), std::rc::Rc::clone(&cache));
+            crate::layout::RowHeights(std::rc::Rc::new(move |row: usize| {
+                asked.set(asked.get() + 1);
+                cache.height(row)
+            }))
+        };
+        let tree = LayoutNode::VirtualStack {
+            row_extent: 0.0,
+            count: 1000,
+            children: vec![(998, text_node("row 998")), (999, text_node("row 999"))],
+            heights: Some(heights),
+            measured: Some(std::rc::Rc::clone(&cache)),
+        };
+        let offsets = HashMap::default();
+        let _ = crate::stats::take();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let content = &scene.children[0];
+        assert_eq!(content.layout.as_ref().expect("flow").height, Some(30_000.0));
+        let slots: Vec<_> = content
+            .children
+            .iter()
+            .map(|row| row.layout.as_ref().expect("flow").slot_y)
+            .collect();
+        assert_eq!(slots, vec![Some(29_940.0), Some(29_970.0)]);
+        assert_eq!(asked.get(), 0, "the closure is never walked");
+        assert_eq!(crate::stats::take().rows_summed, 1000, "the cache summed its rows once");
+        let _ = lower(&tree, &env_fixture(&offsets));
+        assert_eq!(crate::stats::take().rows_summed, 0, "and kept them");
     }
 
     /// The ink rules ride the walk exactly as they ride the capture:
