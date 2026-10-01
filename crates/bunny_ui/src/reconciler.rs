@@ -68,6 +68,9 @@ pub(crate) struct EditorFn {
     pub command: EditFn,
     pub key: Option<FieldKeyFn>,
     pub policy: Option<Rc<dyn crate::text_input::EditingStrategy>>,
+    /// The app's word for the keyboard reaching or leaving the field
+    /// (`TextField::on_focus`).
+    pub focus: Option<Rc<dyn Fn(bool)>>,
 }
 pub(crate) type EditorEntry = (String, EditorFn);
 
@@ -1701,6 +1704,17 @@ pub(crate) fn field_key(
 ) -> bool {
     let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
     editor.and_then(|editor| editor.key).is_some_and(|key| key(stroke, state))
+}
+
+/// The field's own word for the keyboard (`TextField::on_focus`), if the
+/// app gave it one.
+pub(crate) fn field_focus_hook(path: &str) -> Option<Rc<dyn Fn(bool)>> {
+    EDITORS.with(|editors| {
+        editors
+            .borrow()
+            .get(path)
+            .and_then(|editor| editor.focus.clone())
+    })
 }
 
 pub(crate) fn field_policy(path: &str) -> Option<Rc<dyn crate::text_input::EditingStrategy>> {
