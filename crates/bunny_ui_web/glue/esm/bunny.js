@@ -360,6 +360,11 @@ const KEYS = {
   PageDown: 13,
 };
 
+// The keys a field asks a software keyboard for, as the editable's
+// `inputmode` — `bunny_caret_keyboard` answers an index into this table
+// (bunny_ui_web::keyboard_code).
+const INPUT_MODES = ["text", "email", "numeric", "decimal", "tel", "url", "search"];
+
 // The function row: `F1` to `F24`, sent as 101 to 124.
 const FUNCTION_KEY = /^F([1-9]|1[0-9]|2[0-4])$/;
 
@@ -662,6 +667,11 @@ export async function attach(memoryHandle, exports, hostElement, start) {
   // keys would cover — the engine already lifts the field above them, so
   // the page moved twice. There the editable stands at the top.
   const place = () => {
+    // the keys the field asks for: a phone lays out an `@` for an address
+    // and a pad for a code, and lays them out again when the keyboard
+    // moves to a field of another kind while it is up
+    const mode = INPUT_MODES[wasm.bunny_caret_keyboard ? wasm.bunny_caret_keyboard() : 0] || "text";
+    if (ime.inputMode !== mode) ime.inputMode = mode;
     const box = host.getBoundingClientRect();
     ime.style.left = `${box.left + wasm.bunny_caret_x()}px`;
     const top = byFinger ? Math.max(0, box.top) : box.top + wasm.bunny_caret_y();

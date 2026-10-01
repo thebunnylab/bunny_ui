@@ -53,8 +53,12 @@ inset when it rises, so the scene stands above the keys. A view wearing
 reclaims the whole window. The keyboard follows the focus: a field that
 takes it makes the view the first responder, and the view types through
 `UIKeyInput` with the traits answered by hand (no autocorrection, no
-sentence capitals, unless the app asks). A hardware keyboard is asked of
-the keymap first; a letter arrives once, through the keyboard's road.
+sentence capitals, unless the app asks). `keyboardType` is the field's
+own (`TextField::keyboard_type`): an address gets the `@`, a code the
+number pad, and a keyboard already up is laid out again
+(`reloadInputViews`) when the focus moves to a field of another kind. A
+hardware keyboard is asked of the keymap first; a letter arrives once,
+through the keyboard's road.
 
 ## What the shell answers
 

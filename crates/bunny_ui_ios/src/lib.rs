@@ -576,7 +576,9 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
             let display = runtime.display_frame(root, Size { width, height });
             present(runtime, display);
             // the keyboard follows the focus: a field that took it wants
-            // the keys, a scene with none wants them gone
+            // the keys — the ones it asks for — and a scene with none
+            // wants them gone
+            ffi::want_keys(runtime.focus_keyboard_type());
             ffi::want_keyboard(runtime.focus_takes_text());
             // wake or park the frame driver — the event may have
             // started (or finished) an animation, or a finger's clock
