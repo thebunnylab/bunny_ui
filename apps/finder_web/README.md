@@ -148,4 +148,8 @@ pad — and it changes in place when the keys move to a field of another
 kind. The scene lays itself out above the keys (`bunny_keyboard`, read
 off the visual viewport), and a keyboard the reader puts away — iOS's
 Done, Android's back key — lets the field go
-(`bunny_keyboard_dismissed`).
+(`bunny_keyboard_dismissed`). Two fingers are a pinch: the box under them
+hears `Magnify`, and the press the first finger made is taken back, never
+released. A trackpad's pinch reaches the same door (`bunny_magnify`),
+from Chromium's turn of the wheel with control held or Safari's gesture
+events; a turn no box zooms goes on as the wheel.
