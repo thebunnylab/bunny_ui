@@ -489,6 +489,11 @@ export async function attach(memoryHandle, exports, hostElement, start) {
     await document.fonts.ready;
   }
 
+  // `?present=gpu`: the GPU tier takes the page whatever its own probe of
+  // the device says (and `?present=cpu` keeps it off the page)
+  if (new URLSearchParams(location.search).get("present") === "gpu" && wasm.bunny_gpu_forced) {
+    wasm.bunny_gpu_forced();
+  }
   const scale = window.devicePixelRatio || 1;
   const rect = host.getBoundingClientRect();
   lastBox = [rect.width, rect.height, scale];

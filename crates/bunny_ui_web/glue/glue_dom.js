@@ -1337,6 +1337,11 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     }
     // the boot bill: fetch+instantiate, then the first frame inside
     // start_dom — the two numbers a mount argument needs
+    // `?present=gpu`: the GPU tier takes the page whatever its own probe of
+    // the device says (and `?present=cpu` keeps it off the page)
+    if (new URLSearchParams(location.search).get("present") === "gpu" && wasm.bunny_gpu_forced) {
+      wasm.bunny_gpu_forced();
+    }
     window.__bunnyBoot = { instantiate: performance.now() - bootOpened };
     const startOpened = performance.now();
     wasm[START_EXPORT](
