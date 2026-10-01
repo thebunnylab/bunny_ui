@@ -22,6 +22,7 @@ use crate::action::{
     OVERLAY_DISMISS,
 };
 use crate::effects;
+use crate::menu::{Edit, Pick};
 use crate::layout::{
     FieldPlacement, Interaction, LayoutEnv, OverlayPlacement, Point, Px, Rect, ScrollRegion,
 };
@@ -3264,6 +3265,102 @@ impl Runtime {
             }
             None => false,
         }
+    }
+
+    // MARK: - Menus (what a chosen item asks of the window)
+
+    /// Can the window answer this menu item now? What every shell asks
+    /// before it draws an item enabled, so an item is dark on the mac
+    /// exactly when it is dark on a PC.
+    ///
+    /// A command answers while a handler for its action is live, the
+    /// tree's or the host's: the same condition under which its binding
+    /// consumes a key. While an alert asks, no command answers. The alert
+    /// is modal to the menus as it is to the keys, and a Save chosen from
+    /// the bar under an unsaved-work ask would decide it behind its back.
+    ///
+    /// An edit answers while the keyboard is held by someone who can take
+    /// it. A copy needs anyone who can hand text back: a field that is not
+    /// secret, a box, or a read-only view with `.on_copy`. A cut, a paste
+    /// and a select-all need a field or a box. An undo and a redo need a
+    /// box, because a field keeps no history.
+    pub fn menu_answers(&self, pick: Pick) -> bool {
+        self.enter_scene();
+        match pick {
+            Pick::Command(action) => {
+                !self.alert_asks()
+                    && (reconciler::has_handler(action)
+                        || self.hosted_handlers.borrow().contains_key(&action))
+            }
+            Pick::Edit(edit) => {
+                let Some(path) = self.focused() else {
+                    return false;
+                };
+                let boxed = self.custom_at(&path).is_some();
+                let field = self.field_at(&path);
+                let open_field = field.as_ref().is_some_and(|field| !field.secret);
+                match edit {
+                    Edit::Copy => boxed || open_field || reconciler::answers_copy(&path),
+                    Edit::Cut => boxed || open_field,
+                    Edit::Paste | Edit::SelectAll => boxed || field.is_some(),
+                    Edit::Undo | Edit::Redo => boxed,
+                }
+            }
+        }
+    }
+
+    /// Runs a chosen item: a command through the dispatch its binding
+    /// takes, and an edit along the road its stroke takes. `true` means
+    /// something ran, and the shell repaints.
+    ///
+    /// An item the window does not answer ([`Runtime::menu_answers`]) runs
+    /// nothing, whichever way it was chosen.
+    ///
+    /// An edit is first offered, as its stroke ([`Edit::stroke`]), to a
+    /// focused box that reads strokes, so the editor's undo, select-all and
+    /// copy answer the menu exactly as they answer the keys. Only then does
+    /// it run as the field's own command. The clipboard is handled here: a
+    /// copy or a cut writes it and a paste reads it, so a shell has no half
+    /// of its own to add.
+    pub fn menu_pick(&self, pick: Pick) -> bool {
+        if !self.menu_answers(pick) {
+            return false;
+        }
+        match pick {
+            Pick::Command(action) => self.dispatch_action(action),
+            Pick::Edit(edit) => self.menu_edit(edit),
+        }
+    }
+
+    /// [`Runtime::menu_pick`] for an edit the window answers.
+    fn menu_edit(&self, edit: Edit) -> bool {
+        let taken = self.key_stroke(edit.stroke());
+        if taken.handled {
+            if let Some(text) = taken.text {
+                crate::clipboard::write(&text);
+            }
+            return true;
+        }
+        let handed = |command: EditCommand| match self.key(command).output {
+            Some(text) => {
+                crate::clipboard::write(&text);
+                true
+            }
+            None => false,
+        };
+        match edit {
+            Edit::Copy => handed(EditCommand::Copy),
+            Edit::Cut => handed(EditCommand::Cut),
+            Edit::Paste => self.paste(),
+            Edit::SelectAll => self.key(EditCommand::SelectAll).applied,
+            Edit::Undo | Edit::Redo => false,
+        }
+    }
+
+    /// Is an alert asking in this window? While one is, the keymap answers
+    /// from its context alone and the menus answer no command.
+    fn alert_asks(&self) -> bool {
+        reconciler::context_active(ALERT_CONTEXT, self.focus.borrow().as_deref())
     }
 
     // MARK: - Focus and keyboard (the focused field owns the keyboard)

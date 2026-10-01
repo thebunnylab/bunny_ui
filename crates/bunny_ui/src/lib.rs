@@ -53,6 +53,7 @@ pub mod host;
 pub mod icon;
 pub mod image_engine;
 pub mod layout;
+pub mod menu;
 mod loans;
 pub mod modifier;
 pub mod one_of;
@@ -7674,6 +7675,283 @@ mod tests {
         let copied = runtime.key(EditCommand::Copy);
         assert!(!copied.applied, "nothing selected is not a copy");
         assert_eq!(copied.output, None, "and the clipboard keeps what it had");
+    }
+
+    // =========================================================================
+    // Menus — what a chosen item asks of the window
+    // =========================================================================
+
+    /// An item is dark exactly while nothing answers its action: the tree's
+    /// handler or the host's, and it goes dark with the view that mounted
+    /// it. Chosen while dark, it runs nothing.
+    #[test]
+    fn a_menu_command_answers_while_its_handler_lives() {
+        use crate::menu::Pick;
+        use std::cell::Cell;
+
+        const SAVE: ActionId = ActionId("page.save");
+        const QUIT: ActionId = ActionId("host.quit");
+        const NOBODY: ActionId = ActionId("page.nobody");
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            mounted: State<bool>,
+            saved: State<i32>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let saved = self.saved;
+                if self.mounted.get() {
+                    Either::First(text("page").on_action(SAVE, move || saved.add(1)))
+                } else {
+                    Either::Second(text("nothing here"))
+                }
+            }
+        }
+
+        let runtime = Runtime::new();
+        let quits = Rc::new(Cell::new(0));
+        runtime.on_action(QUIT, {
+            let quits = Rc::clone(&quits);
+            move || quits.set(quits.get() + 1)
+        });
+        let page = Page { mounted: State::new(true), saved: State::new(0) };
+        runtime.render_stable(&page);
+
+        assert!(runtime.menu_answers(Pick::Command(SAVE)), "the tree's handler answers");
+        assert!(runtime.menu_answers(Pick::Command(QUIT)), "and so does the host's");
+        assert!(!runtime.menu_answers(Pick::Command(NOBODY)), "nothing mounted: dark");
+
+        assert!(runtime.menu_pick(Pick::Command(SAVE)));
+        assert_eq!(page.saved.get(), 1, "the item ran its action");
+        assert!(runtime.menu_pick(Pick::Command(QUIT)));
+        assert_eq!(quits.get(), 1);
+        assert!(!runtime.menu_pick(Pick::Command(NOBODY)), "a dark item runs nothing");
+
+        page.mounted.set(false);
+        runtime.render_stable(&page);
+        assert!(!runtime.menu_answers(Pick::Command(SAVE)), "gone with its view");
+        assert!(!runtime.menu_pick(Pick::Command(SAVE)));
+        assert_eq!(page.saved.get(), 1);
+        assert!(runtime.menu_answers(Pick::Command(QUIT)), "the host's outlives the view");
+    }
+
+    /// An alert is modal to the menus as it is to the keys: while it asks,
+    /// no command answers from the bar, and once it is answered the page's
+    /// commands are back.
+    #[test]
+    fn an_alert_darkens_the_menus_commands_while_it_asks() {
+        use crate::layout::{AlertSpec, Proposal, Size};
+        use crate::menu::Pick;
+
+        const SAVE: ActionId = ActionId("page.save");
+        const WINDOW: Size = Size { width: 800.0, height: 600.0 };
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            open: State<bool>,
+            saved: State<i32>,
+        }
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                let (open, saved) = (self.open, self.saved);
+                text("the page")
+                    .frame(WINDOW.width, WINDOW.height)
+                    .on_action(SAVE, move || saved.add(1))
+                    .alert(
+                        Binding::new(move || open.get(), move |shown: bool| open.set(shown)),
+                        AlertSpec::new("Unsaved", 300.0),
+                        move |_| erased(text("Save your changes?").frame(200.0, 60.0)),
+                    )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { open: State::new(false), saved: State::new(0) };
+        let lay = || {
+            runtime.render_stable(&page);
+            runtime.layout(&page, Proposal::exact(WINDOW))
+        };
+        lay();
+        assert!(runtime.menu_answers(Pick::Command(SAVE)));
+
+        page.open.set(true);
+        lay();
+        assert!(!runtime.menu_answers(Pick::Command(SAVE)), "the ask holds the bar");
+        assert!(!runtime.menu_pick(Pick::Command(SAVE)));
+        assert_eq!(page.saved.get(), 0, "nothing decided behind the ask's back");
+
+        page.open.set(false);
+        lay();
+        assert!(runtime.menu_pick(Pick::Command(SAVE)), "answered, the bar is the page's again");
+        assert_eq!(page.saved.get(), 1);
+    }
+
+    /// The Edit menu acts on the field that holds the keyboard, and the
+    /// clipboard is the runtime's business: a copy writes it, a paste reads
+    /// it. A field keeps no history, so its Undo is dark.
+    #[test]
+    fn an_edit_item_reaches_the_field_that_holds_the_keyboard() {
+        use crate::layout::{Proposal, Size};
+        use crate::menu::{Edit, Pick};
+
+        #[derive(Clone, Copy)]
+        struct Form {
+            name: State<String>,
+        }
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                text_field("Your name", self.name.binding()).frame_width(200.0)
+            }
+        }
+
+        let form = Form { name: State::new("Deco".to_owned()) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&form);
+        let result = runtime.layout(&form, Proposal::exact(Size { width: 240.0, height: 80.0 }));
+        let answers = |edit: Edit| runtime.menu_answers(Pick::Edit(edit));
+
+        assert!(Edit::ALL.into_iter().all(|edit| !answers(edit)), "nobody holds the keyboard");
+        assert!(!runtime.menu_pick(Pick::Edit(Edit::Copy)));
+
+        let (_, rect) = result.hits.last().expect("the field is a target").clone();
+        let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+        for edit in [Edit::Cut, Edit::Copy, Edit::Paste, Edit::SelectAll] {
+            assert!(answers(edit), "{edit:?} answers in a field");
+        }
+        assert!(!answers(Edit::Undo) && !answers(Edit::Redo), "a field keeps no history");
+
+        assert!(runtime.menu_pick(Pick::Edit(Edit::SelectAll)));
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Copy)));
+        assert_eq!(crate::clipboard::read().as_deref(), Some("Deco"), "the copy reached the clipboard");
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Cut)));
+        runtime.render_stable(&form);
+        assert_eq!(form.name.get(), "", "the cut took the text");
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Paste)));
+        runtime.render_stable(&form);
+        assert_eq!(form.name.get(), "Deco", "the paste read it back");
+        assert!(!runtime.menu_pick(Pick::Edit(Edit::Undo)), "dark, so it runs nothing");
+    }
+
+    /// A read-only view that copies answers Copy from the menu, and nothing
+    /// else: there is nothing in it to cut, paste over or select whole.
+    #[test]
+    fn an_edit_item_reaches_a_read_only_view_that_copies() {
+        use crate::layout::{Proposal, Size};
+        use crate::menu::{Edit, Pick};
+
+        let table = CopyTable { picked: State::new(None) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&table);
+        let result = runtime.layout(&table, Proposal::exact(Size { width: 300.0, height: 200.0 }));
+        let (_, rows) = copy_targets(&result.hits);
+        let (x, y) = rows[1];
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+
+        assert!(runtime.menu_answers(Pick::Edit(Edit::Copy)));
+        for edit in [Edit::Undo, Edit::Redo, Edit::Cut, Edit::Paste, Edit::SelectAll] {
+            assert!(!runtime.menu_answers(Pick::Edit(edit)), "{edit:?} is dark over a read-only view");
+        }
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Copy)));
+        assert_eq!(crate::clipboard::read().as_deref(), Some("beta\t2"));
+    }
+
+    /// A secret field is refused the copy and the cut from the menu as from
+    /// the keys; a paste into it is still a paste.
+    #[test]
+    fn a_secret_field_answers_no_copy_from_the_menu() {
+        use crate::layout::{Proposal, Size};
+        use crate::menu::{Edit, Pick};
+
+        #[derive(Clone, Copy)]
+        struct Form {
+            key: State<String>,
+        }
+        impl Component for Form {
+            fn body(self, _ctx: &Context) -> impl View {
+                text_field("API key", self.key.binding()).secret(true).frame_width(200.0)
+            }
+        }
+
+        let form = Form { key: State::new("sk-secret".to_owned()) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&form);
+        let result = runtime.layout(&form, Proposal::exact(Size { width: 240.0, height: 80.0 }));
+        let (_, rect) = result.hits.last().expect("the field is a target").clone();
+        let (x, y) = (rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+        runtime.pointer_pressed(x, y);
+        runtime.pointer_released(x, y);
+
+        assert!(!runtime.menu_answers(Pick::Edit(Edit::Copy)));
+        assert!(!runtime.menu_answers(Pick::Edit(Edit::Cut)));
+        assert!(runtime.menu_answers(Pick::Edit(Edit::Paste)), "what enters is not what leaks");
+        assert!(!runtime.menu_pick(Pick::Edit(Edit::Copy)));
+        assert_eq!(crate::clipboard::read(), None, "nothing left the box");
+    }
+
+    /// A box that reads strokes hears an edit item as the stroke it stands
+    /// for — the editor's own undo answers Edit ▸ Undo — and what it hands
+    /// back from a copy goes to the clipboard.
+    #[test]
+    fn an_edit_item_reaches_a_box_as_its_stroke() {
+        use crate::layout::{Proposal, Size};
+        use crate::menu::{Edit, Pick};
+        use std::cell::RefCell;
+
+        struct Editor {
+            heard: Rc<RefCell<Vec<KeyPattern>>>,
+        }
+        impl CustomElement for Editor {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+            fn event(&self, event: &ElementEvent, _ctx: &EventCtx) -> crate::custom::Response {
+                let ElementEvent::Key(stroke) = event else {
+                    return crate::custom::Response::ignored();
+                };
+                self.heard.borrow_mut().push(stroke.pattern);
+                if stroke.pattern == Edit::Copy.stroke() {
+                    return crate::custom::Response::text("fn main() {}");
+                }
+                if stroke.pattern == Edit::Undo.stroke() {
+                    return crate::custom::Response::handled();
+                }
+                crate::custom::Response::ignored()
+            }
+        }
+
+        #[derive(Clone)]
+        struct Bench {
+            heard: Rc<RefCell<Vec<KeyPattern>>>,
+        }
+        impl Component for Bench {
+            fn body(self, _ctx: &Context) -> impl View {
+                custom(Editor { heard: self.heard }).id("code")
+            }
+        }
+
+        let bench = Bench { heard: Rc::new(RefCell::new(Vec::new())) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&bench);
+        let result = runtime.layout(&bench, Proposal::exact(Size { width: 400.0, height: 300.0 }));
+        let frame = result.customs.first().expect("the box is placed").frame;
+        runtime.pointer_pressed(frame.origin.x + 10.0, frame.origin.y + 10.0);
+        runtime.pointer_released(frame.origin.x + 10.0, frame.origin.y + 10.0);
+
+        assert!(Edit::ALL.into_iter().all(|edit| runtime.menu_answers(Pick::Edit(edit))), "a box may take any edit");
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Undo)), "its own undo answered");
+        assert!(runtime.menu_pick(Pick::Edit(Edit::Copy)));
+        assert_eq!(crate::clipboard::read().as_deref(), Some("fn main() {}"));
+        assert!(!runtime.menu_pick(Pick::Edit(Edit::Redo)), "declined, and no field stands behind it");
+        assert_eq!(
+            *bench.heard.borrow(),
+            [Edit::Undo.stroke(), Edit::Copy.stroke(), Edit::Redo.stroke()],
+            "each item arrived as its stroke",
+        );
     }
 
     #[test]
