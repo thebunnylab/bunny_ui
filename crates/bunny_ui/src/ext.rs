@@ -1137,6 +1137,20 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         self.glass(crate::layout::Glass::regular().spot(center, radius, alpha))
     }
 
+    /// A click anywhere inside leaves the keyboard where it is — on the
+    /// field or the box that held it.
+    ///
+    /// The scene's rule is that the keyboard follows the click: a press on
+    /// a row or a button takes it away from the editor. Chrome is the
+    /// exception every toolkit makes — a toolbar button, a menu title, a
+    /// menu's row: the reader clicks Edit ▸ Copy for the selection in the
+    /// editor, and a menu that took the keyboard to click on would copy
+    /// from nobody. A box of the app's own says the same with
+    /// `CustomElement::leaves_keyboard`; this is the view's door.
+    fn leaves_keyboard(self) -> Modified<Self> {
+        Modified { base: self, modifier: Modifier::LeavesKeyboard }
+    }
+
     /// Declares a key context ACTIVE while this view is mounted —
     /// `Runtime::bind_in(context, …)` bindings answer only then. The
     /// palette closes, its keys go quiet.

@@ -23,12 +23,13 @@ pub mod webview;
 mod wpe;
 mod x11;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use bunny_ui::action::{Key, KeyMatch, KeyPattern, Modifiers, Stroke};
 use bunny_ui::host::MouseButton;
 use bunny_ui::layout::{Axis, Size};
+use bunny_ui::menu::{AltTap, MenuKey};
 use bunny_ui::pacing::{Beat, FramePacer, Urgency, Verdict};
 use bunny_ui::prelude::{EditCommand, Runtime};
 use bunny_ui::view::{Either, Single, View};
@@ -38,6 +39,13 @@ pub use gl::OffscreenGl;
 pub use image::LinuxImageEngine;
 pub use text::FreeTypeEngine;
 pub use vk::OffscreenVk;
+
+/// A stroke every binding declined, offered to the app's menu bar: plain
+/// F10, or Alt and a letter ([`MenuKey::of_stroke`]). `true` when the bar
+/// took it.
+fn menu_key(runtime: &Runtime, pattern: &KeyPattern) -> bool {
+    MenuKey::of_stroke(pattern).is_some_and(|key| runtime.menu_key(key))
+}
 
 /// XKB keysym → the keymap vocabulary. Named keys come from the sym
 /// table; the rest becomes `Char` through the base char (a clean
@@ -1060,22 +1068,36 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     // mounted does not consume; an AltGr chord that types IS text and
     // never enters. The composition-first step arrives with the IME
     // phase.
+    // Alt let go alone is the menu bar's on a PC, and this platform does not
+    // say so itself (Windows does, as `SC_KEYMENU`): every key the gate reads
+    // and every press the handler hears breaks the tap, and the modifier
+    // reports make it
+    let alt_tap = Rc::new(RefCell::new(AltTap::default()));
     let key_gate: Box<dyn FnMut(&ffi::KeyStroke) -> bool> = Box::new({
         let runtime = Rc::clone(&runtime);
         let root = Rc::clone(&root);
         let blit = blit.clone();
+        let alt_tap = Rc::clone(&alt_tap);
         move |stroke: &ffi::KeyStroke| {
+            let pattern = key_pattern(stroke);
+            if pattern.is_some() || stroke.types_text {
+                alt_tap.borrow_mut().interrupted();
+            }
             if stroke.types_text {
                 return false;
             }
-            let Some(pattern) = key_pattern(stroke) else {
+            let Some(pattern) = pattern else {
                 return false;
             };
             // MID-CHORD the keyboard belongs to the keymap: the stroke
             // that finishes `cmd-k s` is not typing, and it is not the
             // focused box's either
             let mid_chord = !runtime.pending_chord().is_empty();
-            if !mid_chord && runtime.focus_takes_text() && pattern.is_text_input() {
+            // Alt and a letter types nothing here (AltGr does, and arrived
+            // as text above): it is a menu's access key once the box and the
+            // keymap have declined it, never a letter for the field
+            let menu_letter = matches!(MenuKey::of_stroke(&pattern), Some(MenuKey::Access(_)));
+            if !mid_chord && !menu_letter && runtime.focus_takes_text() && pattern.is_text_input() {
                 return false;
             }
             // a focused escape hatch owns its strokes: an editor's
@@ -1107,21 +1129,23 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                 return true;
             }
             let action = match runtime.chord(Stroke::new(pattern, stroke.typed)) {
-                KeyMatch::Action(action) => action,
+                KeyMatch::Action(action) => Some(action),
                 // the stroke opened (or let go of) a sequence: it is
                 // spent, and a which-key panel may have just changed
                 KeyMatch::Pending => {
                     blit(&runtime, &*root, ORIGIN_KEY);
                     return true;
                 }
-                KeyMatch::None => return false,
+                KeyMatch::None => None,
             };
-            if runtime.dispatch_action(action) {
+            // nothing bound, or a binding nobody answered: the stroke may
+            // still be the menu bar's — F10, an access key
+            let taken = action.is_some_and(|action| runtime.dispatch_action(action))
+                || menu_key(&runtime, &pattern);
+            if taken {
                 blit(&runtime, &*root, ORIGIN_KEY);
-                true
-            } else {
-                false
             }
+            taken
         }
     });
 
@@ -1130,9 +1154,16 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
     let handler_present = Rc::clone(&present);
     let handler_pacer = Rc::clone(&pacer);
     let handler_dialogs = Rc::clone(&dialogs);
+    let held = Cell::new(Modifiers::NONE);
     let handler: Box<dyn FnMut(AppEvent)> = Box::new(move |event| {
         let runtime = &handler_runtime;
         let root = &*handler_root;
+        if matches!(
+            event,
+            AppEvent::MouseDown { .. } | AppEvent::RightMouseDown { .. } | AppEvent::MiddleMouseDown { .. }
+        ) {
+            alt_tap.borrow_mut().interrupted();
+        }
         match event {
             AppEvent::Redraw => blit(runtime, root, ORIGIN_REDRAW),
             AppEvent::WindowClosed => {}
@@ -1172,10 +1203,13 @@ fn mount(spec: &WindowSpec, runtime: Rc<Runtime>, root: impl View) -> Rc<Slot> {
                     soon(runtime, root, ORIGIN_KEY);
                 }
             }
-            AppEvent::Modifiers(held) => {
+            AppEvent::Modifiers(now) => {
                 // a release confirms, closes, opens — whatever the sink
-                // did, the frame that shows it is not one to wait for
-                if runtime.modifiers_changed(held) {
+                // did, the frame that shows it is not one to wait for —
+                // and Alt let go alone is the menu bar's
+                let tapped = alt_tap.borrow_mut().modifiers(held.replace(now), now);
+                let changed = runtime.modifiers_changed(now);
+                if (tapped && runtime.menu_key(MenuKey::Bar)) || changed {
                     blit(runtime, root, ORIGIN_KEY);
                 }
             }
