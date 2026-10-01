@@ -108,7 +108,8 @@ enum Phase {
     Pressing { start: Point, held: f64, still: bool },
     /// The finger slides content.
     Panning { start: Point },
-    /// A long press opened a menu: the rest of this touch is spent.
+    /// The rest of this touch is spent: a long press opened a menu, or
+    /// the finger is what is left of a pinch.
     Swallowed,
     /// The finger lifted at speed; content keeps sliding on the clock.
     Flinging { anchor: Point, velocity: (Px, Px) },
@@ -420,16 +421,17 @@ impl Recognizer {
     }
 
     /// After a finger leaves a pinch: two or more left re-anchor the
-    /// span (no jump); one left is a fresh touch of its own, undecided
-    /// where it stands; none is rest.
+    /// span (no jump); none is rest; and the one finger left was half of
+    /// a zoom, so it is spent until it lifts. As a fresh touch it ended
+    /// every pinch in a tap where the last finger stood — and on a map a
+    /// tap walks there.
     fn after_pinch_lift(&mut self) -> Vec<Gesture> {
         match self.fingers.len() {
             0 => self.phase = Phase::Idle,
             1 => {
-                let start = self.fingers[0].at;
                 self.pending = (0.0, 0.0);
                 self.samples.clear();
-                self.phase = Phase::Undecided { start, taps: 1, held: 0.0 };
+                self.phase = Phase::Swallowed;
             }
             _ => self.phase = Phase::Pinching { span: self.spread() },
         }
@@ -681,15 +683,24 @@ mod tests {
     }
 
     #[test]
-    fn lifting_one_finger_of_two_hands_the_touch_to_the_other() {
+    fn the_finger_left_from_a_pinch_is_spent_until_it_lifts() {
         let mut touch = Recognizer::new();
         touch.began(1, p(100.0, 100.0), 1, &LIST);
         touch.began(2, p(200.0, 100.0), 1, &LIST);
-        assert!(touch.ended(2, p(200.0, 100.0)).is_empty());
-        // the remaining finger starts over where it stands: a drag
-        // from here pans from here, and a still lift is a tap here
-        let out = touch.moved(1, p(100.0, 60.0));
-        assert_eq!(out, vec![Gesture::Scroll { anchor: p(100.0, 100.0), dx: 0.0, dy: -40.0 }]);
+        assert_eq!(touch.moved(2, p(300.0, 100.0)), vec![Gesture::Magnify { at: p(200.0, 100.0), scale: 2.0 }]);
+        assert!(touch.ended(2, p(300.0, 100.0)).is_empty());
+        // the finger left was half of the zoom: it does not pan, the
+        // hold ages into nothing, and a still lift is no tap
+        assert!(touch.moved(1, p(100.0, 60.0)).is_empty());
+        assert!(touch.tick(LONG_PRESS + 0.1, &LIST).is_empty());
+        assert!(touch.ended(1, p(100.0, 60.0)).is_empty());
+        // and the next touch is a touch again
+        touch.began(3, p(50.0, 50.0), 1, &FLAT);
+        assert_eq!(
+            touch.ended(3, p(50.0, 50.0)),
+            vec![Gesture::Release { at: p(50.0, 50.0) }],
+            "a press, then its lift",
+        );
     }
 
     #[test]
