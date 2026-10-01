@@ -137,9 +137,12 @@ hands every touch to `bunny_touch`, and the recognizer the iOS and
 Android shells feed decides what it meant — a pan slides the list and
 flings on after the lift, a tap presses, a held finger opens a menu —
 so a drag over the rows scrolls them instead of sweeping a selection.
-The software keyboard opens inside the finger's own `touchend`, the one
-moment iOS grants a focus its keys, and that lift's default is spent so
-no compatibility `mousedown` can take the focus back. The scene lays
-itself out above the keys (`bunny_keyboard`, read off the visual
-viewport), and a keyboard the reader puts away — iOS's Done, Android's
-back key — lets the field go (`bunny_keyboard_dismissed`).
+The software keyboard opens with the tap's own `click`, the one gesture
+every phone grants a focus its keys (an iPhone grants nothing to a
+`touchend`), and the compatibility `mousedown` before it no longer
+takes the focus back while the keyboard is taking text. On a device a
+finger drives, nothing focuses the editable outside a tap, so every tap
+finds a focus of its own to take. The scene lays itself out above the
+keys (`bunny_keyboard`, read off the visual viewport), and a keyboard
+the reader puts away — iOS's Done, Android's back key — lets the field
+go (`bunny_keyboard_dismissed`).
