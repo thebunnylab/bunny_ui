@@ -4590,6 +4590,50 @@ mod tests {
         }
     }
 
+    /// The other half of the border: every export a glue calls is one
+    /// the shell defines. A glue asks for the newer doors before it uses
+    /// them (`if (wasm.bunny_touch)`), so a renamed export never fails a
+    /// load — the page quietly takes the older road, and a finger on a
+    /// phone is a mouse that drags again. This reads the calls off the
+    /// glues and looks for each among the shell's `extern "C"` doors.
+    #[test]
+    fn every_export_a_glue_calls_is_a_door_the_shell_defines() {
+        let shell = [
+            include_str!("../../bunny_ui_web/src/lib.rs"),
+            include_str!("../../bunny_ui_web/src/gpu.rs"),
+        ]
+        .concat();
+        let glues = [
+            ("glue.js", include_str!("../../bunny_ui_web/glue/glue.js")),
+            ("glue_gl.js", include_str!("../../bunny_ui_web/glue/glue_gl.js")),
+            ("glue_dom.js", include_str!("../../bunny_ui_web/glue/glue_dom.js")),
+            ("esm/bunny.js", include_str!("../../bunny_ui_web/glue/esm/bunny.js")),
+            ("esm/bunny_gpu.js", include_str!("../../bunny_ui_web/glue/esm/bunny_gpu.js")),
+        ];
+        let mut asked = 0;
+        for (file, source) in glues {
+            // a member access `.bunny_<name>` is a call into the exports
+            for (at, _) in source.match_indices(".bunny_") {
+                let name: String = source[at + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                asked += 1;
+                assert!(
+                    shell.contains(&format!("pub extern \"C\" fn {name}(")),
+                    "{file} calls `{name}`, which the shell does not export"
+                );
+            }
+        }
+        assert!(asked > 60, "the export scan found too few calls: {asked}");
+        // the phone's doors are among them, on both canvas roads
+        for name in ["bunny_touch", "bunny_keyboard", "bunny_keyboard_dismissed"] {
+            for glue in [glues[0].1, glues[3].1] {
+                assert!(glue.contains(&format!(".{name}(")), "a canvas glue never calls `{name}`");
+            }
+        }
+    }
+
     /// The canonical glue lives beside the shell crate; every app
     /// ships a byte-identical copy. One diverging copy is a fork of
     /// the wire contract — this keeps the fleet on one file.
