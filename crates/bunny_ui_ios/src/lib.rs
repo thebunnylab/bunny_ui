@@ -263,6 +263,21 @@ impl App {
         if self.inner.opened.get() { vec![WindowId(1)] } else { Vec::new() }
     }
 
+    /// Files the app's menus into UIKit's main menu — the iPad's menu bar,
+    /// and the ⌘-hold sheet on any iPhone or iPad with a keyboard —
+    /// replacing the menus filed before. Call it again when the keys behind
+    /// the rows change.
+    ///
+    /// UIKit's own menus keep their rows and take the app's after them; a
+    /// menu UIKit has not stands in the bar's order; Settings files where
+    /// UIKit keeps it, Quit is the system's (`bunny_ui_apple::uikit_menu`
+    /// says why, rule by rule). A row runs through the keymap first — UIKit
+    /// matches a key command before the view hears the key — and a row the
+    /// window does not answer is dark.
+    pub fn set_menu_bar(&self, bar: &bunny_ui::menu::MenuBar) {
+        ffi::install_menu_bar(bunny_ui_apple::uikit_menu::arrange(bar));
+    }
+
     /// What to let go of when the system asks for memory back — the
     /// image caches, a thumbnail store. [`run_window`] drops the engine's.
     pub fn on_memory_warning(&self, release: impl Fn() + 'static) {
@@ -562,14 +577,12 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
     // straight through to whoever holds the keyboard AND is taking text
     // (typing is never stolen); a binding with no handler mounted does
     // not consume
-    let key_gate: Box<dyn FnMut(&ffi::KeyStroke) -> bool> = Box::new({
+    let offer: Rc<dyn Fn(Stroke) -> bool> = Rc::new({
         let runtime = Rc::clone(&runtime);
         let root = Rc::clone(&root);
         let blit = blit.clone();
-        move |stroke: &ffi::KeyStroke| {
-            let Some(pattern) = key_pattern(stroke) else {
-                return false;
-            };
+        move |stroke: Stroke| {
+            let pattern = stroke.pattern;
             // MID-CHORD the keyboard belongs to the keymap: the stroke
             // that finishes `cmd-k s` is not typing
             let mid_chord = !runtime.pending_chord().is_empty();
@@ -578,7 +591,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
             }
             // a focused escape hatch owns its strokes: an editor's
             // arrows, Enter and Tab are its own
-            let taken = runtime.key_stroke(Stroke::new(pattern, stroke.typed));
+            let taken = runtime.key_stroke(stroke);
             if taken.handled {
                 if let Some(text) = taken.text {
                     ffi::clipboard_write(&text);
@@ -600,7 +613,7 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                 blit(&runtime, &*root);
                 return true;
             }
-            let action = match runtime.chord(Stroke::new(pattern, stroke.typed)) {
+            let action = match runtime.chord(stroke) {
                 KeyMatch::Action(action) => action,
                 KeyMatch::Pending => {
                     blit(&runtime, &*root);
@@ -616,6 +629,38 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
             }
         }
     });
+    let key_gate: Box<dyn FnMut(&ffi::KeyStroke) -> bool> = Box::new({
+        let offer = Rc::clone(&offer);
+        move |stroke: &ffi::KeyStroke| {
+            key_pattern(stroke).is_some_and(|pattern| offer(Stroke::new(pattern, stroke.typed)))
+        }
+    });
+
+    // the main menu's rows: UIKit matched the key command BEFORE the view
+    // heard the key, so a row offers its own stroke to the keymap first — a
+    // pending chord, a scoped binding, a rebind keep their strokes — and
+    // runs only what the keymap declined; a click on the row takes the same
+    // road, which is the same answer
+    ffi::set_menu_gate(Box::new({
+        let runtime = Rc::clone(&runtime);
+        let root = Rc::clone(&root);
+        let blit = blit.clone();
+        let offer = Rc::clone(&offer);
+        move |pick, stroke: Option<KeyPattern>| {
+            if stroke.is_some_and(|stroke| offer(Stroke::from(stroke))) {
+                return true;
+            }
+            let ran = runtime.menu_pick(pick);
+            if ran {
+                blit(&runtime, &*root);
+            }
+            ran
+        }
+    }));
+    ffi::set_menu_answers(Box::new({
+        let runtime = Rc::clone(&runtime);
+        move |pick| runtime.menu_answers(pick)
+    }));
 
     // everything a page reports lands here and runs the matching
     // runtime door; a door that ran a retained writer re-presents
