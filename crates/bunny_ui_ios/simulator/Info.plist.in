@@ -34,6 +34,16 @@
     <true/>
     <key>MinimumOSVersion</key>
     <string>17.0</string>
+    <!-- The scene life cycle: the shell builds its window when a scene
+         connects, and an app built with the iOS 27 SDK that declares no
+         manifest is trapped by UIKit before its launch returns. The
+         delegate class is named by the shell itself, not here; one scene,
+         because the screen is the window. -->
+    <key>UIApplicationSceneManifest</key>
+    <dict>
+        <key>UIApplicationSupportsMultipleScenes</key>
+        <false/>
+    </dict>
     <key>UIDeviceFamily</key>
     <array>
         <integer>1</integer>

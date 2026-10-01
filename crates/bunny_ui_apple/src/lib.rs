@@ -20,6 +20,7 @@ pub mod metal;
 pub mod notifications;
 pub mod text;
 pub mod trace;
+pub mod uikit_menu;
 pub mod webview;
 
 pub use image::CoreGraphicsImageEngine;
