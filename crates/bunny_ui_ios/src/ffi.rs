@@ -1110,6 +1110,13 @@ const INLINE: u64 = 1;
 /// `UIMenuElementAttributesDisabled`.
 const DISABLED: u64 = 1;
 
+/// Runs a chosen row, with the single stroke it stands for: `true` = it
+/// ran (or the keymap took the stroke first).
+pub type MenuGate = Box<dyn FnMut(Pick, Option<KeyPattern>) -> bool>;
+
+/// Says whether the window answers a row now.
+pub type MenuAnswers = Box<dyn Fn(Pick) -> bool>;
+
 thread_local! {
     /// The app's main menu, as `buildMenuWithBuilder:` will file it.
     static MENU: RefCell<Option<UiArrangement>> = const { RefCell::new(None) };
@@ -1118,10 +1125,9 @@ thread_local! {
     static MENU_ROWS: RefCell<Vec<(Pick, Option<KeyPattern>)>> = const { RefCell::new(Vec::new()) };
     /// Runs a chosen row: its stroke offered to the keymap first, the row
     /// after — installed by the shell, which holds the runtime.
-    static MENU_GATE: RefCell<Option<Box<dyn FnMut(Pick, Option<KeyPattern>) -> bool>>> =
-        const { RefCell::new(None) };
+    static MENU_GATE: RefCell<Option<MenuGate>> = const { RefCell::new(None) };
     /// Does the window answer a row now?
-    static MENU_ANSWERS: RefCell<Option<Box<dyn Fn(Pick) -> bool>>> = const { RefCell::new(None) };
+    static MENU_ANSWERS: RefCell<Option<MenuAnswers>> = const { RefCell::new(None) };
 }
 
 /// Files `menu` as the app's main menu; UIKit rebuilds it now if the app
@@ -1140,12 +1146,12 @@ pub fn install_menu_bar(menu: UiArrangement) {
 }
 
 /// Registers who runs a chosen row.
-pub fn set_menu_gate(gate: Box<dyn FnMut(Pick, Option<KeyPattern>) -> bool>) {
+pub fn set_menu_gate(gate: MenuGate) {
     MENU_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
 }
 
 /// Registers who says whether the window answers a row.
-pub fn set_menu_answers(answers: Box<dyn Fn(Pick) -> bool>) {
+pub fn set_menu_answers(answers: MenuAnswers) {
     MENU_ANSWERS.with(|slot| *slot.borrow_mut() = Some(answers));
 }
 
