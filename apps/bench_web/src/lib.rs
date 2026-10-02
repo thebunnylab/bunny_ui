@@ -342,11 +342,15 @@ pub mod keyed {
                 move |seed| KeyedRow { seed: *seed, rows, selected }.element("tr"),
             );
 
+            // the table takes the pane's width: a table left to its
+            // own width is measured whole once for the width and once
+            // more to lay out — a thousand rows twice
             vstack!(
                 controls,
                 hstack!(table.element("tbody"))
                     .element("table")
-                    .css_class("table table-hover table-striped test-data"),
+                    .css_class("table table-hover table-striped test-data")
+                    .frame_max(f64::INFINITY, f64::INFINITY, Alignment::Leading),
             )
             .alignment(HorizontalAlignment::Leading)
             .frame(900.0, 800.0)
