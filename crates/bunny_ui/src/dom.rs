@@ -1077,9 +1077,10 @@ impl DomLowering {
     }
 
     /// The retained Groups' identity paths — the flow walk consults
-    /// them before promising a reuse.
-    pub(crate) fn group_paths(&self) -> std::collections::HashSet<std::rc::Rc<str>> {
-        self.group_paths.clone()
+    /// them before promising a reuse. Borrowed, never copied: a frame
+    /// asks for a thousand rows' worth of them.
+    pub(crate) fn group_paths(&self) -> &std::collections::HashSet<std::rc::Rc<str>> {
+        &self.group_paths
     }
 
     /// Does the retained scene hold any canvas island? The runtime

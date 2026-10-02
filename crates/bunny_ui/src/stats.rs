@@ -70,8 +70,12 @@ pub struct FrameStats {
     pub measure_hits: u32,
     /// Text measurements that reached the text engine.
     pub measure_misses: u32,
-    /// Times a pass rebuilt the tables the input doors read.
+    /// Times a pass rebuilt a DERIVED table the input doors read (the
+    /// handlers, the key contexts).
     pub assemblies: u32,
+    /// Retained entries whose registrations entered the live tables —
+    /// one per body that closed an entry.
+    pub entries_indexed: u32,
     /// Second layouts the pointer re-read asked for.
     pub hover_relayouts: u32,
     /// Calls to an app box's `paint`.
@@ -115,6 +119,7 @@ thread_local! {
     static MEASURE_HITS: Cell<u32> = const { Cell::new(0) };
     static MEASURE_MISSES: Cell<u32> = const { Cell::new(0) };
     static ASSEMBLIES: Cell<u32> = const { Cell::new(0) };
+    static ENTRIES_INDEXED: Cell<u32> = const { Cell::new(0) };
     static HOVER_RELAYOUTS: Cell<u32> = const { Cell::new(0) };
     static PAINTS: Cell<u32> = const { Cell::new(0) };
     static PICTURES_REPLAYED: Cell<u32> = const { Cell::new(0) };
@@ -149,6 +154,7 @@ pub fn take() -> FrameStats {
         measure_hits: MEASURE_HITS.with(|c| c.replace(0)),
         measure_misses: MEASURE_MISSES.with(|c| c.replace(0)),
         assemblies: ASSEMBLIES.with(|c| c.replace(0)),
+        entries_indexed: ENTRIES_INDEXED.with(|c| c.replace(0)),
         hover_relayouts: HOVER_RELAYOUTS.with(|c| c.replace(0)),
         paints: PAINTS.with(|c| c.replace(0)),
         pictures_replayed: PICTURES_REPLAYED.with(|c| c.replace(0)),
@@ -223,6 +229,11 @@ pub(crate) fn note_encode(patches: usize, bytes: usize) {
 #[inline]
 pub(crate) fn note_assembly() {
     bump(&ASSEMBLIES, 1);
+}
+
+#[inline]
+pub(crate) fn note_entry_indexed() {
+    bump(&ENTRIES_INDEXED, 1);
 }
 
 #[inline]

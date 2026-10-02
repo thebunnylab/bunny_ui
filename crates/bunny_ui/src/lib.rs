@@ -3243,7 +3243,7 @@ mod tests {
 
             counter.label.set(7);
             let _ = runtime.display_frame(&counter, size);
-            assert!(crate::stats::take().assemblies >= 1, "a body ran: the tables follow it");
+            assert!(crate::stats::take().entries_indexed >= 1, "a body ran: its registrations entered the tables");
             runtime.pointer_clicked(100.0, 30.0, 1, false);
             runtime.pointer_released(100.0, 30.0);
             assert_eq!(counter.pressed.get(), 7, "the new closure answers the same frame");

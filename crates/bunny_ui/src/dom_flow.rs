@@ -72,6 +72,7 @@ pub(crate) struct FlowOutput {
 pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
     let mut walk = Walk {
         env,
+        changed: ChangedIndex::new(env.changed),
         ink: Vec::new(),
         ink_scopes: Vec::new(),
         font: FontSpec::DEFAULT,
@@ -123,8 +124,44 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
     }
 }
 
+/// The bodies that ran this frame, indexed for the one question a
+/// boundary asks: did a run touch me — at my path, under it, or above
+/// it? Three lookups per level answer it, whatever the number of runs;
+/// the list of a thousand rows that each ran used to be scanned once
+/// per boundary the walk met.
+struct ChangedIndex<'a> {
+    /// The runs themselves.
+    exact: motor::hash::FxHashSet<&'a str>,
+    /// Every boundary with a run somewhere under it.
+    above_a_run: motor::hash::FxHashSet<&'a str>,
+}
+
+impl<'a> ChangedIndex<'a> {
+    fn new(changed: &'a [String]) -> Self {
+        let mut exact = motor::hash::FxHashSet::default();
+        let mut above_a_run = motor::hash::FxHashSet::default();
+        for run in changed {
+            exact.insert(run.as_str());
+            for (at, _) in run.match_indices('/') {
+                above_a_run.insert(&run[..at]);
+            }
+        }
+        ChangedIndex { exact, above_a_run }
+    }
+
+    /// Related in EITHER direction dirties: a run below the boundary
+    /// changed its interior; a run above it re-rendered it inline
+    /// (inline renders never reach the body-run ledger on their own).
+    fn touches(&self, path: &str) -> bool {
+        self.exact.contains(path)
+            || self.above_a_run.contains(path)
+            || path.match_indices('/').any(|(at, _)| self.exact.contains(&path[..at]))
+    }
+}
+
 struct Walk<'a> {
     env: &'a FlowEnv<'a>,
+    changed: ChangedIndex<'a>,
     /// The inherited ink — the top colors the text (the capture's
     /// exact rule set rides here unchanged).
     ink: Vec<Color>,
@@ -671,21 +708,7 @@ impl Walk<'_> {
                 // a CLEAN boundary is a promise, not a walk: no body
                 // under it ran, the retained group still holds, and
                 // the diff keeps it wholesale — O(change), by absence
-                if self.env.retained_groups.contains(&**path)
-                    && !self.env.changed.iter().any(|run| {
-                        // related in EITHER direction dirties: a run
-                        // below me changed my interior; a run above me
-                        // re-rendered me inline (inline renders never
-                        // reach the body-run ledger on their own)
-                        let related = |a: &str, b: &str| {
-                            a == b
-                                || (a.len() > b.len()
-                                    && a.as_bytes().starts_with(b.as_bytes())
-                                    && a.as_bytes()[b.len()] == b'/')
-                        };
-                        related(run, path) || related(path, run)
-                    })
-                {
+                if self.env.retained_groups.contains(&**path) && !self.changed.touches(path) {
                     out.push(node(DomKind::Reuse { path: std::rc::Rc::clone(path) }));
                     return;
                 }

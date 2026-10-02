@@ -242,6 +242,225 @@ thread_local! {
     static PASS: RefCell<PassState> = RefCell::new(PassState::default());
     static LAST_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static FRAME_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static LIVE: RefCell<Live> = RefCell::new(Live::default());
+}
+
+// MARK: - The live registry
+
+/// The tables the input doors read, kept TRUE at every change of the
+/// retention instead of rebuilt from it.
+///
+/// A registration enters the retention when a body closes its entry
+/// and leaves it when the entry falls — and those are the only two
+/// moments these tables move. A body that runs in a list of a thousand
+/// used to make every pass walk the thousand entries ten times over to
+/// rebuild what one entry had changed; now the entry's own keys go in
+/// and out, and a pass that ran one body pays for one body.
+///
+/// Paths are unique across every scene on the thread, so the maps hold
+/// all scenes at once. A door that LOOKS UP a path reads them directly;
+/// a door that ENUMERATES (an input by its name, the handles with
+/// commands) keeps to the scene the tables answer for.
+///
+/// Two tables are DERIVED, not kept: the named-action handlers (the
+/// deepest registration wins) and the key contexts (sorted outermost
+/// first). They rebuild only when an entry that carries one is indexed
+/// or dropped — a generation number per kind says when — and from the
+/// entries that carry one, never from the whole retention.
+#[derive(Default)]
+struct Live {
+    actions: HashMap<String, ClickAction>,
+    copies: HashMap<String, CopyFn>,
+    editors: HashMap<String, EditorFn>,
+    splits: HashMap<String, SplitFn>,
+    scrolls: HashMap<String, ScrollFn>,
+    measures: HashMap<String, MeasureFn>,
+    webviews: HashMap<String, WebviewHooks>,
+    /// The app's boxes on screen — paths only.
+    customs: HashSet<String>,
+    /// The subset that answers `accepts_keys` — who may HOLD the
+    /// keyboard, as opposed to who is merely on screen.
+    keyed_customs: HashSet<String>,
+    /// How many action keys are `.on_hover` registrations — a scene with
+    /// none pays nothing for the hover road.
+    hover_keys: usize,
+    /// The entries that carry handlers, contexts and effects: the three
+    /// derived products rebuild from these alone.
+    handler_entries: HashSet<String>,
+    context_entries: HashSet<String>,
+    effect_entries: HashSet<String>,
+    /// Moves when an entry carrying a handler is indexed or dropped.
+    handler_gen: u64,
+    /// The same, for key contexts.
+    context_gen: u64,
+    /// The same, for effects.
+    effect_gen: u64,
+    /// The keys the ROOT REGION of the last assembly put into the maps.
+    /// Those registrations live for one pass: the next assembly takes
+    /// them out before it puts the new region's in.
+    root_keys: RootKeys,
+    /// Entries with no retained boundary above them — the ones only the
+    /// root region mounts, and so the only ones the root region can
+    /// unmount. The sweep reads this instead of searching for them.
+    top_level: HashSet<String>,
+}
+
+#[derive(Default)]
+struct RootKeys {
+    actions: Vec<String>,
+    copies: Vec<String>,
+    editors: Vec<String>,
+    splits: Vec<String>,
+    scrolls: Vec<String>,
+    measures: Vec<String>,
+    webviews: Vec<String>,
+    customs: Vec<String>,
+}
+
+impl Live {
+    fn insert_action(&mut self, key: String, action: ClickAction) {
+        let hover = key.ends_with(HOVER_KEY);
+        if self.actions.insert(key, action).is_none() && hover {
+            self.hover_keys += 1;
+        }
+    }
+
+    fn remove_action(&mut self, key: &str) {
+        if self.actions.remove(key).is_some() && key.ends_with(HOVER_KEY) {
+            self.hover_keys -= 1;
+        }
+    }
+
+    /// Puts one closed entry's registrations into the tables.
+    fn index(&mut self, path: &str, entry: &Entry) {
+        for (key, action) in &entry.actions {
+            self.insert_action(key.clone(), Rc::clone(action));
+        }
+        for (key, copy) in &entry.copies {
+            self.copies.insert(key.clone(), Rc::clone(copy));
+        }
+        for (key, editor) in &entry.editors {
+            self.editors.insert(key.clone(), editor.clone());
+        }
+        for (key, split) in &entry.splits {
+            self.splits.insert(key.clone(), Rc::clone(split));
+        }
+        for (key, scroll) in &entry.scrolls {
+            self.scrolls.insert(key.clone(), Rc::clone(scroll));
+        }
+        for (key, measure) in &entry.measures {
+            self.measures.insert(key.clone(), Rc::clone(measure));
+        }
+        for (key, hooks) in &entry.webviews {
+            self.webviews.insert(key.clone(), hooks.clone());
+        }
+        for (key, accepts_keys) in &entry.customs {
+            self.customs.insert(key.clone());
+            if *accepts_keys {
+                self.keyed_customs.insert(key.clone());
+            }
+        }
+        if !entry.handlers.is_empty() && self.handler_entries.insert(path.to_string()) {
+            self.handler_gen += 1;
+        }
+        if !entry.contexts.is_empty() && self.context_entries.insert(path.to_string()) {
+            self.context_gen += 1;
+        }
+        if !entry.effects.is_empty() && self.effect_entries.insert(path.to_string()) {
+            self.effect_gen += 1;
+        }
+    }
+
+    /// Takes one dropped entry's registrations out. A key belongs to the
+    /// one boundary that renders its position, so nothing else can hold
+    /// the same key while this entry does.
+    fn unindex(&mut self, path: &str, entry: &Entry) {
+        for (key, _) in &entry.actions {
+            self.remove_action(key);
+        }
+        for (key, _) in &entry.copies {
+            self.copies.remove(key);
+        }
+        for (key, _) in &entry.editors {
+            self.editors.remove(key);
+        }
+        for (key, _) in &entry.splits {
+            self.splits.remove(key);
+        }
+        for (key, _) in &entry.scrolls {
+            self.scrolls.remove(key);
+        }
+        for (key, _) in &entry.measures {
+            self.measures.remove(key);
+        }
+        for (key, _) in &entry.webviews {
+            self.webviews.remove(key);
+        }
+        for (key, _) in &entry.customs {
+            self.customs.remove(key);
+            self.keyed_customs.remove(key);
+        }
+        if self.handler_entries.remove(path) {
+            self.handler_gen += 1;
+        }
+        if self.context_entries.remove(path) {
+            self.context_gen += 1;
+        }
+        if self.effect_entries.remove(path) {
+            self.effect_gen += 1;
+        }
+        self.top_level.remove(path);
+    }
+
+    /// Takes the last root region's registrations back out.
+    fn drop_root_region(&mut self) {
+        let keys = std::mem::take(&mut self.root_keys);
+        for key in &keys.actions {
+            self.remove_action(key);
+        }
+        for key in &keys.copies {
+            self.copies.remove(key);
+        }
+        for key in &keys.editors {
+            self.editors.remove(key);
+        }
+        for key in &keys.splits {
+            self.splits.remove(key);
+        }
+        for key in &keys.scrolls {
+            self.scrolls.remove(key);
+        }
+        for key in &keys.measures {
+            self.measures.remove(key);
+        }
+        for key in &keys.webviews {
+            self.webviews.remove(key);
+        }
+        for key in &keys.customs {
+            self.customs.remove(key);
+            self.keyed_customs.remove(key);
+        }
+    }
+}
+
+/// Is a `/`-separated path's proper prefix `at` a cut between two
+/// segments? Every `/` is — a row key may hold a `/` of its own, which
+/// makes a cut that names no boundary, and a lookup that finds nothing
+/// there is harmless.
+fn cuts(path: &str) -> impl Iterator<Item = &str> {
+    path.match_indices('/').map(move |(at, _)| &path[..at])
+}
+
+/// Does the path have a retained boundary, or one being built, above
+/// it? A top-level entry has neither: only the root region mounts it,
+/// so only the root region can unmount it.
+fn is_top_level(path: &str, building: &[BuildingFrame]) -> bool {
+    RETAINED.with(|retained| {
+        let retained = retained.borrow();
+        !cuts(path).any(|prefix| {
+            retained.contains_key(prefix) || building.iter().any(|frame| frame.path == prefix)
+        })
+    })
 }
 
 /// A boundary's place in the retention, as a node of the layout tree
@@ -506,23 +725,30 @@ pub(crate) fn finish_entry(
             }
         });
     let parent_segments = motor::identity::parent_seed();
+    // a top-level entry is known by what stands above it — and the
+    // boundaries still building have no entry yet, so they are asked too
+    let top_level = PASS.with(|pass| is_top_level(path, &pass.borrow().building));
     RETAINED.with(|retained| {
         let mut retained = retained.borrow_mut();
-        // the slot is as old as the path: the entry of the last run goes
-        // FIRST (its drop empties the slot), then the slot is filled again,
-        // so a parent that did not re-run refers to the tree of today
-        let slot = match retained.remove(path) {
-            Some(old) => Rc::clone(&old.slot),
-            None => Slot::empty(),
-        };
-        slot.held.replace(Some(Rc::new(Held {
-            layout,
-            measures_kept: RefCell::new(Vec::new()),
-            quiet: std::cell::OnceCell::new(),
-        })));
-        retained.insert(
-            path.to_string(),
-            Entry {
+        LIVE.with(|live| {
+            let mut live = live.borrow_mut();
+            // the slot is as old as the path: the entry of the last run
+            // goes FIRST (its registrations leave the tables, its drop
+            // empties the slot), then the slot is filled again, so a
+            // parent that did not re-run refers to the tree of today
+            let slot = match retained.remove(path) {
+                Some(old) => {
+                    live.unindex(path, &old);
+                    Rc::clone(&old.slot)
+                }
+                None => Slot::empty(),
+            };
+            slot.held.replace(Some(Rc::new(Held {
+                layout,
+                measures_kept: RefCell::new(Vec::new()),
+                quiet: std::cell::OnceCell::new(),
+            })));
+            let entry = Entry {
                 value,
                 ctx,
                 node,
@@ -539,12 +765,17 @@ pub(crate) fn finish_entry(
                 handlers,
                 contexts,
                 parent_segments,
-            },
-        );
+            };
+            // a body ran and its registrations are new closures: they
+            // replace the old ones in the tables the doors read, now
+            live.index(path, &entry);
+            crate::stats::note_entry_indexed();
+            if top_level {
+                live.top_level.insert(path.to_string());
+            }
+            retained.insert(path.to_string(), entry);
+        });
     });
-    // a body ran and its registrations are new closures: the tables
-    // built from the old entry are stale
-    bump_retention();
     // …and so is every measure kept ABOVE it. The outermost re-run of a
     // pass does this once: the boundaries between it and the ones it
     // re-ran below are new entries themselves.
@@ -693,13 +924,24 @@ thread_local! {
     static DECLARED_CONTEXTS: RefCell<Vec<ContextEntry>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Rebuilds the active contexts from the retention (the live
-/// declarations) — the twin of the handler assembly.
+/// The retained entries under `root` that carry the kind of registration
+/// `carriers` names, in path order — what a derived table rebuilds from.
+fn carriers_under(root: &str, carriers: impl FnOnce(&Live) -> Vec<String>) -> Vec<String> {
+    let mut paths = LIVE.with(|live| carriers(&live.borrow()));
+    paths.retain(|path| covers(root, path));
+    paths.sort();
+    paths
+}
+
+/// Rebuilds the active contexts from the entries that declare one —
+/// the twin of the handler assembly.
 pub(crate) fn assemble_contexts(root: &str) {
     let mut declared: Vec<ContextEntry> = Vec::new();
+    let carriers = carriers_under(root, |live| live.context_entries.iter().cloned().collect());
     RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
+        let retained = retained.borrow();
+        for path in &carriers {
+            if let Some(entry) = retained.get(path) {
                 declared.extend(entry.contexts.iter().cloned());
             }
         }
@@ -793,11 +1035,11 @@ thread_local! {
         RefCell::new(HashMap::default());
 }
 
-/// Reassembles the handler map from the retention under the root + the
-/// root region. Precedence: the DEEPEST path wins (innermost in the
-/// tree); a depth tie → the last one mounted (deterministic from the
-/// retention order, documented as NON-contractual — the semantic
-/// tiebreak arrives with key contexts).
+/// Reassembles the handler map from the entries under the root that
+/// carry one + the root region. Precedence: the DEEPEST path wins
+/// (innermost in the tree); a depth tie → the last one mounted
+/// (deterministic from the path order, documented as NON-contractual —
+/// the semantic tiebreak arrives with key contexts).
 pub(crate) fn assemble_handlers(root: &str) {
     let mut map: HashMap<crate::action::ActionId, (usize, HandlerFn)> = HashMap::default();
     let place = |map: &mut HashMap<crate::action::ActionId, (usize, HandlerFn)>,
@@ -812,9 +1054,11 @@ pub(crate) fn assemble_handlers(root: &str) {
             }
         }
     };
+    let carriers = carriers_under(root, |live| live.handler_entries.iter().cloned().collect());
     RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
+        let retained = retained.borrow();
+        for path in &carriers {
+            if let Some(entry) = retained.get(path) {
                 for (key, id, handler) in &entry.handlers {
                     place(&mut map, key, *id, handler.clone());
                 }
@@ -900,14 +1144,16 @@ fn covers(ancestor: &str, path: &str) -> bool {
         && (path.len() == ancestor.len() || path.as_bytes()[ancestor.len()] == b'/')
 }
 
-/// The pass's effect queue: the root region + the whole retention under
-/// the current root (skipped or not — a retained effect is a live
-/// subscription).
+/// The pass's effect queue: the root region + every retained entry
+/// under the current root that carries one (skipped or not — a retained
+/// effect is a live subscription), in path order.
 pub(crate) fn assemble_effects(root: &str) -> Vec<EffectFn> {
     let mut queue = PASS.with(|pass| std::mem::take(&mut pass.borrow_mut().root_effects));
+    let carriers = carriers_under(root, |live| live.effect_entries.iter().cloned().collect());
     RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
+        let retained = retained.borrow();
+        for path in &carriers {
+            if let Some(entry) = retained.get(path) {
                 queue.extend(entry.effects.iter().cloned());
             }
         }
@@ -915,54 +1161,25 @@ pub(crate) fn assemble_effects(root: &str) -> Vec<EffectFn> {
     queue
 }
 
-thread_local! {
-    /// The live click map: target path → action, which takes the
-    /// platform's click count. Reassembled on every pass, like the
-    /// effect queue.
-    static ACTIONS: RefCell<HashMap<String, ClickAction>> = RefCell::new(HashMap::default());
+/// Is the path inside the scene the tables answer for? A door that
+/// enumerates a table asks this, so a thread with two windows never
+/// answers one window's question with the other's registrations. A
+/// door that looks one path up never needs to: paths are unique.
+fn in_scene(path: &str) -> bool {
+    ASSEMBLED_ROOT.with(|root| root.borrow().as_deref().is_none_or(|root| covers(root, path)))
 }
 
-/// Reassembles the click map from the retention under the root (a
-/// skipped view's button stays clickable) + the root region.
-pub(crate) fn assemble_actions(root: &str) {
-    let mut map: HashMap<String, ClickAction> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, action) in &entry.actions {
-                    map.insert(key.clone(), action.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, action) in std::mem::take(&mut pass.borrow_mut().root_actions) {
-            map.insert(key, action);
-        }
-    });
-    // a scene with no `.on_hover` pays nothing for one: the runtime
-    // asks this before it copies a path to compare against
-    let watched = map.keys().any(|key| key.ends_with(HOVER_KEY));
-    HOVER_WATCHED.with(|flag| flag.set(watched));
-    ACTIONS.with(|actions| *actions.borrow_mut() = map);
-}
-
-thread_local! {
-    static HOVER_WATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Does any view on screen want to hear the pointer arrive? Answered
-/// once per pass, so the hover road can cost nothing at all in a scene
-/// that never asked.
+/// Does any view on screen want to hear the pointer arrive? One read,
+/// so the hover road costs nothing at all in a scene that never asked.
 pub(crate) fn hover_watched() -> bool {
-    HOVER_WATCHED.with(|flag| flag.get())
+    LIVE.with(|live| live.borrow().hover_keys > 0)
 }
 
 /// Fires the target's action (the key comes from the hit-test).
 /// `false` = target not registered (the identity died between frame and
 /// click — harmless).
 pub(crate) fn run_action(path: &str, clicks: u8) -> bool {
-    let action = ACTIONS.with(|actions| actions.borrow().get(path).cloned());
+    let action = LIVE.with(|live| live.borrow().actions.get(path).cloned());
     match action {
         Some(action) => {
             action(clicks);
@@ -972,40 +1189,13 @@ pub(crate) fn run_action(path: &str, clicks: u8) -> bool {
     }
 }
 
-thread_local! {
-    /// The live copy map: target path → what a ⌘C there answers.
-    /// Reassembled on every pass, like the click map.
-    static COPIES: RefCell<HashMap<String, CopyFn>> = RefCell::new(HashMap::default());
-}
-
-/// Reassembles the copy map from the retention under the root (a
-/// skipped view's table still copies) + the root region.
-pub(crate) fn assemble_copies(root: &str) {
-    let mut map: HashMap<String, CopyFn> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, copy) in &entry.copies {
-                    map.insert(key.clone(), copy.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, copy) in std::mem::take(&mut pass.borrow_mut().root_copies) {
-            map.insert(key, copy);
-        }
-    });
-    COPIES.with(|copies| *copies.borrow_mut() = map);
-}
-
 /// The view that answers a copy for a press at `path`: the path itself
 /// or its nearest ancestor that registered `.on_copy`. A click on a row
 /// hands the keyboard to the table the row belongs to.
 pub(crate) fn copy_owner(path: &str) -> Option<String> {
-    COPIES.with(|copies| {
-        copies
-            .borrow()
+    LIVE.with(|live| {
+        live.borrow()
+            .copies
             .keys()
             .filter(|owner| covers(owner, path))
             .max_by_key(|owner| owner.len())
@@ -1016,7 +1206,7 @@ pub(crate) fn copy_owner(path: &str) -> Option<String> {
 /// Does the view at `path` answer a copy? A focus that lands on one
 /// holds the keyboard with no caret.
 pub(crate) fn answers_copy(path: &str) -> bool {
-    COPIES.with(|copies| copies.borrow().contains_key(path))
+    LIVE.with(|live| live.borrow().copies.contains_key(path))
 }
 
 /// What the `.on_copy` at `path` answers now — `None` when nothing is
@@ -1024,123 +1214,8 @@ pub(crate) fn answers_copy(path: &str) -> bool {
 pub(crate) fn run_copy(path: &str) -> Option<Option<String>> {
     // outside the borrow: the answer reads the app's state, which may
     // read the runtime back
-    let copy = COPIES.with(|copies| copies.borrow().get(path).cloned())?;
+    let copy = LIVE.with(|live| live.borrow().copies.get(path).cloned())?;
     Some(copy())
-}
-
-thread_local! {
-    /// The live field-editor map — reassembled per pass, like the
-    /// actions.
-    static EDITORS: RefCell<HashMap<String, EditorFn>> = RefCell::new(HashMap::default());
-    static SPLITS: RefCell<HashMap<String, SplitFn>> = RefCell::new(HashMap::default());
-    static SCROLLS: RefCell<HashMap<String, ScrollFn>> = RefCell::new(HashMap::default());
-    static MEASURES: RefCell<HashMap<String, MeasureFn>> = RefCell::new(HashMap::default());
-    static WEBVIEWS: RefCell<HashMap<String, WebviewHooks>> = RefCell::new(HashMap::default());
-    /// The app's boxes on screen this pass — paths only.
-    static CUSTOMS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
-    /// The subset that answers `accepts_keys` — who may HOLD the
-    /// keyboard, as opposed to who is merely on screen.
-    static KEYED_CUSTOMS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
-}
-
-/// Reassembles the editor map from retention under the root + root region.
-pub(crate) fn assemble_editors(root: &str) {
-    let mut map: HashMap<String, EditorFn> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, editor) in &entry.editors {
-                    map.insert(key.clone(), editor.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, editor) in std::mem::take(&mut pass.borrow_mut().root_editors) {
-            map.insert(key, editor);
-        }
-    });
-    EDITORS.with(|editors| *editors.borrow_mut() = map);
-}
-
-/// Reassembles the split map from retention — the editors' twin.
-pub(crate) fn assemble_splits(root: &str) {
-    let mut map: HashMap<String, SplitFn> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, split) in &entry.splits {
-                    map.insert(key.clone(), split.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, split) in std::mem::take(&mut pass.borrow_mut().root_splits) {
-            map.insert(key, split);
-        }
-    });
-    SPLITS.with(|splits| *splits.borrow_mut() = map);
-}
-
-/// The scroll-offset writers, assembled the same way.
-pub(crate) fn assemble_scrolls(root: &str) {
-    let mut map: HashMap<String, ScrollFn> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, scroll) in &entry.scrolls {
-                    map.insert(key.clone(), scroll.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, scroll) in std::mem::take(&mut pass.borrow_mut().root_scrolls) {
-            map.insert(key, scroll);
-        }
-    });
-    SCROLLS.with(|scrolls| *scrolls.borrow_mut() = map);
-}
-
-/// The measurement probes, assembled the same way.
-pub(crate) fn assemble_measures(root: &str) {
-    let mut map: HashMap<String, MeasureFn> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, measure) in &entry.measures {
-                    map.insert(key.clone(), measure.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, measure) in std::mem::take(&mut pass.borrow_mut().root_measures) {
-            map.insert(key, measure);
-        }
-    });
-    MEASURES.with(|measures| *measures.borrow_mut() = map);
-}
-
-/// The webview hooks, assembled the same way.
-pub(crate) fn assemble_webviews(root: &str) {
-    let mut map: HashMap<String, WebviewHooks> = HashMap::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (key, hooks) in &entry.webviews {
-                    map.insert(key.clone(), hooks.clone());
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (key, hooks) in std::mem::take(&mut pass.borrow_mut().root_webviews) {
-            map.insert(key, hooks);
-        }
-    });
-    WEBVIEWS.with(|webviews| *webviews.borrow_mut() = map);
 }
 
 /// Hands one page report to its retained writer — cloned out of the
@@ -1151,8 +1226,7 @@ fn run_webview_report(
     pick: impl Fn(&WebviewHooks) -> Option<WebviewReport>,
     line: &str,
 ) -> bool {
-    let report =
-        WEBVIEWS.with(|webviews| webviews.borrow().get(path).and_then(|hooks| pick(hooks)));
+    let report = LIVE.with(|live| live.borrow().webviews.get(path).and_then(|hooks| pick(hooks)));
     match report {
         Some(report) => {
             report(line);
@@ -1174,8 +1248,8 @@ pub(crate) fn run_webview_changed(path: &str, html: &str) -> bool {
 
 /// A paste the app owns, to the document's `on_paste`.
 pub(crate) fn run_webview_pasted(path: &str, html: &str, text: &str) -> bool {
-    let report = WEBVIEWS
-        .with(|webviews| webviews.borrow().get(path).and_then(|hooks| hooks.pasted.clone()));
+    let report =
+        LIVE.with(|live| live.borrow().webviews.get(path).and_then(|hooks| hooks.pasted.clone()));
     match report {
         Some(report) => {
             report(html, text);
@@ -1193,8 +1267,8 @@ pub(crate) fn run_webview_navigated(path: &str, url: &str) -> bool {
 /// A refused load, to the page's `on_navigate_failed` — the report
 /// door with two words instead of one.
 pub(crate) fn run_webview_failed(path: &str, url: &str, why: &str) -> bool {
-    let report = WEBVIEWS
-        .with(|webviews| webviews.borrow().get(path).and_then(|hooks| hooks.failed.clone()));
+    let report =
+        LIVE.with(|live| live.borrow().webviews.get(path).and_then(|hooks| hooks.failed.clone()));
     match report {
         Some(report) => {
             report(url, why);
@@ -1219,26 +1293,31 @@ pub(crate) fn run_webview_requested(path: &str, line: &str) -> bool {
     run_webview_report(path, |hooks| hooks.requested.clone(), line)
 }
 
-/// Does any handle hold a command the shell did not spend yet? A peek:
-/// nothing is drained. A handle queues its commands with no state write,
-/// so this is how a shell learns that a frame is due for them.
+/// Does any handle in this scene hold a command the shell did not
+/// spend yet? A peek: nothing is drained. A handle queues its commands
+/// with no state write, so this is how a shell learns that a frame is
+/// due for them.
 pub(crate) fn has_webview_commands() -> bool {
-    WEBVIEWS.with(|webviews| {
-        webviews.borrow().values().any(|hooks| {
-            hooks.commands.as_ref().is_some_and(|queue| !queue.borrow().is_empty())
+    LIVE.with(|live| {
+        live.borrow().webviews.iter().any(|(path, hooks)| {
+            in_scene(path)
+                && hooks.commands.as_ref().is_some_and(|queue| !queue.borrow().is_empty())
         })
     })
 }
 
-/// Drains every handle's queued commands, paired with the path the
-/// handle is bound to — the runtime stamps eval tokens and the shell
-/// spends the rest.
+/// Drains every handle's queued commands in this scene, paired with
+/// the path the handle is bound to — the runtime stamps eval tokens
+/// and the shell spends the rest.
 pub(crate) fn drain_webview_commands() -> Vec<(String, Vec<crate::host::WebviewCommand>)> {
-    WEBVIEWS.with(|webviews| {
-        webviews
-            .borrow()
+    LIVE.with(|live| {
+        live.borrow()
+            .webviews
             .iter()
             .filter_map(|(path, hooks)| {
+                if !in_scene(path) {
+                    return None;
+                }
                 let queue = hooks.commands.as_ref()?;
                 let commands = std::mem::take(&mut *queue.borrow_mut());
                 if commands.is_empty() {
@@ -1250,45 +1329,16 @@ pub(crate) fn drain_webview_commands() -> Vec<(String, Vec<crate::host::WebviewC
     })
 }
 
-/// Reassembles the escape-hatch map from retention — the editors' twin
-/// for the boxes the app paints.
-pub(crate) fn assemble_customs(root: &str) {
-    let mut set: HashSet<String> = HashSet::default();
-    let mut keyed: HashSet<String> = HashSet::default();
-    RETAINED.with(|retained| {
-        for (path, entry) in retained.borrow().iter() {
-            if covers(root, path) {
-                for (path, accepts_keys) in &entry.customs {
-                    set.insert(path.clone());
-                    if *accepts_keys {
-                        keyed.insert(path.clone());
-                    }
-                }
-            }
-        }
-    });
-    PASS.with(|pass| {
-        for (path, accepts_keys) in std::mem::take(&mut pass.borrow_mut().root_customs) {
-            if accepts_keys {
-                keyed.insert(path.clone());
-            }
-            set.insert(path);
-        }
-    });
-    CUSTOMS.with(|customs| *customs.borrow_mut() = set);
-    KEYED_CUSTOMS.with(|keyed_customs| *keyed_customs.borrow_mut() = keyed);
-}
-
 /// Is the app's box at this path still on screen? (The focus of an
 /// escape hatch lives or dies by this answer.)
 pub(crate) fn has_custom(path: &str) -> bool {
-    CUSTOMS.with(|customs| customs.borrow().contains(path))
+    LIVE.with(|live| live.borrow().customs.contains(path))
 }
 
 /// Hands a dragged divider position to the split's retained writer.
 /// `false` = no split registered at the path.
 pub(crate) fn run_split(path: &str, at: crate::layout::Px) -> bool {
-    let split = SPLITS.with(|splits| splits.borrow().get(path).cloned());
+    let split = LIVE.with(|live| live.borrow().splits.get(path).cloned());
     match split {
         Some(split) => {
             split(at);
@@ -1302,7 +1352,7 @@ pub(crate) fn run_split(path: &str, at: crate::layout::Px) -> bool {
 /// binding the app holds it in tells the truth. `false` = no writer at
 /// the path — the region was never given a binding.
 pub(crate) fn run_scroll(path: &str, offset: crate::layout::Point) -> bool {
-    let scroll = SCROLLS.with(|scrolls| scrolls.borrow().get(path).cloned());
+    let scroll = LIVE.with(|live| live.borrow().scrolls.get(path).cloned());
     match scroll {
         Some(scroll) => {
             scroll(offset);
@@ -1312,18 +1362,18 @@ pub(crate) fn run_scroll(path: &str, offset: crate::layout::Point) -> bool {
     }
 }
 
-/// Did any view in this pass ask to be measured? O(1), and it is what
-/// keeps a scene with no probe from paying for the feature: the frame
-/// record holds thousands of entries and walking it per layout to
-/// discover there is nothing to report would be a real cost.
+/// Did any view ask to be measured? O(1), and it is what keeps a scene
+/// with no probe from paying for the feature: the frame record holds
+/// thousands of entries and walking it per layout to discover there is
+/// nothing to report would be a real cost.
 pub(crate) fn has_measures() -> bool {
-    MEASURES.with(|measures| !measures.borrow().is_empty())
+    LIVE.with(|live| !live.borrow().measures.is_empty())
 }
 
 /// Hands a view's resolved size to the probe that asked for it.
 /// `false` = no probe at the path.
 pub(crate) fn run_measure(path: &str, size: crate::layout::Size) -> bool {
-    let measure = MEASURES.with(|measures| measures.borrow().get(path).cloned());
+    let measure = LIVE.with(|live| live.borrow().measures.get(path).cloned());
     match measure {
         Some(measure) => {
             measure(size);
@@ -1333,11 +1383,10 @@ pub(crate) fn run_measure(path: &str, size: crate::layout::Size) -> bool {
     }
 }
 
-/// Is the target a text field? (decides if a click FOCUSES instead of acting)
-/// The ONE live input whose named chain is `chain` — a field's editor
-/// or a box that takes the keyboard. `None` when nothing answers, and
-/// `None` when TWO do: an ambiguous name must never hand the keyboard
-/// over on a guess.
+/// The ONE live input of this scene whose named chain is `chain` — a
+/// field's editor or a box that takes the keyboard. `None` when nothing
+/// answers, and `None` when TWO do: an ambiguous name must never hand
+/// the keyboard over on a guess.
 ///
 /// `editors_only` narrows it to the fields, which is what a caret is
 /// allowed to follow — a caret belongs to an editor, and a box owns
@@ -1348,7 +1397,7 @@ pub(crate) fn input_by_chain(chain: &str, editors_only: bool) -> Option<String> 
     }
     let mut found: Option<String> = None;
     let mut walk = |path: &String| {
-        if motor::identity::named_chain(path) != chain {
+        if !in_scene(path) || motor::identity::named_chain(path) != chain {
             return false;
         }
         match &found {
@@ -1359,14 +1408,22 @@ pub(crate) fn input_by_chain(chain: &str, editors_only: bool) -> Option<String> 
         }
         false
     };
-    let ambiguous = EDITORS.with(|editors| editors.borrow().keys().any(&mut walk))
-        || (!editors_only
-            && KEYED_CUSTOMS.with(|customs| customs.borrow().iter().any(&mut walk)));
+    let ambiguous = LIVE.with(|live| {
+        let live = live.borrow();
+        live.editors.keys().any(&mut walk)
+            || (!editors_only && live.keyed_customs.iter().any(&mut walk))
+    });
     if ambiguous { None } else { found }
 }
 
 pub(crate) fn has_editor(path: &str) -> bool {
-    EDITORS.with(|editors| editors.borrow().contains_key(path))
+    LIVE.with(|live| live.borrow().editors.contains_key(path))
+}
+
+/// The field's editor at `path`, cloned out of the borrow — the record
+/// every field door reads.
+fn editor_at(path: &str) -> Option<EditorFn> {
+    LIVE.with(|live| live.borrow().editors.get(path).cloned())
 }
 
 /// Applies a command to the field — the retained closure is what
@@ -1377,95 +1434,115 @@ pub(crate) fn run_editor(
     command: EditCommand,
     state: &mut CaretState,
 ) -> Option<Option<String>> {
-    let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
-    editor.map(|editor| (editor.command)(command, state))
+    editor_at(path).map(|editor| (editor.command)(command, state))
 }
 
 thread_local! {
-    /// Whose scene the assembled tables below currently answer for.
+    /// Whose scene the DERIVED tables (the handlers, the key contexts)
+    /// answer for.
     ///
-    /// The retention is keyed by PATH and holds every scene at once, but
-    /// the tables the input doors read (`ACTIONS`, `HANDLERS`, `EDITORS`,
-    /// …) are the flattened view of ONE root, rebuilt at the end of its
-    /// pass. On a thread with a single window that is the whole story. On
-    /// a thread with two, the window that rendered last would otherwise
-    /// answer for the window the hand is actually in — so a runtime
-    /// checks this before it reads them, and rebuilds its own if another
-    /// scene left theirs standing.
+    /// The retention is keyed by PATH and holds every scene at once; so
+    /// do the path-keyed tables, and a path is unique, so a lookup never
+    /// needs to know the scene. The two derived tables are flattened
+    /// views of ONE root — on a thread with two windows, the window that
+    /// rendered last would otherwise answer for the window the hand is
+    /// actually in — so a runtime checks this before it reads them, and
+    /// rebuilds its own if another scene left theirs standing.
     static ASSEMBLED_ROOT: RefCell<Option<String>> = const { RefCell::new(None) };
-    /// Moves each time the retention is written: an entry closed, an
-    /// entry fell. A registration enters the retention only through a
-    /// body run, which closes an entry, and leaves it only through a
-    /// sweep — so tables assembled at one generation stay true until the
-    /// number moves.
-    static RETENTION_GEN: Cell<u64> = const { Cell::new(0) };
-    /// The generation the assembled tables were built at, and whether a
-    /// root region fed them. A root region is rebuilt by every pass (its
-    /// closures are new each time), so tables that hold one never stay.
-    static ASSEMBLED_AT: Cell<Option<(u64, bool)>> = const { Cell::new(None) };
+    /// The generations the derived tables were built at — handlers,
+    /// contexts — and whether a root region fed them. A root region is
+    /// rebuilt by every pass (its closures are new each time), so tables
+    /// that hold one never stay.
+    static ASSEMBLED_AT: Cell<Option<(u64, u64, bool)>> = const { Cell::new(None) };
     /// The effect queue of the last FULL assembly, with the root and the
-    /// generation it was built for. It has its own key: the input tables
-    /// are also rebuilt outside a pass, when a scene becomes current
-    /// again, and that rebuild makes no queue.
+    /// effect generation it was built for. It has its own key: the
+    /// derived tables are also rebuilt outside a pass, when a scene
+    /// becomes current again, and that rebuild makes no queue.
     static ASSEMBLED_EFFECTS: RefCell<Option<(String, u64, Rc<[EffectFn]>)>> =
         const { RefCell::new(None) };
 }
 
-/// A number that moves when any assembled table moves: every key, and
-/// the identity of every closure behind it. It is the paranoid check's
-/// question, and nothing else asks it.
-pub(crate) fn input_fingerprint() -> u64 {
+fn fingerprint_key(key: &str) -> u64 {
     use std::hash::{Hash, Hasher};
+    let mut hasher = motor::hash::FxHasher::default();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
 
-    fn of_key(key: &str) -> u64 {
-        let mut hasher = motor::hash::FxHasher::default();
-        key.hash(&mut hasher);
-        hasher.finish()
-    }
-    fn of_ptr<T: ?Sized>(shared: &Rc<T>) -> u64 {
-        Rc::as_ptr(shared) as *const () as usize as u64
-    }
+fn fingerprint_ptr<T: ?Sized>(shared: &Rc<T>) -> u64 {
+    Rc::as_ptr(shared) as *const () as usize as u64
+}
 
+/// The fingerprint of the path-keyed tables: every key, and the identity
+/// of every closure behind it. Order never matters inside a table: a sum
+/// is the same in any order. `without_root` leaves the root region's
+/// keys out — the retention never holds those, so a fingerprint built
+/// from it must not see them either.
+fn tables_fingerprint(live: &Live, without_root: bool) -> u64 {
+    let skip = |keys: &[String], key: &str| without_root && keys.iter().any(|root| root == key);
     let mut total = 0u64;
     let mut mix = |part: u64| total = total.wrapping_mul(31).wrapping_add(part);
-    // order never matters inside a table: a sum is the same in any order
-    mix(ACTIONS.with(|map| {
-        map.borrow().iter().fold(0u64, |sum, (key, action)| sum.wrapping_add(of_key(key) ^ of_ptr(action)))
+    mix(live.actions.iter().fold(0u64, |sum, (key, action)| {
+        if skip(&live.root_keys.actions, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(action)) }
     }));
-    mix(COPIES.with(|map| {
-        map.borrow().iter().fold(0u64, |sum, (key, copy)| sum.wrapping_add(of_key(key) ^ of_ptr(copy)))
+    mix(live.copies.iter().fold(0u64, |sum, (key, copy)| {
+        if skip(&live.root_keys.copies, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(copy)) }
     }));
-    mix(EDITORS.with(|map| {
-        map.borrow().iter().fold(0u64, |sum, (key, editor)| sum.wrapping_add(of_key(key) ^ of_ptr(&editor.command)))
+    mix(live.editors.iter().fold(0u64, |sum, (key, editor)| {
+        if skip(&live.root_keys.editors, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(&editor.command)) }
     }));
-    mix(SPLITS.with(|map| {
-        map.borrow().iter().fold(0u64, |sum, (key, split)| sum.wrapping_add(of_key(key) ^ of_ptr(split)))
+    mix(live.splits.iter().fold(0u64, |sum, (key, split)| {
+        if skip(&live.root_keys.splits, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(split)) }
     }));
-    mix(SCROLLS.with(|map| {
-        map.borrow().iter().fold(0u64, |sum, (key, scroll)| sum.wrapping_add(of_key(key) ^ of_ptr(scroll)))
+    mix(live.scrolls.iter().fold(0u64, |sum, (key, scroll)| {
+        if skip(&live.root_keys.scrolls, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(scroll)) }
     }));
-    mix(MEASURES.with(|map| {
-        map.borrow().iter().fold(0u64, |sum, (key, measure)| sum.wrapping_add(of_key(key) ^ of_ptr(measure)))
+    mix(live.measures.iter().fold(0u64, |sum, (key, measure)| {
+        if skip(&live.root_keys.measures, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(measure)) }
     }));
+    mix(live.webviews.keys().fold(0u64, |sum, key| {
+        if skip(&live.root_keys.webviews, key) { sum } else { sum.wrapping_add(fingerprint_key(key)) }
+    }));
+    mix(live.customs.iter().fold(0u64, |sum, key| {
+        if skip(&live.root_keys.customs, key) { sum } else { sum.wrapping_add(fingerprint_key(key)) }
+    }));
+    mix(live.keyed_customs.iter().fold(0u64, |sum, key| {
+        if skip(&live.root_keys.customs, key) { sum } else { sum.wrapping_add(fingerprint_key(key)) }
+    }));
+    total
+}
+
+/// A number that moves when any table the doors read moves: every key,
+/// and the identity of every closure behind it. It is the paranoid
+/// check's question, and nothing else asks it.
+pub(crate) fn input_fingerprint() -> u64 {
+    let mut total = LIVE.with(|live| tables_fingerprint(&live.borrow(), false));
+    let mut mix = |part: u64| total = total.wrapping_mul(31).wrapping_add(part);
     mix(HANDLERS.with(|map| {
         map.borrow().values().fold(0u64, |sum, (depth, handler)| {
-            sum.wrapping_add((*depth as u64).wrapping_mul(0x9E37_79B9) ^ of_ptr(handler))
+            sum.wrapping_add((*depth as u64).wrapping_mul(0x9E37_79B9) ^ fingerprint_ptr(handler))
         })
     }));
-    mix(WEBVIEWS.with(|map| map.borrow().keys().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
-    mix(CUSTOMS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
-    mix(KEYED_CUSTOMS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
-    mix(ACTIVE_CONTEXTS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(of_key(key)))));
+    mix(ACTIVE_CONTEXTS.with(|set| set.borrow().iter().fold(0u64, |sum, key| sum.wrapping_add(fingerprint_key(key)))));
     mix(DECLARED_CONTEXTS.with(|list| {
         list.borrow().iter().fold(0u64, |sum, (path, name, focused)| {
-            sum.wrapping_add(of_key(path) ^ of_key(name) ^ u64::from(*focused))
+            sum.wrapping_add(fingerprint_key(path) ^ fingerprint_key(name) ^ u64::from(*focused))
         })
     }));
     total
 }
 
-fn bump_retention() {
-    RETENTION_GEN.with(|generation| generation.set(generation.get().wrapping_add(1)));
+/// The paranoid oracle of the live tables: built again from the whole
+/// retention, do they hold the same keys over the same closures? The
+/// root region is left out of both sides.
+pub(crate) fn live_tables_match_retention() -> bool {
+    let mut scratch = Live::default();
+    RETAINED.with(|retained| {
+        for (path, entry) in retained.borrow().iter() {
+            scratch.index(path, entry);
+        }
+    });
+    LIVE.with(|live| tables_fingerprint(&live.borrow(), true) == tables_fingerprint(&scratch, false))
 }
 
 /// Is the root region of THIS pass empty? Registrations made outside
@@ -1487,25 +1564,33 @@ fn root_region_is_empty() -> bool {
     })
 }
 
-/// Do the assembled tables still answer for `root`? They do when they
-/// were built for it, the retention did not move since, and no root
-/// region fed them then or wants to feed them now.
+fn derived_generations() -> (u64, u64) {
+    LIVE.with(|live| {
+        let live = live.borrow();
+        (live.handler_gen, live.context_gen)
+    })
+}
+
+/// Do the derived tables still answer for `root`? They do when they
+/// were built for it, no entry carrying a handler or a context moved
+/// since, and no root region fed them then or wants to feed them now.
 pub(crate) fn assembly_is_current(root: &str) -> bool {
     let same_root = ASSEMBLED_ROOT.with(|slot| slot.borrow().as_deref() == Some(root));
+    let (handlers, contexts) = derived_generations();
     same_root
-        && ASSEMBLED_AT.with(Cell::get) == Some((RETENTION_GEN.with(Cell::get), false))
+        && ASSEMBLED_AT.with(Cell::get) == Some((handlers, contexts, false))
         && root_region_is_empty()
 }
 
 /// The effect queue this root's last full assembly built — `None` when
-/// the retention moved since, when another scene assembled after it, or
-/// when a root region wants to feed the queue now. The caller then
-/// assembles a new one.
+/// an entry carrying an effect moved since, when another scene
+/// assembled after it, or when a root region wants to feed the queue
+/// now. The caller then assembles a new one.
 pub(crate) fn assembled_effects(root: &str) -> Option<Rc<[EffectFn]>> {
     if !root_region_is_empty() {
         return None;
     }
-    let generation = RETENTION_GEN.with(Cell::get);
+    let generation = LIVE.with(|live| live.borrow().effect_gen);
     ASSEMBLED_EFFECTS.with(|slot| match slot.borrow().as_ref() {
         Some((kept_root, kept_at, queue)) if kept_root == root && *kept_at == generation => {
             Some(Rc::clone(queue))
@@ -1518,9 +1603,10 @@ pub(crate) fn assembled_effects(root: &str) -> Option<Rc<[EffectFn]>> {
 /// nothing. A queue a root region fed is never kept: the region's
 /// closures are new on every pass.
 pub(crate) fn keep_assembled_effects(root: &str, queue: &Rc<[EffectFn]>, had_root_region: bool) {
+    let generation = LIVE.with(|live| live.borrow().effect_gen);
     ASSEMBLED_EFFECTS.with(|slot| {
-        *slot.borrow_mut() = (!had_root_region)
-            .then(|| (root.to_string(), RETENTION_GEN.with(Cell::get), Rc::clone(queue)));
+        *slot.borrow_mut() =
+            (!had_root_region).then(|| (root.to_string(), generation, Rc::clone(queue)));
     });
 }
 
@@ -1529,16 +1615,98 @@ pub(crate) fn pass_has_root_region() -> bool {
     !root_region_is_empty()
 }
 
-/// Whose scene the assembled tables answer for right now.
+/// Whose scene the derived tables answer for right now.
 pub(crate) fn assembled_root() -> Option<String> {
     ASSEMBLED_ROOT.with(|root| root.borrow().clone())
 }
 
-/// Records that the tables now answer for `root` — the runtime calls
-/// this as the last step of assembling them.
+/// Records that the derived tables now answer for `root` — the runtime
+/// calls this as the last step of assembling them.
 pub(crate) fn set_assembled_root(root: &str, had_root_region: bool) {
     ASSEMBLED_ROOT.with(|slot| *slot.borrow_mut() = Some(root.to_string()));
-    ASSEMBLED_AT.with(|at| at.set(Some((RETENTION_GEN.with(Cell::get), had_root_region))));
+    let (handlers, contexts) = derived_generations();
+    ASSEMBLED_AT.with(|at| at.set(Some((handlers, contexts, had_root_region))));
+}
+
+/// The root region's registrations — made outside every boundary —
+/// enter the tables for ONE pass: the last region's leave first, this
+/// pass's go in, and their keys are kept so the next assembly can take
+/// them out again.
+pub(crate) fn refresh_root_region() {
+    let (actions, copies, editors, splits, scrolls, measures, webviews, customs) =
+        PASS.with(|pass| {
+            let mut pass = pass.borrow_mut();
+            (
+                std::mem::take(&mut pass.root_actions),
+                std::mem::take(&mut pass.root_copies),
+                std::mem::take(&mut pass.root_editors),
+                std::mem::take(&mut pass.root_splits),
+                std::mem::take(&mut pass.root_scrolls),
+                std::mem::take(&mut pass.root_measures),
+                std::mem::take(&mut pass.root_webviews),
+                std::mem::take(&mut pass.root_customs),
+            )
+        });
+    LIVE.with(|live| {
+        let mut live = live.borrow_mut();
+        live.drop_root_region();
+        let mut keys = RootKeys::default();
+        for (key, action) in actions {
+            keys.actions.push(key.clone());
+            live.insert_action(key, action);
+        }
+        for (key, copy) in copies {
+            keys.copies.push(key.clone());
+            live.copies.insert(key, copy);
+        }
+        for (key, editor) in editors {
+            keys.editors.push(key.clone());
+            live.editors.insert(key, editor);
+        }
+        for (key, split) in splits {
+            keys.splits.push(key.clone());
+            live.splits.insert(key, split);
+        }
+        for (key, scroll) in scrolls {
+            keys.scrolls.push(key.clone());
+            live.scrolls.insert(key, scroll);
+        }
+        for (key, measure) in measures {
+            keys.measures.push(key.clone());
+            live.measures.insert(key, measure);
+        }
+        for (key, hooks) in webviews {
+            keys.webviews.push(key.clone());
+            live.webviews.insert(key, hooks);
+        }
+        for (key, accepts_keys) in customs {
+            keys.customs.push(key.clone());
+            if accepts_keys {
+                live.keyed_customs.insert(key.clone());
+            }
+            live.customs.insert(key);
+        }
+        live.root_keys = keys;
+    });
+}
+
+/// Removes the entries at `paths` from the retention, and their
+/// registrations from the tables the doors read.
+fn drop_entries(paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    RETAINED.with(|retained| {
+        let mut retained = retained.borrow_mut();
+        LIVE.with(|live| {
+            let mut live = live.borrow_mut();
+            for path in paths {
+                if let Some(entry) = retained.remove(path) {
+                    live.unindex(path, &entry);
+                }
+            }
+        });
+    });
 }
 
 /// Drops every retained entry under `root` — the retention half of a
@@ -1546,12 +1714,15 @@ pub(crate) fn set_assembled_root(root: &str, had_root_region: bool) {
 /// other scenes on this thread keep theirs.
 pub(crate) fn forget_under(root: &str) {
     let prefix = format!("{root}/");
-    bump_retention();
-    RETAINED.with(|retained| {
+    let doomed: Vec<String> = RETAINED.with(|retained| {
         retained
-            .borrow_mut()
-            .retain(|path, _| path != root && !path.starts_with(&prefix));
+            .borrow()
+            .keys()
+            .filter(|path| *path == root || path.starts_with(&prefix))
+            .cloned()
+            .collect()
     });
+    drop_entries(&doomed);
     ASSEMBLED_ROOT.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.as_deref() == Some(root) {
@@ -1562,17 +1733,25 @@ pub(crate) fn forget_under(root: &str) {
 
 /// Identities swept by `end_pass`: their entries fall with them.
 pub(crate) fn forget(dead: &[String]) {
-    let fell = RETAINED.with(|retained| {
-        let mut retained = retained.borrow_mut();
-        let mut fell = false;
-        for path in dead {
-            fell |= retained.remove(path).is_some();
+    drop_entries(dead);
+}
+
+/// The bodies that ran, with the ones under another run dropped: a run
+/// covers its subtree, so the outermost runs name every subtree the
+/// sweep must read.
+fn outermost(runs: &HashSet<String>) -> Vec<&String> {
+    let mut sorted: Vec<&String> = runs.iter().collect();
+    sorted.sort_by_key(|run| run.len());
+    let mut outer: Vec<&String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::default();
+    for run in sorted {
+        if cuts(run).any(|prefix| seen.contains(prefix)) {
+            continue;
         }
-        fell
-    });
-    if fell {
-        bump_retention();
+        seen.insert(run.as_str());
+        outer.push(run);
     }
+    outer
 }
 
 /// The TWIN of the identity sweep, for views with NO state of their
@@ -1584,44 +1763,76 @@ pub(crate) fn forget(dead: &[String]) {
 /// walk stayed out of it on purpose). An unvisited descendant of a
 /// parent that RE-RAN is dead — the parent revisited its living
 /// children one by one.
+///
+/// Only two places can hold the dead: the subtrees of the bodies that
+/// ran, and the top level, where the root region mounts and unmounts
+/// on its own. The sweep reads those and nothing else — a pass that
+/// ran one body in a list of a thousand reads that body's subtree.
 pub(crate) fn sweep_stale(root: &str) {
-    let (runs, skipped) = PASS.with(|pass| {
+    let (runs, skipped): (HashSet<String>, HashSet<String>) = PASS.with(|pass| {
         let pass = pass.borrow();
         (
-            pass.body_runs.iter().cloned().collect::<HashSet<String>>(),
-            pass.skipped.clone(),
+            pass.body_runs.iter().cloned().collect(),
+            pass.skipped.iter().cloned().collect(),
         )
     });
-    let fell = RETAINED.with(|retained| {
-        let mut retained = retained.borrow_mut();
-        let before = retained.len();
-        retained.retain(|path, _| {
-            if !covers(root, path) {
-                return true; // another tree mounted on the same thread
+    // alive: it ran, or it stands at or under a boundary the walk
+    // skipped on purpose
+    let alive = |path: &str| {
+        runs.contains(path) || skipped.contains(path) || cuts(path).any(|prefix| skipped.contains(prefix))
+    };
+    let mut dead: Vec<String> = Vec::new();
+    RETAINED.with(|retained| {
+        let retained = retained.borrow();
+        // the entries under one boundary, in one ordered range — the
+        // subtree is contiguous because `/` sorts before every byte a
+        // segment may start with after it
+        let sweep_under = |boundary: &str, dead: &mut Vec<String>| {
+            let lo = format!("{boundary}/");
+            let hi = format!("{boundary}0");
+            let range = (std::ops::Bound::Included(lo.as_str()), std::ops::Bound::Excluded(hi.as_str()));
+            for (path, _) in retained.range::<str, _>(range) {
+                if !alive(path) {
+                    dead.push(path.clone());
+                }
             }
-            runs.contains(path) || skipped.iter().any(|skip| covers(skip, path))
+        };
+        for run in outermost(&runs) {
+            sweep_under(run, &mut dead);
+        }
+        // a top-level entry the root region did not mount again fell,
+        // and everything under it with it
+        let fallen: Vec<String> = LIVE.with(|live| {
+            live.borrow()
+                .top_level
+                .iter()
+                .filter(|path| covers(root, path) && !alive(path))
+                .cloned()
+                .collect()
         });
-        retained.len() != before
+        for path in fallen {
+            sweep_under(&path, &mut dead);
+            dead.push(path);
+        }
     });
-    if fell {
-        bump_retention();
-    }
+    drop_entries(&dead);
 }
 
 /// Drops the whole retention — the next pass runs every body (the
 /// tests' `render_full`; the state in the identity arenas stays).
 pub(crate) fn clear() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
-    bump_retention();
+    LIVE.with(|live| *live.borrow_mut() = Live::default());
+    ASSEMBLED_AT.with(|at| at.set(None));
 }
 
-/// The world-reset twin of [`clear`]: the retention AND every per-pass
-/// assembly falls. A newborn runtime starts from nothing — see
+/// The world-reset twin of [`clear`]: the retention AND every table
+/// falls. A newborn runtime starts from nothing — see
 /// `motor::identity::reset_world` for the other half of the contract.
 pub(crate) fn reset_world() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
     crate::layout::forget_pictures();
-    bump_retention();
+    LIVE.with(|live| *live.borrow_mut() = Live::default());
     ASSEMBLED_ROOT.with(|root| *root.borrow_mut() = None);
     ASSEMBLED_AT.with(|at| at.set(None));
     ASSEMBLED_EFFECTS.with(|slot| *slot.borrow_mut() = None);
@@ -1631,13 +1842,6 @@ pub(crate) fn reset_world() {
     ACTIVE_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     DECLARED_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     HANDLERS.with(|handlers| handlers.borrow_mut().clear());
-    ACTIONS.with(|actions| actions.borrow_mut().clear());
-    COPIES.with(|copies| copies.borrow_mut().clear());
-    EDITORS.with(|editors| editors.borrow_mut().clear());
-    SPLITS.with(|splits| splits.borrow_mut().clear());
-    SCROLLS.with(|scrolls| scrolls.borrow_mut().clear());
-    MEASURES.with(|measures| measures.borrow_mut().clear());
-    CUSTOMS.with(|customs| customs.borrow_mut().clear());
 }
 
 pub(crate) fn end_pass() {
@@ -1708,36 +1912,24 @@ pub(crate) fn field_key(
     stroke: &crate::action::Stroke,
     state: &mut CaretState,
 ) -> bool {
-    let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
+    let editor = editor_at(path);
     editor.and_then(|editor| editor.key).is_some_and(|key| key(stroke, state))
 }
 
 /// The keys the field at `path` asks a software keyboard for — the
 /// letters when nothing there named any.
 pub(crate) fn field_keyboard(path: &str) -> crate::text_input::KeyboardType {
-    EDITORS.with(|editors| {
-        editors.borrow().get(path).map(|editor| editor.keyboard).unwrap_or_default()
-    })
+    editor_at(path).map(|editor| editor.keyboard).unwrap_or_default()
 }
 
 /// The field's own word for the keyboard (`TextField::on_focus`), if the
 /// app gave it one.
 pub(crate) fn field_focus_hook(path: &str) -> Option<Rc<dyn Fn(bool)>> {
-    EDITORS.with(|editors| {
-        editors
-            .borrow()
-            .get(path)
-            .and_then(|editor| editor.focus.clone())
-    })
+    editor_at(path).and_then(|editor| editor.focus.clone())
 }
 
 pub(crate) fn field_policy(path: &str) -> Option<Rc<dyn crate::text_input::EditingStrategy>> {
-    EDITORS.with(|editors| {
-        editors
-            .borrow()
-            .get(path)
-            .and_then(|editor| editor.policy.clone())
-    })
+    editor_at(path).and_then(|editor| editor.policy.clone())
 }
 
 pub(crate) fn field_caret_shape(path: &str) -> crate::text_input::CaretShape {
@@ -1747,40 +1939,28 @@ pub(crate) fn field_caret_shape(path: &str) -> crate::text_input::CaretShape {
 }
 
 pub(crate) fn field_takes_text(path: &str) -> bool {
-    let editor = EDITORS.with(|editors| editors.borrow().get(path).cloned());
+    let editor = editor_at(path);
     editor.is_some_and(|editor| editor.policy.as_ref().is_none_or(|policy| policy.takes_text()))
 }
 
 /// Whether this retained field opts into chat-style Enter submission.
 /// The door a pasted picture goes through, when the field opened one.
 pub(crate) fn field_paste_image(path: &str) -> Option<Rc<dyn Fn(crate::clipboard::ClipboardImage)>> {
-    EDITORS.with(|editors| editors.borrow().get(path).and_then(|editor| editor.paste_image.clone()))
+    editor_at(path).and_then(|editor| editor.paste_image.clone())
 }
 
 /// Does the field stand aside for the app's navigation right now? Read
 /// at the stroke, from the binding the app holds.
 pub(crate) fn field_intercepts_nav(path: &str) -> bool {
-    let intercept = EDITORS.with(|editors| {
-        editors.borrow().get(path).and_then(|editor| editor.nav_intercept.clone())
-    });
+    let intercept = editor_at(path).and_then(|editor| editor.nav_intercept.clone());
     // out of the borrow: reading a binding may reach the app's state
     intercept.is_some_and(|binding| binding.wrappedValue())
 }
 
 pub(crate) fn field_yields_on_submit(path: &str) -> bool {
-    EDITORS.with(|editors| {
-        editors
-            .borrow()
-            .get(path)
-            .is_some_and(|editor| editor.yields_on_submit)
-    })
+    editor_at(path).is_some_and(|editor| editor.yields_on_submit)
 }
 
 pub(crate) fn field_submits_on_enter(path: &str) -> bool {
-    EDITORS.with(|editors| {
-        editors
-            .borrow()
-            .get(path)
-            .is_some_and(|editor| editor.submit_on_enter)
-    })
+    editor_at(path).is_some_and(|editor| editor.submit_on_enter)
 }

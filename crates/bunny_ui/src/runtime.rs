@@ -599,23 +599,21 @@ impl Runtime {
         });
     }
 
-    /// Rebuilds only the tables the input doors read.
+    /// Brings the tables the input doors read up to date. The path-keyed
+    /// ones follow the retention at every entry and need nothing here
+    /// but the root region's one-pass registrations; the two DERIVED
+    /// ones (handlers, key contexts) rebuild from the entries that carry
+    /// them.
     fn assemble_input(&self, root: &str, had_root_region: bool) {
-        reconciler::assemble_actions(root);
-        reconciler::assemble_copies(root);
-        reconciler::assemble_editors(root);
-        reconciler::assemble_splits(root);
-        reconciler::assemble_scrolls(root);
-        reconciler::assemble_measures(root);
-        reconciler::assemble_webviews(root);
-        reconciler::assemble_customs(root);
+        reconciler::refresh_root_region();
         reconciler::assemble_handlers(root);
         reconciler::assemble_contexts(root);
         reconciler::set_assembled_root(root, had_root_region);
     }
 
-    /// The paranoid cross-check of a skipped assembly: build the tables
-    /// again and see that nothing in them moved.
+    /// The paranoid cross-check of a skipped assembly: build the derived
+    /// tables again and see that nothing moved — and that the live tables
+    /// still say what the whole retention says.
     fn assemble_input_again(&self, root: &str) {
         let before = reconciler::input_fingerprint();
         self.assemble_input(root, false);
@@ -623,6 +621,10 @@ impl Runtime {
             before,
             reconciler::input_fingerprint(),
             "a skipped assembly left tables that a full one would have changed"
+        );
+        assert!(
+            reconciler::live_tables_match_retention(),
+            "the live tables drifted from the retention they follow"
         );
     }
 
@@ -1485,8 +1487,19 @@ impl Runtime {
             reconciler::clear();
         }
         effects::reset();
-        let snapshot = motor::identity::dirty_snapshot();
-        reconciler::begin_pass(snapshot.clone());
+        // the dirt this pass serves leaves the registry now: what a body
+        // writes DURING the pass stays for the next one, and another
+        // scene's dirt stays queued for that scene. The first pass does
+        // not know its root yet — it reads everything and consumes under
+        // the root it finds
+        let (dirty, snapshot) = match self.last_root.borrow().as_deref() {
+            Some(root) => (motor::identity::take_dirty_under(root), None),
+            None => {
+                let snapshot = motor::identity::dirty_snapshot();
+                (snapshot.clone(), Some(snapshot))
+            }
+        };
+        reconciler::begin_pass(dirty);
         motor::identity::begin_pass();
 
         let mut nodes = NodeList::new();
@@ -1515,7 +1528,9 @@ impl Runtime {
             // with the editors of THIS pass assembled, dead fields
             // release their carets, auto-focus memory and the focus
             self.release_dead_input();
-            motor::identity::consume_dirty(pass_root, &snapshot);
+            if let Some(snapshot) = &snapshot {
+                motor::identity::consume_dirty(pass_root, snapshot);
+            }
             *self.last_root.borrow_mut() = Some(pass_root.clone());
         }
         reconciler::end_pass();
@@ -4555,7 +4570,11 @@ impl Runtime {
         // whole evidence (a theme change already cleared retention,
         // which re-runs every body and empties no promise wrongly)
         let changed = reconciler::take_frame_runs();
-        let retained_groups = self.dom.borrow().group_paths();
+        // the retained groups stay where they are: the walk reads them
+        // through this borrow, which ends before the diff takes the
+        // lowering for itself
+        let dom = self.dom.borrow();
+        let retained_groups = dom.group_paths();
         // the tree, stable-root shortcut included — the flow twin of
         // the pixel path's pass assembly
         // a drag crossing targets runs no body at all, so the ring is
@@ -4639,6 +4658,7 @@ impl Runtime {
             crate::dom_flow::lower(&tree, &flow)
         });
         drop(boxes);
+        drop(dom);
         self.seed_island_boxes(&output.scene);
         *self.dom_customs.borrow_mut() = output.customs.clone();
         drop(offsets);
@@ -4660,7 +4680,8 @@ impl Runtime {
     pub fn dom_adopt(&self, root: &impl View, size: crate::layout::Size) {
         self.settle(root);
         let _ = reconciler::take_frame_runs();
-        let retained_groups = self.dom.borrow().group_paths();
+        let dom = self.dom.borrow();
+        let retained_groups = dom.group_paths();
         // a drag crossing targets runs no body at all, so the ring is
         // news the reuse shortcut can only hear from the interaction
         let rings = self.drop_rings();
@@ -4739,6 +4760,7 @@ impl Runtime {
         };
         let output = crate::dom_flow::lower(&tree, &flow);
         drop(boxes);
+        drop(dom);
         self.seed_island_boxes(&output.scene);
         *self.dom_customs.borrow_mut() = output.customs.clone();
         drop(offsets);
