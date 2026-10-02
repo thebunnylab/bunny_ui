@@ -4680,7 +4680,7 @@ impl Runtime {
         }
         let mut dom = self.dom.borrow_mut();
         dom.note_groups(output.groups);
-        let mut patches = dom.lower(&output.scene, &output.display);
+        let mut patches = dom.lower(output.scene, &output.display);
         if !dirty_bindings.is_empty() {
             patches.extend(dom.refresh_bindings(&dirty_bindings));
         }
