@@ -6598,6 +6598,150 @@ mod tests {
         assert_eq!(runtime.focused(), None, "a free keyboard is not owed to anyone");
     }
 
+    /// ⌘F on a find bar already open (Trinity T2-BUNNY-257): a selecting
+    /// beat takes the keys AND selects the query, so typing replaces it —
+    /// whether the beat moved the keyboard to the field or found it there.
+    /// A plain beat moves the keys and leaves the caret where it was.
+    #[test]
+    fn a_selecting_beat_selects_the_field_whether_or_not_it_holds_the_keys() {
+        use crate::layout::{Proposal, Size};
+
+        struct Pane;
+
+        impl CustomElement for Pane {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+        }
+
+        #[derive(Clone, Copy)]
+        struct Bar {
+            query: State<String>,
+            beat: State<u64>,
+            selecting: State<bool>,
+        }
+
+        impl Component for Bar {
+            fn body(self, _ctx: &Context) -> impl View {
+                let field = text_field("find", self.query.binding()).id("query");
+                let field = if self.selecting.get() {
+                    erased(field.select_on_beat(self.beat.get()))
+                } else {
+                    erased(field.auto_focus_beat(self.beat.get()))
+                };
+                vstack!(field, custom(Pane).id("editor").frame(300.0, 100.0))
+            }
+        }
+
+        let bar = Bar { query: State::new("foo".to_owned()), beat: State::new(0), selecting: State::new(true) };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 320.0, height: 200.0 });
+        let lay = || {
+            runtime.render_stable(&bar);
+            runtime.layout(&bar, viewport)
+        };
+        let result = lay();
+        let pane = result.customs.iter().find(|p| p.path.ends_with("[editor]")).expect("placed").frame;
+        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        let holds_query = || runtime.focused().is_some_and(|path| path.ends_with("[query]"));
+
+        // the editor holds the keys; ⌘F beats: the query takes them, selected
+        bar.beat.set(1);
+        lay();
+        assert!(holds_query(), "the beat takes the keys from the editor");
+        assert!(runtime.key(EditCommand::Insert("b".into())).applied);
+        assert_eq!(bar.query.get(), "b", "typing replaced the selected query");
+
+        // the query already holds the keys; ⌘F again: selected again
+        assert!(runtime.key(EditCommand::Insert("ar".into())).applied);
+        assert_eq!(bar.query.get(), "bar");
+        bar.beat.set(2);
+        lay();
+        assert!(holds_query());
+        assert!(runtime.key(EditCommand::Insert("baz".into())).applied);
+        assert_eq!(bar.query.get(), "baz", "a beat on the holder selects as well");
+
+        // a plain beat moves the keys and selects nothing
+        bar.selecting.set(false);
+        bar.beat.set(3);
+        lay();
+        assert!(runtime.key(EditCommand::Insert("!".into())).applied);
+        assert_eq!(bar.query.get(), "baz!", "a plain beat leaves the caret where it was");
+    }
+
+    /// Enter in a find bar is commit-and-go (Trinity T2-BUNNY-257): the
+    /// submit runs, and a field that yields on submit hands the keyboard it
+    /// borrowed back to its lender — the editor under it — so the next keys
+    /// walk the matches instead of typing into the query. The field stays on
+    /// screen; one that does not yield keeps the keys.
+    #[test]
+    fn a_field_that_yields_on_submit_hands_the_keys_back() {
+        use crate::layout::{Proposal, Size};
+
+        struct Pane;
+
+        impl CustomElement for Pane {
+            fn accepts_keys(&self) -> bool {
+                true
+            }
+            fn paint(&self, _ctx: &PaintCtx, _painter: &mut Painter) {}
+        }
+
+        #[derive(Clone, Copy)]
+        struct Bar {
+            query: State<String>,
+            beat: State<u64>,
+            yields: State<bool>,
+            committed: State<i32>,
+        }
+
+        impl Component for Bar {
+            fn body(self, _ctx: &Context) -> impl View {
+                let field = text_field("find", self.query.binding()).on_submit(move || self.committed.add(1));
+                let field = if self.yields.get() { field.yield_on_submit() } else { field };
+                vstack!(
+                    field.id("query").auto_focus_beat(self.beat.get()),
+                    custom(Pane).id("editor").frame(300.0, 100.0),
+                )
+            }
+        }
+
+        let bar = Bar { query: State::new(String::new()), beat: State::new(0), yields: State::new(true), committed: State::new(0) };
+        let runtime = Runtime::new();
+        let viewport = Proposal::exact(Size { width: 320.0, height: 200.0 });
+        let lay = || {
+            runtime.render_stable(&bar);
+            runtime.layout(&bar, viewport)
+        };
+        let result = lay();
+        let pane = result.customs.iter().find(|p| p.path.ends_with("[editor]")).expect("placed").frame;
+        runtime.pointer_pressed(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        runtime.pointer_released(pane.origin.x + 10.0, pane.origin.y + 10.0);
+        let editor = runtime.focused().expect("the editor holds the keys");
+        let holds_query = || runtime.focused().is_some_and(|path| path.ends_with("[query]"));
+
+        bar.beat.set(1);
+        lay();
+        assert!(holds_query(), "⌘F borrowed the keys");
+        assert!(runtime.key(EditCommand::Insert("foo".into())).applied);
+        assert!(runtime.key(EditCommand::Newline).applied, "the field took its own key");
+        assert_eq!(bar.committed.get(), 1, "the submit ran");
+        assert_eq!(runtime.focused(), Some(editor.clone()), "and the keys went back to the editor");
+        lay();
+        assert_eq!(runtime.focused(), Some(editor), "the field, still on screen, did not take them again");
+
+        // a field that does not yield keeps the keys after its submit
+        bar.yields.set(false);
+        bar.beat.set(2);
+        lay();
+        assert!(holds_query());
+        assert!(runtime.key(EditCommand::Newline).applied);
+        assert_eq!(bar.committed.get(), 2);
+        assert!(holds_query(), "no yield, no hand-back");
+    }
+
     /// A borrower can lend in turn — a picker's query opens another picker
     /// over it. The road home walks to the first input still on screen:
     /// past a borrower that left WITH the keys' holder, past one that left

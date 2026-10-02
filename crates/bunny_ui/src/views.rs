@@ -185,6 +185,7 @@ pub struct TextField {
     multiline: bool,
     submit: Option<Rc<dyn Fn()>>,
     submit_on_enter: bool,
+    yields_on_submit: bool,
     bare: bool,
     secret: bool,
     editing: Option<Rc<dyn crate::text_input::EditingStrategy>>,
@@ -254,6 +255,19 @@ impl TextField {
     /// box still answers Enter.
     pub fn on_submit(mut self, submit: impl Fn() + 'static) -> Self {
         self.submit = Some(Rc::new(submit));
+        self
+    }
+
+    /// After [`TextField::on_submit`] runs, hand the keyboard back to
+    /// whoever lent it — the editor a find bar's beat borrowed it from —
+    /// while the field stays on screen.
+    ///
+    /// Commit-and-go: Enter in a find bar keeps the bar and its matches,
+    /// and the next keys walk them in the editor instead of typing into
+    /// the query. A field that holds keys it was never lent (a click put
+    /// them there) keeps them: there is nobody to hand them to.
+    pub fn yield_on_submit(mut self) -> Self {
+        self.yields_on_submit = true;
         self
     }
 
@@ -346,6 +360,7 @@ impl View for TextField {
                     path.clone(),
                     crate::reconciler::EditorFn {
                     submit_on_enter: self.submit_on_enter,
+                    yields_on_submit: self.yields_on_submit,
                     nav_intercept: self.nav_intercept.clone(),
                     paste_image: self.paste_image.clone(),
                     focus: self.focus.clone(),
@@ -621,6 +636,7 @@ pub fn text_field(placeholder: impl Into<String>, text: Binding<String>) -> Text
         multiline: false,
         submit: None,
         submit_on_enter: false,
+        yields_on_submit: false,
         bare: false,
         secret: false,
         editing: None,
@@ -648,6 +664,7 @@ pub fn text_editor(placeholder: impl Into<String>, text: Binding<String>) -> Tex
         multiline: true,
         submit: None,
         submit_on_enter: false,
+        yields_on_submit: false,
         bare: false,
         secret: false,
         editing: None,
