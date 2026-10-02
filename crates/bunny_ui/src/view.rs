@@ -222,6 +222,11 @@ impl NodeList {
 /// runtime clones before calling.
 pub trait Component: Clone + 'static {
     fn body(self, ctx: &Context) -> impl View;
+
+    /// The framework's own keyed list stands behind a boundary whose
+    /// rows are kept by key when it re-runs. Only that list says so.
+    #[doc(hidden)]
+    const KEYED_LIST: bool = false;
 }
 
 // MARK: - Rendering a component without stacking its payload
@@ -319,7 +324,7 @@ impl<T: Component> View for T {
         // belong to the new entry.
         motor::identity::mark_reran(&path);
         motor::identity::begin_view_reads(&path);
-        crate::reconciler::begin_entry(&path);
+        crate::reconciler::begin_entry(&path, T::KEYED_LIST);
         let mut body = NodeList::new();
         run_body(self, ctx).render_into(ctx, &mut body);
         retain_entry(self, ctx, &path, body);

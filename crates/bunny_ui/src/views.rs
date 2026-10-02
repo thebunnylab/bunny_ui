@@ -33,7 +33,7 @@ use crate::layout::{
     Axis, Color, Corners, CrossAlign, Edges, Fraction, LayoutNode, SeamUnit, Size as LayoutSize,
     VisualProps,
 };
-use crate::state_ext::BindingExt;
+use crate::state_ext::{BindingExt, StateExt};
 use crate::erased::{Erased, erased};
 use crate::view::{Either, NodeList, Single, View, render_line};
 
@@ -2243,9 +2243,59 @@ where
 /// [`horizontal`](ForEach::horizontal) for a strip of tabs or chips,
 /// with the [`spacing`](ForEach::spacing) of a stack. Cross alignment
 /// follows the axis — leading down a column, centered along a row.
+/// Where a `for_each` takes its items from.
+///
+/// A `Vec` is read by the BODY that builds the list: the body re-runs
+/// when the items change, and every row with it. A `State` of items is
+/// read by the LIST itself: the list is a boundary of its own, the body
+/// above it never hears about a change, and a row renders ONCE per key
+/// — a new key runs its row, a key that left takes its row along, a
+/// key that moved moves — the shape the keyed benchmarks are made of,
+/// and the one a table of a thousand rows wants.
+///
+/// A row rendered once per key reads what it shows through its own
+/// state: the item's fields that may move ride a `State` of their own,
+/// as a row of a signal framework does.
+pub trait ItemSource: Clone + 'static {
+    type Item: Clone + 'static;
+    /// Does the list read for itself?
+    const BOUND: bool;
+    /// The items now.
+    fn with_items<R>(&self, read: impl FnOnce(&[Self::Item]) -> R) -> R;
+}
+
+impl<T: Clone + 'static> ItemSource for Vec<T> {
+    type Item = T;
+    const BOUND: bool = false;
+
+    fn with_items<R>(&self, read: impl FnOnce(&[T]) -> R) -> R {
+        read(self)
+    }
+}
+
+impl<T: Clone + 'static> ItemSource for motor::state::State<Rc<Vec<T>>> {
+    type Item = T;
+    const BOUND: bool = true;
+
+    fn with_items<R>(&self, read: impl FnOnce(&[T]) -> R) -> R {
+        let items = self.get();
+        read(&items)
+    }
+}
+
+impl<T: Clone + 'static> ItemSource for motor::state::State<Vec<T>> {
+    type Item = T;
+    const BOUND: bool = true;
+
+    fn with_items<R>(&self, read: impl FnOnce(&[T]) -> R) -> R {
+        let items = self.get();
+        read(&items)
+    }
+}
+
 #[derive(Clone)]
-pub struct ForEach<T, I, F> {
-    items: Vec<T>,
+pub struct ForEach<S, I, F> {
+    items: S,
     id: I,
     row: F,
     axis: Axis,
@@ -2253,25 +2303,47 @@ pub struct ForEach<T, I, F> {
     align: Option<CrossAlign>,
 }
 
-impl<T, I, F, R> View for ForEach<T, I, F>
+impl<S, I, F, R> View for ForEach<S, I, F>
 where
-    T: Clone + 'static,
-    I: Fn(&T) -> String + Clone + 'static,
-    F: Fn(&T) -> R + Clone + 'static,
+    S: ItemSource,
+    I: Fn(&S::Item) -> String + Clone + 'static,
+    F: Fn(&S::Item) -> R + Clone + 'static,
     R: View,
 {
     type Arity = Single;
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
-        debug_assert_unique_ids("for_each", self.items.iter().map(&self.id));
+        if S::BOUND {
+            // the LIST reads its items: a boundary of its own, whose
+            // rows render once per key
+            Keyed(self.clone()).render_into(ctx, out);
+            return;
+        }
+        self.items.with_items(|items| self.render_rows(items, ctx, out));
+    }
+}
+
+impl<S, I, F, R> ForEach<S, I, F>
+where
+    S: ItemSource,
+    I: Fn(&S::Item) -> String + Clone + 'static,
+    F: Fn(&S::Item) -> R + Clone + 'static,
+    R: View,
+{
+    fn is_plain_column(&self) -> bool {
+        self.axis == Axis::Vertical && self.spacing.is_none() && self.align.is_none()
+    }
+
+    fn render_rows(&self, items: &[S::Item], ctx: &Context, out: &mut NodeList) {
+        debug_assert_unique_ids("for_each", items.iter().map(&self.id));
         let mut rows = NodeList::new();
-        for item in &self.items {
+        for item in items {
             let _frame = motor::identity::enter(format!("[{}]", (self.id)(item)));
             (self.row)(item).render_into(ctx, &mut rows);
         }
         let (prints, layouts) = rows.into_parts();
         out.push(RenderNode::branch(
-            for_each_line(self.items.len(), self.axis, self.spacing, self.align),
+            for_each_line(items.len(), self.axis, self.spacing, self.align),
             prints,
         ));
         out.push_layout(LayoutNode::Stack {
@@ -2288,7 +2360,60 @@ where
     }
 }
 
-impl<T, I, F> ForEach<T, I, F> {
+/// The boundary a list that reads for itself stands behind: its body is
+/// the rows, and under it a retained row is kept by its key, however
+/// often the list re-runs.
+#[derive(Clone)]
+struct Keyed<S, I, F>(ForEach<S, I, F>);
+
+impl<S, I, F, R> crate::view::Component for Keyed<S, I, F>
+where
+    S: ItemSource,
+    I: Fn(&S::Item) -> String + Clone + 'static,
+    F: Fn(&S::Item) -> R + Clone + 'static,
+    R: View,
+{
+    const KEYED_LIST: bool = true;
+
+    fn body(self, _ctx: &Context) -> impl View {
+        KeyedRows(self.0)
+    }
+}
+
+/// The rows of a keyed list. A plain column renders them straight into
+/// the boundary, whose implicit column they stack in — the element the
+/// boundary becomes IS the list, so a `tbody` hint lands on it and the
+/// rows are its direct children. Any other shape renders the stack the
+/// eager list renders.
+#[derive(Clone)]
+struct KeyedRows<S, I, F>(ForEach<S, I, F>);
+
+impl<S, I, F, R> View for KeyedRows<S, I, F>
+where
+    S: ItemSource,
+    I: Fn(&S::Item) -> String + Clone + 'static,
+    F: Fn(&S::Item) -> R + Clone + 'static,
+    R: View,
+{
+    type Arity = crate::view::Many;
+
+    fn render_into(&self, ctx: &Context, out: &mut NodeList) {
+        let list = &self.0;
+        list.items.with_items(|items| {
+            if !list.is_plain_column() {
+                list.render_rows(items, ctx, out);
+                return;
+            }
+            debug_assert_unique_ids("for_each", items.iter().map(&list.id));
+            for item in items {
+                let _frame = motor::identity::enter(format!("[{}]", (list.id)(item)));
+                (list.row)(item).render_into(ctx, out);
+            }
+        });
+    }
+}
+
+impl<S, I, F> ForEach<S, I, F> {
     /// The items sit side by side instead of stacking down.
     pub fn horizontal(mut self) -> Self {
         self.axis = Axis::Horizontal;
@@ -2340,32 +2465,51 @@ fn for_each_line(count: usize, axis: Axis, spacing: Option<f64>, align: Option<C
 /// re-runs for it. Only the Dom lowering listens; everywhere else
 /// this renders nothing at all.
 pub fn boundary_class(class: impl Into<String>) -> BoundaryClass {
-    BoundaryClass { class: class.into() }
+    BoundaryClass { class: crate::bind::ClassSource::Fixed(class.into()) }
+}
+
+/// The class the enclosing element wears, read by the NODE: the closure
+/// runs when the element is placed, what it reads registers on the
+/// node, and a write to any of it flips the class alone — no body
+/// re-runs, not even the row's.
+pub fn boundary_class_with<S: Into<String>>(read: impl Fn() -> S + 'static) -> BoundaryClass {
+    BoundaryClass { class: crate::bind::ClassSource::Lazy(Rc::new(move || read().into())) }
+}
+
+/// `boundary_class_with` for the common shape: the class while the flag
+/// reads true, nothing while it reads false.
+pub fn boundary_class_when(flag: motor::state::State<bool>, class: impl Into<String>) -> BoundaryClass {
+    let class: String = class.into();
+    boundary_class_with(move || if flag.get() { class.clone() } else { String::new() })
 }
 
 #[derive(Clone)]
 pub struct BoundaryClass {
-    class: String,
+    class: crate::bind::ClassSource,
 }
 
 impl View for BoundaryClass {
     type Arity = Single;
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf(if crate::view::print_enabled() {
-            format!("BoundaryClass({:?})", self.class)
-        } else {
-            String::new()
-        }));
-        out.push_layout(LayoutNode::BoundaryHint { class: Some(self.class.clone()) });
+        let class = self.class.place();
+        out.push(match (&class, crate::view::print_enabled()) {
+            (_, false) => RenderNode::leaf(String::new()),
+            (crate::bind::ClassSource::Bound(bound), true) => {
+                let bound = Rc::clone(bound);
+                RenderNode::live(Rc::new(move || format!("BoundaryClass({:?})", bound.get())))
+            }
+            (fixed, true) => RenderNode::leaf(format!("BoundaryClass({:?})", fixed.get())),
+        });
+        out.push_layout(LayoutNode::BoundaryHint { class: Some(class) });
     }
 }
 
-pub fn for_each<T, I, F, R>(items: Vec<T>, id: I, row: F) -> ForEach<T, I, F>
+pub fn for_each<S, I, F, R>(items: S, id: I, row: F) -> ForEach<S, I, F>
 where
-    T: Clone + 'static,
-    I: Fn(&T) -> String + Clone + 'static,
-    F: Fn(&T) -> R + Clone + 'static,
+    S: ItemSource,
+    I: Fn(&S::Item) -> String + Clone + 'static,
+    F: Fn(&S::Item) -> R + Clone + 'static,
     R: View,
 {
     ForEach { items, id, row, axis: Axis::Vertical, spacing: None, align: None }

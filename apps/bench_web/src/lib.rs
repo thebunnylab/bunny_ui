@@ -178,7 +178,9 @@ pub mod keyed {
 
     /// One row: the component wears the `<tr>` (its identity group IS
     /// the element), and its body is the cells — DIRECT children, the
-    /// exact nesting the harness pierces.
+    /// exact nesting the harness pierces. The body runs ONCE per key:
+    /// the label and the selection flag are read by their nodes, so a
+    /// write to either moves one element and runs no body at all.
     #[derive(Clone, Copy)]
     struct KeyedRow {
         seed: RowSeed,
@@ -193,14 +195,15 @@ pub mod keyed {
             let rows = self.rows;
             let selected = self.selected;
             (
-                // the row's OWN selection flag flips its own <tr>
-                boundary_class(if seed.selected.get() { "danger" } else { "" }),
+                // the row's OWN selection flag flips its own <tr>, read
+                // by the element — no body hears about it
+                boundary_class_when(seed.selected, "danger"),
                 text(id.to_string())
                     .foreground_color(theme::fg())
                     .element("td")
                     .css_class("col-md-1"),
                 hstack!(
-                    text(seed.label.get().to_string())
+                    text!(seed.label)
                         .foreground_color(theme::fg())
                         .element("a")
                         .on_click(move || {
@@ -278,7 +281,6 @@ pub mod keyed {
             let rows = self.rows;
             let selected = self.selected;
             let next_id = self.next_id;
-            let data = rows.get();
 
             let chip = |label: &str, id: &str| {
                 text(label.to_string())
@@ -331,8 +333,11 @@ pub mod keyed {
             .spacing(6.0)
             .padding_length(8.0);
 
+            // the LIST reads the rows: a change to them runs the list's
+            // key diff and nothing above it — a new key runs its row
+            // once, a key that left takes its row along, a swap moves
             let table = for_each(
-                (*data).clone(),
+                rows,
                 |seed| seed.id.to_string(),
                 move |seed| KeyedRow { seed: *seed, rows, selected }.element("tr"),
             );

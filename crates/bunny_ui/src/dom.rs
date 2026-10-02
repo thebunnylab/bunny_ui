@@ -364,6 +364,8 @@ pub struct DomField {
 pub enum NodeBinding {
     /// The text of a text node.
     Text(Rc<crate::bind::Bound<Arc<str>>>),
+    /// The class of a group's element (`boundary_class_with`).
+    Class(Rc<crate::bind::Bound<String>>),
 }
 
 impl NodeBinding {
@@ -371,6 +373,7 @@ impl NodeBinding {
     pub fn key(&self) -> &Rc<str> {
         match self {
             NodeBinding::Text(bound) => bound.key(),
+            NodeBinding::Class(bound) => bound.key(),
         }
     }
 
@@ -380,7 +383,27 @@ impl NodeBinding {
     fn same_as(&self, other: &NodeBinding) -> bool {
         match (self, other) {
             (NodeBinding::Text(a), NodeBinding::Text(b)) => Rc::ptr_eq(a, b),
+            (NodeBinding::Class(a), NodeBinding::Class(b)) => Rc::ptr_eq(a, b),
+            _ => false,
         }
+    }
+}
+
+/// Are two nodes driven by the same binding object?
+fn same_binding(old: &DomNode, new: &DomNode) -> bool {
+    match (&old.binding, &new.binding) {
+        (Some(was), Some(now)) => was.same_as(now),
+        _ => false,
+    }
+}
+
+/// Did the hints move, the class of a bound node aside? A class that
+/// reads for itself travels on its own road.
+fn hints_changed(old: &DomNode, new: &DomNode) -> bool {
+    if same_binding(old, new) && matches!(new.binding, Some(NodeBinding::Class(_))) {
+        DomHints { class: old.hints.class.clone(), ..new.hints.clone() } != old.hints
+    } else {
+        old.hints != new.hints
     }
 }
 
@@ -920,7 +943,7 @@ struct LowerCtx<'a> {
     next_id: &'a mut u32,
     display: &'a [DrawCommand],
     islands: &'a mut HashMap<u32, Island>,
-    group_paths: &'a mut std::collections::HashSet<std::rc::Rc<str>>,
+    group_paths: &'a mut motor::hash::FxHashMap<std::rc::Rc<str>, crate::dom_flow::GroupRecord>,
     bindings: &'a mut HashMap<Rc<str>, BoundElement>,
 }
 
@@ -936,10 +959,11 @@ pub struct DomLowering {
     /// Anchor relations already shipped: popover element id → anchor
     /// element id. A relation re-ships when the anchor recreates.
     anchors_sent: HashMap<u32, u32>,
-    /// Every retained Group's identity path — the walk consults this
-    /// before promising a reuse (a promise the diff cannot keep would
-    /// mount a hole).
-    group_paths: std::collections::HashSet<std::rc::Rc<str>>,
+    /// Every retained Group's identity path, with the environment the
+    /// walk lowered it in — the walk consults this before promising a
+    /// reuse (a promise the diff cannot keep would mount a hole, and a
+    /// group lowered in another environment is another scene).
+    group_paths: motor::hash::FxHashMap<std::rc::Rc<str>, crate::dom_flow::GroupRecord>,
     /// The elements that read for themselves, by binding key: the id,
     /// the binding, and the record last shipped for it. A write that
     /// reaches a binding is patched from here — one element, no walk.
@@ -950,9 +974,14 @@ pub struct DomLowering {
 struct BoundElement {
     id: u32,
     binding: NodeBinding,
-    /// The text record the wire last carried — the next patch is a
-    /// copy of it with the new content.
-    shipped: DomText,
+    /// What the wire last carried for it — the next patch is a copy of
+    /// it with the new reading.
+    shipped: Shipped,
+}
+
+enum Shipped {
+    Text(DomText),
+    Hints(DomHints),
 }
 
 impl DomLowering {
@@ -1091,11 +1120,10 @@ impl DomLowering {
         fn adopt_node(node: &DomNode, ctx: &mut LowerCtx) -> Retained {
             let id = *ctx.next_id;
             *ctx.next_id += 1;
-            if let DomKind::Group { path } = &node.kind {
-                ctx.group_paths.insert(path.clone());
-            }
-            if let (DomKind::Text(text), Some(binding)) = (&node.kind, &node.binding) {
-                file_binding(id, binding, text, ctx);
+            match (&node.kind, &node.binding) {
+                (DomKind::Text(text), Some(binding)) => file_binding(id, binding, text, ctx),
+                (DomKind::Group { .. }, Some(binding)) => file_class_binding(id, binding, &node.hints, ctx),
+                _ => {}
             }
             let mut retained = Retained {
                 id,
@@ -1128,11 +1156,20 @@ impl DomLowering {
         self.root = Some(root);
     }
 
-    /// The retained Groups' identity paths — the flow walk consults
-    /// them before promising a reuse. Borrowed, never copied: a frame
-    /// asks for a thousand rows' worth of them.
-    pub(crate) fn group_paths(&self) -> &std::collections::HashSet<std::rc::Rc<str>> {
+    /// The retained Groups' records — the flow walk consults them
+    /// before promising a reuse. Borrowed, never copied: a frame asks
+    /// for a thousand rows' worth of them.
+    pub(crate) fn group_paths(&self) -> &motor::hash::FxHashMap<std::rc::Rc<str>, crate::dom_flow::GroupRecord> {
         &self.group_paths
+    }
+
+    /// The groups a walk lowered, with what it lowered them in: filed
+    /// before the diff, so a group the diff mounts is known to the next
+    /// walk with its environment.
+    pub(crate) fn note_groups(&mut self, groups: Vec<(std::rc::Rc<str>, crate::dom_flow::GroupRecord)>) {
+        for (path, record) in groups {
+            self.group_paths.insert(path, record);
+        }
     }
 
     /// The bindings a write reached, patched by key: each one is read
@@ -1145,15 +1182,29 @@ impl DomLowering {
             let Some(bound) = self.bindings.get_mut(key) else {
                 continue;
             };
-            match &bound.binding {
-                NodeBinding::Text(binding) => {
+            match (&bound.binding, &mut bound.shipped) {
+                (NodeBinding::Text(binding), Shipped::Text(shipped)) => {
                     let content = binding.get();
-                    if content != bound.shipped.content {
-                        bound.shipped.content = content;
-                        patches.push(DomPatch::SetText { id: bound.id, text: bound.shipped.clone() });
+                    if content != shipped.content {
+                        shipped.content = content;
+                        patches.push(DomPatch::SetText { id: bound.id, text: shipped.clone() });
                         crate::stats::note_binding_update();
                     }
                 }
+                (NodeBinding::Class(binding), Shipped::Hints(shipped)) => {
+                    let class = binding.get();
+                    let class: Option<Rc<str>> = (!class.is_empty()).then(|| Rc::from(class.as_str()));
+                    if class != shipped.class {
+                        shipped.class = class;
+                        patches.push(DomPatch::SetHints {
+                            id: bound.id,
+                            class: shipped.class.clone(),
+                            dom_id: shipped.dom_id.clone(),
+                        });
+                        crate::stats::note_binding_update();
+                    }
+                }
+                _ => {}
             }
         }
         patches
@@ -1361,8 +1412,8 @@ fn create_subtree(
         kind: create_kind(&node.kind),
         hints: node.hints.clone(),
     });
-    if let DomKind::Group { path } = &node.kind {
-        ctx.group_paths.insert(path.clone());
+    if let (DomKind::Group { .. }, Some(binding)) = (&node.kind, &node.binding) {
+        file_class_binding(id, binding, &node.hints, ctx);
     }
     match &node.layout {
         // a flow node speaks semantics; its geometry fields are silent
@@ -1422,11 +1473,19 @@ fn create_children(
 
 /// One remove patch frees the whole subtree on the glue's side; the
 /// island registry forgets every canvas underneath.
-/// Files the element a binding drives, with the record just shipped.
+/// Files the element a text binding drives, with the record just shipped.
 fn file_binding(id: u32, binding: &NodeBinding, shipped: &DomText, ctx: &mut LowerCtx) {
     ctx.bindings.insert(
         Rc::clone(binding.key()),
-        BoundElement { id, binding: binding.clone(), shipped: shipped.clone() },
+        BoundElement { id, binding: binding.clone(), shipped: Shipped::Text(shipped.clone()) },
+    );
+}
+
+/// Files the element a class binding drives, with the hints just shipped.
+fn file_class_binding(id: u32, binding: &NodeBinding, shipped: &DomHints, ctx: &mut LowerCtx) {
+    ctx.bindings.insert(
+        Rc::clone(binding.key()),
+        BoundElement { id, binding: binding.clone(), shipped: Shipped::Hints(shipped.clone()) },
     );
 }
 
@@ -1454,7 +1513,7 @@ fn remove_subtree(retained: &Retained, ctx: &mut LowerCtx, patches: &mut Vec<Dom
     forget_islands(retained, ctx.islands);
     fn forget_groups(
         retained: &Retained,
-        groups: &mut std::collections::HashSet<std::rc::Rc<str>>,
+        groups: &mut motor::hash::FxHashMap<std::rc::Rc<str>, crate::dom_flow::GroupRecord>,
     ) {
         if let DomKind::Group { path } = &retained.node.kind {
             groups.remove(path);
@@ -1474,9 +1533,29 @@ fn diff_node(
     patches: &mut Vec<DomPatch>,
 ) {
     // the promise, honored: the walk never descended, the diff never
-    // traverses — the retained subtree IS the frame's truth here
+    // traverses — the retained subtree IS the frame's truth here. Only
+    // the SHELL is read: the parent stamped its flags and hints on the
+    // promise again, and a parent that ran may have stamped them anew
     if let DomKind::Reuse { .. } = &new.kind {
         crate::stats::note_diff_reuse();
+        let id = retained.id;
+        if let Some(layout) = &new.layout
+            && retained.node.layout.as_ref() != Some(layout)
+        {
+            patches.push(DomPatch::SetLayout { id, layout: layout.clone() });
+            retained.node.layout = Some(layout.clone());
+        }
+        if hints_changed(&retained.node, new) {
+            patches.push(DomPatch::SetHints {
+                id,
+                class: new.hints.class.clone(),
+                dom_id: new.hints.dom_id.clone(),
+            });
+            retained.node.hints = new.hints.clone();
+            if let Some(binding) = &new.binding {
+                file_class_binding(id, binding, &new.hints, ctx);
+            }
+        }
         return;
     }
     crate::stats::note_diff_visit();
@@ -1505,7 +1584,8 @@ fn diff_node(
     if old.style != new.style {
         patches.push(DomPatch::SetStyle { id, style: new.style.clone() });
     }
-    if old.hints != new.hints {
+    let same_binding = same_binding(old, new);
+    if hints_changed(old, new) {
         // class and id re-attribute live; a TAG change would need a
         // recreation and the walk never changes one on a kept identity
         patches.push(DomPatch::SetHints {
@@ -1514,15 +1594,16 @@ fn diff_node(
             dom_id: new.hints.dom_id.clone(),
         });
     }
+    if let (DomKind::Group { .. }, Some(binding)) = (&new.kind, &new.binding)
+        && (!same_binding || hints_changed(old, new))
+    {
+        file_class_binding(id, binding, &new.hints, ctx);
+    }
     match (&old.kind, &new.kind) {
         (DomKind::Text(before), DomKind::Text(after)) => {
             // the content of a text that reads for itself travels on its
             // own road: the same binding object means the same reads, and
             // the retained record may lag the patch already shipped
-            let same_binding = match (&old.binding, &new.binding) {
-                (Some(was), Some(now)) => was.same_as(now),
-                _ => false,
-            };
             let changed = if same_binding {
                 DomText { content: Arc::clone(&before.content), ..after.clone() } != *before
             } else {

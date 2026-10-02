@@ -1117,7 +1117,7 @@ pub enum LayoutNode {
     /// inside its body — the door a row uses to flip its own `<tr>`
     /// class without its parent hearing. Invisible everywhere: zero
     /// size, no paint, no hit.
-    BoundaryHint { class: Option<String> },
+    BoundaryHint { class: Option<crate::bind::ClassSource> },
     /// Element hints for the Dom lowering — a real tag, a class, an
     /// id. Transparent everywhere else, like `.rendering()`: a pixel
     /// target never knows the child was ever going to be a `<tr>`.

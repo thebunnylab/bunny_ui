@@ -197,6 +197,8 @@ pub(crate) struct Entry {
 #[derive(Default)]
 struct BuildingFrame {
     path: String,
+    /// The frame of a keyed list: the rows under it are kept by key.
+    list: bool,
     effects: Vec<EffectFn>,
     actions: Vec<ActionEntry>,
     copies: Vec<CopyEntry>,
@@ -657,6 +659,11 @@ pub(crate) enum Decision {
 /// A boundary reached in the walk: skip if it is clean, retained, and
 /// no body above it ran in this pass (a parent that ran built new
 /// values — the config may have changed without going through `State`).
+///
+/// One parent is the exception: a KEYED LIST that re-ran. Its rows are
+/// kept by key — a row renders once per key, and what the row shows
+/// moves through the row's own reads — so under it a retained clean
+/// row is skipped like any clean boundary.
 pub(crate) fn decide(path: &str) -> Decision {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
@@ -664,8 +671,9 @@ pub(crate) fn decide(path: &str) -> Decision {
             return Decision::Render;
         }
         let inside_rerun = !pass.building.is_empty();
+        let under_list = pass.building.last().is_some_and(|frame| frame.list);
         let retained = RETAINED.with(|retained| retained.borrow().contains_key(path));
-        if !inside_rerun && retained && !pass.dirty.contains(path) {
+        if (!inside_rerun || under_list) && retained && !pass.dirty.contains(path) {
             pass.skipped.push(path.to_string());
             Decision::Skip
         } else {
@@ -674,11 +682,11 @@ pub(crate) fn decide(path: &str) -> Decision {
     })
 }
 
-pub(crate) fn begin_entry(path: &str) {
+pub(crate) fn begin_entry(path: &str, list: bool) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         pass.body_runs.push(path.to_string());
-        pass.building.push(BuildingFrame { path: path.to_string(), ..Default::default() });
+        pass.building.push(BuildingFrame { path: path.to_string(), list, ..Default::default() });
     });
 }
 
