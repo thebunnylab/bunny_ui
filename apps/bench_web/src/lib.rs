@@ -220,7 +220,10 @@ pub mod keyed {
                 .css_class("col-md-4"),
                 hstack!(
                     hstack!(
-                        text("x")
+                        // the page's stylesheet draws the glyph through
+                        // the class; words of our own would be a second
+                        // text to lay out on every row
+                        text("")
                             .foreground_color(theme::fg_secondary())
                             .element("span")
                             .css_class("glyphicon glyphicon-remove")
