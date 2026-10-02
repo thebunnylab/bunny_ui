@@ -884,8 +884,11 @@ pub enum DomPatch {
     Remove { id: u32 },
     /// Empties the element: every child and its subtree leaves in one
     /// op — a list that clears, or replaces its rows, costs one word
-    /// instead of one per row.
-    RemoveChildren { id: u32 },
+    /// instead of one per row. `forget` names the ids that leave, as
+    /// ranges: elements are numbered in the order they mount, so a
+    /// thousand rows mounted together are ONE range, and the glue
+    /// forgets them by counting instead of walking the subtree.
+    RemoveChildren { id: u32, forget: Vec<(u32, u32)> },
     SetTransform { id: u32, x: f64, y: f64 },
     SetSize { id: u32, width: f64, height: f64 },
     /// The FULL style record — the glue resets and applies (styles are
@@ -1506,10 +1509,32 @@ fn remove_all_children<'a>(
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
-    patches.push(DomPatch::RemoveChildren { id: parent });
+    let mut ids: Vec<u32> = Vec::new();
     for retained in leaving {
+        collect_ids(retained, &mut ids);
         forget_subtree(retained, ctx);
     }
+    patches.push(DomPatch::RemoveChildren { id: parent, forget: id_ranges(ids) });
+}
+
+fn collect_ids(retained: &Retained, ids: &mut Vec<u32>) {
+    ids.push(retained.id);
+    for child in &retained.children {
+        collect_ids(child, ids);
+    }
+}
+
+/// Sorted ids as half-open ranges `[start, end)`, neighbours merged.
+fn id_ranges(mut ids: Vec<u32>) -> Vec<(u32, u32)> {
+    ids.sort_unstable();
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for id in ids {
+        match ranges.last_mut() {
+            Some((_, end)) if *end == id => *end += 1,
+            _ => ranges.push((id, id + 1)),
+        }
+    }
+    ranges
 }
 
 /// What the lowering kept about a subtree that left: its islands, its
@@ -2166,9 +2191,14 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 out.push(2);
                 push_u32(&mut out, *id);
             }
-            DomPatch::RemoveChildren { id } => {
+            DomPatch::RemoveChildren { id, forget } => {
                 out.push(18);
                 push_u32(&mut out, *id);
+                push_u16(&mut out, forget.len().min(u16::MAX as usize) as u16);
+                for (start, end) in forget.iter().take(u16::MAX as usize) {
+                    push_u32(&mut out, *start);
+                    push_u32(&mut out, *end);
+                }
             }
             DomPatch::SetTransform { id, x, y } => {
                 out.push(3);
@@ -2645,7 +2675,7 @@ mod tests {
         match patch {
             DomPatch::Create { id, .. }
             | DomPatch::Remove { id }
-            | DomPatch::RemoveChildren { id }
+            | DomPatch::RemoveChildren { id, .. }
             | DomPatch::SetTransform { id, .. }
             | DomPatch::SetSize { id, .. }
             | DomPatch::SetStyle { id, .. }
