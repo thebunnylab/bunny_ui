@@ -767,11 +767,13 @@ pub fn image_ui<T: Debug>(image: T) -> ImageUiImage {
 /// layout owns geometry. Draws at the intrinsic size (1 pixel = 1
 /// point) until `.resizable()` lets it negotiate — then
 /// `.aspect_ratio(ContentMode::Fit)` contains and `Fill` covers with a
-/// built-in clip.
+/// built-in clip. A feed (`&ImageFeed`) is an image too: the GPU scales
+/// its newest frame into the box.
 ///
 /// ```ignore
 /// image(ImageSource::from_bytes(LOGO)).resizable().aspect_ratio(ContentMode::Fit)
 /// image(file_icon(path)).resizable().frame(16.0, 16.0)
+/// image(&camera).resizable().aspect_ratio(ContentMode::Fill)
 /// ```
 #[derive(Clone)]
 pub struct Image(pub crate::image_engine::ImageSource);
@@ -789,8 +791,8 @@ impl View for Image {
     }
 }
 
-pub fn image(source: crate::image_engine::ImageSource) -> Image {
-    Image(source)
+pub fn image(source: impl Into<crate::image_engine::ImageSource>) -> Image {
+    Image(source.into())
 }
 
 /// A vector glyph. Sizes with the INHERITED font, the way a character
