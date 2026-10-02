@@ -113,6 +113,9 @@ pub enum Modifier {
     AutoFocus,
     /// The field takes the keyboard on each new beat, from whoever holds it.
     AutoFocusBeat(u64),
+    /// As [`Modifier::AutoFocusBeat`], selecting the field's whole text on
+    /// each new beat.
+    SelectOnBeat(u64),
     /// A soft halo behind the view: (radius, color).
     Shadow(f64, Color),
     /// The liquid-glass material behind the view. Every knob is
@@ -320,6 +323,7 @@ impl Modifier {
             Modifier::OnMeasure(_) => " [.onMeasure]".into(),
             Modifier::AutoFocus => " [.autoFocus()]".into(),
             Modifier::AutoFocusBeat(beat) => format!(" [.autoFocusBeat({beat})]"),
+            Modifier::SelectOnBeat(beat) => format!(" [.selectOnBeat({beat})]"),
             Modifier::Shadow(radius, color) => format!(" [.shadow(radius: {radius}, {color})]"),
             // the knobs a chain named, in a fixed order — the print of
             // a view that only asked for the material stays ` [.glass()]`
@@ -1571,6 +1575,15 @@ fn apply(
             out.wrap_layout_from(mark, move |node| {
                 rewrite_field_node(node, &|parts| {
                     FieldParts { auto_focus: crate::layout::AutoFocus::Beat(beat), ..parts }
+                        .into_node()
+                })
+            })
+        }
+        Modifier::SelectOnBeat(beat) => {
+            let beat = *beat;
+            out.wrap_layout_from(mark, move |node| {
+                rewrite_field_node(node, &|parts| {
+                    FieldParts { auto_focus: crate::layout::AutoFocus::Selecting(beat), ..parts }
                         .into_node()
                 })
             })

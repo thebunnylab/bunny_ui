@@ -3797,6 +3797,11 @@ impl Runtime {
             reconciler::run_editor(path, EditCommand::Submit, &mut state),
             Some(Some(_))
         );
+        // commit-and-go (`TextField::yield_on_submit`): the keys a beat lent
+        // the field go home, so the next stroke reaches the input under it
+        if taken && reconciler::field_yields_on_submit(path) {
+            let _ = self.give_back_keyboard();
+        }
         Edited { applied: taken, output: None }
     }
 
@@ -5945,23 +5950,40 @@ impl Runtime {
         let key = match ask {
             AutoFocus::Off => return false,
             AutoFocus::First => path.to_string(),
-            AutoFocus::Beat(beat) => format!("{path}#{beat}"),
+            AutoFocus::Beat(beat) | AutoFocus::Selecting(beat) => format!("{path}#{beat}"),
         };
         if !self.auto_focused.borrow_mut().insert(key) {
             return false;
         }
-        let free = match ask {
-            AutoFocus::Beat(_) => self.focus.borrow().as_deref() != Some(path),
-            _ => self.focus.borrow().is_none(),
+        let beat = matches!(ask, AutoFocus::Beat(_) | AutoFocus::Selecting(_));
+        let free = if beat {
+            self.focus.borrow().as_deref() != Some(path)
+        } else {
+            self.focus.borrow().is_none()
         };
         if free {
             let lender = self.focus.borrow().clone();
-            if let (AutoFocus::Beat(_), Some(lender)) = (ask, lender) {
+            if let (true, Some(lender)) = (beat, lender) {
                 self.loans.borrow_mut().lend(path, &lender);
             }
             self.focus(path);
         }
+        // a selecting beat selects whether it moved the keys or found them
+        // here: the summon means "replace what the field holds"
+        if matches!(ask, AutoFocus::Selecting(_)) && self.focus.borrow().as_deref() == Some(path) {
+            self.select_all_in(path);
+            return true;
+        }
         free
+    }
+
+    /// Selects the whole text of the field at `path` — the caret state the
+    /// field keeps, moved by the field's own editor.
+    fn select_all_in(&self, path: &str) {
+        let mut state = self.carets.borrow().get(path).copied().unwrap_or_default();
+        let _ = reconciler::run_editor(path, EditCommand::SelectAll, &mut state);
+        self.carets.borrow_mut().insert(path.to_string(), state);
+        self.frame_asked.set(true);
     }
 
     /// Focuses the first field whose ask is new — once per identity for
