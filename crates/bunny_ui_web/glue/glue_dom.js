@@ -441,6 +441,21 @@ function applyPatches(view, length) {
     }
     return fragment.holder;
   };
+  // where a new element lands: before its anchor wherever that lives
+  // (it may still sit in a staged fragment), or appended — staged when
+  // the parent is live, so a thousand rows reach the tree once
+  const place = (el, parent, before) => {
+    const home = elements.get(parent);
+    if (!home) return;
+    const anchor = before ? elements.get(before) : null;
+    if (anchor) {
+      (anchor.parentNode ?? home).insertBefore(el, anchor);
+    } else if (home.isConnected) {
+      stagedFor(parent, home).appendChild(el);
+    } else {
+      home.appendChild(el);
+    }
+  };
   const count = u32();
   for (let i = 0; i < count; i++) {
     const op = u8();
@@ -463,21 +478,46 @@ function applyPatches(view, length) {
       if (kind === 6) {
         wireIsland(el, id);
       }
-      const home = elements.get(parent);
-      if (home) {
-        const anchor = before ? elements.get(before) : null;
-        if (anchor) {
-          // relative to wherever the anchor LIVES — it may still sit
-          // in a staged fragment on its way to the tree
-          (anchor.parentNode ?? home).insertBefore(el, anchor);
-        } else if (home.isConnected) {
-          // stage appends to live parents; detached ones are cheap
-          stagedFor(parent, home).appendChild(el);
+      place(el, parent, before);
+      elements.set(id, el);
+    } else if (op === 17) {
+      // a shape already on the page: one deep clone of the live
+      // instance, numbered in pre-order from the copy's own id — the
+      // words and the action paths follow as their own ops
+      const parent = u32();
+      const before = u32();
+      const source = elements.get(u32());
+      if (source) {
+        const el = source.cloneNode(true);
+        let n = id;
+        const number = (node) => {
+          node.dataset.n = n;
+          elements.set(n, node);
+          fresh.add(n);
+          n++;
+          for (const child of node.children) number(child);
+        };
+        number(el);
+        place(el, parent, before);
+      }
+    } else if (op === 19) {
+      // the action path alone
+      const el = elements.get(id);
+      const path = text(u16());
+      if (el) {
+        if (path) {
+          el.dataset.path = path;
+          el.style.cursor = "default";
         } else {
-          home.appendChild(el);
+          delete el.dataset.path;
+          el.style.cursor = "";
         }
       }
-      elements.set(id, el);
+    } else if (op === 20) {
+      // the words alone: the font and the ink already stand
+      const el = elements.get(id);
+      const raw = bytes(u32());
+      if (el) el.textContent = decoder.decode(raw);
     } else if (op === 2) {
       const el = elements.get(id);
       if (el) {

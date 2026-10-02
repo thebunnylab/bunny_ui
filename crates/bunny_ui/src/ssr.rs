@@ -54,6 +54,7 @@ pub fn render_document(root: &impl View, size: Size, wasm: &str, glue: &str) -> 
 }
 
 /// A toy element: enough DOM to receive the mount and print itself.
+#[derive(Clone)]
 struct Element {
     tag: &'static str,
     /// `data-n` — the identity hydration adopts by.
@@ -259,6 +260,27 @@ impl Tree {
         self.elements.insert(id, element);
     }
 
+    /// Copies `source` and its subtree under fresh ids, pre-order from
+    /// `next` — the twin of the glue's `cloneNode`.
+    fn clone_into(&mut self, source: u32, next: &mut u32) {
+        let Some(mut copy) = self.elements.get(&source).cloned() else {
+            return;
+        };
+        let id = *next;
+        *next += 1;
+        copy.id = id;
+        let children = std::mem::take(&mut copy.children);
+        copy.children = children
+            .iter()
+            .map(|child| {
+                let child_id = *next;
+                self.clone_into(*child, next);
+                child_id
+            })
+            .collect();
+        self.elements.insert(id, copy);
+    }
+
     fn apply(&mut self, patch: &DomPatch) {
         match patch {
             DomPatch::Create { id, parent, before, kind, hints } => {
@@ -281,6 +303,43 @@ impl Tree {
                     element.children.retain(|child| child != id);
                 }
                 self.elements.remove(id);
+            }
+            DomPatch::Clone { id, parent, before, template } => {
+                // the copy takes the template's subtree with ids counted
+                // in pre-order from its own, as the lowering numbered them
+                let mut next = *id;
+                self.clone_into(*template, &mut next);
+                let Some(parent) = self.elements.get_mut(parent) else {
+                    return;
+                };
+                match before {
+                    0 => parent.children.push(*id),
+                    anchor => {
+                        let at = parent
+                            .children
+                            .iter()
+                            .position(|child| child == anchor)
+                            .unwrap_or(parent.children.len());
+                        parent.children.insert(at, *id);
+                    }
+                }
+            }
+            DomPatch::SetPath { id, path } => {
+                if let Some(element) = self.elements.get_mut(id) {
+                    match path {
+                        Some(path) => {
+                            element.attrs.insert("data-path", path.to_string());
+                        }
+                        None => {
+                            element.attrs.remove("data-path");
+                        }
+                    }
+                }
+            }
+            DomPatch::SetContent { id, text } => {
+                if let Some(element) = self.elements.get_mut(id) {
+                    element.text = vec![(text.to_string(), None)];
+                }
             }
             DomPatch::RemoveChildren { id, .. } => {
                 let Some(element) = self.elements.get_mut(id) else {

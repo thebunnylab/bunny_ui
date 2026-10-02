@@ -889,6 +889,17 @@ pub enum DomPatch {
     /// thousand rows mounted together are ONE range, and the glue
     /// forgets them by counting instead of walking the subtree.
     RemoveChildren { id: u32, forget: Vec<(u32, u32)> },
+    /// A new element cloned from a live one of the same SHAPE — the
+    /// template — with its whole subtree; the ids of the copy count up
+    /// in pre-order from `id`, the way a fresh mount numbers them. Only
+    /// what is the copy's own follows: its words (`SetContent`) and its
+    /// action paths (`SetPath`). Eight creates and their styles are one
+    /// word.
+    Clone { id: u32, parent: u32, before: u32, template: u32 },
+    /// The action path alone — what a cloned element keeps of its own.
+    SetPath { id: u32, path: Option<Rc<str>> },
+    /// The words alone, for a text whose font and ink already stand.
+    SetContent { id: u32, text: Arc<str> },
     SetTransform { id: u32, x: f64, y: f64 },
     SetSize { id: u32, width: f64, height: f64 },
     /// The FULL style record — the glue resets and applies (styles are
@@ -952,6 +963,7 @@ struct LowerCtx<'a> {
     islands: &'a mut HashMap<u32, Island>,
     group_paths: &'a mut motor::hash::FxHashMap<std::rc::Rc<str>, crate::dom_flow::GroupRecord>,
     bindings: &'a mut HashMap<Rc<str>, BoundElement>,
+    templates: &'a mut Templates,
 }
 
 /// The retained side of the Dom mode: last frame's scene with ids.
@@ -975,6 +987,8 @@ pub struct DomLowering {
     /// the binding, and the record last shipped for it. A write that
     /// reaches a binding is patched from here — one element, no walk.
     bindings: HashMap<Rc<str>, BoundElement>,
+    /// The shapes on the page a new group can be cloned from.
+    templates: Templates,
 }
 
 /// One element a binding drives.
@@ -989,6 +1003,58 @@ struct BoundElement {
 enum Shipped {
     Text(DomText),
     Hints(DomHints),
+}
+
+/// The shapes the lowering can clone: for each, one live element whose
+/// subtree IS the shape. A shape is everything about a group's subtree
+/// that is not the row's own — kinds, layout, style, tags and classes,
+/// fonts and inks — and never its words or its action paths. A patch
+/// that reaches a member of the live instance (other than its words)
+/// retires the template: the next row of the shape mounts whole and
+/// becomes the template itself.
+#[derive(Default)]
+struct Templates {
+    by_shape: HashMap<u64, u32>,
+    /// A template root → its shape.
+    roots: HashMap<u32, u64>,
+    /// Every element of a template instance → its root.
+    members: HashMap<u32, u32>,
+    /// A root → its members, to forget together.
+    members_of: HashMap<u32, Vec<u32>>,
+}
+
+impl Templates {
+    fn register(&mut self, shape: u64, root: u32, members: Vec<u32>) {
+        if self.by_shape.contains_key(&shape) {
+            return;
+        }
+        self.by_shape.insert(shape, root);
+        self.roots.insert(root, shape);
+        for &id in &members {
+            self.members.insert(id, root);
+        }
+        self.members_of.insert(root, members);
+    }
+
+    fn forget_root(&mut self, root: u32) {
+        let Some(shape) = self.roots.remove(&root) else {
+            return;
+        };
+        if self.by_shape.get(&shape) == Some(&root) {
+            self.by_shape.remove(&shape);
+        }
+        for id in self.members_of.remove(&root).unwrap_or_default() {
+            self.members.remove(&id);
+        }
+    }
+
+    /// Something other than its words reached a member: the live
+    /// instance no longer IS the shape.
+    fn touched(&mut self, id: u32) {
+        if let Some(&root) = self.members.get(&id) {
+            self.forget_root(root);
+        }
+    }
 }
 
 impl DomLowering {
@@ -1033,6 +1099,7 @@ impl DomLowering {
                     islands: &mut self.islands,
                     group_paths: &mut self.group_paths,
                     bindings: &mut self.bindings,
+                    templates: &mut self.templates,
                 };
                 root.children = create_children(scene, 0, &mut ctx, &mut patches);
                 self.next_id = next_id;
@@ -1046,6 +1113,7 @@ impl DomLowering {
                     islands: &mut self.islands,
                     group_paths: &mut self.group_paths,
                     bindings: &mut self.bindings,
+                    templates: &mut self.templates,
                 };
                 diff_node(root, scene, &mut ctx, &mut patches);
                 self.next_id = next_id;
@@ -1147,6 +1215,7 @@ impl DomLowering {
         self.next_id = 1;
         self.group_paths.clear();
         self.bindings.clear();
+        self.templates = Templates::default();
         self.islands.clear();
         self.anchors_sent.clear();
         let mut next_id = self.next_id;
@@ -1156,6 +1225,7 @@ impl DomLowering {
             islands: &mut self.islands,
             group_paths: &mut self.group_paths,
                     bindings: &mut self.bindings,
+                    templates: &mut self.templates,
         };
         let mut root = Retained { id: 0, node: shallow(scene), children: Vec::new() };
         root.children = scene.children.iter().map(|child| adopt_node(child, &mut ctx)).collect();
@@ -1209,6 +1279,7 @@ impl DomLowering {
                             dom_id: shipped.dom_id.clone(),
                         });
                         crate::stats::note_binding_update();
+                        self.templates.touched(bound.id);
                     }
                 }
                 _ => {}
@@ -1397,11 +1468,173 @@ fn create_subtree_before(
     let opened = patches.len();
     let created = create_subtree(node, parent, ctx, patches);
     if before != 0
-        && let DomPatch::Create { before: slot, .. } = &mut patches[opened]
+        && let DomPatch::Create { before: slot, .. } | DomPatch::Clone { before: slot, .. } =
+            &mut patches[opened]
     {
         *slot = before;
     }
     created
+}
+
+/// A group whose shape already stands on the page is cloned from it:
+/// one word for the subtree, then its words and its action paths.
+fn try_clone(
+    node: &DomNode,
+    parent: u32,
+    ctx: &mut LowerCtx,
+    patches: &mut Vec<DomPatch>,
+) -> Option<Retained> {
+    if !matches!(node.kind, DomKind::Group { .. }) {
+        return None;
+    }
+    let shape = shape_of(node)?;
+    let template = *ctx.templates.by_shape.get(&shape)?;
+    let id = *ctx.next_id;
+    *ctx.next_id += 1;
+    patches.push(DomPatch::Clone { id, parent, before: 0, template });
+    crate::stats::note_clone();
+    Some(clone_instance(node, id, ctx, patches))
+}
+
+/// The copy's own: ids in pre-order, every text's words, every action
+/// path — and the bindings filed under the new ids.
+fn clone_instance(
+    node: &DomNode,
+    id: u32,
+    ctx: &mut LowerCtx,
+    patches: &mut Vec<DomPatch>,
+) -> Retained {
+    if let DomKind::Text(text) = &node.kind {
+        patches.push(DomPatch::SetContent { id, text: Arc::clone(&text.content) });
+        if let Some(binding) = &node.binding {
+            file_binding(id, binding, text, ctx);
+        }
+    }
+    if let Some(path) = &node.style.interactive {
+        patches.push(DomPatch::SetPath { id, path: Some(Rc::clone(path)) });
+    }
+    if let (DomKind::Group { .. }, Some(binding)) = (&node.kind, &node.binding) {
+        file_class_binding(id, binding, &node.hints, ctx);
+    }
+    let children = node
+        .children
+        .iter()
+        .map(|child| {
+            let child_id = *ctx.next_id;
+            *ctx.next_id += 1;
+            clone_instance(child, child_id, ctx, patches)
+        })
+        .collect();
+    Retained { id, node: shallow(node), children }
+}
+
+/// The shape of a subtree, hashed — `None` when the subtree holds
+/// something a clone cannot carry: a field or a scroll region (the
+/// browser's own state), an island, an image, an icon, a frame, a
+/// popover, absolute geometry, an id, a highlight, or a style that
+/// hangs a rule or an attribute off the element's own id (states,
+/// groups, glass, tooltips, gradients).
+fn shape_of(node: &DomNode) -> Option<u64> {
+    use std::hash::Hasher;
+    let mut hasher = motor::hash::FxHasher::default();
+    shape_into(node, &mut hasher).then(|| hasher.finish())
+}
+
+fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
+    use std::hash::Hash;
+    let pack = |color: Color| u32::from_be_bytes([color.r, color.g, color.b, color.a]);
+    let kind: u8 = match &node.kind {
+        DomKind::Group { .. } => 0,
+        DomKind::Box => 1,
+        DomKind::Text(_) => 2,
+        DomKind::FlexColumn => 9,
+        DomKind::FlexRow => 10,
+        DomKind::Layers => 11,
+        _ => return false,
+    };
+    kind.hash(hasher);
+    if let DomKind::Text(text) = &node.kind {
+        if text.highlights.is_some() {
+            return false;
+        }
+        let font = &text.font;
+        font.size.to_bits().hash(hasher);
+        (font.weight as u8).hash(hasher);
+        (font.design as u8).hash(hasher);
+        (font.slant as u8).hash(hasher);
+        font.family.name().as_deref().hash(hasher);
+        font.tracking.to_bits().hash(hasher);
+        pack(text.color).hash(hasher);
+        text.inherits_ink.hash(hasher);
+        text.line_height.map(f64::to_bits).hash(hasher);
+        text.text_align.map(|align| align as u8).hash(hasher);
+        text.truncation.map(|mode| mode as u8).hash(hasher);
+    }
+    if node.hints.dom_id.is_some() {
+        return false;
+    }
+    node.hints.tag.as_deref().hash(hasher);
+    node.hints.class.as_deref().hash(hasher);
+    let Some(layout) = &node.layout else {
+        return false;
+    };
+    layout.gap.map(f64::to_bits).hash(hasher);
+    layout.align.hash(hasher);
+    layout
+        .padding
+        .map(|(top, right, bottom, left)| [top.to_bits(), right.to_bits(), bottom.to_bits(), left.to_bits()])
+        .hash(hasher);
+    layout.width.map(f64::to_bits).hash(hasher);
+    layout.height.map(f64::to_bits).hash(hasher);
+    layout.max_width.map(f64::to_bits).hash(hasher);
+    layout.max_height.map(f64::to_bits).hash(hasher);
+    layout.grow.hash(hasher);
+    layout.slot_y.map(f64::to_bits).hash(hasher);
+    layout.stretch.hash(hasher);
+    layout.fill.hash(hasher);
+    layout.wrap.map(f64::to_bits).hash(hasher);
+    let style = &node.style;
+    if style.hover_background.is_some()
+        || style.pressed_background.is_some()
+        || style.hover_color.is_some()
+        || style.pressed_color.is_some()
+        || style.focus_border.is_some()
+        || style.placeholder_color.is_some()
+        || style.hover_opacity.is_some()
+        || style.pressed_opacity.is_some()
+        || style.group.is_some()
+        || style.group_owner.is_some()
+        || style.glass.is_some()
+        || style.tooltip.is_some()
+        || style.gradient.is_some()
+    {
+        return false;
+    }
+    style.background.map(pack).hash(hasher);
+    style.color.map(pack).hash(hasher);
+    style.border.map(|(color, width)| (pack(color), width.to_bits())).hash(hasher);
+    style
+        .corner_radius
+        .map(|corners| {
+            [
+                corners.top_left.to_bits(),
+                corners.top_right.to_bits(),
+                corners.bottom_right.to_bits(),
+                corners.bottom_left.to_bits(),
+            ]
+        })
+        .hash(hasher);
+    style.shadow.map(|(radius, color)| (radius.to_bits(), pack(color))).hash(hasher);
+    style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(hasher);
+    style.clip.hash(hasher);
+    style.opacity.map(f64::to_bits).hash(hasher);
+    style.pass_through.hash(hasher);
+    // the action path is the row's own; that there IS one is the shape
+    style.interactive.is_some().hash(hasher);
+    // a binding reads its own value; that there is one is the shape
+    node.binding.is_some().hash(hasher);
+    node.children.len().hash(hasher);
+    node.children.iter().all(|child| shape_into(child, hasher))
 }
 
 fn create_subtree(
@@ -1410,6 +1643,10 @@ fn create_subtree(
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) -> Retained {
+    // a shape already on the page is cloned, never built again
+    if let Some(cloned) = try_clone(node, parent, ctx, patches) {
+        return cloned;
+    }
     let id = *ctx.next_id;
     *ctx.next_id += 1;
     patches.push(DomPatch::Create {
@@ -1463,7 +1700,17 @@ fn create_subtree(
         _ => {}
     }
     let children = create_children(node, id, ctx, patches);
-    Retained { id, node: shallow(node), children }
+    let retained = Retained { id, node: shallow(node), children };
+    // the first of a shape is the template the next ones clone
+    if matches!(node.kind, DomKind::Group { .. })
+        && let Some(shape) = shape_of(node)
+        && !ctx.templates.by_shape.contains_key(&shape)
+    {
+        let mut members = Vec::new();
+        collect_ids(&retained, &mut members);
+        ctx.templates.register(shape, id, members);
+    }
+    retained
 }
 
 fn create_children(
@@ -1540,6 +1787,13 @@ fn id_ranges(mut ids: Vec<u32>) -> Vec<(u32, u32)> {
 /// What the lowering kept about a subtree that left: its islands, its
 /// groups, its bindings.
 fn forget_subtree(retained: &Retained, ctx: &mut LowerCtx) {
+    fn forget_templates(retained: &Retained, templates: &mut Templates) {
+        templates.touched(retained.id);
+        for child in &retained.children {
+            forget_templates(child, templates);
+        }
+    }
+    forget_templates(retained, ctx.templates);
     fn forget_bindings(retained: &Retained, bindings: &mut HashMap<Rc<str>, BoundElement>) {
         if let Some(binding) = &retained.node.binding
             && bindings.get(binding.key()).is_some_and(|bound| bound.id == retained.id)
@@ -1588,6 +1842,7 @@ fn diff_node(
     if let DomKind::Reuse { .. } = &new.kind {
         crate::stats::note_diff_reuse();
         let id = retained.id;
+        let before = patches.len();
         if let Some(layout) = &new.layout
             && retained.node.layout.as_ref() != Some(layout)
         {
@@ -1605,10 +1860,14 @@ fn diff_node(
                 file_class_binding(id, binding, &new.hints, ctx);
             }
         }
+        if patches.len() > before {
+            ctx.templates.touched(id);
+        }
         return;
     }
     crate::stats::note_diff_visit();
     let id = retained.id;
+    let own_patches_from = patches.len();
     let old = &retained.node;
     match &new.layout {
         // a flow node speaks semantics — its geometry fields are silent
@@ -1689,6 +1948,11 @@ fn diff_node(
             patches.push(DomPatch::SetIframe { id, src: std::rc::Rc::clone(after), sealed: *is });
         }
         _ => {}
+    }
+    // a patch other than its words reached a template's member: the
+    // live instance is no longer the shape
+    if patches.len() > own_patches_from {
+        ctx.templates.touched(id);
     }
     let previous_target = old_kind_for_reveal(retained);
     retained.node = shallow(new);
@@ -1829,6 +2093,9 @@ fn diff_children(
             remove_subtree(leftover, ctx, patches);
         }
     }
+    if survivors < new.children.len() || !leaving.is_empty() {
+        ctx.templates.touched(retained.id);
+    }
     retained.children = next;
 }
 
@@ -1926,6 +2193,11 @@ fn diff_children_ordered(
         for leftover in &leaving {
             remove_subtree(leftover, ctx, patches);
         }
+    }
+    // a child mounted, left or moved under a template's member: the
+    // live instance is no longer the shape
+    if survivors < plan.len() || !leaving.is_empty() {
+        ctx.templates.touched(parent_id);
     }
 
     // the stable spine: survivors whose old order already reads in
@@ -2027,9 +2299,12 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 /// row (101 to 124, `bunny_key` now answering whether a key was taken).
 ///
 /// 11 (2026-10-02): op 18 empties an element (`RemoveChildren` — a list
-/// that clears or replaces its rows is one word), a removal (op 2)
-/// unregisters its own subtree in the glue instead of a sweep over
-/// every element at the end of the batch, and the shell imports
+/// that clears or replaces its rows is one word, with the id ranges it
+/// forgets), a removal (op 2) unregisters its own subtree in the glue
+/// instead of a sweep over every element at the end of the batch, op
+/// 17 clones a shape already on the page (`Clone`, ids in pre-order
+/// from the copy's), op 19 sets an action path alone (`SetPath`), op
+/// 20 sets a text's words alone (`SetContent`), and the shell imports
 /// `js_now` — the page's clock, for the stage table a `?stats` page
 /// reads through `bunny_stats_*`.
 pub const ABI_VERSION: u32 = 11;
@@ -2190,6 +2465,24 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
             DomPatch::Remove { id } => {
                 out.push(2);
                 push_u32(&mut out, *id);
+            }
+            DomPatch::Clone { id, parent, before, template } => {
+                out.push(17);
+                push_u32(&mut out, *id);
+                push_u32(&mut out, *parent);
+                push_u32(&mut out, *before);
+                push_u32(&mut out, *template);
+            }
+            DomPatch::SetPath { id, path } => {
+                out.push(19);
+                push_u32(&mut out, *id);
+                push_bytes_u16(&mut out, path.as_deref().unwrap_or("").as_bytes());
+            }
+            DomPatch::SetContent { id, text } => {
+                out.push(20);
+                push_u32(&mut out, *id);
+                push_u32(&mut out, text.len() as u32);
+                out.extend_from_slice(text.as_bytes());
             }
             DomPatch::RemoveChildren { id, forget } => {
                 out.push(18);
@@ -2676,6 +2969,9 @@ mod tests {
             DomPatch::Create { id, .. }
             | DomPatch::Remove { id }
             | DomPatch::RemoveChildren { id, .. }
+            | DomPatch::Clone { id, .. }
+            | DomPatch::SetPath { id, .. }
+            | DomPatch::SetContent { id, .. }
             | DomPatch::SetTransform { id, .. }
             | DomPatch::SetSize { id, .. }
             | DomPatch::SetStyle { id, .. }
@@ -2745,9 +3041,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // one text per row plus the header
+        // one text per row plus the header — a row of a shape already
+        // on the page is a clone of it, and its text arrives as a word
         let texts = creates.iter().filter(|(_, _, kind)| *kind == CreateKind::Text).count();
-        assert_eq!(texts, 4, "header + three rows: {creates:?}");
+        let clones = patches.iter().filter(|patch| matches!(patch, DomPatch::Clone { .. })).count();
+        assert_eq!(texts + clones, 4, "header + three rows: {creates:?}");
         assert_eq!(
             creates.iter().filter(|(_, _, kind)| *kind == CreateKind::Scroll).count(),
             1
@@ -4387,8 +4685,13 @@ mod tests {
         let rows = |order: &[&str]| flow_root(order.iter().map(|p| flow_row(p)).collect());
 
         let mount = lowering.lower(&rows(&["a", "b", "c", "d", "e"]), &display);
+        // five rows of one shape: the first mounts whole, the others
+        // are clones of it
         assert_eq!(
-            mount.iter().filter(|p| matches!(p, DomPatch::Create { .. })).count(),
+            mount
+                .iter()
+                .filter(|p| matches!(p, DomPatch::Create { .. } | DomPatch::Clone { .. }))
+                .count(),
             5,
             "{mount:#?}"
         );
@@ -4400,7 +4703,10 @@ mod tests {
         assert!(
             !swapped.iter().any(|p| matches!(
                 p,
-                DomPatch::Create { .. } | DomPatch::Remove { .. } | DomPatch::SetTransform { .. }
+                DomPatch::Create { .. }
+                    | DomPatch::Clone { .. }
+                    | DomPatch::Remove { .. }
+                    | DomPatch::SetTransform { .. }
             )),
             "nothing mounts, nothing leaves, nothing is positioned by hand: {swapped:#?}"
         );
@@ -4524,16 +4830,20 @@ mod tests {
         let ids: Vec<u32> = mount
             .iter()
             .filter_map(|p| match p {
-                DomPatch::Create { id, .. } => Some(*id),
+                DomPatch::Create { id, .. } | DomPatch::Clone { id, .. } => Some(*id),
                 _ => None,
             })
             .collect();
 
         let grown = lowering.lower(&rows(&["a", "new", "b", "c"]), &display);
+        // the fresh row is a clone of the shape already on the page,
+        // placed where a create would be
         let creates: Vec<_> = grown
             .iter()
             .filter_map(|p| match p {
-                DomPatch::Create { id, before, .. } => Some((*id, *before)),
+                DomPatch::Create { id, before, .. } | DomPatch::Clone { id, before, .. } => {
+                    Some((*id, *before))
+                }
                 _ => None,
             })
             .collect();

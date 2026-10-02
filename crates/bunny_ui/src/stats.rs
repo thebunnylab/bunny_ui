@@ -79,6 +79,8 @@ pub struct FrameStats {
     /// Elements patched by their binding's key — a text that read for
     /// itself and moved, with no body and no walk.
     pub binding_updates: u32,
+    /// Subtrees mounted as a clone of a shape already on the page.
+    pub clones: u32,
     /// Second layouts the pointer re-read asked for.
     pub hover_relayouts: u32,
     /// Calls to an app box's `paint`.
@@ -120,6 +122,7 @@ impl FrameStats {
             assemblies: 0,
             entries_indexed: 0,
             binding_updates: 0,
+            clones: 0,
             hover_relayouts: 0,
             paints: 0,
             pictures_replayed: 0,
@@ -152,6 +155,7 @@ thread_local! {
     static ASSEMBLIES: Cell<u32> = const { Cell::new(0) };
     static ENTRIES_INDEXED: Cell<u32> = const { Cell::new(0) };
     static BINDING_UPDATES: Cell<u32> = const { Cell::new(0) };
+    static CLONES: Cell<u32> = const { Cell::new(0) };
     static HOVER_RELAYOUTS: Cell<u32> = const { Cell::new(0) };
     static PAINTS: Cell<u32> = const { Cell::new(0) };
     static PICTURES_REPLAYED: Cell<u32> = const { Cell::new(0) };
@@ -188,6 +192,7 @@ pub fn take() -> FrameStats {
         assemblies: ASSEMBLIES.with(|c| c.replace(0)),
         entries_indexed: ENTRIES_INDEXED.with(|c| c.replace(0)),
         binding_updates: BINDING_UPDATES.with(|c| c.replace(0)),
+        clones: CLONES.with(|c| c.replace(0)),
         hover_relayouts: HOVER_RELAYOUTS.with(|c| c.replace(0)),
         paints: PAINTS.with(|c| c.replace(0)),
         pictures_replayed: PICTURES_REPLAYED.with(|c| c.replace(0)),
@@ -271,6 +276,11 @@ pub(crate) fn note_entry_indexed() {
 #[inline]
 pub(crate) fn note_binding_update() {
     bump(&BINDING_UPDATES, 1);
+}
+
+#[inline]
+pub(crate) fn note_clone() {
+    bump(&CLONES, 1);
 }
 
 #[inline]
