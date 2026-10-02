@@ -104,6 +104,34 @@ pub struct FrameStats {
 }
 
 impl FrameStats {
+    /// An empty table — `Default`, for a `const` context.
+    pub const fn new() -> Self {
+        FrameStats {
+            body_passes: 0,
+            layout_passes: 0,
+            display_commands: 0,
+            capture_nodes: 0,
+            diff_visited: 0,
+            diff_reused: 0,
+            patches: 0,
+            encode_bytes: 0,
+            measure_hits: 0,
+            measure_misses: 0,
+            assemblies: 0,
+            entries_indexed: 0,
+            binding_updates: 0,
+            hover_relayouts: 0,
+            paints: 0,
+            pictures_replayed: 0,
+            commands_unseen: 0,
+            children_unplaced: 0,
+            measures_kept: 0,
+            measures_made: 0,
+            rows_summed: 0,
+            stage_ms: [0.0; STAGES],
+        }
+    }
+
     /// The stage's accumulated wall time in milliseconds.
     pub fn ms(&self, stage: Stage) -> f64 {
         self.stage_ms[stage as usize]

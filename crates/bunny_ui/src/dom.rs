@@ -2002,9 +2002,11 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 /// row (101 to 124, `bunny_key` now answering whether a key was taken).
 ///
 /// 11 (2026-10-02): op 18 empties an element (`RemoveChildren` — a list
-/// that clears or replaces its rows is one word), and a removal (op 2)
+/// that clears or replaces its rows is one word), a removal (op 2)
 /// unregisters its own subtree in the glue instead of a sweep over
-/// every element at the end of the batch.
+/// every element at the end of the batch, and the shell imports
+/// `js_now` — the page's clock, for the stage table a `?stats` page
+/// reads through `bunny_stats_*`.
 pub const ABI_VERSION: u32 = 11;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
