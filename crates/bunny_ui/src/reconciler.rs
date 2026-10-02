@@ -60,6 +60,9 @@ pub(crate) type FieldKeyFn = Rc<dyn Fn(&crate::action::Stroke, &mut CaretState) 
 #[derive(Clone)]
 pub(crate) struct EditorFn {
     pub submit_on_enter: bool,
+    /// After its submit runs, the field hands a borrowed keyboard back to
+    /// its lender (`TextField::yield_on_submit`).
+    pub yields_on_submit: bool,
     /// While it reads true the field declines the bare vertical arrows
     /// and the bare Enter (`TextField::nav_intercept`).
     pub nav_intercept: Option<motor::state::Binding<bool>>,
@@ -1762,6 +1765,15 @@ pub(crate) fn field_intercepts_nav(path: &str) -> bool {
     });
     // out of the borrow: reading a binding may reach the app's state
     intercept.is_some_and(|binding| binding.wrappedValue())
+}
+
+pub(crate) fn field_yields_on_submit(path: &str) -> bool {
+    EDITORS.with(|editors| {
+        editors
+            .borrow()
+            .get(path)
+            .is_some_and(|editor| editor.yields_on_submit)
+    })
 }
 
 pub(crate) fn field_submits_on_enter(path: &str) -> bool {

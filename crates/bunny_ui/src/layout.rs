@@ -3072,6 +3072,11 @@ pub enum AutoFocus {
     /// `.auto_focus_beat(beat)` — on each NEW beat, from whoever holds
     /// the keyboard. A beat is one intent of the app's, fired once.
     Beat(u64),
+    /// `.select_on_beat(beat)` — as [`AutoFocus::Beat`], and each new
+    /// beat also selects the field's whole text, whether it moved the
+    /// keyboard to the field or found it there: an intent to REPLACE what
+    /// the field holds.
+    Selecting(u64),
 }
 
 /// A placed text field: geometry + EFFECTIVE font at that point of the

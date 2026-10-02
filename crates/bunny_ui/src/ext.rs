@@ -1021,6 +1021,21 @@ pub trait ViewExt: View<Arity = Single> + Sized {
         }
     }
 
+    /// [`ViewExt::auto_focus_beat`], and each new beat also selects the
+    /// field's whole text — so the next keys REPLACE what it holds.
+    ///
+    /// The summon a find bar wants: ⌘F on a bar already open hands the
+    /// query the keyboard with its text selected, the way every editor's
+    /// find does, whether the keys were in the editor or already in the
+    /// query. A plain beat leaves the caret where the reader left it,
+    /// which is right for a field the app merely hands the keys to.
+    fn select_on_beat(self, beat: u64) -> Modified<Self> {
+        Modified {
+            base: self,
+            modifier: Modifier::SelectOnBeat(beat),
+        }
+    }
+
     /// A soft shadow behind the view — panel-grade halo with the house
     /// ink (quadratic falloff, paints outside the frame only).
     fn shadow(self, radius: f64) -> Modified<Self> {
