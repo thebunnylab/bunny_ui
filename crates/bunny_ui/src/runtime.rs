@@ -4271,6 +4271,8 @@ impl Runtime {
         // the size is known before the settle: the settle's own pass reads
         // it, and a reader runs once for a resize and never with a stale one
         self.note_viewport(crate::layout::Proposal::exact(size));
+        // a binding a write reached reads again when the layout meets it
+        crate::bind::settle_dirty();
         self.settle(root);
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
         if let Some(again) = self.reread_hover(root, size, &result) {
@@ -4441,6 +4443,7 @@ impl Runtime {
             environment: self.env_moved.get(),
             insets: self.last_insets.get() != self.frame_insets(),
             webview: reconciler::has_webview_commands(),
+            bindings: crate::bind::has_dirty(),
         }
     }
 
@@ -4539,6 +4542,8 @@ impl Runtime {
         root: &impl View,
         size: crate::layout::Size,
     ) -> crate::layout::DisplayList {
+        // a tick reads a binding a write reached, like any frame
+        crate::bind::settle_dirty();
         let mut result = self.layout(root, crate::layout::Proposal::exact(size));
         if let Some(again) = self.reread_hover(root, size, &result) {
             result = again;
@@ -4565,6 +4570,10 @@ impl Runtime {
         size: crate::layout::Size,
     ) -> Vec<crate::dom::DomPatch> {
         self.note_viewport(crate::layout::Proposal::exact(size));
+        // the bindings a write reached go stale before anything reads
+        // them: a walk that meets one reads it again, and the ones no
+        // walk meets are patched by key once the diff is done
+        let dirty_bindings = crate::bind::settle_dirty();
         self.settle(root);
         // everything that ran while settling — the reuse decision's
         // whole evidence (a theme change already cleared retention,
@@ -4669,7 +4678,12 @@ impl Runtime {
                 break;
             }
         }
-        self.dom.borrow_mut().lower(&output.scene, &output.display)
+        let mut dom = self.dom.borrow_mut();
+        let mut patches = dom.lower(&output.scene, &output.display);
+        if !dirty_bindings.is_empty() {
+            patches.extend(dom.refresh_bindings(&dirty_bindings));
+        }
+        patches
     }
 
     /// Hydration's engine half: run the same frame the build ran and
@@ -5409,6 +5423,8 @@ impl Runtime {
             reconciler::clear();
             self.printless.set(false);
         }
+        // a print is a frame too: a binding a write reached reads again
+        crate::bind::settle_dirty();
         crate::view::set_print(true);
         self.render_pass(root)
             .into_nodes()
@@ -6458,6 +6474,8 @@ pub struct FrameNeed {
     pub insets: bool,
     /// A webview handle holds a command the shell did not spend.
     pub webview: bool,
+    /// A write reached a node that reads for itself ([`crate::bind`]).
+    pub bindings: bool,
 }
 
 impl FrameNeed {
@@ -6469,6 +6487,7 @@ impl FrameNeed {
             || self.environment
             || self.insets
             || self.webview
+            || self.bindings
     }
 }
 

@@ -89,6 +89,18 @@ struct Registry {
     /// Effect slots by (site, scope) — the retention behind `on_change`/`on_receive`.
     effect_cells: HashMap<(Site, String), Rc<dyn std::any::Any>>,
     next_store_id: u64,
+    /// The binding being read right now: while one is open, a read
+    /// belongs to it and not to the view whose body may be running.
+    binding_scope: Option<Rc<str>>,
+    /// binding → dependencies read in its LAST evaluation.
+    binding_reads: HashMap<Rc<str>, HashSet<DepKey>>,
+    /// inverted index: dependency → the bindings that read it.
+    binding_readers: HashMap<DepKey, HashSet<Rc<str>>>,
+    /// The bindings a write reached since the last frame took them.
+    dirty_bindings: HashSet<Rc<str>>,
+    /// view → the bindings its body made. A body that re-runs makes them
+    /// again; one that dies takes them along.
+    view_bindings: HashMap<String, Vec<Rc<str>>>,
 }
 
 type AnchorKey = (String, TypeId, u32);
@@ -641,6 +653,13 @@ pub fn begin_view_reads(view: &str) {
 }
 
 fn clear_view_reads(registry: &mut Registry, view: &str) {
+    // the bindings the body made read for themselves, but they are the
+    // body's: a re-run makes them again, a death takes them along
+    if let Some(bindings) = registry.view_bindings.remove(view) {
+        for binding in bindings {
+            clear_binding_reads(registry, &binding);
+        }
+    }
     let Some(keys) = registry.reads_by_view.remove(view) else {
         return;
     };
@@ -654,9 +673,97 @@ fn clear_view_reads(registry: &mut Registry, view: &str) {
     }
 }
 
+/// The reads of a view that left the tree fall — the twin of the owner
+/// sweep, for a view that owns no state and so has no owner record.
+pub fn forget_view_reads(view: &str) {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        clear_view_reads(&mut registry, view);
+        registry.dirty.remove(view);
+    });
+}
+
+// MARK: - Bindings
+
+/// A binding's evaluation in progress: every read until the drop
+/// belongs to the binding.
+pub struct BindingScope {
+    previous: Option<Rc<str>>,
+}
+
+impl Drop for BindingScope {
+    fn drop(&mut self) {
+        REGISTRY.with(|registry| registry.borrow_mut().binding_scope = self.previous.take());
+    }
+}
+
+/// Opens the scope of a binding's evaluation: the binding's old reads
+/// fall away, and until the scope drops every read is recorded under
+/// `key` — inside a pass or out of one. `owner` names the view whose
+/// body made the binding, said once at the first evaluation, so the
+/// body's re-run or death takes the binding's reads along.
+pub fn begin_binding(key: &Rc<str>, owner: Option<&str>) -> BindingScope {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        clear_binding_reads(&mut registry, key);
+        if let Some(owner) = owner {
+            match registry.view_bindings.get_mut(owner) {
+                Some(bindings) => bindings.push(Rc::clone(key)),
+                None => {
+                    registry.view_bindings.insert(owner.to_string(), vec![Rc::clone(key)]);
+                }
+            }
+        }
+        BindingScope { previous: registry.binding_scope.replace(Rc::clone(key)) }
+    })
+}
+
+fn clear_binding_reads(registry: &mut Registry, key: &str) {
+    registry.dirty_bindings.remove(key);
+    let Some(deps) = registry.binding_reads.remove(key) else {
+        return;
+    };
+    for dep in deps {
+        if let Some(readers) = registry.binding_readers.get_mut(&dep) {
+            readers.remove(key);
+            if readers.is_empty() {
+                registry.binding_readers.remove(&dep);
+            }
+        }
+    }
+}
+
+/// How many dependencies the binding read in its last evaluation. None
+/// makes it a constant: nothing can ever move it.
+pub fn binding_read_count(key: &str) -> usize {
+    REGISTRY.with(|registry| registry.borrow().binding_reads.get(key).map_or(0, HashSet::len))
+}
+
+/// Did a write reach a binding since the last frame took the dirty ones?
+pub fn has_dirty_bindings() -> bool {
+    REGISTRY.with(|registry| !registry.borrow().dirty_bindings.is_empty())
+}
+
+/// The bindings a write reached, taken: the frame marks them stale and
+/// the element lowering patches them by key.
+pub fn take_dirty_bindings() -> Vec<Rc<str>> {
+    REGISTRY.with(|registry| {
+        let mut dirty: Vec<Rc<str>> = registry.borrow_mut().dirty_bindings.drain().collect();
+        dirty.sort();
+        dirty
+    })
+}
+
 pub(crate) fn record_read(key: DepKey) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
+        if let Some(binding) = registry.binding_scope.clone() {
+            // a binding reads for itself — at a placement or at a
+            // measure as much as inside a body
+            registry.binding_reads.entry(Rc::clone(&binding)).or_default().insert(key);
+            registry.binding_readers.entry(key).or_default().insert(binding);
+            return;
+        }
         if !registry.pass_active {
             return;
         }
@@ -693,6 +800,9 @@ pub(crate) fn record_write(key: DepKey) {
         let registry = &mut *registry;
         if let Some(readers) = registry.readers.get(&key) {
             registry.dirty.extend(readers.iter().cloned());
+        }
+        if let Some(bindings) = registry.binding_readers.get(&key) {
+            registry.dirty_bindings.extend(bindings.iter().cloned());
         }
     });
 }

@@ -115,6 +115,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         layout: None,
         hints: DomHints::default(),
         children,
+        binding: None,
     };
     FlowOutput {
         scene,
@@ -218,6 +219,7 @@ fn node(kind: DomKind) -> DomNode {
         layout: Some(DomLayout::default()),
         hints: DomHints::default(),
         children: Vec::new(),
+        binding: None,
     }
 }
 
@@ -505,8 +507,12 @@ impl Walk<'_> {
                 out.push(boxed);
             }
             LayoutNode::Text { content, highlights, truncation } => {
+                // a text that reads for itself carries its binding into
+                // the scene: the lowering patches it by key when a write
+                // reaches it, and no walk comes this way for that
+                let binding = content.bound().cloned();
                 let mut text = node(DomKind::Text(DomText {
-                    content: content.clone(),
+                    content: content.get(),
                     color: self.current_ink(),
                     inherits_ink: !self.ink_scopes.is_empty(),
                     font: self.font,
@@ -519,6 +525,7 @@ impl Walk<'_> {
                 }));
                 text.style.interactive = self.pending_interactive.take();
                 text.style.tooltip = self.pending_tooltip.take();
+                text.binding = binding.map(crate::dom::NodeBinding::Text);
                 out.push(text);
             }
             LayoutNode::Field {
@@ -1125,7 +1132,7 @@ mod tests {
 
     fn text_node(content: &str) -> LayoutNode {
         LayoutNode::Text {
-            content: Arc::from(content),
+            content: crate::bind::TextSource::from(content),
             highlights: None,
             truncation: None,
         }
