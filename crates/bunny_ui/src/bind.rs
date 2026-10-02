@@ -56,9 +56,9 @@ impl<T: Clone + 'static> Bound<T> {
     /// Makes the binding at `key` and reads it once, under the view
     /// whose body is running (`owner`): the reads land on the key,
     /// never on the body.
-    pub(crate) fn new(key: Rc<str>, owner: Option<&str>, eval: Rc<dyn Fn() -> T>) -> Rc<Self> {
+    pub(crate) fn new(key: Rc<str>, eval: Rc<dyn Fn() -> T>) -> Rc<Self> {
         let bound = Rc::new(Bound { key, eval, cache: RefCell::new(None), stale: Cell::new(true) });
-        bound.evaluate(owner);
+        bound.evaluate(true);
         let weak = Rc::downgrade(&bound);
         let weak: Weak<dyn Stale> = weak;
         LIVE.with(|live| {
@@ -80,12 +80,19 @@ impl<T: Clone + 'static> Bound<T> {
         {
             return value.clone();
         }
-        self.evaluate(None)
+        self.evaluate(false)
     }
 
-    fn evaluate(&self, owner: Option<&str>) -> T {
+    /// Reads under the key. `under_view`: the read is the first, made by
+    /// the body that is running — the binding is filed under that view,
+    /// so it dies and resets with it.
+    fn evaluate(&self, under_view: bool) -> T {
         let value = {
-            let _scope = motor::identity::begin_binding(&self.key, owner);
+            let _scope = if under_view {
+                motor::identity::begin_binding_under_view(&self.key)
+            } else {
+                motor::identity::begin_binding(&self.key, None)
+            };
             (self.eval)()
         };
         *self.cache.borrow_mut() = Some(value.clone());
@@ -162,7 +169,7 @@ pub(crate) fn has_dirty() -> bool {
 /// hover key is named. `None` outside a pass — a decorative render has
 /// no identity to hang a binding on.
 pub(crate) fn key_at_cursor(suffix: &str) -> Option<Rc<str>> {
-    motor::identity::cursor_scope().map(|scope| Rc::from(format!("{scope}/{suffix}")))
+    motor::identity::cursor_key(suffix)
 }
 
 // MARK: - Text
@@ -202,8 +209,7 @@ impl TextSource {
         match self {
             TextSource::Lazy(eval) => match key_at_cursor("#text") {
                 Some(key) => {
-                    let owner = motor::identity::current_view_path();
-                    let bound = Bound::new(key, owner.as_deref(), Rc::clone(eval));
+                    let bound = Bound::new(key, Rc::clone(eval));
                     if bound.reads_anything() {
                         TextSource::Bound(bound)
                     } else {
@@ -286,8 +292,7 @@ impl ClassSource {
         match self {
             ClassSource::Lazy(eval) => match key_at_cursor("#class") {
                 Some(key) => {
-                    let owner = motor::identity::current_view_path();
-                    let bound = Bound::new(key, owner.as_deref(), Rc::clone(eval));
+                    let bound = Bound::new(key, Rc::clone(eval));
                     if bound.reads_anything() {
                         ClassSource::Bound(bound)
                     } else {
@@ -610,7 +615,7 @@ mod tests {
         let count = State::new(1usize);
         motor::identity::begin_pass();
         let key: Rc<str> = Rc::from("Root/#0/#text");
-        let bound = Bound::<Arc<str>>::new(key, Some("Root"), Rc::new(move || Arc::from(format!("{} rows", count.get()).as_str())));
+        let bound = Bound::<Arc<str>>::new(key, Rc::new(move || Arc::from(format!("{} rows", count.get()).as_str())));
         let _ = motor::identity::end_pass();
         assert_eq!(&*bound.get(), "1 rows");
         assert!(bound.reads_anything());
@@ -628,7 +633,7 @@ mod tests {
     #[test]
     fn a_binding_that_reads_nothing_is_a_constant() {
         motor::identity::begin_pass();
-        let bound = Bound::<Arc<str>>::new(Rc::from("Root/#1/#text"), Some("Root"), Rc::new(|| Arc::from("fixed")));
+        let bound = Bound::<Arc<str>>::new(Rc::from("Root/#1/#text"), Rc::new(|| Arc::from("fixed")));
         let _ = motor::identity::end_pass();
         assert!(!bound.reads_anything());
     }
@@ -637,7 +642,7 @@ mod tests {
     fn a_dropped_binding_leaves_the_register() {
         let count = State::new(0usize);
         motor::identity::begin_pass();
-        let bound = Bound::<Arc<str>>::new(Rc::from("Root/#2/#text"), Some("Root"), Rc::new(move || Arc::from(count.get().to_string().as_str())));
+        let bound = Bound::<Arc<str>>::new(Rc::from("Root/#2/#text"), Rc::new(move || Arc::from(count.get().to_string().as_str())));
         let _ = motor::identity::end_pass();
         drop(bound);
         count.set(1);

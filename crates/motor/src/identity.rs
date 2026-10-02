@@ -69,6 +69,9 @@ struct Registry {
     /// LENGTH of `joined`: the path of an open view is a prefix of the
     /// cursor's, so a view that opens costs a number, not a copy.
     views: Vec<usize>,
+    /// The buffer a key derived from the cursor is spelled in before it
+    /// becomes shared — one allocation per key, never one per step.
+    key_scratch: String,
     /// The pass being run, counted. An owner's record carries the last pass
     /// its scope was entered in: that is the alive mark, and it costs a
     /// lookup where a set of every path of the pass cost a copy of each.
@@ -401,6 +404,25 @@ pub fn cursor_scope() -> Option<String> {
     })
 }
 
+/// `{cursor scope}/{suffix}` as a shared string — the key a node's own
+/// reading stands under. Spelled once into the register's buffer and
+/// shared from there: one allocation, where a scope copy, a format
+/// and a share were three.
+pub fn cursor_key(suffix: &str) -> Option<Rc<str>> {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        if !registry.pass_active || registry.joined.is_empty() {
+            return None;
+        }
+        let registry = &mut *registry;
+        registry.key_scratch.clear();
+        registry.key_scratch.push_str(&registry.joined);
+        registry.key_scratch.push('/');
+        registry.key_scratch.push_str(suffix);
+        Some(Rc::from(registry.key_scratch.as_str()))
+    })
+}
+
 /// The NAMED projection of a path — the segments a person chose, in
 /// order, with everything positional dropped.
 ///
@@ -712,6 +734,28 @@ pub fn begin_binding(key: &Rc<str>, owner: Option<&str>) -> BindingScope {
         let mut registry = registry.borrow_mut();
         clear_binding_reads(&mut registry, key);
         if let Some(owner) = owner {
+            match registry.view_bindings.get_mut(owner) {
+                Some(bindings) => bindings.push(Rc::clone(key)),
+                None => {
+                    registry.view_bindings.insert(owner.to_string(), vec![Rc::clone(key)]);
+                }
+            }
+        }
+        BindingScope { previous: registry.binding_scope.replace(Rc::clone(key)) }
+    })
+}
+
+/// [`begin_binding`] under the view whose body is running now, read
+/// off the register itself — the owner's path is a prefix of the
+/// cursor, so naming it costs no copy. Outside a view (a read after
+/// the pass) the binding has no owner, as before.
+pub fn begin_binding_under_view(key: &Rc<str>) -> BindingScope {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        let registry = &mut *registry;
+        clear_binding_reads(registry, key);
+        if let Some(len) = registry.views.last() {
+            let owner = &registry.joined[..*len];
             match registry.view_bindings.get_mut(owner) {
                 Some(bindings) => bindings.push(Rc::clone(key)),
                 None => {
