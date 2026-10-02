@@ -421,6 +421,17 @@ function applyPatches(view, length) {
   };
   const text = (count) => decoder.decode(bytes(count));
 
+  // the words of an element: into the one text node it already holds
+  // when it holds exactly that — a clone's cell, an updated label —
+  // else by replacing the children
+  const setWords = (el, words) => {
+    const first = el.firstChild;
+    if (first !== null && first.nodeType === 3 && first.nextSibling === null) {
+      first.data = words;
+    } else {
+      el.textContent = words;
+    }
+  };
   // the elements born in THIS batch: a fresh element carries no style
   // yet, so the full-replace ops skip the reset they owe an old one —
   // a thousand new rows are thousands of style writes never made
@@ -504,7 +515,6 @@ function applyPatches(view, length) {
           node.__n = n;
           if (stamped) node.removeAttribute("data-n");
           elements.set(n, node);
-          fresh.add(n);
           n++;
           for (const child of node.children) number(child);
         };
@@ -526,7 +536,7 @@ function applyPatches(view, length) {
       // the words alone: the font and the ink already stand
       const el = elements.get(id);
       const raw = bytes(u32());
-      if (el) el.textContent = decoder.decode(raw);
+      if (el) setWords(el, decoder.decode(raw));
     } else if (op === 2) {
       const el = elements.get(id);
       if (el) {
@@ -542,14 +552,37 @@ function applyPatches(view, length) {
       // never by walking the subtree
       const el = elements.get(id);
       const ranges = u16();
+      const spans = [];
+      let leaving = 0;
       for (let r = 0; r < ranges; r++) {
         const start = u32();
         const end = u32();
-        for (let n = start; n < end; n++) {
-          elements.delete(n);
-        }
+        spans.push(start, end);
+        leaving += end - start;
         if (pseudoRules.size) {
           for (let n = start; n < end; n++) dropPseudo(n);
+        }
+      }
+      if (leaving * 2 > elements.size) {
+        // most of the registry leaves: keep the survivors in one pass
+        // over it, instead of a delete per id that leaves
+        const kept = [];
+        for (const entry of elements) {
+          const n = entry[0];
+          let gone = false;
+          for (let i = 0; i < spans.length; i += 2) {
+            if (n >= spans[i] && n < spans[i + 1]) {
+              gone = true;
+              break;
+            }
+          }
+          if (!gone) kept.push(entry);
+        }
+        elements.clear();
+        for (const [n, kept_el] of kept) elements.set(n, kept_el);
+      } else {
+        for (let i = 0; i < spans.length; i += 2) {
+          for (let n = spans[i]; n < spans[i + 1]; n++) elements.delete(n);
         }
       }
       if (el) el.replaceChildren();
@@ -827,8 +860,8 @@ function applyPatches(view, length) {
           el.style.textOverflow = "ellipsis";
         }
         if (spanCount === 0) {
-          // one write: the browser replaces the children itself
-          el.textContent = decoder.decode(raw);
+          // one write, into the text node that stands when one does
+          setWords(el, decoder.decode(raw));
           continue;
         }
         el.textContent = "";
