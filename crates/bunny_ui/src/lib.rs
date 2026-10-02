@@ -133,7 +133,8 @@ pub mod prelude {
     pub use crate::custom::{canvas, custom};
     pub use crate::erased::{CustomModifier, Erased, erased};
     pub use crate::host::{
-        ColorScheme, EditorCommand, HostSpec, NetworkPolicy, WebviewHandle, webview, webview_html,
+        ColorScheme, EditorCommand, HostSpec, MediaHandle, NetworkPolicy, VideoView, WebviewHandle,
+        video, webview, webview_html,
     };
     pub use crate::{hstack, text, vstack, zstack};
     pub use crate::ext::ViewExt;
@@ -9416,7 +9417,9 @@ mod tests {
             .settled_layout(&Page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
         let hosts = runtime.hosts();
         assert_eq!(hosts.len(), 1);
-        let HostSpec::Webview { url, .. } = &hosts[0].spec;
+        let HostSpec::Webview { url, .. } = &hosts[0].spec else {
+            panic!("a webview rides in the spec: {:?}", hosts[0].spec)
+        };
         assert_eq!(&**url, "https://example.test/docs");
         // the page takes the leftover beside the rigid column
         assert_eq!(hosts[0].frame.origin.x, 100.0);
@@ -9449,6 +9452,75 @@ mod tests {
         assert_eq!(hosts[0].frame.size.height, 400.0, "the box keeps its declared height");
         assert_eq!(hosts[0].visible.size.height, 150.0, "the window is the region's worth");
         assert_eq!(hosts[0].visible.origin.y, 0.0);
+    }
+
+    /// A video host is placed by the same walk as a webview: the same
+    /// box, the same window the clip lets through, the same region and
+    /// the same mark in the display list — and no command of its own,
+    /// the browser draws there. The spec carries what the builder said.
+    #[test]
+    fn a_video_host_places_and_marks_like_a_webview() {
+        use crate::host::{HostSpec, MediaHandle, video, webview};
+        use crate::layout::{Proposal, Size};
+
+        #[derive(Clone, Copy)]
+        struct Call;
+        impl Component for Call {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text("in a call").frame(300.0, 40.0),
+                    scroll(
+                        video(MediaHandle(3))
+                            .mirrored()
+                            .aspect_ratio(motor::views::ContentMode::Fit)
+                            .corner_radius(12.0)
+                            .frame(300.0, 400.0)
+                    )
+                    .frame(300.0, 150.0)
+                )
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(
+                    text("in a call").frame(300.0, 40.0),
+                    scroll(webview("https://example.test/").frame(300.0, 400.0))
+                        .frame(300.0, 150.0)
+                )
+            }
+        }
+
+        let window = Proposal::exact(Size { width: 300.0, height: 190.0 });
+        let runtime = Runtime::new();
+        let result = runtime.settled_layout(&Call, window);
+        let hosts = runtime.hosts();
+        assert_eq!(hosts.len(), 1);
+        let feed = &hosts[0];
+        let HostSpec::Video { stream, mirrored, cover, corner_radius } = &feed.spec else {
+            panic!("a video rides in the spec: {:?}", feed.spec)
+        };
+        assert_eq!(*stream, MediaHandle(3), "the handle rides as the page minted it");
+        assert!(*mirrored, "the selfie rides");
+        assert!(!*cover, "Fit is `contain`");
+        assert_eq!(*corner_radius, 12.0);
+        assert_eq!(feed.frame.size.height, 400.0, "the box keeps its declared height");
+        assert_eq!(feed.visible.size.height, 150.0, "the window is the region's worth");
+        assert!(feed.region.is_some(), "the region it scrolls in is named");
+        assert!(feed.mark > 0, "the label painted before it stands under the mark");
+        assert!(feed.mark <= result.display.len());
+
+        // the webview twin in the same scene places identically
+        let twin = Runtime::new();
+        let _ = twin.settled_layout(&Page, window);
+        let page = &twin.hosts()[0];
+        assert_eq!(
+            (feed.frame, feed.visible, feed.region.is_some(), feed.mark),
+            (page.frame, page.visible, page.region.is_some(), page.mark),
+            "the walk places a video exactly where it places a webview"
+        );
+        assert_eq!(video(MediaHandle(1)), video(MediaHandle(1)), "the builder is a value");
     }
 
     /// A shell that owns its page pixels routes the hand itself: the
@@ -9628,7 +9700,10 @@ mod tests {
             .settled_layout(&page, Proposal::exact(Size { width: 400.0, height: 300.0 }));
         let hosts = runtime.hosts();
         let path = hosts[0].path.clone();
-        let HostSpec::Webview { scripts, console, requests, full_motion, .. } = &hosts[0].spec;
+        let HostSpec::Webview { scripts, console, requests, full_motion, .. } = &hosts[0].spec
+        else {
+            panic!("a webview rides in the spec: {:?}", hosts[0].spec)
+        };
         assert_eq!(scripts.len(), 1, "the user script rides in the spec");
         assert!(
             *console && *requests,
@@ -9688,7 +9763,9 @@ mod tests {
             .settled_layout(&composer, Proposal::exact(Size { width: 400.0, height: 300.0 }));
         let hosts = runtime.hosts();
         let path = hosts[0].path.clone();
-        let HostSpec::Webview { url, document, .. } = &hosts[0].spec;
+        let HostSpec::Webview { url, document, .. } = &hosts[0].spec else {
+            panic!("a webview rides in the spec: {:?}", hosts[0].spec)
+        };
         assert_eq!(&**url, "about:blank", "a document never carries a url to fetch");
         let document = document.as_ref().expect("the document rides");
         assert!(document.editable && document.paste && document.focus);

@@ -501,7 +501,9 @@ fn bridge() -> Id {
 /// the scene. `path` is the host's identity, what a document is filed
 /// under for the delegate to find.
 pub fn create(path: &str, spec: &HostSpec) -> Id {
-    let HostSpec::Webview { url, document, .. } = spec;
+    // never reached for a video host — the shells refuse one before
+    // they mount anything — and a null is the honest nothing if it were
+    let HostSpec::Webview { url, document, .. } = spec else { return std::ptr::null_mut() };
     unsafe {
         let config =
             msg_id(msg_id(class("WKWebViewConfiguration"), sel("alloc")), sel("init"));
@@ -641,7 +643,7 @@ unsafe fn install_bridge(controller: Id, spec: &bunny_ui::host::HostSpec) {
 /// editable document (its transport first, the framework's script
 /// after), then the app's own scripts, in declaration order.
 unsafe fn apply_scripts(controller: Id, spec: &HostSpec) {
-    let HostSpec::Webview { scripts, console, requests, document, .. } = spec;
+    let HostSpec::Webview { scripts, console, requests, document, .. } = spec else { return };
     unsafe {
         add_script(controller, WEBKIT_BOOT);
         if *console {
@@ -694,7 +696,7 @@ unsafe fn add_script(controller: Id, source: &str) {
 /// goes from a document back to a url closes the letter — the page
 /// follows its own links again.
 pub fn update(path: &str, view: Id, spec: &HostSpec) {
-    let HostSpec::Webview { url, document, .. } = spec;
+    let HostSpec::Webview { url, document, .. } = spec else { return };
     unsafe {
         let config = msg_id(view, sel("configuration"));
         let controller = msg_id(config, sel("userContentController"));

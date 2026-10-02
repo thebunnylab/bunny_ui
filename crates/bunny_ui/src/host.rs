@@ -39,6 +39,20 @@
 //! editor.exec(EditorCommand::Bold);
 //! ```
 //!
+//! The second tenant is the browser's own `<video>` element, playing a
+//! media stream the page already owns — a camera, a peer's track over
+//! WebRTC — decoded and composited by the browser, with no pixel read
+//! back and none uploaded:
+//!
+//! ```ignore
+//! video(stream).mirrored().aspect_ratio(ContentMode::Fill).corner_radius(12.0)
+//! ```
+//!
+//! The stream never enters wasm: the page registers it with the glue
+//! and hands the engine the integer the registry answered
+//! ([`MediaHandle`]). Served by the web shells; a native shell keeps
+//! the box reserved and empty, and says so once (`docs/video.md`).
+//!
 //! This is a different door from `canvas` and `custom`, which paint
 //! with the framework's own commands and clip like everything else.
 //! The host is for content that arrives with its own renderer.
@@ -49,6 +63,7 @@ use std::rc::Rc;
 
 use motor::state::Context;
 use motor::view::RenderNode;
+use motor::views::ContentMode;
 
 use crate::action::Modifiers;
 use crate::layout::LayoutNode;
@@ -88,6 +103,47 @@ pub enum HostSpec {
         /// passes through, like any browser's.
         full_motion: bool,
     },
+    /// A video element the browser decodes and composites: a media
+    /// stream the page already owns, named by the handle the glue
+    /// minted. Served by the web shells; on a native shell the box
+    /// stays reserved and empty, and one line says so.
+    Video {
+        /// The stream, by the integer the glue's registry answered for
+        /// it. The stream itself never crosses into the engine.
+        stream: MediaHandle,
+        /// The selfie: the picture is flipped left for right, the way
+        /// a mirror shows the person looking into it.
+        mirrored: bool,
+        /// The picture COVERS the box (`object-fit: cover`), cropping
+        /// what does not fit; off, it fits inside (`contain`) and
+        /// letterboxes.
+        cover: bool,
+        /// The corners, rounded by the browser on the element itself —
+        /// the one clip a platform view honours.
+        corner_radius: f64,
+    },
+}
+
+/// A media stream the PAGE owns, by the integer the glue's registry
+/// answered for it — `bunnyMedia.register(stream)` in the classic glue,
+/// `registerMediaStream(stream)` in the ES module. The stream itself
+/// never crosses into the engine: this number is the only thing that
+/// does, through an export the app declares. Zero names no stream — an
+/// element with nothing to play, which stays black.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MediaHandle(pub u32);
+
+/// What a native shell says for a video host it cannot serve — ONCE.
+/// The box stays reserved and empty, exactly as the layout placed it;
+/// a shell's per-frame host loop meets the box sixty times a second,
+/// and the console hears about it one time. The shells call this from
+/// the `else` of their webview destructure and `continue`.
+pub fn refuse_video_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        eprintln!("bunny_ui: a video host is the web's; the box stays empty here");
+    }
 }
 
 /// The colours a document is shown in — sealed into its head as the
@@ -1234,6 +1290,101 @@ pub fn webview_html(
     let mut view = webview("about:blank");
     view.document = Some(Document::new(Rc::from(html.as_ref()), base, policy));
     view
+}
+
+/// The view a video enters the scene as — see [`video`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoView {
+    stream: MediaHandle,
+    mirrored: bool,
+    cover: bool,
+    corner_radius: f64,
+}
+
+impl VideoView {
+    /// The selfie: the picture is flipped left for right (`transform:
+    /// scaleX(-1)`), the way a mirror shows the person looking into
+    /// it — what a preview of oneself wants, and what a peer's picture
+    /// does not.
+    pub fn mirrored(mut self) -> VideoView {
+        self.mirrored = true;
+        self
+    }
+
+    /// How the picture meets a box of another shape. `Fill` (the
+    /// default) covers the box and crops what does not fit —
+    /// `object-fit: cover`; `Fit` keeps the whole picture inside and
+    /// letterboxes — `contain`. The box never follows the picture's
+    /// size: a `.frame(…)` above decides it, like any host's.
+    pub fn aspect_ratio(mut self, mode: ContentMode) -> VideoView {
+        self.cover = matches!(mode, ContentMode::Fill);
+        self
+    }
+
+    /// Rounded corners, cut by the browser on the element itself. THIS
+    /// door rather than the general `.corner_radius(…)`, because that
+    /// one rounds a background the framework paints — and the
+    /// framework paints nothing here: a platform view is clipped only
+    /// by its own element.
+    pub fn corner_radius(mut self, radius: f64) -> VideoView {
+        self.corner_radius = radius.max(0.0);
+        self
+    }
+}
+
+impl View for VideoView {
+    type Arity = Single;
+
+    fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
+        out.push(RenderNode::leaf(if crate::view::print_enabled() {
+            format!("Video({})", self.stream.0)
+        } else {
+            String::new()
+        }));
+        // outside a pass (a decorative render) there is no identity to
+        // key the element by — the box still holds its space, it just
+        // mounts nothing. No writers to retain: a video reports nothing
+        // and takes no command; the page owns the stream's life
+        let path = motor::identity::cursor_scope().unwrap_or_default();
+        out.push_layout(LayoutNode::Host {
+            path,
+            spec: HostSpec::Video {
+                stream: self.stream,
+                mirrored: self.mirrored,
+                cover: self.cover,
+                corner_radius: self.corner_radius,
+            },
+        });
+    }
+}
+
+/// A video in a box: the browser's own `<video>` element, playing a
+/// media stream the page already owns — a camera, a peer's track over
+/// WebRTC — held by the layout like any other view. The browser
+/// decodes and composites it; no pixel is read back into the engine
+/// and none is uploaded. It fills what the parent proposes;
+/// `.frame(…)` pins it. The element is always muted, autoplaying and
+/// inline: the audio is the app's business, on an element of its own
+/// or none.
+///
+/// The stream never enters wasm. The page registers it with the glue
+/// (`bunnyMedia.register(stream)`) and hands the integer in through an
+/// export of its own; the app keeps it in state and shows it:
+///
+/// ```ignore
+/// video(stream)
+///     .mirrored()
+///     .aspect_ratio(ContentMode::Fill)
+///     .corner_radius(12.0)
+///     .frame(600.0, 338.0)
+/// ```
+///
+/// Served by the web shells, in every present tier — the element sits
+/// ABOVE the canvas, so anything the scene paints after it is under
+/// it (`docs/video.md` has the law). On a native shell the box stays
+/// reserved and empty, and the console says so once.
+pub fn video(stream: MediaHandle) -> VideoView {
+    VideoView { stream, mirrored: false, cover: true, corner_radius: 0.0 }
 }
 
 #[cfg(test)]

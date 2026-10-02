@@ -372,7 +372,13 @@ fn mount(runtime: Rc<Runtime>, root: impl View, memory: Option<Rc<dyn Fn()>>) {
                     console,
                     requests,
                     full_motion,
-                } = &host.spec;
+                } = &host.spec
+                else {
+                    // a video host is the web's: the box stays reserved
+                    // and empty here, and the console says so once
+                    bunny_ui::host::refuse_video_once();
+                    continue;
+                };
                 // the stamp fingerprints the whole spec — a change
                 // re-instructs the mounted view, never re-creates it; a
                 // document stamps by its fingerprint, never by its pages
