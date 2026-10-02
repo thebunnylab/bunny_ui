@@ -1112,6 +1112,10 @@ const imports = {
     typeof bunnyGlImports === "object" ? bunnyGlImports : bunnyGlStubsOrNothing(),
   "./bunny.js": {
     js_blit() {},
+    // the page's clock, for the engine's stage timers
+    js_now() {
+      return performance.now();
+    },
     // a focused island copied: the same road the canvas shell takes
     js_clipboard_write(pointer, length) {
       const text = decoder.decode(new Uint8Array(wasm.memory.buffer, pointer, length));
@@ -1345,6 +1349,25 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     // the device says (and `?present=cpu` keeps it off the page)
     if (new URLSearchParams(location.search).get("present") === "gpu" && wasm.bunny_gpu_forced) {
       wasm.bunny_gpu_forced();
+    }
+    if (STATS && wasm.bunny_stats_enable) {
+      // the engine's own stage table beside the glue's apply time: one
+      // read drains both, so a reader times one operation at a time
+      wasm.bunny_stats_enable();
+      window.__bunnyStats = () => {
+        wasm.bunny_stats_take();
+        const stage = (i) => +wasm.bunny_stats_stage(i).toFixed(3);
+        const count = (i) => wasm.bunny_stats_counter(i) >>> 0;
+        const apply = window.__bunnyApply || { ms: 0, batches: 0 };
+        window.__bunnyApply = { ms: 0, batches: 0 };
+        return {
+          settle: stage(0), capture: stage(2), diff: stage(3), encode: stage(4),
+          pass: stage(5), assemble: stage(6),
+          apply: +apply.ms.toFixed(3), batches: apply.batches,
+          passes: count(0), built: count(3), visited: count(4), reused: count(5),
+          patches: count(6), bytes: count(7), indexed: count(11), bound: count(12),
+        };
+      };
     }
     window.__bunnyBoot = { instantiate: performance.now() - bootOpened };
     const startOpened = performance.now();

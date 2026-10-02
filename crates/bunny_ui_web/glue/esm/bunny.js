@@ -221,6 +221,11 @@ export function js_request_frame() {
 // crosses on the channel the page listens to. (Every tab of the same
 // origin hears it too; a spare wake is one settled frame, never a
 // fault.)
+// The page's clock, for the engine's stage timers.
+export function js_now() {
+  return performance.now();
+}
+
 export function js_request_wake() {
   if (IN_WORKER) {
     wakeChannelOnce().postMessage(0);

@@ -86,6 +86,71 @@ unsafe extern "C" {
     /// A panic, on its way to the console. Without it a wasm abort is one
     /// line of `unreachable` and a stack of numbers.
     fn js_panic(pointer: *const u8, len: usize);
+    /// The page's clock, in milliseconds (`performance.now`) — the stage
+    /// timers read it when a page asks for the table (`?stats`).
+    fn js_now() -> f64;
+}
+
+// MARK: - The stage table, read from the page
+
+thread_local! {
+    /// The last frame table a page took — read one number at a time
+    /// through the exports below, because a struct does not cross the
+    /// border.
+    static LAST_STATS: std::cell::Cell<bunny_ui::stats::FrameStats> =
+        const { std::cell::Cell::new(bunny_ui::stats::FrameStats::new()) };
+}
+
+fn now_ms() -> f64 {
+    unsafe { js_now() }
+}
+
+/// Installs the page's clock on the stage timers. Off by default: a
+/// timer without a clock is one branch.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_stats_enable() {
+    bunny_ui::stats::set_clock(Some(now_ms));
+}
+
+/// Takes the table accumulated since the last take, for the stage and
+/// counter reads that follow.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_stats_take() {
+    LAST_STATS.with(|last| last.set(bunny_ui::stats::take()));
+}
+
+/// Milliseconds of one stage in the taken table, by the stage's index
+/// in [`bunny_ui::stats::Stage`].
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_stats_stage(stage: u32) -> f64 {
+    LAST_STATS.with(|last| last.get().stage_ms.get(stage as usize).copied().unwrap_or(0.0))
+}
+
+/// One counter of the taken table: 0 body passes, 1 layout passes, 2
+/// display commands, 3 nodes built, 4 nodes visited, 5 subtrees
+/// reused, 6 patches, 7 wire bytes, 8 measure hits, 9 measure misses,
+/// 10 assemblies, 11 entries indexed, 12 binding updates.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_stats_counter(which: u32) -> u32 {
+    LAST_STATS.with(|last| {
+        let stats = last.get();
+        match which {
+            0 => stats.body_passes,
+            1 => stats.layout_passes,
+            2 => stats.display_commands,
+            3 => stats.capture_nodes,
+            4 => stats.diff_visited,
+            5 => stats.diff_reused,
+            6 => stats.patches,
+            7 => stats.encode_bytes,
+            8 => stats.measure_hits,
+            9 => stats.measure_misses,
+            10 => stats.assemblies,
+            11 => stats.entries_indexed,
+            12 => stats.binding_updates,
+            _ => 0,
+        }
+    })
 }
 
 /// Sends a panic to the console instead of the bare `unreachable` a wasm

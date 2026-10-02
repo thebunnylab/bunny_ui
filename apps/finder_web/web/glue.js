@@ -160,6 +160,10 @@ const imports = {
     js_set_cursor(kind) {
       host.style.cursor = CURSORS[kind >>> 0] || "default";
     },
+    // the page's clock, for the engine's stage timers
+    js_now() {
+      return performance.now();
+    },
     js_blit(pointer, width, height) {
       const context = painter();
       if (paintCanvas.width !== width || paintCanvas.height !== height) {
