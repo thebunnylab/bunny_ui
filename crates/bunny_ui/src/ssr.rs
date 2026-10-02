@@ -282,7 +282,7 @@ impl Tree {
                 }
                 self.elements.remove(id);
             }
-            DomPatch::RemoveChildren { id } => {
+            DomPatch::RemoveChildren { id, .. } => {
                 let Some(element) = self.elements.get_mut(id) else {
                     return;
                 };

@@ -482,13 +482,23 @@ function applyPatches(view, length) {
       elements.delete(id);
       dropPseudo(id);
     } else if (op === 18) {
-      // the element empties: every child leaves in one call, and a
-      // thousand rows cost one word on the wire
+      // the element empties: every child leaves in one call, and the
+      // ids that leave come as ranges — a thousand rows mounted
+      // together are one — so the registry forgets them by counting,
+      // never by walking the subtree
       const el = elements.get(id);
-      if (el) {
-        unregister(el);
-        el.replaceChildren();
+      const ranges = u16();
+      for (let r = 0; r < ranges; r++) {
+        const start = u32();
+        const end = u32();
+        for (let n = start; n < end; n++) {
+          elements.delete(n);
+        }
+        if (pseudoRules.size) {
+          for (let n = start; n < end; n++) dropPseudo(n);
+        }
       }
+      if (el) el.replaceChildren();
     } else if (op === 3) {
       const el = elements.get(id);
       const x = f32();

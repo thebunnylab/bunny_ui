@@ -463,10 +463,18 @@ mod frame_tests {
         assert_eq!(stats::take().entries_indexed, 1, "the list alone");
         assert!(matches!(patches.as_slice(), [DomPatch::Remove { .. }]), "{patches:?}");
 
-        // every row leaves: the list is emptied in one op
+        // every row leaves: the list is emptied in one op, and the ids
+        // it forgets are the rows' own, in a few ranges
         table.rows.set(items(&[]));
         let patches = runtime.dom_frame(&table, SIZE);
-        assert!(matches!(patches.as_slice(), [DomPatch::RemoveChildren { .. }]), "{patches:?}");
+        match patches.as_slice() {
+            [DomPatch::RemoveChildren { forget, .. }] => {
+                let forgotten: u32 = forget.iter().map(|(start, end)| end - start).sum();
+                assert_eq!(forgotten, 10, "five rows of two elements: {forget:?}");
+                assert!(forget.len() <= 2, "rows mounted together are one range: {forget:?}");
+            }
+            other => panic!("one emptying op, got {other:?}"),
+        }
 
         // and rows that replace every old one: one op empties, then the
         // new ones mount — nothing is removed one by one
