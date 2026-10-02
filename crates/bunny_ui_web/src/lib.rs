@@ -442,6 +442,8 @@ enum Event {
     Repaint,
     /// A task has something to run: a fetch came back, a callback fired.
     Wake,
+    /// The browser is idle: free what the frames removed.
+    Idle,
     /// The glue's slow clock beat once — the tooltip ages, then shows.
     TooltipTick,
     /// A right press (the browser's contextmenu, default prevented).
@@ -862,6 +864,10 @@ pub fn start_with(
                 present(&runtime, &full, size, scale, &mut surface);
             }
             Event::Repaint => present(&runtime, &full, size, scale, &mut surface),
+            Event::Idle => {
+                // the page is idle: free what the frames removed
+                runtime.collect_garbage();
+            }
             Event::Wake => {
                 // The work always lands: the tasks are polled. The FRAME is
                 // for a turn that changed something. Most wakes change
@@ -1472,6 +1478,15 @@ pub extern "C" fn bunny_image_ready(_key_hi: u32, _key_lo: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn bunny_wake() {
     dispatch(Event::Wake);
+}
+
+/// The page is idle: the glue calls this after a batch that removed
+/// elements, when the browser has nothing else to do, and the engine
+/// frees the subtrees it kept — off the clock between a click and its
+/// paint.
+#[unsafe(no_mangle)]
+pub extern "C" fn bunny_idle() {
+    dispatch(Event::Idle);
 }
 
 /// Dom mode: the browser resolved a click to the nearest interactive

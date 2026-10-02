@@ -964,6 +964,9 @@ struct LowerCtx<'a> {
     group_paths: &'a mut motor::hash::FxHashMap<std::rc::Rc<str>, crate::dom_flow::GroupRecord>,
     bindings: &'a mut motor::hash::FxHashMap<Rc<str>, BoundElement>,
     templates: &'a mut Templates,
+    /// Subtrees that left this frame, kept until an idle moment frees
+    /// them: a thousand rows' nodes are freed off the frame's clock.
+    graveyard: &'a mut Vec<Retained>,
 }
 
 /// The retained side of the Dom mode: last frame's scene with ids.
@@ -989,6 +992,9 @@ pub struct DomLowering {
     bindings: motor::hash::FxHashMap<Rc<str>, BoundElement>,
     /// The shapes on the page a new group can be cloned from.
     templates: Templates,
+    /// Subtrees that left and are not freed yet — see
+    /// [`DomLowering::collect_garbage`].
+    graveyard: Vec<Retained>,
 }
 
 /// One element a binding drives.
@@ -1101,6 +1107,7 @@ impl DomLowering {
                     group_paths: &mut self.group_paths,
                     bindings: &mut self.bindings,
                     templates: &mut self.templates,
+                    graveyard: &mut self.graveyard,
                 };
                 root.children = create_children(children, 0, &mut ctx, &mut patches);
                 self.next_id = next_id;
@@ -1115,6 +1122,7 @@ impl DomLowering {
                     group_paths: &mut self.group_paths,
                     bindings: &mut self.bindings,
                     templates: &mut self.templates,
+                    graveyard: &mut self.graveyard,
                 };
                 diff_node(root, scene, &mut ctx, &mut patches);
                 self.next_id = next_id;
@@ -1219,19 +1227,37 @@ impl DomLowering {
         self.templates = Templates::default();
         self.islands.clear();
         self.anchors_sent.clear();
+        self.graveyard.clear();
         let mut next_id = self.next_id;
         let mut ctx = LowerCtx {
             next_id: &mut next_id,
             display: display.as_slice(),
             islands: &mut self.islands,
             group_paths: &mut self.group_paths,
-                    bindings: &mut self.bindings,
-                    templates: &mut self.templates,
+            bindings: &mut self.bindings,
+            templates: &mut self.templates,
+            graveyard: &mut self.graveyard,
         };
         let mut root = Retained { id: 0, node: shallow(scene), children: Vec::new() };
         root.children = scene.children.iter().map(|child| adopt_node(child, &mut ctx)).collect();
         self.next_id = next_id;
         self.root = Some(root);
+    }
+
+    /// Frees the subtrees that left since the last call. A frame that
+    /// removes a thousand rows ships one word and keeps their nodes;
+    /// the shell calls this when the page is idle, so the freeing is
+    /// never on the clock between a click and its paint. Returns how
+    /// many subtrees were freed.
+    pub(crate) fn collect_garbage(&mut self) -> usize {
+        let count = self.graveyard.len();
+        self.graveyard.clear();
+        count
+    }
+
+    /// Subtrees waiting to be freed.
+    pub(crate) fn garbage_pending(&self) -> bool {
+        !self.graveyard.is_empty()
     }
 
     /// The retained Groups' records — the flow walk consults them
@@ -1751,24 +1777,27 @@ fn file_class_binding(id: u32, binding: &NodeBinding, shipped: &DomHints, ctx: &
     );
 }
 
-fn remove_subtree(retained: &Retained, ctx: &mut LowerCtx, patches: &mut Vec<DomPatch>) {
+fn remove_subtree(mut retained: Retained, ctx: &mut LowerCtx, patches: &mut Vec<DomPatch>) {
     patches.push(DomPatch::Remove { id: retained.id });
-    forget_subtree(retained, ctx);
+    forget_subtree(&mut retained, ctx);
+    ctx.graveyard.push(retained);
 }
 
 /// Every old child leaves and nothing stays: the parent is emptied in
 /// one op, and each subtree's registrations are forgotten.
-fn remove_all_children<'a>(
+fn remove_all_children(
     parent: u32,
-    leaving: impl Iterator<Item = &'a Retained>,
+    leaving: Vec<Retained>,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
     let mut ids: Vec<u32> = Vec::new();
-    for retained in leaving {
+    let mut leaving = leaving;
+    for retained in &mut leaving {
         forget_subtree_into(retained, ctx, &mut ids);
     }
     patches.push(DomPatch::RemoveChildren { id: parent, forget: id_ranges(ids) });
+    ctx.graveyard.extend(leaving);
 }
 
 fn collect_ids(retained: &Retained, ids: &mut Vec<u32>) {
@@ -1793,7 +1822,7 @@ fn id_ranges(mut ids: Vec<u32>) -> Vec<(u32, u32)> {
 
 /// What the lowering kept about a subtree that left: its islands, its
 /// groups, its bindings, its place in a template.
-fn forget_subtree(retained: &Retained, ctx: &mut LowerCtx) {
+fn forget_subtree(retained: &mut Retained, ctx: &mut LowerCtx) {
     let mut ids = Vec::new();
     forget_subtree_into(retained, ctx, &mut ids);
 }
@@ -1801,7 +1830,7 @@ fn forget_subtree(retained: &Retained, ctx: &mut LowerCtx) {
 /// The same forgetting, in ONE walk that also lists the ids it passes
 /// — a thousand rows leaving together are nine thousand nodes, and a
 /// walk per table was five walks.
-fn forget_subtree_into(retained: &Retained, ctx: &mut LowerCtx, ids: &mut Vec<u32>) {
+fn forget_subtree_into(retained: &mut Retained, ctx: &mut LowerCtx, ids: &mut Vec<u32>) {
     ids.push(retained.id);
     // a template member that leaves retires the template — asked only
     // while any template stands
@@ -1817,12 +1846,14 @@ fn forget_subtree_into(retained: &Retained, ctx: &mut LowerCtx, ids: &mut Vec<u3
         }
         _ => {}
     }
-    if let Some(binding) = &retained.node.binding
+    // the binding leaves NOW, graveyard or not: a key that stays alive
+    // in a kept node would still count as live to the frame
+    if let Some(binding) = retained.node.binding.take()
         && ctx.bindings.get(binding.key()).is_some_and(|bound| bound.id == retained.id)
     {
         ctx.bindings.remove(binding.key());
     }
-    for child in &retained.children {
+    for child in &mut retained.children {
         forget_subtree_into(child, ctx, ids);
     }
 }
@@ -2085,15 +2116,16 @@ fn diff_children(
 
     let leaving: Vec<Retained> =
         by_path.into_values().chain(by_index.into_iter().flatten()).collect();
-    if survivors == 0 && !leaving.is_empty() {
+    let left = !leaving.is_empty();
+    if survivors == 0 && left {
         // every old child left and none stayed: one op empties the parent
-        remove_all_children(retained.id, leaving.iter(), ctx, patches);
+        remove_all_children(retained.id, leaving, ctx, patches);
     } else {
-        for leftover in &leaving {
+        for leftover in leaving {
             remove_subtree(leftover, ctx, patches);
         }
     }
-    if survivors < new_len || !leaving.is_empty() {
+    if survivors < new_len || left {
         ctx.templates.touched(retained.id);
     }
     retained.children = next;
@@ -2188,16 +2220,17 @@ fn diff_children_ordered(
     let survivors = plan.iter().filter(|entry| matches!(entry, Plan::Survivor { .. })).count();
     let leaving: Vec<Retained> =
         by_path.into_values().map(|(_, old)| old).chain(by_index.into_iter().flatten()).collect();
-    if survivors == 0 && !leaving.is_empty() {
-        remove_all_children(parent_id, leaving.iter(), ctx, patches);
+    let left = !leaving.is_empty();
+    if survivors == 0 && left {
+        remove_all_children(parent_id, leaving, ctx, patches);
     } else {
-        for leftover in &leaving {
+        for leftover in leaving {
             remove_subtree(leftover, ctx, patches);
         }
     }
     // a child mounted, left or moved under a template's member: the
     // live instance is no longer the shape
-    if survivors < plan.len() || !leaving.is_empty() {
+    if survivors < plan.len() || left {
         ctx.templates.touched(parent_id);
     }
 

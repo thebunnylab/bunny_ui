@@ -36,6 +36,25 @@ const START_EXPORT = window.BUNNY_START || "start_dom";
 // time in `window.__bunnyApply` — the column the wasm cannot see.
 const STATS = location.search.includes("stats");
 
+// After a batch, the engine is told once when the page is idle: it
+// frees then what the frames removed, never between a click and its
+// paint. One callback at a time; the browser's idle door when it has
+// one, a timeout where it does not.
+let idleArmed = false;
+function armIdle() {
+  if (idleArmed || !wasm || !wasm.bunny_idle) return;
+  idleArmed = true;
+  const run = () => {
+    idleArmed = false;
+    if (wasm && wasm.bunny_idle) wasm.bunny_idle();
+  };
+  if (typeof requestIdleCallback === "function") {
+    requestIdleCallback(run, { timeout: 1000 });
+  } else {
+    setTimeout(run, 50);
+  }
+}
+
 // The engine's key table, mirrored (bunny_ui_web::named_key).
 const KEYS = {
   Backspace: 1,
@@ -1293,6 +1312,7 @@ const imports = {
       const view = new DataView(wasm.memory.buffer, pointer, length);
       if (!STATS) {
         applyPatches(view, length);
+        armIdle();
         return;
       }
       const opened = performance.now();
@@ -1300,6 +1320,7 @@ const imports = {
       const box = (window.__bunnyApply ||= { ms: 0, batches: 0 });
       box.ms += performance.now() - opened;
       box.batches += 1;
+      armIdle();
     },
     // fresh pixels for one canvas island, straight onto its element
     js_island(id, pointer, width, height) {
