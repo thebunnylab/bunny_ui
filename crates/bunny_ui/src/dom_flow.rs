@@ -37,9 +37,11 @@ pub(crate) struct FlowEnv<'a> {
     /// under it is CLEAN, and the walk promises its reuse instead of
     /// descending.
     pub changed: &'a [String],
-    /// The Groups the retained scene actually holds — a promise the
-    /// diff cannot match would mount a hole, so the walk checks first.
-    pub retained_groups: &'a std::collections::HashSet<std::rc::Rc<str>>,
+    /// The Groups the retained scene actually holds, each with the
+    /// environment it was lowered in — a promise the diff cannot match
+    /// would mount a hole, so the walk checks first; and a boundary
+    /// under a body that ran is reused only when that environment held.
+    pub retained_groups: &'a HashMap<std::rc::Rc<str>, GroupRecord>,
     /// Browser-reported boxes by island path — a FLEXIBLE island
     /// measures against its real box, not against a guess.
     #[cfg_attr(not(feature = "canvas"), allow(dead_code))]
@@ -65,6 +67,44 @@ pub(crate) struct FlowOutput {
     /// The app's boxes inside each island, with ISLAND-LOCAL frames —
     /// exactly the coordinates the browser reports on the canvas.
     pub customs: Vec<(std::rc::Rc<str>, crate::layout::CustomPlacement)>,
+    /// The groups this walk lowered, with what they were lowered in.
+    pub groups: Vec<(std::rc::Rc<str>, GroupRecord)>,
+}
+
+/// What a boundary inherits from the walk above it — everything a
+/// group's own lowering reads from the walk and nothing it owns. A
+/// retained group whose key still holds lowers to the same scene, so a
+/// walk that meets it under a body that ran may still reuse it: the run
+/// above changed nothing the group can see.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FlowKey {
+    ink: Color,
+    in_ink_scope: bool,
+    font: FontSpec,
+    line_height: Option<Px>,
+    text_align: Option<motor::views::TextAlignment>,
+    interactive: Option<std::rc::Rc<str>>,
+    transition: Option<(f64, f64)>,
+    tooltip: Option<std::sync::Arc<str>>,
+    group: Option<u64>,
+    in_overlay: bool,
+    slot: (Option<Px>, Option<Px>),
+}
+
+/// What the lowering keeps of a group: the key it was lowered under,
+/// and what the group's OWN lowering gave its element — the parent
+/// stamps the rest again when the group is reused.
+#[derive(Clone, Debug)]
+pub(crate) struct GroupRecord {
+    pub env: FlowKey,
+    /// `stretch` the group took from a hungry child of its own.
+    pub own_stretch: bool,
+    /// The class its body declared for it (`boundary_class`).
+    pub own_class: Option<std::rc::Rc<str>>,
+    /// The binding that class reads through, when it reads for itself.
+    pub class_binding: Option<std::rc::Rc<crate::bind::Bound<String>>>,
+    /// Drop targets inside the group: a reuse must still count them.
+    pub drops: usize,
 }
 
 /// Lowers the semantic tree to a flow scene. The root is the mount
@@ -90,6 +130,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         slot: (None, None),
         pending_boundary_class: None,
         customs: Vec::new(),
+        groups_out: Vec::new(),
     };
     let mut children = Vec::new();
     walk.lower_into(root, &mut children);
@@ -122,6 +163,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         display: walk.display,
         fields: walk.fields,
         customs: walk.customs,
+        groups: walk.groups_out,
     }
 }
 
@@ -150,13 +192,18 @@ impl<'a> ChangedIndex<'a> {
         ChangedIndex { exact, above_a_run }
     }
 
-    /// Related in EITHER direction dirties: a run below the boundary
-    /// changed its interior; a run above it re-rendered it inline
-    /// (inline renders never reach the body-run ledger on their own).
+    /// A run at the boundary or below it changed its interior.
     fn touches(&self, path: &str) -> bool {
-        self.exact.contains(path)
-            || self.above_a_run.contains(path)
-            || path.match_indices('/').any(|(at, _)| self.exact.contains(&path[..at]))
+        self.exact.contains(path) || self.above_a_run.contains(path)
+    }
+
+    /// A run above the boundary re-rendered it inline. For a component
+    /// boundary that says nothing — its body is its own, and the walk
+    /// compares the environment it was lowered in ([`FlowKey`]) — but
+    /// an identity scope with no body of its own (a list's row) is the
+    /// run's content, and moves with it.
+    fn run_above(&self, path: &str) -> bool {
+        path.match_indices('/').any(|(at, _)| self.exact.contains(&path[..at]))
     }
 }
 
@@ -193,13 +240,16 @@ struct Walk<'a> {
     display: crate::layout::DisplayList,
     fields: Vec<(String, crate::layout::AutoFocus)>,
     /// A class the current boundary's body declared for its OWN
-    /// group element (`boundary_class`), consumed when it closes.
-    pending_boundary_class: Option<String>,
+    /// group element (`boundary_class`), consumed when it closes — with
+    /// the binding it reads through, when it reads for itself.
+    pending_boundary_class: Option<(String, Option<std::rc::Rc<crate::bind::Bound<String>>>)>,
     /// The nearest ancestor Frame's declared box — the proposal an
     /// island under it measures against (a flexible island learns its
     /// real box from the browser, in the island round).
     slot: (Option<Px>, Option<Px>),
     customs: Vec<(std::rc::Rc<str>, crate::layout::CustomPlacement)>,
+    /// The groups lowered this walk, for the lowering's records.
+    groups_out: Vec<(std::rc::Rc<str>, GroupRecord)>,
 }
 
 /// A flow node with nothing to say yet.
@@ -233,6 +283,23 @@ fn align_code(align: CrossAlign) -> u8 {
 }
 
 impl Walk<'_> {
+    /// The environment a boundary met here would be lowered in.
+    fn flow_key(&self) -> FlowKey {
+        FlowKey {
+            ink: self.current_ink(),
+            in_ink_scope: !self.ink_scopes.is_empty(),
+            font: self.font,
+            line_height: self.line_height,
+            text_align: self.text_align,
+            interactive: self.pending_interactive.clone(),
+            transition: self.pending_transition,
+            tooltip: self.pending_tooltip.clone(),
+            group: self.groups.last().copied(),
+            in_overlay: self.overlay_depth > 0,
+            slot: self.slot,
+        }
+    }
+
     fn current_ink(&self) -> Color {
         self.ink.last().copied().unwrap_or(crate::theme::current().fg)
     }
@@ -712,29 +779,70 @@ impl Walk<'_> {
             LayoutNode::Measured { child, .. } => self.lower_into(child, out),
 
             LayoutNode::Boundary { path, children, .. } => {
-                // a CLEAN boundary is a promise, not a walk: no body
-                // under it ran, the retained group still holds, and
-                // the diff keeps it wholesale — O(change), by absence
-                if self.env.retained_groups.contains(&**path) && !self.changed.touches(path) {
-                    out.push(node(DomKind::Reuse { path: std::rc::Rc::clone(path) }));
+                // a CLEAN boundary is a promise, not a walk: no body at
+                // or under it ran, the retained group still holds, and
+                // it was lowered in the environment the walk carries
+                // now — so the diff keeps it wholesale, O(change), by
+                // absence. The promise is born as the group's own
+                // shell, and the parent stamps its part again.
+                let key = self.flow_key();
+                let holds = |record: &GroupRecord| {
+                    if crate::reconciler::is_retained(path) {
+                        // a component's body is its own: the run above
+                        // changed nothing it shows unless the environment
+                        // it is lowered in moved
+                        record.env == key
+                    } else {
+                        // an identity scope with no body (a list's row) is
+                        // the content of the body above it
+                        !self.changed.run_above(path)
+                    }
+                };
+                if let Some(record) = self.env.retained_groups.get(&**path)
+                    && !self.changed.touches(path)
+                    && holds(record)
+                {
+                    let mut promise = node(DomKind::Reuse { path: std::rc::Rc::clone(path) });
+                    if let Some(layout) = promise.layout.as_mut() {
+                        layout.stretch = record.own_stretch;
+                    }
+                    promise.hints.class = record.own_class.clone();
+                    promise.binding = record.class_binding.clone().map(crate::dom::NodeBinding::Class);
+                    self.drops_seen += record.drops;
+                    out.push(promise);
                     return;
                 }
                 let mut group = node(DomKind::Group { path: std::rc::Rc::clone(path) });
                 group.children.reserve_exact(children.len());
                 let outer_pending = self.pending_boundary_class.take();
+                let drops_before = self.drops_seen;
                 for child in children {
                     let opened = group.children.len();
                     self.lower_into(child, &mut group.children);
                     Self::stamp_fill(child, &mut group.children[opened..]);
                 }
                 Self::inherit_stretch(&mut group);
-                if let Some(class) = self.pending_boundary_class.take() {
+                let own_stretch = group.layout.as_ref().is_some_and(|layout| layout.stretch);
+                let mut class_binding = None;
+                if let Some((class, binding)) = self.pending_boundary_class.take() {
                     // the body spoke about its own element: an empty
                     // class clears, anything else attributes
                     group.hints.class =
                         (!class.is_empty()).then(|| std::rc::Rc::from(class.as_str()));
+                    class_binding = binding;
                 }
+                group.binding = class_binding.clone().map(crate::dom::NodeBinding::Class);
                 self.pending_boundary_class = outer_pending;
+                self.groups_out.push((
+                    std::rc::Rc::clone(path),
+                    GroupRecord {
+                        env: key,
+                        own_stretch,
+                        own_class: group.hints.class.clone(),
+                        class_binding,
+                        drops: self.drops_seen - drops_before,
+                    },
+                ));
                 out.push(group);
             }
             LayoutNode::BoundaryRef { path, slot } => {
@@ -764,7 +872,10 @@ impl Walk<'_> {
                 self.pending_transition = None;
             }
             LayoutNode::BoundaryHint { class } => {
-                self.pending_boundary_class = Some(class.clone().unwrap_or_default());
+                self.pending_boundary_class = Some(match class {
+                    Some(class) => (class.get(), class.bound().cloned()),
+                    None => (String::new(), None),
+                });
             }
             LayoutNode::Tooltip { text, child, .. } => {
                 // the bubble is a data attribute and one static CSS
@@ -1118,14 +1229,7 @@ mod tests {
             changed: &[],
             // no drag in a fixture: nothing is ringed
             drop_rings: &[],
-            retained_groups: {
-                thread_local! {
-                    static EMPTY: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
-                }
-                // tests never reuse: an empty retained set
-                Box::leak(Box::new(std::collections::HashSet::new()))
-            },
+            retained_groups: Box::leak(Box::new(HashMap::default())),
             island_boxes: Box::leak(Box::new(HashMap::default())),
         }
     }

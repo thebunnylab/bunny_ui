@@ -220,7 +220,6 @@ pub(crate) fn note_diff_visit() {
 }
 
 #[inline]
-#[allow(dead_code)] // the diff learns to reuse in the O(change) round
 pub(crate) fn note_diff_reuse() {
     bump(&DIFF_REUSED, 1);
 }

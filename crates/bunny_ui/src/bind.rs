@@ -250,6 +250,271 @@ impl std::fmt::Debug for TextSource {
     }
 }
 
+// MARK: - Class
+
+/// What a boundary's own element wears as a class: a fixed name, or a
+/// value the node reads for itself.
+#[derive(Clone)]
+pub enum ClassSource {
+    Fixed(String),
+    /// Not placed yet: the closure waits for the node's key.
+    Lazy(Rc<dyn Fn() -> String>),
+    Bound(Rc<Bound<String>>),
+}
+
+impl ClassSource {
+    /// The class now.
+    pub fn get(&self) -> String {
+        match self {
+            ClassSource::Fixed(class) => class.clone(),
+            ClassSource::Lazy(eval) => eval(),
+            ClassSource::Bound(bound) => bound.get(),
+        }
+    }
+
+    /// The binding behind the class, when it reads for itself.
+    pub fn bound(&self) -> Option<&Rc<Bound<String>>> {
+        match self {
+            ClassSource::Bound(bound) => Some(bound),
+            _ => None,
+        }
+    }
+
+    /// At render: a lazy source becomes a binding keyed by the cursor —
+    /// or a fixed class, when its one read depended on nothing.
+    pub(crate) fn place(&self) -> ClassSource {
+        match self {
+            ClassSource::Lazy(eval) => match key_at_cursor("#class") {
+                Some(key) => {
+                    let owner = motor::identity::current_view_path();
+                    let bound = Bound::new(key, owner.as_deref(), Rc::clone(eval));
+                    if bound.reads_anything() {
+                        ClassSource::Bound(bound)
+                    } else {
+                        ClassSource::Fixed(bound.get())
+                    }
+                }
+                None => ClassSource::Fixed(eval()),
+            },
+            other => other.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ClassSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.get())
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    //! The bindings in a frame: what a write to a bound value costs the
+    //! engine, on the element road and on the pixel road.
+
+    use std::rc::Rc;
+
+    use crate::dom::DomPatch;
+    use crate::layout::Size;
+    use crate::prelude::*;
+    use crate::runtime::Runtime;
+    use crate::stats;
+    use crate::views::{boundary_class_when, for_each};
+
+    const SIZE: Size = Size { width: 400.0, height: 300.0 };
+
+    #[derive(Clone, Copy)]
+    struct Label {
+        count: State<usize>,
+    }
+
+    impl Component for Label {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::text!("{} rows", self.count)
+        }
+    }
+
+    #[test]
+    fn a_bound_label_is_one_text_patch_and_no_body() {
+        let label = Label { count: State::new(1) };
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&label, SIZE);
+        let _ = stats::take();
+
+        label.count.set(2);
+        assert!(runtime.needs_frame(), "the write asks for a frame");
+        let patches = runtime.dom_frame(&label, SIZE);
+        let frame = stats::take();
+        assert!(runtime.body_runs().is_empty(), "no body ran: {:?}", runtime.body_runs());
+        assert_eq!(frame.capture_nodes, 0, "the walk built nothing");
+        assert_eq!(frame.binding_updates, 1);
+        match patches.as_slice() {
+            [DomPatch::SetText { text, .. }] => assert_eq!(&*text.content, "2 rows"),
+            other => panic!("one text patch, got {other:?}"),
+        }
+        // the print reads it live
+        assert!(runtime.render(&label).contains("2 rows"));
+    }
+
+    #[test]
+    fn a_bound_label_moves_the_pixels_with_no_body() {
+        let label = Label { count: State::new(1) };
+        let runtime = Runtime::new();
+        let before = runtime.display_frame(&label, SIZE);
+        label.count.set(2);
+        let after = runtime.display_frame(&label, SIZE);
+        assert!(runtime.body_runs().is_empty(), "the measure read the new value itself");
+        assert_ne!(before.as_slice(), after.as_slice(), "and the picture moved");
+    }
+
+    #[derive(Clone, Copy)]
+    struct Flag {
+        on: State<bool>,
+    }
+
+    impl Component for Flag {
+        fn body(self, _ctx: &Context) -> impl View {
+            (boundary_class_when(self.on, "danger"), text("flag"))
+        }
+    }
+
+    #[test]
+    fn a_bound_class_flips_the_element_alone() {
+        let flag = Flag { on: State::new(false) };
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&flag, SIZE);
+        let _ = stats::take();
+
+        flag.on.set(true);
+        let patches = runtime.dom_frame(&flag, SIZE);
+        assert!(runtime.body_runs().is_empty());
+        assert_eq!(stats::take().binding_updates, 1);
+        match patches.as_slice() {
+            [DomPatch::SetHints { class: Some(class), .. }] => assert_eq!(&**class, "danger"),
+            other => panic!("one class patch, got {other:?}"),
+        }
+        flag.on.set(false);
+        let patches = runtime.dom_frame(&flag, SIZE);
+        assert!(matches!(patches.as_slice(), [DomPatch::SetHints { class: None, .. }]), "{patches:?}");
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    struct Item {
+        id: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Row {
+        id: usize,
+    }
+
+    impl Component for Row {
+        fn body(self, _ctx: &Context) -> impl View {
+            text(format!("row {}", self.id))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Table {
+        rows: State<Rc<Vec<Item>>>,
+    }
+
+    impl Component for Table {
+        fn body(self, _ctx: &Context) -> impl View {
+            for_each(self.rows, |item| item.id.to_string(), |item| Row { id: item.id })
+        }
+    }
+
+    fn items(ids: &[usize]) -> Rc<Vec<Item>> {
+        Rc::new(ids.iter().map(|id| Item { id: *id }).collect())
+    }
+
+    #[test]
+    fn a_keyed_list_reads_its_rows_and_renders_each_once() {
+        let table = Table { rows: State::new(items(&[1, 2, 3, 4, 5])) };
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&table, SIZE);
+        // the table, the list and every row once
+        assert_eq!(stats::take().entries_indexed, 7, "every row once at the mount");
+
+        // a swap: the list re-runs, no row does, and the wire carries two moves
+        table.rows.set(items(&[1, 4, 3, 2, 5]));
+        let patches = runtime.dom_frame(&table, SIZE);
+        let frame = stats::take();
+        assert_eq!(frame.entries_indexed, 1, "the list's own body, and no row's");
+        assert_eq!(frame.diff_reused, 5, "every row kept wholesale");
+        assert_eq!(patches.len(), 2, "{patches:?}");
+        assert!(patches.iter().all(|patch| matches!(patch, DomPatch::Move { .. })), "{patches:?}");
+
+        // a new key runs its row, and only it
+        table.rows.set(items(&[1, 4, 3, 2, 5, 6]));
+        let patches = runtime.dom_frame(&table, SIZE);
+        assert_eq!(stats::take().entries_indexed, 2, "the list and the new row");
+        let groups = patches
+            .iter()
+            .filter(|patch| matches!(patch, DomPatch::Create { kind: crate::dom::CreateKind::Group, .. }))
+            .count();
+        assert_eq!(groups, 1, "one row mounted: {patches:?}");
+        assert!(!patches.iter().any(|patch| matches!(patch, DomPatch::Remove { .. })));
+
+        // a key that left takes its row along
+        table.rows.set(items(&[1, 3, 2, 5, 6]));
+        let patches = runtime.dom_frame(&table, SIZE);
+        assert_eq!(stats::take().entries_indexed, 1, "the list alone");
+        assert!(matches!(patches.as_slice(), [DomPatch::Remove { .. }]), "{patches:?}");
+    }
+
+    #[derive(Clone, Copy)]
+    struct Shelf {
+        rows: State<Rc<Vec<Item>>>,
+        head: State<usize>,
+        big: State<bool>,
+    }
+
+    impl Component for Shelf {
+        fn body(self, _ctx: &Context) -> impl View {
+            // the head and the font are read by the body on purpose: a
+            // change to either re-runs the shelf, and the list under it
+            let font = if self.big.get() { Font::Title } else { Font::Body };
+            crate::vstack!(
+                text(self.head.get().to_string()),
+                for_each(self.rows, |item| item.id.to_string(), |item| Row { id: item.id })
+            )
+            .font(font)
+        }
+    }
+
+    #[test]
+    fn a_kept_row_is_lowered_again_when_its_environment_moves() {
+        let shelf = Shelf { rows: State::new(items(&[1, 2, 3])), head: State::new(1), big: State::new(false) };
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&shelf, SIZE);
+        let _ = stats::take();
+
+        // the shelf re-runs for its head: the rows are promises, not walks
+        shelf.head.set(2);
+        let patches = runtime.dom_frame(&shelf, SIZE);
+        let frame = stats::take();
+        assert_eq!(frame.entries_indexed, 2, "the shelf and the list, no row");
+        assert_eq!(frame.diff_reused, 3, "the rows were kept: {patches:?}");
+        assert!(matches!(patches.as_slice(), [DomPatch::SetText { text, .. }] if &*text.content == "2"), "{patches:?}");
+
+        // the shelf re-runs with another font above the rows: the rows
+        // are lowered again, in their new environment — no body of
+        // theirs runs for it
+        shelf.big.set(true);
+        let patches = runtime.dom_frame(&shelf, SIZE);
+        let frame = stats::take();
+        assert_eq!(frame.entries_indexed, 2, "still no row body");
+        assert_eq!(frame.diff_reused, 0, "a moved environment keeps nothing: {patches:?}");
+        let rows_moved = patches
+            .iter()
+            .filter(|patch| matches!(patch, DomPatch::SetText { text, .. } if text.content.starts_with("row ")))
+            .count();
+        assert_eq!(rows_moved, 3, "every row's text wears the new font: {patches:?}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

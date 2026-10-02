@@ -4647,7 +4647,7 @@ impl Runtime {
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
         };
-        let no_promises = std::collections::HashSet::new();
+        let no_promises = motor::hash::FxHashMap::default();
         let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
             scroll_offsets: &*offsets,
@@ -4679,6 +4679,7 @@ impl Runtime {
             }
         }
         let mut dom = self.dom.borrow_mut();
+        dom.note_groups(output.groups);
         let mut patches = dom.lower(&output.scene, &output.display);
         if !dirty_bindings.is_empty() {
             patches.extend(dom.refresh_bindings(&dirty_bindings));
@@ -4756,7 +4757,7 @@ impl Runtime {
             dialog_frames: Some(&dialogs),
         };
         let changed: Vec<String> = Vec::new();
-        let no_promises = std::collections::HashSet::new();
+        let no_promises = motor::hash::FxHashMap::default();
         let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {
             scroll_offsets: &*offsets,
@@ -4779,7 +4780,9 @@ impl Runtime {
         *self.dom_customs.borrow_mut() = output.customs.clone();
         drop(offsets);
         drop(carets);
-        self.dom.borrow_mut().adopt(&output.scene, &output.display);
+        let mut dom = self.dom.borrow_mut();
+        dom.note_groups(output.groups);
+        dom.adopt(&output.scene, &output.display);
     }
 
     /// A click resolved by the BROWSER: the glue walked up from the
