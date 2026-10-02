@@ -282,6 +282,17 @@ impl Tree {
                 }
                 self.elements.remove(id);
             }
+            DomPatch::RemoveChildren { id } => {
+                let Some(element) = self.elements.get_mut(id) else {
+                    return;
+                };
+                let mut doomed = std::mem::take(&mut element.children);
+                while let Some(child) = doomed.pop() {
+                    if let Some(gone) = self.elements.remove(&child) {
+                        doomed.extend(gone.children);
+                    }
+                }
+            }
             DomPatch::SetTransform { id, x, y } => {
                 if let Some(element) = self.elements.get_mut(id) {
                     element.style.insert("position", "absolute".into());

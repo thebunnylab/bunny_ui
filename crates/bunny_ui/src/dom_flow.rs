@@ -521,6 +521,26 @@ impl Walk<'_> {
                     || props.foreground_pressed.is_some();
                 let inheriting =
                     !self.ink_scopes.is_empty() && props.foreground.is_some();
+                // an ink-only style over a text owns no element: the text
+                // takes the ink itself, as it always did, and the box
+                // that would have carried nothing is not made. A state
+                // the ink answers to, an ink inside a hover scope, a
+                // layer, a transition — those keep their box
+                if matches!(**child, LayoutNode::Text { .. })
+                    && !states
+                    && !inheriting
+                    && self.overlay_depth == 0
+                    && self.pending_transition.is_none()
+                    && DomStyle::from_props(props) == DomStyle::default()
+                {
+                    self.ink.push(props.foreground.unwrap_or_else(|| self.current_ink()));
+                    self.lower_into(child, out);
+                    self.ink.pop();
+                    self.font = outer_font;
+                    self.line_height = outer_line_height;
+                    self.text_align = outer_text_align;
+                    return;
+                }
                 let mut boxed = node(DomKind::Box);
                 let interactive = self.pending_interactive.take();
                 boxed.style = DomStyle {
@@ -967,6 +987,13 @@ impl Walk<'_> {
                 // node in practice (a hinted stack, text, or box)
                 let opened = out.len();
                 self.lower_into(child, out);
+                // a table cell that holds one plain text IS that text
+                if let Some(tag) = tag
+                    && (&**tag == "td" || &**tag == "th")
+                    && out.len() == opened + 1
+                {
+                    Self::fold_cell(&mut out[opened]);
+                }
                 for hinted in &mut out[opened..] {
                     if tag.is_some() {
                         hinted.hints.tag = tag.clone();
@@ -1065,6 +1092,33 @@ impl Walk<'_> {
                 }
             }
         }
+    }
+
+    /// A cell whose one child is a plain text becomes that text: the
+    /// cell element carries the words, and the flex box between them
+    /// is not made. A cell lays itself out as a table cell, so nothing
+    /// the flex box said about layout is lost; what the box took from
+    /// the walk — the press, the tooltip, the transition — the text
+    /// takes.
+    fn fold_cell(cell: &mut DomNode) {
+        let plain_text = matches!(cell.kind, DomKind::FlexRow | DomKind::FlexColumn)
+            && cell.children.len() == 1
+            && matches!(cell.children[0].kind, DomKind::Text(_))
+            && cell.children[0].hints.is_empty();
+        if !plain_text {
+            return;
+        }
+        let mut text = cell.children.pop().expect("the one child");
+        if text.style.interactive.is_none() {
+            text.style.interactive = cell.style.interactive.take();
+        }
+        if text.style.tooltip.is_none() {
+            text.style.tooltip = cell.style.tooltip.take();
+        }
+        if text.style.transition.is_none() {
+            text.style.transition = cell.style.transition.take();
+        }
+        *cell = text;
     }
 
     /// A hungry interior keeps its hunger through a pure wrapper —

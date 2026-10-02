@@ -882,6 +882,10 @@ pub enum DomPatch {
     Create { id: u32, parent: u32, before: u32, kind: CreateKind, hints: DomHints },
     /// Removes the element AND its subtree.
     Remove { id: u32 },
+    /// Empties the element: every child and its subtree leaves in one
+    /// op — a list that clears, or replaces its rows, costs one word
+    /// instead of one per row.
+    RemoveChildren { id: u32 },
     SetTransform { id: u32, x: f64, y: f64 },
     SetSize { id: u32, width: f64, height: f64 },
     /// The FULL style record — the glue resets and applies (styles are
@@ -1491,6 +1495,26 @@ fn file_class_binding(id: u32, binding: &NodeBinding, shipped: &DomHints, ctx: &
 
 fn remove_subtree(retained: &Retained, ctx: &mut LowerCtx, patches: &mut Vec<DomPatch>) {
     patches.push(DomPatch::Remove { id: retained.id });
+    forget_subtree(retained, ctx);
+}
+
+/// Every old child leaves and nothing stays: the parent is emptied in
+/// one op, and each subtree's registrations are forgotten.
+fn remove_all_children<'a>(
+    parent: u32,
+    leaving: impl Iterator<Item = &'a Retained>,
+    ctx: &mut LowerCtx,
+    patches: &mut Vec<DomPatch>,
+) {
+    patches.push(DomPatch::RemoveChildren { id: parent });
+    for retained in leaving {
+        forget_subtree(retained, ctx);
+    }
+}
+
+/// What the lowering kept about a subtree that left: its islands, its
+/// groups, its bindings.
+fn forget_subtree(retained: &Retained, ctx: &mut LowerCtx) {
     fn forget_bindings(retained: &Retained, bindings: &mut HashMap<Rc<str>, BoundElement>) {
         if let Some(binding) = &retained.node.binding
             && bindings.get(binding.key()).is_some_and(|bound| bound.id == retained.id)
@@ -1738,6 +1762,7 @@ fn diff_children(
     }
 
     let mut next: Vec<Retained> = Vec::with_capacity(new.children.len());
+    let mut survivors = 0usize;
     for (index, child) in new.children.iter().enumerate() {
         let matched = match &child.kind {
             DomKind::Group { path } | DomKind::Reuse { path } => by_path.remove(path),
@@ -1763,16 +1788,21 @@ fn diff_children(
             Some(mut old) => {
                 diff_node(&mut old, child, ctx, patches);
                 next.push(old);
+                survivors += 1;
             }
             None => next.push(create_subtree(child, retained.id, ctx, patches)),
         }
     }
 
-    for (_, leftover) in by_path {
-        remove_subtree(&leftover, ctx, patches);
-    }
-    for leftover in by_index.into_iter().flatten() {
-        remove_subtree(&leftover, ctx, patches);
+    let leaving: Vec<Retained> =
+        by_path.into_values().chain(by_index.into_iter().flatten()).collect();
+    if survivors == 0 && !leaving.is_empty() {
+        // every old child left and none stayed: one op empties the parent
+        remove_all_children(retained.id, leaving.iter(), ctx, patches);
+    } else {
+        for leftover in &leaving {
+            remove_subtree(leftover, ctx, patches);
+        }
     }
     retained.children = next;
 }
@@ -1818,6 +1848,7 @@ fn diff_children_ordered(
         Fresh(&'a DomNode),
     }
 
+    let parent_id = retained.id;
     let old_children = std::mem::take(&mut retained.children);
     let mut by_path: HashMap<std::rc::Rc<str>, (usize, Retained)> = HashMap::new();
     let mut by_index: Vec<Option<Retained>> = Vec::with_capacity(old_children.len());
@@ -1858,12 +1889,18 @@ fn diff_children_ordered(
         }
     }
 
-    // removals go out before placements: an anchor is never a corpse
-    for (_, (_, leftover)) in by_path {
-        remove_subtree(&leftover, ctx, patches);
-    }
-    for leftover in by_index.into_iter().flatten() {
-        remove_subtree(&leftover, ctx, patches);
+    // removals go out before placements: an anchor is never a corpse.
+    // When nothing survived, the parent is emptied in one op — a list
+    // that clears or replaces its rows says one word, not one per row
+    let survivors = plan.iter().filter(|entry| matches!(entry, Plan::Survivor { .. })).count();
+    let leaving: Vec<Retained> =
+        by_path.into_values().map(|(_, old)| old).chain(by_index.into_iter().flatten()).collect();
+    if survivors == 0 && !leaving.is_empty() {
+        remove_all_children(parent_id, leaving.iter(), ctx, patches);
+    } else {
+        for leftover in &leaving {
+            remove_subtree(leftover, ctx, patches);
+        }
     }
 
     // the stable spine: survivors whose old order already reads in
@@ -1963,7 +2000,12 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 /// 10 (2026-09-24): the flow record carries a wrapping row (bit 11 and
 /// its line gap, after the slot), and the key table grew the function
 /// row (101 to 124, `bunny_key` now answering whether a key was taken).
-pub const ABI_VERSION: u32 = 10;
+///
+/// 11 (2026-10-02): op 18 empties an element (`RemoveChildren` — a list
+/// that clears or replaces its rows is one word), and a removal (op 2)
+/// unregisters its own subtree in the glue instead of a sweep over
+/// every element at the end of the batch.
+pub const ABI_VERSION: u32 = 11;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -2120,6 +2162,10 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
             }
             DomPatch::Remove { id } => {
                 out.push(2);
+                push_u32(&mut out, *id);
+            }
+            DomPatch::RemoveChildren { id } => {
+                out.push(18);
                 push_u32(&mut out, *id);
             }
             DomPatch::SetTransform { id, x, y } => {
@@ -2597,6 +2643,7 @@ mod tests {
         match patch {
             DomPatch::Create { id, .. }
             | DomPatch::Remove { id }
+            | DomPatch::RemoveChildren { id }
             | DomPatch::SetTransform { id, .. }
             | DomPatch::SetSize { id, .. }
             | DomPatch::SetStyle { id, .. }
@@ -2906,7 +2953,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let removes = patches.iter().filter(|p| matches!(p, DomPatch::Remove { .. })).count();
+        // a window that jumped far has no row in common with the old
+        // one: the content empties in one op, then the far band mounts
+        let removes = patches
+            .iter()
+            .filter(|p| matches!(p, DomPatch::Remove { .. } | DomPatch::RemoveChildren { .. }))
+            .count();
         assert!(!created.is_empty(), "the far band mounted");
         assert!(removes > 0, "the old window left");
         // surviving nodes sit at index × extent inside the content box —
@@ -3723,10 +3775,13 @@ mod tests {
         view.image_on.set(false);
         let patches = runtime.dom_frame(&view, size);
         // the swapped subtree leaves whole (one remove on its root
-        // covers the image inside) and the replacement mounts fresh —
-        // nothing ever mutates the old element in place
+        // covers the image inside — or its parent empties, when it was
+        // the only child) and the replacement mounts fresh — nothing
+        // ever mutates the old element in place
         assert!(
-            patches.iter().any(|patch| matches!(patch, DomPatch::Remove { .. })),
+            patches
+                .iter()
+                .any(|patch| matches!(patch, DomPatch::Remove { .. } | DomPatch::RemoveChildren { .. })),
             "the old subtree leaves: {patches:?}"
         );
         assert!(patches
