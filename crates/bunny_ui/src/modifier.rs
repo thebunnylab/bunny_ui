@@ -642,7 +642,7 @@ fn rewrite_pixel_node(
 fn rewrite_text_node(
     node: LayoutNode,
     rewrite: &impl Fn(
-        std::sync::Arc<str>,
+        crate::bind::TextSource,
         Option<TextHighlight>,
         Option<Truncation>,
     ) -> LayoutNode,

@@ -1703,6 +1703,9 @@ fn drop_entries(paths: &[String]) {
             for path in paths {
                 if let Some(entry) = retained.remove(path) {
                     live.unindex(path, &entry);
+                    // a view that left owes the read graph nothing more:
+                    // its reads and its bindings' reads fall with it
+                    motor::identity::forget_view_reads(path);
                 }
             }
         });
@@ -1894,6 +1897,11 @@ pub(crate) fn expand(node: &RenderNode) -> RenderNode {
         };
         let mut expanded = expand(&inner);
         expanded.line.push_str(suffix);
+        if let Some(read) = expanded.live.take() {
+            // a live line keeps its suffixes: they ride the read
+            let suffix = suffix.to_string();
+            expanded.live = Some(Rc::new(move || format!("{}{suffix}", read())));
+        }
         for child in &node.children {
             expanded.children.push(expand(child));
         }
@@ -1901,6 +1909,7 @@ pub(crate) fn expand(node: &RenderNode) -> RenderNode {
     } else {
         RenderNode {
             line: node.line.clone(),
+            live: node.live.clone(),
             children: node.children.iter().map(expand).collect(),
         }
     }

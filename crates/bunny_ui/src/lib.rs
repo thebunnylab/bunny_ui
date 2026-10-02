@@ -39,6 +39,7 @@
 
 pub mod action;
 pub mod anim;
+pub mod bind;
 pub mod clipboard;
 pub mod custom;
 pub mod dom;
@@ -80,12 +81,21 @@ pub mod views;
 
 pub use runtime::request_frame;
 
-/// `text!("Count: {}", self.count)` — the built-in `format!` of text.
-/// Displaying a `State` READS the value: the dependency registers itself.
+/// `text!("Count: {}", self.count)` — the built-in `format!` of text,
+/// and a text that reads for itself: the format runs in a closure the
+/// NODE keeps, so a `State` it displays registers on the node and a
+/// write to it moves the text alone, with no body re-run. Any value
+/// the format names is captured by move, like a `.on_click` closure's.
+/// `text!(label)` is the one-value form.
+///
+/// Reading nothing (a plain literal) costs nothing: the text is fixed.
 #[macro_export]
 macro_rules! text {
-    ($($arg:tt)*) => {
-        $crate::views::text(::std::format!($($arg)*))
+    ($fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::views::text_with(move || ::std::format!($fmt $(, $arg)*))
+    };
+    ($value:expr $(,)?) => {
+        $crate::views::text_with(move || ::std::format!("{}", $value))
     };
 }
 
@@ -10284,9 +10294,11 @@ mod tests {
         runtime.pointer_pressed(cx, cy);
         runtime.pointer_released(cx, cy);
 
-        // State's Display READS — the click invalidates ONLY the Counter
+        // `text!` reads for itself: the click moves the label, and NO body
+        // runs for it — the node read the count, so the node is what the
+        // write reaches, and the print reads it live
         runtime.render(&counter);
-        assert_eq!(runtime.body_runs(), vec!["Counter".to_string()]);
+        assert_eq!(runtime.body_runs(), Vec::<String>::new(), "a bound label costs no body");
         assert!(runtime.render_stable(&counter).contains("Count: 1"));
     }
 

@@ -57,31 +57,47 @@ pub(crate) fn wrap_layout(children: Vec<LayoutNode>) -> LayoutNode {
 
 /// `Text("…")` — `Rc<str>` for cheap clones (views are values).
 #[derive(Clone)]
-pub struct Text(pub Arc<str>);
+pub struct Text(pub crate::bind::TextSource);
 
 impl View for Text {
     type Arity = Single;
 
     fn render_into(&self, _ctx: &Context, out: &mut NodeList) {
-        out.push(RenderNode::leaf(if crate::view::print_enabled() {
-            format!("Text({:?})", self.0)
-        } else {
-            String::new()
-        }));
-        out.push_layout(LayoutNode::Text {
-            content: self.0.clone(),
-            highlights: None,
-            truncation: None,
+        // a text that reads for itself takes its key here, where the
+        // cursor names the node; the print shows what it reads now
+        let content = self.0.place();
+        out.push(match (&content, crate::view::print_enabled()) {
+            (_, false) => RenderNode::leaf(String::new()),
+            // the print of a text that reads for itself reads it too:
+            // what the tree shows is what the node shows
+            (crate::bind::TextSource::Bound(bound), true) => {
+                let bound = Rc::clone(bound);
+                RenderNode::live(Rc::new(move || format!("Text({:?})", bound.get())))
+            }
+            (fixed, true) => RenderNode::leaf(format!("Text({:?})", fixed.get())),
         });
+        out.push_layout(LayoutNode::Text { content, highlights: None, truncation: None });
     }
 }
 
-/// `Text` takes anything that becomes an `Rc<str>`: a literal or a
-/// `String` pay ONE allocation here, and an `Rc<str>` handed in (a row
+/// `Text` takes anything that becomes an `Arc<str>`: a literal or a
+/// `String` pay ONE allocation here, and an `Arc<str>` handed in (a row
 /// model that shares its strings) pays NOTHING — the body of a list
 /// clones pointers, not bytes.
 pub fn text(string: impl Into<Arc<str>>) -> Text {
-    Text(string.into())
+    Text(crate::bind::TextSource::Fixed(string.into()))
+}
+
+/// A text that reads for itself. The closure is the NODE's: it runs
+/// when the node is placed, what it reads registers on the node, and a
+/// write to any of it moves the text alone — no body re-runs. `text!`
+/// spells this for a format; this is the door for a closure of one's
+/// own.
+///
+/// A closure that reads nothing is a fixed text: it costs the same as
+/// [`text`].
+pub fn text_with<S: Into<Arc<str>>>(read: impl Fn() -> S + 'static) -> Text {
+    Text(crate::bind::TextSource::Lazy(Rc::new(move || read().into())))
 }
 
 // The button chrome geometry (Role/Size come later; the future
@@ -426,9 +442,9 @@ impl View for TextField {
             // outside a pass (decorative use): the value becomes plain text
             None => out.push_layout(LayoutNode::Text {
                 content: if value.is_empty() {
-                    self.placeholder.clone()
+                    self.placeholder.clone().into()
                 } else {
-                    Arc::from(value)
+                    Arc::<str>::from(value).into()
                 },
                 highlights: None,
                 truncation: None,

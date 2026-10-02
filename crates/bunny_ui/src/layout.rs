@@ -717,7 +717,8 @@ pub enum LayoutNode {
     /// when truncation is on; highlight paints spans without touching the
     /// measure.
     Text {
-        content: Arc<str>,
+        /// The text — fixed, or read by the node itself (a binding).
+        content: crate::bind::TextSource,
         highlights: Option<TextHighlight>,
         truncation: Option<Truncation>,
     },
@@ -4076,7 +4077,7 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
                                         trailing: MENU_PAD_H,
                                     },
                                     child: Box::new(LayoutNode::Text {
-                                        content: label.clone(),
+                                        content: label.clone().into(),
                                         highlights: None,
                                         truncation: None,
                                     }),
@@ -4187,7 +4188,7 @@ fn tooltip_node(text: Arc<str>) -> LayoutNode {
         child: Box::new(LayoutNode::Padding {
             edges: Edges { top: 3.0, trailing: 7.0, bottom: 4.0, leading: 7.0 },
             child: Box::new(LayoutNode::Text {
-                content: text,
+                content: text.into(),
                 highlights: None,
                 truncation: None,
             }),
@@ -4550,7 +4551,8 @@ impl LayoutNode {
     fn first_baseline(&self, env: &LayoutEnv<'_>) -> Option<Px> {
         match self {
             LayoutNode::Text { content, .. } => {
-                Some(env.cache.get_or_measure(content, &env.font, env.text).ascent)
+                let content = content.get();
+                Some(env.cache.get_or_measure(&content, &env.font, env.text).ascent)
             }
             LayoutNode::Field { .. } => {
                 let metrics = env.cache.get_or_measure("0", &env.font, env.text);
@@ -4608,7 +4610,8 @@ impl LayoutNode {
     pub(crate) fn measure(&self, proposal: Proposal, env: &LayoutEnv<'_>) -> (Size, Fit) {
         match self {
             LayoutNode::Text { content, truncation, .. } => {
-                let metrics = env.cache.get_or_measure(content, &env.font, env.text);
+                let content = content.get();
+                let metrics = env.cache.get_or_measure(&content, &env.font, env.text);
                 let natural = metrics.width;
                 // the line box a paragraph steps by: the face's own box,
                 // or the inherited `.line_height(…)` when one is set. With
@@ -4623,7 +4626,7 @@ impl LayoutNode {
                             Size { width, height: advance }
                         } else {
                             let lines =
-                                env.cache.get_or_break(content, &env.font, width, env.text);
+                                env.cache.get_or_break(&content, &env.font, width, env.text);
                             // A paragraph told how tall it may be answers
                             // that, not what it wishes it were. Answering
                             // the wish is what put a card's text over the
@@ -5170,6 +5173,7 @@ impl LayoutNode {
         match (self, fit.unshared()) {
             // visual leaves: the draw list is born here
             (LayoutNode::Text { content, highlights, truncation }, Fit::Leaf) => {
+                let content = content.get();
                 let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
                 if let Some(dom) = out.dom.as_mut() {
                     // the WHOLE content, unwrapped: the browser re-breaks
@@ -5193,7 +5197,7 @@ impl LayoutNode {
                     );
                 }
                 place_text(
-                    content,
+                    &content,
                     highlights.as_ref(),
                     *truncation,
                     frame,
@@ -7796,7 +7800,7 @@ mod tests {
     use super::*;
 
     fn text(chars: usize) -> LayoutNode {
-        LayoutNode::Text { content: Arc::from("x".repeat(chars)), highlights: None, truncation: None }
+        LayoutNode::Text { content: crate::bind::TextSource::from("x".repeat(chars)), highlights: None, truncation: None }
     }
 
     fn boundary(path: &str, child: LayoutNode) -> LayoutNode {
@@ -8872,7 +8876,7 @@ mod tests {
 
     #[test]
     fn words_wrap_at_spaces_never_mid_word() {
-        let node = LayoutNode::Text { content: Arc::from("aa bb cc"), highlights: None, truncation: None };
+        let node = LayoutNode::Text { content: crate::bind::TextSource::from("aa bb cc"), highlights: None, truncation: None };
         let result = layout(&node, Proposal { width: Some(40.0), height: None });
 
         // "aa bb" (40px) fits; "cc" goes down whole — never an orphan "c"
@@ -8892,7 +8896,7 @@ mod tests {
     fn highlight_splits_the_line_into_colored_runs() {
         let hot = Color::hex(0xFF0000);
         let node = LayoutNode::Text {
-            content: Arc::from("abcdef"),
+            content: crate::bind::TextSource::from("abcdef"),
             highlights: Some(TextHighlight { ranges: Rc::new(vec![(2, 4)]), color: hot }),
             truncation: None,
         };
@@ -8925,7 +8929,7 @@ mod tests {
         // "aa bb cc" at 40px breaks into "aa bb " + "cc"; the ranges
         // cover the "bb" (line 1) and the "cc" (line 2)
         let node = LayoutNode::Text {
-            content: Arc::from("aa bb cc"),
+            content: crate::bind::TextSource::from("aa bb cc"),
             highlights: Some(TextHighlight {
                 ranges: Rc::new(vec![(3, 5), (6, 8)]),
                 color: hot,
@@ -8958,7 +8962,7 @@ mod tests {
     fn truncation_places_the_ellipsis_where_asked() {
         let truncated = |mode: Truncation| {
             let node = LayoutNode::Text {
-                content: Arc::from("abcdefgh"),
+                content: crate::bind::TextSource::from("abcdefgh"),
                 highlights: None,
                 truncation: Some(mode),
             };
@@ -8981,7 +8985,7 @@ mod tests {
 
     #[test]
     fn a_word_longer_than_the_line_hard_breaks() {
-        let node = LayoutNode::Text { content: Arc::from("aaaaaaaaaa"), highlights: None, truncation: None };
+        let node = LayoutNode::Text { content: crate::bind::TextSource::from("aaaaaaaaaa"), highlights: None, truncation: None };
         let result = layout(&node, Proposal { width: Some(40.0), height: None });
 
         // 10 chars of 8px in 40px: 5 per line

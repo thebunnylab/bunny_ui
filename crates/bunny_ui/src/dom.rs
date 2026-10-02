@@ -357,6 +357,33 @@ pub struct DomField {
     pub secret: bool,
 }
 
+/// What a node reads for itself ([`crate::bind`]): the lowering keeps
+/// the element id by the binding's key and patches the one element
+/// when a write reaches the binding — no walk, no diff.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NodeBinding {
+    /// The text of a text node.
+    Text(Rc<crate::bind::Bound<Arc<str>>>),
+}
+
+impl NodeBinding {
+    /// The key the lowering files the element under.
+    pub fn key(&self) -> &Rc<str> {
+        match self {
+            NodeBinding::Text(bound) => bound.key(),
+        }
+    }
+
+    /// The same binding OBJECT — not merely the same key: a body that
+    /// re-ran made a new one at the old key, and it may read something
+    /// else.
+    fn same_as(&self, other: &NodeBinding) -> bool {
+        match (self, other) {
+            (NodeBinding::Text(a), NodeBinding::Text(b)) => Rc::ptr_eq(a, b),
+        }
+    }
+}
+
 /// A captured scene node: kind + parent-relative frame + style +
 /// children, exactly what one element needs to exist.
 #[derive(Clone, Debug, PartialEq)]
@@ -376,6 +403,8 @@ pub struct DomNode {
     /// Real-element hints (tag, class, id) — the Dom's alone.
     pub hints: DomHints,
     pub children: Vec<DomNode>,
+    /// What the node reads for itself, if anything.
+    pub binding: Option<NodeBinding>,
 }
 
 // MARK: - Capture (rides the placement walk)
@@ -434,6 +463,7 @@ impl DomCapture {
             layout: None,
             hints: DomHints::default(),
             children: Vec::new(),
+            binding: None,
         };
         DomCapture {
             stack: vec![(Point { x: 0.0, y: 0.0 }, root)],
@@ -485,6 +515,7 @@ impl DomCapture {
             layout: None,
             hints: DomHints::default(),
             children: Vec::new(),
+            binding: None,
         };
         // the node inherits the ink until a `Styled` says otherwise
         self.ink.push(self.current_ink());
@@ -890,6 +921,7 @@ struct LowerCtx<'a> {
     display: &'a [DrawCommand],
     islands: &'a mut HashMap<u32, Island>,
     group_paths: &'a mut std::collections::HashSet<std::rc::Rc<str>>,
+    bindings: &'a mut HashMap<Rc<str>, BoundElement>,
 }
 
 /// The retained side of the Dom mode: last frame's scene with ids.
@@ -908,6 +940,19 @@ pub struct DomLowering {
     /// before promising a reuse (a promise the diff cannot keep would
     /// mount a hole).
     group_paths: std::collections::HashSet<std::rc::Rc<str>>,
+    /// The elements that read for themselves, by binding key: the id,
+    /// the binding, and the record last shipped for it. A write that
+    /// reaches a binding is patched from here — one element, no walk.
+    bindings: HashMap<Rc<str>, BoundElement>,
+}
+
+/// One element a binding drives.
+struct BoundElement {
+    id: u32,
+    binding: NodeBinding,
+    /// The text record the wire last carried — the next patch is a
+    /// copy of it with the new content.
+    shipped: DomText,
 }
 
 impl DomLowering {
@@ -951,6 +996,7 @@ impl DomLowering {
                     display: display.as_slice(),
                     islands: &mut self.islands,
                     group_paths: &mut self.group_paths,
+                    bindings: &mut self.bindings,
                 };
                 root.children = create_children(scene, 0, &mut ctx, &mut patches);
                 self.next_id = next_id;
@@ -963,6 +1009,7 @@ impl DomLowering {
                     display: display.as_slice(),
                     islands: &mut self.islands,
                     group_paths: &mut self.group_paths,
+                    bindings: &mut self.bindings,
                 };
                 diff_node(root, scene, &mut ctx, &mut patches);
                 self.next_id = next_id;
@@ -1047,6 +1094,9 @@ impl DomLowering {
             if let DomKind::Group { path } = &node.kind {
                 ctx.group_paths.insert(path.clone());
             }
+            if let (DomKind::Text(text), Some(binding)) = (&node.kind, &node.binding) {
+                file_binding(id, binding, text, ctx);
+            }
             let mut retained = Retained {
                 id,
                 node: shallow(node),
@@ -1061,6 +1111,7 @@ impl DomLowering {
         }
         self.next_id = 1;
         self.group_paths.clear();
+        self.bindings.clear();
         self.islands.clear();
         self.anchors_sent.clear();
         let mut next_id = self.next_id;
@@ -1069,6 +1120,7 @@ impl DomLowering {
             display: display.as_slice(),
             islands: &mut self.islands,
             group_paths: &mut self.group_paths,
+                    bindings: &mut self.bindings,
         };
         let mut root = Retained { id: 0, node: shallow(scene), children: Vec::new() };
         root.children = scene.children.iter().map(|child| adopt_node(child, &mut ctx)).collect();
@@ -1081,6 +1133,30 @@ impl DomLowering {
     /// asks for a thousand rows' worth of them.
     pub(crate) fn group_paths(&self) -> &std::collections::HashSet<std::rc::Rc<str>> {
         &self.group_paths
+    }
+
+    /// The bindings a write reached, patched by key: each one is read
+    /// again and the element it drives takes the new content — one
+    /// patch per changed text, no walk and no diff. A key nobody holds
+    /// is a binding whose element left; nothing to do.
+    pub(crate) fn refresh_bindings(&mut self, keys: &[Rc<str>]) -> Vec<DomPatch> {
+        let mut patches = Vec::new();
+        for key in keys {
+            let Some(bound) = self.bindings.get_mut(key) else {
+                continue;
+            };
+            match &bound.binding {
+                NodeBinding::Text(binding) => {
+                    let content = binding.get();
+                    if content != bound.shipped.content {
+                        bound.shipped.content = content;
+                        patches.push(DomPatch::SetText { id: bound.id, text: bound.shipped.clone() });
+                        crate::stats::note_binding_update();
+                    }
+                }
+            }
+        }
+        patches
     }
 
     /// Does the retained scene hold any canvas island? The runtime
@@ -1306,6 +1382,9 @@ fn create_subtree(
     match &node.kind {
         DomKind::Text(text) => {
             patches.push(DomPatch::SetText { id, text: text.clone() });
+            if let Some(binding) = &node.binding {
+                file_binding(id, binding, text, ctx);
+            }
         }
         DomKind::Field(field) => {
             patches.push(DomPatch::SetField { id, field: field.clone() });
@@ -1343,8 +1422,27 @@ fn create_children(
 
 /// One remove patch frees the whole subtree on the glue's side; the
 /// island registry forgets every canvas underneath.
+/// Files the element a binding drives, with the record just shipped.
+fn file_binding(id: u32, binding: &NodeBinding, shipped: &DomText, ctx: &mut LowerCtx) {
+    ctx.bindings.insert(
+        Rc::clone(binding.key()),
+        BoundElement { id, binding: binding.clone(), shipped: shipped.clone() },
+    );
+}
+
 fn remove_subtree(retained: &Retained, ctx: &mut LowerCtx, patches: &mut Vec<DomPatch>) {
     patches.push(DomPatch::Remove { id: retained.id });
+    fn forget_bindings(retained: &Retained, bindings: &mut HashMap<Rc<str>, BoundElement>) {
+        if let Some(binding) = &retained.node.binding
+            && bindings.get(binding.key()).is_some_and(|bound| bound.id == retained.id)
+        {
+            bindings.remove(binding.key());
+        }
+        for child in &retained.children {
+            forget_bindings(child, bindings);
+        }
+    }
+    forget_bindings(retained, ctx.bindings);
     fn forget_islands(retained: &Retained, islands: &mut HashMap<u32, Island>) {
         if matches!(retained.node.kind, DomKind::Canvas { .. }) {
             islands.remove(&retained.id);
@@ -1417,8 +1515,26 @@ fn diff_node(
         });
     }
     match (&old.kind, &new.kind) {
-        (DomKind::Text(before), DomKind::Text(after)) if before != after => {
-            patches.push(DomPatch::SetText { id, text: after.clone() });
+        (DomKind::Text(before), DomKind::Text(after)) => {
+            // the content of a text that reads for itself travels on its
+            // own road: the same binding object means the same reads, and
+            // the retained record may lag the patch already shipped
+            let same_binding = match (&old.binding, &new.binding) {
+                (Some(was), Some(now)) => was.same_as(now),
+                _ => false,
+            };
+            let changed = if same_binding {
+                DomText { content: Arc::clone(&before.content), ..after.clone() } != *before
+            } else {
+                before != after
+            };
+            if changed {
+                patches.push(DomPatch::SetText { id, text: after.clone() });
+            }
+            match &new.binding {
+                Some(binding) if changed || !same_binding => file_binding(id, binding, after, ctx),
+                _ => {}
+            }
         }
         (DomKind::Field(before), DomKind::Field(after)) if before != after => {
             patches.push(DomPatch::SetField { id, field: after.clone() });
@@ -4074,6 +4190,7 @@ mod tests {
             layout: Some(DomLayout::default()),
             hints: DomHints::default(),
             children: Vec::new(),
+            binding: None,
         }
     }
 
@@ -4088,6 +4205,7 @@ mod tests {
             layout: Some(DomLayout { gap: Some(8.0), ..DomLayout::default() }),
             hints: DomHints::default(),
             children,
+            binding: None,
         }
     }
 
@@ -4142,6 +4260,7 @@ mod tests {
                 }),
                 hints: DomHints::default(),
                 children: Vec::new(),
+                binding: None,
             }])
         };
 
@@ -4197,6 +4316,7 @@ mod tests {
                 }),
                 hints: DomHints::default(),
                 children: Vec::new(),
+                binding: None,
             }])
         };
 

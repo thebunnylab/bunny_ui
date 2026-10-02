@@ -4,19 +4,43 @@ use crate::state::Context;
 use std::rc::Rc;
 
 /// A node in the fake render tree (what a real SwiftUI would rasterize).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RenderNode {
     pub line: String,
     pub children: Vec<RenderNode>,
+    /// A line that is read when the tree is PRINTED, not when it was
+    /// rendered: a text that reads for itself shows what it reads now,
+    /// however long ago its body ran. `line` keeps the words as they
+    /// were at render for anyone who reads the field itself.
+    pub live: Option<Rc<dyn Fn() -> String>>,
+}
+
+impl std::fmt::Debug for RenderNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderNode").field("line", &self.text()).field("children", &self.children).finish()
+    }
 }
 
 impl RenderNode {
     pub fn leaf(line: impl Into<String>) -> Self {
-        RenderNode { line: line.into(), children: Vec::new() }
+        RenderNode { line: line.into(), children: Vec::new(), live: None }
     }
 
     pub fn branch(line: impl Into<String>, children: Vec<RenderNode>) -> Self {
-        RenderNode { line: line.into(), children }
+        RenderNode { line: line.into(), children, live: None }
+    }
+
+    /// A leaf whose line is read at print time.
+    pub fn live(read: Rc<dyn Fn() -> String>) -> Self {
+        RenderNode { line: read(), children: Vec::new(), live: Some(read) }
+    }
+
+    /// The line as it reads now.
+    pub fn text(&self) -> String {
+        match &self.live {
+            Some(read) => read(),
+            None => self.line.clone(),
+        }
     }
 
     /// Pretty-prints the tree with box-drawing connectors.
@@ -27,11 +51,12 @@ impl RenderNode {
     }
 
     fn write_into(&self, out: &mut String, prefix: &str, children_prefix: &str) {
-        if self.line.is_empty() && self.children.is_empty() {
+        let line = self.text();
+        if line.is_empty() && self.children.is_empty() {
             return; // EmptyView / Optional(nil) render nothing
         }
         out.push_str(prefix);
-        out.push_str(&self.line);
+        out.push_str(&line);
         out.push('\n');
         let n = self.children.len();
         for (i, child) in self.children.iter().enumerate() {
