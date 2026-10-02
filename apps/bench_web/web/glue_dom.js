@@ -25,7 +25,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 11;
+const EXPECTED_ABI = 12;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -323,6 +323,7 @@ function createElementRaw(kind, tag) {
     el.style.cssText =
       `display:flex;flex-direction:${kind === 9 ? "column" : "row"};` +
       "box-sizing:border-box;min-width:0;min-height:0;";
+    el.__flex = true;
     return el;
   }
   if (kind === 11) {
@@ -393,6 +394,7 @@ function createElementRaw(kind, tag) {
     el.style.cssText =
       "display:flex;flex-direction:column;box-sizing:border-box;" +
       "min-width:0;min-height:0;";
+    el.__flex = true;
     return el;
   }
   el.style.cssText = "box-sizing:border-box;min-width:0;min-height:0;";
@@ -1005,8 +1007,15 @@ function applyPatches(view, length) {
         style.right = "";
         style.transform = "";
         style.alignSelf = "";
+        // a box born flex is flex again unless the record says plain
+        if (el.__flex) style.display = "flex";
       }
       const apply = el ? el.style : null;
+      if (mask & 4096 && apply) {
+        // no flex box: an inline tag around one child keeps the
+        // browser's own display for the tag
+        apply.display = "";
+      }
       if (mask & 1) {
         const gap = f32();
         if (apply) apply.gap = `${gap}px`;

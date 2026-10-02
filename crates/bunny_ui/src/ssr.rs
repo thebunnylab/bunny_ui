@@ -409,6 +409,14 @@ impl Tree {
                 }
                 element.style.insert("min-width", "0".into());
                 element.style.insert("min-height", "0".into());
+                // no flex box: the tag's own display (the glue's rule,
+                // mirrored)
+                if layout.plain {
+                    element.style.remove("display");
+                    element.style.remove("flex-direction");
+                    element.style.remove("min-width");
+                    element.style.remove("min-height");
+                }
                 if let Some(gap) = layout.gap {
                     element.style.insert("gap", px(gap));
                 }
