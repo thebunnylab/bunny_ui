@@ -962,7 +962,7 @@ struct LowerCtx<'a> {
     display: &'a [DrawCommand],
     islands: &'a mut HashMap<u32, Island>,
     group_paths: &'a mut motor::hash::FxHashMap<std::rc::Rc<str>, crate::dom_flow::GroupRecord>,
-    bindings: &'a mut HashMap<Rc<str>, BoundElement>,
+    bindings: &'a mut motor::hash::FxHashMap<Rc<str>, BoundElement>,
     templates: &'a mut Templates,
 }
 
@@ -986,7 +986,7 @@ pub struct DomLowering {
     /// The elements that read for themselves, by binding key: the id,
     /// the binding, and the record last shipped for it. A write that
     /// reaches a binding is patched from here — one element, no walk.
-    bindings: HashMap<Rc<str>, BoundElement>,
+    bindings: motor::hash::FxHashMap<Rc<str>, BoundElement>,
     /// The shapes on the page a new group can be cloned from.
     templates: Templates,
 }
@@ -1014,13 +1014,13 @@ enum Shipped {
 /// becomes the template itself.
 #[derive(Default)]
 struct Templates {
-    by_shape: HashMap<u64, u32>,
+    by_shape: motor::hash::FxHashMap<u64, u32>,
     /// A template root → its shape.
-    roots: HashMap<u32, u64>,
+    roots: motor::hash::FxHashMap<u32, u64>,
     /// Every element of a template instance → its root.
-    members: HashMap<u32, u32>,
+    members: motor::hash::FxHashMap<u32, u32>,
     /// A root → its members, to forget together.
-    members_of: HashMap<u32, Vec<u32>>,
+    members_of: motor::hash::FxHashMap<u32, Vec<u32>>,
 }
 
 impl Templates {
@@ -1341,8 +1341,22 @@ impl DomLowering {
 }
 
 /// The node without its children — what the retention stores per level.
+/// The node alone, without its subtree. Field by field: a struct
+/// update over `node.clone()` would copy the whole subtree first and
+/// drop it — for the row list's node, nine thousand nodes per frame.
 fn shallow(node: &DomNode) -> DomNode {
-    DomNode { children: Vec::new(), ..node.clone() }
+    DomNode {
+        kind: node.kind.clone(),
+        x: node.x,
+        y: node.y,
+        width: node.width,
+        height: node.height,
+        style: node.style.clone(),
+        layout: node.layout.clone(),
+        hints: node.hints.clone(),
+        children: Vec::new(),
+        binding: node.binding.clone(),
+    }
 }
 
 fn create_kind(kind: &DomKind) -> CreateKind {
@@ -1794,7 +1808,7 @@ fn forget_subtree(retained: &Retained, ctx: &mut LowerCtx) {
         }
     }
     forget_templates(retained, ctx.templates);
-    fn forget_bindings(retained: &Retained, bindings: &mut HashMap<Rc<str>, BoundElement>) {
+    fn forget_bindings(retained: &Retained, bindings: &mut motor::hash::FxHashMap<Rc<str>, BoundElement>) {
         if let Some(binding) = &retained.node.binding
             && bindings.get(binding.key()).is_some_and(|bound| bound.id == retained.id)
         {
@@ -2039,7 +2053,7 @@ fn diff_children(
         return;
     }
     let old_children = std::mem::take(&mut retained.children);
-    let mut by_path: HashMap<std::rc::Rc<str>, Retained> = HashMap::new();
+    let mut by_path: motor::hash::FxHashMap<std::rc::Rc<str>, Retained> = motor::hash::FxHashMap::default();
     let mut by_index: Vec<Option<Retained>> = Vec::with_capacity(old_children.len());
     for old in old_children {
         if let DomKind::Group { path } = &old.node.kind {
@@ -2142,7 +2156,8 @@ fn diff_children_ordered(
 
     let parent_id = retained.id;
     let old_children = std::mem::take(&mut retained.children);
-    let mut by_path: HashMap<std::rc::Rc<str>, (usize, Retained)> = HashMap::new();
+    let mut by_path: motor::hash::FxHashMap<std::rc::Rc<str>, (usize, Retained)> =
+        motor::hash::FxHashMap::default();
     let mut by_index: Vec<Option<Retained>> = Vec::with_capacity(old_children.len());
     for (position, old) in old_children.into_iter().enumerate() {
         if let DomKind::Group { path } = &old.node.kind {
