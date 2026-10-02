@@ -871,21 +871,30 @@ impl<C: View<Arity = Single>> View for Modified<C> {
             return;
         }
 
-        // `.inject()` / `.modelContainer()` water the subtree.
-        let mut base_ctx = ctx.clone();
-        if let Modifier::EnvSet { set, .. } = &self.modifier {
-            set(&mut base_ctx.values);
-        }
+        // `.inject()` / `.modelContainer()` water the subtree — the one
+        // modifier that needs a context of its own. Every other borrows
+        // the one it was handed: a chain of a dozen modifiers on a row
+        // used to copy the environment a dozen times.
+        let watered;
+        let base_ctx: &Context = match &self.modifier {
+            Modifier::EnvSet { set, .. } => {
+                let mut own = ctx.clone();
+                set(&mut own.values);
+                watered = own;
+                &watered
+            }
+            _ => ctx,
+        };
 
         // the MARK: what the base adds is ours to wrap; anything
         // already in hand belongs to a sibling and must not be touched
         let mark = out.layout_mark();
-        self.base.render_into(&base_ctx, out);
+        self.base.render_into(base_ctx, out);
 
         // …and everything the modifier does AFTER the base is
         // generic-free, so it lives in ONE function instead of
         // one copy per chain in the program
-        apply(&self.modifier, ctx, &base_ctx, out, mark);
+        apply(&self.modifier, ctx, base_ctx, out, mark);
     }
 }
 

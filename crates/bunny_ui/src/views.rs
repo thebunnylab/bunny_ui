@@ -2338,7 +2338,7 @@ where
         debug_assert_unique_ids("for_each", items.iter().map(&self.id));
         let mut rows = NodeList::new();
         for item in items {
-            let _frame = motor::identity::enter(format!("[{}]", (self.id)(item)));
+            let _frame = motor::identity::enter(row_key((self.id)(item)));
             (self.row)(item).render_into(ctx, &mut rows);
         }
         let (prints, layouts) = rows.into_parts();
@@ -2406,7 +2406,7 @@ where
             }
             debug_assert_unique_ids("for_each", items.iter().map(&list.id));
             for item in items {
-                let _frame = motor::identity::enter(format!("[{}]", (list.id)(item)));
+                let _frame = motor::identity::enter(row_key((list.id)(item)));
                 (list.row)(item).render_into(ctx, out);
             }
         });
@@ -2513,6 +2513,14 @@ where
     R: View,
 {
     ForEach { items, id, row, axis: Axis::Vertical, spacing: None, align: None }
+}
+
+/// The identity segment of a row — the app's id in brackets, written
+/// into the id's own string: one allocation, the app's.
+fn row_key(mut id: String) -> String {
+    id.insert(0, '[');
+    id.push(']');
+    id
 }
 
 fn debug_assert_unique_ids(container: &str, ids: impl Iterator<Item = String>) {

@@ -34,6 +34,7 @@
 //! the simple, verifiable rule.
 
 use std::any::TypeId;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use crate::hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::rc::Rc;
@@ -54,7 +55,10 @@ struct Registry {
     pass_active: bool,
     /// First segment pushed in the pass — defines the swept root.
     pass_root: Option<String>,
-    path: Vec<String>,
+    /// The cursor's segments. A tuple position or a view's name is a
+    /// static word and is borrowed; a row key is the app's string and
+    /// is owned — the common step costs no allocation.
+    path: Vec<Cow<'static, str>>,
     /// The path pre-joined with `/`, maintained incrementally by
     /// push/truncate — reading the scope is one clone, never a walk.
     joined: String,
@@ -341,7 +345,7 @@ pub fn current_pass_root() -> Option<String> {
 
 /// The cursor's segments right now.
 pub fn current_path_segments() -> Vec<String> {
-    REGISTRY.with(|registry| registry.borrow().path.clone())
+    REGISTRY.with(|registry| registry.borrow().path.iter().map(|segment| segment.to_string()).collect())
 }
 
 /// The cursor's PARENT segments, packed: what a retained entry keeps to
@@ -376,7 +380,7 @@ pub fn parent_seed() -> PathSeed {
         let registry = registry.borrow();
         let parents = registry.path.split_last().map_or(&[][..], |(_, parents)| parents);
         let mut seed = PathSeed {
-            text: String::with_capacity(parents.iter().map(String::len).sum()),
+            text: String::with_capacity(parents.iter().map(|segment| segment.len()).sum()),
             ends: Vec::with_capacity(parents.len()),
         };
         for segment in parents {
@@ -454,14 +458,14 @@ impl Drop for Frame {
     }
 }
 
-fn push(segment: String, is_view: bool) -> Frame {
+fn push(segment: Cow<'static, str>, is_view: bool) -> Frame {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         if !registry.pass_active {
             return Frame { pops_view: false, active: false };
         }
         if registry.pass_root.is_none() {
-            registry.pass_root = Some(segment.clone());
+            registry.pass_root = Some(segment.to_string());
         }
         // the joined path grows in place: push_str now, truncate on the
         // frame's drop — the per-step full-path JOIN died here
@@ -487,14 +491,15 @@ fn push(segment: String, is_view: bool) -> Frame {
 }
 
 /// Steps down one structural level: tuple position (`#0`), arm (`@First`),
-/// row key (`[USA]`), sheet content (`sheet`).
-pub fn enter(segment: impl Into<String>) -> Frame {
+/// row key (`[USA]`), sheet content (`sheet`). A static word is borrowed
+/// and costs nothing; a `String` is kept as it is.
+pub fn enter(segment: impl Into<Cow<'static, str>>) -> Frame {
     push(segment.into(), false)
 }
 
 /// Steps down into a view's wrapper (`Component`) — besides the path, it
 /// enters the view stack that read-tracking uses as its target.
-pub fn enter_view(name: impl Into<String>) -> Frame {
+pub fn enter_view(name: impl Into<Cow<'static, str>>) -> Frame {
     push(name.into(), true)
 }
 
@@ -516,7 +521,7 @@ pub fn seed(segments: &[String]) -> Vec<Frame> {
 
 /// [`seed`], from the packed form a retained entry keeps.
 pub fn seed_from(parents: &PathSeed) -> Vec<Frame> {
-    parents.segments().map(enter).collect()
+    parents.segments().map(|segment| enter(segment.to_string())).collect()
 }
 
 fn current_scope(registry: &Registry) -> String {

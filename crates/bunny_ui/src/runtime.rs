@@ -1506,7 +1506,7 @@ impl Runtime {
         {
             // the scene's own segment goes down FIRST, so it is the root
             // the sweep, the dirty drain and the retention all scope by
-            let _scene = self.scene.as_ref().map(|name| motor::identity::enter(&**name));
+            let _scene = self.scene.as_ref().map(|name| motor::identity::enter(name.to_string()));
             let ctx = self.ctx.borrow().clone();
             root.render_into(&ctx, &mut nodes);
         }

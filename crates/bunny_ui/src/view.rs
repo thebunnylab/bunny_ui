@@ -115,7 +115,13 @@ impl NodeList {
     }
 
     pub(crate) fn push(&mut self, node: RenderNode) {
-        self.nodes.push(node);
+        // the printed tree is for people: a frame's pass prints nothing,
+        // and a line kept for every node of the page was memory nobody
+        // read — the retention built without print is rebuilt once when
+        // a print is asked for
+        if print_enabled() {
+            self.nodes.push(node);
+        }
     }
 
     pub(crate) fn push_layout(&mut self, node: crate::layout::LayoutNode) {
@@ -162,7 +168,7 @@ impl NodeList {
         // the marked line is what a PRINT expands; a frame's pass prints
         // nothing, and a line for each boundary of the page was a string
         // nobody read
-        self.nodes.push(RenderNode::leaf(if print_enabled() {
+        self.push(RenderNode::leaf(if print_enabled() {
             crate::reconciler::ref_line(path)
         } else {
             String::new()
@@ -398,7 +404,7 @@ impl<C: View> View for Vec<C> {
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         for (position, view) in self.iter().enumerate() {
-            let _frame = motor::identity::enter(format!("#{position}"));
+            let _frame = motor::identity::enter(position_segment(position));
             view.render_into(ctx, out);
         }
     }
@@ -420,7 +426,7 @@ macro_rules! tuple_view {
                 let mut position = 0usize;
                 $(
                     {
-                        let _frame = motor::identity::enter(format!("#{position}"));
+                        let _frame = motor::identity::enter(position_segment(position));
                         $name.render_into(ctx, out);
                         position += 1;
                     }
@@ -457,11 +463,25 @@ pub(crate) fn render_line(view: &impl View) -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn short_type_name<T: ?Sized>() -> String {
+pub(crate) fn short_type_name<T: ?Sized>() -> &'static str {
     let full = std::any::type_name::<T>();
     // generics: `path::DetailRow<bunny_ui::views::Text>` → `DetailRow`
     let base = full.split('<').next().unwrap_or(full);
-    base.rsplit("::").next().unwrap_or(base).to_string()
+    base.rsplit("::").next().unwrap_or(base)
+}
+
+/// The identity segment of a tuple position — a static word for the
+/// positions a body has, so a step down a tuple allocates nothing.
+pub(crate) fn position_segment(position: usize) -> std::borrow::Cow<'static, str> {
+    const POSITIONS: [&str; 32] = [
+        "#0", "#1", "#2", "#3", "#4", "#5", "#6", "#7", "#8", "#9", "#10", "#11", "#12", "#13", "#14",
+        "#15", "#16", "#17", "#18", "#19", "#20", "#21", "#22", "#23", "#24", "#25", "#26", "#27",
+        "#28", "#29", "#30", "#31",
+    ];
+    match POSITIONS.get(position) {
+        Some(word) => std::borrow::Cow::Borrowed(word),
+        None => std::borrow::Cow::Owned(format!("#{position}")),
+    }
 }
 
 #[cfg(test)]

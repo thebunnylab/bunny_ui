@@ -416,6 +416,10 @@ function applyPatches(view, length) {
   };
   const text = (count) => decoder.decode(bytes(count));
 
+  // the elements born in THIS batch: a fresh element carries no style
+  // yet, so the full-replace ops skip the reset they owe an old one —
+  // a thousand new rows are thousands of style writes never made
+  const fresh = new Set();
   // a removed subtree takes its registrations along: ids are never
   // reused, so a survivor here would leak for the page's whole life
   const unregister = (el) => {
@@ -450,6 +454,7 @@ function applyPatches(view, length) {
       const kind = u8();
       const el = createElementOf(kind, tag);
       el.dataset.n = id;
+      fresh.add(id);
       if (cls) el.className = cls;
       if (domId) el.id = domId;
       if (kind === 4) {
@@ -532,8 +537,9 @@ function applyPatches(view, length) {
       // the mask carries twenty-four bits, so it crosses as a u32
       const mask = u32();
       // full replace, the record's semantics: what the mask does not
-      // carry, the element does not keep
-      if (el) {
+      // carry, the element does not keep — and a fresh element keeps
+      // nothing yet
+      if (el && !fresh.has(id)) {
         const style = el.style;
         style.backgroundColor = "";
         style.backgroundImage = "";
@@ -771,6 +777,11 @@ function applyPatches(view, length) {
           el.style.overflow = "hidden";
           el.style.textOverflow = "ellipsis";
         }
+        if (spanCount === 0) {
+          // one write: the browser replaces the children itself
+          el.textContent = decoder.decode(raw);
+          continue;
+        }
         el.textContent = "";
         // spans are BYTE ranges into the UTF-8 — slice before decoding
         let cursor = 0;
@@ -869,10 +880,11 @@ function applyPatches(view, length) {
         el.appendChild(path);
       }
     } else if (op === 11) {
-      // the FULL flow record — reset, then apply what the mask carries
+      // the FULL flow record — reset, then apply what the mask carries;
+      // a fresh element has nothing to reset
       const el = elements.get(id);
       const mask = u16();
-      if (el) {
+      if (el && !fresh.has(id)) {
         const style = el.style;
         style.gap = "";
         style.alignItems = "";
