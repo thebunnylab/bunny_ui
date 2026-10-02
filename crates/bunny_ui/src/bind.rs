@@ -462,6 +462,25 @@ mod frame_tests {
         let patches = runtime.dom_frame(&table, SIZE);
         assert_eq!(stats::take().entries_indexed, 1, "the list alone");
         assert!(matches!(patches.as_slice(), [DomPatch::Remove { .. }]), "{patches:?}");
+
+        // every row leaves: the list is emptied in one op
+        table.rows.set(items(&[]));
+        let patches = runtime.dom_frame(&table, SIZE);
+        assert!(matches!(patches.as_slice(), [DomPatch::RemoveChildren { .. }]), "{patches:?}");
+
+        // and rows that replace every old one: one op empties, then the
+        // new ones mount — nothing is removed one by one
+        table.rows.set(items(&[7, 8]));
+        let _ = runtime.dom_frame(&table, SIZE);
+        table.rows.set(items(&[9, 10, 11]));
+        let patches = runtime.dom_frame(&table, SIZE);
+        assert!(matches!(patches.first(), Some(DomPatch::RemoveChildren { .. })), "{patches:?}");
+        assert!(!patches.iter().any(|patch| matches!(patch, DomPatch::Remove { .. })), "{patches:?}");
+        let mounted = patches
+            .iter()
+            .filter(|patch| matches!(patch, DomPatch::Create { kind: crate::dom::CreateKind::Group, .. }))
+            .count();
+        assert_eq!(mounted, 3, "{patches:?}");
     }
 
     #[derive(Clone, Copy)]

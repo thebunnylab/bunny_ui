@@ -20,7 +20,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 10;
+const EXPECTED_ABI = 11;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -416,7 +416,15 @@ function applyPatches(view, length) {
   };
   const text = (count) => decoder.decode(bytes(count));
 
-  let removedAny = false;
+  // a removed subtree takes its registrations along: ids are never
+  // reused, so a survivor here would leak for the page's whole life
+  const unregister = (el) => {
+    for (const inner of el.querySelectorAll("[data-n]")) {
+      const n = +inner.dataset.n;
+      elements.delete(n);
+      dropPseudo(n);
+    }
+  };
   // fresh siblings gather in fragments and land on the LIVE tree once
   // per parent — a thousand appended rows must not pay a thousand
   // live-tree insertions
@@ -467,13 +475,20 @@ function applyPatches(view, length) {
       elements.set(id, el);
     } else if (op === 2) {
       const el = elements.get(id);
-      if (el) el.remove();
+      if (el) {
+        unregister(el);
+        el.remove();
+      }
       elements.delete(id);
       dropPseudo(id);
-      // the SUBTREE's registrations die in one sweep at the end of
-      // the batch — a thousand row removals must not pay a thousand
-      // subtree queries
-      removedAny = true;
+    } else if (op === 18) {
+      // the element empties: every child leaves in one call, and a
+      // thousand rows cost one word on the wire
+      const el = elements.get(id);
+      if (el) {
+        unregister(el);
+        el.replaceChildren();
+      }
     } else if (op === 3) {
       const el = elements.get(id);
       const x = f32();
@@ -997,17 +1012,6 @@ function applyPatches(view, length) {
   }
   for (const { holder, parent } of staged.values()) {
     parent.appendChild(holder);
-  }
-  if (removedAny) {
-    // one pass over the registry: whatever a removal detached loses
-    // its entry and its pseudo rules — ids are never reused, so a
-    // survivor here would leak for the page's whole life
-    for (const [id, el] of elements) {
-      if (id !== 0 && !el.isConnected) {
-        elements.delete(id);
-        dropPseudo(id);
-      }
-    }
   }
 }
 
