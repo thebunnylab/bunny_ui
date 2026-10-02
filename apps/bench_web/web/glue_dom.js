@@ -7,8 +7,13 @@ const app = document.getElementById("app");
 // the root element IS scene node 0 — its backdrop arrives through the
 // patches (the theme's canvas), like every other color here
 app.dataset.n = "0";
+app.__n = 0;
 const sheet = document.createElement("style");
 document.head.appendChild(sheet);
+// every target shows the same cursor: one rule on the path attribute,
+// where a declaration per element would copy the inline style of each
+// clone it lands on
+sheet.sheet.insertRule("[data-path]{cursor:default}", 0);
 
 let wasm = null;
 let wakeArmed = false;
@@ -78,7 +83,7 @@ function sendAction(path, clicks) {
 const viewportObserver = new ResizeObserver((entries) => {
   if (!wasm) return;
   for (const entry of entries) {
-    const id = Number(entry.target.dataset.n);
+    const id = entry.target.__n ?? Number(entry.target.dataset.n);
     const box = entry.contentRect;
     wasm.bunny_dom_viewport(id, box.width, box.height);
   }
@@ -89,7 +94,7 @@ const viewportObserver = new ResizeObserver((entries) => {
 const islandObserver = new ResizeObserver((entries) => {
   if (!wasm || !wasm.bunny_dom_box) return;
   for (const entry of entries) {
-    const id = Number(entry.target.dataset.n);
+    const id = entry.target.__n ?? Number(entry.target.dataset.n);
     const box = entry.contentRect;
     wasm.bunny_dom_box(id, box.width, box.height);
   }
@@ -423,8 +428,9 @@ function applyPatches(view, length) {
   // a removed subtree takes its registrations along: ids are never
   // reused, so a survivor here would leak for the page's whole life
   const unregister = (el) => {
-    for (const inner of el.querySelectorAll("[data-n]")) {
-      const n = +inner.dataset.n;
+    for (const inner of el.getElementsByTagName("*")) {
+      const n = inner.__n;
+      if (n === undefined) continue;
       elements.delete(n);
       dropPseudo(n);
     }
@@ -468,7 +474,7 @@ function applyPatches(view, length) {
       const domId = text(u8());
       const kind = u8();
       const el = createElementOf(kind, tag);
-      el.dataset.n = id;
+      el.__n = id;
       fresh.add(id);
       if (cls) el.className = cls;
       if (domId) el.id = domId;
@@ -490,8 +496,13 @@ function applyPatches(view, length) {
       if (source) {
         const el = source.cloneNode(true);
         let n = id;
+        // a template the serializer stamped carries its number as an
+        // attribute, and so does every element under it; the copy must
+        // not wear them — one question at the root, not one per node
+        const stamped = source.hasAttribute("data-n");
         const number = (node) => {
-          node.dataset.n = n;
+          node.__n = n;
+          if (stamped) node.removeAttribute("data-n");
           elements.set(n, node);
           fresh.add(n);
           n++;
@@ -507,10 +518,8 @@ function applyPatches(view, length) {
       if (el) {
         if (path) {
           el.dataset.path = path;
-          el.style.cursor = "default";
         } else {
           delete el.dataset.path;
-          el.style.cursor = "";
         }
       }
     } else if (op === 20) {
@@ -641,10 +650,7 @@ function applyPatches(view, length) {
       }
       if (mask & 128) {
         const path = text(u16());
-        if (el) {
-          el.dataset.path = path;
-          el.style.cursor = "default";
-        }
+        if (el) el.dataset.path = path;
       }
       if (mask & 256) {
         const focus = rgba(u32());
@@ -785,6 +791,9 @@ function applyPatches(view, length) {
       if (pressedFade !== null) {
         pseudo.push(`${on("active")}{opacity:${pressedFade}}`);
       }
+      // the rules address the element by its attribute: it is written
+      // only for an element that has rules, never for every element
+      if (el && pseudo.length) el.dataset.n = id;
       setPseudo(id, pseudo);
     } else if (op === 6) {
       const el = elements.get(id);
@@ -1398,6 +1407,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     if (hydrated) {
       for (const el of app.querySelectorAll("[data-n]")) {
         const id = Number(el.dataset.n);
+        el.__n = id;
         elements.set(id, el);
         if (el.tagName === "INPUT") wireInput(el);
         if (el.style.overflow === "auto") wireScroll(el, id);
