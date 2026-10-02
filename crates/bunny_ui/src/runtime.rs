@@ -4800,6 +4800,19 @@ impl Runtime {
     /// The dirty marks are CONSUMED, so a frame calls one of the two
     /// and never both.
     #[cfg(feature = "canvas")]
+    /// Dom mode: frees what the frames since the last call removed. The
+    /// shell calls this off the frame — on an idle callback — so a
+    /// clear of a thousand rows pays its freeing when nobody is waiting.
+    /// Returns how many subtrees were freed.
+    pub fn collect_garbage(&self) -> usize {
+        self.dom.borrow_mut().collect_garbage()
+    }
+
+    /// Dom mode: is there anything for [`Runtime::collect_garbage`]?
+    pub fn garbage_pending(&self) -> bool {
+        self.dom.borrow().garbage_pending()
+    }
+
     pub fn dom_island_lists(&self, scale: usize) -> Vec<crate::dom::IslandList> {
         self.dom
             .borrow_mut()
