@@ -430,6 +430,53 @@ mod frame_tests {
     }
 
     #[test]
+    fn rows_of_one_shape_mount_as_clones_of_the_first() {
+        let table = Table { rows: State::new(items(&[1, 2, 3, 4, 5])) };
+        let runtime = Runtime::new();
+        let patches = runtime.dom_frame(&table, SIZE);
+        let frame = stats::take();
+        // the first row mounts whole and becomes the template; the four
+        // after it are one clone each, with their own words
+        let groups = patches
+            .iter()
+            .filter(|patch| matches!(patch, DomPatch::Create { kind: crate::dom::CreateKind::Group, .. }))
+            .count();
+        let clones = patches.iter().filter(|patch| matches!(patch, DomPatch::Clone { .. })).count();
+        let words: Vec<&str> = patches
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::SetContent { text, .. } => Some(&**text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(groups, 3, "the table, the list and the first row: {patches:?}");
+        assert_eq!(clones, 4, "{patches:?}");
+        assert_eq!(frame.clones, 4);
+        assert_eq!(words, ["row 2", "row 3", "row 4", "row 5"]);
+
+        // the served page agrees: a clone is the template's subtree with
+        // the copy's words, numbered as a fresh mount numbers them
+        let page = crate::ssr::render(&table, SIZE);
+        assert_eq!(page.html.matches("row ").count(), 5, "{}", page.html);
+        for id in 1..=5 {
+            assert!(page.html.contains(&format!("row {id}")), "{}", page.html);
+        }
+        // and a mount over the served page adopts it in silence
+        let fresh = Runtime::new();
+        fresh.dom_adopt(&table, SIZE);
+        assert!(fresh.dom_frame(&table, SIZE).is_empty(), "adoption says nothing");
+
+        // a sixth row of the shape is one clone and one word
+        let _ = stats::take();
+        table.rows.set(items(&[1, 2, 3, 4, 5, 6]));
+        let patches = runtime.dom_frame(&table, SIZE);
+        assert!(
+            matches!(patches.as_slice(), [DomPatch::Clone { .. }, DomPatch::SetContent { text, .. }] if &**text == "row 6"),
+            "{patches:?}"
+        );
+    }
+
+    #[test]
     fn a_keyed_list_reads_its_rows_and_renders_each_once() {
         let table = Table { rows: State::new(items(&[1, 2, 3, 4, 5])) };
         let runtime = Runtime::new();
@@ -446,13 +493,19 @@ mod frame_tests {
         assert_eq!(patches.len(), 2, "{patches:?}");
         assert!(patches.iter().all(|patch| matches!(patch, DomPatch::Move { .. })), "{patches:?}");
 
-        // a new key runs its row, and only it
+        // a new key runs its row, and only it — mounted as a clone of
+        // the rows already there
         table.rows.set(items(&[1, 4, 3, 2, 5, 6]));
         let patches = runtime.dom_frame(&table, SIZE);
         assert_eq!(stats::take().entries_indexed, 2, "the list and the new row");
         let groups = patches
             .iter()
-            .filter(|patch| matches!(patch, DomPatch::Create { kind: crate::dom::CreateKind::Group, .. }))
+            .filter(|patch| {
+                matches!(
+                    patch,
+                    DomPatch::Create { kind: crate::dom::CreateKind::Group, .. } | DomPatch::Clone { .. }
+                )
+            })
             .count();
         assert_eq!(groups, 1, "one row mounted: {patches:?}");
         assert!(!patches.iter().any(|patch| matches!(patch, DomPatch::Remove { .. })));
@@ -486,7 +539,12 @@ mod frame_tests {
         assert!(!patches.iter().any(|patch| matches!(patch, DomPatch::Remove { .. })), "{patches:?}");
         let mounted = patches
             .iter()
-            .filter(|patch| matches!(patch, DomPatch::Create { kind: crate::dom::CreateKind::Group, .. }))
+            .filter(|patch| {
+                matches!(
+                    patch,
+                    DomPatch::Create { kind: crate::dom::CreateKind::Group, .. } | DomPatch::Clone { .. }
+                )
+            })
             .count();
         assert_eq!(mounted, 3, "{patches:?}");
     }
