@@ -188,31 +188,25 @@ pub fn end_pass() -> Vec<String> {
     })
 }
 
-/// Longest prefix among skipped and re-run boundaries decides: skipped
-/// protects, re-run (or none) lets the normal rule apply.
+/// The nearest skipped or re-run boundary at or above the owner
+/// decides: skipped protects, re-run (or none) lets the normal rule
+/// apply. The owner's own path is asked first, then each cut above it —
+/// a lookup per level, whatever the size of the two sets.
 fn protected_by_skip(registry: &Registry, owner: &str) -> bool {
-    let mut best_len = 0usize;
-    let mut best_is_skip = false;
-    let covers = |candidate: &str| {
-        // byte compare, no allocation — this closure runs per skipped
-        // and re-run boundary for every owner the sweep audits
-        owner.len() >= candidate.len()
-            && owner.as_bytes().starts_with(candidate.as_bytes())
-            && (owner.len() == candidate.len() || owner.as_bytes()[candidate.len()] == b'/')
-    };
-    for skip in &registry.skipped {
-        if covers(skip) && skip.len() > best_len {
-            best_len = skip.len();
-            best_is_skip = true;
+    let mut end = owner.len();
+    loop {
+        let candidate = &owner[..end];
+        if registry.skipped.contains(candidate) {
+            return true;
+        }
+        if registry.reran.contains(candidate) {
+            return false;
+        }
+        match candidate.rfind('/') {
+            Some(cut) => end = cut,
+            None => return false,
         }
     }
-    for rerun in &registry.reran {
-        if covers(rerun) && rerun.len() > best_len {
-            best_len = rerun.len();
-            best_is_skip = false;
-        }
-    }
-    best_is_skip
 }
 
 /// The reconciler reports: this boundary was skipped (clean cache) — its
@@ -265,6 +259,27 @@ pub fn take_dirty_matching(root: &str) -> Vec<String> {
 /// cycle).
 pub fn dirty_snapshot() -> HashSet<String> {
     REGISTRY.with(|registry| registry.borrow().dirty.clone())
+}
+
+/// Moves this root's dirt out of the registry (plus the root region's,
+/// which any pass consumes) — the set that decides the pass, taken
+/// instead of copied. Writes DURING the pass land in the emptied set and
+/// survive into the next cycle; dirt from ANOTHER root stays queued for
+/// that root's render.
+pub fn take_dirty_under(root: &str) -> HashSet<String> {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        if registry.dirty.is_empty() {
+            return HashSet::default();
+        }
+        let prefix = format!("{root}/");
+        let (taken, kept): (HashSet<String>, HashSet<String>) =
+            std::mem::take(&mut registry.dirty).into_iter().partition(|path| {
+                *path == ROOT_READER || *path == root || path.starts_with(&prefix)
+            });
+        registry.dirty = kept;
+        taken
+    })
 }
 
 /// Marks the view at `path` dirty from OUTSIDE the read-tracking — the
@@ -673,10 +688,12 @@ pub(crate) fn record_write(key: DepKey) {
     WRITE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
-        let Some(readers) = registry.readers.get(&key).cloned() else {
-            return;
-        };
-        registry.dirty.extend(readers);
+        // two fields of one registry: the readers are read, the dirty set
+        // is written — no copy of the reader set in between
+        let registry = &mut *registry;
+        if let Some(readers) = registry.readers.get(&key) {
+            registry.dirty.extend(readers.iter().cloned());
+        }
     });
 }
 
