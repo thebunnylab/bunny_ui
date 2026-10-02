@@ -1062,9 +1062,13 @@ impl DomLowering {
     /// list that brings the element tree up to date. The first call
     /// mounts everything. `display` is the SAME pass's draw list —
     /// canvas islands slice their command ranges out of it.
+    ///
+    /// The scene comes BY VALUE: a node the diff keeps moves into the
+    /// retained tree, so a thousand new rows are moved once, never
+    /// copied field by field and then dropped.
     pub fn lower(
         &mut self,
-        scene: &DomNode,
+        scene: DomNode,
         display: &crate::layout::DisplayList,
     ) -> Vec<DomPatch> {
         crate::stats::time(crate::stats::Stage::Diff, || self.lower_timed(scene, display))
@@ -1072,18 +1076,13 @@ impl DomLowering {
 
     fn lower_timed(
         &mut self,
-        scene: &DomNode,
+        mut scene: DomNode,
         display: &crate::layout::DisplayList,
     ) -> Vec<DomPatch> {
         let mut patches = Vec::new();
         match self.root.as_mut() {
             None => {
                 self.next_id = 1;
-                let mut root = Retained {
-                    id: 0,
-                    node: shallow(scene),
-                    children: Vec::new(),
-                };
                 patches.push(DomPatch::SetSize {
                     id: 0,
                     width: scene.width,
@@ -1092,6 +1091,8 @@ impl DomLowering {
                 if scene.style != DomStyle::default() {
                     patches.push(DomPatch::SetStyle { id: 0, style: scene.style.clone() });
                 }
+                let children = std::mem::take(&mut scene.children);
+                let mut root = Retained { id: 0, node: scene, children: Vec::new() };
                 let mut next_id = self.next_id;
                 let mut ctx = LowerCtx {
                     next_id: &mut next_id,
@@ -1101,7 +1102,7 @@ impl DomLowering {
                     bindings: &mut self.bindings,
                     templates: &mut self.templates,
                 };
-                root.children = create_children(scene, 0, &mut ctx, &mut patches);
+                root.children = create_children(children, 0, &mut ctx, &mut patches);
                 self.next_id = next_id;
                 self.root = Some(root);
             }
@@ -1473,7 +1474,7 @@ fn note_island(id: u32, node: &DomNode, ctx: &mut LowerCtx) {
 /// its next sibling (0 = append). The interior appends in order — a
 /// fresh subtree has nothing to dodge.
 fn create_subtree_before(
-    node: &DomNode,
+    node: DomNode,
     parent: u32,
     before: u32,
     ctx: &mut LowerCtx,
@@ -1490,30 +1491,11 @@ fn create_subtree_before(
     created
 }
 
-/// A group whose shape already stands on the page is cloned from it:
-/// one word for the subtree, then its words and its action paths.
-fn try_clone(
-    node: &DomNode,
-    parent: u32,
-    ctx: &mut LowerCtx,
-    patches: &mut Vec<DomPatch>,
-) -> Option<Retained> {
-    if !matches!(node.kind, DomKind::Group { .. }) {
-        return None;
-    }
-    let shape = shape_of(node)?;
-    let template = *ctx.templates.by_shape.get(&shape)?;
-    let id = *ctx.next_id;
-    *ctx.next_id += 1;
-    patches.push(DomPatch::Clone { id, parent, before: 0, template });
-    crate::stats::note_clone();
-    Some(clone_instance(node, id, ctx, patches))
-}
-
 /// The copy's own: ids in pre-order, every text's words, every action
-/// path — and the bindings filed under the new ids.
+/// path — and the bindings filed under the new ids. The node itself
+/// moves into the retention.
 fn clone_instance(
-    node: &DomNode,
+    mut node: DomNode,
     id: u32,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
@@ -1530,16 +1512,15 @@ fn clone_instance(
     if let (DomKind::Group { .. }, Some(binding)) = (&node.kind, &node.binding) {
         file_class_binding(id, binding, &node.hints, ctx);
     }
-    let children = node
-        .children
-        .iter()
+    let children = std::mem::take(&mut node.children)
+        .into_iter()
         .map(|child| {
             let child_id = *ctx.next_id;
             *ctx.next_id += 1;
             clone_instance(child, child_id, ctx, patches)
         })
         .collect();
-    Retained { id, node: shallow(node), children }
+    Retained { id, node, children }
 }
 
 /// The shape of a subtree, hashed — `None` when the subtree holds
@@ -1652,14 +1633,27 @@ fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
 }
 
 fn create_subtree(
-    node: &DomNode,
+    mut node: DomNode,
     parent: u32,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) -> Retained {
-    // a shape already on the page is cloned, never built again
-    if let Some(cloned) = try_clone(node, parent, ctx, patches) {
-        return cloned;
+    // the shape is the whole subtree's: read while the children are
+    // still the node's own
+    let shape = match node.kind {
+        DomKind::Group { .. } => shape_of(&node),
+        _ => None,
+    };
+    // a shape already on the page is cloned, never built again: one
+    // word for the subtree, then its words and its action paths
+    if let Some(shape) = shape
+        && let Some(&template) = ctx.templates.by_shape.get(&shape)
+    {
+        let id = *ctx.next_id;
+        *ctx.next_id += 1;
+        patches.push(DomPatch::Clone { id, parent, before: 0, template });
+        crate::stats::note_clone();
+        return clone_instance(node, id, ctx, patches);
     }
     let id = *ctx.next_id;
     *ctx.next_id += 1;
@@ -1701,7 +1695,7 @@ fn create_subtree(
         DomKind::Scroll { offset, .. } if *offset != (0.0, 0.0) => {
             patches.push(DomPatch::SetScroll { id, x: offset.0, y: offset.1 });
         }
-        DomKind::Canvas { .. } => note_island(id, node, ctx),
+        DomKind::Canvas { .. } => note_island(id, &node, ctx),
         DomKind::Image(image) => {
             patches.push(DomPatch::SetImage { id, image: *image });
         }
@@ -1713,11 +1707,11 @@ fn create_subtree(
         }
         _ => {}
     }
-    let children = create_children(node, id, ctx, patches);
-    let retained = Retained { id, node: shallow(node), children };
+    let children = std::mem::take(&mut node.children);
+    let children = create_children(children, id, ctx, patches);
+    let retained = Retained { id, node, children };
     // the first of a shape is the template the next ones clone
-    if matches!(node.kind, DomKind::Group { .. })
-        && let Some(shape) = shape_of(node)
+    if let Some(shape) = shape
         && !ctx.templates.by_shape.contains_key(&shape)
     {
         let mut members = Vec::new();
@@ -1728,13 +1722,13 @@ fn create_subtree(
 }
 
 fn create_children(
-    node: &DomNode,
+    children: Vec<DomNode>,
     parent: u32,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) -> Vec<Retained> {
-    node.children
-        .iter()
+    children
+        .into_iter()
         .map(|child| create_subtree(child, parent, ctx, patches))
         .collect()
 }
@@ -1772,8 +1766,7 @@ fn remove_all_children<'a>(
 ) {
     let mut ids: Vec<u32> = Vec::new();
     for retained in leaving {
-        collect_ids(retained, &mut ids);
-        forget_subtree(retained, ctx);
+        forget_subtree_into(retained, ctx, &mut ids);
     }
     patches.push(DomPatch::RemoveChildren { id: parent, forget: id_ranges(ids) });
 }
@@ -1799,53 +1792,45 @@ fn id_ranges(mut ids: Vec<u32>) -> Vec<(u32, u32)> {
 }
 
 /// What the lowering kept about a subtree that left: its islands, its
-/// groups, its bindings.
+/// groups, its bindings, its place in a template.
 fn forget_subtree(retained: &Retained, ctx: &mut LowerCtx) {
-    fn forget_templates(retained: &Retained, templates: &mut Templates) {
-        templates.touched(retained.id);
-        for child in &retained.children {
-            forget_templates(child, templates);
-        }
+    let mut ids = Vec::new();
+    forget_subtree_into(retained, ctx, &mut ids);
+}
+
+/// The same forgetting, in ONE walk that also lists the ids it passes
+/// — a thousand rows leaving together are nine thousand nodes, and a
+/// walk per table was five walks.
+fn forget_subtree_into(retained: &Retained, ctx: &mut LowerCtx, ids: &mut Vec<u32>) {
+    ids.push(retained.id);
+    // a template member that leaves retires the template — asked only
+    // while any template stands
+    if !ctx.templates.members.is_empty() {
+        ctx.templates.touched(retained.id);
     }
-    forget_templates(retained, ctx.templates);
-    fn forget_bindings(retained: &Retained, bindings: &mut motor::hash::FxHashMap<Rc<str>, BoundElement>) {
-        if let Some(binding) = &retained.node.binding
-            && bindings.get(binding.key()).is_some_and(|bound| bound.id == retained.id)
-        {
-            bindings.remove(binding.key());
+    match &retained.node.kind {
+        DomKind::Group { path } => {
+            ctx.group_paths.remove(path);
         }
-        for child in &retained.children {
-            forget_bindings(child, bindings);
+        DomKind::Canvas { .. } => {
+            ctx.islands.remove(&retained.id);
         }
+        _ => {}
     }
-    forget_bindings(retained, ctx.bindings);
-    fn forget_islands(retained: &Retained, islands: &mut HashMap<u32, Island>) {
-        if matches!(retained.node.kind, DomKind::Canvas { .. }) {
-            islands.remove(&retained.id);
-        }
-        for child in &retained.children {
-            forget_islands(child, islands);
-        }
+    if let Some(binding) = &retained.node.binding
+        && ctx.bindings.get(binding.key()).is_some_and(|bound| bound.id == retained.id)
+    {
+        ctx.bindings.remove(binding.key());
     }
-    forget_islands(retained, ctx.islands);
-    fn forget_groups(
-        retained: &Retained,
-        groups: &mut motor::hash::FxHashMap<std::rc::Rc<str>, crate::dom_flow::GroupRecord>,
-    ) {
-        if let DomKind::Group { path } = &retained.node.kind {
-            groups.remove(path);
-        }
-        for child in &retained.children {
-            forget_groups(child, groups);
-        }
+    for child in &retained.children {
+        forget_subtree_into(child, ctx, ids);
     }
-    forget_groups(retained, ctx.group_paths);
 }
 
 /// Diffs one matched pair: geometry, style, kind payload, children.
 fn diff_node(
     retained: &mut Retained,
-    new: &DomNode,
+    mut new: DomNode,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
@@ -1863,7 +1848,7 @@ fn diff_node(
             patches.push(DomPatch::SetLayout { id, layout: layout.clone() });
             retained.node.layout = Some(layout.clone());
         }
-        if hints_changed(&retained.node, new) {
+        if hints_changed(&retained.node, &new) {
             patches.push(DomPatch::SetHints {
                 id,
                 class: new.hints.class.clone(),
@@ -1883,6 +1868,7 @@ fn diff_node(
     let id = retained.id;
     let own_patches_from = patches.len();
     let old = &retained.node;
+    let new_children = std::mem::take(&mut new.children);
     match &new.layout {
         // a flow node speaks semantics — its geometry fields are silent
         Some(layout) => {
@@ -1906,8 +1892,8 @@ fn diff_node(
     if old.style != new.style {
         patches.push(DomPatch::SetStyle { id, style: new.style.clone() });
     }
-    let same_binding = same_binding(old, new);
-    if hints_changed(old, new) {
+    let same_binding = same_binding(old, &new);
+    if hints_changed(old, &new) {
         // class and id re-attribute live; a TAG change would need a
         // recreation and the walk never changes one on a kept identity
         patches.push(DomPatch::SetHints {
@@ -1917,7 +1903,7 @@ fn diff_node(
         });
     }
     if let (DomKind::Group { .. }, Some(binding)) = (&new.kind, &new.binding)
-        && (!same_binding || hints_changed(old, new))
+        && (!same_binding || hints_changed(old, &new))
     {
         file_class_binding(id, binding, &new.hints, ctx);
     }
@@ -1948,7 +1934,7 @@ fn diff_node(
         ) if before != after => {
             patches.push(DomPatch::SetScroll { id, x: after.0, y: after.1 });
         }
-        (_, DomKind::Canvas { .. }) => note_island(id, new, ctx),
+        (_, DomKind::Canvas { .. }) => note_island(id, &new, ctx),
         (DomKind::Image(before), DomKind::Image(after)) if before != after => {
             patches.push(DomPatch::SetImage { id, image: *after });
         }
@@ -1969,7 +1955,6 @@ fn diff_node(
         ctx.templates.touched(id);
     }
     let previous_target = old_kind_for_reveal(retained);
-    retained.node = shallow(new);
     let followed = match (&previous_target, &new.kind) {
         // the region follows an item: a CHANGED target reveals it —
         // virtual rows by their slot (they may not exist yet), dense
@@ -1981,9 +1966,12 @@ fn diff_node(
         (None, DomKind::Scroll { target: Some(after), .. }) => Some(after.clone()),
         _ => None,
     };
-    diff_children(retained, new, ctx, patches);
+    let flow = new.layout.is_some();
+    // the node moves into the retention: the children were taken above
+    retained.node = new;
+    diff_children(retained, new_children, flow, ctx, patches);
     if let Some(target) = followed {
-        reveal_target(retained, new, &target, patches);
+        reveal_target(retained, &target, patches);
     }
 }
 
@@ -1998,22 +1986,18 @@ fn old_kind_for_reveal(retained: &Retained) -> Option<Option<String>> {
 
 /// Emits the reveal for `target` under an already-diffed scroll node:
 /// a virtual row scrolls to its slot, a dense row asks the browser.
-fn reveal_target(
-    retained: &Retained,
-    new: &DomNode,
-    target: &str,
-    patches: &mut Vec<DomPatch>,
-) {
+/// The retention is the frame's truth by now: it holds the slots and
+/// the elements both.
+fn reveal_target(retained: &Retained, target: &str, patches: &mut Vec<DomPatch>) {
     let suffix = format!("[{target}]");
-    // the scene knows the slot; the retention knows the element
-    let slot = new
+    let slot = retained
         .children
         .first()
         .into_iter()
         .flat_map(|content| content.children.iter())
-        .find_map(|row| match &row.kind {
+        .find_map(|row| match &row.node.kind {
             DomKind::Group { path } if path.ends_with(&suffix) => {
-                row.layout.as_ref().and_then(|layout| layout.slot_y)
+                row.node.layout.as_ref().and_then(|layout| layout.slot_y)
             }
             _ => None,
         });
@@ -2041,17 +2025,19 @@ fn reveal_target(
 /// children leave; unmatched new ones mount.
 fn diff_children(
     retained: &mut Retained,
-    new: &DomNode,
+    new_children: Vec<DomNode>,
+    flow: bool,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
     // under a FLOW parent sibling order IS the layout, so the matching
     // must also reconcile positions; under an absolute parent order
     // only decides paint stacking and the old path stays byte-for-byte
-    if new.layout.is_some() {
-        diff_children_ordered(retained, new, ctx, patches);
+    if flow {
+        diff_children_ordered(retained, new_children, ctx, patches);
         return;
     }
+    let new_len = new_children.len();
     let old_children = std::mem::take(&mut retained.children);
     let mut by_path: motor::hash::FxHashMap<std::rc::Rc<str>, Retained> = motor::hash::FxHashMap::default();
     let mut by_index: Vec<Option<Retained>> = Vec::with_capacity(old_children.len());
@@ -2064,9 +2050,9 @@ fn diff_children(
         }
     }
 
-    let mut next: Vec<Retained> = Vec::with_capacity(new.children.len());
+    let mut next: Vec<Retained> = Vec::with_capacity(new_len);
     let mut survivors = 0usize;
-    for (index, child) in new.children.iter().enumerate() {
+    for (index, child) in new_children.into_iter().enumerate() {
         let matched = match &child.kind {
             DomKind::Group { path } | DomKind::Reuse { path } => by_path.remove(path),
             // a kind change at the same index is remove+create — the
@@ -2107,7 +2093,7 @@ fn diff_children(
             remove_subtree(leftover, ctx, patches);
         }
     }
-    if survivors < new.children.len() || !leaving.is_empty() {
+    if survivors < new_len || !leaving.is_empty() {
         ctx.templates.touched(retained.id);
     }
     retained.children = next;
@@ -2122,7 +2108,7 @@ fn diff_children(
 /// each — a swap of two rows is exactly two patches.
 fn diff_children_ordered(
     retained: &mut Retained,
-    new: &DomNode,
+    new_children: Vec<DomNode>,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
@@ -2131,8 +2117,8 @@ fn diff_children_ordered(
     // almost every frame. One plain loop, zero allocation; the keyed
     // machinery below only runs when something actually reordered,
     // mounted or left.
-    let aligned = retained.children.len() == new.children.len()
-        && retained.children.iter().zip(&new.children).all(|(old, child)| {
+    let aligned = retained.children.len() == new_children.len()
+        && retained.children.iter().zip(&new_children).all(|(old, child)| {
             match (&old.node.kind, &child.kind) {
                 (DomKind::Group { path: was }, DomKind::Group { path: now }) => was == now,
                 // a reuse promise aligns with the group it promised
@@ -2143,15 +2129,15 @@ fn diff_children_ordered(
             }
         });
     if aligned {
-        for (old, child) in retained.children.iter_mut().zip(&new.children) {
+        for (old, child) in retained.children.iter_mut().zip(new_children) {
             diff_node(old, child, ctx, patches);
         }
         return;
     }
 
-    enum Plan<'a> {
+    enum Plan {
         Survivor { old_position: usize, node: Retained },
-        Fresh(&'a DomNode),
+        Fresh(DomNode),
     }
 
     let parent_id = retained.id;
@@ -2169,8 +2155,8 @@ fn diff_children_ordered(
     }
 
     // match first — creation waits for the placement walk below
-    let mut plan: Vec<Plan> = Vec::with_capacity(new.children.len());
-    for (index, child) in new.children.iter().enumerate() {
+    let mut plan: Vec<Plan> = Vec::with_capacity(new_children.len());
+    for (index, child) in new_children.into_iter().enumerate() {
         let matched = match &child.kind {
             DomKind::Group { path } | DomKind::Reuse { path } => by_path.remove(path),
             kind => by_index.get_mut(index).and_then(|slot| match slot.take() {
@@ -4699,7 +4685,7 @@ mod tests {
         let display = crate::layout::DisplayList::default();
         let rows = |order: &[&str]| flow_root(order.iter().map(|p| flow_row(p)).collect());
 
-        let mount = lowering.lower(&rows(&["a", "b", "c", "d", "e"]), &display);
+        let mount = lowering.lower(rows(&["a", "b", "c", "d", "e"]), &display);
         // five rows of one shape: the first mounts whole, the others
         // are clones of it
         assert_eq!(
@@ -4711,7 +4697,7 @@ mod tests {
             "{mount:#?}"
         );
 
-        let swapped = lowering.lower(&rows(&["a", "d", "c", "b", "e"]), &display);
+        let swapped = lowering.lower(rows(&["a", "d", "c", "b", "e"]), &display);
         let moves: Vec<_> =
             swapped.iter().filter(|p| matches!(p, DomPatch::Move { .. })).collect();
         assert_eq!(moves.len(), 2, "a swap is two moves: {swapped:#?}");
@@ -4753,7 +4739,7 @@ mod tests {
             }])
         };
 
-        let mount = lowering.lower(&page("https://a.test/"), &display);
+        let mount = lowering.lower(page("https://a.test/"), &display);
         assert!(
             mount.iter().any(|patch| matches!(
                 patch,
@@ -4769,10 +4755,10 @@ mod tests {
             "the src rides the mount: {mount:#?}"
         );
 
-        let steady = lowering.lower(&page("https://a.test/"), &display);
+        let steady = lowering.lower(page("https://a.test/"), &display);
         assert!(steady.is_empty(), "an unchanged page ships nothing: {steady:#?}");
 
-        let moved = lowering.lower(&page("https://b.test/"), &display);
+        let moved = lowering.lower(page("https://b.test/"), &display);
         assert_eq!(moved.len(), 1, "a navigation is ONE patch: {moved:#?}");
         assert!(matches!(
             &moved[0],
@@ -4809,7 +4795,7 @@ mod tests {
             }])
         };
 
-        let mount = lowering.lower(&page("<meta><p>a letter</p>", true), &display);
+        let mount = lowering.lower(page("<meta><p>a letter</p>", true), &display);
         assert!(
             mount.iter().any(|patch| matches!(
                 patch,
@@ -4820,7 +4806,7 @@ mod tests {
 
         // the same page, unsealed: ONE patch, the seal flipped — the
         // element survives, its powers change
-        let opened = lowering.lower(&page("<meta><p>a letter</p>", false), &display);
+        let opened = lowering.lower(page("<meta><p>a letter</p>", false), &display);
         assert_eq!(opened.len(), 1, "{opened:#?}");
         assert!(matches!(&opened[0], DomPatch::SetIframe { sealed: false, .. }));
 
@@ -4841,7 +4827,7 @@ mod tests {
         let display = crate::layout::DisplayList::default();
         let rows = |order: &[&str]| flow_root(order.iter().map(|p| flow_row(p)).collect());
 
-        let mount = lowering.lower(&rows(&["a", "b", "c"]), &display);
+        let mount = lowering.lower(rows(&["a", "b", "c"]), &display);
         let ids: Vec<u32> = mount
             .iter()
             .filter_map(|p| match p {
@@ -4850,7 +4836,7 @@ mod tests {
             })
             .collect();
 
-        let grown = lowering.lower(&rows(&["a", "new", "b", "c"]), &display);
+        let grown = lowering.lower(rows(&["a", "new", "b", "c"]), &display);
         // the fresh row is a clone of the shape already on the page,
         // placed where a create would be
         let creates: Vec<_> = grown
@@ -4885,8 +4871,8 @@ mod tests {
             root
         };
 
-        let _ = lowering.lower(&with_gap(8.0), &display);
-        let regapped = lowering.lower(&with_gap(12.0), &display);
+        let _ = lowering.lower(with_gap(8.0), &display);
+        let regapped = lowering.lower(with_gap(12.0), &display);
         assert_eq!(regapped.len(), 1, "{regapped:#?}");
         assert!(matches!(
             &regapped[0],
@@ -5278,5 +5264,34 @@ mod tests {
             include_str!("../../../apps/bench_web/web/glue_dom.js"),
             "bench_web ships a glue_dom.js that drifted from the canonical copy"
         );
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    /// The nodes a frame moves by the thousand: their size is a cost
+    /// of every create — printed here so a diet has a number to start
+    /// from, and bounded so a field added in passing does not double
+    /// the memory a row list moves.
+    #[test]
+    fn the_scene_nodes_stay_small() {
+        use std::mem::size_of;
+        let sizes = [
+            ("DomNode", size_of::<super::DomNode>()),
+            ("DomStyle", size_of::<super::DomStyle>()),
+            ("DomKind", size_of::<super::DomKind>()),
+            ("DomText", size_of::<super::DomText>()),
+            ("DomLayout", size_of::<Option<super::DomLayout>>()),
+            ("DomHints", size_of::<super::DomHints>()),
+            ("DomPatch", size_of::<super::DomPatch>()),
+            ("Retained", size_of::<super::Retained>()),
+            ("LayoutNode", size_of::<crate::layout::LayoutNode>()),
+            ("RenderNode", size_of::<motor::view::RenderNode>()),
+            ("FontSpec", size_of::<crate::text_engine::FontSpec>()),
+        ];
+        for (name, size) in sizes {
+            eprintln!("size {name:<11} {size:>5} bytes");
+        }
+        assert!(size_of::<super::DomNode>() <= 1024, "DomNode grew past a kilobyte");
     }
 }
