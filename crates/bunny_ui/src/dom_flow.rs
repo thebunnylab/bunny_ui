@@ -273,6 +273,13 @@ fn node(kind: DomKind) -> DomNode {
     }
 }
 
+/// The tags whose browser display is inline: a stack wearing one of
+/// these around a single child folds to the tag's own display.
+const INLINE_TAGS: &[&str] = &[
+    "a", "span", "b", "i", "em", "strong", "small", "label", "code", "u", "s", "mark", "abbr",
+    "sub", "sup", "q", "cite", "kbd", "var", "time",
+];
+
 fn align_code(align: CrossAlign) -> u8 {
     match align {
         CrossAlign::Start => 0,
@@ -994,6 +1001,13 @@ impl Walk<'_> {
                 {
                     Self::fold_cell(&mut out[opened]);
                 }
+                // an inline tag around one child is no flex box
+                if let Some(tag) = tag
+                    && INLINE_TAGS.contains(&&**tag)
+                    && out.len() == opened + 1
+                {
+                    Self::fold_inline(&mut out[opened]);
+                }
                 for hinted in &mut out[opened..] {
                     if tag.is_some() {
                         hinted.hints.tag = tag.clone();
@@ -1091,6 +1105,29 @@ impl Walk<'_> {
                     layout.fill = true;
                 }
             }
+        }
+    }
+
+    /// A stack with one child, wearing an inline tag — a link around a
+    /// word, a span around an icon — needs no flex line: with one
+    /// child there is nothing to distribute, and the browser's own
+    /// display for the tag lays the child out the same. A gap, a wrap,
+    /// a pinned size or a slot keep the flex box, because those are
+    /// flex semantics the browser's inline flow would not honour.
+    fn fold_inline(node: &mut DomNode) {
+        let one_child = matches!(node.kind, DomKind::FlexRow | DomKind::FlexColumn)
+            && node.children.len() == 1;
+        if !one_child {
+            return;
+        }
+        if let Some(layout) = node.layout.as_mut()
+            && layout.gap.is_none()
+            && layout.wrap.is_none()
+            && layout.width.is_none()
+            && layout.height.is_none()
+            && layout.slot_y.is_none()
+        {
+            layout.plain = true;
         }
     }
 

@@ -808,6 +808,10 @@ pub struct DomLayout {
     /// The row WRAPS, with this gap between its lines, px — `flex-wrap:
     /// wrap` and `row-gap`, a flow's lowering.
     pub wrap: Option<f64>,
+    /// The element is no flex box: an inline tag around ONE child (a
+    /// link around a word) keeps the browser's own display for the
+    /// tag, where a flex line per row would be a layout per row.
+    pub plain: bool,
 }
 
 /// Element hints only the Dom consumes — a real tag, a class, an id.
@@ -2341,7 +2345,11 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 /// 20 sets a text's words alone (`SetContent`), and the shell imports
 /// `js_now` — the page's clock, for the stage table a `?stats` page
 /// reads through `bunny_stats_*`.
-pub const ABI_VERSION: u32 = 11;
+///
+/// 12 (2026-10-02): the flow record carries `plain` (bit 12, no payload):
+/// an inline tag around one child keeps the browser's own display for
+/// the tag instead of a flex line.
+pub const ABI_VERSION: u32 = 12;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -2687,6 +2695,9 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 }
                 if layout.wrap.is_some() {
                     mask |= 1 << 11;
+                }
+                if layout.plain {
+                    mask |= 1 << 12;
                 }
                 push_u16(&mut out, mask);
                 if let Some(gap) = layout.gap {
@@ -3757,6 +3768,47 @@ mod tests {
         });
         assert!(wraps, "the row wraps, both gaps on the record: {mount:?}");
         // and the record survives its own encoding: bit 11, its gap last
+        let bytes = encode(&mount);
+        assert!(!bytes.is_empty());
+    }
+
+    /// A link around one word is no flex box: the record says `plain`,
+    /// and the browser keeps the tag's own display. The cell that
+    /// holds the link, a table cell, is not touched by the fold; the
+    /// word itself, folded into the span, is not a box at all.
+    #[test]
+    fn an_inline_tag_around_one_child_is_no_flex_box() {
+        #[derive(Clone)]
+        struct Link;
+
+        impl Component for Link {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::hstack!(
+                    crate::hstack!(crate::hstack!(text("")).element("span").css_class("glyph"))
+                        .element("a"),
+                    crate::hstack!(text("one"), text("two")).element("a").css_class("pair"),
+                )
+                .element("td")
+            }
+        }
+
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&Link, Size { width: 300.0, height: 100.0 });
+        let a_ids: Vec<u32> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Create { id, hints, .. } if hints.tag.as_deref() == Some("a") => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(a_ids.len(), 2, "two links: {mount:?}");
+        let plain_of = |id: u32| {
+            mount.iter().any(|patch| {
+                matches!(patch, DomPatch::SetLayout { id: at, layout } if *at == id && layout.plain)
+            })
+        };
+        assert!(plain_of(a_ids[0]), "a link around one child is plain: {mount:?}");
+        assert!(!plain_of(a_ids[1]), "a link around two children keeps its flex line: {mount:?}");
         let bytes = encode(&mount);
         assert!(!bytes.is_empty());
     }
