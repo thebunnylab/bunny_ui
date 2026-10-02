@@ -835,9 +835,45 @@ struct MetalStack {
     sels: Sels,
 }
 
-unsafe fn default_device() -> Option<Id> {
+pub(crate) unsafe fn default_device() -> Option<Id> {
     let device = unsafe { MTLCreateSystemDefaultDevice() };
     (!device.is_null()).then_some(device)
+}
+
+/// A shared-storage, shader-read texture of `pixel_format` the CPU may
+/// fill with `upload_texture` — the atlas's own kind, by any format.
+pub(crate) unsafe fn shared_texture(device: Id, pixel_format: u64, width: u32, height: u32) -> Id {
+    unsafe {
+        let descriptor = msg_id_u64_u64_u64_bool(
+            class("MTLTextureDescriptor"),
+            sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+            pixel_format,
+            width as u64,
+            height as u64,
+            0,
+        );
+        msg_void_u64(descriptor, sel("setUsage:"), TEXTURE_USAGE_SHADER_READ);
+        msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_SHARED);
+        msg_id_arg(device, sel("newTextureWithDescriptor:"), descriptor)
+    }
+}
+
+/// One tile of rows into a shared texture: `bytes` starts at the tile's
+/// first texel and the rows are `pitch_px` apart (four bytes a pixel).
+pub(crate) unsafe fn upload_texture(texture: Id, x: u32, y: u32, w: u32, h: u32, bytes: &[u8], pitch_px: u32) {
+    unsafe {
+        msg_void_region_u64_ptr_u64(
+            texture,
+            sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
+            MTLRegion {
+                origin: MTLOrigin { x: x as u64, y: y as u64, z: 0 },
+                size: MTLSize { width: w as u64, height: h as u64, depth: 1 },
+            },
+            0,
+            bytes.as_ptr() as *const c_void,
+            (pitch_px * 4) as u64,
+        );
+    }
 }
 
 impl MetalStack {
@@ -1592,55 +1628,26 @@ impl MetalGround {
     /// A shared-storage RGBA texture the CPU writes into directly (the
     /// Apple-Silicon premise of the module), read by the sprite pass.
     unsafe fn make_texture(&self, width: u32, height: u32) -> Id {
-        unsafe {
-            let descriptor = msg_id_u64_u64_u64_bool(
-                class("MTLTextureDescriptor"),
-                sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
-                PIXEL_FORMAT_RGBA8,
-                width as u64,
-                height as u64,
-                0,
-            );
-            msg_void_u64(descriptor, sel("setUsage:"), TEXTURE_USAGE_SHADER_READ);
-            msg_void_u64(descriptor, sel("setStorageMode:"), STORAGE_MODE_SHARED);
-            msg_id_arg(self.device, sel("newTextureWithDescriptor:"), descriptor)
-        }
+        unsafe { shared_texture(self.device, PIXEL_FORMAT_RGBA8, width, height) }
     }
 
     /// One tile of straight-RGBA rows into a texture: `bytes` starts at
     /// the tile's first texel and the rows are `pitch_px` apart.
     unsafe fn upload(texture: Id, x: u32, y: u32, w: u32, h: u32, bytes: &[u8], pitch_px: u32) {
-        unsafe {
-            msg_void_region_u64_ptr_u64(
-                texture,
-                sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
-                MTLRegion {
-                    origin: MTLOrigin { x: x as u64, y: y as u64, z: 0 },
-                    size: MTLSize { width: w as u64, height: h as u64, depth: 1 },
-                },
-                0,
-                bytes.as_ptr() as *const c_void,
-                (pitch_px * 4) as u64,
-            );
-        }
+        unsafe { upload_texture(texture, x, y, w, h, bytes, pitch_px) }
     }
 }
 
 impl AtlasGround for MetalGround {
     fn import_native(&mut self, source: &ImageSource) -> Option<u64> {
-        #[cfg(feature = "wgpu-surface")]
-        {
-            let ImageSource::Native { payload, .. } = source else { return None };
-            let surface = payload.downcast_ref::<crate::surface::MetalFrame>()?;
-            let texture = surface.import(self.device)?;
-            let id = self.next;
-            self.next += 1;
-            self.textures.insert(id, texture);
-            self.native.insert(id, payload.clone());
-            Some(id)
-        }
-        #[cfg(not(feature = "wgpu-surface"))]
-        { let _ = source; None }
+        let ImageSource::Native { payload, .. } = source else { return None };
+        let frame = payload.downcast_ref::<crate::surface::MetalFrame>()?;
+        let texture = frame.import(self.device)?;
+        let id = self.next;
+        self.next += 1;
+        self.textures.insert(id, texture);
+        self.native.insert(id, payload.clone());
+        Some(id)
     }
 
     fn ensure_shared(&mut self, size: u32) -> bool {

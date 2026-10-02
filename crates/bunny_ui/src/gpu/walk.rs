@@ -672,9 +672,11 @@ impl RunAtlas {
         };
         if matches!(source, ImageSource::Native { .. }) {
             // Native frames belong to the presenter's in-flight ring, not the
-            // image atlas. A video stream must never trigger atlas GC/fence waits.
+            // image atlas. A video stream must never trigger atlas GC/fence
+            // waits. The frame is the picture's own size and the box another:
+            // it rides the live pipeline, scaled by the linear sampler.
             return Ok(ground.import_native(source)
-                .map(|id| ResolvedImage::Dedicated(id, width, height)));
+                .map(|id| ResolvedImage::Live(id, width, height)));
         }
         if let ImageSource::Feed { key, generation, size, format, bytes } = source {
             return Ok(self.resolve_live(ground, *key, *generation, *size, *format, bytes));

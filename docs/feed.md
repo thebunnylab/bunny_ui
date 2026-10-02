@@ -1,7 +1,9 @@
 # A feed
 
 *Status: the feed door is standing on every tier — Metal, GL, Vulkan,
-WebGL2, D3D11 and the CPU oracle. One texture per feed, sized to the
+WebGL2, D3D11 and the CPU oracle — and on Metal a frame the GPU already
+holds (a camera's or a decoder's texture, RGBA or BGRA) rides the same
+linear road with no copy at all. One texture per feed, sized to the
 picture, replaced in place when the generation moves, scaled into its
 box by a linear sampler; the shared atlas never hears of it and the
 collector is never asked. `cargo test -p bunny-ui --features gpu --lib
@@ -108,6 +110,37 @@ did.
   threw the frame's uploads away — a Vulkan staging arena that grew —
   is made whole by it.
 
+## A frame the GPU already holds (Metal)
+
+A camera's pixel buffer, a hardware decoder's output, a renderer's own
+texture: on the Mac and on iOS these already live on the GPU, and the
+feed's upload would be a copy for nothing. `bunny_ui_apple::surface`
+wraps such a texture as a frame the compositor samples where it lies:
+
+```rust
+// the app's own CoreVideo bindings mint the texture from the pixel buffer
+let frame = unsafe { MetalFrame::from_texture(texture, Arc::new(lease)) }?;
+image(frame.image()).resizable().aspect_ratio(ContentMode::Fill)
+```
+
+- The texture is 2D, one level, shader-readable, `RGBA8Unorm` or
+  `BGRA8Unorm`; anything else is refused by name. Metal reads every
+  ordered format in r, g, b, a, so BGRA needs no view and no swizzle.
+  The sRGB twins are refused: a decode on read would land in linear
+  light inside a gamma-space compositor.
+- The frame retains the texture once and keeps `lease` — a pixel buffer,
+  a cache entry — alive until the last command buffer that sampled it
+  completed. The lease is not optional: a pixel buffer released while
+  its texture is in flight is a torn or black frame.
+- A frame rides the live pipeline: the picture's own size, scaled into
+  its box by the linear sampler, like a feed. The two paint the same
+  bytes (`a_native_frame_samples_like_a_feed`).
+- The wgpu pool (`SurfacePool`, feature `wgpu-surface`) copies a
+  completed wgpu texture GPU to GPU into a leased frame through the same
+  door, with backpressure at twelve frames.
+- Every other tier paints nothing for a native frame; a consumer hands
+  them a feed instead.
+
 ## Limits
 
 - One format: straight RGBA8. A planar layout (NV12, I420) would be a
@@ -127,6 +160,8 @@ did.
 cargo test -p bunny-ui --features gpu --lib gpu::walk
 cargo test -p bunny-ui --lib image_engine
 cargo test -p bunny-ui-apple --lib metal
+cargo test -p bunny-ui-apple --lib surface
+cargo test -p bunny-ui-apple --features wgpu-surface --lib surface
 cargo test -p bunny-ui-vulkan --lib the_committed_spirv_matches_its_source
 cargo check -p bunny-ui-windows --target x86_64-pc-windows-msvc --tests
 cargo check -p bunny-ui-web --target wasm32-unknown-unknown
