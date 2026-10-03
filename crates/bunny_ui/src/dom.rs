@@ -2829,7 +2829,24 @@ fn remove_all_children(
             forget_islands(retained, ctx);
         }
     }
-    patches.push(DomPatch::RemoveChildren { id: parent, forget: id_ranges(runs) });
+    let forget = id_ranges(runs);
+    // a template inside a row that leaves whole, the row none itself (it
+    // holds this one): the row's question never reached it, and left
+    // standing it would hand out copies of an element no longer on the
+    // page. Its root is among the ids that leave — the few templates that
+    // stand are looked up in the runs, and no node is walked again. This
+    // cannot wait for the idle: the next frame may already ask for a copy
+    if !ctx.templates.roots.is_empty() {
+        let inside = |root: u32| {
+            let at = forget.partition_point(|&(_, end)| end <= root);
+            forget.get(at).is_some_and(|&(start, _)| start <= root)
+        };
+        let gone: Vec<u32> = ctx.templates.roots.keys().copied().filter(|&root| inside(root)).collect();
+        for root in gone {
+            ctx.templates.forget_root(root);
+        }
+    }
+    patches.push(DomPatch::RemoveChildren { id: parent, forget });
     ctx.graveyard.push(Buried::Many(leaving));
 }
 
@@ -2901,14 +2918,6 @@ fn number_leaving(retained: &Retained, runs: &mut Vec<(u32, u32)>) {
 fn forget_islands(retained: &Retained, ctx: &mut LowerCtx) {
     if let DomKind::Canvas { .. } = &retained.node.kind {
         ctx.islands.remove(&retained.id);
-    }
-    // a template inside a row that leaves whole, the row none itself (it
-    // holds this one): the row's question never reached it, and left
-    // standing it would hand out copies of an element no longer on the
-    // page. Only a group is a template's root — and this cannot wait for
-    // the idle: the next frame may already ask for a copy
-    if !ctx.templates.roots.is_empty() && matches!(retained.node.kind, DomKind::Group { .. }) {
-        ctx.templates.forget_root(retained.id);
     }
     for child in &retained.children {
         forget_islands(child, ctx);
