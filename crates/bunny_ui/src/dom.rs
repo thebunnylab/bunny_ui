@@ -8460,6 +8460,11 @@ mod tests {
             include_str!("../../../apps/bench_web/web/glue_dom.js"),
             "bench_web ships a glue_dom.js that drifted from the canonical copy"
         );
+        assert_eq!(
+            include_str!("../../bunny_ui_web/glue/glue_dom.js"),
+            include_str!("../../../apps/landing_web/web/glue_dom.js"),
+            "landing_web ships a glue_dom.js that drifted from the canonical copy"
+        );
     }
 }
 

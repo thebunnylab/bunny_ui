@@ -368,6 +368,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "landing-web"
+version = "0.1.0"
+dependencies = [
+ "bunny-ui",
+ "bunny-ui-web",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
