@@ -2321,8 +2321,14 @@ fn remove_all_children(
 }
 
 /// Sorted ids as half-open ranges `[start, end)`, neighbours merged.
+///
+/// Rows mounted together were numbered in the order the walk meets
+/// them again, so the list nearly always arrives sorted: one look
+/// along it says so, and the sort is left for a list a reorder mixed.
 fn id_ranges(mut ids: Vec<u32>) -> Vec<(u32, u32)> {
-    ids.sort_unstable();
+    if !ids.is_sorted() {
+        ids.sort_unstable();
+    }
     let mut ranges: Vec<(u32, u32)> = Vec::new();
     for id in ids {
         match ranges.last_mut() {
@@ -2366,11 +2372,14 @@ fn forget_subtree_into(
         _ => {}
     }
     // the binding leaves NOW, graveyard or not: a key that stays alive
-    // in a kept node would still count as live to the frame
+    // in a kept node would still count as live to the frame. One probe
+    // takes it out; the rare key a newer element took already (a node
+    // made again at the same place) goes straight back
     if let Some(binding) = retained.node.binding.take()
-        && ctx.bindings.get(binding.key()).is_some_and(|bound| bound.id == retained.id)
+        && let Some((key, bound)) = ctx.bindings.remove_entry(binding.key())
+        && bound.id != retained.id
     {
-        ctx.bindings.remove(binding.key());
+        ctx.bindings.insert(key, bound);
     }
     for child in &mut retained.children {
         forget_subtree_into(child, ctx, ids, ask_templates);

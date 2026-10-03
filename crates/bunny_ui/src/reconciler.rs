@@ -192,6 +192,10 @@ pub(crate) struct Entry {
     /// The PARENT's path segments, packed — the cursor seed for an isolated
     /// re-run.
     pub parent_segments: motor::identity::PathSeed,
+    /// Did the entry close with no retained boundary above it? Then it
+    /// stands in the live tables' top level, and it is the one place the
+    /// entry's fall has to take it out of — asked here, never searched.
+    pub top_level: bool,
 }
 
 #[derive(Default)]
@@ -376,6 +380,11 @@ impl Live {
     /// Takes one dropped entry's registrations out. A key belongs to the
     /// one boundary that renders its position, so nothing else can hold
     /// the same key while this entry does.
+    ///
+    /// A path stands in the carrier sets only while its entry carries
+    /// one — [`Live::index`] files it on that condition alone — so an
+    /// entry that carries nothing asks no set: a thousand rows that leave
+    /// a list hash their path for the tables they are in, and none other.
     fn unindex(&mut self, path: &str, entry: &Entry) {
         for (key, _) in &entry.actions {
             self.remove_action(key);
@@ -402,16 +411,18 @@ impl Live {
             self.customs.remove(key);
             self.keyed_customs.remove(key);
         }
-        if self.handler_entries.remove(path) {
+        if !entry.handlers.is_empty() && self.handler_entries.remove(path) {
             self.handler_gen += 1;
         }
-        if self.context_entries.remove(path) {
+        if !entry.contexts.is_empty() && self.context_entries.remove(path) {
             self.context_gen += 1;
         }
-        if self.effect_entries.remove(path) {
+        if !entry.effects.is_empty() && self.effect_entries.remove(path) {
             self.effect_gen += 1;
         }
-        self.top_level.remove(path);
+        if entry.top_level {
+            self.top_level.remove(path);
+        }
     }
 
     /// Takes the last root region's registrations back out.
@@ -789,6 +800,7 @@ pub(crate) fn finish_entry(
                 handlers,
                 contexts,
                 parent_segments,
+                top_level,
             };
             // a body ran and its registrations are new closures: they
             // replace the old ones in the tables the doors read, now
@@ -2057,4 +2069,99 @@ pub(crate) fn field_yields_on_submit(path: &str) -> bool {
 
 pub(crate) fn field_submits_on_enter(path: &str) -> bool {
     editor_at(path).is_some_and(|editor| editor.submit_on_enter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::action::ActionId;
+    use crate::prelude::*;
+    use crate::runtime::Runtime;
+
+    /// The carrier sets and the top level, built again from the
+    /// retention: who carries a handler, a key context, an effect, and
+    /// who closed with nothing retained above it.
+    fn carriers_match_retention() -> bool {
+        RETAINED.with(|retained| {
+            let retained = retained.borrow();
+            let built = |carries: &dyn Fn(&Entry) -> bool| -> HashSet<String> {
+                retained.iter().filter(|(_, entry)| carries(entry)).map(|(path, _)| path.to_string()).collect()
+            };
+            let handlers = built(&|entry| !entry.handlers.is_empty());
+            let contexts = built(&|entry| !entry.contexts.is_empty());
+            let effects = built(&|entry| !entry.effects.is_empty());
+            let top_level = built(&|entry| entry.top_level);
+            LIVE.with(|live| {
+                let live = live.borrow();
+                live.handler_entries == handlers
+                    && live.context_entries == contexts
+                    && live.effect_entries == effects
+                    && live.top_level == top_level
+            })
+        })
+    }
+
+    /// An entry that falls takes its path out of the carrier sets and the
+    /// top level by what it CARRIES, never by asking each set: the guard
+    /// holds only while a path stands in a set exactly as long as its
+    /// entry carries what the set is for. A carrier that re-runs and sheds
+    /// its handler, one that takes it back, and one that unmounts — after
+    /// each, the sets are what the retention says they are.
+    #[test]
+    fn the_carrier_sets_hold_exactly_the_entries_that_carry() {
+        const POKE: ActionId = ActionId("test.carrier");
+
+        #[derive(Clone, Copy)]
+        struct Carrier {
+            armed: State<bool>,
+        }
+
+        impl Component for Carrier {
+            fn body(self, _ctx: &Context) -> impl View {
+                if self.armed.get() {
+                    Either::First(text("armed").on_action(POKE, || {}).key_context("carrier").on_appear(|| {}))
+                } else {
+                    Either::Second(text("plain"))
+                }
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Holder {
+            mounted: State<bool>,
+            armed: State<bool>,
+        }
+
+        impl Component for Holder {
+            fn body(self, _ctx: &Context) -> impl View {
+                if self.mounted.get() {
+                    Either::First(Carrier { armed: self.armed })
+                } else {
+                    Either::Second(text("closed"))
+                }
+            }
+        }
+
+        let holder = Holder { mounted: State::new(true), armed: State::new(true) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&holder);
+        let carried = |set: fn(&Live) -> usize| LIVE.with(|live| set(&live.borrow()));
+        assert_eq!(carried(|live| live.handler_entries.len()), 1, "the carrier stands in the set");
+        assert!(carriers_match_retention(), "mounted, armed");
+
+        holder.armed.set(false);
+        runtime.render_stable(&holder);
+        assert_eq!(carried(|live| live.handler_entries.len()), 0, "it shed its handler");
+        assert!(carriers_match_retention(), "re-ran and shed its handler, context and effect");
+
+        holder.armed.set(true);
+        runtime.render_stable(&holder);
+        assert!(carriers_match_retention(), "re-ran and took them back");
+
+        holder.mounted.set(false);
+        runtime.render_stable(&holder);
+        assert_eq!(carried(|live| live.handler_entries.len()), 0, "the carrier left with its entry");
+        assert!(carriers_match_retention(), "unmounted");
+        assert_eq!(carried(|live| live.top_level.len()), 1, "the holder alone stands at the top");
+    }
 }

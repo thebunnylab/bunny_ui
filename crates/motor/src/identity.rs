@@ -816,10 +816,12 @@ fn clear_view_reads(registry: &mut Registry, view: &str) -> Vec<Rc<str>> {
         return bindings;
     };
     for key in keys {
-        if let Some(readers) = registry.readers.get_mut(&key) {
-            readers.remove(view);
-            if readers.is_empty() {
-                registry.readers.remove(&key);
+        // one probe for the dependency: its readers are found, thinned
+        // and, when the view was the last of them, taken out in place
+        if let std::collections::hash_map::Entry::Occupied(mut readers) = registry.readers.entry(key) {
+            readers.get_mut().remove(view);
+            if readers.get().is_empty() {
+                readers.remove();
             }
         }
     }
@@ -834,7 +836,11 @@ pub fn forget_view_reads(view: &str) -> Vec<Rc<str>> {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         let bindings = clear_view_reads(&mut registry, view);
-        registry.dirty.remove(view);
+        // most frames that let views go hold no dirt at all: an empty
+        // set is not asked, and the path is not hashed for it
+        if !registry.dirty.is_empty() {
+            registry.dirty.remove(view);
+        }
         bindings
     })
 }
@@ -897,15 +903,20 @@ pub fn begin_binding_under_view(key: &Rc<str>) -> BindingScope {
 }
 
 fn clear_binding_reads(registry: &mut Registry, key: &str) {
-    registry.dirty_bindings.remove(key);
+    // a binding is cleared at each of its evaluations and at its death,
+    // and between two frames the dirty set is nearly always empty: the
+    // key is hashed for it only when there is something to find
+    if !registry.dirty_bindings.is_empty() {
+        registry.dirty_bindings.remove(key);
+    }
     let Some(deps) = registry.binding_reads.remove(key) else {
         return;
     };
     for dep in deps {
-        if let Some(readers) = registry.binding_readers.get_mut(&dep) {
-            readers.remove(key);
-            if readers.is_empty() {
-                registry.binding_readers.remove(&dep);
+        if let std::collections::hash_map::Entry::Occupied(mut readers) = registry.binding_readers.entry(dep) {
+            readers.get_mut().remove(key);
+            if readers.get().is_empty() {
+                readers.remove();
             }
         }
     }
