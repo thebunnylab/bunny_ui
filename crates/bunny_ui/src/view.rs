@@ -280,20 +280,30 @@ fn run_body<'a, T: Component>(view: &T, ctx: &'a Context) -> impl View + use<'a,
     view.clone().body(ctx)
 }
 
-/// Files the finished body under its identity.
+/// Files the finished body under its identity, and puts the reference
+/// to it in the parent's list — holding the slot the entry was just
+/// filed with, which no search has to find again.
 ///
 /// Everything here runs AFTER the descent and needs a slot for nothing
 /// during it — including the second copy of the payload, the one the
 /// retention keeps so a skipped view can answer from cache.
 #[inline(never)]
-fn retain_entry<T: Component>(view: &T, ctx: &Context, path: &std::rc::Rc<str>, body: NodeList) {
+fn retain_entry<T: Component>(
+    view: &T,
+    ctx: &Context,
+    path: &std::rc::Rc<str>,
+    retained: bool,
+    body: NodeList,
+    out: &mut NodeList,
+) {
     let (print_children, layout_children) = body.into_parts();
     // the name is the print's, and only a print reads it: a frame's pass
     // keeps none — a retention built without print is rebuilt before
     // anything prints it ([`crate::runtime::Runtime::render`])
     let name = if print_enabled() { short_type_name::<T>() } else { "" };
-    crate::reconciler::finish_entry(
+    let slot = crate::reconciler::finish_entry(
         path,
+        retained,
         crate::erased::erased_from(view),
         ctx.clone(),
         RenderNode::branch(name, print_children),
@@ -303,6 +313,7 @@ fn retain_entry<T: Component>(view: &T, ctx: &Context, path: &std::rc::Rc<str>, 
             quiet: Default::default(),
         },
     );
+    out.push_view_ref(path, Some(slot));
 }
 
 /// The same tail, for a render with no pass around it: nothing is
@@ -338,16 +349,19 @@ impl<T: Component> View for T {
         enum Road {
             Loose,
             Skip(std::rc::Rc<str>, std::rc::Rc<crate::reconciler::Slot>),
-            Run(std::rc::Rc<str>),
+            /// The body runs: the path, and whether the retention held
+            /// the boundary — a fresh mount has no last entry to replace.
+            Run(std::rc::Rc<str>, bool),
         }
         let road = motor::identity::with_current_view_path(|path| match path {
             None => Road::Loose,
             Some(path) => match crate::reconciler::decide_at(path) {
                 (crate::reconciler::Decision::Skip, Some((key, slot))) => Road::Skip(key, slot),
-                (_, found) => Road::Run(found.map_or_else(|| std::rc::Rc::from(path), |(key, _)| key)),
+                (_, Some((key, _))) => Road::Run(key, true),
+                (_, None) => Road::Run(std::rc::Rc::from(path), false),
             },
         });
-        let path = match road {
+        let (path, retained) = match road {
             // No active pass (render outside the Runtime): direct path, no
             // retention — the pre-reconciler behavior.
             Road::Loose => {
@@ -363,7 +377,7 @@ impl<T: Component> View for T {
                 out.push_view_ref(&path, Some(slot));
                 return;
             }
-            Road::Run(path) => path,
+            Road::Run(path, retained) => (path, retained),
         };
 
         // The body will run: this view's old reads drop (the new set is
@@ -374,8 +388,7 @@ impl<T: Component> View for T {
         crate::reconciler::begin_entry(&path, T::KEYED_LIST);
         let mut body = NodeList::new();
         run_body(self, ctx).render_into(ctx, &mut body);
-        retain_entry(self, ctx, &path, body);
-        out.push_view_ref(&path, None);
+        retain_entry(self, ctx, &path, retained, body, out);
     }
 }
 
