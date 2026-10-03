@@ -5,3 +5,4 @@ gitignore/
 apps/*/web/*.wasm
 apps/bench_web/web/index.html
 apps/landing_web/web/index.html
+apps/landing_web/.firebase/
