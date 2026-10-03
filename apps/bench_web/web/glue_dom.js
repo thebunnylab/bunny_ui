@@ -1890,6 +1890,32 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
       }
     });
     window.addEventListener("resize", repositionPopovers);
+    // the window's box: a page that sizes the mount to the viewport
+    // hears it move, and the bodies that read the Viewport run again —
+    // a layout that changes its columns with the width, say. The engine
+    // pins the mount at the size it laid out, so the page's own answer
+    // is read with the pin let go for the one measure
+    let mounted = [app.clientWidth, app.clientHeight];
+    const pageBox = () => {
+      const { width, height } = app.style;
+      app.style.width = "";
+      app.style.height = "";
+      const box = [app.clientWidth, app.clientHeight];
+      app.style.width = width;
+      app.style.height = height;
+      return box;
+    };
+    const remount = () => {
+      if (!wasm) return;
+      const [width, height] = pageBox();
+      if (width === mounted[0] && height === mounted[1]) return;
+      mounted = [width, height];
+      wasm.bunny_resize(width, height, window.devicePixelRatio || 1);
+    };
+    // the window says it moved; the document's own box says so too
+    // when nothing dispatched the event — either is one remount
+    window.addEventListener("resize", remount);
+    new ResizeObserver(remount).observe(document.documentElement);
     // a modifier's release types nothing and makes no stroke: the
     // state it leaves is the whole event
     window.addEventListener("keyup", (event) => {
