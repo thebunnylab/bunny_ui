@@ -2269,12 +2269,14 @@ fn sweep_under(
     // skips it stands inside are borrowed, and a row that stays costs
     // nothing but its compare
     let mut leaving: Vec<Rc<str>> = Vec::new();
+    let lo = format!("{boundary}/");
+    let hi = format!("{boundary}0");
+    let mut walked = 0;
     {
-        let lo = format!("{boundary}/");
-        let hi = format!("{boundary}0");
         let range = (std::ops::Bound::Included(lo.as_str()), std::ops::Bound::Excluded(hi.as_str()));
         let mut shelters: Vec<&str> = Vec::new();
         for (path, entry) in retained.range::<str, _>(range) {
+            walked += 1;
             while shelters.last().is_some_and(|shelter| passed(path, shelter)) {
                 shelters.pop();
             }
@@ -2286,9 +2288,27 @@ fn sweep_under(
             }
         }
     }
-    // …then taken out in a second walk, from the first that leaves to
-    // the last, each where the walk stands: the list is in the order of
-    // the walk, and holds the very keys it meets
+    // everything under the boundary leaves — a list that clears — and
+    // it is most of the retention: the range is cut out of the tree at
+    // its two ends, where taking the entries out one by one rebalanced
+    // the tree at each of them. The cuts touch the entries of the
+    // smaller side, and putting back what lies past the range costs no
+    // more entries than leave
+    if walked > 0 && leaving.len() == walked && walked * 2 >= retained.len() {
+        let mut under = retained.split_off(lo.as_str());
+        let mut after = under.split_off(hi.as_str());
+        if after.len() > retained.len() {
+            std::mem::swap(retained, &mut after);
+        }
+        retained.extend(after);
+        for (path, entry) in under {
+            fall(&path, entry);
+        }
+        return;
+    }
+    // …or taken out in a second walk, from the first that leaves to the
+    // last, each where the walk stands: the list is in the order of the
+    // walk, and holds the very keys it meets
     let (Some(first), Some(last)) = (leaving.first(), leaving.last()) else {
         return;
     };
@@ -2830,6 +2850,62 @@ mod tests {
         assert!(late_by >= GARBAGE_PATIENCE * 3, "the idle was late by {late_by} passes");
         assert_eq!(collect_garbage(), waiting, "the idle frees it all");
         assert_eq!(graveyard_len(), 0);
+    }
+
+    /// A list that clears, most of the retention, leaves whole: its range
+    /// is cut out of the tree at its two ends. What sorts before the list
+    /// and what sorts after it — a header, a footer with boundaries of its
+    /// own, more of them than stand before — stays retained, every entry,
+    /// and every row leaves as a row taken out alone would: to the idle,
+    /// out of the tables, its bindings retired.
+    #[test]
+    fn a_list_that_clears_leaves_whole_and_keeps_what_sorts_around_it() {
+        #[derive(Clone, Copy)]
+        struct Note(&'static str);
+
+        impl Component for Note {
+            fn body(self, _ctx: &Context) -> impl View {
+                text(self.0)
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Footer;
+
+        impl Component for Footer {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(Note("first"), Note("second"), Note("third"), Note("fourth"))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Framed {
+            lines: State<Rc<Vec<Line>>>,
+        }
+
+        impl Component for Framed {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(Note("head"), Lines { lines: self.lines }, Footer)
+            }
+        }
+
+        let rows = State::new(lines(1..=12));
+        let page = Framed { lines: rows };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let all = retained_under("Framed");
+        let around: Vec<String> = all.iter().filter(|path| !path.contains("/[")).cloned().collect();
+        assert_eq!(all.len() - around.len(), 12, "a row each: {all:?}");
+        let _ = collect_garbage();
+
+        rows.set(Rc::new(Vec::new()));
+        let printed = runtime.render(&page);
+        assert_eq!(retained_under("Framed"), around, "the rows left, and everything around them stayed");
+        assert_eq!(graveyard_len(), 12, "to the idle");
+        assert_eq!(motor::identity::retired_count(), 12, "their bindings retired");
+        assert!(live_tables_match_retention() && carriers_match_retention());
+        assert!(printed.contains("head") && printed.contains("third") && !printed.contains("line"), "{printed}");
+        assert_eq!(collect_garbage(), 13, "the rows and the list's old tree");
     }
 
     /// The paths retained under a prefix, sorted.
