@@ -685,6 +685,47 @@ mod frame_tests {
         );
     }
 
+    /// The list, and the table around it, have shapes too — but they hold
+    /// the rows' template, and a member answers to one template. Were
+    /// they templates as well, the row's template would lose its members
+    /// to theirs: retired by nobody when its row left, it would hand the
+    /// next row a copy of an element no longer on the page.
+    #[test]
+    fn a_template_never_holds_another_templates_root() {
+        let table = Table { rows: State::new(items(&[1, 2, 3, 4, 5])) };
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&table, SIZE);
+        // a row joins (the list's live instance changes), then every row
+        // leaves, then rows of the same shape come back
+        table.rows.set(items(&[1, 2, 3, 4, 5, 6]));
+        let _ = runtime.dom_frame(&table, SIZE);
+        table.rows.set(items(&[]));
+        let cleared = runtime.dom_frame(&table, SIZE);
+        let gone: Vec<(u32, u32)> = cleared
+            .iter()
+            .flat_map(|patch| match patch {
+                DomPatch::RemoveChildren { forget, .. } => forget.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(!gone.is_empty(), "the rows left in one op: {cleared:?}");
+        table.rows.set(items(&[7, 8, 9]));
+        let refilled = runtime.dom_frame(&table, SIZE);
+        for patch in &refilled {
+            if let DomPatch::Clone { template, .. } = patch {
+                assert!(
+                    !gone.iter().any(|(start, end)| (*start..*end).contains(template)),
+                    "a clone of element {template}, which left the page: {refilled:?}"
+                );
+            }
+        }
+        // the first row back mounts whole, and the others copy it
+        assert!(
+            refilled.iter().any(|patch| matches!(patch, DomPatch::Create { kind: crate::dom::CreateKind::Group, .. })),
+            "{refilled:?}"
+        );
+    }
+
     #[test]
     fn a_keyed_list_reads_its_rows_and_renders_each_once() {
         let table = Table { rows: State::new(items(&[1, 2, 3, 4, 5])) };
