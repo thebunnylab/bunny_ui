@@ -9,6 +9,10 @@ canvas = ["bunny-ui/canvas"]
 # The WebGL2 tier. Off, the page presents through the CPU Surface
 # and the island canvases take putImageData — today's roads.
 gpu = ["bunny-ui/gpu", "canvas"]
+# The hit rectangles of the last layout, readable from the page
+# (`bunny_hits_*`): what a runner clicks by on a page without elements.
+# Off in every shipped build.
+probe = []
 
 [dependencies]
 bunny-ui.workspace = true

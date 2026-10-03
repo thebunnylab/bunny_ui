@@ -67,6 +67,13 @@ pub(crate) struct FlowOutput {
     /// The app's boxes inside each island, with ISLAND-LOCAL frames —
     /// exactly the coordinates the browser reports on the canvas.
     pub customs: Vec<(std::rc::Rc<str>, crate::layout::CustomPlacement)>,
+    /// The targets drawn inside each island — the island's identity,
+    /// the target's path, its frame in the island's own coordinates.
+    /// The pointer door routes a canvas click by them.
+    pub hits: Vec<(std::rc::Rc<str>, String, crate::layout::Rect)>,
+    /// The islands this walk lowered. An island a reuse promise kept
+    /// is not among them, and its hits from the last walk stand.
+    pub islands_walked: Vec<std::rc::Rc<str>>,
     /// The groups this walk lowered, with what they were lowered in.
     pub groups: Vec<(std::rc::Rc<str>, GroupRecord)>,
 }
@@ -131,6 +138,8 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         pending_boundary_class: None,
         customs: Vec::new(),
         groups_out: Vec::new(),
+        hits: Vec::new(),
+        islands_walked: Vec::new(),
     };
     let mut children = Vec::new();
     walk.lower_into(root, &mut children);
@@ -164,6 +173,8 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         fields: walk.fields,
         customs: walk.customs,
         groups: walk.groups_out,
+        hits: walk.hits,
+        islands_walked: walk.islands_walked,
     }
 }
 
@@ -248,6 +259,10 @@ struct Walk<'a> {
     /// real box from the browser, in the island round).
     slot: (Option<Px>, Option<Px>),
     customs: Vec<(std::rc::Rc<str>, crate::layout::CustomPlacement)>,
+    /// The targets inside each island, canvas-local — see `FlowOutput::hits`.
+    hits: Vec<(std::rc::Rc<str>, String, crate::layout::Rect)>,
+    /// The islands lowered this walk — see `FlowOutput::islands_walked`.
+    islands_walked: Vec<std::rc::Rc<str>>,
     /// The groups lowered this walk, for the lowering's records.
     groups_out: Vec<(std::rc::Rc<str>, GroupRecord)>,
 }
@@ -1286,6 +1301,10 @@ impl Walk<'_> {
         if let Some(island) = &path {
             for custom in placement.customs {
                 self.customs.push((std::rc::Rc::clone(island), custom));
+            }
+            self.islands_walked.push(std::rc::Rc::clone(island));
+            for (target, frame) in placement.hits {
+                self.hits.push((std::rc::Rc::clone(island), target, frame));
             }
         }
         let mut island = node(DomKind::Canvas {

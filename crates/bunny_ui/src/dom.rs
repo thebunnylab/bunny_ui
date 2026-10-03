@@ -1355,6 +1355,38 @@ impl DomLowering {
         self.root.as_ref().and_then(|root| walk(root, id))
     }
 
+    /// The element id of the island with this identity path.
+    pub fn island_id(&self, path: &str) -> Option<u32> {
+        fn walk(retained: &Retained, path: &str) -> Option<u32> {
+            if let DomKind::Canvas { path: Some(own), .. } = &retained.node.kind
+                && &**own == path
+            {
+                return Some(retained.id);
+            }
+            retained.children.iter().find_map(|child| walk(child, path))
+        }
+        self.root.as_ref().and_then(|root| walk(root, path))
+    }
+
+    /// Every island on the page: element id, origin and size in the
+    /// layout's frame — what a probe needs to turn a hit inside an
+    /// island into a point on the island's own canvas.
+    pub fn island_frames(&self) -> Vec<(u32, Px, Px, Px, Px)> {
+        fn walk(retained: &Retained, out: &mut Vec<(u32, Px, Px, Px, Px)>) {
+            if let DomKind::Canvas { origin, .. } = &retained.node.kind {
+                out.push((retained.id, origin.0, origin.1, retained.node.width, retained.node.height));
+            }
+            for child in &retained.children {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(root) = &self.root {
+            walk(root, &mut out);
+        }
+        out
+    }
+
     /// The scroll region path an element id belongs to — the glue's
     /// scroll observer reports by id, the runtime scrolls by path.
     pub fn scroll_path(&self, id: u32) -> Option<String> {

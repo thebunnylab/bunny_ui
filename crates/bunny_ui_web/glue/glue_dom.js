@@ -1451,6 +1451,15 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     if (typeof gpuAttach === "function") gpuAttach(wasm);
     window.__bunny = wasm;
     window.__bunnyDebug = { elements, pseudoRules };
+    // probe builds: the hit table of the last layout, for a runner
+    // that clicks what a page without elements cannot select
+    if (wasm.bunny_hits_json && wasm.bunny_probe_ptr) {
+      window.__bunnyHits = () => {
+        const len = wasm.bunny_hits_json() >>> 0;
+        const ptr = wasm.bunny_probe_ptr() >>> 0;
+        return JSON.parse(new TextDecoder().decode(new Uint8Array(wasm.memory.buffer, ptr, len)));
+      };
+    }
     // the ABI gate: a missing export counts as version 0
     const abi = wasm.bunny_abi_version ? wasm.bunny_abi_version() >>> 0 : 0;
     if (abi !== EXPECTED_ABI) {
