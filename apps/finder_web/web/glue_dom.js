@@ -151,7 +151,76 @@ function sendText(text) {
   new Uint8Array(wasm.memory.buffer, pointer, bytes.length).set(bytes);
   wasm.bunny_text(pointer, bytes.length);
 }
+// The element registry: what the engine created, by id — and the
+// roots of the clones. A clone's members are not registered at all:
+// their ids follow the root's in pre-order, so a member is found by its
+// offset from the root along the shape's trail of child indexes, a hop
+// or three each time an op names it. A thousand rows register a
+// thousand roots, not eight thousand elements — and forget as many on
+// a clear.
 const elements = new Map([[0, app]]);
+// the clone roots in the order they were made (ids only grow), each
+// [root id, element count, template id]
+const cloneRoots = [];
+// a template's shape: for every member in pre-order, the child indexes
+// that lead to it from the root
+const memberTrails = new Map();
+
+function trailsOf(templateId, templateEl) {
+  let trails = memberTrails.get(templateId);
+  if (trails) return trails;
+  trails = [];
+  const walk = (el, trail) => {
+    trails.push(trail);
+    const kids = el.children;
+    for (let i = 0; i < kids.length; i++) walk(kids[i], trail.concat(i));
+  };
+  walk(templateEl, []);
+  memberTrails.set(templateId, trails);
+  return trails;
+}
+
+// the clone whose range holds the id: the last root at or before it
+function cloneAt(id) {
+  let lo = 0;
+  let hi = cloneRoots.length - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (cloneRoots[mid][0] <= id) {
+      found = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return found;
+}
+
+function lookup(id) {
+  const known = elements.get(id);
+  if (known !== undefined) return known;
+  const at = cloneAt(id);
+  if (at < 0) return undefined;
+  const [root, size, template] = cloneRoots[at];
+  const k = id - root;
+  if (k >= size) return undefined;
+  const rootEl = elements.get(root);
+  if (!rootEl) return undefined;
+  const trail = trailsOf(template, rootEl)[k];
+  let el = rootEl;
+  for (let i = 0; i < trail.length; i++) {
+    el = el.children[trail[i]];
+    if (!el) return undefined;
+  }
+  return el;
+}
+
+// a clone root leaves: its range leaves with it
+function forgetClone(root) {
+  const at = cloneAt(root);
+  if (at >= 0 && cloneRoots[at][0] === root) cloneRoots.splice(at, 1);
+}
 // The looks the page wears: one rule per distinct look, inserted once
 // and never removed. An element wears a look by CLASS, so a thousand
 // rows that look alike share one rule — and the browser shares their
@@ -752,9 +821,9 @@ function applyPatches(view, length) {
   // (it may still sit in a staged fragment), or appended — staged when
   // the parent is live, so a thousand rows reach the tree once
   const place = (el, parent, before) => {
-    const home = elements.get(parent);
+    const home = lookup(parent);
     if (!home) return;
-    const anchor = before ? elements.get(before) : null;
+    const anchor = before ? lookup(before) : null;
     if (anchor) {
       (anchor.parentNode ?? home).insertBefore(el, anchor);
     } else if (home.isConnected) {
@@ -808,53 +877,65 @@ function applyPatches(view, length) {
       // words and the action paths follow as their own ops
       const parent = u32();
       const before = u32();
-      const source = elements.get(u32());
+      const source = lookup(u32());
       if (source) {
         const el = source.cloneNode(true);
-        let n = id;
         // a template the serializer stamped carries its number as an
         // attribute, and so does every element under it; the copy must
-        // not wear them — one question at the root, not one per node
-        const stamped = source.hasAttribute("data-n");
-        const number = (node) => {
-          node.__n = n;
-          if (stamped) node.removeAttribute("data-n");
-          elements.set(n, node);
-          n++;
-          for (const child of node.children) number(child);
-        };
-        number(el);
+        // not wear them — such a copy is numbered node by node, the old
+        // way. Any other copy registers its ROOT alone: the members are
+        // found by their offset when an op asks for one
+        if (source.hasAttribute("data-n")) {
+          let n = id;
+          const number = (node) => {
+            node.__n = n;
+            node.removeAttribute("data-n");
+            elements.set(n, node);
+            n++;
+            for (const child of node.children) number(child);
+          };
+          number(el);
+        } else {
+          const templateId = source.__n;
+          const trails = trailsOf(templateId, source);
+          el.__n = id;
+          elements.set(id, el);
+          cloneRoots.push([id, trails.length, templateId]);
+        }
         place(el, parent, before);
       }
     } else if (op === 19) {
       // the action path alone
-      const el = elements.get(id);
+      const el = lookup(id);
       const path = text(u16());
       if (el) {
+        // the attribute written as one: the dataset door converts the
+        // name and costs three times the write, two thousand times a page
         if (path) {
-          el.dataset.path = path;
+          el.setAttribute("data-path", path);
         } else {
-          delete el.dataset.path;
+          el.removeAttribute("data-path");
         }
       }
     } else if (op === 20) {
       // the words alone: the font and the ink already stand
-      const el = elements.get(id);
+      const el = lookup(id);
       const raw = bytes(u32());
       if (el) setWords(el, decoder.decode(raw));
     } else if (op === 2) {
-      const el = elements.get(id);
+      const el = lookup(id);
       if (el) {
         unregister(el);
         el.remove();
       }
       elements.delete(id);
+      forgetClone(id);
     } else if (op === 18) {
       // the element empties: every child leaves in one call, and the
       // ids that leave come as ranges — a thousand rows mounted
       // together are one — so the registry forgets them by counting,
       // never by walking the subtree
-      const el = elements.get(id);
+      const el = lookup(id);
       const ranges = u16();
       const spans = [];
       let leaving = 0;
@@ -863,6 +944,13 @@ function applyPatches(view, length) {
         const end = u32();
         spans.push(start, end);
         leaving += end - start;
+        // the clone roots in the range leave the table: from the first
+        // at or after the start, while before the end
+        let at = cloneAt(start);
+        if (at < 0 || cloneRoots[at][0] < start) at++;
+        let gone = at;
+        while (gone < cloneRoots.length && cloneRoots[gone][0] < end) gone++;
+        if (gone > at) cloneRoots.splice(at, gone - at);
       }
       if (leaving * 2 > elements.size) {
         // most of the registry leaves: keep the survivors in one pass
@@ -888,7 +976,7 @@ function applyPatches(view, length) {
       }
       if (el) el.replaceChildren();
     } else if (op === 3) {
-      const el = elements.get(id);
+      const el = lookup(id);
       const x = f32();
       const y = f32();
       if (el) {
@@ -899,7 +987,7 @@ function applyPatches(view, length) {
         el.style.transform = `translate(${x}px, ${y}px)`;
       }
     } else if (op === 4) {
-      const el = elements.get(id);
+      const el = lookup(id);
       const width = f32();
       const height = f32();
       if (el) {
@@ -917,7 +1005,7 @@ function applyPatches(view, length) {
       }
     } else if (op === 6) {
       // the words and their spans: the face is the look's
-      const el = elements.get(id);
+      const el = lookup(id);
       const raw = bytes(u32());
       const spanCount = u16();
       const spans = [];
@@ -952,7 +1040,7 @@ function applyPatches(view, length) {
         emit(cursor, raw.length, false);
       }
     } else if (op === 7) {
-      const el = elements.get(id);
+      const el = lookup(id);
       const color = rgba(u32());
       const size = f32();
       const weight = CSS_WEIGHTS[u8()];
@@ -972,7 +1060,7 @@ function applyPatches(view, length) {
         if (el.value !== content) el.value = content;
       }
     } else if (op === 8) {
-      const el = elements.get(id);
+      const el = lookup(id);
       const x = f32();
       const y = f32();
       if (el) {
@@ -983,7 +1071,7 @@ function applyPatches(view, length) {
       const hi = u32();
       const lo = u32();
       const cover = u8();
-      const el = elements.get(id);
+      const el = lookup(id);
       const entry = images.get(imageKey(hi, lo));
       if (el && entry) {
         el.src = entry.url;
@@ -997,7 +1085,7 @@ function applyPatches(view, length) {
       const color = rgba(u32());
       const inheritsInk = u8();
       const count = u8();
-      const el = elements.get(id);
+      const el = lookup(id);
       if (el) {
         // an inherited ink takes NO inline color — the box above owns
         // both states, the same law the text keeps
@@ -1030,7 +1118,7 @@ function applyPatches(view, length) {
       // the element wears a look: its class, after the page's own
       const hi = u32();
       const lo = u32();
-      const el = elements.get(id);
+      const el = lookup(id);
       if (el) {
         learn(el);
         el.__look = lookName(hi, lo);
@@ -1040,7 +1128,7 @@ function applyPatches(view, length) {
       // the box the element owns — pinned sizes, ceilings, a virtual
       // row's slot — the record's semantics: what the mask does not
       // carry, the element does not keep; a bare element keeps nothing
-      const el = elements.get(id);
+      const el = lookup(id);
       const mask = u8();
       const width = mask & 1 ? f32() : null;
       const height = mask & 2 ? f32() : null;
@@ -1073,7 +1161,7 @@ function applyPatches(view, length) {
       }
     } else if (op === 24) {
       // the element's marks: the tooltip it shows, the group it owns
-      const el = elements.get(id);
+      const el = lookup(id);
       const mask = u8();
       const tip = mask & 1 ? text(u16()) : null;
       const owner = mask & 2 ? u64text(u32(), u32()) : null;
@@ -1085,19 +1173,19 @@ function applyPatches(view, length) {
       }
     } else if (op === 12) {
       // one insertBefore, identity intact (0 = to the end)
-      const el = elements.get(id);
-      const parent = elements.get(u32());
+      const el = lookup(id);
+      const parent = lookup(u32());
       const before = u32();
-      if (el && parent) parent.insertBefore(el, before ? (elements.get(before) ?? null) : null);
+      if (el && parent) parent.insertBefore(el, before ? (lookup(before) ?? null) : null);
     } else if (op === 13) {
       // the browser computes the offset — dense lists only
-      const target = elements.get(u32());
+      const target = lookup(u32());
       if (target) target.scrollIntoView({ block: "nearest" });
     } else if (op === 15) {
       // live hints: class and id re-attribute in place
       const cls = text(u8());
       const domId = text(u8());
-      const el = elements.get(id);
+      const el = lookup(id);
       if (el) {
         learn(el);
         el.__cls = cls;
@@ -1117,7 +1205,7 @@ function applyPatches(view, length) {
       // set before the document lands, because it is read at the load
       const sealed = u8() === 1;
       const src = text(u32());
-      const el = elements.get(id);
+      const el = lookup(id);
       if (el) {
         if (sealed) {
           el.setAttribute("sandbox", "");
@@ -1135,7 +1223,7 @@ function applyPatches(view, length) {
       const anchor = u32();
       const side = u8();
       const path = text(u16());
-      const el = elements.get(id);
+      const el = lookup(id);
       if (el) {
         el.dataset.popover = path;
         el.dataset.anchor = anchor;
@@ -1156,7 +1244,7 @@ function applyPatches(view, length) {
 const POPOVER_GAP = 6;
 
 function placePopover(el) {
-  const anchorEl = elements.get(Number(el.dataset.anchor));
+  const anchorEl = lookup(Number(el.dataset.anchor));
   if (!anchorEl || !anchorEl.isConnected) {
     // the anchor left (a filter, a window slide): the popover follows
     sendAction(`${el.dataset.popover}/#dismiss`, 1);
@@ -1337,7 +1425,7 @@ const imports = {
     // straight onto its element at the rect's place — the first frame
     // and a resize bring the whole box
     js_island_rect(id, pointer, width, height, x, y, dirtyWidth, dirtyHeight) {
-      const el = elements.get(id);
+      const el = lookup(id);
       if (!el || el.tagName !== "CANVAS") return;
       if (el.width !== width) el.width = width;
       if (el.height !== height) el.height = height;
@@ -1454,7 +1542,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     wasm = instance.exports;
     if (typeof gpuAttach === "function") gpuAttach(wasm);
     window.__bunny = wasm;
-    window.__bunnyDebug = { elements, looks };
+    window.__bunnyDebug = { elements, looks, cloneRoots };
     // probe builds: the hit table of the last layout, for a runner
     // that clicks what a page without elements cannot select
     if (wasm.bunny_hits_json && wasm.bunny_probe_ptr) {
