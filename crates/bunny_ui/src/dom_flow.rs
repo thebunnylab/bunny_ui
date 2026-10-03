@@ -343,6 +343,15 @@ fn node(kind: DomKind) -> DomNode {
     }
 }
 
+/// Puts a flow node in its parent's list and hands it back there, to be
+/// filled where it stays: built aside and pushed when done, each node of
+/// a row (three hundred bytes, which the retention keeps) was written
+/// twice.
+fn placed(out: &mut Vec<DomNode>, node: DomNode) -> &mut DomNode {
+    out.push(node);
+    out.last_mut().expect("just pushed")
+}
+
 /// The promise of a kept boundary: the group's own shell as its record
 /// says it lowered — its stretch, its class and the binding the class
 /// reads through — and nothing of the parent's yet. Made where it is
@@ -526,7 +535,7 @@ impl Walk<'_> {
                     Axis::Vertical => DomKind::FlexColumn,
                     Axis::Horizontal => DomKind::FlexRow,
                 };
-                let mut container = node(kind);
+                let container = placed(out, node(kind));
                 container.children.reserve_exact(children.len());
                 // a container can be the pressed thing too (a bare
                 // stack hinted into an anchor): the pending action
@@ -566,15 +575,14 @@ impl Walk<'_> {
                         }
                     }
                 }
-                Self::inherit_stretch(&mut container);
-                Self::fold_table_wrapper(&mut container);
-                out.push(container);
+                Self::inherit_stretch(container);
+                Self::fold_table_wrapper(container);
             }
             // a row that wraps is the browser's own: a flex row that
             // wraps its items, with the gaps in both directions — the
             // lines break where the items' own widths say, as here
             LayoutNode::Flow { spacing, line_spacing, align, children } => {
-                let mut container = node(DomKind::FlexRow);
+                let container = placed(out, node(DomKind::FlexRow));
                 container.style.interactive = self.pending_interactive.take();
                 container.style.set_tooltip(self.pending_tooltip.take());
                 container.style.set_transition(self.pending_transition.take());
@@ -587,27 +595,24 @@ impl Walk<'_> {
                 for child in children {
                     self.lower_into(child, &mut container.children);
                 }
-                out.push(container);
             }
             // In flow mode there is no native child view to cross and
             // no second surface to present on: the sheet is a layer over
             // the page, which is what it looks like anyway.
             LayoutNode::Sheet { content, child, .. } => {
-                let mut container = node(DomKind::Layers);
+                let container = placed(out, node(DomKind::Layers));
                 container.layout.as_mut().expect("flow node").align =
                     Some(align_code(crate::layout::CrossAlign::Center));
                 self.lower_into(child, &mut container.children);
                 self.lower_into(content, &mut container.children);
-                out.push(container);
             }
             LayoutNode::Layered { align, children, .. } => {
-                let mut container = node(DomKind::Layers);
+                let container = placed(out, node(DomKind::Layers));
                 container.layout.as_mut().expect("flow node").align =
                     Some(align_code(*align));
                 for child in children {
                     self.lower_into(child, &mut container.children);
                 }
-                out.push(container);
             }
             LayoutNode::Padding { edges, child } => {
                 let Edges { top, leading, bottom, trailing } = *edges;
@@ -637,18 +642,17 @@ impl Walk<'_> {
                     out.append(&mut lowered);
                     return;
                 }
-                let mut container = node(DomKind::FlexColumn);
+                let container = placed(out, node(DomKind::FlexColumn));
                 container.layout.as_mut().expect("flow node").padding =
                     Some((top as f32, trailing as f32, bottom as f32, leading as f32));
                 container.children = lowered;
                 Self::stamp_fill(child, &mut container.children);
-                Self::inherit_stretch(&mut container);
-                out.push(container);
+                Self::inherit_stretch(container);
             }
             LayoutNode::Frame { width, height, align, child } => {
                 let outer_slot = self.slot;
                 self.slot = (*width, *height);
-                let mut container = node(DomKind::FlexColumn);
+                let container = placed(out, node(DomKind::FlexColumn));
                 {
                     let layout = container.layout.as_mut().expect("flow node");
                     layout.width = width.map(|width| width as f32);
@@ -662,9 +666,8 @@ impl Walk<'_> {
                 self.lower_into(child, &mut container.children);
                 self.slot = outer_slot;
                 Self::stamp_fill(child, &mut container.children);
-                Self::inherit_stretch(&mut container);
-                Self::fold_table_wrapper(&mut container);
-                out.push(container);
+                Self::inherit_stretch(container);
+                Self::fold_table_wrapper(container);
             }
             // A hug is a native flow rule on the web: a box that is not told
             // to grow already takes what its content needs, and the cap that
@@ -673,7 +676,7 @@ impl Walk<'_> {
             LayoutNode::Hug { child, .. } => self.lower_into(child, out),
 
             LayoutNode::MaxFrame { max_width, max_height, align, child } => {
-                let mut container = node(DomKind::FlexColumn);
+                let container = placed(out, node(DomKind::FlexColumn));
                 {
                     let layout = container.layout.as_mut().expect("flow node");
                     if max_width.is_finite() {
@@ -688,16 +691,15 @@ impl Walk<'_> {
                 }
                 self.lower_into(child, &mut container.children);
                 Self::stamp_fill(child, &mut container.children);
-                Self::inherit_stretch(&mut container);
-                Self::fold_table_wrapper(&mut container);
-                out.push(container);
+                Self::inherit_stretch(container);
+                Self::fold_table_wrapper(container);
             }
             // The flex frame on the web flow: a growing box. Its FLOOR is not
             // honoured here yet — the flow layout carries no minimum, so a
             // pane narrower than a table's floors squeezes the lanes on the
             // web where the desktop scrolls them. Recorded, not hidden.
             LayoutNode::FlexFrame { align, child, .. } => {
-                let mut container = node(DomKind::FlexColumn);
+                let container = placed(out, node(DomKind::FlexColumn));
                 {
                     let layout = container.layout.as_mut().expect("flow node");
                     layout.grow = true;
@@ -705,27 +707,23 @@ impl Walk<'_> {
                 }
                 self.lower_into(child, &mut container.children);
                 Self::stamp_fill(child, &mut container.children);
-                Self::inherit_stretch(&mut container);
-                Self::fold_table_wrapper(&mut container);
-                out.push(container);
+                Self::inherit_stretch(container);
+                Self::fold_table_wrapper(container);
             }
             LayoutNode::Spacer => {
-                let mut spacer = node(DomKind::Box);
+                let spacer = placed(out, node(DomKind::Box));
                 spacer.layout.as_mut().expect("flow node").grow = true;
-                out.push(spacer);
             }
             LayoutNode::Fill => {
-                let mut fill = node(DomKind::Box);
+                let fill = placed(out, node(DomKind::Box));
                 fill.layout.as_mut().expect("flow node").grow = true;
                 fill.style.look_mut().background = Some(Color::FILL);
-                out.push(fill);
             }
             LayoutNode::Leaf { size } => {
-                let mut leaf = node(DomKind::Box);
+                let leaf = placed(out, node(DomKind::Box));
                 let layout = leaf.layout.as_mut().expect("flow node");
                 layout.width = Some(size.width as f32);
                 layout.height = Some(size.height as f32);
-                out.push(leaf);
             }
             LayoutNode::Styled { props, child, .. } => {
                 let outer_font = self.font;
@@ -762,7 +760,7 @@ impl Walk<'_> {
                     self.text_align = outer_text_align;
                     return;
                 }
-                let mut boxed = node(DomKind::Box);
+                let boxed = placed(out, node(DomKind::Box));
                 let interactive = self.pending_interactive.take();
                 let mut look = DomLook {
                     // a layer that asks for nothing lets the click
@@ -817,15 +815,14 @@ impl Walk<'_> {
                 self.line_height = outer_line_height;
                 self.text_align = outer_text_align;
                 Self::stamp_fill(child, &mut boxed.children);
-                Self::inherit_stretch(&mut boxed);
-                out.push(boxed);
+                Self::inherit_stretch(boxed);
             }
             LayoutNode::Text { content, highlights, truncation, .. } => {
                 // a text that reads for itself carries its binding into
                 // the scene: the lowering patches it by key when a write
                 // reaches it, and no walk comes this way for that
                 let binding = content.bound().cloned();
-                let mut text = node(DomKind::Text(DomText {
+                let text = placed(out, node(DomKind::Text(DomText {
                     content: content.get(),
                     color: self.current_ink(),
                     inherits_ink: !self.ink_scopes.is_empty(),
@@ -837,11 +834,10 @@ impl Walk<'_> {
                         .map(|h| (std::rc::Rc::clone(&h.ranges), h.color)),
                     truncation: *truncation,
                     inherits_face: self.font == self.declared,
-                }));
+                })));
                 text.style.interactive = self.pending_interactive.take();
                 text.style.set_tooltip(self.pending_tooltip.take());
                 text.binding = binding.map(crate::dom::NodeBinding::Text);
-                out.push(text);
             }
             LayoutNode::Field {
                 path,
@@ -859,7 +855,7 @@ impl Walk<'_> {
             } => {
                 self.fields.push((path.clone(), *auto_focus));
                 let theme = crate::theme::current();
-                let mut field = node(DomKind::Field(Box::new(crate::dom::DomField {
+                let field = placed(out, node(DomKind::Field(Box::new(crate::dom::DomField {
                     path: path.clone(),
                     content: content.clone(),
                     placeholder: placeholder.clone(),
@@ -867,7 +863,7 @@ impl Walk<'_> {
                     font: self.font,
                     color: self.current_ink(),
                     multiline: *multiline,
-                })));
+                }))));
                 field.style = DomStyle::of_look(DomLook {
                     background: (!*bare).then_some(theme.field),
                     border: (!*bare).then_some((theme.field_border, 1.0)),
@@ -877,7 +873,6 @@ impl Walk<'_> {
                     placeholder_color: Some(theme.placeholder),
                     ..DomLook::default()
                 });
-                out.push(field);
             }
             // a feed has no bytes an `<img>` could name: it is painted,
             // as an island, by the road that scales it on the GPU
@@ -928,11 +923,11 @@ impl Walk<'_> {
                         .copied()
                         .unwrap_or_default()
                 });
-                let mut scroll = node(DomKind::Scroll {
+                let scroll = placed(out, node(DomKind::Scroll {
                     path: path.clone(),
                     offset: (offset.x, offset.y),
                     target: target.clone(),
-                });
+                }));
                 {
                     let layout = scroll.layout.as_mut().expect("flow node");
                     // the leftover length is the scroller's, and the
@@ -955,7 +950,6 @@ impl Walk<'_> {
                         scroll.children.push(content);
                     }
                 }
-                out.push(scroll);
             }
             LayoutNode::VirtualStack { row_extent, count, children, heights, measured } => {
                 // the ONE number the browser cannot give: each row's
@@ -988,7 +982,7 @@ impl Walk<'_> {
                     }
                 };
                 let total = start_of(*count);
-                let mut content = node(DomKind::Content);
+                let content = placed(out, node(DomKind::Content));
                 content.layout.as_mut().expect("flow node").height = Some(total as f32);
                 for (index, child) in children {
                     let opened = content.children.len();
@@ -999,14 +993,13 @@ impl Walk<'_> {
                         }
                     }
                 }
-                out.push(content);
             }
             LayoutNode::Split { axis, at, children, .. } => {
                 let kind = match axis {
                     Axis::Horizontal => DomKind::FlexRow,
                     Axis::Vertical => DomKind::FlexColumn,
                 };
-                let mut container = node(kind);
+                let container = placed(out, node(kind));
                 if let [a, b] = children.as_slice() {
                     let opened = container.children.len();
                     self.lower_into(a, &mut container.children);
@@ -1026,7 +1019,6 @@ impl Walk<'_> {
                         }
                     }
                 }
-                out.push(container);
             }
             // In this mode the BROWSER lays out, so there is no
             // resolved size here to hand back: the probe lowers as its
@@ -1128,7 +1120,7 @@ impl Walk<'_> {
             LayoutNode::Overlay { behind, layer, child, .. } => {
                 // one grid cell, both in it — the browser stacks them
                 // in document order
-                let mut cell = node(DomKind::Layers);
+                let cell = placed(out, node(DomKind::Layers));
                 self.overlay_depth += 1;
                 let mut over = Vec::new();
                 self.lower_into(layer, &mut over);
@@ -1142,7 +1134,6 @@ impl Walk<'_> {
                     cell.children.extend(under);
                     cell.children.extend(over);
                 }
-                out.push(cell);
             }
             LayoutNode::Live { child, .. } => {
                 // the clock belongs to the pixel modes; here the
@@ -1172,14 +1163,13 @@ impl Walk<'_> {
                 // sibling so it covers what it rings
                 if ringed {
                     let accent = crate::theme::current().accent;
-                    let mut ring = node(DomKind::Box);
+                    let ring = placed(out, node(DomKind::Box));
                     ring.style = DomStyle::of_look(DomLook {
                         border: Some((accent, 2.0)),
                         corner_radius: Some(crate::layout::Corners::all(6.0)),
                         pass_through: true,
                         ..DomLook::default()
                     });
-                    out.push(ring);
                 }
             }
             LayoutNode::DragRegion { child } => {
@@ -1224,7 +1214,7 @@ impl Walk<'_> {
             // and the island contract is the one the DOM already
             // enforces
             LayoutNode::Host { spec, .. } => {
-                let mut frame = node(match spec {
+                let frame = placed(out, node(match spec {
                     // a document rides SEALED: the browser's sandbox
                     // with no powers holds it as `srcdoc`, its policy at
                     // its head — never the url, which the policy forbade
@@ -1246,23 +1236,21 @@ impl Walk<'_> {
                             radius: *corner_radius as f32,
                         }
                     }
-                });
+                }));
                 let layout = frame.layout.as_mut().expect("flow node");
                 // a host is a filler on both axes by construction — it
                 // grows along the stack and stretches across it; a
                 // `.frame(…)` above pins it like anything else
                 layout.grow = true;
                 layout.stretch = true;
-                out.push(frame);
             }
             LayoutNode::Anchored { path, side, overlay, child } => {
                 // the anchor gets an IDENTITY the glue can find: a
                 // group wrapped around the child, keyed off the
                 // popover's own path
                 let anchor_path = format!("{path}/#anchor");
-                let mut anchor = node(DomKind::Group { path: std::rc::Rc::from(anchor_path.as_str()) });
+                let anchor = placed(out, node(DomKind::Group { path: std::rc::Rc::from(anchor_path.as_str()) }));
                 self.lower_into(child, &mut anchor.children);
-                out.push(anchor);
 
                 let side = match side {
                     crate::layout::Side::Top => 0u8,
@@ -1355,7 +1343,7 @@ impl Walk<'_> {
     /// record of what it was lowered in filed for the next walk.
     fn lower_group(&mut self, path: &std::rc::Rc<str>, children: &[LayoutNode], out: &mut Vec<DomNode>) {
         let env = self.filed_env();
-        let mut group = node(DomKind::Group { path: std::rc::Rc::clone(path) });
+        let group = placed(out, node(DomKind::Group { path: std::rc::Rc::clone(path) }));
         // room for the nodes, and only for them: what the body says about
         // its own element lowers to none, and the vector is the one the
         // retention keeps — a slot too many was a node's worth of memory
@@ -1389,7 +1377,7 @@ impl Walk<'_> {
             }
         }
         self.runs_below = outer_runs;
-        Self::inherit_stretch(&mut group);
+        Self::inherit_stretch(group);
         let own_stretch = group.layout.as_ref().is_some_and(|layout| layout.stretch);
         let mut class_binding = None;
         if let Some((class, binding)) = self.pending_boundary_class.take() {
@@ -1412,7 +1400,6 @@ impl Walk<'_> {
                 drops: self.drops_seen - drops_before,
             },
         ));
-        out.push(group);
     }
 
     /// The engine PROPOSES a wrapper's box to its interior; a block
@@ -1719,6 +1706,67 @@ mod tests {
         assert!(std::rc::Rc::ptr_eq(env("a"), env("b")) && std::rc::Rc::ptr_eq(env("b"), env("c")), "one record");
         assert!(!std::rc::Rc::ptr_eq(env("c"), env("d")), "the pressed group's environment is its own");
         assert_ne!(**env("c"), **env("d"));
+    }
+
+    /// Every node the walk makes is filled in its parent's list, where it
+    /// stays — and what an arm says once its children are lowered reaches
+    /// the node there: a column around a lone table on the leading edge
+    /// is a block (a stack, a frame and a max frame alike), and a box
+    /// around a child that stretches stretches too (a group, a padding, a
+    /// frame and a style alike).
+    #[test]
+    fn a_node_is_filled_where_it_stays() {
+        let table = || LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children: vec![text_node("cell")],
+            hints: crate::layout::ElementHints { tag: Some("table".into()), ..Default::default() },
+            action: None,
+        };
+        let column = |children: Vec<LayoutNode>| LayoutNode::Stack {
+            axis: Axis::Vertical,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children,
+            hints: Default::default(),
+            action: None,
+        };
+        let scroll = || LayoutNode::Scroll {
+            path: None,
+            target: None,
+            axes: crate::layout::ScrollAxes::Vertical,
+            commanded: None,
+            fill: false,
+            child: Box::new(text_node("long")),
+        };
+        let paper = crate::layout::VisualProps { background: Some(Color::BLACK), ..Default::default() };
+        let tree = column(vec![
+            column(vec![table()]),
+            LayoutNode::Frame { width: None, height: None, align: CrossAlign::Start, child: Box::new(table()) },
+            LayoutNode::MaxFrame {
+                max_width: f64::INFINITY,
+                max_height: f64::INFINITY,
+                align: CrossAlign::Start,
+                child: Box::new(table()),
+            },
+            LayoutNode::Boundary { path: "g".into(), children: vec![scroll()], quiet: Default::default() },
+            LayoutNode::Padding { edges: Edges::uniform(4.0), child: Box::new(scroll()) },
+            LayoutNode::Frame { width: Some(10.0), height: None, align: CrossAlign::Start, child: Box::new(scroll()) },
+            LayoutNode::Styled { props: paper.shared(), child: Box::new(scroll()), hints: Default::default(), action: None },
+        ]);
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let lowered = &scene.children[0].children;
+        assert_eq!(lowered.len(), 7, "{lowered:#?}");
+        for (at, node) in lowered.iter().enumerate() {
+            let layout = node.layout.as_ref().expect("a flow node");
+            if at < 3 {
+                assert!(layout.plain, "a block around the lone table: {node:#?}");
+            } else {
+                assert!(layout.stretch, "it stretches with its child: {node:#?}");
+            }
+        }
     }
 
     /// The inline tags are the twenty they were — and the tags of a
