@@ -1868,6 +1868,11 @@ pub(crate) fn end_pass() {
 /// Every body that ran since the last drain — a FRAME may settle over
 /// several passes, and the reuse decision needs all of them. The Dom
 /// frame drains this once per event.
+/// Diagnostics: how many boundaries the reconciler retains.
+pub(crate) fn retained_len() -> usize {
+    RETAINED.with(|retained| retained.borrow().len())
+}
+
 pub(crate) fn take_frame_runs() -> Vec<String> {
     FRAME_BODY_RUNS.with(|frame| std::mem::take(&mut *frame.borrow_mut()))
 }

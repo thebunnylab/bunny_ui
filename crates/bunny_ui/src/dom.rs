@@ -1270,6 +1270,36 @@ impl DomLowering {
         !self.graveyard.is_empty()
     }
 
+    /// Diagnostics: retained nodes, bound elements, group records,
+    /// template members, subtrees in the graveyard.
+    pub(crate) fn retained_len(&self) -> usize {
+        fn count(retained: &Retained) -> usize {
+            1 + retained.children.iter().map(count).sum::<usize>()
+        }
+        self.root.as_ref().map_or(0, count)
+    }
+
+    pub(crate) fn bindings_len(&self) -> usize {
+        self.bindings.len()
+    }
+
+    pub(crate) fn groups_len(&self) -> usize {
+        self.group_paths.len()
+    }
+
+    pub(crate) fn template_members_len(&self) -> usize {
+        self.templates.members.len()
+    }
+
+    pub(crate) fn graveyard_len(&self) -> usize {
+        self.graveyard.iter().map(|retained| {
+            fn count(retained: &Retained) -> usize {
+                1 + retained.children.iter().map(count).sum::<usize>()
+            }
+            count(retained)
+        }).sum()
+    }
+
     /// The retained Groups' records — the flow walk consults them
     /// before promising a reuse. Borrowed, never copied: a frame asks
     /// for a thousand rows' worth of them.

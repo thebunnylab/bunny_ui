@@ -32,15 +32,19 @@ struct Counting;
 
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Bytes allocated and not yet freed — what a leak shows up in.
+static LIVE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
         BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
         unsafe { System.dealloc(pointer, layout) }
     }
 }
@@ -50,6 +54,30 @@ static GLOBAL: Counting = Counting;
 
 fn allocations() -> (usize, usize) {
     (ALLOCS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed))
+}
+
+fn live_kib() -> isize {
+    LIVE.load(Ordering::Relaxed) / 1024
+}
+
+/// `--cycles N`: one runtime, N rounds of create 1k → clear → collect,
+/// with the live bytes and the engine's retained counts after each step
+/// — the probe for a leak, where the official memory benchmark only
+/// shows the total.
+fn cycles(rounds: usize) {
+    let (runtime, app) = fresh();
+    println!("cycle step             live KiB  retained");
+    let report = |step: &str| println!("{:<22} {:>8}  {}", step, live_kib(), runtime.retained_counts());
+    report("ready");
+    for round in 1..=rounds {
+        create(&app, &runtime, 1_000);
+        report(&format!("{round}: after create"));
+        app.rows.set(Rc::new(Vec::new()));
+        let _ = runtime.dom_frame(&app, SIZE);
+        report(&format!("{round}: after clear"));
+        runtime.collect_garbage();
+        report(&format!("{round}: after collect"));
+    }
 }
 
 // MARK: - The scene
@@ -202,6 +230,14 @@ fn main() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(5);
     stats::set_clock(Some(now_ms));
+    if let Some(rounds) = std::env::args()
+        .skip_while(|arg| arg != "--cycles")
+        .nth(1)
+        .and_then(|value| value.parse().ok())
+    {
+        cycles(rounds);
+        return;
+    }
 
     println!(
         "{:<12} {:>6} {:>6} {:>7} {:>6} {:>7} {:>7} {:>7} | {:>7} {:>7} {:>7} {:>7} {:>8}",

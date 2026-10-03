@@ -4869,6 +4869,33 @@ impl Runtime {
         }
     }
 
+    /// Diagnostics: the sizes of what the engine retains — the
+    /// reconciler's boundaries, the live bindings, the element
+    /// lowering's retained nodes, bindings, groups and template members,
+    /// the subtrees waiting to be freed, and the identity register's
+    /// tables. One line, for a probe that watches a leak.
+    pub fn retained_counts(&self) -> String {
+        let dom = self.dom.borrow();
+        let identity = motor::identity::registry_counts();
+        format!(
+            "boundaries {} · bindings live {} · dom nodes {} · dom bindings {} · groups {} · template members {} · graveyard {} · identity owners {} reads {} readers {} view-bindings {} binding-reads {} dirty {} dirty-bindings {}",
+            reconciler::retained_len(),
+            crate::bind::live_count(),
+            dom.retained_len(),
+            dom.bindings_len(),
+            dom.groups_len(),
+            dom.template_members_len(),
+            dom.graveyard_len(),
+            identity[0],
+            identity[1],
+            identity[2],
+            identity[3],
+            identity[4],
+            identity[5],
+            identity[6],
+        )
+    }
+
     /// Dom mode: frees what the frames since the last call removed. The
     /// shell calls this off the frame — on an idle callback — so a
     /// clear of a thousand rows pays its freeing when nobody is waiting.

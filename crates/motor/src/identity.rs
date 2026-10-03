@@ -397,6 +397,24 @@ pub fn parent_seed() -> PathSeed {
 /// The cursor's full path right now (`None` outside a pass) — the key
 /// interactive nodes register their actions under. One clone of the
 /// incrementally maintained path: no join walk, ever.
+/// Diagnostics: the sizes of the register's tables — owners, views
+/// with reads, dependencies with readers, views with bindings, bindings
+/// with reads, dirty views, dirty bindings.
+pub fn registry_counts() -> [usize; 7] {
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        [
+            registry.owners.len(),
+            registry.reads_by_view.len(),
+            registry.readers.len(),
+            registry.view_bindings.len(),
+            registry.binding_reads.len(),
+            registry.dirty.len(),
+            registry.dirty_bindings.len(),
+        ]
+    })
+}
+
 pub fn cursor_scope() -> Option<String> {
     REGISTRY.with(|registry| {
         let registry = registry.borrow();

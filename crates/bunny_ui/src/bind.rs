@@ -168,6 +168,11 @@ pub(crate) fn has_dirty() -> bool {
 /// stands, with a suffix for what it is, the way a measure probe or a
 /// hover key is named. `None` outside a pass — a decorative render has
 /// no identity to hang a binding on.
+/// Diagnostics: how many bindings are registered as live.
+pub(crate) fn live_count() -> usize {
+    LIVE.with(|live| live.borrow().len())
+}
+
 pub(crate) fn key_at_cursor(suffix: &str) -> Option<Rc<str>> {
     motor::identity::cursor_key(suffix)
 }
