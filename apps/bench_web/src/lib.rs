@@ -199,12 +199,10 @@ pub mod keyed {
                 // by the element — no body hears about it
                 boundary_class_when(seed.selected, "danger"),
                 text(id.to_string())
-                    .foreground_color(theme::fg())
                     .element("td")
                     .css_class("col-md-1"),
                 hstack!(
                     text!(seed.label)
-                        .foreground_color(theme::fg())
                         .element("a")
                         .on_click(move || {
                             // the two rows that change are the only
