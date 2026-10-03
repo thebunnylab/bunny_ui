@@ -184,6 +184,16 @@ impl FramePacer {
         Beat::Quiet
     }
 
+    /// A discrete event — a release, a press, a key — ended the gesture:
+    /// the warm period closes now. The quiet beats exist for a STREAM
+    /// with gaps (a trackpad's pauses, a wheel's notches), where the
+    /// next event is coming and must not be drawn cold; after a click
+    /// nothing is coming, and three beats with nothing to draw would be
+    /// three empty frames the display still has to commit.
+    pub fn rest(&self) {
+        self.quiet.set(Self::QUIET_BEATS);
+    }
+
     /// Is a warm period open? While it is, the shell keeps the display
     /// beat running for this window.
     pub fn warm(&self) -> bool {
@@ -237,6 +247,21 @@ mod tests {
         assert_eq!(asked.first, WHEEL, "the tape still says who asked first");
         assert_eq!(asked.all, (1 << WHEEL) | (1 << WAKE), "and everyone who did");
         assert_eq!(pacer.beat(false), Beat::Quiet, "nothing is left");
+    }
+
+    #[test]
+    fn a_rest_ends_the_warm_period_at_once() {
+        let pacer = FramePacer::new();
+        assert_eq!(pacer.ask(WHEEL, Urgency::Soon, false), Verdict::Draw);
+        pacer.drew();
+        assert!(pacer.warm(), "a drawn beat opens a warm period");
+        pacer.rest();
+        assert!(!pacer.warm(), "the click's release closes it: no empty beats follow");
+        // an ask that still waits keeps its beat, rest or not
+        pacer.set_beating(true);
+        assert_eq!(pacer.ask(WHEEL, Urgency::Soon, false), Verdict::Wait);
+        pacer.rest();
+        assert!(pacer.warm(), "what waits is still owed its frame");
     }
 
     #[test]
