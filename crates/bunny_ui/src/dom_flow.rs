@@ -378,10 +378,24 @@ impl Walk<'_> {
     }
 
     /// Lowers one semantic node into `out` — most nodes append exactly
-    /// one flow node; wrappers pass through and arm the next box.
+    /// one flow node; wrappers pass through and arm the next box. The
+    /// hints a stack, a text or a style carries itself are stamped on
+    /// what it lowered to, as the wrapper they replace stamped them.
     fn lower_into(&mut self, tree: &LayoutNode, out: &mut Vec<DomNode>) {
+        match tree.carried_hints() {
+            Some(hints) if !hints.is_empty() => {
+                let opened = out.len();
+                self.lower_node(tree, out);
+                Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &hints.dom_id);
+            }
+            _ => self.lower_node(tree, out),
+        }
+    }
+
+    /// The node itself, its own hints aside.
+    fn lower_node(&mut self, tree: &LayoutNode, out: &mut Vec<DomNode>) {
         match tree {
-            LayoutNode::Stack { axis, spacing, align, children } => {
+            LayoutNode::Stack { axis, spacing, align, children, .. } => {
                 let kind = match axis {
                     Axis::Vertical => DomKind::FlexColumn,
                     Axis::Horizontal => DomKind::FlexRow,
@@ -587,7 +601,7 @@ impl Walk<'_> {
                 layout.height = Some(size.height as f32);
                 out.push(leaf);
             }
-            LayoutNode::Styled { props, child } => {
+            LayoutNode::Styled { props, child, .. } => {
                 let outer_font = self.font;
                 let outer_line_height = self.line_height;
                 let outer_text_align = self.text_align;
@@ -604,7 +618,10 @@ impl Walk<'_> {
                 // that would have carried nothing is not made. A state
                 // the ink answers to, an ink inside a hover scope, a
                 // layer, a transition — those keep their box
+                // (a text that wears hints stood behind their wrapper, and
+                // a style over a wrapper keeps its box)
                 if matches!(**child, LayoutNode::Text { .. })
+                    && child.is_bare()
                     && !states
                     && !inheriting
                     && self.overlay_depth == 0
@@ -677,7 +694,7 @@ impl Walk<'_> {
                 Self::inherit_stretch(&mut boxed);
                 out.push(boxed);
             }
-            LayoutNode::Text { content, highlights, truncation } => {
+            LayoutNode::Text { content, highlights, truncation, .. } => {
                 // a text that reads for itself carries its binding into
                 // the scene: the lowering patches it by key when a write
                 // reaches it, and no walk comes this way for that
@@ -1519,6 +1536,7 @@ mod tests {
             content: crate::bind::TextSource::from(content),
             highlights: None,
             truncation: None,
+            hints: Default::default(),
         }
     }
 
@@ -1586,6 +1604,7 @@ mod tests {
                     },
                 },
             ],
+            hints: Default::default(),
         };
         let offsets = HashMap::default();
         let scene = lower(&tree, &env_fixture(&offsets)).scene;
@@ -1675,6 +1694,7 @@ mod tests {
             spacing: 8.0,
             align: CrossAlign::Start,
             children: vec![text_node("head"), LayoutNode::Spacer, text_node("foot")],
+            hints: Default::default(),
         };
         let offsets = HashMap::default();
         let scene = lower(&tree, &env_fixture(&offsets)).scene;
@@ -1711,6 +1731,7 @@ mod tests {
                     child: Box::new(text_node("b")),
                 },
             ],
+            hints: Default::default(),
         };
         let offsets = HashMap::default();
         let scene = lower(&tree, &env_fixture(&offsets)).scene;
@@ -1857,6 +1878,7 @@ mod tests {
         let tree = LayoutNode::Styled {
             props: std::rc::Rc::new(props),
             child: Box::new(text_node("flip me")),
+            hints: Default::default(),
         };
         let offsets = HashMap::default();
         let scene = lower(&tree, &env_fixture(&offsets)).scene;
@@ -1881,6 +1903,7 @@ mod tests {
                 overlay: std::rc::Rc::new(text_node("the card")),
                 child: Box::new(text_node("the row")),
             }],
+            hints: Default::default(),
         };
         let offsets = HashMap::default();
         let scene = lower(&tree, &env_fixture(&offsets)).scene;
