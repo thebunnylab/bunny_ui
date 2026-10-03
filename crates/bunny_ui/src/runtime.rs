@@ -5580,11 +5580,21 @@ impl Runtime {
         if walked.is_empty() {
             return;
         }
+        /// A pin is the wire's `f32`; the node's own box is the `f64`
+        /// the walk sized the pixels at. Where the pin is that box, the
+        /// seed is the box itself — the next walk measures against the
+        /// number this one did. A pin a split lane wrote over the box
+        /// is the lane's.
+        fn seed(pin: f32, own: f64) -> f64 {
+            if own as f32 == pin { own } else { pin.into() }
+        }
         fn walk(node: &crate::dom::DomNode, boxes: &mut HashMap<Rc<str>, (f64, f64)>) {
             if let crate::dom::DomKind::Canvas { path: Some(path), .. } = &node.kind {
                 if let Some(layout) = &node.layout {
                     if let (Some(w), Some(h)) = (layout.width, layout.height) {
-                        boxes.entry(Rc::clone(path)).or_insert((w, h));
+                        boxes
+                            .entry(Rc::clone(path))
+                            .or_insert((seed(w, node.width), seed(h, node.height)));
                     }
                 }
             }

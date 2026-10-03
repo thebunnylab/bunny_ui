@@ -104,7 +104,11 @@ fn color(value: Color) -> String {
     )
 }
 
-fn px(value: f64) -> String {
+/// A length: an `f64`, or a flow record's `f32` printed as the `f64`
+/// it widens to — for every value an `f32` holds, the text the page
+/// served when the record held `f64`.
+fn px(value: impl Into<f64>) -> String {
+    let value: f64 = value.into();
     // trim the float the way the browser would print it back
     if value.fract() == 0.0 {
         format!("{}px", value as i64)
@@ -816,7 +820,7 @@ fn rule_text(
         // after the font shorthand, which resets it — the served page
         // steps its lines the way the engine measured them
         if let Some(height) = text.line_height {
-            base.insert("line-height", format!("{height}px"));
+            base.insert("line-height", format!("{}px", f64::from(height)));
         }
         match text.text_align {
             Some(motor::views::TextAlignment::Center) => {
@@ -1002,5 +1006,46 @@ mod tests {
         served.on.set(true);
         let patches = fresh.dom_frame(&served, size);
         assert!(!patches.is_empty());
+    }
+
+    /// A `.layout(Exact)` interior is served at the engine's own
+    /// numbers: a box centred in a fractional frame, and one placed
+    /// under a padding no `f32` holds, print the `f64`s the engine
+    /// placed them at — the text a page has always served for them.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn an_exact_interior_serves_the_engines_own_numbers() {
+        #[derive(Clone, Copy)]
+        struct Placed;
+
+        impl Component for Placed {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("flow above"),
+                    crate::vstack!(
+                        text("pinned"),
+                        text("x").padding_length(7.8).background_color(Color::hex(0x3B82F6)),
+                    )
+                        .frame(120.3, 60.7)
+                        .layout(crate::layout::LayoutMode::Exact),
+                    text("flow below"),
+                )
+            }
+        }
+
+        let page = render(&Placed, Size { width: 200.0, height: 200.0 });
+        for served in [
+            // the flow's wrapper: a pinned box, at the wire's precision
+            "style=\"height:60.70000076293945px;width:120.30000305175781px\"",
+            // the interior: the engine's own numbers
+            "style=\"height:16px;left:0;position:absolute;top:0;\
+             transform:translate(36.15px, 6.550000000000001px);width:48px\"",
+            "style=\"height:31.6px;left:0;position:absolute;top:0;\
+             transform:translate(48.349999999999994px, 22.55px);width:23.6px\"",
+            "style=\"height:16px;left:0;position:absolute;top:0;\
+             transform:translate(7.799999999999997px, 7.800000000000001px);width:8px\"",
+        ] {
+            assert!(page.html.contains(served), "{served} in {}", page.html);
+        }
     }
 }

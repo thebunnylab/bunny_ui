@@ -525,8 +525,9 @@ pub struct DomText {
     pub font: FontSpec,
     /// The line box, when `.line_height(…)` set one — the browser steps
     /// its own lines by it, so the element wraps at the same rhythm the
-    /// engine measured. `None` leaves the face's own box.
-    pub line_height: Option<crate::layout::Px>,
+    /// engine measured. `None` leaves the face's own box. `f32`, the
+    /// wire's precision.
+    pub line_height: Option<f32>,
     /// Where each wrapped line sits in the box — `None` is leading, the
     /// browser's own default for our writing direction.
     pub text_align: Option<motor::views::TextAlignment>,
@@ -614,7 +615,10 @@ pub struct DomNode {
     pub kind: DomKind,
     /// Offset from the parent NODE's origin (logical px). Owned by
     /// the ABSOLUTE lowering; a flow node leaves all four at zero and
-    /// speaks through `layout`.
+    /// speaks through `layout`. `f64`, where the flow record holds
+    /// the wire's `f32`: the served page prints the engine's own
+    /// number for a placed element, and the island ledger sizes the
+    /// pixels by it.
     pub x: Px,
     pub y: Px,
     pub width: Px,
@@ -990,22 +994,26 @@ impl DomCapture {
 /// lowering owns its geometry (today's whole scene; tomorrow only a
 /// `.layout(Exact)` interior). The wire twin of [`DomStyle`]: a full
 /// replace, one write per changed node.
+///
+/// The numbers are `f32`, the precision the wire carries them at: a
+/// record half the size of one in `f64`, and nothing the browser could
+/// tell apart.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DomLayout {
     /// Gap between a flex container's children, px.
-    pub gap: Option<f64>,
+    pub gap: Option<f32>,
     /// Cross-axis alignment: 0 start, 1 center, 2 end, 3 baseline.
     pub align: Option<u8>,
     /// Padding `(top, right, bottom, left)`, px.
-    pub padding: Option<(f64, f64, f64, f64)>,
-    pub width: Option<f64>,
-    pub height: Option<f64>,
-    pub max_width: Option<f64>,
-    pub max_height: Option<f64>,
+    pub padding: Option<(f32, f32, f32, f32)>,
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+    pub max_width: Option<f32>,
+    pub max_height: Option<f32>,
     /// The flexible child: `flex:1 1 0` and a zeroed min-size.
     pub grow: bool,
     /// A virtual row's absolute offset inside its content box, px.
-    pub slot_y: Option<f64>,
+    pub slot_y: Option<f32>,
     /// The child follows its container's cross size — `align-self:
     /// stretch`, and no pinned size on the stretched axis.
     pub stretch: bool,
@@ -1016,7 +1024,7 @@ pub struct DomLayout {
     pub fill: bool,
     /// The row WRAPS, with this gap between its lines, px — `flex-wrap:
     /// wrap` and `row-gap`, a flow's lowering.
-    pub wrap: Option<f64>,
+    pub wrap: Option<f32>,
     /// The element is no flex box: an inline tag around ONE child (a
     /// link around a word) keeps the browser's own display for the
     /// tag, where a flex line per row would be a layout per row.
@@ -1758,6 +1766,13 @@ fn hash_f64(value: Option<f64>, hasher: &mut motor::hash::FxHasher) {
     value.map(f64::to_bits).hash(hasher);
 }
 
+/// An `f32` of the scene, hashed as the `f64` it widens to: the record
+/// held `f64` once, and a rule's hash is part of the served page's
+/// contract — the same value keeps the same hash.
+fn hash_f32(value: Option<f32>, hasher: &mut motor::hash::FxHasher) {
+    hash_f64(value.map(f64::from), hasher);
+}
+
 /// Does the element lay itself out? The table family's display is the
 /// browser's own: a `<tr>` is a row, never a flex line.
 pub(crate) fn lays_itself_out(hints: &DomHints) -> bool {
@@ -1797,16 +1812,16 @@ fn look_hash(node: &DomNode) -> u64 {
     match &node.layout {
         Some(layout) => {
             1u8.hash(&mut hasher);
-            hash_f64(layout.gap, &mut hasher);
+            hash_f32(layout.gap, &mut hasher);
             layout.align.hash(&mut hasher);
             layout
                 .padding
-                .map(|(top, right, bottom, left)| [top.to_bits(), right.to_bits(), bottom.to_bits(), left.to_bits()])
+                .map(|(top, right, bottom, left)| [top, right, bottom, left].map(|side| f64::from(side).to_bits()))
                 .hash(&mut hasher);
             layout.grow.hash(&mut hasher);
             layout.stretch.hash(&mut hasher);
             layout.fill.hash(&mut hasher);
-            hash_f64(layout.wrap, &mut hasher);
+            hash_f32(layout.wrap, &mut hasher);
             layout.plain.hash(&mut hasher);
         }
         None => 0u8.hash(&mut hasher),
@@ -1878,7 +1893,7 @@ fn look_hash(node: &DomNode) -> u64 {
         (text.font.slant as u8).hash(&mut hasher);
         text.font.family.name().as_deref().hash(&mut hasher);
         text.font.tracking.to_bits().hash(&mut hasher);
-        hash_f64(text.line_height, &mut hasher);
+        hash_f32(text.line_height, &mut hasher);
         text.text_align.map(|align| align as u8).hash(&mut hasher);
         text.truncation.map(|mode| mode as u8).hash(&mut hasher);
     }
@@ -1925,13 +1940,7 @@ fn face_only(face: FontSpec) -> DomText {
 
 /// The element's own geometry, as the box patch carries it.
 fn geometry_of(layout: &DomLayout) -> [Option<f32>; 5] {
-    [
-        layout.width.map(|value| value as f32),
-        layout.height.map(|value| value as f32),
-        layout.max_width.map(|value| value as f32),
-        layout.max_height.map(|value| value as f32),
-        layout.slot_y.map(|value| value as f32),
-    ]
+    [layout.width, layout.height, layout.max_width, layout.max_height, layout.slot_y]
 }
 
 fn box_patch(id: u32, geometry: [Option<f32>; 5]) -> DomPatch {
@@ -2830,7 +2839,7 @@ fn reveal_target(retained: &Retained, target: &str, patches: &mut Vec<DomPatch>)
             _ => None,
         });
     match slot {
-        Some(y) => patches.push(DomPatch::SetScroll { id: retained.id, x: 0.0, y }),
+        Some(y) => patches.push(DomPatch::SetScroll { id: retained.id, x: 0.0, y: y.into() }),
         None => {
             let row_id = retained
                 .children
@@ -4082,8 +4091,10 @@ fn push_hint(out: &mut Vec<u8>, hint: Option<&str>) {
     }
 }
 
-fn push_f32(out: &mut Vec<u8>, value: f64) {
-    out.extend_from_slice(&(value as f32).to_le_bytes());
+/// Every number crosses as `f32` — the scene's own `f32`s exactly, an
+/// `f64` rounded once.
+fn push_f32(out: &mut Vec<u8>, value: impl Into<f64>) {
+    out.extend_from_slice(&(value.into() as f32).to_le_bytes());
 }
 
 fn push_bytes_u32(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -4874,6 +4885,53 @@ mod tests {
             !runtime.dom_island_box(canvas_id, 300.0, 40.0),
             "an echo is not news"
         );
+    }
+
+    /// A flexible island whose box is finer than an `f32`: the element's
+    /// pin crosses at the wire's precision, and the box the island seeds
+    /// is the one its pixels were sized at — the next walk measures
+    /// against the same number, and pixels that did not change stay put.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn a_fine_island_box_survives_the_next_walk() {
+        #[derive(Clone)]
+        struct FineIsland {
+            count: State<usize>,
+        }
+
+        impl Component for FineIsland {
+            fn body(self, _ctx: &Context) -> impl View {
+                // a label that gives way: flexible along its row, and
+                // natural against any offer
+                let label = text("abc")
+                    .truncation_mode(crate::layout::Truncation::End)
+                    .padding_length(0.1);
+                crate::vstack!(
+                    text(format!("count {}", self.count.get())),
+                    crate::hstack!(label).rendering(crate::layout::Rendering::Gpu),
+                )
+            }
+        }
+
+        let size = Size { width: 240.0, height: 120.0 };
+        let count = State::new(0usize);
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&FineIsland { count }, size);
+        let fine = 24.0 + 2.0 * 0.1;
+        assert!(f64::from(fine as f32) != fine, "the box is finer than an f32");
+        assert!(
+            mount.iter().any(|patch| matches!(
+                patch,
+                DomPatch::SetBox { width: Some(width), .. } if *width == fine as f32
+            )),
+            "the element is pinned at the natural width: {mount:?}"
+        );
+        assert_eq!(runtime.dom_island_lists(1).len(), 1, "the island paints once");
+
+        // a walk the island takes part in, with nothing in it changed
+        count.set(1);
+        let _ = runtime.dom_frame(&FineIsland { count }, size);
+        assert!(runtime.dom_island_lists(1).is_empty(), "the same box, the same pixels");
     }
 
     /// The Scratch pattern: a custom element whose measure EATS the
@@ -5826,6 +5884,84 @@ mod tests {
         assert!(boxed.is_default());
     }
 
+    /// A look's hash names its rule, and a served page is adopted by
+    /// trusting that the rules this build hashes are the ones the page
+    /// defined: the hash is part of the contract, pinned here as
+    /// numbers — every field a look reads, and none of the element's own.
+    #[test]
+    fn a_look_hashes_to_the_rule_the_served_page_names() {
+        let mut boxed = flow_row("a");
+        boxed.kind = DomKind::Box;
+        boxed.layout = Some(DomLayout {
+            gap: Some(8.0),
+            align: Some(1),
+            padding: Some((12.5, 4.0, 0.5, 2.25)),
+            grow: true,
+            stretch: true,
+            fill: true,
+            wrap: Some(2.25),
+            plain: true,
+            width: Some(120.0),
+            ..DomLayout::default()
+        });
+        boxed.style = DomStyle::of_look(DomLook {
+            background: Some(Color::hex(0x112233)),
+            gradient: Some(crate::layout::Gradient::Linear {
+                start: crate::layout::UnitPoint { x: 0.0, y: 0.0 },
+                end: crate::layout::UnitPoint { x: 1.0, y: 0.5 },
+                from: Color::BLACK,
+                to: Color::WHITE,
+            }),
+            hover_background: Some(Color::hex(0x223344)),
+            pressed_background: Some(Color::hex(0x334455)),
+            color: Some(Color::hex(0x445566)),
+            hover_color: Some(Color::hex(0x556677)),
+            pressed_color: Some(Color::hex(0x667788)),
+            border: Some((Color::hex(0x778899), 1.5)),
+            corner_radius: Some(Corners::all(6.0)),
+            shadow: Some((4.0, Color::hex_a(0x0000_0040))),
+            transition: Some((0.4, 0.8)),
+            focus_border: Some(Color::hex(0x8899AA)),
+            placeholder_color: Some(Color::hex(0x99AABB)),
+            clip: true,
+            opacity: Some(0.5),
+            hover_opacity: Some(0.75),
+            pressed_opacity: Some(0.25),
+            group: Some(7),
+            glass: Some(GlassFilter {
+                blur: 8.0,
+                saturation: 1.5,
+                brightness: 1.0,
+                rim: Color::WHITE,
+                rim_band: 1.5,
+            }),
+            pass_through: true,
+        });
+        boxed.face = Some(FontSpec::DEFAULT);
+        let mut words = flow_row("b");
+        words.kind = DomKind::Text(DomText {
+            content: Arc::from("words"),
+            color: Color::hex(0x202020),
+            inherits_ink: true,
+            font: FontSpec::DEFAULT,
+            line_height: Some(18.5),
+            text_align: Some(motor::views::TextAlignment::Center),
+            highlights: None,
+            truncation: Some(Truncation::End),
+            inherits_face: false,
+        });
+        let plain = flow_row("c");
+        assert_eq!(look_hash(&boxed), 0x14d3_3cb5_f0e2_1ffa);
+        assert_eq!(look_hash(&words), 0xaeb5_8869_66cf_63d7);
+        assert_eq!(look_hash(&plain), 0x5727_5724_1e9c_57df);
+        // the element's own parts wear the same rule
+        boxed.style.interactive = Some(Rc::from("a/b"));
+        boxed.style.set_tooltip(Some(Arc::from("tip")));
+        boxed.style.set_group_owner(Some(9));
+        boxed.layout.as_mut().expect("flow").slot_y = Some(40.0);
+        assert_eq!(look_hash(&boxed), 0x14d3_3cb5_f0e2_1ffa);
+    }
+
     #[test]
     fn a_clipped_box_sets_the_overflow_bit_and_nothing_else() {
         let bare = DomLook {
@@ -6612,7 +6748,7 @@ mod tests {
     fn a_flow_layout_change_is_one_setlayout() {
         let mut lowering = DomLowering::default();
         let display = crate::layout::DisplayList::default();
-        let with_gap = |gap: f64| {
+        let with_gap = |gap: f32| {
             let mut root = flow_root(vec![flow_row("a")]);
             root.layout = Some(DomLayout { gap: Some(gap), ..DomLayout::default() });
             root
