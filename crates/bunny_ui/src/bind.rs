@@ -484,6 +484,60 @@ mod frame_tests {
         );
     }
 
+    /// A row whose shape differs from its neighbour's is built, not
+    /// cloned — and the row after it, of the first shape again, still
+    /// finds the first row's template.
+    #[test]
+    fn a_row_of_another_shape_is_built_and_the_shape_after_it_still_clones() {
+        #[derive(Clone)]
+        struct Row {
+            item: Item,
+        }
+
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                let id = self.item.id;
+                // every third row carries a second cell
+                crate::hstack!(text(id.to_string()), (id % 3 == 0).then(|| text("marked"))).element("tr")
+            }
+        }
+
+        #[derive(Clone)]
+        struct Page {
+            rows: State<Rc<Vec<Item>>>,
+        }
+
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(for_each(self.rows, |item| item.id.to_string(), |item| Row { item: *item }))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Page { rows: State::new(items(&[1, 2, 3, 4, 5, 6, 7])) };
+        let mount = runtime.dom_frame(&page, SIZE);
+        let frame = stats::take();
+        let groups = mount
+            .iter()
+            .filter(|patch| matches!(patch, DomPatch::Create { kind: crate::dom::CreateKind::Group, .. }))
+            .count();
+        let clones = mount.iter().filter(|patch| matches!(patch, DomPatch::Clone { .. })).count();
+        // rows 1 and 3 are the two templates; 2, 4, 5, 7 clone the first,
+        // 6 clones the second — across neighbours of the other shape
+        assert_eq!(groups, 4, "the page, the list and two template rows: {mount:?}");
+        assert_eq!(clones, 5, "{mount:?}");
+        assert_eq!(frame.clones, 5);
+        // the words of every row reached the page
+        let words: Vec<&str> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::SetContent { text, .. } => Some(&**text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(words, ["1", "2", "3", "marked", "4", "5", "6", "marked", "7"]);
+    }
+
     #[test]
     fn a_bound_label_is_one_text_patch_and_no_body() {
         let label = Label { count: State::new(1) };
