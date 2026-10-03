@@ -706,14 +706,19 @@ pub fn start_with(
                 }
                 point_cursor(&runtime);
             }
+            // a press and a release are discrete: they draw at once and
+            // close the warm period a move may have opened — no empty
+            // beats follow a click
             Event::PointerDown { x, y, clicks, modifiers } => {
                 if runtime.pointer_clicked(x, y, clicks, modifiers) {
                     present(&runtime, &full, size, scale, &mut surface);
                 }
+                pacer.rest();
             }
             Event::PointerUp { x, y } => {
                 let _ = runtime.pointer_released(x, y);
                 present(&runtime, &full, size, scale, &mut surface);
+                pacer.rest();
             }
             // A landing that changed nothing visible may still have put the
             // finger on the clock — a hold that may become a menu, a press
