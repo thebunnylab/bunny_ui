@@ -1896,42 +1896,11 @@ pub(crate) fn sweep_stale(root: &str) {
         }
     }
     let visit = Visit::now();
-    let mut dead: Vec<Rc<str>> = Vec::new();
-    RETAINED.with(|retained| {
+    // a top-level entry the root region did not mount again fell, and
+    // everything under it with it — unless the walk skipped a boundary
+    // between the root and it. Asked first, while nothing has left
+    let fallen: Vec<Rc<str>> = RETAINED.with(|retained| {
         let retained = retained.borrow();
-        // alive under a boundary that ran: it ran itself, or it stands at
-        // or under a boundary the walk skipped on purpose BELOW that run.
-        // A skipped ancestor above the run says nothing about what is
-        // under the run: the run rebuilt its subtree, and an entry it did
-        // not reach again has left (a list under a clean page clears, and
-        // the page is skipped — its rows must still go). The entries
-        // under one boundary come in one ordered range — the subtree is
-        // contiguous because `/` sorts before every byte a segment may
-        // start with after it — and a skipped entry comes before its
-        // own subtree, so the walk carries the skips it is inside
-        let sweep_under = |boundary: &str, dead: &mut Vec<Rc<str>>| {
-            let lo = format!("{boundary}/");
-            let hi = format!("{boundary}0");
-            let range = (std::ops::Bound::Included(lo.as_str()), std::ops::Bound::Excluded(hi.as_str()));
-            let mut shelters: Vec<&str> = Vec::new();
-            for (path, entry) in retained.range::<str, _>(range) {
-                while shelters.last().is_some_and(|shelter| passed(path, shelter)) {
-                    shelters.pop();
-                }
-                let stamp = entry.visit.get();
-                if stamp == visit.skipped {
-                    shelters.push(path);
-                } else if stamp != visit.ran && !shelters.iter().any(|shelter| covers(shelter, path)) {
-                    dead.push(Rc::clone(path));
-                }
-            }
-        };
-        for run in &runs {
-            sweep_under(run, &mut dead);
-        }
-        // a top-level entry the root region did not mount again fell,
-        // and everything under it with it — unless the walk skipped a
-        // boundary between the root and it
         let alive_at_top = |path: &str| {
             let stamp = retained.get(path).map(|entry| entry.visit.get());
             if stamp == Some(visit.ran) || stamp == Some(visit.skipped) {
@@ -1949,20 +1918,99 @@ pub(crate) fn sweep_stale(root: &str) {
             }
             false
         };
-        let fallen: Vec<String> = LIVE.with(|live| {
+        LIVE.with(|live| {
             live.borrow()
                 .top_level
                 .iter()
                 .filter(|path| covers(root, path) && !alive_at_top(path))
-                .cloned()
+                .map(|path| Rc::from(path.as_str()))
                 .collect()
-        });
-        for path in fallen {
-            sweep_under(&path, &mut dead);
-            dead.push(Rc::from(path.as_str()));
-        }
+        })
     });
-    drop_entries(&dead);
+    RETAINED.with(|retained| {
+        let mut retained = retained.borrow_mut();
+        LIVE.with(|live| {
+            let mut live = live.borrow_mut();
+            GRAVEYARD.with(|graveyard| {
+                let mut graveyard = graveyard.borrow_mut();
+                // the entry leaves the tables and the read graph as it
+                // leaves the retention, and waits for the idle to be freed
+                let mut fall = |path: &Rc<str>, entry: Entry| {
+                    live.unindex(path, &entry);
+                    motor::identity::retire_view(path);
+                    graveyard.push(entry);
+                };
+                for run in &runs {
+                    sweep_under(&mut retained, run, visit, &mut fall);
+                }
+                for top in &fallen {
+                    sweep_under(&mut retained, top, visit, &mut fall);
+                    if let Some((path, entry)) = retained.remove_entry(&**top) {
+                        fall(&path, entry);
+                    }
+                }
+            });
+        });
+    });
+}
+
+/// Takes out of the retention every entry under `boundary` the pass did
+/// not meet, and hands each to `fall`.
+///
+/// Alive under a boundary that ran: it ran itself, or it stands at or
+/// under a boundary the walk skipped on purpose BELOW that run. A skipped
+/// ancestor above the run says nothing about what is under the run: the
+/// run rebuilt its subtree, and an entry it did not reach again has left
+/// (a list under a clean page clears, and the page is skipped — its rows
+/// must still go). The entries under one boundary come in one ordered
+/// range — the subtree is contiguous because `/` sorts before every byte
+/// a segment may start with after it — and a skipped entry comes before
+/// its own subtree, so the walk carries the skips it is inside. An entry
+/// that leaves is taken out where a walk stands: no search from the root
+/// of the tree for each one.
+fn sweep_under(
+    retained: &mut BTreeMap<Rc<str>, Entry>,
+    boundary: &str,
+    visit: Visit,
+    fall: &mut impl FnMut(&Rc<str>, Entry),
+) {
+    // who leaves, read off the stamps in a walk that only looks: the
+    // skips it stands inside are borrowed, and a row that stays costs
+    // nothing but its compare
+    let mut leaving: Vec<Rc<str>> = Vec::new();
+    {
+        let lo = format!("{boundary}/");
+        let hi = format!("{boundary}0");
+        let range = (std::ops::Bound::Included(lo.as_str()), std::ops::Bound::Excluded(hi.as_str()));
+        let mut shelters: Vec<&str> = Vec::new();
+        for (path, entry) in retained.range::<str, _>(range) {
+            while shelters.last().is_some_and(|shelter| passed(path, shelter)) {
+                shelters.pop();
+            }
+            let stamp = entry.visit.get();
+            if stamp == visit.skipped {
+                shelters.push(path);
+            } else if stamp != visit.ran && !shelters.iter().any(|shelter| covers(shelter, path)) {
+                leaving.push(Rc::clone(path));
+            }
+        }
+    }
+    // …then taken out in a second walk, from the first that leaves to
+    // the last, each where the walk stands: the list is in the order of
+    // the walk, and holds the very keys it meets
+    let (Some(first), Some(last)) = (leaving.first(), leaving.last()) else {
+        return;
+    };
+    let range = (std::ops::Bound::Included(Rc::clone(first)), std::ops::Bound::Included(Rc::clone(last)));
+    let mut next = 0;
+    let taken = retained.extract_if(range, |path, _| {
+        let leaves = leaving.get(next).is_some_and(|dead| Rc::ptr_eq(dead, path));
+        next += usize::from(leaves);
+        leaves
+    });
+    for (path, entry) in taken {
+        fall(&path, entry);
+    }
 }
 
 /// Drops the whole retention — the next pass runs every body (the
