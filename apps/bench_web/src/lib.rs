@@ -236,7 +236,9 @@ pub mod keyed {
                 )
                 .element("td")
                 .css_class("col-md-1"),
-                hstack!(text(String::new())).element("td").css_class("col-md-6"),
+                // the last cell holds nothing at all: no text node to
+                // fill on every row the list mounts
+                hstack!(empty()).element("td").css_class("col-md-6"),
             )
         }
     }
@@ -509,6 +511,35 @@ pub mod keyed {
                 .element("table")
                 .css_class("table table-hover table-striped test-data")
                 .frame_max(f64::INFINITY, f64::INFINITY, Alignment::Leading)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A row is the markup the harness pierces: four cells, the label
+        /// as a link in the second, the glyph's link in the third, and a
+        /// last cell with nothing in it — no element, no text node.
+        #[test]
+        fn a_row_is_the_markup_the_harness_reads() {
+            let page = app();
+            page.rows.set(Rc::new(build(1, 2)));
+            let served = bunny_ui::ssr::render(&page, bunny_ui::layout::Size { width: 1200.0, height: 800.0 });
+            let html = &served.html;
+            let rows: Vec<&str> = html.split("<tr").skip(1).collect();
+            assert_eq!(rows.len(), 2, "{html}");
+            for (id, row) in (1..).zip(rows) {
+                let row = &row[..row.find("</tr>").expect("a closed row")];
+                assert_eq!(row.matches("<td").count(), 4, "four cells: {row}");
+                let cells: Vec<&str> = row.split("<td").skip(1).collect();
+                assert!(cells[0].contains(&format!(">{id}</td>")), "the id cell: {row}");
+                assert!(cells[1].contains("<a") && cells[1].contains(&label_for(id)), "the label is a link: {row}");
+                assert!(cells[2].contains("<a") && cells[2].contains("glyphicon glyphicon-remove"), "the glyph's link: {row}");
+                let last = cells[3];
+                let body = &last[last.find('>').expect("the cell opens") + 1..];
+                assert!(body.starts_with("</td>"), "the last cell is empty: {row}");
+            }
         }
     }
 }
