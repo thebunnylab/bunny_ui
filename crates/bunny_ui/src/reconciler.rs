@@ -956,6 +956,110 @@ pub(crate) fn decide_at(path: &str) -> (Decision, Option<(Rc<str>, Rc<Slot>)>) {
     })
 }
 
+/// What a keyed list that builds each row once per key reads of its own
+/// last run while it runs again: the value that run was built from and
+/// the tree it built — both still in the list's entry until this run
+/// closes — and, when the pass prints, the lines it printed.
+pub(crate) struct LastRun {
+    /// The list's path, the retention's own copy.
+    path: Rc<str>,
+    value: Erased,
+    held: Rc<Held>,
+    /// Empty unless the pass prints.
+    prints: Vec<RenderNode>,
+}
+
+impl LastRun {
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The list the last run was built from, when it was a `V`: the shape
+    /// that run stood its rows in is read off it.
+    pub(crate) fn value<V: crate::view::View>(&self) -> Option<&V> {
+        self.value.downcast_ref()
+    }
+
+    /// The last run's rows, in order: the list boundary's children — or,
+    /// `nested`, the children of the one stack they stood in (a list with
+    /// an axis, a spacing or an alignment of its own). `nested` is the
+    /// shape the last run was built in, which the tree alone cannot tell:
+    /// a plain column whose one row is a stack has the shape of a stack
+    /// of rows.
+    pub(crate) fn rows(&self, nested: bool) -> &[LayoutNode] {
+        let LayoutNode::Boundary { children, .. } = &self.held.layout else {
+            return &[];
+        };
+        match (nested, children.as_slice()) {
+            (false, _) => children,
+            (true, [LayoutNode::Stack { children, .. }]) => children,
+            (true, _) => &[],
+        }
+    }
+
+    /// The line the row at `at` printed, when the pass prints: the
+    /// reference to `path`, and only while the last run printed exactly
+    /// one line per node, so the line at `at` is that row's own.
+    pub(crate) fn line(&self, nested: bool, at: usize, path: &str) -> Option<&RenderNode> {
+        let lines = match (nested, self.prints.as_slice()) {
+            (false, lines) => lines,
+            (true, [branch]) => branch.children.as_slice(),
+            (true, _) => &[],
+        };
+        if lines.len() != self.rows(nested).len() {
+            return None;
+        }
+        lines.get(at).filter(|line| parse_ref(&line.line).is_some_and(|(of, _)| of == path))
+    }
+}
+
+/// The last run of the keyed list at `path`, for its rows to be kept by
+/// key — or nothing, when there is none to keep from, or when the entry
+/// it closed carries registrations of its own: a row's closure that
+/// attached one outside its row's component (a click on the row's
+/// element, an effect, a handler) filed it with the list, and a row kept
+/// without its closure would lose it. Such a list builds every row.
+pub(crate) fn last_run(path: &str) -> Option<LastRun> {
+    RETAINED.with(|retained| {
+        let retained = retained.borrow();
+        let (key, entry) = retained.get_key_value(path)?;
+        if !entry.actions.is_empty() || !entry.effects.is_empty() || entry.rare.is_some() {
+            return None;
+        }
+        let held = entry.slot.held()?;
+        let prints = if crate::view::print_enabled() { entry.node.children.clone() } else { Vec::new() };
+        Some(LastRun { path: Rc::clone(key), value: entry.value.clone(), held, prints })
+    })
+}
+
+/// Keeps a row of the keyed list being built, by its key, without
+/// entering it — the row's closure does not run. Its boundary at `path`,
+/// the one the last run referred to, is kept as a skip keeps it: stamped
+/// skipped for the sweep, the owners of the row's key scope and of its
+/// own scope touched as the steps into them would touch them, and the
+/// subtree reported skipped to the identity. Nothing is kept, and the
+/// answer is `false`, when the row is dirty itself: it runs.
+pub(crate) fn keep_row(path: &Rc<str>, slot: &Slot, key_scope: &str) -> bool {
+    let kept = PASS.with(|pass| {
+        let pass = pass.borrow();
+        let Some(list) = pass.building.last().filter(|frame| frame.list) else {
+            return false;
+        };
+        if !pass.active || (list.has_dirt_below(&pass.dirty) && pass.dirty.contains(&**path)) {
+            return false;
+        }
+        // the last run's tree names only retained rows: a row leaves
+        // when its list runs, and that run's tree no longer names it
+        debug_assert!(is_retained(path), "a kept row refers to a boundary that left: {path}");
+        slot.visit.set(Visit::now().skipped);
+        true
+    });
+    if kept {
+        motor::identity::keep_unentered(key_scope, path);
+    }
+    kept
+}
+
 pub(crate) fn begin_entry(path: &Rc<str>, list: bool) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();

@@ -433,6 +433,30 @@ fn protected_by_skip(registry: &Registry, owner: &str) -> bool {
     }
 }
 
+/// A boundary the walk keeps without stepping into it — a row a keyed
+/// list kept by its key, whose closure did not run. The owners of the two
+/// scopes the steps to it would have entered, the row's key scope
+/// ([`enter_key`]) and the boundary's own ([`enter_view`]), stay alive as
+/// those steps would have kept them — the state the row's closure made
+/// lives at the first — and the boundary counts as skipped
+/// ([`mark_skipped`]).
+pub fn keep_unentered(key_scope: &str, boundary: &Rc<str>) {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        if registry.pass_active {
+            let pass_no = registry.pass_no;
+            for scope in [key_scope, &**boundary] {
+                if let Some(record) = registry.owners.get_mut(scope) {
+                    record.touched = pass_no;
+                }
+            }
+        }
+        if registry.skips_asked {
+            registry.skipped.insert(Rc::clone(boundary));
+        }
+    });
+}
+
 /// The reconciler reports: this boundary was skipped (clean cache) — its
 /// subtree counts as alive.
 pub fn mark_skipped(path: &Rc<str>) {
