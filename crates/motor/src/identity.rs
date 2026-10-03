@@ -253,21 +253,26 @@ fn file_few<K: Eq + std::hash::Hash, T: Eq + std::hash::Hash>(map: &mut HashMap<
 
 /// The bindings one body made, in the order it made them: two for a
 /// row of a table (its class and its label), seldom more. Up to two
-/// are held inline; a list is grown only past that. The list a body's
-/// first binding started was an allocation per row that mounted, and
-/// its second binding grew it.
-#[derive(Default)]
-struct BindingKeys {
-    inline: [Option<Rc<str>>; 2],
-    more: Vec<Rc<str>>,
+/// are held inline, in the width of two keys; a list is made only past
+/// that. The list a body's first binding started was an allocation per
+/// row that mounted, and its second binding grew it.
+enum BindingKeys {
+    One(Rc<str>),
+    Two(Rc<str>, Rc<str>),
+    More(Vec<Rc<str>>),
 }
 
 impl BindingKeys {
     fn push(&mut self, key: Rc<str>) {
-        match self.inline.iter_mut().find(|slot| slot.is_none()) {
-            Some(slot) => *slot = Some(key),
-            None => self.more.push(key),
-        }
+        let held = std::mem::replace(self, BindingKeys::More(Vec::new()));
+        *self = match held {
+            BindingKeys::One(first) => BindingKeys::Two(first, key),
+            BindingKeys::Two(first, second) => BindingKeys::More(vec![first, second, key]),
+            BindingKeys::More(mut keys) => {
+                keys.push(key);
+                BindingKeys::More(keys)
+            }
+        };
     }
 
     #[cfg(test)]
@@ -276,11 +281,21 @@ impl BindingKeys {
     }
 
     fn iter(&self) -> impl Iterator<Item = &Rc<str>> {
-        self.inline.iter().flatten().chain(self.more.iter())
+        let (pair, more): ([Option<&Rc<str>>; 2], &[Rc<str>]) = match self {
+            BindingKeys::One(first) => ([Some(first), None], &[]),
+            BindingKeys::Two(first, second) => ([Some(first), Some(second)], &[]),
+            BindingKeys::More(keys) => ([None, None], keys),
+        };
+        pair.into_iter().flatten().chain(more.iter())
     }
 
     fn into_keys(self) -> impl Iterator<Item = Rc<str>> {
-        self.inline.into_iter().flatten().chain(self.more)
+        let (pair, more) = match self {
+            BindingKeys::One(first) => ([Some(first), None], Vec::new()),
+            BindingKeys::Two(first, second) => ([Some(first), Some(second)], Vec::new()),
+            BindingKeys::More(keys) => ([None, None], keys),
+        };
+        pair.into_iter().flatten().chain(more)
     }
 }
 
@@ -1142,9 +1157,7 @@ pub fn begin_binding(key: &Rc<str>, owner: Option<&str>) -> BindingScope {
             match registry.view_bindings.get_mut(owner) {
                 Some(bindings) => bindings.push(Rc::clone(key)),
                 None => {
-                    let mut bindings = BindingKeys::default();
-                    bindings.push(Rc::clone(key));
-                    registry.view_bindings.insert(Rc::from(owner), bindings);
+                    registry.view_bindings.insert(Rc::from(owner), BindingKeys::One(Rc::clone(key)));
                 }
             }
         }
@@ -1183,9 +1196,7 @@ fn file_under_view(registry: &mut Registry, key: &Rc<str>) {
                     Some(Some(shared)) => Rc::clone(shared),
                     _ => Rc::from(owner),
                 };
-                let mut bindings = BindingKeys::default();
-                bindings.push(Rc::clone(key));
-                registry.view_bindings.insert(owner, bindings);
+                registry.view_bindings.insert(owner, BindingKeys::One(Rc::clone(key)));
             }
         }
     }
@@ -1609,6 +1620,26 @@ mod tests {
         assert!(Few::One(7u64).remove(&7), "a set of one empties with its member");
     }
 
+    /// A body's bindings are held in the order they were made: one and
+    /// two in the width of two keys, a list from the third on — and every
+    /// one of them is read back, by reference and by value.
+    #[test]
+    fn a_bodys_bindings_are_held_in_order_inline_up_to_two() {
+        use super::BindingKeys;
+        use std::rc::Rc;
+
+        let keys: Vec<Rc<str>> = ["#0/#class", "#1/#text", "#2/#text"].into_iter().map(Rc::from).collect();
+        let mut held = BindingKeys::One(Rc::clone(&keys[0]));
+        held.push(Rc::clone(&keys[1]));
+        assert!(matches!(held, BindingKeys::Two(..)), "two keys take no list");
+        assert_eq!(held.iter().cloned().collect::<Vec<_>>(), keys[..2]);
+        held.push(Rc::clone(&keys[2]));
+        assert!(matches!(&held, BindingKeys::More(list) if list.len() == 3), "the third makes the list");
+        assert_eq!(held.iter().cloned().collect::<Vec<_>>(), keys);
+        assert_eq!(held.into_keys().collect::<Vec<_>>(), keys);
+        assert!(std::mem::size_of::<BindingKeys>() <= 2 * std::mem::size_of::<Rc<str>>() + 8, "two keys wide");
+    }
+
     /// The register of a row's bindings holds what a row has inline: the
     /// one value each binding reads, the one binding that reads it, the
     /// two bindings the row's body made. A write still reaches the
@@ -1617,8 +1648,8 @@ mod tests {
     #[test]
     fn a_rows_bindings_are_filed_inline_and_unfiled_whole() {
         use super::{
-            DepKey, Few, REGISTRY, begin_binding_under_view, begin_pass, begin_view_reads, cursor_key, end_pass,
-            enter_view, record_read, record_write, reset_world, take_dirty_bindings,
+            BindingKeys, DepKey, Few, REGISTRY, begin_binding_under_view, begin_pass, begin_view_reads, cursor_key,
+            end_pass, enter_view, record_read, record_write, reset_world, take_dirty_bindings,
         };
         use std::rc::Rc;
 
@@ -1646,8 +1677,10 @@ mod tests {
             assert!(matches!(registry.binding_reads.get(&text), Some(Few::One(dep)) if *dep == label));
             assert!(matches!(registry.binding_readers.get(&flag), Some(Few::One(key)) if *key == class));
             let filed = registry.view_bindings.get("Row").expect("the row's bindings are filed");
-            assert_eq!(filed.len(), 2);
-            assert_eq!(filed.more.capacity(), 0, "two bindings take no list");
+            assert!(
+                matches!(filed, BindingKeys::Two(first, second) if *first == text && *second == class),
+                "two bindings take no list, held in the order they were made"
+            );
         });
 
         record_write(label);
