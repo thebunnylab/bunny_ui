@@ -24,7 +24,7 @@ impl Runtime {
     }
 
     pub fn with_environment(values: EnvironmentValues) -> Self {
-        Runtime { ctx: Context { values, effects: Rc::new(RefCell::new(Vec::new())) } }
+        Runtime { ctx: Context { values: Rc::new(values), effects: Rc::new(RefCell::new(Vec::new())) } }
     }
 
     pub fn context(&self) -> Context {

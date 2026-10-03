@@ -879,7 +879,7 @@ impl<C: View<Arity = Single>> View for Modified<C> {
         let base_ctx: &Context = match &self.modifier {
             Modifier::EnvSet { set, .. } => {
                 let mut own = ctx.clone();
-                set(&mut own.values);
+                set(Rc::make_mut(&mut own.values));
                 watered = own;
                 &watered
             }

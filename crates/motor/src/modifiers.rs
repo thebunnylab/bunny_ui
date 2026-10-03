@@ -55,8 +55,8 @@ impl View for ModifiedView {
 
         let base_ctx = match &self.modifier.behavior {
             Some(ModifierBehavior::EnvSet(set)) => {
-                let mut values = ctx.values.clone();
-                set(&mut values);
+                let mut values = Rc::clone(&ctx.values);
+                set(Rc::make_mut(&mut values));
                 Context { values, effects: ctx.effects.clone() }
             }
             _ => ctx.clone(),

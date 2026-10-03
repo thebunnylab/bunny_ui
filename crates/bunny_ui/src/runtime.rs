@@ -492,7 +492,7 @@ impl Runtime {
 
     pub fn with_environment(values: EnvironmentValues) -> Self {
         let mut ctx = Context::default();
-        ctx.values = values;
+        ctx.values = Rc::new(values);
         Self::with_parts(ctx, Rc::new(PixelFont))
     }
 
@@ -747,7 +747,9 @@ impl Runtime {
     /// runtime.set_environment(|values| values.horizontalSizeClass = SizeClass::Compact);
     /// ```
     pub fn set_environment(&self, update: impl FnOnce(&mut motor::state::EnvironmentValues)) {
-        update(&mut self.ctx.borrow_mut().values);
+        // the values the retained entries share are copied once, here,
+        // and every entry keeps the ones it ran in
+        update(Rc::make_mut(&mut self.ctx.borrow_mut().values));
         self.env_moved.set(true);
     }
 
