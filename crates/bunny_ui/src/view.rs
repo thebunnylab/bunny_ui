@@ -288,11 +288,15 @@ fn run_body<'a, T: Component>(view: &T, ctx: &'a Context) -> impl View + use<'a,
 #[inline(never)]
 fn retain_entry<T: Component>(view: &T, ctx: &Context, path: &std::rc::Rc<str>, body: NodeList) {
     let (print_children, layout_children) = body.into_parts();
+    // the name is the print's, and only a print reads it: a frame's pass
+    // keeps none — a retention built without print is rebuilt before
+    // anything prints it ([`crate::runtime::Runtime::render`])
+    let name = if print_enabled() { short_type_name::<T>() } else { "" };
     crate::reconciler::finish_entry(
         path,
         crate::erased::erased_from(view),
         ctx.clone(),
-        RenderNode::branch(short_type_name::<T>(), print_children),
+        RenderNode::branch(name, print_children),
         crate::layout::LayoutNode::Boundary {
             path: std::rc::Rc::clone(path),
             children: layout_children,
