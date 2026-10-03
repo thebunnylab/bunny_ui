@@ -198,6 +198,11 @@ pub struct Runtime {
     /// coordinates, from the last walk that lowered the island. A
     /// canvas click is routed by them.
     island_hits: RefCell<HashMap<Rc<str>, Vec<(String, Rect)>>>,
+    /// Dom mode: one retained paint target per island, by element id —
+    /// a frame repaints what changed inside the island and ships that
+    /// rect, where it once rasterized the whole box into a fresh bitmap.
+    #[cfg(feature = "canvas")]
+    island_surfaces: RefCell<HashMap<u32, crate::raster::Surface>>,
     /// The app's boxes inside each island, frames ISLAND-LOCAL — the
     /// canvas pointer door routes the browser's coordinates by them.
     dom_customs: RefCell<Vec<(Rc<str>, crate::layout::CustomPlacement)>>,
@@ -1333,6 +1338,8 @@ impl Runtime {
             dom_viewports: RefCell::new(HashMap::default()),
             island_boxes: RefCell::new(HashMap::default()),
             island_hits: RefCell::new(HashMap::default()),
+            #[cfg(feature = "canvas")]
+            island_surfaces: RefCell::new(HashMap::default()),
             dom_customs: RefCell::new(Vec::new()),
             last_scrolls: RefCell::new(Vec::new()),
             last_modal_floor: std::cell::Cell::new(None),
@@ -4899,30 +4906,62 @@ impl Runtime {
     /// has no islands or nothing inside one moved.
     #[cfg(feature = "canvas")]
     pub fn dom_islands(&self, scale: usize) -> Vec<crate::dom::IslandFrame> {
-        self.dom_island_lists(scale)
-            .into_iter()
-            .map(|island| {
-                let bitmap = crate::raster::rasterize_with(
-                    &island.display,
-                    island.width,
-                    island.height,
-                    scale,
-                    crate::layout::Color::rgba(0, 0, 0, 0),
-                    &*self.text,
-                    &*self.images,
+        let lists = self.dom_island_lists(scale);
+        let mut surfaces = self.island_surfaces.borrow_mut();
+        // an island that left takes its surface along
+        {
+            let dom = self.dom.borrow();
+            surfaces.retain(|id, _| dom.has_island(*id));
+        }
+        let mut frames = Vec::with_capacity(lists.len());
+        for island in lists {
+            // the retained target, born or reborn at the island's box:
+            // a new surface damages everything on its first frame
+            let stale = surfaces.get(&island.id).is_none_or(|surface| {
+                surface.bitmap().width() != island.width
+                    || surface.bitmap().height() != island.height
+            });
+            if stale {
+                surfaces.insert(
+                    island.id,
+                    crate::raster::Surface::new(
+                        island.width,
+                        island.height,
+                        scale,
+                        crate::layout::Color::rgba(0, 0, 0, 0),
+                    ),
                 );
-                crate::dom::IslandFrame {
-                    id: island.id,
-                    width: island.width,
-                    height: island.height,
-                    // the island cleared to NOTHING, so the blend left
-                    // the colour multiplied by its own coverage —
-                    // `putImageData` reads straight and would multiply
-                    // it a second time
-                    rgba: crate::raster::unpremultiplied(&bitmap.to_rgba_bytes()),
-                }
-            })
-            .collect()
+            }
+            let surface = surfaces.get_mut(&island.id).expect("the surface just placed");
+            let damage = surface.frame(island.display, &*self.text, &*self.images);
+            let Some((x0, y0, x1, y1)) = crate::raster::damage_union(&damage) else {
+                continue;
+            };
+            let x0 = x0.clamp(0, island.width as i64) as usize;
+            let x1 = x1.clamp(0, island.width as i64) as usize;
+            let y0 = y0.clamp(0, island.height as i64) as usize;
+            let y1 = y1.clamp(0, island.height as i64) as usize;
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            // the island cleared to NOTHING, so the blend left the colour
+            // multiplied by its own coverage — `putImageData` reads
+            // straight, and the mirror is kept that way
+            let mirror = surface.rgba_straight();
+            let mut rgba = Vec::with_capacity((x1 - x0) * (y1 - y0) * 4);
+            for row in y0..y1 {
+                let from = (row * island.width + x0) * 4;
+                rgba.extend_from_slice(&mirror[from..from + (x1 - x0) * 4]);
+            }
+            frames.push(crate::dom::IslandFrame {
+                id: island.id,
+                width: island.width,
+                height: island.height,
+                rgba,
+                dirty: (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32),
+            });
+        }
+        frames
     }
 
     /// Which drop targets a live drag rings, in walk order — the flow

@@ -25,7 +25,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 12;
+const EXPECTED_ABI = 13;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -1331,8 +1331,10 @@ const imports = {
       box.batches += 1;
       armIdle();
     },
-    // fresh pixels for one canvas island, straight onto its element
-    js_island(id, pointer, width, height) {
+    // the pixels of the rect that changed inside one canvas island,
+    // straight onto its element at the rect's place — the first frame
+    // and a resize bring the whole box
+    js_island_rect(id, pointer, width, height, x, y, dirtyWidth, dirtyHeight) {
       const el = elements.get(id);
       if (!el || el.tagName !== "CANVAS") return;
       if (el.width !== width) el.width = width;
@@ -1340,9 +1342,9 @@ const imports = {
       const pixels = new Uint8ClampedArray(
         wasm.memory.buffer,
         pointer,
-        width * height * 4,
+        dirtyWidth * dirtyHeight * 4,
       );
-      el.getContext("2d").putImageData(new ImageData(pixels, width, height), 0, 0);
+      el.getContext("2d").putImageData(new ImageData(pixels, dirtyWidth, dirtyHeight), x, y);
     },
     // A panic on its way out of wasm: decode the message and log it, so
     // an abort is a sentence instead of `unreachable` and a stack of

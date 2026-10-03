@@ -1226,6 +1226,15 @@ pub fn rasterize_over(
 /// clamped to the surface.
 pub type DamageRect = (i64, i64, i64, i64);
 
+/// The one rect that covers every damaged rect — `None` for no damage.
+pub fn damage_union(damage: &[DamageRect]) -> Option<DamageRect> {
+    let mut rects = damage.iter();
+    let first = *rects.next()?;
+    Some(rects.fold(first, |(x0, y0, x1, y1), &(a0, b0, a1, b1)| {
+        (x0.min(a0), y0.min(b0), x1.max(a1), y1.max(b1))
+    }))
+}
+
 fn intersect(a: DamageRect, b: DamageRect) -> Option<DamageRect> {
     let rect = (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3));
     (rect.0 < rect.2 && rect.1 < rect.3).then_some(rect)
@@ -1579,6 +1588,42 @@ impl Surface {
         self.bounds = new_bounds;
         self.rgba_pending.extend(damage.iter().copied());
         damage
+    }
+
+    /// [`Surface::rgba`] for a surface cleared to NOTHING: the blend
+    /// left each pixel's colour multiplied by its own coverage, and a
+    /// canvas blit reads straight — so the sync divides it back out,
+    /// damage-only like the rest. A surface is synced one way or the
+    /// other for its whole life.
+    pub fn rgba_straight(&mut self) -> &[u8] {
+        let width = self.bitmap.width;
+        for &(x0, y0, x1, y1) in &self.rgba_pending {
+            let x0 = x0.clamp(0, width as i64) as usize;
+            let x1 = x1.clamp(0, width as i64) as usize;
+            let y0 = y0.clamp(0, self.bitmap.height as i64) as usize;
+            let y1 = y1.clamp(0, self.bitmap.height as i64) as usize;
+            for y in y0..y1 {
+                let row = y * width;
+                for x in x0..x1 {
+                    let pixel = self.bitmap.pixels[row + x];
+                    let alpha = (pixel & 0xff) as u32;
+                    let straight = |channel: u32| -> u8 {
+                        if alpha == 0 || alpha == 255 {
+                            channel as u8
+                        } else {
+                            ((channel * 255 + alpha / 2) / alpha).min(255) as u8
+                        }
+                    };
+                    let out = (row + x) * 4;
+                    self.rgba[out] = straight(pixel >> 24);
+                    self.rgba[out + 1] = straight((pixel >> 16) & 0xff);
+                    self.rgba[out + 2] = straight((pixel >> 8) & 0xff);
+                    self.rgba[out + 3] = alpha as u8;
+                }
+            }
+        }
+        self.rgba_pending.clear();
+        &self.rgba
     }
 
     /// The RGBA mirror, synced: pending damage converts in place (a
