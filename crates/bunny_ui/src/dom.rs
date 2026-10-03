@@ -4671,6 +4671,70 @@ mod tests {
         assert!(!bytes.is_empty());
     }
 
+    /// A column around one table, on the leading edge, is a block: the
+    /// table is laid out once, not measured as a flex item and laid out
+    /// again. A centred column keeps its flex line (a block cannot
+    /// centre), and so does a column around a table that fills it.
+    #[test]
+    fn a_lone_table_on_the_leading_edge_sits_in_a_block() {
+        #[derive(Clone)]
+        struct Tables;
+
+        impl Component for Tables {
+            fn body(self, _ctx: &Context) -> impl View {
+                let table = |class: &'static str| {
+                    crate::hstack!(crate::hstack!(text("cell")).element("tbody"))
+                        .element("table")
+                        .css_class(class)
+                };
+                crate::vstack!(
+                    table("leading").frame_max(f64::INFINITY, f64::INFINITY, motor::views::Alignment::Leading),
+                    table("centred").frame_max(f64::INFINITY, f64::INFINITY, motor::views::Alignment::Center),
+                    table("filling")
+                        .frame_max(f64::INFINITY, f64::INFINITY, motor::views::Alignment::Leading)
+                        .frame_max(f64::INFINITY, f64::INFINITY, motor::views::Alignment::Leading),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&Tables, Size { width: 600.0, height: 400.0 });
+        let parent_of = |class: &str| {
+            mount
+                .iter()
+                .find_map(|patch| match patch {
+                    DomPatch::Create { parent, hints, .. }
+                        if hints.tag.as_deref() == Some("table") && hints.class.as_deref() == Some(class) =>
+                    {
+                        Some(*parent)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the {class} table mounted: {mount:?}"))
+        };
+        let plain_of = |id: u32| look_of(&mount, id).is_some_and(|(_, layout)| layout.plain);
+        assert!(plain_of(parent_of("leading")), "the leading column is a block: {mount:?}");
+        assert!(!plain_of(parent_of("centred")), "a centred column keeps its flex line: {mount:?}");
+        // the inner frame of the doubled one is a block around the table;
+        // the outer one holds a block, not a table, and stays a column
+        let inner = parent_of("filling");
+        assert!(plain_of(inner), "the frame right around the table is a block: {mount:?}");
+        let outer = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, parent, .. } if *id == inner => Some(*parent),
+                _ => None,
+            })
+            .expect("the inner frame mounted");
+        assert!(!plain_of(outer), "a column around a block is still a column: {mount:?}");
+        // the block is still an item of the column above it, and still
+        // takes that line's offer
+        assert!(
+            look_of(&mount, inner).is_some_and(|(_, layout)| layout.grow || layout.fill),
+            "the block still takes its own line's offer: {mount:?}"
+        );
+    }
+
     #[test]
     fn the_windows_box_flows_down_to_a_padded_panel() {
         #[derive(Clone)]
