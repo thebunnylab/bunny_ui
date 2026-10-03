@@ -2483,9 +2483,18 @@ pub fn boundary_class_with<S: Into<String>>(read: impl Fn() -> S + 'static) -> B
 
 /// `boundary_class_with` for the common shape: the class while the flag
 /// reads true, nothing while it reads false.
-pub fn boundary_class_when(flag: motor::state::State<bool>, class: impl Into<String>) -> BoundaryClass {
-    let class: String = class.into();
-    boundary_class_with(move || if flag.get() { class.clone() } else { String::new() })
+///
+/// A class named by a literal stays the literal: the body that makes the
+/// binding copies nothing, and the class is spelled only when the flag
+/// reads true. A row's body ran once per row of a list, and the copy of
+/// "danger" it kept for a selection most rows never see was an
+/// allocation each.
+pub fn boundary_class_when(
+    flag: motor::state::State<bool>,
+    class: impl Into<std::borrow::Cow<'static, str>>,
+) -> BoundaryClass {
+    let class = class.into();
+    boundary_class_with(move || if flag.get() { String::from(&*class) } else { String::new() })
 }
 
 #[derive(Clone)]

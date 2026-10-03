@@ -207,11 +207,14 @@ fn a_body_takes_the_room_its_tuple_says_and_no_more() {
 /// The class a row's own element wears while it is selected is a
 /// binding too, filed the same way: no set for the flag it reads, none
 /// for the one binding reading that flag. With the label beside it the
-/// row's body made two bindings, and two are held without a list.
+/// row's body made two bindings, and two are held without a list. A
+/// class named by a literal is not copied while the flag reads false:
+/// the binding's closure, its key, the binding and the node's list are
+/// all a row pays for it.
 #[test]
 fn a_bound_class_beside_a_bound_label_files_without_a_list() {
     let class = beyond_empty(|item| boundary_class_when(item.on, "selected"));
-    assert!(class <= 5, "a bound class costs the settle {class} allocations beyond the empty row");
+    assert!(class <= 4, "a bound class costs the settle {class} allocations beyond the empty row");
     let label = beyond_empty(|item| text!(item.label));
     let both = beyond_empty(|item| (boundary_class_when(item.on, "selected"), text!(item.label)));
     assert!(both <= class + label, "the two bindings of one body cost {both}, apart {class} + {label}");
