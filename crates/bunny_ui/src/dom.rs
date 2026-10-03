@@ -8274,6 +8274,9 @@ mod size_tests {
         // the flow record holds the wire's f32s
         assert!(size_of::<Option<super::DomLayout>>() <= 84, "DomLayout grew: a length is an f32");
         assert!(size_of::<super::Retained>() <= 360, "Retained grew");
+        // a stack, a text and a style carry their hints and their action,
+        // the text the widest: a wrapper for each was a box per row
+        assert!(size_of::<crate::layout::LayoutNode>() <= 120, "LayoutNode grew: box the rare payload");
         // a patch list is thousands long on a create: its slot must stay
         // small, the fat records boxed
         assert!(size_of::<super::DomPatch>() <= 96, "DomPatch grew: box the record, not the list");

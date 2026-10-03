@@ -378,21 +378,31 @@ impl Walk<'_> {
     }
 
     /// Lowers one semantic node into `out` — most nodes append exactly
-    /// one flow node; wrappers pass through and arm the next box. The
-    /// hints a stack, a text or a style carries itself are stamped on
-    /// what it lowered to, as the wrapper they replace stamped them.
+    /// one flow node; wrappers pass through and arm the next box. What a
+    /// stack, a text or a style carries itself lowers as the wrappers it
+    /// replaces did: its action arms the box it opens, and its hints are
+    /// stamped on what it lowered to.
     fn lower_into(&mut self, tree: &LayoutNode, out: &mut Vec<DomNode>) {
-        match tree.carried_hints() {
-            Some(hints) if !hints.is_empty() => {
-                let opened = out.len();
+        if tree.is_bare() {
+            return self.lower_node(tree, out);
+        }
+        let opened = out.len();
+        match tree.carried_action() {
+            Some(path) => {
+                self.pending_interactive = Some(std::rc::Rc::clone(path));
                 self.lower_node(tree, out);
-                Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &hints.dom_id);
+                self.pending_interactive = None;
             }
-            _ => self.lower_node(tree, out),
+            None => self.lower_node(tree, out),
+        }
+        if let Some(hints) = tree.carried_hints()
+            && !hints.is_empty()
+        {
+            Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &hints.dom_id);
         }
     }
 
-    /// The node itself, its own hints aside.
+    /// The node itself, what it carries aside.
     fn lower_node(&mut self, tree: &LayoutNode, out: &mut Vec<DomNode>) {
         match tree {
             LayoutNode::Stack { axis, spacing, align, children, .. } => {
@@ -618,8 +628,8 @@ impl Walk<'_> {
                 // that would have carried nothing is not made. A state
                 // the ink answers to, an ink inside a hover scope, a
                 // layer, a transition — those keep their box
-                // (a text that wears hints stood behind their wrapper, and
-                // a style over a wrapper keeps its box)
+                // (a text that wears hints or an action stood behind their
+                // wrapper, and a style over a wrapper keeps its box)
                 if matches!(**child, LayoutNode::Text { .. })
                     && child.is_bare()
                     && !states
@@ -1537,6 +1547,7 @@ mod tests {
             highlights: None,
             truncation: None,
             hints: Default::default(),
+            action: None,
         }
     }
 
@@ -1605,6 +1616,7 @@ mod tests {
                 },
             ],
             hints: Default::default(),
+            action: None,
         };
         let offsets = HashMap::default();
         let scene = lower(&tree, &env_fixture(&offsets)).scene;
@@ -1695,6 +1707,7 @@ mod tests {
             align: CrossAlign::Start,
             children: vec![text_node("head"), LayoutNode::Spacer, text_node("foot")],
             hints: Default::default(),
+            action: None,
         };
         let offsets = HashMap::default();
         let scene = lower(&tree, &env_fixture(&offsets)).scene;
@@ -1732,6 +1745,7 @@ mod tests {
                 },
             ],
             hints: Default::default(),
+            action: None,
         };
         let offsets = HashMap::default();
         let scene = lower(&tree, &env_fixture(&offsets)).scene;
@@ -1879,6 +1893,7 @@ mod tests {
             props: std::rc::Rc::new(props),
             child: Box::new(text_node("flip me")),
             hints: Default::default(),
+            action: None,
         };
         let offsets = HashMap::default();
         let scene = lower(&tree, &env_fixture(&offsets)).scene;
@@ -1888,6 +1903,77 @@ mod tests {
             panic!("a text under the box");
         };
         assert!(text.inherits_ink, "the box owns both states");
+    }
+
+    /// What a node carries itself lowers as the wrappers it replaces: a
+    /// cell that carries its tag and its click around one text is that
+    /// text, tagged and armed, as a hinted target around the cell was.
+    #[test]
+    fn a_cell_that_carries_its_hints_and_its_click_is_its_text() {
+        let tree = LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing: 0.0,
+            align: CrossAlign::Center,
+            children: vec![text_node("x")],
+            hints: crate::layout::ElementHints {
+                tag: Some(crate::modifier::hint("td")),
+                class: Some(crate::modifier::hint("cell")),
+                dom_id: None,
+            },
+            action: Some(std::rc::Rc::from("Row/#1")),
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let [cell] = scene.children.as_slice() else {
+            panic!("one cell: {:?}", scene.children);
+        };
+        assert!(matches!(cell.kind, DomKind::Text(_)), "the cell is its text: {cell:?}");
+        assert_eq!(cell.hints.tag.as_deref(), Some("td"));
+        assert_eq!(cell.hints.class.as_deref(), Some("cell"));
+        assert_eq!(cell.style.interactive.as_deref(), Some("Row/#1"), "and answers the click");
+    }
+
+    /// An ink-only style over a text owns no element — but a text that
+    /// carries its own tag stood behind a wrapper once, and the style
+    /// over it keeps its box. A style that carries the tag lends it to
+    /// the text it folds into.
+    #[test]
+    fn a_style_over_a_hinted_text_keeps_its_box() {
+        use crate::layout::VisualProps;
+        let ink = VisualProps { foreground: Some(Color::hex(0x336699)), ..VisualProps::default() };
+        let hinted = |tag: &str| crate::layout::ElementHints {
+            tag: Some(crate::modifier::hint(tag)),
+            class: None,
+            dom_id: None,
+        };
+        let over_hinted = LayoutNode::Styled {
+            props: std::rc::Rc::new(ink),
+            child: Box::new(LayoutNode::Text {
+                content: crate::bind::TextSource::from("a"),
+                highlights: None,
+                truncation: None,
+                hints: hinted("a"),
+                action: None,
+            }),
+            hints: Default::default(),
+            action: None,
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&over_hinted, &env_fixture(&offsets)).scene;
+        let boxed = &scene.children[0];
+        assert!(matches!(boxed.kind, DomKind::Box), "the style keeps its box: {boxed:?}");
+        assert_eq!(boxed.children[0].hints.tag.as_deref(), Some("a"));
+
+        let hinted_style = LayoutNode::Styled {
+            props: std::rc::Rc::new(ink),
+            child: Box::new(text_node("b")),
+            hints: hinted("td"),
+            action: None,
+        };
+        let scene = lower(&hinted_style, &env_fixture(&offsets)).scene;
+        let text = &scene.children[0];
+        assert!(matches!(text.kind, DomKind::Text(_)), "the ink folds into the text: {text:?}");
+        assert_eq!(text.hints.tag.as_deref(), Some("td"));
     }
 
     /// A popover mounts under the root — the portal survives the flow.
@@ -1904,6 +1990,7 @@ mod tests {
                 child: Box::new(text_node("the row")),
             }],
             hints: Default::default(),
+            action: None,
         };
         let offsets = HashMap::default();
         let scene = lower(&tree, &env_fixture(&offsets)).scene;

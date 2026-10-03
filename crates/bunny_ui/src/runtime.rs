@@ -4645,6 +4645,7 @@ impl Runtime {
                         align: crate::layout::CrossAlign::Start,
                         children: roots,
                         hints: Default::default(),
+                        action: None,
                     }
                 }
             }
@@ -4763,6 +4764,7 @@ impl Runtime {
                         align: crate::layout::CrossAlign::Start,
                         children: roots,
                         hints: Default::default(),
+                        action: None,
                     }
                 }
             }
@@ -6398,6 +6400,7 @@ impl Runtime {
                         align: crate::layout::CrossAlign::Start,
                         children: roots,
                         hints: Default::default(),
+                        action: None,
                     }
                 }
             }
