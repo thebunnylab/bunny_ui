@@ -78,7 +78,9 @@ strokes reach it before the key bindings, text arrives as text
 input system asks it directly where the caret is.
 
 Use it for content that has no views. A rounded corner, a hover state
-or a gradient belongs in the framework.
+or a gradient belongs in the framework. Content that arrives with its
+own renderer — a web page, a camera's video — takes the native host
+instead (`docs/webview.md`, `docs/video.md`).
 
 ## Gradients
 

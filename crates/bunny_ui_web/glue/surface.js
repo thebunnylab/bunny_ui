@@ -31,7 +31,10 @@ function surface(kind) {
       spent.height = 0;
       surfaces.delete(held);
     }
-    host.replaceChildren(canvas);
+    // the host overlay (glue.js) rides ABOVE whichever surface holds
+    // the page: it is kept across the swap, after the new canvas
+    const kept = [...host.children].filter((child) => child.dataset.bunnyKeep !== undefined);
+    host.replaceChildren(canvas, ...kept);
   }
   return canvas;
 }

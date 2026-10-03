@@ -246,7 +246,10 @@ fn ensure_engine(stack: &Stack) -> bool {
 /// The stamp fingerprints the whole spec — a change re-instructs the
 /// mounted view, never re-creates it. A document stamps by its digest.
 fn stamp_of(spec: &HostSpec) -> String {
-    let HostSpec::Webview { url, document, scripts, console, requests, full_motion } = spec;
+    // a video has no page to stamp: the reconcile refused it already
+    let HostSpec::Webview { url, document, scripts, console, requests, full_motion } = spec else {
+        return String::new();
+    };
     let mut stamp = String::with_capacity(url.len() + 22);
     stamp.push_str(url);
     if let Some(document) = document {
@@ -269,6 +272,12 @@ fn stamp_of(spec: &HostSpec) -> String {
 /// every box places it, and a box that left takes its page with it.
 pub(crate) fn reconcile(window: usize, hosts: &[HostPlacement], scale: f64) {
     for host in hosts {
+        // a video host is the web's: the box stays reserved and empty
+        // here, and the console says so once
+        let HostSpec::Webview { .. } = &host.spec else {
+            bunny_ui::host::refuse_video_once();
+            continue;
+        };
         let stamp = stamp_of(&host.spec);
         let shown = !host.visible.is_empty();
         let standing = HOSTS.with(|all| {
@@ -318,7 +327,7 @@ fn create(
     if !ensure_engine(stack) {
         return;
     }
-    let HostSpec::Webview { url, document, .. } = spec;
+    let HostSpec::Webview { url, document, .. } = spec else { return };
     let size = logical_size(frame);
     let tag = Box::into_raw(Box::new(Tag { window, path: path.to_string() }));
     let (exportable, backend, view, ucm) = unsafe {
@@ -414,7 +423,7 @@ fn create(
 /// first, then the hooks the app DECLARED, then the editor for an
 /// editable document, then the app's own scripts.
 unsafe fn apply_scripts(stack: &Stack, ucm: *mut c_void, spec: &HostSpec) {
-    let HostSpec::Webview { scripts, console, requests, document, .. } = spec;
+    let HostSpec::Webview { scripts, console, requests, document, .. } = spec else { return };
     unsafe {
         (stack.webkit.user_content_manager_remove_all_scripts)(ucm);
         add_script(stack, ucm, WEBKIT_BOOT);
@@ -492,7 +501,7 @@ unsafe fn current_uri(stack: &Stack, view: *mut c_void) -> Option<String> {
 /// its digest, a url by where the engine already is.
 fn update(window: usize, path: &str, spec: &HostSpec, stamp: String) {
     let Some(stack) = wpe::loader() else { return };
-    let HostSpec::Webview { url, document, .. } = spec;
+    let HostSpec::Webview { url, document, .. } = spec else { return };
     with_host(window, path, |host| {
         host.stamp = stamp;
         unsafe { apply_scripts(stack, host.ucm, spec) };
@@ -1334,7 +1343,15 @@ mod tests {
         let stamp = stamp_of(&plain);
         assert!(stamp.starts_with("https://example.test/"));
         assert!(stamp.ends_with("-r-"));
-        let HostSpec::Webview { console, .. } = &plain;
+        let HostSpec::Webview { console, .. } = &plain else { unreachable!() };
         assert!(!console);
+        // a video stamps as nothing: the reconcile never mounts one
+        let feed = HostSpec::Video {
+            stream: bunny_ui::host::MediaHandle(3),
+            mirrored: false,
+            cover: true,
+            corner_radius: 0.0,
+        };
+        assert!(stamp_of(&feed).is_empty());
     }
 }
