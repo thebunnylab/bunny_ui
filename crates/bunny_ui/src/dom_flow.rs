@@ -690,6 +690,16 @@ impl Walk<'_> {
                 };
                 out.push(field);
             }
+            // a feed has no bytes an `<img>` could name: it is painted,
+            // as an island, by the road that scales it on the GPU
+            #[cfg(feature = "canvas")]
+            LayoutNode::Image { source: Some(crate::image_engine::ImageSource::Feed { .. }), .. } => {
+                out.push(self.island(tree, None));
+            }
+            #[cfg(not(feature = "canvas"))]
+            LayoutNode::Image { source: Some(crate::image_engine::ImageSource::Feed { .. }), .. } => {
+                out.push(node(DomKind::Box));
+            }
             LayoutNode::Image { source, fit, .. } => {
                 match source {
                     Some(source) => {
@@ -1075,22 +1085,37 @@ impl Walk<'_> {
             LayoutNode::Island { .. } | LayoutNode::Custom { .. } => {
                 out.push(node(DomKind::Box));
             }
-            // the native host's web lowering (`docs/webview.md`): the
-            // "native view" is an iframe, and the island contract is
-            // the one the DOM already enforces
+            // the native host's web lowering (`docs/webview.md`,
+            // `docs/video.md`): the "native view" is the browser's own
+            // element — an iframe for a page, a video for a stream —
+            // and the island contract is the one the DOM already
+            // enforces
             LayoutNode::Host { spec, .. } => {
-                let crate::host::HostSpec::Webview { url, document, .. } = spec;
-                // a document rides SEALED: the browser's sandbox with no
-                // powers holds it as `srcdoc`, its policy at its head —
-                // never the url, which the policy forbade
-                let mut frame = node(match document {
-                    Some(document) => {
-                        DomKind::Iframe { src: std::rc::Rc::from(document.sealed()), sealed: true }
+                let mut frame = node(match spec {
+                    // a document rides SEALED: the browser's sandbox
+                    // with no powers holds it as `srcdoc`, its policy at
+                    // its head — never the url, which the policy forbade
+                    crate::host::HostSpec::Webview { url, document, .. } => match document {
+                        Some(document) => DomKind::Iframe {
+                            src: std::rc::Rc::from(document.sealed()),
+                            sealed: true,
+                        },
+                        None => DomKind::Iframe { src: std::rc::Rc::clone(url), sealed: false },
+                    },
+                    // the stream rides by its handle; the glue finds it
+                    // in the page's registry — the stream itself never
+                    // crossed into the engine
+                    crate::host::HostSpec::Video { stream, mirrored, cover, corner_radius } => {
+                        DomKind::Video {
+                            stream: stream.0,
+                            mirrored: *mirrored,
+                            cover: *cover,
+                            radius: *corner_radius as f32,
+                        }
                     }
-                    None => DomKind::Iframe { src: std::rc::Rc::clone(url), sealed: false },
                 });
                 let layout = frame.layout.as_mut().expect("flow node");
-                // a page is a filler on both axes by construction — it
+                // a host is a filler on both axes by construction — it
                 // grows along the stack and stretches across it; a
                 // `.frame(…)` above pins it like anything else
                 layout.grow = true;
@@ -1466,6 +1491,34 @@ mod tests {
             }
             other => panic!("the document is a sealed iframe: {other:?}"),
         }
+    }
+
+    /// The video host lowers to the browser's own `<video>`: the stream
+    /// by its handle, the mirror, the fit and the radius riding the
+    /// kind — hungry on both axes like the iframe, because a feed has
+    /// no natural size either; the frame above decides it.
+    #[test]
+    fn a_video_host_lowers_to_a_video_that_fills() {
+        let tree = LayoutNode::Host {
+            path: "feed".into(),
+            spec: crate::host::HostSpec::Video {
+                stream: crate::host::MediaHandle(3),
+                mirrored: true,
+                cover: false,
+                corner_radius: 12.0,
+            },
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let feed = &scene.children[0];
+        assert_eq!(
+            feed.kind,
+            DomKind::Video { stream: 3, mirrored: true, cover: false, radius: 12.0 },
+            "the host is a video with its handle and its asks"
+        );
+        let layout = feed.layout.as_ref().expect("flow");
+        assert!(layout.grow, "the feed takes the leftover");
+        assert!(layout.stretch, "and follows the cross axis");
     }
 
     /// The dream mapping: a vstack with spacing IS a flex column with

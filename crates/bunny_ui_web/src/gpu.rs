@@ -28,6 +28,7 @@ use bunny_ui::gpu::walk::{
     build_frame, AtlasGround, FrameBatches, GlassInstance, RectInstance, RunAtlas, RunKind,
     SpriteInstance, GLASS_MAX_LEVEL,
 };
+use bunny_ui::image_engine::PixelFormat;
 use bunny_ui::image_engine::ImageEngine;
 use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
@@ -181,6 +182,8 @@ const UBO_ROUND_BINDING: u32 = 1;
 struct Pipelines {
     rect: u32,
     sprite: u32,
+    /// The feeds' program: the sprite vertex over a LINEAR sampler.
+    live: u32,
     glass: u32,
     blur: u32,
     blit: u32,
@@ -248,19 +251,21 @@ pub(crate) fn force() {
 /// so it gets a texture of its own.
 const PROBE_TALL: u32 = 300;
 
-/// Can this tier show what it uploads? One tile and one tall picture go
-/// the whole road — the tile shelved in the shared atlas, the picture
-/// given a texture of its own, both sampled and drawn — and come back
-/// through a read of the drawable. A tier that loses them draws the boxes
-/// and none of the words, and the CPU road draws the same scene whole.
+/// Can this tier show what it uploads? One tile, one tall picture and
+/// one feed go the whole road — the tile shelved in the shared atlas,
+/// the picture given a texture of its own, the feed a live texture the
+/// sampler scales — and come back through a read of the drawable. A tier
+/// that loses them draws the boxes and none of the words, and the CPU
+/// road draws the same scene whole.
 fn tiles_survive() -> bool {
     use bunny_ui::custom::{CustomElement, Metrics, PaintCtx, Painter};
-    use bunny_ui::image_engine::ImageSource;
+    use bunny_ui::image_engine::{FeedKey, ImageSource};
     use bunny_ui::layout::{Point, Proposal, Rect};
 
     struct Probe {
         tile: ImageSource,
         tall: ImageSource,
+        feed: ImageSource,
     }
     impl CustomElement for Probe {
         fn measure(&self, proposal: Proposal, _metrics: &Metrics) -> Size {
@@ -273,6 +278,8 @@ fn tiles_survive() -> bool {
             };
             painter.image(at(0.0, 8.0, 8.0), self.tile.clone());
             painter.image(at(8.0, 2.0, f64::from(PROBE_TALL)), self.tall.clone());
+            // a 2×2 picture in an 8×8 box: the live road, scaled 4×
+            painter.image(at(10.0, 8.0, 8.0), self.feed.clone());
         }
     }
 
@@ -295,29 +302,37 @@ fn tiles_survive() -> bool {
         }
     }
     let tall = MAGENTA.repeat(2 * PROBE_TALL as usize);
+    let quad = [RED, GREEN, BLUE, WHITE].concat();
     let probe = Probe {
         tile: ImageSource::rgba(0x7E57_0000_0000_0001, (8, 8), tile),
         tall: ImageSource::rgba(0x7E57_0000_0000_0002, (2, PROBE_TALL), tall),
+        feed: ImageSource::feed(FeedKey::new(0x7E57_0000_0000_0003), 1, (2, 2), quad),
     };
 
-    let size = Size { width: 10.0, height: f64::from(PROBE_TALL) };
+    let size = Size { width: 18.0, height: f64::from(PROBE_TALL) };
     // a scene of its own: runtimes on one thread take turns at the input
     // tables by their roots' names, and the page's is never this one
     let runtime = bunny_ui::runtime::Runtime::scene("bunny-gpu-probe");
     let display = runtime.display_frame(&bunny_ui::custom::custom(probe), size);
     let black = Color { r: 0, g: 0, b: 0, a: 255 };
     present_window(None, &display, size, 1, black, &*runtime.text(), &*runtime.images());
-    let rgba = read_rgba((10, PROBE_TALL));
+    let rgba = read_rgba((18, PROBE_TALL));
     let near = |x: usize, y: usize, want: [u8; 4]| {
-        let at = (y * 10 + x) * 4;
+        let at = (y * 18 + x) * 4;
         rgba.get(at..at + 3)
             .is_some_and(|got| got.iter().zip(want).all(|(&got, want)| got.abs_diff(want) <= 8))
     };
+    // the feed's corners: a linear sampler clamped at the edge reads a
+    // corner texel whole at the box's corner pixels
     near(1, 1, RED)
         && near(6, 1, GREEN)
         && near(1, 6, BLUE)
         && near(6, 6, WHITE)
         && near(8, PROBE_TALL as usize - 10, MAGENTA)
+        && near(10, 0, RED)
+        && near(17, 0, GREEN)
+        && near(10, 7, BLUE)
+        && near(17, 7, WHITE)
 }
 
 fn compile(kind: u32, source: &str) -> u32 {
@@ -374,6 +389,11 @@ impl Pipelines {
             &format!("{}{}{}", PRELUDE_300ES, src::SHARED_FRAG, src::SPRITE_FRAG_BODY),
             &["a_dest", "a_tex", "a_clip"],
         )?;
+        let live = program(
+            &format!("{}{}", PRELUDE_300ES, src::SPRITE_VERT),
+            &format!("{}{}{}", PRELUDE_300ES, src::SHARED_FRAG, src::LIVE_FRAG_BODY),
+            &["a_dest", "a_tex", "a_clip"],
+        )?;
         let glass = program(
             &format!("{}{}", PRELUDE_300ES, src::GLASS_VERT),
             &format!("{}{}{}", PRELUDE_300ES, src::SHARED_FRAG, src::GLASS_FRAG_BODY),
@@ -400,6 +420,7 @@ impl Pipelines {
             }
         };
         sampler(sprite, "atlas");
+        sampler(live, "atlas");
         sampler(glass, "pyramid");
         sampler(blur, "source");
         sampler(blit, "source");
@@ -416,6 +437,7 @@ impl Pipelines {
             Pipelines {
                 rect,
                 sprite,
+                live,
                 glass,
                 blur,
                 blit,
@@ -708,6 +730,8 @@ fn glass_attribs(base: usize) {
 struct WebGround {
     shared: Option<u32>,
     dedicated: std::collections::HashMap<u64, u32>,
+    /// The feeds' textures: sized to the picture, LINEAR, written whole.
+    live: std::collections::HashMap<u64, u32>,
     next: u64,
 }
 
@@ -777,6 +801,48 @@ impl AtlasGround for WebGround {
 
     fn drop_dedicated(&mut self, id: u64) {
         if let Some(texture) = self.dedicated.remove(&id) {
+            unsafe { gl_delete_texture(texture) };
+        }
+    }
+
+    fn make_live(&mut self, w: u32, h: u32, format: PixelFormat) -> Option<u64> {
+        let PixelFormat::Rgba8 = format else { return None };
+        // no `settle`: the first `update_live` overwrites the whole
+        // texture, so a lazy clear racing it has nothing to win
+        let texture = unsafe {
+            let texture = gl_create_texture();
+            gl_bind_texture(GL_TEXTURE_2D, texture);
+            gl_tex_image_2d(
+                GL_TEXTURE_2D, 0, GL_RGBA as i32, w as i32, h as i32,
+                GL_RGBA, GL_UNSIGNED_BYTE, std::ptr::null(), 0,
+            );
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            gl_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            texture
+        };
+        self.next += 1;
+        self.live.insert(self.next, texture);
+        Some(self.next)
+    }
+
+    fn update_live(&mut self, id: u64, w: u32, h: u32, bytes: &[u8], pitch_px: u32) -> bool {
+        let Some(&texture) = self.live.get(&id) else { return false };
+        unsafe {
+            gl_bind_texture(GL_TEXTURE_2D, texture);
+            gl_pixel_storei(GL_UNPACK_ROW_LENGTH, pitch_px as i32);
+            gl_tex_sub_image_2d(
+                GL_TEXTURE_2D, 0, 0, 0, w as i32, h as i32,
+                GL_RGBA, GL_UNSIGNED_BYTE, bytes.as_ptr(), bytes.len(),
+            );
+            gl_pixel_storei(GL_UNPACK_ROW_LENGTH, 0);
+        }
+        true
+    }
+
+    fn drop_live(&mut self, id: u64) {
+        if let Some(texture) = self.live.remove(&id) {
             unsafe { gl_delete_texture(texture) };
         }
     }
@@ -1043,9 +1109,13 @@ pub(crate) fn present_window(
                     }
                     rect_attribs(run.base as usize * std::mem::size_of::<RectInstance>());
                 }
-                RunKind::Sprites | RunKind::Texture(_) => {
-                    if program != tier.pipelines.sprite {
-                        program = tier.pipelines.sprite;
+                RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => {
+                    let wanted = match run.kind {
+                        RunKind::Live(_) => tier.pipelines.live,
+                        _ => tier.pipelines.sprite,
+                    };
+                    if program != wanted {
+                        program = wanted;
                         unsafe {
                             gl_use_program(program);
                             gl_bind_vertex_array(tier.pipelines.vao_sprite);
@@ -1058,6 +1128,12 @@ pub(crate) fn present_window(
                             .textures
                             .get(index as usize)
                             .and_then(|handle| tier.ground.dedicated.get(handle).copied())
+                            .unwrap_or(0),
+                        RunKind::Live(index) => tier
+                            .batches
+                            .textures
+                            .get(index as usize)
+                            .and_then(|handle| tier.ground.live.get(handle).copied())
                             .unwrap_or(0),
                         _ => tier.ground.shared.unwrap_or(0),
                     };

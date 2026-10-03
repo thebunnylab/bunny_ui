@@ -582,8 +582,10 @@ impl<'a> Painter<'a> {
     }
 
     /// One image, at the platform's own decode of the destination size.
-    pub fn image(&mut self, rect: Rect, source: ImageSource) {
-        self.display.push(DrawCommand::Image { rect: self.shift(rect), source });
+    /// A feed (`&ImageFeed`) goes through the same door: the GPU scales
+    /// its newest frame into `rect`.
+    pub fn image(&mut self, rect: Rect, source: impl Into<ImageSource>) {
+        self.display.push(DrawCommand::Image { rect: self.shift(rect), source: source.into() });
     }
 
     /// A two-stop ramp inside the rounded rect — the same value

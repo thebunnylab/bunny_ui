@@ -412,9 +412,11 @@ fn resolve_gl(egl: &EglFns) -> Option<GlFns> {
 
 use bunny_ui::gpu::shaders::PRELUDE_330 as SHADER_PRELUDE;
 use bunny_ui::gpu::shaders::{
-    BLIT_FRAG, BLUR_FRAG, FULL_VERT, GLASS_FRAG_BODY, GLASS_VERT, MASK_FRAG_BODY,
-    MASK_VERT, RECT_FRAG_BODY, RECT_VERT, SHARED_FRAG, SPRITE_FRAG_BODY, SPRITE_VERT,
+    BLIT_FRAG, BLUR_FRAG, FULL_VERT, GLASS_FRAG_BODY, GLASS_VERT, LIVE_FRAG_BODY,
+    MASK_FRAG_BODY, MASK_VERT, RECT_FRAG_BODY, RECT_VERT, SHARED_FRAG, SPRITE_FRAG_BODY,
+    SPRITE_VERT,
 };
+use bunny_ui::image_engine::PixelFormat;
 
 
 // MARK: - The stack (display, context, pipelines, fixed state)
@@ -430,6 +432,9 @@ struct GlStack {
     context: EglContext,
     rect_program: u32,
     sprite_program: u32,
+    /// The feeds' program: the sprite vertex over a LINEAR sampler, so a
+    /// picture of one size lands in a box of another.
+    live_program: u32,
     mask_program: u32,
     mask_quad: i32,
     /// The three programs liquid glass adds: the pane itself, one
@@ -682,6 +687,7 @@ impl GlStack {
                 context,
                 rect_program: 0,
                 sprite_program: 0,
+                live_program: 0,
                 mask_program: 0,
                 mask_quad: -1,
                 glass_program: 0,
@@ -731,6 +737,13 @@ impl GlStack {
                 &[c"a_dest", c"a_tex", c"a_clip"],
             )
             .map_err(|log| format!("sprite pipeline refused: {}", log.trim()))?;
+            self.live_program = build_program(
+                gl,
+                &[SHADER_PRELUDE, SPRITE_VERT],
+                &[SHADER_PRELUDE, SHARED_FRAG, LIVE_FRAG_BODY],
+                &[c"a_dest", c"a_tex", c"a_clip"],
+            )
+            .map_err(|log| format!("live pipeline refused: {}", log.trim()))?;
             self.mask_program = build_program(
                 gl,
                 &[SHADER_PRELUDE, MASK_VERT],
@@ -925,6 +938,7 @@ impl GlStack {
                 let swap_kind = match (bound, run.kind) {
                     (Some(RunKind::Sprites | RunKind::Texture(_)), RunKind::Sprites
                     | RunKind::Texture(_)) => false,
+                    (Some(RunKind::Live(_)), RunKind::Live(_)) => false,
                     (was, now) => was != Some(now),
                 };
                 if swap_kind {
@@ -935,6 +949,11 @@ impl GlStack {
                         }
                         RunKind::Sprites | RunKind::Texture(_) => {
                             (gl.use_program)(self.sprite_program);
+                            (gl.bind_vertex_array)(self.vao_sprite);
+                        }
+                        // the feeds: the same sprites, through the sampler
+                        RunKind::Live(_) => {
+                            (gl.use_program)(self.live_program);
                             (gl.bind_vertex_array)(self.vao_sprite);
                         }
                         // handled above, in a pass of its own
@@ -952,15 +971,17 @@ impl GlStack {
                         let base = run.base as usize * std::mem::size_of::<RectInstance>();
                         rect_attribs(gl, base);
                     }
-                    RunKind::Sprites | RunKind::Texture(_) => {
+                    RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => {
                         (gl.bind_buffer)(GL_ARRAY_BUFFER, slot.sprites.buffer);
                         let base = run.base as usize * std::mem::size_of::<SpriteInstance>();
                         sprite_attribs(gl, base);
-                        // the shared atlas, or the run's own dedicated
-                        // texture — same pipeline (the walk's handles
-                        // ARE gl texture names on this tier)
+                        // the shared atlas, or the run's own dedicated or
+                        // live texture (the walk's handles ARE gl texture
+                        // names on this tier)
                         let texture = match run.kind {
-                            RunKind::Texture(index) => textures[index as usize] as u32,
+                            RunKind::Texture(index) | RunKind::Live(index) => {
+                                textures[index as usize] as u32
+                            }
                             _ => atlas_texture,
                         };
                         if bound_texture != Some(texture) {
@@ -1252,15 +1273,23 @@ unsafe fn sprite_attribs(gl: &GlFns, base: usize) {
 
 // MARK: - The GL ground (where the walk's tiles land on this tier)
 
-/// One RGBA texture, shader-read only, NEAREST/CLAMP (texelFetch never
-/// samples, but complete state keeps every driver honest).
-unsafe fn make_texture(gl: &GlFns, width: u32, height: u32, initial: Option<&[u8]>) -> u32 {
+/// One RGBA texture, shader-read only, CLAMP; NEAREST for the atlas and
+/// the dedicated pictures (texelFetch never samples, but complete state
+/// keeps every driver honest), LINEAR for a feed the sampler scales.
+unsafe fn make_texture(
+    gl: &GlFns,
+    width: u32,
+    height: u32,
+    initial: Option<&[u8]>,
+    linear: bool,
+) -> u32 {
     unsafe {
+        let filter = if linear { GL_LINEAR } else { GL_NEAREST };
         let mut texture = 0;
         (gl.gen_textures)(1, &mut texture);
         (gl.bind_texture)(GL_TEXTURE_2D, texture);
-        (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+        (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
         (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         (gl.tex_image_2d)(
@@ -1290,7 +1319,7 @@ impl AtlasGround for GlGround<'_> {
         if self.shared.is_some() {
             return true;
         }
-        let texture = unsafe { make_texture(self.gl, size, size, None) };
+        let texture = unsafe { make_texture(self.gl, size, size, None, false) };
         *self.shared = (texture != 0).then_some(texture);
         self.shared.is_some()
     }
@@ -1324,13 +1353,48 @@ impl AtlasGround for GlGround<'_> {
     fn make_dedicated(&mut self, w: u32, h: u32, bytes: &[u8], pitch_px: u32) -> Option<u64> {
         unsafe {
             (self.gl.pixel_storei)(GL_UNPACK_ROW_LENGTH, pitch_px as i32);
-            let texture = make_texture(self.gl, w, h, Some(bytes));
+            let texture = make_texture(self.gl, w, h, Some(bytes), false);
             (self.gl.pixel_storei)(GL_UNPACK_ROW_LENGTH, 0);
             (texture != 0).then_some(texture as u64)
         }
     }
 
     fn drop_dedicated(&mut self, id: u64) {
+        let texture = id as u32;
+        unsafe { (self.gl.delete_textures)(1, &texture) };
+    }
+
+    fn make_live(&mut self, w: u32, h: u32, format: PixelFormat) -> Option<u64> {
+        let PixelFormat::Rgba8 = format else { return None };
+        let texture = unsafe { make_texture(self.gl, w, h, None, true) };
+        (texture != 0).then_some(texture as u64)
+    }
+
+    fn update_live(&mut self, id: u64, w: u32, h: u32, bytes: &[u8], pitch_px: u32) -> bool {
+        // the driver orders the store after the frames still sampling
+        // the texture — `texSubImage2D` is synchronous with respect to
+        // the queue, which `replaceRegion` on the Mac is not
+        unsafe {
+            let texture = id as u32;
+            (self.gl.bind_texture)(GL_TEXTURE_2D, texture);
+            (self.gl.pixel_storei)(GL_UNPACK_ROW_LENGTH, pitch_px as i32);
+            (self.gl.tex_sub_image_2d)(
+                GL_TEXTURE_2D,
+                0,
+                0,
+                0,
+                w as i32,
+                h as i32,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                bytes.as_ptr().cast(),
+            );
+            (self.gl.pixel_storei)(GL_UNPACK_ROW_LENGTH, 0);
+        }
+        true
+    }
+
+    fn drop_live(&mut self, id: u64) {
         let texture = id as u32;
         unsafe { (self.gl.delete_textures)(1, &texture) };
     }
@@ -1394,7 +1458,7 @@ impl GlassTargets {
                 return None;
             }
             let half = (size.0.div_ceil(2).max(1), size.1.div_ceil(2).max(1));
-            let scene = make_texture(gl, size.0, size.1, None);
+            let scene = make_texture(gl, size.0, size.1, None, false);
             // the scene is SAMPLED by the blur, so it must filter
             (gl.bind_texture)(GL_TEXTURE_2D, scene);
             (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -2056,7 +2120,7 @@ impl OffscreenGl {
             GlStack::create(TargetKind::Offscreen, EGL_PLATFORM_WAYLAND, std::ptr::null_mut())?;
         let gl = &stack.gl;
         let (framebuffer, target) = unsafe {
-            let target = make_texture(gl, width as u32, height as u32, None);
+            let target = make_texture(gl, width as u32, height as u32, None, false);
             if target == 0 {
                 return None;
             }

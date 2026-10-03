@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 
 use bunny_ui::image_engine::ImageEngine;
+use bunny_ui::image_engine::PixelFormat;
 use bunny_ui::layout::{Color, DisplayList, Size};
 use bunny_ui::text_engine::TextEngine;
 
@@ -51,6 +52,9 @@ const RECT_VERT_SPV: &[u8] = include_bytes!("shaders/rect.vert.spv");
 const RECT_FRAG_SPV: &[u8] = include_bytes!("shaders/rect.frag.spv");
 const SPRITE_VERT_SPV: &[u8] = include_bytes!("shaders/sprite.vert.spv");
 const SPRITE_FRAG_SPV: &[u8] = include_bytes!("shaders/sprite.frag.spv");
+// a feed's sprite: the picture's own size, scaled into the box by the
+// linear sampler
+const LIVE_FRAG_SPV: &[u8] = include_bytes!("shaders/live.frag.spv");
 const MASK_VERT_SPV: &[u8] = include_bytes!("shaders/mask.vert.spv");
 const MASK_FRAG_SPV: &[u8] = include_bytes!("shaders/mask.frag.spv");
 // liquid glass: the pane, one separable blur pass, and the copy of the
@@ -1400,6 +1404,8 @@ struct VkStack {
     render_pass: RenderPass,
     rect_pipeline: Pipeline,
     sprite_pipeline: Pipeline,
+    /// The feeds' pipeline: the sprite vertex over the LINEAR sampler.
+    live_pipeline: Pipeline,
     mask_pipeline: Pipeline,
     command_pool: CommandPool,
     /// The colour format the target wears — the scene a glass frame
@@ -1852,6 +1858,7 @@ impl VkStack {
                 render_pass,
                 rect_pipeline: 0,
                 sprite_pipeline: 0,
+                live_pipeline: 0,
                 mask_pipeline: 0,
                 command_pool,
                 format,
@@ -2065,6 +2072,7 @@ impl VkStack {
         let rect_frag = self.shader(RECT_FRAG_SPV)?;
         let sprite_vert = self.shader(SPRITE_VERT_SPV)?;
         let sprite_frag = self.shader(SPRITE_FRAG_SPV)?;
+        let live_frag = self.shader(LIVE_FRAG_SPV)?;
         let mask_vert = self.shader(MASK_VERT_SPV)?;
         let mask_frag = self.shader(MASK_FRAG_SPV)?;
         // the RectInstance bytes as instance-rate attributes — the
@@ -2094,6 +2102,8 @@ impl VkStack {
             VertexInputAttribute { location: 1, binding: 0, format: FORMAT_R32G32B32A32_SFLOAT, offset: 16 },
             VertexInputAttribute { location: 2, binding: 0, format: FORMAT_R32G32B32A32_SFLOAT, offset: 32 },
         ];
+        // the feeds ride the sprite's lattice, through another fragment
+        let live_binding = VertexInputBinding { ..sprite_binding };
         // a pane's instance: six vec4 and two normalized ubyte4, the
         // 112-byte lattice every tier shares
         let glass_binding = VertexInputBinding {
@@ -2136,6 +2146,14 @@ impl VkStack {
             source_over,
             self.render_pass,
         )?;
+        self.live_pipeline = self.pipeline(
+            sprite_vert,
+            live_frag,
+            &[live_binding],
+            &sprite_attributes,
+            source_over,
+            self.render_pass,
+        )?;
         self.mask_pipeline =
             self.pipeline(mask_vert, mask_frag, &[], &[], multiply, self.render_pass)?;
         // the scene passes carry the SAME format as the target, so
@@ -2159,6 +2177,7 @@ impl VkStack {
                 rect_frag,
                 sprite_vert,
                 sprite_frag,
+                live_frag,
                 mask_vert,
                 mask_frag,
                 glass_vert,
@@ -2226,11 +2245,14 @@ impl VkStack {
     }
 
     /// A sampled+transfer image bound to device-local memory, with its
-    /// view and its descriptor set already written.
+    /// view and its descriptor set already written — through `sampler`:
+    /// the nearest one for the atlas and the dedicated pictures, the
+    /// linear one for a feed the shader scales.
     fn texture(
         &self,
         width: u32,
         height: u32,
+        sampler: Sampler,
     ) -> Option<(ImageHandle, DeviceMemory, ImageView, DescriptorSet)> {
         unsafe {
             let info = ImageCreateInfo {
@@ -2292,7 +2314,7 @@ impl VkStack {
                 return None;
             }
             let image_info = DescriptorImageInfo {
-                sampler: self.sampler,
+                sampler,
                 image_view: view,
                 layout: IMAGE_LAYOUT_SHADER_READ_ONLY,
             };
@@ -2344,6 +2366,7 @@ impl Drop for VkStack {
             (self.fns.device_wait_idle)(self.device);
             (self.fns.destroy_pipeline)(self.device, self.rect_pipeline, std::ptr::null());
             (self.fns.destroy_pipeline)(self.device, self.sprite_pipeline, std::ptr::null());
+            (self.fns.destroy_pipeline)(self.device, self.live_pipeline, std::ptr::null());
             (self.fns.destroy_pipeline)(self.device, self.mask_pipeline, std::ptr::null());
             (self.fns.destroy_command_pool)(self.device, self.command_pool, std::ptr::null());
             (self.fns.destroy_render_pass)(self.device, self.render_pass, std::ptr::null());
@@ -2741,7 +2764,8 @@ impl AtlasGround for VkGroundView<'_> {
         if self.ground.shared.is_some() {
             return true;
         }
-        let Some((image, memory, view, set)) = self.stack.texture(size, size) else {
+        let Some((image, memory, view, set)) = self.stack.texture(size, size, self.stack.sampler)
+        else {
             return false;
         };
         let id = self.ground.next_id;
@@ -2785,7 +2809,7 @@ impl AtlasGround for VkGroundView<'_> {
     }
 
     fn make_dedicated(&mut self, w: u32, h: u32, bytes: &[u8], pitch_px: u32) -> Option<u64> {
-        let (image, memory, view, set) = self.stack.texture(w, h)?;
+        let (image, memory, view, set) = self.stack.texture(w, h, self.stack.sampler)?;
         let id = self.ground.next_id;
         self.ground.next_id += 1;
         self.ground
@@ -2812,6 +2836,30 @@ impl AtlasGround for VkGroundView<'_> {
                 (self.stack.fns.free_memory)(self.stack.device, texture.memory, std::ptr::null());
             }
         }
+    }
+
+    fn make_live(&mut self, w: u32, h: u32, format: PixelFormat) -> Option<u64> {
+        let PixelFormat::Rgba8 = format else { return None };
+        let (image, memory, view, set) = self.stack.texture(w, h, self.stack.linear_sampler)?;
+        let id = self.ground.next_id;
+        self.ground.next_id += 1;
+        self.ground
+            .textures
+            .insert(id, GroundTexture { image, memory, view, set, initialized: false });
+        Some(id)
+    }
+
+    fn update_live(&mut self, id: u64, w: u32, h: u32, bytes: &[u8], pitch_px: u32) -> bool {
+        // the recorder's own round trip — SHADER_READ_ONLY to TRANSFER_DST
+        // and back, after every frame still sampling the image — is the
+        // in-place replacement; an arena with no room says so, and the
+        // retry that grows it uploads again
+        self.ground.stage(id, 0, 0, w, h, bytes.as_ptr(), pitch_px);
+        !self.ground.overflow
+    }
+
+    fn drop_live(&mut self, id: u64) {
+        self.drop_dedicated(id);
     }
 }
 
@@ -3042,11 +3090,13 @@ fn draw_runs(
             let swap = match (bound, run.kind) {
                 (Some(RunKind::Sprites | RunKind::Texture(_)), RunKind::Sprites
                 | RunKind::Texture(_)) => false,
+                (Some(RunKind::Live(_)), RunKind::Live(_)) => false,
                 (was, now) => was != Some(now),
             };
             if swap {
                 let pipeline = match run.kind {
                     RunKind::Rects => stack.rect_pipeline,
+                    RunKind::Live(_) => stack.live_pipeline,
                     _ => stack.sprite_pipeline,
                 };
                 (fns.cmd_bind_pipeline)(command, PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -3059,12 +3109,12 @@ fn draw_runs(
                         run.base as u64 * std::mem::size_of::<RectInstance>() as u64;
                     (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.rects, &offset);
                 }
-                RunKind::Sprites | RunKind::Texture(_) => {
+                RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => {
                     let offset =
                         run.base as u64 * std::mem::size_of::<SpriteInstance>() as u64;
                     (fns.cmd_bind_vertex_buffers)(command, 0, 1, &slot.sprites, &offset);
                     let set = match run.kind {
-                        RunKind::Texture(index) => batches
+                        RunKind::Texture(index) | RunKind::Live(index) => batches
                             .textures
                             .get(index as usize)
                             .and_then(|id| ground.textures.get(id))
@@ -5192,6 +5242,7 @@ mod tests {
             "rect.frag",
             "sprite.vert",
             "sprite.frag",
+            "live.frag",
             "mask.vert",
             "mask.frag",
             "glass.vert",
