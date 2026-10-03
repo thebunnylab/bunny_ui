@@ -323,7 +323,10 @@ struct PassState {
 }
 
 thread_local! {
-    static RETAINED: RefCell<BTreeMap<Rc<str>, Entry>> = const { RefCell::new(BTreeMap::new()) };
+    /// Every retained boundary by path. The tree holds each entry by its
+    /// box: a node shifts, lends and merges its values at every row that
+    /// mounts or leaves, and a value a word wide moves for nothing.
+    static RETAINED: RefCell<BTreeMap<Rc<str>, Box<Entry>>> = const { RefCell::new(BTreeMap::new()) };
     static PASS: RefCell<PassState> = RefCell::new(PassState::default());
     /// The passes, counted: the number the entries are stamped with
     /// ([`Visit`]). It never goes back, so no stamp is ever met twice.
@@ -893,7 +896,7 @@ pub(crate) fn finish_entry(
             if top_level {
                 live.top_level.insert(path.to_string());
             }
-            retained.insert(Rc::clone(path), entry);
+            retained.insert(Rc::clone(path), Box::new(entry));
         });
     });
     // …and so is every measure kept ABOVE it. The outermost re-run of a
@@ -1851,7 +1854,7 @@ thread_local! {
     /// Entries that left the retention and wait for an idle moment to
     /// be freed: a thousand rows that leave a list are a thousand layout
     /// trees, and the frame that drops them must not pay their frees.
-    static GRAVEYARD: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+    static GRAVEYARD: RefCell<Vec<Box<Entry>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Frees the entries that left since the last call; returns how many.
@@ -1988,7 +1991,7 @@ pub(crate) fn sweep_stale(root: &str) {
                 let mut graveyard = graveyard.borrow_mut();
                 // the entry leaves the tables and the read graph as it
                 // leaves the retention, and waits for the idle to be freed
-                let mut fall = |path: &Rc<str>, entry: Entry| {
+                let mut fall = |path: &Rc<str>, entry: Box<Entry>| {
                     live.unindex(path, &entry);
                     motor::identity::retire_view(path);
                     graveyard.push(entry);
@@ -2022,10 +2025,10 @@ pub(crate) fn sweep_stale(root: &str) {
 /// that leaves is taken out where a walk stands: no search from the root
 /// of the tree for each one.
 fn sweep_under(
-    retained: &mut BTreeMap<Rc<str>, Entry>,
+    retained: &mut BTreeMap<Rc<str>, Box<Entry>>,
     boundary: &str,
     visit: Visit,
-    fall: &mut impl FnMut(&Rc<str>, Entry),
+    fall: &mut impl FnMut(&Rc<str>, Box<Entry>),
 ) {
     // who leaves, read off the stamps in a walk that only looks: the
     // skips it stands inside are borrowed, and a row that stays costs
