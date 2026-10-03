@@ -5482,7 +5482,7 @@ mod tests {
 
         let runtime = Runtime::new();
         let patches = runtime.dom_frame(&Row, Size { width: 200.0, height: 40.0 });
-        let styles: Vec<crate::dom::DomStyle> = patches
+        let styles: Vec<crate::dom::DomLook> = patches
             .iter()
             .filter_map(|patch| match patch {
                 crate::dom::DomPatch::DefineRule { style, .. } => Some((**style).clone()),

@@ -5301,14 +5301,14 @@ impl LayoutNode {
                             // a bare field carries no ground, no edge
                             // and no rounding here either — the caller's
                             // own box is what shows
-                            crate::dom::DomStyle {
+                            crate::dom::DomLook {
                                 background: (!*bare).then_some(theme.field),
                                 border: (!*bare).then_some((theme.field_border, 1.0)),
                                 corner_radius: (!*bare)
                                     .then_some(Corners::all(FIELD_RADIUS)),
                                 focus_border: (!*bare).then_some(theme.focus),
                                 placeholder_color: Some(theme.placeholder),
-                                ..crate::dom::DomStyle::default()
+                                ..crate::dom::DomLook::default()
                             },
                         );
                     }
@@ -6020,10 +6020,10 @@ impl LayoutNode {
                             dom.leaf_styled(
                                 crate::dom::DomKind::Box,
                                 frame,
-                                crate::dom::DomStyle {
+                                crate::dom::DomLook {
                                     border: Some((accent, 2.0)),
                                     corner_radius: Some(Corners::all(6.0)),
-                                    ..crate::dom::DomStyle::default()
+                                    ..crate::dom::DomLook::default()
                                 },
                             );
                         }
