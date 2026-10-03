@@ -441,6 +441,9 @@ function lookRules(selector, kind, flags, style, layout, face) {
     decl["align-items"] =
       layout.align === 1 ? "center" : layout.align === 2 ? "flex-end" : layout.align === 3 ? "baseline" : "flex-start";
   }
+  // layers: the same alignment across the cell, so a centred stack
+  // centres both ways
+  if (kind === 11 && decl["align-items"]) decl["justify-items"] = decl["align-items"];
   if (layout.padding) decl.padding = layout.padding.map((side) => `${side}px`).join(" ");
   if (layout.grow) {
     // the flexible child — and the classic flex footgun: a zeroed
@@ -510,6 +513,9 @@ function lookRules(selector, kind, flags, style, layout, face) {
     .map(([name, value]) => `${name}:${value}`)
     .join(";");
   const rules = [`${selector}{${body}}`];
+  // layers: one grid cell, and every child IN it — auto-placement
+  // would give each layer a row of its own
+  if (kind === 11) rules.push(`${selector}>*{grid-area:1/1}`);
   // a follower hangs its states off the GROUP's pointer: the same
   // rules, hung off the group's selector, so the browser still owns
   // the hover and a group frame costs no patch; a box without one
