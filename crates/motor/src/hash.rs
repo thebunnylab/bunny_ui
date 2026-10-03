@@ -16,6 +16,28 @@ const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 #[derive(Default)]
 pub struct FxHasher(u64);
 
+/// One to seven bytes as the little-endian word they fill, zeros above.
+///
+/// Copied into a zeroed word, a tail of unknown length was a call to
+/// `memmove` for every key hashed — nearly every path has one. Two loads
+/// that overlap in the middle make the same word: a byte they both read
+/// lands at the same place from both, so the halves merge with an `or`.
+fn tail_word(tail: &[u8]) -> u64 {
+    let len = tail.len();
+    let pair = |low: u64, high: u64, width: usize| low | (high << (8 * (len - width)));
+    if len >= 4 {
+        let low = u32::from_le_bytes(tail[..4].try_into().expect("four bytes"));
+        let high = u32::from_le_bytes(tail[len - 4..].try_into().expect("four bytes"));
+        pair(u64::from(low), u64::from(high), 4)
+    } else if len >= 2 {
+        let low = u16::from_le_bytes(tail[..2].try_into().expect("two bytes"));
+        let high = u16::from_le_bytes(tail[len - 2..].try_into().expect("two bytes"));
+        pair(u64::from(low), u64::from(high), 2)
+    } else {
+        u64::from(tail[0])
+    }
+}
+
 impl Hasher for FxHasher {
     fn finish(&self) -> u64 {
         self.0
@@ -34,11 +56,7 @@ impl Hasher for FxHasher {
         // the tail, zero-filled: the same word the loop above would make
         let tail = words.remainder();
         if !tail.is_empty() {
-            let mut word = [0u8; 8];
-            for (slot, byte) in word.iter_mut().zip(tail) {
-                *slot = *byte;
-            }
-            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(SEED);
+            self.0 = (self.0.rotate_left(5) ^ tail_word(tail)).wrapping_mul(SEED);
         }
     }
 
