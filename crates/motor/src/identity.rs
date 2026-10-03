@@ -125,6 +125,13 @@ struct Registry {
     /// path: a row that mounts files its bindings under the copy its
     /// boundary already holds, and one that leaves frees no string.
     view_bindings: HashMap<Rc<str>, Vec<Rc<str>>>,
+    /// Views that left the tree, each with the bindings its body made:
+    /// the half of their teardown that waits for an idle moment
+    /// ([`collect_retired`]).
+    retired: Vec<(Rc<str>, Vec<Rc<str>>)>,
+    /// The keys of those bindings while they wait. A write that reaches
+    /// one marks nothing; a body that makes the key again takes it back.
+    retired_bindings: HashSet<Rc<str>>,
 }
 
 impl Registry {
@@ -829,8 +836,14 @@ fn clear_view_reads(registry: &mut Registry, view: &str) -> Vec<Rc<str>> {
     for binding in &bindings {
         clear_binding_reads(registry, binding);
     }
+    clear_own_reads(registry, view);
+    bindings
+}
+
+/// The reads the view's body made itself (its bindings' aside).
+fn clear_own_reads(registry: &mut Registry, view: &str) {
     let Some(keys) = registry.reads_by_view.remove(view) else {
-        return bindings;
+        return;
     };
     for key in keys {
         // one probe for the dependency: its readers are found, thinned
@@ -842,24 +855,72 @@ fn clear_view_reads(registry: &mut Registry, view: &str) -> Vec<Rc<str>> {
             }
         }
     }
-    bindings
 }
 
-/// The reads of a view that left the tree fall — the twin of the owner
-/// sweep, for a view that owns no state and so has no owner record.
-/// Returns the keys of the bindings the view had made: dead to the
-/// frame from here, whatever still holds their objects.
-pub fn forget_view_reads(view: &str) -> Vec<Rc<str>> {
+/// A view left the tree — the twin of the owner sweep, for a view that
+/// owns no state and so has no owner record.
+///
+/// What its body read falls now: no write can make it dirty again, and
+/// it never runs again. Its bindings are RETIRED: from here a write that
+/// reaches one of them marks nothing, and taking their reads apart waits
+/// for an idle moment ([`collect_retired`]). A thousand rows that leave
+/// a list are two thousand bindings, and unpicking each — the readers of
+/// every dependency, the sets freed one by one — was the larger part of
+/// the click that let them go.
+pub fn retire_view(view: &str) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
-        let bindings = clear_view_reads(&mut registry, view);
+        let registry = &mut *registry;
+        clear_own_reads(registry, view);
         // most frames that let views go hold no dirt at all: an empty
         // set is not asked, and the path is not hashed for it
         if !registry.dirty.is_empty() {
             registry.dirty.remove(view);
         }
-        bindings
+        if let Some((view, bindings)) = registry.view_bindings.remove_entry(view) {
+            for binding in &bindings {
+                // a write that reached it before it left is not news to
+                // anyone now
+                if !registry.dirty_bindings.is_empty() {
+                    registry.dirty_bindings.remove(binding);
+                }
+                registry.retired_bindings.insert(Rc::clone(binding));
+            }
+            registry.retired.push((view, bindings));
+        }
     })
+}
+
+/// Takes apart the read graph of the bindings retired since the last
+/// call ([`retire_view`]) and returns their keys, for the caller to drop
+/// them where else they live. A key a body made again in the meantime is
+/// left alone: its reads are the new binding's now.
+pub fn collect_retired() -> Vec<Rc<str>> {
+    REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        let registry = &mut *registry;
+        if registry.retired.is_empty() {
+            return Vec::new();
+        }
+        let mut torn = Vec::with_capacity(registry.retired_bindings.len());
+        let mut retired = std::mem::take(&mut registry.retired);
+        for (_, bindings) in retired.drain(..) {
+            for binding in bindings {
+                if registry.retired_bindings.remove(&binding) {
+                    clear_binding_reads(registry, &binding);
+                    torn.push(binding);
+                }
+            }
+        }
+        // the list keeps its room for the next rows that leave
+        registry.retired = retired;
+        torn
+    })
+}
+
+/// Bindings retired and not yet taken apart — diagnostics.
+pub fn retired_count() -> usize {
+    REGISTRY.with(|registry| registry.borrow().retired_bindings.len())
 }
 
 // MARK: - Bindings
@@ -886,6 +947,8 @@ pub fn begin_binding(key: &Rc<str>, owner: Option<&str>) -> BindingScope {
         let mut registry = registry.borrow_mut();
         clear_binding_reads(&mut registry, key);
         if let Some(owner) = owner {
+            // filed under a view, the binding is a body's new one
+            unretire(&mut registry, key);
             match registry.view_bindings.get_mut(owner) {
                 Some(bindings) => bindings.push(Rc::clone(key)),
                 None => {
@@ -906,6 +969,9 @@ pub fn begin_binding_under_view(key: &Rc<str>) -> BindingScope {
         let mut registry = registry.borrow_mut();
         let registry = &mut *registry;
         clear_binding_reads(registry, key);
+        // a binding made at a key that waits retired is a body's new one
+        // there: it hears writes again, and the idle leaves it alone
+        unretire(registry, key);
         if let Some(len) = registry.views.last() {
             let owner = &registry.joined[..*len];
             match registry.view_bindings.get_mut(owner) {
@@ -923,6 +989,13 @@ pub fn begin_binding_under_view(key: &Rc<str>) -> BindingScope {
         }
         BindingScope { previous: registry.binding_scope.replace(Rc::clone(key)) }
     })
+}
+
+/// The key is a live binding's again ([`retire_view`]).
+fn unretire(registry: &mut Registry, key: &str) {
+    if !registry.retired_bindings.is_empty() {
+        registry.retired_bindings.remove(key);
+    }
 }
 
 fn clear_binding_reads(registry: &mut Registry, key: &str) {
@@ -1024,7 +1097,14 @@ pub(crate) fn record_write(key: DepKey) {
             }
         }
         if let Some(bindings) = registry.binding_readers.get(&key) {
-            registry.dirty_bindings.extend(bindings.iter().cloned());
+            if registry.retired_bindings.is_empty() {
+                registry.dirty_bindings.extend(bindings.iter().cloned());
+            } else {
+                // a retired binding still stands in the readers until the
+                // idle takes it apart — and a write reaches it no more
+                let retired = &registry.retired_bindings;
+                registry.dirty_bindings.extend(bindings.iter().filter(|binding| !retired.contains(*binding)).cloned());
+            }
         }
     });
 }

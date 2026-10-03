@@ -881,44 +881,56 @@ mod frame_tests {
 mod tests {
     use super::*;
     use crate::prelude::*;
+    use crate::stats;
+
+    #[derive(Clone, Copy)]
+    struct Row {
+        id: usize,
+        label: State<Rc<str>>,
+    }
+
+    // each row is a boundary of its own, the way a list's rows are
+    #[derive(Clone, Copy)]
+    struct RowView(Row);
+
+    impl Component for RowView {
+        fn body(self, _ctx: &Context) -> impl View {
+            let row = self.0;
+            crate::hstack!(text(row.id.to_string()), crate::text!(row.label))
+        }
+    }
+
+    #[derive(Clone)]
+    struct Page {
+        rows: State<Rc<Vec<Row>>>,
+    }
+
+    impl Component for Page {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::vstack!(
+                text("a page that never runs again"),
+                for_each(self.rows, |row| row.id.to_string(), |row| RowView(*row)),
+            )
+        }
+    }
+
+    fn labelled(ids: std::ops::RangeInclusive<usize>) -> Vec<Row> {
+        ids.map(|id| Row { id, label: State::new(Rc::from(format!("row {id}").as_str())) }).collect()
+    }
+
+    /// Bindings the register holds the reads of.
+    fn binding_reads() -> usize {
+        motor::identity::registry_counts()[4]
+    }
 
     /// A keyed list under a page that did not run: the rows that leave
     /// the list leave the retention too — their boundaries, their
     /// bindings, their reads. The page is skipped, and a skipped page
-    /// must not shelter what the list under it let go.
+    /// must not shelter what the list under it let go. The bindings'
+    /// reads are unpicked when the page is idle, with the rows' memory:
+    /// until then they are retired, and after it nothing of them stays.
     #[test]
     fn rows_that_leave_a_list_under_a_clean_page_are_swept() {
-        #[derive(Clone, Copy)]
-        struct Row {
-            id: usize,
-            label: State<Rc<str>>,
-        }
-
-        // each row is a boundary of its own, the way a list's rows are
-        #[derive(Clone, Copy)]
-        struct RowView(Row);
-
-        impl Component for RowView {
-            fn body(self, _ctx: &Context) -> impl View {
-                let row = self.0;
-                crate::hstack!(text(row.id.to_string()), crate::text!(row.label))
-            }
-        }
-
-        #[derive(Clone)]
-        struct Page {
-            rows: State<Rc<Vec<Row>>>,
-        }
-
-        impl Component for Page {
-            fn body(self, _ctx: &Context) -> impl View {
-                crate::vstack!(
-                    text("a page that never runs again"),
-                    for_each(self.rows, |row| row.id.to_string(), |row| RowView(*row)),
-                )
-            }
-        }
-
         let rows = State::new(Rc::new(Vec::new()));
         let runtime = Runtime::new();
         let size = Size { width: 400.0, height: 300.0 };
@@ -935,9 +947,114 @@ mod tests {
         rows.set(Rc::new(Vec::new()));
         let _ = runtime.dom_frame(&Page { rows }, size);
         assert_eq!(crate::reconciler::retained_len(), empty_boundaries, "the rows left the retention");
-        assert_eq!(live_count(), empty_bindings, "their bindings left with them");
         let counts = motor::identity::registry_counts();
         assert_eq!(counts[3], 0, "no view keeps bindings: {counts:?}");
+        assert_eq!(motor::identity::retired_count(), 5, "their bindings wait retired for the idle");
+
+        runtime.collect_garbage();
+        assert_eq!(live_count(), empty_bindings, "their bindings left with them");
+        assert_eq!(binding_reads(), 0, "and their reads");
+        assert_eq!(motor::identity::retired_count(), 0);
+    }
+
+    /// Between the frame that lets rows go and the idle that unpicks
+    /// their bindings, the bindings still stand in the register — and a
+    /// write to what they read reaches none of them. Nothing goes dirty,
+    /// no frame is asked for them, and the next frame patches nothing:
+    /// a row that left never hears a write again, idle or not.
+    #[test]
+    fn a_row_that_left_hears_no_write_before_the_idle() {
+        let size = Size { width: 400.0, height: 300.0 };
+        let seeds = labelled(1..=3);
+        let rows = State::new(Rc::new(seeds.clone()));
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&Page { rows }, size);
+
+        rows.set(Rc::new(Vec::new()));
+        let _ = runtime.dom_frame(&Page { rows }, size);
+        assert_eq!(motor::identity::retired_count(), 3, "retired, not yet unpicked");
+
+        seeds[1].label.set(Rc::from("written after it left"));
+        assert!(!has_dirty(), "the write reached no binding");
+        let need = runtime.frame_need();
+        assert!(!need.bindings && !need.dirty, "no frame is asked for a row that left: {need:?}");
+        let _ = stats::take();
+        let patches = runtime.dom_frame(&Page { rows }, size);
+        assert!(patches.is_empty(), "nothing to patch: {patches:?}");
+        assert_eq!(stats::take().binding_updates, 0);
+
+        runtime.collect_garbage();
+        seeds[2].label.set(Rc::from("and after the idle"));
+        assert!(!has_dirty(), "the idle took the reads apart");
+        assert_eq!(binding_reads(), 0);
+    }
+
+    /// The idle unpicks what a row that left had made — never what the
+    /// same key made again before it came. A row that leaves and comes
+    /// back in ONE frame (an effect puts it back before the frame rests)
+    /// makes its bindings again at the same keys; the idle that follows
+    /// leaves them alone, and the next write to its label still patches
+    /// its text.
+    #[test]
+    fn a_key_that_comes_back_before_the_idle_keeps_its_bindings() {
+        #[derive(Clone)]
+        struct Restoring {
+            rows: State<Rc<Vec<Row>>>,
+            all: Rc<Vec<Row>>,
+        }
+
+        impl Component for Restoring {
+            fn body(self, _ctx: &Context) -> impl View {
+                let rows = self.rows;
+                let all = Rc::clone(&self.all);
+                let short = rows.get().len() < all.len();
+                crate::vstack!(
+                    for_each(rows, |row| row.id.to_string(), |row| RowView(*row)),
+                    short.then(move || text("restoring").on_appear(move || rows.set(Rc::clone(&all)))),
+                )
+            }
+        }
+
+        let size = Size { width: 400.0, height: 300.0 };
+        let all = Rc::new(labelled(1..=3));
+        let rows = State::new(Rc::clone(&all));
+        let page = Restoring { rows, all: Rc::clone(&all) };
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&page, size);
+        let mounted = live_count();
+
+        // row 2 leaves, and the same frame's effect puts it back
+        rows.set(Rc::new(vec![all[0], all[2]]));
+        let _ = stats::take();
+        let _ = runtime.dom_frame(&page, size);
+        assert!(stats::take().body_passes >= 2, "it left and came back in one frame");
+        assert_eq!(rows.get().len(), 3, "the effect put it back");
+        assert_eq!(motor::identity::retired_count(), 0, "the key is a live binding's again");
+
+        runtime.collect_garbage();
+        assert_eq!(live_count(), mounted, "the idle kept the new bindings");
+        all[1].label.set(Rc::from("row 2, written"));
+        assert!(has_dirty(), "the write reaches the binding made again");
+        let patches = runtime.dom_frame(&page, size);
+        let texts: Vec<&str> = patches
+            .iter()
+            .filter_map(|patch| match patch {
+                crate::dom::DomPatch::SetContent { text, .. } => Some(&**text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["row 2, written"], "its text is patched: {patches:?}");
+
+        // and the same, a frame later: the key comes back before an idle
+        rows.set(Rc::new(vec![all[0], all[2]]));
+        let _ = runtime.dom_frame(&page, size);
+        runtime.collect_garbage();
+        all[1].label.set(Rc::from("row 2, again"));
+        let patches = runtime.dom_frame(&page, size);
+        assert!(
+            patches.iter().any(|patch| matches!(patch, crate::dom::DomPatch::SetContent { text, .. } if &**text == "row 2, again")),
+            "{patches:?}"
+        );
     }
 
     #[test]
