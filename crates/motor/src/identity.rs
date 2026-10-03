@@ -1216,6 +1216,14 @@ pub fn collect_retired() -> Vec<Rc<str>> {
     })
 }
 
+/// Does a view that left wait for [`collect_retired`]?
+pub fn retirement_pending() -> bool {
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        !registry.leaving.is_empty() || !registry.retired.is_empty()
+    })
+}
+
 /// Bindings retired and not yet taken apart — diagnostics.
 pub fn retired_count() -> usize {
     REGISTRY.with(|registry| {

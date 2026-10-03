@@ -4896,18 +4896,27 @@ impl Runtime {
     /// reconciler's boundaries, the live bindings, the element
     /// lowering's retained nodes, bindings, groups and template members,
     /// the subtrees waiting to be freed, and the identity register's
-    /// tables. One line, for a probe that watches a leak.
+    /// tables. One line, for a probe that watches a leak. Everything that
+    /// waits for the idle is named beside what stands: the entries and
+    /// the trees to free, the click keys and the element tables' entries
+    /// to take out, the bindings retired.
     pub fn retained_counts(&self) -> String {
         let dom = self.dom.borrow();
         let identity = motor::identity::registry_counts();
+        let (bindings_waiting, groups_waiting) = dom.unpicked_len();
         format!(
-            "boundaries {} (+{} to free) · bindings live {} · dom nodes {} · dom bindings {} · groups {} · template members {} · graveyard {} · identity owners {} reads {} readers {} view-bindings {} binding-reads {} dirty {} dirty-bindings {}",
+            "boundaries {} (+{} to free, +{} trees replaced, +{} click keys) · bindings live {} ({} retired) · dom nodes {} · dom bindings {} (+{} to unpick) · groups {} (+{} to unpick) · template members {} · graveyard {} · identity owners {} reads {} readers {} view-bindings {} binding-reads {} dirty {} dirty-bindings {}",
             reconciler::retained_len(),
             reconciler::graveyard_len(),
+            reconciler::replaced_len(),
+            reconciler::buried_actions(),
             crate::bind::live_count(),
+            motor::identity::retired_count(),
             dom.retained_len(),
-            dom.bindings_len(),
-            dom.groups_len(),
+            dom.bindings_len() - bindings_waiting,
+            bindings_waiting,
+            dom.groups_len() - groups_waiting,
+            groups_waiting,
             dom.template_members_len(),
             dom.graveyard_len(),
             identity[0],
@@ -4936,9 +4945,11 @@ impl Runtime {
         (dom.bindings_len(), dom.groups_len())
     }
 
-    /// Is there anything for [`Runtime::collect_garbage`]?
+    /// Is there anything for [`Runtime::collect_garbage`]? Every kind the
+    /// frames leave for it counts: the subtrees and the entries that left,
+    /// the trees re-runs replaced, the bindings of views that left.
     pub fn garbage_pending(&self) -> bool {
-        self.dom.borrow().garbage_pending() || reconciler::graveyard_len() > 0
+        self.dom.borrow().garbage_pending() || reconciler::garbage_pending()
     }
 
     pub fn dom_island_lists(&self, scale: usize) -> Vec<crate::dom::IslandList> {
