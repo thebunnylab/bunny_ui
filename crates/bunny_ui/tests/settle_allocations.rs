@@ -184,11 +184,12 @@ where
 /// closure it reads through, the text it reads and the list its node
 /// is held in. The register of what it reads costs nothing more: one
 /// value read by one binding, and the bindings of one body, are held
-/// inline — four sets and a list a row, before.
+/// inline — four sets and a list a row, before. And the text is one
+/// allocation: formatted in the thread's buffer and shared from there.
 #[test]
 fn a_bound_label_files_its_reads_without_a_set() {
     let cost = beyond_empty(|item| text!(item.label));
-    assert!(cost <= 6, "a bound label costs the settle {cost} allocations beyond the empty row");
+    assert!(cost <= 5, "a bound label costs the settle {cost} allocations beyond the empty row");
 }
 
 /// The class a row's own element wears while it is selected is a

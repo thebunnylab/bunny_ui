@@ -89,13 +89,17 @@ pub use runtime::request_frame;
 /// `text!(label)` is the one-value form.
 ///
 /// Reading nothing (a plain literal) costs nothing: the text is fixed.
+///
+/// Each reading formats into one buffer the thread keeps
+/// ([`bind::shared_text`]) and shares the result: the text a node shows
+/// is one allocation, where a `format!` and its copy were two.
 #[macro_export]
 macro_rules! text {
     ($fmt:literal $(, $arg:expr)* $(,)?) => {
-        $crate::views::text_with(move || ::std::format!($fmt $(, $arg)*))
+        $crate::views::text_with(move || $crate::bind::shared_text(::std::format_args!($fmt $(, $arg)*)))
     };
     ($value:expr $(,)?) => {
-        $crate::views::text_with(move || ::std::format!("{}", $value))
+        $crate::views::text_with(move || $crate::bind::shared_text(::std::format_args!("{}", $value)))
     };
 }
 
