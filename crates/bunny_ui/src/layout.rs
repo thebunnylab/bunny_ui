@@ -5210,7 +5210,7 @@ impl LayoutNode {
                             // hover ink is open above this leaf
                             inherits_ink: false,
                             font: env.font,
-                            line_height: env.line_height,
+                            line_height: env.line_height.map(|height| height as f32),
                             text_align: env.text_align,
                             highlights: highlights
                                 .as_ref()

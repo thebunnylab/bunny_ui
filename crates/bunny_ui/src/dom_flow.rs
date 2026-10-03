@@ -359,7 +359,7 @@ impl Walk<'_> {
                 container.style.set_transition(self.pending_transition.take());
                 let layout = container.layout.as_mut().expect("flow node");
                 if *spacing != 0.0 {
-                    layout.gap = Some(*spacing);
+                    layout.gap = Some(*spacing as f32);
                 }
                 layout.align = Some(align_code(*align));
                 for child in children {
@@ -403,10 +403,10 @@ impl Walk<'_> {
                 container.style.set_transition(self.pending_transition.take());
                 let layout = container.layout.as_mut().expect("flow node");
                 if *spacing != 0.0 {
-                    layout.gap = Some(*spacing);
+                    layout.gap = Some(*spacing as f32);
                 }
                 layout.align = Some(align_code(*align));
-                layout.wrap = Some(*line_spacing);
+                layout.wrap = Some(*line_spacing as f32);
                 for child in children {
                     self.lower_into(child, &mut container.children);
                 }
@@ -450,18 +450,19 @@ impl Walk<'_> {
                 {
                     let (was_top, was_right, was_bottom, was_left) =
                         layout.padding.unwrap_or((0.0, 0.0, 0.0, 0.0));
+                    let sum = |was: f32, more: Px| (f64::from(was) + more) as f32;
                     layout.padding = Some((
-                        was_top + top,
-                        was_right + trailing,
-                        was_bottom + bottom,
-                        was_left + leading,
+                        sum(was_top, top),
+                        sum(was_right, trailing),
+                        sum(was_bottom, bottom),
+                        sum(was_left, leading),
                     ));
                     out.append(&mut lowered);
                     return;
                 }
                 let mut container = node(DomKind::FlexColumn);
                 container.layout.as_mut().expect("flow node").padding =
-                    Some((top, trailing, bottom, leading));
+                    Some((top as f32, trailing as f32, bottom as f32, leading as f32));
                 container.children = lowered;
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(&mut container);
@@ -473,8 +474,8 @@ impl Walk<'_> {
                 let mut container = node(DomKind::FlexColumn);
                 {
                     let layout = container.layout.as_mut().expect("flow node");
-                    layout.width = *width;
-                    layout.height = *height;
+                    layout.width = width.map(|width| width as f32);
+                    layout.height = height.map(|height| height as f32);
                     // a frame places its child on the edge it was given —
                     // the cross axis obeys align, the main one the
                     // browser's default; v1 concedes exact centring to
@@ -499,12 +500,12 @@ impl Walk<'_> {
                 {
                     let layout = container.layout.as_mut().expect("flow node");
                     if max_width.is_finite() {
-                        layout.max_width = Some(*max_width);
+                        layout.max_width = Some(*max_width as f32);
                     } else {
                         layout.grow = true;
                     }
                     if max_height.is_finite() {
-                        layout.max_height = Some(*max_height);
+                        layout.max_height = Some(*max_height as f32);
                     }
                     layout.align = Some(align_code(*align));
                 }
@@ -545,8 +546,8 @@ impl Walk<'_> {
             LayoutNode::Leaf { size } => {
                 let mut leaf = node(DomKind::Box);
                 let layout = leaf.layout.as_mut().expect("flow node");
-                layout.width = Some(size.width);
-                layout.height = Some(size.height);
+                layout.width = Some(size.width as f32);
+                layout.height = Some(size.height as f32);
                 out.push(leaf);
             }
             LayoutNode::Styled { props, child } => {
@@ -649,7 +650,7 @@ impl Walk<'_> {
                     color: self.current_ink(),
                     inherits_ink: !self.ink_scopes.is_empty(),
                     font: self.font,
-                    line_height: self.line_height,
+                    line_height: self.line_height.map(|height| height as f32),
                     text_align: self.text_align,
                     highlights: highlights
                         .as_ref()
@@ -808,13 +809,13 @@ impl Walk<'_> {
                 };
                 let total = start_of(*count);
                 let mut content = node(DomKind::Content);
-                content.layout.as_mut().expect("flow node").height = Some(total);
+                content.layout.as_mut().expect("flow node").height = Some(total as f32);
                 for (index, child) in children {
                     let opened = content.children.len();
                     self.lower_into(child, &mut content.children);
                     for row in &mut content.children[opened..] {
                         if let Some(layout) = row.layout.as_mut() {
-                            layout.slot_y = Some(start_of(*index));
+                            layout.slot_y = Some(start_of(*index) as f32);
                         }
                     }
                 }
@@ -832,8 +833,8 @@ impl Walk<'_> {
                     for lane in &mut container.children[opened..] {
                         if let Some(layout) = lane.layout.as_mut() {
                             match axis {
-                                Axis::Horizontal => layout.width = Some(*at),
-                                Axis::Vertical => layout.height = Some(*at),
+                                Axis::Horizontal => layout.width = Some(*at as f32),
+                                Axis::Vertical => layout.height = Some(*at as f32),
                             }
                         }
                     }
@@ -1351,8 +1352,8 @@ impl Walk<'_> {
         let mut wrapper = node(DomKind::Content);
         {
             let layout = wrapper.layout.as_mut().expect("flow node");
-            layout.width = Some(size.width);
-            layout.height = Some(size.height);
+            layout.width = Some(size.width as f32);
+            layout.height = Some(size.height as f32);
         }
         wrapper.children = captured.children;
         self.display.extend(placement.display);
@@ -1446,8 +1447,8 @@ impl Walk<'_> {
         });
         {
             let layout = island.layout.as_mut().expect("flow node");
-            layout.width = (!hungry.0).then_some(size.width);
-            layout.height = (!hungry.1).then_some(size.height);
+            layout.width = (!hungry.0).then_some(size.width as f32);
+            layout.height = (!hungry.1).then_some(size.height as f32);
             layout.stretch = hungry.0 || hungry.1;
         }
         // the node's own box feeds the raster — the flow diff never
