@@ -520,6 +520,16 @@ impl Walk<'_> {
                 };
                 out.push(field);
             }
+            // a feed has no bytes an `<img>` could name: it is painted,
+            // as an island, by the road that scales it on the GPU
+            #[cfg(feature = "canvas")]
+            LayoutNode::Image { source: Some(crate::image_engine::ImageSource::Feed { .. }), .. } => {
+                out.push(self.island(tree, None));
+            }
+            #[cfg(not(feature = "canvas"))]
+            LayoutNode::Image { source: Some(crate::image_engine::ImageSource::Feed { .. }), .. } => {
+                out.push(node(DomKind::Box));
+            }
             LayoutNode::Image { source, fit, .. } => {
                 match source {
                     Some(source) => {

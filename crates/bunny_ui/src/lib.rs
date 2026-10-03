@@ -139,7 +139,9 @@ pub mod prelude {
     pub use crate::ext::ViewExt;
     pub use crate::icon::house as symbol;
     pub use crate::icon::{ICON_GRID, Ink, Paint, Rule, Symbol, Verb};
-    pub use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, RawImages, file_icon};
+    pub use crate::image_engine::{
+        FeedKey, ImageEngine, ImageFeed, ImageRaster, ImageSource, PixelFormat, RawImages, file_icon,
+    };
     // geometry is app vocabulary the moment the app paints a box of
     // its own (`custom(…)` / `canvas(…)`)
     pub use crate::layout::{

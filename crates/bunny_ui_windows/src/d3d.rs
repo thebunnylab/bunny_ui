@@ -894,6 +894,19 @@ float4 sprite_fragment(SpriteVary vary) : SV_Target {
     return float4(ink.rgb, ink.a * clip_cov(vary.position.xy));
 }
 
+// a feed's sprite: the picture is its own size and the box is another,
+// so the sampler scales — linear, the one sampler this stack binds —
+// from the pixel's centre in the box to its place in the picture
+float4 live_fragment(SpriteVary vary) : SV_Target {
+    SpriteInstance sprite = sprites[vary.id];
+    float2 ratio = (sprite.tex.zw - sprite.tex.xy) / (sprite.dest.zw - sprite.dest.xy);
+    float2 texel = sprite.tex.xy + (vary.position.xy - sprite.dest.xy) * ratio;
+    uint width, height;
+    atlas.GetDimensions(width, height);
+    float4 ink = atlas.Sample(source_sampler, texel / float2(width, height));
+    return float4(ink.rgb, ink.a * clip_cov(vary.position.xy));
+}
+
 // the fractional-DPI pass: the frame renders at the integer raster
 // scale, and one triangle resamples it onto the client-pixel
 // backbuffer — the StretchBlt of the GPU road
@@ -1147,6 +1160,8 @@ struct D3dStack {
     rect_ps: Com<PixelShader>,
     sprite_vs: Com<VertexShader>,
     sprite_ps: Com<PixelShader>,
+    /// The feeds' pixel shader, over the sprite vertex shader.
+    live_ps: Com<PixelShader>,
     blit_vs: Com<VertexShader>,
     blit_ps: Com<PixelShader>,
     /// Liquid glass: the pane, and one separable blur pass. Both ride
@@ -1327,6 +1342,7 @@ impl D3dStack {
             let rect_ps = make_ps(&shader("rect_fragment", "ps_5_0")?, "rect_fragment")?;
             let sprite_vs = make_vs(&shader("sprite_vertex", "vs_5_0")?, "sprite_vertex")?;
             let sprite_ps = make_ps(&shader("sprite_fragment", "ps_5_0")?, "sprite_fragment")?;
+            let live_ps = make_ps(&shader("live_fragment", "ps_5_0")?, "live_fragment")?;
             let blit_vs = make_vs(&shader("blit_vertex", "vs_5_0")?, "blit_vertex")?;
             let blit_ps = make_ps(&shader("blit_fragment", "ps_5_0")?, "blit_fragment")?;
             let glass_vs = make_vs(&shader("glass_vertex", "vs_5_0")?, "glass_vertex")?;
@@ -1403,6 +1419,7 @@ impl D3dStack {
                 rect_ps,
                 sprite_vs,
                 sprite_ps,
+                live_ps,
                 blit_vs,
                 blit_ps,
                 glass_vs,
@@ -1537,15 +1554,21 @@ impl D3dStack {
                             (vtbl.vs_set_shader_resources)(context, 0, 1, &rect_srv);
                             (vtbl.ps_set_shader_resources)(context, 0, 1, &rect_srv);
                         }
-                        RunKind::Sprites | RunKind::Texture(_) => {
+                        RunKind::Sprites | RunKind::Texture(_) | RunKind::Live(_) => {
+                            let pixel = match run.kind {
+                                RunKind::Live(_) => self.live_ps.as_ptr(),
+                                _ => self.sprite_ps.as_ptr(),
+                            };
                             (vtbl.vs_set_shader)(context, self.sprite_vs.as_ptr(), null(), 0);
-                            (vtbl.ps_set_shader)(context, self.sprite_ps.as_ptr(), null(), 0);
+                            (vtbl.ps_set_shader)(context, pixel, null(), 0);
                             (vtbl.vs_set_shader_resources)(context, 0, 1, &sprite_srv);
                             (vtbl.ps_set_shader_resources)(context, 0, 1, &sprite_srv);
                             // the shared atlas, or the run's own
-                            // dedicated texture — same pipeline
+                            // dedicated or live texture
                             let texture = match run.kind {
-                                RunKind::Texture(index) => textures[index as usize],
+                                RunKind::Texture(index) | RunKind::Live(index) => {
+                                    textures[index as usize]
+                                }
                                 _ => atlas_srv,
                             };
                             (vtbl.ps_set_shader_resources)(context, 1, 1, &texture);
@@ -1881,6 +1904,11 @@ struct RunAtlas {
     /// against (the Atrium floor at scale 2 — dozens of painted paths
     /// taller than a shelf, on ONE frame).
     dedicated: HashMap<(u64, u32, u32), Dedicated>,
+    /// Feeds, by slot: one texture each, sized to the picture, its bytes
+    /// replaced in place when the generation moves. Outside the
+    /// collector's reach — a reset leaves them standing — and retired on
+    /// idleness instead.
+    live: HashMap<u64, Live>,
     /// The walk in progress: `build_frame` opens one per attempt, and
     /// every dedicated read stamps its texture with it.
     walk: u64,
@@ -1897,6 +1925,24 @@ struct Dedicated {
     walk: u64,
 }
 
+/// One feed's texture: the picture's size, the generation the texture
+/// holds, and the last walk that read it. `stale` = a reset asked for
+/// the bytes again.
+struct Live {
+    texture: Com<Texture2d>,
+    srv: Com<Srv>,
+    width: u32,
+    height: u32,
+    generation: u64,
+    walk: u64,
+    stale: bool,
+}
+
+/// Feeds kept warm between frames, and the walks one may go unread
+/// before its texture is given back — the shared walk's numbers.
+const LIVE_KEEP: usize = 16;
+const LIVE_IDLE_WALKS: u64 = 120;
+
 /// One cached image on the shared atlas: its chunk tiles at one
 /// physical size.
 struct ImageEntry {
@@ -1908,6 +1954,9 @@ struct ImageEntry {
 enum ResolvedImage<'a> {
     Tiles(&'a ImageEntry),
     Dedicated(*mut Srv, u32, u32),
+    /// A feed's own texture, at the PICTURE's size — the destination is
+    /// another, and the live pixel shader's sampler bridges the two.
+    Live(*mut Srv, u32, u32),
 }
 
 /// The shelf ceiling: taller goes dedicated (uniform shelf heights
@@ -1982,6 +2031,7 @@ impl RunAtlas {
             entries: HashMap::new(),
             images: HashMap::new(),
             dedicated: HashMap::new(),
+            live: HashMap::new(),
             walk: 0,
             reset_walk: 0,
         }
@@ -2021,7 +2071,87 @@ impl RunAtlas {
         // the dedicated textures ride the same collector: the caller
         // drained the GPU before any reset, so releasing here is safe
         self.dedicated.clear();
+        // the feeds stay — their textures are written in place, never in
+        // virgin space — and are asked for their bytes again
+        for entry in self.live.values_mut() {
+            entry.stale = true;
+        }
         self.reset_walk = self.walk;
+    }
+
+    /// Gives back the feeds no walk read for `LIVE_IDLE_WALKS` walks.
+    /// `build_frame` asks at the end of every walk.
+    fn retire_live(&mut self) {
+        let walk = self.walk;
+        self.live.retain(|_, entry| walk.wrapping_sub(entry.walk) <= LIVE_IDLE_WALKS);
+    }
+
+    /// One texture per feed, sized to the picture: minted on first
+    /// sight, its bytes replaced when the generation moved, read as it
+    /// is when not. Never the shelves, never the collector. `None` = an
+    /// empty feed, or a texture the device refused.
+    fn resolve_live(
+        &mut self,
+        key: u64,
+        generation: u64,
+        size: (u32, u32),
+        bytes: &[u8],
+    ) -> Option<ResolvedImage<'_>> {
+        if size.0 == 0 || size.1 == 0 || bytes.len() < size.0 as usize * size.1 as usize * 4 {
+            return None;
+        }
+        let walk = self.walk;
+        if let Some(entry) = self.live.get_mut(&key) {
+            if (entry.width, entry.height) == size {
+                if entry.stale || entry.generation != generation {
+                    // the runtime orders the write after the frames still
+                    // reading the texture — a DEFAULT resource's
+                    // UpdateSubresource is synchronous with the queue
+                    unsafe {
+                        ((*(*self.context).vtbl).update_subresource)(
+                            self.context,
+                            entry.texture.as_ptr() as *mut c_void,
+                            0,
+                            null(),
+                            bytes.as_ptr() as *const c_void,
+                            size.0 * 4,
+                            0,
+                        );
+                    }
+                    entry.generation = generation;
+                    entry.stale = false;
+                }
+                entry.walk = walk;
+                return Some(ResolvedImage::Live(entry.srv.as_ptr(), entry.width, entry.height));
+            }
+            // a picture that changed size takes a texture of the new size
+            self.live.remove(&key);
+        }
+        if self.live.len() >= LIVE_KEEP {
+            // the slot nobody read this walk, idle the longest, makes
+            // room; a frame that reads more than the cap keeps every one
+            let oldest = self
+                .live
+                .iter()
+                .filter(|(_, entry)| entry.walk != walk)
+                .min_by_key(|(_, entry)| entry.walk)
+                .map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                self.live.remove(&oldest);
+            }
+        }
+        let (texture, srv) =
+            unsafe { make_texture(self.device, size.0, size.1, Some((bytes, size.0 * 4)))? };
+        let entry = self.live.entry(key).or_insert(Live {
+            texture,
+            srv,
+            width: size.0,
+            height: size.1,
+            generation,
+            walk,
+            stale: false,
+        });
+        Some(ResolvedImage::Live(entry.srv.as_ptr(), entry.width, entry.height))
     }
 
     fn ensure_texture(&mut self) -> bool {
@@ -2134,6 +2264,9 @@ impl RunAtlas {
         height: u32,
         engine: &dyn ImageEngine,
     ) -> Result<Option<ResolvedImage<'_>>, AtlasFull> {
+        if let ImageSource::Feed { key, generation, size, bytes, .. } = source {
+            return Ok(self.resolve_live(*key, *generation, *size, bytes));
+        }
         let cache_key = (source.key(), width, height);
         let walk = self.walk;
         if let Some(entry) = self.dedicated.get_mut(&cache_key) {
@@ -2290,6 +2423,10 @@ enum RunKind {
     /// Sprites read from a DEDICATED texture (an image too big for the
     /// shared atlas) — the index points into the frame's texture list.
     Texture(u16),
+    /// Sprites read from a feed's LIVE texture — the picture's own size,
+    /// scaled to the destination by the sampler. The index points into
+    /// the same texture list.
+    Live(u16),
 }
 
 #[derive(Clone, Copy)]
@@ -2679,6 +2816,28 @@ fn build_frame(
                             batches.sprites.len() - 1,
                         );
                     }
+                    // the picture's own texels under the destination's
+                    // box: the sprite carries both, the live shader scales
+                    Some(ResolvedImage::Live(srv, tex_w, tex_h)) => {
+                        let index = match batches.textures.iter().position(|t| *t == srv) {
+                            Some(index) => index,
+                            None => {
+                                batches.textures.push(srv);
+                                batches.textures.len() - 1
+                            }
+                        };
+                        batches.sprites.push(SpriteInstance {
+                            dest: [dest.0 as f32, dest.1 as f32, dest.2 as f32, dest.3 as f32],
+                            tex: [0.0, 0.0, tex_w as f32, tex_h as f32],
+                            clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
+                        });
+                        note_run(
+                            &mut batches.runs,
+                            RunKind::Live(index as u16),
+                            round_of(&clips),
+                            batches.sprites.len() - 1,
+                        );
+                    }
                 }
             }
             DrawCommand::PushClip { rect, corner_radius } => {
@@ -2718,6 +2877,7 @@ fn build_frame(
             }
         }
     }
+    atlas.retire_live();
     Ok(())
 }
 

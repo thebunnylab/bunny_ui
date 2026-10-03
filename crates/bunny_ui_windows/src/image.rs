@@ -446,6 +446,7 @@ impl WicImageEngine {
             | ImageSource::Path { .. }
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
+            | ImageSource::Feed { .. }
             | ImageSource::Faded { .. } => None,
         };
         let answer = decoded.as_ref().map(read);
@@ -612,6 +613,7 @@ impl ImageEngine for WicImageEngine {
             | ImageSource::Path { .. }
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
+            | ImageSource::Feed { .. }
             | ImageSource::Faded { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
                 return None;

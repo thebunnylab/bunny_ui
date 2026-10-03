@@ -27,5 +27,4 @@ pub use image::CoreGraphicsImageEngine;
 pub use metal::{MetalPresenter, OffscreenGpu};
 pub use text::CoreTextEngine;
 
-#[cfg(feature = "wgpu-surface")]
 pub mod surface;
