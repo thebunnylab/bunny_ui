@@ -4285,7 +4285,7 @@ mod tests {
         impl Component for Link {
             fn body(self, _ctx: &Context) -> impl View {
                 crate::hstack!(
-                    crate::hstack!(crate::hstack!(text("")).element("span").css_class("glyph"))
+                    crate::hstack!(crate::hstack!(empty()).element("span").css_class("glyph"))
                         .element("a"),
                     crate::hstack!(text("one"), text("two")).element("a").css_class("pair"),
                 )
@@ -4306,6 +4306,20 @@ mod tests {
         let plain_of = |id: u32| look_of(&mount, id).is_some_and(|(_, layout)| layout.plain);
         assert!(plain_of(a_ids[0]), "a link around one child is plain: {mount:?}");
         assert!(!plain_of(a_ids[1]), "a link around two children keeps its flex line: {mount:?}");
+        // and the empty span inside the first link: no child, no flex
+        // line — the page's stylesheet draws the glyph in its own font
+        let span = mount
+            .iter()
+            .find_map(|patch| match patch {
+                DomPatch::Create { id, hints, .. } if hints.tag.as_deref() == Some("span") => Some(*id),
+                _ => None,
+            })
+            .expect("the span mounted");
+        assert!(plain_of(span), "an empty inline tag is plain: {mount:?}");
+        assert!(
+            look_of(&mount, span).is_some_and(|(style, _)| style.color.is_none()),
+            "and wears no face of ours: {mount:?}"
+        );
         let bytes = encode(&mount);
         assert!(!bytes.is_empty());
     }
