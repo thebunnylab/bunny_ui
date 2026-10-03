@@ -196,7 +196,7 @@ pub(crate) struct Entry {
 
 #[derive(Default)]
 struct BuildingFrame {
-    path: String,
+    path: Rc<str>,
     /// The frame of a keyed list: the rows under it are kept by key.
     list: bool,
     effects: Vec<EffectFn>,
@@ -233,16 +233,16 @@ struct PassState {
     root_handlers: Vec<HandlerEntry>,
     root_contexts: Vec<ContextEntry>,
     /// Instrumentation: bodies that ran in this pass.
-    body_runs: Vec<String>,
+    body_runs: Vec<Rc<str>>,
     /// Boundaries SKIPPED in this pass — a skipped one's subtree
     /// survives the entry sweep (the walk stayed out on purpose).
-    skipped: Vec<String>,
+    skipped: Vec<Rc<str>>,
 }
 
 thread_local! {
-    static RETAINED: RefCell<BTreeMap<String, Entry>> = const { RefCell::new(BTreeMap::new()) };
+    static RETAINED: RefCell<BTreeMap<Rc<str>, Entry>> = const { RefCell::new(BTreeMap::new()) };
     static PASS: RefCell<PassState> = RefCell::new(PassState::default());
-    static LAST_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static LAST_BODY_RUNS: RefCell<Vec<Rc<str>>> = const { RefCell::new(Vec::new()) };
     static FRAME_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static LIVE: RefCell<Live> = RefCell::new(Live::default());
 }
@@ -460,7 +460,7 @@ fn is_top_level(path: &str, building: &[BuildingFrame]) -> bool {
     RETAINED.with(|retained| {
         let retained = retained.borrow();
         !cuts(path).any(|prefix| {
-            retained.contains_key(prefix) || building.iter().any(|frame| frame.path == prefix)
+            retained.contains_key(prefix) || building.iter().any(|frame| &*frame.path == prefix)
         })
     })
 }
@@ -665,33 +665,44 @@ pub(crate) enum Decision {
 /// moves through the row's own reads — so under it a retained clean
 /// row is skipped like any clean boundary.
 pub(crate) fn decide(path: &str) -> Decision {
+    decide_at(path).0
+}
+
+/// [`decide`], with the retained boundary's own path handed back when
+/// there is one: the one copy of it the page holds, for the marks and
+/// the reference to share instead of copying the path again.
+pub(crate) fn decide_at(path: &str) -> (Decision, Option<Rc<str>>) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
+        let key = RETAINED
+            .with(|retained| retained.borrow().get_key_value(path).map(|(key, _)| Rc::clone(key)));
         if !pass.active {
-            return Decision::Render;
+            return (Decision::Render, key);
         }
         let inside_rerun = !pass.building.is_empty();
         let under_list = pass.building.last().is_some_and(|frame| frame.list);
-        let retained = RETAINED.with(|retained| retained.borrow().contains_key(path));
-        if (!inside_rerun || under_list) && retained && !pass.dirty.contains(path) {
-            pass.skipped.push(path.to_string());
-            Decision::Skip
+        if let Some(retained) = &key
+            && (!inside_rerun || under_list)
+            && !pass.dirty.contains(path)
+        {
+            pass.skipped.push(Rc::clone(retained));
+            (Decision::Skip, key)
         } else {
-            Decision::Render
+            (Decision::Render, key)
         }
     })
 }
 
-pub(crate) fn begin_entry(path: &str, list: bool) {
+pub(crate) fn begin_entry(path: &Rc<str>, list: bool) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
-        pass.body_runs.push(path.to_string());
-        pass.building.push(BuildingFrame { path: path.to_string(), list, ..Default::default() });
+        pass.body_runs.push(Rc::clone(path));
+        pass.building.push(BuildingFrame { path: Rc::clone(path), list, ..Default::default() });
     });
 }
 
 pub(crate) fn finish_entry(
-    path: &str,
+    path: &Rc<str>,
     value: Erased,
     ctx: Context,
     node: RenderNode,
@@ -702,7 +713,7 @@ pub(crate) fn finish_entry(
             let mut pass = pass.borrow_mut();
             match pass.building.pop() {
                 Some(frame) => {
-                    debug_assert_eq!(frame.path, path, "entries close in the order they open");
+                    debug_assert_eq!(&*frame.path, &**path, "entries close in the order they open");
                     (
                         frame.effects,
                         frame.actions,
@@ -781,7 +792,7 @@ pub(crate) fn finish_entry(
             if top_level {
                 live.top_level.insert(path.to_string());
             }
-            retained.insert(path.to_string(), entry);
+            retained.insert(Rc::clone(path), entry);
         });
     });
     // …and so is every measure kept ABOVE it. The outermost re-run of a
@@ -949,7 +960,7 @@ pub(crate) fn assemble_contexts(root: &str) {
     RETAINED.with(|retained| {
         let retained = retained.borrow();
         for path in &carriers {
-            if let Some(entry) = retained.get(path) {
+            if let Some(entry) = retained.get(path.as_str()) {
                 declared.extend(entry.contexts.iter().cloned());
             }
         }
@@ -1066,7 +1077,7 @@ pub(crate) fn assemble_handlers(root: &str) {
     RETAINED.with(|retained| {
         let retained = retained.borrow();
         for path in &carriers {
-            if let Some(entry) = retained.get(path) {
+            if let Some(entry) = retained.get(path.as_str()) {
                 for (key, id, handler) in &entry.handlers {
                     place(&mut map, key, *id, handler.clone());
                 }
@@ -1128,7 +1139,7 @@ pub(crate) fn run_isolated(root: &str) {
             continue;
         }
         let Some((value, ctx, parents)) = RETAINED.with(|retained| {
-            retained.borrow().get(&path).map(|entry| {
+            retained.borrow().get(path.as_str()).map(|entry| {
                 (entry.value.clone(), entry.ctx.clone(), entry.parent_segments.clone())
             })
         }) else {
@@ -1161,7 +1172,7 @@ pub(crate) fn assemble_effects(root: &str) -> Vec<EffectFn> {
     RETAINED.with(|retained| {
         let retained = retained.borrow();
         for path in &carriers {
-            if let Some(entry) = retained.get(path) {
+            if let Some(entry) = retained.get(path.as_str()) {
                 queue.extend(entry.effects.iter().cloned());
             }
         }
@@ -1700,7 +1711,7 @@ pub(crate) fn refresh_root_region() {
 
 /// Removes the entries at `paths` from the retention, and their
 /// registrations from the tables the doors read.
-fn drop_entries(paths: &[String]) {
+fn drop_entries<P: AsRef<str>>(paths: &[P]) {
     if paths.is_empty() {
         return;
     }
@@ -1711,6 +1722,7 @@ fn drop_entries(paths: &[String]) {
             GRAVEYARD.with(|graveyard| {
                 let mut graveyard = graveyard.borrow_mut();
                 for path in paths {
+                    let path: &str = path.as_ref();
                     if let Some(entry) = retained.remove(path) {
                         live.unindex(path, &entry);
                         // a view that left owes the read graph nothing
@@ -1760,8 +1772,8 @@ pub(crate) fn forget_under(root: &str) {
         retained
             .borrow()
             .keys()
-            .filter(|path| *path == root || path.starts_with(&prefix))
-            .cloned()
+            .filter(|path| &***path == root || path.starts_with(&prefix))
+            .map(|path| path.to_string())
             .collect()
     });
     drop_entries(&doomed);
@@ -1781,16 +1793,16 @@ pub(crate) fn forget(dead: &[String]) {
 /// The bodies that ran, with the ones under another run dropped: a run
 /// covers its subtree, so the outermost runs name every subtree the
 /// sweep must read.
-fn outermost(runs: &HashSet<String>) -> Vec<&String> {
-    let mut sorted: Vec<&String> = runs.iter().collect();
+fn outermost(runs: &HashSet<Rc<str>>) -> Vec<&Rc<str>> {
+    let mut sorted: Vec<&Rc<str>> = runs.iter().collect();
     sorted.sort_by_key(|run| run.len());
-    let mut outer: Vec<&String> = Vec::new();
+    let mut outer: Vec<&Rc<str>> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::default();
     for run in sorted {
         if cuts(run).any(|prefix| seen.contains(prefix)) {
             continue;
         }
-        seen.insert(run.as_str());
+        seen.insert(run);
         outer.push(run);
     }
     outer
@@ -1811,7 +1823,7 @@ fn outermost(runs: &HashSet<String>) -> Vec<&String> {
 /// on its own. The sweep reads those and nothing else — a pass that
 /// ran one body in a list of a thousand reads that body's subtree.
 pub(crate) fn sweep_stale(root: &str) {
-    let (runs, skipped): (HashSet<String>, HashSet<String>) = PASS.with(|pass| {
+    let (runs, skipped): (HashSet<Rc<str>>, HashSet<Rc<str>>) = PASS.with(|pass| {
         let pass = pass.borrow();
         (
             pass.body_runs.iter().cloned().collect(),
@@ -1840,13 +1852,13 @@ pub(crate) fn sweep_stale(root: &str) {
         }
         false
     };
-    let mut dead: Vec<String> = Vec::new();
+    let mut dead: Vec<Rc<str>> = Vec::new();
     RETAINED.with(|retained| {
         let retained = retained.borrow();
         // the entries under one boundary, in one ordered range — the
         // subtree is contiguous because `/` sorts before every byte a
         // segment may start with after it
-        let sweep_under = |boundary: &str, dead: &mut Vec<String>| {
+        let sweep_under = |boundary: &str, dead: &mut Vec<Rc<str>>| {
             let lo = format!("{boundary}/");
             let hi = format!("{boundary}0");
             let range = (std::ops::Bound::Included(lo.as_str()), std::ops::Bound::Excluded(hi.as_str()));
@@ -1871,7 +1883,7 @@ pub(crate) fn sweep_stale(root: &str) {
         });
         for path in fallen {
             sweep_under(&path, &mut dead);
-            dead.push(path);
+            dead.push(Rc::from(path.as_str()));
         }
     });
     drop_entries(&dead);
@@ -1910,7 +1922,7 @@ pub(crate) fn end_pass() {
         let mut pass = pass.borrow_mut();
         pass.active = false;
         let runs = std::mem::take(&mut pass.body_runs);
-        FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().extend(runs.iter().cloned()));
+        FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().extend(runs.iter().map(|run| run.to_string())));
         LAST_BODY_RUNS.with(|last| *last.borrow_mut() = runs);
     });
 }
@@ -1930,7 +1942,7 @@ pub(crate) fn take_frame_runs() -> Vec<String> {
 /// Instrumentation: the bodies that ran in the last pass (identity
 /// paths) — the proof of incrementality in the tests.
 pub(crate) fn last_body_runs() -> Vec<String> {
-    LAST_BODY_RUNS.with(|last| last.borrow().clone())
+    LAST_BODY_RUNS.with(|last| last.borrow().iter().map(|run| run.to_string()).collect())
 }
 
 // MARK: - References and expansion

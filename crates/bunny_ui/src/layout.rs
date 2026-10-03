@@ -997,7 +997,7 @@ pub enum LayoutNode {
     /// Reference to a retained boundary (skipped by the reconciler);
     /// measure and place resolve ON-THE-FLY against the retention — the
     /// frame's tree is never stitched into a copy.
-    BoundaryRef { path: String, slot: Rc<crate::reconciler::Slot> },
+    BoundaryRef { path: Rc<str>, slot: Rc<crate::reconciler::Slot> },
     /// `.rendering(Gpu)`: this subtree insists on the pixel pipeline.
     /// Transparent to geometry everywhere; in Dom mode it becomes a
     /// CANVAS ISLAND — an element our layout positions, filled with the

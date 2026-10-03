@@ -78,10 +78,10 @@ struct Registry {
     pass_no: u64,
     /// Boundaries the reconciler skipped this pass (clean cache): their
     /// subtree counts as alive in the sweep.
-    skipped: HashSet<String>,
+    skipped: HashSet<Rc<str>>,
     /// Boundaries whose body RAN this pass: inside them the sweep follows
     /// the normal rule (what did not show up, died).
-    reran: HashSet<String>,
+    reran: HashSet<Rc<str>>,
     /// Identity → resources that die with it.
     owners: HashMap<String, OwnerRecord>,
     /// (scope, type, seq) → (index in the type's arena, generation, dep-id).
@@ -230,17 +230,27 @@ fn protected_by_skip(registry: &Registry, owner: &str) -> bool {
 
 /// The reconciler reports: this boundary was skipped (clean cache) — its
 /// subtree counts as alive.
-pub fn mark_skipped(path: &str) {
+pub fn mark_skipped(path: &Rc<str>) {
     REGISTRY.with(|registry| {
-        registry.borrow_mut().skipped.insert(path.to_string());
+        registry.borrow_mut().skipped.insert(Rc::clone(path));
     });
 }
 
 /// The reconciler reports: this boundary's body ran this pass.
-pub fn mark_reran(path: &str) {
+pub fn mark_reran(path: &Rc<str>) {
     REGISTRY.with(|registry| {
-        registry.borrow_mut().reran.insert(path.to_string());
+        registry.borrow_mut().reran.insert(Rc::clone(path));
     });
+}
+
+/// The current view's path, borrowed from the cursor for the length
+/// of `read` — a decision that needs no copy of it. `read` must not
+/// touch the registry itself.
+pub fn with_current_view_path<R>(read: impl FnOnce(Option<&str>) -> R) -> R {
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        read(registry.views.last().map(|len| &registry.joined[..*len]))
+    })
 }
 
 /// Views dirtied by writes since the last drain — the fine-grained
