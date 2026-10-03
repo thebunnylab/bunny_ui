@@ -1517,20 +1517,17 @@ pub(crate) fn run_handler(id: crate::action::ActionId) -> bool {
     }
 }
 
-/// Dirty views the walk did not reach (skipped parent): re-runs each
-/// one from the retained value, with the cursor seeded on the parent's
-/// path — ancestors first, because a parent's re-run covers the
-/// descendants.
+/// Dirty views the walk did not reach (a skipped parent, or a row a keyed
+/// list that ran kept): re-runs each one from the retained value, with
+/// the cursor seeded on the parent's path — ancestors first, because a
+/// parent's re-run covers the descendants.
 pub(crate) fn run_isolated(root: &str) {
     let mut pending: Vec<String> = PASS.with(|pass| {
         let pass = pass.borrow();
-        pass.dirty
-            .iter()
-            .filter(|path| {
-                covers(root, path) && !pass.body_runs.iter().any(|ran| covers(ran, path))
-            })
-            .cloned()
-            .collect()
+        LIVE.with(|live| {
+            let live = live.borrow();
+            pass.dirty.iter().filter(|path| covers(root, path) && !reached(&pass, &live, path)).cloned().collect()
+        })
     });
     // shallower first, so an ancestor's run covers its dirty descendants —
     // then by path, so siblings of one depth run in ONE order. The set they
@@ -1540,9 +1537,7 @@ pub(crate) fn run_isolated(root: &str) {
     pending.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
 
     for path in pending {
-        let already_ran = PASS.with(|pass| {
-            pass.borrow().body_runs.iter().any(|ran| covers(ran, &path))
-        });
+        let already_ran = PASS.with(|pass| LIVE.with(|live| reached(&pass.borrow(), &live.borrow(), &path)));
         if already_ran {
             continue;
         }
@@ -1561,6 +1556,31 @@ pub(crate) fn run_isolated(root: &str) {
         // re-retains
         value.render_into(&ctx, &mut scratch);
     }
+}
+
+/// Did the bodies that ran in this pass answer for `path`? The deepest
+/// run above it rebuilt its subtree: the path ran again with it, or left
+/// it. Unless the walk under that run stayed out of a boundary on the
+/// way down to the path — a keyed list that ran keeps its clean rows, and
+/// what is dirty inside one of them no body of the walk reached. The cut
+/// is read off the slots' stamps, one lookup per boundary between, as the
+/// sweep reads who a skip shelters.
+fn reached(pass: &PassState, live: &Live, path: &str) -> bool {
+    let Some(ran) = pass.body_runs.iter().filter(|ran| covers(ran, path)).max_by_key(|ran| ran.len()) else {
+        return false;
+    };
+    let skipped = Visit::now().skipped;
+    let mut cut = path.len();
+    while let Some(at) = path[..cut].rfind('/') {
+        if at <= ran.len() {
+            break;
+        }
+        if live.slots.get(&path[..at]).is_some_and(|slot| slot.visit.get() == skipped) {
+            return false;
+        }
+        cut = at;
+    }
+    true
 }
 
 fn covers(ancestor: &str, path: &str) -> bool {
@@ -3204,6 +3224,107 @@ mod tests {
         assert_eq!(runs.len(), 2, "the list and the written row ran: {runs:?}");
         assert!(runs.iter().any(|run| run.ends_with("[3]/ReadingLine")), "the written row is row 3: {runs:?}");
         assert!(printed.contains("written") && !printed.contains("line 3"), "and shows what was written: {printed}");
+    }
+
+    /// The counts the components inside a row made, by row and depth.
+    type Counts = Rc<RefCell<HashMap<(usize, u8), State<usize>>>>;
+
+    /// A row with a component inside it, and one inside that.
+    #[derive(Clone)]
+    struct Holder {
+        id: usize,
+        counts: Counts,
+    }
+
+    impl Component for Holder {
+        fn body(self, _ctx: &Context) -> impl View {
+            (text(format!("holder {}", self.id)), Tap { id: self.id, counts: self.counts })
+        }
+    }
+
+    /// Holds a count of its own, and a component that holds another.
+    #[derive(Clone)]
+    struct Tap {
+        id: usize,
+        counts: Counts,
+    }
+
+    impl Component for Tap {
+        fn body(self, _ctx: &Context) -> impl View {
+            let taps = State::new(0usize);
+            self.counts.borrow_mut().insert((self.id, 1), taps);
+            (text(format!("taps {} {}", self.id, taps.get())), Deep { id: self.id, counts: self.counts })
+        }
+    }
+
+    #[derive(Clone)]
+    struct Deep {
+        id: usize,
+        counts: Counts,
+    }
+
+    impl Component for Deep {
+        fn body(self, _ctx: &Context) -> impl View {
+            let deep = State::new(0usize);
+            self.counts.borrow_mut().insert((self.id, 2), deep);
+            text(format!("deep {} {}", self.id, deep.get()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct Holders {
+        ids: State<Rc<Vec<usize>>>,
+        counts: Counts,
+        once: bool,
+    }
+
+    impl Component for Holders {
+        fn body(self, _ctx: &Context) -> impl View {
+            let counts = self.counts;
+            let row = move |id: &usize| Holder { id: *id, counts: counts.clone() };
+            let list = crate::views::for_each(self.ids, |id| id.to_string(), row);
+            if self.once { list.once_per_key() } else { list }
+        }
+    }
+
+    /// A list that runs again keeps its clean rows, and the walk stays out
+    /// of them — so what is dirty inside a kept row runs after the walk,
+    /// once: a component written in the frame its list reorders, the one
+    /// inside it written too (it runs with its parent, not again), and one
+    /// written two boundaries down in a row whose middle is clean. What is
+    /// dirty inside a row that left in the frame its list ran is not run
+    /// back to life: it left with its row.
+    #[test]
+    fn what_is_dirty_inside_a_kept_row_runs_once_and_inside_a_row_that_left_not_at_all() {
+        for once in [false, true] {
+            let counts = Counts::default();
+            let page = Holders { ids: State::new(Rc::new(vec![1, 2, 3, 4])), counts: Rc::clone(&counts), once };
+            let runtime = Runtime::new();
+            runtime.render(&page);
+            let count = |id: usize, depth: u8| counts.borrow()[&(id, depth)];
+
+            page.ids.set(Rc::new(vec![1, 3, 2, 4]));
+            count(2, 1).set(5);
+            count(2, 2).set(6);
+            count(3, 2).set(7);
+            let printed = runtime.render(&page);
+            let runs = runtime.body_runs();
+            let ran = |end: &str| runs.iter().filter(|run| run.ends_with(end)).count();
+            assert_eq!(runs.len(), 4, "the list and three components (once {once}): {runs:?}");
+            let ends = ["/Keyed", "/[2]/Holder/#1/Tap", "/[2]/Holder/#1/Tap/#1/Deep", "/[3]/Holder/#1/Tap/#1/Deep"];
+            assert_eq!(ends.map(ran), [1; 4], "the list, then each dirty component once (once {once}): {runs:?}");
+            for shown in ["taps 2 5", "deep 2 6", "deep 3 7"] {
+                assert!(printed.contains(shown), "{shown:?} shows (once {once}): {printed}");
+            }
+
+            page.ids.set(Rc::new(vec![1, 3, 2]));
+            count(4, 1).set(8);
+            let printed = runtime.render(&page);
+            assert_eq!(runtime.body_runs().len(), 1, "only the list ran (once {once}): {:?}", runtime.body_runs());
+            assert!(!printed.contains("holder 4"), "row 4 left (once {once}): {printed}");
+            let held = retained_under("Holders");
+            assert!(held.iter().all(|path| !path.contains("[4]")), "and all it held with it (once {once}): {held:?}");
+        }
     }
 
     /// The paths retained under a prefix, sorted.
