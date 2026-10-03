@@ -2339,6 +2339,7 @@ where
     fn render_rows(&self, items: &[S::Item], ctx: &Context, out: &mut NodeList) {
         debug_assert_unique_ids("for_each", items.iter().map(&self.id));
         let mut rows = NodeList::new();
+        rows.reserve_layout(items.len());
         for item in items {
             let _frame = motor::identity::enter_key(&(self.id)(item));
             (self.row)(item).render_into(ctx, &mut rows);
@@ -2407,6 +2408,8 @@ where
                 return;
             }
             debug_assert_unique_ids("for_each", items.iter().map(&list.id));
+            // one row, one node: the boundary's list is sized once
+            out.reserve_layout(items.len());
             for item in items {
                 let _frame = motor::identity::enter_key(&(list.id)(item));
                 (list.row)(item).render_into(ctx, out);
