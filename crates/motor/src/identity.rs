@@ -119,21 +119,23 @@ struct Registry {
     /// The binding being read right now: while one is open, a read
     /// belongs to it and not to the view whose body may be running.
     binding_scope: Option<Rc<str>>,
-    /// binding → dependencies read in its LAST evaluation.
-    binding_reads: HashMap<Rc<str>, HashSet<DepKey>>,
-    /// inverted index: dependency → the bindings that read it.
-    binding_readers: HashMap<DepKey, HashSet<Rc<str>>>,
+    /// binding → dependencies read in its LAST evaluation — nearly
+    /// always one, held inline ([`Few`]).
+    binding_reads: HashMap<Rc<str>, Few<DepKey>>,
+    /// inverted index: dependency → the bindings that read it — a row's
+    /// own state is read by the row's own binding alone.
+    binding_readers: HashMap<DepKey, Few<Rc<str>>>,
     /// The bindings a write reached since the last frame took them.
     dirty_bindings: HashSet<Rc<str>>,
     /// view → the bindings its body made. A body that re-runs makes them
     /// again; one that dies takes them along. Keyed by the view's shared
     /// path: a row that mounts files its bindings under the copy its
     /// boundary already holds, and one that leaves frees no string.
-    view_bindings: HashMap<Rc<str>, Vec<Rc<str>>>,
+    view_bindings: HashMap<Rc<str>, BindingKeys>,
     /// Views that left the tree, each with the bindings its body made:
     /// the half of their teardown that waits for an idle moment
     /// ([`collect_retired`]).
-    retired: Vec<(Rc<str>, Vec<Rc<str>>)>,
+    retired: Vec<(Rc<str>, BindingKeys)>,
     /// The keys of those bindings while they wait. A write that reaches
     /// one marks nothing; a body that makes the key again takes it back.
     retired_bindings: HashSet<Rc<str>>,
@@ -150,6 +152,127 @@ impl Registry {
             let end = lens.get(at + 1).copied().unwrap_or(self.joined.len());
             &self.joined[start..end]
         })
+    }
+}
+
+/// A set that nearly always holds one member, held inline until a
+/// second one arrives.
+///
+/// A binding reads one value as a rule — a row's label, its selection
+/// flag — and that value is read by that binding alone. A hash set of
+/// one is an allocation all the same, made on the first insert: a row
+/// with two bindings made four of them when it mounted, and freed four
+/// when it left. An empty set has no form here — the entry that would
+/// hold it is taken out of its map instead ([`Few::remove`]).
+#[derive(Debug)]
+enum Few<T> {
+    One(T),
+    Many(HashSet<T>),
+}
+
+impl<T: Eq + std::hash::Hash> Few<T> {
+    /// Adds a member; one already there is not added twice.
+    fn insert(&mut self, member: T) {
+        match self {
+            Few::One(one) if *one == member => {}
+            Few::One(_) => {
+                let Few::One(one) = std::mem::replace(self, Few::Many(HashSet::default())) else {
+                    unreachable!("the arm above matched one member")
+                };
+                if let Few::Many(set) = self {
+                    set.insert(one);
+                    set.insert(member);
+                }
+            }
+            Few::Many(set) => {
+                set.insert(member);
+            }
+        }
+    }
+
+    /// Takes a member out, and says whether the set is EMPTY now — the
+    /// holder then takes the whole entry out, since an empty set has no
+    /// form of its own.
+    fn remove<Q>(&mut self, member: &Q) -> bool
+    where
+        T: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        match self {
+            Few::One(one) => <T as std::borrow::Borrow<Q>>::borrow(one) == member,
+            Few::Many(set) => {
+                set.remove(member);
+                set.is_empty()
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Few::One(_) => 1,
+            Few::Many(set) => set.len(),
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        let (one, many) = match self {
+            Few::One(one) => (Some(one), None),
+            Few::Many(set) => (None, Some(set.iter())),
+        };
+        one.into_iter().chain(many.into_iter().flatten())
+    }
+
+    /// The members, by value.
+    fn into_members(self) -> impl Iterator<Item = T> {
+        let (one, many) = match self {
+            Few::One(one) => (Some(one), None),
+            Few::Many(set) => (None, Some(set.into_iter())),
+        };
+        one.into_iter().chain(many.into_iter().flatten())
+    }
+}
+
+/// Files `member` in the set `map` keeps at `key`: a set of one the
+/// first time, inline.
+fn file_few<K: Eq + std::hash::Hash, T: Eq + std::hash::Hash>(map: &mut HashMap<K, Few<T>>, key: K, member: T) {
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut set) => set.get_mut().insert(member),
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(Few::One(member));
+        }
+    }
+}
+
+/// The bindings one body made, in the order it made them: two for a
+/// row of a table (its class and its label), seldom more. Up to two
+/// are held inline; a list is grown only past that. The list a body's
+/// first binding started was an allocation per row that mounted, and
+/// its second binding grew it.
+#[derive(Default)]
+struct BindingKeys {
+    inline: [Option<Rc<str>>; 2],
+    more: Vec<Rc<str>>,
+}
+
+impl BindingKeys {
+    fn push(&mut self, key: Rc<str>) {
+        match self.inline.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => *slot = Some(key),
+            None => self.more.push(key),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Rc<str>> {
+        self.inline.iter().flatten().chain(self.more.iter())
+    }
+
+    fn into_keys(self) -> impl Iterator<Item = Rc<str>> {
+        self.inline.into_iter().flatten().chain(self.more)
     }
 }
 
@@ -838,17 +961,16 @@ pub fn begin_view_reads(view: &Rc<str>) {
     });
 }
 
-/// Clears a view's reads and its bindings' reads; returns the keys of
-/// the bindings it had, so the caller can retire them where they live.
-fn clear_view_reads(registry: &mut Registry, view: &str) -> Vec<Rc<str>> {
+/// Clears a view's reads and its bindings' reads.
+fn clear_view_reads(registry: &mut Registry, view: &str) {
     // the bindings the body made read for themselves, but they are the
     // body's: a re-run makes them again, a death takes them along
-    let bindings = registry.view_bindings.remove(view).unwrap_or_default();
-    for binding in &bindings {
-        clear_binding_reads(registry, binding);
+    if let Some(bindings) = registry.view_bindings.remove(view) {
+        for binding in bindings.iter() {
+            clear_binding_reads(registry, binding);
+        }
     }
     clear_own_reads(registry, view);
-    bindings
 }
 
 /// The reads the view's body made itself (its bindings' aside).
@@ -889,7 +1011,7 @@ pub fn retire_view(view: &str) {
             registry.dirty.remove(view);
         }
         if let Some((view, bindings)) = registry.view_bindings.remove_entry(view) {
-            for binding in &bindings {
+            for binding in bindings.iter() {
                 // a write that reached it before it left is not news to
                 // anyone now
                 if !registry.dirty_bindings.is_empty() {
@@ -916,7 +1038,7 @@ pub fn collect_retired() -> Vec<Rc<str>> {
         let mut torn = Vec::with_capacity(registry.retired_bindings.len());
         let mut retired = std::mem::take(&mut registry.retired);
         for (_, bindings) in retired.drain(..) {
-            for binding in bindings {
+            for binding in bindings.into_keys() {
                 if registry.retired_bindings.remove(&binding) {
                     clear_binding_reads(registry, &binding);
                     torn.push(binding);
@@ -963,7 +1085,9 @@ pub fn begin_binding(key: &Rc<str>, owner: Option<&str>) -> BindingScope {
             match registry.view_bindings.get_mut(owner) {
                 Some(bindings) => bindings.push(Rc::clone(key)),
                 None => {
-                    registry.view_bindings.insert(Rc::from(owner), vec![Rc::clone(key)]);
+                    let mut bindings = BindingKeys::default();
+                    bindings.push(Rc::clone(key));
+                    registry.view_bindings.insert(Rc::from(owner), bindings);
                 }
             }
         }
@@ -994,7 +1118,9 @@ pub fn begin_binding_under_view(key: &Rc<str>) -> BindingScope {
                         Some(Some(shared)) => Rc::clone(shared),
                         _ => Rc::from(owner),
                     };
-                    registry.view_bindings.insert(owner, vec![Rc::clone(key)]);
+                    let mut bindings = BindingKeys::default();
+                    bindings.push(Rc::clone(key));
+                    registry.view_bindings.insert(owner, bindings);
                 }
             }
         }
@@ -1019,10 +1145,10 @@ fn clear_binding_reads(registry: &mut Registry, key: &str) {
     let Some(deps) = registry.binding_reads.remove(key) else {
         return;
     };
-    for dep in deps {
+    for dep in deps.into_members() {
         if let std::collections::hash_map::Entry::Occupied(mut readers) = registry.binding_readers.entry(dep) {
-            readers.get_mut().remove(key);
-            if readers.get().is_empty() {
+            // the binding was the dependency's last reader: the entry goes
+            if readers.get_mut().remove(key) {
                 readers.remove();
             }
         }
@@ -1032,7 +1158,7 @@ fn clear_binding_reads(registry: &mut Registry, key: &str) {
 /// How many dependencies the binding read in its last evaluation. None
 /// makes it a constant: nothing can ever move it.
 pub fn binding_read_count(key: &str) -> usize {
-    REGISTRY.with(|registry| registry.borrow().binding_reads.get(key).map_or(0, HashSet::len))
+    REGISTRY.with(|registry| registry.borrow().binding_reads.get(key).map_or(0, Few::len))
 }
 
 /// Did a write reach a binding since the last frame took the dirty ones?
@@ -1056,8 +1182,8 @@ pub(crate) fn record_read(key: DepKey) {
         if let Some(binding) = registry.binding_scope.clone() {
             // a binding reads for itself — at a placement or at a
             // measure as much as inside a body
-            registry.binding_reads.entry(Rc::clone(&binding)).or_default().insert(key);
-            registry.binding_readers.entry(key).or_default().insert(binding);
+            file_few(&mut registry.binding_reads, Rc::clone(&binding), key);
+            file_few(&mut registry.binding_readers, key, binding);
             return;
         }
         if !registry.pass_active {
@@ -1262,6 +1388,101 @@ mod tests {
         assert_eq!(&*spelled, "Spelled");
         assert_eq!(count, 1);
         super::reset_world();
+    }
+
+    /// A set of one is the member itself: a second insert of it adds
+    /// nothing, a second member makes it a set, and taking the last
+    /// member out says so — the holder takes the entry out, since an
+    /// empty set has no form of its own. A member it does not hold
+    /// leaves it as it was.
+    #[test]
+    fn a_set_of_one_is_its_member_until_a_second_arrives() {
+        use super::Few;
+
+        let mut few = Few::One(1u64);
+        few.insert(1);
+        assert!(matches!(few, Few::One(1)), "the same member, inserted again, is not a second");
+        assert!(!few.remove(&2), "a member it does not hold leaves it as it was");
+        assert!(matches!(few, Few::One(1)));
+        few.insert(2);
+        assert!(matches!(&few, Few::Many(set) if set.len() == 2), "a second member makes it a set");
+        assert_eq!(few.iter().copied().collect::<std::collections::BTreeSet<_>>(), [1, 2].into());
+        assert!(!few.remove(&1), "one member is left");
+        assert!(few.remove(&2), "the last one out empties it");
+        assert!(Few::One(7u64).remove(&7), "a set of one empties with its member");
+    }
+
+    /// The register of a row's bindings holds what a row has inline: the
+    /// one value each binding reads, the one binding that reads it, the
+    /// two bindings the row's body made. A write still reaches the
+    /// binding, a second reader of the same value still joins it, and
+    /// the body's re-run still takes every entry out.
+    #[test]
+    fn a_rows_bindings_are_filed_inline_and_unfiled_whole() {
+        use super::{
+            DepKey, Few, REGISTRY, begin_binding_under_view, begin_pass, begin_view_reads, cursor_key, end_pass,
+            enter_view, record_read, record_write, reset_world, take_dirty_bindings,
+        };
+        use std::rc::Rc;
+
+        reset_world();
+        let label = DepKey::State(1);
+        let flag = DepKey::State(2);
+        let row: Rc<str> = Rc::from("Row");
+        begin_pass();
+        let (text, class) = {
+            let _view = enter_view("Row");
+            begin_view_reads(&row);
+            let text = cursor_key("#text").expect("inside a pass");
+            let scope = begin_binding_under_view(&text);
+            record_read(label);
+            drop(scope);
+            let class = cursor_key("#class").expect("inside a pass");
+            let scope = begin_binding_under_view(&class);
+            record_read(flag);
+            drop(scope);
+            (text, class)
+        };
+        let _ = end_pass();
+        REGISTRY.with(|registry| {
+            let registry = registry.borrow();
+            assert!(matches!(registry.binding_reads.get(&text), Some(Few::One(dep)) if *dep == label));
+            assert!(matches!(registry.binding_readers.get(&flag), Some(Few::One(key)) if *key == class));
+            let filed = registry.view_bindings.get("Row").expect("the row's bindings are filed");
+            assert_eq!(filed.len(), 2);
+            assert_eq!(filed.more.capacity(), 0, "two bindings take no list");
+        });
+
+        record_write(label);
+        assert_eq!(take_dirty_bindings(), vec![Rc::clone(&text)], "a write reaches the binding that read it");
+
+        // a second reader of the label joins the first
+        let other: Rc<str> = Rc::from("Other/#text");
+        drop(super::begin_binding(&other, None));
+        {
+            let scope = super::begin_binding(&other, None);
+            record_read(label);
+            drop(scope);
+        }
+        REGISTRY.with(|registry| {
+            assert_eq!(registry.borrow().binding_readers.get(&label).map(Few::len), Some(2), "two readers now");
+        });
+
+        // the row's body runs again: its bindings' entries all leave
+        begin_pass();
+        {
+            let _view = enter_view("Row");
+            begin_view_reads(&row);
+        }
+        let _ = end_pass();
+        REGISTRY.with(|registry| {
+            let registry = registry.borrow();
+            assert!(!registry.binding_reads.contains_key(&text) && !registry.binding_reads.contains_key(&class));
+            assert!(!registry.binding_readers.contains_key(&flag), "the flag's one reader left with its entry");
+            assert_eq!(registry.binding_readers.get(&label).map(Few::len), Some(1), "the other reader stays");
+            assert!(!registry.view_bindings.contains_key("Row"));
+        });
+        reset_world();
     }
 
     /// The skips of a pass are asked for one thing: an owner the pass did
