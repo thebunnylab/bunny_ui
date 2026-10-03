@@ -321,12 +321,57 @@ fn node(kind: DomKind) -> DomNode {
     }
 }
 
+/// The promise of a kept boundary: the group's own shell as its record
+/// says it lowered — its stretch, its class and the binding the class
+/// reads through — and nothing of the parent's yet. Made where it is
+/// pushed: a node is three hundred bytes, and a promise built aside was
+/// copied twice on its way into the list.
+fn promise(path: &std::rc::Rc<str>, record: &GroupRecord) -> DomNode {
+    // a reuse marker is a promise, not a built node: the capture counter
+    // tracks real construction, and does not count it
+    DomNode {
+        kind: DomKind::Reuse { path: std::rc::Rc::clone(path) },
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+        style: DomStyle::default(),
+        layout: Some(DomLayout { stretch: record.own_stretch, ..DomLayout::default() }),
+        hints: DomHints { class: record.own_class.clone(), ..DomHints::default() },
+        children: Vec::new(),
+        binding: record.class_binding.clone().map(crate::dom::NodeBinding::Class),
+        face: None,
+    }
+}
+
 /// The tags whose browser display is inline: a stack wearing one of
-/// these around a single child folds to the tag's own display.
-const INLINE_TAGS: &[&str] = &[
-    "a", "span", "b", "i", "em", "strong", "small", "label", "code", "u", "s", "mark", "abbr",
-    "sub", "sup", "q", "cite", "kbd", "var", "time",
-];
+/// these around a single child folds to the tag's own display. A match,
+/// not a list: every hinted node asks, a thousand rows' `tr` included,
+/// and a list was a score of compares to say no.
+fn is_inline_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "a" | "span"
+            | "b"
+            | "i"
+            | "em"
+            | "strong"
+            | "small"
+            | "label"
+            | "code"
+            | "u"
+            | "s"
+            | "mark"
+            | "abbr"
+            | "sub"
+            | "sup"
+            | "q"
+            | "cite"
+            | "kbd"
+            | "var"
+            | "time"
+    )
+}
 
 fn align_code(align: CrossAlign) -> u8 {
     match align {
@@ -353,6 +398,38 @@ impl Walk<'_> {
             in_overlay: self.overlay_depth > 0,
             slot: self.slot,
         }
+    }
+
+    /// Would a boundary met here be lowered in `env` — is it the key
+    /// [`Walk::flow_key`] would make? Asked field by field, without the
+    /// key: every kept boundary asks, and only a group lowered again
+    /// keeps the key it was lowered in. Every field is named, so a field
+    /// the key gains must be asked here too.
+    fn lowers_in(&self, env: &FlowKey) -> bool {
+        let FlowKey {
+            ink,
+            in_ink_scope,
+            font,
+            line_height,
+            text_align,
+            interactive,
+            transition,
+            tooltip,
+            group,
+            in_overlay,
+            slot,
+        } = env;
+        *font == self.font
+            && *slot == self.slot
+            && *line_height == self.line_height
+            && *text_align == self.text_align
+            && *group == self.groups.last().copied()
+            && *in_overlay == (self.overlay_depth > 0)
+            && *in_ink_scope == !self.ink_scopes.is_empty()
+            && *transition == self.pending_transition
+            && *interactive == self.pending_interactive
+            && *tooltip == self.pending_tooltip
+            && *ink == self.current_ink()
     }
 
     fn current_ink(&self) -> Color {
@@ -1170,7 +1247,7 @@ impl Walk<'_> {
         }
         // an inline tag around one child is no flex box
         if let Some(tag) = tag
-            && INLINE_TAGS.contains(&&**tag)
+            && is_inline_tag(tag)
             && let [only] = lowered
         {
             Self::fold_inline(only);
@@ -1205,13 +1282,12 @@ impl Walk<'_> {
         // now — so the diff keeps it wholesale, O(change), by
         // absence. The promise is born as the group's own
         // shell, and the parent stamps its part again.
-        let key = self.flow_key();
         let holds = |record: &GroupRecord| {
             if retained || crate::reconciler::is_retained(path) {
                 // a component's body is its own: the run above
                 // changed nothing it shows unless the environment
                 // it is lowered in moved
-                record.env == key
+                self.lowers_in(&record.env)
             } else {
                 // an identity scope with no body (a list's row) is
                 // the content of the body above it
@@ -1222,16 +1298,11 @@ impl Walk<'_> {
             && !(self.runs_below && self.changed.touches(path))
             && holds(record)
         {
-            let mut promise = node(DomKind::Reuse { path: std::rc::Rc::clone(path) });
-            if let Some(layout) = promise.layout.as_mut() {
-                layout.stretch = record.own_stretch;
-            }
-            promise.hints.class = record.own_class.clone();
-            promise.binding = record.class_binding.clone().map(crate::dom::NodeBinding::Class);
             self.drops_seen += record.drops;
-            out.push(promise);
+            out.push(promise(path, record));
             return;
         }
+        let key = self.flow_key();
         let mut group = node(DomKind::Group { path: std::rc::Rc::clone(path) });
         group.children.reserve_exact(children.len());
         let outer_pending = self.pending_boundary_class.take();
@@ -1548,6 +1619,85 @@ mod tests {
             truncation: None,
             hints: Default::default(),
             action: None,
+        }
+    }
+
+    /// The inline tags are the twenty they were — and the tags of a
+    /// table, a block, a list item and nothing at all are none of them.
+    #[test]
+    fn the_inline_tags_are_the_twenty() {
+        let inline = [
+            "a", "span", "b", "i", "em", "strong", "small", "label", "code", "u", "s", "mark", "abbr", "sub",
+            "sup", "q", "cite", "kbd", "var", "time",
+        ];
+        for tag in inline {
+            assert!(is_inline_tag(tag), "{tag} is inline");
+        }
+        for tag in ["tr", "td", "th", "tbody", "table", "div", "li", "p", "", "A", "spans", "tim"] {
+            assert!(!is_inline_tag(tag), "{tag:?} is not inline");
+        }
+    }
+
+    /// A kept boundary asks the walk whether it would be lowered in the
+    /// environment its group was lowered in, field by field, instead of
+    /// making the key to compare. The answer must be the key's: the same
+    /// walk holds its own key, and each thing a wrapper above can change
+    /// — the ink, an ink scope, the face, the line box, the alignment,
+    /// a press, a transition, a tooltip, a hover group, an overlay, the
+    /// slot — makes the key of the walk before it fail, as it makes the
+    /// two keys differ.
+    #[test]
+    fn a_kept_boundary_asks_the_walk_what_its_key_would_say() {
+        let offsets = HashMap::default();
+        let env = env_fixture(&offsets);
+        let mut walk = Walk {
+            env: &env,
+            changed: ChangedIndex::new(env.changed),
+            ink: Vec::new(),
+            ink_scopes: Vec::new(),
+            font: FontSpec::DEFAULT,
+            declared: FontSpec::DEFAULT,
+            line_height: None,
+            text_align: None,
+            pending_interactive: None,
+            pending_transition: None,
+            pending_tooltip: None,
+            groups: Vec::new(),
+            overlay_depth: 0,
+            drops_seen: 0,
+            overlays: Vec::new(),
+            display: crate::layout::DisplayList::default(),
+            fields: Vec::new(),
+            slot: (None, None),
+            pending_boundary_class: None,
+            customs: Vec::new(),
+            groups_out: Vec::new(),
+            hits: Vec::new(),
+            islands_walked: Vec::new(),
+            runs_below: true,
+            last_face: None,
+        };
+        assert!(walk.lowers_in(&walk.flow_key()), "a walk holds its own key");
+        let moves: [(&str, fn(&mut Walk)); 11] = [
+            ("the ink", |walk| walk.ink.push(Color { r: 1, g: 2, b: 3, a: 255 })),
+            ("an ink scope", |walk| walk.ink_scopes.push(0)),
+            ("the face", |walk| walk.font.size += 3.0),
+            ("the line box", |walk| walk.line_height = Some(21.0)),
+            ("the alignment", |walk| walk.text_align = Some(motor::views::TextAlignment::Center)),
+            ("a press", |walk| walk.pending_interactive = Some(std::rc::Rc::from("App/#0/button"))),
+            ("a transition", |walk| walk.pending_transition = Some((0.3, 0.8))),
+            ("a tooltip", |walk| walk.pending_tooltip = Some(Arc::from("tip"))),
+            ("a hover group", |walk| walk.groups.push(7)),
+            ("an overlay", |walk| walk.overlay_depth += 1),
+            ("the slot", |walk| walk.slot = (Some(120.0), None)),
+        ];
+        for (what, change) in moves {
+            let before = walk.flow_key();
+            change(&mut walk);
+            let after = walk.flow_key();
+            assert_ne!(before, after, "{what} moves the key");
+            assert!(!walk.lowers_in(&before), "{what} moved, and the old key no longer holds");
+            assert!(walk.lowers_in(&after), "the walk holds its key after {what}");
         }
     }
 
