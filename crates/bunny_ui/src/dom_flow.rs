@@ -383,6 +383,7 @@ impl Walk<'_> {
                     }
                 }
                 Self::inherit_stretch(&mut container);
+                Self::fold_table_wrapper(&mut container);
                 out.push(container);
             }
             // a row that wraps is the browser's own: a flex row that
@@ -477,6 +478,7 @@ impl Walk<'_> {
                 self.slot = outer_slot;
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(&mut container);
+                Self::fold_table_wrapper(&mut container);
                 out.push(container);
             }
             // A hug is a native flow rule on the web: a box that is not told
@@ -502,6 +504,7 @@ impl Walk<'_> {
                 self.lower_into(child, &mut container.children);
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(&mut container);
+                Self::fold_table_wrapper(&mut container);
                 out.push(container);
             }
             // The flex frame on the web flow: a growing box. Its FLOOR is not
@@ -518,6 +521,7 @@ impl Walk<'_> {
                 self.lower_into(child, &mut container.children);
                 Self::stamp_fill(child, &mut container.children);
                 Self::inherit_stretch(&mut container);
+                Self::fold_table_wrapper(&mut container);
                 out.push(container);
             }
             LayoutNode::Spacer => {
@@ -1190,6 +1194,37 @@ impl Walk<'_> {
         }
     }
 
+    /// A column around ONE table, pinned to the leading edge, is a
+    /// block. A table is never a flex line's cheap item: as the item of
+    /// a column the browser measures the whole table for its flex base
+    /// size and lays it out again at the size the line settles on —
+    /// every row, on every relayout the table takes part in. As the one
+    /// child of a block it is laid out once, at the same place and the
+    /// same width: a table in block flow already sizes to its content
+    /// and sits on the leading edge, as a column's leading item does.
+    /// A table that grows, fills or stretches keeps the flex line — a
+    /// block would not hand it the offer — and so does any other
+    /// alignment, which a block cannot say.
+    fn fold_table_wrapper(container: &mut DomNode) {
+        if !matches!(container.kind, DomKind::FlexColumn) || container.children.len() != 1 {
+            return;
+        }
+        let table = &container.children[0];
+        let lone_table = table.hints.tag.as_deref() == Some("table")
+            && table.layout.as_ref().is_none_or(|layout| {
+                !layout.grow && !layout.fill && !layout.stretch && layout.slot_y.is_none()
+            });
+        if !lone_table {
+            return;
+        }
+        if let Some(layout) = container.layout.as_mut()
+            && layout.align == Some(align_code(CrossAlign::Start))
+            && layout.wrap.is_none()
+        {
+            layout.plain = true;
+        }
+    }
+
     /// A cell whose one child is a plain text becomes that text: the
     /// cell element carries the words, and the flex box between them
     /// is not made. A cell lays itself out as a table cell, so nothing
@@ -1394,6 +1429,25 @@ mod tests {
             highlights: None,
             truncation: None,
         }
+    }
+
+    /// A table the column must feed — one that stretches across it —
+    /// keeps the flex line: a block would leave it at its content's
+    /// width. A table that asks nothing of the line sits in a block.
+    #[test]
+    fn a_table_the_line_feeds_keeps_its_flex_line() {
+        let column = |stretch: bool| {
+            let mut table = node(DomKind::FlexRow);
+            table.hints.tag = Some("table".into());
+            table.layout.as_mut().expect("flow").stretch = stretch;
+            let mut container = node(DomKind::FlexColumn);
+            container.layout.as_mut().expect("flow").align = Some(align_code(CrossAlign::Start));
+            container.children.push(table);
+            Walk::fold_table_wrapper(&mut container);
+            container.layout.expect("flow").plain
+        };
+        assert!(column(false), "a table that asks nothing sits in a block");
+        assert!(!column(true), "a stretched table keeps the line that stretches it");
     }
 
     /// The exact box says WHERE on the second road too: the browser
