@@ -604,7 +604,10 @@ fn same_binding(old: &DomNode, new: &DomNode) -> bool {
 /// reads for itself travels on its own road.
 fn hints_changed(old: &DomNode, new: &DomNode) -> bool {
     if same_binding(old, new) && matches!(new.binding, Some(NodeBinding::Class(_))) {
-        DomHints { class: old.hints.class.clone(), ..new.hints.clone() } != old.hints
+        // the class aside, field by field: a copy of the hints with the
+        // old class in it was three shared words taken and let go for
+        // every kept row of a list
+        old.hints.tag != new.hints.tag || old.hints.dom_id != new.hints.dom_id
     } else {
         old.hints != new.hints
     }
@@ -3683,7 +3686,11 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
         if position == FRESH {
             continue;
         }
-        let place = tails.partition_point(|&tail| plan[tail] < position);
+        // the tails rise, so a position past the last one extends the
+        // run — the common case, a list that mostly kept its order: no
+        // search for the rows that did
+        let extends = tails.last().is_none_or(|&last| plan[last] < position);
+        let place = if extends { tails.len() } else { tails.partition_point(|&tail| plan[tail] < position) };
         if place > 0 {
             parents[at] = tails[place - 1];
         }
@@ -6742,6 +6749,93 @@ mod tests {
             !patches.is_empty(),
             "the second world invalidates — its reads bind to living states"
         );
+    }
+
+    /// A kept row's hints move by its tag and its id. Its class moves by
+    /// them too — unless the class reads for itself through the same
+    /// binding object on both sides, and then the class travels on its
+    /// own road and says nothing here.
+    #[test]
+    fn a_kept_rows_hints_move_by_tag_and_id_and_not_by_a_class_that_reads_for_itself() {
+        let binding = NodeBinding::Class(crate::bind::Bound::new(Rc::from("row/#class"), Rc::new(String::new)));
+        let hinted = |tag: &str, class: &str, id: &str, bound: bool| {
+            let mut node = flow_row("row");
+            node.hints = DomHints { tag: Some(tag.into()), class: Some(class.into()), dom_id: Some(id.into()) };
+            node.binding = bound.then(|| match &binding {
+                NodeBinding::Class(bound) => NodeBinding::Class(Rc::clone(bound)),
+                NodeBinding::Text(bound) => NodeBinding::Text(Rc::clone(bound)),
+            });
+            node
+        };
+        let was = hinted("tr", "a", "x", true);
+        assert!(!hints_changed(&was, &hinted("tr", "a", "x", true)), "nothing moved");
+        assert!(!hints_changed(&was, &hinted("tr", "b", "x", true)), "the bound class rides its own road");
+        assert!(hints_changed(&was, &hinted("td", "a", "x", true)), "the tag moved");
+        assert!(hints_changed(&was, &hinted("tr", "a", "y", true)), "the id moved");
+        let plain = hinted("tr", "a", "x", false);
+        assert!(hints_changed(&plain, &hinted("tr", "b", "x", false)), "a class that does not read for itself moved");
+    }
+
+    /// The rows that need no move are found the same with the search and
+    /// without it: a position past the last tail extends the run, which
+    /// is where the search would have put it. Plans of every shape — a
+    /// swap, a reversal, a rotation, a few out of place, fresh entries
+    /// among them, and scrambles — stand on the same rows.
+    #[test]
+    fn the_stable_rows_are_the_ones_the_search_finds() {
+        fn searched(plan: &[usize]) -> Vec<bool> {
+            const NONE: usize = usize::MAX;
+            let mut tails: Vec<usize> = Vec::new();
+            let mut parents = vec![NONE; plan.len()];
+            for (at, &position) in plan.iter().enumerate() {
+                if position == FRESH {
+                    continue;
+                }
+                let place = tails.partition_point(|&tail| plan[tail] < position);
+                if place > 0 {
+                    parents[at] = tails[place - 1];
+                }
+                if place == tails.len() {
+                    tails.push(at);
+                } else {
+                    tails[place] = at;
+                }
+            }
+            let mut stable = vec![false; plan.len()];
+            let mut cursor = tails.last().copied().unwrap_or(NONE);
+            while cursor != NONE {
+                stable[cursor] = true;
+                cursor = parents[cursor];
+            }
+            stable
+        }
+        let mut plans: Vec<Vec<usize>> = Vec::new();
+        let mut swapped: Vec<usize> = (0..40).collect();
+        swapped.swap(1, 38);
+        plans.push(swapped);
+        plans.push((0..40).rev().collect());
+        plans.push((5..40).chain(0..5).collect());
+        let mut few: Vec<usize> = (0..40).collect();
+        few.swap(3, 9);
+        few.swap(20, 21);
+        few[30] = FRESH;
+        few.insert(12, FRESH);
+        plans.push(few);
+        let mut seed = 0x2545_f491_u64;
+        for length in [1usize, 2, 7, 64, 300] {
+            let mut scramble: Vec<usize> = (0..length).collect();
+            for at in (1..length).rev() {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                scramble.swap(at, (seed >> 33) as usize % (at + 1));
+                if seed % 11 == 0 {
+                    scramble[at] = FRESH;
+                }
+            }
+            plans.push(scramble);
+        }
+        for plan in &plans {
+            assert_eq!(longest_increasing(plan), searched(plan), "{plan:?}");
+        }
     }
 
     // MARK: - The flow vocabulary (the wire half; the capture rides
