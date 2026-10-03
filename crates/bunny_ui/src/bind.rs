@@ -360,6 +360,130 @@ mod frame_tests {
         }
     }
 
+    /// A text that reads for itself wears the face above it like any
+    /// other text: the family named by `.font_family` reaches it.
+    #[test]
+    fn a_bound_text_wears_the_family_above_it() {
+        #[derive(Clone)]
+        struct Pair {
+            count: State<usize>,
+        }
+
+        impl Component for Pair {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(text("fixed"), crate::text!("{} rows", self.count)).font_family("Menlo")
+            }
+        }
+
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&Pair { count: State::new(1) }, SIZE);
+        let families: Vec<Option<std::sync::Arc<str>>> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::DefineRule { text: Some(text), .. } => Some(text.font.family.name()),
+                _ => None,
+            })
+            .collect();
+        assert!(!families.is_empty(), "{mount:?}");
+        assert!(
+            families.iter().all(|family| family.as_deref() == Some("Menlo")),
+            "every text face names the family: {families:?} in {mount:?}"
+        );
+    }
+
+    /// The same, in the shape of a keyed row: the label a bound text in
+    /// a link inside a cell, the row a component the list keys.
+    #[test]
+    fn a_bound_label_in_a_keyed_row_wears_the_family_above_it() {
+        #[derive(Clone)]
+        struct Row {
+            item: Item,
+            on: State<bool>,
+        }
+
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                let id = self.item.id;
+                (
+                    boundary_class_when(self.on, "danger"),
+                    text(id.to_string()).foreground_color(Color::BLACK).element("td").css_class("a"),
+                    crate::hstack!(
+                        crate::text!("label {}", id)
+                            .foreground_color(Color::BLACK)
+                            .element("a")
+                            .on_click(|| {})
+                    )
+                    .element("td")
+                    .css_class("b"),
+                )
+            }
+        }
+
+        #[derive(Clone)]
+        struct Page {
+            rows: State<Rc<Vec<Item>>>,
+        }
+
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(for_each(self.rows, |item| item.id.to_string(), |item| {
+                    Row { item: *item, on: State::new(false) }.element("tr")
+                }))
+                .font_family("Menlo")
+                .font_size(14.0)
+            }
+        }
+
+        let faces_of = |patches: &[DomPatch]| -> Vec<(Option<std::sync::Arc<str>>, f64)> {
+            patches
+                .iter()
+                .filter_map(|patch| match patch {
+                    DomPatch::DefineRule { text: Some(text), .. } => Some((text.font.family.name(), text.font.size)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let runtime = Runtime::new();
+        let page = Page { rows: State::new(items(&[1, 2])) };
+        let mount = runtime.dom_frame(&page, SIZE);
+        let faces = faces_of(&mount);
+        assert!(faces.len() >= 2, "{mount:?}");
+        assert!(
+            faces.iter().all(|(family, size)| family.as_deref() == Some("Menlo") && *size == 14.0),
+            "every text face names the family and the size: {faces:?}"
+        );
+
+        // and a table that was EMPTY at the mount: its first rows arrive
+        // through the list's own update, and their looks are defined
+        // then — under the same family
+        let runtime = Runtime::new();
+        let page = Page { rows: State::new(items(&[])) };
+        let _ = runtime.dom_frame(&page, SIZE);
+        page.rows.set(items(&[1, 2]));
+        let update = runtime.dom_frame(&page, SIZE);
+        let later = faces_of(&update);
+        assert!(later.len() >= 2, "the first rows define their looks: {update:?}");
+        assert!(
+            later.iter().all(|(family, size)| family.as_deref() == Some("Menlo") && *size == 14.0),
+            "a row the list adds wears the face above it: {later:?}"
+        );
+
+        // and the served page, adopted: the build painted the empty
+        // table, the first rows arrive by the click — the same face
+        let runtime = Runtime::new();
+        let page = Page { rows: State::new(items(&[])) };
+        runtime.dom_adopt(&page, SIZE);
+        assert!(runtime.dom_frame(&page, SIZE).is_empty(), "the adopted page is already true");
+        page.rows.set(items(&[1, 2]));
+        let update = runtime.dom_frame(&page, SIZE);
+        let adopted = faces_of(&update);
+        assert!(adopted.len() >= 2, "the first rows define their looks: {update:?}");
+        assert!(
+            adopted.iter().all(|(family, size)| family.as_deref() == Some("Menlo") && *size == 14.0),
+            "a row added to an adopted page wears the face above it: {adopted:?}"
+        );
+    }
+
     #[test]
     fn a_bound_label_is_one_text_patch_and_no_body() {
         let label = Label { count: State::new(1) };

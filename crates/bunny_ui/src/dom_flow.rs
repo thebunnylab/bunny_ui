@@ -1130,9 +1130,11 @@ impl Walk<'_> {
     /// a pinned size or a slot keep the flex box, because those are
     /// flex semantics the browser's inline flow would not honour.
     fn fold_inline(node: &mut DomNode) {
-        let one_child = matches!(node.kind, DomKind::FlexRow | DomKind::FlexColumn)
-            && node.children.len() == 1;
-        if !one_child {
+        // one child or none: an empty inline tag — a glyph the page's
+        // stylesheet draws — has no line to lay out either
+        let at_most_one = matches!(node.kind, DomKind::FlexRow | DomKind::FlexColumn)
+            && node.children.len() <= 1;
+        if !at_most_one {
             return;
         }
         if let Some(layout) = node.layout.as_mut()

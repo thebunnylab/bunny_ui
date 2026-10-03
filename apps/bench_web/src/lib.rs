@@ -221,10 +221,9 @@ pub mod keyed {
                 hstack!(
                     hstack!(
                         // the page's stylesheet draws the glyph through
-                        // the class; words of our own would be a second
-                        // text to lay out on every row
-                        text("")
-                            .foreground_color(theme::fg_secondary())
+                        // the class, in its own icon font: an empty
+                        // element, not a text wearing a face of ours
+                        hstack!(empty())
                             .element("span")
                             .css_class("glyphicon glyphicon-remove")
                     )
@@ -387,12 +386,22 @@ pub mod keyed {
             .collect()
     }
 
+    /// The page's own typography — the face and the size its stylesheet
+    /// gives every other implementation by inheritance. A face named
+    /// matches once in the browser and is cached; the system face, a
+    /// generic the browser resolves per text run, costs the layout a
+    /// millisecond per thousand rows.
+    const PAGE_FACE: &str = "Helvetica Neue";
+    const PAGE_SIZE: f64 = 14.0;
+
     impl Component for App {
         fn body(self, _ctx: &Context) -> impl View {
             vstack!(self.clone().controls(), self.table())
                 .alignment(HorizontalAlignment::Leading)
                 .frame(900.0, 800.0)
                 .background_color(theme::panel())
+                .font_family(PAGE_FACE)
+                .font_size(PAGE_SIZE)
                 .element_id("main")
         }
     }
@@ -411,6 +420,8 @@ pub mod keyed {
             .alignment(HorizontalAlignment::Leading)
             .frame(900.0, 800.0)
             .background_color(theme::panel())
+            .font_family(PAGE_FACE)
+            .font_size(PAGE_SIZE)
             .element_id("main")
         }
     }

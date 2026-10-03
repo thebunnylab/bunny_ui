@@ -817,13 +817,23 @@ fn css_font(font: &crate::text_engine::FontSpec) -> String {
         crate::text_engine::Weight::ExtraBold => 800,
         crate::text_engine::Weight::Black => 900,
     };
-    let family = match font.design {
-        crate::text_engine::FontDesign::Mono => {
-            "ui-monospace, Menlo, Consolas, monospace"
-        }
+    let house = match font.design {
+        crate::text_engine::FontDesign::Mono => "ui-monospace, Menlo, Consolas, monospace",
         _ => "system-ui, -apple-system, \"Segoe UI\", sans-serif",
     };
-    format!("{weight} {}px {family}", font.size)
+    // a face named goes first, the house stack behind it; the lean is
+    // a real face too — the glue's `cssFont`, mirrored: a served page
+    // must agree with a mounted one, or the looks it defines are worn
+    // by the elements the glue mounts later under the same hash
+    let family = match font.family.name() {
+        Some(name) => format!("\"{}\", {house}", name.replace('"', "")),
+        None => house.to_string(),
+    };
+    let lean = match font.slant {
+        crate::text_engine::Slant::Italic => "italic ",
+        _ => "",
+    };
+    format!("{lean}{weight} {}px {family}", font.size)
 }
 
 /// The glue's gradient lowering, mirrored: a proportional centre or
