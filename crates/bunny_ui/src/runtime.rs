@@ -4609,7 +4609,7 @@ impl Runtime {
             if !dom.has_binding(key)
                 && let Some((scope, _)) = key.rsplit_once('/')
             {
-                changed.push(scope.to_string());
+                changed.push(Rc::from(scope));
             }
         }
         let retained_groups = dom.group_paths();
@@ -4795,7 +4795,7 @@ impl Runtime {
             overlay_bounds: self.overlay_bounds.get(),
             dialog_frames: Some(&dialogs),
         };
-        let changed: Vec<String> = Vec::new();
+        let changed: Vec<Rc<str>> = Vec::new();
         let no_promises = motor::hash::FxHashMap::default();
         let boxes = self.island_boxes.borrow();
         let flow = crate::dom_flow::FlowEnv {

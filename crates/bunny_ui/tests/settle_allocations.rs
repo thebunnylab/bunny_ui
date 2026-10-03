@@ -159,16 +159,16 @@ const KEY_CHECK: u64 = if cfg!(debug_assertions) { 2 } else { 0 };
 // MARK: - The budgets
 
 /// A row whose body shows nothing still pays for being a row: its key,
-/// its path, the retained copy of itself, the entry and the slot its
-/// tree is filed in, and the note that its body ran. Nothing on top of
-/// that: a body that opens mints no placeholder path, a frame names no
-/// boundary it never prints, the seed of the row's parents is where they
-/// end in its path, held inline, and the environment it ran in is the
-/// page's own, shared.
+/// its path, the retained copy of itself, and the entry and the slot its
+/// tree is filed in. Nothing on top of that: a body that opens mints no
+/// placeholder path, a frame names no boundary it never prints, the seed
+/// of the row's parents is where they end in its path, held inline, the
+/// environment it ran in is the page's own, shared, and the note that
+/// its body ran is its own path, counted once more.
 #[test]
 fn a_row_that_mounts_pays_for_its_entry_and_nothing_else() {
     let cost = per_row(|_| empty());
-    assert!(cost <= 7 + KEY_CHECK, "an empty row costs the settle {cost} allocations");
+    assert!(cost <= 6 + KEY_CHECK, "an empty row costs the settle {cost} allocations");
 }
 
 /// What a row costs beyond the empty row: the measure of one feature.

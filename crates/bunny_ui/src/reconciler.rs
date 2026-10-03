@@ -356,7 +356,10 @@ thread_local! {
     /// ([`Visit`]). It never goes back, so no stamp is ever met twice.
     static PASS_NO: Cell<u64> = const { Cell::new(0) };
     static LAST_BODY_RUNS: RefCell<Vec<Rc<str>>> = const { RefCell::new(Vec::new()) };
-    static FRAME_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Every body that ran since the frame last drained them — the
+    /// pass's own paths, shared: a thousand rows that mount are a
+    /// thousand counts, not a thousand copies.
+    static FRAME_BODY_RUNS: RefCell<Vec<Rc<str>>> = const { RefCell::new(Vec::new()) };
     static LIVE: RefCell<Live> = RefCell::new(Live::default());
 }
 
@@ -2364,7 +2367,7 @@ pub(crate) fn end_pass() {
         let mut pass = pass.borrow_mut();
         pass.active = false;
         let runs = std::mem::take(&mut pass.body_runs);
-        FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().extend(runs.iter().map(|run| run.to_string())));
+        FRAME_BODY_RUNS.with(|frame| frame.borrow_mut().extend(runs.iter().cloned()));
         LAST_BODY_RUNS.with(|last| *last.borrow_mut() = runs);
     });
 }
@@ -2377,7 +2380,7 @@ pub(crate) fn retained_len() -> usize {
     RETAINED.with(|retained| retained.borrow().len())
 }
 
-pub(crate) fn take_frame_runs() -> Vec<String> {
+pub(crate) fn take_frame_runs() -> Vec<Rc<str>> {
     FRAME_BODY_RUNS.with(|frame| std::mem::take(&mut *frame.borrow_mut()))
 }
 
