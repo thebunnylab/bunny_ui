@@ -33,6 +33,7 @@ use crate::layout::{
     Axis, Color, Corners, CrossAlign, Edges, Fraction, LayoutNode, SeamUnit, Size as LayoutSize,
     VisualProps,
 };
+use crate::reconciler::LastRun;
 use crate::state_ext::{BindingExt, StateExt};
 use crate::erased::{Erased, erased};
 use crate::view::{Either, NodeList, Single, View, render_line};
@@ -2316,6 +2317,8 @@ pub struct ForEach<S, I, F> {
     axis: Axis,
     spacing: Option<f64>,
     align: Option<CrossAlign>,
+    /// Is each row built once per key ([`ForEach::once_per_key`])?
+    once_per_key: bool,
 }
 
 impl<S, I, F, R> View for ForEach<S, I, F>
@@ -2334,7 +2337,7 @@ where
             Keyed(self.clone()).render_into(ctx, out);
             return;
         }
-        self.items.with_items(|items| self.render_rows(items, ctx, out));
+        self.items.with_items(|items| self.render_rows(items, ctx, out, None));
     }
 }
 
@@ -2349,14 +2352,11 @@ where
         self.axis == Axis::Vertical && self.spacing.is_none() && self.align.is_none()
     }
 
-    fn render_rows(&self, items: &[S::Item], ctx: &Context, out: &mut NodeList) {
+    fn render_rows(&self, items: &[S::Item], ctx: &Context, out: &mut NodeList, last: Option<&LastRun>) {
         debug_assert_unique_ids("for_each", items.iter().map(&self.id));
         let mut rows = NodeList::new();
         rows.reserve_layout(items.len());
-        for item in items {
-            let _frame = motor::identity::enter_key(&(self.id)(item));
-            (self.row)(item).render_into(ctx, &mut rows);
-        }
+        self.each_row(items, ctx, &mut rows, last.map(|last| (last, true)));
         let (prints, layouts) = rows.into_parts();
         out.push(RenderNode::branch(
             for_each_line(items.len(), self.axis, self.spacing, self.align),
@@ -2375,6 +2375,166 @@ where
             hints: Default::default(),
             action: None,
         });
+    }
+
+    /// Every row into `out`, in order. With the list's last run in hand
+    /// (`last`, and whether its rows stood in a stack of their own), a
+    /// row that run built as one boundary under the same key is kept
+    /// whole — no closure, no step into its scope, no decision: the node
+    /// the last run made goes out again. Every other row is built.
+    fn each_row(&self, items: &[S::Item], ctx: &Context, out: &mut NodeList, last: Option<(&LastRun, bool)>) {
+        // a last run with no row to keep is no last run at all
+        let rows = last.map_or(&[][..], |(last, nested)| last.rows(nested));
+        let (Some((last, nested)), false) = (last, rows.is_empty()) else {
+            for item in items {
+                let _frame = motor::identity::enter_key(&(self.id)(item));
+                (self.row)(item).render_into(ctx, out);
+            }
+            return;
+        };
+        let keys: Vec<String> = items.iter().map(&self.id).collect();
+        let mut kept = KeptRows::new(last.path(), rows, &keys);
+        for (at, (item, key)) in items.iter().zip(&keys).enumerate() {
+            if let Some((was, row)) = kept.row(at, key)
+                && keep_row(last, nested, was, row, key, out)
+            {
+                continue;
+            }
+            let _frame = motor::identity::enter_key(key);
+            (self.row)(item).render_into(ctx, out);
+        }
+    }
+}
+
+/// Keeps the last run's row `row`, at `was` in that run, for `key`: the
+/// reconciler keeps its boundary as a skip would, and the node — with
+/// its line, when the pass prints — goes out again. `false` when the row
+/// must be built: it is dirty itself, or its line cannot be told apart.
+fn keep_row(last: &LastRun, nested: bool, was: usize, row: &LayoutNode, key: &str, out: &mut NodeList) -> bool {
+    let LayoutNode::BoundaryRef { path, slot, .. } = row else {
+        return false;
+    };
+    let line = if crate::view::print_enabled() {
+        match last.line(nested, was, path) {
+            Some(line) => Some(line),
+            None => return false,
+        }
+    } else {
+        None
+    };
+    // `list/[key]`: the scope the step into the row would have opened
+    let key_scope = &path[..last.path().len() + key.len() + 3];
+    if !crate::reconciler::keep_row(path, slot, key_scope) {
+        return false;
+    }
+    if let Some(line) = line {
+        out.push(line.clone());
+    }
+    out.push_layout(row.clone());
+    true
+}
+
+/// Is `row` of the last run the row of `key`, one the list may keep
+/// whole: one boundary straight under its key — `list/[key]/Name`, the
+/// name holding no `/` (a key may)? A row built as anything else — under
+/// an arm, a position, an `.id`, inside a wrapper's box — is not, and is
+/// built again. Bytes compared in place: every kept row asks once.
+fn is_row_of(list: &str, row: &LayoutNode, key: &str) -> bool {
+    let LayoutNode::BoundaryRef { path, .. } = row else {
+        return false;
+    };
+    let (path, at, end) = (path.as_bytes(), list.len(), list.len() + 2 + key.len());
+    path.len() > end + 2
+        && path[at..at + 2] == *b"/["
+        && path[end..end + 2] == *b"]/"
+        && path[at + 2..end] == *key.as_bytes()
+        && !path[end + 2..].contains(&b'/')
+        && path[..at] == *list.as_bytes()
+}
+
+/// The key a row would be [`is_row_of`], read back from its path — for a
+/// row that did not keep its place, indexed by its key. A row found by it
+/// is asked [`is_row_of`] before it is kept, so the list's own part of the
+/// path is not compared here.
+fn key_of<'a>(list: &str, row: &'a LayoutNode) -> Option<&'a str> {
+    let LayoutNode::BoundaryRef { path, .. } = row else {
+        return None;
+    };
+    let (scope, _name) = path.get(list.len()..)?.strip_prefix("/[")?.rsplit_once('/')?;
+    scope.strip_suffix(']')
+}
+
+/// Which row of the last run each key of this run is. The rows that kept
+/// their place are found at it — the head of the list, its tail counted
+/// from the back, and every row in between that did not move — each
+/// asked once; only the rows that did not keep their place are indexed
+/// by key, the first time a key is looked for: a swap indexes the two
+/// rows that traded places, a row removed or added indexes none.
+struct KeptRows<'a> {
+    list: &'a str,
+    rows: &'a [LayoutNode],
+    head: usize,
+    /// Where the tail starts, in the last run and in this one.
+    old_end: usize,
+    new_end: usize,
+    /// The places of the middle both runs have, in order, whose row is not
+    /// the row of this run's key there: a row there came from elsewhere,
+    /// if at all.
+    astray: Vec<usize>,
+    /// How far the walk has read `astray`: places are asked in order.
+    read: usize,
+    moved: Option<motor::hash::FxHashMap<&'a str, usize>>,
+}
+
+impl<'a> KeptRows<'a> {
+    fn new(list: &'a str, rows: &'a [LayoutNode], keys: &[String]) -> Self {
+        let shortest = rows.len().min(keys.len());
+        let head = (0..shortest).take_while(|&at| is_row_of(list, &rows[at], &keys[at])).count();
+        let tail = (0..shortest - head)
+            .take_while(|&back| is_row_of(list, &rows[rows.len() - 1 - back], &keys[keys.len() - 1 - back]))
+            .count();
+        let (old_end, new_end) = (rows.len() - tail, keys.len() - tail);
+        let astray = (head..old_end.min(new_end)).filter(|&at| !is_row_of(list, &rows[at], &keys[at])).collect();
+        KeptRows { list, rows, head, old_end, new_end, astray, read: 0, moved: None }
+    }
+
+    /// The last run's row for `key`, at `at` in this run — asked in order
+    /// — with its place in that run, when that run built it as a row the
+    /// list may keep.
+    fn row(&mut self, at: usize, key: &str) -> Option<(usize, &'a LayoutNode)> {
+        let was = if at < self.head {
+            at
+        } else if at >= self.new_end {
+            self.old_end + (at - self.new_end)
+        } else {
+            while self.astray.get(self.read).is_some_and(|&astray| astray < at) {
+                self.read += 1;
+            }
+            if at < self.old_end && self.astray.get(self.read) != Some(&at) {
+                at
+            } else {
+                // a row that moved left its place to another, or stood
+                // past the places this run has: only those are indexed
+                let (list, rows, astray) = (self.list, self.rows, &self.astray);
+                let past = self.new_end.max(self.head)..self.old_end;
+                let moved = self.moved.get_or_insert_with(|| {
+                    let mut moved = motor::hash::FxHashMap::default();
+                    moved.reserve(astray.len() + past.len());
+                    for was in astray.iter().copied().chain(past) {
+                        if let Some(key) = key_of(list, &rows[was]) {
+                            moved.insert(key, was);
+                        }
+                    }
+                    moved
+                });
+                let was = *moved.get(key)?;
+                if !is_row_of(self.list, &self.rows[was], key) {
+                    return None;
+                }
+                was
+            }
+        };
+        Some((was, &self.rows[was]))
     }
 }
 
@@ -2417,18 +2577,26 @@ where
 
     fn render_into(&self, ctx: &Context, out: &mut NodeList) {
         let list = &self.0;
+        // the run before this one, while the list builds once per key:
+        // the rows it kept are the rows it built — when it stood them
+        // where this run stands them. A plain column whose one row is a
+        // stack looks like a stack of rows, and that row is no row
+        let last = list
+            .once_per_key
+            .then(|| motor::identity::with_current_view_path(|path| path.and_then(crate::reconciler::last_run)))
+            .flatten()
+            .filter(|last| {
+                last.value::<Keyed<S, I, F>>().is_some_and(|was| was.0.is_plain_column() == list.is_plain_column())
+            });
         list.items.with_items(|items| {
             if !list.is_plain_column() {
-                list.render_rows(items, ctx, out);
+                list.render_rows(items, ctx, out, last.as_ref());
                 return;
             }
             debug_assert_unique_ids("for_each", items.iter().map(&list.id));
             // one row, one node: the boundary's list is sized once
             out.reserve_layout(items.len());
-            for item in items {
-                let _frame = motor::identity::enter_key(&(list.id)(item));
-                (list.row)(item).render_into(ctx, out);
-            }
+            list.each_row(items, ctx, out, last.as_ref().map(|last| (last, false)));
         });
     }
 }
@@ -2459,6 +2627,34 @@ impl<S, I, F> ForEach<S, I, F> {
     /// wrapping each one in a frame.
     pub fn cross_alignment(mut self, align: CrossAlign) -> Self {
         self.align = Some(align);
+        self
+    }
+
+    /// Builds each row ONCE PER KEY. A list that reads its items runs
+    /// again whenever they change, and the rows it keeps are skipped —
+    /// but it calls the row closure for every item again, and what the
+    /// closure puts around the row's component (its hints, a class read
+    /// off the item, an `on_appear`) is built and run anew, a thousand
+    /// times for a swap of two rows. With this, a row whose key the last
+    /// run had, and which is not dirty itself, is the row that run built:
+    /// its closure is not called, nothing around its component is built
+    /// or run again, and the list pays a key for it. What the row shows
+    /// moves through its own reads, as it always did; the state its
+    /// closure made stays with its key; a row that is dirty runs.
+    ///
+    /// Ask for it for a closure whose row, for a key, is the one it built
+    /// the first time — the component, its props, the modifiers on it —
+    /// for as long as the key stays: a closure that reads a state to build
+    /// its row reads it once per key here. A row built as anything but one
+    /// component behind its key (under an arm, a position or an `.id`,
+    /// inside a wrapper's box) is built every time, and so is every row
+    /// of a list whose last run filed a registration of its own — a
+    /// click or an effect a closure attached outside its row's component,
+    /// which a row kept without its closure would lose. Only a list that
+    /// reads its items keeps rows: a list of a plain `Vec` is built whole
+    /// with its parent.
+    pub fn once_per_key(mut self) -> Self {
+        self.once_per_key = true;
         self
     }
 }
@@ -2541,7 +2737,7 @@ where
     F: Fn(&S::Item) -> R + Clone + 'static,
     R: View,
 {
-    ForEach { items, id, row, axis: Axis::Vertical, spacing: None, align: None }
+    ForEach { items, id, row, axis: Axis::Vertical, spacing: None, align: None, once_per_key: false }
 }
 
 fn debug_assert_unique_ids(container: &str, ids: impl Iterator<Item = String>) {
@@ -2755,4 +2951,376 @@ impl<C: View> View for WindowGroup<C> {
 
 pub fn window_group<C: View>(children: C) -> WindowGroup<C> {
     WindowGroup { children }
+}
+
+#[cfg(test)]
+mod once_per_key_tests {
+    //! A keyed list that builds each row once per key: the rows it keeps
+    //! cost no closure, and the frames are the frames of a list that
+    //! builds every row.
+
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use crate::layout::Size;
+    use crate::prelude::*;
+    use crate::runtime::Runtime;
+    use crate::stats;
+    use crate::views::{ForEach, for_each};
+
+    const SIZE: Size = Size { width: 400.0, height: 300.0 };
+
+    #[derive(Clone, Copy)]
+    struct Item {
+        id: usize,
+        label: State<Rc<str>>,
+    }
+
+    fn items(ids: &[usize]) -> Vec<Item> {
+        ids.iter().map(|&id| Item { id, label: State::new(Rc::from(format!("item {id}").as_str())) }).collect()
+    }
+
+    thread_local! {
+        /// Every handle an `Inner` body made, in the order they ran.
+        static INNER: RefCell<Vec<State<usize>>> = const { RefCell::new(Vec::new()) };
+        /// Every handle a `Line` body made, in the order they ran.
+        static OWN: RefCell<Vec<State<usize>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A component inside each row with state of its own, born in its
+    /// body: it lives under the row, sheltered by the row's skip.
+    #[derive(Clone, Copy)]
+    struct Inner;
+
+    impl Component for Inner {
+        fn body(self, _ctx: &Context) -> impl View {
+            let taps = State::new(0usize);
+            INNER.with(|inner| inner.borrow_mut().push(taps));
+            text(format!("taps {}", taps.get()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct Line {
+        item: Item,
+        /// Made by the row's closure: it anchors to the row's key scope.
+        mark: State<usize>,
+    }
+
+    impl Component for Line {
+        fn body(self, _ctx: &Context) -> impl View {
+            // state of the row's own, born in its body: it anchors at the
+            // row's own scope
+            let own = State::new(0usize);
+            OWN.with(|made| made.borrow_mut().push(own));
+            (text(format!("{} / {} / own {}", self.item.label.get(), self.mark.get(), own.get())), Inner)
+        }
+    }
+
+    /// What the row closure builds.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Shape {
+        /// One component behind its key, its element hinted.
+        Plain,
+        /// The same, with a key context the list itself files.
+        Registers,
+        /// The component under an arm of its own.
+        Armed,
+    }
+
+    #[derive(Clone)]
+    struct Page {
+        items: State<Rc<Vec<Item>>>,
+        once: bool,
+        spaced: bool,
+        shape: Shape,
+        /// How many times the row closure ran.
+        built: Rc<Cell<usize>>,
+        /// The mark each key's closure made, the last time it ran.
+        marks: Rc<RefCell<HashMap<usize, State<usize>>>>,
+    }
+
+    impl Component for Page {
+        fn body(self, _ctx: &Context) -> impl View {
+            let (built, marks) = (self.built.clone(), self.marks.clone());
+            let line = move |item: &Item| {
+                built.set(built.get() + 1);
+                let mark = State::new(item.id * 10);
+                marks.borrow_mut().insert(item.id, mark);
+                Line { item: *item, mark }
+            };
+            let (once, spaced) = (self.once, self.spaced);
+            let id = |item: &Item| item.id.to_string();
+            // each shape its own list: an arm around a row would name the
+            // row's scope, and that is the third shape's whole point
+            match self.shape {
+                Shape::Plain => {
+                    Either::First(configured(for_each(self.items, id, move |item| line(item).element("tr")), once, spaced))
+                }
+                Shape::Registers => Either::Second(Either::First(configured(
+                    for_each(self.items, id, move |item| line(item).element("tr").key_context("line")),
+                    once,
+                    spaced,
+                ))),
+                Shape::Armed => Either::Second(Either::Second(configured(
+                    for_each(self.items, id, move |item| Either::<Line, Line>::First(line(item))),
+                    once,
+                    spaced,
+                ))),
+            }
+        }
+    }
+
+    fn configured<S, I, F>(list: ForEach<S, I, F>, once: bool, spaced: bool) -> ForEach<S, I, F> {
+        let list = if once { list.once_per_key() } else { list };
+        if spaced { list.spacing(4.0) } else { list }
+    }
+
+    fn page(once: bool, spaced: bool, shape: Shape, ids: &[usize]) -> Page {
+        Page {
+            items: State::new(Rc::new(items(ids))),
+            once,
+            spaced,
+            shape,
+            built: Rc::new(Cell::new(0)),
+            marks: Rc::new(RefCell::new(HashMap::new())),
+        }
+    }
+
+    /// The operations of a keyed table, one per step, on a page's items.
+    fn operate(page: &Page, step: usize) {
+        let mut now = (*page.items.get()).clone();
+        match step {
+            0 => now.swap(1, 4),
+            1 => {
+                now.remove(2);
+            }
+            2 => now.extend(items(&[7, 8])),
+            3 => now.reverse(),
+            4 => {
+                let moved = now.remove(0);
+                now.push(moved);
+            }
+            5 => {
+                // the last row to the front, the two before it gone: a
+                // row from past the places this run has, found by key
+                let last = now.pop().expect("rows to move");
+                now.truncate(now.len() - 2);
+                now.insert(0, last);
+            }
+            6 => now.truncate(2),
+            7 => now = items(&[9, 10, 11]),
+            _ => now.clear(),
+        }
+        page.items.set(Rc::new(now));
+    }
+
+    const STEPS: usize = 9;
+
+    /// How many rows the closure builds in each frame of the operations:
+    /// every item when the list builds every row, the keys that arrive
+    /// when it builds once per key.
+    const BUILT_EVERY: [usize; STEPS + 1] = [6, 6, 5, 7, 7, 7, 5, 2, 3, 0];
+    const BUILT_ONCE: [usize; STEPS + 1] = [6, 0, 0, 2, 0, 0, 0, 0, 3, 0];
+
+    /// The operations on a fresh runtime: every frame's patches with the
+    /// bodies it ran and the rows it reused, and how many rows the closure
+    /// built in each.
+    fn frames(once: bool, spaced: bool, shape: Shape) -> (Vec<String>, Vec<usize>) {
+        let page = page(once, spaced, shape, &[1, 2, 3, 4, 5, 6]);
+        let runtime = Runtime::new();
+        let mut seen = Vec::new();
+        let mut built = Vec::new();
+        for step in 0..=STEPS {
+            if step > 0 {
+                operate(&page, step - 1);
+            }
+            let _ = stats::take();
+            let patches = runtime.dom_frame(&page, SIZE);
+            let frame = stats::take();
+            seen.push(format!("{patches:?} ran {} reused {}", frame.entries_indexed, frame.diff_reused));
+            built.push(page.built.replace(0));
+        }
+        (seen, built)
+    }
+
+    /// A list that builds once per key shows what a list that builds every
+    /// row shows, frame for frame — the same patches, the same bodies run —
+    /// through a swap, a removal, an append, a reversal, a row moved to the
+    /// end, the last row moved to the front past two that left, a
+    /// truncation, a replacement and a clear, as a plain column and as a
+    /// spaced one; but its closure runs for the keys that arrive and for
+    /// no other.
+    #[test]
+    fn a_list_built_once_per_key_shows_what_building_every_row_shows() {
+        for spaced in [false, true] {
+            let (every, built_every) = frames(false, spaced, Shape::Plain);
+            let (once, built_once) = frames(true, spaced, Shape::Plain);
+            for (at, (was, now)) in every.iter().zip(&once).enumerate() {
+                assert_eq!(was, now, "frame {at} (spaced {spaced})");
+            }
+            assert_eq!(built_every, BUILT_EVERY, "every item, every frame (spaced {spaced})");
+            assert_eq!(built_once, BUILT_ONCE, "the keys that arrive (spaced {spaced})");
+        }
+    }
+
+    /// The state a row's closure made anchors at the row's key, and the
+    /// state its component's body made at the row's own scope: each lives
+    /// while the key stays only because the walk keeps that scope alive,
+    /// and a row kept without its closure keeps both as the steps into
+    /// them did. The state of a component inside the row lives under the
+    /// row's skip. All three are written after their rows were kept, and
+    /// all three answer.
+    #[test]
+    fn the_state_a_kept_row_holds_stays_with_its_key() {
+        INNER.with(|inner| inner.borrow_mut().clear());
+        OWN.with(|own| own.borrow_mut().clear());
+        let page = page(true, false, Shape::Plain, &[1, 2, 3]);
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&page, SIZE);
+        let inner_of_2 = INNER.with(|inner| inner.borrow()[1]);
+        let own_of_2 = OWN.with(|own| own.borrow()[1]);
+        page.built.set(0);
+        for step in [3, 4] {
+            operate(&page, step);
+            let _ = runtime.dom_frame(&page, SIZE);
+        }
+        assert_eq!(page.built.get(), 0, "both frames kept every row");
+        page.marks.borrow()[&2].set(99);
+        own_of_2.set(5);
+        inner_of_2.set(7);
+        let printed = runtime.render(&page);
+        assert!(printed.contains("item 2 / 99 / own 5"), "the closure's and the row's state answered: {printed}");
+        assert!(printed.contains("taps 7"), "the inner component's state answered: {printed}");
+    }
+
+    /// A row whose own read was written in the frame its list runs again
+    /// is dirty: it runs, while the rows beside it are kept.
+    #[test]
+    fn a_kept_row_written_in_the_same_frame_runs() {
+        let page = page(true, false, Shape::Plain, &[1, 2, 3, 4]);
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&page, SIZE);
+        page.built.set(0);
+        let mut now = (*page.items.get()).clone();
+        now.swap(0, 3);
+        now[1].label.set(Rc::from("written"));
+        page.items.set(Rc::new(now));
+        let _ = stats::take();
+        let _ = runtime.dom_frame(&page, SIZE);
+        assert_eq!(stats::take().entries_indexed, 3, "the list, the written row and the component in it ran");
+        assert_eq!(page.built.get(), 1, "the written row was built, and only it");
+        let printed = runtime.render(&page);
+        assert!(printed.contains("written / 20"), "row 2 shows what was written: {printed}");
+    }
+
+    /// A row's closure that files a registration with the list — a key
+    /// context here — would lose it if its row were kept without it: the
+    /// list builds every row, and the context stays declared.
+    #[test]
+    fn a_list_whose_rows_file_registrations_with_it_builds_every_row() {
+        let page = page(true, false, Shape::Registers, &[1, 2, 3]);
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&page, SIZE);
+        page.built.set(0);
+        operate(&page, 3);
+        let _ = runtime.dom_frame(&page, SIZE);
+        assert_eq!(page.built.get(), 3, "every row built again");
+        assert!(crate::reconciler::context_active("line", None), "the rows still declare their context");
+    }
+
+    /// A row built as more than one boundary behind its key — here under
+    /// an arm — is not a row the list keeps whole: it is built every time,
+    /// and shows what it showed.
+    #[test]
+    fn a_row_behind_more_than_its_key_is_built_every_time() {
+        let (every, _) = frames(false, false, Shape::Armed);
+        let (once, built) = frames(true, false, Shape::Armed);
+        assert_eq!(every, once);
+        assert_eq!(built, BUILT_EVERY, "every item, every frame");
+    }
+
+    /// The printed tree of a list that builds once per key is the printed
+    /// tree of one that builds every row: its kept rows print the lines
+    /// the last run printed.
+    #[test]
+    fn a_printed_list_built_once_per_key_prints_what_building_every_row_prints() {
+        let printed = |once: bool| {
+            let page = page(once, false, Shape::Plain, &[1, 2, 3, 4, 5, 6]);
+            let runtime = Runtime::new();
+            let mut lines = vec![runtime.render(&page)];
+            let mut built = vec![page.built.replace(0)];
+            for step in 0..STEPS {
+                operate(&page, step);
+                lines.push(runtime.render(&page));
+                built.push(page.built.replace(0));
+            }
+            (lines, built)
+        };
+        let (every, _) = printed(false);
+        let (once, built) = printed(true);
+        assert_eq!(every, once);
+        assert_eq!(built, BUILT_ONCE, "the printing pass keeps rows too");
+    }
+
+    /// The shapes a list takes on [`Reshaped`].
+    #[derive(Clone, Copy, PartialEq)]
+    enum Stand {
+        Column,
+        Spaced,
+        Strip,
+    }
+
+    /// A page whose list changes its shape as a state of the page moves:
+    /// a plain column, a spaced one, a strip. Its rows are a stack of one
+    /// component each.
+    #[derive(Clone)]
+    struct Reshaped {
+        items: State<Rc<Vec<Item>>>,
+        stand: State<Stand>,
+        once: bool,
+    }
+
+    impl Component for Reshaped {
+        fn body(self, _ctx: &Context) -> impl View {
+            let row = |item: &Item| vstack(Line { item: *item, mark: State::new(item.id * 10) });
+            let stand = self.stand.get();
+            let list = for_each(self.items, |item| item.id.to_string(), row);
+            let list = configured(list, self.once, stand == Stand::Spaced);
+            if stand == Stand::Strip { list.horizontal() } else { list }
+        }
+    }
+
+    /// A row that stands in a stack of its own is no row a list keeps
+    /// whole: its component sits inside a box the closure builds. A plain
+    /// column's one row is such a stack, and the stack a spaced list or a
+    /// strip puts its rows in has the same shape — so a list keeps rows
+    /// only from a last run of its own shape. Moved from a column to a
+    /// spaced column, to a strip and back, with one row and then two, it
+    /// shows and prints what a list that builds every row shows and
+    /// prints.
+    #[test]
+    fn a_list_that_changes_its_shape_keeps_no_row_of_the_other_shape() {
+        use Stand::*;
+        let run = |once: bool| {
+            let page = Reshaped { items: State::new(Rc::new(items(&[1]))), stand: State::new(Column), once };
+            let (shown, printed) = (Runtime::new(), Runtime::new());
+            let mut seen = Vec::new();
+            let stands = [Column, Spaced, Column, Strip, Column, Column, Spaced, Strip, Column];
+            for (step, stand) in stands.into_iter().enumerate() {
+                if step == 5 {
+                    page.items.set(Rc::new(items(&[1, 2])));
+                }
+                page.stand.set(stand);
+                seen.push(format!("{:?}", shown.dom_frame(&page, SIZE)));
+                seen.push(printed.render(&page));
+            }
+            seen
+        };
+        let (every, once) = (run(false), run(true));
+        for (at, (was, now)) in every.iter().zip(&once).enumerate() {
+            assert_eq!(was, now, "step {} ({})", at / 2, if at % 2 == 0 { "patches" } else { "print" });
+        }
+    }
 }
