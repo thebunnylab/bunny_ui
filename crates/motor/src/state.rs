@@ -4,7 +4,7 @@
 use crate::combine::Store;
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use crate::hash::FxHashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
@@ -313,10 +313,13 @@ impl<T> TypedArena<T> {
 thread_local! {
     /// One arena per `TypeId` — the `dyn Any` wraps the ARENA (cold edge,
     /// one downcast per access to the typed container), never the value.
-    static ARENAS: RefCell<HashMap<TypeId, Rc<dyn Any>>> = RefCell::new(HashMap::new());
+    /// Every read and write of a state looks its arena up here, so the
+    /// key is hashed the cheap way: a `TypeId` is the compiler's, never an
+    /// outside caller's.
+    static ARENAS: RefCell<FxHashMap<TypeId, Rc<dyn Any>>> = RefCell::new(FxHashMap::default());
     /// How the sweep frees without knowing `T`: one function pointer per
     /// type, registered when the arena is born.
-    static FREERS: RefCell<HashMap<TypeId, fn(usize)>> = RefCell::new(HashMap::new());
+    static FREERS: RefCell<FxHashMap<TypeId, fn(usize)>> = RefCell::new(FxHashMap::default());
     static NEXT_DEP: Cell<u64> = const { Cell::new(0) };
 }
 
