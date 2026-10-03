@@ -14,6 +14,18 @@ document.head.appendChild(sheet);
 // where a declaration per element would copy the inline style of each
 // clone it lands on
 sheet.sheet.insertRule("[data-path]{cursor:default}", 0);
+// a link is pressable wherever it stands: a layer that asks for nothing
+// lets the click through to what it covers, and its children inherit
+// that — but not the links inside it. The doubled attribute outranks a
+// look's own cursor, the text's arrow
+sheet.sheet.insertRule("a[href][href]{cursor:pointer;pointer-events:auto}", 1);
+// a semantic tag says what an element IS, never how it looks: the
+// browser's own margins, list marks, heading faces and link ink step
+// aside, at no specificity at all, so every look still wins
+sheet.sheet.insertRule(":where(#app) :where(h1,h2,h3,h4,h5,h6,p,figure,blockquote,pre,ol,ul,li,dl,dd){margin:0;padding:0}", 2);
+sheet.sheet.insertRule(":where(#app) :where(h1,h2,h3,h4,h5,h6,code,pre,kbd,samp,small,b,strong,i,em){font:inherit}", 3);
+sheet.sheet.insertRule(":where(#app) :where(ol,ul){list-style:none}", 4);
+sheet.sheet.insertRule(":where(#app) :where(a){color:inherit;text-decoration:none}", 5);
 
 let wasm = null;
 let wakeArmed = false;
