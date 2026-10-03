@@ -267,6 +267,33 @@ impl DomStyle {
             pass_through: false,
         }
     }
+
+    /// Do these props paint anything — would [`DomStyle::from_props`]
+    /// say more than the default? Read prop by prop, the same props
+    /// `from_props` reads and no other, so the walk that asks it of
+    /// every styled text builds no style just to compare it.
+    pub(crate) fn paints(props: &VisualProps) -> bool {
+        let paints = props.background.is_some()
+            || props.gradient.is_some()
+            || props.background_hovered.is_some()
+            || props.background_pressed.is_some()
+            || props.foreground_hovered.is_some()
+            || props.foreground_pressed.is_some()
+            || props.border.is_some()
+            || props.corner_radius.is_some()
+            || props.shadow.is_some()
+            || props.clip
+            || props.opacity.is_some()
+            || props.opacity_hovered.is_some()
+            || props.opacity_pressed.is_some()
+            || props.glass.is_some();
+        debug_assert_eq!(
+            paints,
+            DomStyle::from_props(props) != DomStyle::default(),
+            "a prop from_props reads is missing here"
+        );
+        paints
+    }
 }
 
 /// What a browser can carry of a pane of glass.
@@ -5602,6 +5629,47 @@ mod tests {
         ]
         .concat();
         assert_eq!(bytes, expected);
+    }
+
+    /// The walk asks whether a style paints without building one: the
+    /// answer must be the one the built style gives, prop by prop — a
+    /// prop it missed would fold a painted box into its text.
+    #[test]
+    fn whether_props_paint_is_asked_prop_by_prop() {
+        let ink = Color::hex(0x123456);
+        let each: [fn(&mut VisualProps); 14] = [
+            |props| props.background = Some(Color::hex(0x123456)),
+            |props| {
+                props.gradient = Some(crate::layout::Gradient::Linear {
+                    start: crate::layout::UnitPoint { x: 0.0, y: 0.0 },
+                    end: crate::layout::UnitPoint { x: 1.0, y: 1.0 },
+                    from: Color::BLACK,
+                    to: Color::WHITE,
+                })
+            },
+            |props| props.background_hovered = Some(Color::BLACK),
+            |props| props.background_pressed = Some(Color::BLACK),
+            |props| props.foreground_hovered = Some(Color::BLACK),
+            |props| props.foreground_pressed = Some(Color::BLACK),
+            |props| props.border = Some((Color::BLACK, 1.0)),
+            |props| props.corner_radius = Some(Corners::all(4.0)),
+            |props| props.shadow = Some((8.0, Color::BLACK)),
+            |props| props.clip = true,
+            |props| props.opacity = Some(0.5),
+            |props| props.opacity_hovered = Some(0.5),
+            |props| props.opacity_pressed = Some(0.5),
+            |props| props.glass = Some(crate::layout::Glass::regular()),
+        ];
+        // an ink alone paints nothing a style records: the text takes it
+        let bare = VisualProps { foreground: Some(ink), ..VisualProps::default() };
+        assert!(!DomStyle::paints(&bare));
+        assert_eq!(DomStyle::from_props(&bare), DomStyle::default());
+        for (at, set) in each.iter().enumerate() {
+            let mut props = bare;
+            set(&mut props);
+            assert!(DomStyle::paints(&props), "prop {at} paints");
+            assert_ne!(DomStyle::from_props(&props), DomStyle::default(), "prop {at} is recorded");
+        }
     }
 
     #[test]
