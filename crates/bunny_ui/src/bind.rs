@@ -195,6 +195,50 @@ pub(crate) fn key_at_cursor(suffix: &str) -> Option<Rc<str>> {
 
 // MARK: - Text
 
+thread_local! {
+    /// The buffer `text!` formats into: a reading writes its words here
+    /// and shares them from here, and the room stays for the next one.
+    static TEXT_BUFFER: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// The room the buffer keeps between readings. A text longer than this
+/// is formatted all the same; the buffer just lets the room go after.
+const TEXT_BUFFER_KEPT: usize = 4096;
+
+/// A formatted text, shared — what `text!` reads through. The words are
+/// written into a buffer the thread keeps and shared from there: one
+/// allocation for the text, where a `format!` into a string of its own
+/// and the copy into the shared one were two, every time a label is
+/// read. A format with no arguments is its literal, shared as it is.
+///
+/// A value whose `Display` formats a text of its own while this one is
+/// being written finds the buffer taken and formats its words apart —
+/// the same words, one allocation more.
+#[doc(hidden)]
+pub fn shared_text(words: std::fmt::Arguments<'_>) -> Arc<str> {
+    use std::fmt::Write as _;
+
+    if let Some(literal) = words.as_str() {
+        return Arc::from(literal);
+    }
+    TEXT_BUFFER.with(|buffer| match buffer.try_borrow_mut() {
+        Ok(mut buffer) => {
+            buffer.clear();
+            // the same promise `format!` keeps: only a `Display` that
+            // lies about its error can fail a write into a string
+            buffer
+                .write_fmt(words)
+                .expect("a formatting trait implementation returned an error when the underlying stream did not");
+            let shared = Arc::from(buffer.as_str());
+            if buffer.capacity() > TEXT_BUFFER_KEPT {
+                *buffer = String::new();
+            }
+            shared
+        }
+        Err(_) => Arc::from(std::fmt::format(words)),
+    })
+}
+
 /// What a text shows: a fixed string, or a value the node reads for
 /// itself.
 #[derive(Clone)]
@@ -1097,5 +1141,42 @@ mod tests {
         let dirty = settle_dirty();
         assert_eq!(dirty.len(), 1);
         assert!(LIVE.with(|live| live.borrow().is_empty()), "a dead key leaves on the frame that meets it");
+    }
+
+    /// A text formatted in the thread's buffer is the text `format!`
+    /// writes, byte for byte, whatever the format asks — a literal, the
+    /// flags and widths, a name the format captures, a text past the room
+    /// the buffer keeps — and the buffer gives that room back after a long
+    /// one.
+    #[test]
+    fn a_text_formatted_in_the_buffer_is_the_text_format_writes() {
+        let count = 7usize;
+        let label: Rc<str> = Rc::from("row 7");
+        let long = "x".repeat(TEXT_BUFFER_KEPT * 2);
+        assert_eq!(&*shared_text(format_args!("fixed")), "fixed");
+        assert_eq!(&*shared_text(format_args!("")), "");
+        assert_eq!(&*shared_text(format_args!("{count} rows")), format!("{count} rows"));
+        assert_eq!(&*shared_text(format_args!("{:>5}|{:<4}|{:#x}|{:?}", count, "ab", 255, label)), format!("{:>5}|{:<4}|{:#x}|{:?}", count, "ab", 255, label));
+        assert_eq!(&*shared_text(format_args!("{}", label)), "row 7");
+        assert_eq!(&*shared_text(format_args!("{long}{count}")), format!("{long}{count}"));
+        assert!(TEXT_BUFFER.with(|buffer| buffer.borrow().capacity()) <= TEXT_BUFFER_KEPT, "the long text's room was let go");
+        assert_eq!(&*shared_text(format_args!("{count}")), "7", "and the next text formats as ever");
+    }
+
+    /// A value whose `Display` formats a text of its own while the outer
+    /// text is being written finds the buffer taken: it formats apart,
+    /// and both texts come out whole.
+    #[test]
+    fn a_text_formatted_inside_another_comes_out_whole() {
+        struct Nested(usize);
+
+        impl std::fmt::Display for Nested {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let inner = shared_text(format_args!("<{}>", self.0));
+                f.write_str(&inner)
+            }
+        }
+
+        assert_eq!(&*shared_text(format_args!("a {} b {}", Nested(1), Nested(2))), "a <1> b <2>");
     }
 }
