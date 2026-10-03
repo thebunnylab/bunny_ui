@@ -1628,11 +1628,19 @@ fn apply(
         }
         Modifier::ElementHint(tag, class, dom_id) => {
             let (tag, class, dom_id) = (tag.clone(), class.clone(), dom_id.clone());
-            out.wrap_layout_from(mark, move |node| LayoutNode::Hinted {
-                tag,
-                class,
-                dom_id,
-                child: Box::new(node),
+            out.wrap_layout_from(mark, move |node| match node {
+                // a hint over a hint is one hint: the outer word wins
+                // where both speak, as the flow applies them anyway —
+                // `.element("a").css_class("x")` is one node, not two
+                LayoutNode::Hinted { tag: inner_tag, class: inner_class, dom_id: inner_id, child } => {
+                    LayoutNode::Hinted {
+                        tag: tag.or(inner_tag),
+                        class: class.or(inner_class),
+                        dom_id: dom_id.or(inner_id),
+                        child,
+                    }
+                }
+                other => LayoutNode::Hinted { tag, class, dom_id, child: Box::new(other) },
             });
         }
         Modifier::LayoutMode(mode) => {
@@ -1701,4 +1709,32 @@ fn apply(
             node.line.push_str(&modifier.suffix());
         }
     }
+}
+
+thread_local! {
+    /// The words a page hints with — tags, classes, element ids — each
+    /// held once. A row's `.element("td")` is the same word a thousand
+    /// times over; it should cost a thousand pointer bumps, not a
+    /// thousand copies.
+    static HINTS: std::cell::RefCell<motor::hash::FxHashSet<std::rc::Rc<str>>> =
+        std::cell::RefCell::new(motor::hash::FxHashSet::default());
+}
+
+/// The words a page may hint with before the table stops growing: a
+/// page that mints an id per row keeps its own copies past this.
+const HINT_WORDS: usize = 4096;
+
+/// One shared copy of a hint word.
+pub(crate) fn hint(word: &str) -> std::rc::Rc<str> {
+    HINTS.with(|hints| {
+        let mut hints = hints.borrow_mut();
+        if let Some(shared) = hints.get(word) {
+            return std::rc::Rc::clone(shared);
+        }
+        let shared: std::rc::Rc<str> = std::rc::Rc::from(word);
+        if hints.len() < HINT_WORDS {
+            hints.insert(std::rc::Rc::clone(&shared));
+        }
+        shared
+    })
 }

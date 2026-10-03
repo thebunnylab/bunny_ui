@@ -35,11 +35,39 @@ static BYTES: AtomicUsize = AtomicUsize::new(0);
 /// Bytes allocated and not yet freed — what a leak shows up in.
 static LIVE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
+/// Every Kth allocation keeps its backtrace while `--alloc-sites K`
+/// runs: who allocates, by the first frame of ours above the allocator.
+static SAMPLE_EVERY: AtomicUsize = AtomicUsize::new(0);
+static SAMPLES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+thread_local! {
+    /// A sample allocates (the backtrace, its text, the vector): those
+    /// are counted, never sampled — or the sampler would sample itself.
+    static SAMPLING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn sample_site() {
+    SAMPLING.with(|flag| {
+        if flag.get() {
+            return;
+        }
+        flag.set(true);
+        let text = std::backtrace::Backtrace::force_capture().to_string();
+        if let Ok(mut samples) = SAMPLES.lock() {
+            samples.push(text);
+        }
+        flag.set(false);
+    });
+}
+
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        let n = ALLOCS.fetch_add(1, Ordering::Relaxed);
         BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
+        let every = SAMPLE_EVERY.load(Ordering::Relaxed);
+        if every != 0 && n % every == 0 {
+            sample_site();
+        }
         unsafe { System.alloc(layout) }
     }
 
@@ -223,6 +251,53 @@ fn now_ms() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_secs_f64() * 1000.0
 }
 
+/// Who allocates on a create of a thousand rows: one in `every`
+/// allocations keeps its backtrace, and the sites are counted by the
+/// first frame of ours above the allocator.
+fn alloc_sites(every: usize) {
+    let (runtime, app) = fresh();
+    // the page warm: one create and clear before the one that counts
+    create(&app, &runtime, 1_000);
+    app.rows.set(Rc::new(Vec::new()));
+    let _ = runtime.dom_frame(&app, SIZE);
+    SAMPLE_EVERY.store(every, Ordering::Relaxed);
+    let before = ALLOCS.load(Ordering::Relaxed);
+    create(&app, &runtime, 1_000);
+    let made = ALLOCS.load(Ordering::Relaxed) - before;
+    SAMPLE_EVERY.store(0, Ordering::Relaxed);
+    let samples = SAMPLES.lock().map(|s| s.clone()).unwrap_or_default();
+    let ours = |frame: &str| {
+        (frame.contains("bunny_ui::") || frame.contains("motor::") || frame.contains("bench_web::"))
+            && !frame.contains("ops_cost")
+    };
+    let mut by_site: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut by_pair: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for text in &samples {
+        let frames: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.trim_start().split_once(": ").map(|(_, name)| name.trim()))
+            .filter(|name| !name.starts_with('/') && !name.starts_with("at "))
+            .collect();
+        let mine: Vec<&str> = frames.iter().copied().filter(|f| ours(f)).collect();
+        let site = mine.first().copied().unwrap_or("?").to_string();
+        let caller = mine.get(1).copied().unwrap_or("?");
+        *by_site.entry(site.clone()).or_default() += 1;
+        *by_pair.entry(format!("{site}  <-  {caller}")).or_default() += 1;
+    }
+    println!("create 1k: {made} allocations, {} sampled (one in {every}); sites by the first frame of ours:", samples.len());
+    let mut sites: Vec<(String, usize)> = by_site.into_iter().collect();
+    sites.sort_by(|a, b| b.1.cmp(&a.1));
+    for (site, n) in sites.iter().take(28) {
+        println!("{:>7}  {site}", n * every);
+    }
+    println!("--- with the caller above ---");
+    let mut pairs: Vec<(String, usize)> = by_pair.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1));
+    for (pair, n) in pairs.iter().take(28) {
+        println!("{:>7}  {pair}", n * every);
+    }
+}
+
 fn main() {
     let rounds: usize = std::env::args()
         .skip_while(|arg| arg != "--rounds")
@@ -230,6 +305,7 @@ fn main() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(5);
     stats::set_clock(Some(now_ms));
+    stats::set_alloc_probe(Some(|| ALLOCS.load(Ordering::Relaxed) as u64));
     if let Some(rounds) = std::env::args()
         .skip_while(|arg| arg != "--cycles")
         .nth(1)
@@ -238,11 +314,19 @@ fn main() {
         cycles(rounds);
         return;
     }
+    if let Some(every) = std::env::args()
+        .skip_while(|arg| arg != "--alloc-sites")
+        .nth(1)
+        .and_then(|value| value.parse().ok())
+    {
+        alloc_sites(every);
+        return;
+    }
 
     println!(
-        "{:<12} {:>6} {:>6} {:>7} {:>6} {:>7} {:>7} {:>7} | {:>7} {:>7} {:>7} {:>7} {:>8}",
+        "{:<12} {:>6} {:>6} {:>7} {:>6} {:>7} {:>7} {:>7} | {:>7} {:>7} {:>7} {:>7} {:>8} | {:>7} {:>7} {:>7}",
         "op (median)", "bodies", "built", "visited", "reused", "patches", "allocs", "KiB", "settle", "build",
-        "diff", "encode", "total ms"
+        "diff", "encode", "total ms", "a:settl", "a:build", "a:diff"
     );
     for op in OPS {
         let samples: Vec<Sample> = (0..rounds).map(|_| measure(op)).collect();
@@ -253,7 +337,7 @@ fn main() {
         let mut totals: Vec<f64> = samples.iter().map(|sample| sample.total_ms).collect();
         let last = samples.last().expect("at least one round");
         println!(
-            "{:<12} {:>6} {:>6} {:>7} {:>6} {:>7} {:>7} {:>7} | {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>8.3}",
+            "{:<12} {:>6} {:>6} {:>7} {:>6} {:>7} {:>7} {:>7} | {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>8.3} | {:>7} {:>7} {:>7}",
             op.name,
             last.bodies,
             last.stats.capture_nodes,
@@ -267,6 +351,9 @@ fn main() {
             stage(stats::Stage::Diff),
             stage(stats::Stage::Encode),
             median(&mut totals),
+            last.stats.allocs(stats::Stage::Settle),
+            last.stats.allocs(stats::Stage::Capture),
+            last.stats.allocs(stats::Stage::Diff),
         );
     }
     println!(

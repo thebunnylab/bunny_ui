@@ -4386,6 +4386,41 @@ mod tests {
         assert!(!bytes.is_empty());
     }
 
+    /// A chain of hints is one hinted node, and the words a page hints
+    /// with are held once: the same tag a thousand times is one copy.
+    #[test]
+    fn hints_fold_into_one_node_and_share_their_words() {
+        let a = crate::modifier::hint("td");
+        let b = crate::modifier::hint("td");
+        assert!(std::rc::Rc::ptr_eq(&a, &b), "one copy of the word");
+
+        #[derive(Clone)]
+        struct Cell;
+
+        impl Component for Cell {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("x").element("a").css_class("lbl")
+            }
+        }
+
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&Cell, Size { width: 100.0, height: 40.0 });
+        let hints: Vec<&DomHints> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::Create { kind: CreateKind::Text, hints, .. } => Some(hints),
+                _ => None,
+            })
+            .collect();
+        let [hints] = hints.as_slice() else {
+            panic!("one text element: {mount:?}");
+        };
+        assert_eq!(hints.tag.as_deref(), Some("a"));
+        assert_eq!(hints.class.as_deref(), Some("lbl"));
+        // and the words are the shared ones
+        assert!(hints.tag.as_ref().is_some_and(|tag| std::rc::Rc::ptr_eq(tag, &crate::modifier::hint("a"))));
+    }
+
     /// A link around one word is no flex box: the record says `plain`,
     /// and the browser keeps the tag's own display. The cell that
     /// holds the link, a table cell, is not touched by the fold; the
