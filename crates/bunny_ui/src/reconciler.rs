@@ -175,10 +175,6 @@ pub(crate) struct Entry {
     /// stands in the live tables' top level, and it is the one place the
     /// entry's fall has to take it out of — asked here, never searched.
     pub top_level: bool,
-    /// The last pass that met the entry, and how ([`Visit`]): the sweep
-    /// reads who is alive off the entry it walks past, instead of
-    /// hashing its path into the sets of the pass.
-    visit: Cell<u64>,
 }
 
 /// The registrations a body seldom makes, kept apart from its entry.
@@ -259,9 +255,9 @@ impl Entry {
     }
 }
 
-/// How a pass met an entry, stamped on the entry: its body RAN, or the
-/// walk SKIPPED it on purpose (clean and retained). A stamp from an
-/// earlier pass reads as neither.
+/// How a pass met an entry, stamped on the entry's slot: its body RAN,
+/// or the walk SKIPPED it on purpose (clean and retained). A stamp from
+/// an earlier pass reads as neither.
 #[derive(Clone, Copy)]
 struct Visit {
     ran: u64,
@@ -431,6 +427,14 @@ struct Live {
     /// root region mounts, and so the only ones the root region can
     /// unmount. The sweep reads this instead of searching for them.
     top_level: HashSet<String>,
+    /// Every retained boundary's slot, by the path the retention keys it
+    /// by (the same shared copy). The retention's own tree is ordered for
+    /// the sweeps' ranges, and a point lookup in it descends a tree of
+    /// long strings that share their whole head: a thousand kept rows
+    /// were a thousand descents, each a score of string compares, and the
+    /// first cost of a list that re-ran. A decision, a reference's slot
+    /// and a "still there?" hash the path once here instead.
+    slots: HashMap<Rc<str>, Rc<Slot>>,
 }
 
 #[derive(Default)]
@@ -489,7 +493,8 @@ impl Live {
     }
 
     /// Puts one closed entry's registrations into the tables.
-    fn index(&mut self, path: &str, entry: &Entry) {
+    fn index(&mut self, path: &Rc<str>, entry: &Entry) {
+        self.slots.insert(Rc::clone(path), Rc::clone(&entry.slot));
         for (key, action) in &entry.actions {
             self.insert_action(key.clone(), Rc::clone(action), Some(Rc::clone(&entry.slot)));
         }
@@ -539,6 +544,7 @@ impl Live {
     /// entry that carries nothing asks no set: a thousand rows that leave
     /// a list hash their path for the tables they are in, and none other.
     fn unindex(&mut self, path: &str, entry: &Entry) {
+        self.slots.remove(path);
         for (key, _) in &entry.actions {
             self.remove_action(key);
         }
@@ -550,6 +556,9 @@ impl Live {
     /// out ([`Live::take_buried`]), firing nothing meanwhile. A hover key
     /// leaves now — the count of them says whether the hover road runs.
     fn unindex_leaving(&mut self, path: &str, entry: &Entry) {
+        // the slot index answers for the retention: a path that left it
+        // is found by no hash, though its tree waits for the idle
+        self.slots.remove(path);
         entry.slot.left.set(true);
         for (key, _) in &entry.actions {
             if key.ends_with(HOVER_KEY) {
@@ -665,11 +674,12 @@ fn cuts(path: &str) -> impl Iterator<Item = &str> {
 /// has none: only the root region mounts it, so only the root region
 /// can unmount it. Asked only with no body building around the path —
 /// a body still open above it is a boundary above it, and the caller
-/// knows that without a search ([`finish_entry`]).
+/// knows that without a search ([`finish_entry`]) — and each cut is a
+/// hash in the slot index, never a descent of the ordered retention.
 fn is_top_level(path: &str) -> bool {
-    RETAINED.with(|retained| {
-        let retained = retained.borrow();
-        !cuts(path).any(|prefix| retained.contains_key(prefix))
+    LIVE.with(|live| {
+        let live = live.borrow();
+        !cuts(path).any(|prefix| live.slots.contains_key(prefix))
     })
 }
 
@@ -692,6 +702,12 @@ pub struct Slot {
     /// a boundary that mounts at the same path afterwards gets a slot of
     /// its own. The click keys the entry left behind ask it ([`Registered`]).
     left: Cell<bool>,
+    /// The last pass that met the boundary, and how ([`Visit`]): the
+    /// sweep reads who is alive off the entry it walks past, instead of
+    /// hashing its path into the sets of the pass. On the slot, not the
+    /// entry: the decision that stamps a skip finds the slot by the
+    /// path's hash ([`Live::slots`]) and never reaches for the entry.
+    visit: Cell<u64>,
 }
 
 /// What a slot holds while its boundary is retained.
@@ -716,7 +732,7 @@ impl std::fmt::Debug for Slot {
 
 impl Slot {
     fn empty() -> Rc<Slot> {
-        Rc::new(Slot { held: RefCell::new(None), left: Cell::new(false) })
+        Rc::new(Slot { held: RefCell::new(None), left: Cell::new(false), visit: Cell::new(0) })
     }
 
     fn held(&self) -> Option<Rc<Held>> {
@@ -755,9 +771,7 @@ impl Drop for Entry {
 /// A path nothing retains answers an empty slot: the reference measures
 /// zero and places nothing, as it always did.
 pub(crate) fn slot_of(path: &str) -> Rc<Slot> {
-    RETAINED.with(|retained| {
-        retained.borrow().get(path).map_or_else(Slot::empty, |entry| Rc::clone(&entry.slot))
-    })
+    LIVE.with(|live| live.borrow().slots.get(path).map_or_else(Slot::empty, Rc::clone))
 }
 
 /// One kept answer of a retained tree's measure.
@@ -824,10 +838,10 @@ pub(crate) fn measure_retained(
 /// at a `/`. An id can hold a `/` of its own, so a prefix may name no
 /// entry — and then there is nothing to clear.
 fn clear_measures_above(path: &str) {
-    RETAINED.with(|retained| {
-        let retained = retained.borrow();
+    LIVE.with(|live| {
+        let live = live.borrow();
         for (at, _) in path.match_indices('/') {
-            if let Some(held) = retained.get(&path[..at]).and_then(|entry| entry.slot.held()) {
+            if let Some(held) = live.slots.get(&path[..at]).and_then(|slot| slot.held()) {
                 held.measures_kept.borrow_mut().clear();
             }
         }
@@ -836,7 +850,7 @@ fn clear_measures_above(path: &str) {
 
 /// Is the boundary retained? (The guard for the `Runtime` stable frame.)
 pub(crate) fn is_retained(path: &str) -> bool {
-    RETAINED.with(|retained| retained.borrow().contains_key(path))
+    LIVE.with(|live| live.borrow().slots.contains_key(path))
 }
 
 /// Records that the current frame was served WITHOUT a pass (stable
@@ -897,22 +911,21 @@ pub(crate) fn decide(path: &str) -> Decision {
 pub(crate) fn decide_at(path: &str) -> (Decision, Option<(Rc<str>, Rc<Slot>)>) {
     PASS.with(|pass| {
         let pass = pass.borrow();
-        RETAINED.with(|retained| {
-            let retained = retained.borrow();
-            // one lookup: the key and the slot the reference will point
-            // at, and the entry the decision is stamped on
-            let entry = retained.get_key_value(path);
-            let found = entry.map(|(key, entry)| (Rc::clone(key), Rc::clone(&entry.slot)));
+        LIVE.with(|live| {
+            let live = live.borrow();
+            // one lookup, by the path's hash: the key and the slot the
+            // reference will point at, and the stamp the decision leaves
+            let found = live.slots.get_key_value(path).map(|(key, slot)| (Rc::clone(key), Rc::clone(slot)));
             if !pass.active {
                 return (Decision::Render, found);
             }
             let inside_rerun = !pass.building.is_empty();
             let under_list = pass.building.last().is_some_and(|frame| frame.list);
-            match entry {
-                Some((_, entry)) if (!inside_rerun || under_list) && !pass.dirty.contains(path) => {
-                    // the walk stays out on purpose, and the entry says
+            match &found {
+                Some((_, slot)) if (!inside_rerun || under_list) && !pass.dirty.contains(path) => {
+                    // the walk stays out on purpose, and the slot says
                     // so to the sweep: its subtree survives it
-                    entry.visit.set(Visit::now().skipped);
+                    slot.visit.set(Visit::now().skipped);
                     (Decision::Skip, found)
                 }
                 _ => (Decision::Render, found),
@@ -1030,8 +1043,8 @@ pub(crate) fn finish_entry(
                 rare: Rare::boxed(copies, editors, splits, scrolls, measures, webviews, customs, handlers, contexts),
                 parent_segments,
                 top_level,
-                visit: Cell::new(Visit::now().ran),
             };
+            entry.slot.visit.set(Visit::now().ran);
             // a body ran and its registrations are new closures: they
             // replace the old ones in the tables the doors read, now
             live.index(path, &entry);
@@ -1829,7 +1842,23 @@ pub(crate) fn live_tables_match_retention() -> bool {
             scratch.index(path, entry);
         }
     });
-    LIVE.with(|live| tables_fingerprint(&live.borrow(), true) == tables_fingerprint(&scratch, false))
+    LIVE.with(|live| {
+        let live = live.borrow();
+        tables_fingerprint(&live, true) == tables_fingerprint(&scratch, false) && slots_match(&live, &scratch)
+    })
+}
+
+/// Does the slot index hold the retention's slots — every retained path
+/// under the same shared copy, the same slot behind it, and nothing
+/// else? The index is kept beside the tree, never rebuilt from it, so
+/// the two drifting apart is the one way it can lie.
+fn slots_match(live: &Live, rebuilt: &Live) -> bool {
+    live.slots.len() == rebuilt.slots.len()
+        && rebuilt.slots.iter().all(|(path, slot)| {
+            live.slots
+                .get_key_value(path)
+                .is_some_and(|(key, kept)| Rc::ptr_eq(key, path) && Rc::ptr_eq(kept, slot))
+        })
 }
 
 /// Is the root region of THIS pass empty? Registrations made outside
@@ -2192,7 +2221,7 @@ pub(crate) fn sweep_stale(root: &str) {
     let fallen: Vec<Rc<str>> = RETAINED.with(|retained| {
         let retained = retained.borrow();
         let alive_at_top = |path: &str| {
-            let stamp = retained.get(path).map(|entry| entry.visit.get());
+            let stamp = retained.get(path).map(|entry| entry.slot.visit.get());
             if stamp == Some(visit.ran) || stamp == Some(visit.skipped) {
                 return true;
             }
@@ -2201,7 +2230,7 @@ pub(crate) fn sweep_stale(root: &str) {
                 if at <= root.len() {
                     break;
                 }
-                if retained.get(&path[..at]).is_some_and(|entry| entry.visit.get() == visit.skipped) {
+                if retained.get(&path[..at]).is_some_and(|entry| entry.slot.visit.get() == visit.skipped) {
                     return true;
                 }
                 cut = at;
@@ -2283,7 +2312,7 @@ fn sweep_under(
             while shelters.last().is_some_and(|shelter| passed(path, shelter)) {
                 shelters.pop();
             }
-            let stamp = entry.visit.get();
+            let stamp = entry.slot.visit.get();
             if stamp == visit.skipped {
                 shelters.push(path);
             } else if stamp != visit.ran && !shelters.iter().any(|shelter| covers(shelter, path)) {
@@ -2909,6 +2938,85 @@ mod tests {
         assert!(live_tables_match_retention() && carriers_match_retention());
         assert!(printed.contains("head") && printed.contains("third") && !printed.contains("line"), "{printed}");
         assert_eq!(collect_garbage(), 13, "the rows and the list's old tree");
+    }
+
+    /// The slot index, built again from the retention, against the one
+    /// kept beside it.
+    fn slot_index_matches_retention() -> bool {
+        let mut rebuilt = Live::default();
+        RETAINED.with(|retained| {
+            for (path, entry) in retained.borrow().iter() {
+                rebuilt.index(path, entry);
+            }
+        });
+        LIVE.with(|live| slots_match(&live.borrow(), &rebuilt))
+    }
+
+    /// The decisions, the references and the "still there?" questions
+    /// hash a path into the slot index instead of descending the
+    /// retention's ordered tree — so the index must say what the tree
+    /// says, at every change of it: rows that mount, a list that runs
+    /// again around rows it keeps, a row that runs alone, rows that
+    /// leave, a list that clears and the retention dropped whole.
+    #[test]
+    fn the_slot_index_follows_the_retention_through_every_change() {
+        let page = Lines { lines: State::new(lines(1..=4)) };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let retained = || RETAINED.with(|retained| retained.borrow().len());
+        let indexed = || LIVE.with(|live| live.borrow().slots.len());
+        assert_eq!((retained(), indexed()), (6, 6), "the page, the list and four rows, each indexed");
+        assert!(slot_index_matches_retention(), "mounted");
+
+        let mut swapped = (*page.lines.get()).clone();
+        swapped.swap(0, 3);
+        page.lines.set(Rc::new(swapped));
+        runtime.render(&page);
+        assert!(slot_index_matches_retention(), "the list ran again around the rows it kept");
+
+        page.lines.get()[1].label.set(Rc::from("relabeled"));
+        runtime.render(&page);
+        assert!(slot_index_matches_retention(), "a row ran alone");
+
+        let mut fewer = (*page.lines.get()).clone();
+        fewer.remove(1);
+        page.lines.set(Rc::new(fewer));
+        runtime.render(&page);
+        assert_eq!((retained(), indexed()), (5, 5), "the row that left left the index too");
+        assert!(slot_index_matches_retention(), "a row left");
+
+        page.lines.set(Rc::new(Vec::new()));
+        runtime.render(&page);
+        assert!(slot_index_matches_retention(), "the list cleared");
+        let _ = collect_garbage();
+        assert!(slot_index_matches_retention(), "the idle freed what left, the index did not move");
+
+        clear();
+        assert_eq!(indexed(), 0, "the retention dropped whole takes the index along");
+    }
+
+    /// A kept row is skipped by its slot's stamp: the decision finds the
+    /// slot in the index, stamps it, and the sweep that walks the list's
+    /// range reads the stamp off the entry's slot — so the row stays.
+    #[test]
+    fn a_kept_row_is_stamped_on_its_slot_and_survives_the_sweep() {
+        let page = Lines { lines: State::new(lines(1..=3)) };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let row = retained_under("Lines").into_iter().find(|path| path.ends_with("[2]/Line")).expect("row 2");
+        let slot = slot_of(&row);
+        let stamp_before = slot.visit.get();
+
+        let mut reversed = (*page.lines.get()).clone();
+        reversed.reverse();
+        page.lines.set(Rc::new(reversed));
+        runtime.render(&page);
+        assert_eq!(runtime.body_runs().len(), 1, "the list ran, its rows did not: {:?}", runtime.body_runs());
+        assert_eq!(slot.visit.get(), Visit::now().skipped, "the decision stamped the row's slot as skipped");
+        assert_ne!(slot.visit.get(), stamp_before, "a stamp of this pass, not the last one");
+        assert!(Rc::ptr_eq(&slot, &slot_of(&row)), "the row kept its slot");
+        assert!(is_retained(&row), "and the sweep kept the row");
+        assert_eq!(retained_under("Lines").len(), 5, "the page, the list and its three rows: nothing left");
     }
 
     /// The paths retained under a prefix, sorted.
