@@ -336,6 +336,9 @@ pub struct DomText {
     /// Match highlight spans (byte ranges) + their color.
     pub highlights: Option<(Rc<Vec<(usize, usize)>>, Color)>,
     pub truncation: Option<Truncation>,
+    /// The face is the one declared above: the text names no font of
+    /// its own, and the look it wears carries none.
+    pub inherits_face: bool,
 }
 
 /// One text field. Focus, caret and composition stay with the browser;
@@ -428,6 +431,12 @@ pub struct DomNode {
     pub children: Vec<DomNode>,
     /// What the node reads for itself, if anything.
     pub binding: Option<NodeBinding>,
+    /// The face this element declares for everything under it: the
+    /// root's default, or a box whose modifiers changed the face. A
+    /// text with the declared face inherits it and declares none of
+    /// its own — a thousand cells share the one declaration above
+    /// them, as a page's own stylesheet would have it.
+    pub face: Option<FontSpec>,
 }
 
 // MARK: - Capture (rides the placement walk)
@@ -487,6 +496,7 @@ impl DomCapture {
             hints: DomHints::default(),
             children: Vec::new(),
             binding: None,
+            face: None,
         };
         DomCapture {
             stack: vec![(Point { x: 0.0, y: 0.0 }, root)],
@@ -539,6 +549,7 @@ impl DomCapture {
             hints: DomHints::default(),
             children: Vec::new(),
             binding: None,
+            face: None,
         };
         // the node inherits the ink until a `Styled` says otherwise
         self.ink.push(self.current_ink());
@@ -1639,7 +1650,20 @@ fn look_hash(node: &DomNode) -> u64 {
         }
         None => 0u8.hash(&mut hasher),
     }
+    match &node.face {
+        Some(face) => {
+            1u8.hash(&mut hasher);
+            face.size.to_bits().hash(&mut hasher);
+            (face.weight as u8).hash(&mut hasher);
+            (face.design as u8).hash(&mut hasher);
+            (face.slant as u8).hash(&mut hasher);
+            face.family.name().as_deref().hash(&mut hasher);
+            face.tracking.to_bits().hash(&mut hasher);
+        }
+        None => 0u8.hash(&mut hasher),
+    }
     if let DomKind::Text(text) = &node.kind {
+        text.inherits_face.hash(&mut hasher);
         hash_color(Some(text.color), &mut hasher);
         text.inherits_ink.hash(&mut hasher);
         text.font.size.to_bits().hash(&mut hasher);
@@ -1672,9 +1696,25 @@ fn define_rule(rule: u64, node: &DomNode, ctx: &mut LowerCtx, patches: &mut Vec<
         layout: Box::new(node.layout.as_ref().map(look_layout).unwrap_or_default()),
         text: match &node.kind {
             DomKind::Text(text) => Some(Box::new(look_text(text))),
-            _ => None,
+            _ => node.face.map(|face| Box::new(face_only(face))),
         },
     });
+}
+
+/// The look's text record for an element that declares a face for its
+/// subtree and shows no words of its own: the face, nothing else.
+fn face_only(face: FontSpec) -> DomText {
+    DomText {
+        content: Arc::from(""),
+        color: Color::BLACK,
+        inherits_ink: true,
+        font: face,
+        line_height: None,
+        text_align: None,
+        highlights: None,
+        truncation: None,
+        inherits_face: false,
+    }
 }
 
 /// The element's own geometry, as the box patch carries it.
@@ -1723,6 +1763,7 @@ fn shallow(node: &DomNode) -> DomNode {
         hints: node.hints.clone(),
         children: Vec::new(),
         binding: node.binding.clone(),
+        face: node.face,
     }
 }
 
@@ -1933,6 +1974,7 @@ fn same_shape(node: &DomNode, template: &Retained) -> bool {
             };
             // the face and the ink, never the words
             if text.color != was.color
+                || text.inherits_face != was.inherits_face
                 || text.inherits_ink != was.inherits_ink
                 || text.font != was.font
                 || text.line_height != was.line_height
@@ -1950,7 +1992,8 @@ fn same_shape(node: &DomNode, template: &Retained) -> bool {
     let (Some(layout), Some(old_layout)) = (&node.layout, &old.layout) else {
         return false;
     };
-    same_look_layout(layout, old_layout)
+    node.face == old.face
+        && same_look_layout(layout, old_layout)
         && geometry_of(layout) == geometry_of(old_layout)
         && same_look_style(&node.style, &old.style)
         && node.hints.tag == old.hints.tag
@@ -2804,7 +2847,13 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 /// own travels beside it — its box (op 23, `SetBox`: pinned sizes,
 /// ceilings, a virtual row's slot), its marks (op 24, `SetMarks`:
 /// tooltip, hover group owned), its action path (op 19).
-pub const ABI_VERSION: u32 = 14;
+///
+/// 15 (2026-10-03): a face is declared once and inherited. The text
+/// look's record ends with one byte, `inherits_face`: 1 means the text
+/// takes the face declared above it and its look names no font; the
+/// root's look and the look of a box whose modifiers changed the face
+/// carry that face as their text record, words aside.
+pub const ABI_VERSION: u32 = 15;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -3433,6 +3482,8 @@ fn encode_text_look(out: &mut Vec<u8>, text: &DomText) {
         Some(Truncation::Middle) => 2,
         Some(Truncation::End) => 3,
     });
+    // 1 = the face is the one declared above: the look names no font
+    out.push(text.inherits_face as u8);
 }
 
 /// The kind's byte on the wire, shared by the create op and the rule.
@@ -4384,6 +4435,68 @@ mod tests {
         // and the record survives its own encoding: bit 11, its gap last
         let bytes = encode(&mount);
         assert!(!bytes.is_empty());
+    }
+
+    /// A face is declared once and inherited: the root's look carries
+    /// the default face, a text with that face names none of its own,
+    /// a text with another face declares it — and a box whose modifier
+    /// changes the face declares it for everything under it.
+    #[test]
+    fn a_face_is_declared_once_and_inherited() {
+        #[derive(Clone)]
+        struct Page;
+
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("plain"),
+                    text("big").font(Font::Title),
+                    crate::vstack!(text("a"), text("b")).font_family("Menlo"),
+                )
+            }
+        }
+
+        let runtime = Runtime::new();
+        let mount = runtime.dom_frame(&Page, Size { width: 300.0, height: 200.0 });
+        let looks: Vec<(CreateKind, Option<&DomText>)> = mount
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::DefineRule { kind, text, .. } => Some((*kind, text.as_deref())),
+                _ => None,
+            })
+            .collect();
+        // the root declares the default face
+        let root = look_of(&mount, 0).map(|_| ()).is_some();
+        assert!(root, "{mount:?}");
+        assert!(
+            mount.iter().any(|patch| matches!(patch,
+                DomPatch::DefineRule { kind: CreateKind::Group, text: Some(text), .. }
+                    if text.font == crate::text_engine::FontSpec::DEFAULT && !text.inherits_face)),
+            "the root's look carries the default face: {looks:?}"
+        );
+        // the plain text inherits; the title declares
+        let texts: Vec<&DomText> = looks
+            .iter()
+            .filter_map(|(kind, text)| (*kind == CreateKind::Text).then_some(*text).flatten())
+            .collect();
+        assert!(
+            texts.iter().any(|text| text.inherits_face && text.font == crate::text_engine::FontSpec::DEFAULT),
+            "a text with the default face names none: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| !text.inherits_face && text.font.size > crate::text_engine::FontSpec::DEFAULT.size),
+            "a title names its face: {texts:?}"
+        );
+        // the Menlo box declares the family; its texts inherit it
+        assert!(
+            looks.iter().any(|(kind, text)| *kind != CreateKind::Text
+                && text.is_some_and(|text| text.font.family.name().as_deref() == Some("Menlo"))),
+            "the box declares the family it sets: {looks:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.inherits_face && text.font.family.name().as_deref() == Some("Menlo")),
+            "the texts under it inherit it: {texts:?}"
+        );
     }
 
     /// A chain of hints is one hinted node, and the words a page hints
@@ -5386,6 +5499,7 @@ mod tests {
             hints: DomHints::default(),
             children: Vec::new(),
             binding: None,
+            face: None,
         }
     }
 
@@ -5401,6 +5515,7 @@ mod tests {
             hints: DomHints::default(),
             children,
             binding: None,
+            face: None,
         }
     }
 
@@ -5464,6 +5579,7 @@ mod tests {
                 hints: DomHints::default(),
                 children: Vec::new(),
                 binding: None,
+                face: None,
             }])
         };
 
@@ -5520,6 +5636,7 @@ mod tests {
                 hints: DomHints::default(),
                 children: Vec::new(),
                 binding: None,
+                face: None,
             }])
         };
 
