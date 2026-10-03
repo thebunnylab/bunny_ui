@@ -581,6 +581,7 @@ impl Walk<'_> {
                 }
                 Self::inherit_stretch(container);
                 Self::fold_table_wrapper(container);
+                Self::fold_paragraph(container);
             }
             // a row that wraps is the browser's own: a flex row that
             // wraps its items, with the gaps in both directions — the
@@ -1451,6 +1452,29 @@ impl Walk<'_> {
             && layout.width.is_none()
             && layout.height.is_none()
             && layout.slot_y.is_none()
+        {
+            layout.plain = true;
+        }
+    }
+
+    /// A row of inline runs, side by side with no gap, is a paragraph:
+    /// `hstack!(text("Run ").element("span"), text("cargo").element("code"))`
+    /// says one sentence with a word set apart. As a flex line it would
+    /// keep each run a box of its own and break the sentence between
+    /// boxes; as a block of inline elements the browser breaks it
+    /// between WORDS, wherever the width says.
+    fn fold_paragraph(container: &mut DomNode) {
+        if !matches!(container.kind, DomKind::FlexRow) || container.children.is_empty() {
+            return;
+        }
+        let inline = container
+            .children
+            .iter()
+            .all(|run| run.hints.tag.as_deref().is_some_and(is_inline_tag));
+        if let Some(layout) = container.layout.as_mut()
+            && inline
+            && layout.gap.is_none()
+            && layout.wrap.is_none()
         {
             layout.plain = true;
         }
@@ -2591,5 +2615,34 @@ mod tests {
             .expect("the island mounted");
         assert!(!runtime.dom_island_box(canvas, 120.0, 40.0), "the mount's echo is not news");
         assert!(runtime.dom_island_box(canvas, 130.0, 40.0), "a box of the browser's own is");
+    }
+
+    /// Runs side by side with no gap read as one sentence: the row is
+    /// a block of inline elements, never a flex line of boxes.
+    #[test]
+    fn a_row_of_inline_runs_is_a_paragraph() {
+        use crate::layout::ElementHints;
+        let run = |words: &str, tag: &str| LayoutNode::Text {
+            content: crate::bind::TextSource::from(words),
+            highlights: None,
+            truncation: None,
+            hints: ElementHints { tag: Some(crate::modifier::hint(tag)), ..Default::default() },
+            action: None,
+        };
+        let row = |spacing: f64| LayoutNode::Stack {
+            axis: Axis::Horizontal,
+            spacing,
+            align: CrossAlign::Center,
+            children: vec![run("The display of ", "span"), run("count", "code"), run(" records.", "span")],
+            hints: Default::default(),
+            action: None,
+        };
+        let offsets = HashMap::default();
+        let plain = |tree: &LayoutNode| {
+            let scene = lower(tree, &env_fixture(&offsets)).scene;
+            scene.children[0].layout.as_ref().expect("flow").plain
+        };
+        assert!(plain(&row(0.0)), "a sentence flows as one block");
+        assert!(!plain(&row(8.0)), "a gap says these are items, not words");
     }
 }
