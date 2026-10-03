@@ -33,7 +33,17 @@ pub fn render(root: &impl View, size: Size) -> SsrPage {
     for patch in &patches {
         tree.apply(patch);
     }
-    let mut css: Vec<String> = vec!["[data-path]{cursor:default}".to_string()];
+    let mut css: Vec<String> = vec![
+        "[data-path]{cursor:default}".to_string(),
+        // a link is pressable wherever it stands — the glue's twin rule
+        "a[href][href]{cursor:pointer;pointer-events:auto}".to_string(),
+        // a semantic tag never brings the browser's own look — the
+        // glue's twin rules
+        ":where(#app) :where(h1,h2,h3,h4,h5,h6,p,figure,blockquote,pre,ol,ul,li,dl,dd){margin:0;padding:0}".to_string(),
+        ":where(#app) :where(h1,h2,h3,h4,h5,h6,code,pre,kbd,samp,small,b,strong,i,em){font:inherit}".to_string(),
+        ":where(#app) :where(ol,ul){list-style:none}".to_string(),
+        ":where(#app) :where(a){color:inherit;text-decoration:none}".to_string(),
+    ];
     css.extend(tree.rules.values().cloned());
     SsrPage { html: tree.serialize_root(), css: css.join("\n") }
 }
