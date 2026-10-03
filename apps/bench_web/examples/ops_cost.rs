@@ -214,6 +214,8 @@ struct Sample {
     stats: stats::FrameStats,
     bodies: usize,
     patches: usize,
+    /// The patches' bytes on the wire — what the glue decodes.
+    wire: usize,
     allocs: usize,
     kib: usize,
     total_ms: f64,
@@ -229,10 +231,14 @@ fn measure(op: &Op) -> Sample {
     let patches = runtime.dom_frame(&app, SIZE);
     let total_ms = now_ms() - started;
     let (allocs_after, bytes_after) = allocations();
+    let stats = stats::take();
+    // encoded off the clock and off the counters: the shell's work
+    let wire = bunny_ui::dom::encode(&patches).len();
     Sample {
-        stats: stats::take(),
+        stats,
         bodies: runtime.body_runs().len(),
         patches: patches.len(),
+        wire,
         allocs: allocs_after - allocs_before,
         kib: (bytes_after - bytes_before) / 1024,
         total_ms,
@@ -324,8 +330,8 @@ fn main() {
     }
 
     println!(
-        "{:<12} {:>6} {:>6} {:>7} {:>6} {:>7} {:>7} {:>7} | {:>7} {:>7} {:>7} {:>7} {:>8} | {:>7} {:>7} {:>7}",
-        "op (median)", "bodies", "built", "visited", "reused", "patches", "allocs", "KiB", "settle", "build",
+        "{:<12} {:>6} {:>6} {:>7} {:>6} {:>7} {:>8} {:>7} {:>7} | {:>7} {:>7} {:>7} {:>7} {:>8} | {:>7} {:>7} {:>7}",
+        "op (median)", "bodies", "built", "visited", "reused", "patches", "wire B", "allocs", "KiB", "settle", "build",
         "diff", "encode", "total ms", "a:settl", "a:build", "a:diff"
     );
     for op in OPS {
@@ -337,13 +343,14 @@ fn main() {
         let mut totals: Vec<f64> = samples.iter().map(|sample| sample.total_ms).collect();
         let last = samples.last().expect("at least one round");
         println!(
-            "{:<12} {:>6} {:>6} {:>7} {:>6} {:>7} {:>7} {:>7} | {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>8.3} | {:>7} {:>7} {:>7}",
+            "{:<12} {:>6} {:>6} {:>7} {:>6} {:>7} {:>8} {:>7} {:>7} | {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>8.3} | {:>7} {:>7} {:>7}",
             op.name,
             last.bodies,
             last.stats.capture_nodes,
             last.stats.diff_visited,
             last.stats.diff_reused,
             last.patches,
+            last.wire,
             last.allocs,
             last.kib,
             stage(stats::Stage::Settle),
@@ -358,6 +365,6 @@ fn main() {
     }
     println!(
         "{rounds} rounds per op, each on a fresh runtime; stages are medians, counters are the last round's. \
-         `encode` is 0 here: the wire bytes are the shell's business."
+         `encode` is 0 here: the shell encodes, and `wire B` is its stream, encoded off the clock."
     );
 }
