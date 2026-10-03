@@ -858,8 +858,9 @@ pub(crate) fn begin_pass(dirty: HashSet<String>) {
     });
     // garbage that waited out its patience is freed now: no idle came
     let buried = BURIED_AT.with(Cell::get);
-    if buried != 0 && pass_no - buried >= GARBAGE_PATIENCE {
-        collect_garbage();
+    let patience = if HOST_COLLECTS.with(Cell::get) { IDLE_HOST_PATIENCE } else { GARBAGE_PATIENCE };
+    if buried != 0 && pass_no - buried >= patience {
+        free_garbage();
     }
     PASS.with(|pass| {
         *pass.borrow_mut() = PassState {
@@ -2018,6 +2019,10 @@ thread_local! {
     /// The pass that buried the oldest garbage still waiting; 0 when
     /// nothing waits.
     static BURIED_AT: Cell<u64> = const { Cell::new(0) };
+    /// Has the host asked for the collection itself — a page that goes
+    /// idle between two clicks? Then the valve waits for it as long as
+    /// [`IDLE_HOST_PATIENCE`]. A newborn runtime has not been asked yet.
+    static HOST_COLLECTS: Cell<bool> = const { Cell::new(false) };
 }
 
 /// How many passes garbage waits for an idle moment. A page goes idle
@@ -2025,6 +2030,16 @@ thread_local! {
 /// shell that never asks for the collection — has it freed by the first
 /// pass after this many, so what leaves is never kept for good.
 const GARBAGE_PATIENCE: u64 = 64;
+
+/// How many passes garbage waits on a host that has asked for the
+/// collection. Such a host asks again within a second of any frame (the
+/// page's idle callback has a one-second timeout), and a frame of its own
+/// must never pay for the freeing: sixty-four passes are sixty-four frames
+/// of a list that clicks fast, which may all fall inside one second. This
+/// many passes are more than a quarter minute of frames at sixty a second
+/// — no burst of clicks reaches it — and the valve stays the floor under a
+/// host that stopped asking.
+const IDLE_HOST_PATIENCE: u64 = 1024;
 
 /// Garbage was buried in the pass under way: the oldest starts waiting.
 fn note_buried() {
@@ -2038,8 +2053,15 @@ fn note_buried() {
 /// Frees the entries that left since the last call, and the trees the
 /// re-runs replaced; returns how many of both. The read graph of the
 /// views that left goes first: the bindings they made are taken out of
-/// the register and out of the live table.
+/// the register and out of the live table. The host asks for this when
+/// it is idle — and is known from then on as a host that does.
 pub(crate) fn collect_garbage() -> usize {
+    HOST_COLLECTS.with(|asked| asked.set(true));
+    free_garbage()
+}
+
+/// [`collect_garbage`]'s work, for the host's idle and for the valve.
+fn free_garbage() -> usize {
     BURIED_AT.with(|at| at.set(0));
     collect_retired_reads();
     let replaced = take_replaced();
@@ -2303,6 +2325,7 @@ pub(crate) fn reset_world() {
     drop(take_replaced());
     GRAVEYARD.with(|graveyard| graveyard.borrow_mut().clear());
     BURIED_AT.with(|at| at.set(0));
+    HOST_COLLECTS.with(|asked| asked.set(false));
     crate::layout::forget_pictures();
     LIVE.with(|live| *live.borrow_mut() = Live::default());
     ASSEMBLED_ROOT.with(|root| *root.borrow_mut() = None);
@@ -2617,9 +2640,13 @@ mod tests {
     /// it for good: garbage that waited out its patience is freed by the
     /// next pass, the read graph of its bindings with it. Until then it
     /// waits, so the frames of a page that does go idle still free
-    /// nothing.
+    /// nothing. A runtime born on a thread whose last host asked for the
+    /// collection has not been asked itself.
     #[test]
     fn garbage_no_idle_came_for_is_freed_by_a_later_pass() {
+        let earlier = Runtime::new();
+        let _ = collect_garbage();
+        drop(earlier);
         let three = (1..=3).map(|id| Line { id, label: State::new(Rc::from("line")) }).collect();
         let lines = State::new(Rc::new(three));
         let page = Lines { lines };
@@ -2762,6 +2789,47 @@ mod tests {
         assert!(live_tables_match_retention());
         let _ = collect_garbage();
         assert!(click_keys("[2]").is_empty(), "the idle took the left key out");
+    }
+
+    /// A host that asks for the collection when it goes idle — the page —
+    /// never has one of its frames pay for the freeing. Lists replaced,
+    /// rows swapped and lists cleared, click after click, with the idle
+    /// late by far more passes than a host that never asks is given: every
+    /// frame keeps what it let go, and what earlier frames let go, for the
+    /// idle. The idle then frees it all.
+    #[test]
+    fn a_host_that_collects_at_idle_never_frees_inside_a_frame() {
+        let rows = State::new(lines(1..=10));
+        let page = Lines { lines: rows };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let _ = collect_garbage();
+
+        let idle_at = PASS_NO.with(Cell::get);
+        let mut next = 11;
+        let mut waiting = 0;
+        for click in 0..GARBAGE_PATIENCE * 3 {
+            match click % 3 {
+                0 => {
+                    rows.set(lines(next..=next + 9));
+                    next += 10;
+                }
+                1 => {
+                    let mut swapped = (*rows.get()).clone();
+                    swapped.swap(0, 9);
+                    rows.set(Rc::new(swapped));
+                }
+                _ => rows.set(Rc::new(Vec::new())),
+            }
+            runtime.render(&page);
+            let now = graveyard_len() + REPLACED.with(|replaced| replaced.borrow().len());
+            assert!(now > waiting, "click {click} freed what waited for the idle: {waiting} -> {now}");
+            waiting = now;
+        }
+        let late_by = PASS_NO.with(Cell::get) - idle_at;
+        assert!(late_by >= GARBAGE_PATIENCE * 3, "the idle was late by {late_by} passes");
+        assert_eq!(collect_garbage(), waiting, "the idle frees it all");
+        assert_eq!(graveyard_len(), 0);
     }
 
     /// The paths retained under a prefix, sorted.
