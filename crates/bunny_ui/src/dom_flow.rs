@@ -920,18 +920,20 @@ impl Walk<'_> {
             }
             LayoutNode::BoundaryRef { path, slot } => {
                 // resolves through the retention IN PLACE, the same
-                // door the placement walk uses — a missing entry keeps
-                // the identity anchor so the diff can match later
-                let lowered = slot.with_layout(|tree| {
-                    tree.map(|tree| {
-                        let mut nodes = Vec::new();
-                        self.lower_into(tree, &mut nodes);
-                        nodes
-                    })
+                // door the placement walk uses, and lowers straight into
+                // the parent's list — a list of its own was a block of
+                // four nodes per row, filled with one and copied out. A
+                // missing entry keeps the identity anchor so the diff
+                // can match later
+                let found = slot.with_layout(|tree| match tree {
+                    Some(tree) => {
+                        self.lower_into(tree, out);
+                        true
+                    }
+                    None => false,
                 });
-                match lowered {
-                    Some(nodes) => out.extend(nodes),
-                    None => out.push(node(DomKind::Group { path: std::rc::Rc::clone(path) })),
+                if !found {
+                    out.push(node(DomKind::Group { path: std::rc::Rc::clone(path) }));
                 }
             }
             LayoutNode::Interactive { path, child } => {
