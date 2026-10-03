@@ -1662,6 +1662,32 @@ impl DomLowering {
         self.group_paths.len()
     }
 
+    /// Diagnostics: of [`DomLowering::bindings_len`] and
+    /// [`DomLowering::groups_len`], the entries that only subtrees that
+    /// left still hold, waiting for the idle to take them out.
+    pub(crate) fn unpicked_len(&self) -> (usize, usize) {
+        fn count(retained: &Retained, lowering: &DomLowering, counts: &mut (usize, usize)) {
+            if let Some(binding) = &retained.node.binding
+                && lowering.bindings.get(binding.key()).is_some_and(|bound| bound.id == retained.id)
+            {
+                counts.0 += 1;
+            }
+            if let DomKind::Group { path } = &retained.node.kind
+                && lowering.group_paths.contains_key(path)
+            {
+                counts.1 += 1;
+            }
+            for child in &retained.children {
+                count(child, lowering, counts);
+            }
+        }
+        let mut counts = (0, 0);
+        for root in self.graveyard[self.unpicked..].iter().flat_map(Buried::roots) {
+            count(root, self, &mut counts);
+        }
+        counts
+    }
+
     pub(crate) fn template_members_len(&self) -> usize {
         self.templates.members.len()
     }

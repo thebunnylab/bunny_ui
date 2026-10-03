@@ -2075,6 +2075,24 @@ pub(crate) fn graveyard_len() -> usize {
     GRAVEYARD.with(|graveyard| graveyard.borrow().len())
 }
 
+/// Diagnostics: the trees re-runs replaced, waiting to be freed.
+pub(crate) fn replaced_len() -> usize {
+    REPLACED.with(|replaced| replaced.borrow().len())
+}
+
+/// Diagnostics: the click keys entries that left still keep in the live
+/// table, for the idle to take out.
+pub(crate) fn buried_actions() -> usize {
+    LIVE.with(|live| live.borrow().buried_actions)
+}
+
+/// Is anything waiting for [`collect_garbage`] — an entry that left, a
+/// tree a re-run replaced, or the bindings of a view that left, whose
+/// reads still stand in the register?
+pub(crate) fn garbage_pending() -> bool {
+    graveyard_len() > 0 || replaced_len() > 0 || motor::identity::retirement_pending()
+}
+
 /// Drops every retained entry under `root` — the retention half of a
 /// SCENE reset (`motor::identity::reset_scene` is the other half). The
 /// other scenes on this thread keep theirs.

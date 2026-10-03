@@ -1244,6 +1244,47 @@ mod tests {
         assert!(runtime.garbage_pending(), "and left the freeing to the idle");
     }
 
+    /// Whatever a frame leaves for the idle, the runtime says there is
+    /// something to collect — a list that only re-ran, every row kept,
+    /// leaves the tree it replaced — and the diagnostics line names each
+    /// kind beside what stands, so a probe that watches for a leak sees
+    /// the wait for what it is. After the idle nothing waits.
+    #[test]
+    fn every_kind_the_idle_waits_for_is_pending_and_counted() {
+        let size = Size { width: 400.0, height: 300.0 };
+        let rows = State::new(Rc::new(labelled(1..=3)));
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&Page { rows }, size);
+        runtime.collect_garbage();
+        assert!(!runtime.garbage_pending(), "nothing waits: {}", runtime.retained_counts());
+
+        let mut swapped = (*rows.get()).clone();
+        swapped.swap(0, 2);
+        rows.set(Rc::new(swapped));
+        let _ = runtime.dom_frame(&Page { rows }, size);
+        assert_eq!(crate::reconciler::graveyard_len(), 0, "no row left");
+        assert!(runtime.garbage_pending(), "the tree the list replaced waits for the idle");
+        let counts = runtime.retained_counts();
+        assert!(counts.contains("+1 trees replaced"), "{counts}");
+        runtime.collect_garbage();
+        assert!(!runtime.garbage_pending(), "{}", runtime.retained_counts());
+
+        rows.set(Rc::new(Vec::new()));
+        let _ = runtime.dom_frame(&Page { rows }, size);
+        let counts = runtime.retained_counts();
+        assert!(counts.contains("(+3 to free"), "the rows' entries: {counts}");
+        assert!(counts.contains("(3 retired)"), "their bindings: {counts}");
+        assert!(counts.contains("dom bindings 0 (+3 to unpick)"), "their elements' bindings: {counts}");
+        assert_eq!(counts.matches("(+3 to unpick)").count(), 2, "and their groups: {counts}");
+        assert!(runtime.garbage_pending());
+
+        runtime.collect_garbage();
+        assert!(!runtime.garbage_pending());
+        let counts = runtime.retained_counts();
+        assert!(counts.contains("(+0 to free, +0 trees replaced, +0 click keys)") && counts.contains("(0 retired)"), "{counts}");
+        assert_eq!(counts.matches("(+0 to unpick)").count(), 2, "{counts}");
+    }
+
     /// A row written to and let go in one click is not patched: its text
     /// was going stale when the frame began, but the frame that removes its
     /// element takes its binding out before it patches the stale ones.
