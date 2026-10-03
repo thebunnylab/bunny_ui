@@ -4584,11 +4584,21 @@ impl Runtime {
         // everything that ran while settling — the reuse decision's
         // whole evidence (a theme change already cleared retention,
         // which re-runs every body and empties no promise wrongly)
-        let changed = reconciler::take_frame_runs();
+        let mut changed = reconciler::take_frame_runs();
         // the retained groups stay where they are: the walk reads them
         // through this borrow, which ends before the diff takes the
         // lowering for itself
         let dom = self.dom.borrow();
+        // a binding that reads inside an island has no element to
+        // patch: its subtree is lowered again, so the island's pixels
+        // follow the reading — the scope counts as a run under its row
+        for key in &dirty_bindings {
+            if !dom.has_binding(key)
+                && let Some((scope, _)) = key.rsplit_once('/')
+            {
+                changed.push(scope.to_string());
+            }
+        }
         let retained_groups = dom.group_paths();
         // the tree, stable-root shortcut included — the flow twin of
         // the pixel path's pass assembly

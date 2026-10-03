@@ -1355,6 +1355,17 @@ impl DomLowering {
         self.root.as_ref().and_then(|root| walk(root, id))
     }
 
+    /// Does an island with this element id still stand?
+    pub(crate) fn has_island(&self, id: u32) -> bool {
+        self.islands.contains_key(&id)
+    }
+
+    /// Is there an element this binding key drives? A key without one
+    /// reads inside pixels — an island — where no patch can reach it.
+    pub(crate) fn has_binding(&self, key: &str) -> bool {
+        self.bindings.contains_key(key)
+    }
+
     /// The element id of the island with this identity path.
     pub fn island_id(&self, path: &str) -> Option<u32> {
         fn walk(retained: &Retained, path: &str) -> Option<u32> {
