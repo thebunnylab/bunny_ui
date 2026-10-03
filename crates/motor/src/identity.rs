@@ -577,46 +577,94 @@ pub fn current_path_segments() -> Vec<String> {
     REGISTRY.with(|registry| registry.borrow().segments().map(str::to_string).collect())
 }
 
-/// The cursor's PARENT segments, packed: what a retained entry keeps to
-/// seed an isolated re-run ([`seed_from`]).
+/// The cursor's PARENT segments, as the points the path they were taken
+/// at is cut: what a retained entry keeps to seed an isolated re-run
+/// ([`seed_from`]), beside that path — which it keeps anyway, as its key.
 ///
-/// Every boundary of a mount keeps one, and the path above a row is a dozen
-/// segments deep: a `Vec<String>` of them was a dozen allocations for each
-/// boundary, made twice. Packed, it is the segments end to end and where
-/// each one stops — two allocations, whatever the depth. The cut points are
-/// kept and not found again: a segment may hold a `/` of its own (a row's
-/// key is the app's string), so the joined path cannot be split back.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Every boundary of a mount keeps one, and the path above a row is a
+/// dozen segments deep. The segments were copied out of the path (end to
+/// end, with where each one stops: two allocations a boundary), but the
+/// path holds them already: only the cuts are kept, as short numbers
+/// held inline up to a depth few trees reach. A deeper path, or one
+/// longer than a short number counts, keeps its cuts on the heap. The
+/// cuts are kept and not found again: a segment may hold a `/` of its
+/// own (a row's key is the app's string), so the path cannot be split
+/// back.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathSeed {
-    text: String,
-    ends: Vec<u32>,
+    ends: SeedEnds,
+}
+
+/// Where each parent segment ends in the path, the separator after it
+/// not counted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SeedEnds {
+    Inline { count: u8, ends: [u16; SEED_INLINE] },
+    Spilled(Box<[u32]>),
+}
+
+/// How many parent segments a seed holds without an allocation.
+const SEED_INLINE: usize = 23;
+
+impl Default for PathSeed {
+    fn default() -> Self {
+        PathSeed { ends: SeedEnds::Inline { count: 0, ends: [0; SEED_INLINE] } }
+    }
 }
 
 impl PathSeed {
-    fn segments(&self) -> impl Iterator<Item = &str> {
+    /// The seed of the parents that end at `ends`.
+    fn from_ends(ends: &[usize]) -> PathSeed {
+        let short = ends.len() <= SEED_INLINE && ends.iter().all(|end| *end <= u16::MAX as usize);
+        let ends = if short {
+            let mut inline = [0u16; SEED_INLINE];
+            for (slot, end) in inline.iter_mut().zip(ends) {
+                *slot = *end as u16;
+            }
+            SeedEnds::Inline { count: ends.len() as u8, ends: inline }
+        } else {
+            SeedEnds::Spilled(ends.iter().map(|end| *end as u32).collect())
+        };
+        PathSeed { ends }
+    }
+
+    fn ends(&self) -> impl Iterator<Item = usize> + '_ {
+        let (inline, spilled): (&[u16], &[u32]) = match &self.ends {
+            SeedEnds::Inline { count, ends } => (&ends[..*count as usize], &[]),
+            SeedEnds::Spilled(ends) => (&[], ends),
+        };
+        inline.iter().map(|end| *end as usize).chain(spilled.iter().map(|end| *end as usize))
+    }
+
+    /// Does the seed hold its cuts without an allocation?
+    #[cfg(test)]
+    fn is_inline(&self) -> bool {
+        matches!(self.ends, SeedEnds::Inline { .. })
+    }
+
+    /// The parent segments, read back from `path` — the path the seed
+    /// was taken at. A separator follows a non-empty path, so a segment
+    /// starts one byte past the end of the last, or at the start.
+    fn segments<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         let mut from = 0usize;
-        self.ends.iter().map(move |end| {
-            let segment = &self.text[from..*end as usize];
-            from = *end as usize;
+        self.ends().map(move |end| {
+            let segment = &path[from..end];
+            from = end + usize::from(end > 0);
             segment
         })
     }
 }
 
-/// [`PathSeed`] of the cursor right now: every segment but the last.
+/// [`PathSeed`] of the cursor right now: every segment but the last, cut
+/// from the cursor's path where the frames above it cut it.
 pub fn parent_seed() -> PathSeed {
     REGISTRY.with(|registry| {
         let registry = registry.borrow();
-        let parents = registry.joined_lens.len().saturating_sub(1);
-        let mut seed = PathSeed {
-            text: String::with_capacity(registry.segments().take(parents).map(str::len).sum()),
-            ends: Vec::with_capacity(parents),
-        };
-        for segment in registry.segments().take(parents) {
-            seed.text.push_str(segment);
-            seed.ends.push(seed.text.len() as u32);
-        }
-        seed
+        // each frame saved where the path stood before it: the frame
+        // after a parent saved where that parent ends
+        let lens = &registry.joined_lens;
+        debug_assert!(lens.first().is_none_or(|first| *first == 0), "the cursor starts at an empty path");
+        PathSeed::from_ends(lens.get(1..).unwrap_or(&[]))
     })
 }
 
@@ -816,9 +864,10 @@ pub fn seed(segments: &[String]) -> Vec<Frame> {
     segments.iter().map(|segment| push(|joined| joined.push_str(segment), false)).collect()
 }
 
-/// [`seed`], from the packed form a retained entry keeps.
-pub fn seed_from(parents: &PathSeed) -> Vec<Frame> {
-    parents.segments().map(|segment| push(|joined| joined.push_str(segment), false)).collect()
+/// [`seed`], from the cuts a retained entry keeps and the path they cut
+/// — the entry's own, which they were taken at.
+pub fn seed_from(path: &str, parents: &PathSeed) -> Vec<Frame> {
+    parents.segments(path).map(|segment| push(|joined| joined.push_str(segment), false)).collect()
 }
 
 fn current_scope(registry: &Registry) -> String {
@@ -1285,28 +1334,73 @@ pub fn scoped_effect_slot<V: 'static>(site: impl Into<Site>) -> Rc<RefCell<Optio
 
 #[cfg(test)]
 mod tests {
-    /// A packed seed re-enters the same segments — a row's key with a `/`
-    /// of its own included, which is why the cut points are kept and the
-    /// joined path is never split back.
+    /// A seed re-enters the same segments from the path it was taken at —
+    /// a row's key with a `/` of its own included, which is why the cut
+    /// points are kept and the path is never split back — and holds its
+    /// cuts inline, with no allocation.
     #[test]
-    fn a_packed_seed_re_enters_the_segments_it_was_cut_from() {
-        use super::{begin_pass, current_path_segments, end_pass, enter, enter_view, parent_seed, seed_from};
+    fn a_seed_re_enters_the_segments_it_was_cut_from() {
+        use super::{begin_pass, current_path_segments, current_view_path, end_pass, enter, enter_view, parent_seed, seed_from};
 
         begin_pass();
-        let seed = {
+        let (seed, path) = {
             let _root = enter("Root");
             let _row = enter("[a/b]");
             let _stack = enter("#0");
             let _leaf = enter_view("Leaf");
-            parent_seed()
+            (parent_seed(), current_view_path().expect("inside a view"))
         };
         let _ = end_pass();
-        assert_eq!(seed.segments().collect::<Vec<_>>(), ["Root", "[a/b]", "#0"]);
+        assert_eq!(path, "Root/[a/b]/#0/Leaf");
+        assert!(seed.is_inline(), "a seed of three parents allocates nothing");
+        assert_eq!(seed.segments(&path).collect::<Vec<_>>(), ["Root", "[a/b]", "#0"]);
         begin_pass();
-        let frames = seed_from(&seed);
+        let frames = seed_from(&path, &seed);
         assert_eq!(current_path_segments(), ["Root", "[a/b]", "#0"]);
         drop(frames);
         let _ = end_pass();
+
+        // an empty first segment adds no separator to the path: the
+        // next segment starts where it ends, not one byte past it
+        begin_pass();
+        let (seed, path) = {
+            let _scene = enter("");
+            let _row = enter("[a/b]");
+            let _leaf = enter_view("Leaf");
+            (parent_seed(), current_view_path().expect("inside a view"))
+        };
+        let _ = end_pass();
+        assert_eq!(path, "[a/b]/Leaf");
+        assert_eq!(seed.segments(&path).collect::<Vec<_>>(), ["", "[a/b]"]);
+    }
+
+    /// A tree deeper than a seed holds inline, or a path longer than its
+    /// short numbers count, keeps its cuts on the heap — and reads back
+    /// the same segments all the same.
+    #[test]
+    fn a_seed_too_deep_or_too_long_for_inline_reads_back_the_same() {
+        use super::{begin_pass, cursor_scope, end_pass, enter, parent_seed, Frame, SEED_INLINE};
+
+        let walk = |words: &[String]| {
+            begin_pass();
+            let read = {
+                let _frames: Vec<Frame> = words.iter().map(|word| enter(word.clone())).collect();
+                let path = cursor_scope().expect("inside a pass");
+                let seed = parent_seed();
+                let segments = seed.segments(&path).map(str::to_string).collect::<Vec<_>>();
+                (seed.is_inline(), segments)
+            };
+            let _ = end_pass();
+            read
+        };
+        let deep: Vec<String> = (0..=SEED_INLINE + 1).map(|at| format!("#{at}")).collect();
+        let (inline, segments) = walk(&deep);
+        assert!(!inline, "deeper than the inline room");
+        assert_eq!(segments, deep[..deep.len() - 1]);
+        let long = vec!["Root".to_string(), "x".repeat(70_000), "[a/b]".to_string(), "Leaf".to_string()];
+        let (inline, segments) = walk(&long);
+        assert!(!inline, "longer than a short number counts");
+        assert_eq!(segments, long[..long.len() - 1]);
     }
 
     /// A row's key is written into the path between its brackets, and
@@ -1330,11 +1424,10 @@ mod tests {
                 let _key = if keyed { enter_key("a/b") } else { enter("[a/b]") };
                 let _blank = if keyed { enter_key("") } else { enter("[]") };
                 let _leaf = enter("#0");
-                (
-                    cursor_scope(),
-                    current_path_segments(),
-                    parent_seed().segments().map(str::to_string).collect::<Vec<_>>(),
-                )
+                let scope = cursor_scope();
+                let seed = parent_seed();
+                let parents = seed.segments(scope.as_deref().unwrap_or("")).map(str::to_string).collect::<Vec<_>>();
+                (scope, current_path_segments(), parents)
             };
             let root = current_pass_root();
             // every frame dropped: the path is empty again

@@ -168,8 +168,8 @@ pub(crate) struct Entry {
     /// The registrations few bodies make ([`Rare`]) — `None` for a body
     /// that made none of them, which is nearly every row of a list.
     pub rare: Option<Box<Rare>>,
-    /// The PARENT's path segments, packed — the cursor seed for an isolated
-    /// re-run.
+    /// Where the PARENT's path segments end in the entry's own path —
+    /// the cursor seed for an isolated re-run, read against the key.
     pub parent_segments: motor::identity::PathSeed,
     /// Did the entry close with no retained boundary above it? Then it
     /// stands in the live tables' top level, and it is the one place the
@@ -1318,7 +1318,7 @@ pub(crate) fn run_isolated(root: &str) {
         }) else {
             continue; // dirty but never mounted (or already swept): nothing to re-run
         };
-        let _frames = motor::identity::seed_from(&parents);
+        let _frames = motor::identity::seed_from(&path, &parents);
         let mut scratch = crate::view::NodeList::new();
         use crate::view::View;
         // the retained value re-renders through the blanket's normal
