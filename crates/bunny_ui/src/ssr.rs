@@ -934,6 +934,11 @@ fn rule_text(
         // a text with the face declared above it names none of its own
         if !text.inherits_face {
             base.insert("font", css_font(&text.font));
+            // the shorthand leaves the spacing alone; the face's own
+            // advance rides beside it
+            if text.font.tracking != 0.0 {
+                base.insert("letter-spacing", format!("{}px", f64::from(text.font.tracking)));
+            }
         }
         // after the font shorthand, which resets it — the served page
         // steps its lines the way the engine measured them
@@ -1231,5 +1236,22 @@ mod tests {
         assert!(page.html.contains("href=\"#top\""), "{}", page.html);
         assert!(page.html.contains("id=\"back\""), "{}", page.html);
         assert_eq!(page.html.matches("<a ").count(), 2, "{}", page.html);
+    }
+
+    /// Tracking is the face's own advance: an eyebrow's wide spacing
+    /// reaches the served page as `letter-spacing`, in points.
+    #[test]
+    fn tracking_serves_as_letter_spacing() {
+        #[derive(Clone, Copy)]
+        struct Eyebrow;
+
+        impl Component for Eyebrow {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("QUICK LOOK").font_size(12.0).tracking(2.0)
+            }
+        }
+
+        let page = render(&Eyebrow, Size { width: 200.0, height: 200.0 });
+        assert!(page.css.contains("letter-spacing:2px"), "{}", page.css);
     }
 }

@@ -25,7 +25,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 18;
+const EXPECTED_ABI = 19;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -493,7 +493,12 @@ function lookRules(selector, kind, flags, style, layout, face) {
     decl["-webkit-backdrop-filter"] = style.filter;
   }
   if (face) {
-    if (!face.inheritsFace) decl.font = face.font;
+    if (!face.inheritsFace) {
+      decl.font = face.font;
+      // the shorthand leaves the spacing alone; the face's own advance
+      // rides beside it
+      if (face.tracking) decl["letter-spacing"] = `${face.tracking}px`;
+    }
     // AFTER the font shorthand, which resets line-height: 0 means the
     // face's own box
     if (face.lineHeight > 0) decl["line-height"] = `${face.lineHeight}px`;
@@ -930,6 +935,7 @@ function applyPatches(view, length) {
     const italic = u8();
     const family = text(u16());
     const lineHeight = f32();
+    const tracking = f32();
     const align = u8();
     const truncation = u8();
     // 1 = the face declared above is this text's: its look names no font
@@ -938,6 +944,7 @@ function applyPatches(view, length) {
       font: cssFont(size, weight, mono, italic, family),
       inheritsFace,
       lineHeight,
+      tracking,
       align,
       color: inheritsInk ? null : color,
       truncation,

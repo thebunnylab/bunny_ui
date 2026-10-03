@@ -3821,7 +3821,11 @@ fn longest_increasing(plan: &[usize]) -> Vec<bool> {
 ///
 /// 18 (2026-10-03): links. Create (op 1) and SetHints (op 15) carry a
 /// fourth hint after the id — the href, u16 len + utf8, empty for none.
-pub const ABI_VERSION: u32 = 18;
+///
+/// 19 (2026-10-03): tracking. The text look's record carries the face's
+/// extra advance (f32 points, resolved) after the line height; the glue
+/// writes it as `letter-spacing`.
+pub const ABI_VERSION: u32 = 19;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -4468,6 +4472,8 @@ fn encode_text_look(out: &mut Vec<u8>, text: &DomText) {
     // the line box, or 0 for "the face's own" — the browser steps its
     // lines by the same number our placement does
     push_f32(out, text.line_height.unwrap_or(0.0));
+    // the extra advance after every character, in points, resolved
+    push_f32(out, text.font.tracking);
     // 0 leading (the default), 1 centre, 2 trailing
     out.push(match text.text_align {
         None | Some(motor::views::TextAlignment::Leading) => 0,
