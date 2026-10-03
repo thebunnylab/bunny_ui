@@ -3323,4 +3323,30 @@ mod once_per_key_tests {
             assert_eq!(was, now, "step {} ({})", at / 2, if at % 2 == 0 { "patches" } else { "print" });
         }
     }
+
+    /// A component inside a kept row whose state was written in the frame
+    /// its list runs again is dirty, though its row is not: it runs after
+    /// the list, as it would under a list that did not run — in a row that
+    /// moved and in a row that kept its place alike.
+    #[test]
+    fn a_dirty_component_inside_a_kept_row_runs_in_the_frame_its_list_runs() {
+        for once in [false, true] {
+            INNER.with(|inner| inner.borrow_mut().clear());
+            let page = page(once, false, Shape::Plain, &[1, 2, 3, 4, 5, 6]);
+            let runtime = Runtime::new();
+            let _ = runtime.dom_frame(&page, SIZE);
+            let (moved, stayed) = INNER.with(|inner| (inner.borrow()[1], inner.borrow()[2]));
+            // rows 2 and 5 trade places, row 3 keeps its own
+            operate(&page, 0);
+            moved.set(7);
+            stayed.set(8);
+            let patches = format!("{:?}", runtime.dom_frame(&page, SIZE));
+            for taps in ["taps 7", "taps 8"] {
+                assert!(patches.contains(taps), "the frame patched {taps:?} (once {once}): {patches}");
+            }
+            let printed = runtime.render(&page);
+            let both = printed.contains("taps 7") && printed.contains("taps 8");
+            assert!(both, "the print shows both (once {once}): {printed}");
+        }
+    }
 }
