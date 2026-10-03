@@ -766,6 +766,12 @@ impl Slot {
         })
     }
 
+    /// Does the slot hold its boundary's tree — asked of the slot alone,
+    /// without reaching for the tree, which lives elsewhere in memory.
+    pub(crate) fn holds(&self) -> bool {
+        self.held.borrow().is_some()
+    }
+
     /// The boundary's layout tree, borrowed in place — measure and place
     /// resolve a `BoundaryRef` through here, WITHOUT stitching an expanded
     /// copy. `None` = the boundary left the retention.
