@@ -1903,9 +1903,10 @@ fn create_subtree_before(
     before: u32,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
-) -> Retained {
+    sibling: Option<(&Retained, u32)>,
+) -> (Retained, Option<u32>) {
     let opened = patches.len();
-    let created = create_subtree(node, parent, ctx, patches, None);
+    let created = create_subtree(node, parent, ctx, patches, sibling);
     if before != 0
         && let DomPatch::Create { before: slot, .. } | DomPatch::Clone { before: slot, .. } =
             &mut patches[opened]
@@ -1964,6 +1965,7 @@ fn clone_instance(
 /// groups, glass, tooltips, gradients).
 fn shape_of(node: &DomNode) -> Option<u64> {
     use std::hash::Hasher;
+    crate::stats::note_shape_hashed();
     let mut hasher = motor::hash::FxHasher::default();
     shape_into(node, &mut hasher).then(|| hasher.finish())
 }
@@ -2098,30 +2100,38 @@ fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
     node.children.iter().all(|child| shape_into(child, hasher))
 }
 
+/// Emits the patches that build `node` under `parent` and returns its
+/// retained mirror — and the template the subtree is an instance of,
+/// when it is one (a clone of it, or the template itself), so the next
+/// sibling can be compared with it instead of hashed.
+///
+/// `sibling` is the sibling made just before this one, with the
+/// template IT is an instance of.
 fn create_subtree(
     mut node: DomNode,
     parent: u32,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
-    previous: Option<&Retained>,
-) -> Retained {
-    // the sibling made just before this one, when it is the live
-    // instance of a template and this subtree has its shape: cloned
-    // at once, by a walk that compares and stops at the first
-    // difference — never a hash over every node of every row. A
-    // list's rows mostly look alike, and this is the road they take
-    if let Some(previous) = previous
+    sibling: Option<(&Retained, u32)>,
+) -> (Retained, Option<u32>) {
+    // the sibling made just before this one, when it is an instance of a
+    // live template and this subtree has its shape: cloned from that
+    // template at once, by a walk that compares and stops at the first
+    // difference — never a hash over every node of every row. A list's
+    // rows mostly look alike, and this is the road they take, row after
+    // row: each new row is compared with the copy made just before it
+    if let Some((sibling, template)) = sibling
         && matches!(node.kind, DomKind::Group { .. })
-        && ctx.templates.roots.contains_key(&previous.id)
-        && same_shape(&node, previous)
+        && ctx.templates.roots.contains_key(&template)
+        && same_shape(&node, sibling)
     {
         let id = *ctx.next_id;
         *ctx.next_id += 1;
-        patches.push(DomPatch::Clone { id, parent, before: 0, template: previous.id });
+        patches.push(DomPatch::Clone { id, parent, before: 0, template });
         crate::stats::note_clone();
-        let rules = ctx.templates.rules_of(previous.id);
+        let rules = ctx.templates.rules_of(template);
         let mut at = 0;
-        return clone_instance(node, id, &rules, &mut at, ctx, patches);
+        return (clone_instance(node, id, &rules, &mut at, ctx, patches), Some(template));
     }
     // the shape is the whole subtree's: read while the children are
     // still the node's own
@@ -2140,7 +2150,7 @@ fn create_subtree(
         crate::stats::note_clone();
         let rules = ctx.templates.rules_of(template);
         let mut at = 0;
-        return clone_instance(node, id, &rules, &mut at, ctx, patches);
+        return (clone_instance(node, id, &rules, &mut at, ctx, patches), Some(template));
     }
     let id = *ctx.next_id;
     *ctx.next_id += 1;
@@ -2232,8 +2242,9 @@ fn create_subtree(
         let mut rules = Vec::new();
         collect_ids_and_rules(&retained, &mut members, &mut rules);
         ctx.templates.register(shape, id, members, rules);
+        return (retained, Some(id));
     }
-    retained
+    (retained, None)
 }
 
 /// Every id and every look of a subtree, in pre-order — the order a
@@ -2253,8 +2264,11 @@ fn create_children(
     patches: &mut Vec<DomPatch>,
 ) -> Vec<Retained> {
     let mut out: Vec<Retained> = Vec::with_capacity(children.len());
+    let mut template = None;
     for child in children {
-        let created = create_subtree(child, parent, ctx, patches, out.last());
+        let sibling = out.last().zip(template);
+        let (created, made_of) = create_subtree(child, parent, ctx, patches, sibling);
+        template = made_of;
         out.push(created);
     }
     out
@@ -2627,6 +2641,9 @@ fn diff_children(
 
     let mut next: Vec<Retained> = Vec::with_capacity(new_len);
     let mut survivors = 0usize;
+    // the template the sibling made just before is an instance of —
+    // only a sibling made in this walk; a kept one breaks the run
+    let mut template = None;
     for (index, child) in new_children.into_iter().enumerate() {
         let matched = match &child.kind {
             DomKind::Group { path } | DomKind::Reuse { path } => by_path.remove(path),
@@ -2653,9 +2670,12 @@ fn diff_children(
                 diff_node(&mut old, child, ctx, patches);
                 next.push(old);
                 survivors += 1;
+                template = None;
             }
             None => {
-                let created = create_subtree(child, retained.id, ctx, patches, next.last());
+                let sibling = next.last().zip(template);
+                let (created, made_of) = create_subtree(child, retained.id, ctx, patches, sibling);
+                template = made_of;
                 next.push(created);
             }
         }
@@ -2815,6 +2835,10 @@ fn diff_children_ordered(
         .iter()
         .map(|_| None)
         .collect();
+    // the template the row made just before (the one BELOW, walking
+    // back to front) is an instance of: the next fresh row is compared
+    // with that row, never hashed. A survivor breaks the run
+    let mut template = None;
     for at in (0..plan.len()).rev() {
         match plan.pop().expect("walking the plan") {
             Plan::Survivor { old_position } => {
@@ -2824,9 +2848,13 @@ fn diff_children_ordered(
                 }
                 anchor = node.id;
                 next[at] = Some(node);
+                template = None;
             }
             Plan::Fresh(child) => {
-                let created = create_subtree_before(child, parent, anchor, ctx, patches);
+                let sibling = next.get(at + 1).and_then(Option::as_ref).zip(template);
+                let (created, made_of) =
+                    create_subtree_before(child, parent, anchor, ctx, patches, sibling);
+                template = made_of;
                 anchor = created.id;
                 next[at] = Some(created);
             }

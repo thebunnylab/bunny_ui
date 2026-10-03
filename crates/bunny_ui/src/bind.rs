@@ -661,6 +661,9 @@ mod frame_tests {
         assert_eq!(groups, 3, "the table, the list and the first row: {patches:?}");
         assert_eq!(clones, 4, "{patches:?}");
         assert_eq!(frame.clones, 4);
+        // each row after the first is compared with the copy made just
+        // before it: only the three groups that mounted whole hashed
+        assert_eq!(frame.shapes_hashed, 3, "the table, the list and the first row");
         assert_eq!(words, ["row 1", "row 2", "row 3", "row 4", "row 5"]);
 
         // the served page agrees: a clone is the template's subtree with
@@ -683,6 +686,28 @@ mod frame_tests {
             matches!(patches.as_slice(), [DomPatch::Clone { .. }, DomPatch::SetContent { text, .. }] if &**text == "row 6"),
             "{patches:?}"
         );
+
+        // emptied and filled again: the rows are made back to front, the
+        // first one made mounts whole, and every other one is compared
+        // with the row made just before it — one shape hashed, not five
+        table.rows.set(items(&[]));
+        let _ = runtime.dom_frame(&table, SIZE);
+        let _ = stats::take();
+        table.rows.set(items(&[7, 8, 9, 10, 11]));
+        let patches = runtime.dom_frame(&table, SIZE);
+        let frame = stats::take();
+        let clones = patches.iter().filter(|patch| matches!(patch, DomPatch::Clone { .. })).count();
+        assert_eq!(clones, 4, "{patches:?}");
+        assert_eq!(frame.shapes_hashed, 1, "the first row made, alone: {patches:?}");
+        let mut words: Vec<&str> = patches
+            .iter()
+            .filter_map(|patch| match patch {
+                DomPatch::SetContent { text, .. } => Some(&**text),
+                _ => None,
+            })
+            .collect();
+        words.sort_unstable();
+        assert_eq!(words, ["row 10", "row 11", "row 7", "row 8", "row 9"], "every row's words: {patches:?}");
     }
 
     /// The list, and the table around it, have shapes too — but they hold
