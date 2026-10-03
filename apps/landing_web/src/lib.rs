@@ -365,9 +365,13 @@ fn nav(shape: Shape, mark: ImageSource) -> impl View<Arity = Single> {
     let gutter = if shape.width < 640.0 { 20.0 } else { 32.0 };
     vstack!(
         wide(
+            // the bar's row is 29 points tall (the outlined button); the
+            // padding centres it in the 55 above the hairline — a pinned
+            // frame would leave it at the top on the element page
             hstack!(brand, spacer(), links)
                 .alignment(VerticalAlignment::Center)
-                .frame_height(55.0)
+                .padding_edge(Edge::Top, 13.0)
+                .padding_edge(Edge::Bottom, 13.0)
                 .padding_edge(Edge::Leading, gutter)
                 .padding_edge(Edge::Trailing, gutter),
         ),
