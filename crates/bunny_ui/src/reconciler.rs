@@ -1748,10 +1748,10 @@ fn drop_entries<P: AsRef<str>>(paths: &[P]) {
                     if let Some(entry) = retained.remove(path) {
                         live.unindex(path, &entry);
                         // a view that left owes the read graph nothing
-                        // more: its reads and its bindings' reads fall
-                        // with it, and its bindings are dead to the frame
-                        let bindings = motor::identity::forget_view_reads(path);
-                        crate::bind::forget_live(&bindings);
+                        // more: its reads fall with it, and its bindings
+                        // hear no write from here. Unpicking their reads
+                        // waits for the idle, with the entry's memory
+                        motor::identity::retire_view(path);
                         // the entry's memory — a layout tree, a value, the
                         // bindings' objects — is freed when the page is
                         // idle, not inside the frame that let it go
@@ -1771,13 +1771,25 @@ thread_local! {
 }
 
 /// Frees the entries that left since the last call; returns how many.
+/// The read graph of their views goes first: the bindings they made are
+/// taken out of the register and out of the live table.
 pub(crate) fn collect_garbage() -> usize {
+    collect_retired_reads();
     GRAVEYARD.with(|graveyard| {
         let mut graveyard = graveyard.borrow_mut();
         let count = graveyard.len();
         graveyard.clear();
         count
     })
+}
+
+/// The bindings retired since the last collection, taken apart: their
+/// reads in the register ([`motor::identity::collect_retired`]), then
+/// their keys in the live table — a key a body made again stays the new
+/// binding's in both.
+fn collect_retired_reads() {
+    let torn = motor::identity::collect_retired();
+    crate::bind::forget_live(&torn);
 }
 
 /// Diagnostics: entries waiting to be freed.
@@ -1916,6 +1928,7 @@ pub(crate) fn sweep_stale(root: &str) {
 pub(crate) fn clear() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
     LIVE.with(|live| *live.borrow_mut() = Live::default());
+    collect_retired_reads();
     GRAVEYARD.with(|graveyard| graveyard.borrow_mut().clear());
     ASSEMBLED_AT.with(|at| at.set(None));
 }
@@ -1925,6 +1938,7 @@ pub(crate) fn clear() {
 /// `motor::identity::reset_world` for the other half of the contract.
 pub(crate) fn reset_world() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
+    collect_retired_reads();
     GRAVEYARD.with(|graveyard| graveyard.borrow_mut().clear());
     crate::layout::forget_pictures();
     LIVE.with(|live| *live.borrow_mut() = Live::default());
