@@ -817,7 +817,11 @@ function applyPatches(view, length) {
     if (mask & 64) {
       const response = f32();
       f32(); // damping — the CSS side keeps the duration
-      style.transition = `background-color ${response}s ease-out, transform ${response}s ease-out`;
+      // every colour the engine's springs move — the fill, the ink,
+      // the border, the halo — and the transform
+      style.transition = ["background-color", "color", "border-color", "box-shadow", "transform"]
+        .map((property) => `${property} ${response}s ease-out`)
+        .join(", ");
     }
     // the action path, the tooltip and the group owned are the
     // element's own (ops 19 and 24): a look carries none, but the

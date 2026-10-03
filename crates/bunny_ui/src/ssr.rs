@@ -871,10 +871,13 @@ fn rule_text(
         shadows.push(format!("0 0 {} {}", px(radius), color(shadow)));
     }
     if let Some((response, _)) = style.transition {
-        base.insert(
-            "transition",
-            format!("background-color {response}s ease-out, transform {response}s ease-out"),
-        );
+        // every colour the engine's springs move — the fill, the ink,
+        // the border, the halo — and the transform
+        let eased: Vec<String> = ["background-color", "color", "border-color", "box-shadow", "transform"]
+            .iter()
+            .map(|property| format!("{property} {response}s ease-out"))
+            .collect();
+        base.insert("transition", eased.join(", "));
     }
     if let Some(focus) = style.focus_border {
         states.push(format!("{selector}:focus{{border-color:{c};caret-color:{c}}}", c = color(focus)));
