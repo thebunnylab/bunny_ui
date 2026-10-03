@@ -69,6 +69,15 @@ pub enum ImageSource {
     /// CPU/headless renderers never download it implicitly. The producer must
     /// publish only completed frames and retain resources through this owner.
     Native { key: u64, size: (u32, u32), payload: std::sync::Arc<dyn std::any::Any + Send + Sync> },
+    /// A picture whose BYTES change every frame and whose identity does
+    /// not — a camera, a decoded video, a chart redrawing itself. `key`
+    /// is the SLOT: the texture a tier keeps for it. `generation` moves
+    /// with every new frame and rides the equality, so a new frame is
+    /// damage while the slot stays the same texture. The GPU scales it
+    /// to its box with a linear sampler; nothing is resampled on the
+    /// CPU, nothing is minted per frame, and the shared atlas never
+    /// hears of it. [`ImageFeed`] is the handle that mints these.
+    Feed { key: u64, generation: u64, size: (u32, u32), format: PixelFormat, bytes: Rc<[u8]> },
     /// Any source, seen through a VEIL — what `.opacity(…)` leaves for
     /// the pixel pipelines, where there is no offscreen layer to fade.
     /// The fade rides the identity, so the compositor, the GPU atlas
@@ -84,6 +93,7 @@ const ICON_TAG: u64 = 0x62_6e_79_5f_69_63_6f_6e; // "bny_icon"
 const PATH_TAG: u64 = 0x62_6e_79_5f_70_61_74_68; // "bny_path"
 const FADE_TAG: u64 = 0x62_6e_79_5f_66_61_64_65; // "bny_fade"
 const RGBA_TAG: u64 = 0x62_6e_79_5f_72_67_62_61; // "bny_rgba"
+const FEED_TAG: u64 = 0x626e_795f_6665_6564; // "bny_feed"
 
 fn fx_hash(tag: u64, bytes: &[u8]) -> u64 {
     let mut hasher = motor::hash::FxHasher::default();
@@ -126,6 +136,25 @@ impl ImageSource {
             "an RGBA buffer is width × height × 4 bytes"
         );
         ImageSource::Rgba { key: key ^ RGBA_TAG, size, rgba }
+    }
+
+    /// One frame of a feed, for an app that keeps its own slots and
+    /// counts its own frames — [`ImageFeed`] does both for everyone
+    /// else. `generation` must climb with every new frame of the slot;
+    /// the bytes are straight RGBA, `width × height × 4`.
+    pub fn feed(
+        key: FeedKey,
+        generation: u64,
+        size: (u32, u32),
+        rgba: impl Into<Rc<[u8]>>,
+    ) -> ImageSource {
+        let bytes = rgba.into();
+        debug_assert_eq!(
+            bytes.len(),
+            PixelFormat::Rgba8.bytes_for(size),
+            "an RGBA feed frame is width × height × 4 bytes"
+        );
+        ImageSource::Feed { key: key.0, generation, size, format: PixelFormat::Rgba8, bytes }
     }
 
     /// A tinted glyph — built at PLACEMENT, where the ink is known.
@@ -302,6 +331,12 @@ impl ImageSource {
         let mut hasher = motor::hash::FxHasher::default();
         hasher.write_u64(FADE_TAG);
         hasher.write_u64(inner.key());
+        // a feed's key is its SLOT: the veil over frame 40 must not be
+        // the veil over frame 41, or the faded cache would show a stale
+        // picture through it
+        if let ImageSource::Feed { generation, .. } = &*inner {
+            hasher.write_u64(*generation);
+        }
         hasher.write_u8(alpha);
         ImageSource::Faded { key: hasher.finish(), inner, alpha }
     }
@@ -315,6 +350,7 @@ impl ImageSource {
             | ImageSource::Path { key, .. }
             | ImageSource::Native { key, .. }
             | ImageSource::Rgba { key, .. }
+            | ImageSource::Feed { key, .. }
             | ImageSource::Faded { key, .. } => *key,
         }
     }
@@ -354,6 +390,17 @@ impl PartialEq for ImageSource {
                 ImageSource::Native { key, size, .. },
                 ImageSource::Native { key: other_key, size: other_size, .. },
             ) => key == other_key && size == other_size,
+            // the slot AND the frame: two generations of one feed are two
+            // images to the damage diff, one texture to the tier
+            (
+                ImageSource::Feed { key, generation, size, .. },
+                ImageSource::Feed {
+                    key: other_key,
+                    generation: other_generation,
+                    size: other_size,
+                    ..
+                },
+            ) => key == other_key && generation == other_generation && size == other_size,
             (
                 ImageSource::Rgba { key, .. },
                 ImageSource::Rgba { key: other_key, .. },
@@ -394,6 +441,9 @@ impl fmt::Debug for ImageSource {
             ImageSource::Native { key, size, .. } => write!(f, "native(0x{key:016x}, {}×{})", size.0, size.1),
             ImageSource::Rgba { key, size, .. } => {
                 write!(f, "rgba(0x{key:016x}, {}×{})", size.0, size.1)
+            }
+            ImageSource::Feed { key, generation, size, .. } => {
+                write!(f, "feed(0x{key:016x}, {}×{} #{generation})", size.0, size.1)
             }
             ImageSource::Faded { inner, alpha, .. } => {
                 write!(f, "faded({inner:?}, {alpha})")
@@ -489,6 +539,15 @@ pub fn raster_source(
                 rgba: resample_rgba(rgba, *size, width, height),
             }))
         }
+        // a feed scales BILINEAR, like the sampler the GPU tiers read it
+        // with, once per generation and size — the damage replay asks
+        // several times a frame
+        ImageSource::Feed { key, generation, size, format, bytes } => {
+            if width == 0 || height == 0 || size.0 == 0 || size.1 == 0 {
+                return None;
+            }
+            Some(feed_raster(*key, *generation, *size, *format, bytes, width, height))
+        }
         ImageSource::Faded { key, inner, alpha } => {
             fade_raster(*key, engine, inner, *alpha, width, height)
         }
@@ -512,7 +571,9 @@ pub fn intrinsic_of(engine: &dyn ImageEngine, source: &ImageSource) -> Option<(u
             Some((box_size.0.round() as u32, box_size.1.round() as u32))
         }
         // the app declared its own box when it handed the pixels over
-        ImageSource::Rgba { size, .. } | ImageSource::Native { size, .. } => Some(*size),
+        ImageSource::Rgba { size, .. }
+        | ImageSource::Native { size, .. }
+        | ImageSource::Feed { size, .. } => Some(*size),
         // a veil never changes a size
         ImageSource::Faded { inner, .. } => intrinsic_of(engine, inner),
         _ => engine.intrinsic(source),
@@ -557,6 +618,260 @@ fn fade_raster(
         cache.insert((key, width, height), Rc::clone(&faded));
     });
     Some(faded)
+}
+
+// MARK: - Feeds: a picture whose bytes change and whose identity stays
+
+/// The pixel layout of a feed's bytes. RGBA8 today; a planar layout
+/// (NV12, I420) would be named here, with an upload arm per ground and
+/// a conversion in the shader — the enum is open for it.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PixelFormat {
+    /// Straight RGBA, 8 bits a channel, row major: `width × height × 4`.
+    Rgba8,
+}
+
+impl PixelFormat {
+    /// How many bytes `size` pixels take in this layout.
+    pub fn bytes_for(self, size: (u32, u32)) -> usize {
+        match self {
+            PixelFormat::Rgba8 => size.0 as usize * size.1 as usize * 4,
+        }
+    }
+}
+
+/// The identity of one feed — the SLOT a tier keeps a texture for. An
+/// app that numbers its own slots builds one with [`FeedKey::new`]; the
+/// keys [`ImageFeed::new`] mints keep the top bit set, so the two never
+/// meet while the app's numbers stay below it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FeedKey(u64);
+
+impl FeedKey {
+    /// A slot of the app's own numbering.
+    pub fn new(slot: u64) -> FeedKey {
+        FeedKey(slot ^ FEED_TAG)
+    }
+
+    /// The number the tiers know the slot by.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// The slots `ImageFeed::new` mints, counted once for the process — a
+/// feed made on any thread never shares a slot with another.
+static NEXT_FEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct FeedFrame {
+    generation: u64,
+    size: (u32, u32),
+    bytes: Rc<[u8]>,
+}
+
+/// The app's end of a feed: a picture whose BYTES change every frame
+/// and whose identity does not — a camera, a decoded video, a chart
+/// that redraws itself. Mint one per picture and keep it; `push` the
+/// bytes as they arrive; draw it like any image:
+///
+/// ```ignore
+/// let camera = ImageFeed::new();                 // once, in state
+/// camera.push((640, 360), rgba);                 // per frame
+/// image(&camera).resizable().aspect_ratio(ContentMode::Fill)
+/// painter.image(rect, &camera);
+/// ```
+///
+/// Every tier keeps ONE texture per feed, sized to the picture,
+/// replaces its bytes in place when the generation moves, and scales it
+/// to its box on the GPU with a linear sampler. No resample on the CPU,
+/// no texture per frame, and the shared atlas never hears of it. The
+/// CPU oracle scales it bilinear, so the two roads agree within a step.
+#[derive(Clone)]
+pub struct ImageFeed {
+    key: FeedKey,
+    latest: Rc<RefCell<FeedFrame>>,
+}
+
+impl Default for ImageFeed {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ImageFeed {
+    /// An empty feed with a slot of its own. Nothing paints until the
+    /// first `push`.
+    pub fn new() -> ImageFeed {
+        let serial = NEXT_FEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        ImageFeed {
+            key: FeedKey((serial | (1 << 63)) ^ FEED_TAG),
+            latest: Rc::new(RefCell::new(FeedFrame {
+                generation: 0,
+                size: (0, 0),
+                bytes: Rc::from(Vec::new()),
+            })),
+        }
+    }
+
+    /// The next frame: straight RGBA, `width × height × 4`. Answers the
+    /// generation it became. One `Rc` move — no hash, no copy.
+    pub fn push(&self, size: (u32, u32), rgba: impl Into<Rc<[u8]>>) -> u64 {
+        let bytes = rgba.into();
+        debug_assert_eq!(
+            bytes.len(),
+            PixelFormat::Rgba8.bytes_for(size),
+            "an RGBA feed frame is width × height × 4 bytes"
+        );
+        let mut latest = self.latest.borrow_mut();
+        latest.generation = latest.generation.wrapping_add(1);
+        latest.size = size;
+        latest.bytes = bytes;
+        latest.generation
+    }
+
+    /// The slot.
+    pub fn key(&self) -> FeedKey {
+        self.key
+    }
+
+    /// How many frames were pushed — zero while the feed is empty.
+    pub fn generation(&self) -> u64 {
+        self.latest.borrow().generation
+    }
+
+    /// The picture's size, once something was pushed.
+    pub fn size(&self) -> Option<(u32, u32)> {
+        let latest = self.latest.borrow();
+        (latest.generation != 0).then_some(latest.size)
+    }
+
+    /// The newest frame as a source — what `image(&feed)` and
+    /// `painter.image(rect, &feed)` take through `Into`.
+    pub fn source(&self) -> ImageSource {
+        let latest = self.latest.borrow();
+        ImageSource::Feed {
+            key: self.key.0,
+            generation: latest.generation,
+            size: latest.size,
+            format: PixelFormat::Rgba8,
+            bytes: Rc::clone(&latest.bytes),
+        }
+    }
+}
+
+impl From<&ImageFeed> for ImageSource {
+    fn from(feed: &ImageFeed) -> ImageSource {
+        feed.source()
+    }
+}
+
+impl From<ImageFeed> for ImageSource {
+    fn from(feed: ImageFeed) -> ImageSource {
+        feed.source()
+    }
+}
+
+/// How many feed rasters stay warm — one per feed and size on screen.
+/// A feed is a camera or a video: a handful on a screen, never a crowd.
+const FEED_KEEP: usize = 32;
+
+struct FeedRaster {
+    generation: u64,
+    raster: Rc<ImageRaster>,
+}
+
+thread_local! {
+    static FEEDS: RefCell<HashMap<(u64, usize, usize), FeedRaster>> =
+        RefCell::new(HashMap::default());
+}
+
+/// The feed's newest frame at one physical size, bilinear — once per
+/// generation and size. The CPU surface replays a command once per
+/// damage rect, and a video frame under three rects must cost one
+/// resample, not three.
+fn feed_raster(
+    key: u64,
+    generation: u64,
+    size: (u32, u32),
+    format: PixelFormat,
+    bytes: &[u8],
+    width: usize,
+    height: usize,
+) -> Rc<ImageRaster> {
+    let slot = (key, width, height);
+    let warm = FEEDS.with(|cache| {
+        cache.borrow().get(&slot).and_then(|feed| {
+            (feed.generation == generation).then(|| Rc::clone(&feed.raster))
+        })
+    });
+    if let Some(raster) = warm {
+        return raster;
+    }
+    let rgba = match format {
+        PixelFormat::Rgba8 => resample_rgba_bilinear(bytes, size, width, height),
+    };
+    let raster = Rc::new(ImageRaster { width, height, rgba });
+    FEEDS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= FEED_KEEP && !cache.contains_key(&slot) {
+            cache.clear();
+        }
+        cache.insert(slot, FeedRaster { generation, raster: Rc::clone(&raster) });
+    });
+    raster
+}
+
+/// Bilinear into the destination size, every channel on its own over
+/// straight alpha — the arithmetic a GPU's linear sampler does over the
+/// same texels, in 16.16 fixed point so every machine agrees. At 1:1 it
+/// is a copy, byte for byte; a source shorter than its size paints
+/// nothing rather than reading past its end.
+fn resample_rgba_bilinear(
+    source: &[u8],
+    (src_w, src_h): (u32, u32),
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
+    let (src_w, src_h) = (src_w as usize, src_h as usize);
+    if src_w == 0 || src_h == 0 || source.len() < src_w * src_h * 4 {
+        return vec![0u8; width * height * 4];
+    }
+    if src_w == width && src_h == height {
+        return source[..width * height * 4].to_vec();
+    }
+    // destination pixel `i` of `n` samples the source of `m` at
+    // (i + ½)·m/n − ½: the texel below, the one after it, and the
+    // weight between them in 8 bits — clamped at both edges
+    let axis = |n: usize, m: usize| -> Vec<(usize, usize, u32)> {
+        (0..n)
+            .map(|i| {
+                let centred = (((2 * i as u64 + 1) * m as u64) << 16) / (2 * n as u64);
+                let fixed = centred.saturating_sub(1 << 15);
+                let low = ((fixed >> 16) as usize).min(m - 1);
+                let high = (low + 1).min(m - 1);
+                let weight = ((fixed & 0xffff) >> 8) as u32;
+                (low, high, weight)
+            })
+            .collect()
+    };
+    let columns = axis(width, src_w);
+    let rows = axis(height, src_h);
+    let mut rgba = vec![0u8; width * height * 4];
+    for (y, &(y0, y1, wy)) in rows.iter().enumerate() {
+        let (row0, row1) = (y0 * src_w, y1 * src_w);
+        for (x, &(x0, x1, wx)) in columns.iter().enumerate() {
+            let at = |row: usize, col: usize| &source[(row + col) * 4..(row + col) * 4 + 4];
+            let (p00, p01, p10, p11) = (at(row0, x0), at(row0, x1), at(row1, x0), at(row1, x1));
+            let to = (y * width + x) * 4;
+            for channel in 0..4 {
+                let top = p00[channel] as u32 * (256 - wx) + p01[channel] as u32 * wx;
+                let bottom = p10[channel] as u32 * (256 - wx) + p11[channel] as u32 * wx;
+                rgba[to + channel] = ((top * (256 - wy) + bottom * wy + (1 << 15)) >> 16) as u8;
+            }
+        }
+    }
+    rgba
 }
 
 // MARK: - RawImages, the default engine
@@ -658,6 +973,7 @@ impl ImageEngine for RawImages {
             | ImageSource::Path { .. }
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
+            | ImageSource::Feed { .. }
             | ImageSource::Faded { .. } => {
                 // the door intercepts what the house draws before any
                 // engine — a regression at a call site should be LOUD
@@ -690,6 +1006,7 @@ impl ImageEngine for RawImages {
             | ImageSource::Path { .. }
             | ImageSource::Native { .. }
             | ImageSource::Rgba { .. }
+            | ImageSource::Feed { .. }
             | ImageSource::Faded { .. } => {
                 debug_assert!(false, "a house drawing never reaches an engine");
                 return None;
@@ -821,6 +1138,86 @@ mod tests {
         for (solid, faded) in before.iter().zip(&after) {
             assert_eq!(*faded, ((*solid as u32 * 128 + 127) / 255) as u8);
         }
+    }
+
+    // MARK: - Feeds
+
+    #[test]
+    fn a_feed_changes_its_bytes_but_not_its_identity() {
+        let feed = ImageFeed::new();
+        assert_eq!(feed.generation(), 0);
+        assert_eq!(feed.size(), None, "nothing was pushed yet");
+        let empty = feed.source();
+        assert!(
+            raster_source(&RawImages::default(), &empty, 4, 4).is_none(),
+            "an empty feed paints nothing"
+        );
+
+        assert_eq!(feed.push((2, 1), vec![255, 0, 0, 255, 0, 0, 255, 255]), 1);
+        let first = feed.source();
+        assert_eq!(feed.push((2, 1), vec![0, 255, 0, 255, 0, 0, 255, 255]), 2);
+        let second = feed.source();
+        // the slot is the identity the tiers keep a texture by…
+        assert_eq!(first.key(), second.key());
+        assert_eq!(first.key(), feed.key().raw());
+        // …and the generation is what makes a new frame a new image to
+        // the damage diff
+        assert_ne!(first, second);
+        assert_eq!(second, feed.source());
+        assert_eq!(feed.size(), Some((2, 1)));
+        assert_eq!(intrinsic_of(&RawImages::default(), &second), Some((2, 1)));
+        assert_eq!(
+            format!("{second:?}"),
+            format!("feed(0x{:016x}, 2×1 #2)", feed.key().raw())
+        );
+        // two feeds never share a slot, and an app's own slot never
+        // meets a minted one
+        assert_ne!(ImageFeed::new().key(), feed.key());
+        assert_ne!(FeedKey::new(1).raw(), ImageFeed::new().key().raw());
+        assert_eq!(ImageSource::feed(FeedKey::new(9), 3, (1, 1), vec![1, 2, 3, 4]).key(), FeedKey::new(9).raw());
+    }
+
+    #[test]
+    fn a_feed_resamples_bilinear_and_is_exact_at_one_to_one() {
+        let engine = RawImages::default();
+        let feed = ImageFeed::new();
+        // red | blue, one row
+        feed.push((2, 1), vec![255, 0, 0, 255, 0, 0, 255, 255]);
+        let exact = raster_source(&engine, &feed.source(), 2, 1).expect("pixels");
+        assert_eq!(exact.rgba, vec![255, 0, 0, 255, 0, 0, 255, 255], "1:1 is a copy");
+        // four across: the two outer pixels sit on their texels, the two
+        // inner ones a quarter of the way into the other — never nearest
+        let wide = raster_source(&engine, &feed.source(), 4, 1).expect("pixels");
+        assert_eq!(&wide.rgba[0..4], &[255, 0, 0, 255], "the left edge clamps to red");
+        assert_eq!(&wide.rgba[12..16], &[0, 0, 255, 255], "the right edge clamps to blue");
+        let (second, third) = (&wide.rgba[4..8], &wide.rgba[8..12]);
+        assert!(second[0] > 128 && second[2] < 128, "mostly red: {second:?}");
+        assert!(third[0] < 128 && third[2] > 128, "mostly blue: {third:?}");
+        assert_eq!(second[0] + second[2], third[0] + third[2], "the ramp is symmetric");
+        // down: the one pixel is the middle of the row
+        let narrow = raster_source(&engine, &feed.source(), 1, 1).expect("pixels");
+        assert_eq!(&narrow.rgba[..], &[128, 0, 128, 255]);
+        // the same generation at the same size is the same allocation —
+        // the damage replay never resamples twice
+        let again = raster_source(&engine, &feed.source(), 4, 1).expect("pixels");
+        assert!(Rc::ptr_eq(&wide, &again));
+        feed.push((2, 1), vec![0, 255, 0, 255, 0, 255, 0, 255]);
+        let fresh = raster_source(&engine, &feed.source(), 4, 1).expect("pixels");
+        assert!(!Rc::ptr_eq(&wide, &fresh), "a new generation is a new raster");
+        assert_eq!(&fresh.rgba[0..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn a_veil_over_a_feed_follows_the_generation() {
+        let engine = RawImages::default();
+        let feed = ImageFeed::new();
+        feed.push((1, 1), vec![255, 255, 255, 255]);
+        let first = feed.source().faded(0.5);
+        feed.push((1, 1), vec![0, 0, 0, 255]);
+        let second = feed.source().faded(0.5);
+        assert_ne!(first.key(), second.key(), "the veil's identity moves with the frame");
+        let shown = raster_source(&engine, &second, 1, 1).expect("pixels");
+        assert_eq!(&shown.rgba[..], &[0, 0, 0, 128], "the veil shows the NEW frame");
     }
 
     #[test]

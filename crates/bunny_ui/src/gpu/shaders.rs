@@ -247,6 +247,25 @@ void main() {
 }
 "#;
 
+/// A feed's sprite: the picture is its own size and the box is another,
+/// so the sampler scales — linear — from the pixel's centre in the box
+/// to its place in the picture. `v_tex` is the picture's extent, `v_dest`
+/// the box; the ratio between them is the scale.
+pub const LIVE_FRAG_BODY: &str = r#"
+flat in vec4 v_dest;
+flat in vec4 v_tex;
+out vec4 out_color;
+uniform sampler2D atlas;
+
+void main() {
+    vec2 p = raster_p();
+    vec2 ratio = (v_tex.zw - v_tex.xy) / (v_dest.zw - v_dest.xy);
+    vec2 texel = v_tex.xy + (p - v_dest.xy) * ratio;
+    vec4 ink = texture(atlas, texel / vec2(textureSize(atlas, 0)));
+    out_color = vec4(ink.rgb, ink.a * clip_cov(p));
+}
+"#;
+
 // the scene's corner pass: the CPU road multiplies the corner squares
 // of its ARGB backing by the rounded-window coverage (premultiplied);
 // the GPU twin draws the same four squares with dst *= coverage —
@@ -553,12 +572,13 @@ mod tests {
 
     /// Every source a tier concatenates, by name, so a new one cannot
     /// join the set without joining the guards below.
-    const BODIES: [(&str, &str); 12] = [
+    const BODIES: [(&str, &str); 13] = [
         ("SHARED_FRAG", SHARED_FRAG),
         ("RECT_VERT", RECT_VERT),
         ("RECT_FRAG_BODY", RECT_FRAG_BODY),
         ("SPRITE_VERT", SPRITE_VERT),
         ("SPRITE_FRAG_BODY", SPRITE_FRAG_BODY),
+        ("LIVE_FRAG_BODY", LIVE_FRAG_BODY),
         ("MASK_VERT", MASK_VERT),
         ("MASK_FRAG_BODY", MASK_FRAG_BODY),
         ("FULL_VERT", FULL_VERT),

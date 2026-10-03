@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, raster_source};
+use crate::image_engine::{ImageEngine, ImageRaster, ImageSource, PixelFormat, raster_source};
 use crate::layout::{Color, Corners, DisplayList, DrawCommand, Rect};
 use crate::raster::physical_extent;
 use crate::text_engine::{FontKey, FontSpec, TextEngine};
@@ -212,6 +212,24 @@ pub trait AtlasGround {
     /// through its in-flight present. Native frames do not enter the atlas cache.
     fn import_native(&mut self, _source: &ImageSource) -> Option<u64> { None }
 
+    /// A texture of its own for one feed, sized to the PICTURE and
+    /// sampled LINEAR, whose bytes `update_live` replaces in place —
+    /// never a shelf, never a dedicated texture, never the collector's
+    /// business. `None` = this tier cannot, and the feed paints nothing.
+    fn make_live(&mut self, _w: u32, _h: u32, _format: PixelFormat) -> Option<u64> {
+        None
+    }
+    /// The whole picture's bytes replaced — `w`×`h`, the texture's own
+    /// size — ordered after every frame still sampling the texture.
+    /// `pitch_px` is the row length in pixels, as for `upload_shared`.
+    /// `false` = the tier could not take the bytes this walk (a staging
+    /// arena with no room); the walk keeps the old generation and asks
+    /// again on the retry.
+    fn update_live(&mut self, _id: u64, _w: u32, _h: u32, _bytes: &[u8], _pitch_px: u32) -> bool {
+        false
+    }
+    fn drop_live(&mut self, _id: u64) {}
+
     /// The shared texture exists at `size`×`size` (create if absent).
     fn ensure_shared(&mut self, size: u32) -> bool;
     /// One tile of straight-RGBA rows into virgin shared space.
@@ -351,6 +369,9 @@ pub struct ImageEntry {
 pub enum ResolvedImage<'a> {
     Tiles(&'a ImageEntry),
     Dedicated(u64, u32, u32),
+    /// A feed's own texture, at the PICTURE's size — the destination is
+    /// another, and the tier's linear sampler bridges the two.
+    Live(u64, u32, u32),
 }
 
 /// The shelf ceiling: taller goes dedicated (uniform shelf heights
@@ -362,6 +383,12 @@ const DEDICATED_AREA: u32 = 512 * 512;
 /// A frame that reads more keeps them all: the collector can only take
 /// a texture no walk needs.
 const DEDICATED_KEEP: usize = 8;
+/// Feeds kept warm between frames: a camera or a video is a handful on a
+/// screen, never a crowd. A frame that reads more keeps them all.
+pub const LIVE_KEEP: usize = 16;
+/// Walks a feed may go unread before its texture is given back — a tile
+/// that scrolled away, a call that ended. Two seconds of frames.
+pub const LIVE_IDLE_WALKS: u64 = 120;
 
 /// The text-and-image side of the GPU frame: the DATA of one shared
 /// atlas, keyed by (font, color, scale, content) and by (source,
@@ -383,6 +410,10 @@ pub struct RunAtlas {
     /// frame that needs more than the cap keeps every one: asking the
     /// collector again would be a livelock.
     pub dedicated: HashMap<(u64, u32, u32), Dedicated>,
+    /// Feeds, by slot: one texture each, sized to the picture, replaced
+    /// in place when the generation moves. Outside the collector's reach
+    /// — a reset leaves them standing — and retired on idleness instead.
+    pub live: HashMap<u64, LiveEntry>,
     /// The walk in progress: `build_frame` opens one per attempt, and
     /// every dedicated read stamps its texture with it.
     pub walk: u64,
@@ -400,6 +431,22 @@ pub struct Dedicated {
     pub walk: u64,
 }
 
+/// One feed's texture: the ground's handle, the picture's size and
+/// layout, the generation the texture holds, and the last walk that
+/// read it.
+pub struct LiveEntry {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
+    pub generation: u64,
+    pub walk: u64,
+    /// The texture may not hold its generation's bytes: a reset threw
+    /// the frame's uploads away (a staging arena that grew), so the next
+    /// resolve uploads again whatever the generation says.
+    pub stale: bool,
+}
+
 impl RunAtlas {
     pub fn new() -> RunAtlas {
         RunAtlas {
@@ -408,6 +455,7 @@ impl RunAtlas {
             entries: HashMap::new(),
             images: HashMap::new(),
             dedicated: HashMap::new(),
+            live: HashMap::new(),
             walk: 0,
             reset_walk: 0,
         }
@@ -444,7 +492,91 @@ impl RunAtlas {
             ground.drop_dedicated(entry.id);
         }
         self.dedicated.clear();
+        // the feeds stay: their textures are their own, written in place
+        // and never in virgin space, so a reset has nothing to give back
+        // from them — and a camera must not go dark because text
+        // overflowed. Their bytes are asked for again: a tier that threw
+        // this frame's uploads away with the reset uploads them anew
+        for entry in self.live.values_mut() {
+            entry.stale = true;
+        }
         self.reset_walk = self.walk;
+    }
+
+    /// Gives back the feeds no walk read for [`LIVE_IDLE_WALKS`] walks.
+    /// `build_frame` asks at the end of every walk.
+    pub fn retire_live(&mut self, ground: &mut dyn AtlasGround) {
+        let walk = self.walk;
+        let idle: Vec<u64> = self
+            .live
+            .iter()
+            .filter(|(_, entry)| walk.wrapping_sub(entry.walk) > LIVE_IDLE_WALKS)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in idle {
+            if let Some(entry) = self.live.remove(&key) {
+                ground.drop_live(entry.id);
+            }
+        }
+    }
+
+    /// One texture per feed, sized to the picture: minted on first
+    /// sight, its bytes replaced when the generation moved, read as it
+    /// is when not. Never the shelves, never the collector — a feed that
+    /// paints thirty times a second must never ask the atlas to drain.
+    /// `None` = an empty feed, or a tier with no live textures.
+    fn resolve_live(
+        &mut self,
+        ground: &mut dyn AtlasGround,
+        key: u64,
+        generation: u64,
+        size: (u32, u32),
+        format: PixelFormat,
+        bytes: &[u8],
+    ) -> Option<ResolvedImage<'_>> {
+        if size.0 == 0 || size.1 == 0 || bytes.len() < format.bytes_for(size) {
+            return None;
+        }
+        let walk = self.walk;
+        if let Some(entry) = self.live.get_mut(&key) {
+            if (entry.width, entry.height, entry.format) == (size.0, size.1, format) {
+                if (entry.stale || entry.generation != generation)
+                    && ground.update_live(entry.id, size.0, size.1, bytes, size.0)
+                {
+                    entry.generation = generation;
+                    entry.stale = false;
+                }
+                entry.walk = walk;
+                return Some(ResolvedImage::Live(entry.id, entry.width, entry.height));
+            }
+            // a picture that changed size takes a texture of the new size
+            if let Some(stale) = self.live.remove(&key) {
+                ground.drop_live(stale.id);
+            }
+        }
+        if self.live.len() >= LIVE_KEEP {
+            // the slot nobody read this walk, idle the longest, makes
+            // room; a frame that reads more than the cap keeps every one
+            let oldest = self
+                .live
+                .iter()
+                .filter(|(_, entry)| entry.walk != walk)
+                .min_by_key(|(_, entry)| entry.walk)
+                .map(|(key, _)| *key);
+            if let Some(gone) = oldest.and_then(|key| self.live.remove(&key)) {
+                ground.drop_live(gone.id);
+            }
+        }
+        let id = ground.make_live(size.0, size.1, format)?;
+        // a texture that could not take its first bytes shows nothing
+        // rather than garbage; the generation stays behind so the retry
+        // uploads them
+        let stale = !ground.update_live(id, size.0, size.1, bytes, size.0);
+        self.live.insert(
+            key,
+            LiveEntry { id, width: size.0, height: size.1, format, generation, walk, stale },
+        );
+        Some(ResolvedImage::Live(id, size.0, size.1))
     }
 
     /// The tiles for one run — warm from the map, or rasterized by the
@@ -540,9 +672,14 @@ impl RunAtlas {
         };
         if matches!(source, ImageSource::Native { .. }) {
             // Native frames belong to the presenter's in-flight ring, not the
-            // image atlas. A video stream must never trigger atlas GC/fence waits.
+            // image atlas. A video stream must never trigger atlas GC/fence
+            // waits. The frame is the picture's own size and the box another:
+            // it rides the live pipeline, scaled by the linear sampler.
             return Ok(ground.import_native(source)
-                .map(|id| ResolvedImage::Dedicated(id, width, height)));
+                .map(|id| ResolvedImage::Live(id, width, height)));
+        }
+        if let ImageSource::Feed { key, generation, size, format, bytes } = source {
+            return Ok(self.resolve_live(ground, *key, *generation, *size, *format, bytes));
         }
         let cache_key = (source.key(), width, height);
         let walk = self.walk;
@@ -631,7 +768,7 @@ impl RunAtlas {
     pub fn footprint(&self) -> (usize, u32) {
         let entries: usize = self.entries.values().map(Vec::len).sum();
         (
-            entries + self.images.len() + self.dedicated.len(),
+            entries + self.images.len() + self.dedicated.len() + self.live.len(),
             self.packer.next_y,
         )
     }
@@ -701,6 +838,10 @@ pub enum RunKind {
     /// Sprites read from a DEDICATED texture (an image too big for the
     /// shared atlas) — the index points into the frame's texture list.
     Texture(u16),
+    /// Sprites read from a feed's LIVE texture — the picture's own size,
+    /// scaled to the destination by the tier's linear sampler. The index
+    /// points into the same texture list.
+    Live(u16),
 }
 
 #[derive(Clone, Copy)]
@@ -1107,6 +1248,28 @@ pub fn build_frame(
                             batches.sprites.len() - 1,
                         );
                     }
+                    // the picture's own texels under the destination's
+                    // box: the sprite carries both, the live shader scales
+                    Some(ResolvedImage::Live(id, tex_w, tex_h)) => {
+                        let index = match batches.textures.iter().position(|t| *t == id) {
+                            Some(index) => index,
+                            None => {
+                                batches.textures.push(id);
+                                batches.textures.len() - 1
+                            }
+                        };
+                        batches.sprites.push(SpriteInstance {
+                            dest: [dest.0 as f32, dest.1 as f32, dest.2 as f32, dest.3 as f32],
+                            tex: [0.0, 0.0, tex_w as f32, tex_h as f32],
+                            clip: [clip.0 as f32, clip.1 as f32, clip.2 as f32, clip.3 as f32],
+                        });
+                        note_run(
+                            &mut batches.runs,
+                            RunKind::Live(index as u16),
+                            round_of(&clips),
+                            batches.sprites.len() - 1,
+                        );
+                    }
                 }
             }
             DrawCommand::PushClip { rect, corner_radius } => {
@@ -1146,6 +1309,7 @@ pub fn build_frame(
             }
         }
     }
+    atlas.retire_live(ground);
     Ok(())
 }
 
@@ -1182,6 +1346,12 @@ pub struct RecordingGround {
     pub dedicated: Vec<(u64, u32, u32)>,
     /// How many times the copying collector wiped the shared texture.
     pub drops: usize,
+    /// Live textures standing, by handle and size.
+    pub live: Vec<(u64, u32, u32)>,
+    /// How many times a live texture's bytes were replaced.
+    pub live_updates: usize,
+    /// How many live textures were given back.
+    pub live_drops: usize,
     next: u64,
 }
 
@@ -1217,6 +1387,24 @@ impl AtlasGround for RecordingGround {
 
     fn drop_dedicated(&mut self, id: u64) {
         self.dedicated.retain(|(held, _, _)| *held != id);
+    }
+
+    fn make_live(&mut self, w: u32, h: u32, _format: PixelFormat) -> Option<u64> {
+        self.next += 1;
+        self.live.push((self.next, w, h));
+        Some(self.next)
+    }
+
+    fn update_live(&mut self, id: u64, w: u32, h: u32, bytes: &[u8], pitch_px: u32) -> bool {
+        assert!(self.live.iter().any(|(held, _, _)| *held == id), "a live texture that stands");
+        assert!(bytes.len() >= (h as usize - 1) * pitch_px as usize * 4 + w as usize * 4);
+        self.live_updates += 1;
+        true
+    }
+
+    fn drop_live(&mut self, id: u64) {
+        self.live.retain(|(held, _, _)| *held != id);
+        self.live_drops += 1;
     }
 }
 
@@ -1579,6 +1767,150 @@ mod tests {
         assert!(present(&mut ground, &mut atlas, &photos(12, 50, (40.0, 130.0))));
         assert_eq!(atlas.dedicated.len(), 12, "the collector took the stale textures");
         assert_eq!(ground.dedicated.len(), 12, "and the ground dropped them");
+    }
+
+    /// One feed over `rect`, as a frame to walk.
+    fn feed_frame(feed: &crate::image_engine::ImageFeed, size: (f64, f64)) -> DisplayList {
+        let mut display = DisplayList::default();
+        display.push(DrawCommand::Image {
+            rect: crate::layout::Rect {
+                origin: crate::layout::Point { x: 10.0, y: 10.0 },
+                size: crate::layout::Size { width: size.0, height: size.1 },
+            },
+            source: feed.source(),
+        });
+        display
+    }
+
+    /// A new frame of `w`×`h` for `feed`, with `tint` in every byte.
+    fn push_frame(feed: &crate::image_engine::ImageFeed, (w, h): (u32, u32), tint: u8) {
+        feed.push((w, h), vec![tint; w as usize * h as usize * 4]);
+    }
+
+    #[test]
+    fn a_feed_keeps_one_texture_across_a_hundred_generations() {
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let feed = crate::image_engine::ImageFeed::new();
+        for generation in 0..100u8 {
+            push_frame(&feed, (64, 36), generation);
+            assert!(present(&mut ground, &mut atlas, &feed_frame(&feed, (600.0, 338.0))));
+        }
+        assert_eq!(ground.live.len(), 1, "one texture for one feed");
+        assert_eq!(ground.live[0], (ground.live[0].0, 64, 36), "sized to the PICTURE, not the box");
+        assert_eq!(ground.live_updates, 100, "every generation replaced its bytes");
+        assert!(ground.dedicated.is_empty(), "a feed is never a dedicated texture");
+        assert!(atlas.dedicated.is_empty() && atlas.images.is_empty());
+        assert_eq!(ground.drops, 0, "and never a reset");
+    }
+
+    #[test]
+    fn a_still_feed_uploads_nothing() {
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let feed = crate::image_engine::ImageFeed::new();
+        push_frame(&feed, (8, 8), 7);
+        let frame = feed_frame(&feed, (80.0, 80.0));
+        assert!(present(&mut ground, &mut atlas, &frame));
+        assert!(present(&mut ground, &mut atlas, &frame));
+        assert!(present(&mut ground, &mut atlas, &frame));
+        assert_eq!(ground.live_updates, 1, "the same generation is read as it is");
+    }
+
+    #[test]
+    fn a_reset_asks_the_feeds_for_their_bytes_again() {
+        // a tier whose reset threw the frame's uploads away must not be
+        // left with a texture that never got its generation's bytes
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let feed = crate::image_engine::ImageFeed::new();
+        push_frame(&feed, (8, 8), 1);
+        let frame = feed_frame(&feed, (80.0, 80.0));
+        assert!(present(&mut ground, &mut atlas, &frame));
+        assert_eq!(ground.live_updates, 1);
+        atlas.reset(&mut ground, false);
+        assert_eq!(ground.live.len(), 1, "the reset leaves the feed's texture standing");
+        assert!(present(&mut ground, &mut atlas, &frame));
+        assert_eq!(ground.live_updates, 2, "and its bytes were uploaded again");
+        assert!(present(&mut ground, &mut atlas, &frame));
+        assert_eq!(ground.live_updates, 2, "once");
+    }
+
+    #[test]
+    fn a_feed_that_changes_size_takes_a_new_texture() {
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let feed = crate::image_engine::ImageFeed::new();
+        push_frame(&feed, (64, 36), 1);
+        assert!(present(&mut ground, &mut atlas, &feed_frame(&feed, (300.0, 200.0))));
+        push_frame(&feed, (32, 18), 2);
+        assert!(present(&mut ground, &mut atlas, &feed_frame(&feed, (300.0, 200.0))));
+        assert_eq!(ground.live.len(), 1);
+        assert_eq!((ground.live[0].1, ground.live[0].2), (32, 18));
+        assert_eq!(ground.live_drops, 1, "the old size was given back");
+    }
+
+    #[test]
+    fn a_feed_beside_a_crowd_never_asks_the_collector() {
+        // twelve photos over the dedicated cap, warm, and a feed changing
+        // under them every frame: the collector has stale textures to
+        // take only if something asks — and a feed never asks
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let feed = crate::image_engine::ImageFeed::new();
+        for generation in 0..20u8 {
+            push_frame(&feed, (64, 36), generation);
+            let mut frame = photos(12, 10, (40.0, 130.0));
+            frame.extend(feed_frame(&feed, (200.0, 112.0)));
+            assert!(present(&mut ground, &mut atlas, &frame));
+        }
+        assert_eq!(atlas.reset_walk, 0, "no walk ever reset the atlas");
+        assert_eq!(ground.drops, 0);
+        assert_eq!(atlas.dedicated.len(), 12);
+        assert_eq!(ground.live_updates, 20);
+    }
+
+    #[test]
+    fn an_idle_feed_retires_after_its_grace() {
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let feed = crate::image_engine::ImageFeed::new();
+        push_frame(&feed, (8, 8), 1);
+        assert!(present(&mut ground, &mut atlas, &feed_frame(&feed, (80.0, 80.0))));
+        let empty = DisplayList::default();
+        for _ in 0..LIVE_IDLE_WALKS {
+            assert!(present(&mut ground, &mut atlas, &empty));
+        }
+        assert_eq!(ground.live.len(), 1, "within the grace the texture stands");
+        assert!(present(&mut ground, &mut atlas, &empty));
+        assert!(ground.live.is_empty(), "one walk past it, the texture is given back");
+        assert!(atlas.live.is_empty());
+    }
+
+    #[test]
+    fn a_feed_is_its_own_run_kind() {
+        let mut ground = RecordingGround::default();
+        let mut atlas = RunAtlas::new();
+        let mut batches = FrameBatches::default();
+        let feed = crate::image_engine::ImageFeed::new();
+        push_frame(&feed, (64, 36), 1);
+        build_frame(
+            &mut ground,
+            &feed_frame(&feed, (600.0, 338.0)),
+            2,
+            (2000, 1000),
+            &crate::text_engine::PixelFont,
+            &RawImages::default(),
+            &mut atlas,
+            &mut batches,
+        )
+        .expect("the frame walks");
+        assert_eq!(batches.runs.len(), 1);
+        assert_eq!(batches.runs[0].kind, RunKind::Live(0));
+        assert_eq!(batches.textures.len(), 1);
+        let sprite = &batches.sprites[0];
+        assert_eq!(sprite.tex, [0.0, 0.0, 64.0, 36.0], "the texels are the picture's");
+        assert_eq!(sprite.dest, [20.0, 20.0, 1220.0, 696.0], "the box is the destination's");
     }
 
     #[test]
