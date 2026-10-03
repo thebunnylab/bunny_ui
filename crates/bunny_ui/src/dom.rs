@@ -2524,7 +2524,8 @@ fn remove_all_children(
     let mut leaving = leaving;
     for retained in &mut leaving {
         // a whole row leaves: the template question is the row's, once
-        // — a member below it cannot outlive its root
+        // — a member below it cannot outlive its root; a template the
+        // row holds leaves as the walk passes its root
         if !ctx.templates.members.is_empty() {
             ctx.templates.touched(retained.id);
         }
@@ -2591,6 +2592,14 @@ fn forget_subtree_into(
     match &retained.node.kind {
         DomKind::Group { path } => {
             ctx.group_paths.remove(path);
+            // a template inside a row that leaves whole, the row none
+            // itself (it holds this one): the row's question never
+            // reached it, and left standing it would hand out copies of
+            // an element no longer on the page. Only a group is a
+            // template's root
+            if !ask_templates && !ctx.templates.roots.is_empty() {
+                ctx.templates.forget_root(retained.id);
+            }
         }
         DomKind::Canvas { .. } => {
             ctx.islands.remove(&retained.id);
@@ -6773,6 +6782,75 @@ mod tests {
             !grown.iter().any(|p| matches!(p, DomPatch::Move { .. })),
             "an insert never moves a survivor: {grown:#?}"
         );
+    }
+
+    /// A row that holds a template is none itself — so when the rows
+    /// leave whole, the row's question reaches no template, and the one
+    /// inside it must leave with it: a template left standing hands the
+    /// next row built around it a copy of an element no longer on the
+    /// page, and every row copied from that one inherits the hole.
+    #[test]
+    fn a_template_inside_a_row_leaves_with_the_row() {
+        let mut lowering = DomLowering::default();
+        let display = crate::layout::DisplayList::default();
+        let leaf = || DomNode { kind: DomKind::Box, ..flow_row("") };
+        // each row a component holding one of its own after a leaf
+        let rows = |ids: std::ops::Range<usize>| {
+            flow_root(
+                ids.map(|id| {
+                    let mut inner = flow_row(&format!("L/[{id}]/Item/#1/Inner"));
+                    inner.children = vec![leaf()];
+                    let mut row = flow_row(&format!("L/[{id}]/Item"));
+                    row.children = vec![leaf(), inner];
+                    row
+                })
+                .collect(),
+            )
+        };
+        // every template stands on an element of the page, and every
+        // copy the frame made is of one
+        fn assert_live(lowering: &DomLowering, patches: &[DomPatch]) {
+            fn walk(retained: &Retained, live: &mut std::collections::HashSet<u32>) {
+                live.insert(retained.id);
+                for child in &retained.children {
+                    walk(child, live);
+                }
+            }
+            let mut live = std::collections::HashSet::new();
+            if let Some(root) = &lowering.root {
+                walk(root, &mut live);
+            }
+            for root in lowering.templates.roots.keys() {
+                assert!(live.contains(root), "template {root} stands on a removed element");
+            }
+            for patch in patches {
+                if let DomPatch::Clone { template, .. } = patch {
+                    assert!(live.contains(template), "a copy of a removed template {template}");
+                }
+            }
+        }
+        let built = |patches: &[DomPatch]| {
+            let creates = patches.iter().filter(|p| matches!(p, DomPatch::Create { .. })).count();
+            let clones = patches.iter().filter(|p| matches!(p, DomPatch::Clone { .. })).count();
+            (creates, clones)
+        };
+
+        // row 1 holds the inner template; row 2 is built around a copy
+        // of it and is the template rows 3 and 4 copy
+        let mount = lowering.lower(rows(1..5), &display);
+        assert_live(&lowering, &mount);
+        assert_eq!(built(&mount), (6, 3), "{mount:#?}");
+
+        let cleared = lowering.lower(rows(5..5), &display);
+        assert!(cleared.iter().any(|p| matches!(p, DomPatch::RemoveChildren { .. })), "{cleared:#?}");
+        assert_live(&lowering, &cleared);
+        assert!(lowering.templates.roots.is_empty(), "no row is left to be a template");
+        assert!(lowering.templates.members.is_empty());
+
+        // a run after the clear builds as the mount did
+        let again = lowering.lower(rows(5..9), &display);
+        assert_live(&lowering, &again);
+        assert_eq!(built(&again), built(&mount), "{again:#?}");
     }
 
     /// A flow node's layout travels as ONE record — and its geometry
