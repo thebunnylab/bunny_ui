@@ -25,7 +25,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 13;
+const EXPECTED_ABI = 14;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -152,41 +152,227 @@ function sendText(text) {
   wasm.bunny_text(pointer, bytes.length);
 }
 const elements = new Map([[0, app]]);
-// Pseudo-STATE rules only (:hover, :active, :focus, ::placeholder),
-// one CSSRule object per declaration, keyed by element id. Everything
-// a resting element shows lives inline on the element — the style
-// placement law, shared with the server-side serializer. Pseudo rules
-// carry !important because an inline declaration outranks the sheet.
-const pseudoRules = new Map();
+// The looks the page wears: one rule per distinct look, inserted once
+// and never removed. An element wears a look by CLASS, so a thousand
+// rows that look alike share one rule — and the browser shares their
+// computed style, where an inline declaration per element gave each
+// its own. The class doubles in the selector so the rule outranks a
+// page's own class rules, as the inline declaration did; a state rule
+// (:hover, :active, :focus, ::placeholder) outranks the base by its
+// pseudo-class alone, so none carries !important any more.
+const looks = new Map(); // the look's high word -> (low word -> class)
+const defined = new Set(); // the classes whose rules this page inserted
 
-function dropPseudo(id) {
-  const live = pseudoRules.get(id);
-  if (!live) return;
-  const styles = sheet.sheet;
-  for (const rule of live) {
-    const rules = styles.cssRules;
-    // reverse scan: recent elements die young and sit near the end
-    for (let i = rules.length - 1; i >= 0; i--) {
-      if (rules[i] === rule) {
-        styles.deleteRule(i);
-        break;
-      }
-    }
+// The class a look is worn by: base36 of its two words, the
+// serializer's spelling — a served page and a mounted one agree.
+function lookName(hi, lo) {
+  let inner = looks.get(hi);
+  if (!inner) {
+    inner = new Map();
+    looks.set(hi, inner);
   }
-  pseudoRules.delete(id);
+  let name = inner.get(lo);
+  if (name === undefined) {
+    name = "b_" + ((BigInt(hi >>> 0) << 32n) | BigInt(lo >>> 0)).toString(36);
+    inner.set(lo, name);
+  }
+  return name;
 }
 
-function setPseudo(id, texts) {
-  dropPseudo(id);
-  if (!texts.length) return;
+function defineLook(hi, lo, kind, flags, style, layout, face) {
+  const name = lookName(hi, lo);
+  if (defined.has(name)) return;
+  defined.add(name);
   const styles = sheet.sheet;
-  const live = [];
-  for (const text of texts) {
-    const at = styles.cssRules.length;
-    styles.insertRule(text, at);
-    live.push(styles.cssRules[at]);
+  for (const rule of lookRules(`.${name}.${name}`, kind, flags, style, layout, face)) {
+    styles.insertRule(rule, styles.cssRules.length);
   }
-  pseudoRules.set(id, live);
+}
+
+// A group crosses as a NUMBER in two words; its anchor on the page is
+// the decimal of the whole, the serializer's spelling.
+function u64text(hi, lo) {
+  return ((BigInt(hi >>> 0) << 32n) | BigInt(lo >>> 0)).toString();
+}
+
+// The declarations a kind brings along — what createElement wrote
+// inline before looks were shared (ssr::kind_shape, mirrored).
+const KIND_BASE = [
+  // 0 group, 1 box: a wrapper is a COLUMN, not a block — the engine
+  // proposes its box to the child, and only a flex line can hand the
+  // offer down (width by the stretch default, height by the fill flag)
+  "display:flex;flex-direction:column;box-sizing:border-box;min-width:0;min-height:0",
+  "display:flex;flex-direction:column;box-sizing:border-box;min-width:0;min-height:0",
+  // 2 text: the browser breaks the lines in this mode — pre-wrap keeps
+  // the engine's explicit newlines and wraps the rest
+  "box-sizing:border-box;min-width:0;min-height:0;white-space:pre-wrap;cursor:default",
+  // 3 field: the padding mirrors the engine's FIELD_PAD; every color
+  // and border arrives through the look — the theme owns the chrome
+  "box-sizing:border-box;padding:5px 8px;outline:none",
+  // 4 scroll
+  "box-sizing:border-box;min-width:0;min-height:0;overflow:auto;scroll-behavior:smooth",
+  // 5 content: hosts virtual rows at absolute slots
+  "box-sizing:border-box;min-width:0;min-height:0;position:relative",
+  // 6 canvas: position rides the ops
+  "",
+  // 7 image, 8 icon: the box underneath owns the clicks
+  "pointer-events:none",
+  "pointer-events:none",
+  // 9 flex column, 10 flex row: FLOW containers, the browser lays
+  // their children out
+  "display:flex;flex-direction:column;box-sizing:border-box;min-width:0;min-height:0",
+  "display:flex;flex-direction:row;box-sizing:border-box;min-width:0;min-height:0",
+  // 11 layers: one grid cell, everyone in it
+  "display:grid;box-sizing:border-box;min-width:0;min-height:0",
+  // 12 popover: absolute under the root; the glue positions it from
+  // the anchor's real box once the placement round lands
+  "position:absolute;left:0;top:0;box-sizing:border-box",
+  // 13 editor: the field of MANY lines
+  "box-sizing:border-box;padding:5px 8px;outline:none;resize:none;font:inherit",
+  // 14 iframe: the native host's page, pointer events ON
+  "border:0;box-sizing:border-box;min-width:0;min-height:0",
+];
+
+// The rules of one look: the base, then one per state. The twin of the
+// serializer's `rule_text` — a served page must agree with a mounted one.
+function lookRules(selector, kind, flags, style, layout, face) {
+  const decl = {};
+  for (const pair of (KIND_BASE[kind] || "").split(";")) {
+    if (!pair) continue;
+    const at = pair.indexOf(":");
+    decl[pair.slice(0, at)] = pair.slice(at + 1);
+  }
+  if (flags & 1) {
+    // the table family lays itself out — a hinted <tr> must BE a table
+    // row, not a flex box wearing its name: the browser's own display
+    // wins and our flex steps aside
+    delete decl.display;
+    delete decl["flex-direction"];
+    delete decl["min-width"];
+    delete decl["min-height"];
+  } else if (layout.plain) {
+    // no flex box: an inline tag around one child keeps the browser's
+    // own display for the tag
+    delete decl.display;
+    delete decl["flex-direction"];
+  }
+  if (layout.gap !== null) decl.gap = `${layout.gap}px`;
+  if (layout.align !== null) {
+    decl["align-items"] =
+      layout.align === 1 ? "center" : layout.align === 2 ? "flex-end" : layout.align === 3 ? "baseline" : "flex-start";
+  }
+  if (layout.padding) decl.padding = layout.padding.map((side) => `${side}px`).join(" ");
+  if (layout.grow) {
+    // the flexible child — and the classic flex footgun: a zeroed
+    // min-size, or content refuses to shrink
+    decl.flex = "1 1 0";
+    decl["min-width"] = "0";
+    decl["min-height"] = "0";
+  }
+  if (layout.stretch) {
+    // the axis the child left to its container — a flexible island
+    // discovers its real box this way
+    decl["align-self"] = "stretch";
+  }
+  if (layout.fill) {
+    // take the offer, keep the content floor
+    decl.flex = "1 1 auto";
+    decl["min-width"] = "0";
+    decl["min-height"] = "0";
+  }
+  if (layout.wrap !== null) {
+    // a row that wraps: its lines break where its items' widths say
+    decl["flex-wrap"] = "wrap";
+    decl["row-gap"] = `${layout.wrap}px`;
+  }
+  if (style.background) decl["background-color"] = style.background;
+  // background-image sits OVER the flat background
+  if (style.image) decl["background-image"] = style.image;
+  if (style.border) decl.border = style.border;
+  if (style.radius) decl["border-radius"] = style.radius;
+  // the halo and the glass rim share one property
+  if (style.shadows.length) decl["box-shadow"] = style.shadows.join(",");
+  if (style.transition) decl.transition = style.transition;
+  // the ink the subtree INHERITS: the text below sets no color of its
+  // own, so the hover and active rules flip the box at once
+  if (style.ink) decl.color = style.ink;
+  // overflow + the radius already on the box: the browser clips the
+  // subtree to the curve, natively, as a layer
+  if (style.clip) decl.overflow = "hidden";
+  // the fade is a real LAYER here: the browser composites the subtree
+  // once, which the per-command multiply of the pixel pipelines only
+  // approximates
+  if (style.fade !== null) decl.opacity = `${style.fade}`;
+  // a layer that asks for nothing: the click belongs to whatever it covers
+  if (style.passThrough) decl["pointer-events"] = "none";
+  if (style.filter) {
+    decl["backdrop-filter"] = style.filter;
+    decl["-webkit-backdrop-filter"] = style.filter;
+  }
+  if (face) {
+    decl.font = face.font;
+    // AFTER the font shorthand, which resets line-height: 0 means the
+    // face's own box
+    if (face.lineHeight > 0) decl["line-height"] = `${face.lineHeight}px`;
+    // 0 leading — the browser's own default for this direction
+    if (face.align === 1) decl["text-align"] = "center";
+    else if (face.align === 2) decl["text-align"] = "right";
+    // an inherited ink takes NO color: the box above owns both states
+    if (face.color) decl.color = face.color;
+    else delete decl.color;
+    if (face.truncation !== 0) {
+      decl.overflow = "hidden";
+      decl["text-overflow"] = "ellipsis";
+      decl["white-space"] = "nowrap";
+    }
+  }
+  const body = Object.entries(decl)
+    .map(([name, value]) => `${name}:${value}`)
+    .join(";");
+  const rules = [`${selector}{${body}}`];
+  // a follower hangs its states off the GROUP's pointer: the same
+  // rules, hung off the group's selector, so the browser still owns
+  // the hover and a group frame costs no patch; a box without one
+  // listens to its own
+  const on = (state) =>
+    style.group ? `[data-g="${style.group}"]:${state} ${selector}` : `${selector}:${state}`;
+  if (style.hover) rules.push(`${on("hover")}{background-color:${style.hover}}`);
+  if (style.pressed) rules.push(`${on("active")}{background-color:${style.pressed}}`);
+  if (style.hoverInk) rules.push(`${on("hover")}{color:${style.hoverInk}}`);
+  if (style.pressedInk) rules.push(`${on("active")}{color:${style.pressedInk}}`);
+  if (style.hoverFade !== null) rules.push(`${on("hover")}{opacity:${style.hoverFade}}`);
+  if (style.pressedFade !== null) rules.push(`${on("active")}{opacity:${style.pressedFade}}`);
+  if (style.focus) {
+    rules.push(`${selector}:focus{border-color:${style.focus};caret-color:${style.focus}}`);
+  }
+  if (style.placeholder) rules.push(`${selector}::placeholder{color:${style.placeholder}}`);
+  return rules;
+}
+
+// The class attribute: the page's own classes first, the look's last
+// (the serializer's order). An element the glue did not create — a
+// clone, a hydrated one — tells the two apart by the look's spelling.
+const LOOK = /^b_[0-9a-z]+$/;
+
+function learn(el) {
+  if (el.__cls !== undefined) return;
+  let own = "";
+  let look = "";
+  for (const token of (el.getAttribute("class") || "").split(" ")) {
+    if (!token) continue;
+    if (LOOK.test(token)) look = token;
+    else own = own ? `${own} ${token}` : token;
+  }
+  el.__cls = own;
+  el.__look = look;
+}
+
+function dress(el) {
+  const own = el.__cls;
+  const look = el.__look;
+  if (own && look) el.setAttribute("class", `${own} ${look}`);
+  else if (own || look) el.setAttribute("class", own || look);
+  else el.removeAttribute("class");
 }
 
 // Registered images by split key ("hi:lo"): a blob URL the <img>
@@ -297,68 +483,17 @@ function wireScroll(el, id) {
   viewportObserver.observe(el);
 }
 
-// The table family lays itself out — a hinted <tr> must BE a table
-// row, not a flex box wearing its name. For these tags the browser's
-// own display wins and our flex steps aside.
-const TABLE_TAGS = new Set(["table", "thead", "tbody", "tfoot", "tr", "td", "th"]);
-
 function createElementOf(kind, tag) {
-  const el = createElementRaw(kind, tag);
-  if (tag && TABLE_TAGS.has(tag)) {
-    el.style.display = "";
-    el.style.minWidth = "";
-    el.style.minHeight = "";
-  }
-  return el;
-}
-
-function createElementRaw(kind, tag) {
   // 0 group, 1 box, 2 text, 3 field, 4 scroll, 5 content, 6 canvas,
   // 7 image, 8 icon, 9 flex column, 10 flex row, 11 layers, 12 popover,
   // 13 editor — the field of MANY lines, a `<textarea>` —
-  // 14 iframe — the native host's page
-  if (kind === 9 || kind === 10) {
-    // a FLOW container: static, the browser lays its children out
-    const el = document.createElement(tag || "div");
-    el.style.cssText =
-      `display:flex;flex-direction:${kind === 9 ? "column" : "row"};` +
-      "box-sizing:border-box;min-width:0;min-height:0;";
-    el.__flex = true;
-    return el;
-  }
-  if (kind === 11) {
-    // layered children: one grid cell, everyone in it
-    const el = document.createElement(tag || "div");
-    el.style.cssText =
-      "display:grid;box-sizing:border-box;min-width:0;min-height:0;";
-    return el;
-  }
-  if (kind === 12) {
-    // a popover: absolute under the root; the glue positions it from
-    // the anchor's real box once the placement round lands
-    const el = document.createElement(tag || "div");
-    el.style.cssText = "position:absolute;left:0;top:0;box-sizing:border-box;";
-    return el;
-  }
-  if (kind === 6) {
-    const canvas = document.createElement("canvas");
-    // position rides the ops: absolute geometry sets it, flow leaves
-    // the element in the stream
-    canvas.style.cssText = "";
-    return canvas;
-  }
-  if (kind === 14) {
-    // the native host's web lowering: the browser's own island. The
-    // page inside draws, scrolls and reads input by itself — pointer
-    // events stay ON, unlike an img's
-    const frame = document.createElement("iframe");
-    frame.style.cssText = "border:0;box-sizing:border-box;min-width:0;min-height:0;";
-    return frame;
-  }
+  // 14 iframe — the native host's page. The element is born BARE:
+  // every declaration its kind brings along is the look's (op 21),
+  // worn by class — a thousand rows that look alike share one rule
+  if (kind === 6) return document.createElement("canvas");
+  if (kind === 14) return document.createElement("iframe");
   if (kind === 7) {
     const img = document.createElement("img");
-    // the box underneath owns the clicks; our geometry owns the frame
-    img.style.cssText = "pointer-events:none;";
     img.draggable = false;
     return img;
   }
@@ -368,7 +503,6 @@ function createElementRaw(kind, tag) {
     // preserveAspectRatio (xMidYMid meet) is the SAME centred square
     // the rasterizers paint
     svg.setAttribute("viewBox", "0 0 24 24");
-    svg.style.cssText = "pointer-events:none;";
     return svg;
   }
   if (kind === 3 || kind === 13) {
@@ -377,44 +511,10 @@ function createElementRaw(kind, tag) {
     // RECREATED — that is the only way an input becomes a textarea
     const input = document.createElement(kind === 13 ? "textarea" : "input");
     if (kind === 3) input.type = "text";
-    // padding mirrors the engine's FIELD_PAD; every color and border
-    // arrives through the patches — the theme owns the chrome, and no
-    // inline border may outrank the stylesheet rule
-    input.style.cssText =
-      "box-sizing:border-box;padding:5px 8px;outline:none;" +
-      (kind === 13 ? "resize:none;font:inherit;" : "");
     wireInput(input);
     return input;
   }
-  const el = document.createElement(tag || "div");
-  if (kind === 0 || kind === 1) {
-    // a wrapper is a COLUMN, not a block: the engine proposes its box
-    // to the child, and only a flex line can hand the offer down
-    // (width by the stretch default, height by the fill flag)
-    el.style.cssText =
-      "display:flex;flex-direction:column;box-sizing:border-box;" +
-      "min-width:0;min-height:0;";
-    el.__flex = true;
-    return el;
-  }
-  el.style.cssText = "box-sizing:border-box;min-width:0;min-height:0;";
-  if (kind === 2) {
-    // the browser breaks the lines in this mode — pre-wrap keeps the
-    // engine's explicit newlines and wraps the rest
-    el.style.whiteSpace = "pre-wrap";
-    el.style.cursor = "default";
-  }
-  if (kind === 4) {
-    el.style.overflow = "auto";
-    el.style.scrollBehavior = "smooth";
-  }
-  if (kind === 5) {
-    // content hosts virtual rows at absolute slots — the element OWNS
-    // this position: the layout reset restores it, never erases it
-    el.style.position = "relative";
-    el.__pos = "relative";
-  }
-  return el;
+  return document.createElement(tag || "div");
 }
 
 function applyPatches(view, length) {
@@ -442,6 +542,180 @@ function applyPatches(view, length) {
   };
   const text = (count) => decoder.decode(bytes(count));
 
+  // the three records a look is made of, decoded with no element in
+  // hand: a look is defined once (op 21), then worn by class (op 22)
+  const readStyle = () => {
+    // the mask carries twenty-four bits, so it crosses as a u32
+    const mask = u32();
+    const style = {
+      background: null,
+      hover: null,
+      pressed: null,
+      border: null,
+      radius: null,
+      shadows: [],
+      transition: null,
+      focus: null,
+      placeholder: null,
+      ink: null,
+      hoverInk: null,
+      pressedInk: null,
+      image: null,
+      clip: false,
+      fade: null,
+      hoverFade: null,
+      pressedFade: null,
+      group: null,
+      passThrough: false,
+      filter: null,
+    };
+    if (mask & 1) style.background = rgba(u32());
+    if (mask & 2) style.hover = rgba(u32());
+    if (mask & 4) style.pressed = rgba(u32());
+    if (mask & 8) {
+      const borderColor = u32();
+      const borderWidth = f32();
+      style.border = `${borderWidth}px solid ${rgba(borderColor)}`;
+    }
+    // bit 4 is the one radius every corner shares; bit 22 below is the
+    // four, and a box sends one or the other, never both
+    if (mask & 16) style.radius = `${f32()}px`;
+    if (mask & 32) {
+      const radius = f32();
+      style.shadows.push(`0 0 ${radius}px ${rgba(u32())}`);
+    }
+    if (mask & 64) {
+      const response = f32();
+      f32(); // damping — the CSS side keeps the duration
+      style.transition = `background-color ${response}s ease-out, transform ${response}s ease-out`;
+    }
+    // the action path, the tooltip and the group owned are the
+    // element's own (ops 19 and 24): a look carries none, but the
+    // record keeps their bits
+    if (mask & 128) text(u16());
+    if (mask & 256) style.focus = rgba(u32());
+    if (mask & 512) style.placeholder = rgba(u32());
+    if (mask & 1024) style.ink = rgba(u32());
+    if (mask & 2048) style.hoverInk = rgba(u32());
+    if (mask & 4096) style.pressedInk = rgba(u32());
+    // a two-stop ramp: the geometry is the engine's, the pixels are
+    // the browser's
+    if (mask & 8192) {
+      const kind = u8();
+      const [a, b, c, d] = [f32(), f32(), f32(), f32()];
+      const aspect = kind === 0 ? f32() : 1;
+      const near = rgba(u32());
+      const far = rgba(u32());
+      if (kind === 0 && aspect !== 1 && d > 0) {
+        // the ellipse: X radius on the wire, Y is X times the aspect
+        style.image =
+          `radial-gradient(ellipse ${d}px ${d * aspect}px at ` +
+          `${a * 100}% ${b * 100}%, ${near} ${((c / d) * 100).toFixed(2)}%, ${far} 100%)`;
+      } else if (kind === 0) {
+        const reach = d < 0 ? "farthest-corner" : `${d}px`;
+        const stop = d < 0 ? "100%" : `${d}px`;
+        style.image =
+          `radial-gradient(circle ${reach} at ` +
+          `${a * 100}% ${b * 100}%, ${near} ${c}px, ${far} ${stop})`;
+      } else {
+        // CSS runs its line through the centre: the angle carries the
+        // direction (0deg points up, clockwise)
+        const degrees = (Math.atan2(c - a, -(d - b)) * 180) / Math.PI;
+        style.image = `linear-gradient(${degrees.toFixed(2)}deg, ${near}, ${far})`;
+      }
+    }
+    if (mask & 16384) style.clip = true;
+    if (mask & 32768) text(u16());
+    if (mask & 65536) style.fade = f32();
+    if (mask & 131072) style.hoverFade = f32();
+    if (mask & 262144) style.pressedFade = f32();
+    // a box that follows a GROUP takes its states from an ANCESTOR's
+    // pointer. The group crosses as a NUMBER: the browser needs an
+    // anchor to hang a selector on, never the path a person reads
+    if (mask & 524288) style.group = u64text(u32(), u32());
+    if (mask & 1048576) {
+      u32();
+      u32();
+    }
+    if (mask & 2097152) style.passThrough = true;
+    if (mask & 4194304) {
+      // four corners, clockwise from the top left — the CSS order
+      const tl = f32();
+      const tr = f32();
+      const br = f32();
+      const bl = f32();
+      style.radius = `${tl}px ${tr}px ${br}px ${bl}px`;
+    }
+    // liquid glass, the half a browser owns: the blur, the saturation
+    // and the brightness are one native filter over what is BEHIND
+    // the element, and the rim goes on as two inset shadows along the
+    // lit diagonals — the dual lobe the material is known by. The
+    // tint already arrived folded into the background. The lens and
+    // the touch lights stay with the pixel modes: CSS has no
+    // displacement map, and this mode promises the geometry with
+    // native text, never the pixels
+    if (mask & 8388608) {
+      const blur = f32();
+      const saturation = f32();
+      const brightness = f32();
+      const rim = rgba(u32());
+      const band = f32();
+      style.filter = `blur(${blur}px) saturate(${saturation}) brightness(${brightness})`;
+      if (band > 0) {
+        const spread = Math.max(1, band);
+        style.shadows.push(`inset ${spread}px ${spread}px ${spread * 1.5}px ${-spread}px ${rim}`);
+        style.shadows.push(
+          `inset ${-spread}px ${-spread}px ${spread * 1.5}px ${-spread}px ${rim}`,
+        );
+      }
+    }
+    return style;
+  };
+  const readLayout = () => {
+    const mask = u16();
+    const layout = {
+      gap: null,
+      align: null,
+      padding: null,
+      grow: (mask & 128) !== 0,
+      stretch: (mask & 512) !== 0,
+      fill: (mask & 1024) !== 0,
+      wrap: null,
+      plain: (mask & 4096) !== 0,
+    };
+    if (mask & 1) layout.gap = f32();
+    if (mask & 2) layout.align = u8();
+    if (mask & 4) layout.padding = [f32(), f32(), f32(), f32()];
+    // a look carries no box of its own (op 23 does), but the record
+    // keeps the bits
+    if (mask & 8) f32();
+    if (mask & 16) f32();
+    if (mask & 32) f32();
+    if (mask & 64) f32();
+    if (mask & 256) f32();
+    if (mask & 2048) layout.wrap = f32();
+    return layout;
+  };
+  const readFace = () => {
+    const color = rgba(u32());
+    const inheritsInk = u8();
+    const size = f32();
+    const weight = CSS_WEIGHTS[u8()];
+    const mono = u8();
+    const italic = u8();
+    const family = text(u16());
+    const lineHeight = f32();
+    const align = u8();
+    const truncation = u8();
+    return {
+      font: cssFont(size, weight, mono, italic, family),
+      lineHeight,
+      align,
+      color: inheritsInk ? null : color,
+      truncation,
+    };
+  };
+
   // the words of an element: into the one text node it already holds
   // when it holds exactly that — a clone's cell, an updated label —
   // else by replacing the children
@@ -453,10 +727,6 @@ function applyPatches(view, length) {
       el.textContent = words;
     }
   };
-  // the elements born in THIS batch: a fresh element carries no style
-  // yet, so the full-replace ops skip the reset they owe an old one —
-  // a thousand new rows are thousands of style writes never made
-  const fresh = new Set();
   // a removed subtree takes its registrations along: ids are never
   // reused, so a survivor here would leak for the page's whole life
   const unregister = (el) => {
@@ -464,7 +734,6 @@ function applyPatches(view, length) {
       const n = inner.__n;
       if (n === undefined) continue;
       elements.delete(n);
-      dropPseudo(n);
     }
   };
   // fresh siblings gather in fragments and land on the LIVE tree once
@@ -497,6 +766,20 @@ function applyPatches(view, length) {
   const count = u32();
   for (let i = 0; i < count; i++) {
     const op = u8();
+    if (op === 21) {
+      // a look, defined once: its two words, the kind it dresses, the
+      // flags (bit 0: the element lays itself out — the table family),
+      // its style, its flow record and, for a text, its face
+      const hi = u32();
+      const lo = u32();
+      const kind = u8();
+      const flags = u8();
+      const style = readStyle();
+      const layout = readLayout();
+      const face = u8() ? readFace() : null;
+      defineLook(hi, lo, kind, flags, style, layout, face);
+      continue;
+    }
     const id = u32();
     if (op === 1) {
       const parent = u32();
@@ -507,8 +790,9 @@ function applyPatches(view, length) {
       const kind = u8();
       const el = createElementOf(kind, tag);
       el.__n = id;
-      fresh.add(id);
-      if (cls) el.className = cls;
+      el.__cls = cls;
+      el.__look = "";
+      if (cls) el.setAttribute("class", cls);
       if (domId) el.id = domId;
       if (kind === 4) {
         wireScroll(el, id);
@@ -565,7 +849,6 @@ function applyPatches(view, length) {
         el.remove();
       }
       elements.delete(id);
-      dropPseudo(id);
     } else if (op === 18) {
       // the element empties: every child leaves in one call, and the
       // ids that leave come as ranges — a thousand rows mounted
@@ -580,9 +863,6 @@ function applyPatches(view, length) {
         const end = u32();
         spans.push(start, end);
         leaving += end - start;
-        if (pseudoRules.size) {
-          for (let n = start; n < end; n++) dropPseudo(n);
-        }
       }
       if (leaving * 2 > elements.size) {
         // most of the registry leaves: keep the survivors in one pass
@@ -635,251 +915,15 @@ function applyPatches(view, length) {
           el.height = Math.max(1, Math.round(height * dpr));
         }
       }
-    } else if (op === 5) {
-      const el = elements.get(id);
-      // the mask carries twenty-four bits, so it crosses as a u32
-      const mask = u32();
-      // full replace, the record's semantics: what the mask does not
-      // carry, the element does not keep — and a fresh element keeps
-      // nothing yet
-      if (el && !fresh.has(id)) {
-        const style = el.style;
-        style.backgroundColor = "";
-        style.backgroundImage = "";
-        style.border = "";
-        style.borderRadius = "";
-        style.boxShadow = "";
-        style.transition = "";
-        style.color = "";
-        style.overflow = "";
-        style.opacity = "";
-        style.pointerEvents = "";
-        style.backdropFilter = "";
-        style.webkitBackdropFilter = "";
-      }
-      const name = `[data-n="${id}"]`;
-      const pseudo = [];
-      // the halo and the glass rim share one property: collect both and
-      // write a single declaration at the end
-      const shadows = [];
-      // the states are held back until the whole record is read: the
-      // group arrives at bit 19, AFTER the hover and pressed values,
-      // and it decides whose pointer the rule listens to
-      let hover = null;
-      let pressed = null;
-      let hoverInk = null;
-      let pressedInk = null;
-      let hoverFade = null;
-      let pressedFade = null;
-      let group = null;
-      if (mask & 1) {
-        const color = rgba(u32());
-        if (el) el.style.backgroundColor = color;
-      }
-      if (mask & 2) hover = rgba(u32());
-      if (mask & 4) pressed = rgba(u32());
-      if (mask & 8) {
-        const borderColor = u32();
-        const borderWidth = f32();
-        if (el) el.style.border = `${borderWidth}px solid ${rgba(borderColor)}`;
-      }
-      // bit 4 is the one radius every corner shares; bit 22 below is the
-      // four, and a box sends one or the other, never both
-      if (mask & 16) {
-        const radius = f32();
-        if (el) el.style.borderRadius = `${radius}px`;
-      }
-      if (mask & 32) {
-        const radius = f32();
-        shadows.push(`0 0 ${radius}px ${rgba(u32())}`);
-      }
-      if (mask & 64) {
-        const response = f32();
-        f32(); // damping — the CSS side keeps the duration
-        if (el) {
-          el.style.transition =
-            `background-color ${response}s ease-out,` +
-            ` transform ${response}s ease-out`;
-        }
-      }
-      if (mask & 128) {
-        const path = text(u16());
-        if (el) el.dataset.path = path;
-      }
-      if (mask & 256) {
-        const focus = rgba(u32());
-        pseudo.push(
-          `${name}:focus{border-color:${focus} !important;caret-color:${focus}}`,
-        );
-      }
-      if (mask & 512) {
-        pseudo.push(`${name}::placeholder{color:${rgba(u32())}}`);
-      }
-      // the ink the subtree INHERITS: the text below sets no color of
-      // its own, so the hover and active rules flip the box at once
-      if (mask & 1024) {
-        const ink = rgba(u32());
-        if (el) el.style.color = ink;
-      }
-      if (mask & 2048) hoverInk = rgba(u32());
-      if (mask & 4096) pressedInk = rgba(u32());
-      // a two-stop ramp: the geometry is the engine's, the pixels are
-      // the browser's (background-image sits OVER the flat background)
-      if (mask & 8192) {
-        const kind = u8();
-        const [a, b, c, d] = [f32(), f32(), f32(), f32()];
-        const aspect = kind === 0 ? f32() : 1;
-        const near = rgba(u32());
-        const far = rgba(u32());
-        let image;
-        if (kind === 0 && aspect !== 1 && d > 0) {
-          // the ellipse: X radius on the wire, Y is X times the aspect
-          image =
-            `radial-gradient(ellipse ${d}px ${d * aspect}px at ` +
-            `${a * 100}% ${b * 100}%, ${near} ${((c / d) * 100).toFixed(2)}%, ${far} 100%)`;
-        } else if (kind === 0) {
-          const reach = d < 0 ? "farthest-corner" : `${d}px`;
-          const stop = d < 0 ? "100%" : `${d}px`;
-          image =
-            `radial-gradient(circle ${reach} at ` +
-            `${a * 100}% ${b * 100}%, ${near} ${c}px, ${far} ${stop})`;
-        } else {
-          // CSS runs its line through the centre: the angle carries the
-          // direction (0deg points up, clockwise)
-          const degrees = (Math.atan2(c - a, -(d - b)) * 180) / Math.PI;
-          image = `linear-gradient(${degrees.toFixed(2)}deg, ${near}, ${far})`;
-        }
-        if (el) el.style.backgroundImage = image;
-      }
-      if (mask & 16384) {
-        // overflow + the radius already on the box: the browser clips
-        // the subtree to the curve, natively, as a layer
-        if (el) el.style.overflow = "hidden";
-      }
-      if (mask & 32768) {
-        const tip = text(u16());
-        if (el) el.dataset.tip = tip;
-      } else if (el && el.dataset.tip !== undefined) {
-        delete el.dataset.tip;
-      }
-      // the fade is a real LAYER here: the browser composites the
-      // subtree once, which the per-command multiply of the pixel
-      // pipelines only approximates
-      if (mask & 65536) {
-        const fade = f32();
-        if (el) el.style.opacity = `${fade}`;
-      }
-      if (mask & 131072) hoverFade = f32();
-      if (mask & 262144) pressedFade = f32();
-      // a box that follows a GROUP takes its states from an ANCESTOR's
-      // pointer: the same rules, hung off the group's selector, so the
-      // browser still owns the hover and a group frame costs no patch.
-      // The group crosses as a NUMBER: the browser needs an anchor to
-      // hang a selector on, never the path a person reads
-      if (mask & 524288) group = imageKey(u32(), u32());
-      if (mask & 1048576) {
-        const owner = imageKey(u32(), u32());
-        if (el) el.dataset.g = owner;
-      } else if (el && el.dataset.g !== undefined) {
-        delete el.dataset.g;
-      }
-      if (mask & 2097152) {
-        // a layer that asks for nothing: the click belongs to whatever
-        // it covers
-        if (el) el.style.pointerEvents = "none";
-      }
-      if (mask & 4194304) {
-        // four corners, clockwise from the top left — the CSS order
-        const tl = f32();
-        const tr = f32();
-        const br = f32();
-        const bl = f32();
-        if (el) el.style.borderRadius = `${tl}px ${tr}px ${br}px ${bl}px`;
-      }
-      // liquid glass, the half a browser owns: the blur, the saturation
-      // and the brightness are one native filter over what is BEHIND
-      // the element, and the rim goes on as two inset shadows along the
-      // lit diagonals — the dual lobe the material is known by. The
-      // tint already arrived folded into the background. The lens and
-      // the touch lights stay with the pixel modes: CSS has no
-      // displacement map, and this mode promises the geometry with
-      // native text, never the pixels
-      if (mask & 8388608) {
-        const blur = f32();
-        const saturation = f32();
-        const brightness = f32();
-        const rim = rgba(u32());
-        const band = f32();
-        const filter =
-          `blur(${blur}px) saturate(${saturation}) brightness(${brightness})`;
-        if (el) {
-          el.style.backdropFilter = filter;
-          el.style.webkitBackdropFilter = filter;
-        }
-        if (band > 0) {
-          const spread = Math.max(1, band);
-          shadows.push(
-            `inset ${spread}px ${spread}px ${spread * 1.5}px ${-spread}px ${rim}`,
-          );
-          shadows.push(
-            `inset ${-spread}px ${-spread}px ${spread * 1.5}px ${-spread}px ${rim}`,
-          );
-        }
-      }
-      if (shadows.length && el) el.style.boxShadow = shadows.join(",");
-      // a follower hangs its states off the GROUP's pointer; a box
-      // without one listens to its own
-      const on = (state) =>
-        group ? `[data-g="${group}"]:${state} ${name}` : `${name}:${state}`;
-      if (hover) pseudo.push(`${on("hover")}{background:${hover} !important}`);
-      if (pressed) {
-        pseudo.push(`${on("active")}{background:${pressed} !important}`);
-      }
-      if (hoverInk) pseudo.push(`${on("hover")}{color:${hoverInk} !important}`);
-      if (pressedInk) {
-        pseudo.push(`${on("active")}{color:${pressedInk} !important}`);
-      }
-      if (hoverFade !== null) {
-        pseudo.push(`${on("hover")}{opacity:${hoverFade}}`);
-      }
-      if (pressedFade !== null) {
-        pseudo.push(`${on("active")}{opacity:${pressedFade}}`);
-      }
-      // the rules address the element by its attribute: it is written
-      // only for an element that has rules, never for every element
-      if (el && pseudo.length) el.dataset.n = id;
-      setPseudo(id, pseudo);
     } else if (op === 6) {
+      // the words and their spans: the face is the look's
       const el = elements.get(id);
-      const color = rgba(u32());
-      const inheritsInk = u8();
-      const size = f32();
-      const weight = CSS_WEIGHTS[u8()];
-      const mono = u8();
-      const italic = u8();
-      const family = text(u16());
-      const lineHeight = f32();
-      const align = u8();
-      const truncation = u8();
       const raw = bytes(u32());
       const spanCount = u16();
       const spans = [];
       for (let s = 0; s < spanCount; s++) spans.push([u32(), u32()]);
       const spanColor = rgba(u32());
       if (el) {
-        el.style.font = cssFont(size, weight, mono, italic, family);
-        // AFTER the font shorthand, which resets line-height: 0 means
-        // the face's own box, which is what an empty string restores
-        el.style.lineHeight = lineHeight > 0 ? `${lineHeight}px` : "";
-        // 0 leading — the browser's own default for this direction
-        el.style.textAlign = align === 1 ? "center" : align === 2 ? "right" : "";
-        // an inherited ink takes NO inline color: an inline one would
-        // outrank the :hover rule of the box that owns both states
-        el.style.color = inheritsInk ? "" : color;
-        if (truncation !== 0) {
-          el.style.overflow = "hidden";
-          el.style.textOverflow = "ellipsis";
-        }
         if (spanCount === 0) {
           // one write, into the text node that stands when one does
           setWords(el, decoder.decode(raw));
@@ -982,106 +1026,62 @@ function applyPatches(view, length) {
         }
         el.appendChild(path);
       }
-    } else if (op === 11) {
-      // the FULL flow record — reset, then apply what the mask carries;
-      // a fresh element has nothing to reset
+    } else if (op === 22) {
+      // the element wears a look: its class, after the page's own
+      const hi = u32();
+      const lo = u32();
       const el = elements.get(id);
-      const mask = u16();
-      if (el && !fresh.has(id)) {
+      if (el) {
+        learn(el);
+        el.__look = lookName(hi, lo);
+        dress(el);
+      }
+    } else if (op === 23) {
+      // the box the element owns — pinned sizes, ceilings, a virtual
+      // row's slot — the record's semantics: what the mask does not
+      // carry, the element does not keep; a bare element keeps nothing
+      const el = elements.get(id);
+      const mask = u8();
+      const width = mask & 1 ? f32() : null;
+      const height = mask & 2 ? f32() : null;
+      const maxWidth = mask & 4 ? f32() : null;
+      const maxHeight = mask & 8 ? f32() : null;
+      const slotY = mask & 16 ? f32() : null;
+      if (el) {
         const style = el.style;
-        style.gap = "";
-        style.alignItems = "";
-        style.padding = "";
-        style.width = "";
-        style.height = "";
-        style.maxWidth = "";
-        style.maxHeight = "";
-        style.flex = "";
-        style.flexWrap = "";
-        style.rowGap = "";
-        style.minWidth = "0";
-        style.minHeight = "0";
-        style.position = el.__pos || "";
-        style.top = "";
-        style.left = "";
-        style.right = "";
-        style.transform = "";
-        style.alignSelf = "";
-        // a box born flex is flex again unless the record says plain
-        if (el.__flex) style.display = "flex";
-      }
-      const apply = el ? el.style : null;
-      if (mask & 4096 && apply) {
-        // no flex box: an inline tag around one child keeps the
-        // browser's own display for the tag
-        apply.display = "";
-      }
-      if (mask & 1) {
-        const gap = f32();
-        if (apply) apply.gap = `${gap}px`;
-      }
-      if (mask & 2) {
-        const align = u8();
-        if (apply) {
-          apply.alignItems =
-            align === 1 ? "center" : align === 2 ? "flex-end" : align === 3 ? "baseline" : "flex-start";
-        }
-      }
-      if (mask & 4) {
-        const [top, right, bottom, left] = [f32(), f32(), f32(), f32()];
-        if (apply) apply.padding = `${top}px ${right}px ${bottom}px ${left}px`;
-      }
-      if (mask & 8) {
-        const width = f32();
-        if (apply) apply.width = `${width}px`;
-      }
-      if (mask & 16) {
-        const height = f32();
-        if (apply) apply.height = `${height}px`;
-      }
-      if (mask & 32) {
-        const max = f32();
-        if (apply) apply.maxWidth = `${max}px`;
-      }
-      if (mask & 64) {
-        const max = f32();
-        if (apply) apply.maxHeight = `${max}px`;
-      }
-      if (mask & 128 && apply) {
-        // the flexible child — and the classic flex footgun: a zeroed
-        // min-size, or content refuses to shrink
-        apply.flex = "1 1 0";
-        apply.minWidth = "0";
-        apply.minHeight = "0";
-      }
-      if (mask & 256) {
-        const slotY = f32();
-        if (apply) {
+        const dressed = style.length !== 0;
+        if (width !== null) style.width = `${width}px`;
+        else if (dressed) style.width = "";
+        if (height !== null) style.height = `${height}px`;
+        else if (dressed) style.height = "";
+        if (maxWidth !== null) style.maxWidth = `${maxWidth}px`;
+        else if (dressed) style.maxWidth = "";
+        if (maxHeight !== null) style.maxHeight = `${maxHeight}px`;
+        else if (dressed) style.maxHeight = "";
+        if (slotY !== null) {
           // a virtual row: absolute inside its relative content box
-          apply.position = "absolute";
-          apply.top = `${slotY}px`;
-          apply.left = "0";
-          apply.right = "0";
+          style.position = "absolute";
+          style.top = `${slotY}px`;
+          style.left = "0";
+          style.right = "0";
+        } else if (dressed) {
+          style.position = "";
+          style.top = "";
+          style.left = "";
+          style.right = "";
         }
       }
-      if (mask & 512 && apply) {
-        // the axis the child left to its container — a flexible
-        // island discovers its real box this way
-        apply.alignSelf = "stretch";
-      }
-      if (mask & 1024 && apply) {
-        // take the offer, keep the content floor
-        apply.flex = "1 1 auto";
-        apply.minWidth = "0";
-        apply.minHeight = "0";
-      }
-      if (mask & 2048) {
-        // a row that wraps: its lines break where its items' widths say
-        const lineGap = f32();
-        if (apply) {
-          apply.flexWrap = "wrap";
-          apply.rowGap = `${lineGap}px`;
-        }
+    } else if (op === 24) {
+      // the element's marks: the tooltip it shows, the group it owns
+      const el = elements.get(id);
+      const mask = u8();
+      const tip = mask & 1 ? text(u16()) : null;
+      const owner = mask & 2 ? u64text(u32(), u32()) : null;
+      if (el) {
+        if (tip !== null) el.dataset.tip = tip;
+        else if (el.dataset.tip !== undefined) delete el.dataset.tip;
+        if (owner !== null) el.dataset.g = owner;
+        else if (el.dataset.g !== undefined) delete el.dataset.g;
       }
     } else if (op === 12) {
       // one insertBefore, identity intact (0 = to the end)
@@ -1099,7 +1099,9 @@ function applyPatches(view, length) {
       const domId = text(u8());
       const el = elements.get(id);
       if (el) {
-        el.className = cls;
+        learn(el);
+        el.__cls = cls;
+        dress(el);
         if (domId) {
           el.id = domId;
         } else {
@@ -1452,7 +1454,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     wasm = instance.exports;
     if (typeof gpuAttach === "function") gpuAttach(wasm);
     window.__bunny = wasm;
-    window.__bunnyDebug = { elements, pseudoRules };
+    window.__bunnyDebug = { elements, looks };
     // probe builds: the hit table of the last layout, for a runner
     // that clicks what a page without elements cannot select
     if (wasm.bunny_hits_json && wasm.bunny_probe_ptr) {
@@ -1484,9 +1486,10 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
         el.__n = id;
         elements.set(id, el);
         if (el.tagName === "INPUT") wireInput(el);
-        if (el.style.overflow === "auto") wireScroll(el, id);
+        // a scroll box wears its kind as a mark: its look is a class,
+        // which says nothing to a hydration that must wire the wheel
+        if (el.dataset.k === "4") wireScroll(el, id);
         if (el.tagName === "CANVAS") wireIsland(el, id);
-        if (el.style.position === "relative") el.__pos = "relative";
       }
     }
     // the boot bill: fetch+instantiate, then the first frame inside

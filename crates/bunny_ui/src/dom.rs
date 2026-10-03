@@ -910,11 +910,41 @@ pub enum DomPatch {
     SetPath { id: u32, path: Option<Rc<str>> },
     /// The words alone, for a text whose font and ink already stand.
     SetContent { id: u32, text: Arc<str> },
+    /// A look the page shares: one rule in its sheet, worn by every
+    /// element with that look — defined once per distinct look, by the
+    /// hash of what the rule carries (the kind, the shared part of the
+    /// flow record, the shared part of the style, a text's face and
+    /// ink). What is the element's own — its box, its marks, its
+    /// action path — travels beside it.
+    DefineRule {
+        rule: u64,
+        kind: CreateKind,
+        /// Bit 0: the element lays itself out — a table-family tag,
+        /// whose display is the browser's own and takes no flex line.
+        flags: u8,
+        style: Box<DomStyle>,
+        layout: Box<DomLayout>,
+        text: Option<Box<DomText>>,
+    },
+    /// The element wears the look.
+    UseRule { id: u32, rule: u64 },
+    /// The element's own geometry — a pinned width or height, a
+    /// ceiling, a virtual row's slot — inline, the element's and not a
+    /// look's. `None` clears.
+    SetBox {
+        id: u32,
+        width: Option<f32>,
+        height: Option<f32>,
+        max_width: Option<f32>,
+        max_height: Option<f32>,
+        slot_y: Option<f32>,
+    },
+    /// The element's own marks: its tooltip and the hover group it owns.
+    SetMarks { id: u32, tooltip: Option<Arc<str>>, group_owner: Option<u64> },
     SetTransform { id: u32, x: f64, y: f64 },
     SetSize { id: u32, width: f64, height: f64 },
     /// The FULL style record — the glue resets and applies (styles are
     /// small; one write per changed node).
-    SetStyle { id: u32, style: Box<DomStyle> },
     SetText { id: u32, text: Box<DomText> },
     SetField { id: u32, field: Box<DomField> },
     SetScroll { id: u32, x: f64, y: f64 },
@@ -926,7 +956,6 @@ pub enum DomPatch {
     SetIframe { id: u32, src: std::rc::Rc<str>, sealed: bool },
     /// The FULL flow record — the glue resets and applies, the exact
     /// twin of `SetStyle` for the other half of an element's truth.
-    SetLayout { id: u32, layout: Box<DomLayout> },
     /// The element moves before sibling `before` (0 = to the end)
     /// under `parent` — one `insertBefore`, identity intact. Emitted
     /// for flow parents only: absolute children never need it.
@@ -952,6 +981,8 @@ struct Retained {
     id: u32,
     node: DomNode,
     children: Vec<Retained>,
+    /// The look the element wears — the rule's hash.
+    rule: u64,
 }
 
 /// One retained island: its commands already TRANSLATED to island-
@@ -977,6 +1008,8 @@ struct LowerCtx<'a> {
     /// Subtrees that left this frame, kept until an idle moment frees
     /// them: a thousand rows' nodes are freed off the frame's clock.
     graveyard: &'a mut Vec<Retained>,
+    /// The looks the page's sheet already defines, by rule hash.
+    rules: &'a mut motor::hash::FxHashSet<u64>,
 }
 
 /// The retained side of the Dom mode: last frame's scene with ids.
@@ -1005,6 +1038,8 @@ pub struct DomLowering {
     /// Subtrees that left and are not freed yet — see
     /// [`DomLowering::collect_garbage`].
     graveyard: Vec<Retained>,
+    /// The looks the page's sheet defines — a rule is sent once.
+    rules: motor::hash::FxHashSet<u64>,
 }
 
 /// One element a binding drives.
@@ -1037,10 +1072,13 @@ struct Templates {
     members: motor::hash::FxHashMap<u32, u32>,
     /// A root → its members, to forget together.
     members_of: motor::hash::FxHashMap<u32, Vec<u32>>,
+    /// A root → the looks of its members, in pre-order: what a clone's
+    /// members wear, without hashing them again.
+    rules_of: motor::hash::FxHashMap<u32, Rc<[u64]>>,
 }
 
 impl Templates {
-    fn register(&mut self, shape: u64, root: u32, members: Vec<u32>) {
+    fn register(&mut self, shape: u64, root: u32, members: Vec<u32>, rules: Vec<u64>) {
         if self.by_shape.contains_key(&shape) {
             return;
         }
@@ -1050,6 +1088,12 @@ impl Templates {
             self.members.insert(id, root);
         }
         self.members_of.insert(root, members);
+        self.rules_of.insert(root, rules.into());
+    }
+
+    /// The looks of a template's members, in pre-order.
+    fn rules_of(&self, root: u32) -> Rc<[u64]> {
+        self.rules_of.get(&root).cloned().unwrap_or_else(|| Rc::from(Vec::new()))
     }
 
     fn forget_root(&mut self, root: u32) {
@@ -1062,6 +1106,7 @@ impl Templates {
         for id in self.members_of.remove(&root).unwrap_or_default() {
             self.members.remove(&id);
         }
+        self.rules_of.remove(&root);
     }
 
     /// Something other than its words reached a member: the live
@@ -1104,11 +1149,9 @@ impl DomLowering {
                     width: scene.width,
                     height: scene.height,
                 });
-                if scene.style != DomStyle::default() {
-                    patches.push(DomPatch::SetStyle { id: 0, style: Box::new(scene.style.clone()) });
-                }
                 let children = std::mem::take(&mut scene.children);
-                let mut root = Retained { id: 0, node: scene, children: Vec::new() };
+                let rule = look_hash(&scene);
+                let mut root = Retained { id: 0, node: scene, children: Vec::new(), rule };
                 let mut next_id = self.next_id;
                 let mut ctx = LowerCtx {
                     next_id: &mut next_id,
@@ -1118,7 +1161,10 @@ impl DomLowering {
                     bindings: &mut self.bindings,
                     templates: &mut self.templates,
                     graveyard: &mut self.graveyard,
+                    rules: &mut self.rules,
                 };
+                define_rule(rule, &root.node, &mut ctx, &mut patches);
+                patches.push(DomPatch::UseRule { id: 0, rule });
                 root.children = create_children(children, 0, &mut ctx, &mut patches);
                 self.next_id = next_id;
                 self.root = Some(root);
@@ -1133,6 +1179,7 @@ impl DomLowering {
                     bindings: &mut self.bindings,
                     templates: &mut self.templates,
                     graveyard: &mut self.graveyard,
+                    rules: &mut self.rules,
                 };
                 diff_node(root, scene, &mut ctx, &mut patches);
                 self.next_id = next_id;
@@ -1219,10 +1266,13 @@ impl DomLowering {
                 (DomKind::Group { .. }, Some(binding)) => file_class_binding(id, binding, &node.hints, ctx),
                 _ => {}
             }
+            let rule = look_hash(node);
+            ctx.rules.insert(rule);
             let mut retained = Retained {
                 id,
                 node: shallow(node),
                 children: Vec::new(),
+                rule,
             };
             if matches!(node.kind, DomKind::Canvas { .. }) {
                 note_island(id, node, ctx);
@@ -1238,6 +1288,7 @@ impl DomLowering {
         self.islands.clear();
         self.anchors_sent.clear();
         self.graveyard.clear();
+        self.rules.clear();
         let mut next_id = self.next_id;
         let mut ctx = LowerCtx {
             next_id: &mut next_id,
@@ -1247,8 +1298,12 @@ impl DomLowering {
             bindings: &mut self.bindings,
             templates: &mut self.templates,
             graveyard: &mut self.graveyard,
+            rules: &mut self.rules,
         };
-        let mut root = Retained { id: 0, node: shallow(scene), children: Vec::new() };
+        // the page the build painted defined the root's look too
+        let rule = look_hash(scene);
+        ctx.rules.insert(rule);
+        let mut root = Retained { id: 0, node: shallow(scene), children: Vec::new(), rule };
         root.children = scene.children.iter().map(|child| adopt_node(child, &mut ctx)).collect();
         self.next_id = next_id;
         self.root = Some(root);
@@ -1331,7 +1386,7 @@ impl DomLowering {
                     let content = binding.get();
                     if content != shipped.content {
                         shipped.content = content;
-                        patches.push(DomPatch::SetText { id: bound.id, text: Box::new(shipped.clone()) });
+                        patches.push(text_words_patch(bound.id, shipped));
                         crate::stats::note_binding_update();
                     }
                 }
@@ -1451,6 +1506,208 @@ impl DomLowering {
 }
 
 /// The node without its children — what the retention stores per level.
+// MARK: - The look
+
+/// The part of a flow record a rule shares: everything but the
+/// element's own geometry.
+fn look_layout(layout: &DomLayout) -> DomLayout {
+    DomLayout {
+        width: None,
+        height: None,
+        max_width: None,
+        max_height: None,
+        slot_y: None,
+        ..layout.clone()
+    }
+}
+
+/// The part of a style a rule shares: everything but the element's own
+/// action path, tooltip and the group it owns.
+fn look_style(style: &DomStyle) -> DomStyle {
+    DomStyle { interactive: None, tooltip: None, group_owner: None, ..style.clone() }
+}
+
+/// A text's face and ink, without its words.
+fn look_text(text: &DomText) -> DomText {
+    DomText { content: Arc::from(""), highlights: None, ..text.clone() }
+}
+
+fn hash_color(color: Option<Color>, hasher: &mut motor::hash::FxHasher) {
+    use std::hash::Hash;
+    color.map(|color| u32::from_be_bytes([color.r, color.g, color.b, color.a])).hash(hasher);
+}
+
+fn hash_f64(value: Option<f64>, hasher: &mut motor::hash::FxHasher) {
+    use std::hash::Hash;
+    value.map(f64::to_bits).hash(hasher);
+}
+
+/// Does the element lay itself out? The table family's display is the
+/// browser's own: a `<tr>` is a row, never a flex line.
+pub(crate) fn lays_itself_out(hints: &DomHints) -> bool {
+    matches!(
+        hints.tag.as_deref(),
+        Some("table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th")
+    )
+}
+
+/// The hash of a node's look: its kind, the shared part of its flow
+/// record, the shared part of its style and, for a text, its face and
+/// ink. Two elements with one hash wear one rule.
+fn look_hash(node: &DomNode) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = motor::hash::FxHasher::default();
+    lays_itself_out(&node.hints).hash(&mut hasher);
+    let kind: u8 = match &node.kind {
+        DomKind::Root => 0,
+        DomKind::Group { .. } => 1,
+        DomKind::Box => 2,
+        DomKind::Text(_) => 3,
+        DomKind::Field(_) => 4,
+        DomKind::Scroll { .. } => 5,
+        DomKind::Content => 6,
+        DomKind::Canvas { .. } => 7,
+        DomKind::Image(_) => 8,
+        DomKind::Icon(_) => 9,
+        DomKind::Iframe { .. } => 10,
+        DomKind::FlexColumn => 11,
+        DomKind::FlexRow => 12,
+        DomKind::Layers => 13,
+        DomKind::Reuse { .. } => 14,
+        DomKind::Popover { .. } => 15,
+    };
+    kind.hash(&mut hasher);
+    match &node.layout {
+        Some(layout) => {
+            1u8.hash(&mut hasher);
+            hash_f64(layout.gap, &mut hasher);
+            layout.align.hash(&mut hasher);
+            layout
+                .padding
+                .map(|(top, right, bottom, left)| [top.to_bits(), right.to_bits(), bottom.to_bits(), left.to_bits()])
+                .hash(&mut hasher);
+            layout.grow.hash(&mut hasher);
+            layout.stretch.hash(&mut hasher);
+            layout.fill.hash(&mut hasher);
+            hash_f64(layout.wrap, &mut hasher);
+            layout.plain.hash(&mut hasher);
+        }
+        None => 0u8.hash(&mut hasher),
+    }
+    let style = &node.style;
+    hash_color(style.background, &mut hasher);
+    hash_color(style.hover_background, &mut hasher);
+    hash_color(style.pressed_background, &mut hasher);
+    hash_color(style.color, &mut hasher);
+    hash_color(style.hover_color, &mut hasher);
+    hash_color(style.pressed_color, &mut hasher);
+    hash_color(style.focus_border, &mut hasher);
+    hash_color(style.placeholder_color, &mut hasher);
+    style.border.map(|(color, width)| (u32::from_be_bytes([color.r, color.g, color.b, color.a]), width.to_bits())).hash(&mut hasher);
+    style
+        .corner_radius
+        .map(|corners| [corners.top_left.to_bits(), corners.top_right.to_bits(), corners.bottom_right.to_bits(), corners.bottom_left.to_bits()])
+        .hash(&mut hasher);
+    style.shadow.map(|(radius, color)| (radius.to_bits(), u32::from_be_bytes([color.r, color.g, color.b, color.a]))).hash(&mut hasher);
+    style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(&mut hasher);
+    style.clip.hash(&mut hasher);
+    hash_f64(style.opacity, &mut hasher);
+    hash_f64(style.hover_opacity, &mut hasher);
+    hash_f64(style.pressed_opacity, &mut hasher);
+    style.group.hash(&mut hasher);
+    style.pass_through.hash(&mut hasher);
+    match &style.gradient {
+        Some(crate::layout::Gradient::Radial { center, start, end, aspect, inner, outer }) => {
+            1u8.hash(&mut hasher);
+            [center.x.to_bits(), center.y.to_bits(), start.to_bits(), end.unwrap_or(-1.0).to_bits(), aspect.to_bits()].hash(&mut hasher);
+            hash_color(Some(*inner), &mut hasher);
+            hash_color(Some(*outer), &mut hasher);
+        }
+        Some(crate::layout::Gradient::Linear { start, end, from, to }) => {
+            2u8.hash(&mut hasher);
+            [start.x.to_bits(), start.y.to_bits(), end.x.to_bits(), end.y.to_bits()].hash(&mut hasher);
+            hash_color(Some(*from), &mut hasher);
+            hash_color(Some(*to), &mut hasher);
+        }
+        None => 0u8.hash(&mut hasher),
+    }
+    match &style.glass {
+        Some(glass) => {
+            1u8.hash(&mut hasher);
+            [glass.blur.to_bits(), glass.saturation.to_bits(), glass.brightness.to_bits(), glass.rim_band.to_bits()].hash(&mut hasher);
+            hash_color(Some(glass.rim), &mut hasher);
+        }
+        None => 0u8.hash(&mut hasher),
+    }
+    if let DomKind::Text(text) = &node.kind {
+        hash_color(Some(text.color), &mut hasher);
+        text.inherits_ink.hash(&mut hasher);
+        text.font.size.to_bits().hash(&mut hasher);
+        (text.font.weight as u8).hash(&mut hasher);
+        (text.font.design as u8).hash(&mut hasher);
+        (text.font.slant as u8).hash(&mut hasher);
+        text.font.family.name().as_deref().hash(&mut hasher);
+        text.font.tracking.to_bits().hash(&mut hasher);
+        hash_f64(text.line_height, &mut hasher);
+        text.text_align.map(|align| align as u8).hash(&mut hasher);
+        text.truncation.map(|mode| mode as u8).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Sends the look's rule once: the first element to wear it defines it.
+fn define_rule(rule: u64, node: &DomNode, ctx: &mut LowerCtx, patches: &mut Vec<DomPatch>) {
+    if !ctx.rules.insert(rule) {
+        return;
+    }
+    let kind = match &node.kind {
+        DomKind::Root => CreateKind::Group,
+        other => create_kind(other),
+    };
+    patches.push(DomPatch::DefineRule {
+        rule,
+        kind,
+        flags: u8::from(lays_itself_out(&node.hints)),
+        style: Box::new(look_style(&node.style)),
+        layout: Box::new(node.layout.as_ref().map(look_layout).unwrap_or_default()),
+        text: match &node.kind {
+            DomKind::Text(text) => Some(Box::new(look_text(text))),
+            _ => None,
+        },
+    });
+}
+
+/// The element's own geometry, as the box patch carries it.
+fn geometry_of(layout: &DomLayout) -> [Option<f32>; 5] {
+    [
+        layout.width.map(|value| value as f32),
+        layout.height.map(|value| value as f32),
+        layout.max_width.map(|value| value as f32),
+        layout.max_height.map(|value| value as f32),
+        layout.slot_y.map(|value| value as f32),
+    ]
+}
+
+fn box_patch(id: u32, geometry: [Option<f32>; 5]) -> DomPatch {
+    let [width, height, max_width, max_height, slot_y] = geometry;
+    DomPatch::SetBox { id, width, height, max_width, max_height, slot_y }
+}
+
+/// The element's own marks.
+fn marks_of(style: &DomStyle) -> (Option<Arc<str>>, Option<u64>) {
+    (style.tooltip.clone(), style.group_owner)
+}
+
+/// A text's words: alone when nothing is highlighted, with the spans
+/// when something is.
+fn text_words_patch(id: u32, text: &DomText) -> DomPatch {
+    if text.highlights.is_some() {
+        DomPatch::SetText { id, text: Box::new(text.clone()) }
+    } else {
+        DomPatch::SetContent { id, text: Arc::clone(&text.content) }
+    }
+}
+
 /// The node alone, without its subtree. Field by field: a struct
 /// update over `node.clone()` would copy the whole subtree first and
 /// drop it — for the row list's node, nine thousand nodes per frame.
@@ -1606,9 +1863,18 @@ fn create_subtree_before(
 fn clone_instance(
     mut node: DomNode,
     id: u32,
+    rules: &[u64],
+    at: &mut usize,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) -> Retained {
+    // the look is the template's, by position; a template that lost its
+    // list of looks is hashed again
+    let rule = match rules.get(*at) {
+        Some(rule) => *rule,
+        None => look_hash(&node),
+    };
+    *at += 1;
     if let DomKind::Text(text) = &node.kind {
         patches.push(DomPatch::SetContent { id, text: Arc::clone(&text.content) });
         if let Some(binding) = &node.binding {
@@ -1626,10 +1892,10 @@ fn clone_instance(
         .map(|child| {
             let child_id = *ctx.next_id;
             *ctx.next_id += 1;
-            clone_instance(child, child_id, ctx, patches)
+            clone_instance(child, child_id, rules, at, ctx, patches)
         })
         .collect();
-    Retained { id, node, children }
+    Retained { id, node, children, rule }
 }
 
 /// The shape of a subtree, hashed — `None` when the subtree holds
@@ -1646,95 +1912,37 @@ fn shape_of(node: &DomNode) -> Option<u64> {
 
 fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
     use std::hash::Hash;
-    let pack = |color: Color| u32::from_be_bytes([color.r, color.g, color.b, color.a]);
-    let kind: u8 = match &node.kind {
-        DomKind::Group { .. } => 0,
-        DomKind::Box => 1,
-        DomKind::Text(_) => 2,
-        DomKind::FlexColumn => 9,
-        DomKind::FlexRow => 10,
-        DomKind::Layers => 11,
+    // the kinds a clone can carry: the ones with no state of the
+    // browser's own and no identity of their own
+    match &node.kind {
+        DomKind::Group { .. }
+        | DomKind::Box
+        | DomKind::Text(_)
+        | DomKind::FlexColumn
+        | DomKind::FlexRow
+        | DomKind::Layers => {}
         _ => return false,
-    };
-    kind.hash(hasher);
-    if let DomKind::Text(text) = &node.kind {
-        if text.highlights.is_some() {
-            return false;
-        }
-        let font = &text.font;
-        font.size.to_bits().hash(hasher);
-        (font.weight as u8).hash(hasher);
-        (font.design as u8).hash(hasher);
-        (font.slant as u8).hash(hasher);
-        font.family.name().as_deref().hash(hasher);
-        font.tracking.to_bits().hash(hasher);
-        pack(text.color).hash(hasher);
-        text.inherits_ink.hash(hasher);
-        text.line_height.map(f64::to_bits).hash(hasher);
-        text.text_align.map(|align| align as u8).hash(hasher);
-        text.truncation.map(|mode| mode as u8).hash(hasher);
     }
-    if node.hints.dom_id.is_some() {
-        return false;
-    }
-    node.hints.tag.as_deref().hash(hasher);
-    node.hints.class.as_deref().hash(hasher);
-    let Some(layout) = &node.layout else {
-        return false;
-    };
-    layout.gap.map(f64::to_bits).hash(hasher);
-    layout.align.hash(hasher);
-    layout
-        .padding
-        .map(|(top, right, bottom, left)| [top.to_bits(), right.to_bits(), bottom.to_bits(), left.to_bits()])
-        .hash(hasher);
-    layout.width.map(f64::to_bits).hash(hasher);
-    layout.height.map(f64::to_bits).hash(hasher);
-    layout.max_width.map(f64::to_bits).hash(hasher);
-    layout.max_height.map(f64::to_bits).hash(hasher);
-    layout.grow.hash(hasher);
-    layout.slot_y.map(f64::to_bits).hash(hasher);
-    layout.stretch.hash(hasher);
-    layout.fill.hash(hasher);
-    layout.wrap.map(f64::to_bits).hash(hasher);
-    let style = &node.style;
-    if style.hover_background.is_some()
-        || style.pressed_background.is_some()
-        || style.hover_color.is_some()
-        || style.pressed_color.is_some()
-        || style.focus_border.is_some()
-        || style.placeholder_color.is_some()
-        || style.hover_opacity.is_some()
-        || style.pressed_opacity.is_some()
-        || style.group.is_some()
-        || style.group_owner.is_some()
-        || style.glass.is_some()
-        || style.tooltip.is_some()
-        || style.gradient.is_some()
+    if let DomKind::Text(text) = &node.kind
+        && text.highlights.is_some()
     {
         return false;
     }
-    style.background.map(pack).hash(hasher);
-    style.color.map(pack).hash(hasher);
-    style.border.map(|(color, width)| (pack(color), width.to_bits())).hash(hasher);
-    style
-        .corner_radius
-        .map(|corners| {
-            [
-                corners.top_left.to_bits(),
-                corners.top_right.to_bits(),
-                corners.bottom_right.to_bits(),
-                corners.bottom_left.to_bits(),
-            ]
-        })
-        .hash(hasher);
-    style.shadow.map(|(radius, color)| (radius.to_bits(), pack(color))).hash(hasher);
-    style.transition.map(|(response, damping)| (response.to_bits(), damping.to_bits())).hash(hasher);
-    style.clip.hash(hasher);
-    style.opacity.map(f64::to_bits).hash(hasher);
-    style.pass_through.hash(hasher);
+    // an id, a tooltip, a group of its own: the element's, never a shape's
+    if node.hints.dom_id.is_some() || node.style.tooltip.is_some() || node.style.group_owner.is_some() {
+        return false;
+    }
+    let Some(layout) = &node.layout else {
+        return false;
+    };
+    // the look says everything a rule shares; the box and the hints
+    // say the rest the clone must carry byte for byte
+    look_hash(node).hash(hasher);
+    geometry_of(layout).map(|value| value.map(f32::to_bits)).hash(hasher);
+    node.hints.tag.as_deref().hash(hasher);
+    node.hints.class.as_deref().hash(hasher);
     // the action path is the row's own; that there IS one is the shape
-    style.interactive.is_some().hash(hasher);
+    node.style.interactive.is_some().hash(hasher);
     // a binding reads its own value; that there is one is the shape
     node.binding.is_some().hash(hasher);
     node.children.len().hash(hasher);
@@ -1762,7 +1970,9 @@ fn create_subtree(
         *ctx.next_id += 1;
         patches.push(DomPatch::Clone { id, parent, before: 0, template });
         crate::stats::note_clone();
-        return clone_instance(node, id, ctx, patches);
+        let rules = ctx.templates.rules_of(template);
+        let mut at = 0;
+        return clone_instance(node, id, &rules, &mut at, ctx, patches);
     }
     let id = *ctx.next_id;
     *ctx.next_id += 1;
@@ -1776,11 +1986,17 @@ fn create_subtree(
     if let (DomKind::Group { .. }, Some(binding)) = (&node.kind, &node.binding) {
         file_class_binding(id, binding, &node.hints, ctx);
     }
+    // the look is shared; the box, the marks and the path are the
+    // element's own
+    let rule = look_hash(&node);
+    define_rule(rule, &node, ctx, patches);
+    patches.push(DomPatch::UseRule { id, rule });
     match &node.layout {
         // a flow node speaks semantics; its geometry fields are silent
         Some(layout) => {
-            if *layout != DomLayout::default() {
-                patches.push(DomPatch::SetLayout { id, layout: Box::new(layout.clone()) });
+            let geometry = geometry_of(layout);
+            if geometry.iter().any(Option::is_some) {
+                patches.push(box_patch(id, geometry));
             }
         }
         None => {
@@ -1788,12 +2004,16 @@ fn create_subtree(
             patches.push(DomPatch::SetSize { id, width: node.width, height: node.height });
         }
     }
-    if node.style != DomStyle::default() {
-        patches.push(DomPatch::SetStyle { id, style: Box::new(node.style.clone()) });
+    if node.style.tooltip.is_some() || node.style.group_owner.is_some() {
+        let (tooltip, group_owner) = marks_of(&node.style);
+        patches.push(DomPatch::SetMarks { id, tooltip, group_owner });
+    }
+    if let Some(path) = &node.style.interactive {
+        patches.push(DomPatch::SetPath { id, path: Some(Rc::clone(path)) });
     }
     match &node.kind {
         DomKind::Text(text) => {
-            patches.push(DomPatch::SetText { id, text: Box::new(text.clone()) });
+            patches.push(text_words_patch(id, text));
             if let Some(binding) = &node.binding {
                 file_binding(id, binding, text, ctx);
             }
@@ -1818,16 +2038,27 @@ fn create_subtree(
     }
     let children = std::mem::take(&mut node.children);
     let children = create_children(children, id, ctx, patches);
-    let retained = Retained { id, node, children };
+    let retained = Retained { id, node, children, rule };
     // the first of a shape is the template the next ones clone
     if let Some(shape) = shape
         && !ctx.templates.by_shape.contains_key(&shape)
     {
         let mut members = Vec::new();
-        collect_ids(&retained, &mut members);
-        ctx.templates.register(shape, id, members);
+        let mut rules = Vec::new();
+        collect_ids_and_rules(&retained, &mut members, &mut rules);
+        ctx.templates.register(shape, id, members, rules);
     }
     retained
+}
+
+/// Every id and every look of a subtree, in pre-order — the order a
+/// clone is numbered in.
+fn collect_ids_and_rules(retained: &Retained, ids: &mut Vec<u32>, rules: &mut Vec<u64>) {
+    ids.push(retained.id);
+    rules.push(retained.rule);
+    for child in &retained.children {
+        collect_ids_and_rules(child, ids, rules);
+    }
 }
 
 fn create_children(
@@ -1881,13 +2112,6 @@ fn remove_all_children(
     }
     patches.push(DomPatch::RemoveChildren { id: parent, forget: id_ranges(ids) });
     ctx.graveyard.extend(leaving);
-}
-
-fn collect_ids(retained: &Retained, ids: &mut Vec<u32>) {
-    ids.push(retained.id);
-    for child in &retained.children {
-        collect_ids(child, ids);
-    }
 }
 
 /// Sorted ids as half-open ranges `[start, end)`, neighbours merged.
@@ -1959,8 +2183,20 @@ fn diff_node(
         if let Some(layout) = &new.layout
             && retained.node.layout.as_ref() != Some(layout)
         {
-            patches.push(DomPatch::SetLayout { id, layout: Box::new(layout.clone()) });
+            // the stamp changed: the look may have (a flag), the box
+            // may have (a pin) — each travels its own road
+            let was = retained.node.layout.as_ref().map(geometry_of).unwrap_or_default();
             retained.node.layout = Some(layout.clone());
+            let rule = look_hash(&retained.node);
+            if rule != retained.rule {
+                define_rule(rule, &retained.node, ctx, patches);
+                patches.push(DomPatch::UseRule { id, rule });
+                retained.rule = rule;
+            }
+            let now = geometry_of(layout);
+            if now != was {
+                patches.push(box_patch(id, now));
+            }
         }
         if hints_changed(&retained.node, &new) {
             patches.push(DomPatch::SetHints {
@@ -1983,17 +2219,25 @@ fn diff_node(
     let own_patches_from = patches.len();
     let old = &retained.node;
     let new_children = std::mem::take(&mut new.children);
+    // the look, by its hash — a rule the page has not seen is defined
+    let rule = look_hash(&new);
+    if rule != retained.rule {
+        define_rule(rule, &new, ctx, patches);
+        patches.push(DomPatch::UseRule { id, rule });
+    }
     match &new.layout {
         // a flow node speaks semantics — its geometry fields are silent
         Some(layout) => {
-            if old.layout.as_ref() != Some(layout) {
-                patches.push(DomPatch::SetLayout { id, layout: Box::new(layout.clone()) });
+            let was = old.layout.as_ref().map(geometry_of);
+            let now = geometry_of(layout);
+            if was != Some(now) {
+                patches.push(box_patch(id, now));
             }
         }
         None => {
-            // an absolute node that WAS flow clears its record first
+            // an absolute node that WAS flow clears its box first
             if old.layout.is_some() {
-                patches.push(DomPatch::SetLayout { id, layout: Box::new(DomLayout::default()) });
+                patches.push(box_patch(id, [None; 5]));
             }
             if (old.x, old.y) != (new.x, new.y) {
                 patches.push(DomPatch::SetTransform { id, x: new.x, y: new.y });
@@ -2003,8 +2247,12 @@ fn diff_node(
             }
         }
     }
-    if old.style != new.style {
-        patches.push(DomPatch::SetStyle { id, style: Box::new(new.style.clone()) });
+    if marks_of(&old.style) != marks_of(&new.style) {
+        let (tooltip, group_owner) = marks_of(&new.style);
+        patches.push(DomPatch::SetMarks { id, tooltip, group_owner });
+    }
+    if old.style.interactive != new.style.interactive {
+        patches.push(DomPatch::SetPath { id, path: new.style.interactive.clone() });
     }
     let same_binding = same_binding(old, &new);
     if hints_changed(old, &new) {
@@ -2023,16 +2271,17 @@ fn diff_node(
     }
     match (&old.kind, &new.kind) {
         (DomKind::Text(before), DomKind::Text(after)) => {
-            // the content of a text that reads for itself travels on its
-            // own road: the same binding object means the same reads, and
+            // the face is the look's; the words are the element's. The
+            // words of a text that reads for itself travel on their own
+            // road: the same binding object means the same reads, and
             // the retained record may lag the patch already shipped
             let changed = if same_binding {
-                DomText { content: Arc::clone(&before.content), ..after.clone() } != *before
+                before.highlights != after.highlights
             } else {
-                before != after
+                before.content != after.content || before.highlights != after.highlights
             };
             if changed {
-                patches.push(DomPatch::SetText { id, text: Box::new(after.clone()) });
+                patches.push(text_words_patch(id, after));
             }
             match &new.binding {
                 Some(binding) if changed || !same_binding => file_binding(id, binding, after, ctx),
@@ -2082,6 +2331,7 @@ fn diff_node(
     };
     let flow = new.layout.is_some();
     // the node moves into the retention: the children were taken above
+    retained.rule = rule;
     retained.node = new;
     diff_children(retained, new_children, flow, ctx, patches);
     if let Some(target) = followed {
@@ -2432,7 +2682,16 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 /// 13 (2026-10-02): an island's pixels arrive by the rect that changed
 /// (`js_island_rect`, with the box's size and the rect's place and
 /// size) instead of the whole box every time (`js_island` is gone).
-pub const ABI_VERSION: u32 = 13;
+///
+/// 14 (2026-10-03): looks are shared. An element's style, flow record
+/// and text face no longer travel inline per element (ops 5 and 11 are
+/// gone, op 6 carries words and spans alone): a look is defined once
+/// by its hash (op 21, `DefineRule`: kind, style, flow record, text
+/// face) and worn by its class (op 22, `UseRule`); what is the element's
+/// own travels beside it — its box (op 23, `SetBox`: pinned sizes,
+/// ceilings, a virtual row's slot), its marks (op 24, `SetMarks`:
+/// tooltip, hover group owned), its action path (op 19).
+pub const ABI_VERSION: u32 = 14;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -2569,23 +2828,7 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_hint(&mut out, hints.tag.as_deref());
                 push_hint(&mut out, hints.class.as_deref());
                 push_hint(&mut out, hints.dom_id.as_deref());
-                out.push(match kind {
-                    CreateKind::Group => 0,
-                    CreateKind::Box => 1,
-                    CreateKind::Text => 2,
-                    CreateKind::Field => 3,
-                    CreateKind::Scroll => 4,
-                    CreateKind::Content => 5,
-                    CreateKind::Canvas => 6,
-                    CreateKind::Image => 7,
-                    CreateKind::Icon => 8,
-                    CreateKind::FlexColumn => 9,
-                    CreateKind::FlexRow => 10,
-                    CreateKind::Layers => 11,
-                    CreateKind::Popover => 12,
-                    CreateKind::Editor => 13,
-                    CreateKind::Iframe => 14,
-                });
+                out.push(kind_code(*kind));
             }
             DomPatch::Remove { id } => {
                 out.push(2);
@@ -2630,37 +2873,10 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 push_f32(&mut out, *width);
                 push_f32(&mut out, *height);
             }
-            DomPatch::SetStyle { id, style } => {
-                out.push(5);
-                push_u32(&mut out, *id);
-                encode_style(&mut out, style);
-            }
             DomPatch::SetText { id, text } => {
+                // the words and the spans: the face is the look's
                 out.push(6);
                 push_u32(&mut out, *id);
-                push_u32(&mut out, pack_color(text.color));
-                // 1 = take no color of your own; the box above owns it
-                out.push(text.inherits_ink as u8);
-                push_f32(&mut out, text.font.size);
-                out.push(weight_code(text.font.weight));
-                out.push(matches!(text.font.design, FontDesign::Mono) as u8);
-                out.push(matches!(text.font.slant, crate::text_engine::Slant::Italic) as u8);
-                push_family(&mut out, &text.font);
-                // the line box, or 0 for "the face's own" — the browser
-                // steps its lines by the same number our placement does
-                push_f32(&mut out, text.line_height.unwrap_or(0.0));
-                // 0 leading (the default), 1 centre, 2 trailing
-                out.push(match text.text_align {
-                    None | Some(motor::views::TextAlignment::Leading) => 0,
-                    Some(motor::views::TextAlignment::Center) => 1,
-                    Some(motor::views::TextAlignment::Trailing) => 2,
-                });
-                out.push(match text.truncation {
-                    None => 0,
-                    Some(Truncation::Start) => 1,
-                    Some(Truncation::Middle) => 2,
-                    Some(Truncation::End) => 3,
-                });
                 push_bytes_u32(&mut out, text.content.as_bytes());
                 match &text.highlights {
                     Some((ranges, color)) => {
@@ -2739,79 +2955,60 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
                 out.push(u8::from(*sealed));
                 push_bytes_u32(&mut out, src.as_bytes());
             }
-            DomPatch::SetLayout { id, layout } => {
-                out.push(11);
+            DomPatch::DefineRule { rule, kind, flags, style, layout, text } => {
+                out.push(21);
+                push_u32(&mut out, (*rule >> 32) as u32);
+                push_u32(&mut out, *rule as u32);
+                out.push(kind_code(*kind));
+                out.push(*flags);
+                encode_style(&mut out, style);
+                encode_layout(&mut out, layout);
+                match text {
+                    Some(text) => {
+                        out.push(1);
+                        encode_text_look(&mut out, text);
+                    }
+                    None => out.push(0),
+                }
+            }
+            DomPatch::UseRule { id, rule } => {
+                out.push(22);
                 push_u32(&mut out, *id);
-                let mut mask = 0u16;
-                if layout.gap.is_some() {
+                push_u32(&mut out, (*rule >> 32) as u32);
+                push_u32(&mut out, *rule as u32);
+            }
+            DomPatch::SetBox { id, width, height, max_width, max_height, slot_y } => {
+                out.push(23);
+                push_u32(&mut out, *id);
+                let fields = [width, height, max_width, max_height, slot_y];
+                let mut mask = 0u8;
+                for (bit, field) in fields.iter().enumerate() {
+                    if field.is_some() {
+                        mask |= 1 << bit;
+                    }
+                }
+                out.push(mask);
+                for field in fields.into_iter().flatten() {
+                    push_f32(&mut out, *field as f64);
+                }
+            }
+            DomPatch::SetMarks { id, tooltip, group_owner } => {
+                out.push(24);
+                push_u32(&mut out, *id);
+                let mut mask = 0u8;
+                if tooltip.is_some() {
                     mask |= 1;
                 }
-                if layout.align.is_some() {
-                    mask |= 1 << 1;
+                if group_owner.is_some() {
+                    mask |= 2;
                 }
-                if layout.padding.is_some() {
-                    mask |= 1 << 2;
+                out.push(mask);
+                if let Some(tooltip) = tooltip {
+                    push_bytes_u16(&mut out, tooltip.as_bytes());
                 }
-                if layout.width.is_some() {
-                    mask |= 1 << 3;
-                }
-                if layout.height.is_some() {
-                    mask |= 1 << 4;
-                }
-                if layout.max_width.is_some() {
-                    mask |= 1 << 5;
-                }
-                if layout.max_height.is_some() {
-                    mask |= 1 << 6;
-                }
-                if layout.grow {
-                    mask |= 1 << 7;
-                }
-                if layout.slot_y.is_some() {
-                    mask |= 1 << 8;
-                }
-                if layout.stretch {
-                    mask |= 1 << 9;
-                }
-                if layout.fill {
-                    mask |= 1 << 10;
-                }
-                if layout.wrap.is_some() {
-                    mask |= 1 << 11;
-                }
-                if layout.plain {
-                    mask |= 1 << 12;
-                }
-                push_u16(&mut out, mask);
-                if let Some(gap) = layout.gap {
-                    push_f32(&mut out, gap);
-                }
-                if let Some(align) = layout.align {
-                    out.push(align);
-                }
-                if let Some((top, right, bottom, left)) = layout.padding {
-                    push_f32(&mut out, top);
-                    push_f32(&mut out, right);
-                    push_f32(&mut out, bottom);
-                    push_f32(&mut out, left);
-                }
-                if let Some(width) = layout.width {
-                    push_f32(&mut out, width);
-                }
-                if let Some(height) = layout.height {
-                    push_f32(&mut out, height);
-                }
-                if let Some(max_width) = layout.max_width {
-                    push_f32(&mut out, max_width);
-                }
-                if let Some(max_height) = layout.max_height {
-                    push_f32(&mut out, max_height);
-                }
-                if let Some(slot_y) = layout.slot_y {
-                    push_f32(&mut out, slot_y);
-                }
-                if let Some(wrap) = layout.wrap {
-                    push_f32(&mut out, wrap);
+                if let Some(owner) = group_owner {
+                    push_u32(&mut out, (*owner >> 32) as u32);
+                    push_u32(&mut out, *owner as u32);
                 }
             }
             DomPatch::Move { id, parent, before } => {
@@ -3024,6 +3221,128 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     }
 }
 
+fn encode_layout(out: &mut Vec<u8>, layout: &DomLayout) {
+                let mut mask = 0u16;
+                if layout.gap.is_some() {
+                    mask |= 1;
+                }
+                if layout.align.is_some() {
+                    mask |= 1 << 1;
+                }
+                if layout.padding.is_some() {
+                    mask |= 1 << 2;
+                }
+                if layout.width.is_some() {
+                    mask |= 1 << 3;
+                }
+                if layout.height.is_some() {
+                    mask |= 1 << 4;
+                }
+                if layout.max_width.is_some() {
+                    mask |= 1 << 5;
+                }
+                if layout.max_height.is_some() {
+                    mask |= 1 << 6;
+                }
+                if layout.grow {
+                    mask |= 1 << 7;
+                }
+                if layout.slot_y.is_some() {
+                    mask |= 1 << 8;
+                }
+                if layout.stretch {
+                    mask |= 1 << 9;
+                }
+                if layout.fill {
+                    mask |= 1 << 10;
+                }
+                if layout.wrap.is_some() {
+                    mask |= 1 << 11;
+                }
+                if layout.plain {
+                    mask |= 1 << 12;
+                }
+                push_u16(out, mask);
+                if let Some(gap) = layout.gap {
+                    push_f32(out, gap);
+                }
+                if let Some(align) = layout.align {
+                    out.push(align);
+                }
+                if let Some((top, right, bottom, left)) = layout.padding {
+                    push_f32(out, top);
+                    push_f32(out, right);
+                    push_f32(out, bottom);
+                    push_f32(out, left);
+                }
+                if let Some(width) = layout.width {
+                    push_f32(out, width);
+                }
+                if let Some(height) = layout.height {
+                    push_f32(out, height);
+                }
+                if let Some(max_width) = layout.max_width {
+                    push_f32(out, max_width);
+                }
+                if let Some(max_height) = layout.max_height {
+                    push_f32(out, max_height);
+                }
+                if let Some(slot_y) = layout.slot_y {
+                    push_f32(out, slot_y);
+                }
+                if let Some(wrap) = layout.wrap {
+                    push_f32(out, wrap);
+                }
+}
+
+/// A text's face and ink, as a look carries them.
+fn encode_text_look(out: &mut Vec<u8>, text: &DomText) {
+    push_u32(out, pack_color(text.color));
+    // 1 = take no color of your own; the box above owns it
+    out.push(text.inherits_ink as u8);
+    push_f32(out, text.font.size);
+    out.push(weight_code(text.font.weight));
+    out.push(matches!(text.font.design, FontDesign::Mono) as u8);
+    out.push(matches!(text.font.slant, crate::text_engine::Slant::Italic) as u8);
+    push_family(out, &text.font);
+    // the line box, or 0 for "the face's own" — the browser steps its
+    // lines by the same number our placement does
+    push_f32(out, text.line_height.unwrap_or(0.0));
+    // 0 leading (the default), 1 centre, 2 trailing
+    out.push(match text.text_align {
+        None | Some(motor::views::TextAlignment::Leading) => 0,
+        Some(motor::views::TextAlignment::Center) => 1,
+        Some(motor::views::TextAlignment::Trailing) => 2,
+    });
+    out.push(match text.truncation {
+        None => 0,
+        Some(Truncation::Start) => 1,
+        Some(Truncation::Middle) => 2,
+        Some(Truncation::End) => 3,
+    });
+}
+
+/// The kind's byte on the wire, shared by the create op and the rule.
+fn kind_code(kind: CreateKind) -> u8 {
+    match kind {
+        CreateKind::Group => 0,
+        CreateKind::Box => 1,
+        CreateKind::Text => 2,
+        CreateKind::Field => 3,
+        CreateKind::Scroll => 4,
+        CreateKind::Content => 5,
+        CreateKind::Canvas => 6,
+        CreateKind::Image => 7,
+        CreateKind::Icon => 8,
+        CreateKind::FlexColumn => 9,
+        CreateKind::FlexRow => 10,
+        CreateKind::Layers => 11,
+        CreateKind::Popover => 12,
+        CreateKind::Editor => 13,
+        CreateKind::Iframe => 14,
+    }
+}
+
 fn weight_code(weight: Weight) -> u8 {
     match weight {
         Weight::Regular => 0,
@@ -3102,20 +3421,56 @@ mod tests {
             | DomPatch::SetContent { id, .. }
             | DomPatch::SetTransform { id, .. }
             | DomPatch::SetSize { id, .. }
-            | DomPatch::SetStyle { id, .. }
+            | DomPatch::UseRule { id, .. }
+            | DomPatch::SetBox { id, .. }
+            | DomPatch::SetMarks { id, .. }
             | DomPatch::SetText { id, .. }
             | DomPatch::SetField { id, .. }
             | DomPatch::SetImage { id, .. }
             | DomPatch::SetIcon { id, .. }
             | DomPatch::SetIframe { id, .. }
             | DomPatch::SetScroll { id, .. }
-            | DomPatch::SetLayout { id, .. }
             | DomPatch::Move { id, .. }
             | DomPatch::Reveal { id, .. }
             | DomPatch::SetAnchor { id, .. }
             | DomPatch::SetHints { id, .. } => *id,
+            DomPatch::DefineRule { .. } => 0,
         }
     }
+
+    /// The look an element wears at the end of the stream: the style
+    /// and the flow record of the rule it was last told to wear.
+    fn look_of(patches: &[DomPatch], wanted: u32) -> Option<(&DomStyle, &DomLayout)> {
+        let rule = patches.iter().rev().find_map(|patch| match patch {
+            DomPatch::UseRule { id, rule } if *id == wanted => Some(*rule),
+            _ => None,
+        })?;
+        patches.iter().find_map(|patch| match patch {
+            DomPatch::DefineRule { rule: at, style, layout, .. } if *at == rule => {
+                Some((&**style, &**layout))
+            }
+            _ => None,
+        })
+    }
+
+    /// A look with this style alone, as a stream would define it.
+    fn define(style: DomStyle) -> DomPatch {
+        DomPatch::DefineRule {
+            rule: 0,
+            kind: CreateKind::Box,
+            flags: 0,
+            style: Box::new(style),
+            layout: Box::new(DomLayout::default()),
+            text: None,
+        }
+    }
+
+    /// Where a look's style mask starts in its encoding: after the
+    /// count, the op, the rule's two words, the kind and the flags.
+    const MASK_AT: usize = 4 + 1 + 8 + 1 + 1;
+    /// What follows a look's style record when the flow record is bare
+    /// and no text face rides along: the flow mask and the text flag.
+    const BARE_TAIL: usize = 2 + 1;
 
     #[derive(Clone)]
     struct MiniList {
@@ -3191,7 +3546,7 @@ mod tests {
         }
         // the interactive rows carry their action paths
         let interactive = patches.iter().any(|patch| {
-            matches!(patch, DomPatch::SetStyle { style, .. } if style.interactive.is_some())
+            matches!(patch, DomPatch::SetPath { path: Some(_), .. })
         });
         assert!(interactive, "rows are clickable in the scene");
     }
@@ -3218,7 +3573,7 @@ mod tests {
     }
 
     #[test]
-    fn a_selection_change_patches_only_the_two_styles() {
+    fn a_selection_change_patches_only_the_two_looks() {
         let (runtime, view, size) = mini();
         let _ = runtime.dom_frame(&view, size);
 
@@ -3226,13 +3581,15 @@ mod tests {
         let patches = runtime.dom_frame(&view, size);
 
         assert!(!patches.is_empty());
+        // a look the page has not seen is defined once; the rows wear
         for patch in &patches {
             assert!(
-                matches!(patch, DomPatch::SetStyle { .. }),
-                "only styles move on a selection change: {patch:?}"
+                matches!(patch, DomPatch::DefineRule { .. } | DomPatch::UseRule { .. }),
+                "only looks move on a selection change: {patch:?}"
             );
         }
-        assert_eq!(patches.len(), 2, "the old row and the new one: {patches:?}");
+        let worn = patches.iter().filter(|patch| matches!(patch, DomPatch::UseRule { .. })).count();
+        assert_eq!(worn, 2, "the old row and the new one: {patches:?}");
     }
 
     #[test]
@@ -3287,17 +3644,18 @@ mod tests {
         view.gap.set(12.0);
         let patches = runtime.dom_frame(&view, size);
 
-        // under the flow the browser reflows: the padded node re-
-        // records its ONE layout, and the component beside it hears
-        // NOTHING — not even a transform
+        // under the flow the browser reflows: the padded node changes
+        // its ONE look (defined, then worn), and the component beside
+        // it hears NOTHING — not even a transform
         let on_inner: Vec<_> =
             patches.iter().filter(|patch| patch_id(patch) >= inner_group).collect();
         assert!(on_inner.is_empty(), "the sibling never hears a padding: {patches:?}");
-        assert_eq!(patches.len(), 1, "{patches:?}");
+        assert_eq!(patches.len(), 2, "{patches:?}");
         assert!(matches!(
             &patches[0],
-            DomPatch::SetLayout { layout, .. } if layout.padding == Some((12.0, 12.0, 12.0, 12.0))
+            DomPatch::DefineRule { layout, .. } if layout.padding == Some((12.0, 12.0, 12.0, 12.0))
         ));
+        assert!(matches!(&patches[1], DomPatch::UseRule { .. }), "{patches:?}");
     }
 
     /// The browser owns the wheel in this mode: a scroll it reported
@@ -3453,7 +3811,7 @@ mod tests {
         let size = Size { width: 200.0, height: 60.0 };
         let mount = runtime.dom_frame(&view, size);
         let chrome = mount.iter().any(|patch| {
-            matches!(patch, DomPatch::SetStyle { style, .. }
+            matches!(patch, DomPatch::DefineRule { style, .. }
                 if style.focus_border.is_some()
                     && style.background.is_some()
                     && style.placeholder_color.is_some())
@@ -3547,7 +3905,7 @@ mod tests {
         let style = patches
             .iter()
             .find_map(|patch| match patch {
-                DomPatch::SetStyle { style, .. } if style.border.is_some() => Some(style),
+                DomPatch::DefineRule { style, .. } if style.border.is_some() => Some(style),
                 _ => None,
             })
             .expect("the panel chrome reached the patches");
@@ -3574,7 +3932,7 @@ mod tests {
         let runtime = Runtime::new();
         let patches = runtime.dom_frame(&Hoverable, Size { width: 100.0, height: 50.0 });
         let hovered = patches.iter().any(|patch| {
-            matches!(patch, DomPatch::SetStyle { style, .. } if style.hover_background.is_some())
+            matches!(patch, DomPatch::DefineRule { style, .. } if style.hover_background.is_some())
         });
         assert!(hovered, "the :hover alternative reached the patches: {patches:#?}");
     }
@@ -3604,7 +3962,7 @@ mod tests {
         let ink = patches
             .iter()
             .find_map(|patch| match patch {
-                DomPatch::SetStyle { style, .. } if style.hover_color.is_some() => {
+                DomPatch::DefineRule { style, .. } if style.hover_color.is_some() => {
                     Some((style.color, style.hover_color))
                 }
                 _ => None,
@@ -3614,7 +3972,7 @@ mod tests {
         // and the text takes NO color of its own: an inline one would
         // outrank the rule that flips it
         let inherits = patches.iter().any(|patch| {
-            matches!(patch, DomPatch::SetText { text, .. } if text.inherits_ink)
+            matches!(patch, DomPatch::DefineRule { text: Some(text), .. } if text.inherits_ink)
         });
         assert!(inherits, "the glyph inherits its ink: {patches:#?}");
 
@@ -3860,16 +4218,15 @@ mod tests {
                 _ => None,
             })
             .expect("the island mounted");
-        let stretched = mount.iter().any(|patch| {
-            matches!(
-                patch,
-                DomPatch::SetLayout { id, layout }
-                    if *id == canvas_id
-                        && layout.stretch
-                        && layout.width.is_none()
-                        && layout.height == Some(30.0)
-            )
-        });
+        // the stretch is the look's; the pinned height is the box's own
+        let stretched = look_of(&mount, canvas_id).is_some_and(|(_, layout)| layout.stretch)
+            && mount.iter().any(|patch| {
+                matches!(
+                    patch,
+                    DomPatch::SetBox { id, width: None, height: Some(height), .. }
+                        if *id == canvas_id && *height == 30.0
+                )
+            });
         assert!(stretched, "width is the browser's, height is pinned: {mount:?}");
         let _ = runtime.dom_islands(1);
 
@@ -3906,7 +4263,7 @@ mod tests {
         let wraps = mount.iter().any(|patch| {
             matches!(
                 patch,
-                DomPatch::SetLayout { layout, .. }
+                DomPatch::DefineRule { layout, .. }
                     if layout.wrap == Some(4.0) && layout.gap == Some(6.0)
             )
         });
@@ -3946,11 +4303,7 @@ mod tests {
             })
             .collect();
         assert_eq!(a_ids.len(), 2, "two links: {mount:?}");
-        let plain_of = |id: u32| {
-            mount.iter().any(|patch| {
-                matches!(patch, DomPatch::SetLayout { id: at, layout } if *at == id && layout.plain)
-            })
-        };
+        let plain_of = |id: u32| look_of(&mount, id).is_some_and(|(_, layout)| layout.plain);
         assert!(plain_of(a_ids[0]), "a link around one child is plain: {mount:?}");
         assert!(!plain_of(a_ids[1]), "a link around two children keeps its flex line: {mount:?}");
         let bytes = encode(&mount);
@@ -3985,14 +4338,7 @@ mod tests {
                 _ => None,
             })
             .expect("the app mounted");
-        let takes = |wanted: u32| {
-            mount.iter().any(|patch| {
-                matches!(
-                    patch,
-                    DomPatch::SetLayout { id, layout } if *id == wanted && layout.fill
-                )
-            })
-        };
+        let takes = |wanted: u32| look_of(&mount, wanted).is_some_and(|(_, layout)| layout.fill);
         assert!(takes(first), "the root child takes the window: {mount:?}");
     }
 
@@ -4181,14 +4527,7 @@ mod tests {
                 hints: DomHints::default(),
             },
             DomPatch::SetTransform { id: 7, x: 10.0, y: 20.0 },
-            DomPatch::SetStyle {
-                id: 7,
-                style: Box::new(DomStyle {
-                    background: Some(Color::hex(0x112233)),
-                    interactive: Some(std::rc::Rc::from("go")),
-                    ..DomStyle::default()
-                }),
-            },
+            DomPatch::SetPath { id: 7, path: Some(std::rc::Rc::from("go")) },
             DomPatch::Remove { id: 7 },
         ];
         let bytes = encode(&patches);
@@ -4204,10 +4543,8 @@ mod tests {
             &7u32.to_le_bytes()[..],
             &10f32.to_le_bytes()[..],
             &20f32.to_le_bytes()[..],
-            &[5],
+            &[19],
             &7u32.to_le_bytes()[..],
-            &(1u32 | 1 << 7).to_le_bytes()[..],
-            &0x112233FFu32.to_le_bytes()[..],
             &2u16.to_le_bytes()[..],
             b"go",
             &[2],
@@ -4295,7 +4632,7 @@ mod tests {
                     patch,
                     DomPatch::SetSize { .. }
                         | DomPatch::SetTransform { .. }
-                        | DomPatch::SetLayout { .. }
+                        | DomPatch::SetBox { .. }
                 ),
                 "a resize is geometry records only — the image never re-travels: {patch:?}"
             );
@@ -4505,7 +4842,7 @@ mod tests {
         let style = patches
             .iter()
             .find_map(|patch| match patch {
-                DomPatch::SetStyle { style, .. } if style.gradient.is_some() => Some(style),
+                DomPatch::DefineRule { style, .. } if style.gradient.is_some() => Some(style),
                 _ => None,
             })
             .expect("the ramp travels as style, not as pixels");
@@ -4520,10 +4857,10 @@ mod tests {
         // the mask bit and the payload are the wire contract
         let bytes = encode(&[patches
             .iter()
-            .find(|patch| matches!(patch, DomPatch::SetStyle { style, .. } if style.gradient.is_some()))
+            .find(|patch| matches!(patch, DomPatch::DefineRule { style, .. } if style.gradient.is_some()))
             .cloned()
-            .expect("the style patch")]);
-        let mask = u16::from_le_bytes([bytes[9], bytes[10]]);
+            .expect("the look")]);
+        let mask = u16::from_le_bytes([bytes[MASK_AT], bytes[MASK_AT + 1]]);
         assert_eq!(mask & (1 << 13), 1 << 13, "bit 13 says a ramp follows");
     }
 
@@ -4553,15 +4890,15 @@ mod tests {
             ..DomStyle::default()
         };
         let cut = DomStyle { clip: true, ..bare.clone() };
-        let without = encode(&[DomPatch::SetStyle { id: 3, style: Box::new(bare) }]);
-        let with = encode(&[DomPatch::SetStyle { id: 3, style: Box::new(cut) }]);
+        let without = encode(&[define(bare)]);
+        let with = encode(&[define(cut)]);
         // the first payload-free bit: the streams differ by ONE bit in
         // the mask's high byte and nothing else
         assert_eq!(with.len(), without.len(), "the bit carries no payload");
-        let mask = u16::from_le_bytes([with[9], with[10]]);
+        let mask = u16::from_le_bytes([with[MASK_AT], with[MASK_AT + 1]]);
         assert_eq!(mask & (1 << 14), 1 << 14, "bit 14 says the overflow hides");
         let mut expected = without.clone();
-        expected[10] |= 0x40;
+        expected[MASK_AT + 1] |= 0x40;
         assert_eq!(with, expected);
     }
 
@@ -4573,10 +4910,10 @@ mod tests {
             corner_radius: Some(Corners::all(6.0)),
             ..DomStyle::default()
         };
-        let bytes = encode(&[DomPatch::SetStyle { id: 3, style: Box::new(one) }]);
-        let mask = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
+        let bytes = encode(&[define(one)]);
+        let mask = u32::from_le_bytes(bytes[MASK_AT..MASK_AT + 4].try_into().unwrap());
         assert_eq!(mask, 1 << 4, "the one radius is bit 4, alone");
-        assert_eq!(bytes.len(), 13 + 4, "and it costs one float");
+        assert_eq!(bytes.len(), MASK_AT + 4 + 4 + BARE_TAIL, "and it costs one float");
 
         // four different ones take bit 22 INSTEAD, with the four in
         // CSS order behind it
@@ -4589,10 +4926,10 @@ mod tests {
             }),
             ..DomStyle::default()
         };
-        let bytes = encode(&[DomPatch::SetStyle { id: 3, style: Box::new(four) }]);
-        let mask = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
+        let bytes = encode(&[define(four)]);
+        let mask = u32::from_le_bytes(bytes[MASK_AT..MASK_AT + 4].try_into().unwrap());
         assert_eq!(mask, 1 << 22, "four radii take bit 22, and bit 4 stays clear");
-        let radii: Vec<f32> = bytes[13..]
+        let radii: Vec<f32> = bytes[MASK_AT + 4..MASK_AT + 4 + 16]
             .chunks_exact(4)
             .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
             .collect();
@@ -4696,7 +5033,7 @@ mod tests {
         let ink = patches
             .iter()
             .find_map(|patch| match patch {
-                DomPatch::SetStyle { style, .. } if style.hover_color.is_some() => {
+                DomPatch::DefineRule { style, .. } if style.hover_color.is_some() => {
                     Some((style.color, style.hover_color))
                 }
                 _ => None,
@@ -4779,7 +5116,7 @@ mod tests {
         let glass = patches
             .iter()
             .find_map(|patch| match patch {
-                DomPatch::SetStyle { style, .. } => style.glass,
+                DomPatch::DefineRule { style, .. } => style.glass,
                 _ => None,
             })
             .expect("the pane carries a filter");
@@ -4793,7 +5130,7 @@ mod tests {
         let background = patches
             .iter()
             .find_map(|patch| match patch {
-                DomPatch::SetStyle { style, .. } if style.glass.is_some() => style.background,
+                DomPatch::DefineRule { style, .. } if style.glass.is_some() => style.background,
                 _ => None,
             })
             .expect("the tint became the background");
@@ -5102,25 +5439,27 @@ mod tests {
 
         let _ = lowering.lower(with_gap(8.0), &display);
         let regapped = lowering.lower(with_gap(12.0), &display);
-        assert_eq!(regapped.len(), 1, "{regapped:#?}");
+        // the root changes looks: the new one defined, then worn
+        assert_eq!(regapped.len(), 2, "{regapped:#?}");
         assert!(matches!(
             &regapped[0],
-            DomPatch::SetLayout { id: 0, layout } if layout.gap == Some(12.0)
+            DomPatch::DefineRule { layout, .. } if layout.gap == Some(12.0)
         ));
+        assert!(matches!(&regapped[1], DomPatch::UseRule { id: 0, .. }), "{regapped:#?}");
     }
 
-    /// The three new encodings, pinned byte for byte.
+    /// The box an element owns, a move and a reveal, pinned byte for
+    /// byte: the box is a mask of five and the floats it names, in order.
     #[test]
     fn the_flow_encoding_is_byte_stable() {
         let patches = vec![
-            DomPatch::SetLayout {
+            DomPatch::SetBox {
                 id: 5,
-                layout: Box::new(DomLayout {
-                    gap: Some(8.0),
-                    grow: true,
-                    slot_y: Some(120.0),
-                    ..DomLayout::default()
-                }),
+                width: None,
+                height: Some(24.0),
+                max_width: None,
+                max_height: None,
+                slot_y: Some(120.0),
             },
             DomPatch::Move { id: 5, parent: 1, before: 9 },
             DomPatch::Reveal { id: 3, target: 44 },
@@ -5128,10 +5467,10 @@ mod tests {
         let bytes = encode(&patches);
         let expected: Vec<u8> = [
             &3u32.to_le_bytes()[..],
-            &[11],
+            &[23],
             &5u32.to_le_bytes()[..],
-            &(1u16 | 1 << 7 | 1 << 8).to_le_bytes()[..],
-            &8f32.to_le_bytes()[..],
+            &[1 << 1 | 1 << 4],
+            &24f32.to_le_bytes()[..],
             &120f32.to_le_bytes()[..],
             &[12],
             &5u32.to_le_bytes()[..],
@@ -5140,6 +5479,55 @@ mod tests {
             &[13],
             &3u32.to_le_bytes()[..],
             &44u32.to_le_bytes()[..],
+        ]
+        .concat();
+        assert_eq!(bytes, expected);
+    }
+
+    /// A look on the wire, pinned byte for byte: its two words, the
+    /// kind, the flags, the style and flow records and the text flag —
+    /// then an element that wears it, and the marks of its own.
+    #[test]
+    fn the_look_encoding_is_byte_stable() {
+        let rule = 0x0000_0001_0000_0002u64;
+        let patches = vec![
+            DomPatch::DefineRule {
+                rule,
+                kind: CreateKind::FlexRow,
+                flags: 1,
+                style: Box::new(DomStyle {
+                    background: Some(Color::hex(0x112233)),
+                    ..DomStyle::default()
+                }),
+                layout: Box::new(DomLayout { gap: Some(8.0), grow: true, ..DomLayout::default() }),
+                text: None,
+            },
+            DomPatch::UseRule { id: 5, rule },
+            DomPatch::SetMarks { id: 5, tooltip: Some(Arc::from("Hi")), group_owner: Some(7) },
+        ];
+        let bytes = encode(&patches);
+        let expected: Vec<u8> = [
+            &3u32.to_le_bytes()[..],
+            &[21],
+            &1u32.to_le_bytes()[..],
+            &2u32.to_le_bytes()[..],
+            &[10, 1],
+            &1u32.to_le_bytes()[..],
+            &0x112233FFu32.to_le_bytes()[..],
+            &(1u16 | 1 << 7).to_le_bytes()[..],
+            &8f32.to_le_bytes()[..],
+            &[0],
+            &[22],
+            &5u32.to_le_bytes()[..],
+            &1u32.to_le_bytes()[..],
+            &2u32.to_le_bytes()[..],
+            &[24],
+            &5u32.to_le_bytes()[..],
+            &[3],
+            &2u16.to_le_bytes()[..],
+            b"Hi",
+            &0u32.to_le_bytes()[..],
+            &7u32.to_le_bytes()[..],
         ]
         .concat();
         assert_eq!(bytes, expected);
@@ -5266,7 +5654,7 @@ mod tests {
         let patches = runtime.dom_frame(&view, size);
         let stats = crate::stats::take();
 
-        assert_eq!(patches.len(), 2, "the flip is two style records: {patches:?}");
+        assert_eq!(patches.len(), 3, "the flip is a look defined, worn, and the words: {patches:?}");
         assert!(
             stats.diff_visited < 20,
             "the diff visited {} nodes for one flipped cell",
@@ -5323,7 +5711,7 @@ mod tests {
         // a layout record, not a transform)
         let flow_texts = patches
             .iter()
-            .filter(|p| matches!(p, DomPatch::SetText { .. }))
+            .filter(|p| matches!(p, DomPatch::SetContent { .. }))
             .count();
         assert_eq!(flow_texts, 4, "{patches:#?}");
         // a second frame with nothing changed is silent — the exact

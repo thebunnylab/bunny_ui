@@ -20,6 +20,7 @@ use crate::view::View;
 /// One rendered page: the body markup and the pseudo-state rules.
 pub struct SsrPage {
     pub html: String,
+    /// The looks the page wears, one rule each — and the targets' cursor.
     pub css: String,
 }
 
@@ -32,7 +33,9 @@ pub fn render(root: &impl View, size: Size) -> SsrPage {
     for patch in &patches {
         tree.apply(patch);
     }
-    SsrPage { html: tree.serialize_root(), css: tree.rules.values().cloned().collect::<Vec<_>>().join("\n") }
+    let mut css: Vec<String> = vec!["[data-path]{cursor:default}".to_string()];
+    css.extend(tree.rules.values().cloned());
+    SsrPage { html: tree.serialize_root(), css: css.join("\n") }
 }
 
 /// A whole document: the page, its stylesheet, and the boot scripts.
@@ -60,14 +63,35 @@ struct Element {
     /// `data-n` — the identity hydration adopts by.
     id: u32,
     attrs: BTreeMap<&'static str, String>,
+    /// The element's own inline declarations: its box, its geometry.
     style: BTreeMap<&'static str, String>,
     text: Vec<(String, Option<Color>)>,
     children: Vec<u32>,
+    /// The look it wears — a class on the page's sheet.
+    rule: Option<u64>,
 }
 
 struct Tree {
     elements: BTreeMap<u32, Element>,
-    rules: BTreeMap<u32, String>,
+    /// The looks, by hash: the rule's whole text, states included.
+    rules: BTreeMap<u64, String>,
+}
+
+/// The class a look is worn by. The selector doubles it so the rule
+/// outranks a page's own class rules, as an inline declaration did.
+pub(crate) fn rule_class(rule: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut digits = Vec::new();
+    let mut value = rule;
+    loop {
+        digits.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+        if value == 0 {
+            break;
+        }
+    }
+    digits.reverse();
+    format!("b_{}", String::from_utf8(digits).expect("ascii digits"))
 }
 
 fn color(value: Color) -> String {
@@ -98,6 +122,7 @@ impl Tree {
             style: BTreeMap::new(),
             text: Vec::new(),
             children: Vec::new(),
+            rule: None,
         };
         root.attrs.insert("id", "app".to_string());
         root.attrs.insert("data-hydrate", "1".to_string());
@@ -112,119 +137,9 @@ impl Tree {
 
     /// The glue's `createElementOf`, mirrored.
     fn create(&mut self, id: u32, kind: CreateKind, hints: &crate::dom::DomHints) {
-        let (tag, style): (&'static str, &[(&'static str, &str)]) = match kind {
-            CreateKind::Canvas => ("canvas", &[]),
-            CreateKind::Image => ("img", &[("pointer-events", "none")]),
-            CreateKind::Iframe => (
-                "iframe",
-                &[
-                    ("border", "0"),
-                    ("box-sizing", "border-box"),
-                    ("min-width", "0"),
-                    ("min-height", "0"),
-                ],
-            ),
-            CreateKind::Icon => ("svg", &[("pointer-events", "none")]),
-            CreateKind::Field => (
-                "input",
-                &[
-                    ("box-sizing", "border-box"),
-                    ("padding", "5px 8px"),
-                    ("outline", "none"),
-                ],
-            ),
-            CreateKind::Editor => (
-                "textarea",
-                &[
-                    ("box-sizing", "border-box"),
-                    ("padding", "5px 8px"),
-                    ("outline", "none"),
-                    ("resize", "none"),
-                    ("font", "inherit"),
-                ],
-            ),
-            CreateKind::FlexColumn => (
-                "div",
-                &[
-                    ("display", "flex"),
-                    ("flex-direction", "column"),
-                    ("box-sizing", "border-box"),
-                    ("min-width", "0"),
-                    ("min-height", "0"),
-                ],
-            ),
-            CreateKind::FlexRow => (
-                "div",
-                &[
-                    ("display", "flex"),
-                    ("flex-direction", "row"),
-                    ("box-sizing", "border-box"),
-                    ("min-width", "0"),
-                    ("min-height", "0"),
-                ],
-            ),
-            CreateKind::Layers => (
-                "div",
-                &[
-                    ("display", "grid"),
-                    ("box-sizing", "border-box"),
-                    ("min-width", "0"),
-                    ("min-height", "0"),
-                ],
-            ),
-            CreateKind::Popover => (
-                "div",
-                &[
-                    ("position", "absolute"),
-                    ("left", "0"),
-                    ("top", "0"),
-                    ("box-sizing", "border-box"),
-                ],
-            ),
-            CreateKind::Text => (
-                "div",
-                &[
-                    ("box-sizing", "border-box"),
-                    ("min-width", "0"),
-                    ("min-height", "0"),
-                    ("white-space", "pre-wrap"),
-                    ("cursor", "default"),
-                ],
-            ),
-            CreateKind::Scroll => (
-                "div",
-                &[
-                    ("box-sizing", "border-box"),
-                    ("min-width", "0"),
-                    ("min-height", "0"),
-                    ("overflow", "auto"),
-                    ("scroll-behavior", "smooth"),
-                ],
-            ),
-            CreateKind::Content => (
-                "div",
-                &[
-                    ("box-sizing", "border-box"),
-                    ("min-width", "0"),
-                    ("min-height", "0"),
-                    ("position", "relative"),
-                ],
-            ),
-            // a wrapper is a COLUMN, not a block: the engine proposes
-            // its box to the child, and only a flex line can hand the
-            // offer down (width by the stretch default, height by the
-            // fill flag)
-            CreateKind::Group | CreateKind::Box => (
-                "div",
-                &[
-                    ("display", "flex"),
-                    ("flex-direction", "column"),
-                    ("box-sizing", "border-box"),
-                    ("min-width", "0"),
-                    ("min-height", "0"),
-                ],
-            ),
-        };
+        // the kind's declarations are the look's: the element keeps its
+        // tag and its attributes
+        let (tag, _) = kind_shape(kind);
         let mut element = Element {
             tag,
             id,
@@ -232,24 +147,16 @@ impl Tree {
             style: BTreeMap::new(),
             text: Vec::new(),
             children: Vec::new(),
+            rule: None,
         };
-        for (name, value) in style {
-            element.style.insert(name, (*value).to_string());
-        }
         if let Some(tag_hint) = &hints.tag {
             element.tag = leak_tag(tag_hint);
-            // the table family lays itself out — the browser's own
-            // display wins and our flex steps aside (the glue's rule,
-            // mirrored: a serialized page must agree with a mounted one)
-            if matches!(
-                element.tag,
-                "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
-            ) {
-                element.style.remove("display");
-                element.style.remove("flex-direction");
-                element.style.remove("min-width");
-                element.style.remove("min-height");
-            }
+        }
+        if matches!(kind, CreateKind::Scroll) {
+            // a scroll box wears its kind as a mark: its look is a
+            // class, which says nothing to a hydration that must wire
+            // the wheel
+            element.attrs.insert("data-k", "4".to_string());
         }
         if let Some(class) = &hints.class {
             element.attrs.insert("class", class.to_string());
@@ -386,214 +293,75 @@ impl Tree {
                     element.style.insert("height", px(*height));
                 }
             }
-            DomPatch::SetLayout { id, layout } => {
-                let Some(element) = self.elements.get_mut(id) else {
-                    return;
-                };
-                for name in [
-                    "gap",
-                    "align-items",
-                    "padding",
-                    "width",
-                    "height",
-                    "max-width",
-                    "max-height",
-                    "flex",
-                    "position",
-                    "top",
-                    "left",
-                    "right",
-                    "transform",
-                ] {
-                    element.style.remove(name);
-                }
-                element.style.insert("min-width", "0".into());
-                element.style.insert("min-height", "0".into());
-                // no flex box: the tag's own display (the glue's rule,
-                // mirrored)
-                if layout.plain {
-                    element.style.remove("display");
-                    element.style.remove("flex-direction");
-                    element.style.remove("min-width");
-                    element.style.remove("min-height");
-                }
-                if let Some(gap) = layout.gap {
-                    element.style.insert("gap", px(gap));
-                }
-                if let Some(align) = layout.align {
-                    element.style.insert(
-                        "align-items",
-                        match align {
-                            1 => "center",
-                            2 => "flex-end",
-                            3 => "baseline",
-                            _ => "flex-start",
-                        }
-                        .into(),
-                    );
-                }
-                if let Some((top, right, bottom, left)) = layout.padding {
-                    element.style.insert(
-                        "padding",
-                        format!("{} {} {} {}", px(top), px(right), px(bottom), px(left)),
-                    );
-                }
-                if let Some(width) = layout.width {
-                    element.style.insert("width", px(width));
-                }
-                if let Some(height) = layout.height {
-                    element.style.insert("height", px(height));
-                }
-                if let Some(max) = layout.max_width {
-                    element.style.insert("max-width", px(max));
-                }
-                if let Some(max) = layout.max_height {
-                    element.style.insert("max-height", px(max));
-                }
-                if layout.grow {
-                    element.style.insert("flex", "1 1 0".into());
-                }
-                if let Some(slot) = layout.slot_y {
-                    element.style.insert("position", "absolute".into());
-                    element.style.insert("top", px(slot));
-                    element.style.insert("left", "0".into());
-                    element.style.insert("right", "0".into());
-                }
-                if layout.stretch {
-                    element.style.insert("align-self", "stretch".into());
-                }
-                if layout.fill {
-                    element.style.insert("flex", "1 1 auto".into());
+            DomPatch::DefineRule { rule, kind, flags, style, layout, text } => {
+                let class = rule_class(*rule);
+                let css = rule_text(&class, *kind, *flags & 1 != 0, style, layout, text.as_deref());
+                self.rules.insert(*rule, css);
+            }
+            DomPatch::UseRule { id, rule } => {
+                if let Some(element) = self.elements.get_mut(id) {
+                    element.rule = Some(*rule);
                 }
             }
-            DomPatch::SetStyle { id, style } => {
+            DomPatch::SetBox { id, width, height, max_width, max_height, slot_y } => {
                 let Some(element) = self.elements.get_mut(id) else {
                     return;
                 };
-                for name in [
-                    "background-color",
-                    "background-image",
-                    "border",
-                    "border-radius",
-                    "box-shadow",
-                    "transition",
-                    "color",
-                    "overflow",
+                for (name, value) in [
+                    ("width", width),
+                    ("height", height),
+                    ("max-width", max_width),
+                    ("max-height", max_height),
                 ] {
-                    element.style.remove(name);
+                    match value {
+                        Some(value) => {
+                            element.style.insert(name, px(f64::from(*value)));
+                        }
+                        None => {
+                            element.style.remove(name);
+                        }
+                    }
                 }
-                let name = format!("[data-n=\"{id}\"]");
-                let mut pseudo: Vec<String> = Vec::new();
-                if let Some(background) = style.background {
-                    element.style.insert("background-color", color(background));
+                match slot_y {
+                    Some(slot) => {
+                        element.style.insert("position", "absolute".into());
+                        element.style.insert("top", px(f64::from(*slot)));
+                        element.style.insert("left", "0".into());
+                        element.style.insert("right", "0".into());
+                    }
+                    None => {
+                        for name in ["position", "top", "left", "right"] {
+                            element.style.remove(name);
+                        }
+                    }
                 }
-                if let Some(hover) = style.hover_background {
-                    pseudo.push(format!("{name}:hover{{background:{} !important}}", color(hover)));
+            }
+            DomPatch::SetMarks { id, tooltip, group_owner } => {
+                let Some(element) = self.elements.get_mut(id) else {
+                    return;
+                };
+                match tooltip {
+                    Some(tip) => {
+                        element.attrs.insert("data-tip", tip.to_string());
+                    }
+                    None => {
+                        element.attrs.remove("data-tip");
+                    }
                 }
-                if let Some(pressed) = style.pressed_background {
-                    pseudo
-                        .push(format!("{name}:active{{background:{} !important}}", color(pressed)));
-                }
-                if let Some((border, width)) = style.border {
-                    element
-                        .style
-                        .insert("border", format!("{} solid {}", px(width), color(border)));
-                }
-                if let Some(radii) = style.corner_radius {
-                    // one number when every corner shares it, four in
-                    // the CSS order otherwise — clockwise from top left
-                    let uniform = radii.top_left == radii.top_right
-                        && radii.top_left == radii.bottom_right
-                        && radii.top_left == radii.bottom_left;
-                    let value = if uniform {
-                        px(radii.top_left)
-                    } else {
-                        format!(
-                            "{} {} {} {}",
-                            px(radii.top_left),
-                            px(radii.top_right),
-                            px(radii.bottom_right),
-                            px(radii.bottom_left),
-                        )
-                    };
-                    element.style.insert("border-radius", value);
-                }
-                if let Some((radius, shadow)) = style.shadow {
-                    element
-                        .style
-                        .insert("box-shadow", format!("0 0 {} {}", px(radius), color(shadow)));
-                }
-                if let Some((response, _)) = style.transition {
-                    element.style.insert(
-                        "transition",
-                        format!(
-                            "background-color {response}s ease-out, transform {response}s ease-out"
-                        ),
-                    );
-                }
-                if let Some(path) = &style.interactive {
-                    element.attrs.insert("data-path", path.to_string());
-                    element.style.insert("cursor", "default".into());
-                }
-                if let Some(focus) = style.focus_border {
-                    pseudo.push(format!(
-                        "{name}:focus{{border-color:{c} !important;caret-color:{c}}}",
-                        c = color(focus)
-                    ));
-                }
-                if let Some(placeholder) = style.placeholder_color {
-                    pseudo.push(format!("{name}::placeholder{{color:{}}}", color(placeholder)));
-                }
-                if let Some(ink) = style.color {
-                    element.style.insert("color", color(ink));
-                }
-                if let Some(hover) = style.hover_color {
-                    pseudo.push(format!("{name}:hover{{color:{} !important}}", color(hover)));
-                }
-                if let Some(pressed) = style.pressed_color {
-                    pseudo.push(format!("{name}:active{{color:{} !important}}", color(pressed)));
-                }
-                if let Some(gradient) = &style.gradient {
-                    element.style.insert("background-image", css_gradient(gradient));
-                }
-                if style.clip {
-                    element.style.insert("overflow", "hidden".into());
-                }
-                if pseudo.is_empty() {
-                    self.rules.remove(id);
-                } else {
-                    self.rules.insert(*id, pseudo.join("\n"));
+                match group_owner {
+                    Some(owner) => {
+                        element.attrs.insert("data-g", owner.to_string());
+                    }
+                    None => {
+                        element.attrs.remove("data-g");
+                    }
                 }
             }
             DomPatch::SetText { id, text } => {
+                // the words and their spans: the face is the look's
                 let Some(element) = self.elements.get_mut(id) else {
                     return;
                 };
-                element.style.insert("font", css_font(&text.font));
-                // after the font shorthand, which resets it — the served
-                // page steps its lines the way the engine measured them
-                if let Some(height) = text.line_height {
-                    element.style.insert("line-height", format!("{height}px"));
-                }
-                match text.text_align {
-                    Some(motor::views::TextAlignment::Center) => {
-                        element.style.insert("text-align", "center".into());
-                    }
-                    Some(motor::views::TextAlignment::Trailing) => {
-                        element.style.insert("text-align", "right".into());
-                    }
-                    _ => {}
-                }
-                if text.inherits_ink {
-                    element.style.remove("color");
-                } else {
-                    element.style.insert("color", color(text.color));
-                }
-                if text.truncation.is_some() {
-                    element.style.insert("overflow", "hidden".into());
-                    element.style.insert("text-overflow", "ellipsis".into());
-                    element.style.insert("white-space", "nowrap".into());
-                }
                 element.text.clear();
                 match &text.highlights {
                     Some((ranges, highlight)) => {
@@ -669,7 +437,21 @@ impl Tree {
         out.push_str(element.tag);
         out.push_str(&format!(" data-n=\"{}\"", element.id));
         for (name, value) in &element.attrs {
+            if *name == "class" {
+                continue;
+            }
             out.push_str(&format!(" {name}=\"{}\"", escape_attr(value)));
+        }
+        // the page's own classes first, the look's last
+        let mut classes: Vec<String> = Vec::new();
+        if let Some(class) = element.attrs.get("class") {
+            classes.push(class.clone());
+        }
+        if let Some(rule) = element.rule {
+            classes.push(rule_class(rule));
+        }
+        if !classes.is_empty() {
+            out.push_str(&format!(" class=\"{}\"", escape_attr(&classes.join(" "))));
         }
         if !element.style.is_empty() {
             let style: Vec<String> = element
@@ -699,6 +481,331 @@ impl Tree {
         }
         out.push_str(&format!("</{}>", element.tag));
     }
+}
+
+/// The tag an element of this kind is, and the declarations its kind
+/// brings along — the look carries them, the element wears the tag.
+fn kind_shape(kind: CreateKind) -> (&'static str, &'static [(&'static str, &'static str)]) {
+    match kind {
+        CreateKind::Canvas => ("canvas", &[]),
+        CreateKind::Image => ("img", &[("pointer-events", "none")]),
+        CreateKind::Iframe => (
+            "iframe",
+            &[
+                ("border", "0"),
+                ("box-sizing", "border-box"),
+                ("min-width", "0"),
+                ("min-height", "0"),
+            ],
+        ),
+        CreateKind::Icon => ("svg", &[("pointer-events", "none")]),
+        CreateKind::Field => (
+            "input",
+            &[
+                ("box-sizing", "border-box"),
+                ("padding", "5px 8px"),
+                ("outline", "none"),
+            ],
+        ),
+        CreateKind::Editor => (
+            "textarea",
+            &[
+                ("box-sizing", "border-box"),
+                ("padding", "5px 8px"),
+                ("outline", "none"),
+                ("resize", "none"),
+                ("font", "inherit"),
+            ],
+        ),
+        CreateKind::FlexColumn => (
+            "div",
+            &[
+                ("display", "flex"),
+                ("flex-direction", "column"),
+                ("box-sizing", "border-box"),
+                ("min-width", "0"),
+                ("min-height", "0"),
+            ],
+        ),
+        CreateKind::FlexRow => (
+            "div",
+            &[
+                ("display", "flex"),
+                ("flex-direction", "row"),
+                ("box-sizing", "border-box"),
+                ("min-width", "0"),
+                ("min-height", "0"),
+            ],
+        ),
+        CreateKind::Layers => (
+            "div",
+            &[
+                ("display", "grid"),
+                ("box-sizing", "border-box"),
+                ("min-width", "0"),
+                ("min-height", "0"),
+            ],
+        ),
+        CreateKind::Popover => (
+            "div",
+            &[
+                ("position", "absolute"),
+                ("left", "0"),
+                ("top", "0"),
+                ("box-sizing", "border-box"),
+            ],
+        ),
+        CreateKind::Text => (
+            "div",
+            &[
+                ("box-sizing", "border-box"),
+                ("min-width", "0"),
+                ("min-height", "0"),
+                ("white-space", "pre-wrap"),
+                ("cursor", "default"),
+            ],
+        ),
+        CreateKind::Scroll => (
+            "div",
+            &[
+                ("box-sizing", "border-box"),
+                ("min-width", "0"),
+                ("min-height", "0"),
+                ("overflow", "auto"),
+                ("scroll-behavior", "smooth"),
+            ],
+        ),
+        CreateKind::Content => (
+            "div",
+            &[
+                ("box-sizing", "border-box"),
+                ("min-width", "0"),
+                ("min-height", "0"),
+                ("position", "relative"),
+            ],
+        ),
+        // a wrapper is a COLUMN, not a block: the engine proposes
+        // its box to the child, and only a flex line can hand the
+        // offer down (width by the stretch default, height by the
+        // fill flag)
+        CreateKind::Group | CreateKind::Box => (
+            "div",
+            &[
+                ("display", "flex"),
+                ("flex-direction", "column"),
+                ("box-sizing", "border-box"),
+                ("min-width", "0"),
+                ("min-height", "0"),
+            ],
+        ),
+    }
+}
+
+/// The look's rule: the kind's defaults, the flow record, the style,
+/// the text's face — and its states, one rule each. The twin of the
+/// glue's `defineRule`: a served page must agree with a mounted one.
+fn rule_text(
+    class: &str,
+    kind: CreateKind,
+    lays_itself_out: bool,
+    style: &crate::dom::DomStyle,
+    layout: &crate::dom::DomLayout,
+    text: Option<&crate::dom::DomText>,
+) -> String {
+    let selector = format!(".{class}.{class}");
+    let mut base: BTreeMap<&'static str, String> = BTreeMap::new();
+    let (_, defaults) = kind_shape(kind);
+    for &(name, value) in defaults {
+        base.insert(name, value.to_string());
+    }
+    // the table family lays itself out — the browser's own display
+    // wins and our flex steps aside; a plain inline tag keeps its own
+    // display too, and the floor its kind gave it
+    if lays_itself_out {
+        base.remove("display");
+        base.remove("flex-direction");
+        base.remove("min-width");
+        base.remove("min-height");
+    } else if layout.plain {
+        base.remove("display");
+        base.remove("flex-direction");
+    }
+    if let Some(gap) = layout.gap {
+        base.insert("gap", px(gap));
+    }
+    if let Some(align) = layout.align {
+        base.insert(
+            "align-items",
+            match align {
+                1 => "center",
+                2 => "flex-end",
+                3 => "baseline",
+                _ => "flex-start",
+            }
+            .into(),
+        );
+    }
+    if let Some((top, right, bottom, left)) = layout.padding {
+        base.insert("padding", format!("{} {} {} {}", px(top), px(right), px(bottom), px(left)));
+    }
+    if layout.grow {
+        // the flexible child — and the classic flex footgun: a zeroed
+        // min-size, or content refuses to shrink
+        base.insert("flex", "1 1 0".into());
+        base.insert("min-width", "0".into());
+        base.insert("min-height", "0".into());
+    }
+    if layout.stretch {
+        base.insert("align-self", "stretch".into());
+    }
+    if layout.fill {
+        // take the offer, keep the content floor
+        base.insert("flex", "1 1 auto".into());
+        base.insert("min-width", "0".into());
+        base.insert("min-height", "0".into());
+    }
+    if let Some(line_gap) = layout.wrap {
+        base.insert("flex-wrap", "wrap".into());
+        base.insert("row-gap", px(line_gap));
+    }
+    let mut states: Vec<String> = Vec::new();
+    // a follower hangs its states off the GROUP's pointer: the same
+    // rules, hung off the group's selector; a box without one listens
+    // to its own
+    let on = |state: &str| match style.group {
+        Some(group) => format!("[data-g=\"{group}\"]:{state} {selector}"),
+        None => format!("{selector}:{state}"),
+    };
+    if let Some(background) = style.background {
+        base.insert("background-color", color(background));
+    }
+    if let Some(hover) = style.hover_background {
+        states.push(format!("{}{{background-color:{}}}", on("hover"), color(hover)));
+    }
+    if let Some(pressed) = style.pressed_background {
+        states.push(format!("{}{{background-color:{}}}", on("active"), color(pressed)));
+    }
+    if let Some((border, width)) = style.border {
+        base.insert("border", format!("{} solid {}", px(width), color(border)));
+    }
+    if let Some(radii) = style.corner_radius {
+        // one number when every corner shares it, four in the CSS
+        // order otherwise — clockwise from top left
+        let uniform = radii.top_left == radii.top_right
+            && radii.top_left == radii.bottom_right
+            && radii.top_left == radii.bottom_left;
+        let value = if uniform {
+            px(radii.top_left)
+        } else {
+            format!(
+                "{} {} {} {}",
+                px(radii.top_left),
+                px(radii.top_right),
+                px(radii.bottom_right),
+                px(radii.bottom_left),
+            )
+        };
+        base.insert("border-radius", value);
+    }
+    // the halo and the glass rim share one property
+    let mut shadows: Vec<String> = Vec::new();
+    if let Some((radius, shadow)) = style.shadow {
+        shadows.push(format!("0 0 {} {}", px(radius), color(shadow)));
+    }
+    if let Some((response, _)) = style.transition {
+        base.insert(
+            "transition",
+            format!("background-color {response}s ease-out, transform {response}s ease-out"),
+        );
+    }
+    if let Some(focus) = style.focus_border {
+        states.push(format!("{selector}:focus{{border-color:{c};caret-color:{c}}}", c = color(focus)));
+    }
+    if let Some(placeholder) = style.placeholder_color {
+        states.push(format!("{selector}::placeholder{{color:{}}}", color(placeholder)));
+    }
+    if let Some(ink) = style.color {
+        base.insert("color", color(ink));
+    }
+    if let Some(hover) = style.hover_color {
+        states.push(format!("{}{{color:{}}}", on("hover"), color(hover)));
+    }
+    if let Some(pressed) = style.pressed_color {
+        states.push(format!("{}{{color:{}}}", on("active"), color(pressed)));
+    }
+    if let Some(gradient) = &style.gradient {
+        base.insert("background-image", css_gradient(gradient));
+    }
+    if style.clip {
+        base.insert("overflow", "hidden".into());
+    }
+    if let Some(opacity) = style.opacity {
+        base.insert("opacity", format!("{opacity}"));
+    }
+    if let Some(opacity) = style.hover_opacity {
+        states.push(format!("{}{{opacity:{opacity}}}", on("hover")));
+    }
+    if let Some(opacity) = style.pressed_opacity {
+        states.push(format!("{}{{opacity:{opacity}}}", on("active")));
+    }
+    if style.pass_through {
+        base.insert("pointer-events", "none".into());
+    }
+    // liquid glass, the half a browser owns: one native filter over
+    // what is behind the element, and the rim as two inset shadows
+    // along the lit diagonals
+    if let Some(glass) = style.glass {
+        let filter = format!(
+            "blur({}px) saturate({}) brightness({})",
+            glass.blur, glass.saturation, glass.brightness
+        );
+        base.insert("backdrop-filter", filter.clone());
+        base.insert("-webkit-backdrop-filter", filter);
+        if glass.rim_band > 0.0 {
+            let spread = glass.rim_band.max(1.0);
+            let soft = spread * 1.5;
+            let rim = color(glass.rim);
+            shadows.push(format!("inset {spread}px {spread}px {soft}px -{spread}px {rim}"));
+            shadows.push(format!("inset -{spread}px -{spread}px {soft}px -{spread}px {rim}"));
+        }
+    }
+    if !shadows.is_empty() {
+        base.insert("box-shadow", shadows.join(","));
+    }
+    if let Some(text) = text {
+        base.insert("font", css_font(&text.font));
+        // after the font shorthand, which resets it — the served page
+        // steps its lines the way the engine measured them
+        if let Some(height) = text.line_height {
+            base.insert("line-height", format!("{height}px"));
+        }
+        match text.text_align {
+            Some(motor::views::TextAlignment::Center) => {
+                base.insert("text-align", "center".into());
+            }
+            Some(motor::views::TextAlignment::Trailing) => {
+                base.insert("text-align", "right".into());
+            }
+            _ => {}
+        }
+        if text.inherits_ink {
+            base.remove("color");
+        } else {
+            base.insert("color", color(text.color));
+        }
+        if text.truncation.is_some() {
+            base.insert("overflow", "hidden".into());
+            base.insert("text-overflow", "ellipsis".into());
+            base.insert("white-space", "nowrap".into());
+        }
+    }
+    let declarations: Vec<String> = base.iter().map(|(name, value)| format!("{name}:{value}")).collect();
+    let mut out = format!("{selector}{{{}}}", declarations.join(";"));
+    for state in states {
+        out.push('\n');
+        out.push_str(&state);
+    }
+    out
 }
 
 fn css_font(font: &crate::text_engine::FontSpec) -> String {
