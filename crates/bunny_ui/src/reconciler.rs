@@ -1708,16 +1708,47 @@ fn drop_entries(paths: &[String]) {
         let mut retained = retained.borrow_mut();
         LIVE.with(|live| {
             let mut live = live.borrow_mut();
-            for path in paths {
-                if let Some(entry) = retained.remove(path) {
-                    live.unindex(path, &entry);
-                    // a view that left owes the read graph nothing more:
-                    // its reads and its bindings' reads fall with it
-                    motor::identity::forget_view_reads(path);
+            GRAVEYARD.with(|graveyard| {
+                let mut graveyard = graveyard.borrow_mut();
+                for path in paths {
+                    if let Some(entry) = retained.remove(path) {
+                        live.unindex(path, &entry);
+                        // a view that left owes the read graph nothing
+                        // more: its reads and its bindings' reads fall
+                        // with it, and its bindings are dead to the frame
+                        let bindings = motor::identity::forget_view_reads(path);
+                        crate::bind::forget_live(&bindings);
+                        // the entry's memory — a layout tree, a value, the
+                        // bindings' objects — is freed when the page is
+                        // idle, not inside the frame that let it go
+                        graveyard.push(entry);
+                    }
                 }
-            }
+            });
         });
     });
+}
+
+thread_local! {
+    /// Entries that left the retention and wait for an idle moment to
+    /// be freed: a thousand rows that leave a list are a thousand layout
+    /// trees, and the frame that drops them must not pay their frees.
+    static GRAVEYARD: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Frees the entries that left since the last call; returns how many.
+pub(crate) fn collect_garbage() -> usize {
+    GRAVEYARD.with(|graveyard| {
+        let mut graveyard = graveyard.borrow_mut();
+        let count = graveyard.len();
+        graveyard.clear();
+        count
+    })
+}
+
+/// Diagnostics: entries waiting to be freed.
+pub(crate) fn graveyard_len() -> usize {
+    GRAVEYARD.with(|graveyard| graveyard.borrow().len())
 }
 
 /// Drops every retained entry under `root` — the retention half of a
@@ -1851,6 +1882,7 @@ pub(crate) fn sweep_stale(root: &str) {
 pub(crate) fn clear() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
     LIVE.with(|live| *live.borrow_mut() = Live::default());
+    GRAVEYARD.with(|graveyard| graveyard.borrow_mut().clear());
     ASSEMBLED_AT.with(|at| at.set(None));
 }
 
@@ -1859,6 +1891,7 @@ pub(crate) fn clear() {
 /// `motor::identity::reset_world` for the other half of the contract.
 pub(crate) fn reset_world() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
+    GRAVEYARD.with(|graveyard| graveyard.borrow_mut().clear());
     crate::layout::forget_pictures();
     LIVE.with(|live| *live.borrow_mut() = Live::default());
     ASSEMBLED_ROOT.with(|root| *root.borrow_mut() = None);
