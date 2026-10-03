@@ -119,9 +119,9 @@ fn items(count: usize) -> Rc<Vec<Item>> {
     )
 }
 
-/// The settle allocations of a frame that mounts `count` rows into a
-/// page that was mounted empty.
-fn settle_of<B, V>(count: usize, body: B) -> u64
+/// The allocations `stage` makes in a frame that mounts `count` rows
+/// into a page that was mounted empty.
+fn mount_of<B, V>(stage: Stage, count: usize, body: B) -> u64
 where
     B: Fn(Item) -> V + Copy + 'static,
     V: View,
@@ -134,7 +134,17 @@ where
     page.items.set(items(count));
     let _ = stats::take();
     let _ = runtime.dom_frame(&page, SIZE);
-    stats::take().allocs(Stage::Settle)
+    stats::take().allocs(stage)
+}
+
+/// The settle allocations of a frame that mounts `count` rows into a
+/// page that was mounted empty.
+fn settle_of<B, V>(count: usize, body: B) -> u64
+where
+    B: Fn(Item) -> V + Copy + 'static,
+    V: View,
+{
+    mount_of(Stage::Settle, count, body)
 }
 
 /// What one more row costs the settle, rounded: the shared costs of a
@@ -268,29 +278,50 @@ fn a_hint_rides_the_node_it_names() {
 
 /// The row of the keyed benchmark: its own class, an id cell, a cell
 /// with a link to its bound label, a cell with a link around a glyph,
-/// and an empty cell — seven hints and two actions. Beyond the empty
-/// row it pays for its two bindings, its two texts, the closures of its
-/// two clicks and their paths, and the lists its stacks and its actions
-/// are held in; its hints and the targets its clicks arm cost nothing.
+/// and an empty cell — seven hints and two actions.
+fn benchmark_row(item: Item) -> impl View {
+    let id = item.id;
+    (
+        boundary_class_when(item.on, "danger"),
+        text(id.to_string()).element("td").css_class("col-md-1"),
+        hstack!(text!(item.label).element("a").on_click(|| {})).element("td").css_class("col-md-4"),
+        hstack!(
+            hstack!(hstack!(empty()).element("span").css_class("glyphicon glyphicon-remove"))
+                .element("a")
+                .on_click(|| {})
+        )
+        .element("td")
+        .css_class("col-md-1"),
+        hstack!(empty()).element("td").css_class("col-md-6"),
+    )
+}
+
+/// Beyond the empty row the benchmark's row pays for its two bindings,
+/// its two texts, the closures of its two clicks and their paths, and
+/// the lists its stacks and its actions are held in; its hints and the
+/// targets its clicks arm cost nothing.
 #[test]
 fn a_row_of_the_benchmark_pays_for_its_bindings_and_its_clicks() {
-    let cost = beyond_empty(|item| {
-        let id = item.id;
-        (
-            boundary_class_when(item.on, "danger"),
-            text(id.to_string()).element("td").css_class("col-md-1"),
-            hstack!(text!(item.label).element("a").on_click(|| {})).element("td").css_class("col-md-4"),
-            hstack!(
-                hstack!(hstack!(empty()).element("span").css_class("glyphicon glyphicon-remove"))
-                    .element("a")
-                    .on_click(|| {})
-            )
-            .element("td")
-            .css_class("col-md-1"),
-            hstack!(empty()).element("td").css_class("col-md-6"),
-        )
-    });
+    let cost = beyond_empty(benchmark_row);
     assert!(cost <= 18, "a row of the benchmark costs the settle {cost} allocations beyond the empty row");
+}
+
+// MARK: - The lowering
+
+/// A row that mounts is kept as the scene made it: the diff writes the
+/// element ids and the looks on the scene's own nodes, where they stand,
+/// and keeps the vectors they came in — the scene's list of rows becomes
+/// the retention's. Twice the rows cost the diff nothing more than the
+/// rows: no vector per parent (the benchmark's row has four, and each
+/// took a vector of its own, the nodes copied into it), and none to
+/// give back room the capture made and did not fill.
+#[test]
+fn a_row_that_mounts_is_kept_as_the_scene_made_it() {
+    const ROWS: usize = 100;
+    let once = mount_of(Stage::Diff, ROWS, benchmark_row);
+    let twice = mount_of(Stage::Diff, 2 * ROWS, benchmark_row);
+    let per_row = (twice.saturating_sub(once) as f64 / ROWS as f64).round() as u64;
+    assert_eq!(per_row, 0, "a row that mounts costs the diff {per_row} allocations ({once} for {ROWS}, {twice} for twice)");
 }
 
 /// A row's links are armed in every body it runs, and the action rides

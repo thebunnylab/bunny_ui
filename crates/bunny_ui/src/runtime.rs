@@ -4826,7 +4826,7 @@ impl Runtime {
         let mut dom = self.dom.borrow_mut();
         self.note_island_hits(&output.islands_walked, output.hits);
         dom.note_groups(output.groups);
-        dom.adopt(&output.scene, &output.display);
+        dom.adopt(output.scene, &output.display);
     }
 
     /// A click resolved by the BROWSER: the glue walked up from the

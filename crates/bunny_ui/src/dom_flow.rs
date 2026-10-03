@@ -187,6 +187,8 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         hints: DomHints::default(),
         children,
         binding: None,
+        id: 0,
+        rule: 0,
     };
     FlowOutput {
         scene,
@@ -336,6 +338,8 @@ fn node(kind: DomKind) -> DomNode {
         children: Vec::new(),
         binding: None,
         face: None,
+        id: 0,
+        rule: 0,
     }
 }
 
@@ -359,6 +363,8 @@ fn promise(path: &std::rc::Rc<str>, record: &GroupRecord) -> DomNode {
         children: Vec::new(),
         binding: record.class_binding.clone().map(crate::dom::NodeBinding::Class),
         face: None,
+        id: 0,
+        rule: 0,
     }
 }
 
@@ -1350,7 +1356,13 @@ impl Walk<'_> {
     fn lower_group(&mut self, path: &std::rc::Rc<str>, children: &[LayoutNode], out: &mut Vec<DomNode>) {
         let env = self.filed_env();
         let mut group = node(DomKind::Group { path: std::rc::Rc::clone(path) });
-        group.children.reserve_exact(children.len());
+        // room for the nodes, and only for them: what the body says about
+        // its own element lowers to none, and the vector is the one the
+        // retention keeps — a slot too many was a node's worth of memory
+        // held by every row of a list
+        group.children.reserve_exact(
+            children.iter().filter(|child| !matches!(child, LayoutNode::BoundaryHint { .. })).count(),
+        );
         let outer_pending = self.pending_boundary_class.take();
         let drops_before = self.drops_seen;
         // what ran under this boundary is what ran under its parent and
