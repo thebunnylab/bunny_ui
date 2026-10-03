@@ -1787,10 +1787,27 @@ pub(crate) fn sweep_stale(root: &str) {
             pass.skipped.iter().cloned().collect(),
         )
     });
-    // alive: it ran, or it stands at or under a boundary the walk
-    // skipped on purpose
-    let alive = |path: &str| {
-        runs.contains(path) || skipped.contains(path) || cuts(path).any(|prefix| skipped.contains(prefix))
+    // alive under a boundary that ran: it ran itself, or it stands at
+    // or under a boundary the walk skipped on purpose BELOW that run.
+    // A skipped ancestor above the run says nothing about what is
+    // under the run: the run rebuilt its subtree, and an entry it did
+    // not reach again has left (a list under a clean page clears, and
+    // the page is skipped — its rows must still go)
+    let alive = |boundary: &str, path: &str| {
+        if runs.contains(path) || skipped.contains(path) {
+            return true;
+        }
+        let mut cut = path.len();
+        while let Some(at) = path[..cut].rfind('/') {
+            if at <= boundary.len() {
+                break;
+            }
+            if skipped.contains(&path[..at]) {
+                return true;
+            }
+            cut = at;
+        }
+        false
     };
     let mut dead: Vec<String> = Vec::new();
     RETAINED.with(|retained| {
@@ -1803,7 +1820,7 @@ pub(crate) fn sweep_stale(root: &str) {
             let hi = format!("{boundary}0");
             let range = (std::ops::Bound::Included(lo.as_str()), std::ops::Bound::Excluded(hi.as_str()));
             for (path, _) in retained.range::<str, _>(range) {
-                if !alive(path) {
+                if !alive(boundary, path) {
                     dead.push(path.clone());
                 }
             }
@@ -1817,7 +1834,7 @@ pub(crate) fn sweep_stale(root: &str) {
             live.borrow()
                 .top_level
                 .iter()
-                .filter(|path| covers(root, path) && !alive(path))
+                .filter(|path| covers(root, path) && !alive(root, path))
                 .cloned()
                 .collect()
         });

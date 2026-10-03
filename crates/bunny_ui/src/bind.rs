@@ -615,6 +615,64 @@ mod tests {
     use super::*;
     use crate::prelude::*;
 
+    /// A keyed list under a page that did not run: the rows that leave
+    /// the list leave the retention too — their boundaries, their
+    /// bindings, their reads. The page is skipped, and a skipped page
+    /// must not shelter what the list under it let go.
+    #[test]
+    fn rows_that_leave_a_list_under_a_clean_page_are_swept() {
+        #[derive(Clone, Copy)]
+        struct Row {
+            id: usize,
+            label: State<Rc<str>>,
+        }
+
+        // each row is a boundary of its own, the way a list's rows are
+        #[derive(Clone, Copy)]
+        struct RowView(Row);
+
+        impl Component for RowView {
+            fn body(self, _ctx: &Context) -> impl View {
+                let row = self.0;
+                crate::hstack!(text(row.id.to_string()), crate::text!(row.label))
+            }
+        }
+
+        #[derive(Clone)]
+        struct Page {
+            rows: State<Rc<Vec<Row>>>,
+        }
+
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(
+                    text("a page that never runs again"),
+                    for_each(self.rows, |row| row.id.to_string(), |row| RowView(*row)),
+                )
+            }
+        }
+
+        let rows = State::new(Rc::new(Vec::new()));
+        let runtime = Runtime::new();
+        let size = Size { width: 400.0, height: 300.0 };
+        let _ = runtime.dom_frame(&Page { rows }, size);
+        let empty_boundaries = crate::reconciler::retained_len();
+        let empty_bindings = live_count();
+
+        let seeds: Vec<Row> = (1..=5).map(|id| Row { id, label: State::new(Rc::from("one")) }).collect();
+        rows.set(Rc::new(seeds));
+        let _ = runtime.dom_frame(&Page { rows }, size);
+        assert_eq!(crate::reconciler::retained_len(), empty_boundaries + 5, "five rows retained");
+        assert_eq!(live_count(), empty_bindings + 5, "five bound labels");
+
+        rows.set(Rc::new(Vec::new()));
+        let _ = runtime.dom_frame(&Page { rows }, size);
+        assert_eq!(crate::reconciler::retained_len(), empty_boundaries, "the rows left the retention");
+        assert_eq!(live_count(), empty_bindings, "their bindings left with them");
+        let counts = motor::identity::registry_counts();
+        assert_eq!(counts[3], 0, "no view keeps bindings: {counts:?}");
+    }
+
     #[test]
     fn a_binding_reads_for_itself_and_goes_stale_on_a_write() {
         let count = State::new(1usize);
