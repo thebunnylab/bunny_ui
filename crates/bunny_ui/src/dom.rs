@@ -1847,7 +1847,7 @@ fn create_subtree_before(
     patches: &mut Vec<DomPatch>,
 ) -> Retained {
     let opened = patches.len();
-    let created = create_subtree(node, parent, ctx, patches);
+    let created = create_subtree(node, parent, ctx, patches, None);
     if before != 0
         && let DomPatch::Create { before: slot, .. } | DomPatch::Clone { before: slot, .. } =
             &mut patches[opened]
@@ -1910,6 +1910,95 @@ fn shape_of(node: &DomNode) -> Option<u64> {
     shape_into(node, &mut hasher).then(|| hasher.finish())
 }
 
+/// Does the subtree have the shape of this template instance? The
+/// twin of [`shape_into`] that compares instead of hashing: the same
+/// fields, in the same sense, and the first difference ends it.
+fn same_shape(node: &DomNode, template: &Retained) -> bool {
+    let old = &template.node;
+    if std::mem::discriminant(&node.kind) != std::mem::discriminant(&old.kind) {
+        return false;
+    }
+    match &node.kind {
+        DomKind::Group { .. }
+        | DomKind::Box
+        | DomKind::FlexColumn
+        | DomKind::FlexRow
+        | DomKind::Layers => {}
+        DomKind::Text(text) => {
+            if text.highlights.is_some() {
+                return false;
+            }
+            let DomKind::Text(was) = &old.kind else {
+                return false;
+            };
+            // the face and the ink, never the words
+            if text.color != was.color
+                || text.inherits_ink != was.inherits_ink
+                || text.font != was.font
+                || text.line_height != was.line_height
+                || text.text_align != was.text_align
+                || text.truncation != was.truncation
+            {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+    if node.hints.dom_id.is_some() || node.style.tooltip.is_some() || node.style.group_owner.is_some() {
+        return false;
+    }
+    let (Some(layout), Some(old_layout)) = (&node.layout, &old.layout) else {
+        return false;
+    };
+    same_look_layout(layout, old_layout)
+        && geometry_of(layout) == geometry_of(old_layout)
+        && same_look_style(&node.style, &old.style)
+        && node.hints.tag == old.hints.tag
+        && node.hints.class == old.hints.class
+        && node.style.interactive.is_some() == old.style.interactive.is_some()
+        && node.binding.is_some() == old.binding.is_some()
+        && node.children.len() == template.children.len()
+        && node.children.iter().zip(&template.children).all(|(child, was)| same_shape(child, was))
+}
+
+/// The shared part of two flow records, equal? (What [`look_hash`]
+/// reads of a layout.)
+fn same_look_layout(a: &DomLayout, b: &DomLayout) -> bool {
+    a.gap == b.gap
+        && a.align == b.align
+        && a.padding == b.padding
+        && a.grow == b.grow
+        && a.stretch == b.stretch
+        && a.fill == b.fill
+        && a.wrap == b.wrap
+        && a.plain == b.plain
+}
+
+/// The shared part of two styles, equal? (What [`look_hash`] reads of
+/// a style: everything but the element's own path, tooltip and group.)
+fn same_look_style(a: &DomStyle, b: &DomStyle) -> bool {
+    a.background == b.background
+        && a.hover_background == b.hover_background
+        && a.pressed_background == b.pressed_background
+        && a.color == b.color
+        && a.hover_color == b.hover_color
+        && a.pressed_color == b.pressed_color
+        && a.focus_border == b.focus_border
+        && a.placeholder_color == b.placeholder_color
+        && a.border == b.border
+        && a.corner_radius == b.corner_radius
+        && a.shadow == b.shadow
+        && a.transition == b.transition
+        && a.clip == b.clip
+        && a.opacity == b.opacity
+        && a.hover_opacity == b.hover_opacity
+        && a.pressed_opacity == b.pressed_opacity
+        && a.group == b.group
+        && a.pass_through == b.pass_through
+        && a.gradient == b.gradient
+        && a.glass == b.glass
+}
+
 fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
     use std::hash::Hash;
     // the kinds a clone can carry: the ones with no state of the
@@ -1954,7 +2043,26 @@ fn create_subtree(
     parent: u32,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
+    previous: Option<&Retained>,
 ) -> Retained {
+    // the sibling made just before this one, when it is the live
+    // instance of a template and this subtree has its shape: cloned
+    // at once, by a walk that compares and stops at the first
+    // difference — never a hash over every node of every row. A
+    // list's rows mostly look alike, and this is the road they take
+    if let Some(previous) = previous
+        && matches!(node.kind, DomKind::Group { .. })
+        && ctx.templates.roots.contains_key(&previous.id)
+        && same_shape(&node, previous)
+    {
+        let id = *ctx.next_id;
+        *ctx.next_id += 1;
+        patches.push(DomPatch::Clone { id, parent, before: 0, template: previous.id });
+        crate::stats::note_clone();
+        let rules = ctx.templates.rules_of(previous.id);
+        let mut at = 0;
+        return clone_instance(node, id, &rules, &mut at, ctx, patches);
+    }
     // the shape is the whole subtree's: read while the children are
     // still the node's own
     let shape = match node.kind {
@@ -2067,10 +2175,12 @@ fn create_children(
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) -> Vec<Retained> {
-    children
-        .into_iter()
-        .map(|child| create_subtree(child, parent, ctx, patches))
-        .collect()
+    let mut out: Vec<Retained> = Vec::with_capacity(children.len());
+    for child in children {
+        let created = create_subtree(child, parent, ctx, patches, out.last());
+        out.push(created);
+    }
+    out
 }
 
 /// One remove patch frees the whole subtree on the glue's side; the
@@ -2443,7 +2553,10 @@ fn diff_children(
                 next.push(old);
                 survivors += 1;
             }
-            None => next.push(create_subtree(child, retained.id, ctx, patches)),
+            None => {
+                let created = create_subtree(child, retained.id, ctx, patches, next.last());
+                next.push(created);
+            }
         }
     }
 
