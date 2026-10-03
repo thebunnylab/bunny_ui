@@ -887,6 +887,13 @@ impl Walk<'_> {
             LayoutNode::Image { source, fit, .. } => {
                 match source {
                     Some(source) => {
+                        // the walk never measures, so nothing else asks
+                        // the platform about these bytes: the ask hands
+                        // them over (once per identity), and the <img>
+                        // finds its URL when the patch lands
+                        if let Some(env) = &self.env.layout {
+                            let _ = crate::image_engine::intrinsic_of(env.images, source);
+                        }
                         let cover = matches!(
                             fit,
                             Some(motor::views::ContentMode::Fill)

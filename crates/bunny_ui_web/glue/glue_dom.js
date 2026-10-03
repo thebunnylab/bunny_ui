@@ -1258,6 +1258,7 @@ function applyPatches(view, length) {
       const cover = u8();
       const el = lookup(id);
       const entry = images.get(imageKey(hi, lo));
+      if (el) el.dataset.img = imageKey(hi, lo);
       if (el && entry) {
         el.src = entry.url;
         // false: our frame IS the rect (contain and stretch resolve in
@@ -1590,10 +1591,18 @@ const imports = {
     js_image_register(hi, lo, pointer, length) {
       const key = imageKey(hi, lo);
       const bytes = new Uint8Array(wasm.memory.buffer, pointer, length).slice();
-      const url = URL.createObjectURL(new Blob([bytes]));
+      // a browser sniffs the raster formats, never SVG: the markup
+      // needs its type named or the blob never decodes
+      const head = decoder.decode(bytes.subarray(0, 256)).trimStart();
+      const svg = head.startsWith("<svg") || (head.startsWith("<?xml") && head.includes("<svg"));
+      const url = URL.createObjectURL(new Blob([bytes], svg ? { type: "image/svg+xml" } : {}));
       const probe = new Image();
       const entry = { url, probe, width: 0, height: 0 };
       images.set(key, entry);
+      // a served page's <img> waits for these bytes by identity
+      for (const el of app.querySelectorAll(`img[data-img="${key}"]`)) {
+        if (!el.getAttribute("src")) el.src = url;
+      }
       probe.onload = () => {
         entry.width = probe.naturalWidth;
         entry.height = probe.naturalHeight;
