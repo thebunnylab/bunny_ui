@@ -141,6 +141,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         groups_out: Vec::new(),
         hits: Vec::new(),
         islands_walked: Vec::new(),
+        runs_below: true,
     };
     let mut children = Vec::new();
     walk.lower_into(root, &mut children);
@@ -271,6 +272,10 @@ struct Walk<'a> {
     islands_walked: Vec<std::rc::Rc<str>>,
     /// The groups lowered this walk, for the lowering's records.
     groups_out: Vec<(std::rc::Rc<str>, GroupRecord)>,
+    /// May a run sit under the boundary being lowered? False once a
+    /// boundary with nothing run below it opens: a thousand kept rows
+    /// under a list that ran alone ask the index nothing.
+    runs_below: bool,
 }
 
 /// A flow node with nothing to say yet.
@@ -330,7 +335,9 @@ impl Walk<'_> {
     }
 
     fn current_ink(&self) -> Color {
-        self.ink.last().copied().unwrap_or(crate::theme::current().fg)
+        // the theme is read only when no ink is open: every boundary
+        // asks, and the whole theme is copied out to answer
+        self.ink.last().copied().unwrap_or_else(|| crate::theme::current().fg)
     }
 
     /// Lowers one semantic node into `out` — most nodes append exactly
@@ -852,71 +859,7 @@ impl Walk<'_> {
             LayoutNode::Measured { child, .. } => self.lower_into(child, out),
 
             LayoutNode::Boundary { path, children, .. } => {
-                // a CLEAN boundary is a promise, not a walk: no body at
-                // or under it ran, the retained group still holds, and
-                // it was lowered in the environment the walk carries
-                // now — so the diff keeps it wholesale, O(change), by
-                // absence. The promise is born as the group's own
-                // shell, and the parent stamps its part again.
-                let key = self.flow_key();
-                let holds = |record: &GroupRecord| {
-                    if crate::reconciler::is_retained(path) {
-                        // a component's body is its own: the run above
-                        // changed nothing it shows unless the environment
-                        // it is lowered in moved
-                        record.env == key
-                    } else {
-                        // an identity scope with no body (a list's row) is
-                        // the content of the body above it
-                        !self.changed.run_above(path)
-                    }
-                };
-                if let Some(record) = self.env.retained_groups.get(&**path)
-                    && !self.changed.touches(path)
-                    && holds(record)
-                {
-                    let mut promise = node(DomKind::Reuse { path: std::rc::Rc::clone(path) });
-                    if let Some(layout) = promise.layout.as_mut() {
-                        layout.stretch = record.own_stretch;
-                    }
-                    promise.hints.class = record.own_class.clone();
-                    promise.binding = record.class_binding.clone().map(crate::dom::NodeBinding::Class);
-                    self.drops_seen += record.drops;
-                    out.push(promise);
-                    return;
-                }
-                let mut group = node(DomKind::Group { path: std::rc::Rc::clone(path) });
-                group.children.reserve_exact(children.len());
-                let outer_pending = self.pending_boundary_class.take();
-                let drops_before = self.drops_seen;
-                for child in children {
-                    let opened = group.children.len();
-                    self.lower_into(child, &mut group.children);
-                    Self::stamp_fill(child, &mut group.children[opened..]);
-                }
-                Self::inherit_stretch(&mut group);
-                let own_stretch = group.layout.as_ref().is_some_and(|layout| layout.stretch);
-                let mut class_binding = None;
-                if let Some((class, binding)) = self.pending_boundary_class.take() {
-                    // the body spoke about its own element: an empty
-                    // class clears, anything else attributes
-                    group.hints.class =
-                        (!class.is_empty()).then(|| std::rc::Rc::from(class.as_str()));
-                    class_binding = binding;
-                }
-                group.binding = class_binding.clone().map(crate::dom::NodeBinding::Class);
-                self.pending_boundary_class = outer_pending;
-                self.groups_out.push((
-                    std::rc::Rc::clone(path),
-                    GroupRecord {
-                        env: key,
-                        own_stretch,
-                        own_class: group.hints.class.clone(),
-                        class_binding,
-                        drops: self.drops_seen - drops_before,
-                    },
-                ));
-                out.push(group);
+                self.lower_boundary(path, children, false, out);
             }
             LayoutNode::BoundaryRef { path, slot } => {
                 // resolves through the retention IN PLACE, the same
@@ -926,6 +869,18 @@ impl Walk<'_> {
                 // missing entry keeps the identity anchor so the diff
                 // can match later
                 let found = slot.with_layout(|tree| match tree {
+                    // the frame's tree names only retained boundaries:
+                    // an entry that left keeps its slot filled until the
+                    // page is idle, but no tree of the frame refers to it
+                    // any more — so the boundary is not asked again
+                    Some(LayoutNode::Boundary { path, children, .. }) => {
+                        debug_assert!(
+                            crate::reconciler::is_retained(path),
+                            "the frame reached a boundary that left: {path}"
+                        );
+                        self.lower_boundary(path, children, true, out);
+                        true
+                    }
                     Some(tree) => {
                         self.lower_into(tree, out);
                         true
@@ -1154,6 +1109,90 @@ impl Walk<'_> {
                 self.overlays.push(popover);
             }
         }
+    }
+
+    /// A boundary: a promise of reuse when nothing it shows can have
+    /// changed, its group lowered again otherwise. `retained` says the
+    /// walk reached it through its slot, which only a retained entry
+    /// fills — the retention is not asked again.
+    fn lower_boundary(
+        &mut self,
+        path: &std::rc::Rc<str>,
+        children: &[LayoutNode],
+        retained: bool,
+        out: &mut Vec<DomNode>,
+    ) {
+        // a CLEAN boundary is a promise, not a walk: no body at
+        // or under it ran, the retained group still holds, and
+        // it was lowered in the environment the walk carries
+        // now — so the diff keeps it wholesale, O(change), by
+        // absence. The promise is born as the group's own
+        // shell, and the parent stamps its part again.
+        let key = self.flow_key();
+        let holds = |record: &GroupRecord| {
+            if retained || crate::reconciler::is_retained(path) {
+                // a component's body is its own: the run above
+                // changed nothing it shows unless the environment
+                // it is lowered in moved
+                record.env == key
+            } else {
+                // an identity scope with no body (a list's row) is
+                // the content of the body above it
+                !self.changed.run_above(path)
+            }
+        };
+        if let Some(record) = self.env.retained_groups.get(&**path)
+            && !(self.runs_below && self.changed.touches(path))
+            && holds(record)
+        {
+            let mut promise = node(DomKind::Reuse { path: std::rc::Rc::clone(path) });
+            if let Some(layout) = promise.layout.as_mut() {
+                layout.stretch = record.own_stretch;
+            }
+            promise.hints.class = record.own_class.clone();
+            promise.binding = record.class_binding.clone().map(crate::dom::NodeBinding::Class);
+            self.drops_seen += record.drops;
+            out.push(promise);
+            return;
+        }
+        let mut group = node(DomKind::Group { path: std::rc::Rc::clone(path) });
+        group.children.reserve_exact(children.len());
+        let outer_pending = self.pending_boundary_class.take();
+        let drops_before = self.drops_seen;
+        // what ran under this boundary is what ran under its parent and
+        // under its own path: when nothing did, no boundary below it is
+        // touched, and none of them asks
+        let outer_runs = self.runs_below;
+        self.runs_below = outer_runs && self.changed.above_a_run.contains(&**path);
+        for child in children {
+            let opened = group.children.len();
+            self.lower_into(child, &mut group.children);
+            Self::stamp_fill(child, &mut group.children[opened..]);
+        }
+        self.runs_below = outer_runs;
+        Self::inherit_stretch(&mut group);
+        let own_stretch = group.layout.as_ref().is_some_and(|layout| layout.stretch);
+        let mut class_binding = None;
+        if let Some((class, binding)) = self.pending_boundary_class.take() {
+            // the body spoke about its own element: an empty
+            // class clears, anything else attributes
+            group.hints.class =
+                (!class.is_empty()).then(|| std::rc::Rc::from(class.as_str()));
+            class_binding = binding;
+        }
+        group.binding = class_binding.clone().map(crate::dom::NodeBinding::Class);
+        self.pending_boundary_class = outer_pending;
+        self.groups_out.push((
+            std::rc::Rc::clone(path),
+            GroupRecord {
+                env: key,
+                own_stretch,
+                own_class: group.hints.class.clone(),
+                class_binding,
+                drops: self.drops_seen - drops_before,
+            },
+        ));
+        out.push(group);
     }
 
     /// The engine PROPOSES a wrapper's box to its interior; a block
@@ -1802,5 +1841,76 @@ mod tests {
                 if path == "app/[row]" && anchor == "app/[row]/#anchor"
         ));
         assert!(!last.children.is_empty(), "the card lowered under the portal");
+    }
+
+    /// A keyed list that re-runs alone keeps every row as a promise, and
+    /// the walk asks nothing of a row it reached through the row's slot:
+    /// the slot holds a tree only while the row is retained, and below a
+    /// boundary nothing ran under no row can have been touched. A run
+    /// UNDER the list is under it, though — a row whose own state moved
+    /// in the frame its list reordered is lowered again, with its new
+    /// words, and the rows around it stay promises.
+    #[test]
+    fn a_row_that_ran_while_its_list_reordered_is_lowered_again() {
+        use crate::prelude::*;
+
+        #[derive(Clone, Copy)]
+        struct Item {
+            id: usize,
+            seen: State<usize>,
+        }
+
+        #[derive(Clone, Copy)]
+        struct Row(Item);
+
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                text(format!("row {} seen {}", self.0.id, self.0.seen.get()))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Table {
+            rows: State<std::rc::Rc<Vec<Item>>>,
+        }
+
+        impl Component for Table {
+            fn body(self, _ctx: &Context) -> impl View {
+                for_each(self.rows, |item| item.id.to_string(), |item| Row(*item))
+            }
+        }
+
+        let size = crate::layout::Size { width: 400.0, height: 300.0 };
+        let made: Vec<Item> = (1..=5).map(|id| Item { id, seen: State::new(0) }).collect();
+        let table = Table { rows: State::new(std::rc::Rc::new(made.clone())) };
+        let runtime = crate::runtime::Runtime::new();
+        let _ = runtime.dom_frame(&table, size);
+        let _ = crate::stats::take();
+        let moves = |patches: &[crate::dom::DomPatch]| {
+            patches.iter().filter(|p| matches!(p, crate::dom::DomPatch::Move { .. })).count()
+        };
+
+        // the list alone: every row a promise, two moves
+        let mut order = made.clone();
+        order.swap(1, 3);
+        table.rows.set(std::rc::Rc::new(order.clone()));
+        let patches = runtime.dom_frame(&table, size);
+        assert_eq!(crate::stats::take().diff_reused, 5, "every row kept: {patches:?}");
+        assert_eq!((moves(&patches), patches.len()), (2, 2), "{patches:?}");
+
+        // the list and a row in one frame: that row is lowered again
+        order.swap(0, 4);
+        table.rows.set(std::rc::Rc::new(order));
+        made[2].seen.set(1);
+        let patches = runtime.dom_frame(&table, size);
+        assert_eq!(crate::stats::take().diff_reused, 4, "the rows that did not run: {patches:?}");
+        assert!(
+            patches.iter().any(|p| matches!(
+                p,
+                crate::dom::DomPatch::SetContent { text, .. } if &**text == "row 3 seen 1"
+            )),
+            "the row that ran shows its new words: {patches:?}"
+        );
+        assert_eq!(moves(&patches), 2, "{patches:?}");
     }
 }
