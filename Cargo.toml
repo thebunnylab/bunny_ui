@@ -15,6 +15,7 @@ members = [
     "apps/countries_pure",
     "apps/finder_web",
     "apps/bench_web",
+    "apps/landing_web",
 ]
 
 [workspace.package]
