@@ -686,11 +686,18 @@ impl Walk<'_> {
                     let layout = container.layout.as_mut().expect("flow node");
                     if max_width.is_finite() {
                         layout.max_width = Some(*max_width as f32);
-                    } else {
-                        layout.grow = true;
                     }
                     if max_height.is_finite() {
                         layout.max_height = Some(*max_height as f32);
+                    }
+                    // a frame open on BOTH axes fills whatever holds it.
+                    // Open on one, it is flexible on that one alone, and
+                    // `flex` is the holder's main axis, whichever that is:
+                    // a stack around it already grows or stretches it by
+                    // the axis it asks about, and a width left open in a
+                    // column would otherwise grow the HEIGHT from nothing
+                    if max_width.is_infinite() && max_height.is_infinite() {
+                        layout.grow = true;
                     }
                     layout.align = Some(align_code(*align));
                 }
@@ -2644,5 +2651,32 @@ mod tests {
         };
         assert!(plain(&row(0.0)), "a sentence flows as one block");
         assert!(!plain(&row(8.0)), "a gap says these are items, not words");
+    }
+
+    /// A frame open across a column only, the width: the column
+    /// stretches it to its edges, and its height stays its content's —
+    /// a `flex` on it would be the column's main axis, a height grown
+    /// from a zero basis, and the page would fold to nothing.
+    #[test]
+    fn a_width_left_open_in_a_column_never_grows_the_height() {
+        let open_width = LayoutNode::MaxFrame {
+            max_width: f64::INFINITY,
+            max_height: f64::MAX,
+            align: CrossAlign::Start,
+            child: Box::new(text_node("a band")),
+        };
+        let tree = LayoutNode::Stack {
+            axis: Axis::Vertical,
+            spacing: 0.0,
+            align: CrossAlign::Start,
+            children: vec![open_width],
+            hints: Default::default(),
+            action: None,
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let band = scene.children[0].children[0].layout.as_ref().expect("flow");
+        assert!(!band.grow, "no flex on the column's axis: {band:?}");
+        assert!(band.stretch, "the column takes it edge to edge: {band:?}");
     }
 }
