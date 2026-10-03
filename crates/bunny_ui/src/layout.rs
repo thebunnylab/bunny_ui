@@ -5288,7 +5288,7 @@ impl LayoutNode {
                         .unwrap_or(theme.fg);
                     if let Some(dom) = out.dom.as_mut() {
                         dom.leaf_styled(
-                            crate::dom::DomKind::Field(crate::dom::DomField {
+                            crate::dom::DomKind::Field(Box::new(crate::dom::DomField {
                                 path: path.clone(),
                                 content: content.clone(),
                                 placeholder: placeholder.clone(),
@@ -5296,7 +5296,7 @@ impl LayoutNode {
                                 color,
                                 multiline,
                                 secret,
-                            }),
+                            })),
                             frame,
                             // a bare field carries no ground, no edge
                             // and no rounding here either — the caller's
