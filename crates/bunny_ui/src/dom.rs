@@ -2824,7 +2824,10 @@ fn remove_all_children(
         if !ctx.templates.members.is_empty() {
             ctx.templates.touched(retained.id);
         }
-        number_leaving(retained, ctx, &mut runs, islands);
+        number_leaving(retained, &mut runs);
+        if islands {
+            forget_islands(retained, ctx);
+        }
     }
     patches.push(DomPatch::RemoveChildren { id: parent, forget: id_ranges(runs) });
     ctx.graveyard.push(Buried::Many(leaving));
@@ -2876,15 +2879,27 @@ fn forget_now(retained: &Retained, ctx: &mut LowerCtx) {
     }
 }
 
-/// The ids of a row that leaves whole, as runs — the patch names them —
-/// and its islands out of the registry, when any island stands. Its
-/// template question was the row's own, and its groups and bindings wait
-/// for the idle: a thousand rows that leave together are nine thousand
-/// nodes, and the walk asks each one for its id and nothing it would
-/// hash.
-fn number_leaving(retained: &Retained, ctx: &mut LowerCtx, runs: &mut Vec<(u32, u32)>, islands: bool) {
+/// The ids of a row that leaves whole, as runs — the patch names them.
+/// Its template question was the row's own, its islands are asked apart
+/// and only while any stands, and its groups and bindings wait for the
+/// idle: a thousand rows that leave together are nine thousand nodes, and
+/// the walk asks each one for its id and its children, and nothing else.
+fn number_leaving(retained: &Retained, runs: &mut Vec<(u32, u32)>) {
     push_run(runs, retained.id);
-    if islands && let DomKind::Canvas { .. } = &retained.node.kind {
+    for child in &retained.children {
+        // most nodes of a row are leaves: they cost no call
+        if child.children.is_empty() {
+            push_run(runs, child.id);
+        } else {
+            number_leaving(child, runs);
+        }
+    }
+}
+
+/// The islands of a subtree that left, out of the registry: nothing may
+/// paint them again.
+fn forget_islands(retained: &Retained, ctx: &mut LowerCtx) {
+    if let DomKind::Canvas { .. } = &retained.node.kind {
         ctx.islands.remove(&retained.id);
     }
     // a template inside a row that leaves whole, the row none itself (it
@@ -2896,7 +2911,7 @@ fn number_leaving(retained: &Retained, ctx: &mut LowerCtx, runs: &mut Vec<(u32, 
         ctx.templates.forget_root(retained.id);
     }
     for child in &retained.children {
-        number_leaving(child, ctx, runs, islands);
+        forget_islands(child, ctx);
     }
 }
 
@@ -5149,6 +5164,56 @@ mod tests {
             "no structure churn on a redraw: {patches:?}"
         );
         assert_eq!(runtime.dom_islands(1).len(), 1, "fresh pixels follow the state");
+    }
+
+    /// Rows that each hold an island leave — one alone, then the rest
+    /// together, a list that clears in one op for the page — and their
+    /// islands leave the registry in the frame that lets them go, while
+    /// their groups and bindings wait for the idle: no island of theirs is
+    /// painted, though none was painted yet when they left.
+    #[cfg(feature = "canvas")]
+    #[test]
+    fn the_islands_of_rows_that_leave_are_never_painted() {
+        #[derive(Clone, Copy)]
+        struct Swatch(usize);
+
+        impl Component for Swatch {
+            fn body(self, _ctx: &Context) -> impl View {
+                spacer()
+                    .frame(10.0 + self.0 as f64, 10.0)
+                    .background_color(Color::hex(0x3B82F6))
+                    .rendering(Rendering::Gpu)
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Swatches {
+            ids: State<Rc<Vec<usize>>>,
+        }
+
+        impl Component for Swatches {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::views::for_each(self.ids, |id| id.to_string(), |id| Swatch(*id))
+            }
+        }
+
+        let runtime = Runtime::new();
+        let page = Swatches { ids: State::new(Rc::new(vec![1, 2, 3, 4])) };
+        let size = Size { width: 120.0, height: 80.0 };
+        let mount = runtime.dom_frame(&page, size);
+        let canvases = mount.iter().filter(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Canvas, .. })).count();
+        assert_eq!(canvases, 4, "an island a row: {mount:?}");
+
+        // one row leaves alone, then the rest together, before a single
+        // pixel was asked for
+        page.ids.set(Rc::new(vec![1, 3, 4]));
+        let patches = runtime.dom_frame(&page, size);
+        assert!(patches.iter().any(|patch| matches!(patch, DomPatch::Remove { .. })), "{patches:?}");
+        page.ids.set(Rc::new(Vec::new()));
+        let patches = runtime.dom_frame(&page, size);
+        assert!(patches.iter().any(|patch| matches!(patch, DomPatch::RemoveChildren { .. })), "{patches:?}");
+        assert!(runtime.dom_islands(1).is_empty(), "the islands that left are not painted");
+        assert!(runtime.island_frames().is_empty());
     }
 
     /// A FLEXIBLE island guesses at mount, then the browser reports
