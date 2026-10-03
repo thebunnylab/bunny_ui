@@ -43,7 +43,7 @@ use crate::text_input::{CaretState, EditCommand};
 /// framework holds no clock; it carries what the shell counted.
 pub(crate) type ClickAction = Rc<dyn Fn(u8)>;
 
-pub(crate) type ActionEntry = (String, ClickAction);
+pub(crate) type ActionEntry = (Rc<str>, ClickAction);
 
 /// What a `.on_copy` answers when ⌘C reaches it: the text of what the
 /// view has selected, or `None` when nothing is. Retained like the
@@ -271,7 +271,7 @@ thread_local! {
 /// entries that carry one, never from the whole retention.
 #[derive(Default)]
 struct Live {
-    actions: HashMap<String, ClickAction>,
+    actions: HashMap<Rc<str>, ClickAction>,
     copies: HashMap<String, CopyFn>,
     editors: HashMap<String, EditorFn>,
     splits: HashMap<String, SplitFn>,
@@ -320,7 +320,7 @@ struct RootKeys {
 }
 
 impl Live {
-    fn insert_action(&mut self, key: String, action: ClickAction) {
+    fn insert_action(&mut self, key: Rc<str>, action: ClickAction) {
         let hover = key.ends_with(HOVER_KEY);
         if self.actions.insert(key, action).is_none() && hover {
             self.hover_keys += 1;
@@ -818,7 +818,7 @@ pub(crate) fn attribute_effect(effect: EffectFn) {
 }
 
 /// An interactive action registered during render — same attribution.
-pub(crate) fn attribute_action(path: String, action: ClickAction) {
+pub(crate) fn attribute_action(path: Rc<str>, action: ClickAction) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         if let Some(frame) = pass.building.last_mut() {
@@ -1671,7 +1671,7 @@ pub(crate) fn refresh_root_region() {
         live.drop_root_region();
         let mut keys = RootKeys::default();
         for (key, action) in actions {
-            keys.actions.push(key.clone());
+            keys.actions.push(key.to_string());
             live.insert_action(key, action);
         }
         for (key, copy) in copies {

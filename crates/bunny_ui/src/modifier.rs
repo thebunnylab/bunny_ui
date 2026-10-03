@@ -1026,7 +1026,7 @@ fn apply(
                 // popover, and Escape stays the app's to bind.
                 let is_presented = is_presented.clone();
                 crate::reconciler::attribute_action(
-                    format!("{path}/#dismiss"),
+                    Rc::from(format!("{path}/#dismiss")),
                     Rc::new(move |_| is_presented.set(false)),
                 );
             }
@@ -1077,7 +1077,7 @@ fn apply(
                     let is_presented = is_presented.clone();
                     Rc::new(move || is_presented.set(false))
                 };
-                crate::reconciler::attribute_action(format!("{path}/#dismiss"), {
+                crate::reconciler::attribute_action(Rc::from(format!("{path}/#dismiss")), {
                     let cancel = cancel.clone();
                     Rc::new(move |_| cancel())
                 });
@@ -1151,7 +1151,7 @@ fn apply(
                         }
                     })
                 };
-                crate::reconciler::attribute_action(format!("{path}/#dismiss"), {
+                crate::reconciler::attribute_action(Rc::from(format!("{path}/#dismiss")), {
                     // a dismiss has no count to hear: the same
                     // closure the keyboard's Escape handler holds
                     let close = close.clone();
@@ -1655,8 +1655,8 @@ fn apply(
         Modifier::OnClick(action) => {
             // the same registration as the Button: action retained in the
             // reconciler, frame in the hit-test under the cursor identity
-            if let Some(path) = motor::identity::cursor_scope() {
-                crate::reconciler::attribute_action(path.clone(), action.clone());
+            if let Some(path) = motor::identity::cursor_scope_rc() {
+                crate::reconciler::attribute_action(Rc::clone(&path), action.clone());
                 out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
                     path,
                     child: Box::new(node),
@@ -1669,9 +1669,9 @@ fn apply(
             // reserved key beside the click's own, which is how the
             // popover's dismiss already rides. A view with both keeps
             // one path and answers two questions.
-            if let Some(path) = motor::identity::cursor_scope() {
+            if let Some(path) = motor::identity::cursor_scope_rc() {
                 crate::reconciler::attribute_action(
-                    format!("{path}/{}", crate::reconciler::HOVER_KEY),
+                    Rc::from(format!("{path}/{}", crate::reconciler::HOVER_KEY)),
                     action.clone(),
                 );
                 out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
@@ -1688,7 +1688,7 @@ fn apply(
             if let Some(path) = motor::identity::cursor_scope() {
                 crate::reconciler::attribute_copy(path.clone(), copy.clone());
                 out.wrap_layout_from(mark, |node| LayoutNode::Interactive {
-                    path,
+                    path: Rc::from(path),
                     child: Box::new(node),
                 });
             }

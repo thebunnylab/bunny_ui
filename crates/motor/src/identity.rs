@@ -432,6 +432,15 @@ pub fn cursor_scope() -> Option<String> {
     })
 }
 
+/// [`cursor_scope`] as a shared string: the one copy an action's key,
+/// its layout node and the element's own path all hold.
+pub fn cursor_scope_rc() -> Option<Rc<str>> {
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        (registry.pass_active && !registry.joined.is_empty()).then(|| Rc::from(registry.joined.as_str()))
+    })
+}
+
 /// `{cursor scope}/{suffix}` as a shared string — the key a node's own
 /// reading stands under. Spelled once into the register's buffer and
 /// shared from there: one allocation, where a scope copy, a format
