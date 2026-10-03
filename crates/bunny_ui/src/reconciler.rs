@@ -277,6 +277,11 @@ struct BuildingFrame {
     path: Rc<str>,
     /// The frame of a keyed list: the rows under it are kept by key.
     list: bool,
+    /// A keyed list's answer to "does any dirty path lie under it?",
+    /// asked by the first row it keeps. A list that ran alone has none,
+    /// and then no row it keeps can be dirty: a thousand rows ask the
+    /// dirty set nothing instead of hashing a thousand paths into it.
+    dirt_below: Cell<Option<bool>>,
     effects: Vec<EffectFn>,
     actions: Vec<ActionEntry>,
     copies: Vec<CopyEntry>,
@@ -311,7 +316,19 @@ impl BuildingFrame {
             customs: Vec::new(),
             handlers: Vec::new(),
             contexts: Vec::new(),
+            dirt_below: Cell::new(None),
         }
+    }
+
+    /// Does a path of the dirty snapshot lie strictly under this frame?
+    /// Asked once per frame: the snapshot does not move during a pass.
+    fn has_dirt_below(&self, dirty: &HashSet<String>) -> bool {
+        if let Some(known) = self.dirt_below.get() {
+            return known;
+        }
+        let below = dirty.iter().any(|path| path.len() > self.path.len() && covers(&self.path, path));
+        self.dirt_below.set(Some(below));
+        below
     }
 }
 
@@ -920,9 +937,14 @@ pub(crate) fn decide_at(path: &str) -> (Decision, Option<(Rc<str>, Rc<Slot>)>) {
                 return (Decision::Render, found);
             }
             let inside_rerun = !pass.building.is_empty();
-            let under_list = pass.building.last().is_some_and(|frame| frame.list);
+            let list = pass.building.last().filter(|frame| frame.list);
+            // every path decided under a list lies under the list's own:
+            // with no dirt there, none of them is dirty
+            let dirty = |path: &str| {
+                list.is_none_or(|list| list.has_dirt_below(&pass.dirty)) && pass.dirty.contains(path)
+            };
             match &found {
-                Some((_, slot)) if (!inside_rerun || under_list) && !pass.dirty.contains(path) => {
+                Some((_, slot)) if (!inside_rerun || list.is_some()) && !dirty(path) => {
                     // the walk stays out on purpose, and the slot says
                     // so to the sweep: its subtree survives it
                     slot.visit.set(Visit::now().skipped);
@@ -3017,6 +3039,61 @@ mod tests {
         assert!(Rc::ptr_eq(&slot, &slot_of(&row)), "the row kept its slot");
         assert!(is_retained(&row), "and the sweep kept the row");
         assert_eq!(retained_under("Lines").len(), 5, "the page, the list and its three rows: nothing left");
+    }
+
+    /// A row of a list that reads its label in its body.
+    #[derive(Clone, Copy)]
+    struct ReadingLine {
+        id: usize,
+        label: State<Rc<str>>,
+    }
+
+    impl Component for ReadingLine {
+        fn body(self, _ctx: &Context) -> impl View {
+            text(self.label.get().to_string())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ReadingLines {
+        lines: State<Rc<Vec<ReadingLine>>>,
+    }
+
+    impl Component for ReadingLines {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::views::for_each(self.lines, |line| line.id.to_string(), |line| *line)
+        }
+    }
+
+    /// A list that runs with no dirt under it asks the dirty set nothing
+    /// for the rows it keeps — but a row whose own read was written in
+    /// the same frame is dirt under the list, and it runs again while
+    /// the rows beside it are kept.
+    #[test]
+    fn a_kept_row_written_while_its_list_runs_still_runs() {
+        let made = (1..=4).map(|id| ReadingLine { id, label: State::new(Rc::from(format!("line {id}").as_str())) });
+        let page = ReadingLines { lines: State::new(Rc::new(made.collect())) };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+
+        // the list alone: every row kept
+        let mut reversed = (*page.lines.get()).clone();
+        reversed.reverse();
+        page.lines.set(Rc::new(reversed));
+        let printed = runtime.render(&page);
+        assert_eq!(runtime.body_runs().len(), 1, "only the list ran: {:?}", runtime.body_runs());
+        assert!(printed.find("line 4") < printed.find("line 1"), "{printed}");
+
+        // the list and one of its rows, in one frame
+        let mut swapped = (*page.lines.get()).clone();
+        swapped.swap(0, 3);
+        swapped[1].label.set(Rc::from("written"));
+        page.lines.set(Rc::new(swapped));
+        let printed = runtime.render(&page);
+        let runs = runtime.body_runs();
+        assert_eq!(runs.len(), 2, "the list and the written row ran: {runs:?}");
+        assert!(runs.iter().any(|run| run.ends_with("[3]/ReadingLine")), "the written row is row 3: {runs:?}");
+        assert!(printed.contains("written") && !printed.contains("line 3"), "and shows what was written: {printed}");
     }
 
     /// The paths retained under a prefix, sorted.
