@@ -900,7 +900,7 @@ impl Walk<'_> {
                 });
                 match lowered {
                     Some(nodes) => out.extend(nodes),
-                    None => out.push(node(DomKind::Group { path: std::rc::Rc::from(path.as_str()) })),
+                    None => out.push(node(DomKind::Group { path: std::rc::Rc::clone(path) })),
                 }
             }
             LayoutNode::Interactive { path, child } => {
