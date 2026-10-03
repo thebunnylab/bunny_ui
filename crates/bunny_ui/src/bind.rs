@@ -1191,6 +1191,132 @@ mod tests {
         );
     }
 
+    /// A list that clears says one word to the page, and what the element
+    /// lowering kept of its rows — their group records, their bindings —
+    /// stays in the tables until the idle frees the rows: a thousand rows
+    /// were three thousand keys hashed out of them in the click. The idle
+    /// takes them out; the tables then hold what stands.
+    #[test]
+    fn a_clear_leaves_its_groups_and_bindings_for_the_idle() {
+        let size = Size { width: 400.0, height: 300.0 };
+        let rows = State::new(Rc::new(Vec::new()));
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&Page { rows }, size);
+        let empty = runtime.dom_tables();
+        rows.set(Rc::new(labelled(1..=3)));
+        let _ = runtime.dom_frame(&Page { rows }, size);
+        let full = runtime.dom_tables();
+        assert!(full.0 > empty.0 && full.1 > empty.1, "rows bind and group: {empty:?} -> {full:?}");
+
+        rows.set(Rc::new(Vec::new()));
+        let patches = runtime.dom_frame(&Page { rows }, size);
+        let removals: Vec<&crate::dom::DomPatch> = patches
+            .iter()
+            .filter(|patch| matches!(patch, crate::dom::DomPatch::RemoveChildren { .. } | crate::dom::DomPatch::Remove { .. }))
+            .collect();
+        assert!(matches!(removals.as_slice(), [crate::dom::DomPatch::RemoveChildren { .. }]), "one word: {patches:?}");
+        assert_eq!(runtime.dom_tables(), full, "the rows' groups and bindings wait for the idle");
+
+        runtime.collect_garbage();
+        assert_eq!(runtime.dom_tables(), empty, "the idle took them out");
+    }
+
+    /// When no idle comes between two frames, the second one takes out
+    /// what the first let go before it reads either table: the walk that
+    /// promises groups and the frame that patches bindings by key never
+    /// meet a row that left.
+    #[test]
+    fn the_next_frame_takes_out_what_no_idle_did() {
+        let size = Size { width: 400.0, height: 300.0 };
+        let rows = State::new(Rc::new(Vec::new()));
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&Page { rows }, size);
+        let empty = runtime.dom_tables();
+        rows.set(Rc::new(labelled(1..=3)));
+        let _ = runtime.dom_frame(&Page { rows }, size);
+        rows.set(Rc::new(Vec::new()));
+        let _ = runtime.dom_frame(&Page { rows }, size);
+        assert_ne!(runtime.dom_tables(), empty, "waiting for the idle");
+
+        let patches = runtime.dom_frame(&Page { rows }, size);
+        assert!(patches.is_empty(), "nothing moved: {patches:?}");
+        assert_eq!(runtime.dom_tables(), empty, "the next frame took them out");
+        assert!(runtime.garbage_pending(), "and left the freeing to the idle");
+    }
+
+    /// A row written to and let go in one click is not patched: its text
+    /// was going stale when the frame began, but the frame that removes its
+    /// element takes its binding out before it patches the stale ones.
+    #[test]
+    fn a_row_written_as_it_leaves_is_not_patched() {
+        let size = Size { width: 400.0, height: 300.0 };
+        let seeds = labelled(1..=3);
+        let rows = State::new(Rc::new(seeds.clone()));
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&Page { rows }, size);
+
+        seeds[1].label.set(Rc::from("written as it leaves"));
+        rows.set(Rc::new(vec![seeds[0], seeds[2]]));
+        let patches = runtime.dom_frame(&Page { rows }, size);
+        assert!(patches.iter().any(|patch| matches!(patch, crate::dom::DomPatch::Remove { .. })), "row 2 left: {patches:?}");
+        assert!(
+            !patches.iter().any(|patch| matches!(patch, crate::dom::DomPatch::SetContent { .. })),
+            "the element that left is not patched: {patches:?}"
+        );
+    }
+
+    /// A text the body makes again at the same key, as a new element — a
+    /// sibling mounted before it moved it off its place — files its binding
+    /// over the one the old element held, in the frame that buries the old
+    /// one. The idle that takes the old element's binding out leaves the new
+    /// one's: the next write still patches the text.
+    #[test]
+    fn a_text_made_again_at_its_key_keeps_its_binding_through_the_idle() {
+        #[derive(Clone, Copy)]
+        struct Badge;
+
+        impl Component for Badge {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("new")
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Flagged {
+            flag: State<bool>,
+            label: State<Rc<str>>,
+        }
+
+        impl Component for Flagged {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::vstack!(self.flag.get().then_some(Badge), crate::text!(self.label))
+            }
+        }
+
+        let size = Size { width: 400.0, height: 300.0 };
+        let page = Flagged { flag: State::new(false), label: State::new(Rc::from("first")) };
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&page, size);
+
+        page.flag.set(true);
+        let patches = runtime.dom_frame(&page, size);
+        assert!(
+            patches.iter().any(|patch| matches!(
+                patch,
+                crate::dom::DomPatch::Remove { .. } | crate::dom::DomPatch::RemoveChildren { .. }
+            )),
+            "the old text left, and a new one took its key: {patches:?}"
+        );
+        runtime.collect_garbage();
+
+        page.label.set(Rc::from("second"));
+        let patches = runtime.dom_frame(&page, size);
+        assert!(
+            patches.iter().any(|patch| matches!(patch, crate::dom::DomPatch::SetContent { text, .. } if &**text == "second")),
+            "the new text is still patched by its key: {patches:?}"
+        );
+    }
+
     #[test]
     fn a_binding_reads_for_itself_and_goes_stale_on_a_write() {
         let count = State::new(1usize);
