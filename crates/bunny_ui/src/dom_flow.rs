@@ -138,7 +138,13 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         slot: (None, None),
         pending_boundary_class: None,
         customs: Vec::new(),
-        groups_out: Vec::new(),
+        // every run lowers its own group, and the few groups above the
+        // runs ride on the margin: a thousand rows mounting fill the list
+        // without doubling it ten times. No run, no group, no list
+        groups_out: Vec::with_capacity(match env.changed.len() {
+            0 => 0,
+            runs => runs + 4,
+        }),
         hits: Vec::new(),
         islands_walked: Vec::new(),
         runs_below: true,
@@ -196,8 +202,12 @@ struct ChangedIndex<'a> {
 
 impl<'a> ChangedIndex<'a> {
     fn new(changed: &'a [String]) -> Self {
+        // a run is one entry, and mostly one boundary above it of its own
+        // (a list's row under its identity): both sets sized once
         let mut exact = motor::hash::FxHashSet::default();
+        exact.reserve(changed.len());
         let mut above_a_run = motor::hash::FxHashSet::default();
+        above_a_run.reserve(changed.len());
         for run in changed {
             exact.insert(run.as_str());
             for (at, _) in run.match_indices('/') {

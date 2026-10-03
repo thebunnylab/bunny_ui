@@ -1267,7 +1267,16 @@ pub struct DomLowering {
     graveyard: Vec<Retained>,
     /// The looks the page's sheet defines — a rule is sent once.
     rules: motor::hash::FxHashSet<u64>,
+    /// How many of the groups the walk just noted the page has not
+    /// seen — the rows this frame mounts, which its patch list is
+    /// sized for.
+    fresh_groups: usize,
 }
+
+/// The patches a mounted row costs, about: its clone or its creates,
+/// its words, its action paths. The list is sized by it once, instead
+/// of doubling a dozen times on a thousand rows.
+const PATCHES_PER_FRESH_GROUP: usize = 8;
 
 /// One element a binding drives.
 struct BoundElement {
@@ -1367,7 +1376,12 @@ impl DomLowering {
         mut scene: DomNode,
         display: &crate::layout::DisplayList,
     ) -> Vec<DomPatch> {
-        let mut patches = Vec::new();
+        let mut patches =
+            Vec::with_capacity(std::mem::take(&mut self.fresh_groups) * PATCHES_PER_FRESH_GROUP);
+        // a popover is a child of the root, the portal: a scene without
+        // one cannot create one
+        let popover_in_scene =
+            scene.children.iter().any(|child| matches!(child.kind, DomKind::Popover { .. }));
         match self.root.as_mut() {
             None => {
                 self.next_id = 1;
@@ -1416,9 +1430,10 @@ impl DomLowering {
         // ship the relation when it changed — the walk only runs while
         // a popover exists (or just left)
         if !self.anchors_sent.is_empty()
-            || patches
-                .iter()
-                .any(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Popover, .. }))
+            || (popover_in_scene
+                && patches
+                    .iter()
+                    .any(|patch| matches!(patch, DomPatch::Create { kind: CreateKind::Popover, .. })))
         {
             let mut relations: Vec<(u32, u32, u8, String)> = Vec::new();
             if let Some(root) = self.root.as_ref() {
@@ -1516,6 +1531,8 @@ impl DomLowering {
         self.anchors_sent.clear();
         self.graveyard.clear();
         self.rules.clear();
+        // the page holds the mount already: no patch is coming for it
+        self.fresh_groups = 0;
         let mut next_id = self.next_id;
         let mut ctx = LowerCtx {
             next_id: &mut next_id,
@@ -1593,9 +1610,22 @@ impl DomLowering {
     /// before the diff, so a group the diff mounts is known to the next
     /// walk with its environment.
     pub(crate) fn note_groups(&mut self, groups: Vec<(std::rc::Rc<str>, crate::dom_flow::GroupRecord)>) {
+        // sized once for the rows a frame mounts, not rehashed ten times
+        // on the way to a thousand
+        self.group_paths.reserve(groups.len());
+        let mut fresh = 0;
+        let mut fresh_classes = 0;
         for (path, record) in groups {
-            self.group_paths.insert(path, record);
+            let reads_its_class = record.class_binding.is_some();
+            if self.group_paths.insert(path, record).is_none() {
+                fresh += 1;
+                fresh_classes += usize::from(reads_its_class);
+            }
         }
+        self.fresh_groups = fresh;
+        // the classes the new rows read for themselves are filed this
+        // frame, whatever else is: what the bindings take at the least
+        self.bindings.reserve(fresh_classes);
     }
 
     /// The bindings a write reached, patched by key: each one is read
