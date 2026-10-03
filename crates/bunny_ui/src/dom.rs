@@ -1241,12 +1241,11 @@ struct LowerCtx<'a> {
     next_id: &'a mut u32,
     display: &'a [DrawCommand],
     islands: &'a mut HashMap<u32, Island>,
-    group_paths: &'a mut motor::hash::FxHashMap<std::rc::Rc<str>, crate::dom_flow::GroupRecord>,
     bindings: &'a mut motor::hash::FxHashMap<Rc<str>, BoundElement>,
     templates: &'a mut Templates,
     /// Subtrees that left this frame, kept until an idle moment frees
     /// them: a thousand rows' nodes are freed off the frame's clock.
-    graveyard: &'a mut Vec<Retained>,
+    graveyard: &'a mut Vec<Buried>,
     /// The looks the page's sheet already defines, by rule hash.
     rules: &'a mut motor::hash::FxHashSet<u64>,
 }
@@ -1276,7 +1275,12 @@ pub struct DomLowering {
     templates: Templates,
     /// Subtrees that left and are not freed yet — see
     /// [`DomLowering::collect_garbage`].
-    graveyard: Vec<Retained>,
+    graveyard: Vec<Buried>,
+    /// How many of those had their group records and bindings taken out
+    /// of the tables. The rest still stand in them, for the idle to take
+    /// out — or the next frame, before it reads either table
+    /// ([`DomLowering::unpick_buried`]).
+    unpicked: usize,
     /// The looks the page's sheet defines — a rule is sent once.
     rules: motor::hash::FxHashSet<u64>,
     /// How many of the groups the walk just noted the page has not
@@ -1289,6 +1293,25 @@ pub struct DomLowering {
 /// its words, its action paths. The list is sized by it once, instead
 /// of doubling a dozen times on a thousand rows.
 const PATCHES_PER_FRESH_GROUP: usize = 8;
+
+/// What a frame let go, kept whole until an idle moment frees it: one
+/// subtree, or every child a parent had — in the one vector they left
+/// in, so a list that clears moves no row and frees no vector inside
+/// the frame.
+enum Buried {
+    One(Retained),
+    Many(Vec<Retained>),
+}
+
+impl Buried {
+    /// The subtrees, root by root.
+    fn roots(&self) -> &[Retained] {
+        match self {
+            Buried::One(root) => std::slice::from_ref(root),
+            Buried::Many(roots) => roots,
+        }
+    }
+}
 
 /// One element a binding drives.
 struct BoundElement {
@@ -1433,7 +1456,6 @@ impl DomLowering {
                     next_id: &mut next_id,
                     display: display.as_slice(),
                     islands: &mut self.islands,
-                    group_paths: &mut self.group_paths,
                     bindings: &mut self.bindings,
                     templates: &mut self.templates,
                     graveyard: &mut self.graveyard,
@@ -1451,7 +1473,6 @@ impl DomLowering {
                     next_id: &mut next_id,
                     display: display.as_slice(),
                     islands: &mut self.islands,
-                    group_paths: &mut self.group_paths,
                     bindings: &mut self.bindings,
                     templates: &mut self.templates,
                     graveyard: &mut self.graveyard,
@@ -1565,6 +1586,7 @@ impl DomLowering {
         self.islands.clear();
         self.anchors_sent.clear();
         self.graveyard.clear();
+        self.unpicked = 0;
         self.rules.clear();
         // the page holds the mount already: no patch is coming for it
         self.fresh_groups = 0;
@@ -1573,7 +1595,6 @@ impl DomLowering {
             next_id: &mut next_id,
             display: display.as_slice(),
             islands: &mut self.islands,
-            group_paths: &mut self.group_paths,
             bindings: &mut self.bindings,
             templates: &mut self.templates,
             graveyard: &mut self.graveyard,
@@ -1591,12 +1612,32 @@ impl DomLowering {
     /// Frees the subtrees that left since the last call. A frame that
     /// removes a thousand rows ships one word and keeps their nodes;
     /// the shell calls this when the page is idle, so the freeing is
-    /// never on the clock between a click and its paint. Returns how
-    /// many subtrees were freed.
+    /// never on the clock between a click and its paint. Their group
+    /// records and bindings leave the tables first. Returns how many
+    /// subtrees were freed.
     pub(crate) fn collect_garbage(&mut self) -> usize {
-        let count = self.graveyard.len();
+        self.unpick_buried();
+        let count = self.graveyard.iter().map(|buried| buried.roots().len()).sum();
         self.graveyard.clear();
+        self.unpicked = 0;
         count
+    }
+
+    /// Takes the group records and the bindings of the subtrees that left
+    /// out of the tables — the half of their forgetting a frame leaves for
+    /// the idle. A thousand rows that leave are a thousand group paths and
+    /// two thousand binding keys hashed out, and nothing asks either table
+    /// before the next frame walks: the idle does it, with the freeing, or
+    /// that frame does, before it reads them, when no idle came between.
+    /// A binding the same frame patches by key is asked for in the frame
+    /// itself ([`DomLowering::refresh_bindings`]), which does it first.
+    pub(crate) fn unpick_buried(&mut self) {
+        for buried in &self.graveyard[self.unpicked..] {
+            for root in buried.roots() {
+                unpick(root, &mut self.group_paths, &mut self.bindings);
+            }
+        }
+        self.unpicked = self.graveyard.len();
     }
 
     /// Subtrees waiting to be freed.
@@ -1626,12 +1667,10 @@ impl DomLowering {
     }
 
     pub(crate) fn graveyard_len(&self) -> usize {
-        self.graveyard.iter().map(|retained| {
-            fn count(retained: &Retained) -> usize {
-                1 + retained.children.iter().map(count).sum::<usize>()
-            }
-            count(retained)
-        }).sum()
+        fn count(retained: &Retained) -> usize {
+            1 + retained.children.iter().map(count).sum::<usize>()
+        }
+        self.graveyard.iter().flat_map(Buried::roots).map(count).sum()
     }
 
     /// The retained Groups' records — the flow walk consults them
@@ -1668,6 +1707,9 @@ impl DomLowering {
     /// patch per changed text, no walk and no diff. A key nobody holds
     /// is a binding whose element left; nothing to do.
     pub(crate) fn refresh_bindings(&mut self, keys: &[Rc<str>]) -> Vec<DomPatch> {
+        // an element this frame let go must not be patched: its binding
+        // leaves the table before any key is asked
+        self.unpick_buried();
         let mut patches = Vec::new();
         for key in keys {
             let Some(bound) = self.bindings.get_mut(key) else {
@@ -2725,14 +2767,22 @@ fn file_class_binding(id: u32, binding: &NodeBinding, shipped: &DomHints, ctx: &
     );
 }
 
-fn remove_subtree(mut retained: Retained, ctx: &mut LowerCtx, patches: &mut Vec<DomPatch>) {
+/// One subtree leaves: one remove patch frees it on the glue's side.
+/// What the diff itself may still ask about it leaves now — a template
+/// it held must not be cloned, an island it held must not be painted —
+/// and a subtree that held neither is not walked at all. Its groups and
+/// bindings wait with it ([`DomLowering::unpick_buried`]).
+fn remove_subtree(retained: Retained, ctx: &mut LowerCtx, patches: &mut Vec<DomPatch>) {
     patches.push(DomPatch::Remove { id: retained.id });
-    forget_subtree(&mut retained, ctx);
-    ctx.graveyard.push(retained);
+    if !ctx.templates.members.is_empty() || !ctx.islands.is_empty() {
+        forget_now(&retained, ctx);
+    }
+    ctx.graveyard.push(Buried::One(retained));
 }
 
 /// Every old child leaves and nothing stays: the parent is emptied in
-/// one op, and each subtree's registrations are forgotten.
+/// one op, which names every id that leaves, and the children go to the
+/// graveyard as the one vector they were.
 fn remove_all_children(
     parent: u32,
     leaving: Vec<Retained>,
@@ -2740,18 +2790,18 @@ fn remove_all_children(
     patches: &mut Vec<DomPatch>,
 ) {
     let mut runs: Vec<(u32, u32)> = Vec::new();
-    let mut leaving = leaving;
-    for retained in &mut leaving {
+    let islands = !ctx.islands.is_empty();
+    for retained in &leaving {
         // a whole row leaves: the template question is the row's, once
         // — a member below it cannot outlive its root; a template the
         // row holds leaves as the walk passes its root
         if !ctx.templates.members.is_empty() {
             ctx.templates.touched(retained.id);
         }
-        forget_subtree_into(retained, ctx, &mut runs, false);
+        number_leaving(retained, ctx, &mut runs, islands);
     }
     patches.push(DomPatch::RemoveChildren { id: parent, forget: id_ranges(runs) });
-    ctx.graveyard.extend(leaving);
+    ctx.graveyard.push(Buried::Many(leaving));
 }
 
 /// Runs of ids as sorted half-open ranges `[start, end)`, neighbours
@@ -2785,58 +2835,65 @@ fn push_run(runs: &mut Vec<(u32, u32)>, id: u32) {
     }
 }
 
-/// What the lowering kept about a subtree that left: its islands, its
-/// groups, its bindings, its place in a template.
-fn forget_subtree(retained: &mut Retained, ctx: &mut LowerCtx) {
-    let mut runs = Vec::new();
-    forget_subtree_into(retained, ctx, &mut runs, true);
-}
-
-/// The same forgetting, in ONE walk that also lists the ids it passes,
-/// as runs — a thousand rows leaving together are nine thousand nodes,
-/// and a walk per table was five walks.
-fn forget_subtree_into(
-    retained: &mut Retained,
-    ctx: &mut LowerCtx,
-    runs: &mut Vec<(u32, u32)>,
-    ask_templates: bool,
-) {
-    push_run(runs, retained.id);
-    // a template member that leaves retires the template — asked only
-    // while any template stands, and not at all under a row that
-    // leaves whole (its root was asked)
-    if ask_templates && !ctx.templates.members.is_empty() {
+/// What the diff of this very frame may still ask about a subtree that
+/// left: a template member retires its template (asked only while any
+/// template stands), and an island leaves the registry.
+fn forget_now(retained: &Retained, ctx: &mut LowerCtx) {
+    if !ctx.templates.members.is_empty() {
         ctx.templates.touched(retained.id);
     }
-    match &retained.node.kind {
-        DomKind::Group { path } => {
-            ctx.group_paths.remove(path);
-            // a template inside a row that leaves whole, the row none
-            // itself (it holds this one): the row's question never
-            // reached it, and left standing it would hand out copies of
-            // an element no longer on the page. Only a group is a
-            // template's root
-            if !ask_templates && !ctx.templates.roots.is_empty() {
-                ctx.templates.forget_root(retained.id);
-            }
-        }
-        DomKind::Canvas { .. } => {
-            ctx.islands.remove(&retained.id);
-        }
-        _ => {}
+    if let DomKind::Canvas { .. } = &retained.node.kind {
+        ctx.islands.remove(&retained.id);
     }
-    // the binding leaves NOW, graveyard or not: a key that stays alive
-    // in a kept node would still count as live to the frame. One probe
-    // takes it out; the rare key a newer element took already (a node
-    // made again at the same place) goes straight back
-    if let Some(binding) = retained.node.binding.take()
-        && let Some((key, bound)) = ctx.bindings.remove_entry(binding.key())
-        && bound.id != retained.id
+    for child in &retained.children {
+        forget_now(child, ctx);
+    }
+}
+
+/// The ids of a row that leaves whole, as runs — the patch names them —
+/// and its islands out of the registry, when any island stands. Its
+/// template question was the row's own, and its groups and bindings wait
+/// for the idle: a thousand rows that leave together are nine thousand
+/// nodes, and the walk asks each one for its id and nothing it would
+/// hash.
+fn number_leaving(retained: &Retained, ctx: &mut LowerCtx, runs: &mut Vec<(u32, u32)>, islands: bool) {
+    push_run(runs, retained.id);
+    if islands && let DomKind::Canvas { .. } = &retained.node.kind {
+        ctx.islands.remove(&retained.id);
+    }
+    // a template inside a row that leaves whole, the row none itself (it
+    // holds this one): the row's question never reached it, and left
+    // standing it would hand out copies of an element no longer on the
+    // page. Only a group is a template's root — and this cannot wait for
+    // the idle: the next frame may already ask for a copy
+    if !ctx.templates.roots.is_empty() && matches!(retained.node.kind, DomKind::Group { .. }) {
+        ctx.templates.forget_root(retained.id);
+    }
+    for child in &retained.children {
+        number_leaving(child, ctx, runs, islands);
+    }
+}
+
+/// A subtree's group records and its bindings, out of the tables: each
+/// group by its path, and each binding only while it still drives this
+/// element — a node made at the same place since took the key over, and
+/// keeps it.
+fn unpick(
+    retained: &Retained,
+    groups: &mut motor::hash::FxHashMap<std::rc::Rc<str>, crate::dom_flow::GroupRecord>,
+    bindings: &mut motor::hash::FxHashMap<Rc<str>, BoundElement>,
+) {
+    if let DomKind::Group { path } = &retained.node.kind {
+        groups.remove(path);
+    }
+    if let Some(binding) = &retained.node.binding
+        && let std::collections::hash_map::Entry::Occupied(bound) = bindings.entry(Rc::clone(binding.key()))
+        && bound.get().id == retained.id
     {
-        ctx.bindings.insert(key, bound);
+        bound.remove();
     }
-    for child in &mut retained.children {
-        forget_subtree_into(child, ctx, runs, ask_templates);
+    for child in &retained.children {
+        unpick(child, groups, bindings);
     }
 }
 

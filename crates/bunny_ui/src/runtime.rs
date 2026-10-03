@@ -4594,6 +4594,10 @@ impl Runtime {
         // whole evidence (a theme change already cleared retention,
         // which re-runs every body and empties no promise wrongly)
         let mut changed = reconciler::take_frame_runs();
+        // what the last frame let go leaves the group records and the
+        // bindings at the idle — now, when no idle came between: the
+        // walk reads the one table and this frame the other
+        self.dom.borrow_mut().unpick_buried();
         // the retained groups stay where they are: the walk reads them
         // through this borrow, which ends before the diff takes the
         // lowering for itself
@@ -4725,6 +4729,7 @@ impl Runtime {
     pub fn dom_adopt(&self, root: &impl View, size: crate::layout::Size) {
         self.settle(root);
         let _ = reconciler::take_frame_runs();
+        self.dom.borrow_mut().unpick_buried();
         let dom = self.dom.borrow();
         let retained_groups = dom.group_paths();
         // a drag crossing targets runs no body at all, so the ring is
@@ -4921,6 +4926,14 @@ impl Runtime {
     /// Returns how many subtrees were freed.
     pub fn collect_garbage(&self) -> usize {
         self.dom.borrow_mut().collect_garbage() + reconciler::collect_garbage()
+    }
+
+    /// The element lowering's two path-keyed tables, as they stand: the
+    /// bindings it patches by key, and the groups a walk may promise.
+    #[cfg(test)]
+    pub(crate) fn dom_tables(&self) -> (usize, usize) {
+        let dom = self.dom.borrow();
+        (dom.bindings_len(), dom.groups_len())
     }
 
     /// Is there anything for [`Runtime::collect_garbage`]?
