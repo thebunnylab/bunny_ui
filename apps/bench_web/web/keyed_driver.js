@@ -34,9 +34,10 @@ const SCENARIOS = {
     prep: () => press("run"),
     run: () => {
       // the row's label cell, by its action path — resilient to how
-      // deep the markup nests it
+      // deep the markup nests it; the path read whole, as the glue
+      // resolves a row's relative one
       const label = [...document.querySelectorAll("#app tr [data-path]")].find(
-        (el) => !el.dataset.path.endsWith("#dismiss"),
+        (el) => !window.__bunnyPath(el).endsWith("#dismiss"),
       );
       const rect = label.getBoundingClientRect();
       label.dispatchEvent(

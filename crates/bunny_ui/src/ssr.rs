@@ -56,6 +56,59 @@ pub fn render_document(root: &impl View, size: Size, wasm: &str, glue: &str) -> 
     )
 }
 
+/// The page kept alive across frames: the toy tree a build renders
+/// into, taking every frame's patches the way the browser's glue does.
+/// What a test replays a session on, to see the page a browser would
+/// hold after it — and the action path a click on each element sends.
+pub struct Replay {
+    tree: Tree,
+}
+
+impl Replay {
+    pub fn new(size: Size) -> Replay {
+        Replay { tree: Tree::new(size) }
+    }
+
+    /// One frame's patches, in order.
+    pub fn apply(&mut self, patches: &[DomPatch]) {
+        for patch in patches {
+            self.tree.apply(patch);
+        }
+    }
+
+    /// Every element that shows an action path, by id, with the path a
+    /// click on it sends: one shown as `~` and the rest is told against
+    /// the nearest `data-base` at or above the element — the element
+    /// itself when it carries one — which is the glue's own reading. A
+    /// relative path with no base above it stays as it is shown.
+    pub fn action_paths(&self) -> BTreeMap<u32, String> {
+        fn walk(tree: &Tree, id: u32, base: Option<&str>, out: &mut BTreeMap<u32, String>) {
+            let Some(element) = tree.elements.get(&id) else {
+                return;
+            };
+            let base = element.attrs.get("data-base").map(String::as_str).or(base);
+            if let Some(shown) = element.attrs.get("data-path") {
+                let path = match (shown.strip_prefix('~'), base) {
+                    (Some(rest), Some(base)) => format!("{base}{rest}"),
+                    _ => shown.clone(),
+                };
+                out.insert(id, path);
+            }
+            for child in &element.children {
+                walk(tree, *child, base, out);
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(&self.tree, 0, None, &mut out);
+        out
+    }
+
+    /// The page's markup, as a build would serve it.
+    pub fn html(&self) -> String {
+        self.tree.serialize_root()
+    }
+}
+
 /// A toy element: enough DOM to receive the mount and print itself.
 #[derive(Clone)]
 struct Element {
@@ -222,11 +275,17 @@ impl Tree {
                 }
                 self.elements.remove(id);
             }
-            DomPatch::Clone { id, parent, before, template } => {
+            DomPatch::Clone { id, parent, before, template, base } => {
                 // the copy takes the template's subtree with ids counted
                 // in pre-order from its own, as the lowering numbered them
                 let mut next = *id;
                 self.clone_into(*template, &mut next);
+                // and its own base, over the one it was copied with
+                if let Some(base) = base
+                    && let Some(element) = self.elements.get_mut(id)
+                {
+                    element.attrs.insert("data-base", base.to_string());
+                }
                 let Some(parent) = self.elements.get_mut(parent) else {
                     return;
                 };
@@ -242,16 +301,23 @@ impl Tree {
                     }
                 }
             }
-            DomPatch::SetPath { id, path } => {
+            DomPatch::SetPath { id, path, base_len } => {
                 if let Some(element) = self.elements.get_mut(id) {
                     match path {
+                        // as the page shows it: `~` and the rest when
+                        // the path lies under its base
                         Some(path) => {
-                            element.attrs.insert("data-path", path.to_string());
+                            element.attrs.insert("data-path", crate::dom::shown_path(path, *base_len));
                         }
                         None => {
                             element.attrs.remove("data-path");
                         }
                     }
+                }
+            }
+            DomPatch::SetBase { id, base } => {
+                if let Some(element) = self.elements.get_mut(id) {
+                    element.attrs.insert("data-base", base.to_string());
                 }
             }
             DomPatch::SetContent { id, text } => {
@@ -441,10 +507,27 @@ impl Tree {
                     };
                 }
             }
+            DomPatch::Move { id, parent, before } => {
+                // a mount never moves an element; a replayed session does
+                for element in self.elements.values_mut() {
+                    element.children.retain(|child| child != id);
+                }
+                let Some(parent) = self.elements.get_mut(parent) else {
+                    return;
+                };
+                let at = match before {
+                    0 => parent.children.len(),
+                    anchor => parent
+                        .children
+                        .iter()
+                        .position(|child| child == anchor)
+                        .unwrap_or(parent.children.len()),
+                };
+                parent.children.insert(at, *id);
+            }
             DomPatch::SetScroll { .. }
             | DomPatch::SetImage { .. }
             | DomPatch::SetIcon { .. }
-            | DomPatch::Move { .. }
             | DomPatch::Reveal { .. }
             | DomPatch::SetAnchor { .. } => {
                 // scroll offsets, image bytes and icon geometry arrive

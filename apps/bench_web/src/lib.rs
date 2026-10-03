@@ -539,6 +539,62 @@ pub mod keyed {
                 assert!(body.starts_with("</td>"), "the last cell is empty: {row}");
             }
         }
+
+        /// One frame, replayed on the page the way the glue applies it:
+        /// every target on it must send the path the engine knows it by.
+        fn frame(page: &App, runtime: &bunny_ui::runtime::Runtime, replay: &mut bunny_ui::ssr::Replay) {
+            replay.apply(&runtime.dom_frame(page, SIZE));
+            assert_eq!(replay.action_paths(), runtime.dom_action_paths());
+        }
+
+        /// A click on the target whose whole path ends so, by the path
+        /// the page resolves for it.
+        fn click(replay: &bunny_ui::ssr::Replay, runtime: &bunny_ui::runtime::Runtime, ends_with: &str) {
+            let path = replay
+                .action_paths()
+                .into_values()
+                .find(|path| path.ends_with(ends_with))
+                .unwrap_or_else(|| panic!("no target ends with {ends_with}"));
+            assert!(runtime.dom_action(&path, 1), "a live action: {path}");
+        }
+
+        const SIZE: bunny_ui::layout::Size = bunny_ui::layout::Size { width: 1200.0, height: 800.0 };
+
+        /// The official session, clicked through the paths the page
+        /// resolves — a row's label and remove cross told against the
+        /// row, the chips against the app — and every target on the page
+        /// sends, after every operation, the path it sent when paths
+        /// crossed whole.
+        #[test]
+        fn every_click_sends_the_engines_path() {
+            let page = app();
+            let runtime = bunny_ui::runtime::Runtime::new();
+            let mut replay = bunny_ui::ssr::Replay::new(SIZE);
+            frame(&page, &runtime, &mut replay);
+
+            click(&replay, &runtime, "[run]");
+            frame(&page, &runtime, &mut replay);
+            assert_eq!(page.rows.get().len(), 1_000);
+            assert!(replay.html().contains("data-path=\"~/#2/#0\""), "a row's label is told against the row");
+
+            // select row 2 by its label, remove row 5 by its glyph
+            click(&replay, &runtime, "[2]/KeyedRow/#2/#0");
+            frame(&page, &runtime, &mut replay);
+            assert!(page.rows.get()[1].selected.get());
+            for chip in ["[update]", "[swaprows]"] {
+                click(&replay, &runtime, chip);
+                frame(&page, &runtime, &mut replay);
+            }
+            click(&replay, &runtime, "[5]/KeyedRow/#3/#0");
+            frame(&page, &runtime, &mut replay);
+            assert!(page.rows.get().iter().all(|seed| seed.id != 5));
+            assert_eq!(page.rows.get().len(), 999);
+            for chip in ["[add]", "[run]", "[clear]", "[run]"] {
+                click(&replay, &runtime, chip);
+                frame(&page, &runtime, &mut replay);
+            }
+            assert_eq!(page.rows.get().len(), 1_000);
+        }
     }
 }
 

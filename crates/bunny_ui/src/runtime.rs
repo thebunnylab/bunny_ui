@@ -4846,6 +4846,14 @@ impl Runtime {
         self.dom.borrow().island_frames()
     }
 
+    /// Dom mode: every element that answers a click or an edit, by id,
+    /// with its path whole — what a click on it must send, however the
+    /// page spells it ([`crate::ssr::Replay::action_paths`] reads the
+    /// spelling back).
+    pub fn dom_action_paths(&self) -> std::collections::BTreeMap<u32, String> {
+        self.dom.borrow().action_paths()
+    }
+
     /// Dom mode: the targets drawn inside the islands — the island's
     /// element id, the target's path, its frame on the island's own
     /// canvas. What a probe clicks a row on a canvas by.
