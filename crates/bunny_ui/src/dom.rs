@@ -2306,7 +2306,7 @@ fn remove_all_children(
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
-    let mut ids: Vec<u32> = Vec::new();
+    let mut runs: Vec<(u32, u32)> = Vec::new();
     let mut leaving = leaving;
     for retained in &mut leaving {
         // a whole row leaves: the template question is the row's, once
@@ -2314,48 +2314,60 @@ fn remove_all_children(
         if !ctx.templates.members.is_empty() {
             ctx.templates.touched(retained.id);
         }
-        forget_subtree_into(retained, ctx, &mut ids, false);
+        forget_subtree_into(retained, ctx, &mut runs, false);
     }
-    patches.push(DomPatch::RemoveChildren { id: parent, forget: id_ranges(ids) });
+    patches.push(DomPatch::RemoveChildren { id: parent, forget: id_ranges(runs) });
     ctx.graveyard.extend(leaving);
 }
 
-/// Sorted ids as half-open ranges `[start, end)`, neighbours merged.
+/// Runs of ids as sorted half-open ranges `[start, end)`, neighbours
+/// merged.
 ///
-/// Rows mounted together were numbered in the order the walk meets
-/// them again, so the list nearly always arrives sorted: one look
-/// along it says so, and the sort is left for a list a reorder mixed.
-fn id_ranges(mut ids: Vec<u32>) -> Vec<(u32, u32)> {
-    if !ids.is_sorted() {
-        ids.sort_unstable();
+/// A subtree numbered in one piece is one run, so the walk hands over a
+/// run per row, not an id per node; and a list filled back to front
+/// numbers its last row first, so the runs come in reverse. A thousand
+/// of them are put in order where nine thousand ids were — and not at
+/// all when they already are.
+fn id_ranges(mut runs: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    if !runs.is_sorted() {
+        runs.sort_unstable();
     }
-    let mut ranges: Vec<(u32, u32)> = Vec::new();
-    for id in ids {
+    let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(runs.len());
+    for (start, end) in runs {
         match ranges.last_mut() {
-            Some((_, end)) if *end == id => *end += 1,
-            _ => ranges.push((id, id + 1)),
+            Some((_, last)) if *last == start => *last = end,
+            _ => ranges.push((start, end)),
         }
     }
     ranges
 }
 
+/// The id at the end of the runs: the run it continues grows, any other
+/// starts its own.
+fn push_run(runs: &mut Vec<(u32, u32)>, id: u32) {
+    match runs.last_mut() {
+        Some((_, end)) if *end == id => *end += 1,
+        _ => runs.push((id, id + 1)),
+    }
+}
+
 /// What the lowering kept about a subtree that left: its islands, its
 /// groups, its bindings, its place in a template.
 fn forget_subtree(retained: &mut Retained, ctx: &mut LowerCtx) {
-    let mut ids = Vec::new();
-    forget_subtree_into(retained, ctx, &mut ids, true);
+    let mut runs = Vec::new();
+    forget_subtree_into(retained, ctx, &mut runs, true);
 }
 
-/// The same forgetting, in ONE walk that also lists the ids it passes
-/// — a thousand rows leaving together are nine thousand nodes, and a
-/// walk per table was five walks.
+/// The same forgetting, in ONE walk that also lists the ids it passes,
+/// as runs — a thousand rows leaving together are nine thousand nodes,
+/// and a walk per table was five walks.
 fn forget_subtree_into(
     retained: &mut Retained,
     ctx: &mut LowerCtx,
-    ids: &mut Vec<u32>,
+    runs: &mut Vec<(u32, u32)>,
     ask_templates: bool,
 ) {
-    ids.push(retained.id);
+    push_run(runs, retained.id);
     // a template member that leaves retires the template — asked only
     // while any template stands, and not at all under a row that
     // leaves whole (its root was asked)
@@ -2382,7 +2394,53 @@ fn forget_subtree_into(
         ctx.bindings.insert(key, bound);
     }
     for child in &mut retained.children {
-        forget_subtree_into(child, ctx, ids, ask_templates);
+        forget_subtree_into(child, ctx, runs, ask_templates);
+    }
+}
+
+#[cfg(test)]
+mod forget_tests {
+    use super::{id_ranges, push_run};
+
+    /// The ranges the old way spelled: every id, sorted, neighbours merged.
+    fn by_ids(ids: &[u32]) -> Vec<(u32, u32)> {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for id in ids {
+            match ranges.last_mut() {
+                Some((_, end)) if *end == id => *end += 1,
+                _ => ranges.push((id, id + 1)),
+            }
+        }
+        ranges
+    }
+
+    fn by_runs(ids: &[u32]) -> Vec<(u32, u32)> {
+        let mut runs = Vec::new();
+        for id in ids {
+            push_run(&mut runs, *id);
+        }
+        id_ranges(runs)
+    }
+
+    /// A clear forgets every id that leaves, as ranges the glue prunes by.
+    /// The walk now hands them over as runs — a row numbered in one piece
+    /// is one — and the ranges must be exactly those every id sorted and
+    /// merged would give: rows mounted back to front (the last row
+    /// numbered first) close into one range, a reorder's mix into the
+    /// same ranges as before, a gap stays a gap.
+    #[test]
+    fn rows_forgotten_as_runs_give_the_ranges_every_id_gave() {
+        // three rows of nine nodes, numbered last row first
+        let back_to_front: Vec<u32> = (0..3u32).rev().flat_map(|row| row * 9..row * 9 + 9).collect();
+        assert_eq!(by_runs(&back_to_front), [(0, 27)]);
+        assert_eq!(by_runs(&back_to_front), by_ids(&back_to_front));
+        // a mixed order with a hole, and a row split by a node made later
+        let mixed = [12, 13, 14, 3, 4, 5, 40, 6, 7, 8, 9, 30, 31, 0, 1, 2];
+        assert_eq!(by_runs(&mixed), by_ids(&mixed));
+        assert_eq!(by_runs(&mixed), [(0, 10), (12, 15), (30, 32), (40, 41)]);
+        assert_eq!(by_runs(&[]), []);
     }
 }
 
