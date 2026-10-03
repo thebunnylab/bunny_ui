@@ -197,9 +197,57 @@ function cloneAt(id) {
   return found;
 }
 
+// The clone made last: its words and its paths are named right after
+// it, in the pre-order its ids were counted in — so a walk that only
+// moves forward finds each member a hop or two from the one before,
+// with no search for the clone and no trail from its root.
+let cursorRoot = -1;
+let cursorEnd = -1;
+let cursorAt = 0;
+let cursorEl = null;
+let cursorTop = null;
+
+function forgetCursor() {
+  cursorRoot = -1;
+  cursorEnd = -1;
+  cursorEl = null;
+  cursorTop = null;
+}
+
+// the element after `el` in pre-order, inside `top`
+function nextInOrder(el, top) {
+  const first = el.firstElementChild;
+  if (first !== null) return first;
+  while (el !== top) {
+    const next = el.nextElementSibling;
+    if (next !== null) return next;
+    el = el.parentElement;
+  }
+  return null;
+}
+
 function lookup(id) {
   const known = elements.get(id);
   if (known !== undefined) return known;
+  if (id > cursorRoot && id < cursorEnd) {
+    const k = id - cursorRoot;
+    let el = cursorEl;
+    let at = cursorAt;
+    if (k < at) {
+      el = cursorTop;
+      at = 0;
+    }
+    while (at < k && el !== null) {
+      el = nextInOrder(el, cursorTop);
+      at++;
+    }
+    if (el !== null) {
+      cursorAt = at;
+      cursorEl = el;
+      return el;
+    }
+    return undefined;
+  }
   const at = cloneAt(id);
   if (at < 0) return undefined;
   const [root, size, template] = cloneRoots[at];
@@ -220,6 +268,7 @@ function lookup(id) {
 function forgetClone(root) {
   const at = cloneAt(root);
   if (at >= 0 && cloneRoots[at][0] === root) cloneRoots.splice(at, 1);
+  if (root === cursorRoot) forgetCursor();
 }
 
 // A member is found by its offset only while the clone keeps its
@@ -242,6 +291,7 @@ function settleClone(at) {
     delete rootEl.__members;
   }
   cloneRoots.splice(at, 1);
+  if (root === cursorRoot) forgetCursor();
 }
 
 // the clone `id` belongs to, member or root, as an index into the roots
@@ -648,6 +698,8 @@ function createElementOf(kind, tag) {
 }
 
 function applyPatches(view, length) {
+  // the cursor walks one batch's clone; a batch never inherits it
+  forgetCursor();
   let at = 0;
   const u8 = () => view.getUint8(at++);
   const u16 = () => {
@@ -967,6 +1019,11 @@ function applyPatches(view, length) {
           el.__members = trails.length;
           elements.set(id, el);
           cloneRoots.push([id, trails.length, templateId]);
+          cursorRoot = id;
+          cursorEnd = id + trails.length;
+          cursorAt = 0;
+          cursorEl = el;
+          cursorTop = el;
         }
         place(el, parent, before);
       }
@@ -1020,6 +1077,7 @@ function applyPatches(view, length) {
         while (gone < cloneRoots.length && cloneRoots[gone][0] < end) gone++;
         if (gone > at) cloneRoots.splice(at, gone - at);
       }
+      forgetCursor();
       if (leaving * 2 > elements.size) {
         // most of the registry leaves: keep the survivors in one pass
         // over it, instead of a delete per id that leaves
