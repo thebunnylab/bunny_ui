@@ -2705,20 +2705,36 @@ fn diff_children(
 /// insert costs zero moves), while surviving children off the longest
 /// increasing subsequence of their old order move with one `Move`
 /// each — a swap of two rows is exactly two patches.
+///
+/// The ends that kept their place never enter the plan: a row appended,
+/// removed or replaced leaves the rows before it where they stood, and
+/// the rows after it too, found by path from the back. Only the middle
+/// is matched, and the old rows stay in their list while it is: a
+/// survivor is a position, diffed where it stands. A middle that only
+/// reordered is put in order in place, row by row along its cycles —
+/// a swap of two rows trades two rows, and the thousand between them
+/// never move.
 fn diff_children_ordered(
     retained: &mut Retained,
     new_children: Vec<DomNode>,
     ctx: &mut LowerCtx,
     patches: &mut Vec<DomPatch>,
 ) {
+    let old_len = retained.children.len();
+    let new_len = new_children.len();
+    let shortest = old_len.min(new_len);
+    // the head: every child that takes the old one at its own place
+    let head = (0..shortest)
+        .take_while(|&at| takes_place(&retained.children[at].node.kind, &new_children[at].kind))
+        .count();
     // the ALIGNED fast path: same length, every child matching its
     // old position (groups by path, the rest by kind) — the shape of
     // almost every frame. One plain loop, zero allocation; the keyed
     // machinery below only runs when something actually reordered,
     // mounted or left.
-    let aligned = retained.children.len() == new_children.len()
-        && retained.children.iter().zip(&new_children).all(|(old, child)| {
-            match (&old.node.kind, &child.kind) {
+    let aligned = old_len == new_len
+        && (head..old_len).all(|at| {
+            match (&retained.children[at].node.kind, &new_children[at].kind) {
                 (DomKind::Group { path: was }, DomKind::Group { path: now }) => was == now,
                 // a reuse promise aligns with the group it promised
                 (DomKind::Group { path: was }, DomKind::Reuse { path: now }) => was == now,
@@ -2733,162 +2749,340 @@ fn diff_children_ordered(
         }
         return;
     }
-
-    enum Plan {
-        Survivor { old_position: usize },
-        Fresh(DomNode),
+    // the tail, from the back. Where the lengths differ, a place moved
+    // with the rows before it and only a path still names a row; where
+    // they do not, the places are the same ones and match as the head's
+    let shifted = old_len != new_len;
+    let tail = (0..shortest - head)
+        .take_while(|&back| {
+            let was = &retained.children[old_len - 1 - back].node.kind;
+            let now = &new_children[new_len - 1 - back].kind;
+            (!shifted || matches!(now, DomKind::Group { .. } | DomKind::Reuse { .. }))
+                && takes_place(was, now)
+        })
+        .count();
+    let (old_end, new_end) = (old_len - tail, new_len - tail);
+    let parent = retained.id;
+    let mut nodes = new_children.into_iter();
+    for old in &mut retained.children[..head] {
+        diff_node(old, nodes.next().expect("the head is in the new list"), ctx, patches);
     }
 
-    let parent_id = retained.id;
-    // the old children stay where they are until they are placed: a
-    // survivor is a POSITION here, and the node moves once, at the end
-    let mut old: Vec<Option<Retained>> =
-        std::mem::take(&mut retained.children).into_iter().map(Some).collect();
-    let mut claimed: Vec<bool> = vec![false; old.len()];
-    // the paths of the old rows, indexed only when a new child does not
-    // find its row at its own position — a swap asks twice, a list that
-    // kept its order never asks, and the index holds positions, not rows
-    let mut by_path: Option<motor::hash::FxHashMap<std::rc::Rc<str>, usize>> = None;
+    // INSERTED, and nothing else: the fresh rows mount before the tail
+    if head == old_end {
+        if tail == 0 {
+            // they end the list: created straight from it, back to front
+            ctx.templates.touched(parent);
+            let placed = create_back_to_front(nodes.rev(), parent, 0, ctx, patches);
+            put_placed(&mut retained.children, head, placed);
+            return;
+        }
+        let fresh: Vec<DomNode> = nodes.by_ref().take(new_end - head).collect();
+        for old in &mut retained.children[old_end..] {
+            diff_node(old, nodes.next().expect("the tail is in the new list"), ctx, patches);
+        }
+        ctx.templates.touched(parent);
+        let anchor = retained.children[old_end].id;
+        let placed = create_back_to_front(fresh.into_iter().rev(), parent, anchor, ctx, patches);
+        put_placed(&mut retained.children, head, placed);
+        return;
+    }
 
-    // match first — creation waits for the placement walk below
-    let mut plan: Vec<Plan> = Vec::with_capacity(new_children.len());
-    for (index, child) in new_children.into_iter().enumerate() {
+    // REMOVED, and nothing else: the tail closes up behind the rows that
+    // left. When nothing at all survives, the parent is emptied in one
+    // op — a list that clears its rows says one word, not one per row
+    if head == new_end {
+        for old in &mut retained.children[old_end..] {
+            diff_node(old, nodes.next().expect("the tail is in the new list"), ctx, patches);
+        }
+        if head == 0 && tail == 0 {
+            remove_all_children(parent, std::mem::take(&mut retained.children), ctx, patches);
+        } else {
+            for leftover in retained.children.drain(head..old_end) {
+                remove_subtree(leftover, ctx, patches);
+            }
+        }
+        ctx.templates.touched(parent);
+        return;
+    }
+
+    // the middle, matched — creation waits for the placement walk
+    // below. The plan holds each new child's old POSITION, or FRESH;
+    // the fresh nodes wait in order beside it
+    let mut plan: Vec<usize> = Vec::with_capacity(new_end - head);
+    let mut fresh: Vec<DomNode> = Vec::new();
+    let mut claimed: Vec<bool> = vec![false; old_end - head];
+    // the old rows that may have moved, indexed by path only when a new
+    // child does not find its row at its own position — a list that
+    // kept its order never asks, and a swap indexes the two rows that
+    // traded places, not the rows that stayed
+    let mut moved: Option<motor::hash::FxHashMap<std::rc::Rc<str>, usize>> = None;
+    for index in head..new_end {
+        let child = nodes.next().expect("the middle is in the new list");
         let matched: Option<usize> = match &child.kind {
             DomKind::Group { path } | DomKind::Reuse { path } => {
-                let at_place = old.get(index).and_then(|slot| slot.as_ref()).is_some_and(|was| {
-                    matches!(&was.node.kind, DomKind::Group { path: there } if there == path)
-                });
+                let at_place = index < old_end
+                    && matches!(
+                        &retained.children[index].node.kind,
+                        DomKind::Group { path: there } if there == path
+                    );
                 if at_place {
                     Some(index)
                 } else {
-                    let index_of = by_path.get_or_insert_with(|| {
-                        let mut map = motor::hash::FxHashMap::default();
-                        for (position, slot) in old.iter().enumerate() {
-                            if let Some(was) = slot
-                                && let DomKind::Group { path } = &was.node.kind
-                            {
-                                map.insert(std::rc::Rc::clone(path), position);
-                            }
-                        }
-                        map
-                    });
-                    index_of.remove(path)
+                    moved
+                        .get_or_insert_with(|| {
+                            rows_that_may_move(
+                                &retained.children,
+                                head..old_end,
+                                index,
+                                &claimed,
+                                nodes.as_slice(),
+                                new_end,
+                            )
+                        })
+                        .remove(path)
                 }
             }
-            kind => old.get(index).and_then(|slot| slot.as_ref()).and_then(|was| {
-                (std::mem::discriminant(&was.node.kind) == std::mem::discriminant(kind)).then_some(index)
-            }),
+            kind => (index < old_end
+                && std::mem::discriminant(&retained.children[index].node.kind)
+                    == std::mem::discriminant(kind))
+            .then_some(index),
         };
         match matched {
-            Some(position) if !claimed[position] => {
-                claimed[position] = true;
-                let was = old[position].as_mut().expect("an unclaimed old child is present");
-                diff_node(was, child, ctx, patches);
-                plan.push(Plan::Survivor { old_position: position });
+            Some(position) if !claimed[position - head] => {
+                claimed[position - head] = true;
+                diff_node(&mut retained.children[position], child, ctx, patches);
+                plan.push(position);
             }
-            _ => plan.push(Plan::Fresh(child)),
+            _ => {
+                // sized once, by the first: the rest of the middle may
+                // all be fresh (a list that replaced its rows), and a
+                // node is too big to be copied on every doubling
+                if fresh.is_empty() {
+                    fresh.reserve_exact(new_end - index);
+                }
+                fresh.push(child);
+                plan.push(FRESH);
+            }
         }
+    }
+    for old in &mut retained.children[old_end..] {
+        diff_node(old, nodes.next().expect("the tail is in the new list"), ctx, patches);
+    }
+    let survivors = plan.len() - fresh.len();
+    let next_after = |children: &[Retained], at: usize| children.get(at).map_or(0, |next| next.id);
+
+    // REORDERED, and nothing else: no row mounts, none leaves
+    if fresh.is_empty() && survivors == old_end - head {
+        let anchor = next_after(&retained.children, old_end);
+        let middle = &mut retained.children[head..old_end];
+        reorder_in_place(middle, head, plan, parent, anchor, patches);
+        return;
     }
 
     // removals go out before placements: an anchor is never a corpse.
     // When nothing survived, the parent is emptied in one op — a list
-    // that clears or replaces its rows says one word, not one per row
-    let survivors = plan.iter().filter(|entry| matches!(entry, Plan::Survivor { .. })).count();
-    let leaving: Vec<Retained> = old
-        .iter_mut()
-        .zip(&claimed)
-        .filter_map(|(slot, taken)| if *taken { None } else { slot.take() })
-        .collect();
-    let left = !leaving.is_empty();
-    if survivors == 0 && left {
-        remove_all_children(parent_id, leaving, ctx, patches);
-    } else {
-        for leftover in leaving {
+    // that replaces its rows says one word, not one per row
+    let mut kept: Vec<Option<Retained>> = Vec::new();
+    if survivors == 0 && head == 0 && tail == 0 {
+        remove_all_children(parent, std::mem::take(&mut retained.children), ctx, patches);
+    } else if survivors == 0 {
+        for leftover in retained.children.drain(head..old_end) {
             remove_subtree(leftover, ctx, patches);
+        }
+    } else {
+        kept = retained.children.drain(head..old_end).map(Some).collect();
+        for (slot, taken) in kept.iter_mut().zip(&claimed) {
+            if !taken && let Some(leftover) = slot.take() {
+                remove_subtree(leftover, ctx, patches);
+            }
         }
     }
     // a child mounted, left or moved under a template's member: the
     // live instance is no longer the shape
-    if survivors < plan.len() || left {
-        ctx.templates.touched(parent_id);
-    }
+    ctx.templates.touched(parent);
 
     // the stable spine: survivors whose old order already reads in
-    // increasing sequence stay put; everything else moves or mounts
-    let survivor_positions: Vec<(usize, usize)> = plan
-        .iter()
-        .enumerate()
-        .filter_map(|(at, entry)| match entry {
-            Plan::Survivor { old_position, .. } => Some((at, *old_position)),
-            Plan::Fresh(_) => None,
-        })
-        .collect();
-    let mut stable: Vec<bool> = vec![false; plan.len()];
-    for at in longest_increasing(&survivor_positions) {
-        stable[at] = true;
-    }
-
-    // back to front: the anchor below is always already real
-    let parent = retained.id;
-    let mut anchor = 0u32;
-    let mut next: Vec<Option<Retained>> = plan
-        .iter()
-        .map(|_| None)
-        .collect();
+    // increasing sequence stay put; everything else moves or mounts.
+    // Back to front: the anchor below is always already real — the
+    // tail's first row, which the drain brought to `head`
+    let stable = longest_increasing(&plan);
+    let mut anchor = next_after(&retained.children, head);
+    let mut placed: Vec<Retained> = Vec::with_capacity(plan.len());
+    let mut fresh = fresh.into_iter();
     // the template the row made just before (the one BELOW, walking
     // back to front) is an instance of: the next fresh row is compared
     // with that row, never hashed. A survivor breaks the run
     let mut template = None;
-    for at in (0..plan.len()).rev() {
-        match plan.pop().expect("walking the plan") {
-            Plan::Survivor { old_position } => {
-                let node = old[old_position].take().expect("a survivor is placed once");
-                if !stable[at] {
-                    patches.push(DomPatch::Move { id: node.id, parent, before: anchor });
-                }
-                anchor = node.id;
-                next[at] = Some(node);
-                template = None;
+    for (at, &position) in plan.iter().enumerate().rev() {
+        if position == FRESH {
+            let child = fresh.next_back().expect("a fresh node for every fresh entry");
+            let sibling = placed.last().zip(template);
+            let (created, made_of) =
+                create_subtree_before(child, parent, anchor, ctx, patches, sibling);
+            template = made_of;
+            anchor = created.id;
+            placed.push(created);
+        } else {
+            let node = kept[position - head].take().expect("a survivor is placed once");
+            if !stable[at] {
+                patches.push(DomPatch::Move { id: node.id, parent, before: anchor });
             }
-            Plan::Fresh(child) => {
-                let sibling = next.get(at + 1).and_then(Option::as_ref).zip(template);
-                let (created, made_of) =
-                    create_subtree_before(child, parent, anchor, ctx, patches, sibling);
-                template = made_of;
-                anchor = created.id;
-                next[at] = Some(created);
-            }
+            anchor = node.id;
+            template = None;
+            placed.push(node);
         }
     }
-    retained.children = next.into_iter().map(|slot| slot.expect("planned")).collect();
+    put_placed(&mut retained.children, head, placed);
 }
 
-/// The `at` indices of the longest increasing run of `old_position`s —
-/// the survivors that need no move. O(n log n), std only.
-fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
-    let mut tails: Vec<usize> = Vec::new(); // indices into `pairs`
-    let mut parents: Vec<Option<usize>> = vec![None; pairs.len()];
-    for (index, &(_, old_position)) in pairs.iter().enumerate() {
-        let place = tails
-            .partition_point(|&tail| pairs[tail].1 < old_position);
+/// A plan entry with no old position: the child mounts.
+const FRESH: usize = usize::MAX;
+
+/// Does the new child take the old one at its own place? A group or a
+/// reuse promise by its path, anything else by its kind.
+fn takes_place(was: &DomKind, now: &DomKind) -> bool {
+    match now {
+        DomKind::Group { path } | DomKind::Reuse { path } => {
+            matches!(was, DomKind::Group { path: there } if there == path)
+        }
+        kind => std::mem::discriminant(was) == std::mem::discriminant(kind),
+    }
+}
+
+/// The old groups a new child of the middle may have come from, by
+/// path: every one whose own place no new child takes by path. A row
+/// that moved left its place to another row, so it is always here; a
+/// row still waiting for the new child at its own place is not.
+/// Asked once, by the first child (`asking`) that misses its place —
+/// `ahead` is the new list after it.
+fn rows_that_may_move(
+    old: &[Retained],
+    middle: std::ops::Range<usize>,
+    asking: usize,
+    claimed: &[bool],
+    ahead: &[DomNode],
+    new_end: usize,
+) -> motor::hash::FxHashMap<std::rc::Rc<str>, usize> {
+    let mut rows = motor::hash::FxHashMap::default();
+    let head = middle.start;
+    for position in middle {
+        let DomKind::Group { path } = &old[position].node.kind else {
+            continue;
+        };
+        let waits = position > asking
+            && position < new_end
+            && takes_place(&old[position].node.kind, &ahead[position - asking - 1].kind);
+        if !claimed[position - head] && !waits {
+            rows.insert(std::rc::Rc::clone(path), position);
+        }
+    }
+    rows
+}
+
+/// A middle that only reordered: the survivors off the stable spine
+/// move, back to front before their next sibling, and then the rows
+/// trade places in the list where they stand — cycle by cycle, one
+/// swap per row out of place. A row the plan keeps where it was is
+/// never touched.
+fn reorder_in_place(
+    middle: &mut [Retained],
+    head: usize,
+    mut plan: Vec<usize>,
+    parent: u32,
+    mut anchor: u32,
+    patches: &mut Vec<DomPatch>,
+) {
+    let stable = longest_increasing(&plan);
+    for (at, &position) in plan.iter().enumerate().rev() {
+        let id = middle[position - head].id;
+        if !stable[at] {
+            patches.push(DomPatch::Move { id, parent, before: anchor });
+        }
+        anchor = id;
+    }
+    // `plan[at]` names the row that belongs at `at`; a row put in its
+    // place is marked by pointing at itself
+    for position in &mut plan {
+        *position -= head;
+    }
+    for start in 0..plan.len() {
+        let mut at = start;
+        let mut from = plan[at];
+        while from != start {
+            middle.swap(at, from);
+            plan[at] = at;
+            at = from;
+            from = plan[at];
+        }
+        plan[at] = at;
+    }
+}
+
+/// Mounts the fresh children `fresh` hands over back to front, the
+/// first before `anchor` and each next one before the one made just
+/// ahead of it. Returns them made, back to front.
+fn create_back_to_front(
+    fresh: impl Iterator<Item = DomNode>,
+    parent: u32,
+    mut anchor: u32,
+    ctx: &mut LowerCtx,
+    patches: &mut Vec<DomPatch>,
+) -> Vec<Retained> {
+    let mut placed: Vec<Retained> = Vec::with_capacity(fresh.size_hint().0);
+    let mut template = None;
+    for child in fresh {
+        let sibling = placed.last().zip(template);
+        let (created, made_of) =
+            create_subtree_before(child, parent, anchor, ctx, patches, sibling);
+        template = made_of;
+        anchor = created.id;
+        placed.push(created);
+    }
+    placed
+}
+
+/// Puts the children a placement walk made back to front into the
+/// list at `at`, in their order. An empty list takes them as they are.
+fn put_placed(children: &mut Vec<Retained>, at: usize, mut placed: Vec<Retained>) {
+    if children.is_empty() {
+        placed.reverse();
+        *children = placed;
+    } else {
+        children.splice(at..at, placed.into_iter().rev());
+    }
+}
+
+/// Which entries of the plan stand on the longest increasing run of
+/// old positions — the survivors that need no move. A fresh entry is
+/// never on it. O(n log n), std only, and sized once.
+fn longest_increasing(plan: &[usize]) -> Vec<bool> {
+    const NONE: usize = usize::MAX;
+    let mut tails: Vec<usize> = Vec::with_capacity(plan.len()); // indices into `plan`
+    let mut parents: Vec<usize> = vec![NONE; plan.len()];
+    for (at, &position) in plan.iter().enumerate() {
+        if position == FRESH {
+            continue;
+        }
+        let place = tails.partition_point(|&tail| plan[tail] < position);
         if place > 0 {
-            parents[index] = Some(tails[place - 1]);
+            parents[at] = tails[place - 1];
         }
         if place == tails.len() {
-            tails.push(index);
+            tails.push(at);
         } else {
-            tails[place] = index;
+            tails[place] = at;
         }
     }
-    let mut run = Vec::with_capacity(tails.len());
-    let mut cursor = tails.last().copied();
-    while let Some(index) = cursor {
-        run.push(pairs[index].0);
-        cursor = parents[index];
+    let mut stable = vec![false; plan.len()];
+    let mut cursor = tails.last().copied().unwrap_or(NONE);
+    while cursor != NONE {
+        stable[cursor] = true;
+        cursor = parents[cursor];
     }
-    run.reverse();
-    run
+    stable
 }
+
 
 // MARK: - The wire encoding
 
@@ -5702,6 +5896,156 @@ mod tests {
             children,
             binding: None,
             face: None,
+        }
+    }
+
+
+    /// The reorder law, in bulk: whatever a keyed list becomes — rows
+    /// swapped, moved, inserted, removed, replaced, reversed, kept by
+    /// promise or lowered again — the patches bring the page's children
+    /// to exactly the order asked for, the retained mirror agrees with
+    /// the page, and the survivors that travel are the fewest that can:
+    /// one move for each survivor off the longest run of its old order,
+    /// none for a row on it. The diff trims the ends a frame did not
+    /// touch and reorders the middle in place; this is what it may never
+    /// get wrong while doing so.
+    #[test]
+    fn every_reorder_lands_in_the_order_asked_with_the_fewest_moves() {
+        let display = crate::layout::DisplayList::default();
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut roll = move |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below.max(1) as u64) as usize
+        };
+        // a row the page already holds may come back as a promise
+        let scene = |order: &[String], promised: &dyn Fn(usize) -> bool| {
+            flow_root(
+                order
+                    .iter()
+                    .enumerate()
+                    .map(|(at, path)| {
+                        let mut row = flow_row(path);
+                        if promised(at) {
+                            row.kind = DomKind::Reuse { path: std::rc::Rc::from(path.as_str()) };
+                        }
+                        row
+                    })
+                    .collect(),
+            )
+        };
+        let mut minted = 0usize;
+        let mut mint = move || {
+            minted += 1;
+            format!("row{minted}")
+        };
+        for _ in 0..400 {
+            let mut lowering = DomLowering::default();
+            let mut page: Vec<u32> = Vec::new();
+            let mut order: Vec<String> = (0..roll(20)).map(|_| mint()).collect();
+            let mut was: Vec<String> = Vec::new();
+            for _ in 0..10 {
+                let held: std::collections::HashSet<&str> =
+                    was.iter().map(String::as_str).collect();
+                let coin: Vec<bool> = (0..order.len()).map(|_| roll(2) == 0).collect();
+                let patches = lowering.lower(
+                    scene(&order, &|at| held.contains(order[at].as_str()) && coin[at]),
+                    &display,
+                );
+                // the page, as the browser would be left by the patches
+                for patch in &patches {
+                    match patch {
+                        DomPatch::Create { id, parent: 0, before, .. }
+                        | DomPatch::Clone { id, parent: 0, before, .. } => {
+                            let at = page.iter().position(|el| el == before).unwrap_or(page.len());
+                            page.insert(at, *id);
+                        }
+                        DomPatch::Move { id, before, .. } => {
+                            page.retain(|el| el != id);
+                            let at = page.iter().position(|el| el == before).unwrap_or(page.len());
+                            page.insert(at, *id);
+                        }
+                        DomPatch::Remove { id } => page.retain(|el| el != id),
+                        DomPatch::RemoveChildren { id: 0, .. } => page.clear(),
+                        _ => {}
+                    }
+                }
+                let mirror = &lowering.root.as_ref().expect("mounted").children;
+                let paths: Vec<String> = mirror
+                    .iter()
+                    .map(|row| match &row.node.kind {
+                        DomKind::Group { path } => path.to_string(),
+                        other => panic!("a row is a group: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(paths, order, "the mirror holds the order asked for");
+                assert_eq!(
+                    page,
+                    mirror.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    "the page holds the mirror's elements, in its order: {patches:#?}"
+                );
+                // the fewest moves: the survivors off the longest
+                // increasing run of their old positions
+                let old_at: std::collections::HashMap<&String, usize> =
+                    was.iter().enumerate().map(|(at, path)| (path, at)).collect();
+                let survivors: Vec<usize> =
+                    order.iter().filter_map(|path| old_at.get(path).copied()).collect();
+                let mut tails: Vec<usize> = Vec::new();
+                for &position in &survivors {
+                    let place = tails.partition_point(|&tail| tail < position);
+                    if place == tails.len() {
+                        tails.push(position);
+                    } else {
+                        tails[place] = position;
+                    }
+                }
+                let moves = patches.iter().filter(|p| matches!(p, DomPatch::Move { .. })).count();
+                assert_eq!(
+                    moves,
+                    survivors.len() - tails.len(),
+                    "{was:?} -> {order:?}: {patches:#?}"
+                );
+
+                // the next frame: one of the shapes a keyed list takes
+                was = order.clone();
+                let len = order.len();
+                match roll(7) {
+                    0 if len > 1 => {
+                        let (i, j) = (roll(len), roll(len));
+                        order.swap(i, j);
+                    }
+                    1 if len > 0 => {
+                        order.remove(roll(len));
+                    }
+                    2 => {
+                        let at = roll(len + 1);
+                        order.insert(at, mint());
+                    }
+                    3 => {
+                        for _ in 0..roll(4) {
+                            if order.len() > 1 {
+                                let row = order.remove(roll(order.len()));
+                                let at = roll(order.len() + 1);
+                                order.insert(at, row);
+                            }
+                        }
+                    }
+                    4 => order = (0..roll(12)).map(|_| mint()).collect(),
+                    5 => {
+                        for _ in 0..roll(4) {
+                            let at = roll(order.len() + 1);
+                            order.insert(at, mint());
+                        }
+                        for _ in 0..roll(3) {
+                            if !order.is_empty() {
+                                order.remove(roll(order.len()));
+                            }
+                        }
+                    }
+                    _ => order.reverse(),
+                }
+            }
         }
     }
 
