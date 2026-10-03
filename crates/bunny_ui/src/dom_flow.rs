@@ -142,6 +142,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         hits: Vec::new(),
         islands_walked: Vec::new(),
         runs_below: true,
+        last_face: None,
     };
     let mut children = Vec::new();
     walk.lower_into(root, &mut children);
@@ -154,7 +155,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
     children.extend(overlays);
     let scene = DomNode {
         kind: DomKind::Root,
-        face: Some(FontSpec::DEFAULT),
+        face: Some(walk.face_record(FontSpec::DEFAULT)),
         x: 0.0,
         y: 0.0,
         width: env.size.0,
@@ -276,6 +277,16 @@ struct Walk<'a> {
     /// boundary with nothing run below it opens: a thousand kept rows
     /// under a list that ran alone ask the index nothing.
     runs_below: bool,
+    /// The face this walk declared last, shared by the boxes that
+    /// declare it again — the rows of a list declare one face as many
+    /// times as there are rows.
+    last_face: Option<std::rc::Rc<FontSpec>>,
+}
+
+thread_local! {
+    /// The root's face, and every box's that declares the default one:
+    /// one record for the thread, never built again.
+    static DEFAULT_FACE: std::rc::Rc<FontSpec> = std::rc::Rc::new(FontSpec::DEFAULT);
 }
 
 /// A flow node with nothing to say yet.
@@ -338,6 +349,22 @@ impl Walk<'_> {
         // the theme is read only when no ink is open: every boundary
         // asks, and the whole theme is copied out to answer
         self.ink.last().copied().unwrap_or_else(|| crate::theme::current().fg)
+    }
+
+    /// A shared record of this face: the thread's for the default
+    /// face, the walk's last one when it is the same face again.
+    fn face_record(&mut self, face: FontSpec) -> std::rc::Rc<FontSpec> {
+        if face == FontSpec::DEFAULT {
+            return DEFAULT_FACE.with(std::rc::Rc::clone);
+        }
+        match &self.last_face {
+            Some(record) if **record == face => std::rc::Rc::clone(record),
+            _ => {
+                let record = std::rc::Rc::new(face);
+                self.last_face = Some(std::rc::Rc::clone(&record));
+                record
+            }
+        }
     }
 
     /// Lowers one semantic node into `out` — most nodes append exactly
@@ -624,7 +651,7 @@ impl Walk<'_> {
                 // inherit it and name none of their own
                 let outer_declared = self.declared;
                 if self.font != self.declared {
-                    boxed.face = Some(self.font);
+                    boxed.face = Some(self.face_record(self.font));
                     self.declared = self.font;
                 }
                 self.lower_into(child, &mut boxed.children);
@@ -679,7 +706,7 @@ impl Walk<'_> {
             } => {
                 self.fields.push((path.clone(), *auto_focus));
                 let theme = crate::theme::current();
-                let mut field = node(DomKind::Field(crate::dom::DomField {
+                let mut field = node(DomKind::Field(Box::new(crate::dom::DomField {
                     path: path.clone(),
                     content: content.clone(),
                     placeholder: placeholder.clone(),
@@ -687,7 +714,7 @@ impl Walk<'_> {
                     font: self.font,
                     color: self.current_ink(),
                     multiline: *multiline,
-                }));
+                })));
                 field.style = DomStyle::of_look(DomLook {
                     background: (!*bare).then_some(theme.field),
                     border: (!*bare).then_some((theme.field_border, 1.0)),

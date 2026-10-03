@@ -50,8 +50,10 @@ pub enum DomKind {
     Box,
     /// One run of text — the browser renders and selects it natively.
     Text(DomText),
-    /// A native `<input>` — the browser owns the editing.
-    Field(DomField),
+    /// A native `<input>` — the browser owns the editing. Boxed: the
+    /// widest record of the set and among the rarest, it would size
+    /// every node of the scene by itself.
+    Field(Box<DomField>),
     /// A scroll viewport; `offset` is ours, the element mirrors it.
     Scroll {
         path: Option<String>,
@@ -636,8 +638,9 @@ pub struct DomNode {
     /// root's default, or a box whose modifiers changed the face. A
     /// text with the declared face inherits it and declares none of
     /// its own — a thousand cells share the one declaration above
-    /// them, as a page's own stylesheet would have it.
-    pub face: Option<FontSpec>,
+    /// them, as a page's own stylesheet would have it. Shared: the
+    /// boxes a walk declares one face on hold one record of it.
+    pub face: Option<Rc<FontSpec>>,
 }
 
 // MARK: - Capture (rides the placement walk)
@@ -1917,7 +1920,7 @@ fn define_rule(rule: u64, node: &DomNode, ctx: &mut LowerCtx, patches: &mut Vec<
         layout: Box::new(node.layout.as_ref().map(look_layout).unwrap_or_default()),
         text: match &node.kind {
             DomKind::Text(text) => Some(Box::new(look_text(text))),
-            _ => node.face.map(|face| Box::new(face_only(face))),
+            _ => node.face.as_deref().map(|face| Box::new(face_only(*face))),
         },
     });
 }
@@ -1978,7 +1981,7 @@ fn shallow(node: &DomNode) -> DomNode {
         hints: node.hints.clone(),
         children: Vec::new(),
         binding: node.binding.clone(),
-        face: node.face,
+        face: node.face.clone(),
     }
 }
 
@@ -2378,7 +2381,7 @@ fn create_subtree(
             }
         }
         DomKind::Field(field) => {
-            patches.push(DomPatch::SetField { id, field: Box::new(field.clone()) });
+            patches.push(DomPatch::SetField { id, field: field.clone() });
         }
         DomKind::Scroll { offset, .. } if *offset != (0.0, 0.0) => {
             patches.push(DomPatch::SetScroll { id, x: offset.0, y: offset.1 });
@@ -2749,7 +2752,7 @@ fn diff_node(
             }
         }
         (DomKind::Field(before), DomKind::Field(after)) if before != after => {
-            patches.push(DomPatch::SetField { id, field: Box::new(after.clone()) });
+            patches.push(DomPatch::SetField { id, field: after.clone() });
         }
         (
             DomKind::Scroll { offset: before, .. },
@@ -5937,7 +5940,7 @@ mod tests {
             }),
             pass_through: true,
         });
-        boxed.face = Some(FontSpec::DEFAULT);
+        boxed.face = Some(Rc::new(FontSpec::DEFAULT));
         let mut words = flow_row("b");
         words.kind = DomKind::Text(DomText {
             content: Arc::from("words"),
