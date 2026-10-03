@@ -382,9 +382,15 @@ thread_local! {
 /// first). They rebuild only when an entry that carries one is indexed
 /// or dropped — a generation number per kind says when — and from the
 /// entries that carry one, never from the whole retention.
+///
+/// One table lags on purpose: the click keys of an entry that LEFT stay
+/// until the idle takes them out ([`collect_garbage`]), because a
+/// thousand rows that leave are two thousand keys hashed out of it in the
+/// click that let them go. Until then each one still names its owner, and
+/// a key whose owner left fires nothing ([`Live::click`]).
 #[derive(Default)]
 struct Live {
-    actions: HashMap<Rc<str>, ClickAction>,
+    actions: HashMap<Rc<str>, Registered>,
     copies: HashMap<String, CopyFn>,
     editors: HashMap<String, EditorFn>,
     splits: HashMap<String, SplitFn>,
@@ -399,6 +405,10 @@ struct Live {
     /// How many action keys are `.on_hover` registrations — a scene with
     /// none pays nothing for the hover road.
     hover_keys: usize,
+    /// How many click keys of entries that left still stand in the
+    /// table, for the idle to take out — none, and the idle has nothing
+    /// to look for.
+    buried_actions: usize,
     /// The entries that carry handlers, contexts and effects: the three
     /// derived products rebuild from these alone.
     handler_entries: HashSet<String>,
@@ -432,10 +442,29 @@ struct RootKeys {
     customs: Vec<String>,
 }
 
+/// A click key's registration: what it fires, and whose it is.
+struct Registered {
+    action: ClickAction,
+    /// The slot of the boundary whose body registered it — as old as the
+    /// boundary's stay in the retention: a body that re-runs keeps it and
+    /// replaces its registrations, one that leaves marks it left, and the
+    /// boundary that mounts at the same path afterwards gets a slot of its
+    /// own. `None` for the root region, whose keys leave at the next
+    /// assembly.
+    owner: Option<Rc<Slot>>,
+}
+
+impl Registered {
+    /// Does the registration still belong to a retained entry?
+    fn is_live(&self) -> bool {
+        self.owner.as_ref().is_none_or(|slot| !slot.left.get())
+    }
+}
+
 impl Live {
-    fn insert_action(&mut self, key: Rc<str>, action: ClickAction) {
+    fn insert_action(&mut self, key: Rc<str>, action: ClickAction, owner: Option<Rc<Slot>>) {
         let hover = key.ends_with(HOVER_KEY);
-        if self.actions.insert(key, action).is_none() && hover {
+        if self.actions.insert(key, Registered { action, owner }).is_none() && hover {
             self.hover_keys += 1;
         }
     }
@@ -446,10 +475,20 @@ impl Live {
         }
     }
 
+    /// What a click at `key` fires — nothing when the key's owner left
+    /// and the idle has not taken the key out yet. A press can still
+    /// name it: the event was queued before the frame that let the row
+    /// go, and the element it hit is gone from the page but not from
+    /// the event.
+    fn click(&self, key: &str) -> Option<ClickAction> {
+        let registered = self.actions.get(key)?;
+        registered.is_live().then(|| Rc::clone(&registered.action))
+    }
+
     /// Puts one closed entry's registrations into the tables.
     fn index(&mut self, path: &str, entry: &Entry) {
         for (key, action) in &entry.actions {
-            self.insert_action(key.clone(), Rc::clone(action));
+            self.insert_action(key.clone(), Rc::clone(action), Some(Rc::clone(&entry.slot)));
         }
         if let Some(rare) = &entry.rare {
             for (key, copy) in &rare.copies {
@@ -500,6 +539,48 @@ impl Live {
         for (key, _) in &entry.actions {
             self.remove_action(key);
         }
+        self.unindex_rest(path, entry);
+    }
+
+    /// [`Live::unindex`] for an entry that LEFT the retention: its slot
+    /// is marked left, and its click keys stay until the idle takes them
+    /// out ([`Live::take_buried`]), firing nothing meanwhile. A hover key
+    /// leaves now — the count of them says whether the hover road runs.
+    fn unindex_leaving(&mut self, path: &str, entry: &Entry) {
+        entry.slot.left.set(true);
+        for (key, _) in &entry.actions {
+            if key.ends_with(HOVER_KEY) {
+                self.remove_action(key);
+            } else {
+                self.buried_actions += 1;
+            }
+        }
+        self.unindex_rest(path, entry);
+    }
+
+    /// Takes out the click keys the entries that left kept in the table —
+    /// each one only while it is still the left entry's own: a boundary
+    /// that mounted at the same path since then registered its own over
+    /// it, from a slot of its own.
+    fn take_buried(&mut self, graveyard: &[Box<Entry>]) {
+        if self.buried_actions == 0 {
+            return;
+        }
+        for entry in graveyard {
+            for (key, action) in &entry.actions {
+                if let std::collections::hash_map::Entry::Occupied(found) = self.actions.entry(Rc::clone(key))
+                    && found.get().owner.as_ref().is_some_and(|owner| Rc::ptr_eq(owner, &entry.slot))
+                    && Rc::ptr_eq(&found.get().action, action)
+                {
+                    found.remove();
+                }
+            }
+        }
+        self.buried_actions = 0;
+    }
+
+    /// The registrations of [`Live::unindex`] other than the click keys.
+    fn unindex_rest(&mut self, path: &str, entry: &Entry) {
         if let Some(rare) = &entry.rare {
             for (key, _) in &rare.copies {
                 self.copies.remove(key);
@@ -603,6 +684,11 @@ fn is_top_level(path: &str) -> bool {
 /// public. An app has no door to one and nothing to do with one.
 pub struct Slot {
     held: RefCell<Option<Rc<Held>>>,
+    /// Did the entry it was filled for leave the retention? Set when it
+    /// leaves, while its tree still waits for the idle, and never cleared:
+    /// a boundary that mounts at the same path afterwards gets a slot of
+    /// its own. The click keys the entry left behind ask it ([`Registered`]).
+    left: Cell<bool>,
 }
 
 /// What a slot holds while its boundary is retained.
@@ -627,7 +713,7 @@ impl std::fmt::Debug for Slot {
 
 impl Slot {
     fn empty() -> Rc<Slot> {
-        Rc::new(Slot { held: RefCell::new(None) })
+        Rc::new(Slot { held: RefCell::new(None), left: Cell::new(false) })
     }
 
     fn held(&self) -> Option<Rc<Held>> {
@@ -1371,7 +1457,7 @@ pub(crate) fn hover_watched() -> bool {
 /// `false` = target not registered (the identity died between frame and
 /// click — harmless).
 pub(crate) fn run_action(path: &str, clicks: u8) -> bool {
-    let action = LIVE.with(|live| live.borrow().actions.get(path).cloned());
+    let action = LIVE.with(|live| live.borrow().click(path));
     match action {
         Some(action) => {
             action(clicks);
@@ -1674,8 +1760,13 @@ fn tables_fingerprint(live: &Live, without_root: bool) -> u64 {
     let skip = |keys: &[String], key: &str| without_root && keys.iter().any(|root| root == key);
     let mut total = 0u64;
     let mut mix = |part: u64| total = total.wrapping_mul(31).wrapping_add(part);
-    mix(live.actions.iter().fold(0u64, |sum, (key, action)| {
-        if skip(&live.root_keys.actions, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(action)) }
+    // a click key whose owner left waits for the idle: it is not live
+    mix(live.actions.iter().fold(0u64, |sum, (key, registered)| {
+        if skip(&live.root_keys.actions, key) || !registered.is_live() {
+            sum
+        } else {
+            sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(&registered.action))
+        }
     }));
     mix(live.copies.iter().fold(0u64, |sum, (key, copy)| {
         if skip(&live.root_keys.copies, key) { sum } else { sum.wrapping_add(fingerprint_key(key) ^ fingerprint_ptr(copy)) }
@@ -1845,7 +1936,7 @@ pub(crate) fn refresh_root_region() {
         let mut keys = RootKeys::default();
         for (key, action) in actions {
             keys.actions.push(key.to_string());
-            live.insert_action(key, action);
+            live.insert_action(key, action, None);
         }
         for (key, copy) in copies {
             keys.copies.push(key.clone());
@@ -1898,7 +1989,7 @@ fn drop_entries<P: AsRef<str>>(paths: &[P]) {
                 for path in paths {
                     let path: &str = path.as_ref();
                     if let Some(entry) = retained.remove(path) {
-                        live.unindex(path, &entry);
+                        live.unindex_leaving(path, &entry);
                         // a view that left owes the read graph nothing
                         // more: its reads fall with it, and its bindings
                         // hear no write from here. Unpicking their reads
@@ -1958,6 +2049,7 @@ pub(crate) fn collect_garbage() -> usize {
     count
         + GRAVEYARD.with(|graveyard| {
             let mut graveyard = graveyard.borrow_mut();
+            LIVE.with(|live| live.borrow_mut().take_buried(&graveyard));
             let count = graveyard.len();
             graveyard.clear();
             count
@@ -2093,7 +2185,7 @@ pub(crate) fn sweep_stale(root: &str) {
                 // the entry leaves the tables and the read graph as it
                 // leaves the retention, and waits for the idle to be freed
                 let mut fall = |path: &Rc<str>, entry: Box<Entry>| {
-                    live.unindex(path, &entry);
+                    live.unindex_leaving(path, &entry);
                     motor::identity::retire_view(path);
                     graveyard.push(entry);
                 };
@@ -2528,6 +2620,131 @@ mod tests {
         runtime.render(&page);
         assert_eq!(graveyard_len(), 0, "past it, the pass freed it");
         assert_eq!(motor::identity::retired_count(), 0, "read graph and all");
+    }
+
+    /// A row that answers a click — or, unarmed, shows the same words
+    /// and answers nothing. The click counts into the row's own state.
+    #[derive(Clone, Copy)]
+    struct Pressable {
+        id: usize,
+        armed: bool,
+        presses: State<usize>,
+    }
+
+    impl Component for Pressable {
+        fn body(self, _ctx: &Context) -> impl View {
+            let presses = self.presses;
+            let words = format!("row {}", self.id);
+            if self.armed {
+                Either::First(text(words).on_click(move || presses.set(presses.get() + 1)))
+            } else {
+                Either::Second(text(words))
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Pressables {
+        rows: State<Rc<Vec<Pressable>>>,
+    }
+
+    impl Component for Pressables {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::views::for_each(self.rows, |row| row.id.to_string(), |row| *row)
+        }
+    }
+
+    fn pressables(ids: &[usize]) -> Vec<Pressable> {
+        ids.iter().map(|&id| Pressable { id, armed: true, presses: State::new(0) }).collect()
+    }
+
+    /// The click keys standing in the live table whose path holds `part`.
+    fn click_keys(part: &str) -> Vec<String> {
+        LIVE.with(|live| {
+            live.borrow().actions.keys().filter(|key| key.contains(part)).map(|key| key.to_string()).collect()
+        })
+    }
+
+    fn buried_actions() -> usize {
+        LIVE.with(|live| live.borrow().buried_actions)
+    }
+
+    /// A row that leaves keeps its click key in the live table until the
+    /// idle: a thousand rows hashed out of it were the larger part of the
+    /// sweep. But a key whose owner left fires nothing — a press queued
+    /// before the frame still names the element it hit, which is gone —
+    /// and the tables say what the retention says all the while. The idle
+    /// takes the key out; the rows that stayed answer throughout.
+    #[test]
+    fn a_row_that_left_fires_nothing_until_the_idle_takes_its_key_out() {
+        let all = pressables(&[1, 2, 3]);
+        let rows = State::new(Rc::new(all.clone()));
+        let page = Pressables { rows };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let gone = click_keys("[2]");
+        let kept = click_keys("[3]");
+        assert_eq!((gone.len(), kept.len()), (1, 1), "one click per row: {gone:?} {kept:?}");
+        assert!(run_action(&gone[0], 1), "row 2 answers while it stands");
+        assert_eq!(all[1].presses.get(), 1);
+
+        rows.set(Rc::new(vec![all[0], all[2]]));
+        runtime.render(&page);
+        assert_eq!(click_keys("[2]"), gone, "the key of the row that left waits for the idle");
+        assert_eq!(buried_actions(), 1);
+        assert!(!run_action(&gone[0], 1), "and fires nothing");
+        assert_eq!(all[1].presses.get(), 1, "the row that left was not pressed");
+        assert!(live_tables_match_retention(), "a waiting key is not a live one");
+        assert!(run_action(&kept[0], 1), "a row that stayed answers");
+        assert_eq!(all[2].presses.get(), 1);
+
+        let _ = collect_garbage();
+        assert!(click_keys("[2]").is_empty(), "the idle took the key out");
+        assert_eq!(buried_actions(), 0);
+        assert!(!run_action(&gone[0], 1));
+        assert!(run_action(&kept[0], 1), "and left the rows that stayed alone");
+        assert_eq!(all[2].presses.get(), 2);
+    }
+
+    /// A row that comes back before the idle registers its click again at
+    /// the same key, over the one the row that left kept there: it answers
+    /// with the new closure, and the idle that follows leaves it standing.
+    /// One that comes back with nothing to click stands at the same path
+    /// with a slot of its own — the left key is still not its, and fires
+    /// nothing.
+    #[test]
+    fn a_row_that_comes_back_before_the_idle_answers_with_its_own_click() {
+        let all = pressables(&[1, 2, 3]);
+        let rows = State::new(Rc::new(all.clone()));
+        let page = Pressables { rows };
+        let runtime = Runtime::new();
+        runtime.render(&page);
+        let key = click_keys("[2]").pop().expect("row 2's click");
+
+        rows.set(Rc::new(vec![all[0], all[2]]));
+        runtime.render(&page);
+        rows.set(Rc::new(all.clone()));
+        runtime.render(&page);
+        assert!(run_action(&key, 1), "the row that came back answers");
+        assert_eq!(all[1].presses.get(), 1);
+        let _ = collect_garbage();
+        assert_eq!(click_keys("[2]"), [key.clone()], "the idle kept the new registration");
+        assert!(run_action(&key, 1));
+        assert_eq!(all[1].presses.get(), 2);
+
+        // it leaves again, and comes back with nothing to click
+        rows.set(Rc::new(vec![all[0], all[2]]));
+        runtime.render(&page);
+        let plain = Pressable { armed: false, ..all[1] };
+        rows.set(Rc::new(vec![all[0], plain, all[2]]));
+        runtime.render(&page);
+        let back = retained_under("Pressables");
+        assert!(back.iter().any(|path| path.contains("[2]")), "row 2 stands again: {back:?}");
+        assert!(!run_action(&key, 1), "the path stands again, but the key is not the new row's");
+        assert_eq!(all[1].presses.get(), 2);
+        assert!(live_tables_match_retention());
+        let _ = collect_garbage();
+        assert!(click_keys("[2]").is_empty(), "the idle took the left key out");
     }
 
     /// The paths retained under a prefix, sorted.
