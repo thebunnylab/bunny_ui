@@ -768,6 +768,13 @@ fn rule_text(
             .into(),
         );
     }
+    // layers: the same alignment across the cell, so a centred stack
+    // centres both ways
+    if matches!(kind, CreateKind::Layers) {
+        if let Some(align) = base.get("align-items").cloned() {
+            base.insert("justify-items", align);
+        }
+    }
     if let Some((top, right, bottom, left)) = layout.padding {
         base.insert("padding", format!("{} {} {} {}", px(top), px(right), px(bottom), px(left)));
     }
@@ -792,6 +799,11 @@ fn rule_text(
         base.insert("row-gap", px(line_gap));
     }
     let mut states: Vec<String> = Vec::new();
+    // layers: one grid cell, and every child IN it — auto-placement
+    // would give each layer a row of its own
+    if matches!(kind, CreateKind::Layers) {
+        states.push(format!("{selector}>*{{grid-area:1/1}}"));
+    }
     // a follower hangs its states off the GROUP's pointer: the same
     // rules, hung off the group's selector; a box without one listens
     // to its own
@@ -1130,5 +1142,23 @@ mod tests {
         ] {
             assert!(page.html.contains(served), "{served} in {}", page.html);
         }
+    }
+
+    /// A stack of layers is ONE cell with every layer in it — grid
+    /// auto-placement alone would give each layer a row of its own.
+    #[test]
+    fn layers_share_one_cell() {
+        #[derive(Clone, Copy)]
+        struct Badge;
+
+        impl Component for Badge {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::zstack!(rectangle().frame(80.0, 20.0), text("on top"))
+            }
+        }
+
+        let page = render(&Badge, Size { width: 200.0, height: 200.0 });
+        assert!(page.css.contains(">*{grid-area:1/1}"), "{}", page.css);
+        assert!(page.css.contains("justify-items:center"), "{}", page.css);
     }
 }
