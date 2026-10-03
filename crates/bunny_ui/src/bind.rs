@@ -651,6 +651,33 @@ mod frame_tests {
         assert!(matches!(patches.as_slice(), [DomPatch::SetHints { class: None, .. }]), "{patches:?}");
     }
 
+    /// A class spelled at render — a string of the body's own, not a
+    /// literal — is kept as it is and worn the same way.
+    #[test]
+    fn a_class_spelled_at_render_flips_like_a_literal() {
+        #[derive(Clone, Copy)]
+        struct Tagged {
+            on: State<bool>,
+            id: usize,
+        }
+
+        impl Component for Tagged {
+            fn body(self, _ctx: &Context) -> impl View {
+                (boundary_class_when(self.on, format!("tag-{}", self.id)), text("tagged"))
+            }
+        }
+
+        let tagged = Tagged { on: State::new(false), id: 7 };
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&tagged, SIZE);
+        tagged.on.set(true);
+        let patches = runtime.dom_frame(&tagged, SIZE);
+        match patches.as_slice() {
+            [DomPatch::SetHints { class: Some(class), .. }] => assert_eq!(&**class, "tag-7"),
+            other => panic!("one class patch, got {other:?}"),
+        }
+    }
+
     #[derive(Clone, Copy, PartialEq)]
     struct Item {
         id: usize,
