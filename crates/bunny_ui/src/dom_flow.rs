@@ -18,7 +18,7 @@
 
 use motor::hash::FxHashMap as HashMap;
 
-use crate::dom::{DomHints, DomKind, DomLayout, DomNode, DomStyle, DomText};
+use crate::dom::{DomHints, DomKind, DomLayout, DomLook, DomMarks, DomNode, DomStyle, DomText};
 use crate::layout::{Axis, Color, CrossAlign, Edges, LayoutNode, Point, Px};
 use crate::text_engine::FontSpec;
 
@@ -159,10 +159,10 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         y: 0.0,
         width: env.size.0,
         height: env.size.1,
-        style: DomStyle {
+        style: DomStyle::of_look(DomLook {
             background: Some(crate::theme::current().canvas),
-            ..DomStyle::default()
-        },
+            ..DomLook::default()
+        }),
         // the root is the one ABSOLUTE citizen of a flow scene: the
         // window's box is real geometry, and a resize is its SetSize
         layout: None,
@@ -355,8 +355,8 @@ impl Walk<'_> {
                 // stack hinted into an anchor): the pending action
                 // lands here the way it lands on a styled box
                 container.style.interactive = self.pending_interactive.take();
-                container.style.tooltip = self.pending_tooltip.take();
-                container.style.transition = self.pending_transition.take();
+                container.style.set_tooltip(self.pending_tooltip.take());
+                container.style.set_transition(self.pending_transition.take());
                 let layout = container.layout.as_mut().expect("flow node");
                 if *spacing != 0.0 {
                     layout.gap = Some(*spacing);
@@ -399,8 +399,8 @@ impl Walk<'_> {
             LayoutNode::Flow { spacing, line_spacing, align, children } => {
                 let mut container = node(DomKind::FlexRow);
                 container.style.interactive = self.pending_interactive.take();
-                container.style.tooltip = self.pending_tooltip.take();
-                container.style.transition = self.pending_transition.take();
+                container.style.set_tooltip(self.pending_tooltip.take());
+                container.style.set_transition(self.pending_transition.take());
                 let layout = container.layout.as_mut().expect("flow node");
                 if *spacing != 0.0 {
                     layout.gap = Some(*spacing);
@@ -441,7 +441,7 @@ impl Walk<'_> {
                 // boxes never fold — their background must stay tight
                 // to the child, and CSS padding would slide under it.
                 if let [only] = lowered.as_mut_slice()
-                    && only.style == DomStyle::default()
+                    && only.style.is_default()
                     && matches!(
                         only.kind,
                         DomKind::FlexColumn | DomKind::FlexRow | DomKind::Layers | DomKind::Box
@@ -539,7 +539,7 @@ impl Walk<'_> {
             LayoutNode::Fill => {
                 let mut fill = node(DomKind::Box);
                 fill.layout.as_mut().expect("flow node").grow = true;
-                fill.style.background = Some(Color::FILL);
+                fill.style.look_mut().background = Some(Color::FILL);
                 out.push(fill);
             }
             LayoutNode::Leaf { size } => {
@@ -571,7 +571,7 @@ impl Walk<'_> {
                     && !inheriting
                     && self.overlay_depth == 0
                     && self.pending_transition.is_none()
-                    && !DomStyle::paints(props)
+                    && !DomLook::paints(props)
                 {
                     self.ink.push(props.foreground.unwrap_or_else(|| self.current_ink()));
                     self.lower_into(child, out);
@@ -583,30 +583,26 @@ impl Walk<'_> {
                 }
                 let mut boxed = node(DomKind::Box);
                 let interactive = self.pending_interactive.take();
-                boxed.style = DomStyle {
+                let mut look = DomLook {
                     // a layer that asks for nothing lets the click
                     // reach whatever it covers
                     pass_through: self.overlay_depth > 0 && interactive.is_none(),
                     group: self.groups.last().copied(),
-                    tooltip: self.pending_tooltip.take(),
-                    interactive,
                     transition: self.pending_transition.take(),
-                    ..DomStyle::from_props(props)
+                    ..DomLook::from_props(props)
                 };
+                let marks = DomMarks { tooltip: self.pending_tooltip.take(), group_owner: None };
                 // the tint is the half of the material an ELEMENT owns:
                 // it sits under whatever the box paints itself, because
                 // an element has one background colour. The tint never
                 // rides the wire on its own — it folds in here
                 if let Some(glass) = props.glass {
                     let tint = glass.resolve(crate::layout::Rect { origin: crate::layout::Point { x: 0.0, y: 0.0 }, size: crate::layout::Size::default() }).tint;
-                    boxed.style.background =
-                        crate::dom::GlassFilter::under(tint, boxed.style.background);
-                    boxed.style.hover_background = boxed
-                        .style
+                    look.background = crate::dom::GlassFilter::under(tint, look.background);
+                    look.hover_background = look
                         .hover_background
                         .and_then(|color| crate::dom::GlassFilter::under(tint, Some(color)));
-                    boxed.style.pressed_background = boxed
-                        .style
+                    look.pressed_background = look
                         .pressed_background
                         .and_then(|color| crate::dom::GlassFilter::under(tint, Some(color)));
                 }
@@ -616,8 +612,9 @@ impl Walk<'_> {
                     self.ink.push(self.current_ink());
                 }
                 if states || inheriting {
-                    boxed.style.color = Some(self.current_ink());
+                    look.color = Some(self.current_ink());
                 }
+                boxed.style = DomStyle::new(interactive, look, marks);
                 if states {
                     self.ink_scopes.push(self.ink.len());
                 }
@@ -661,7 +658,7 @@ impl Walk<'_> {
                     inherits_face: self.font == self.declared,
                 }));
                 text.style.interactive = self.pending_interactive.take();
-                text.style.tooltip = self.pending_tooltip.take();
+                text.style.set_tooltip(self.pending_tooltip.take());
                 text.binding = binding.map(crate::dom::NodeBinding::Text);
                 out.push(text);
             }
@@ -690,15 +687,15 @@ impl Walk<'_> {
                     color: self.current_ink(),
                     multiline: *multiline,
                 }));
-                field.style = DomStyle {
+                field.style = DomStyle::of_look(DomLook {
                     background: (!*bare).then_some(theme.field),
                     border: (!*bare).then_some((theme.field_border, 1.0)),
                     corner_radius: (!*bare)
                         .then_some(crate::layout::Corners::all(crate::layout::FIELD_RADIUS)),
                     focus_border: (!*bare).then_some(theme.focus),
                     placeholder_color: Some(theme.placeholder),
-                    ..DomStyle::default()
-                };
+                    ..DomLook::default()
+                });
                 out.push(field);
             }
             // a feed has no bytes an `<img>` could name: it is painted,
@@ -930,7 +927,7 @@ impl Walk<'_> {
                 // the owner names itself; the followers below point
                 // their selectors at it
                 for owner in &mut out[opened..] {
-                    owner.style.group_owner = Some(key);
+                    owner.style.set_group_owner(Some(key));
                 }
             }
             LayoutNode::Overlay { behind, layer, child, .. } => {
@@ -981,12 +978,12 @@ impl Walk<'_> {
                 if ringed {
                     let accent = crate::theme::current().accent;
                     let mut ring = node(DomKind::Box);
-                    ring.style = DomStyle {
+                    ring.style = DomStyle::of_look(DomLook {
                         border: Some((accent, 2.0)),
                         corner_radius: Some(crate::layout::Corners::all(6.0)),
                         pass_through: true,
-                        ..DomStyle::default()
-                    };
+                        ..DomLook::default()
+                    });
                     out.push(ring);
                 }
             }
@@ -1299,11 +1296,11 @@ impl Walk<'_> {
         if text.style.interactive.is_none() {
             text.style.interactive = cell.style.interactive.take();
         }
-        if text.style.tooltip.is_none() {
-            text.style.tooltip = cell.style.tooltip.take();
+        if text.style.tooltip().is_none() {
+            text.style.set_tooltip(cell.style.take_tooltip());
         }
-        if text.style.transition.is_none() {
-            text.style.transition = cell.style.transition.take();
+        if text.style.look().transition.is_none() {
+            text.style.set_transition(cell.style.take_transition());
         }
         *cell = text;
     }
@@ -1826,7 +1823,7 @@ mod tests {
         let offsets = HashMap::default();
         let scene = lower(&tree, &env_fixture(&offsets)).scene;
         let boxed = &scene.children[0];
-        assert_eq!(boxed.style.color, Some(Color::hex(0x888888)));
+        assert_eq!(boxed.style.look().color, Some(Color::hex(0x888888)));
         let DomKind::Text(text) = &boxed.children[0].kind else {
             panic!("a text under the box");
         };

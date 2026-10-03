@@ -155,11 +155,148 @@ pub struct DomIcon {
     pub forced: bool,
 }
 
-/// The visual record of a node — everything CSS will say about it.
-/// Hover and pressed live HERE as alternatives, never resolved: the
-/// scene is pointer-invariant.
-#[derive(Clone, Debug, PartialEq, Default)]
+/// The visual record of a node — everything CSS will say about it, in
+/// the three parts a page tells apart. The action path is the
+/// element's own and rides inline: a row's every link carries one. The
+/// LOOK is what a rule shares, and the MARKS (a tooltip, the hover
+/// group a box owns) are the element's own and rare: both are boxed,
+/// and held as none when they say nothing — a flow scene's cells,
+/// links and stacks mostly wear the default look, and a default style
+/// is three words that allocate nothing.
+#[derive(Clone, Debug, Default)]
 pub struct DomStyle {
+    /// The action path of the enclosing `Interactive` — the glue posts
+    /// clicks back with it, and `:hover`/`:active` scope to it.
+    pub interactive: Option<std::rc::Rc<str>>,
+    /// `None` = the look that paints nothing ([`DomLook::NONE`]).
+    look: Option<Box<DomLook>>,
+    /// `None` = no marks.
+    marks: Option<Box<DomMarks>>,
+}
+
+/// Equal by what the parts SAY: a look boxed at its default reads the
+/// same as none.
+impl PartialEq for DomStyle {
+    fn eq(&self, other: &DomStyle) -> bool {
+        self.interactive == other.interactive
+            && same_look(self.look(), other.look())
+            && self.marks() == other.marks()
+    }
+}
+
+/// The look nobody boxed.
+static NO_LOOK: DomLook = DomLook::NONE;
+/// The marks nobody boxed.
+static NO_MARKS: DomMarks = DomMarks { tooltip: None, group_owner: None };
+
+impl DomStyle {
+    /// A style of its three parts; a default look and empty marks are
+    /// held as none.
+    pub fn new(interactive: Option<std::rc::Rc<str>>, look: DomLook, marks: DomMarks) -> DomStyle {
+        let mut style = DomStyle { interactive, look: None, marks: None };
+        style.set_look(look);
+        if marks != NO_MARKS {
+            style.marks = Some(Box::new(marks));
+        }
+        style
+    }
+
+    /// A style that is a look alone: no action path, no marks.
+    pub fn of_look(look: DomLook) -> DomStyle {
+        DomStyle::new(None, look, DomMarks::default())
+    }
+
+    /// The look — [`DomLook::NONE`] when the style paints nothing.
+    pub fn look(&self) -> &DomLook {
+        self.look.as_deref().unwrap_or(&NO_LOOK)
+    }
+
+    /// The look, to change in place: a style that painted nothing takes
+    /// a record of its own here.
+    pub fn look_mut(&mut self) -> &mut DomLook {
+        self.look.get_or_insert_with(Box::default)
+    }
+
+    /// Replaces the look; the default one is held as none.
+    pub fn set_look(&mut self, look: DomLook) {
+        self.look = (look != NO_LOOK).then(|| Box::new(look));
+    }
+
+    /// The transition of the enclosing animation scope — a look's.
+    /// Setting none on a style that paints nothing boxes nothing.
+    pub fn set_transition(&mut self, transition: Option<(f64, f64)>) {
+        if transition.is_some() || self.look.is_some() {
+            self.look_mut().transition = transition;
+        }
+    }
+
+    pub fn take_transition(&mut self) -> Option<(f64, f64)> {
+        self.look.as_mut().and_then(|look| look.transition.take())
+    }
+
+    /// The element's own marks — empty when it has none.
+    pub fn marks(&self) -> &DomMarks {
+        self.marks.as_deref().unwrap_or(&NO_MARKS)
+    }
+
+    /// Does the element carry a mark of its own?
+    pub fn has_marks(&self) -> bool {
+        *self.marks() != NO_MARKS
+    }
+
+    pub fn tooltip(&self) -> Option<&Arc<str>> {
+        self.marks().tooltip.as_ref()
+    }
+
+    pub fn group_owner(&self) -> Option<u64> {
+        self.marks().group_owner
+    }
+
+    /// Setting none on an element without marks boxes nothing.
+    pub fn set_tooltip(&mut self, tooltip: Option<Arc<str>>) {
+        if tooltip.is_some() || self.marks.is_some() {
+            self.marks.get_or_insert_with(Box::default).tooltip = tooltip;
+            self.settle_marks();
+        }
+    }
+
+    pub fn take_tooltip(&mut self) -> Option<Arc<str>> {
+        let tooltip = self.marks.as_mut().and_then(|marks| marks.tooltip.take());
+        self.settle_marks();
+        tooltip
+    }
+
+    pub fn set_group_owner(&mut self, owner: Option<u64>) {
+        if owner.is_some() || self.marks.is_some() {
+            self.marks.get_or_insert_with(Box::default).group_owner = owner;
+            self.settle_marks();
+        }
+    }
+
+    /// Marks emptied are held as none again.
+    fn settle_marks(&mut self) {
+        if self.marks.as_deref() == Some(&NO_MARKS) {
+            self.marks = None;
+        }
+    }
+
+    /// No action path, the look that paints nothing, no marks.
+    pub fn is_default(&self) -> bool {
+        self.interactive.is_none() && *self.look() == NO_LOOK && !self.has_marks()
+    }
+}
+
+/// Two looks, equal? The same record — the unboxed default on both
+/// sides, most of a scene — answers without reading a field.
+fn same_look(a: &DomLook, b: &DomLook) -> bool {
+    std::ptr::eq(a, b) || a == b
+}
+
+/// The part of a style a rule shares: everything CSS says about the
+/// element but its action path and its marks. Hover and pressed live
+/// HERE as alternatives, never resolved: the scene is pointer-invariant.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct DomLook {
     pub background: Option<Color>,
     /// A two-stop ramp over the flat background — the browser's own
     /// `radial-gradient`/`linear-gradient`. The geometry is ours (a
@@ -177,9 +314,6 @@ pub struct DomStyle {
     pub border: Option<(Color, Px)>,
     pub corner_radius: Option<Corners>,
     pub shadow: Option<(Px, Color)>,
-    /// The action path of the enclosing `Interactive` — the glue posts
-    /// clicks back with it, and `:hover`/`:active` scope to it.
-    pub interactive: Option<std::rc::Rc<str>>,
     /// `(response, damping)` of the enclosing animation scope — the
     /// glue lowers it to a CSS transition; the engine never ticks here.
     pub transition: Option<(f64, f64)>,
@@ -192,11 +326,6 @@ pub struct DomStyle {
     /// the radius already on the box: the browser cuts the subtree to
     /// the curve as a LAYER, its own native rounded clip.
     pub clip: bool,
-    /// `.tooltip(…)` — in THIS mode the browser owns the wait and the
-    /// bubble (a CSS rule on a data attribute), the way it owns the
-    /// hover and the inputs: zero patches by construction. The pixel
-    /// modes run the engine's own bubble instead.
-    pub tooltip: Option<Arc<str>>,
     /// `.opacity(…)` and its two states. In THIS mode the fade is a
     /// real LAYER — the browser composites the subtree once — which is
     /// strictly better than the per-command multiply the pixel
@@ -211,9 +340,6 @@ pub struct DomStyle {
     /// browser keeps owning the hover and a group frame still costs
     /// zero patches.
     pub group: Option<u64>,
-    /// The box a `.hover_group()` owns names itself here — the anchor
-    /// every follower's selector points at.
-    pub group_owner: Option<u64>,
     /// The liquid-glass material, as much of it as a browser owns:
     /// `backdrop-filter` gives the blur, the saturation and the
     /// brightness natively, and the rim goes on as two inset shadows
@@ -239,9 +365,34 @@ pub struct DomStyle {
     pub pass_through: bool,
 }
 
-impl DomStyle {
-    pub(crate) fn from_props(props: &VisualProps) -> DomStyle {
-        DomStyle {
+impl DomLook {
+    /// The look that paints nothing — what a style with no look of its
+    /// own wears.
+    pub const NONE: DomLook = DomLook {
+        background: None,
+        gradient: None,
+        hover_background: None,
+        pressed_background: None,
+        color: None,
+        hover_color: None,
+        pressed_color: None,
+        border: None,
+        corner_radius: None,
+        shadow: None,
+        transition: None,
+        focus_border: None,
+        placeholder_color: None,
+        clip: false,
+        opacity: None,
+        hover_opacity: None,
+        pressed_opacity: None,
+        group: None,
+        glass: None,
+        pass_through: false,
+    };
+
+    pub(crate) fn from_props(props: &VisualProps) -> DomLook {
+        DomLook {
             background: props.background,
             gradient: props.gradient,
             hover_background: props.background_hovered,
@@ -252,26 +403,23 @@ impl DomStyle {
             border: props.border,
             corner_radius: props.corner_radius,
             shadow: props.shadow,
-            interactive: None,
             transition: None,
             focus_border: None,
             placeholder_color: None,
             clip: props.clip,
-            tooltip: None,
             opacity: props.opacity,
             hover_opacity: props.opacity_hovered,
             pressed_opacity: props.opacity_pressed,
             group: None,
-            group_owner: None,
             glass: props.glass.map(GlassFilter::of),
             pass_through: false,
         }
     }
 
-    /// Do these props paint anything — would [`DomStyle::from_props`]
-    /// say more than the default? Read prop by prop, the same props
-    /// `from_props` reads and no other, so the walk that asks it of
-    /// every styled text builds no style just to compare it.
+    /// Do these props paint anything — would [`DomLook::from_props`]
+    /// say more than [`DomLook::NONE`]? Read prop by prop, the same
+    /// props `from_props` reads and no other, so the walk that asks it
+    /// of every styled text builds no look just to compare it.
     pub(crate) fn paints(props: &VisualProps) -> bool {
         let paints = props.background.is_some()
             || props.gradient.is_some()
@@ -289,11 +437,25 @@ impl DomStyle {
             || props.glass.is_some();
         debug_assert_eq!(
             paints,
-            DomStyle::from_props(props) != DomStyle::default(),
+            DomLook::from_props(props) != DomLook::NONE,
             "a prop from_props reads is missing here"
         );
         paints
     }
+}
+
+/// The element's own marks — never a look's: what one element says
+/// about itself, attributes on it alone.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct DomMarks {
+    /// `.tooltip(…)` — in THIS mode the browser owns the wait and the
+    /// bubble (a CSS rule on a data attribute), the way it owns the
+    /// hover and the inputs: zero patches by construction. The pixel
+    /// modes run the engine's own bubble instead.
+    pub tooltip: Option<Arc<str>>,
+    /// The box a `.hover_group()` owns names itself here — the anchor
+    /// every follower's selector points at.
+    pub group_owner: Option<u64>,
 }
 
 /// What a browser can carry of a pane of glass.
@@ -523,10 +685,10 @@ impl DomCapture {
             y: 0.0,
             width: size.width,
             height: size.height,
-            style: DomStyle {
+            style: DomStyle::of_look(DomLook {
                 background: Some(crate::theme::current().canvas),
-                ..DomStyle::default()
-            },
+                ..DomLook::default()
+            }),
             layout: None,
             hints: DomHints::default(),
             children: Vec::new(),
@@ -570,9 +732,11 @@ impl DomCapture {
         }
         // inside a layer, a box that asks for nothing lets the pointer
         // through to what it covers
-        style.pass_through = self.overlay_depth > 0 && style.interactive.is_none();
-        style.transition = self.pending_transition.take();
-        style.tooltip = self.armed_tooltip.take();
+        if self.overlay_depth > 0 && style.interactive.is_none() {
+            style.look_mut().pass_through = true;
+        }
+        style.set_transition(self.pending_transition.take());
+        style.set_tooltip(self.armed_tooltip.take());
         let node = DomNode {
             kind,
             x: frame.origin.x - parent_origin.x,
@@ -612,32 +776,29 @@ impl DomCapture {
         let (_, node) = self.stack.last_mut().expect("just opened");
         // the rebuild must not drop what open() already stamped — a
         // tooltip armed by the wrapper lands on THIS box
-        let tooltip = node.style.tooltip.take();
-        node.style = DomStyle {
+        let tooltip = node.style.take_tooltip();
+        let mut look = DomLook {
             // the rebuild must not drop what the layer scope decided
             pass_through: self.overlay_depth > 0 && interactive.is_none(),
-            interactive,
             transition,
-            tooltip,
             group: props.from_group.then(|| group).flatten(),
-            ..DomStyle::from_props(props)
+            ..DomLook::from_props(props)
         };
         // the tint has no layer of its own in a browser: it folds into
         // the background, where it belongs — under whatever the box
         // paints itself and over the blurred backdrop
         if let Some(glass) = props.glass {
             let tint = glass.resolve(frame).tint;
-            node.style.background = GlassFilter::under(tint, node.style.background);
-            node.style.hover_background =
-                node.style.hover_background.and_then(|color| GlassFilter::under(tint, Some(color)));
-            node.style.pressed_background = node
-                .style
-                .pressed_background
-                .and_then(|color| GlassFilter::under(tint, Some(color)));
+            look.background = GlassFilter::under(tint, look.background);
+            look.hover_background =
+                look.hover_background.and_then(|color| GlassFilter::under(tint, Some(color)));
+            look.pressed_background =
+                look.pressed_background.and_then(|color| GlassFilter::under(tint, Some(color)));
         }
         if states || inheriting {
-            node.style.color = Some(ink);
+            look.color = Some(ink);
         }
+        node.style = DomStyle::new(interactive, look, DomMarks { tooltip, group_owner: None });
         if states {
             self.ink_scopes.push(self.stack.len());
         }
@@ -655,7 +816,7 @@ impl DomCapture {
             return;
         }
         let (_, node) = self.stack.last_mut().expect("an open node");
-        node.style.background = Some(color);
+        node.style.look_mut().background = Some(color);
     }
 
     /// Strokes the OPEN node's border (the stub leaves).
@@ -664,7 +825,7 @@ impl DomCapture {
             return;
         }
         let (_, node) = self.stack.last_mut().expect("an open node");
-        node.style.border = Some((color, width));
+        node.style.look_mut().border = Some((color, width));
     }
 
     pub(crate) fn close(&mut self) {
@@ -711,9 +872,9 @@ impl DomCapture {
         self.close();
     }
 
-    /// A childless element that carries its own style (the field's
+    /// A childless element that carries its own look (the field's
     /// theme chrome travels in the record, never hardcoded in a glue).
-    pub(crate) fn leaf_styled(&mut self, kind: DomKind, frame: Rect, style: DomStyle) {
+    pub(crate) fn leaf_styled(&mut self, kind: DomKind, frame: Rect, look: DomLook) {
         if self.island > 0 {
             return;
         }
@@ -725,9 +886,11 @@ impl DomCapture {
             field.color = self.current_ink();
         }
         self.open(kind, frame, frame.origin);
-        let pass_through = self.overlay_depth > 0 && style.interactive.is_none();
+        // the look names no action of its own: inside a layer it lets
+        // the pointer through
+        let pass_through = self.overlay_depth > 0;
         let (_, node) = self.stack.last_mut().expect("just opened");
-        node.style = DomStyle { pass_through, ..style };
+        node.style = DomStyle::of_look(DomLook { pass_through, ..look });
         self.close();
     }
 
@@ -750,7 +913,7 @@ impl DomCapture {
         }
         self.open(DomKind::Box, frame, frame.origin);
         let (_, node) = self.stack.last_mut().expect("just opened");
-        node.style.group_owner = Some(key);
+        node.style.set_group_owner(Some(key));
     }
 
     /// Opens/closes an overlay LAYER scope: what it paints inside is
@@ -970,7 +1133,7 @@ pub enum DomPatch {
         /// Bit 0: the element lays itself out — a table-family tag,
         /// whose display is the browser's own and takes no flex line.
         flags: u8,
-        style: Box<DomStyle>,
+        style: Box<DomLook>,
         layout: Box<DomLayout>,
         text: Option<Box<DomText>>,
     },
@@ -1576,8 +1739,8 @@ fn look_layout(layout: &DomLayout) -> DomLayout {
 
 /// The part of a style a rule shares: everything but the element's own
 /// action path, tooltip and the group it owns.
-fn look_style(style: &DomStyle) -> DomStyle {
-    DomStyle { interactive: None, tooltip: None, group_owner: None, ..style.clone() }
+fn look_style(style: &DomStyle) -> DomLook {
+    style.look().clone()
 }
 
 /// A text's face and ink, without its words.
@@ -1648,7 +1811,7 @@ fn look_hash(node: &DomNode) -> u64 {
         }
         None => 0u8.hash(&mut hasher),
     }
-    let style = &node.style;
+    let style = node.style.look();
     hash_color(style.background, &mut hasher);
     hash_color(style.hover_background, &mut hasher);
     hash_color(style.pressed_background, &mut hasher);
@@ -1778,7 +1941,7 @@ fn box_patch(id: u32, geometry: [Option<f32>; 5]) -> DomPatch {
 
 /// The element's own marks.
 fn marks_of(style: &DomStyle) -> (Option<Arc<str>>, Option<u64>) {
-    (style.tooltip.clone(), style.group_owner)
+    (style.tooltip().cloned(), style.group_owner())
 }
 
 /// A text's words: alone when nothing is highlighted, with the spans
@@ -2032,7 +2195,7 @@ fn same_shape(node: &DomNode, template: &Retained) -> bool {
         }
         _ => return false,
     }
-    if node.hints.dom_id.is_some() || node.style.tooltip.is_some() || node.style.group_owner.is_some() {
+    if node.hints.dom_id.is_some() || node.style.has_marks() {
         return false;
     }
     let (Some(layout), Some(old_layout)) = (&node.layout, &old.layout) else {
@@ -2064,28 +2227,10 @@ fn same_look_layout(a: &DomLayout, b: &DomLayout) -> bool {
 }
 
 /// The shared part of two styles, equal? (What [`look_hash`] reads of
-/// a style: everything but the element's own path, tooltip and group.)
+/// a style: its look — everything but the element's own path, tooltip
+/// and group.)
 fn same_look_style(a: &DomStyle, b: &DomStyle) -> bool {
-    a.background == b.background
-        && a.hover_background == b.hover_background
-        && a.pressed_background == b.pressed_background
-        && a.color == b.color
-        && a.hover_color == b.hover_color
-        && a.pressed_color == b.pressed_color
-        && a.focus_border == b.focus_border
-        && a.placeholder_color == b.placeholder_color
-        && a.border == b.border
-        && a.corner_radius == b.corner_radius
-        && a.shadow == b.shadow
-        && a.transition == b.transition
-        && a.clip == b.clip
-        && a.opacity == b.opacity
-        && a.hover_opacity == b.hover_opacity
-        && a.pressed_opacity == b.pressed_opacity
-        && a.group == b.group
-        && a.pass_through == b.pass_through
-        && a.gradient == b.gradient
-        && a.glass == b.glass
+    same_look(a.look(), b.look())
 }
 
 fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
@@ -2107,7 +2252,7 @@ fn shape_into(node: &DomNode, hasher: &mut motor::hash::FxHasher) -> bool {
         return false;
     }
     // an id, a tooltip, a group of its own: the element's, never a shape's
-    if node.hints.dom_id.is_some() || node.style.tooltip.is_some() || node.style.group_owner.is_some() {
+    if node.hints.dom_id.is_some() || node.style.has_marks() {
         return false;
     }
     let Some(layout) = &node.layout else {
@@ -2209,7 +2354,7 @@ fn create_subtree(
             patches.push(DomPatch::SetSize { id, width: node.width, height: node.height });
         }
     }
-    if node.style.tooltip.is_some() || node.style.group_owner.is_some() {
+    if node.style.has_marks() {
         let (tooltip, group_owner) = marks_of(&node.style);
         patches.push(DomPatch::SetMarks { id, tooltip, group_owner });
     }
@@ -2553,7 +2698,7 @@ fn diff_node(
             }
         }
     }
-    if marks_of(&old.style) != marks_of(&new.style) {
+    if old.style.marks() != new.style.marks() {
         let (tooltip, group_owner) = marks_of(&new.style);
         patches.push(DomPatch::SetMarks { id, tooltip, group_owner });
     }
@@ -3610,7 +3755,10 @@ fn encode_unclocked(patches: &[DomPatch]) -> Vec<u8> {
     out
 }
 
-fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
+/// A look's style record. The format keeps a bit for the element's own
+/// action path (7), tooltip (15) and owned group (20): a look never
+/// sets them — those travel as `SetPath` and `SetMarks`.
+fn encode_style(out: &mut Vec<u8>, style: &DomLook) {
     let mut mask: u32 = 0;
     if style.background.is_some() {
         mask |= 1;
@@ -3638,9 +3786,6 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     if style.transition.is_some() {
         mask |= 1 << 6;
     }
-    if style.interactive.is_some() {
-        mask |= 1 << 7;
-    }
     if style.focus_border.is_some() {
         mask |= 1 << 8;
     }
@@ -3663,9 +3808,6 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
         // the first payload-free bit of the format: the bit IS the value
         mask |= 1 << 14;
     }
-    if style.tooltip.is_some() {
-        mask |= 1 << 15;
-    }
     if style.opacity.is_some() {
         mask |= 1 << 16;
     }
@@ -3677,9 +3819,6 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     }
     if style.group.is_some() {
         mask |= 1 << 19;
-    }
-    if style.group_owner.is_some() {
-        mask |= 1 << 20;
     }
     if style.pass_through {
         // payload-free, like the clip bit: the bit IS the value
@@ -3712,9 +3851,6 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     if let Some((response, damping)) = style.transition {
         push_f32(out, response);
         push_f32(out, damping);
-    }
-    if let Some(path) = &style.interactive {
-        push_bytes_u16(out, path.as_bytes());
     }
     if let Some(color) = style.focus_border {
         push_u32(out, pack_color(color));
@@ -3756,9 +3892,6 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
             }
         }
     }
-    if let Some(tooltip) = &style.tooltip {
-        push_bytes_u16(out, tooltip.as_bytes());
-    }
     if let Some(opacity) = style.opacity {
         push_f32(out, opacity);
     }
@@ -3771,10 +3904,6 @@ fn encode_style(out: &mut Vec<u8>, style: &DomStyle) {
     if let Some(group) = style.group {
         push_u32(out, (group >> 32) as u32);
         push_u32(out, group as u32);
-    }
-    if let Some(owner) = style.group_owner {
-        push_u32(out, (owner >> 32) as u32);
-        push_u32(out, owner as u32);
     }
     if let Some(radii) = style.corner_radius.filter(|radii| radii.uniform().is_none()) {
         push_f32(out, radii.top_left);
@@ -4014,7 +4143,7 @@ mod tests {
 
     /// The look an element wears at the end of the stream: the style
     /// and the flow record of the rule it was last told to wear.
-    fn look_of(patches: &[DomPatch], wanted: u32) -> Option<(&DomStyle, &DomLayout)> {
+    fn look_of(patches: &[DomPatch], wanted: u32) -> Option<(&DomLook, &DomLayout)> {
         let rule = patches.iter().rev().find_map(|patch| match patch {
             DomPatch::UseRule { id, rule } if *id == wanted => Some(*rule),
             _ => None,
@@ -4028,7 +4157,7 @@ mod tests {
     }
 
     /// A look with this style alone, as a stream would define it.
-    fn define(style: DomStyle) -> DomPatch {
+    fn define(style: DomLook) -> DomPatch {
         DomPatch::DefineRule {
             rule: 0,
             kind: CreateKind::Box,
@@ -5662,24 +5791,49 @@ mod tests {
         ];
         // an ink alone paints nothing a style records: the text takes it
         let bare = VisualProps { foreground: Some(ink), ..VisualProps::default() };
-        assert!(!DomStyle::paints(&bare));
-        assert_eq!(DomStyle::from_props(&bare), DomStyle::default());
+        assert!(!DomLook::paints(&bare));
+        assert_eq!(DomLook::from_props(&bare), DomLook::NONE);
         for (at, set) in each.iter().enumerate() {
             let mut props = bare;
             set(&mut props);
-            assert!(DomStyle::paints(&props), "prop {at} paints");
-            assert_ne!(DomStyle::from_props(&props), DomStyle::default(), "prop {at} is recorded");
+            assert!(DomLook::paints(&props), "prop {at} paints");
+            assert_ne!(DomLook::from_props(&props), DomLook::NONE, "prop {at} is recorded");
         }
+    }
+
+    /// A style that says nothing holds nothing: setting none boxes no
+    /// record, marks emptied and a look set back to the default are
+    /// held as none again, and a look boxed at its default reads as
+    /// none.
+    #[test]
+    fn a_style_that_says_nothing_boxes_nothing() {
+        let mut style = DomStyle::default();
+        style.set_transition(None);
+        style.set_tooltip(None);
+        style.set_group_owner(None);
+        assert!(style.look.is_none() && style.marks.is_none());
+        style.set_tooltip(Some(Arc::from("tip")));
+        assert!(style.has_marks());
+        assert_eq!(style.take_tooltip().as_deref(), Some("tip"));
+        assert!(style.marks.is_none(), "emptied marks are none again");
+        style.set_look(DomLook { background: Some(Color::BLACK), ..DomLook::default() });
+        assert!(style.look.is_some());
+        style.set_look(DomLook::NONE);
+        assert!(style.look.is_none());
+        let mut boxed = DomStyle::default();
+        boxed.look_mut();
+        assert_eq!(boxed, DomStyle::default());
+        assert!(boxed.is_default());
     }
 
     #[test]
     fn a_clipped_box_sets_the_overflow_bit_and_nothing_else() {
-        let bare = DomStyle {
+        let bare = DomLook {
             background: Some(Color::hex(0x123456)),
             corner_radius: Some(Corners::all(6.0)),
-            ..DomStyle::default()
+            ..DomLook::default()
         };
-        let cut = DomStyle { clip: true, ..bare.clone() };
+        let cut = DomLook { clip: true, ..bare.clone() };
         let without = encode(&[define(bare)]);
         let with = encode(&[define(cut)]);
         // the first payload-free bit: the streams differ by ONE bit in
@@ -5696,9 +5850,9 @@ mod tests {
     fn four_corners_take_their_own_bit_and_leave_the_one_radius_alone() {
         // one radius keeps bit 4 and its single float — the wire a box
         // that rounds all four has always sent
-        let one = DomStyle {
+        let one = DomLook {
             corner_radius: Some(Corners::all(6.0)),
-            ..DomStyle::default()
+            ..DomLook::default()
         };
         let bytes = encode(&[define(one)]);
         let mask = u32::from_le_bytes(bytes[MASK_AT..MASK_AT + 4].try_into().unwrap());
@@ -5707,14 +5861,14 @@ mod tests {
 
         // four different ones take bit 22 INSTEAD, with the four in
         // CSS order behind it
-        let four = DomStyle {
+        let four = DomLook {
             corner_radius: Some(Corners {
                 top_left: 1.0,
                 top_right: 2.0,
                 bottom_right: 3.0,
                 bottom_left: 4.0,
             }),
-            ..DomStyle::default()
+            ..DomLook::default()
         };
         let bytes = encode(&[define(four)]);
         let mask = u32::from_le_bytes(bytes[MASK_AT..MASK_AT + 4].try_into().unwrap());
@@ -6522,9 +6676,9 @@ mod tests {
                 rule,
                 kind: CreateKind::FlexRow,
                 flags: 1,
-                style: Box::new(DomStyle {
+                style: Box::new(DomLook {
                     background: Some(Color::hex(0x112233)),
-                    ..DomStyle::default()
+                    ..DomLook::default()
                 }),
                 layout: Box::new(DomLayout { gap: Some(8.0), grow: true, ..DomLayout::default() }),
                 text: None,

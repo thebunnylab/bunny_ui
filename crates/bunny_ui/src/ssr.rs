@@ -644,7 +644,7 @@ fn rule_text(
     class: &str,
     kind: CreateKind,
     lays_itself_out: bool,
-    style: &crate::dom::DomStyle,
+    style: &crate::dom::DomLook,
     layout: &crate::dom::DomLayout,
     text: Option<&crate::dom::DomText>,
 ) -> String {
