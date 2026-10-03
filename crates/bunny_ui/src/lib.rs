@@ -413,6 +413,145 @@ mod tests {
         assert!(dirty[0].ends_with("Digit"));
     }
 
+    /// A write made during a pass reaches a view whose body already ran in
+    /// that pass (T2-BUNNY-277): the view was dirty at the pass's start, so
+    /// the pass consumed its dirt — and with it the write that came after
+    /// its body, which left it showing the old value until something else
+    /// dirtied it. The write schedules the next pass for it instead.
+    #[test]
+    fn a_write_after_a_body_ran_in_the_pass_reruns_it_next_pass() {
+        #[derive(Clone, Copy)]
+        struct Reader {
+            shown: State<i32>,
+            poke: State<u32>,
+        }
+        impl Component for Reader {
+            fn body(self, _ctx: &Context) -> impl View {
+                let _ = self.poke.get();
+                text(format!("{}", self.shown.get()))
+            }
+        }
+        // writes what the reader shows, from its own body, every run
+        #[derive(Clone, Copy)]
+        struct Writer {
+            shown: State<i32>,
+            poke: State<u32>,
+        }
+        impl Component for Writer {
+            fn body(self, _ctx: &Context) -> impl View {
+                let poked = self.poke.get();
+                self.shown.set(i32::try_from(poked).unwrap_or(i32::MAX));
+                text("writer")
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Pair {
+            reader: Reader,
+            writer: Writer,
+        }
+        impl Component for Pair {
+            fn body(self, _ctx: &Context) -> impl View {
+                // the reader first: its body runs before the writer's
+                vstack((self.reader, self.writer))
+            }
+        }
+
+        let (shown, poke) = (State::new(0), State::new(0));
+        let pair = Pair { reader: Reader { shown, poke }, writer: Writer { shown, poke } };
+        let runtime = Runtime::new();
+        runtime.render_stable(&pair);
+
+        // both read `poke`: both are dirty when the pass starts, the reader
+        // runs first, and the writer then writes what it shows
+        poke.set(7);
+        let printed = runtime.render(&pair);
+        assert!(printed.contains("Text(\"0\")"), "this pass's reader ran before the write: {printed}");
+        let printed = runtime.render(&pair);
+        assert_eq!(runtime.body_runs(), vec!["Pair/#0/Reader".to_string()], "the write reran the reader");
+        assert!(printed.contains("Text(\"7\")"), "and it shows the write: {printed}");
+        let _ = runtime.render(&pair);
+        assert!(runtime.body_runs().is_empty(), "and the frame is still again");
+    }
+
+    /// A write made during a pass BEFORE its reader's body runs is served by
+    /// that same pass: the reader reads the new value when it runs, so no
+    /// pass follows for it.
+    #[test]
+    fn a_write_before_a_body_runs_in_the_pass_costs_no_further_pass() {
+        #[derive(Clone, Copy)]
+        struct Reader {
+            shown: State<i32>,
+            poke: State<u32>,
+        }
+        impl Component for Reader {
+            fn body(self, _ctx: &Context) -> impl View {
+                let _ = self.poke.get();
+                text(format!("{}", self.shown.get()))
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Writer {
+            shown: State<i32>,
+            poke: State<u32>,
+        }
+        impl Component for Writer {
+            fn body(self, _ctx: &Context) -> impl View {
+                let poked = self.poke.get();
+                self.shown.set(i32::try_from(poked).unwrap_or(i32::MAX));
+                text("writer")
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Pair {
+            writer: Writer,
+            reader: Reader,
+        }
+        impl Component for Pair {
+            fn body(self, _ctx: &Context) -> impl View {
+                // the writer first: the reader runs after the write
+                vstack((self.writer, self.reader))
+            }
+        }
+
+        let (shown, poke) = (State::new(0), State::new(0));
+        let pair = Pair { writer: Writer { shown, poke }, reader: Reader { shown, poke } };
+        let runtime = Runtime::new();
+        runtime.render_stable(&pair);
+
+        poke.set(7);
+        let printed = runtime.render(&pair);
+        assert!(printed.contains("Text(\"7\")"), "the reader ran after the write: {printed}");
+        let _ = runtime.render(&pair);
+        assert!(runtime.body_runs().is_empty(), "the pass served it; nothing runs again");
+    }
+
+    /// A body that writes what it reads, inside its own frame, is not sent
+    /// round again for it: it would write again on every pass, and a write
+    /// always notifies, so the frame would never be still.
+    #[test]
+    fn a_body_writing_what_it_reads_in_its_own_frame_is_not_rerun_for_it() {
+        #[derive(Clone, Copy)]
+        struct Clamp {
+            value: State<i32>,
+        }
+        impl Component for Clamp {
+            fn body(self, _ctx: &Context) -> impl View {
+                let value = self.value.get();
+                self.value.set(value.min(10));
+                text(format!("{}", value.min(10)))
+            }
+        }
+
+        let clamp = Clamp { value: State::new(3) };
+        let runtime = Runtime::new();
+        runtime.render_stable(&clamp);
+        clamp.value.set(40);
+        let printed = runtime.render(&clamp);
+        assert!(printed.contains("Text(\"10\")"), "{printed}");
+        let _ = runtime.render(&clamp);
+        assert!(runtime.body_runs().is_empty(), "its own write does not send it round again");
+    }
+
     #[test]
     fn only_the_dirty_body_reruns_and_the_rest_comes_from_cache() {
         #[derive(Clone, Copy)]

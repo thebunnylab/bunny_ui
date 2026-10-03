@@ -86,6 +86,13 @@ struct Registry {
     /// inverted index: dependency → reader views.
     readers: HashMap<DepKey, HashSet<String>>,
     dirty: HashSet<String>,
+    /// From `begin_pass` to `consume_dirty`: whether a write is landing
+    /// inside a pass, where it may reach a view whose body already ran.
+    serving: bool,
+    /// Views a write reached during this pass AFTER their body ran in it
+    /// (T2-BUNNY-277). Their dirt is not the dirt the pass served, so the
+    /// pass's end leaves it for the next one.
+    missed: HashSet<String>,
     /// Effect slots by (site, scope) — the retention behind `on_change`/`on_receive`.
     effect_cells: HashMap<(Site, String), Rc<dyn std::any::Any>>,
     next_store_id: u64,
@@ -127,6 +134,8 @@ pub fn begin_pass() {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         registry.pass_active = true;
+        registry.serving = true;
+        registry.missed.clear();
         registry.pass_root = None;
         registry.path.clear();
         registry.joined.clear();
@@ -273,7 +282,9 @@ pub fn dirty_snapshot() -> HashSet<String> {
 /// view like any dirty one; consumption stays with the pass.
 pub fn invalidate(path: &str) {
     REGISTRY.with(|registry| {
-        registry.borrow_mut().dirty.insert(path.to_string());
+        let mut registry = registry.borrow_mut();
+        note_missed(&mut registry, std::iter::once(path));
+        registry.dirty.insert(path.to_string());
     });
 }
 
@@ -294,17 +305,40 @@ pub fn has_dirty_matching(root: &str) -> bool {
 /// End of the pass: consumes from the registry the dirt this pass served —
 /// the intersection of the snapshot with the root (and the root region).
 /// What came from writes during render stays; what belongs to another root
-/// stays.
+/// stays; and a view the snapshot held that a write reached after its body
+/// ran stays too — the pass ran it, but before the write (T2-BUNNY-277).
 pub fn consume_dirty(root: &str, snapshot: &HashSet<String>) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
+        let registry = &mut *registry;
         let prefix = format!("{root}/");
         for path in snapshot {
-            if path == ROOT_READER || path == root || path.starts_with(&prefix) {
+            if (path == ROOT_READER || path == root || path.starts_with(&prefix))
+                && !registry.missed.contains(path)
+            {
                 registry.dirty.remove(path);
             }
         }
+        registry.serving = false;
+        registry.missed.clear();
     });
+}
+
+/// Records which of `readers` a write during the pass reached too late:
+/// their body already ran in it, and their frame is closed. A reader whose
+/// frame is still OPEN is the writer itself, or an ancestor of it, mid-body —
+/// sending it round again for its own write would never let the frame rest,
+/// since a write always notifies.
+fn note_missed<'a>(registry: &mut Registry, readers: impl Iterator<Item = &'a str>) {
+    if !registry.serving {
+        return;
+    }
+    let open = |reader: &str| registry.views.iter().any(|len| &registry.joined[..*len] == reader);
+    let late: Vec<String> = readers
+        .filter(|reader| registry.reran.contains(*reader) && !open(reader))
+        .map(str::to_string)
+        .collect();
+    registry.missed.extend(late);
 }
 
 /// The first segment pushed in the current pass (or in the last one closed).
@@ -676,6 +710,7 @@ pub(crate) fn record_write(key: DepKey) {
         let Some(readers) = registry.readers.get(&key).cloned() else {
             return;
         };
+        note_missed(&mut registry, readers.iter().map(String::as_str));
         registry.dirty.extend(readers);
     });
 }
