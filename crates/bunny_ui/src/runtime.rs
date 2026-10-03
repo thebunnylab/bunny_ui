@@ -4695,7 +4695,7 @@ impl Runtime {
         });
         drop(boxes);
         drop(dom);
-        self.seed_island_boxes(&output.scene);
+        self.seed_island_boxes(&output.scene, &output.islands_walked);
         *self.dom_customs.borrow_mut() = output.customs.clone();
         drop(offsets);
         drop(carets);
@@ -4808,7 +4808,7 @@ impl Runtime {
         let output = crate::dom_flow::lower(&tree, &flow);
         drop(boxes);
         drop(dom);
-        self.seed_island_boxes(&output.scene);
+        self.seed_island_boxes(&output.scene, &output.islands_walked);
         *self.dom_customs.borrow_mut() = output.customs.clone();
         drop(offsets);
         drop(carets);
@@ -5571,7 +5571,15 @@ impl Runtime {
     /// Every island the scene holds seeds its measured box once — so
     /// the observer's FIRST report (which only echoes the mount) does
     /// not buy a frame. Later reports that disagree are real news.
-    fn seed_island_boxes(&self, scene: &crate::dom::DomNode) {
+    fn seed_island_boxes(&self, scene: &crate::dom::DomNode, walked: &[Rc<str>]) {
+        // only an island the walk measured has a path and a box: a page
+        // that lowered none — a page of elements, a list of a thousand
+        // rows — has nothing to seed, and its scene is not walked at
+        // all. (The walk is the scene's, not the island's own record: a
+        // split sizes the lane an island stands in after it is made.)
+        if walked.is_empty() {
+            return;
+        }
         fn walk(node: &crate::dom::DomNode, boxes: &mut HashMap<Rc<str>, (f64, f64)>) {
             if let crate::dom::DomKind::Canvas { path: Some(path), .. } = &node.kind {
                 if let Some(layout) = &node.layout {
