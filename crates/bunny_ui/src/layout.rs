@@ -2140,34 +2140,36 @@ impl VisualProps {
     }
 
     /// The record of `outer` merged under the props a node holds ([`or`]:
-    /// what the node holds wins), shared like [`shared`]. A chain of
-    /// modifiers on one view makes its record ONCE: the step a chain
-    /// made a moment ago, worn by nothing else yet, becomes the next
-    /// step in place — a look nobody repeats costs what a box cost.
+    /// what the node holds wins), shared like [`shared`], in the node's
+    /// own field. A chain of modifiers on one view makes its record ONCE:
+    /// the step a chain made a moment ago, worn by nothing else yet,
+    /// becomes the next step in place — a look nobody repeats costs what
+    /// a box cost.
     ///
     /// [`or`]: VisualProps::or
     /// [`shared`]: VisualProps::shared
-    pub(crate) fn restyled(mut held: Rc<VisualProps>, outer: VisualProps) -> Rc<VisualProps> {
-        let merged = (*held).or(outer);
+    pub(crate) fn restyle(held: &mut Rc<VisualProps>, outer: VisualProps) {
+        let merged = (**held).or(outer);
         LOOKS.with(|looks| {
             let mut looks = looks.borrow_mut();
             if let Some(look) = looks.find(&merged) {
-                return look;
+                *held = look;
+                return;
             }
             let newest = looks.newest;
-            if looks.held[newest].as_ref().is_some_and(|look| Rc::ptr_eq(look, &held))
-                && Rc::strong_count(&held) == 2
+            if looks.held[newest].as_ref().is_some_and(|look| Rc::ptr_eq(look, held))
+                && Rc::strong_count(held) == 2
             {
                 looks.held[newest] = None;
-                if let Some(props) = Rc::get_mut(&mut held) {
+                if let Some(props) = Rc::get_mut(held) {
                     *props = merged;
-                    looks.held[newest] = Some(Rc::clone(&held));
-                    return held;
+                    looks.held[newest] = Some(Rc::clone(held));
+                    return;
                 }
             }
             let look = Rc::new(merged);
             looks.keep(&look);
-            look
+            *held = look;
         })
     }
 }
