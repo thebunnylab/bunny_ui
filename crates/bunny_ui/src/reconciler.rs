@@ -196,6 +196,28 @@ pub(crate) struct Entry {
     /// stands in the live tables' top level, and it is the one place the
     /// entry's fall has to take it out of — asked here, never searched.
     pub top_level: bool,
+    /// The last pass that met the entry, and how ([`Visit`]): the sweep
+    /// reads who is alive off the entry it walks past, instead of
+    /// hashing its path into the sets of the pass.
+    visit: Cell<u64>,
+}
+
+/// How a pass met an entry, stamped on the entry: its body RAN, or the
+/// walk SKIPPED it on purpose (clean and retained). A stamp from an
+/// earlier pass reads as neither.
+#[derive(Clone, Copy)]
+struct Visit {
+    ran: u64,
+    skipped: u64,
+}
+
+impl Visit {
+    /// The stamps of the pass under way. A pass is numbered from one, so
+    /// an entry that was never met (stamped zero) is met by no pass.
+    fn now() -> Visit {
+        let pass = PASS_NO.with(Cell::get);
+        Visit { ran: pass * 2, skipped: pass * 2 + 1 }
+    }
 }
 
 #[derive(Default)]
@@ -238,14 +260,17 @@ struct PassState {
     root_contexts: Vec<ContextEntry>,
     /// Instrumentation: bodies that ran in this pass.
     body_runs: Vec<Rc<str>>,
-    /// Boundaries SKIPPED in this pass — a skipped one's subtree
-    /// survives the entry sweep (the walk stayed out on purpose).
-    skipped: Vec<Rc<str>>,
+    /// The runs that began with no body open around them — the subtrees
+    /// the entry sweep reads. Known when they begin, never searched for.
+    outermost: Vec<Rc<str>>,
 }
 
 thread_local! {
     static RETAINED: RefCell<BTreeMap<Rc<str>, Entry>> = const { RefCell::new(BTreeMap::new()) };
     static PASS: RefCell<PassState> = RefCell::new(PassState::default());
+    /// The passes, counted: the number the entries are stamped with
+    /// ([`Visit`]). It never goes back, so no stamp is ever met twice.
+    static PASS_NO: Cell<u64> = const { Cell::new(0) };
     static LAST_BODY_RUNS: RefCell<Vec<Rc<str>>> = const { RefCell::new(Vec::new()) };
     static FRAME_BODY_RUNS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static LIVE: RefCell<Live> = RefCell::new(Live::default());
@@ -653,6 +678,7 @@ const REF_MARK: char = '\u{1}';
 pub const HOVER_KEY: &str = "#hover";
 
 pub(crate) fn begin_pass(dirty: HashSet<String>) {
+    PASS_NO.with(|count| count.set(count.get() + 1));
     PASS.with(|pass| {
         *pass.borrow_mut() = PassState {
             active: true,
@@ -684,28 +710,28 @@ pub(crate) fn decide(path: &str) -> Decision {
 /// the reference to share instead of copying the path again.
 pub(crate) fn decide_at(path: &str) -> (Decision, Option<(Rc<str>, Rc<Slot>)>) {
     PASS.with(|pass| {
-        let mut pass = pass.borrow_mut();
-        // one lookup: the key and the slot the reference will point at
-        let found = RETAINED.with(|retained| {
-            retained
-                .borrow()
-                .get_key_value(path)
-                .map(|(key, entry)| (Rc::clone(key), Rc::clone(&entry.slot)))
-        });
-        if !pass.active {
-            return (Decision::Render, found);
-        }
-        let inside_rerun = !pass.building.is_empty();
-        let under_list = pass.building.last().is_some_and(|frame| frame.list);
-        if let Some((retained, _)) = &found
-            && (!inside_rerun || under_list)
-            && !pass.dirty.contains(path)
-        {
-            pass.skipped.push(Rc::clone(retained));
-            (Decision::Skip, found)
-        } else {
-            (Decision::Render, found)
-        }
+        let pass = pass.borrow();
+        RETAINED.with(|retained| {
+            let retained = retained.borrow();
+            // one lookup: the key and the slot the reference will point
+            // at, and the entry the decision is stamped on
+            let entry = retained.get_key_value(path);
+            let found = entry.map(|(key, entry)| (Rc::clone(key), Rc::clone(&entry.slot)));
+            if !pass.active {
+                return (Decision::Render, found);
+            }
+            let inside_rerun = !pass.building.is_empty();
+            let under_list = pass.building.last().is_some_and(|frame| frame.list);
+            match entry {
+                Some((_, entry)) if (!inside_rerun || under_list) && !pass.dirty.contains(path) => {
+                    // the walk stays out on purpose, and the entry says
+                    // so to the sweep: its subtree survives it
+                    entry.visit.set(Visit::now().skipped);
+                    (Decision::Skip, found)
+                }
+                _ => (Decision::Render, found),
+            }
+        })
     })
 }
 
@@ -713,6 +739,10 @@ pub(crate) fn begin_entry(path: &Rc<str>, list: bool) {
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         pass.body_runs.push(Rc::clone(path));
+        if pass.building.is_empty() {
+            // no body open around it: a subtree the sweep will read
+            pass.outermost.push(Rc::clone(path));
+        }
         pass.building.push(BuildingFrame { path: Rc::clone(path), list, ..Default::default() });
     });
 }
@@ -801,6 +831,7 @@ pub(crate) fn finish_entry(
                 contexts,
                 parent_segments,
                 top_level,
+                visit: Cell::new(Visit::now().ran),
             };
             // a body ran and its registrations are new closures: they
             // replace the old ones in the tables the doors read, now
@@ -1824,22 +1855,14 @@ pub(crate) fn forget(dead: &[String]) {
     drop_entries(dead);
 }
 
-/// The bodies that ran, with the ones under another run dropped: a run
-/// covers its subtree, so the outermost runs name every subtree the
-/// sweep must read.
-fn outermost(runs: &HashSet<Rc<str>>) -> Vec<&Rc<str>> {
-    let mut sorted: Vec<&Rc<str>> = runs.iter().collect();
-    sorted.sort_by_key(|run| run.len());
-    let mut outer: Vec<&Rc<str>> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::default();
-    for run in sorted {
-        if cuts(run).any(|prefix| seen.contains(prefix)) {
-            continue;
-        }
-        seen.insert(run);
-        outer.push(run);
-    }
-    outer
+/// Has the ordered walk passed the whole subtree of `shelter`, which
+/// it met before `path`? The subtree `[shelter/, shelter0)` is one run
+/// of the order, but it does not always follow its root at once: a
+/// sibling that extends the name with a byte below `/` sorts between
+/// them (`P/A` < `P/A!x` < `P/A/c`). Only a path at or past `shelter0`
+/// has left it.
+fn passed(path: &str, shelter: &str) -> bool {
+    !path.starts_with(shelter) || path.as_bytes().get(shelter.len()).is_some_and(|byte| *byte >= b'0')
 }
 
 /// The TWIN of the identity sweep, for views with NO state of their
@@ -1856,62 +1879,81 @@ fn outermost(runs: &HashSet<Rc<str>>) -> Vec<&Rc<str>> {
 /// ran, and the top level, where the root region mounts and unmounts
 /// on its own. The sweep reads those and nothing else — a pass that
 /// ran one body in a list of a thousand reads that body's subtree.
+///
+/// Who survives is read off the entries as the walk passes them: the
+/// pass stamped each one it met ([`Visit`]), so a row costs a compare,
+/// where it cost its path hashed into the sets of every run and every
+/// skip of the pass.
 pub(crate) fn sweep_stale(root: &str) {
-    let (runs, skipped): (HashSet<Rc<str>>, HashSet<Rc<str>>) = PASS.with(|pass| {
-        let pass = pass.borrow();
-        (
-            pass.body_runs.iter().cloned().collect(),
-            pass.skipped.iter().cloned().collect(),
-        )
-    });
-    // alive under a boundary that ran: it ran itself, or it stands at
-    // or under a boundary the walk skipped on purpose BELOW that run.
-    // A skipped ancestor above the run says nothing about what is
-    // under the run: the run rebuilt its subtree, and an entry it did
-    // not reach again has left (a list under a clean page clears, and
-    // the page is skipped — its rows must still go)
-    let alive = |boundary: &str, path: &str| {
-        if runs.contains(path) || skipped.contains(path) {
-            return true;
+    let mut outermost: Vec<Rc<str>> = PASS.with(|pass| std::mem::take(&mut pass.borrow_mut().outermost));
+    // a run that began with nothing open is outermost by construction;
+    // the few are checked against each other all the same
+    outermost.sort_by_key(|run| run.len());
+    let mut runs: Vec<Rc<str>> = Vec::with_capacity(outermost.len());
+    for run in outermost {
+        if !runs.iter().any(|outer| covers(outer, &run)) {
+            runs.push(run);
         }
-        let mut cut = path.len();
-        while let Some(at) = path[..cut].rfind('/') {
-            if at <= boundary.len() {
-                break;
-            }
-            if skipped.contains(&path[..at]) {
-                return true;
-            }
-            cut = at;
-        }
-        false
-    };
+    }
+    let visit = Visit::now();
     let mut dead: Vec<Rc<str>> = Vec::new();
     RETAINED.with(|retained| {
         let retained = retained.borrow();
-        // the entries under one boundary, in one ordered range — the
-        // subtree is contiguous because `/` sorts before every byte a
-        // segment may start with after it
+        // alive under a boundary that ran: it ran itself, or it stands at
+        // or under a boundary the walk skipped on purpose BELOW that run.
+        // A skipped ancestor above the run says nothing about what is
+        // under the run: the run rebuilt its subtree, and an entry it did
+        // not reach again has left (a list under a clean page clears, and
+        // the page is skipped — its rows must still go). The entries
+        // under one boundary come in one ordered range — the subtree is
+        // contiguous because `/` sorts before every byte a segment may
+        // start with after it — and a skipped entry comes before its
+        // own subtree, so the walk carries the skips it is inside
         let sweep_under = |boundary: &str, dead: &mut Vec<Rc<str>>| {
             let lo = format!("{boundary}/");
             let hi = format!("{boundary}0");
             let range = (std::ops::Bound::Included(lo.as_str()), std::ops::Bound::Excluded(hi.as_str()));
-            for (path, _) in retained.range::<str, _>(range) {
-                if !alive(boundary, path) {
-                    dead.push(path.clone());
+            let mut shelters: Vec<&str> = Vec::new();
+            for (path, entry) in retained.range::<str, _>(range) {
+                while shelters.last().is_some_and(|shelter| passed(path, shelter)) {
+                    shelters.pop();
+                }
+                let stamp = entry.visit.get();
+                if stamp == visit.skipped {
+                    shelters.push(path);
+                } else if stamp != visit.ran && !shelters.iter().any(|shelter| covers(shelter, path)) {
+                    dead.push(Rc::clone(path));
                 }
             }
         };
-        for run in outermost(&runs) {
+        for run in &runs {
             sweep_under(run, &mut dead);
         }
         // a top-level entry the root region did not mount again fell,
-        // and everything under it with it
+        // and everything under it with it — unless the walk skipped a
+        // boundary between the root and it
+        let alive_at_top = |path: &str| {
+            let stamp = retained.get(path).map(|entry| entry.visit.get());
+            if stamp == Some(visit.ran) || stamp == Some(visit.skipped) {
+                return true;
+            }
+            let mut cut = path.len();
+            while let Some(at) = path[..cut].rfind('/') {
+                if at <= root.len() {
+                    break;
+                }
+                if retained.get(&path[..at]).is_some_and(|entry| entry.visit.get() == visit.skipped) {
+                    return true;
+                }
+                cut = at;
+            }
+            false
+        };
         let fallen: Vec<String> = LIVE.with(|live| {
             live.borrow()
                 .top_level
                 .iter()
-                .filter(|path| covers(root, path) && !alive(root, path))
+                .filter(|path| covers(root, path) && !alive_at_top(path))
                 .cloned()
                 .collect()
         });
@@ -2177,5 +2219,85 @@ mod tests {
         assert_eq!(carried(|live| live.handler_entries.len()), 0, "the carrier left with its entry");
         assert!(carriers_match_retention(), "unmounted");
         assert_eq!(carried(|live| live.top_level.len()), 1, "the holder alone stands at the top");
+    }
+
+    /// The paths retained under a prefix, sorted.
+    fn retained_under(prefix: &str) -> Vec<String> {
+        RETAINED.with(|retained| {
+            retained.borrow().keys().filter(|path| path.starts_with(prefix)).map(|path| path.to_string()).collect()
+        })
+    }
+
+    /// The sweep reads who survives off the entries in path order, and a
+    /// row the walk skipped shelters its subtree. The subtree is one run
+    /// of the order, but not always right after its row: a row whose key
+    /// extends the other's path with a byte that sorts below `/` falls in
+    /// between (`…/[a]/Row` < `…/[a]/Row!]/Row` < `…/[a]/Row/Leaf`). Both
+    /// rows are kept while the list re-runs around them, and neither one
+    /// loses the boundary inside it.
+    #[test]
+    fn a_row_that_sorts_inside_another_rows_name_leaves_its_subtree_sheltered() {
+        #[derive(Clone)]
+        struct Leaf {
+            word: Rc<str>,
+        }
+
+        impl Component for Leaf {
+            fn body(self, _ctx: &Context) -> impl View {
+                text(self.word.to_string())
+            }
+        }
+
+        #[derive(Clone)]
+        struct Row {
+            key: Rc<str>,
+        }
+
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                Leaf { word: Rc::clone(&self.key) }
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            keys: State<Rc<Vec<Rc<str>>>>,
+        }
+
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                crate::views::for_each(self.keys, |key| key.to_string(), |key| Row { key: Rc::clone(key) })
+            }
+        }
+
+        let keys: State<Rc<Vec<Rc<str>>>> = State::new(Rc::new(vec![Rc::from("a"), Rc::from("a]/Row!")]));
+        let page = Page { keys };
+        let runtime = Runtime::new();
+        runtime.render_stable(&page);
+        let leaves = |all: &[String]| all.iter().filter(|path| path.ends_with("/Leaf")).cloned().collect::<Vec<_>>();
+        let before = retained_under("Page");
+        let sheltered = leaves(&before);
+        assert_eq!(sheltered.len(), 2, "a leaf in each row: {before:?}");
+        let inner = sheltered.iter().find(|path| path.contains("[a]/Row/")).expect("row a's leaf");
+        let between = before.iter().find(|path| path.ends_with("[a]/Row!]/Row")).expect("the other row");
+        assert!(
+            inner.as_str() > between.as_str() && between.as_str() > inner.trim_end_matches("/Leaf"),
+            "the other row sorts between row a and its leaf: {before:?}"
+        );
+
+        // the list re-runs around both rows: they are kept, and skipped
+        keys.set(Rc::new(vec![Rc::from("a"), Rc::from("a]/Row!"), Rc::from("b")]));
+        runtime.render_stable(&page);
+        let after = retained_under("Page");
+        for leaf in &sheltered {
+            assert!(after.contains(leaf), "{leaf} survived the sweep: {after:?}");
+        }
+        assert_eq!(after.len(), before.len() + 2, "row b and its leaf joined: {after:?}");
+
+        // and a row that leaves takes its leaf along
+        keys.set(Rc::new(vec![Rc::from("a]/Row!"), Rc::from("b")]));
+        runtime.render_stable(&page);
+        let gone = retained_under("Page");
+        assert!(!gone.contains(inner) && gone.len() == after.len() - 2, "row a and its leaf left: {gone:?}");
     }
 }
