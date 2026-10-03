@@ -277,7 +277,6 @@ impl Visit {
     }
 }
 
-#[derive(Default)]
 struct BuildingFrame {
     path: Rc<str>,
     /// The frame of a keyed list: the rows under it are kept by key.
@@ -293,6 +292,31 @@ struct BuildingFrame {
     customs: Vec<(String, bool)>,
     handlers: Vec<HandlerEntry>,
     contexts: Vec<ContextEntry>,
+}
+
+impl BuildingFrame {
+    /// The frame of a body that begins, every list empty. Spelled out
+    /// and not defaulted: a default frame is a default PATH too, and an
+    /// empty shared string is an allocation of its own — one for every
+    /// body that ran, thrown away the moment the real path took its
+    /// place.
+    fn new(path: Rc<str>, list: bool) -> BuildingFrame {
+        BuildingFrame {
+            path,
+            list,
+            effects: Vec::new(),
+            actions: Vec::new(),
+            copies: Vec::new(),
+            editors: Vec::new(),
+            splits: Vec::new(),
+            scrolls: Vec::new(),
+            measures: Vec::new(),
+            webviews: Vec::new(),
+            customs: Vec::new(),
+            handlers: Vec::new(),
+            contexts: Vec::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -815,7 +839,7 @@ pub(crate) fn begin_entry(path: &Rc<str>, list: bool) {
             // no body open around it: a subtree the sweep will read
             pass.outermost.push(Rc::clone(path));
         }
-        pass.building.push(BuildingFrame { path: Rc::clone(path), list, ..Default::default() });
+        pass.building.push(BuildingFrame::new(Rc::clone(path), list));
     });
 }
 
