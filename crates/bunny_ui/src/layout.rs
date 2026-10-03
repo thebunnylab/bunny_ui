@@ -7912,7 +7912,6 @@ fn draw_scrollbar_h(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// A target's placement around what it places: its frame enters the
 /// hit-test, and what is painted inside reads its hover and press. An
 /// `Interactive` places its child inside; a stack, a text or a style
@@ -7955,6 +7954,7 @@ fn place_target(
     out.pointer_hit.pop();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn place_stack(
     axis: Axis,
     spacing: Px,
