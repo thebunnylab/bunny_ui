@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>bunny_ui — keyed benchmark</title>
+    <title>bunny_ui — keyed benchmark, hybrid</title>
     <style>
       html,
       body {
@@ -22,10 +22,10 @@
   <body>
     <div id="app"></div>
     <script>
-      window.BUNNY_WASM = "bench_web.wasm";
-      window.BUNNY_START = "start_keyed";
+      // the controls are real elements; the table is one canvas island
+      window.BUNNY_WASM = "bench_web_px.wasm";
+      window.BUNNY_START = "start_keyed_hybrid";
     </script>
     <script src="glue_dom.js?v=12"></script>
-    <script src="keyed_driver.js?v=4"></script>
   </body>
 </html>
