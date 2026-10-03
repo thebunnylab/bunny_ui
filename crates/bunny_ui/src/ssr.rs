@@ -525,12 +525,25 @@ impl Tree {
                 };
                 parent.children.insert(at, *id);
             }
+            DomPatch::SetImage { id, image } => {
+                // the bytes arrive with the wasm: the element wears the
+                // identity it waits for, and the glue fills the source
+                // when the platform has the picture
+                if let Some(element) = self.elements.get_mut(id) {
+                    let key = image.key;
+                    element
+                        .attrs
+                        .insert("data-img", format!("{}:{}", key >> 32, key as u32));
+                    if image.cover {
+                        element.style.insert("object-fit", "cover".into());
+                    }
+                }
+            }
             DomPatch::SetScroll { .. }
-            | DomPatch::SetImage { .. }
             | DomPatch::SetIcon { .. }
             | DomPatch::Reveal { .. }
             | DomPatch::SetAnchor { .. } => {
-                // scroll offsets, image bytes and icon geometry arrive
+                // scroll offsets and icon geometry arrive
                 // after boot; a built page starts at rest
             }
         }
@@ -1160,5 +1173,26 @@ mod tests {
         let page = render(&Badge, Size { width: 200.0, height: 200.0 });
         assert!(page.css.contains(">*{grid-area:1/1}"), "{}", page.css);
         assert!(page.css.contains("justify-items:center"), "{}", page.css);
+    }
+
+    /// A served picture has no bytes yet: it wears the identity the
+    /// glue fills the source by, once the wasm hands the bytes over.
+    #[test]
+    fn a_served_image_waits_by_its_identity() {
+        #[derive(Clone)]
+        struct Picture(crate::image_engine::ImageSource);
+
+        impl Component for Picture {
+            fn body(self, _ctx: &Context) -> impl View {
+                image(self.0.clone()).resizable().frame(20.0, 20.0)
+            }
+        }
+
+        let source = crate::image_engine::ImageSource::bytes_keyed(
+            (7u64 << 32) | 9,
+            vec![0u8; 4],
+        );
+        let page = render(&Picture(source), Size { width: 200.0, height: 200.0 });
+        assert!(page.html.contains("data-img=\"7:9\""), "{}", page.html);
     }
 }
