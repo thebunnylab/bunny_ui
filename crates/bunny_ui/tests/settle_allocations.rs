@@ -247,3 +247,48 @@ fn a_styled_cell_shares_the_look_of_the_rows_before_it() {
     });
     assert!(styled <= plain + 1, "a styled cell costs the settle {styled} allocations, a plain one {plain}");
 }
+
+/// A row hints a cell, a link and a glyph in every body it runs, and
+/// each hint rides the node it names: a text, a stack or a style that
+/// wears a tag, a class and an id costs what it costs bare. A box around
+/// each was an allocation per hint per row.
+#[test]
+fn a_hint_rides_the_node_it_names() {
+    let text_bare = beyond_empty(|_| text("a"));
+    let text_hinted = beyond_empty(|_| text("a").element("td").css_class("cell").element_id("first"));
+    assert!(text_hinted <= text_bare, "a hinted text costs {text_hinted}, a bare one {text_bare}");
+    let stack_bare = beyond_empty(|_| hstack!(empty()));
+    let stack_hinted = beyond_empty(|_| hstack!(empty()).element("span").css_class("glyph"));
+    assert!(stack_hinted <= stack_bare, "a hinted stack costs {stack_hinted}, a bare one {stack_bare}");
+    let ink = Color::hex(0x336699);
+    let styled_bare = beyond_empty(move |_| text("a").foreground_color(ink));
+    let styled_hinted = beyond_empty(move |_| text("a").foreground_color(ink).element("td"));
+    assert!(styled_hinted <= styled_bare, "a hinted style costs {styled_hinted}, a bare one {styled_bare}");
+}
+
+/// The row of the keyed benchmark: its own class, an id cell, a cell
+/// with a link to its bound label, a cell with a link around a glyph,
+/// and an empty cell — seven hints and two actions. Beyond the empty
+/// row it pays for its two bindings, its two texts, the closures of its
+/// two clicks, their paths and the targets they arm, and the lists its
+/// stacks hold; its hints cost nothing.
+#[test]
+fn a_row_of_the_benchmark_pays_for_its_bindings_and_its_clicks() {
+    let cost = beyond_empty(|item| {
+        let id = item.id;
+        (
+            boundary_class_when(item.on, "danger"),
+            text(id.to_string()).element("td").css_class("col-md-1"),
+            hstack!(text!(item.label).element("a").on_click(|| {})).element("td").css_class("col-md-4"),
+            hstack!(
+                hstack!(hstack!(empty()).element("span").css_class("glyphicon glyphicon-remove"))
+                    .element("a")
+                    .on_click(|| {})
+            )
+            .element("td")
+            .css_class("col-md-1"),
+            hstack!(empty()).element("td").css_class("col-md-6"),
+        )
+    });
+    assert!(cost <= 20, "a row of the benchmark costs the settle {cost} allocations beyond the empty row");
+}

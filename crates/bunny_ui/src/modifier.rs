@@ -411,12 +411,16 @@ fn rewrite_scroll_node(
     ) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        // a node that wears hints stood behind their wrapper, which no
+        // rewrite crosses: it is left as the wrapper left it
+        marked if !marked.is_bare() => marked,
         LayoutNode::Scroll { path, axes, fill, commanded, child, .. } => {
             rewrite(path, axes, fill, commanded, child)
         }
-        LayoutNode::Styled { props, child } => LayoutNode::Styled {
+        LayoutNode::Styled { props, child, hints } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_scroll_node(*child, rewrite)),
+            hints,
         },
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
@@ -501,6 +505,9 @@ fn rewrite_field_node(
     rewrite: &impl Fn(FieldParts) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        // a node that wears hints stood behind their wrapper, which no
+        // rewrite crosses: it is left as the wrapper left it
+        marked if !marked.is_bare() => marked,
         LayoutNode::Field {
             path,
             content,
@@ -520,9 +527,10 @@ fn rewrite_field_node(
             highlights,
             secret,
         }),
-        LayoutNode::Styled { props, child } => LayoutNode::Styled {
+        LayoutNode::Styled { props, child, hints } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_field_node(*child, rewrite)),
+            hints,
         },
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
@@ -586,11 +594,15 @@ fn rewrite_pixel_node(
     icon: &impl Fn(crate::icon::Symbol, bool, bool) -> LayoutNode,
 ) -> LayoutNode {
     match node {
+        // a node that wears hints stood behind their wrapper, which no
+        // rewrite crosses: it is left as the wrapper left it
+        marked if !marked.is_bare() => marked,
         LayoutNode::Image { source, resizable, fit } => rewrite(source, resizable, fit),
         LayoutNode::Icon { symbol, resizable, forced } => icon(symbol, resizable, forced),
-        LayoutNode::Styled { props, child } => LayoutNode::Styled {
+        LayoutNode::Styled { props, child, hints } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_pixel_node(*child, rewrite, icon)),
+            hints,
         },
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
@@ -648,12 +660,16 @@ fn rewrite_text_node(
     ) -> LayoutNode,
 ) -> LayoutNode {
     match node {
-        LayoutNode::Text { content, highlights, truncation } => {
+        // a node that wears hints stood behind their wrapper, which no
+        // rewrite crosses: it is left as the wrapper left it
+        marked if !marked.is_bare() => marked,
+        LayoutNode::Text { content, highlights, truncation, .. } => {
             rewrite(content, highlights, truncation)
         }
-        LayoutNode::Styled { props, child } => LayoutNode::Styled {
+        LayoutNode::Styled { props, child, hints } => LayoutNode::Styled {
             props,
             child: Box::new(rewrite_text_node(*child, rewrite)),
+            hints,
         },
         LayoutNode::Animated { key, spec, child } => LayoutNode::Animated {
             key,
@@ -701,10 +717,16 @@ fn wrap_padding(out: &mut NodeList, mark: usize, edges: Edges) {
 
 fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
     out.wrap_layout_from(mark, |node| match node {
-        LayoutNode::Styled { props, child } => {
-            LayoutNode::Styled { props: VisualProps::restyled(props, delta), child }
+        // a style that wears hints stood behind their wrapper, where no
+        // style reached it to merge: the new one nests, as it did
+        LayoutNode::Styled { props, child, hints } if hints.is_empty() => {
+            LayoutNode::Styled { props: VisualProps::restyled(props, delta), child, hints }
         }
-        other => LayoutNode::Styled { props: delta.shared(), child: Box::new(other) },
+        other => LayoutNode::Styled {
+            props: delta.shared(),
+            child: Box::new(other),
+            hints: Default::default(),
+        },
     });
 }
 
@@ -1483,6 +1505,7 @@ fn apply(
                 content,
                 highlights: Some(highlight.clone()),
                 truncation,
+                hints: Default::default(),
             });
             rewrite_field_node(node, &|parts| {
                 FieldParts { highlights: Some(highlight.clone()), ..parts }.into_node()
@@ -1493,6 +1516,7 @@ fn apply(
                 content,
                 highlights,
                 truncation: Some(*mode),
+                hints: Default::default(),
             })
         }),
         Modifier::OnMeasure(report) => {
@@ -1627,31 +1651,44 @@ fn apply(
         }
         Modifier::ElementHint(tag, class, dom_id) => {
             let (tag, class, dom_id) = (tag.clone(), class.clone(), dom_id.clone());
-            out.wrap_layout_from(mark, move |node| match node {
-                // a hint over a hint is one hint: the outer word wins
-                // where both speak, as the flow applies them anyway —
-                // `.element("a").css_class("x")` is one node, not two
-                LayoutNode::Hinted { tag: inner_tag, class: inner_class, dom_id: inner_id, child } => {
-                    LayoutNode::Hinted {
-                        tag: tag.or(inner_tag),
-                        class: class.or(inner_class),
-                        dom_id: dom_id.or(inner_id),
-                        child,
-                    }
+            out.wrap_layout_from(mark, move |mut node| {
+                // a hint over a stack, a text or a style rides the node
+                // itself: the cells, links and glyphs of a row hint in
+                // every body it runs, and a box around each was an
+                // allocation per hint per row. The outer word wins, as
+                // it does over a hint
+                if let Some(hints) = node.carried_hints_mut() {
+                    hints.tag = tag.or(hints.tag.take());
+                    hints.class = class.or(hints.class.take());
+                    hints.dom_id = dom_id.or(hints.dom_id.take());
+                    return node;
                 }
-                // a hint over a kept boundary rides the reference itself:
-                // a list that re-runs makes one per row, and a box around
-                // each was an allocation per row per run
-                LayoutNode::BoundaryRef { path, slot, hints } => LayoutNode::BoundaryRef {
-                    path,
-                    slot,
-                    hints: crate::layout::ElementHints {
-                        tag: tag.or(hints.tag),
-                        class: class.or(hints.class),
-                        dom_id: dom_id.or(hints.dom_id),
+                match node {
+                    // a hint over a hint is one hint: the outer word wins
+                    // where both speak, as the flow applies them anyway —
+                    // `.element("a").css_class("x")` is one node, not two
+                    LayoutNode::Hinted { tag: inner_tag, class: inner_class, dom_id: inner_id, child } => {
+                        LayoutNode::Hinted {
+                            tag: tag.or(inner_tag),
+                            class: class.or(inner_class),
+                            dom_id: dom_id.or(inner_id),
+                            child,
+                        }
+                    }
+                    // a hint over a kept boundary rides the reference itself:
+                    // a list that re-runs makes one per row, and a box around
+                    // each was an allocation per row per run
+                    LayoutNode::BoundaryRef { path, slot, hints } => LayoutNode::BoundaryRef {
+                        path,
+                        slot,
+                        hints: crate::layout::ElementHints {
+                            tag: tag.or(hints.tag),
+                            class: class.or(hints.class),
+                            dom_id: dom_id.or(hints.dom_id),
+                        },
                     },
-                },
-                other => LayoutNode::Hinted { tag, class, dom_id, child: Box::new(other) },
+                    other => LayoutNode::Hinted { tag, class, dom_id, child: Box::new(other) },
+                }
             });
         }
         Modifier::LayoutMode(mode) => {

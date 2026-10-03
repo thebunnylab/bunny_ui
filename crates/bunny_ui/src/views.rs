@@ -49,6 +49,7 @@ pub(crate) fn wrap_layout(children: Vec<LayoutNode>) -> LayoutNode {
             spacing: 0.0,
             align: CrossAlign::Start,
             children,
+            hints: Default::default(),
         }
     }
 }
@@ -76,7 +77,12 @@ impl View for Text {
             }
             (fixed, true) => RenderNode::leaf(format!("Text({:?})", fixed.get())),
         });
-        out.push_layout(LayoutNode::Text { content, highlights: None, truncation: None });
+        out.push_layout(LayoutNode::Text {
+            content,
+            highlights: None,
+            truncation: None,
+            hints: Default::default(),
+        });
     }
 }
 
@@ -150,6 +156,7 @@ where
                 },
                 child: Box::new(wrap_layout(layouts)),
             }),
+            hints: Default::default(),
         };
 
         // inside a pass, the button is an interaction target: the frame joins
@@ -449,6 +456,7 @@ impl View for TextField {
                 },
                 highlights: None,
                 truncation: None,
+                hints: Default::default(),
             }),
         }
     }
@@ -641,6 +649,7 @@ where
                 spacing: 0.0,
                 align: CrossAlign::Start,
                 children: layouts,
+                hints: Default::default(),
             }),
         }
     }
@@ -1496,6 +1505,7 @@ fn render_stack<C: View>(
             spacing: spacing.unwrap_or(0.0),
             align,
             children: layouts,
+            hints: Default::default(),
         },
         // ZStack: all children in the same frame
         None => LayoutNode::Layered { align, modal: false, children: layouts },
@@ -1827,6 +1837,7 @@ where
                 spacing: 0.0,
                 align: CrossAlign::Start,
                 children: row_layouts,
+                hints: Default::default(),
             }),
         });
     }
@@ -2360,6 +2371,7 @@ where
                 Axis::Horizontal => CrossAlign::Center,
             }),
             children: layouts,
+            hints: Default::default(),
         });
     }
 }
@@ -2571,6 +2583,7 @@ impl<H: View, C: View> View for Section<H, C> {
             spacing: 0.0,
             align: CrossAlign::Start,
             children: layouts,
+            hints: Default::default(),
         };
         // the List of sections (list_content) is a scroll region; the plain
         // Section is just the stacking

@@ -721,6 +721,8 @@ pub enum LayoutNode {
         content: crate::bind::TextSource,
         highlights: Option<TextHighlight>,
         truncation: Option<Truncation>,
+        /// What an `.element(…)` over the text says ([`ElementHints`]).
+        hints: ElementHints,
     },
     /// Flexible on the main axis of the stack that contains it.
     Spacer,
@@ -760,7 +762,15 @@ pub enum LayoutNode {
     Measured { path: String, child: Box<LayoutNode> },
     /// Fills whatever the proposal gives (Rectangle).
     Fill,
-    Stack { axis: Axis, spacing: Px, align: CrossAlign, children: Vec<LayoutNode> },
+    /// `hints` are what an `.element(…)` over the stack says
+    /// ([`ElementHints`]).
+    Stack {
+        axis: Axis,
+        spacing: Px,
+        align: CrossAlign,
+        children: Vec<LayoutNode>,
+        hints: ElementHints,
+    },
     /// A row that WRAPS (`hstack!(…).wrapping()`): the children go left to
     /// right at their own size, and a child that would pass the width the
     /// row was offered starts the next line. `spacing` separates the
@@ -927,7 +937,9 @@ pub enum LayoutNode {
     },
     /// Semantic visual property: background behind the child, border on
     /// top, foreground inherited. Transparent to the measure — by type.
-    Styled { props: Rc<VisualProps>, child: Box<LayoutNode> },
+    /// `hints` are what an `.element(…)` over the style says
+    /// ([`ElementHints`]).
+    Styled { props: Rc<VisualProps>, child: Box<LayoutNode>, hints: ElementHints },
     /// An animation scope: the nearest styled below interpolates its
     /// colors through this spring, keyed by the identity captured at
     /// render (`key` is `None` outside a pass — the scope is inert).
@@ -1124,6 +1136,9 @@ pub enum LayoutNode {
     /// Element hints for the Dom lowering — a real tag, a class, an
     /// id. Transparent everywhere else, like `.rendering()`: a pixel
     /// target never knows the child was ever going to be a `<tr>`.
+    /// Only around a node that cannot carry the hints itself: a stack,
+    /// a text, a style and a reference to a retained boundary hold
+    /// their own ([`ElementHints`]).
     Hinted {
         tag: Option<std::rc::Rc<str>>,
         class: Option<std::rc::Rc<str>>,
@@ -1145,10 +1160,13 @@ pub enum LayoutNode {
     Host { path: String, spec: crate::host::HostSpec },
 }
 
-/// The element hints a reference to a retained boundary carries itself
-/// ([`LayoutNode::BoundaryRef`]) — the words a [`LayoutNode::Hinted`]
-/// around it would hold, and as transparent: only the Dom lowering
-/// reads them.
+/// The element hints a node carries itself — a stack, a text, a style,
+/// a reference to a retained boundary: the nodes an `.element(…)` lands
+/// on most. They are the words a [`LayoutNode::Hinted`] around the node
+/// would hold, and as transparent: only the Dom lowering reads them, and
+/// a node that wears them lowers as the wrapper they replace did. A row
+/// of a list hints a cell, a link and a glyph in every body it runs, and
+/// a box around each was an allocation per hint per row.
 ///
 /// Public in name only, like the slot beside it.
 #[derive(Clone, Debug, Default)]
@@ -1161,6 +1179,38 @@ pub struct ElementHints {
 impl ElementHints {
     pub(crate) fn is_empty(&self) -> bool {
         self.tag.is_none() && self.class.is_none() && self.dom_id.is_none()
+    }
+}
+
+impl LayoutNode {
+    /// The hints a stack, a text or a style carries itself — `None` for
+    /// any other node. A reference to a retained boundary keeps its own,
+    /// read where the reference is.
+    pub(crate) fn carried_hints(&self) -> Option<&ElementHints> {
+        match self {
+            LayoutNode::Stack { hints, .. }
+            | LayoutNode::Text { hints, .. }
+            | LayoutNode::Styled { hints, .. } => Some(hints),
+            _ => None,
+        }
+    }
+
+    /// The same hints, to write — where an `.element(…)` folds its words
+    /// into the node instead of boxing it.
+    pub(crate) fn carried_hints_mut(&mut self) -> Option<&mut ElementHints> {
+        match self {
+            LayoutNode::Stack { hints, .. }
+            | LayoutNode::Text { hints, .. }
+            | LayoutNode::Styled { hints, .. } => Some(hints),
+            _ => None,
+        }
+    }
+
+    /// Does the node stand alone — no hints of its own? A node that
+    /// carries hints stood behind a wrapper once, and a rewrite or a fold
+    /// that looked for the bare node never reached it there.
+    pub(crate) fn is_bare(&self) -> bool {
+        self.carried_hints().is_none_or(ElementHints::is_empty)
     }
 }
 
@@ -4178,12 +4228,15 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
                                         content: label.clone().into(),
                                         highlights: None,
                                         truncation: None,
+                                        hints: ElementHints::default(),
                                     }),
                                 },
                                 LayoutNode::Spacer,
                             ],
+                            hints: ElementHints::default(),
                         }),
                     }),
+                    hints: ElementHints::default(),
                 });
             }
             None => {
@@ -4206,6 +4259,7 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
                             }
                             .shared(),
                             child: Box::new(LayoutNode::Fill),
+                            hints: ElementHints::default(),
                         }),
                     }),
                 });
@@ -4236,8 +4290,10 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
                 spacing: 0.0,
                 align: CrossAlign::Start,
                 children: rows,
+                hints: ElementHints::default(),
             }),
         }),
+        hints: ElementHints::default(),
     }
 }
 
@@ -4292,8 +4348,10 @@ fn tooltip_node(text: Arc<str>) -> LayoutNode {
                 content: text.into(),
                 highlights: None,
                 truncation: None,
+                hints: ElementHints::default(),
             }),
         }),
+        hints: ElementHints::default(),
     }
 }
 
@@ -4659,7 +4717,7 @@ impl LayoutNode {
                 let metrics = env.cache.get_or_measure("0", &env.font, env.text);
                 Some(FIELD_PAD_V + metrics.ascent)
             }
-            LayoutNode::Styled { props, child } => {
+            LayoutNode::Styled { props, child, .. } => {
                 let env = LayoutEnv {
                     font: props.font.apply_over(env.font),
                     line_height: props.line_height.or(env.line_height),
@@ -5203,7 +5261,7 @@ impl LayoutNode {
                 (size, Fit::Wrapped(size, Box::new(fit)))
             }
 
-            LayoutNode::Styled { props, child } => {
+            LayoutNode::Styled { props, child, .. } => {
                 // the inherited font swaps HERE, at measure time — the
                 // sanctioned VisualProps exception (font changes measure)
                 let env = LayoutEnv {
@@ -5273,7 +5331,7 @@ impl LayoutNode {
     pub(crate) fn place(&self, frame: Rect, fit: &Fit, env: &LayoutEnv<'_>, out: &mut Placement) {
         match (self, fit.unshared()) {
             // visual leaves: the draw list is born here
-            (LayoutNode::Text { content, highlights, truncation }, Fit::Leaf) => {
+            (LayoutNode::Text { content, highlights, truncation, .. }, Fit::Leaf) => {
                 let content = content.get();
                 let color = out.foreground.last().copied().unwrap_or_else(|| crate::theme::current().fg);
                 if let Some(dom) = out.dom.as_mut() {
@@ -6197,7 +6255,7 @@ impl LayoutNode {
                 }
             }
 
-            (LayoutNode::Stack { axis, spacing, align, children }, Fit::Children(fits)) => {
+            (LayoutNode::Stack { axis, spacing, align, children, .. }, Fit::Children(fits)) => {
                 place_stack(*axis, *spacing, *align, children, frame, fits, env, out);
             }
 
@@ -6502,7 +6560,7 @@ impl LayoutNode {
                 out.pop_clip();
             }
 
-            (LayoutNode::Styled { props, child }, Fit::Wrapped(_, fit)) => {
+            (LayoutNode::Styled { props, child, .. }, Fit::Wrapped(_, fit)) => {
                 // the nearest styled EATS the color scope: its colors
                 // move, deeper styled nodes paint plain (no shared-key
                 // thrash between siblings of one scope)
@@ -7902,7 +7960,7 @@ mod tests {
     use super::*;
 
     fn text(chars: usize) -> LayoutNode {
-        LayoutNode::Text { content: crate::bind::TextSource::from("x".repeat(chars)), highlights: None, truncation: None }
+        LayoutNode::Text { content: crate::bind::TextSource::from("x".repeat(chars)), highlights: None, truncation: None, hints: ElementHints::default() }
     }
 
     fn boundary(path: &str, child: LayoutNode) -> LayoutNode {
@@ -7978,6 +8036,7 @@ mod tests {
                 boundary("gap", LayoutNode::Spacer),
                 boundary("bottom", text(5)),
             ],
+            hints: ElementHints::default(),
         };
         let result = layout(&root, Proposal { width: Some(200.0), height: Some(100.0) });
 
@@ -8012,6 +8071,7 @@ mod tests {
             spacing: 0.0,
             align: CrossAlign::Center,
             children: vec![rail, boundary("body", LayoutNode::Fill)],
+            hints: ElementHints::default(),
         };
         let result = layout(&row, Proposal { width: Some(1280.0), height: Some(174.0) });
 
@@ -8056,6 +8116,7 @@ mod tests {
             spacing: 0.0,
             align: CrossAlign::Center,
             children: vec![bar, body],
+            hints: ElementHints::default(),
         };
         let result = layout(&column, Proposal { width: Some(500.0), height: Some(800.0) });
 
@@ -8122,6 +8183,7 @@ mod tests {
                 boundary("body", LayoutNode::Spacer),
                 capped("foot", 26.0),
             ],
+            hints: ElementHints::default(),
         };
         let result = layout(&root, Proposal { width: Some(1280.0), height: Some(800.0) });
 
@@ -8162,6 +8224,7 @@ mod tests {
                 ),
                 boundary("editor", LayoutNode::Spacer),
             ],
+            hints: ElementHints::default(),
         };
         let result = layout(&root, Proposal { width: Some(1200.0), height: Some(700.0) });
 
@@ -8183,6 +8246,7 @@ mod tests {
             spacing: 0.0,
             align: CrossAlign::Center,
             children,
+            hints: ElementHints::default(),
         };
         let bar = row(vec![
             boundary("lead", row(vec![leaf(300.0), LayoutNode::Spacer])),
@@ -8241,6 +8305,7 @@ mod tests {
                 ),
                 boundary("rest", LayoutNode::Spacer),
             ],
+            hints: ElementHints::default(),
         };
         let result = layout(&root, Proposal { width: Some(500.0), height: Some(100.0) });
         assert_eq!(result.frames.get("lane").unwrap().size.width, 300.0);
@@ -8310,6 +8375,7 @@ mod tests {
                     boundary("chips", chips(&[110.0, 130.0, 90.0])),
                     boundary("below", LayoutNode::Leaf { size: Size { width: 60.0, height: 16.0 } }),
                 ],
+                hints: ElementHints::default(),
             }),
         };
         let result = layout(&rail, Proposal { width: Some(800.0), height: Some(600.0) });
@@ -8350,6 +8416,7 @@ mod tests {
                     },
                 ),
             ],
+            hints: ElementHints::default(),
         };
         let width_of = |result: &LayoutResult, name: &str| result.frames.get(name).unwrap().size.width;
 
@@ -8407,6 +8474,7 @@ mod tests {
                 LayoutNode::Leaf { size: Size { width: 40.0, height: 20.0 } },
                 child,
             ],
+            hints: ElementHints::default(),
         };
         let bare = row(LayoutNode::Spacer);
         assert!(bare.is_flexible(Axis::Horizontal, None), "the row spreads sideways");
@@ -8430,6 +8498,7 @@ mod tests {
             spacing: 0.0,
             align: CrossAlign::Center,
             children: vec![LayoutNode::Spacer],
+            hints: ElementHints::default(),
         };
         assert!(column.is_flexible(Axis::Vertical, None));
         assert!(!column.is_flexible(Axis::Horizontal, None));
@@ -8747,6 +8816,7 @@ mod tests {
                     },
                 ),
             ],
+            hints: ElementHints::default(),
         };
         let result = layout(&root, Proposal { width: Some(400.0), height: Some(300.0) });
 
@@ -8978,7 +9048,7 @@ mod tests {
 
     #[test]
     fn words_wrap_at_spaces_never_mid_word() {
-        let node = LayoutNode::Text { content: crate::bind::TextSource::from("aa bb cc"), highlights: None, truncation: None };
+        let node = LayoutNode::Text { content: crate::bind::TextSource::from("aa bb cc"), highlights: None, truncation: None, hints: ElementHints::default() };
         let result = layout(&node, Proposal { width: Some(40.0), height: None });
 
         // "aa bb" (40px) fits; "cc" goes down whole — never an orphan "c"
@@ -9001,6 +9071,7 @@ mod tests {
             content: crate::bind::TextSource::from("abcdef"),
             highlights: Some(TextHighlight { ranges: Rc::new(vec![(2, 4)]), color: hot }),
             truncation: None,
+            hints: ElementHints::default(),
         };
         let result = layout(&node, Proposal::unspecified());
 
@@ -9037,6 +9108,7 @@ mod tests {
                 color: hot,
             }),
             truncation: None,
+            hints: ElementHints::default(),
         };
         let result = layout(&node, Proposal::exact(Size { width: 40.0, height: 100.0 }));
 
@@ -9067,6 +9139,7 @@ mod tests {
                 content: crate::bind::TextSource::from("abcdefgh"),
                 highlights: None,
                 truncation: Some(mode),
+                hints: ElementHints::default(),
             };
             let result = layout(&node, Proposal { width: Some(40.0), height: None });
             assert_eq!(result.size.height, LINE_H, "truncation never wraps a line");
@@ -9087,7 +9160,7 @@ mod tests {
 
     #[test]
     fn a_word_longer_than_the_line_hard_breaks() {
-        let node = LayoutNode::Text { content: crate::bind::TextSource::from("aaaaaaaaaa"), highlights: None, truncation: None };
+        let node = LayoutNode::Text { content: crate::bind::TextSource::from("aaaaaaaaaa"), highlights: None, truncation: None, hints: ElementHints::default() };
         let result = layout(&node, Proposal { width: Some(40.0), height: None });
 
         // 10 chars of 8px in 40px: 5 per line
@@ -9104,7 +9177,7 @@ mod tests {
     }
 
     fn styled(props: VisualProps, child: LayoutNode) -> LayoutNode {
-        LayoutNode::Styled { props: Rc::new(props), child: Box::new(child) }
+        LayoutNode::Styled { props: Rc::new(props), child: Box::new(child), hints: ElementHints::default() }
     }
 
     fn rows(count: usize) -> LayoutNode {
@@ -9115,6 +9188,7 @@ mod tests {
             children: (0..count)
                 .map(|index| boundary(&format!("row{index}"), text(4)))
                 .collect(),
+            hints: ElementHints::default(),
         }
     }
 
@@ -9218,6 +9292,7 @@ mod tests {
                 LayoutNode::Leaf { size: Size { width: 100.0, height: 50.0 } },
                 host("pane"),
             ],
+            hints: ElementHints::default(),
         };
         let result = layout(&root, Proposal { width: Some(300.0), height: Some(200.0) });
         let placed = &result.hosts[0];
@@ -9391,6 +9466,7 @@ mod tests {
                     interactive("half"),    // y [16, 32) — the viewport cuts at 24
                     interactive("outside"), // y [32, 48) — invisible
                 ],
+                hints: ElementHints::default(),
             }),
         };
         let result = layout(&root, Proposal::exact(Size { width: 100.0, height: 24.0 }));
@@ -9504,6 +9580,7 @@ mod tests {
                         text(3),
                     ),
                 ],
+                hints: ElementHints::default(),
             },
         );
         let result = layout(&root, Proposal::unspecified());
