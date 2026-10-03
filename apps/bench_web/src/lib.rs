@@ -358,11 +358,10 @@ pub mod keyed {
         fn pixel_table(self) -> impl View<Arity = bunny_ui::view::Single> {
             let rows = self.rows;
             let selected = self.selected;
-            scroll(for_each(
-                rows,
-                |seed| seed.id.to_string(),
-                move |seed| PixelRow { seed: *seed, rows, selected },
-            ))
+            scroll(
+                for_each(rows, |seed| seed.id.to_string(), move |seed| PixelRow { seed: *seed, rows, selected })
+                    .once_per_key(),
+            )
         }
     }
 
@@ -499,12 +498,15 @@ pub mod keyed {
             let selected = self.selected;
             // the LIST reads the rows: a change to them runs the list's
             // key diff and nothing above it — a new key runs its row
-            // once, a key that left takes its row along, a swap moves
+            // once, a key that left takes its row along, a swap moves.
+            // A row is its seed's, for as long as the seed's id stays:
+            // the closure builds it once per key
             let table = for_each(
                 rows,
                 |seed| seed.id.to_string(),
                 move |seed| KeyedRow { seed: *seed, rows, selected }.element("tr"),
-            );
+            )
+            .once_per_key();
             hstack!(table.element("tbody"))
                 .element("table")
                 .css_class("table table-hover table-striped test-data")
