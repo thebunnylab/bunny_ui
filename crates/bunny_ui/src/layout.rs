@@ -927,7 +927,7 @@ pub enum LayoutNode {
     },
     /// Semantic visual property: background behind the child, border on
     /// top, foreground inherited. Transparent to the measure — by type.
-    Styled { props: Box<VisualProps>, child: Box<LayoutNode> },
+    Styled { props: Rc<VisualProps>, child: Box<LayoutNode> },
     /// An animation scope: the nearest styled below interpolates its
     /// colors through this spring, keyed by the identity captured at
     /// render (`key` is `None` outside a pass — the scope is inert).
@@ -2034,6 +2034,79 @@ impl VisualProps {
             from_group: self.from_group || outer.from_group,
         }
     }
+
+    /// One record of these props, shared: the one the last styled nodes
+    /// were given when the look is the same. The rows of a list wear a
+    /// few looks a thousand times over, and a thousand cells in one ink
+    /// hold one record of it.
+    pub(crate) fn shared(self) -> Rc<VisualProps> {
+        LOOKS.with(|looks| {
+            let mut looks = looks.borrow_mut();
+            if let Some(held) = looks.find(&self) {
+                return held;
+            }
+            let look = Rc::new(self);
+            looks.keep(&look);
+            look
+        })
+    }
+
+    /// The record of `outer` merged under the props a node holds ([`or`]:
+    /// what the node holds wins), shared like [`shared`]. A chain of
+    /// modifiers on one view makes its record ONCE: the step a chain
+    /// made a moment ago, worn by nothing else yet, becomes the next
+    /// step in place — a look nobody repeats costs what a box cost.
+    ///
+    /// [`or`]: VisualProps::or
+    /// [`shared`]: VisualProps::shared
+    pub(crate) fn restyled(mut held: Rc<VisualProps>, outer: VisualProps) -> Rc<VisualProps> {
+        let merged = (*held).or(outer);
+        LOOKS.with(|looks| {
+            let mut looks = looks.borrow_mut();
+            if let Some(look) = looks.find(&merged) {
+                return look;
+            }
+            let newest = looks.newest;
+            if looks.held[newest].as_ref().is_some_and(|look| Rc::ptr_eq(look, &held))
+                && Rc::strong_count(&held) == 2
+            {
+                looks.held[newest] = None;
+                if let Some(props) = Rc::get_mut(&mut held) {
+                    *props = merged;
+                    looks.held[newest] = Some(Rc::clone(&held));
+                    return held;
+                }
+            }
+            let look = Rc::new(merged);
+            looks.keep(&look);
+            look
+        })
+    }
+}
+
+/// How many looks the styled nodes share from: the few a row wears.
+const LOOKS_HELD: usize = 4;
+
+/// The looks the last styled nodes were given, newest at `newest`.
+#[derive(Default)]
+struct Looks {
+    held: [Option<Rc<VisualProps>>; LOOKS_HELD],
+    newest: usize,
+}
+
+impl Looks {
+    fn find(&self, props: &VisualProps) -> Option<Rc<VisualProps>> {
+        self.held.iter().flatten().find(|look| ***look == *props).cloned()
+    }
+
+    fn keep(&mut self, look: &Rc<VisualProps>) {
+        self.newest = (self.newest + 1) % LOOKS_HELD;
+        self.held[self.newest] = Some(Rc::clone(look));
+    }
+}
+
+thread_local! {
+    static LOOKS: std::cell::RefCell<Looks> = std::cell::RefCell::new(Looks::default());
 }
 
 /// Interaction state of a frame — resolved BEFORE layout and stamped into
@@ -4072,7 +4145,7 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
             Some(label) => {
                 let hovered = open.hovered == Some(index);
                 rows.push(LayoutNode::Styled {
-                    props: Box::new(VisualProps {
+                    props: VisualProps {
                         background: hovered.then_some(theme.accent),
                         background_hovered: Some(theme.accent),
                         foreground: if hovered {
@@ -4083,7 +4156,8 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
                         foreground_hovered: Some(Color::WHITE),
                         corner_radius: Some(Corners::all(4.0)),
                         ..VisualProps::default()
-                    }),
+                    }
+                    .shared(),
                     child: Box::new(LayoutNode::Frame {
                         width: None,
                         height: Some(MENU_ROW_H),
@@ -4126,10 +4200,11 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
                             trailing: MENU_PAD_H,
                         },
                         child: Box::new(LayoutNode::Styled {
-                            props: Box::new(VisualProps {
+                            props: VisualProps {
                                 background: Some(theme.border),
                                 ..VisualProps::default()
-                            }),
+                            }
+                            .shared(),
                             child: Box::new(LayoutNode::Fill),
                         }),
                     }),
@@ -4139,7 +4214,7 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
     }
     let _ = env;
     LayoutNode::Styled {
-        props: Box::new(VisualProps {
+        props: VisualProps {
             background: Some(theme.panel),
             border: Some((theme.border, 1.0)),
             corner_radius: Some(Corners::all(7.0)),
@@ -4147,7 +4222,8 @@ fn menu_node(open: &MenuOpen, env: &LayoutEnv<'_>) -> LayoutNode {
             clip: true,
             font: FontPatch { size: Some(13.0), ..FontPatch::default() },
             ..VisualProps::default()
-        }),
+        }
+        .shared(),
         child: Box::new(LayoutNode::Padding {
             edges: Edges {
                 top: MENU_PAD_V,
@@ -4201,14 +4277,15 @@ fn menu_frame(at: Point, size: Size, container: Rect) -> Rect {
 fn tooltip_node(text: Arc<str>) -> LayoutNode {
     let theme = crate::theme::current();
     LayoutNode::Styled {
-        props: Box::new(VisualProps {
+        props: VisualProps {
             background: Some(Color { a: 242, ..theme.fg }),
             foreground: Some(theme.canvas),
             corner_radius: Some(Corners::all(5.0)),
             shadow: Some((10.0, Color { r: 0, g: 0, b: 0, a: 90 })),
             font: FontPatch { size: Some(11.0), ..FontPatch::default() },
             ..VisualProps::default()
-        }),
+        }
+        .shared(),
         child: Box::new(LayoutNode::Padding {
             edges: Edges { top: 3.0, trailing: 7.0, bottom: 4.0, leading: 7.0 },
             child: Box::new(LayoutNode::Text {
@@ -9027,7 +9104,7 @@ mod tests {
     }
 
     fn styled(props: VisualProps, child: LayoutNode) -> LayoutNode {
-        LayoutNode::Styled { props: Box::new(props), child: Box::new(child) }
+        LayoutNode::Styled { props: Rc::new(props), child: Box::new(child) }
     }
 
     fn rows(count: usize) -> LayoutNode {

@@ -701,11 +701,10 @@ fn wrap_padding(out: &mut NodeList, mark: usize, edges: Edges) {
 
 fn wrap_styled(out: &mut NodeList, mark: usize, delta: VisualProps) {
     out.wrap_layout_from(mark, |node| match node {
-        LayoutNode::Styled { mut props, child } => {
-            *props = (*props).or(delta);
-            LayoutNode::Styled { props, child }
+        LayoutNode::Styled { props, child } => {
+            LayoutNode::Styled { props: VisualProps::restyled(props, delta), child }
         }
-        other => LayoutNode::Styled { props: Box::new(delta), child: Box::new(other) },
+        other => LayoutNode::Styled { props: delta.shared(), child: Box::new(other) },
     });
 }
 

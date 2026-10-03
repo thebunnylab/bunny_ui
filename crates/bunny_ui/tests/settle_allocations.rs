@@ -231,3 +231,19 @@ fn a_bound_class_beside_a_bound_label_files_without_a_list() {
     let both = beyond_empty(|item| (boundary_class_when(item.on, "selected"), text!(item.label)));
     assert!(both <= class + label, "the two bindings of one body cost {both}, apart {class} + {label}");
 }
+
+/// A cell in an ink of its own wears the look the rows before it were
+/// given: one record of the props is shared by every row, however many
+/// modifiers made it, and the styled node pays for the box its child is
+/// held in and nothing more.
+#[test]
+fn a_styled_cell_shares_the_look_of_the_rows_before_it() {
+    let plain = beyond_empty(|_| text("a"));
+    let styled = beyond_empty(|_| {
+        text("a")
+            .foreground_color(Color::hex(0x336699))
+            .background_color(Color::hex(0x112233))
+            .corner_radius(4.0)
+    });
+    assert!(styled <= plain + 1, "a styled cell costs the settle {styled} allocations, a plain one {plain}");
+}
