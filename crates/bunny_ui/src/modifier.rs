@@ -1640,6 +1640,18 @@ fn apply(
                         child,
                     }
                 }
+                // a hint over a kept boundary rides the reference itself:
+                // a list that re-runs makes one per row, and a box around
+                // each was an allocation per row per run
+                LayoutNode::BoundaryRef { path, slot, hints } => LayoutNode::BoundaryRef {
+                    path,
+                    slot,
+                    hints: crate::layout::ElementHints {
+                        tag: tag.or(hints.tag),
+                        class: class.or(hints.class),
+                        dom_id: dom_id.or(hints.dom_id),
+                    },
+                },
                 other => LayoutNode::Hinted { tag, class, dom_id, child: Box::new(other) },
             });
         }

@@ -861,7 +861,8 @@ impl Walk<'_> {
             LayoutNode::Boundary { path, children, .. } => {
                 self.lower_boundary(path, children, false, out);
             }
-            LayoutNode::BoundaryRef { path, slot } => {
+            LayoutNode::BoundaryRef { path, slot, hints } => {
+                let opened = out.len();
                 // resolves through the retention IN PLACE, the same
                 // door the placement walk uses, and lowers straight into
                 // the parent's list — a list of its own was a block of
@@ -889,6 +890,11 @@ impl Walk<'_> {
                 });
                 if !found {
                     out.push(node(DomKind::Group { path: std::rc::Rc::clone(path) }));
+                }
+                // the hints an `.element(…)` gave the boundary, stamped
+                // as the wrapper they replace would stamp them
+                if !hints.is_empty() {
+                    Self::stamp_hints(&mut out[opened..], &hints.tag, &hints.class, &hints.dom_id);
                 }
             }
             LayoutNode::Interactive { path, child } => {
@@ -993,35 +999,9 @@ impl Walk<'_> {
                 self.lower_into(child, out);
             }
             LayoutNode::Hinted { tag, class, dom_id, child } => {
-                // the hint stamps whatever the child lowered to — one
-                // node in practice (a hinted stack, text, or box)
                 let opened = out.len();
                 self.lower_into(child, out);
-                // a table cell that holds one plain text IS that text
-                if let Some(tag) = tag
-                    && (&**tag == "td" || &**tag == "th")
-                    && out.len() == opened + 1
-                {
-                    Self::fold_cell(&mut out[opened]);
-                }
-                // an inline tag around one child is no flex box
-                if let Some(tag) = tag
-                    && INLINE_TAGS.contains(&&**tag)
-                    && out.len() == opened + 1
-                {
-                    Self::fold_inline(&mut out[opened]);
-                }
-                for hinted in &mut out[opened..] {
-                    if tag.is_some() {
-                        hinted.hints.tag = tag.clone();
-                    }
-                    if class.is_some() {
-                        hinted.hints.class = class.clone();
-                    }
-                    if dom_id.is_some() {
-                        hinted.hints.dom_id = dom_id.clone();
-                    }
-                }
+                Self::stamp_hints(&mut out[opened..], tag, class, dom_id);
             }
             #[cfg(feature = "canvas")]
             LayoutNode::ExactLayout { child } => {
@@ -1107,6 +1087,41 @@ impl Walk<'_> {
                 // whole subtree, not a marker
                 self.lower_into(overlay, &mut popover.children);
                 self.overlays.push(popover);
+            }
+        }
+    }
+
+    /// The hints stamp whatever their child lowered to — one node in
+    /// practice (a hinted stack, text, box, or boundary).
+    fn stamp_hints(
+        lowered: &mut [DomNode],
+        tag: &Option<std::rc::Rc<str>>,
+        class: &Option<std::rc::Rc<str>>,
+        dom_id: &Option<std::rc::Rc<str>>,
+    ) {
+        // a table cell that holds one plain text IS that text
+        if let Some(tag) = tag
+            && (&**tag == "td" || &**tag == "th")
+            && let [cell] = lowered
+        {
+            Self::fold_cell(cell);
+        }
+        // an inline tag around one child is no flex box
+        if let Some(tag) = tag
+            && INLINE_TAGS.contains(&&**tag)
+            && let [only] = lowered
+        {
+            Self::fold_inline(only);
+        }
+        for hinted in lowered {
+            if tag.is_some() {
+                hinted.hints.tag = tag.clone();
+            }
+            if class.is_some() {
+                hinted.hints.class = class.clone();
+            }
+            if dom_id.is_some() {
+                hinted.hints.dom_id = dom_id.clone();
             }
         }
     }
@@ -1912,5 +1927,113 @@ mod tests {
             "the row that ran shows its new words: {patches:?}"
         );
         assert_eq!(moves(&patches), 2, "{patches:?}");
+    }
+
+    /// A row's `.element("tr")` rides the reference to the row's kept
+    /// boundary instead of a wrapper around it: the list's tree holds
+    /// the references with their hints and no box between, and the page
+    /// wears them as it did — the tag and the class on every row, and a
+    /// swap that moves two rows and says nothing else.
+    #[test]
+    fn a_hint_over_a_kept_row_rides_its_reference() {
+        use crate::prelude::*;
+
+        #[derive(Clone, Copy)]
+        struct Row(usize);
+
+        impl Component for Row {
+            fn body(self, _ctx: &Context) -> impl View {
+                text(format!("row {}", self.0))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct Table {
+            rows: State<std::rc::Rc<Vec<usize>>>,
+        }
+
+        impl Component for Table {
+            fn body(self, _ctx: &Context) -> impl View {
+                for_each(self.rows, |id| id.to_string(), |id| {
+                    Row(*id).element("tr").css_class("row")
+                })
+            }
+        }
+
+        let size = crate::layout::Size { width: 400.0, height: 300.0 };
+        let table = Table { rows: State::new(std::rc::Rc::new(vec![1, 2, 3, 4, 5])) };
+        let runtime = crate::runtime::Runtime::new();
+        let _ = runtime.dom_frame(&table, size);
+        let hinted_refs = || {
+            crate::reconciler::slot_of("Table/Keyed").with_layout(|tree| match tree {
+                Some(LayoutNode::Boundary { children, .. }) => children
+                    .iter()
+                    .filter(|row| matches!(
+                        row,
+                        LayoutNode::BoundaryRef { hints, .. }
+                            if hints.tag.as_deref() == Some("tr")
+                                && hints.class.as_deref() == Some("row")
+                                && hints.dom_id.is_none()
+                    ))
+                    .count(),
+                other => panic!("the list's retained tree: {other:?}"),
+            })
+        };
+        assert_eq!(hinted_refs(), 5, "every row a hinted reference, no wrapper");
+        let page = crate::ssr::render(&table, size);
+        assert_eq!(page.html.matches("<tr ").count(), 5, "{}", page.html);
+        assert_eq!(page.html.matches("class=\"row ").count(), 5, "{}", page.html);
+
+        table.rows.set(std::rc::Rc::new(vec![1, 4, 3, 2, 5]));
+        let patches = runtime.dom_frame(&table, size);
+        assert_eq!(hinted_refs(), 5, "the list re-ran: its rows are references again");
+        assert_eq!(patches.len(), 2, "{patches:?}");
+        assert!(
+            patches.iter().all(|p| matches!(p, crate::dom::DomPatch::Move { .. })),
+            "the kept rows keep their tag and class: {patches:?}"
+        );
+    }
+
+    /// A page whose root view is hinted is not the bare boundary a frame
+    /// with nothing to do stands in for — the stand-in would carry no
+    /// hints, and the page would lose the class it wears. Such a root
+    /// runs its pass; the frame still says nothing.
+    #[test]
+    fn a_hinted_root_keeps_its_hints_through_a_quiet_frame() {
+        use crate::prelude::*;
+
+        #[derive(Clone, Copy)]
+        struct Page {
+            count: State<usize>,
+        }
+
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                text(format!("count {}", self.count.get()))
+            }
+        }
+
+        let size = crate::layout::Size { width: 400.0, height: 300.0 };
+        let count = State::new(0);
+        let root = Page { count }.element("main").css_class("page");
+        let runtime = crate::runtime::Runtime::new();
+        let mount = runtime.dom_frame(&root, size);
+        assert!(
+            mount.iter().any(|p| matches!(
+                p,
+                crate::dom::DomPatch::Create { hints, .. }
+                    if hints.tag.as_deref() == Some("main")
+                        && hints.class.as_deref() == Some("page")
+            )),
+            "{mount:?}"
+        );
+        let quiet = runtime.dom_frame(&root, size);
+        assert!(quiet.is_empty(), "nothing changed, nothing is said: {quiet:?}");
+        count.set(1);
+        let counted = runtime.dom_frame(&root, size);
+        assert!(
+            !counted.iter().any(|p| matches!(p, crate::dom::DomPatch::SetHints { .. })),
+            "the page keeps its class: {counted:?}"
+        );
     }
 }
