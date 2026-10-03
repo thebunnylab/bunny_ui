@@ -3546,6 +3546,55 @@ mod tests {
         crate::paranoid::release();
     }
 
+    /// A boundary is asked a few ways in one frame — a stack measures a
+    /// flexible child twice, a stack of stacks doubles that, and each
+    /// phase comes with and without a width — and it keeps every answer.
+    /// At four kept, a tree asked six ways evicted two answers every
+    /// frame and measured afresh at rest (Trinity's agent panel,
+    /// 2026-10-03).
+    #[test]
+    fn a_boundary_asked_six_ways_keeps_all_six_answers() {
+        use crate::layout::{Fit, MeasureKey, Proposal, Size};
+        #[derive(Clone, Copy)]
+        struct Page;
+        impl Component for Page {
+            fn body(self, _ctx: &Context) -> impl View {
+                text("page")
+            }
+        }
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&Page, Size { width: 200.0, height: 100.0 });
+        let slot = crate::reconciler::slot_of("Page");
+        let font = crate::text_engine::FontSpec { size: 13.0, ..crate::text_engine::FontSpec::DEFAULT };
+        let keys: Vec<MeasureKey> = [
+            (Some(360.0), Some(699.0)),
+            (Some(360.0), Some(1152.0)),
+            (None, Some(699.0)),
+            (None, Some(1152.0)),
+            (Some(360.0), None),
+            (None, None),
+        ]
+        .into_iter()
+        .map(|(width, height)| MeasureKey { proposal: Proposal { width, height }, font, line_height: None })
+        .collect();
+        let answer = |_: &crate::layout::LayoutNode| (Size { width: 360.0, height: 42.0 }, Fit::Leaf);
+
+        let _ = crate::stats::take();
+        for key in &keys {
+            let _ = crate::reconciler::measure_retained(&slot, "Page", *key, answer);
+        }
+        let first = crate::stats::take();
+        assert_eq!(first.measures_made, 6, "six questions, six measures the first time: {first:?}");
+
+        let _ = crate::stats::take();
+        for key in &keys {
+            let _ = crate::reconciler::measure_retained(&slot, "Page", *key, answer);
+        }
+        let again = crate::stats::take();
+        assert_eq!(again.measures_made, 0, "the same six questions are all answered from what was kept: {again:?}");
+        assert_eq!(again.measures_kept, 6);
+    }
+
     #[test]
     fn a_clean_frame_measures_nothing_and_a_rerun_below_is_measured_again() {
         // a boundary that did not re-run holds the same tree, so the same
