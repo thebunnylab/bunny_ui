@@ -914,9 +914,9 @@ pub enum DomPatch {
     SetSize { id: u32, width: f64, height: f64 },
     /// The FULL style record — the glue resets and applies (styles are
     /// small; one write per changed node).
-    SetStyle { id: u32, style: DomStyle },
-    SetText { id: u32, text: DomText },
-    SetField { id: u32, field: DomField },
+    SetStyle { id: u32, style: Box<DomStyle> },
+    SetText { id: u32, text: Box<DomText> },
+    SetField { id: u32, field: Box<DomField> },
     SetScroll { id: u32, x: f64, y: f64 },
     SetImage { id: u32, image: DomImage },
     SetIcon { id: u32, icon: DomIcon },
@@ -926,7 +926,7 @@ pub enum DomPatch {
     SetIframe { id: u32, src: std::rc::Rc<str>, sealed: bool },
     /// The FULL flow record — the glue resets and applies, the exact
     /// twin of `SetStyle` for the other half of an element's truth.
-    SetLayout { id: u32, layout: DomLayout },
+    SetLayout { id: u32, layout: Box<DomLayout> },
     /// The element moves before sibling `before` (0 = to the end)
     /// under `parent` — one `insertBefore`, identity intact. Emitted
     /// for flow parents only: absolute children never need it.
@@ -1105,7 +1105,7 @@ impl DomLowering {
                     height: scene.height,
                 });
                 if scene.style != DomStyle::default() {
-                    patches.push(DomPatch::SetStyle { id: 0, style: scene.style.clone() });
+                    patches.push(DomPatch::SetStyle { id: 0, style: Box::new(scene.style.clone()) });
                 }
                 let children = std::mem::take(&mut scene.children);
                 let mut root = Retained { id: 0, node: scene, children: Vec::new() };
@@ -1331,7 +1331,7 @@ impl DomLowering {
                     let content = binding.get();
                     if content != shipped.content {
                         shipped.content = content;
-                        patches.push(DomPatch::SetText { id: bound.id, text: shipped.clone() });
+                        patches.push(DomPatch::SetText { id: bound.id, text: Box::new(shipped.clone()) });
                         crate::stats::note_binding_update();
                     }
                 }
@@ -1780,7 +1780,7 @@ fn create_subtree(
         // a flow node speaks semantics; its geometry fields are silent
         Some(layout) => {
             if *layout != DomLayout::default() {
-                patches.push(DomPatch::SetLayout { id, layout: layout.clone() });
+                patches.push(DomPatch::SetLayout { id, layout: Box::new(layout.clone()) });
             }
         }
         None => {
@@ -1789,17 +1789,17 @@ fn create_subtree(
         }
     }
     if node.style != DomStyle::default() {
-        patches.push(DomPatch::SetStyle { id, style: node.style.clone() });
+        patches.push(DomPatch::SetStyle { id, style: Box::new(node.style.clone()) });
     }
     match &node.kind {
         DomKind::Text(text) => {
-            patches.push(DomPatch::SetText { id, text: text.clone() });
+            patches.push(DomPatch::SetText { id, text: Box::new(text.clone()) });
             if let Some(binding) = &node.binding {
                 file_binding(id, binding, text, ctx);
             }
         }
         DomKind::Field(field) => {
-            patches.push(DomPatch::SetField { id, field: field.clone() });
+            patches.push(DomPatch::SetField { id, field: Box::new(field.clone()) });
         }
         DomKind::Scroll { offset, .. } if *offset != (0.0, 0.0) => {
             patches.push(DomPatch::SetScroll { id, x: offset.0, y: offset.1 });
@@ -1959,7 +1959,7 @@ fn diff_node(
         if let Some(layout) = &new.layout
             && retained.node.layout.as_ref() != Some(layout)
         {
-            patches.push(DomPatch::SetLayout { id, layout: layout.clone() });
+            patches.push(DomPatch::SetLayout { id, layout: Box::new(layout.clone()) });
             retained.node.layout = Some(layout.clone());
         }
         if hints_changed(&retained.node, &new) {
@@ -1987,13 +1987,13 @@ fn diff_node(
         // a flow node speaks semantics — its geometry fields are silent
         Some(layout) => {
             if old.layout.as_ref() != Some(layout) {
-                patches.push(DomPatch::SetLayout { id, layout: layout.clone() });
+                patches.push(DomPatch::SetLayout { id, layout: Box::new(layout.clone()) });
             }
         }
         None => {
             // an absolute node that WAS flow clears its record first
             if old.layout.is_some() {
-                patches.push(DomPatch::SetLayout { id, layout: DomLayout::default() });
+                patches.push(DomPatch::SetLayout { id, layout: Box::new(DomLayout::default()) });
             }
             if (old.x, old.y) != (new.x, new.y) {
                 patches.push(DomPatch::SetTransform { id, x: new.x, y: new.y });
@@ -2004,7 +2004,7 @@ fn diff_node(
         }
     }
     if old.style != new.style {
-        patches.push(DomPatch::SetStyle { id, style: new.style.clone() });
+        patches.push(DomPatch::SetStyle { id, style: Box::new(new.style.clone()) });
     }
     let same_binding = same_binding(old, &new);
     if hints_changed(old, &new) {
@@ -2032,7 +2032,7 @@ fn diff_node(
                 before != after
             };
             if changed {
-                patches.push(DomPatch::SetText { id, text: after.clone() });
+                patches.push(DomPatch::SetText { id, text: Box::new(after.clone()) });
             }
             match &new.binding {
                 Some(binding) if changed || !same_binding => file_binding(id, binding, after, ctx),
@@ -2040,7 +2040,7 @@ fn diff_node(
             }
         }
         (DomKind::Field(before), DomKind::Field(after)) if before != after => {
-            patches.push(DomPatch::SetField { id, field: after.clone() });
+            patches.push(DomPatch::SetField { id, field: Box::new(after.clone()) });
         }
         (
             DomKind::Scroll { offset: before, .. },
@@ -4183,11 +4183,11 @@ mod tests {
             DomPatch::SetTransform { id: 7, x: 10.0, y: 20.0 },
             DomPatch::SetStyle {
                 id: 7,
-                style: DomStyle {
+                style: Box::new(DomStyle {
                     background: Some(Color::hex(0x112233)),
                     interactive: Some(std::rc::Rc::from("go")),
                     ..DomStyle::default()
-                },
+                }),
             },
             DomPatch::Remove { id: 7 },
         ];
@@ -4553,8 +4553,8 @@ mod tests {
             ..DomStyle::default()
         };
         let cut = DomStyle { clip: true, ..bare.clone() };
-        let without = encode(&[DomPatch::SetStyle { id: 3, style: bare }]);
-        let with = encode(&[DomPatch::SetStyle { id: 3, style: cut }]);
+        let without = encode(&[DomPatch::SetStyle { id: 3, style: Box::new(bare) }]);
+        let with = encode(&[DomPatch::SetStyle { id: 3, style: Box::new(cut) }]);
         // the first payload-free bit: the streams differ by ONE bit in
         // the mask's high byte and nothing else
         assert_eq!(with.len(), without.len(), "the bit carries no payload");
@@ -4573,7 +4573,7 @@ mod tests {
             corner_radius: Some(Corners::all(6.0)),
             ..DomStyle::default()
         };
-        let bytes = encode(&[DomPatch::SetStyle { id: 3, style: one }]);
+        let bytes = encode(&[DomPatch::SetStyle { id: 3, style: Box::new(one) }]);
         let mask = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
         assert_eq!(mask, 1 << 4, "the one radius is bit 4, alone");
         assert_eq!(bytes.len(), 13 + 4, "and it costs one float");
@@ -4589,7 +4589,7 @@ mod tests {
             }),
             ..DomStyle::default()
         };
-        let bytes = encode(&[DomPatch::SetStyle { id: 3, style: four }]);
+        let bytes = encode(&[DomPatch::SetStyle { id: 3, style: Box::new(four) }]);
         let mask = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
         assert_eq!(mask, 1 << 22, "four radii take bit 22, and bit 4 stays clear");
         let radii: Vec<f32> = bytes[13..]
@@ -5115,12 +5115,12 @@ mod tests {
         let patches = vec![
             DomPatch::SetLayout {
                 id: 5,
-                layout: DomLayout {
+                layout: Box::new(DomLayout {
                     gap: Some(8.0),
                     grow: true,
                     slot_y: Some(120.0),
                     ..DomLayout::default()
-                },
+                }),
             },
             DomPatch::Move { id: 5, parent: 1, before: 9 },
             DomPatch::Reveal { id: 3, target: 44 },
@@ -5513,6 +5513,7 @@ mod size_tests {
             ("DomLayout", size_of::<Option<super::DomLayout>>()),
             ("DomHints", size_of::<super::DomHints>()),
             ("DomPatch", size_of::<super::DomPatch>()),
+            ("DomPatch max", 96),
             ("Retained", size_of::<super::Retained>()),
             ("LayoutNode", size_of::<crate::layout::LayoutNode>()),
             ("RenderNode", size_of::<motor::view::RenderNode>()),
@@ -5522,5 +5523,8 @@ mod size_tests {
             eprintln!("size {name:<11} {size:>5} bytes");
         }
         assert!(size_of::<super::DomNode>() <= 1024, "DomNode grew past a kilobyte");
+        // a patch list is thousands long on a create: its slot must stay
+        // small, the fat records boxed
+        assert!(size_of::<super::DomPatch>() <= 96, "DomPatch grew: box the record, not the list");
     }
 }

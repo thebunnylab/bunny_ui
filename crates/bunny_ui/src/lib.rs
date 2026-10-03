@@ -2029,7 +2029,7 @@ mod tests {
                 highlights: None,
                 truncation: None,
             };
-            let bytes = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 1, text }]);
+            let bytes = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 1, text: Box::new(text) }]);
             // count(4), op(1), id(4), color(4), inherits(1), size(4) —
             // then the weight
             bytes[18]
@@ -5333,7 +5333,7 @@ mod tests {
         let styles: Vec<crate::dom::DomStyle> = patches
             .iter()
             .filter_map(|patch| match patch {
-                crate::dom::DomPatch::SetStyle { style, .. } => Some(style.clone()),
+                crate::dom::DomPatch::SetStyle { style, .. } => Some((**style).clone()),
                 _ => None,
             })
             .collect();
@@ -13684,10 +13684,10 @@ mod tests {
         // and the wire says so: bit 15, u16 len + utf8 at the tail
         let bytes = crate::dom::encode(&[crate::dom::DomPatch::SetStyle {
             id: 3,
-            style: crate::dom::DomStyle {
+            style: Box::new(crate::dom::DomStyle {
                 tooltip: Some(std::sync::Arc::from("Hi")),
                 ..crate::dom::DomStyle::default()
-            },
+            }),
         }]);
         let expected: Vec<u8> = [
             &1u32.to_le_bytes()[..],
@@ -15211,7 +15211,7 @@ mod tests {
             highlights: None,
             truncation: None,
         };
-        let with = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: stepped }]);
+        let with = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: Box::new(stepped) }]);
         let plain = crate::dom::DomText {
             content: std::sync::Arc::from("a paragraph"),
             color: Color::hex(0x202531),
@@ -15222,7 +15222,7 @@ mod tests {
             highlights: None,
             truncation: None,
         };
-        let without = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: plain }]);
+        let without = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: Box::new(plain) }]);
 
         // the same stream, four bytes apart — the line box is an f32
         // beside the family, and NONE travels as a plain zero
@@ -15246,7 +15246,7 @@ mod tests {
             highlights: None,
             truncation: None,
         };
-        let bytes = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: leaning }]);
+        let bytes = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: Box::new(leaning) }]);
         let upright = crate::dom::DomText {
             content: std::sync::Arc::from("preview.rs"),
             color: Color::hex(0x202531),
@@ -15257,7 +15257,7 @@ mod tests {
             highlights: None,
             truncation: None,
         };
-        let plain = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: upright }]);
+        let plain = crate::dom::encode(&[crate::dom::DomPatch::SetText { id: 4, text: Box::new(upright) }]);
 
         // the same stream, ONE byte apart — the slant is a flag beside
         // mono, not a payload that grows the wire
