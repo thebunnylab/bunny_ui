@@ -571,7 +571,7 @@ impl Walk<'_> {
                     && !inheriting
                     && self.overlay_depth == 0
                     && self.pending_transition.is_none()
-                    && DomStyle::from_props(props) == DomStyle::default()
+                    && !DomStyle::paints(props)
                 {
                     self.ink.push(props.foreground.unwrap_or_else(|| self.current_ink()));
                     self.lower_into(child, out);
