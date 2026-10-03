@@ -876,6 +876,13 @@ pub(crate) fn finish_entry(
             let slot = match retained.remove(path) {
                 Some(old) => {
                     live.unindex(path, &old);
+                    // the tree of the last run waits for the idle with the
+                    // entries that left: a list that runs again replaces a
+                    // node per row, and the frame must not pay their frees
+                    if let Some(held) = old.slot.held.take() {
+                        REPLACED.with(|replaced| replaced.borrow_mut().push(held));
+                        note_buried();
+                    }
                     Rc::clone(&old.slot)
                 }
                 None => Slot::empty(),
@@ -1867,6 +1874,8 @@ thread_local! {
     /// be freed: a thousand rows that leave a list are a thousand layout
     /// trees, and the frame that drops them must not pay their frees.
     static GRAVEYARD: RefCell<Vec<Box<Entry>>> = const { RefCell::new(Vec::new()) };
+    /// The trees re-runs replaced, waiting for the same idle moment.
+    static REPLACED: RefCell<Vec<Rc<Held>>> = const { RefCell::new(Vec::new()) };
     /// The pass that buried the oldest garbage still waiting; 0 when
     /// nothing waits.
     static BURIED_AT: Cell<u64> = const { Cell::new(0) };
@@ -1887,18 +1896,29 @@ fn note_buried() {
     });
 }
 
-/// Frees the entries that left since the last call; returns how many.
-/// The read graph of their views goes first: the bindings they made are
-/// taken out of the register and out of the live table.
+/// Frees the entries that left since the last call, and the trees the
+/// re-runs replaced; returns how many of both. The read graph of the
+/// views that left goes first: the bindings they made are taken out of
+/// the register and out of the live table.
 pub(crate) fn collect_garbage() -> usize {
     BURIED_AT.with(|at| at.set(0));
     collect_retired_reads();
-    GRAVEYARD.with(|graveyard| {
-        let mut graveyard = graveyard.borrow_mut();
-        let count = graveyard.len();
-        graveyard.clear();
-        count
-    })
+    let replaced = take_replaced();
+    let count = replaced.len();
+    drop(replaced);
+    count
+        + GRAVEYARD.with(|graveyard| {
+            let mut graveyard = graveyard.borrow_mut();
+            let count = graveyard.len();
+            graveyard.clear();
+            count
+        })
+}
+
+/// The replaced trees, out of their list — to be dropped by the caller,
+/// with no borrow of the list held while they fall.
+fn take_replaced() -> Vec<Rc<Held>> {
+    REPLACED.with(|replaced| std::mem::take(&mut *replaced.borrow_mut()))
 }
 
 /// The bindings retired since the last collection, taken apart: their
@@ -2110,6 +2130,7 @@ pub(crate) fn clear() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
     LIVE.with(|live| *live.borrow_mut() = Live::default());
     collect_retired_reads();
+    drop(take_replaced());
     GRAVEYARD.with(|graveyard| graveyard.borrow_mut().clear());
     BURIED_AT.with(|at| at.set(0));
     ASSEMBLED_AT.with(|at| at.set(None));
@@ -2121,6 +2142,7 @@ pub(crate) fn clear() {
 pub(crate) fn reset_world() {
     RETAINED.with(|retained| retained.borrow_mut().clear());
     collect_retired_reads();
+    drop(take_replaced());
     GRAVEYARD.with(|graveyard| graveyard.borrow_mut().clear());
     BURIED_AT.with(|at| at.set(0));
     crate::layout::forget_pictures();
@@ -2376,6 +2398,62 @@ mod tests {
         assert_eq!(carried(|live| live.top_level.len()), 1, "the holder alone stands at the top");
     }
 
+    /// A row of a list, its label bound.
+    #[derive(Clone, Copy)]
+    struct Line {
+        id: usize,
+        label: State<Rc<str>>,
+    }
+
+    impl Component for Line {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::text!(self.label)
+        }
+    }
+
+    /// A page that is only its list: the list runs, the page is skipped.
+    #[derive(Clone, Copy)]
+    struct Lines {
+        lines: State<Rc<Vec<Line>>>,
+    }
+
+    impl Component for Lines {
+        fn body(self, _ctx: &Context) -> impl View {
+            crate::views::for_each(self.lines, |line| line.id.to_string(), |line| *line)
+        }
+    }
+
+    fn lines(ids: std::ops::RangeInclusive<usize>) -> Rc<Vec<Line>> {
+        Rc::new(ids.map(|id| Line { id, label: State::new(Rc::from(format!("line {id}").as_str())) }).collect())
+    }
+
+    /// A body that runs again fills its slot with the tree of today at
+    /// once — the page above it did not run, and reads the list through
+    /// that slot — while the tree it replaced waits for the idle with the
+    /// entries that left, and leaves with them.
+    #[test]
+    fn a_list_that_runs_again_leaves_the_tree_it_replaced_for_the_idle() {
+        let replaced = || REPLACED.with(|replaced| replaced.borrow().len());
+        let page = Lines { lines: State::new(lines(1..=3)) };
+        let runtime = Runtime::new();
+        let printed = runtime.render(&page);
+        assert!(printed.contains("line 3"), "{printed}");
+        let _ = collect_garbage();
+
+        page.lines.set(lines(4..=5));
+        let printed = runtime.render(&page);
+        assert!(printed.contains("line 4") && printed.contains("line 5"), "the tree of today: {printed}");
+        assert!(!printed.contains("line 3"), "and nothing of the last one: {printed}");
+        assert_eq!(runtime.body_runs().len(), 3, "the list and its two new rows ran, the page did not: {:?}", runtime.body_runs());
+        assert_eq!(replaced(), 1, "the list's last tree waits for the idle");
+        assert_eq!(graveyard_len(), 3, "with the rows that left");
+
+        assert_eq!(collect_garbage(), 4, "the idle frees the tree and the rows");
+        assert_eq!(replaced(), 0);
+        let printed = runtime.render(&page);
+        assert!(printed.contains("line 4") && printed.contains("line 5"), "the slot still holds today's tree: {printed}");
+    }
+
     /// A page frees what left when it goes idle. A host that never goes
     /// idle — a shell that never asks for the collection — must not keep
     /// it for good: garbage that waited out its patience is freed by the
@@ -2384,29 +2462,6 @@ mod tests {
     /// nothing.
     #[test]
     fn garbage_no_idle_came_for_is_freed_by_a_later_pass() {
-        #[derive(Clone, Copy)]
-        struct Line {
-            id: usize,
-            label: State<Rc<str>>,
-        }
-
-        impl Component for Line {
-            fn body(self, _ctx: &Context) -> impl View {
-                crate::text!(self.label)
-            }
-        }
-
-        #[derive(Clone, Copy)]
-        struct Lines {
-            lines: State<Rc<Vec<Line>>>,
-        }
-
-        impl Component for Lines {
-            fn body(self, _ctx: &Context) -> impl View {
-                crate::views::for_each(self.lines, |line| line.id.to_string(), |line| *line)
-            }
-        }
-
         let three = (1..=3).map(|id| Line { id, label: State::new(Rc::from("line")) }).collect();
         let lines = State::new(Rc::new(three));
         let page = Lines { lines };
