@@ -2214,10 +2214,18 @@ fn create_subtree(
         _ => {}
     }
     let children = std::mem::take(&mut node.children);
+    let templates_before = ctx.templates.roots.len();
     let children = create_children(children, id, ctx, patches);
     let retained = Retained { id, node, children, rule };
-    // the first of a shape is the template the next ones clone
+    // the first of a shape is the template the next ones clone — unless
+    // a template was made inside it. A member answers to ONE template:
+    // a subtree holding another template's root would take that
+    // template's members as its own, and the inner one, retired by
+    // nobody when its row changed or left, would hand out copies of an
+    // element no longer on the page
+    let holds_a_template = ctx.templates.roots.len() > templates_before;
     if let Some(shape) = shape
+        && !holds_a_template
         && !ctx.templates.by_shape.contains_key(&shape)
     {
         let mut members = Vec::new();
