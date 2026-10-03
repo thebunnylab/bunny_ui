@@ -505,9 +505,11 @@ function lookRules(selector, kind, flags, style, layout, face) {
     // 0 leading — the browser's own default for this direction
     if (face.align === 1) decl["text-align"] = "center";
     else if (face.align === 2) decl["text-align"] = "right";
-    // an inherited ink takes NO color: the box above owns both states
+    // an inherited ink takes NO color: the box above owns both states.
+    // A box's face record is the face alone — the box's own ink, the
+    // one its hover rules flip, stays
     if (face.color) decl.color = face.color;
-    else delete decl.color;
+    else if (kind === 2) delete decl.color;
     if (face.truncation !== 0) {
       decl.overflow = "hidden";
       decl["text-overflow"] = "ellipsis";
