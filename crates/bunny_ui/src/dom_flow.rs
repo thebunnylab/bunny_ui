@@ -931,7 +931,7 @@ impl Walk<'_> {
             LayoutNode::Image { source: Some(crate::image_engine::ImageSource::Feed { .. }), .. } => {
                 out.push(node(DomKind::Box));
             }
-            LayoutNode::Image { source, fit, .. } => {
+            LayoutNode::Image { source, fit, resizable } => {
                 match source {
                     Some(source) => {
                         // the walk never measures, so nothing else asks
@@ -945,10 +945,22 @@ impl Walk<'_> {
                             fit,
                             Some(motor::views::ContentMode::Fill)
                         );
-                        out.push(node(DomKind::Image(crate::dom::DomImage {
+                        let mut picture = node(DomKind::Image(crate::dom::DomImage {
                             key: source.key(),
                             cover,
-                        })));
+                        }));
+                        // a resizable picture takes the length it is offered
+                        // down its holder, as the pixel layout sizes it to
+                        // the proposal. Left to the browser, an <img> keeps
+                        // its natural height there with its floor at that
+                        // height — WebKit does, past a frame of 22 — where
+                        // Chrome derives it from the width by the ratio. The
+                        // width already follows by the ratio in both; a
+                        // stretch here would climb to the holders above
+                        if *resizable && let Some(layout) = picture.layout.as_mut() {
+                            layout.fill = true;
+                        }
+                        out.push(picture);
                     }
                     // no source yet: an empty box holds the room
                     None => out.push(node(DomKind::Box)),
@@ -2825,5 +2837,32 @@ mod tests {
         let frame = scene.children[0].layout.as_ref().expect("flow");
         assert_eq!(frame.max_width, Some(500.0));
         assert_eq!(frame.max_height, None, "{frame:?}");
+    }
+
+    /// A resizable picture in a frame takes the frame's length, its
+    /// floor let go — an <img> left to itself keeps its natural height
+    /// in WebKit, past a frame of 22. It stretches nothing: the frame's
+    /// own place in its holder stays the holder's.
+    #[test]
+    fn a_resizable_picture_takes_its_frame() {
+        let picture = |resizable| LayoutNode::Frame {
+            width: Some(13.4),
+            height: Some(22.0),
+            align: CrossAlign::Center,
+            child: Box::new(LayoutNode::Image {
+                source: Some(crate::image_engine::ImageSource::bytes_keyed(1, vec![0u8; 4])),
+                resizable,
+                fit: None,
+            }),
+        };
+        let offsets = HashMap::default();
+        let lowered = |resizable| {
+            let scene = lower(&picture(resizable), &env_fixture(&offsets)).scene;
+            scene.children[0].children[0].layout.clone().expect("flow")
+        };
+        let held = lowered(true);
+        assert!(held.fill && !held.stretch, "the picture fills its frame: {held:?}");
+        let natural = lowered(false);
+        assert!(!natural.stretch && !natural.fill, "a fixed picture keeps its size: {natural:?}");
     }
 }
