@@ -1647,6 +1647,73 @@ mod tests {
         assert!(at_the_end(&result), "and the tail is still followed");
     }
 
+    /// A transcript at rest keeps the measure of every boundary above it.
+    /// Rows that measure themselves used to poison the measure on every
+    /// frame — "the glass answers the heights: not ours to keep" — so the
+    /// panel, the dock and the window above Trinity's transcript measured
+    /// afresh on every caret frame with nothing changed (2026-10-03). A
+    /// measure whose rows confirm what the cache knew is a function of its
+    /// key; one that moved a height is asked again, once.
+    #[test]
+    fn a_settled_transcript_keeps_the_measures_above_it() {
+        #[derive(Clone, Copy)]
+        struct Transcript {
+            reply: State<f64>,
+        }
+        impl Component for Transcript {
+            fn body(self, _ctx: &Context) -> impl View {
+                let reply = self.reply.get();
+                virtual_list(200, |row| format!("entry{row}"), move |row| {
+                    let height = match row {
+                        199 => reply,
+                        _ => 20.0 * (1 + row % 3) as f64,
+                    };
+                    spacer().frame_height(height)
+                })
+                .measured_rows(30.0)
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct Panel {
+            reply: State<f64>,
+        }
+        impl Component for Panel {
+            fn body(self, _ctx: &Context) -> impl View {
+                vstack!(text("Agents"), Transcript { reply: self.reply })
+            }
+        }
+        let size = crate::layout::Size { width: 200.0, height: 300.0 };
+        let panel = Panel { reply: State::new(40.0) };
+        crate::paranoid::force(crate::paranoid::MEMO);
+        let runtime = Runtime::new();
+        let _ = runtime.display_frame(&panel, size);
+        let _ = runtime.display_frame(&panel, size);
+
+        // at rest: three frames, and no boundary above the list is asked
+        // again — the paranoid check confirms every kept answer against
+        // a fresh measure
+        let _ = crate::stats::take();
+        for _ in 0..3 {
+            let _ = runtime.display_frame(&panel, size);
+        }
+        let stats = crate::stats::take();
+        assert_eq!(stats.measures_made, 0, "a transcript at rest measured a boundary afresh: {stats:?}");
+        assert!(stats.measures_kept > 0, "the panel's own measure was the kept one");
+
+        // the reply streams into the newest entry: the list's body re-runs,
+        // the boundaries above measure again, and settle again after
+        panel.reply.set(100.0);
+        let _ = crate::stats::take();
+        let _ = runtime.display_frame(&panel, size);
+        let stats = crate::stats::take();
+        assert!(stats.measures_made >= 1, "a grown row re-measured the boundaries above: {stats:?}");
+        let _ = runtime.display_frame(&panel, size);
+        let _ = crate::stats::take();
+        let _ = runtime.display_frame(&panel, size);
+        let stats = crate::stats::take();
+        assert_eq!(stats.measures_made, 0, "and the list settled again: {stats:?}");
+    }
+
     #[test]
     fn a_reveal_lands_on_a_variable_row() {
         #[derive(Clone, Copy)]
