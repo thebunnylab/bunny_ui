@@ -20,7 +20,7 @@ const decoder = new TextDecoder();
 // The wasm exports its own number; boot compares the two and refuses
 // a stream this mirror was not written for. Deploy the page and the
 // wasm together.
-const EXPECTED_ABI = 10;
+const EXPECTED_ABI = 11;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default. The
@@ -292,7 +292,8 @@ function createElementRaw(kind, tag) {
   // 0 group, 1 box, 2 text, 3 field, 4 scroll, 5 content, 6 canvas,
   // 7 image, 8 icon, 9 flex column, 10 flex row, 11 layers, 12 popover,
   // 13 editor — the field of MANY lines, a `<textarea>` —
-  // 14 iframe — the native host's page
+  // 14 iframe — the native host's page, 15 video — the video host's
+  // stream
   if (kind === 9 || kind === 10) {
     // a FLOW container: static, the browser lays its children out
     const el = document.createElement(tag || "div");
@@ -329,6 +330,20 @@ function createElementRaw(kind, tag) {
     const frame = document.createElement("iframe");
     frame.style.cssText = "border:0;box-sizing:border-box;min-width:0;min-height:0;";
     return frame;
+  }
+  if (kind === 15) {
+    // the video host's web lowering: the browser's own `<video>`,
+    // playing a stream the page registered (media.js). Muted, inline
+    // and autoplaying — the audio is the app's business — and the box
+    // underneath owns the clicks, like an img's
+    const video = document.createElement("video");
+    video.autoplay = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.setAttribute("playsinline", "");
+    video.style.cssText =
+      "display:block;pointer-events:none;box-sizing:border-box;min-width:0;min-height:0;";
+    return video;
   }
   if (kind === 7) {
     const img = document.createElement("img");
@@ -980,6 +995,27 @@ function applyPatches(view, length) {
           el.src = src;
         }
       }
+    } else if (op === 17) {
+      // the video's whole record. The fit, the mirror and the radius
+      // are writes; the stream is a REWIRE, performed only when the
+      // handle changed — setting srcObject again restarts the playback.
+      // The mirror rides the `scale` property and not `transform`,
+      // which the layout record resets on every change of the box
+      const stream = u32();
+      const mirrored = u8() === 1;
+      const cover = u8() === 1;
+      const radius = f32();
+      const el = elements.get(id);
+      if (el) {
+        el.style.objectFit = cover ? "cover" : "contain";
+        el.style.scale = mirrored ? "-1 1" : "";
+        el.style.borderRadius = radius > 0 ? `${radius}px` : "";
+        if (el.__stream !== stream) {
+          el.__stream = stream;
+          el.srcObject = typeof bunnyMedia === "object" && stream ? bunnyMedia.get(stream) : null;
+          el.play().catch(() => {});
+        }
+      }
     } else if (op === 14) {
       // the popover's anchor relation — position now, and again
       // whenever anything scrolls or the window resizes
@@ -1108,6 +1144,11 @@ const imports = {
     typeof bunnyGlImports === "object" ? bunnyGlImports : bunnyGlStubsOrNothing(),
   "./bunny.js": {
     js_blit() {},
+    // the canvas shell's host overlay: this page lowers a host to an
+    // element of its own (kind 15), so the three verbs answer nothing
+    js_host_begin() {},
+    js_host_video() {},
+    js_host_end() {},
     // a focused island copied: the same road the canvas shell takes
     js_clipboard_write(pointer, length) {
       const text = decoder.decode(new Uint8Array(wasm.memory.buffer, pointer, length));

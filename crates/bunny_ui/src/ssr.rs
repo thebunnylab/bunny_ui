@@ -123,6 +123,16 @@ impl Tree {
                     ("min-height", "0"),
                 ],
             ),
+            CreateKind::Video => (
+                "video",
+                &[
+                    ("display", "block"),
+                    ("pointer-events", "none"),
+                    ("box-sizing", "border-box"),
+                    ("min-width", "0"),
+                    ("min-height", "0"),
+                ],
+            ),
             CreateKind::Icon => ("svg", &[("pointer-events", "none")]),
             CreateKind::Field => (
                 "input",
@@ -235,6 +245,13 @@ impl Tree {
         for (name, value) in style {
             element.style.insert(name, (*value).to_string());
         }
+        // the glue's three attributes on a video: muted, inline and
+        // autoplaying — the audio is the app's business
+        if matches!(kind, CreateKind::Video) {
+            for name in ["autoplay", "muted", "playsinline"] {
+                element.attrs.insert(name, String::new());
+            }
+        }
         if let Some(tag_hint) = &hints.tag {
             element.tag = leak_tag(tag_hint);
             // the table family lays itself out — the browser's own
@@ -304,6 +321,25 @@ impl Tree {
                         element.attrs.remove("sandbox");
                         element.attrs.remove("srcdoc");
                         element.attrs.insert("src", src.to_string());
+                    }
+                }
+            }
+            DomPatch::SetVideo { id, mirrored, cover, radius, .. } => {
+                // the stream is a runtime object the page registers
+                // after boot — nothing of it serializes; the fit, the
+                // mirror and the radius do, as the glue writes them
+                if let Some(element) = self.elements.get_mut(id) {
+                    let fit = if *cover { "cover" } else { "contain" };
+                    element.style.insert("object-fit", fit.to_string());
+                    if *mirrored {
+                        element.style.insert("scale", "-1 1".to_string());
+                    } else {
+                        element.style.remove("scale");
+                    }
+                    if *radius > 0.0 {
+                        element.style.insert("border-radius", px(f64::from(*radius)));
+                    } else {
+                        element.style.remove("border-radius");
                     }
                 }
             }

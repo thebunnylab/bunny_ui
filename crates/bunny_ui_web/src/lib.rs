@@ -86,6 +86,75 @@ unsafe extern "C" {
     /// A panic, on its way to the console. Without it a wasm abort is one
     /// line of `unreachable` and a stack of numbers.
     fn js_panic(pointer: *const u8, len: usize);
+    /// The host overlay, in three verbs — the mac's `host_place` and
+    /// `host_sweep` discipline with the glue holding the elements
+    /// (`docs/video.md`). `begin` opens a pass; `video` places one
+    /// `<video>` by the host's path: the box `(x, y, width, height)`
+    /// and the window the clip lets through, box-local — logical
+    /// points, which on this page are CSS pixels. The element mounts
+    /// on first sight, keeps its playback while the handle is the
+    /// same, and hides — never unmounts — when the window is empty.
+    /// `flags` is bit 0 mirrored, bit 1 cover. `end` sweeps whatever
+    /// the pass did not touch: the host left the scene, its element
+    /// goes with it. The canvas shell's verbs: the element lowering
+    /// mounts a video as an element of its own and never speaks them.
+    #[cfg(feature = "canvas")]
+    fn js_host_begin();
+    #[cfg(feature = "canvas")]
+    fn js_host_video(
+        pointer: *const u8,
+        len: usize,
+        stream: u32,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        window_x: f64,
+        window_y: f64,
+        window_width: f64,
+        window_height: f64,
+        flags: u32,
+        radius: f64,
+    );
+    #[cfg(feature = "canvas")]
+    fn js_host_end();
+}
+
+/// The hosts of the last layout, told to the page: one `<video>` per
+/// video host, placed by its box and its window, and whatever the page
+/// held for a host that left is swept — every present, before the
+/// pixels go up, the way the desktops place their platform views
+/// first. The element sits ABOVE the canvas in the page's own order, so
+/// the sequence of the two never shows; a sweep that lagged a frame
+/// behind the scene would. A webview host has no tenant on this road:
+/// the box stays the empty hole it always was here.
+#[cfg(feature = "canvas")]
+fn sync_hosts(runtime: &Runtime) {
+    unsafe { js_host_begin() };
+    for host in runtime.hosts() {
+        let HostSpec::Video { stream, mirrored, cover, corner_radius } = &host.spec else {
+            continue;
+        };
+        let flags = u32::from(*mirrored) | (u32::from(*cover) << 1);
+        unsafe {
+            js_host_video(
+                host.path.as_ptr(),
+                host.path.len(),
+                stream.0,
+                host.frame.origin.x,
+                host.frame.origin.y,
+                host.frame.size.width,
+                host.frame.size.height,
+                host.visible.origin.x,
+                host.visible.origin.y,
+                host.visible.size.width,
+                host.visible.size.height,
+                flags,
+                *corner_radius,
+            );
+        }
+    }
+    unsafe { js_host_end() };
 }
 
 /// Sends a panic to the console instead of the bare `unreachable` a wasm
@@ -577,6 +646,9 @@ pub fn start_with(
         let physical =
             ((size.width.round() as usize) * scale, (size.height.round() as usize) * scale);
         let display = root(runtime, size);
+        // the hosts first, as the desktops do: the page's elements over
+        // the canvas follow the layout the list was built from
+        sync_hosts(runtime);
         #[cfg(feature = "gpu")]
         if tier::active() {
             // the same display list, no Surface in the path — the frame

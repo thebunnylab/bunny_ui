@@ -20,7 +20,7 @@ function painter() {
 // the key table, the modifier bits, the import/export surface. The
 // wasm exports its own number; boot compares the two and refuses a
 // pairing this mirror was not written for.
-const EXPECTED_ABI = 10;
+const EXPECTED_ABI = 11;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default.
@@ -113,6 +113,47 @@ function imageKey(hi, lo) {
   return `${hi >>> 0}:${lo >>> 0}`;
 }
 
+// The host overlay: the page's own elements over the canvas — one
+// `<video>` per video host, placed by the engine's boxes each present
+// (`docs/video.md`). The overlay is a child of the host that outlives
+// the surface: `surface()` keeps it across a tier swap by its mark, and
+// `js_host_begin` puts it back should anything else have taken it.
+// Pointer events pass through it to the canvas. Each host gets a clip
+// div on the window the layout granted, holding the element at the
+// whole box — the mac's container and tenant, in CSS — so a feed half
+// scrolled off is cut, never rescaled.
+//
+// The z-order law: the element is ABOVE the canvas, whatever the scene
+// paints after the host is under it. The desktops lift that tail onto
+// a segment surface; this page does not yet, and says so in the doc.
+let overlay = null;
+// path → { clip, video, stamp, stream }: the mounted elements, by the
+// host's identity
+const hosted = new Map();
+// what the pass in flight placed; the rest is swept at `js_host_end`
+let touched = null;
+
+function hostOverlay() {
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.dataset.bunnyKeep = "";
+    overlay.style.cssText = "position:absolute;inset:0;overflow:hidden;pointer-events:none;";
+  }
+  if (overlay.parentNode !== host) {
+    // the host anchors its children's absolute boxes
+    if (getComputedStyle(host).position === "static") host.style.position = "relative";
+    host.appendChild(overlay);
+  }
+  return overlay;
+}
+
+// The stream behind a handle — the registry the page filled (media.js,
+// loaded before this file). A page without one, or a zero, plays
+// nothing: the element stays black.
+function mediaOf(stream) {
+  return typeof bunnyMedia === "object" && stream ? bunnyMedia.get(stream) : null;
+}
+
 // glue_gl.js may be absent (a build without the tier, a file that
 // failed to load). Every verb answers zero, `gl_init` included, so the
 // tier refuses and the page presents by CPU.
@@ -198,6 +239,81 @@ const imports = {
     js_panic(pointer, length) {
       const bytes = new Uint8Array(wasm.memory.buffer, pointer, length);
       console.error("bunny panic: " + new TextDecoder().decode(bytes));
+    },
+    // A host pass opens: nothing is placed yet.
+    js_host_begin() {
+      hostOverlay();
+      touched = new Set();
+    },
+    // One video host by its path: the box (x, y, w, h) and the window
+    // the clip lets through (vx, vy, vw, vh), box-local — CSS px both.
+    // The clip div lands on the window and the element keeps the whole
+    // box inside it, so the cut shows through and the picture never
+    // rescales; an empty window hides, never unmounts. A stamp gates the
+    // attribute writes, and the stream is rewired only when the HANDLE
+    // changed — writing the same one again restarts the playback.
+    js_host_video(pointer, length, stream, x, y, w, h, vx, vy, vw, vh, flags, radius) {
+      const path = decoder.decode(new Uint8Array(wasm.memory.buffer, pointer, length));
+      let slot = hosted.get(path);
+      if (!slot) {
+        const clip = document.createElement("div");
+        clip.style.cssText = "position:absolute;overflow:hidden;";
+        // muted, inline and autoplaying: the audio is the app's business,
+        // on an element of its own or none
+        const video = document.createElement("video");
+        video.autoplay = true;
+        video.muted = true;
+        video.playsInline = true;
+        video.setAttribute("playsinline", "");
+        video.style.cssText = "position:absolute;display:block;pointer-events:none;";
+        clip.appendChild(video);
+        hostOverlay().appendChild(clip);
+        slot = { clip, video, stamp: "", stream: 0 };
+        hosted.set(path, slot);
+      }
+      if (touched) touched.add(path);
+      const { clip, video } = slot;
+      if (vw <= 0 || vh <= 0) {
+        clip.style.display = "none";
+      } else {
+        clip.style.display = "";
+        clip.style.left = `${x + vx}px`;
+        clip.style.top = `${y + vy}px`;
+        clip.style.width = `${vw}px`;
+        clip.style.height = `${vh}px`;
+        video.style.left = `${-vx}px`;
+        video.style.top = `${-vy}px`;
+        video.style.width = `${w}px`;
+        video.style.height = `${h}px`;
+      }
+      const handle = stream >>> 0;
+      const stamp = `${handle}|${flags >>> 0}|${radius}`;
+      if (slot.stamp === stamp) return;
+      slot.stamp = stamp;
+      video.style.objectFit = flags & 2 ? "cover" : "contain";
+      // the selfie: flipped in place, around the element's own centre
+      video.style.transform = flags & 1 ? "scaleX(-1)" : "";
+      // the corners are the BOX's, so they ride the element: a feed half
+      // scrolled off keeps its rounded corners where they are and the
+      // clip's cut edge stays straight, as a clipped rounded box paints
+      video.style.borderRadius = radius > 0 ? `${radius}px` : "";
+      if (slot.stream !== handle) {
+        slot.stream = handle;
+        video.srcObject = mediaOf(handle);
+        video.play().catch(() => {});
+      }
+    },
+    // The pass closes: whatever it did not place left the scene, and
+    // its element goes with it. The stream stays the page's to stop.
+    js_host_end() {
+      if (!touched) return;
+      for (const [path, slot] of hosted) {
+        if (touched.has(path)) continue;
+        slot.video.srcObject = null;
+        slot.clip.remove();
+        hosted.delete(path);
+      }
+      touched = null;
     },
     // The image edge: the engine hands the encoded bytes ONCE; the
     // browser decodes off-thread and calls bunny_image_ready when the

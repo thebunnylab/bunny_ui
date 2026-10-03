@@ -1106,16 +1106,21 @@ struct SpecCopy {
 }
 
 impl SpecCopy {
-    fn of(spec: &HostSpec) -> SpecCopy {
-        let HostSpec::Webview { url, document, scripts, console, requests, full_motion } = spec;
-        SpecCopy {
+    /// `None` for a video host: there is no page to copy, and the shell
+    /// refused the box before it reached this module.
+    fn of(spec: &HostSpec) -> Option<SpecCopy> {
+        let HostSpec::Webview { url, document, scripts, console, requests, full_motion } = spec
+        else {
+            return None;
+        };
+        Some(SpecCopy {
             url: Rc::clone(url),
             document: document.clone(),
             scripts: Rc::clone(scripts),
             console: *console,
             requests: *requests,
             full_motion: *full_motion,
-        }
+        })
     }
 }
 
@@ -1208,6 +1213,7 @@ thread_local! {
 /// assembling, and an `Err` here would be a lie about a webview that
 /// exists.
 pub(crate) fn create(path: &str, container: Hwnd, spec: &HostSpec) {
+    let Some(copied) = SpecCopy::of(spec) else { return };
     com_init();
     VIEWS.with(|views| {
         views.borrow_mut().insert(
@@ -1215,7 +1221,7 @@ pub(crate) fn create(path: &str, container: Hwnd, spec: &HostSpec) {
             Slot {
                 container,
                 generation: 0,
-                spec: SpecCopy::of(spec),
+                spec: copied,
                 bounds: (0, 0, 0, 0),
                 shown: false,
                 queued: Vec::new(),
@@ -2364,7 +2370,7 @@ unsafe fn read_snapshot(stream: *mut c_void) -> Result<(usize, usize, Vec<u8>), 
 /// engine just arrived at). While pending, the newest spec simply
 /// replaces the parked one — the land sequence reads the latest.
 pub(crate) fn update(path: &str, spec: &HostSpec) {
-    let copied = SpecCopy::of(spec);
+    let Some(copied) = SpecCopy::of(spec) else { return };
     struct ReInstruct {
         core: *mut WebView2,
         core2: Option<*mut WebView2_2>,
