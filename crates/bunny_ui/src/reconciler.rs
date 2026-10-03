@@ -165,7 +165,33 @@ pub(crate) struct Entry {
     /// The body's interactive actions — retained like the effects: a
     /// skipped view's button stays clickable.
     pub actions: Vec<ActionEntry>,
-    /// The body's `.on_copy` answers — same retention.
+    /// The registrations few bodies make ([`Rare`]) — `None` for a body
+    /// that made none of them, which is nearly every row of a list.
+    pub rare: Option<Box<Rare>>,
+    /// The PARENT's path segments, packed — the cursor seed for an isolated
+    /// re-run.
+    pub parent_segments: motor::identity::PathSeed,
+    /// Did the entry close with no retained boundary above it? Then it
+    /// stands in the live tables' top level, and it is the one place the
+    /// entry's fall has to take it out of — asked here, never searched.
+    pub top_level: bool,
+    /// The last pass that met the entry, and how ([`Visit`]): the sweep
+    /// reads who is alive off the entry it walks past, instead of
+    /// hashing its path into the sets of the pass.
+    visit: Cell<u64>,
+}
+
+/// The registrations a body seldom makes, kept apart from its entry.
+///
+/// An entry sits in the retention's tree by value, and the tree moves
+/// its values: a row that leaves shifts the rows after it in its node,
+/// and the node that runs short borrows from or merges with the next. A
+/// row carried nine empty lists through every one of those moves; boxed
+/// apart, they are one word, and a row that makes none of them makes no
+/// box.
+#[derive(Default)]
+pub(crate) struct Rare {
+    /// The body's `.on_copy` answers — same retention as the actions.
     pub copies: Vec<CopyEntry>,
     /// The body's field editors — same retention.
     pub editors: Vec<EditorEntry>,
@@ -189,17 +215,48 @@ pub(crate) struct Entry {
     /// context is ACTIVE while a view declaring it stays mounted, or
     /// (`.key_context_focused(name)`) while the keyboard is inside it.
     pub contexts: Vec<ContextEntry>,
-    /// The PARENT's path segments, packed — the cursor seed for an isolated
-    /// re-run.
-    pub parent_segments: motor::identity::PathSeed,
-    /// Did the entry close with no retained boundary above it? Then it
-    /// stands in the live tables' top level, and it is the one place the
-    /// entry's fall has to take it out of — asked here, never searched.
-    pub top_level: bool,
-    /// The last pass that met the entry, and how ([`Visit`]): the sweep
-    /// reads who is alive off the entry it walks past, instead of
-    /// hashing its path into the sets of the pass.
-    visit: Cell<u64>,
+}
+
+impl Rare {
+    /// The lists a body closed with, boxed — or nothing, when it made
+    /// none of them.
+    #[allow(clippy::too_many_arguments)]
+    fn boxed(
+        copies: Vec<CopyEntry>,
+        editors: Vec<EditorEntry>,
+        splits: Vec<SplitEntry>,
+        scrolls: Vec<ScrollEntry>,
+        measures: Vec<MeasureEntry>,
+        webviews: Vec<WebviewEntry>,
+        customs: Vec<(String, bool)>,
+        handlers: Vec<HandlerEntry>,
+        contexts: Vec<ContextEntry>,
+    ) -> Option<Box<Rare>> {
+        let none = copies.is_empty()
+            && editors.is_empty()
+            && splits.is_empty()
+            && scrolls.is_empty()
+            && measures.is_empty()
+            && webviews.is_empty()
+            && customs.is_empty()
+            && handlers.is_empty()
+            && contexts.is_empty();
+        (!none).then(|| {
+            Box::new(Rare { copies, editors, splits, scrolls, measures, webviews, customs, handlers, contexts })
+        })
+    }
+}
+
+impl Entry {
+    /// The body's named-action handlers.
+    fn handlers(&self) -> &[HandlerEntry] {
+        self.rare.as_ref().map_or(&[], |rare| &rare.handlers)
+    }
+
+    /// The key contexts the body declared.
+    fn contexts(&self) -> &[ContextEntry] {
+        self.rare.as_ref().map_or(&[], |rare| &rare.contexts)
+    }
 }
 
 /// How a pass met an entry, stamped on the entry: its body RAN, or the
@@ -367,34 +424,36 @@ impl Live {
         for (key, action) in &entry.actions {
             self.insert_action(key.clone(), Rc::clone(action));
         }
-        for (key, copy) in &entry.copies {
-            self.copies.insert(key.clone(), Rc::clone(copy));
-        }
-        for (key, editor) in &entry.editors {
-            self.editors.insert(key.clone(), editor.clone());
-        }
-        for (key, split) in &entry.splits {
-            self.splits.insert(key.clone(), Rc::clone(split));
-        }
-        for (key, scroll) in &entry.scrolls {
-            self.scrolls.insert(key.clone(), Rc::clone(scroll));
-        }
-        for (key, measure) in &entry.measures {
-            self.measures.insert(key.clone(), Rc::clone(measure));
-        }
-        for (key, hooks) in &entry.webviews {
-            self.webviews.insert(key.clone(), hooks.clone());
-        }
-        for (key, accepts_keys) in &entry.customs {
-            self.customs.insert(key.clone());
-            if *accepts_keys {
-                self.keyed_customs.insert(key.clone());
+        if let Some(rare) = &entry.rare {
+            for (key, copy) in &rare.copies {
+                self.copies.insert(key.clone(), Rc::clone(copy));
+            }
+            for (key, editor) in &rare.editors {
+                self.editors.insert(key.clone(), editor.clone());
+            }
+            for (key, split) in &rare.splits {
+                self.splits.insert(key.clone(), Rc::clone(split));
+            }
+            for (key, scroll) in &rare.scrolls {
+                self.scrolls.insert(key.clone(), Rc::clone(scroll));
+            }
+            for (key, measure) in &rare.measures {
+                self.measures.insert(key.clone(), Rc::clone(measure));
+            }
+            for (key, hooks) in &rare.webviews {
+                self.webviews.insert(key.clone(), hooks.clone());
+            }
+            for (key, accepts_keys) in &rare.customs {
+                self.customs.insert(key.clone());
+                if *accepts_keys {
+                    self.keyed_customs.insert(key.clone());
+                }
             }
         }
-        if !entry.handlers.is_empty() && self.handler_entries.insert(path.to_string()) {
+        if !entry.handlers().is_empty() && self.handler_entries.insert(path.to_string()) {
             self.handler_gen += 1;
         }
-        if !entry.contexts.is_empty() && self.context_entries.insert(path.to_string()) {
+        if !entry.contexts().is_empty() && self.context_entries.insert(path.to_string()) {
             self.context_gen += 1;
         }
         if !entry.effects.is_empty() && self.effect_entries.insert(path.to_string()) {
@@ -414,32 +473,34 @@ impl Live {
         for (key, _) in &entry.actions {
             self.remove_action(key);
         }
-        for (key, _) in &entry.copies {
-            self.copies.remove(key);
+        if let Some(rare) = &entry.rare {
+            for (key, _) in &rare.copies {
+                self.copies.remove(key);
+            }
+            for (key, _) in &rare.editors {
+                self.editors.remove(key);
+            }
+            for (key, _) in &rare.splits {
+                self.splits.remove(key);
+            }
+            for (key, _) in &rare.scrolls {
+                self.scrolls.remove(key);
+            }
+            for (key, _) in &rare.measures {
+                self.measures.remove(key);
+            }
+            for (key, _) in &rare.webviews {
+                self.webviews.remove(key);
+            }
+            for (key, _) in &rare.customs {
+                self.customs.remove(key);
+                self.keyed_customs.remove(key);
+            }
         }
-        for (key, _) in &entry.editors {
-            self.editors.remove(key);
-        }
-        for (key, _) in &entry.splits {
-            self.splits.remove(key);
-        }
-        for (key, _) in &entry.scrolls {
-            self.scrolls.remove(key);
-        }
-        for (key, _) in &entry.measures {
-            self.measures.remove(key);
-        }
-        for (key, _) in &entry.webviews {
-            self.webviews.remove(key);
-        }
-        for (key, _) in &entry.customs {
-            self.customs.remove(key);
-            self.keyed_customs.remove(key);
-        }
-        if !entry.handlers.is_empty() && self.handler_entries.remove(path) {
+        if !entry.handlers().is_empty() && self.handler_entries.remove(path) {
             self.handler_gen += 1;
         }
-        if !entry.contexts.is_empty() && self.context_entries.remove(path) {
+        if !entry.contexts().is_empty() && self.context_entries.remove(path) {
             self.context_gen += 1;
         }
         if !entry.effects.is_empty() && self.effect_entries.remove(path) {
@@ -820,15 +881,7 @@ pub(crate) fn finish_entry(
                 slot,
                 effects,
                 actions,
-                copies,
-                editors,
-                splits,
-                scrolls,
-                measures,
-                webviews,
-                customs,
-                handlers,
-                contexts,
+                rare: Rare::boxed(copies, editors, splits, scrolls, measures, webviews, customs, handlers, contexts),
                 parent_segments,
                 top_level,
                 visit: Cell::new(Visit::now().ran),
@@ -1009,7 +1062,7 @@ pub(crate) fn assemble_contexts(root: &str) {
         let retained = retained.borrow();
         for path in &carriers {
             if let Some(entry) = retained.get(path.as_str()) {
-                declared.extend(entry.contexts.iter().cloned());
+                declared.extend(entry.contexts().iter().cloned());
             }
         }
     });
@@ -1126,7 +1179,7 @@ pub(crate) fn assemble_handlers(root: &str) {
         let retained = retained.borrow();
         for path in &carriers {
             if let Some(entry) = retained.get(path.as_str()) {
-                for (key, id, handler) in &entry.handlers {
+                for (key, id, handler) in entry.handlers() {
                     place(&mut map, key, *id, handler.clone());
                 }
             }
@@ -2191,8 +2244,8 @@ mod tests {
             let built = |carries: &dyn Fn(&Entry) -> bool| -> HashSet<String> {
                 retained.iter().filter(|(_, entry)| carries(entry)).map(|(path, _)| path.to_string()).collect()
             };
-            let handlers = built(&|entry| !entry.handlers.is_empty());
-            let contexts = built(&|entry| !entry.contexts.is_empty());
+            let handlers = built(&|entry| !entry.handlers().is_empty());
+            let contexts = built(&|entry| !entry.contexts().is_empty());
             let effects = built(&|entry| !entry.effects.is_empty());
             let top_level = built(&|entry| entry.top_level);
             LIVE.with(|live| {
@@ -2261,6 +2314,20 @@ mod tests {
         holder.armed.set(true);
         runtime.render_stable(&holder);
         assert!(carriers_match_retention(), "re-ran and took them back");
+
+        // the handler and the context are kept apart from the entry, boxed
+        // only while the body makes them
+        let boxed = || {
+            RETAINED.with(|retained| {
+                retained.borrow().iter().filter(|(_, entry)| entry.rare.is_some()).map(|(path, _)| path.to_string()).collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(boxed().len(), 1, "the armed carrier boxes its rare registrations: {:?}", boxed());
+        holder.armed.set(false);
+        runtime.render_stable(&holder);
+        assert!(boxed().is_empty(), "a body that makes none keeps no box: {:?}", boxed());
+        holder.armed.set(true);
+        runtime.render_stable(&holder);
 
         holder.mounted.set(false);
         runtime.render_stable(&holder);
