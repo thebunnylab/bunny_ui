@@ -555,7 +555,11 @@ pub(crate) fn short_type_name<T: ?Sized>() -> &'static str {
     let full = std::any::type_name::<T>();
     // generics: `path::DetailRow<bunny_ui::views::Text>` → `DetailRow`
     let base = full.split('<').next().unwrap_or(full);
-    base.rsplit("::").next().unwrap_or(base)
+    // the last `::` ends at the last `:` — a type's path never holds one
+    // alone — so a byte search finds it. Every boundary the walk meets
+    // names itself here, a thousand kept rows included, and the search
+    // for the two-byte pattern built a searcher each time
+    base.rfind(':').map_or(base, |at| &base[at + 1..])
 }
 
 /// The identity segment of a tuple position — a static word for the
@@ -715,5 +719,38 @@ mod tests {
              (slim {slim} B, fat {fat} B, {added} B of payload apart) — \
              a copy of `self` is being named in the recursive frame again",
         );
+    }
+
+    /// A boundary's name is its type's last path segment before the
+    /// generics — the identity segment every retained path is spelled
+    /// with, so the byte search must name each type as the reading by
+    /// `::` always did: plain, generic, nested, a closure, a tuple, a
+    /// primitive, a reference and a trait object.
+    #[test]
+    fn a_boundary_is_named_as_the_path_reading_named_it() {
+        fn by_path<T: ?Sized>() -> &'static str {
+            let full = std::any::type_name::<T>();
+            let base = full.split('<').next().unwrap_or(full);
+            base.rsplit("::").next().unwrap_or(base)
+        }
+        fn check<T: ?Sized>() {
+            assert_eq!(short_type_name::<T>(), by_path::<T>(), "{}", std::any::type_name::<T>());
+        }
+        let closure = || 1u8;
+        fn named<T>(_: &T) -> (&'static str, &'static str) {
+            (short_type_name::<T>(), by_path::<T>())
+        }
+        check::<Runtime>();
+        check::<State<Vec<Option<String>>>>();
+        check::<crate::views::ForEach<Vec<u8>, fn(&u8) -> String, fn(&u8) -> crate::views::Text>>();
+        check::<(Runtime, crate::layout::Size)>();
+        check::<u64>();
+        check::<&'static str>();
+        check::<dyn Fn(u8) -> u8>();
+        check::<[Size; 3]>();
+        let (short, path) = named(&closure);
+        assert_eq!(short, path, "a closure");
+        assert_eq!(short_type_name::<Runtime>(), "Runtime");
+        assert_eq!(short_type_name::<State<Vec<u8>>>(), "State");
     }
 }
