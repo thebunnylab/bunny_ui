@@ -128,6 +128,13 @@ impl NodeList {
         self.layout.push(node);
     }
 
+    /// Room for `more` layout nodes, made once — a list knows how many
+    /// rows it is about to add, and a thousand pushes grew the list ten
+    /// times, each growth a copy of every node before it.
+    pub(crate) fn reserve_layout(&mut self, more: usize) {
+        self.layout.reserve(more);
+    }
+
     /// Wraps the last layout node (the one from the Single view that just
     /// rendered) — the path of the layout modifiers (`.padding()`, frames).
     /// How many layout nodes are in hand — the MARK a modifier takes
