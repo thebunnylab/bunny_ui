@@ -2040,6 +2040,7 @@ mod tests {
                 text_align: None,
                 highlights: None,
                 truncation: None,
+                inherits_face: false,
             };
             let bytes = crate::dom::encode(&[look_with(text)]);
             // count(4), op(1), rule(8), kind(1), flags(1), a bare style
@@ -15217,6 +15218,7 @@ mod tests {
             text_align: None,
             highlights: None,
             truncation: None,
+            inherits_face: false,
         };
         let with = crate::dom::encode(&[look_with(stepped)]);
         let plain = crate::dom::DomText {
@@ -15228,6 +15230,7 @@ mod tests {
             text_align: None,
             highlights: None,
             truncation: None,
+            inherits_face: false,
         };
         let without = crate::dom::encode(&[look_with(plain)]);
 
@@ -15252,6 +15255,7 @@ mod tests {
             text_align: None,
             highlights: None,
             truncation: None,
+            inherits_face: false,
         };
         let bytes = crate::dom::encode(&[look_with(leaning)]);
         let upright = crate::dom::DomText {
@@ -15263,6 +15267,7 @@ mod tests {
             text_align: None,
             highlights: None,
             truncation: None,
+            inherits_face: false,
         };
         let plain = crate::dom::encode(&[look_with(upright)]);
 

@@ -5192,6 +5192,7 @@ impl LayoutNode {
                                 .as_ref()
                                 .map(|h| (Rc::clone(&h.ranges), h.color)),
                             truncation: *truncation,
+                            inherits_face: false,
                         }),
                         frame,
                     );

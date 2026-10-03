@@ -773,7 +773,10 @@ fn rule_text(
         base.insert("box-shadow", shadows.join(","));
     }
     if let Some(text) = text {
-        base.insert("font", css_font(&text.font));
+        // a text with the face declared above it names none of its own
+        if !text.inherits_face {
+            base.insert("font", css_font(&text.font));
+        }
         // after the font shorthand, which resets it — the served page
         // steps its lines the way the engine measured them
         if let Some(height) = text.line_height {

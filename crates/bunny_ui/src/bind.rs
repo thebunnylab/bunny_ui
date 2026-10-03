@@ -377,10 +377,13 @@ mod frame_tests {
 
         let runtime = Runtime::new();
         let mount = runtime.dom_frame(&Pair { count: State::new(1) }, SIZE);
+        // the texts' own looks (the root and a box declare a face too)
         let families: Vec<Option<std::sync::Arc<str>>> = mount
             .iter()
             .filter_map(|patch| match patch {
-                DomPatch::DefineRule { text: Some(text), .. } => Some(text.font.family.name()),
+                DomPatch::DefineRule { kind: crate::dom::CreateKind::Text, text: Some(text), .. } => {
+                    Some(text.font.family.name())
+                }
                 _ => None,
             })
             .collect();
@@ -438,7 +441,9 @@ mod frame_tests {
             patches
                 .iter()
                 .filter_map(|patch| match patch {
-                    DomPatch::DefineRule { text: Some(text), .. } => Some((text.font.family.name(), text.font.size)),
+                    DomPatch::DefineRule { kind: crate::dom::CreateKind::Text, text: Some(text), .. } => {
+                        Some((text.font.family.name(), text.font.size))
+                    }
                     _ => None,
                 })
                 .collect()
@@ -796,11 +801,13 @@ mod frame_tests {
         let frame = stats::take();
         assert_eq!(frame.entries_indexed, 2, "still no row body");
         assert_eq!(frame.diff_reused, 0, "a moved environment keeps nothing: {patches:?}");
-        // the new face is one look, defined once; the head and every
-        // row's text wear it
+        // the new face is declared once, by the shelf's box, and the
+        // texts under it inherit it: two looks defined (the box's with
+        // the face, the texts' without a font), worn by the box, the
+        // head and every row's text
         let defined = patches.iter().filter(|patch| matches!(patch, DomPatch::DefineRule { .. })).count();
         let worn = patches.iter().filter(|patch| matches!(patch, DomPatch::UseRule { .. })).count();
-        assert_eq!((defined, worn), (1, 4), "the head and every row's text wear the new font: {patches:?}");
+        assert_eq!((defined, worn), (2, 5), "the head and every row's text wear the new font: {patches:?}");
     }
 }
 

@@ -123,6 +123,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
         ink: Vec::new(),
         ink_scopes: Vec::new(),
         font: FontSpec::DEFAULT,
+        declared: FontSpec::DEFAULT,
         line_height: None,
         text_align: None,
         pending_interactive: None,
@@ -152,6 +153,7 @@ pub(crate) fn lower(root: &LayoutNode, env: &FlowEnv) -> FlowOutput {
     children.extend(overlays);
     let scene = DomNode {
         kind: DomKind::Root,
+        face: Some(FontSpec::DEFAULT),
         x: 0.0,
         y: 0.0,
         width: env.size.0,
@@ -228,6 +230,10 @@ struct Walk<'a> {
     /// inherits instead of painting its own color.
     ink_scopes: Vec<usize>,
     font: FontSpec,
+    /// The face declared by the nearest element above that declares
+    /// one — the root's default until a box changes it. A text with
+    /// this face inherits it.
+    declared: FontSpec,
     /// The inherited line box, mirroring `font` — the browser steps the
     /// lines by it, the way our own placement does.
     line_height: Option<crate::layout::Px>,
@@ -285,6 +291,7 @@ fn node(kind: DomKind) -> DomNode {
         hints: DomHints::default(),
         children: Vec::new(),
         binding: None,
+        face: None,
     }
 }
 
@@ -603,7 +610,16 @@ impl Walk<'_> {
                 if states {
                     self.ink_scopes.push(self.ink.len());
                 }
+                // a box that changes the face declares it for its
+                // subtree, once; the texts under it with that face
+                // inherit it and name none of their own
+                let outer_declared = self.declared;
+                if self.font != self.declared {
+                    boxed.face = Some(self.font);
+                    self.declared = self.font;
+                }
                 self.lower_into(child, &mut boxed.children);
+                self.declared = outer_declared;
                 if states {
                     self.ink_scopes.pop();
                 }
@@ -631,6 +647,7 @@ impl Walk<'_> {
                         .as_ref()
                         .map(|h| (std::rc::Rc::clone(&h.ranges), h.color)),
                     truncation: *truncation,
+                    inherits_face: self.font == self.declared,
                 }));
                 text.style.interactive = self.pending_interactive.take();
                 text.style.tooltip = self.pending_tooltip.take();
