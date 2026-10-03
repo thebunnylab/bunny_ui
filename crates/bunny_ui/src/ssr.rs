@@ -1071,22 +1071,20 @@ fn escape_attr(value: &str) -> String {
     escape_text(value).replace('"', "&quot;")
 }
 
-/// Tag hints are a tiny closed-ish set (tr, td, table, a, span…) — a
-/// leaked str keeps the toy tree's static tags simple.
+/// The tags a served page writes as themselves — the glue builds any
+/// tag it is handed, so a tag missing here would serve a `<div>` the
+/// mounted page calls a `<section>`. A static table keeps the toy tree's
+/// tags `&'static`; an unknown word still serves as a `<div>`.
+const SERVED_TAGS: &[&str] = &[
+    "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "a", "span", "button",
+    "h1", "h2", "h3", "h4", "h5", "h6", "p", "code", "pre", "kbd", "samp", "b", "strong", "i",
+    "em", "small", "mark", "abbr", "cite", "q", "sub", "sup", "time", "var", "u", "s", "label",
+    "nav", "header", "footer", "main", "section", "article", "aside", "figure", "figcaption",
+    "blockquote", "ol", "ul", "li", "dl", "dt", "dd", "address",
+];
+
 fn leak_tag(tag: &str) -> &'static str {
-    match tag {
-        "table" => "table",
-        "thead" => "thead",
-        "tbody" => "tbody",
-        "tr" => "tr",
-        "td" => "td",
-        "th" => "th",
-        "a" => "a",
-        "span" => "span",
-        "h1" => "h1",
-        "button" => "button",
-        _ => "div",
-    }
+    SERVED_TAGS.iter().find(|served| **served == tag).copied().unwrap_or("div")
 }
 
 #[cfg(test)]
