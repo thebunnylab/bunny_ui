@@ -193,10 +193,14 @@ impl Tree {
         };
         root.attrs.insert("id", "app".to_string());
         root.attrs.insert("data-hydrate", "1".to_string());
+        // the box the page was laid out in: the boot adopts the served
+        // elements at THIS size, where the scene is the one they show,
+        // and lays out at the reader's from there
+        root.attrs.insert("data-width", size.width.to_string());
+        root.attrs.insert("data-height", size.height.to_string());
         // the window is a one-slot column: its child can take the box
         root.style.insert("display", "flex".into());
         root.style.insert("flex-direction", "column".into());
-        let _ = size;
         let mut elements = BTreeMap::new();
         elements.insert(0, root);
         Tree { elements, rules: BTreeMap::new() }
@@ -1118,6 +1122,8 @@ mod tests {
         let second = render(&Page { on: State::new(false) }, size);
         assert_eq!(first.html, second.html, "deterministic bytes");
         assert!(first.html.contains("data-hydrate=\"1\""));
+        assert!(first.html.contains("data-width=\"300\""), "the served box");
+        assert!(first.html.contains("data-height=\"200\""), "the served box");
         assert!(first.html.contains("hello, prerender"));
         assert!(first.html.contains("display:flex"));
         assert!(!first.html.contains("position:absolute"), "a flow page ships in the flow");

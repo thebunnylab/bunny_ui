@@ -1792,6 +1792,21 @@ const imports = {
   },
 };
 
+// The box the page gives its mount. The engine pins the mount at the
+// size it laid out, so the page's own answer — its stylesheet's — is
+// read with that pin let go for the one measure.
+function pageBox() {
+  const { width, height } = app.style;
+  app.style.width = "";
+  app.style.height = "";
+  const box = [app.clientWidth, app.clientHeight];
+  app.style.width = width;
+  app.style.height = height;
+  return box;
+}
+// What the engine laid the mount out at last.
+let mounted = [0, 0];
+
 const bootOpened = performance.now();
 WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
   ({ instance }) => {
@@ -1864,12 +1879,20 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     }
     window.__bunnyBoot = { instantiate: performance.now() - bootOpened };
     const startOpened = performance.now();
-    wasm[START_EXPORT](
-      app.clientWidth,
-      app.clientHeight,
-      window.devicePixelRatio || 1,
-      hydrated ? 1 : 0,
-    );
+    // a served page is adopted at the size it was laid out in — there
+    // the scene is the one its elements show — and the reader's own
+    // box follows as a resize: the difference, and nothing else
+    const reader = pageBox();
+    const served =
+      hydrated && app.dataset.width
+        ? [Number(app.dataset.width), Number(app.dataset.height)]
+        : reader;
+    mounted = served;
+    wasm[START_EXPORT](served[0], served[1], window.devicePixelRatio || 1, hydrated ? 1 : 0);
+    if (reader[0] !== served[0] || reader[1] !== served[1]) {
+      mounted = reader;
+      wasm.bunny_resize(reader[0], reader[1], window.devicePixelRatio || 1);
+    }
     window.__bunnyBoot.start = performance.now() - startOpened;
 
     // Is motion welcome? The PLATFORM answers, not this file: a reader
@@ -1910,19 +1933,7 @@ WebAssembly.instantiateStreaming(fetch(WASM_URL), imports).then(
     window.addEventListener("resize", repositionPopovers);
     // the window's box: a page that sizes the mount to the viewport
     // hears it move, and the bodies that read the Viewport run again —
-    // a layout that changes its columns with the width, say. The engine
-    // pins the mount at the size it laid out, so the page's own answer
-    // is read with the pin let go for the one measure
-    let mounted = [app.clientWidth, app.clientHeight];
-    const pageBox = () => {
-      const { width, height } = app.style;
-      app.style.width = "";
-      app.style.height = "";
-      const box = [app.clientWidth, app.clientHeight];
-      app.style.width = width;
-      app.style.height = height;
-      return box;
-    };
+    // a layout that changes its columns with the width, say
     const remount = () => {
       if (!wasm) return;
       const [width, height] = pageBox();
