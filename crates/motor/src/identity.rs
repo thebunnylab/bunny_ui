@@ -55,15 +55,14 @@ struct Registry {
     pass_active: bool,
     /// First segment pushed in the pass — defines the swept root.
     pass_root: Option<String>,
-    /// The cursor's segments. A tuple position or a view's name is a
-    /// static word and is borrowed; a row key is the app's string and
-    /// is owned — the common step costs no allocation.
-    path: Vec<Cow<'static, str>>,
-    /// The path pre-joined with `/`, maintained incrementally by
-    /// push/truncate — reading the scope is one clone, never a walk.
+    /// The cursor's path, joined with `/`, maintained incrementally by
+    /// push/truncate — reading the scope is one clone, never a walk. It
+    /// is the only spelling of the cursor: a step writes its segment
+    /// here and nowhere else, so a row's key costs no string of its own.
     joined: String,
     /// Saved lengths of `joined`, one per open frame — the truncation
-    /// points of the drops.
+    /// points of the drops, and where each segment starts: the segments
+    /// read back from them exactly, a key with a `/` of its own included.
     joined_lens: Vec<usize>,
     /// Only the view wrappers — the target of read-tracking. Each one is a
     /// LENGTH of `joined`: the path of an open view is a prefix of the
@@ -121,6 +120,20 @@ struct Registry {
     view_bindings: HashMap<String, Vec<Rc<str>>>,
 }
 
+impl Registry {
+    /// The cursor's segments, read back from the joined path: each open
+    /// frame saved where the path stood before it, and a separator
+    /// follows a non-empty path — so every cut is exact.
+    fn segments(&self) -> impl Iterator<Item = &str> + '_ {
+        let lens = &self.joined_lens;
+        (0..lens.len()).map(move |at| {
+            let start = lens[at] + usize::from(lens[at] > 0);
+            let end = lens.get(at + 1).copied().unwrap_or(self.joined.len());
+            &self.joined[start..end]
+        })
+    }
+}
+
 type AnchorKey = (String, TypeId, u32);
 
 #[derive(Default)]
@@ -160,7 +173,6 @@ pub fn begin_pass() {
         registry.serving = true;
         registry.missed.clear();
         registry.pass_root = None;
-        registry.path.clear();
         registry.joined.clear();
         registry.joined_lens.clear();
         registry.views.clear();
@@ -413,7 +425,7 @@ pub fn current_pass_root() -> Option<String> {
 
 /// The cursor's segments right now.
 pub fn current_path_segments() -> Vec<String> {
-    REGISTRY.with(|registry| registry.borrow().path.iter().map(|segment| segment.to_string()).collect())
+    REGISTRY.with(|registry| registry.borrow().segments().map(str::to_string).collect())
 }
 
 /// The cursor's PARENT segments, packed: what a retained entry keeps to
@@ -446,12 +458,12 @@ impl PathSeed {
 pub fn parent_seed() -> PathSeed {
     REGISTRY.with(|registry| {
         let registry = registry.borrow();
-        let parents = registry.path.split_last().map_or(&[][..], |(_, parents)| parents);
+        let parents = registry.joined_lens.len().saturating_sub(1);
         let mut seed = PathSeed {
-            text: String::with_capacity(parents.iter().map(|segment| segment.len()).sum()),
-            ends: Vec::with_capacity(parents.len()),
+            text: String::with_capacity(registry.segments().take(parents).map(str::len).sum()),
+            ends: Vec::with_capacity(parents),
         };
-        for segment in parents {
+        for segment in registry.segments().take(parents) {
             seed.text.push_str(segment);
             seed.ends.push(seed.text.len() as u32);
         }
@@ -560,7 +572,6 @@ impl Drop for Frame {
         }
         REGISTRY.with(|registry| {
             let mut registry = registry.borrow_mut();
-            registry.path.pop();
             // the joined path steps back by truncation — the bytes of
             // the parent are still in place, untouched
             let depth = registry.joined_lens.pop().unwrap_or(0);
@@ -572,24 +583,27 @@ impl Drop for Frame {
     }
 }
 
-fn push(segment: Cow<'static, str>, is_view: bool) -> Frame {
+/// One step down: `spell` writes the segment at the end of the joined
+/// path — a word as it is, a row's key inside its brackets.
+fn push(spell: impl FnOnce(&mut String), is_view: bool) -> Frame {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         if !registry.pass_active {
             return Frame { pops_view: false, active: false };
         }
-        if registry.pass_root.is_none() {
-            registry.pass_root = Some(segment.to_string());
-        }
-        // the joined path grows in place: push_str now, truncate on the
-        // frame's drop — the per-step full-path JOIN died here
+        // the joined path grows in place: the segment is written now and
+        // truncated on the frame's drop — the per-step full-path JOIN
+        // died here
         let depth = registry.joined.len();
         registry.joined_lens.push(depth);
         if !registry.joined.is_empty() {
             registry.joined.push('/');
         }
-        registry.joined.push_str(&segment);
-        registry.path.push(segment);
+        let start = registry.joined.len();
+        spell(&mut registry.joined);
+        if registry.pass_root.is_none() {
+            registry.pass_root = Some(registry.joined[start..].to_string());
+        }
         // the alive mark: an identity that owns something and was entered
         // this pass stays. One that owns nothing has no record to mark —
         // and nothing to sweep
@@ -606,15 +620,33 @@ fn push(segment: Cow<'static, str>, is_view: bool) -> Frame {
 
 /// Steps down one structural level: tuple position (`#0`), arm (`@First`),
 /// row key (`[USA]`), sheet content (`sheet`). A static word is borrowed
-/// and costs nothing; a `String` is kept as it is.
+/// and costs nothing; a `String` is written into the path and let go —
+/// the path is the one place a segment lives.
 pub fn enter(segment: impl Into<Cow<'static, str>>) -> Frame {
-    push(segment.into(), false)
+    let segment = segment.into();
+    push(|joined| joined.push_str(&segment), false)
+}
+
+/// Steps down into a list's row: the app's key inside brackets
+/// (`[USA]`), written straight into the cursor's path. The segment is
+/// never a string of its own — bracketing the app's string in place
+/// grew it, a reallocation for every row each time a list ran.
+pub fn enter_key(key: &str) -> Frame {
+    push(
+        |joined| {
+            joined.push('[');
+            joined.push_str(key);
+            joined.push(']');
+        },
+        false,
+    )
 }
 
 /// Steps down into a view's wrapper (`Component`) — besides the path, it
 /// enters the view stack that read-tracking uses as its target.
 pub fn enter_view(name: impl Into<Cow<'static, str>>) -> Frame {
-    push(name.into(), true)
+    let name = name.into();
+    push(|joined| joined.push_str(&name), true)
 }
 
 /// The path of the innermost view being rendered — the reconciler's key.
@@ -630,12 +662,12 @@ pub fn current_view_path() -> Option<String> {
 /// parent) with correct anchors and identities. The returned frames undo on
 /// drop.
 pub fn seed(segments: &[String]) -> Vec<Frame> {
-    segments.iter().map(|segment| enter(segment.clone())).collect()
+    segments.iter().map(|segment| push(|joined| joined.push_str(segment), false)).collect()
 }
 
 /// [`seed`], from the packed form a retained entry keeps.
 pub fn seed_from(parents: &PathSeed) -> Vec<Frame> {
-    parents.segments().map(|segment| enter(segment.to_string())).collect()
+    parents.segments().map(|segment| push(|joined| joined.push_str(segment), false)).collect()
 }
 
 fn current_scope(registry: &Registry) -> String {
@@ -1024,6 +1056,47 @@ mod tests {
         assert_eq!(current_path_segments(), ["Root", "[a/b]", "#0"]);
         drop(frames);
         let _ = end_pass();
+    }
+
+    /// A row's key is written into the path between its brackets, and
+    /// the path is the only place the cursor's segments live: they read
+    /// back from where each frame cut it — a key with a `/` of its own,
+    /// an empty key and an empty word included — and the scope, the
+    /// segments, the seed and the pass's root are what entering the
+    /// bracketed string gave.
+    #[test]
+    fn a_key_written_into_the_path_reads_back_as_its_own_segment() {
+        use super::{
+            begin_pass, current_pass_root, current_path_segments, cursor_scope, end_pass, enter,
+            enter_key, parent_seed,
+        };
+
+        let walk = |keyed: bool| {
+            begin_pass();
+            let read = {
+                let _row = if keyed { enter_key("top") } else { enter("[top]") };
+                let _empty = enter("");
+                let _key = if keyed { enter_key("a/b") } else { enter("[a/b]") };
+                let _blank = if keyed { enter_key("") } else { enter("[]") };
+                let _leaf = enter("#0");
+                (
+                    cursor_scope(),
+                    current_path_segments(),
+                    parent_seed().segments().map(str::to_string).collect::<Vec<_>>(),
+                )
+            };
+            let root = current_pass_root();
+            // every frame dropped: the path is empty again
+            assert_eq!(current_path_segments(), Vec::<String>::new());
+            let _ = end_pass();
+            (read, root)
+        };
+        let ((scope, segments, seed), root) = walk(true);
+        assert_eq!(scope.as_deref(), Some("[top]//[a/b]/[]/#0"));
+        assert_eq!(segments, ["[top]", "", "[a/b]", "[]", "#0"]);
+        assert_eq!(seed, ["[top]", "", "[a/b]", "[]"]);
+        assert_eq!(root.as_deref(), Some("[top]"));
+        assert_eq!(walk(true), walk(false), "a key in place is the bracketed string, entered");
     }
 
     use super::named_chain;
