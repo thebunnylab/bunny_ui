@@ -462,27 +462,27 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     /// `<tr>`, a `<td>`, a `<button>`. Semantic HTML when the page
     /// wants it; every other lowering ignores the hint, the way a
     /// pixel target ignores `.rendering()`.
-    fn element(self, tag: impl Into<String>) -> Modified<Self> {
+    fn element(self, tag: impl AsRef<str>) -> Modified<Self> {
         Modified {
             base: self,
-            modifier: Modifier::ElementHint(Some(std::rc::Rc::from(tag.into().as_str())), None, None),
+            modifier: Modifier::ElementHint(Some(crate::modifier::hint(tag.as_ref())), None, None),
         }
     }
 
     /// The Dom element's `class` attribute — for a stylesheet the
     /// page brings, or a harness that looks elements up by it.
-    fn css_class(self, class: impl Into<String>) -> Modified<Self> {
+    fn css_class(self, class: impl AsRef<str>) -> Modified<Self> {
         Modified {
             base: self,
-            modifier: Modifier::ElementHint(None, Some(std::rc::Rc::from(class.into().as_str())), None),
+            modifier: Modifier::ElementHint(None, Some(crate::modifier::hint(class.as_ref())), None),
         }
     }
 
     /// The Dom element's `id` attribute.
-    fn element_id(self, id: impl Into<String>) -> Modified<Self> {
+    fn element_id(self, id: impl AsRef<str>) -> Modified<Self> {
         Modified {
             base: self,
-            modifier: Modifier::ElementHint(None, None, Some(std::rc::Rc::from(id.into().as_str())),),
+            modifier: Modifier::ElementHint(None, None, Some(crate::modifier::hint(id.as_ref()))),
         }
     }
 

@@ -103,6 +103,9 @@ pub struct FrameStats {
     pub rows_summed: u32,
     /// Milliseconds per [`Stage`], all zero without a clock.
     pub stage_ms: [f64; STAGES],
+    /// Allocations made under each stage, when a bench installed a
+    /// probe ([`set_alloc_probe`]); zeros otherwise.
+    pub stage_allocs: [u64; STAGES],
 }
 
 impl FrameStats {
@@ -132,12 +135,18 @@ impl FrameStats {
             measures_made: 0,
             rows_summed: 0,
             stage_ms: [0.0; STAGES],
+            stage_allocs: [0; STAGES],
         }
     }
 
     /// The stage's accumulated wall time in milliseconds.
     pub fn ms(&self, stage: Stage) -> f64 {
         self.stage_ms[stage as usize]
+    }
+
+    /// The allocations the stage made, when a probe counts them.
+    pub fn allocs(&self, stage: Stage) -> u64 {
+        self.stage_allocs[stage as usize]
     }
 }
 
@@ -165,7 +174,9 @@ thread_local! {
     static MEASURES_MADE: Cell<u32> = const { Cell::new(0) };
     static ROWS_SUMMED: Cell<u32> = const { Cell::new(0) };
     static STAGE_MS: Cell<[f64; STAGES]> = const { Cell::new([0.0; STAGES]) };
+    static STAGE_ALLOCS: Cell<[u64; STAGES]> = const { Cell::new([0; STAGES]) };
     static CLOCK: Cell<Option<fn() -> f64>> = const { Cell::new(None) };
+    static ALLOC_PROBE: Cell<Option<fn() -> u64>> = const { Cell::new(None) };
 }
 
 /// Installs the wall clock the timers read, in milliseconds. `None`
@@ -174,6 +185,13 @@ thread_local! {
 /// on `performance.now` when the page asks for the table.
 pub fn set_clock(clock: Option<fn() -> f64>) {
     CLOCK.with(|slot| slot.set(clock));
+}
+
+/// Installs a reader of the allocation count — a bench's counting
+/// allocator — so every timed stage also learns how many allocations
+/// it made. Only a timed stage samples it.
+pub fn set_alloc_probe(probe: Option<fn() -> u64>) {
+    ALLOC_PROBE.with(|slot| slot.set(probe));
 }
 
 /// Snapshots the totals accumulated since the last call, and resets.
@@ -202,6 +220,7 @@ pub fn take() -> FrameStats {
         measures_made: MEASURES_MADE.with(|c| c.replace(0)),
         rows_summed: ROWS_SUMMED.with(|c| c.replace(0)),
         stage_ms: STAGE_MS.with(|c| c.replace([0.0; STAGES])),
+        stage_allocs: STAGE_ALLOCS.with(|c| c.replace([0; STAGES])),
     }
 }
 
@@ -211,6 +230,8 @@ pub(crate) fn time<T>(stage: Stage, run: impl FnOnce() -> T) -> T {
     let Some(clock) = CLOCK.with(|slot| slot.get()) else {
         return run();
     };
+    let probe = ALLOC_PROBE.with(|slot| slot.get());
+    let allocs_before = probe.map(|probe| probe());
     let start = clock();
     let out = run();
     let elapsed = clock() - start;
@@ -219,6 +240,14 @@ pub(crate) fn time<T>(stage: Stage, run: impl FnOnce() -> T) -> T {
         totals[stage as usize] += elapsed;
         cell.set(totals);
     });
+    if let (Some(probe), Some(before)) = (probe, allocs_before) {
+        let made = probe().saturating_sub(before);
+        STAGE_ALLOCS.with(|cell| {
+            let mut totals = cell.get();
+            totals[stage as usize] += made;
+            cell.set(totals);
+        });
+    }
     out
 }
 
