@@ -83,6 +83,11 @@ struct Registry {
     /// Boundaries the reconciler skipped this pass (clean cache): their
     /// subtree counts as alive in the sweep.
     skipped: HashSet<Rc<str>>,
+    /// Did any owner stand when the pass began? The skips are asked only
+    /// for an owner the pass did not touch ([`protected_by_skip`]), and
+    /// an owner born during the pass is touched by its birth — so a pass
+    /// that began with none never asks, and keeps no skips.
+    skips_asked: bool,
     /// Boundaries whose body RAN this pass: inside them the sweep follows
     /// the normal rule (what did not show up, died).
     reran: HashSet<Rc<str>>,
@@ -193,6 +198,7 @@ pub fn begin_pass() {
         registry.view_keys.clear();
         registry.pass_no += 1;
         registry.skipped.clear();
+        registry.skips_asked = !registry.owners.is_empty();
         registry.reran.clear();
         registry.seqs.clear();
         clear_view_reads(&mut registry, ROOT_READER);
@@ -275,7 +281,12 @@ fn protected_by_skip(registry: &Registry, owner: &str) -> bool {
 /// subtree counts as alive.
 pub fn mark_skipped(path: &Rc<str>) {
     REGISTRY.with(|registry| {
-        registry.borrow_mut().skipped.insert(Rc::clone(path));
+        let mut registry = registry.borrow_mut();
+        // a list of a thousand kept rows is a thousand skips: kept only
+        // when an owner from before the pass may ask for them
+        if registry.skips_asked {
+            registry.skipped.insert(Rc::clone(path));
+        }
     });
 }
 
@@ -1251,6 +1262,51 @@ mod tests {
         assert_eq!(&*spelled, "Spelled");
         assert_eq!(count, 1);
         super::reset_world();
+    }
+
+    /// The skips of a pass are asked for one thing: an owner the pass did
+    /// not touch, whose nearest skipped boundary shelters it. An owner born
+    /// during the pass is touched by its birth, so a pass that began with no
+    /// owner keeps none of its skips — a list of a thousand kept rows files
+    /// nothing — and the owner it bears lives all the same. The next pass,
+    /// which begins with that owner standing, keeps its skips again, and the
+    /// skip shelters the owner it did not visit.
+    #[test]
+    fn a_pass_that_begins_with_no_owner_keeps_no_skips() {
+        use super::{begin_pass, end_pass, enter, mark_skipped, reset_world, REGISTRY};
+        use std::rc::Rc;
+
+        reset_world();
+        let skipped = || REGISTRY.with(|registry| registry.borrow().skipped.len());
+        let owners = || REGISTRY.with(|registry| registry.borrow().owners.len());
+        let kept: Rc<str> = Rc::from("Root/Kept");
+        begin_pass();
+        {
+            let _root = enter("Root");
+            mark_skipped(&kept);
+            let _row = enter("Row");
+            let _ = crate::state::State::new(0u8);
+        }
+        assert_eq!(skipped(), 0, "no owner stood when the pass began");
+        assert!(end_pass().is_empty(), "the owner born in the pass lives");
+        assert_eq!(owners(), 1);
+
+        begin_pass();
+        {
+            let _root = enter("Root");
+            mark_skipped(&Rc::from("Root/Row"));
+        }
+        assert_eq!(skipped(), 1, "an owner stood: the skips are kept");
+        assert!(end_pass().is_empty(), "the skip sheltered the owner it did not visit");
+        assert_eq!(owners(), 1);
+
+        begin_pass();
+        {
+            let _root = enter("Root");
+            mark_skipped(&kept);
+        }
+        assert_eq!(end_pass(), ["Root/Row"], "unsheltered and unvisited, it died");
+        reset_world();
     }
 
     use super::named_chain;
