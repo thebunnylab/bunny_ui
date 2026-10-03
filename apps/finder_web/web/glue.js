@@ -20,7 +20,7 @@ function painter() {
 // the key table, the modifier bits, the import/export surface. The
 // wasm exports its own number; boot compares the two and refuses a
 // pairing this mirror was not written for.
-const EXPECTED_ABI = 12;
+const EXPECTED_ABI = 13;
 
 // Which wasm this page boots: the page sets `window.BUNNY_WASM`
 // before this script loads; the finder's binary is the default.
@@ -197,7 +197,7 @@ const imports = {
     // dom-mode imports — the single binary carries both shells, and
     // this page only ever drives the canvas one
     js_apply_patches() {},
-    js_island() {},
+    js_island_rect() {},
     // A panic on its way out of wasm: decode the message and log it, so
     // an abort is a sentence instead of `unreachable` and a stack of
     // numbers.

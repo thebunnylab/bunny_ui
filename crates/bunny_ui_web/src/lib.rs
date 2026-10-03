@@ -81,8 +81,20 @@ unsafe extern "C" {
     /// little-endian ABI of `bunny_ui::dom::encode`) and mutates the
     /// element tree.
     fn js_apply_patches(pointer: *const u8, len: usize);
-    /// Dom mode: fresh pixels for one canvas island (physical size).
-    fn js_island(id: u32, pointer: *const u8, width: u32, height: u32);
+    /// Dom mode: the pixels of the rect that changed inside one canvas
+    /// island — the island's box (physical size, the canvas's), then
+    /// the rect's place and size inside it; `pointer` holds the rect's
+    /// pixels, straight RGBA, row by row.
+    fn js_island_rect(
+        id: u32,
+        pointer: *const u8,
+        width: u32,
+        height: u32,
+        x: u32,
+        y: u32,
+        dirty_width: u32,
+        dirty_height: u32,
+    );
     /// A panic, on its way to the console. Without it a wasm abort is one
     /// line of `unreachable` and a stack of numbers.
     fn js_panic(pointer: *const u8, len: usize);
@@ -1009,12 +1021,17 @@ fn start_dom_with(
         }
         #[cfg(feature = "canvas")]
         for island in runtime.dom_islands(scale) {
+            let (x, y, dirty_width, dirty_height) = island.dirty;
             unsafe {
-                js_island(
+                js_island_rect(
                     island.id,
                     island.rgba.as_ptr(),
                     island.width as u32,
                     island.height as u32,
+                    x,
+                    y,
+                    dirty_width,
+                    dirty_height,
                 );
             }
         }
@@ -1161,12 +1178,17 @@ fn start_dom_with(
                 if moved.islands {
                     #[cfg(feature = "canvas")]
                     for island in runtime.dom_islands(scale) {
+                        let (x, y, dirty_width, dirty_height) = island.dirty;
                         unsafe {
-                            js_island(
+                            js_island_rect(
                                 island.id,
                                 island.rgba.as_ptr(),
                                 island.width as u32,
                                 island.height as u32,
+                                x,
+                                y,
+                                dirty_width,
+                                dirty_height,
                             );
                         }
                     }

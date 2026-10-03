@@ -30,7 +30,7 @@ import { attach as attachGpu } from "./bunny_gpu.js";
 // the key table, the modifier bits, the import/export surface. The
 // wasm exports its own number; `attach` compares the two and refuses a
 // pairing this mirror was not written for.
-export const EXPECTED_ABI = 12;
+export const EXPECTED_ABI = 13;
 
 const IN_WORKER = typeof window === "undefined";
 const WAKE_CHANNEL = "bunny-wake";
@@ -237,7 +237,7 @@ export function js_request_wake() {
 // Dom-mode imports — the single binary carries both shells, and this
 // module only ever drives the canvas one.
 export function js_apply_patches() {}
-export function js_island() {}
+export function js_island_rect() {}
 
 // A panic on its way out of wasm: decode the message and log it, so an
 // abort is a sentence instead of `unreachable` and a stack of numbers.

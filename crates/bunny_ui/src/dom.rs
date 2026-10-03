@@ -870,9 +870,15 @@ pub struct IslandList {
 /// `<canvas>`. Only islands whose commands actually changed re-raster.
 pub struct IslandFrame {
     pub id: u32,
+    /// The island's whole box, physical px — the canvas's size.
     pub width: usize,
     pub height: usize,
+    /// The pixels of `dirty` alone, straight RGBA, row by row.
     pub rgba: Vec<u8>,
+    /// What changed, physical px: `(x, y, width, height)` inside the
+    /// box. The first frame of an island, and a resized one, is the
+    /// whole box; a row that changed is a strip.
+    pub dirty: (u32, u32, u32, u32),
 }
 
 /// One mutation of the element tree. A frame's worth of patches is the
@@ -2392,7 +2398,11 @@ fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<usize> {
 /// 12 (2026-10-02): the flow record carries `plain` (bit 12, no payload):
 /// an inline tag around one child keeps the browser's own display for
 /// the tag instead of a flex line.
-pub const ABI_VERSION: u32 = 12;
+///
+/// 13 (2026-10-02): an island's pixels arrive by the rect that changed
+/// (`js_island_rect`, with the box's size and the rect's place and
+/// size) instead of the whole box every time (`js_island` is gone).
+pub const ABI_VERSION: u32 = 13;
 
 /// Encodes a patch list into the fixed little-endian stream the glue
 /// decodes with one `DataView` walk. Layout:
@@ -3663,6 +3673,67 @@ mod tests {
     /// against that box and the pixels agree with the element. The
     /// observer's echo of what the engine already said buys nothing.
     #[cfg(feature = "canvas")]
+    /// An island keeps a paint target of its own: a change inside it
+    /// repaints the rows it touched and ships that strip, byte for byte
+    /// what a full repaint would put there; an identical frame ships
+    /// nothing.
+    #[test]
+    fn an_island_repaints_its_damage_not_its_box() {
+        #[derive(Clone)]
+        struct Island {
+            count: State<usize>,
+        }
+
+        impl Component for Island {
+            fn body(self, _ctx: &Context) -> impl View {
+                let count = self.count;
+                crate::vstack!(
+                    text("a fixed line"),
+                    crate::text!("count {}", count.get()),
+                    text("another fixed line"),
+                )
+                .frame(200.0, 90.0)
+                .rendering(crate::layout::Rendering::Gpu)
+            }
+        }
+
+        let size = Size { width: 240.0, height: 120.0 };
+        let count = State::new(0usize);
+        let runtime = Runtime::new();
+        let _ = runtime.dom_frame(&Island { count }, size);
+        let first = runtime.dom_islands(1);
+        assert_eq!(first.len(), 1, "one island");
+        let (width, height) = (first[0].width, first[0].height);
+        assert_eq!(first[0].dirty, (0, 0, width as u32, height as u32), "the first frame is the whole box");
+        assert_eq!(first[0].rgba.len(), width * height * 4);
+
+        count.set(1);
+        let _ = runtime.dom_frame(&Island { count }, size);
+        let second = runtime.dom_islands(1);
+        assert_eq!(second.len(), 1, "the island changed");
+        let (x, y, dirty_width, dirty_height) = second[0].dirty;
+        assert!(
+            (dirty_height as usize) < height,
+            "one line changed: a strip, not the box ({dirty_height} of {height})"
+        );
+        assert_eq!(second[0].rgba.len(), dirty_width as usize * dirty_height as usize * 4);
+
+        // the strip is what a fresh runtime paints there
+        let fresh = Runtime::new();
+        let _ = fresh.dom_frame(&Island { count: State::new(1usize) }, size);
+        let whole = fresh.dom_islands(1).remove(0);
+        let mut expected = Vec::new();
+        for row in y..y + dirty_height {
+            let from = (row as usize * width + x as usize) * 4;
+            expected.extend_from_slice(&whole.rgba[from..from + dirty_width as usize * 4]);
+        }
+        assert_eq!(second[0].rgba, expected, "the strip matches a full repaint byte for byte");
+
+        // nothing moved: nothing ships
+        let _ = runtime.dom_frame(&Island { count }, size);
+        assert!(runtime.dom_islands(1).is_empty(), "an identical frame blits nothing");
+    }
+
     #[test]
     fn a_flexible_island_takes_the_browsers_box() {
         #[derive(Clone)]
