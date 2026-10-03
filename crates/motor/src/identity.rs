@@ -140,16 +140,17 @@ struct Registry {
     /// path: a row that mounts files its bindings under the copy its
     /// boundary already holds, and one that leaves frees no string.
     view_bindings: HashMap<Rc<str>, BindingKeys>,
-    /// Views that left the tree, each with the bindings its body made:
-    /// the half of their teardown that waits for an idle moment
-    /// ([`collect_retired`]).
+    /// Views that left the tree, by the shared path their bindings stand
+    /// under: the bindings stay there until a write asks for them or the
+    /// idle takes them apart ([`file_retired`]). A view made at the same
+    /// path afterwards files under a path of its own.
+    leaving: Vec<Rc<str>>,
+    /// Views that left, each with the bindings its body made, taken out
+    /// from under it: the half of their teardown that waits for an idle
+    /// moment ([`collect_retired`]).
     retired: Vec<(Rc<str>, BindingKeys)>,
-    /// How many of those have their bindings filed in `retired_bindings`.
-    /// A view that leaves files nothing: the first question asked of the
-    /// set files every view that waits ([`file_retired`]).
-    retired_filed: usize,
-    /// The bindings of the filed views, by the IDENTITY of their key — the
-    /// copy the binding was made with. A write that reaches one marks
+    /// The bindings of the retired views, by the IDENTITY of their key —
+    /// the copy the binding was made with. A write that reaches one marks
     /// nothing. A body that makes the key again spells a copy of its own,
     /// which none of them is.
     retired_bindings: HashSet<usize>,
@@ -713,7 +714,10 @@ pub fn registry_counts() -> [usize; 7] {
             registry.owners.len(),
             registry.reads_by_view.len(),
             registry.readers.len(),
-            registry.view_bindings.len(),
+            // the views that left still stand there until their bindings
+            // are taken out: not views that keep any
+            registry.view_bindings.len()
+                - registry.leaving.iter().filter(|view| standing_bindings(&registry.view_bindings, view).is_some()).count(),
             registry.binding_reads.len(),
             registry.dirty.len(),
             registry.dirty_bindings.len(),
@@ -1080,10 +1084,12 @@ fn clear_own_reads(registry: &mut Registry, view: &str) {
 /// for an idle moment ([`collect_retired`]). A thousand rows that leave
 /// a list are two thousand bindings, and unpicking each — the readers of
 /// every dependency, the sets freed one by one — was the larger part of
-/// the click that let them go. Even filing each one as retired hashed
-/// two thousand keys into a set no write may ever ask: they are filed
-/// when one does ([`file_retired`]).
-pub fn retire_view(view: &str) {
+/// the click that let them go. Even taking their list from under the
+/// view and filing each one as retired hashed a path and two thousand
+/// keys that no write may ever ask for: the view is only noted, by the
+/// shared path its bindings stand under, and they are taken out and filed
+/// when a write does ask ([`file_retired`]).
+pub fn retire_view(view: &Rc<str>) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         let registry = &mut *registry;
@@ -1091,19 +1097,28 @@ pub fn retire_view(view: &str) {
         // most frames that let views go hold no dirt at all: an empty
         // set is not asked, and the path is not hashed for it
         if !registry.dirty.is_empty() {
-            registry.dirty.remove(view);
+            registry.dirty.remove(&**view);
         }
-        if let Some((view, bindings)) = registry.view_bindings.remove_entry(view) {
-            // a write that reached them before they left is not news to
-            // anyone now
-            if !registry.dirty_bindings.is_empty() {
-                for binding in bindings.iter() {
-                    registry.dirty_bindings.remove(binding);
-                }
+        // a write that reached its bindings before it left is not news
+        // to anyone now
+        if !registry.dirty_bindings.is_empty()
+            && let Some(bindings) = standing_bindings(&registry.view_bindings, view)
+        {
+            for binding in bindings.iter() {
+                registry.dirty_bindings.remove(binding);
             }
-            registry.retired.push((view, bindings));
         }
+        registry.leaving.push(Rc::clone(view));
     })
+}
+
+/// The bindings still filed under the very path a view that left shared
+/// — none, when a view made at its path since filed its own there.
+fn standing_bindings<'a>(view_bindings: &'a HashMap<Rc<str>, BindingKeys>, view: &Rc<str>) -> Option<&'a BindingKeys> {
+    view_bindings
+        .get_key_value(&**view)
+        .filter(|(standing, _)| Rc::ptr_eq(standing, view))
+        .map(|(_, bindings)| bindings)
 }
 
 /// The identity of a binding's key: the copy it was made with.
@@ -1111,24 +1126,46 @@ fn identity(key: &Rc<str>) -> usize {
     Rc::as_ptr(key) as *const u8 as usize
 }
 
-/// Files the bindings of the views that retired since the last filing in
-/// the set a write asks. The retired list holds their keys, so no key
-/// filed by its identity is freed — or spelled again at the same place —
-/// while it stands in the set.
-fn file_retired(retired: &[(Rc<str>, BindingKeys)], filed: &mut usize, set: &mut HashSet<usize>) {
-    for (_, bindings) in &retired[*filed..] {
-        set.extend(bindings.iter().map(identity));
+/// Takes the bindings of the views that left since the last filing from
+/// under them, and files each in the set a write asks. The retired list
+/// holds their keys, so no key filed by its identity is freed — or
+/// spelled again at the same place — while it stands in the set. A view
+/// made at the same path since cleared the ones that left as it began,
+/// and filed its own under a path of its own: nothing is taken.
+fn file_retired(
+    leaving: &mut Vec<Rc<str>>,
+    view_bindings: &mut HashMap<Rc<str>, BindingKeys>,
+    retired: &mut Vec<(Rc<str>, BindingKeys)>,
+    set: &mut HashSet<usize>,
+) {
+    for view in leaving.drain(..) {
+        if let std::collections::hash_map::Entry::Occupied(standing) = view_bindings.entry(Rc::clone(&view))
+            && Rc::ptr_eq(standing.key(), &view)
+        {
+            let bindings = standing.remove();
+            set.extend(bindings.iter().map(identity));
+            retired.push((view, bindings));
+        }
     }
-    *filed = retired.len();
 }
 
-/// Is a retired binding still the one whose reads stand under its key?
-/// A body that made the key again cleared them and reads under a copy of
-/// its own; a retired key whose binding read nothing has nothing standing.
-fn still_retired(registry: &Registry, at: usize, binding: &Rc<str>) -> bool {
-    let filed_back = at < registry.retired_filed && !registry.retired_bindings.contains(&identity(binding));
-    !filed_back
-        && registry.binding_reads.get_key_value(&**binding).is_none_or(|(standing, _)| Rc::ptr_eq(standing, binding))
+/// [`file_retired`] on the register's own lists.
+fn file_all_retired(registry: &mut Registry) {
+    file_retired(&mut registry.leaving, &mut registry.view_bindings, &mut registry.retired, &mut registry.retired_bindings);
+}
+
+/// Are a retired binding's reads still the ones standing under its key?
+/// Not when a body made the key again, clearing them and reading under a
+/// copy of its own. A key whose binding read nothing has nothing standing
+/// either way.
+fn reads_stand(registry: &Registry, binding: &Rc<str>) -> bool {
+    registry.binding_reads.get_key_value(&**binding).is_none_or(|(standing, _)| Rc::ptr_eq(standing, binding))
+}
+
+/// Is a filed binding still retired — not taken back by name, and its
+/// reads still its own?
+fn still_retired(registry: &Registry, binding: &Rc<str>) -> bool {
+    registry.retired_bindings.contains(&identity(binding)) && reads_stand(registry, binding)
 }
 
 /// Takes apart the read graph of the bindings retired since the last
@@ -1139,23 +1176,42 @@ pub fn collect_retired() -> Vec<Rc<str>> {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         let registry = &mut *registry;
-        if registry.retired.is_empty() {
+        if registry.retired.is_empty() && registry.leaving.is_empty() {
             return Vec::new();
         }
+        let mut torn = Vec::new();
+        let mut tear = |registry: &mut Registry, binding: Rc<str>| {
+            clear_binding_reads(registry, &binding);
+            torn.push(binding);
+        };
+        // the ones a write asked for were filed, and one may have been
+        // taken back by name since
         let mut retired = std::mem::take(&mut registry.retired);
-        let mut torn = Vec::with_capacity(retired.iter().map(|(_, bindings)| bindings.len()).sum());
-        for (at, (_, bindings)) in retired.drain(..).enumerate() {
+        for (_, bindings) in retired.drain(..) {
             for binding in bindings.into_keys() {
-                if still_retired(registry, at, &binding) {
-                    clear_binding_reads(registry, &binding);
-                    torn.push(binding);
+                if still_retired(registry, &binding) {
+                    tear(registry, binding);
+                }
+            }
+        }
+        // the ones no write asked for are taken from under their views
+        // here, unfiled: taking one back by name files them all first
+        let mut leaving = std::mem::take(&mut registry.leaving);
+        for view in leaving.drain(..) {
+            if let std::collections::hash_map::Entry::Occupied(standing) = registry.view_bindings.entry(Rc::clone(&view))
+                && Rc::ptr_eq(standing.key(), &view)
+            {
+                for binding in standing.remove().into_keys() {
+                    if reads_stand(registry, &binding) {
+                        tear(registry, binding);
+                    }
                 }
             }
         }
         registry.retired_bindings.clear();
-        registry.retired_filed = 0;
-        // the list keeps its room for the next rows that leave
+        // the lists keep their room for the next rows that leave
         registry.retired = retired;
+        registry.leaving = leaving;
         torn
     })
 }
@@ -1164,12 +1220,18 @@ pub fn collect_retired() -> Vec<Rc<str>> {
 pub fn retired_count() -> usize {
     REGISTRY.with(|registry| {
         let registry = registry.borrow();
-        registry
+        let leaving: usize = registry
+            .leaving
+            .iter()
+            .filter_map(|view| standing_bindings(&registry.view_bindings, view))
+            .map(|bindings| bindings.iter().filter(|binding| reads_stand(&registry, binding)).count())
+            .sum();
+        let filed: usize = registry
             .retired
             .iter()
-            .enumerate()
-            .map(|(at, (_, bindings))| bindings.iter().filter(|binding| still_retired(&registry, at, binding)).count())
-            .sum()
+            .map(|(_, bindings)| bindings.iter().filter(|binding| still_retired(&registry, binding)).count())
+            .sum();
+        leaving + filed
     })
 }
 
@@ -1329,8 +1391,8 @@ pub fn forget_probe() {
 
 /// The key is a live binding's again ([`retire_view`]).
 fn unretire(registry: &mut Registry, key: &Rc<str>) {
-    if !registry.retired.is_empty() {
-        file_retired(&registry.retired, &mut registry.retired_filed, &mut registry.retired_bindings);
+    file_all_retired(registry);
+    if !registry.retired_bindings.is_empty() {
         registry.retired_bindings.remove(&identity(key));
     }
 }
@@ -1444,12 +1506,17 @@ pub(crate) fn record_write(key: DepKey) {
             }
         }
         if let Some(bindings) = registry.binding_readers.get(&key) {
-            if registry.retired.is_empty() {
+            if registry.retired.is_empty() && registry.leaving.is_empty() {
                 registry.dirty_bindings.extend(bindings.iter().cloned());
             } else {
                 // a retired binding still stands in the readers until the
                 // idle takes it apart — and a write reaches it no more
-                file_retired(&registry.retired, &mut registry.retired_filed, &mut registry.retired_bindings);
+                file_retired(
+                    &mut registry.leaving,
+                    &mut registry.view_bindings,
+                    &mut registry.retired,
+                    &mut registry.retired_bindings,
+                );
                 let retired = &registry.retired_bindings;
                 registry
                     .dirty_bindings
@@ -1831,53 +1898,68 @@ mod tests {
         assert_eq!(registry_counts()[4], 2, "only the bindings' reads stand");
     }
 
-    /// One pass: a view at `view` whose body makes one binding that reads
-    /// `count`. Returns the binding's key.
-    fn bind_under(view: &'static str, count: crate::state::State<u32>) -> std::rc::Rc<str> {
+    /// One pass: a view at `view`, its path shared the way a boundary
+    /// shares it, whose body makes one binding that reads `count`. Returns
+    /// the shared path and the binding's key.
+    fn bind_under(view: &'static str, count: crate::state::State<u32>) -> (std::rc::Rc<str>, std::rc::Rc<str>) {
         use super::{begin_binding_under_view, begin_pass, begin_view_reads, cursor_key, end_pass, enter_view};
+        let shared: std::rc::Rc<str> = std::rc::Rc::from(view);
         begin_pass();
         let key = {
             let _view = enter_view(view);
-            begin_view_reads(&std::rc::Rc::from(view));
+            begin_view_reads(&shared);
             let key = cursor_key("#text").expect("inside a pass");
             let _reading = begin_binding_under_view(&key);
             let _ = count.wrappedValue();
             key
         };
         let _ = end_pass();
-        key
+        (shared, key)
     }
 
     fn filed_retired() -> usize {
         super::REGISTRY.with(|registry| registry.borrow().retired_bindings.len())
     }
 
-    /// A view that leaves files none of its bindings as retired: a list
-    /// that clears is two thousand of them, and the set was asked by no
-    /// one in the click that let them go. The first write that reaches a
-    /// binding files them all, and reaches none of them — the row that
-    /// left hears nothing. The idle takes their reads apart.
+    fn standing_under(view: &str) -> usize {
+        super::REGISTRY.with(|registry| registry.borrow().view_bindings.get(view).map_or(0, super::BindingKeys::len))
+    }
+
+    /// A view that leaves is only noted: its bindings stay filed under it,
+    /// none is filed as retired — a list that clears is two thousand of
+    /// them, and no one asked in the click that let them go — and the
+    /// register counts no view that keeps any. The first write that
+    /// reaches a binding takes them out and files them, and reaches none
+    /// of them: the row that left hears nothing. The idle takes their
+    /// reads apart.
     #[test]
     fn a_view_that_leaves_files_its_bindings_only_when_a_write_asks() {
-        use super::{binding_read_count, collect_retired, has_dirty_bindings, reset_world, retire_view, retired_count};
+        use super::{binding_read_count, collect_retired, has_dirty_bindings, registry_counts, reset_world, retire_view, retired_count};
         reset_world();
         let count = crate::state::State::new(0u32);
-        let key = bind_under("Row", count);
+        let (view, key) = bind_under("Row", count);
         assert_eq!(binding_read_count(&key), 1);
 
-        retire_view("Row");
-        assert_eq!(filed_retired(), 0, "the view left, and filed nothing");
+        retire_view(&view);
+        assert_eq!((standing_under("Row"), filed_retired()), (1, 0), "the view left, and was only noted");
+        assert_eq!(registry_counts()[3], 0, "no view keeps bindings");
         assert_eq!(retired_count(), 1, "its binding waits retired all the same");
 
         count.set(1);
         assert!(!has_dirty_bindings(), "the write reached no binding of the view that left");
-        assert_eq!(filed_retired(), 1, "the write asked, and filed it");
+        assert_eq!((standing_under("Row"), filed_retired()), (0, 1), "the write asked: taken out and filed");
 
         let torn = collect_retired();
         assert_eq!(torn.len(), 1);
         assert!(std::rc::Rc::ptr_eq(&torn[0], &key), "the idle took apart the very binding that left");
         assert_eq!(binding_read_count(&key), 0);
         assert_eq!((filed_retired(), retired_count()), (0, 0));
+
+        // and with no write between, the idle takes them out itself
+        let (view, key) = bind_under("Row", count);
+        retire_view(&view);
+        assert_eq!(collect_retired().len(), 1);
+        assert_eq!((standing_under("Row"), binding_read_count(&key)), (0, 0));
         reset_world();
     }
 
@@ -1890,9 +1972,9 @@ mod tests {
         use super::{binding_read_count, collect_retired, reset_world, retire_view, retired_count, take_dirty_bindings};
         reset_world();
         let count = crate::state::State::new(0u32);
-        let left = bind_under("Row", count);
-        retire_view("Row");
-        let again = bind_under("Row", count);
+        let (view, left) = bind_under("Row", count);
+        retire_view(&view);
+        let (_, again) = bind_under("Row", count);
         assert_eq!(&*again, &*left, "the same key");
         assert!(!std::rc::Rc::ptr_eq(&again, &left), "spelled again");
         assert_eq!(filed_retired(), 0, "making it again filed nothing");
@@ -1907,6 +1989,28 @@ mod tests {
         assert_eq!(binding_read_count(&again), 1, "the new binding's reads stand");
         count.set(2);
         assert_eq!(take_dirty_bindings().len(), 1, "and it still hears writes");
+        reset_world();
+    }
+
+    /// The door that files a binding under an owner it names takes a
+    /// retired binding back — the very copy of the key, live again: a
+    /// write reaches it, and the idle leaves its reads standing.
+    #[test]
+    fn a_binding_filed_again_by_name_is_taken_back() {
+        use super::{begin_binding, binding_read_count, collect_retired, reset_world, retire_view, retired_count, take_dirty_bindings};
+        reset_world();
+        let count = crate::state::State::new(0u32);
+        let (view, key) = bind_under("Row", count);
+        retire_view(&view);
+        {
+            let _reading = begin_binding(&key, Some("Elsewhere"));
+            let _ = count.wrappedValue();
+        }
+        assert_eq!(retired_count(), 0, "taken back");
+        count.set(1);
+        assert_eq!(take_dirty_bindings().len(), 1, "a write reaches it");
+        assert!(collect_retired().is_empty(), "the idle leaves it alone");
+        assert_eq!(binding_read_count(&key), 1);
         reset_world();
     }
 
