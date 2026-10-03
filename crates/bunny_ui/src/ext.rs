@@ -1075,7 +1075,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
     fn glass(self, glass: crate::layout::Glass) -> Modified<Self> {
         Modified {
             base: self,
-            modifier: Modifier::Glass(glass),
+            modifier: Modifier::Glass(Box::new(glass)),
         }
     }
 
@@ -1408,7 +1408,7 @@ pub trait ViewExt: View<Arity = Single> + Sized {
             base: self,
             modifier: Modifier::Dialog {
                 is_presented,
-                spec,
+                spec: Box::new(spec),
                 content: Rc::new(content),
             },
         }

@@ -119,8 +119,10 @@ pub enum Modifier {
     /// A soft halo behind the view: (radius, color).
     Shadow(f64, Color),
     /// The liquid-glass material behind the view. Every knob is
-    /// optional, so a chain of them MERGES into one material.
-    Glass(crate::layout::Glass),
+    /// optional, so a chain of them MERGES into one material. Boxed: the
+    /// widest record of the set and among the rarest, it sized every
+    /// modifier by itself — and a row's body holds one per modifier.
+    Glass(Box<crate::layout::Glass>),
     /// The image below negotiates size with the proposal.
     Resizable,
     /// How a resizable image maps into its box: contain or cover.
@@ -183,9 +185,10 @@ pub enum Modifier {
     /// titled, resizable, key while it is up — where the shell has
     /// one, and presents as the sheet it is everywhere else. The
     /// window's close button flips the binding; it never terminates.
+    /// The spec is boxed, for the reason the glass is.
     Dialog {
         is_presented: Binding<bool>,
-        spec: crate::layout::DialogSpec,
+        spec: Box<crate::layout::DialogSpec>,
         content: Rc<dyn Fn(&Context) -> crate::erased::Erased>,
     },
     /// `.alert(…)`: a dialog's window with an ask's manners — one size
@@ -1091,7 +1094,7 @@ fn apply(
                     path: path.clone(),
                     content: Rc::new(wrap_layout(dialog_layouts.clone())),
                     child: Box::new(base),
-                    surface: crate::layout::OverlaySurface::Window(spec.clone()),
+                    surface: crate::layout::OverlaySurface::Window((**spec).clone()),
                 }),
                 None => out.wrap_layout_from(mark, |base| LayoutNode::Layered {
                     align: CrossAlign::Center,
@@ -1326,7 +1329,7 @@ fn apply(
         Modifier::Glass(glass) => wrap_styled(
             out,
             mark,
-            VisualProps { glass: Some(*glass), ..VisualProps::default() },
+            VisualProps { glass: Some(**glass), ..VisualProps::default() },
         ),
         Modifier::ForegroundColor(color) => wrap_styled(
             out,

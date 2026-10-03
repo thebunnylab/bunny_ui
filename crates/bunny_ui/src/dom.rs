@@ -8446,14 +8446,15 @@ mod size_tests {
             ("LayoutNode", size_of::<crate::layout::LayoutNode>()),
             ("RenderNode", size_of::<motor::view::RenderNode>()),
             ("FontSpec", size_of::<crate::text_engine::FontSpec>()),
+            ("Modifier", size_of::<crate::modifier::Modifier>()),
         ];
         for (name, size) in sizes {
             eprintln!("size {name:<11} {size:>5} bytes");
         }
         // the bounds are the 64-bit sizes; a 32-bit target is smaller
-        // (wasm: DomNode 248, DomStyle 16, DomKind 56); a placed
-        // element's box stays f64, the served page prints it. The node
-        // is the retention too: its element id and its rule are the
+        // (wasm: DomNode 248, DomStyle 16, DomKind 56, Modifier 56); a
+        // placed element's box stays f64, the served page prints it. The
+        // node is the retention too: its element id and its rule are the
         // eight bytes over 320, where a wrapper around every kept node
         // was forty and a second vector per parent
         assert!(size_of::<super::DomNode>() <= 328, "DomNode grew: box the rare record, not the node");
@@ -8470,5 +8471,8 @@ mod size_tests {
         // a patch list is thousands long on a create: its slot must stay
         // small, the fat records boxed
         assert!(size_of::<super::DomPatch>() <= 96, "DomPatch grew: box the record, not the list");
+        // a view holds one per modifier, and a row's body is built and
+        // moved whole in every run: the rare wide payload is boxed
+        assert!(size_of::<crate::modifier::Modifier>() <= 80, "Modifier grew: box the wide payload");
     }
 }
