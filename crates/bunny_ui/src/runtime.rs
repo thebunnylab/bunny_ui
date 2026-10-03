@@ -4729,6 +4729,9 @@ impl Runtime {
     /// next [`Runtime::dom_frame`] diffs against a page that is
     /// already true and says nothing.
     pub fn dom_adopt(&self, root: &impl View, size: crate::layout::Size) {
+        // the build's frame knew its window: a body that bends with the
+        // width must see the same one here, or it adopts another scene
+        self.note_viewport(crate::layout::Proposal::exact(size));
         self.settle(root);
         let _ = reconciler::take_frame_runs();
         self.dom.borrow_mut().unpick_buried();

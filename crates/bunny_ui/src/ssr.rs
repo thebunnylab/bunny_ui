@@ -1302,4 +1302,31 @@ mod tests {
             .expect("the box that declares the face");
         assert!(rule.contains("color:rgba(143, 134, 168"), "{}", page.css);
     }
+
+    /// A body that bends with the width — two columns or one — adopts
+    /// the scene the build served: the adoption reads the window the
+    /// build read, and the first frame after it says nothing.
+    #[test]
+    fn a_page_that_reads_the_window_adopts_in_silence() {
+        #[derive(Clone, Copy)]
+        struct Shaped;
+
+        impl Component for Shaped {
+            fn body(self, ctx: &Context) -> impl View {
+                let wide = ctx.environment::<Viewport>().width >= 800.0;
+                if wide {
+                    Either::First(crate::hstack!(text("words"), text("code")))
+                } else {
+                    Either::Second(crate::vstack!(text("words"), text("code"), text("more")))
+                }
+            }
+        }
+
+        let size = Size { width: 1200.0, height: 800.0 };
+        let built = Runtime::new();
+        assert!(!built.dom_frame(&Shaped, size).is_empty());
+        let fresh = Runtime::new();
+        fresh.dom_adopt(&Shaped, size);
+        assert_eq!(fresh.dom_frame(&Shaped, size), Vec::new(), "the served page is already true");
+    }
 }
