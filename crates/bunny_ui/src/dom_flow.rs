@@ -718,12 +718,11 @@ impl Walk<'_> {
                 let container = placed(out, node(DomKind::FlexColumn));
                 {
                     let layout = container.layout.as_mut().expect("flow node");
-                    if max_width.is_finite() {
-                        layout.max_width = Some(*max_width as f32);
-                    }
-                    if max_height.is_finite() {
-                        layout.max_height = Some(*max_height as f32);
-                    }
+                    // the wire carries f32: a ceiling past what it holds
+                    // (`f64::MAX`, "no ceiling, but not open") is none
+                    let ceiling = |length: f64| Some(length as f32).filter(|length| length.is_finite());
+                    layout.max_width = ceiling(*max_width);
+                    layout.max_height = ceiling(*max_height);
                     // a frame open on BOTH axes fills whatever holds it.
                     // Open on one, it is flexible on that one alone, and
                     // `flex` is the holder's main axis, whichever that is:
@@ -2809,5 +2808,22 @@ mod tests {
         assert!(section.stretch, "the column still takes it edge to edge: {section:?}");
         let spacer = column.children[1].children[1].layout.as_ref().expect("flow");
         assert!(spacer.grow, "a row has a length to share: {spacer:?}");
+    }
+
+    /// A ceiling the wire's f32 cannot hold is no ceiling at all — it
+    /// would cross as infinity and serve `max-height:infpx`.
+    #[test]
+    fn a_ceiling_past_the_wire_is_none() {
+        let tree = LayoutNode::MaxFrame {
+            max_width: 500.0,
+            max_height: f64::MAX,
+            align: CrossAlign::Start,
+            child: Box::new(text_node("words")),
+        };
+        let offsets = HashMap::default();
+        let scene = lower(&tree, &env_fixture(&offsets)).scene;
+        let frame = scene.children[0].layout.as_ref().expect("flow");
+        assert_eq!(frame.max_width, Some(500.0));
+        assert_eq!(frame.max_height, None, "{frame:?}");
     }
 }
